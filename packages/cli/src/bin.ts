@@ -1,3 +1,14 @@
-// Entry point for the `kora` CLI command
-// Will be wired up with citty subcommands in a later commit
-console.log('kora CLI — coming soon')
+import { defineCommand, runMain } from 'citty'
+import { createCommand } from './commands/create/create-command'
+
+const main = defineCommand({
+	meta: {
+		name: 'kora',
+		description: 'Kora.js — Offline-first application framework',
+	},
+	subCommands: {
+		create: createCommand,
+	},
+})
+
+runMain(main)
