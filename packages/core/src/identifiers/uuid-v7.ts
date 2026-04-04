@@ -1,6 +1,6 @@
 import type { RandomSource } from '../types'
 
-const defaultRandom: RandomSource = globalThis.crypto
+const defaultRandom: RandomSource = globalThis.crypto as RandomSource
 
 /**
  * Generates a UUID v7 per RFC 9562.
@@ -34,10 +34,10 @@ export function generateUUIDv7(
 	bytes[5] = ms & 0xff
 
 	// Set version 7 (0111) in bits 48-51
-	bytes[6] = (bytes[6] & 0x0f) | 0x70
+	bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x70
 
 	// Set variant 10 in bits 64-65
-	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80
 
 	return formatUUID(bytes)
 }

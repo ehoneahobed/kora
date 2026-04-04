@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import { SchemaValidationError } from '../errors/errors'
 import { FULL_SCHEMA } from '../../tests/fixtures/schemas'
+import { SchemaValidationError } from '../errors/errors'
 import { defineSchema } from './define'
 import { t } from './types'
 import { validateRecord } from './validation'
@@ -32,10 +32,15 @@ describe('validateRecord', () => {
 	describe('insert operations', () => {
 		test('accepts valid insert data with all required fields', () => {
 			if (!todosCollection) return
-			const result = validateRecord('todos', todosCollection, {
-				title: 'Ship it',
-				notes: 'Some notes',
-			}, 'insert')
+			const result = validateRecord(
+				'todos',
+				todosCollection,
+				{
+					title: 'Ship it',
+					notes: 'Some notes',
+				},
+				'insert',
+			)
 			expect(result.title).toBe('Ship it')
 			expect(result.completed).toBe(false) // default applied
 			expect(result.priority).toBe('medium') // default applied
@@ -59,39 +64,54 @@ describe('validateRecord', () => {
 
 		test('rejects missing required fields', () => {
 			if (!todosCollection) return
-			expect(() =>
-				validateRecord('todos', todosCollection, { completed: true }, 'insert'),
-			).toThrow(SchemaValidationError)
+			expect(() => validateRecord('todos', todosCollection, { completed: true }, 'insert')).toThrow(
+				SchemaValidationError,
+			)
 		})
 
 		test('rejects auto fields provided by developer', () => {
 			if (!todosCollection) return
 			expect(() =>
-				validateRecord('todos', todosCollection, {
-					title: 'test',
-					notes: 'n',
-					created_at: 123456,
-				}, 'insert'),
+				validateRecord(
+					'todos',
+					todosCollection,
+					{
+						title: 'test',
+						notes: 'n',
+						created_at: 123456,
+					},
+					'insert',
+				),
 			).toThrow(/auto-populated/)
 		})
 
 		test('skips auto fields in output', () => {
 			if (!todosCollection) return
-			const result = validateRecord('todos', todosCollection, {
-				title: 'test',
-				notes: 'n',
-			}, 'insert')
+			const result = validateRecord(
+				'todos',
+				todosCollection,
+				{
+					title: 'test',
+					notes: 'n',
+				},
+				'insert',
+			)
 			expect(result).not.toHaveProperty('created_at')
 		})
 
 		test('rejects extra fields not in schema', () => {
 			if (!todosCollection) return
 			expect(() =>
-				validateRecord('todos', todosCollection, {
-					title: 'test',
-					notes: 'n',
-					extra_field: 'bad',
-				}, 'insert'),
+				validateRecord(
+					'todos',
+					todosCollection,
+					{
+						title: 'test',
+						notes: 'n',
+						extra_field: 'bad',
+					},
+					'insert',
+				),
 			).toThrow(SchemaValidationError)
 		})
 	})
@@ -130,17 +150,17 @@ describe('validateRecord', () => {
 		test('rejects non-string for string field', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
-			expect(() =>
-				validateRecord('items', col, { name: 123, count: 1 }, 'insert'),
-			).toThrow(/must be a string/)
+			expect(() => validateRecord('items', col, { name: 123, count: 1 }, 'insert')).toThrow(
+				/must be a string/,
+			)
 		})
 
 		test('rejects non-number for number field', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
-			expect(() =>
-				validateRecord('items', col, { name: 'test', count: 'abc' }, 'insert'),
-			).toThrow(/must be a number/)
+			expect(() => validateRecord('items', col, { name: 'test', count: 'abc' }, 'insert')).toThrow(
+				/must be a number/,
+			)
 		})
 
 		test('rejects NaN for number field', () => {
@@ -170,7 +190,12 @@ describe('validateRecord', () => {
 		test('accepts valid enum value', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
-			const result = validateRecord('items', col, { name: 'test', count: 1, category: 'a' }, 'insert')
+			const result = validateRecord(
+				'items',
+				col,
+				{ name: 'test', count: 1, category: 'a' },
+				'insert',
+			)
 			expect(result.category).toBe('a')
 		})
 
@@ -193,22 +218,32 @@ describe('validateRecord', () => {
 		test('accepts valid array items', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
-			const result = validateRecord('items', col, {
-				name: 'test',
-				count: 1,
-				tags: ['a', 'b'],
-			}, 'insert')
+			const result = validateRecord(
+				'items',
+				col,
+				{
+					name: 'test',
+					count: 1,
+					tags: ['a', 'b'],
+				},
+				'insert',
+			)
 			expect(result.tags).toEqual(['a', 'b'])
 		})
 
 		test('accepts string for richtext field', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
-			const result = validateRecord('items', col, {
-				name: 'test',
-				count: 1,
-				notes: 'plain text',
-			}, 'insert')
+			const result = validateRecord(
+				'items',
+				col,
+				{
+					name: 'test',
+					count: 1,
+					notes: 'plain text',
+				},
+				'insert',
+			)
 			expect(result.notes).toBe('plain text')
 		})
 
@@ -216,11 +251,16 @@ describe('validateRecord', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
 			const bytes = new Uint8Array([1, 2, 3])
-			const result = validateRecord('items', col, {
-				name: 'test',
-				count: 1,
-				notes: bytes,
-			}, 'insert')
+			const result = validateRecord(
+				'items',
+				col,
+				{
+					name: 'test',
+					count: 1,
+					notes: bytes,
+				},
+				'insert',
+			)
 			expect(result.notes).toEqual(bytes)
 		})
 
@@ -251,7 +291,12 @@ describe('validateRecord', () => {
 			const events = schema2.collections.events
 			if (!events) return
 			expect(() =>
-				validateRecord('events', events, { name: 'e', happened_at: Number.POSITIVE_INFINITY }, 'insert'),
+				validateRecord(
+					'events',
+					events,
+					{ name: 'e', happened_at: Number.POSITIVE_INFINITY },
+					'insert',
+				),
 			).toThrow(/timestamp/)
 		})
 	})

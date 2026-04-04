@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'vitest'
+import { MockTimeSource } from '../../tests/fixtures/timestamps'
 import { HybridLogicalClock } from '../clock/hlc'
 import { OperationError } from '../errors/errors'
 import type { OperationInput } from '../types'
-import { MockTimeSource } from '../../tests/fixtures/timestamps'
 import {
 	createOperation,
 	isValidOperation,
@@ -48,7 +48,7 @@ describe('createOperation', () => {
 
 		expect(Object.isFrozen(op)).toBe(true)
 		expect(() => {
-			;(op as Record<string, unknown>).type = 'delete'
+			;(op as unknown as Record<string, unknown>).type = 'delete'
 		}).toThrow()
 	})
 
@@ -112,27 +112,23 @@ describe('validateOperationParams', () => {
 	})
 
 	test('rejects empty nodeId', () => {
-		expect(() => validateOperationParams(makeInsertInput({ nodeId: '' }))).toThrow(
-			OperationError,
-		)
+		expect(() => validateOperationParams(makeInsertInput({ nodeId: '' }))).toThrow(OperationError)
 	})
 
 	test('rejects invalid type', () => {
-		expect(() =>
-			validateOperationParams(makeInsertInput({ type: 'invalid' as 'insert' })),
-		).toThrow(OperationError)
-	})
-
-	test('rejects insert with null data', () => {
-		expect(() => validateOperationParams(makeInsertInput({ data: null }))).toThrow(
+		expect(() => validateOperationParams(makeInsertInput({ type: 'invalid' as 'insert' }))).toThrow(
 			OperationError,
 		)
 	})
 
+	test('rejects insert with null data', () => {
+		expect(() => validateOperationParams(makeInsertInput({ data: null }))).toThrow(OperationError)
+	})
+
 	test('rejects update with null data', () => {
-		expect(() =>
-			validateOperationParams(makeInsertInput({ type: 'update', data: null })),
-		).toThrow(OperationError)
+		expect(() => validateOperationParams(makeInsertInput({ type: 'update', data: null }))).toThrow(
+			OperationError,
+		)
 	})
 
 	test('rejects update with null previousData', () => {
@@ -145,9 +141,7 @@ describe('validateOperationParams', () => {
 
 	test('rejects delete with non-null data', () => {
 		expect(() =>
-			validateOperationParams(
-				makeInsertInput({ type: 'delete', data: { leftover: true } }),
-			),
+			validateOperationParams(makeInsertInput({ type: 'delete', data: { leftover: true } })),
 		).toThrow(OperationError)
 	})
 

@@ -24,11 +24,7 @@ export function mergeVectors(a: VersionVector, b: VersionVector): VersionVector 
  * Advance a version vector for a specific node to a new sequence number.
  * Only advances forward — if the current value is higher, no change is made.
  */
-export function advanceVector(
-	vector: VersionVector,
-	nodeId: string,
-	seq: number,
-): VersionVector {
+export function advanceVector(vector: VersionVector, nodeId: string, seq: number): VersionVector {
 	const updated = new Map(vector)
 	updated.set(nodeId, Math.max(updated.get(nodeId) ?? 0, seq))
 	return updated

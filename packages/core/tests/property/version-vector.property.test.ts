@@ -1,17 +1,10 @@
 import fc from 'fast-check'
 import { describe, expect, test } from 'vitest'
 import type { VersionVector } from '../../src/types'
-import {
-	dominates,
-	mergeVectors,
-	vectorsEqual,
-} from '../../src/version-vector/version-vector'
+import { dominates, mergeVectors, vectorsEqual } from '../../src/version-vector/version-vector'
 
 const versionVectorArb: fc.Arbitrary<VersionVector> = fc
-	.array(
-		fc.tuple(fc.stringMatching(/^[a-z]{1,4}$/), fc.nat({ max: 100 })),
-		{ maxLength: 5 },
-	)
+	.array(fc.tuple(fc.stringMatching(/^[a-z]{1,4}$/), fc.nat({ max: 100 })), { maxLength: 5 })
 	.map((entries) => new Map(entries))
 
 describe('Version vector property-based tests', () => {

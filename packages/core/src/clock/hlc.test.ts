@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from 'vitest'
+import { MockTimeSource } from '../../tests/fixtures/timestamps'
 import { ClockDriftError } from '../errors/errors'
 import type { HLCTimestamp } from '../types'
-import { MockTimeSource } from '../../tests/fixtures/timestamps'
 import { HybridLogicalClock } from './hlc'
 
 describe('HybridLogicalClock', () => {

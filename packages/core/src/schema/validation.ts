@@ -173,10 +173,10 @@ function validateFieldValue(
 				)
 			}
 			if (descriptor.itemKind) {
+				const expectedType = jsTypeForKind(descriptor.itemKind)
 				for (let i = 0; i < value.length; i++) {
 					const item = value[i]
-					const expectedType = jsTypeForKind(descriptor.itemKind)
-					if (typeof item !== expectedType) {
+					if (!matchesJsType(item, expectedType)) {
 						throw new SchemaValidationError(
 							`Field "${fieldName}[${i}]" in collection "${collection}" must be a ${descriptor.itemKind}, got ${typeof item}`,
 							{
@@ -222,5 +222,22 @@ function jsTypeForKind(kind: string): string {
 			return 'boolean'
 		default:
 			return 'object'
+	}
+}
+
+function matchesJsType(value: unknown, expected: string): boolean {
+	// Using explicit comparisons to satisfy Biome's useValidTypeof rule,
+	// which requires typeof to be compared against string literals.
+	switch (expected) {
+		case 'string':
+			return typeof value === 'string'
+		case 'number':
+			return typeof value === 'number'
+		case 'boolean':
+			return typeof value === 'boolean'
+		case 'object':
+			return typeof value === 'object'
+		default:
+			return false
 	}
 }

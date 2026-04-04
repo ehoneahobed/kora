@@ -7,10 +7,7 @@ import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '..
  * @param collection - The collection definition
  * @returns An array of SQL statements (CREATE TABLE + CREATE INDEX)
  */
-export function generateSQL(
-	collectionName: string,
-	collection: CollectionDefinition,
-): string[] {
+export function generateSQL(collectionName: string, collection: CollectionDefinition): string[] {
 	const statements: string[] = []
 	const columns: string[] = ['id TEXT PRIMARY KEY NOT NULL']
 
@@ -34,18 +31,18 @@ export function generateSQL(
 
 	// Per-collection operations log table
 	statements.push(
-		`CREATE TABLE IF NOT EXISTS _kora_ops_${collectionName} (\n` +
-			'  id TEXT PRIMARY KEY NOT NULL,\n' +
-			'  node_id TEXT NOT NULL,\n' +
-			'  type TEXT NOT NULL,\n' +
-			'  record_id TEXT NOT NULL,\n' +
-			'  data TEXT,\n' +
-			'  previous_data TEXT,\n' +
-			'  timestamp TEXT NOT NULL,\n' +
-			'  sequence_number INTEGER NOT NULL,\n' +
-			'  causal_deps TEXT NOT NULL,\n' +
-			'  schema_version INTEGER NOT NULL\n' +
-			')',
+		`CREATE TABLE IF NOT EXISTS _kora_ops_${collectionName} (
+  id TEXT PRIMARY KEY NOT NULL,
+  node_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  data TEXT,
+  previous_data TEXT,
+  timestamp TEXT NOT NULL,
+  sequence_number INTEGER NOT NULL,
+  causal_deps TEXT NOT NULL,
+  schema_version INTEGER NOT NULL
+)`,
 	)
 
 	return statements

@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'vitest'
 import type { Operation, VersionVector } from '../types'
 import {
+	type OperationLog,
 	advanceVector,
 	computeDelta,
 	createVersionVector,
 	deserializeVector,
 	dominates,
 	mergeVectors,
-	type OperationLog,
 	serializeVector,
 	vectorsEqual,
 } from './version-vector'
@@ -56,7 +56,10 @@ describe('mergeVectors', () => {
 
 	test('is commutative', () => {
 		const a: VersionVector = new Map([['n1', 5]])
-		const b: VersionVector = new Map([['n1', 3], ['n2', 7]])
+		const b: VersionVector = new Map([
+			['n1', 3],
+			['n2', 7],
+		])
 
 		const ab = mergeVectors(a, b)
 		const ba = mergeVectors(b, a)
@@ -65,7 +68,10 @@ describe('mergeVectors', () => {
 	})
 
 	test('is idempotent', () => {
-		const a: VersionVector = new Map([['n1', 5], ['n2', 3]])
+		const a: VersionVector = new Map([
+			['n1', 5],
+			['n2', 3],
+		])
 		const result = mergeVectors(a, a)
 		expect(vectorsEqual(result, a)).toBe(true)
 	})
@@ -116,15 +122,27 @@ describe('dominates', () => {
 	})
 
 	test('detects domination', () => {
-		const a: VersionVector = new Map([['n1', 5], ['n2', 3]])
-		const b: VersionVector = new Map([['n1', 3], ['n2', 2]])
+		const a: VersionVector = new Map([
+			['n1', 5],
+			['n2', 3],
+		])
+		const b: VersionVector = new Map([
+			['n1', 3],
+			['n2', 2],
+		])
 		expect(dominates(a, b)).toBe(true)
 		expect(dominates(b, a)).toBe(false)
 	})
 
 	test('concurrent vectors do not dominate each other', () => {
-		const a: VersionVector = new Map([['n1', 5], ['n2', 1]])
-		const b: VersionVector = new Map([['n1', 3], ['n2', 7]])
+		const a: VersionVector = new Map([
+			['n1', 5],
+			['n2', 1],
+		])
+		const b: VersionVector = new Map([
+			['n1', 3],
+			['n2', 7],
+		])
 		expect(dominates(a, b)).toBe(false)
 		expect(dominates(b, a)).toBe(false)
 	})
@@ -149,7 +167,10 @@ describe('vectorsEqual', () => {
 
 	test('vectors with different keys are not equal', () => {
 		const a: VersionVector = new Map([['n1', 5]])
-		const b: VersionVector = new Map([['n1', 5], ['n2', 1]])
+		const b: VersionVector = new Map([
+			['n1', 5],
+			['n2', 1],
+		])
 		expect(vectorsEqual(a, b)).toBe(false)
 	})
 })
@@ -169,9 +190,7 @@ describe('computeDelta', () => {
 			getRange(nodeId, fromSeq, toSeq) {
 				return ops.filter(
 					(op) =>
-						op.nodeId === nodeId &&
-						op.sequenceNumber >= fromSeq &&
-						op.sequenceNumber <= toSeq,
+						op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq,
 				)
 			},
 		}
@@ -191,7 +210,10 @@ describe('computeDelta', () => {
 	})
 
 	test('returns operations from multiple nodes', () => {
-		const localVector: VersionVector = new Map([['n1', 2], ['n2', 1]])
+		const localVector: VersionVector = new Map([
+			['n1', 2],
+			['n2', 1],
+		])
 		const remoteVector: VersionVector = new Map([['n1', 1]])
 
 		const ops = [
@@ -215,9 +237,7 @@ describe('computeDelta', () => {
 			getRange(nodeId, fromSeq, toSeq) {
 				return ops.filter(
 					(op) =>
-						op.nodeId === nodeId &&
-						op.sequenceNumber >= fromSeq &&
-						op.sequenceNumber <= toSeq,
+						op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq,
 				)
 			},
 		}
@@ -229,15 +249,25 @@ describe('computeDelta', () => {
 
 describe('serialize/deserialize vector', () => {
 	test('round-trips correctly', () => {
-		const vv: VersionVector = new Map([['n1', 5], ['n2', 3], ['n3', 1]])
+		const vv: VersionVector = new Map([
+			['n1', 5],
+			['n2', 3],
+			['n3', 1],
+		])
 		const serialized = serializeVector(vv)
 		const deserialized = deserializeVector(serialized)
 		expect(vectorsEqual(deserialized, vv)).toBe(true)
 	})
 
 	test('serialization is deterministic (sorted keys)', () => {
-		const a: VersionVector = new Map([['n2', 3], ['n1', 5]])
-		const b: VersionVector = new Map([['n1', 5], ['n2', 3]])
+		const a: VersionVector = new Map([
+			['n2', 3],
+			['n1', 5],
+		])
+		const b: VersionVector = new Map([
+			['n1', 5],
+			['n2', 3],
+		])
 		expect(serializeVector(a)).toBe(serializeVector(b))
 	})
 

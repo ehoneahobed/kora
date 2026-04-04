@@ -96,9 +96,7 @@ describe('generateFullDDL', () => {
 		const stmts = generateFullDDL(schema)
 
 		const metaIndex = stmts.findIndex((s) => s.includes('_kora_meta'))
-		const todosIndex = stmts.findIndex((s) =>
-			s.includes('CREATE TABLE IF NOT EXISTS todos'),
-		)
+		const todosIndex = stmts.findIndex((s) => s.includes('CREATE TABLE IF NOT EXISTS todos'))
 
 		expect(metaIndex).toBeLessThan(todosIndex)
 	})

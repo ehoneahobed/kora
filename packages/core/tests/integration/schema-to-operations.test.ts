@@ -76,12 +76,7 @@ describe('Schema → Validate → Operation integration', () => {
 	test('update: validateRecord (partial) → createOperation → verify', async () => {
 		if (!todosCollection) return
 
-		const validatedData = validateRecord(
-			'todos',
-			todosCollection,
-			{ completed: true },
-			'update',
-		)
+		const validatedData = validateRecord('todos', todosCollection, { completed: true }, 'update')
 		expect(validatedData).toEqual({ completed: true })
 
 		const clock = new HybridLogicalClock('device-1', new MockTimeSource(1712188800000))
@@ -111,23 +106,18 @@ describe('Schema → Validate → Operation integration', () => {
 		if (!todosCollection) return
 
 		// Missing required field
-		expect(() =>
-			validateRecord('todos', todosCollection, { completed: true }, 'insert'),
-		).toThrow(/Required field "title"/)
+		expect(() => validateRecord('todos', todosCollection, { completed: true }, 'insert')).toThrow(
+			/Required field "title"/,
+		)
 
 		// Invalid type
-		expect(() =>
-			validateRecord('todos', todosCollection, { title: 123 }, 'insert'),
-		).toThrow(/must be a string/)
+		expect(() => validateRecord('todos', todosCollection, { title: 123 }, 'insert')).toThrow(
+			/must be a string/,
+		)
 
 		// Invalid enum value
 		expect(() =>
-			validateRecord(
-				'todos',
-				todosCollection,
-				{ title: 'test', priority: 'urgent' },
-				'insert',
-			),
+			validateRecord('todos', todosCollection, { title: 'test', priority: 'urgent' }, 'insert'),
 		).toThrow(/must be one of/)
 	})
 })

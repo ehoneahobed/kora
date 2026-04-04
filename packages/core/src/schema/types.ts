@@ -116,12 +116,7 @@ export class ArrayFieldBuilder extends FieldBuilder<'array'> {
 	}
 
 	override default(value: unknown[]): ArrayFieldBuilder {
-		return new ArrayFieldBuilder(
-			new FieldBuilder(this._itemKind),
-			false,
-			value,
-			this._auto,
-		)
+		return new ArrayFieldBuilder(new FieldBuilder(this._itemKind), false, value, this._auto)
 	}
 
 	override _build(): FieldDescriptor {

@@ -3,11 +3,7 @@ import { OperationError } from '../errors/errors'
 import type { HLCTimestamp, Operation } from '../types'
 import { topologicalSort } from './topological-sort'
 
-function makeOp(
-	id: string,
-	deps: string[] = [],
-	timestamp?: Partial<HLCTimestamp>,
-): Operation {
+function makeOp(id: string, deps: string[] = [], timestamp?: Partial<HLCTimestamp>): Operation {
 	return {
 		id,
 		nodeId: 'node-1',
@@ -90,20 +86,14 @@ describe('topologicalSort', () => {
 
 	test('ignores causal deps that are outside the operation set', () => {
 		// op-b depends on op-a, but op-a is not in the set
-		const ops = [
-			makeOp('c', ['b'], { wallTime: 1002 }),
-			makeOp('b', ['a'], { wallTime: 1001 }),
-		]
+		const ops = [makeOp('c', ['b'], { wallTime: 1002 }), makeOp('b', ['a'], { wallTime: 1001 })]
 
 		const sorted = topologicalSort(ops)
 		expect(sorted.map((op) => op.id)).toEqual(['b', 'c'])
 	})
 
 	test('throws OperationError on cycle', () => {
-		const ops = [
-			makeOp('a', ['b']),
-			makeOp('b', ['a']),
-		]
+		const ops = [makeOp('a', ['b']), makeOp('b', ['a'])]
 
 		expect(() => topologicalSort(ops)).toThrow(OperationError)
 	})

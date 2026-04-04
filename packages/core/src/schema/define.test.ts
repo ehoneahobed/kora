@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import { SchemaValidationError } from '../errors/errors'
 import { FULL_SCHEMA, MINIMAL_SCHEMA } from '../../tests/fixtures/schemas'
+import { SchemaValidationError } from '../errors/errors'
 import { defineSchema } from './define'
 import { t } from './types'
 
@@ -38,21 +38,15 @@ describe('defineSchema', () => {
 
 	describe('version validation', () => {
 		test('rejects version 0', () => {
-			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: 0 })).toThrow(
-				SchemaValidationError,
-			)
+			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: 0 })).toThrow(SchemaValidationError)
 		})
 
 		test('rejects negative version', () => {
-			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: -1 })).toThrow(
-				SchemaValidationError,
-			)
+			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: -1 })).toThrow(SchemaValidationError)
 		})
 
 		test('rejects non-integer version', () => {
-			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: 1.5 })).toThrow(
-				SchemaValidationError,
-			)
+			expect(() => defineSchema({ ...MINIMAL_SCHEMA, version: 1.5 })).toThrow(SchemaValidationError)
 		})
 	})
 

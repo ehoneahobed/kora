@@ -3,11 +3,11 @@ import { HybridLogicalClock } from '../../src/clock/hlc'
 import { createOperation } from '../../src/operations/operation'
 import type { Operation, VersionVector } from '../../src/types'
 import {
+	type OperationLog,
 	advanceVector,
 	computeDelta,
 	createVersionVector,
 	mergeVectors,
-	type OperationLog,
 } from '../../src/version-vector/version-vector'
 import { MockTimeSource } from '../fixtures/timestamps'
 
@@ -82,9 +82,7 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 			getRange(nodeId, fromSeq, toSeq) {
 				return allOps.filter(
 					(op) =>
-						op.nodeId === nodeId &&
-						op.sequenceNumber >= fromSeq &&
-						op.sequenceNumber <= toSeq,
+						op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq,
 				)
 			},
 		}
@@ -140,9 +138,7 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 			getRange(nodeId, fromSeq, toSeq) {
 				return ops.filter(
 					(op) =>
-						op.nodeId === nodeId &&
-						op.sequenceNumber >= fromSeq &&
-						op.sequenceNumber <= toSeq,
+						op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq,
 				)
 			},
 		}
@@ -210,8 +206,6 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 			clockA,
 		)
 
-		expect(
-			HybridLogicalClock.compare(nextOpA.timestamp, opB.timestamp),
-		).toBeGreaterThan(0)
+		expect(HybridLogicalClock.compare(nextOpA.timestamp, opB.timestamp)).toBeGreaterThan(0)
 	})
 })

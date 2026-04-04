@@ -5,7 +5,7 @@ import type { TimeSource } from '../../src/types'
  * Allows precise control over what Date.now() returns.
  */
 export class MockTimeSource implements TimeSource {
-	constructor(private time: number = 1000) {}
+	constructor(private time = 1000) {}
 
 	now(): number {
 		return this.time
