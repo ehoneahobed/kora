@@ -1,7 +1,7 @@
 {
   "name": "@kora/react",
   "version": "0.0.0",
-  "description": "Kora.js react package",
+  "description": "Kora.js React hooks and bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -25,7 +25,16 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ tests/",
     "clean": "rm -rf dist .turbo coverage"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": false
+    }
   },
   "dependencies": {
     "@kora/core": "workspace:*",
@@ -33,8 +42,15 @@
     "@kora/sync": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.7.3",
+    "@testing-library/jest-dom": "^6.0.0",
+    "@testing-library/react": "^16.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "jsdom": "^25.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
     "tsup": "^8.3.6",
+    "typescript": "^5.7.3",
     "vitest": "^3.0.4"
   },
   "license": "MIT"

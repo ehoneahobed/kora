@@ -6,6 +6,7 @@ export default mergeConfig(
 	defineConfig({
 		test: {
 			root: '.',
+			environment: 'jsdom',
 		},
 	}),
 )
