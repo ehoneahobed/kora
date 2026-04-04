@@ -101,6 +101,9 @@ importers:
         specifier: workspace:*
         version: link:../core
     devDependencies:
+      '@fast-check/vitest':
+        specifier: 0.2.0
+        version: 0.2.0(vitest@3.2.4(@types/node@25.5.2))
       tsup:
         specifier: ^8.3.6
         version: 8.5.1(postcss@8.5.8)(typescript@5.9.3)
@@ -465,6 +468,11 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@fast-check/vitest@0.2.0':
+    resolution: {integrity: sha512-oVklBEHMh0u55bWRz2BQwQjDTT/QzAQh9m14zNLj6iq/UdBn2+C/GTwUsUVCfiCYjDu2ajMEeqP1ZGWCGRJ+Yw==}
+    peerDependencies:
+      vitest: ^1 || ^2 || ^3
 
   '@inquirer/external-editor@1.0.3':
     resolution: {integrity: sha512-RWbSrDiYmO4LbejWY7ttpxczuwQyZLBUyygsA9Nsv95hpzUWwnNTVQmAq3xuh7vNwCp07UTmE5i11XAEExx4RA==}
@@ -1735,6 +1743,11 @@ snapshots:
 
   '@esbuild/win32-x64@0.27.7':
     optional: true
+
+  '@fast-check/vitest@0.2.0(vitest@3.2.4(@types/node@25.5.2))':
+    dependencies:
+      fast-check: 4.6.0
+      vitest: 3.2.4(@types/node@25.5.2)
 
   '@inquirer/external-editor@1.0.3(@types/node@25.5.2)':
     dependencies:
