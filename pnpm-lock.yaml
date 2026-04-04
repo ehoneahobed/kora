@@ -53,6 +53,13 @@ importers:
         version: 3.2.4(@types/node@25.5.2)(jsdom@25.0.1)
 
   packages/cli:
+    dependencies:
+      '@kora/core':
+        specifier: workspace:*
+        version: link:../core
+      citty:
+        specifier: ^0.1.6
+        version: 0.1.6
     devDependencies:
       tsup:
         specifier: ^8.3.6
@@ -934,6 +941,9 @@ packages:
 
   chownr@1.1.4:
     resolution: {integrity: sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==}
+
+  citty@0.1.6:
+    resolution: {integrity: sha512-tskPPKEs8D2KPafUypv2gxwJP8h/OaJmC82QQGGDQcHvXX43xF2VDACcJVmZ0EuSxkpO9Kc4MlrA3q0+FG58AQ==}
 
   combined-stream@1.0.8:
     resolution: {integrity: sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==}
@@ -2520,6 +2530,10 @@ snapshots:
       readdirp: 4.1.2
 
   chownr@1.1.4: {}
+
+  citty@0.1.6:
+    dependencies:
+      consola: 3.4.2
 
   combined-stream@1.0.8:
     dependencies:
