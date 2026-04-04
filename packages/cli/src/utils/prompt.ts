@@ -1,4 +1,4 @@
-import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
+import { type Interface as ReadlineInterface, createInterface } from 'node:readline'
 
 export interface PromptOptions {
 	/** Input stream (defaults to process.stdin) */

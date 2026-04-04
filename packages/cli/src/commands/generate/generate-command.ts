@@ -44,7 +44,7 @@ export const generateCommand = defineCommand({
 
 				// Find schema file
 				let schemaPath: string
-				if (args.schema) {
+				if (args.schema && typeof args.schema === 'string') {
 					schemaPath = resolve(args.schema)
 				} else {
 					const found = await findSchemaFile(projectRoot)
@@ -66,16 +66,15 @@ export const generateCommand = defineCommand({
 				const schema = extractSchema(schemaModule)
 
 				if (!schema) {
-					logger.error(
-						'Schema file must export a SchemaDefinition as the default export.',
-					)
+					logger.error('Schema file must export a SchemaDefinition as the default export.')
 					process.exitCode = 1
 					return
 				}
 
 				// Generate types
 				const output = generateTypes(schema)
-				const outputPath = resolve(projectRoot, args.output ?? 'kora/generated/types.ts')
+				const outputFile = typeof args.output === 'string' ? args.output : 'kora/generated/types.ts'
+				const outputPath = resolve(projectRoot, outputFile)
 
 				await mkdir(dirname(outputPath), { recursive: true })
 				await writeFile(outputPath, output, 'utf-8')
@@ -91,7 +90,7 @@ function extractSchema(mod: unknown): SchemaDefinition | null {
 	const record = mod as Record<string, unknown>
 
 	// Check for default export
-	const candidate = record['default'] ?? record
+	const candidate = record.default ?? record
 	if (isSchemaDefinition(candidate)) return candidate
 
 	return null
@@ -101,8 +100,8 @@ function isSchemaDefinition(value: unknown): value is SchemaDefinition {
 	if (typeof value !== 'object' || value === null) return false
 	const obj = value as Record<string, unknown>
 	return (
-		typeof obj['version'] === 'number' &&
-		typeof obj['collections'] === 'object' &&
-		obj['collections'] !== null
+		typeof obj.version === 'number' &&
+		typeof obj.collections === 'object' &&
+		obj.collections !== null
 	)
 }

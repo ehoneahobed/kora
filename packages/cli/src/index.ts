@@ -12,3 +12,6 @@ export {
 	ProjectExistsError,
 	SchemaNotFoundError,
 } from './errors'
+
+// === Type Generation (programmatic use) ===
+export { generateTypes } from './commands/generate/type-generator'

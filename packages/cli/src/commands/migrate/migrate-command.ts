@@ -29,12 +29,7 @@ export const migrateCommand = defineCommand({
 
 		const schemaFile = await findSchemaFile(projectRoot)
 		if (!schemaFile) {
-			throw new SchemaNotFoundError([
-				'src/schema.ts',
-				'schema.ts',
-				'src/schema.js',
-				'schema.js',
-			])
+			throw new SchemaNotFoundError(['src/schema.ts', 'schema.ts', 'src/schema.js', 'schema.js'])
 		}
 
 		logger.banner()

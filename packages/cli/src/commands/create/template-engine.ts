@@ -10,10 +10,7 @@ import type { TemplateContext, TemplateName } from '../../types'
  * @param context - Key-value pairs to substitute
  * @returns The template with all placeholders replaced
  */
-export function substituteVariables(
-	template: string,
-	context: Record<string, string>,
-): string {
+export function substituteVariables(template: string, context: Record<string, string>): string {
 	return template.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => {
 		const value = context[key]
 		return value !== undefined ? value : `{{${key}}}`

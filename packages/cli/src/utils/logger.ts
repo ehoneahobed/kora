@@ -28,7 +28,7 @@ export interface Logger {
  */
 export function createLogger(options?: LoggerOptions): Logger {
 	const colorDisabled =
-		options?.noColor === true || process.env['NO_COLOR'] !== undefined || !process.stdout.isTTY
+		options?.noColor === true || process.env.NO_COLOR !== undefined || !process.stdout.isTTY
 
 	function color(code: string, text: string): string {
 		return colorDisabled ? text : `${code}${text}${RESET}`
@@ -55,7 +55,9 @@ export function createLogger(options?: LoggerOptions): Logger {
 		},
 		banner(): void {
 			console.log()
-			console.log(color(BOLD + CYAN, '  Kora.js') + color(DIM, ' — Offline-first application framework'))
+			console.log(
+				color(BOLD + CYAN, '  Kora.js') + color(DIM, ' — Offline-first application framework'),
+			)
 			console.log()
 		},
 	}

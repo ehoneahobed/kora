@@ -70,7 +70,7 @@ export async function findSchemaFile(projectRoot: string): Promise<string | null
 function isKoraProject(pkg: unknown): boolean {
 	if (typeof pkg !== 'object' || pkg === null) return false
 	const record = pkg as Record<string, unknown>
-	return hasKoraDep(record['dependencies']) || hasKoraDep(record['devDependencies'])
+	return hasKoraDep(record.dependencies) || hasKoraDep(record.devDependencies)
 }
 
 function hasKoraDep(deps: unknown): boolean {

@@ -2,9 +2,11 @@ import { PassThrough } from 'node:stream'
 import { describe, expect, test } from 'vitest'
 import { promptSelect, promptText } from './prompt'
 
-function createMockStreams(
-	inputData: string,
-): { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; getOutput: () => string } {
+function createMockStreams(inputData: string): {
+	input: NodeJS.ReadableStream
+	output: NodeJS.WritableStream
+	getOutput: () => string
+} {
 	const input = new PassThrough()
 	const output = new PassThrough()
 	let outputData = ''

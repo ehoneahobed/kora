@@ -7,7 +7,7 @@ import type { PackageManager } from '../types'
  * Falls back to 'npm' if detection fails.
  */
 export function detectPackageManager(): PackageManager {
-	const userAgent = process.env['npm_config_user_agent']
+	const userAgent = process.env.npm_config_user_agent
 	if (!userAgent) return 'npm'
 
 	if (userAgent.startsWith('pnpm/')) return 'pnpm'

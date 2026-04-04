@@ -7,38 +7,38 @@ import {
 } from './package-manager'
 
 describe('detectPackageManager', () => {
-	const originalEnv = process.env['npm_config_user_agent']
+	const originalEnv = process.env.npm_config_user_agent
 
 	afterEach(() => {
 		if (originalEnv === undefined) {
-			delete process.env['npm_config_user_agent']
+			process.env.npm_config_user_agent = undefined
 		} else {
-			process.env['npm_config_user_agent'] = originalEnv
+			process.env.npm_config_user_agent = originalEnv
 		}
 	})
 
 	test('detects pnpm from user agent', () => {
-		process.env['npm_config_user_agent'] = 'pnpm/9.15.4 node/v20.0.0'
+		process.env.npm_config_user_agent = 'pnpm/9.15.4 node/v20.0.0'
 		expect(detectPackageManager()).toBe('pnpm')
 	})
 
 	test('detects yarn from user agent', () => {
-		process.env['npm_config_user_agent'] = 'yarn/4.0.0 node/v20.0.0'
+		process.env.npm_config_user_agent = 'yarn/4.0.0 node/v20.0.0'
 		expect(detectPackageManager()).toBe('yarn')
 	})
 
 	test('detects bun from user agent', () => {
-		process.env['npm_config_user_agent'] = 'bun/1.0.0 node/v20.0.0'
+		process.env.npm_config_user_agent = 'bun/1.0.0 node/v20.0.0'
 		expect(detectPackageManager()).toBe('bun')
 	})
 
 	test('detects npm from user agent', () => {
-		process.env['npm_config_user_agent'] = 'npm/10.0.0 node/v20.0.0'
+		process.env.npm_config_user_agent = 'npm/10.0.0 node/v20.0.0'
 		expect(detectPackageManager()).toBe('npm')
 	})
 
 	test('falls back to npm when no user agent', () => {
-		delete process.env['npm_config_user_agent']
+		process.env.npm_config_user_agent = undefined
 		expect(detectPackageManager()).toBe('npm')
 	})
 })
