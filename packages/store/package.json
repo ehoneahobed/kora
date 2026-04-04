@@ -16,23 +16,39 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./better-sqlite3": {
+      "import": {
+        "types": "./dist/adapters/better-sqlite3.d.ts",
+        "default": "./dist/adapters/better-sqlite3.js"
+      },
+      "require": {
+        "types": "./dist/adapters/better-sqlite3.d.cts",
+        "default": "./dist/adapters/better-sqlite3.cjs"
+      }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
     "@kora/core": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.7.3",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.2",
+    "better-sqlite3": "^12.8.0",
     "tsup": "^8.3.6",
+    "typescript": "^5.7.3",
     "vitest": "^3.0.4"
   },
   "license": "MIT"
