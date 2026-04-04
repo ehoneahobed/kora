@@ -1,7 +1,7 @@
 {
   "name": "@kora/server",
   "version": "0.0.0",
-  "description": "Kora.js server package",
+  "description": "Kora.js self-hosted sync server",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -16,6 +16,16 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./internal": {
+      "import": {
+        "types": "./dist/internal.d.ts",
+        "default": "./dist/internal.js"
+      },
+      "require": {
+        "types": "./dist/internal.d.cts",
+        "default": "./dist/internal.cjs"
+      }
     }
   },
   "files": ["dist"],
@@ -25,13 +35,17 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "lint": "biome check src/",
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
     "@kora/core": "workspace:*",
-    "@kora/sync": "workspace:*"
+    "@kora/sync": "workspace:*",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@fast-check/vitest": "0.2.0",
+    "@types/ws": "^8.5.13",
     "typescript": "^5.7.3",
     "tsup": "^8.3.6",
     "vitest": "^3.0.4"
