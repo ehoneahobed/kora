@@ -26,6 +26,36 @@
         "types": "./dist/adapters/better-sqlite3.d.cts",
         "default": "./dist/adapters/better-sqlite3.cjs"
       }
+    },
+    "./sqlite-wasm": {
+      "import": {
+        "types": "./dist/adapters/sqlite-wasm.d.ts",
+        "default": "./dist/adapters/sqlite-wasm.js"
+      },
+      "require": {
+        "types": "./dist/adapters/sqlite-wasm.d.cts",
+        "default": "./dist/adapters/sqlite-wasm.cjs"
+      }
+    },
+    "./sqlite-wasm/worker": {
+      "import": {
+        "types": "./dist/adapters/sqlite-wasm-worker.d.ts",
+        "default": "./dist/adapters/sqlite-wasm-worker.js"
+      },
+      "require": {
+        "types": "./dist/adapters/sqlite-wasm-worker.d.cts",
+        "default": "./dist/adapters/sqlite-wasm-worker.cjs"
+      }
+    },
+    "./indexeddb": {
+      "import": {
+        "types": "./dist/adapters/indexeddb.d.ts",
+        "default": "./dist/adapters/indexeddb.js"
+      },
+      "require": {
+        "types": "./dist/adapters/indexeddb.d.cts",
+        "default": "./dist/adapters/indexeddb.cjs"
+      }
     }
   },
   "files": [
@@ -43,10 +73,19 @@
   "dependencies": {
     "@kora/core": "workspace:*"
   },
+  "peerDependencies": {
+    "@sqlite.org/sqlite-wasm": ">=3.51.0"
+  },
+  "peerDependenciesMeta": {
+    "@sqlite.org/sqlite-wasm": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
     "better-sqlite3": "^12.8.0",
+    "fake-indexeddb": "^6.2.5",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
     "vitest": "^3.0.4"

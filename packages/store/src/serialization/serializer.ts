@@ -140,8 +140,9 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 			}
 			return value
 		case 'richtext':
-			// BLOB comes back as Buffer in Node.js — convert to Uint8Array
-			if (Buffer.isBuffer(value)) {
+			// BLOB comes back as Buffer in Node.js — convert to Uint8Array.
+			// Buffer is not available in browsers, so guard the check.
+			if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
 				return new Uint8Array(value)
 			}
 			return value

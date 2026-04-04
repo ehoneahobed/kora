@@ -18,7 +18,15 @@ export type {
 } from './types'
 
 // === Errors ===
-export { AdapterError, QueryError, RecordNotFoundError, StoreNotOpenError } from './errors'
+export {
+	AdapterError,
+	PersistenceError,
+	QueryError,
+	RecordNotFoundError,
+	StoreNotOpenError,
+	WorkerInitError,
+	WorkerTimeoutError,
+} from './errors'
 
 // === Store ===
 export { Store } from './store/store'
