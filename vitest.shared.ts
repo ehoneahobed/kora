@@ -13,5 +13,6 @@ export default defineConfig({
 			exclude: ['node_modules', 'dist', '**/*.test.ts', 'tests/fixtures/**'],
 		},
 		environment: 'node',
+		passWithNoTests: true,
 	},
 })
