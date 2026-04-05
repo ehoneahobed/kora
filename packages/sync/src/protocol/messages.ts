@@ -1,4 +1,4 @@
-import type { HLCTimestamp, OperationType } from '@kora/core'
+import type { HLCTimestamp, OperationType } from '@korajs/core'
 
 export type WireFormat = 'json' | 'protobuf'
 

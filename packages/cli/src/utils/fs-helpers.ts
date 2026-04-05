@@ -13,7 +13,7 @@ export async function directoryExists(path: string): Promise<boolean> {
 
 /**
  * Walks up the directory tree from startDir looking for a package.json
- * that contains a kora or @kora/* dependency.
+ * that contains a kora or @korajs/* dependency.
  *
  * @param startDir - Directory to start searching from (defaults to cwd)
  * @returns Absolute path to the project root, or null if not found
@@ -96,5 +96,5 @@ function isKoraProject(pkg: unknown): boolean {
 
 function hasKoraDep(deps: unknown): boolean {
 	if (typeof deps !== 'object' || deps === null) return false
-	return Object.keys(deps).some((key) => key === 'kora' || key.startsWith('@kora/'))
+	return Object.keys(deps).some((key) => key === 'kora' || key.startsWith('@korajs/'))
 }

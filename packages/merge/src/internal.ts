@@ -1,4 +1,4 @@
-// @kora/merge — internal exports for other @kora packages
+// @korajs/merge — internal exports for other @kora packages
 // These are NOT part of the public API. Only import from other @kora packages.
 
 export { mergeField } from './engine/field-merger'

@@ -1,4 +1,4 @@
-import { KoraError } from '@kora/core'
+import { KoraError } from '@korajs/core'
 
 /**
  * Thrown when a query is invalid (bad field names, invalid operators, etc.).

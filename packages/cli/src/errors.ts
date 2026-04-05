@@ -1,4 +1,4 @@
-import { KoraError } from '@kora/core'
+import { KoraError } from '@korajs/core'
 
 /**
  * Base error class for all CLI errors.
@@ -30,7 +30,7 @@ export class ProjectExistsError extends KoraError {
 export class SchemaNotFoundError extends KoraError {
 	constructor(public readonly searchedPaths: string[]) {
 		super(
-			`Could not find a schema file. Searched: ${searchedPaths.join(', ')}. Create a schema file using defineSchema() from @kora/core.`,
+			`Could not find a schema file. Searched: ${searchedPaths.join(', ')}. Create a schema file using defineSchema() from @korajs/core.`,
 			'SCHEMA_NOT_FOUND',
 			{ searchedPaths },
 		)

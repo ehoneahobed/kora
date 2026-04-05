@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Constraint, Operation } from '@kora/core'
+import type { CollectionDefinition, Constraint, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MergeEngine } from '../../src/engine/merge-engine'
 import type { ConstraintContext } from '../../src/types'

@@ -1,6 +1,6 @@
 {
-  "name": "@kora/cli",
-  "version": "0.0.0",
+  "name": "@korajs/cli",
+  "version": "0.1.1",
   "description": "Kora.js CLI tooling and project scaffolding",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -20,9 +20,16 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./create": {
+      "import": "./dist/create.js",
+      "require": "./dist/create.cjs"
     }
   },
-  "files": ["dist", "templates"],
+  "files": [
+    "dist",
+    "templates"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -33,7 +40,7 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
+    "@korajs/core": "workspace:*",
     "citty": "^0.1.6"
   },
   "devDependencies": {

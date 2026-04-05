@@ -1,5 +1,5 @@
-import { defineSchema, t } from '@kora/core'
-import type { KoraEvent } from '@kora/core'
+import { defineSchema, t } from '@korajs/core'
+import type { KoraEvent } from '@korajs/core'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
 import type { KoraApp } from './types'
@@ -58,7 +58,7 @@ describe('createApp', () => {
 		await app.ready
 
 		// Accessing the collection accessor should work
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		expect(todos).toBeDefined()
 		expect(typeof todos.insert).toBe('function')
 		expect(typeof todos.findById).toBe('function')
@@ -73,7 +73,7 @@ describe('createApp', () => {
 			store: { adapter: 'better-sqlite3', name: ':memory:' },
 		})
 
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		expect(await todos.findById('missing')).toBeNull()
 		expect(await todos.where({ completed: false }).exec()).toEqual([])
 		expect(await todos.where({ completed: false }).count()).toBe(0)
@@ -98,7 +98,7 @@ describe('createApp', () => {
 		})
 		await app.ready
 
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		const record = await todos.insert({ title: 'Test Todo' })
 		expect(record.id).toBeDefined()
 		expect(record.title).toBe('Test Todo')
@@ -119,7 +119,7 @@ describe('createApp', () => {
 		const events: KoraEvent[] = []
 		app.events.on('operation:created', (e) => events.push(e))
 
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		await todos.insert({ title: 'Event Test' })
 
 		expect(events.length).toBe(1)
@@ -262,7 +262,7 @@ describe('createApp', () => {
 		app.events.on('operation:created', (e) => events.push(e))
 		await app.ready
 
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		await todos.insert({ title: 'DevTools Test' })
 
 		expect(events.length).toBe(1)
@@ -276,7 +276,7 @@ describe('createApp', () => {
 		})
 		await app.ready
 
-		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const todos = (app as Record<string, unknown>).todos as import('@korajs/store').CollectionAccessor
 		const record = await todos.insert({ title: 'No DevTools' })
 		expect(record.title).toBe('No DevTools')
 	})

@@ -1,13 +1,13 @@
 # Core API Reference
 
-`@kora/core` is the foundation of every Kora.js application. It defines the schema system, operation model, hybrid logical clock, and shared types. It has zero dependencies on other `@kora` packages.
+`@korajs/core` is the foundation of every Kora.js application. It defines the schema system, operation model, hybrid logical clock, and shared types. It has zero dependencies on other `@kora` packages.
 
 All exports documented here are also available from the `kora` meta-package.
 
 ```typescript
-import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from '@kora/core'
+import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from '@korajs/core'
 // or
-import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from 'kora'
+import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from 'korajs'
 ```
 
 ---
@@ -62,7 +62,7 @@ function defineSchema(input: SchemaInput): SchemaDefinition
 ### Example
 
 ```typescript
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 const schema = defineSchema({
   version: 1,
@@ -117,7 +117,7 @@ const schema = defineSchema({
 The `t` object provides builder methods for defining field types in your schema. Each method returns a `FieldDescriptor` that can be further configured with modifier methods.
 
 ```typescript
-import { t } from 'kora'
+import { t } from 'korajs'
 ```
 
 ### t.string()
@@ -321,7 +321,7 @@ function generateUUIDv7(): string
 ### Example
 
 ```typescript
-import { generateUUIDv7 } from 'kora'
+import { generateUUIDv7 } from 'korajs'
 
 const id = generateUUIDv7()
 ```
@@ -366,7 +366,7 @@ function createOperation(input: OperationInput): Operation
 ### Example
 
 ```typescript
-import { createOperation, HybridLogicalClock, generateUUIDv7 } from 'kora'
+import { createOperation, HybridLogicalClock, generateUUIDv7 } from 'korajs'
 
 const nodeId = generateUUIDv7()
 const clock = new HybridLogicalClock(nodeId)
@@ -592,7 +592,7 @@ new KoraError(message: string, code: string, context?: Record<string, unknown>)
 ### Example
 
 ```typescript
-import { KoraError } from 'kora'
+import { KoraError } from 'korajs'
 
 try {
   await app.todos.insert({ title: 123 }) // wrong type

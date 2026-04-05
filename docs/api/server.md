@@ -1,6 +1,6 @@
 # Server API Reference
 
-`@kora/server` provides a self-hosted sync server that coordinates operations between connected clients. It handles operation relay, persistence, authentication, and multi-transport support.
+`@korajs/server` provides a self-hosted sync server that coordinates operations between connected clients. It handles operation relay, persistence, authentication, and multi-transport support.
 
 ```typescript
 import {
@@ -11,7 +11,7 @@ import {
   SqliteServerStore,
   NoAuthProvider,
   TokenAuthProvider,
-} from '@kora/server'
+} from '@korajs/server'
 ```
 
 ---
@@ -51,8 +51,8 @@ function createKoraServer(config: KoraSyncServerConfig): KoraSyncServer
 ### Example
 
 ```typescript
-import { createKoraServer, PostgresServerStore, TokenAuthProvider } from '@kora/server'
-import { defineSchema, t } from 'kora'
+import { createKoraServer, PostgresServerStore, TokenAuthProvider } from '@korajs/server'
+import { defineSchema, t } from 'korajs'
 
 const schema = defineSchema({
   version: 1,
@@ -210,7 +210,7 @@ new WsServerTransport(options?: WsServerTransportOptions)
 | `heartbeatInterval` | `number` | No | `30000` (30s) | Interval between keepalive pings in milliseconds. |
 
 ```typescript
-import { WsServerTransport } from '@kora/server'
+import { WsServerTransport } from '@korajs/server'
 
 const server = createKoraServer({
   schema,
@@ -246,7 +246,7 @@ new HttpServerTransport(options?: HttpServerTransportOptions)
 | `batchSize` | `number` | No | `100` | Maximum number of operations per response. |
 
 ```typescript
-import { HttpServerTransport, WsServerTransport } from '@kora/server'
+import { HttpServerTransport, WsServerTransport } from '@korajs/server'
 
 const server = createKoraServer({
   schema,
@@ -301,7 +301,7 @@ interface AuthContext {
 ### Example with JWT
 
 ```typescript
-import { TokenAuthProvider } from '@kora/server'
+import { TokenAuthProvider } from '@korajs/server'
 import jwt from 'jsonwebtoken'
 
 const auth = new TokenAuthProvider({
@@ -375,8 +375,8 @@ import {
   TokenAuthProvider,
   WsServerTransport,
   HttpServerTransport,
-} from '@kora/server'
-import { defineSchema, t } from 'kora'
+} from '@korajs/server'
+import { defineSchema, t } from 'korajs'
 
 const schema = defineSchema({
   version: 1,

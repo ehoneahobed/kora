@@ -1,4 +1,4 @@
-import type { CollectionDefinition, FieldDescriptor } from '@kora/core'
+import type { CollectionDefinition, FieldDescriptor } from '@korajs/core'
 import { QueryError } from '../errors'
 import type { QueryDescriptor, WhereOperators } from '../types'
 

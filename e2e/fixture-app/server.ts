@@ -1,4 +1,4 @@
-import { createKoraServer, MemoryServerStore } from '@kora/server'
+import { createKoraServer, MemoryServerStore } from '@korajs/server'
 
 const port = Number(process.env.PORT) || 3001
 

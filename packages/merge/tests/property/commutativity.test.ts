@@ -1,6 +1,6 @@
 import { test } from '@fast-check/vitest'
 import { fc } from '@fast-check/vitest'
-import type { CollectionDefinition } from '@kora/core'
+import type { CollectionDefinition } from '@korajs/core'
 import { describe, expect } from 'vitest'
 import { MergeEngine } from '../../src/engine/merge-engine'
 import {

@@ -15,16 +15,16 @@ What Kora.js will be
   Honestly? You can't use it yet. Here's the analogy:
 
   We're building a car. So far we've built:
-  - The engine block (@kora/core) — the fundamental machinery
-  - The fuel system (@kora/store) — how data gets stored and retrieved locally
+  - The engine block (@korajs/core) — the fundamental machinery
+  - The fuel system (@korajs/store) — how data gets stored and retrieved locally
 
   What's still missing:
-  - The transmission (@kora/merge) — how conflicts get resolved
-  - The wheels (@kora/sync) — how devices talk to each other
-  - The steering wheel (@kora/react) — how developers actually interact with it
-  - The chassis (@kora/server) — the backend/server piece
-  - The dashboard (@kora/devtools) — debugging tools
-  - The ignition key (@kora/cli) — the npx create-kora-app command
+  - The transmission (@korajs/merge) — how conflicts get resolved
+  - The wheels (@korajs/sync) — how devices talk to each other
+  - The steering wheel (@korajs/react) — how developers actually interact with it
+  - The chassis (@korajs/server) — the backend/server piece
+  - The dashboard (@korajs/devtools) — debugging tools
+  - The ignition key (@korajs/cli) — the npx create-kora-app command
 
   There is no npx create-kora-app yet. That's the last thing to be built. Right now this is engine internals — useful only to the developers building Kora
   itself.
@@ -38,7 +38,7 @@ What Kora.js will be
   npm start
 
   "How do I build my app using React?"
-  When @kora/react is built, it'll look something like this — you just use your data and Kora handles everything else:
+  When @korajs/react is built, it'll look something like this — you just use your data and Kora handles everything else:
   function TodoList() {
     const todos = useQuery(app.todos.where({ completed: false }))
     // That's it. Works offline. Syncs automatically. No loading spinners.
@@ -49,7 +49,7 @@ What Kora.js will be
   "If React is frontend, how do I get the backend/server/database?"
   This is actually the magic of Kora's design:
   - Database: lives on the user's device (in the browser, using SQLite). No separate database to set up for basic use.
-  - Server: Kora will include a small sync server (@kora/server) that you can run to let multiple devices/users sync with each other. But your app works
+  - Server: Kora will include a small sync server (@korajs/server) that you can run to let multiple devices/users sync with each other. But your app works
   without it — the server is optional, just for syncing.
   - Backend API: You don't need one for data. Traditional apps need a backend because your data lives on a server. With Kora, data lives locally first. The
   "backend" is just a relay for syncing between devices.
@@ -258,7 +258,7 @@ so if i am building a platform, will i be able to also have a cloud database? an
 
   The Main Entry Point (Meta-Package) — Done
 
-  import { createApp, defineSchema, t } from 'kora' works. It wires everything together
+  import { createApp, defineSchema, t } from 'korajs' works. It wires everything together
   automatically.
 
   ---

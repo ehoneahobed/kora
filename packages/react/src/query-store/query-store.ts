@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder } from '@kora/store'
+import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 
 /**
  * Frozen empty array returned as the initial snapshot before any data loads.

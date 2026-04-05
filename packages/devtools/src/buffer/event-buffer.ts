@@ -1,4 +1,4 @@
-import type { KoraEventType } from '@kora/core'
+import type { KoraEventType } from '@korajs/core'
 import type { TimestampedEvent } from '../types'
 
 const DEFAULT_CAPACITY = 10_000

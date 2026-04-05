@@ -63,9 +63,9 @@ describe('create-kora-app flow', () => {
 		expect(main).toContain('sync:')
 		expect(main).toContain('ws://localhost:3001')
 
-		// Verify @kora/server in devDependencies
+		// Verify @korajs/server in devDependencies
 		const pkgContent = await readFile(join(targetDir, 'package.json'), 'utf-8')
-		expect(pkgContent).toContain('@kora/server')
+		expect(pkgContent).toContain('@korajs/server')
 	})
 
 	test('variable substitution applied correctly in all .hbs files', async () => {

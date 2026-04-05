@@ -1,5 +1,5 @@
-import type { Operation, VersionVector } from '@kora/core'
-import type { ApplyResult, SyncMessage } from '@kora/sync'
+import type { Operation, VersionVector } from '@korajs/core'
+import type { ApplyResult, SyncMessage } from '@korajs/sync'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'

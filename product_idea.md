@@ -376,7 +376,7 @@ my-app/
 ### Schema Definition
 
 ```typescript
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export default defineSchema({
   version: 1,
@@ -423,7 +423,7 @@ TypeScript types are generated automatically from the schema. No separate type d
 ### Querying and Mutations
 
 ```typescript
-import { useKora } from 'kora/react'  // or kora/vue, kora/svelte
+import { useKora } from 'korajs/react'  // or kora/vue, kora/svelte
 
 function TodoList() {
   const db = useKora()
@@ -470,7 +470,7 @@ function TodoList() {
 
 ```typescript
 // kora.config.ts
-import { defineConfig } from 'kora'
+import { defineConfig } from 'korajs'
 
 export default defineConfig({
   // Storage: auto-detected by platform, or override

@@ -1,5 +1,5 @@
-import { HybridLogicalClock } from '@kora/core'
-import type { Operation } from '@kora/core'
+import { HybridLogicalClock } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTestAdapter } from '../../tests/fixtures/test-adapter'
 import { minimalSchema } from '../../tests/fixtures/test-schema'

@@ -1,4 +1,4 @@
-import type { FieldDescriptor, HLCTimestamp, Operation } from '@kora/core'
+import type { FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { mergeField } from './field-merger'
 import { richtextToString, stringToRichtextUpdate } from '../strategies/yjs-richtext'

@@ -8,14 +8,14 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 
 | Package | Tests | Status |
 |---------|-------|--------|
-| @kora/core | 231 | Complete — HLC, operations, schema, version vectors, events, type inference utilities |
-| @kora/store | 222 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback, relational `.include()` queries |
-| @kora/merge | 97 | Three-tier merge working, including Yjs richtext CRDT merge strategy |
-| @kora/sync | 180 | Engine, transports, protocol complete. Negotiated JSON/protobuf + HTTP long-polling fallback |
-| @kora/server | 118 | Memory + SQLite + PostgreSQL stores (both using Drizzle ORM); server-side scope filtering and HTTP sync endpoint support |
-| @kora/react | 60 | Hooks + query-store integration complete (generic type threading) |
-| @kora/devtools | 49 | Instrumentation backend + browser DevTools extension UI complete |
-| @kora/cli | 120 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
+| @korajs/core | 231 | Complete — HLC, operations, schema, version vectors, events, type inference utilities |
+| @korajs/store | 222 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback, relational `.include()` queries |
+| @korajs/merge | 97 | Three-tier merge working, including Yjs richtext CRDT merge strategy |
+| @korajs/sync | 180 | Engine, transports, protocol complete. Negotiated JSON/protobuf + HTTP long-polling fallback |
+| @korajs/server | 118 | Memory + SQLite + PostgreSQL stores (both using Drizzle ORM); server-side scope filtering and HTTP sync endpoint support |
+| @korajs/react | 60 | Hooks + query-store integration complete (generic type threading) |
+| @korajs/devtools | 49 | Instrumentation backend + browser DevTools extension UI complete |
+| @korajs/cli | 120 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
 | kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped, with typed overload for full schema inference |
 
 **What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends (both using Drizzle ORM query builders), server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution. Full end-to-end type inference flows from `defineSchema()` through `createApp()` to collection accessors and React hooks. Relational queries via `.include()` resolve many-to-one and one-to-many relations.
@@ -24,7 +24,7 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 
 ### Known Issues
 
-- **`@kora/react` test environment:** All 60 React tests pass when run within the package (`cd packages/react && npx vitest run`), but 45 fail when run from the monorepo root due to missing `jsdom` environment configuration in the root vitest setup.
+- **`@korajs/react` test environment:** All 60 React tests pass when run within the package (`cd packages/react && npx vitest run`), but 45 fail when run from the monorepo root due to missing `jsdom` environment configuration in the root vitest setup.
 
 ## Current Phase Status
 
@@ -128,7 +128,7 @@ function detectAdapter(): 'sqlite-wasm' | 'indexeddb' | 'memory' {
 }
 ```
 
-**Deliverable:** After Phase 1, `@kora/store` works in every JavaScript environment — Node.js (BetterSqlite3), modern browsers (SQLite WASM + OPFS), older browsers (IndexedDB), and test/SSR (in-memory).
+**Deliverable:** After Phase 1, `@korajs/store` works in every JavaScript environment — Node.js (BetterSqlite3), modern browsers (SQLite WASM + OPFS), older browsers (IndexedDB), and test/SSR (in-memory).
 
 ---
 
@@ -136,7 +136,7 @@ function detectAdapter(): 'sqlite-wasm' | 'indexeddb' | 'memory' {
 
 **Status:** Complete
 
-**Goal:** `import { createApp, defineSchema, t } from 'kora'` works and wires everything together.
+**Goal:** `import { createApp, defineSchema, t } from 'korajs'` works and wires everything together.
 
 **Why second:** With storage working, we can build the orchestration layer that connects store + sync + merge into a single developer-facing object.
 
@@ -201,8 +201,8 @@ export { createApp } from './create-app'
 export type { KoraApp } from './kora-app'
 
 // Re-export developer-facing APIs from packages
-export { defineSchema, t } from '@kora/core'
-export type { SchemaDefinition, FieldDescriptor } from '@kora/core'
+export { defineSchema, t } from '@korajs/core'
+export type { SchemaDefinition, FieldDescriptor } from '@korajs/core'
 ```
 
 **Deliverable:** After Phase 2, a developer writes `const app = createApp({ schema })` and gets a fully typed, reactive, offline-capable data layer with zero configuration.
@@ -283,7 +283,7 @@ packages/server/src/store/
 ### 3b. Server Configuration
 
 ```typescript
-import { createKoraServer } from '@kora/server'
+import { createKoraServer } from '@korajs/server'
 import { drizzle } from 'drizzle-orm/postgres-js'
 
 const server = createKoraServer({
@@ -342,7 +342,7 @@ packages/cli/src/commands/dev/
 
 ```typescript
 // kora.config.ts — developer writes this
-import { defineConfig } from 'kora/config'
+import { defineConfig } from 'korajs/config'
 
 export default defineConfig({
   schema: './src/schema.ts',
@@ -370,9 +370,9 @@ export default defineConfig({
 
 ### Implemented
 
-- Yjs-backed richtext merge strategy (`crdt-text`) in `@kora/merge`
-- Richtext serialization helpers for string/Uint8Array/Buffer handling in `@kora/store`
-- Initial `useRichText(collection, recordId, field)` hook in `@kora/react` with persistence wiring
+- Yjs-backed richtext merge strategy (`crdt-text`) in `@korajs/merge`
+- Richtext serialization helpers for string/Uint8Array/Buffer handling in `@korajs/store`
+- Initial `useRichText(collection, recordId, field)` hook in `@korajs/react` with persistence wiring
 - Undo/redo controls exposed through `useRichText` via Yjs `UndoManager`
 - Incremental Yjs update tracking with periodic in-memory compaction before persistence
 - Focused tests for strategy merge behavior, serializer correctness, and hook load/persist flow
@@ -587,7 +587,7 @@ packages/cli/src/commands/migrate/
 
 **Architecture:**
 - Lightweight module-based panel UI rendered from derived event state
-- `MessageBridge` (already built in @kora/devtools) connects page context to extension panel
+- `MessageBridge` (already built in @korajs/devtools) connects page context to extension panel
 - Extension manifest v3 (Chrome) with content script injection
 - Event stream from `Instrumenter` → `MessageBridge` → DevTools panel
 - Panel state management: local in-panel event state, no external state library
@@ -683,13 +683,13 @@ Both `SqliteServerStore` and `PostgresServerStore` now use Drizzle ORM typed que
 
 ### Implemented so far
 
-- Protobuf message serializer in `@kora/sync` (`ProtobufMessageSerializer`) with operation/message roundtrip coverage
+- Protobuf message serializer in `@korajs/sync` (`ProtobufMessageSerializer`) with operation/message roundtrip coverage
 - Runtime wire-format negotiation (`json` / `protobuf`) via handshake `supportedWireFormats` and `selectedWireFormat`
 - Negotiated serializer support in sync engine and server sessions, with JSON compatibility fallback
 - WebSocket client/server transports updated to send/receive string or binary payloads
-- HTTP long-polling client transport in `@kora/sync` (POST send + GET receive + optional WebSocket upgrade)
-- Server-side HTTP sync request handling in `@kora/server` with long-poll queueing and ETag support
-- Performance benchmark gates implemented for `@kora/store`, `@kora/merge`, and `@kora/sync`, plus CI workflow execution
+- HTTP long-polling client transport in `@korajs/sync` (POST send + GET receive + optional WebSocket upgrade)
+- Server-side HTTP sync request handling in `@korajs/server` with long-poll queueing and ETag support
+- Performance benchmark gates implemented for `@korajs/store`, `@korajs/merge`, and `@korajs/sync`, plus CI workflow execution
 - Nightly chaos convergence suite added (`10 clients × 1,000 ops`, `10% drop`, `5% duplicate`) with scheduled CI workflow
 
 ### 9a. Protobuf Wire Format
@@ -715,16 +715,16 @@ For environments where WebSocket is unavailable (corporate proxies, serverless f
 Implement the benchmarks specified in CLAUDE.md as CI-enforced gates:
 
 ```
-@kora/store:
+@korajs/store:
   Insert 10,000 records: < 2 seconds
   Query 1,000 records with WHERE: < 50ms
   Reactive query notification: < 16ms
 
-@kora/merge:
+@korajs/merge:
   Merge 1,000 concurrent operations: < 500ms
   LWW comparison: < 1 microsecond
 
-@kora/sync:
+@korajs/sync:
   Initial sync 10,000 operations: < 5 seconds
   Incremental sync 1 operation: < 200ms end-to-end
   Version vector delta: < 10ms for 100 nodes

@@ -2,7 +2,7 @@ import {
 	type SyncMessage,
 	NegotiatedMessageSerializer,
 	ProtobufMessageSerializer,
-} from '@kora/sync'
+} from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import type { WsWebSocket } from './ws-server-transport'
 import { WsServerTransport } from './ws-server-transport'

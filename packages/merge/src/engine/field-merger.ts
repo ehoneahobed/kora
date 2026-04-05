@@ -1,5 +1,5 @@
-import type { CustomResolver, FieldDescriptor, HLCTimestamp, Operation } from '@kora/core'
-import type { MergeTrace } from '@kora/core'
+import type { CustomResolver, FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
+import type { MergeTrace } from '@korajs/core'
 import { addWinsSet } from '../strategies/add-wins-set'
 import { lastWriteWins } from '../strategies/lww'
 import { mergeRichtext } from '../strategies/yjs-richtext'

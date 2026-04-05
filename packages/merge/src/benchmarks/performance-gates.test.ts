@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Operation } from '@kora/core'
+import type { CollectionDefinition, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MergeEngine } from '../engine/merge-engine'
 import { lastWriteWins } from '../strategies/lww'

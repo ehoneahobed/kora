@@ -1,4 +1,4 @@
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 
 /**
  * Per-collection scope map from auth context.

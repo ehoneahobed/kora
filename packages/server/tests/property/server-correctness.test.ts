@@ -1,7 +1,7 @@
 import { test } from '@fast-check/vitest'
 import { fc } from '@fast-check/vitest'
 import { describe, expect } from 'vitest'
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 
 // --- Arbitraries ---

@@ -1,5 +1,5 @@
-import type { Operation, VersionVector } from '@kora/core'
-import { SyncError } from '@kora/core'
+import type { Operation, VersionVector } from '@korajs/core'
+import { SyncError } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type {
 	AcknowledgmentMessage,

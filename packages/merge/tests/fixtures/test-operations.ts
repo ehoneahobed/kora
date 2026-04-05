@@ -1,5 +1,5 @@
 import { fc } from '@fast-check/vitest'
-import type { HLCTimestamp, Operation, OperationType } from '@kora/core'
+import type { HLCTimestamp, Operation, OperationType } from '@korajs/core'
 
 /**
  * Create a test operation with sensible defaults. Override any field as needed.

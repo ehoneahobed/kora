@@ -1,6 +1,6 @@
-import type { Operation, VersionVector } from '@kora/core'
-import { generateUUIDv7 } from '@kora/core'
-import type { ApplyResult } from '@kora/sync'
+import type { Operation, VersionVector } from '@korajs/core'
+import { generateUUIDv7 } from '@korajs/core'
+import type { ApplyResult } from '@korajs/sync'
 import { and, asc, between, count, eq, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { operations, syncState } from './drizzle-schema'
@@ -206,7 +206,7 @@ export class SqliteServerStore implements ServerStore {
  *
  * @example
  * ```typescript
- * import { createSqliteServerStore } from '@kora/server'
+ * import { createSqliteServerStore } from '@korajs/server'
  *
  * const store = createSqliteServerStore({ filename: './kora-server.db' })
  * const server = createKoraServer({ store, port: 3001 })

@@ -1,5 +1,5 @@
-import type { CollectionDefinition, Constraint, HLCTimestamp, Operation } from '@kora/core'
-import type { MergeTrace } from '@kora/core'
+import type { CollectionDefinition, Constraint, HLCTimestamp, Operation } from '@korajs/core'
+import type { MergeTrace } from '@korajs/core'
 
 /**
  * Input to the merge engine when two concurrent operations conflict.
@@ -39,7 +39,7 @@ export interface FieldMergeResult {
 
 /**
  * Pluggable database lookup interface for Tier 2 constraint checking.
- * @kora/store provides the implementation at runtime; the merge package
+ * @korajs/store provides the implementation at runtime; the merge package
  * only depends on this interface, keeping it storage-agnostic.
  */
 export interface ConstraintContext {

@@ -6,7 +6,7 @@ import type {
 	KoraEventType,
 	MergeTrace,
 	Operation,
-} from '@kora/core'
+} from '@korajs/core'
 import type { TimestampedEvent } from '../../src/types'
 
 /**

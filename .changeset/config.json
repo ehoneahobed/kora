@@ -4,7 +4,7 @@
   "commit": false,
   "fixed": [],
   "linked": [
-    ["@kora/core", "@kora/store", "@kora/merge", "@kora/sync", "@kora/server", "@kora/react", "@kora/devtools", "@kora/cli", "kora"]
+    ["@korajs/core", "@korajs/store", "@korajs/merge", "@korajs/sync", "@korajs/server", "@korajs/react", "@korajs/devtools", "@korajs/cli", "korajs"]
   ],
   "access": "public",
   "baseBranch": "main",

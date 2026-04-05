@@ -1,11 +1,11 @@
 # Store API Reference
 
-`@kora/store` provides the local storage layer and the collection API that developers interact with for all data operations. It manages persistence (SQLite WASM, IndexedDB), reactive queries, and operation creation.
+`@korajs/store` provides the local storage layer and the collection API that developers interact with for all data operations. It manages persistence (SQLite WASM, IndexedDB), reactive queries, and operation creation.
 
 You do not typically instantiate a `Store` directly. Instead, `createApp()` creates and configures one for you. The collection methods documented here are accessed through the app instance.
 
 ```typescript
-import { createApp, defineSchema, t } from 'kora'
+import { createApp, defineSchema, t } from 'korajs'
 
 const app = createApp({ schema })
 

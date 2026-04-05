@@ -1,18 +1,18 @@
-import type { KoraEventEmitter, Operation } from '@kora/core'
-import { SyncError, generateUUIDv7 } from '@kora/core'
-import { topologicalSort } from '@kora/core/internal'
+import type { KoraEventEmitter, Operation } from '@korajs/core'
+import { SyncError, generateUUIDv7 } from '@korajs/core'
+import { topologicalSort } from '@korajs/core/internal'
 import type {
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
 	SyncMessage,
 	WireFormat,
-} from '@kora/sync'
+} from '@korajs/sync'
 import {
 	NegotiatedMessageSerializer,
 	versionVectorToWire,
 	wireToVersionVector,
-} from '@kora/sync'
+} from '@korajs/sync'
 import type { ServerStore } from '../store/server-store'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerTransport } from '../transport/server-transport'

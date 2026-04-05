@@ -1,4 +1,4 @@
-import { SyncError } from '@kora/core'
+import { SyncError } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
 import type { HandshakeMessage } from '../protocol/messages'
 import { MemoryTransport, createMemoryTransportPair } from './memory-transport'

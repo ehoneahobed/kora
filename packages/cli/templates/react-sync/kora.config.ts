@@ -1,4 +1,4 @@
-import { defineConfig } from 'kora/config'
+import { defineConfig } from 'korajs/config'
 
 export default defineConfig({
 	schema: './src/schema.ts',

@@ -1,5 +1,5 @@
-import type { Operation } from '@kora/core'
-import type { SyncMessage } from '@kora/sync'
+import type { Operation } from '@korajs/core'
+import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'

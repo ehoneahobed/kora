@@ -1,4 +1,4 @@
-// @kora/react — public API
+// @korajs/react — public API
 // Every export here is a public API commitment. Be explicit.
 
 // === Types ===

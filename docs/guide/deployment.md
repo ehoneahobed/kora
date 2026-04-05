@@ -9,13 +9,13 @@ Kora's sync server is a lightweight Node.js process that relays operations betwe
 Install the server package:
 
 ```bash
-pnpm add @kora/server
+pnpm add @korajs/server
 ```
 
 Create a server file (`server.ts`):
 
 ```typescript
-import { createServer } from '@kora/server'
+import { createServer } from '@korajs/server'
 import schema from './schema'
 
 const server = createServer({
@@ -46,7 +46,7 @@ const app = createApp({
 ### Server Configuration
 
 ```typescript
-import { createServer, PostgresStore, TokenAuthProvider } from '@kora/server'
+import { createServer, PostgresStore, TokenAuthProvider } from '@korajs/server'
 import schema from './schema'
 
 const server = createServer({
@@ -96,7 +96,7 @@ The server needs a storage backend to persist the operation log and relay operat
 Stores operations in memory. All data is lost when the server restarts. Use only for development and testing.
 
 ```typescript
-import { MemoryStore } from '@kora/server'
+import { MemoryStore } from '@korajs/server'
 
 const server = createServer({
   schema,
@@ -111,7 +111,7 @@ This is the default if no `store` is specified.
 Stores operations in a local SQLite database file. Good for single-server deployments and prototyping.
 
 ```typescript
-import { SQLiteStore } from '@kora/server'
+import { SQLiteStore } from '@korajs/server'
 
 const server = createServer({
   schema,
@@ -126,7 +126,7 @@ const server = createServer({
 Stores operations in PostgreSQL. Recommended for production deployments.
 
 ```typescript
-import { PostgresStore } from '@kora/server'
+import { PostgresStore } from '@korajs/server'
 
 const server = createServer({
   schema,
@@ -153,7 +153,7 @@ The `PostgresStore` uses Drizzle ORM under the hood. It creates the necessary ta
 `TokenAuthProvider` validates tokens sent by clients during the sync handshake. The `verify` function receives the raw token string and returns a user context object.
 
 ```typescript
-import { TokenAuthProvider } from '@kora/server'
+import { TokenAuthProvider } from '@korajs/server'
 
 const auth = new TokenAuthProvider({
   verify: async (token) => {

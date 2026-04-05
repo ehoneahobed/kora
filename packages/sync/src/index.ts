@@ -1,4 +1,4 @@
-// @kora/sync — public API
+// @korajs/sync — public API
 // Every export here is a public API commitment. Be explicit.
 
 // === Types ===

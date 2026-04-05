@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Constraint } from '@kora/core'
+import type { CollectionDefinition, Constraint } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { ConstraintContext } from '../types'
 import { checkConstraints } from './constraint-checker'

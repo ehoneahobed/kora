@@ -1,4 +1,4 @@
-import type { SyncStatusInfo } from '@kora/sync'
+import type { SyncStatusInfo } from '@korajs/sync'
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 

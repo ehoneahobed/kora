@@ -8,7 +8,7 @@ Start by describing your data. Kora infers all TypeScript types from this defini
 
 ```typescript
 // schema.ts
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export const schema = defineSchema({
   version: 1,
@@ -32,7 +32,7 @@ export const schema = defineSchema({
 
 ```typescript
 // app.ts
-import { createApp } from 'kora'
+import { createApp } from 'korajs'
 import { schema } from './schema'
 
 export const app = createApp({
@@ -53,7 +53,7 @@ Wrap your application in `KoraProvider` to make the app instance available to al
 
 ```tsx
 // main.tsx
-import { KoraProvider } from '@kora/react'
+import { KoraProvider } from '@korajs/react'
 import { app } from './app'
 import { TodoApp } from './TodoApp'
 
@@ -71,7 +71,7 @@ function Main() {
 ```tsx
 // TodoApp.tsx
 import { useState } from 'react'
-import { useQuery, useSyncStatus } from '@kora/react'
+import { useQuery, useSyncStatus } from '@korajs/react'
 import { app } from './app'
 import { AddTodo } from './AddTodo'
 import { TodoItem } from './TodoItem'
@@ -132,7 +132,7 @@ function TodoList({ filter }: { filter: Filter }) {
 ```tsx
 // AddTodo.tsx
 import { useState } from 'react'
-import { useMutation } from '@kora/react'
+import { useMutation } from '@korajs/react'
 import { app } from './app'
 
 export function AddTodo() {
@@ -165,7 +165,7 @@ export function AddTodo() {
 
 ```tsx
 // TodoItem.tsx
-import { useMutation } from '@kora/react'
+import { useMutation } from '@korajs/react'
 import { app } from './app'
 
 interface Todo {
@@ -201,7 +201,7 @@ export function TodoItem({ todo }: { todo: Todo }) {
 
 ```tsx
 // SyncIndicator.tsx
-import { useSyncStatus } from '@kora/react'
+import { useSyncStatus } from '@korajs/react'
 
 function SyncIndicator() {
   const status = useSyncStatus()

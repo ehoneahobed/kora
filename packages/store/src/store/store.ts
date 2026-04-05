@@ -1,11 +1,11 @@
-import { HybridLogicalClock, createVersionVector, generateUUIDv7 } from '@kora/core'
+import { HybridLogicalClock, createVersionVector, generateUUIDv7 } from '@korajs/core'
 import type {
 	KoraEventEmitter,
 	Operation,
 	OperationLog,
 	SchemaDefinition,
 	VersionVector,
-} from '@kora/core'
+} from '@korajs/core'
 import { Collection } from '../collection/collection'
 import { StoreNotOpenError } from '../errors'
 import { QueryBuilder } from '../query/query-builder'

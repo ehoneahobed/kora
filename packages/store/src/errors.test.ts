@@ -1,4 +1,4 @@
-import { KoraError } from '@kora/core'
+import { KoraError } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { AdapterError, QueryError, RecordNotFoundError, StoreNotOpenError } from './errors'
 

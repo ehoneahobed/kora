@@ -1,4 +1,4 @@
-import type { ConnectionQuality, TimeSource } from '@kora/core'
+import type { ConnectionQuality, TimeSource } from '@korajs/core'
 
 /**
  * Configuration for the connection monitor.

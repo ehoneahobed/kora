@@ -73,7 +73,7 @@ On each successful reconnection, the full sync handshake runs to bring both side
 Use `useSyncStatus` in React to track the current sync state:
 
 ```tsx
-import { useSyncStatus } from '@kora/react'
+import { useSyncStatus } from '@korajs/react'
 
 function SyncIndicator() {
   const status = useSyncStatus()

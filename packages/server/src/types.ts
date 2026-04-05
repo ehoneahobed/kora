@@ -1,5 +1,5 @@
-import type { KoraEventEmitter } from '@kora/core'
-import type { MessageSerializer } from '@kora/sync'
+import type { KoraEventEmitter } from '@korajs/core'
+import type { MessageSerializer } from '@korajs/sync'
 import type { ServerStore } from './store/server-store'
 
 /**

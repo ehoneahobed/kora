@@ -1,5 +1,5 @@
-import { SyncError } from '@kora/core'
-import type { Operation, VersionVector } from '@kora/core'
+import { SyncError } from '@korajs/core'
+import type { Operation, VersionVector } from '@korajs/core'
 import { Reader, Writer } from 'protobufjs/minimal'
 import type {
 	AcknowledgmentMessage,

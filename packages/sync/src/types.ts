@@ -1,4 +1,4 @@
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 
 /**
  * Internal sync engine states. Used for state machine transitions.

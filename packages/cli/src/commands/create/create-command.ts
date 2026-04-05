@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineCommand } from 'citty'
@@ -131,14 +131,25 @@ function isValidPackageManager(value: string): value is PackageManager {
 }
 
 /**
- * Reads the version from @kora/cli's own package.json.
+ * Reads the version from @korajs/cli's own package.json.
  * Scaffolded projects pin their kora dependencies to this version.
+ * Walks up from the current file to find the package root (works both
+ * in source and after tsup bundling).
  */
 function resolveKoraVersion(): string {
 	try {
-		const cliDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
-		const pkg = JSON.parse(readFileSync(resolve(cliDir, 'package.json'), 'utf-8')) as { version: string }
-		return pkg.version === '0.0.0' ? 'latest' : `^${pkg.version}`
+		let dir = dirname(fileURLToPath(import.meta.url))
+		for (let i = 0; i < 5; i++) {
+			const pkgPath = resolve(dir, 'package.json')
+			if (existsSync(pkgPath)) {
+				const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: string; version: string }
+				if (pkg.name === '@korajs/cli') {
+					return pkg.version === '0.0.0' ? 'latest' : `^${pkg.version}`
+				}
+			}
+			dir = dirname(dir)
+		}
+		return 'latest'
 	} catch {
 		return 'latest'
 	}

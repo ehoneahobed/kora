@@ -4,8 +4,8 @@ import type {
 	HybridLogicalClock,
 	Operation,
 	SchemaDefinition,
-} from '@kora/core'
-import { createOperation, generateUUIDv7, validateRecord } from '@kora/core'
+} from '@korajs/core'
+import { createOperation, generateUUIDv7, validateRecord } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'

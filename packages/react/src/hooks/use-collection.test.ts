@@ -1,4 +1,4 @@
-import type { CollectionAccessor, Store } from '@kora/store'
+import type { CollectionAccessor, Store } from '@korajs/store'
 import { cleanup, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'

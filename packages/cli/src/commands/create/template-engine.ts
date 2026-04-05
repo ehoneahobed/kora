@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,13 +21,24 @@ export function substituteVariables(template: string, context: Record<string, st
 /**
  * Resolves the absolute path to a bundled template directory.
  *
+ * After tsup bundling, import.meta.url points to dist/<file>.js (1 level from root).
+ * In source, it's src/commands/create/template-engine.ts (3 levels from root).
+ * We walk up from the current file to find the package root containing templates/.
+ *
  * @param templateName - Name of the template (e.g. 'react-basic')
  * @returns Absolute path to the template directory
  */
 export function getTemplatePath(templateName: TemplateName): string {
-	// Navigate from src/commands/create/ up to package root, then into templates/
+	let dir = dirname(fileURLToPath(import.meta.url))
+	for (let i = 0; i < 5; i++) {
+		if (existsSync(resolve(dir, 'templates'))) {
+			return resolve(dir, 'templates', templateName)
+		}
+		dir = dirname(dir)
+	}
+	// Fallback: assume bundled (1 level from package root)
 	const currentDir = dirname(fileURLToPath(import.meta.url))
-	return resolve(currentDir, '..', '..', '..', 'templates', templateName)
+	return resolve(currentDir, '..', 'templates', templateName)
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { SyncEngine } from '../../src/engine/sync-engine'
 import type {

@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder } from '@kora/store'
+import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { QueryStore } from '../query-store/query-store'
 import type { UseQueryOptions } from '../types'

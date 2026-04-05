@@ -1,4 +1,4 @@
-import type { FieldDescriptor, HLCTimestamp, Operation } from '@kora/core'
+import type { FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { OperationRow, RawCollectionRow } from '../types'
 import {

@@ -1,4 +1,4 @@
-import type { KoraEventEmitter, Operation, SchemaDefinition } from '@kora/core'
+import type { KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
 
 /**
  * Transaction interface for executing multiple operations atomically.

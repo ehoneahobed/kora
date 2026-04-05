@@ -46,7 +46,7 @@ function createChaosServerHandler(
 			)
 
 			const hubVector = serverStore.getVersionVector()
-			const missingOps: import('@kora/core').Operation[] = []
+			const missingOps: import('@korajs/core').Operation[] = []
 			const promises: Promise<void>[] = []
 
 			for (const [nodeId, hubSeq] of hubVector) {

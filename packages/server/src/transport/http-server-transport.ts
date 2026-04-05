@@ -1,5 +1,5 @@
-import { SyncError } from '@kora/core'
-import type { MessageSerializer } from '@kora/sync'
+import { SyncError } from '@korajs/core'
+import type { MessageSerializer } from '@korajs/sync'
 import type {
 	ServerCloseHandler,
 	ServerErrorHandler,
@@ -40,7 +40,7 @@ export class HttpServerTransport implements ServerTransport {
 		this.serializer = serializer
 	}
 
-	send(message: import('@kora/sync').SyncMessage): void {
+	send(message: import('@korajs/sync').SyncMessage): void {
 		if (!this.connected) return
 
 		const encoded = this.serializer.encode(message)

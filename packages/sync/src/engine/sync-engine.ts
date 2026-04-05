@@ -1,6 +1,6 @@
-import type { KoraEventEmitter, Operation, VersionVector } from '@kora/core'
-import { SyncError } from '@kora/core'
-import { topologicalSort } from '@kora/core/internal'
+import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
+import { SyncError } from '@korajs/core'
+import { topologicalSort } from '@korajs/core/internal'
 import type {
 	AcknowledgmentMessage,
 	HandshakeResponseMessage,

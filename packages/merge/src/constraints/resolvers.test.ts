@@ -1,4 +1,4 @@
-import type { Constraint, Operation } from '@kora/core'
+import type { Constraint, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { ConstraintViolation } from '../types'
 import { resolveConstraintViolation } from './resolvers'

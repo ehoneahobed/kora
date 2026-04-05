@@ -1,4 +1,4 @@
-import type { CollectionAccessor } from '@kora/store'
+import type { CollectionAccessor } from '@korajs/store'
 import { useMemo } from 'react'
 import { useKoraContext } from '../context/kora-context'
 

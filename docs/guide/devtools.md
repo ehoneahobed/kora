@@ -14,7 +14,7 @@ For local development or contributing:
 
 ```bash
 # From the Kora monorepo root
-pnpm --filter @kora/devtools build
+pnpm --filter @korajs/devtools build
 
 # Load the unpacked extension
 # 1. Open chrome://extensions

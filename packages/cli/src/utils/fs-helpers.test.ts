@@ -43,8 +43,8 @@ describe('findProjectRoot', () => {
 		expect(result).toBe(tempDir.path)
 	})
 
-	test('finds project root with @kora/ scoped dependency', async () => {
-		const pkg = { name: 'test', devDependencies: { '@kora/react': '1.0.0' } }
+	test('finds project root with @korajs/ scoped dependency', async () => {
+		const pkg = { name: 'test', devDependencies: { '@korajs/react': '1.0.0' } }
 		await writeFile(join(tempDir.path, 'package.json'), JSON.stringify(pkg))
 
 		const result = await findProjectRoot(tempDir.path)

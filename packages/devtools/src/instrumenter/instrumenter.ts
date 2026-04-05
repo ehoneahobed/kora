@@ -1,4 +1,4 @@
-import type { KoraEvent, KoraEventEmitter, KoraEventType } from '@kora/core'
+import type { KoraEvent, KoraEventEmitter, KoraEventType } from '@korajs/core'
 import { MessageBridge } from '../bridge/message-bridge'
 import { EventBuffer } from '../buffer/event-buffer'
 import type { DevtoolsConfig, TimestampedEvent } from '../types'

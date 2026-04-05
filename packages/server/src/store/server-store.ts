@@ -1,4 +1,4 @@
-import type { SyncStore } from '@kora/sync'
+import type { SyncStore } from '@korajs/sync'
 
 /**
  * Server-side store interface. Extends SyncStore with lifecycle

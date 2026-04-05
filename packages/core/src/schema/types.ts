@@ -162,7 +162,7 @@ export class ArrayFieldBuilder<
  *
  * @example
  * ```typescript
- * import { t } from '@kora/core'
+ * import { t } from '@korajs/core'
  *
  * const fields = {
  *   title: t.string(),

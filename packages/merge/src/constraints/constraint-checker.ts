@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Constraint } from '@kora/core'
+import type { CollectionDefinition, Constraint } from '@korajs/core'
 import type { ConstraintContext, ConstraintViolation } from '../types'
 
 /**

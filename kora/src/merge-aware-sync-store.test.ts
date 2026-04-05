@@ -1,18 +1,18 @@
-import { defineSchema, t } from '@kora/core'
+import { defineSchema, t } from '@korajs/core'
 import type {
 	KoraEventByType,
 	KoraEventEmitter,
 	KoraEventListener,
 	KoraEventType,
 	Operation,
-} from '@kora/core'
-import { MergeEngine } from '@kora/merge'
-import { Store } from '@kora/store'
-import { BetterSqlite3Adapter } from '@kora/store/better-sqlite3'
+} from '@korajs/core'
+import { MergeEngine } from '@korajs/merge'
+import { Store } from '@korajs/store'
+import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
 
-/** Minimal event emitter for testing (avoids @kora/core/internal import) */
+/** Minimal event emitter for testing (avoids @korajs/core/internal import) */
 class TestEventEmitter implements KoraEventEmitter {
 	private listeners = new Map<string, Set<(event: unknown) => void>>()
 	on<T extends KoraEventType>(type: T, listener: KoraEventListener<T>): () => void {

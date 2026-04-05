@@ -1,4 +1,4 @@
-import { SyncError } from '@kora/core'
+import { SyncError } from '@korajs/core'
 import { NegotiatedMessageSerializer } from '../protocol/serializer'
 import type { MessageSerializer } from '../protocol/serializer'
 import { WebSocketTransport } from './websocket-transport'

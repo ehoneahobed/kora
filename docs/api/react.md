@@ -1,6 +1,6 @@
 # React API Reference
 
-`@kora/react` provides React hooks and components for building reactive offline-first UIs. All hooks are concurrent-mode safe (using `useSyncExternalStore` internally) and compatible with React.StrictMode.
+`@korajs/react` provides React hooks and components for building reactive offline-first UIs. All hooks are concurrent-mode safe (using `useSyncExternalStore` internally) and compatible with React.StrictMode.
 
 ```typescript
 import {
@@ -10,7 +10,7 @@ import {
   useSyncStatus,
   useCollection,
   useRichText,
-} from '@kora/react'
+} from '@korajs/react'
 ```
 
 ---
@@ -29,8 +29,8 @@ Context provider that makes the Kora app instance available to all hooks in the 
 ### Example
 
 ```tsx
-import { createApp, defineSchema, t } from 'kora'
-import { KoraProvider } from '@kora/react'
+import { createApp, defineSchema, t } from 'korajs'
+import { KoraProvider } from '@korajs/react'
 
 const schema = defineSchema({
   version: 1,
@@ -86,7 +86,7 @@ Data is always returned synchronously from the local store. There is no loading 
 ### Example
 
 ```tsx
-import { useQuery } from '@kora/react'
+import { useQuery } from '@korajs/react'
 
 function TodoList() {
   const todos = useQuery(
@@ -171,7 +171,7 @@ function useMutation<TInput, TOutput>(
 ### Example
 
 ```tsx
-import { useMutation } from '@kora/react'
+import { useMutation } from '@korajs/react'
 
 function AddTodo() {
   const { mutate: addTodo } = useMutation(app.todos.insert)
@@ -268,7 +268,7 @@ function useSyncStatus(): SyncStatus
 ### Example
 
 ```tsx
-import { useSyncStatus } from '@kora/react'
+import { useSyncStatus } from '@korajs/react'
 
 function SyncIndicator() {
   const { status, pendingOperations, lastSyncedAt } = useSyncStatus()
@@ -315,7 +315,7 @@ function useCollection<T extends CollectionRecord>(name: string): CollectionAcce
 ### Example
 
 ```tsx
-import { useCollection } from '@kora/react'
+import { useCollection } from '@korajs/react'
 
 function TodoActions() {
   const todos = useCollection('todos')
@@ -376,7 +376,7 @@ function useRichText(
 ### Example with TipTap
 
 ```tsx
-import { useRichText } from '@kora/react'
+import { useRichText } from '@korajs/react'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
@@ -411,8 +411,8 @@ function NoteEditor({ noteId }: { noteId: string }) {
 A complete example combining all hooks:
 
 ```tsx
-import { createApp, defineSchema, t } from 'kora'
-import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@kora/react'
+import { createApp, defineSchema, t } from 'korajs'
+import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@korajs/react'
 
 const schema = defineSchema({
   version: 1,

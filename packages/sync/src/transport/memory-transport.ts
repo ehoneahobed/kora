@@ -1,4 +1,4 @@
-import { SyncError } from '@kora/core'
+import { SyncError } from '@korajs/core'
 import type { SyncMessage } from '../protocol/messages'
 import type {
 	SyncTransport,

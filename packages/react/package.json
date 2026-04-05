@@ -1,6 +1,6 @@
 {
-  "name": "@kora/react",
-  "version": "0.0.0",
+  "name": "@korajs/react",
+  "version": "0.1.0",
   "description": "Kora.js React hooks and bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -39,9 +39,9 @@
     }
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
-    "@kora/store": "workspace:*",
-    "@kora/sync": "workspace:*",
+    "@korajs/core": "workspace:*",
+    "@korajs/store": "workspace:*",
+    "@korajs/sync": "workspace:*",
     "yjs": "^13.6.30"
   },
   "devDependencies": {

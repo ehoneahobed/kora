@@ -1,6 +1,6 @@
 {
   "name": "kora-e2e-fixture",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,13 +8,13 @@
     "dev:server": "tsx server.ts"
   },
   "dependencies": {
-    "kora": "workspace:*",
-    "@kora/react": "workspace:*",
+    "korajs": "workspace:*",
+    "@korajs/react": "workspace:*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@kora/server": "workspace:*",
+    "@korajs/server": "workspace:*",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",

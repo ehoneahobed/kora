@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import type { SchemaDefinition } from '@kora/core'
+import type { SchemaDefinition } from '@korajs/core'
 import { defineCommand } from 'citty'
 import { InvalidProjectError, SchemaNotFoundError } from '../../errors'
 import { findProjectRoot, findSchemaFile } from '../../utils/fs-helpers'

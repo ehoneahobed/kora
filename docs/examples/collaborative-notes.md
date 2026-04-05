@@ -6,7 +6,7 @@ Build a collaborative note-taking app where multiple users can edit the same doc
 
 ```typescript
 // schema.ts
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export const schema = defineSchema({
   version: 1,
@@ -46,7 +46,7 @@ Two things to notice here:
 
 ```typescript
 // app.ts
-import { createApp } from 'kora'
+import { createApp } from 'korajs'
 import { schema } from './schema'
 
 export const app = createApp({
@@ -63,7 +63,7 @@ export const app = createApp({
 
 ```tsx
 // main.tsx
-import { KoraProvider } from '@kora/react'
+import { KoraProvider } from '@korajs/react'
 import { app } from './app'
 import { NotesApp } from './NotesApp'
 
@@ -81,7 +81,7 @@ function Main() {
 ```tsx
 // NotesApp.tsx
 import { useState } from 'react'
-import { useQuery, useMutation, useSyncStatus } from '@kora/react'
+import { useQuery, useMutation, useSyncStatus } from '@korajs/react'
 import { app } from './app'
 import { NoteEditor } from './NoteEditor'
 
@@ -143,7 +143,7 @@ The `useRichText` hook connects a Kora `t.richtext()` field to a text editor. It
 
 ```tsx
 // NoteEditor.tsx
-import { useQuery, useMutation, useRichText } from '@kora/react'
+import { useQuery, useMutation, useRichText } from '@korajs/react'
 import { app } from './app'
 
 export function NoteEditor({ noteId }: { noteId: string }) {

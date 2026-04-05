@@ -1,5 +1,5 @@
-import type { SyncMessage } from '@kora/sync'
-import { JsonMessageSerializer, ProtobufMessageSerializer } from '@kora/sync'
+import type { SyncMessage } from '@korajs/sync'
+import { JsonMessageSerializer, ProtobufMessageSerializer } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { HttpServerTransport } from './http-server-transport'
 

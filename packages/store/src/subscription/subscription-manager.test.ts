@@ -1,4 +1,4 @@
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { CollectionRecord } from '../types'
 import { SubscriptionManager } from './subscription-manager'

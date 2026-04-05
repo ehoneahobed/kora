@@ -1,4 +1,4 @@
-// @kora/cli — public API
+// @korajs/cli — public API
 // Every export here is a public API commitment. Be explicit.
 
 // === Types ===

@@ -5,10 +5,10 @@ import type {
 	KoraEventEmitter,
 	SchemaDefinition,
 	SchemaInput,
-} from '@kora/core'
-import type { FieldBuilder } from '@kora/core'
-import type { CollectionAccessor, CollectionRecord, QueryBuilder } from '@kora/store'
-import type { SyncEngine, SyncStatusInfo } from '@kora/sync'
+} from '@korajs/core'
+import type { FieldBuilder } from '@korajs/core'
+import type { CollectionAccessor, CollectionRecord, QueryBuilder } from '@korajs/store'
+import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
 
 /**
  * Adapter type for local storage.
@@ -104,7 +104,7 @@ export interface KoraApp {
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** Get the underlying Store instance (for advanced use / React integration). */
-	getStore(): import('@kora/store').Store
+	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
 	/** Gracefully close the app: stop sync, close store. */
@@ -142,7 +142,7 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** Get the underlying Store instance (for advanced use / React integration). */
-	getStore(): import('@kora/store').Store
+	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
 	/** Gracefully close the app: stop sync, close store. */

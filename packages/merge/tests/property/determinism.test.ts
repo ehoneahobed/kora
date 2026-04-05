@@ -1,7 +1,7 @@
 import { test } from '@fast-check/vitest'
 import { fc } from '@fast-check/vitest'
-import { HybridLogicalClock } from '@kora/core'
-import type { Operation } from '@kora/core'
+import { HybridLogicalClock } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { describe, expect } from 'vitest'
 import { MergeEngine } from '../../src/engine/merge-engine'
 import {

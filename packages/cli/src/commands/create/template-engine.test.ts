@@ -96,7 +96,7 @@ describe('scaffoldTemplate', () => {
 
 		// Check sync-specific content in package.json
 		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
-		expect(pkg).toContain('@kora/server')
+		expect(pkg).toContain('@korajs/server')
 		expect(pkg).toContain('"dev": "kora dev"')
 
 		// Check sync config in main.tsx

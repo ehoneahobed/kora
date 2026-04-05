@@ -1,4 +1,4 @@
-import type { KoraEvent } from '@kora/core'
+import type { KoraEvent } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { TimestampedEvent } from '../types'
 import { buildPanelModel } from './panel-state'

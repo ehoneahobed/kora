@@ -1,4 +1,4 @@
-import type { KoraEventType } from '@kora/core'
+import type { KoraEventType } from '@korajs/core'
 import type { EventCategory, EventFilterCriteria, TimestampedEvent } from '../types'
 import { eventTypeToCategory } from '../types'
 

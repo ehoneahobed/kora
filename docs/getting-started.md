@@ -41,7 +41,7 @@ Your app is running. Everything works offline out of the box.
 If you prefer to add Kora to an existing project:
 
 ```bash
-pnpm add kora @kora/react
+pnpm add kora @korajs/react
 ```
 
 ## Project Structure
@@ -64,7 +64,7 @@ my-app/
 The schema is the single source of truth for your data model. Create `src/schema.ts`:
 
 ```typescript
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export default defineSchema({
   version: 1,
@@ -94,7 +94,7 @@ Key points:
 Create `src/app.ts`:
 
 ```typescript
-import { createApp } from 'kora'
+import { createApp } from 'korajs'
 import schema from './schema'
 
 export const app = createApp({ schema })
@@ -144,7 +144,7 @@ Every operation works offline. Data is persisted to the local store immediately.
 Wrap your app in `KoraProvider` and use hooks to access data reactively:
 
 ```tsx
-import { KoraProvider, useQuery, useMutation } from '@kora/react'
+import { KoraProvider, useQuery, useMutation } from '@korajs/react'
 import { app } from './app'
 
 function App() {
@@ -185,7 +185,7 @@ function TodoList() {
 To sync data across devices, add a single `sync` property to your app config:
 
 ```typescript
-import { createApp } from 'kora'
+import { createApp } from 'korajs'
 import schema from './schema'
 
 export const app = createApp({

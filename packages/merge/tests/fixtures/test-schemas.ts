@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Constraint } from '@kora/core'
+import type { CollectionDefinition, Constraint } from '@korajs/core'
 
 /**
  * Simple schema with string, boolean, number, and array fields.

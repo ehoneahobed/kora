@@ -1,11 +1,11 @@
 # React Hooks
 
-Kora provides first-class React bindings through the `@kora/react` package. All hooks are designed for offline-first: data loads synchronously from the local store, mutations are optimistic, and reactive queries update in real time.
+Kora provides first-class React bindings through the `@korajs/react` package. All hooks are designed for offline-first: data loads synchronously from the local store, mutations are optimistic, and reactive queries update in real time.
 
 ## Installation
 
 ```bash
-pnpm add @kora/react
+pnpm add @korajs/react
 ```
 
 ## KoraProvider
@@ -13,7 +13,7 @@ pnpm add @kora/react
 Wrap your app with `KoraProvider` to make the Kora app instance available to all hooks:
 
 ```tsx
-import { KoraProvider } from '@kora/react'
+import { KoraProvider } from '@korajs/react'
 import { app } from './app'
 
 function App() {
@@ -32,7 +32,7 @@ function App() {
 `useQuery` subscribes to a reactive query and re-renders the component when the results change.
 
 ```tsx
-import { useQuery } from '@kora/react'
+import { useQuery } from '@korajs/react'
 import { app } from './app'
 
 function TodoList() {
@@ -111,7 +111,7 @@ function TodoList({ userId }: { userId: string }) {
 `useMutation` returns a function that performs an optimistic mutation.
 
 ```tsx
-import { useMutation } from '@kora/react'
+import { useMutation } from '@korajs/react'
 import { app } from './app'
 
 function AddTodo() {
@@ -165,7 +165,7 @@ async function handleAdd() {
 `useSyncStatus` provides real-time sync state for building status indicators.
 
 ```tsx
-import { useSyncStatus } from '@kora/react'
+import { useSyncStatus } from '@korajs/react'
 
 function SyncIndicator() {
   const status = useSyncStatus()
@@ -218,7 +218,7 @@ function PendingBadge() {
 `useCollection` provides direct access to a collection's API within a component. This is useful when you need multiple operations on the same collection:
 
 ```tsx
-import { useCollection } from '@kora/react'
+import { useCollection } from '@korajs/react'
 
 function TodoManager() {
   const todos = useCollection(app.todos)
@@ -244,7 +244,7 @@ function TodoManager() {
 `useRichText` binds a `t.richtext()` field to a rich text editor. It returns the Yjs document and a binding helper.
 
 ```tsx
-import { useRichText } from '@kora/react'
+import { useRichText } from '@korajs/react'
 
 function NoteEditor({ todoId }: { todoId: string }) {
   const { doc, provider } = useRichText(app.todos, todoId, 'notes')
@@ -262,7 +262,7 @@ function NoteEditor({ todoId }: { todoId: string }) {
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
-import { useRichText } from '@kora/react'
+import { useRichText } from '@korajs/react'
 
 function NoteEditor({ todoId }: { todoId: string }) {
   const { doc } = useRichText(app.todos, todoId, 'notes')
@@ -288,7 +288,7 @@ import {
   useQuery,
   useMutation,
   useSyncStatus,
-} from '@kora/react'
+} from '@korajs/react'
 import { app } from './app'
 
 function App() {

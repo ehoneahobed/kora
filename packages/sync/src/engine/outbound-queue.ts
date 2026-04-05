@@ -1,5 +1,5 @@
-import type { Operation } from '@kora/core'
-import { topologicalSort } from '@kora/core/internal'
+import type { Operation } from '@korajs/core'
+import { topologicalSort } from '@korajs/core/internal'
 import type { QueueStorage } from '../types'
 
 /**

@@ -1,4 +1,4 @@
-import type { KoraEvent, Operation } from '@kora/core'
+import type { KoraEvent, Operation } from '@korajs/core'
 import type { TimestampedEvent } from '../types'
 
 export interface TimelineItem {

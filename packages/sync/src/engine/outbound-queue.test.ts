@@ -1,4 +1,4 @@
-import type { Operation } from '@kora/core'
+import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryQueueStorage } from './memory-queue-storage'
 import { OutboundQueue } from './outbound-queue'

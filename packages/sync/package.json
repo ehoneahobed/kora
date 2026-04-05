@@ -1,6 +1,6 @@
 {
-  "name": "@kora/sync",
-  "version": "0.0.0",
+  "name": "@korajs/sync",
+  "version": "0.1.0",
   "description": "Kora.js sync package",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -42,8 +42,8 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
-    "@kora/merge": "workspace:*",
+    "@korajs/core": "workspace:*",
+    "@korajs/merge": "workspace:*",
     "protobufjs": "^8.0.1"
   },
   "devDependencies": {

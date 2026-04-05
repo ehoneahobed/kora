@@ -1,4 +1,4 @@
-import type { SchemaDefinition } from '@kora/core'
+import type { SchemaDefinition } from '@korajs/core'
 import { AdapterError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'

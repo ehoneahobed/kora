@@ -1,7 +1,7 @@
-import type { KoraEventEmitter, Operation, VersionVector } from '@kora/core'
-import type { MergeEngine, MergeInput } from '@kora/merge'
-import type { Store } from '@kora/store'
-import type { ApplyResult, SyncStore } from '@kora/sync'
+import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
+import type { MergeEngine, MergeInput } from '@korajs/merge'
+import type { Store } from '@korajs/store'
+import type { ApplyResult, SyncStore } from '@korajs/sync'
 
 /**
  * Wraps a Store to interpose merge resolution before applying remote operations.

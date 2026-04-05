@@ -66,7 +66,7 @@ export interface RelationInput {
  *
  * @example
  * ```typescript
- * import { defineSchema, t } from '@kora/core'
+ * import { defineSchema, t } from '@korajs/core'
  *
  * const schema = defineSchema({
  *   version: 1,

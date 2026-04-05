@@ -11,7 +11,7 @@ The CLI is included when you install `kora` or can be installed standalone:
 pnpm add kora
 
 # Or install standalone
-pnpm add -D @kora/cli
+pnpm add -D @korajs/cli
 ```
 
 ---
@@ -156,7 +156,7 @@ The `kora dev` command reads from `kora.config.ts` in the project root:
 
 ```typescript
 // kora.config.ts
-import { defineConfig } from 'kora/config'
+import { defineConfig } from 'korajs/config'
 
 export default defineConfig({
   schema: './src/schema.ts',
@@ -223,7 +223,7 @@ $ kora migrate
 
 ```typescript
 // kora/migrations/002-add-priority-change-tags.ts
-import { defineMigration } from 'kora'
+import { defineMigration } from 'korajs'
 
 export default defineMigration({
   version: 2,

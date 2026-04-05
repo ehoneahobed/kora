@@ -1,6 +1,6 @@
 {
-  "name": "@kora/merge",
-  "version": "0.0.0",
+  "name": "@korajs/merge",
+  "version": "0.1.0",
   "description": "Kora.js merge package",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -31,7 +31,7 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
+    "@korajs/core": "workspace:*",
     "yjs": "^13.6.30"
   },
   "devDependencies": {

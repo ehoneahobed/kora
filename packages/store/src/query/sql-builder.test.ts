@@ -1,4 +1,4 @@
-import type { FieldDescriptor } from '@kora/core'
+import type { FieldDescriptor } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { QueryError } from '../errors'
 import type { QueryDescriptor } from '../types'

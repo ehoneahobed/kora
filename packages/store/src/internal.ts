@@ -1,5 +1,5 @@
 // Internal exports — shared within @kora packages but NOT part of the public API.
-// Other @kora packages can import from '@kora/store/internal' if needed.
+// Other @kora packages can import from '@korajs/store/internal' if needed.
 
 export {
 	serializeOperation,

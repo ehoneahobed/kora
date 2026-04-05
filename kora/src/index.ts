@@ -1,5 +1,5 @@
 // kora — meta-package re-exporting core, store, merge, sync
-// This is the primary entry point for `import { createApp, defineSchema, t } from 'kora'`
+// This is the primary entry point for `import { createApp, defineSchema, t } from 'korajs'`
 
 // === createApp factory ===
 export { createApp } from './create-app'
@@ -17,12 +17,12 @@ export type {
 	TypedKoraConfig,
 } from './types'
 
-// === @kora/core re-exports ===
-export { defineSchema, t } from '@kora/core'
-export { HybridLogicalClock } from '@kora/core'
-export { generateUUIDv7 } from '@kora/core'
-export { createOperation } from '@kora/core'
-export { KoraError } from '@kora/core'
+// === @korajs/core re-exports ===
+export { defineSchema, t } from '@korajs/core'
+export { HybridLogicalClock } from '@korajs/core'
+export { generateUUIDv7 } from '@korajs/core'
+export { createOperation } from '@korajs/core'
+export { KoraError } from '@korajs/core'
 export type {
 	CollectionDefinition,
 	ConnectionQuality,
@@ -45,27 +45,27 @@ export type {
 	SchemaInput,
 	TypedSchemaDefinition,
 	VersionVector,
-} from '@kora/core'
+} from '@korajs/core'
 
-// === @kora/store re-exports ===
-export { Store } from '@kora/store'
+// === @korajs/store re-exports ===
+export { Store } from '@korajs/store'
 export type {
 	CollectionAccessor,
 	CollectionRecord,
 	StorageAdapter,
 	StoreConfig,
-} from '@kora/store'
+} from '@korajs/store'
 
-// === @kora/merge re-exports ===
-export { MergeEngine } from '@kora/merge'
-export type { MergeInput, MergeResult } from '@kora/merge'
+// === @korajs/merge re-exports ===
+export { MergeEngine } from '@korajs/merge'
+export type { MergeInput, MergeResult } from '@korajs/merge'
 
-// === @kora/sync re-exports ===
-export { SyncEngine, WebSocketTransport } from '@kora/sync'
+// === @korajs/sync re-exports ===
+export { SyncEngine, WebSocketTransport } from '@korajs/sync'
 export type {
 	SyncConfig,
 	SyncState,
 	SyncStatus,
 	SyncStatusInfo,
 	SyncStore,
-} from '@kora/sync'
+} from '@korajs/sync'

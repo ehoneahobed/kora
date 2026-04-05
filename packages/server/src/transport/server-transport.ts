@@ -1,4 +1,4 @@
-import type { SyncMessage } from '@kora/sync'
+import type { SyncMessage } from '@korajs/sync'
 
 /**
  * Handler for incoming sync messages on the server side.

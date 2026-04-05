@@ -1,5 +1,5 @@
-import type { Store } from '@kora/store'
-import type { SyncEngine } from '@kora/sync'
+import type { Store } from '@korajs/store'
+import type { SyncEngine } from '@korajs/sync'
 import type { ReactNode } from 'react'
 import type * as Y from 'yjs'
 

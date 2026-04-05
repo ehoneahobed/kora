@@ -1,6 +1,6 @@
 {
-  "name": "@kora/server",
-  "version": "0.0.0",
+  "name": "@korajs/server",
+  "version": "0.1.0",
   "description": "Kora.js self-hosted sync server",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -41,8 +41,8 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
-    "@kora/sync": "workspace:*",
+    "@korajs/core": "workspace:*",
+    "@korajs/sync": "workspace:*",
     "better-sqlite3": "^12.8.0",
     "drizzle-orm": "^0.45.2",
     "ws": "^8.18.0"

@@ -1,4 +1,4 @@
-import { defineSchema, t } from '@kora/core'
+import { defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'

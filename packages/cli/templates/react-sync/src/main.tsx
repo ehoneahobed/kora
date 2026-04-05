@@ -1,5 +1,5 @@
-import { createApp } from 'kora'
-import { KoraProvider } from '@kora/react'
+import { createApp } from 'korajs'
+import { KoraProvider } from '@korajs/react'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import schema from './schema'

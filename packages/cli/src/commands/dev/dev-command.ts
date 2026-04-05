@@ -101,7 +101,7 @@ export const devCommand = defineCommand({
 			)
 			if (!hasServerPackage) {
 				logger.warn(
-					'Managed sync is configured, but @kora/server is not installed. Install it or add server.ts.',
+					'Managed sync is configured, but @korajs/server is not installed. Install it or add server.ts.',
 				)
 				managedSyncStore = null
 				shouldStartSync = syncAllowed && (syncServerFile !== null || managedSyncStore !== null)
@@ -315,7 +315,7 @@ const {
   MemoryServerStore,
   createSqliteServerStore,
   createPostgresServerStore,
-} = await import('@kora/server');
+} = await import('@korajs/server');
 const storeConfig = config.store ?? { type: 'memory' };
 let store;
 if (storeConfig.type === 'memory') {

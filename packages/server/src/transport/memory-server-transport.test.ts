@@ -1,4 +1,4 @@
-import type { SyncMessage } from '@kora/sync'
+import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerTransport, createServerTransportPair } from './memory-server-transport'
 

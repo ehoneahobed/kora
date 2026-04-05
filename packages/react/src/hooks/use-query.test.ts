@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@kora/store'
+import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { createElement, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'

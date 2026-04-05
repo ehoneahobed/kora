@@ -7,7 +7,7 @@ Kora sync is opt-in. Your app works fully offline without any sync configuration
 The minimal sync configuration is a single URL:
 
 ```typescript
-import { createApp } from 'kora'
+import { createApp } from 'korajs'
 import schema from './schema'
 
 const app = createApp({

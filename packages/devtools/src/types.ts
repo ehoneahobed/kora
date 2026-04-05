@@ -1,4 +1,4 @@
-import type { KoraEvent, KoraEventType } from '@kora/core'
+import type { KoraEvent, KoraEventType } from '@korajs/core'
 
 /** A KoraEvent wrapped with a reception timestamp and sequential ID */
 export interface TimestampedEvent {

@@ -5,7 +5,7 @@ import type {
 	KoraEventType,
 	Operation,
 	VersionVector,
-} from '@kora/core'
+} from '@korajs/core'
 import type { SyncStore } from '../../src/engine/sync-store'
 
 /**

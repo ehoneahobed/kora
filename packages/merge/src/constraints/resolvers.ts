@@ -1,6 +1,6 @@
-import { HybridLogicalClock } from '@kora/core'
-import type { CollectionDefinition, Operation } from '@kora/core'
-import type { MergeTrace } from '@kora/core'
+import { HybridLogicalClock } from '@korajs/core'
+import type { CollectionDefinition, Operation } from '@korajs/core'
+import type { MergeTrace } from '@korajs/core'
 import type { ConstraintViolation } from '../types'
 
 /**

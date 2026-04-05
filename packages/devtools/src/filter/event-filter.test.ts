@@ -1,4 +1,4 @@
-import type { KoraEventType } from '@kora/core'
+import type { KoraEventType } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { createSampleEvent, createTimestampedEvent } from '../../tests/fixtures/test-helpers'
 import { filterEvents, getEventCategory } from './event-filter'

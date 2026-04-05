@@ -1,4 +1,4 @@
-import { defineSchema, t } from '@kora/core'
+import { defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { diffSchemas } from './schema-differ'
 

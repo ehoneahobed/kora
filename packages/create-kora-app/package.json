@@ -1,0 +1,16 @@
+{
+  "name": "create-kora-app",
+  "version": "0.1.2",
+  "description": "Create a new Kora.js offline-first application",
+  "type": "module",
+  "bin": {
+    "create-kora-app": "./bin.js"
+  },
+  "files": [
+    "bin.js"
+  ],
+  "dependencies": {
+    "@korajs/cli": "workspace:*"
+  },
+  "license": "MIT"
+}

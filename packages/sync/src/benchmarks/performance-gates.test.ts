@@ -1,4 +1,4 @@
-import type { Operation, VersionVector } from '@kora/core'
+import type { Operation, VersionVector } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { SyncEngine } from '../engine/sync-engine'
 import type {

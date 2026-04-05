@@ -1,4 +1,4 @@
-import { defineSchema, t } from '@kora/core'
+import { defineSchema, t } from '@korajs/core'
 
 /**
  * Minimal todo schema for basic tests.

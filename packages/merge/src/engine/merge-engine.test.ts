@@ -1,4 +1,4 @@
-import type { CollectionDefinition, Constraint, Operation } from '@kora/core'
+import type { CollectionDefinition, Constraint, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { richtextToString, stringToRichtextUpdate } from '../strategies/yjs-richtext'
 import type { ConstraintContext } from '../types'

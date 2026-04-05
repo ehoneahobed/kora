@@ -1,6 +1,6 @@
-import type { Operation, VersionVector } from '@kora/core'
-import type { KoraEvent, KoraEventEmitter, KoraEventListener, KoraEventType } from '@kora/core'
-import { SyncError } from '@kora/core'
+import type { Operation, VersionVector } from '@korajs/core'
+import type { KoraEvent, KoraEventEmitter, KoraEventListener, KoraEventType } from '@korajs/core'
+import { SyncError } from '@korajs/core'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type {
 	AcknowledgmentMessage,

@@ -1,4 +1,4 @@
-import type { FieldDescriptor, SchemaDefinition } from '@kora/core'
+import type { FieldDescriptor, SchemaDefinition } from '@korajs/core'
 
 export type SchemaChange =
 	| { type: 'collection-added'; collection: string }

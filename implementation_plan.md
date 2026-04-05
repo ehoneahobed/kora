@@ -71,7 +71,7 @@ kora/
 │   └── config.json
 │
 ├── packages/
-│   ├── core/                         # @kora/core
+│   ├── core/                         # @korajs/core
 │   │   ├── src/
 │   │   │   ├── schema/
 │   │   │   │   ├── define.ts         # defineSchema(), field type builders
@@ -92,7 +92,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── store/                        # @kora/store
+│   ├── store/                        # @korajs/store
 │   │   ├── src/
 │   │   │   ├── adapters/
 │   │   │   │   ├── adapter.ts        # Storage adapter interface
@@ -112,7 +112,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── merge/                        # @kora/merge
+│   ├── merge/                        # @korajs/merge
 │   │   ├── src/
 │   │   │   ├── strategies/
 │   │   │   │   ├── auto-merge.ts     # Tier 1: CRDT-based auto-merge
@@ -136,7 +136,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── sync/                         # @kora/sync
+│   ├── sync/                         # @korajs/sync
 │   │   ├── src/
 │   │   │   ├── protocol/
 │   │   │   │   ├── handshake.ts      # Version vector exchange
@@ -158,7 +158,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── react/                        # @kora/react
+│   ├── react/                        # @korajs/react
 │   │   ├── src/
 │   │   │   ├── hooks/
 │   │   │   │   ├── use-kora.ts       # Main hook: useKora()
@@ -173,7 +173,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── server/                       # @kora/server
+│   ├── server/                       # @korajs/server
 │   │   ├── src/
 │   │   │   ├── adapters/
 │   │   │   │   ├── adapter.ts        # Backend database adapter interface
@@ -195,7 +195,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   ├── devtools/                     # @kora/devtools
+│   ├── devtools/                     # @korajs/devtools
 │   │   ├── src/
 │   │   │   ├── panel/
 │   │   │   │   ├── app.tsx           # DevTools panel UI (Preact)
@@ -215,7 +215,7 @@ kora/
 │   │   ├── tsup.config.ts
 │   │   └── vitest.config.ts
 │   │
-│   └── cli/                          # @kora/cli (also: create-kora-app)
+│   └── cli/                          # @korajs/cli (also: create-kora-app)
 │       ├── src/
 │       │   ├── commands/
 │       │   │   ├── create.ts         # npx create-kora-app
@@ -269,19 +269,19 @@ kora/
 ## 3. Package Dependency Graph
 
 ```
-@kora/core  (zero dependencies on other @kora packages)
+@korajs/core  (zero dependencies on other @kora packages)
     ↑
-@kora/store  (depends on @kora/core)
+@korajs/store  (depends on @korajs/core)
     ↑
-@kora/merge  (depends on @kora/core, uses Yjs)
+@korajs/merge  (depends on @korajs/core, uses Yjs)
     ↑
-@kora/sync   (depends on @kora/core, @kora/merge)
+@korajs/sync   (depends on @korajs/core, @korajs/merge)
     ↑
-@kora/server (depends on @kora/core, @kora/sync)
+@korajs/server (depends on @korajs/core, @korajs/sync)
 
-@kora/react  (depends on @kora/core, @kora/store, @kora/sync)
-@kora/devtools (depends on @kora/core)
-@kora/cli    (depends on all packages for scaffolding)
+@korajs/react  (depends on @korajs/core, @korajs/store, @korajs/sync)
+@korajs/devtools (depends on @korajs/core)
+@korajs/cli    (depends on all packages for scaffolding)
 ```
 
 The main developer-facing package `kora` is a meta-package that re-exports from core, store, merge, sync:
@@ -291,18 +291,18 @@ The main developer-facing package `kora` is a meta-package that re-exports from 
 {
   "name": "kora",
   "dependencies": {
-    "@kora/core": "workspace:*",
-    "@kora/store": "workspace:*",
-    "@kora/merge": "workspace:*",
-    "@kora/sync": "workspace:*"
+    "@korajs/core": "workspace:*",
+    "@korajs/store": "workspace:*",
+    "@korajs/merge": "workspace:*",
+    "@korajs/sync": "workspace:*"
   }
 }
 ```
 
 Developer imports from `kora` directly:
 ```typescript
-import { defineSchema, createApp, t } from 'kora'
-import { useKora } from 'kora/react'
+import { defineSchema, createApp, t } from 'korajs'
+import { useKora } from 'korajs/react'
 ```
 
 ---
@@ -335,7 +335,7 @@ Architecture Documentation:
 
 ---
 
-### Sprint 1-2 (Weeks 3-6): @kora/core
+### Sprint 1-2 (Weeks 3-6): @korajs/core
 
 **Goal:** Schema system, operation types, and clock implementations.
 
@@ -374,13 +374,13 @@ Relation Definitions:
 - Implement relation declaration in schema (many-to-one, many-to-many)
 - Implement relation type validation
 
-**Deliverables:** `@kora/core` published to npm (internal). Schema can be defined, validated, and produces correct TypeScript types. Operations can be created, hashed, and appended to the log. HLC and version vectors work correctly.
+**Deliverables:** `@korajs/core` published to npm (internal). Schema can be defined, validated, and produces correct TypeScript types. Operations can be created, hashed, and appended to the log. HLC and version vectors work correctly.
 
 **Test coverage target:** 95%+ for core.
 
 ---
 
-### Sprint 3-4 (Weeks 7-10): @kora/store
+### Sprint 3-4 (Weeks 7-10): @korajs/store
 
 **Goal:** Local storage abstraction with SQLite WASM and reactive queries.
 
@@ -425,13 +425,13 @@ Database Instance:
 - Implement database.collection('name') accessor
 - Implement database.close() cleanup
 
-**Deliverables:** `@kora/store` published. Developer can create a schema, insert/query/update/delete data in SQLite WASM, and subscribe to reactive queries. All mutations produce operations in the log.
+**Deliverables:** `@korajs/store` published. Developer can create a schema, insert/query/update/delete data in SQLite WASM, and subscribe to reactive queries. All mutations produce operations in the log.
 
 **Test coverage target:** 90%+. Include performance benchmarks for CRUD operations.
 
 ---
 
-### Sprint 5-6 (Weeks 11-14): @kora/merge
+### Sprint 5-6 (Weeks 11-14): @korajs/merge
 
 **Goal:** Three-tier conflict resolution engine.
 
@@ -478,13 +478,13 @@ Yjs Integration Layer:
 - Implement Yjs garbage collection configuration
 - Implement selective Yjs usage (only for fields that need CRDT merging)
 
-**Deliverables:** `@kora/merge` published. All three tiers of conflict resolution work. Given two divergent operation logs, the merge engine produces a deterministic, correct merged state. Constraints are enforced.
+**Deliverables:** `@korajs/merge` published. All three tiers of conflict resolution work. Given two divergent operation logs, the merge engine produces a deterministic, correct merged state. Constraints are enforced.
 
 **Test coverage target:** 95%+. This is the most critical package. Include adversarial tests (concurrent writes, partition scenarios, clock skew).
 
 ---
 
-### Sprint 7-8 (Weeks 15-18): @kora/sync
+### Sprint 7-8 (Weeks 15-18): @korajs/sync
 
 **Goal:** Sync engine with WebSocket transport.
 
@@ -534,13 +534,13 @@ Sync Engine Integration:
 - Implement background sync: periodically attempt to sync pending operations
 - Implement sync status events: syncing, synced, error, offline
 
-**Deliverables:** `@kora/sync` published. Two browser instances can sync data via WebSocket. Operations flow bidirectionally, conflicts resolve automatically, and the system handles disconnection/reconnection gracefully.
+**Deliverables:** `@korajs/sync` published. Two browser instances can sync data via WebSocket. Operations flow bidirectionally, conflicts resolve automatically, and the system handles disconnection/reconnection gracefully.
 
 **Test coverage target:** 90%+. Include chaos tests: random disconnections, out-of-order delivery, duplicate delivery, partial network partitions.
 
 ---
 
-### Sprint 9-10 (Weeks 19-22): @kora/server
+### Sprint 9-10 (Weeks 19-22): @korajs/server
 
 **Goal:** Self-hosted sync server with Postgres adapter.
 
@@ -588,13 +588,13 @@ Server CLI Integration:
 - Implement `kora server migrate` for server database migrations
 - Implement configuration via kora.config.ts
 
-**Deliverables:** `@kora/server` published. Developer can run `kora server start` and have a sync server that accepts WebSocket connections, stores operations in Postgres (or SQLite), replays operations to new clients, and handles auth/scopes.
+**Deliverables:** `@korajs/server` published. Developer can run `kora server start` and have a sync server that accepts WebSocket connections, stores operations in Postgres (or SQLite), replays operations to new clients, and handles auth/scopes.
 
 **Test coverage target:** 90%+. Include multi-client integration tests.
 
 ---
 
-### Sprint 11-12 (Weeks 23-26): @kora/react and Integration
+### Sprint 11-12 (Weeks 23-26): @korajs/react and Integration
 
 **Goal:** React bindings and end-to-end integration testing.
 
@@ -640,7 +640,7 @@ createApp() Final Integration:
 
 ---
 
-### Sprint 13-14 (Weeks 27-30): @kora/devtools
+### Sprint 13-14 (Weeks 27-30): @korajs/devtools
 
 **Goal:** Browser DevTools extension and embedded panel.
 
@@ -689,11 +689,11 @@ Chrome Extension:
 - Register DevTools panel via chrome.devtools.panels.create
 - Test in Chrome, Edge, Firefox (with WebExtension API)
 
-**Deliverables:** `@kora/devtools` published. Developer can install the Chrome extension or use the embedded panel to inspect sync timeline, operation log, and conflicts in real-time.
+**Deliverables:** `@korajs/devtools` published. Developer can install the Chrome extension or use the embedded panel to inspect sync timeline, operation log, and conflicts in real-time.
 
 ---
 
-### Sprint 15-16 (Weeks 31-34): @kora/cli and Templates
+### Sprint 15-16 (Weeks 31-34): @korajs/cli and Templates
 
 **Goal:** CLI tooling and project scaffolding.
 
@@ -738,7 +738,7 @@ CLI Polish:
 - Implement `kora --version`, `kora --help` with clear documentation
 - Implement update checker (notify when new version available)
 
-**Deliverables:** `create-kora-app` and `@kora/cli` published on npm. Developer can run `npx create-kora-app my-app` and have a working project in under 2 minutes.
+**Deliverables:** `create-kora-app` and `@korajs/cli` published on npm. Developer can run `npx create-kora-app my-app` and have a working project in under 2 minutes.
 
 ---
 
@@ -1070,11 +1070,11 @@ Steps:
 
 | Role | Count | Focus |
 |------|-------|-------|
-| Core Engine Lead | 1 | @kora/core, @kora/merge (most critical, deepest technical challenge) |
-| Storage Engineer | 1 | @kora/store (SQLite WASM, OPFS, reactive queries) |
-| Sync Engineer | 1 | @kora/sync, @kora/server (protocol, transport, server) |
-| DX Engineer | 1 | @kora/react, @kora/cli, templates, documentation |
-| DevTools Engineer | 1 | @kora/devtools (browser extension, visualization) |
+| Core Engine Lead | 1 | @korajs/core, @korajs/merge (most critical, deepest technical challenge) |
+| Storage Engineer | 1 | @korajs/store (SQLite WASM, OPFS, reactive queries) |
+| Sync Engineer | 1 | @korajs/sync, @korajs/server (protocol, transport, server) |
+| DX Engineer | 1 | @korajs/react, @korajs/cli, templates, documentation |
+| DevTools Engineer | 1 | @korajs/devtools (browser extension, visualization) |
 | QA/Reliability | 1 | Testing infrastructure, chaos tests, benchmarks, cross-browser |
 
 Total: 6 engineers for Phase 1.

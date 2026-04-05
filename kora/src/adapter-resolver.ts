@@ -1,4 +1,4 @@
-import type { StorageAdapter } from '@kora/store'
+import type { StorageAdapter } from '@korajs/store'
 import type { AdapterType } from './types'
 
 /**
@@ -38,15 +38,15 @@ export function detectAdapterType(): AdapterType {
 export async function createAdapter(type: AdapterType, dbName: string): Promise<StorageAdapter> {
 	switch (type) {
 		case 'better-sqlite3': {
-			const { BetterSqlite3Adapter } = await import('@kora/store/better-sqlite3')
+			const { BetterSqlite3Adapter } = await import('@korajs/store/better-sqlite3')
 			return new BetterSqlite3Adapter(dbName)
 		}
 		case 'sqlite-wasm': {
-			const { SqliteWasmAdapter } = await import('@kora/store/sqlite-wasm')
+			const { SqliteWasmAdapter } = await import('@korajs/store/sqlite-wasm')
 			return new SqliteWasmAdapter({ dbName })
 		}
 		case 'indexeddb': {
-			const { IndexedDbAdapter } = await import('@kora/store/indexeddb')
+			const { IndexedDbAdapter } = await import('@korajs/store/indexeddb')
 			return new IndexedDbAdapter({ dbName })
 		}
 		default: {

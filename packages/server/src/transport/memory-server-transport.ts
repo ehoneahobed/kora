@@ -1,4 +1,4 @@
-import type { SyncMessage } from '@kora/sync'
+import type { SyncMessage } from '@korajs/sync'
 import type {
 	ServerCloseHandler,
 	ServerErrorHandler,
@@ -92,7 +92,7 @@ export class MemoryServerTransport implements ServerTransport {
 
 /**
  * Minimal client-side transport that pairs with MemoryServerTransport.
- * Implements the same interface shape as @kora/sync MemoryTransport but
+ * Implements the same interface shape as @korajs/sync MemoryTransport but
  * specifically designed for server testing without importing internal modules.
  */
 class MemoryClientTransport {

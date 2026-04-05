@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@kora/store'
+import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
 import { describe, expect, it, vi } from 'vitest'
 import { QueryStore } from './query-store'
 

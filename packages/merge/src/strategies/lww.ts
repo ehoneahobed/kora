@@ -1,5 +1,5 @@
-import { HybridLogicalClock } from '@kora/core'
-import type { HLCTimestamp } from '@kora/core'
+import { HybridLogicalClock } from '@korajs/core'
+import type { HLCTimestamp } from '@korajs/core'
 
 /**
  * Result of a Last-Write-Wins comparison.

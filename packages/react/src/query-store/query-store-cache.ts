@@ -1,4 +1,4 @@
-import type { QueryBuilder } from '@kora/store'
+import type { QueryBuilder } from '@korajs/store'
 import { QueryStore } from './query-store'
 
 interface CacheEntry {

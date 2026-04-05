@@ -1,4 +1,4 @@
-import type { TimeSource } from '@kora/core'
+import type { TimeSource } from '@korajs/core'
 
 /**
  * Configuration for the reconnection manager.

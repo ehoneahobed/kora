@@ -1,6 +1,6 @@
 {
-  "name": "@kora/devtools",
-  "version": "0.0.0",
+  "name": "@korajs/devtools",
+  "version": "0.1.0",
   "description": "Kora.js devtools package",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -18,7 +18,9 @@
       }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup && node ./scripts/build-extension-assets.mjs",
     "dev": "tsup --watch",
@@ -29,7 +31,7 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*"
+    "@korajs/core": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.3",

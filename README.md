@@ -12,14 +12,14 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 | Package | Tests | Description |
 |---------|-------|-------------|
-| `@kora/core` | 231 | Schema, operations, HLC, version vectors, type inference |
-| `@kora/store` | 225 | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
-| `@kora/merge` | 99 | Three-tier conflict resolution with Yjs CRDT richtext merge |
-| `@kora/sync` | 180 | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
-| `@kora/server` | 118 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
-| `@kora/react` | 60 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
-| `@kora/devtools` | 49 | Browser DevTools extension with sync timeline, conflict inspector |
-| `@kora/cli` | 120 | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
+| `@korajs/core` | 231 | Schema, operations, HLC, version vectors, type inference |
+| `@korajs/store` | 225 | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
+| `@korajs/merge` | 99 | Three-tier conflict resolution with Yjs CRDT richtext merge |
+| `@korajs/sync` | 180 | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
+| `@korajs/server` | 118 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
+| `@korajs/react` | 60 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
+| `@korajs/devtools` | 49 | Browser DevTools extension with sync timeline, conflict inspector |
+| `@korajs/cli` | 120 | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
 | `kora` | 46 | Meta-package with `createApp`, full type inference from schema to hooks |
 
 ## What It Does
@@ -50,7 +50,7 @@ This gives you a React app with local persistence, reactive queries, and optiona
 ### Or start from scratch
 
 ```typescript
-import { createApp, defineSchema, t } from 'kora'
+import { createApp, defineSchema, t } from 'korajs'
 
 const app = createApp({
   schema: defineSchema({
@@ -93,7 +93,7 @@ const app = createApp({
 ### React hooks
 
 ```tsx
-import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@kora/react'
+import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@korajs/react'
 
 function TodoList() {
   const todos = useQuery(app.todos.where({ completed: false }))
@@ -141,14 +141,14 @@ Operation {
 
 ```
 packages/
-  core/       @kora/core     — Schema, operations, HLC, version vectors
-  store/      @kora/store    — Local storage, CRUD, reactive queries
-  merge/      @kora/merge    — Three-tier conflict resolution
-  sync/       @kora/sync     — Sync protocol and transports
-  server/     @kora/server   — Self-hosted sync server
-  react/      @kora/react    — React hooks and bindings
-  devtools/   @kora/devtools — Browser DevTools extension
-  cli/        @kora/cli      — CLI tooling and scaffolding
+  core/       @korajs/core     — Schema, operations, HLC, version vectors
+  store/      @korajs/store    — Local storage, CRUD, reactive queries
+  merge/      @korajs/merge    — Three-tier conflict resolution
+  sync/       @korajs/sync     — Sync protocol and transports
+  server/     @korajs/server   — Self-hosted sync server
+  react/      @korajs/react    — React hooks and bindings
+  devtools/   @korajs/devtools — Browser DevTools extension
+  cli/        @korajs/cli      — CLI tooling and scaffolding
 kora/         Meta-package re-exporting core, store, merge, sync
 e2e/          Playwright E2E test suite
 docs/         VitePress documentation site
@@ -273,8 +273,8 @@ pnpm dev
 # 1. Login to npm
 npm login
 
-# 2. Create the @kora org on https://www.npmjs.com/org/create
-#    This reserves the @kora/* package scope
+# 2. Create the @korajs org on https://www.npmjs.com/org/create (already done)
+#    This reserves the @korajs/* package scope
 
 # 3. Create a changeset (describes what changed)
 pnpm changeset
@@ -343,7 +343,7 @@ To test sync across different machines/locations, deploy the sync server:
 
 ```typescript
 // server.ts — deploy to any Node.js host (Railway, Render, Fly.io, VPS)
-import { createKoraServer, MemoryServerStore } from '@kora/server'
+import { createKoraServer, MemoryServerStore } from '@korajs/server'
 
 const server = createKoraServer({
   store: new MemoryServerStore(),

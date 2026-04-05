@@ -7,7 +7,7 @@ The schema is the foundation of every Kora app. It defines your collections, fie
 Use `defineSchema` to declare your data model:
 
 ```typescript
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export default defineSchema({
   version: 1,

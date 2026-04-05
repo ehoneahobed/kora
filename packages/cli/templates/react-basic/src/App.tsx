@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useCollection } from '@kora/react'
+import { useQuery, useMutation, useCollection } from '@korajs/react'
 
 export function App() {
   const todos = useCollection('todos')

@@ -21,14 +21,14 @@ A monorepo containing these packages:
 ```
 kora/                       # Meta-package re-exporting core, store, merge, sync
 packages/
-  core/                     # @kora/core - Schema, operations, clocks, types
-  store/                    # @kora/store - Local storage (SQLite WASM, IndexedDB)
-  merge/                    # @kora/merge - Three-tier conflict resolution
-  sync/                     # @kora/sync - Sync protocol and transports
-  server/                   # @kora/server - Self-hosted sync server
-  react/                    # @kora/react - React hooks and bindings
-  devtools/                 # @kora/devtools - Browser DevTools extension
-  cli/                      # @kora/cli - CLI tooling and scaffolding
+  core/                     # @korajs/core - Schema, operations, clocks, types
+  store/                    # @korajs/store - Local storage (SQLite WASM, IndexedDB)
+  merge/                    # @korajs/merge - Three-tier conflict resolution
+  sync/                     # @korajs/sync - Sync protocol and transports
+  server/                   # @korajs/server - Self-hosted sync server
+  react/                    # @korajs/react - React hooks and bindings
+  devtools/                 # @korajs/devtools - Browser DevTools extension
+  cli/                      # @korajs/cli - CLI tooling and scaffolding
 ```
 
 ---
@@ -99,19 +99,19 @@ These decisions are locked. Do not deviate or substitute.
 ## PACKAGE DEPENDENCY RULES
 
 ```
-@kora/core       -> (no @kora dependencies)
-@kora/store      -> @kora/core
-@kora/merge      -> @kora/core
-@kora/sync       -> @kora/core, @kora/merge
-@kora/server     -> @kora/core, @kora/sync
-@kora/react      -> @kora/core, @kora/store, @kora/sync
-@kora/devtools   -> @kora/core
-@kora/cli        -> (all packages, dev dependency)
+@korajs/core       -> (no @kora dependencies)
+@korajs/store      -> @korajs/core
+@korajs/merge      -> @korajs/core
+@korajs/sync       -> @korajs/core, @korajs/merge
+@korajs/server     -> @korajs/core, @korajs/sync
+@korajs/react      -> @korajs/core, @korajs/store, @korajs/sync
+@korajs/devtools   -> @korajs/core
+@korajs/cli        -> (all packages, dev dependency)
 ```
 
 **Strict rules:**
 - A package may NEVER import from a package that depends on it (no circular deps)
-- @kora/core has ZERO dependencies on other @kora packages. It is the foundation.
+- @korajs/core has ZERO dependencies on other @kora packages. It is the foundation.
 - External dependencies must be minimal. Before adding a dependency, ask: can this be implemented in under 100 lines? If yes, implement it.
 
 ---
@@ -149,7 +149,7 @@ Interfaces:      PascalCase, no I prefix (Operation, not IOperation)
 Types:           PascalCase (MergeStrategy, ConnectionQuality)
 Functions:       camelCase (createApp, defineSchema)
 Constants:       UPPER_SNAKE_CASE (MAX_OPERATION_SIZE, DEFAULT_BATCH_SIZE)
-Packages:        @kora/package-name
+Packages:        @korajs/package-name
 Test files:      same-name.test.ts (merge-engine.test.ts)
 ```
 
@@ -421,7 +421,7 @@ The schema is the developer's primary interaction point. It must be beautiful.
 
 ```typescript
 // This is what the developer writes:
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export default defineSchema({
   version: 1,
@@ -660,7 +660,7 @@ The public API is the product. Every function, hook, and type the developer touc
 ### createApp()
 
 ```typescript
-import { createApp, defineSchema, t } from 'kora'
+import { createApp, defineSchema, t } from 'korajs'
 
 // Minimal (local-only, zero config)
 const app = createApp({
@@ -756,7 +756,7 @@ const count = await app.todos.where({ completed: false }).count()
 ### React Hooks
 
 ```typescript
-import { KoraProvider, useQuery, useMutation, useSyncStatus } from 'kora/react'
+import { KoraProvider, useQuery, useMutation, useSyncStatus } from 'korajs/react'
 
 // Provider (wraps app)
 function App() {
@@ -904,16 +904,16 @@ class ChaosTransport implements KoraTransport {
 Track and enforce with CI. Fail the build if regression exceeds 10%.
 
 ```
-@kora/store:
+@korajs/store:
   - Insert 10,000 records: < 2 seconds
   - Query 1,000 records with WHERE: < 50ms
   - Reactive query notification latency: < 16ms (one frame)
 
-@kora/merge:
+@korajs/merge:
   - Merge 1,000 concurrent operations: < 500ms
   - LWW comparison: < 1 microsecond
 
-@kora/sync:
+@korajs/sync:
   - Initial sync of 10,000 operations: < 5 seconds
   - Incremental sync of 1 operation: < 200ms (end-to-end)
   - Version vector delta computation: < 10ms for 100 nodes
@@ -1121,14 +1121,14 @@ When you complete a feature, check against these criteria:
 Build packages in this exact order. Each package depends only on packages built before it.
 
 ```
-1. @kora/core         (schema, operations, clocks - the foundation)
-2. @kora/store         (local storage - can demo locally after this)
-3. @kora/merge         (conflict resolution - the hardest part)
-4. @kora/sync          (sync protocol - requires merge)
-5. @kora/server        (sync server - requires sync)
-6. @kora/react         (React bindings - requires store + sync)
-7. @kora/devtools      (DevTools - requires core for event types)
-8. @kora/cli           (CLI - requires all packages for templates)
+1. @korajs/core         (schema, operations, clocks - the foundation)
+2. @korajs/store         (local storage - can demo locally after this)
+3. @korajs/merge         (conflict resolution - the hardest part)
+4. @korajs/sync          (sync protocol - requires merge)
+5. @korajs/server        (sync server - requires sync)
+6. @korajs/react         (React bindings - requires store + sync)
+7. @korajs/devtools      (DevTools - requires core for event types)
+8. @korajs/cli           (CLI - requires all packages for templates)
 ```
 
 After each package, write an integration test that validates the new package works with all previously built packages. The test suite grows monotonically.

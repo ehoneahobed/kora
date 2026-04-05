@@ -1,5 +1,5 @@
-import type { Store } from '@kora/store'
-import type { SyncEngine } from '@kora/sync'
+import type { Store } from '@korajs/store'
+import type { SyncEngine } from '@korajs/sync'
 import { createContext, createElement, useContext, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { KoraContextValue, KoraProviderProps } from '../types'

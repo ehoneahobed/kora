@@ -1,4 +1,4 @@
-import { defineSchema, t } from 'kora'
+import { defineSchema, t } from 'korajs'
 
 export default defineSchema({
   version: 1,

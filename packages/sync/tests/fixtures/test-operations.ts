@@ -1,5 +1,5 @@
 import { fc } from '@fast-check/vitest'
-import type { Operation, VersionVector } from '@kora/core'
+import type { Operation, VersionVector } from '@korajs/core'
 import type { SyncMessage } from '../../src/protocol/messages'
 
 /**

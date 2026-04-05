@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { extname } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { SchemaDefinition } from '@kora/core'
+import type { SchemaDefinition } from '@korajs/core'
 import { resolveProjectBinary } from '../../utils/fs-helpers'
 
 /**

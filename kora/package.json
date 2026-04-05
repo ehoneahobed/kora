@@ -1,6 +1,6 @@
 {
-  "name": "kora",
-  "version": "0.0.0",
+  "name": "korajs",
+  "version": "0.1.0",
   "description": "Kora.js — offline-first application framework",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -28,7 +28,9 @@
       }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -38,11 +40,11 @@
     "clean": "rm -rf dist .turbo coverage"
   },
   "dependencies": {
-    "@kora/core": "workspace:*",
-    "@kora/store": "workspace:*",
-    "@kora/merge": "workspace:*",
-    "@kora/sync": "workspace:*",
-    "@kora/devtools": "workspace:*"
+    "@korajs/core": "workspace:*",
+    "@korajs/store": "workspace:*",
+    "@korajs/merge": "workspace:*",
+    "@korajs/sync": "workspace:*",
+    "@korajs/devtools": "workspace:*"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

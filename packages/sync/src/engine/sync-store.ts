@@ -1,4 +1,4 @@
-import type { Operation, VersionVector } from '@kora/core'
+import type { Operation, VersionVector } from '@korajs/core'
 
 /**
  * Result of applying a remote operation to the store.
@@ -7,9 +7,9 @@ export type ApplyResult = 'applied' | 'duplicate' | 'skipped'
 
 /**
  * Interface that the local store must implement for sync.
- * This decouples @kora/sync from @kora/store — the store satisfies this interface.
+ * This decouples @korajs/sync from @korajs/store — the store satisfies this interface.
  *
- * @kora/store's Store class already implements these methods:
+ * @korajs/store's Store class already implements these methods:
  * - getVersionVector() — returns the current version vector
  * - getNodeId() — returns this instance's nodeId
  * - applyRemoteOperation(op) — applies a remote op with dedup and merge

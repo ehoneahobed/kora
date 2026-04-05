@@ -1,5 +1,5 @@
-import type { Store } from '@kora/store'
-import type { SyncEngine, SyncStatusInfo } from '@kora/sync'
+import type { Store } from '@korajs/store'
+import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { createElement, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'

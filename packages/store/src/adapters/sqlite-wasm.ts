@@ -1,4 +1,4 @@
-// Entry point for @kora/store/sqlite-wasm
+// Entry point for @korajs/store/sqlite-wasm
 export { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 export type { SqliteWasmAdapterOptions } from './sqlite-wasm-adapter'
 export { WebWorkerBridge, Mutex } from './sqlite-wasm-channel'

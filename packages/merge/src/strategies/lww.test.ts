@@ -1,4 +1,4 @@
-import type { HLCTimestamp } from '@kora/core'
+import type { HLCTimestamp } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { lastWriteWins } from './lww'
 

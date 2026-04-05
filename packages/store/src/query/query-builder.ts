@@ -1,4 +1,4 @@
-import type { CollectionDefinition, SchemaDefinition } from '@kora/core'
+import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
 import { deserializeRecord } from '../serialization/serializer'
 import type { SubscriptionManager } from '../subscription/subscription-manager'
 import type {

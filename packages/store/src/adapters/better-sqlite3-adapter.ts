@@ -1,5 +1,5 @@
-import { generateFullDDL } from '@kora/core'
-import type { SchemaDefinition } from '@kora/core'
+import { generateFullDDL } from '@korajs/core'
+import type { SchemaDefinition } from '@korajs/core'
 import type Database from 'better-sqlite3'
 import { AdapterError, StoreNotOpenError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
@@ -10,7 +10,7 @@ import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
  *
  * @example
  * ```typescript
- * import { BetterSqlite3Adapter } from '@kora/store/better-sqlite3'
+ * import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
  *
  * const adapter = new BetterSqlite3Adapter(':memory:')
  * ```

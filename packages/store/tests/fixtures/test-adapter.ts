@@ -1,4 +1,4 @@
-import type { SchemaDefinition } from '@kora/core'
+import type { SchemaDefinition } from '@korajs/core'
 import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
 import { minimalSchema } from './test-schema'
 

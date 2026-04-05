@@ -1,7 +1,7 @@
-import { SyncError } from '@kora/core'
-import type { SyncMessage } from '@kora/sync'
-import { JsonMessageSerializer } from '@kora/sync'
-import type { MessageSerializer } from '@kora/sync'
+import { SyncError } from '@korajs/core'
+import type { SyncMessage } from '@korajs/sync'
+import { JsonMessageSerializer } from '@korajs/sync'
+import type { MessageSerializer } from '@korajs/sync'
 import type {
 	ServerCloseHandler,
 	ServerErrorHandler,

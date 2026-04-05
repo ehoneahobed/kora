@@ -1,5 +1,5 @@
-import { generateSQL } from '@kora/core'
-import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@kora/core'
+import { generateSQL } from '@korajs/core'
+import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@korajs/core'
 import type { SchemaDiff } from './schema-differ'
 import { getChangedCollections } from './schema-differ'
 

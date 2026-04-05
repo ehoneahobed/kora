@@ -1,5 +1,5 @@
-import { HybridLogicalClock, createOperation, generateUUIDv7 } from '@kora/core'
-import type { Operation } from '@kora/core'
+import { HybridLogicalClock, createOperation, generateUUIDv7 } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
