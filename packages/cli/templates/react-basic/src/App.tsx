@@ -1,15 +1,18 @@
-import { useQuery, useMutation, useSyncStatus } from '@kora/react'
+import { useQuery, useMutation, useCollection } from '@kora/react'
 
 export function App() {
-  const todos = useQuery(app => app.todos.where({ completed: false }).orderBy('createdAt'))
-  const addTodo = useMutation(app => app.todos.insert)
-  const toggleTodo = useMutation(app => app.todos.update)
-  const status = useSyncStatus()
+  const todos = useCollection('todos')
+  const activeTodos = useQuery(todos.where({ completed: false }))
+  const { mutate: addTodo } = useMutation(
+    (data: { title: string }) => todos.insert(data)
+  )
+  const { mutate: toggleTodo } = useMutation(
+    (id: string, data: { completed: boolean }) => todos.update(id, data)
+  )
 
   return (
     <div style={{ maxWidth: 600, margin: '0 auto', padding: 20 }}>
       <h1>Kora Todo App</h1>
-      <p>Status: {status}</p>
 
       <form
         onSubmit={async (e) => {
@@ -17,7 +20,7 @@ export function App() {
           const form = e.currentTarget
           const input = form.elements.namedItem('title') as HTMLInputElement
           if (input.value.trim()) {
-            await addTodo({ title: input.value.trim() })
+            addTodo({ title: input.value.trim() })
             input.value = ''
           }
         }}
@@ -27,15 +30,15 @@ export function App() {
       </form>
 
       <ul>
-        {todos.map((todo) => (
+        {activeTodos.map((todo) => (
           <li key={todo.id}>
             <label>
               <input
                 type="checkbox"
-                checked={todo.completed}
+                checked={!!todo.completed}
                 onChange={() => toggleTodo(todo.id, { completed: !todo.completed })}
               />
-              {todo.title}
+              {String(todo.title)}
             </label>
           </li>
         ))}

@@ -2,7 +2,13 @@
 // Every export here is a public API commitment. Be explicit.
 
 // === Types ===
-export type { KoraContextValue, UseQueryOptions, UseMutationResult } from './types'
+export type {
+	KoraAppLike,
+	KoraContextValue,
+	KoraProviderProps,
+	UseQueryOptions,
+	UseMutationResult,
+} from './types'
 
 // === Context ===
 export { KoraProvider } from './context/kora-context'

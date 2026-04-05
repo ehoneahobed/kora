@@ -1,40 +1,74 @@
 import type { Store } from '@kora/store'
 import type { SyncEngine } from '@kora/sync'
-import { createContext, createElement, useContext } from 'react'
+import { createContext, createElement, useContext, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { KoraContextValue } from '../types'
+import type { KoraContextValue, KoraProviderProps } from '../types'
 
 const KoraContext = createContext<KoraContextValue | null>(null)
-
-/**
- * Props for the KoraProvider component.
- */
-interface KoraProviderProps {
-	/** The local Kora store instance (must be open) */
-	store: Store
-	/** Optional sync engine for remote synchronization */
-	syncEngine?: SyncEngine | null
-	/** Child components (passed via createElement's third arg or JSX children) */
-	children?: ReactNode
-}
 
 /**
  * Provides Kora store and optional sync engine to all child components.
  * Must wrap any component that uses Kora hooks (useQuery, useMutation, etc.).
  *
+ * Accepts either an `app` prop (recommended) or explicit `store` + `syncEngine` props.
+ *
+ * When using the `app` prop, KoraProvider waits for `app.ready` before rendering
+ * children. A `fallback` prop can be provided to show content while initializing.
+ *
  * @example
  * ```typescript
- * import { KoraProvider } from '@kora/react'
+ * // Recommended: pass the app object directly
+ * const app = createApp({ schema })
+ * <KoraProvider app={app}><App /></KoraProvider>
  *
- * function App() {
- *   return createElement(KoraProvider, { store }, createElement(TodoList))
- * }
+ * // Advanced: pass store and syncEngine explicitly
+ * <KoraProvider store={store} syncEngine={syncEngine}><App /></KoraProvider>
  * ```
  */
-function KoraProvider({ store, syncEngine, children }: KoraProviderProps): ReactNode {
+function KoraProvider({
+	app,
+	store,
+	syncEngine,
+	fallback,
+	children,
+}: KoraProviderProps): ReactNode {
+	const [resolvedStore, setResolvedStore] = useState<Store | null>(
+		store ?? null,
+	)
+	const [resolvedSync, setResolvedSync] = useState<SyncEngine | null>(
+		syncEngine ?? null,
+	)
+	// If no app prop, we're using the store prop and are ready immediately
+	const [ready, setReady] = useState(!app)
+
+	useEffect(() => {
+		if (!app) return
+		let cancelled = false
+		app.ready.then(() => {
+			if (cancelled) return
+			setResolvedStore(app.getStore())
+			setResolvedSync(app.getSyncEngine())
+			setReady(true)
+		})
+		return () => {
+			cancelled = true
+		}
+	}, [app])
+
+	if (!ready) {
+		return (fallback ?? null) as ReactNode
+	}
+
+	if (!resolvedStore) {
+		throw new Error(
+			'KoraProvider requires either an "app" or "store" prop. ' +
+				'Pass a KoraApp from createApp() or a Store instance.',
+		)
+	}
+
 	const value: KoraContextValue = {
-		store,
-		syncEngine: syncEngine ?? null,
+		store: resolvedStore,
+		syncEngine: resolvedSync,
 	}
 	return createElement(KoraContext.Provider, { value }, children)
 }
