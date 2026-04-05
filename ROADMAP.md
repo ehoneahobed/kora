@@ -20,7 +20,7 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 
 **What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends (both using Drizzle ORM query builders), server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution. Full end-to-end type inference flows from `defineSchema()` through `createApp()` to collection accessors and React hooks. Relational queries via `.include()` resolve many-to-one and one-to-many relations.
 
-**What does not work today:** Remaining major gaps are chaos/e2e/publish pipeline completion.
+**What does not work today:** Remaining major gaps are e2e/publish pipeline completion.
 
 ### Known Issues
 
@@ -40,7 +40,7 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 | 6 | Complete | Server-side scope filtering enforced for delta, relay, and inbound operation paths |
 | 7 | Complete | `kora migrate` supports diff/generate/apply with breaking-change confirmation and idempotent ordered execution |
 | 8 | Complete | DevTools extension routes instrumented events into a multi-panel browser UI in real time |
-| 9 | In progress | Protobuf wire serializer + negotiation + HTTP fallback + benchmark gates landed; chaos CI wiring remains |
+| 9 | Complete | Protobuf negotiation, HTTP fallback, benchmark gates, and nightly chaos convergence gating are in place |
 | 10 | Not started | E2E/docs/publish automation still pending |
 | Cross-cutting | Complete | End-to-end type inference, relational `.include()` queries, full Drizzle ORM migration |
 
@@ -679,7 +679,7 @@ Both `SqliteServerStore` and `PostgresServerStore` now use Drizzle ORM typed que
 
 ## Phase 9: Protocol and Performance Hardening
 
-**Status:** In progress
+**Status:** Complete
 
 **Goal:** Production-grade wire format and validated performance targets.
 
@@ -692,6 +692,7 @@ Both `SqliteServerStore` and `PostgresServerStore` now use Drizzle ORM typed que
 - HTTP long-polling client transport in `@kora/sync` (POST send + GET receive + optional WebSocket upgrade)
 - Server-side HTTP sync request handling in `@kora/server` with long-poll queueing and ETag support
 - Performance benchmark gates implemented for `@kora/store`, `@kora/merge`, and `@kora/sync`, plus CI workflow execution
+- Nightly chaos convergence suite added (`10 clients × 1,000 ops`, `10% drop`, `5% duplicate`) with scheduled CI workflow
 
 ### 9a. Protobuf Wire Format
 
@@ -787,7 +788,7 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 | **7** | `kora migrate` command | Complete |
 | **8** | DevTools browser extension | Complete |
 | **Cross-cutting** | Type inference, relational queries, Drizzle migration | Complete |
-| **9** | Protobuf, HTTP transport, benchmarks | In progress |
+| **9** | Protobuf, HTTP transport, benchmarks, chaos | Complete |
 | **10** | E2E tests, docs, publish | Not started |
 
-**Updated critical path:** Phase 9 remaining (benchmark CI gates) → Phase 10 (E2E, docs, publish).
+**Updated critical path:** Phase 10 (E2E, docs, publish).

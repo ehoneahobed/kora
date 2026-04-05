@@ -7,6 +7,7 @@
     "dev": "turbo run dev",
     "test": "turbo run test",
     "benchmark:gates": "pnpm --filter @kora/store test -- src/benchmarks/performance-gates.test.ts && pnpm --filter @kora/merge test -- src/benchmarks/performance-gates.test.ts && pnpm --filter @kora/sync test -- src/benchmarks/performance-gates.test.ts",
+    "chaos:nightly": "pnpm --filter @kora/sync test:chaos",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "turbo run typecheck",
