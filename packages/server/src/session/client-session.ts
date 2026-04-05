@@ -9,6 +9,7 @@ import type {
 } from '@kora/sync'
 import { JsonMessageSerializer, versionVectorToWire, wireToVersionVector } from '@kora/sync'
 import type { ServerStore } from '../store/server-store'
+import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider } from '../types'
 
@@ -116,7 +117,12 @@ export class ClientSession {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (operations.length === 0) return
 
-		const serializedOps = operations.map((op) => this.serializer.encodeOperation(op))
+		const visibleOperations = operations.filter((op) =>
+			operationMatchesScopes(op, this.authContext?.scopes),
+		)
+		if (visibleOperations.length === 0) return
+
+		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
 		const msg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
@@ -231,6 +237,10 @@ export class ClientSession {
 		const applied: Operation[] = []
 
 		for (const op of operations) {
+			if (!operationMatchesScopes(op, this.authContext?.scopes)) {
+				continue
+			}
+
 			const result = await this.store.applyRemoteOperation(op)
 			if (result === 'applied') {
 				applied.push(op)
@@ -269,7 +279,8 @@ export class ClientSession {
 			const clientSeq = clientVector.get(nodeId) ?? 0
 			if (serverSeq > clientSeq) {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
-				missing.push(...ops)
+				const visible = ops.filter((op) => operationMatchesScopes(op, this.authContext?.scopes))
+				missing.push(...visible)
 			}
 		}
 

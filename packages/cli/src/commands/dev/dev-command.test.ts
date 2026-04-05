@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
@@ -9,6 +9,7 @@ const {
 	findSchemaFileMock,
 	resolveProjectBinaryMock,
 	createLoggerMock,
+	loadKoraConfigMock,
 	processManagerCtorMock,
 	processManagerSpawnMock,
 	processManagerHasRunningMock,
@@ -36,6 +37,7 @@ const {
 		findSchemaFileMock: vi.fn(),
 		resolveProjectBinaryMock: vi.fn(),
 		createLoggerMock: vi.fn(() => logger),
+		loadKoraConfigMock: vi.fn(),
 		processManagerCtorMock: vi.fn(() => ({
 			spawn: processManagerSpawn,
 			hasRunning: processManagerHasRunning,
@@ -67,6 +69,12 @@ vi.mock('../../utils/logger', () => {
 	}
 })
 
+vi.mock('./kora-config', () => {
+	return {
+		loadKoraConfig: loadKoraConfigMock,
+	}
+})
+
 vi.mock('./process-manager', () => {
 	return {
 		ProcessManager: processManagerCtorMock,
@@ -95,6 +103,7 @@ describe('dev command', () => {
 		findSchemaFileMock.mockReset()
 		resolveProjectBinaryMock.mockReset()
 		processManagerCtorMock.mockClear()
+		loadKoraConfigMock.mockReset()
 		processManagerSpawnMock.mockReset()
 		processManagerHasRunningMock.mockReset()
 		processManagerShutdownAllMock.mockReset()
@@ -103,6 +112,7 @@ describe('dev command', () => {
 		schemaWatcherStopMock.mockReset()
 
 		processManagerHasRunningMock.mockReturnValue(false)
+		loadKoraConfigMock.mockResolvedValue(null)
 		processManagerShutdownAllMock.mockResolvedValue(undefined)
 		processManagerSpawnMock.mockImplementation((config: { onExit?: () => void }) => {
 			config.onExit?.()
@@ -196,14 +206,138 @@ describe('dev command', () => {
 			}),
 		)
 	})
+
+	test('uses ports from kora.config when args are omitted', async () => {
+		const { devCommand } = await import('./dev-command')
+		findProjectRootMock.mockResolvedValue(tempDir.path)
+		findSchemaFileMock.mockResolvedValue(null)
+		loadKoraConfigMock.mockResolvedValue({
+			dev: {
+				port: 4111,
+				sync: { enabled: true, port: 3222 },
+			},
+		})
+		await writeFile(join(tempDir.path, 'server.ts'), 'console.log("sync")')
+
+		await devCommand.run({
+			args: { 'no-sync': false, 'no-watch': false },
+		})
+
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({ label: 'vite', args: ['--port', '4111'] }),
+		)
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				label: 'sync',
+				env: expect.objectContaining({ PORT: '3222', KORA_SYNC_PORT: '3222' }),
+			}),
+		)
+	})
+
+	test('starts managed sync from config when server.ts is missing', async () => {
+		const { devCommand } = await import('./dev-command')
+		findProjectRootMock.mockResolvedValue(tempDir.path)
+		findSchemaFileMock.mockResolvedValue(null)
+		loadKoraConfigMock.mockResolvedValue({
+			dev: {
+				sync: { enabled: true, port: 3777, store: 'memory' },
+			},
+		})
+
+		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+
+		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
+
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({ label: 'sync', command: process.execPath }),
+		)
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				label: 'sync',
+				args: expect.arrayContaining(['--input-type=module', '--eval']),
+				env: expect.objectContaining({
+					KORA_DEV_SYNC_CONFIG: JSON.stringify({
+						port: 3777,
+						store: { type: 'memory' },
+					}),
+				}),
+			}),
+		)
+	})
+
+	test('starts managed sqlite sync with resolved filename', async () => {
+		const { devCommand } = await import('./dev-command')
+		findProjectRootMock.mockResolvedValue(tempDir.path)
+		findSchemaFileMock.mockResolvedValue(null)
+		loadKoraConfigMock.mockResolvedValue({
+			dev: {
+				sync: {
+					enabled: true,
+					port: 3888,
+					store: { type: 'sqlite', filename: './data/dev-sync.db' },
+				},
+			},
+		})
+
+		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+
+		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
+
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				label: 'sync',
+				env: expect.objectContaining({
+					KORA_DEV_SYNC_CONFIG: JSON.stringify({
+						port: 3888,
+						store: { type: 'sqlite', filename: join(tempDir.path, 'data', 'dev-sync.db') },
+					}),
+				}),
+			}),
+		)
+	})
+
+	test('starts managed postgres sync with connection string', async () => {
+		const { devCommand } = await import('./dev-command')
+		findProjectRootMock.mockResolvedValue(tempDir.path)
+		findSchemaFileMock.mockResolvedValue(null)
+		loadKoraConfigMock.mockResolvedValue({
+			dev: {
+				sync: {
+					enabled: true,
+					port: 3999,
+					store: {
+						type: 'postgres',
+						connectionString: 'postgres://user:pass@localhost:5432/kora_dev',
+					},
+				},
+			},
+		})
+
+		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+
+		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
+
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				label: 'sync',
+				env: expect.objectContaining({
+					KORA_DEV_SYNC_CONFIG: JSON.stringify({
+						port: 3999,
+						store: {
+							type: 'postgres',
+							connectionString: 'postgres://user:pass@localhost:5432/kora_dev',
+						},
+					}),
+				}),
+			}),
+		)
+	})
 })
 
-function defaultArgs(): {
-	port: string
-	'sync-port': string
-	'no-sync': boolean
-	'no-watch': boolean
-} {
+function defaultArgs(): Record<string, unknown> {
 	return {
 		port: '5173',
 		'sync-port': '3001',

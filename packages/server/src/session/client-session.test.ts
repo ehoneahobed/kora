@@ -514,6 +514,146 @@ describe('ClientSession', () => {
 		})
 	})
 
+	describe('scopes', () => {
+		test('delta only includes operations matching auth scope', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'todo-user-1',
+					nodeId: 'node-a',
+					sequenceNumber: 1,
+					data: { ownerId: 'user-1', title: 'Mine' },
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'todo-user-2',
+					nodeId: 'node-a',
+					sequenceNumber: 2,
+					data: { ownerId: 'user-2', title: 'Not mine' },
+				}),
+			)
+
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				auth,
+			})
+			session.start()
+
+			sendHandshake(client, { authToken: 'ok' })
+
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			const batches = messages.filter((m) => m.type === 'operation-batch')
+			const allIds = batches.flatMap((batch) =>
+				batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : [],
+			)
+			expect(allIds).toContain('todo-user-1')
+			expect(allIds).not.toContain('todo-user-2')
+		})
+
+		test('relay only sends operations matching auth scope', async () => {
+			const store = new MemoryServerStore('server-1')
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				auth,
+			})
+			session.start()
+
+			sendHandshake(client, { authToken: 'ok' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			session.relayOperations([
+				createTestOp({ id: 'visible', data: { ownerId: 'user-1', title: 'Mine' } }),
+				createTestOp({ id: 'hidden', data: { ownerId: 'user-2', title: 'Not mine' } }),
+			])
+
+			await vi.waitFor(() => {
+				const relayBatch = messages.find(
+					(m) =>
+						m.type === 'operation-batch' && m.operations.some((op) => op.id === 'visible'),
+				)
+				expect(relayBatch).toBeDefined()
+			})
+
+			const ids = messages
+				.filter((m) => m.type === 'operation-batch')
+				.flatMap((batch) => (batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : []))
+			expect(ids).toContain('visible')
+			expect(ids).not.toContain('hidden')
+		})
+
+		test('drops incoming out-of-scope operations', async () => {
+			const store = new MemoryServerStore('server-1')
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+			const onRelay = vi.fn()
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				auth,
+				onRelay,
+			})
+			session.start()
+
+			sendHandshake(client, { authToken: 'ok' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			sendOpBatch(client, [
+				createTestOp({
+					id: 'outside-scope',
+					sequenceNumber: 1,
+					data: { ownerId: 'user-2', title: 'Nope' },
+				}),
+			])
+
+			await vi.waitFor(() => {
+				const ack = messages.find(
+					(m) =>
+						m.type === 'acknowledgment' &&
+						(m as { acknowledgedMessageId: string }).acknowledgedMessageId === 'batch-1',
+				)
+				expect(ack).toBeDefined()
+			})
+
+			expect(await store.getOperationCount()).toBe(0)
+			expect(onRelay).not.toHaveBeenCalled()
+		})
+	})
+
 	describe('close', () => {
 		test('transitions to closed state', async () => {
 			const store = new MemoryServerStore('server-1')

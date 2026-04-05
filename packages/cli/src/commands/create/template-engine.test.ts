@@ -66,10 +66,12 @@ describe('scaffoldTemplate', () => {
 		expect(files).toContain('index.html')
 		expect(files).toContain('tsconfig.json')
 		expect(files).toContain('vite.config.ts')
+		expect(files).toContain('kora.config.ts')
 
 		// Check variable substitution
 		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
 		expect(pkg).toContain('"my-app"')
+		expect(pkg).toContain('"dev": "kora dev"')
 		expect(pkg).not.toContain('{{projectName}}')
 
 		// Check src directory was copied
@@ -90,10 +92,12 @@ describe('scaffoldTemplate', () => {
 		const files = await readdir(targetDir)
 		expect(files).toContain('server.ts')
 		expect(files).toContain('package.json')
+		expect(files).toContain('kora.config.ts')
 
 		// Check sync-specific content in package.json
 		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
 		expect(pkg).toContain('@kora/server')
+		expect(pkg).toContain('"dev": "kora dev"')
 
 		// Check sync config in main.tsx
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')

@@ -57,7 +57,7 @@ export class SchemaWatcher {
 		}
 
 		const command = tsxBinary ?? process.execPath
-		const args = [koraBinary, 'generate', 'types']
+		const args = [koraBinary, 'generate', 'types', '--schema', this.config.schemaPath]
 
 		await spawnCommand(command, args, this.config.projectRoot)
 		this.config.onRegenerate?.()

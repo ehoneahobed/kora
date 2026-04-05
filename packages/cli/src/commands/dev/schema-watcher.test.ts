@@ -142,7 +142,7 @@ describe('SchemaWatcher', () => {
 
 		expect(spawnMock).toHaveBeenCalledWith(
 			'/project/node_modules/.bin/tsx',
-			['/project/node_modules/.bin/kora', 'generate', 'types'],
+			['/project/node_modules/.bin/kora', 'generate', 'types', '--schema', '/project/src/schema.ts'],
 			expect.objectContaining({ cwd: '/project' }),
 		)
 	})
@@ -173,7 +173,7 @@ describe('SchemaWatcher', () => {
 
 		expect(spawnMock).toHaveBeenCalledWith(
 			process.execPath,
-			['/project/node_modules/.bin/kora', 'generate', 'types'],
+			['/project/node_modules/.bin/kora', 'generate', 'types', '--schema', '/project/src/schema.ts'],
 			expect.objectContaining({ cwd: '/project' }),
 		)
 		expect(stderrSpy).toHaveBeenCalledWith(

@@ -43,14 +43,22 @@
   "dependencies": {
     "@kora/core": "workspace:*",
     "@kora/sync": "workspace:*",
+    "better-sqlite3": "^12.8.0",
     "drizzle-orm": "^0.45.2",
     "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "postgres": "^3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "postgres": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@fast-check/vitest": "0.2.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/ws": "^8.5.13",
-    "better-sqlite3": "^12.8.0",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
     "vitest": "^3.0.4"
