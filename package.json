@@ -14,7 +14,9 @@
     "clean": "turbo run clean",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "pnpm build && changeset publish"
+    "release": "pnpm build && changeset publish",
+    "test:e2e": "pnpm --filter kora-e2e test:e2e",
+    "docs:dev": "pnpm --filter kora-docs dev"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

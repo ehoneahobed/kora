@@ -135,8 +135,12 @@ function encodeRichtextInput(value: unknown): Uint8Array | null {
 		return new Uint8Array(value)
 	}
 
-	if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
-		return new Uint8Array(value)
+	// Handle Node.js Buffer without requiring @types/node
+	if (typeof globalThis !== 'undefined' && 'Buffer' in globalThis) {
+		const BufferCtor = (globalThis as Record<string, unknown>).Buffer as { isBuffer(v: unknown): v is { buffer: ArrayBuffer; byteOffset: number; byteLength: number } }
+		if (BufferCtor.isBuffer(value)) {
+			return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+		}
 	}
 
 	throw new Error('Richtext record value must be a string, Uint8Array, ArrayBuffer, or null.')

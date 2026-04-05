@@ -3,6 +3,7 @@ import type { MergeTrace } from '@kora/core'
 import { addWinsSet } from '../strategies/add-wins-set'
 import { lastWriteWins } from '../strategies/lww'
 import { mergeRichtext } from '../strategies/yjs-richtext'
+import type { RichtextValue } from '../strategies/yjs-richtext'
 import type { FieldMergeResult } from '../types'
 
 /**
@@ -185,7 +186,11 @@ function autoMerge(
 		}
 
 		case 'richtext': {
-			const merged = mergeRichtext(localValue, remoteValue, baseValue)
+			const merged = mergeRichtext(
+				localValue as RichtextValue,
+				remoteValue as RichtextValue,
+				baseValue as RichtextValue,
+			)
 			return createResult(
 				merged,
 				fieldName,
