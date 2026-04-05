@@ -28,8 +28,6 @@ export class ProcessManager {
 			cwd: config.cwd,
 			env: { ...process.env, ...config.env },
 			stdio: ['ignore', 'pipe', 'pipe'],
-			// On Windows, .cmd shims require shell to execute
-			shell: process.platform === 'win32',
 		}
 
 		const child = spawnChild(config.command, config.args, options)

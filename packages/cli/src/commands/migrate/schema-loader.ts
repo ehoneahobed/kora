@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { extname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { SchemaDefinition } from '@korajs/core'
-import { resolveProjectBinary } from '../../utils/fs-helpers'
+import { hasTsxInstalled } from '../../utils/fs-helpers'
 
 /**
  * Loads a schema definition from a TS/JS module.
@@ -48,8 +48,7 @@ function isSchemaDefinition(value: unknown): value is SchemaDefinition {
 }
 
 async function loadTypeScriptModule(schemaPath: string, projectRoot: string): Promise<unknown> {
-	const tsxBinary = await resolveProjectBinary(projectRoot, 'tsx')
-	if (!tsxBinary) {
+	if (!(await hasTsxInstalled(projectRoot))) {
 		throw new Error(
 			`Schema file is TypeScript (${schemaPath}) but local "tsx" was not found. Install tsx in the project.`,
 		)
@@ -61,7 +60,11 @@ async function loadTypeScriptModule(schemaPath: string, projectRoot: string): Pr
 		'.then(mod => { const v = mod.default ?? mod; process.stdout.write(JSON.stringify(v)) })' +
 		'.catch(e => { process.stderr.write(String(e)); process.exit(1) })'
 
-	const output = await runCommand(tsxBinary, ['--eval', script, schemaPath], projectRoot)
+	const output = await runCommand(
+		process.execPath,
+		['--import', 'tsx', '--eval', script, schemaPath],
+		projectRoot,
+	)
 
 	try {
 		return JSON.parse(output)
@@ -76,7 +79,6 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
-			shell: process.platform === 'win32',
 		})
 
 		let stdout = ''

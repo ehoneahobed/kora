@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { access } from 'node:fs/promises'
 import { extname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { resolveProjectBinary } from '../../utils/fs-helpers'
+import { hasTsxInstalled } from '../../utils/fs-helpers'
 
 export interface KoraConfigFile {
 	schema?: string
@@ -79,22 +79,25 @@ async function findKoraConfigFile(projectRoot: string): Promise<string | null> {
 }
 
 async function loadTypeScriptConfig(configPath: string, projectRoot: string): Promise<unknown> {
-	const tsxBinary = await resolveProjectBinary(projectRoot, 'tsx')
-	if (!tsxBinary) {
+	if (!(await hasTsxInstalled(projectRoot))) {
 		throw new Error(
 			`Found TypeScript config at ${configPath}, but "tsx" is not installed in this project. Install tsx or use kora.config.js.`,
 		)
 	}
 
-	// Use dynamic import() and .then() to avoid top-level await,
-	// which fails when tsx treats --eval as CJS.
+	// Use process.execPath (node) + --import tsx to avoid .cmd shim issues on Windows.
+	// Use dynamic import() with .then() since --eval may run as CJS (no top-level await).
 	const script =
 		'const configPath = process.argv[process.argv.length - 1];' +
 		"import('node:url').then(u => import(u.pathToFileURL(configPath).href))" +
 		'.then(mod => { const v = mod.default ?? mod; process.stdout.write(JSON.stringify(v)) })' +
 		'.catch(e => { process.stderr.write(String(e)); process.exit(1) })'
 
-	const output = await runCommand(tsxBinary, ['--eval', script, configPath], projectRoot)
+	const output = await runCommand(
+		process.execPath,
+		['--import', 'tsx', '--eval', script, configPath],
+		projectRoot,
+	)
 
 	try {
 		return JSON.parse(output)
@@ -109,7 +112,6 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
-			shell: process.platform === 'win32',
 		})
 
 		let stdout = ''

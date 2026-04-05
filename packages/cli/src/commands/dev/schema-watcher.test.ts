@@ -3,11 +3,11 @@ import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { SchemaWatcher } from './schema-watcher'
 
-const { watchMock, spawnMock, resolveProjectBinaryMock } = vi.hoisted(() => {
+const { watchMock, spawnMock, hasTsxInstalledMock } = vi.hoisted(() => {
 	return {
 		watchMock: vi.fn(),
 		spawnMock: vi.fn(),
-		resolveProjectBinaryMock: vi.fn(),
+		hasTsxInstalledMock: vi.fn(),
 	}
 })
 
@@ -25,7 +25,7 @@ vi.mock('node:child_process', () => {
 
 vi.mock('../../utils/fs-helpers', () => {
 	return {
-		resolveProjectBinary: resolveProjectBinaryMock,
+		hasTsxInstalled: hasTsxInstalledMock,
 	}
 })
 
@@ -40,7 +40,7 @@ describe('SchemaWatcher', () => {
 
 		watchMock.mockReset()
 		spawnMock.mockReset()
-		resolveProjectBinaryMock.mockReset()
+		hasTsxInstalledMock.mockReset()
 
 		watchMock.mockImplementation((_path: string, callback: () => void) => {
 			watchCallback = callback
@@ -119,42 +119,7 @@ describe('SchemaWatcher', () => {
 	})
 
 	test('regenerate() uses tsx when available', async () => {
-		resolveProjectBinaryMock.mockImplementation(async (_projectRoot: string, binaryName: string) => {
-			if (binaryName === 'kora') return '/project/node_modules/.bin/kora'
-			if (binaryName === 'tsx') return '/project/node_modules/.bin/tsx'
-			return null
-		})
-
-		spawnMock.mockImplementation(() => {
-			const child = createFakeChild()
-			queueMicrotask(() => {
-				child.emit('exit', 0, null)
-			})
-			return child
-		})
-
-		const watcher = new SchemaWatcher({
-			schemaPath: '/project/src/schema.ts',
-			projectRoot: '/project',
-		})
-
-		await watcher.regenerate()
-
-		expect(spawnMock).toHaveBeenCalledWith(
-			'/project/node_modules/.bin/tsx',
-			['/project/node_modules/.bin/kora', 'generate', 'types', '--schema', '/project/src/schema.ts'],
-			expect.objectContaining({ cwd: '/project' }),
-		)
-	})
-
-	test('regenerate() falls back to node when tsx is unavailable', async () => {
-		const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-
-		resolveProjectBinaryMock.mockImplementation(async (_projectRoot: string, binaryName: string) => {
-			if (binaryName === 'kora') return '/project/node_modules/.bin/kora'
-			if (binaryName === 'tsx') return null
-			return null
-		})
+		hasTsxInstalledMock.mockResolvedValue(true)
 
 		spawnMock.mockImplementation(() => {
 			const child = createFakeChild()
@@ -173,14 +138,41 @@ describe('SchemaWatcher', () => {
 
 		expect(spawnMock).toHaveBeenCalledWith(
 			process.execPath,
-			['/project/node_modules/.bin/kora', 'generate', 'types', '--schema', '/project/src/schema.ts'],
+			[
+				'--import', 'tsx',
+				'/project/node_modules/@korajs/cli/dist/bin.js',
+				'generate', 'types', '--schema', '/project/src/schema.ts',
+			],
 			expect.objectContaining({ cwd: '/project' }),
 		)
-		expect(stderrSpy).toHaveBeenCalledWith(
-			'[kora] Could not find "tsx" binary. Falling back to node.\n',
-		)
+	})
 
-		stderrSpy.mockRestore()
+	test('regenerate() falls back to node when tsx is unavailable', async () => {
+		hasTsxInstalledMock.mockResolvedValue(false)
+
+		spawnMock.mockImplementation(() => {
+			const child = createFakeChild()
+			queueMicrotask(() => {
+				child.emit('exit', 0, null)
+			})
+			return child
+		})
+
+		const watcher = new SchemaWatcher({
+			schemaPath: '/project/src/schema.ts',
+			projectRoot: '/project',
+		})
+
+		await watcher.regenerate()
+
+		expect(spawnMock).toHaveBeenCalledWith(
+			process.execPath,
+			[
+				'/project/node_modules/@korajs/cli/dist/bin.js',
+				'generate', 'types', '--schema', '/project/src/schema.ts',
+			],
+			expect.objectContaining({ cwd: '/project' }),
+		)
 	})
 })
 

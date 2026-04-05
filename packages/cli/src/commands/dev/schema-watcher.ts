@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
 import { watch } from 'node:fs'
 import type { FSWatcher } from 'node:fs'
-import { resolveProjectBinary } from '../../utils/fs-helpers'
+import { join } from 'node:path'
+import { hasTsxInstalled } from '../../utils/fs-helpers'
 
 export interface SchemaWatcherConfig {
 	schemaPath: string
@@ -46,18 +47,15 @@ export class SchemaWatcher {
 	}
 
 	async regenerate(): Promise<void> {
-		const koraBinary = await resolveProjectBinary(this.config.projectRoot, 'kora')
-		if (!koraBinary) {
-			throw new Error('Could not find project binary "kora" in node_modules/.bin.')
-		}
+		// Use process.execPath (node) + --import tsx to run kora generate,
+		// avoiding .cmd shim issues on Windows with paths containing spaces.
+		const koraBinJs = join(this.config.projectRoot, 'node_modules', '@korajs', 'cli', 'dist', 'bin.js')
+		const hasTsx = await hasTsxInstalled(this.config.projectRoot)
 
-		const tsxBinary = await resolveProjectBinary(this.config.projectRoot, 'tsx')
-		if (!tsxBinary) {
-			process.stderr.write('[kora] Could not find "tsx" binary. Falling back to node.\n')
-		}
-
-		const command = tsxBinary ?? process.execPath
-		const args = [koraBinary, 'generate', 'types', '--schema', this.config.schemaPath]
+		const command = process.execPath
+		const args = hasTsx
+			? ['--import', 'tsx', koraBinJs, 'generate', 'types', '--schema', this.config.schemaPath]
+			: [koraBinJs, 'generate', 'types', '--schema', this.config.schemaPath]
 
 		await spawnCommand(command, args, this.config.projectRoot)
 		this.config.onRegenerate?.()
@@ -83,7 +81,6 @@ async function spawnCommand(command: string, args: string[], cwd: string): Promi
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
-			shell: process.platform === 'win32',
 		})
 
 		child.stdout?.on('data', (chunk: Buffer) => {

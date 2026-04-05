@@ -3,7 +3,12 @@ import { join } from 'node:path'
 import { resolve } from 'node:path'
 import { defineCommand } from 'citty'
 import { DevServerError, InvalidProjectError } from '../../errors'
-import { findProjectRoot, findSchemaFile, resolveProjectBinary } from '../../utils/fs-helpers'
+import {
+	findProjectRoot,
+	findSchemaFile,
+	hasTsxInstalled,
+	resolveProjectBinaryEntryPoint,
+} from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
 import { loadKoraConfig } from './kora-config'
 import type { KoraConfigFile } from './kora-config'
@@ -76,8 +81,8 @@ export const devCommand = defineCommand({
 				? config.dev.watch.debounceMs
 				: 300
 
-		const viteBinary = await resolveProjectBinary(projectRoot, 'vite')
-		if (!viteBinary) {
+		const viteEntryPoint = await resolveProjectBinaryEntryPoint(projectRoot, 'vite', 'vite')
+		if (!viteEntryPoint) {
 			throw new DevServerError('vite', join(projectRoot, 'node_modules', '.bin', 'vite'))
 		}
 
@@ -87,11 +92,11 @@ export const devCommand = defineCommand({
 		const syncAllowed = args['no-sync'] !== true && configSyncEnabled
 		let shouldStartSync = syncAllowed && (syncServerFile !== null || managedSyncStore !== null)
 
-		let syncBinary: string | null = null
+		let hasTsx = false
 		if (shouldStartSync && syncServerFile !== null) {
-			syncBinary = await resolveProjectBinary(projectRoot, 'tsx')
-			if (!syncBinary) {
-				logger.warn('Sync server detected, but local "tsx" binary was not found. Skipping sync.')
+			hasTsx = await hasTsxInstalled(projectRoot)
+			if (!hasTsx) {
+				logger.warn('Sync server detected, but "tsx" is not installed. Skipping sync.')
 			}
 		}
 
@@ -163,7 +168,7 @@ export const devCommand = defineCommand({
 		logger.info('Starting development environment:')
 		logger.blank()
 		logger.step(`  Vite dev server on port ${vitePort}`)
-		if (shouldStartSync && syncBinary && syncServerFile) {
+		if (shouldStartSync && hasTsx && syncServerFile) {
 			logger.step(`  Sync server on port ${syncPort}`)
 		} else if (shouldStartSync && syncServerFile === null && managedSyncStore !== null) {
 			logger.step(`  Managed sync server on port ${syncPort} (${managedSyncStore.type})`)
@@ -184,17 +189,17 @@ export const devCommand = defineCommand({
 
 		processManager.spawn({
 			label: 'vite',
-			command: viteBinary,
-			args: ['--port', String(vitePort)],
+			command: process.execPath,
+			args: [viteEntryPoint, '--port', String(vitePort)],
 			cwd: projectRoot,
 			onExit: onManagedProcessExit,
 		})
 
-		if (shouldStartSync && syncBinary && syncServerFile) {
+		if (shouldStartSync && hasTsx && syncServerFile) {
 			processManager.spawn({
 				label: 'sync',
-				command: syncBinary,
-				args: [syncServerFile],
+				command: process.execPath,
+				args: ['--import', 'tsx', syncServerFile],
 				cwd: projectRoot,
 				env: {
 					PORT: String(syncPort),

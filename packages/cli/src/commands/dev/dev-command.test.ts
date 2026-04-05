@@ -7,7 +7,8 @@ import { DevServerError, InvalidProjectError } from '../../errors'
 const {
 	findProjectRootMock,
 	findSchemaFileMock,
-	resolveProjectBinaryMock,
+	resolveProjectBinaryEntryPointMock,
+	hasTsxInstalledMock,
 	createLoggerMock,
 	loadKoraConfigMock,
 	processManagerCtorMock,
@@ -35,7 +36,8 @@ const {
 	return {
 		findProjectRootMock: vi.fn(),
 		findSchemaFileMock: vi.fn(),
-		resolveProjectBinaryMock: vi.fn(),
+		resolveProjectBinaryEntryPointMock: vi.fn(),
+		hasTsxInstalledMock: vi.fn(),
 		createLoggerMock: vi.fn(() => logger),
 		loadKoraConfigMock: vi.fn(),
 		processManagerCtorMock: vi.fn(() => ({
@@ -59,7 +61,8 @@ vi.mock('../../utils/fs-helpers', () => {
 	return {
 		findProjectRoot: findProjectRootMock,
 		findSchemaFile: findSchemaFileMock,
-		resolveProjectBinary: resolveProjectBinaryMock,
+		resolveProjectBinaryEntryPoint: resolveProjectBinaryEntryPointMock,
+		hasTsxInstalled: hasTsxInstalledMock,
 	}
 })
 
@@ -101,7 +104,8 @@ describe('dev command', () => {
 
 		findProjectRootMock.mockReset()
 		findSchemaFileMock.mockReset()
-		resolveProjectBinaryMock.mockReset()
+		resolveProjectBinaryEntryPointMock.mockReset()
+		hasTsxInstalledMock.mockReset()
 		processManagerCtorMock.mockClear()
 		loadKoraConfigMock.mockReset()
 		processManagerSpawnMock.mockReset()
@@ -117,11 +121,8 @@ describe('dev command', () => {
 		processManagerSpawnMock.mockImplementation((config: { onExit?: () => void }) => {
 			config.onExit?.()
 		})
-		resolveProjectBinaryMock.mockImplementation(async (_projectRoot: string, binaryName: string) => {
-			if (binaryName === 'vite') return '/project/node_modules/.bin/vite'
-			if (binaryName === 'tsx') return '/project/node_modules/.bin/tsx'
-			return null
-		})
+		resolveProjectBinaryEntryPointMock.mockResolvedValue('/project/node_modules/vite/bin/vite.js')
+		hasTsxInstalledMock.mockResolvedValue(true)
 	})
 
 	afterEach(async () => {
@@ -147,7 +148,7 @@ describe('dev command', () => {
 	test('throws DevServerError when vite binary is missing', async () => {
 		const { devCommand } = await import('./dev-command')
 		findProjectRootMock.mockResolvedValue('/project')
-		resolveProjectBinaryMock.mockResolvedValue(null)
+		resolveProjectBinaryEntryPointMock.mockResolvedValue(null)
 
 		await expect(devCommand.run({ args: defaultArgs() })).rejects.toBeInstanceOf(DevServerError)
 	})
@@ -164,7 +165,11 @@ describe('dev command', () => {
 			expect.objectContaining({ label: 'vite' }),
 		)
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(
-			expect.objectContaining({ label: 'sync', args: [join(tempDir.path, 'server.ts')] }),
+			expect.objectContaining({
+				label: 'sync',
+				command: process.execPath,
+				args: ['--import', 'tsx', join(tempDir.path, 'server.ts')],
+			}),
 		)
 	})
 
@@ -202,7 +207,8 @@ describe('dev command', () => {
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(
 			expect.objectContaining({
 				label: 'vite',
-				args: ['--port', '4123'],
+				command: process.execPath,
+				args: ['/project/node_modules/vite/bin/vite.js', '--port', '4123'],
 			}),
 		)
 	})
@@ -224,11 +230,15 @@ describe('dev command', () => {
 		})
 
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(
-			expect.objectContaining({ label: 'vite', args: ['--port', '4111'] }),
+			expect.objectContaining({
+				label: 'vite',
+				args: ['/project/node_modules/vite/bin/vite.js', '--port', '4111'],
+			}),
 		)
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(
 			expect.objectContaining({
 				label: 'sync',
+				command: process.execPath,
 				env: expect.objectContaining({ PORT: '3222', KORA_SYNC_PORT: '3222' }),
 			}),
 		)
@@ -244,8 +254,8 @@ describe('dev command', () => {
 			},
 		})
 
-		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
-		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+		await mkdir(join(tempDir.path, 'node_modules', '@korajs', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@korajs', 'server', 'package.json'), '{}')
 
 		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
 
@@ -280,8 +290,8 @@ describe('dev command', () => {
 			},
 		})
 
-		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
-		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+		await mkdir(join(tempDir.path, 'node_modules', '@korajs', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@korajs', 'server', 'package.json'), '{}')
 
 		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
 
@@ -315,8 +325,8 @@ describe('dev command', () => {
 			},
 		})
 
-		await mkdir(join(tempDir.path, 'node_modules', '@kora', 'server'), { recursive: true })
-		await writeFile(join(tempDir.path, 'node_modules', '@kora', 'server', 'package.json'), '{}')
+		await mkdir(join(tempDir.path, 'node_modules', '@korajs', 'server'), { recursive: true })
+		await writeFile(join(tempDir.path, 'node_modules', '@korajs', 'server', 'package.json'), '{}')
 
 		await devCommand.run({ args: { 'no-sync': false, 'no-watch': false } })
 

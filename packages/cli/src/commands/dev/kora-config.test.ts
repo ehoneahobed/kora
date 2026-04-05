@@ -6,10 +6,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { loadKoraConfig } from './kora-config'
 
-const { spawnMock, resolveProjectBinaryMock } = vi.hoisted(() => {
+const { spawnMock, hasTsxInstalledMock } = vi.hoisted(() => {
 	return {
 		spawnMock: vi.fn(),
-		resolveProjectBinaryMock: vi.fn(),
+		hasTsxInstalledMock: vi.fn(),
 	}
 })
 
@@ -21,7 +21,7 @@ vi.mock('node:child_process', () => {
 
 vi.mock('../../utils/fs-helpers', () => {
 	return {
-		resolveProjectBinary: resolveProjectBinaryMock,
+		hasTsxInstalled: hasTsxInstalledMock,
 	}
 })
 
@@ -31,7 +31,7 @@ describe('loadKoraConfig', () => {
 	beforeEach(async () => {
 		tempDir = await createTempDir()
 		spawnMock.mockReset()
-		resolveProjectBinaryMock.mockReset()
+		hasTsxInstalledMock.mockReset()
 	})
 
 	afterEach(async () => {
@@ -55,14 +55,14 @@ describe('loadKoraConfig', () => {
 
 	test('throws for TypeScript config when tsx is missing', async () => {
 		await writeFile(join(tempDir.path, 'kora.config.ts'), 'export default { dev: { port: 4000 } }')
-		resolveProjectBinaryMock.mockResolvedValue(null)
+		hasTsxInstalledMock.mockResolvedValue(false)
 
 		await expect(loadKoraConfig(tempDir.path)).rejects.toThrow('tsx')
 	})
 
 	test('loads TypeScript config via tsx process', async () => {
 		await writeFile(join(tempDir.path, 'kora.config.ts'), 'export default { dev: { port: 4000 } }')
-		resolveProjectBinaryMock.mockResolvedValue('/project/node_modules/.bin/tsx')
+		hasTsxInstalledMock.mockResolvedValue(true)
 
 		spawnMock.mockImplementation(() => {
 			const child = createFakeChild()
@@ -75,6 +75,12 @@ describe('loadKoraConfig', () => {
 
 		const result = await loadKoraConfig(tempDir.path)
 		expect(result).toEqual({ dev: { port: 4000 } })
+
+		expect(spawnMock).toHaveBeenCalledWith(
+			process.execPath,
+			expect.arrayContaining(['--import', 'tsx', '--eval']),
+			expect.objectContaining({ cwd: tempDir.path }),
+		)
 	})
 })
 

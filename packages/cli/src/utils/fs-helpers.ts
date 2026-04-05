@@ -97,6 +97,50 @@ export async function resolveProjectBinary(
 	return null
 }
 
+/**
+ * Checks whether the `tsx` package is installed in the project's node_modules.
+ * Used to determine if we can use `--import tsx` with process.execPath.
+ */
+export async function hasTsxInstalled(projectRoot: string): Promise<boolean> {
+	try {
+		await access(join(projectRoot, 'node_modules', 'tsx', 'package.json'))
+		return true
+	} catch {
+		return false
+	}
+}
+
+/**
+ * Resolves the JS entry point for a package binary.
+ * Reads the package.json bin field to find the actual JS file,
+ * avoiding .cmd shims and shell:true on Windows.
+ *
+ * @returns Absolute path to the JS entry point, or null if not found
+ */
+export async function resolveProjectBinaryEntryPoint(
+	projectRoot: string,
+	packageName: string,
+	binaryName: string,
+): Promise<string | null> {
+	const pkgJsonPath = join(projectRoot, 'node_modules', packageName, 'package.json')
+	try {
+		const content = await readFile(pkgJsonPath, 'utf-8')
+		const pkg = JSON.parse(content) as { bin?: string | Record<string, string> }
+		let binPath: string | undefined
+		if (typeof pkg.bin === 'string') {
+			binPath = pkg.bin
+		} else if (typeof pkg.bin === 'object' && pkg.bin !== null) {
+			binPath = pkg.bin[binaryName]
+		}
+		if (!binPath) return null
+		const fullPath = join(projectRoot, 'node_modules', packageName, binPath)
+		await access(fullPath)
+		return fullPath
+	} catch {
+		return null
+	}
+}
+
 function isKoraProject(pkg: unknown): boolean {
 	if (typeof pkg !== 'object' || pkg === null) return false
 	const record = pkg as Record<string, unknown>
