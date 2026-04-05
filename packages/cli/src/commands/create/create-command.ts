@@ -131,10 +131,12 @@ function isValidPackageManager(value: string): value is PackageManager {
 }
 
 /**
- * Reads the version from @korajs/cli's own package.json.
- * Scaffolded projects pin their kora dependencies to this version.
- * Walks up from the current file to find the package root (works both
- * in source and after tsup bundling).
+ * Reads the version from @korajs/cli's own package.json and derives a
+ * compatible version range for all @korajs packages.
+ *
+ * The CLI may be a patch ahead of other packages (e.g. CLI-only fixes),
+ * so we use the major.minor range (^major.minor.0) which matches all
+ * packages in the same release series.
  */
 function resolveKoraVersion(): string {
 	try {
@@ -144,7 +146,10 @@ function resolveKoraVersion(): string {
 			if (existsSync(pkgPath)) {
 				const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: string; version: string }
 				if (pkg.name === '@korajs/cli') {
-					return pkg.version === '0.0.0' ? 'latest' : `^${pkg.version}`
+					if (pkg.version === '0.0.0') return 'latest'
+					// Use ^major.minor.0 so all packages in the series match
+					const parts = pkg.version.split('.')
+					return `^${parts[0]}.${parts[1]}.0`
 				}
 			}
 			dir = dirname(dir)
