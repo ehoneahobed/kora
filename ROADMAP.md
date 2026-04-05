@@ -15,12 +15,12 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 | @kora/server | 112 | Memory + SQLite + PostgreSQL stores; server-side scope filtering enforced |
 | @kora/react | 56 | Hooks + query-store integration complete |
 | @kora/devtools | 46 | Instrumentation and event capture complete. No browser UI extension yet |
-| @kora/cli | 103 | `kora dev` implemented with config, managed sync, schema watch; `migrate` still stubbed |
+| @kora/cli | 109 | `kora dev` implemented; `kora migrate` core diff/generate/apply workflow shipped |
 | kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped |
 
 **What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, and server-side scope filtering is active.
 
-**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), migration workflow (`kora migrate`), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
+**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), migration workflow polish (interactive conflict UX + broader backend validation), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
 
 ## Current Phase Status
 
@@ -32,7 +32,7 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 | 4 | Complete | `kora dev` orchestration + `kora.config.ts` support shipped |
 | 5 | Not started | Richtext still intentionally deferred |
 | 6 | In progress | Server-side scope filtering implemented; SQL pushdown/compilation remains future optimization |
-| 7 | Not started | `kora migrate` still stubbed |
+| 7 | In progress | Core migration workflow is implemented; advanced conflict and DX features remain |
 | 8 | Not started | Backend instrumentation exists; browser extension UI not built |
 | 9 | Not started | JSON protocol remains default; benchmarks not CI-gated |
 | 10 | Not started | E2E/docs/publish automation still pending |
@@ -459,11 +459,26 @@ packages/server/src/scopes/
 
 ## Phase 7: CLI `kora migrate` Command
 
-**Status:** Not started
+**Status:** In progress
 
 **Goal:** Schema changes are detected, migration plans generated, and applied — locally and to the server.
 
 **Why seventh:** As applications evolve, schemas change. Without a migration system, developers must manually alter databases or wipe data. This phase automates that.
+
+### Implemented so far
+
+- Schema snapshot baseline and schema loading from TS/JS modules
+- Structural schema diffing (collections, fields, indexes)
+- SQL migration generation with up/down statements
+- Migration file emission under `kora/migrations/`
+- Optional apply flow for SQLite and Postgres backends
+
+### Remaining to fully complete Phase 7
+
+- Interactive conflict resolution prompts for breaking changes
+- Richer transform support for lossy type changes
+- Expanded migration history/state tracking (`_kora_migrations`) in apply runner
+- End-to-end migration integration coverage with live server backends
 
 ### 7a. Schema Diff Engine
 
@@ -661,9 +676,9 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 | **4** | `kora dev` command | Complete |
 | **5** | Yjs richtext merge | Not started |
 | **6** | Sync scopes | In progress |
-| **7** | `kora migrate` command | Not started |
+| **7** | `kora migrate` command | In progress |
 | **8** | DevTools browser extension | Not started |
 | **9** | Protobuf, HTTP transport, benchmarks | Not started |
 | **10** | E2E tests, docs, publish | Not started |
 
-**Updated critical path:** complete Phase 7 migration workflow, then Phase 5 richtext and Phase 8+ launch hardening.
+**Updated critical path:** finish Phase 7 polish and migration safety guarantees, then Phase 5 richtext and Phase 8+ launch hardening.
