@@ -72,6 +72,52 @@ export function promptSelect<T extends string>(
 	})
 }
 
+/**
+ * Prompts the user with a yes/no confirmation.
+ *
+ * @param message - The prompt message to display
+ * @param defaultValue - Default when input is empty (true => yes)
+ * @param options - Optional input/output streams for testing
+ */
+export function promptConfirm(
+	message: string,
+	defaultValue = false,
+	options?: PromptOptions,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		const rl = createReadline(options)
+		const suffix = defaultValue ? 'Y/n' : 'y/N'
+
+		const ask = (): void => {
+			rl.question(`  ? ${message} (${suffix}): `, (answer) => {
+				const normalized = answer.trim().toLowerCase()
+				if (normalized.length === 0) {
+					rl.close()
+					resolve(defaultValue)
+					return
+				}
+
+				if (normalized === 'y' || normalized === 'yes') {
+					rl.close()
+					resolve(true)
+					return
+				}
+
+				if (normalized === 'n' || normalized === 'no') {
+					rl.close()
+					resolve(false)
+					return
+				}
+
+				(options?.output ?? process.stdout).write('  Please answer with y or n\n')
+				ask()
+			})
+		}
+
+		ask()
+	})
+}
+
 function createReadline(options?: PromptOptions): ReadlineInterface {
 	return createInterface({
 		input: options?.input ?? process.stdin,

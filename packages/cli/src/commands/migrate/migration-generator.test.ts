@@ -66,4 +66,56 @@ describe('generateMigration', () => {
 			true,
 		)
 	})
+
+	test('adds conversion SQL for string-to-boolean field change', () => {
+		const previous = defineSchema({
+			version: 1,
+			collections: {
+				todos: {
+					fields: { done: t.string().optional() },
+				},
+			},
+		})
+
+		const current = defineSchema({
+			version: 2,
+			collections: {
+				todos: {
+					fields: { done: t.boolean().optional() },
+				},
+			},
+		})
+
+		const generated = generateMigration(previous, current, diffSchemas(previous, current))
+		const insertStatement = generated.up.find((statement) =>
+			statement.startsWith('INSERT INTO _kora_mig_todos_new'),
+		)
+
+		expect(insertStatement).toContain("LOWER(TRIM(CAST(done AS TEXT)))")
+		expect(insertStatement).toContain("IN ('1','true','t','yes','y','on')")
+	})
+
+	test('rejects unsafe required lossy type changes', () => {
+		const previous = defineSchema({
+			version: 1,
+			collections: {
+				todos: {
+					fields: { notes: t.array(t.string()).optional() },
+				},
+			},
+		})
+
+		const current = defineSchema({
+			version: 2,
+			collections: {
+				todos: {
+					fields: { notes: t.richtext() },
+				},
+			},
+		})
+
+		expect(() => generateMigration(previous, current, diffSchemas(previous, current))).toThrow(
+			'Cannot auto-migrate collection "todos"',
+		)
+	})
 })

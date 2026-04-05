@@ -127,6 +127,18 @@ function validateRebuildSafety(
 			)
 		}
 	}
+
+	for (const [fieldName, targetDescriptor] of Object.entries(to.fields)) {
+		const sourceDescriptor = from.fields[fieldName]
+		if (!sourceDescriptor) continue
+		if (canTransformField(sourceDescriptor, targetDescriptor)) continue
+
+		if (targetDescriptor.required && targetDescriptor.defaultValue === undefined && !targetDescriptor.auto) {
+			throw new Error(
+				`Cannot auto-migrate collection "${collection}": changed required field "${fieldName}" from ${sourceDescriptor.kind} to ${targetDescriptor.kind} without a safe transform/default.`,
+			)
+		}
+	}
 }
 
 function projectionForColumn(
@@ -138,7 +150,12 @@ function projectionForColumn(
 		return quoteIdentifier(column)
 	}
 
-	if (column in fromFields) {
+	const sourceDescriptor = fromFields[column]
+	if (sourceDescriptor && targetDescriptor) {
+		return projectionForFieldTransform(column, sourceDescriptor, targetDescriptor)
+	}
+
+	if (sourceDescriptor) {
 		return quoteIdentifier(column)
 	}
 
@@ -152,6 +169,123 @@ function projectionForColumn(
 
 	if (targetDescriptor.defaultValue !== undefined) {
 		return sqlLiteral(targetDescriptor.defaultValue)
+	}
+
+	return 'NULL'
+}
+
+function projectionForFieldTransform(
+	column: string,
+	source: FieldDescriptor,
+	target: FieldDescriptor,
+): string {
+	const sourceColumn = quoteIdentifier(column)
+	if (source.kind === target.kind && source.itemKind === target.itemKind) {
+		if (target.kind === 'enum' && target.enumValues && target.enumValues.length > 0) {
+			const allowed = target.enumValues.map((value) => sqlLiteral(value)).join(', ')
+			const fallback =
+				target.defaultValue !== undefined ? sqlLiteral(target.defaultValue) : sourceColumn
+			return `CASE WHEN ${sourceColumn} IN (${allowed}) THEN ${sourceColumn} ELSE ${fallback} END`
+		}
+		return sourceColumn
+	}
+
+	if (target.kind === 'string') {
+		return `CAST(${sourceColumn} AS TEXT)`
+	}
+
+	if (target.kind === 'number' || target.kind === 'timestamp') {
+		if (
+			source.kind === 'string' ||
+			source.kind === 'enum' ||
+			source.kind === 'number' ||
+			source.kind === 'timestamp' ||
+			source.kind === 'boolean'
+		) {
+			const castType = target.kind === 'number' ? 'REAL' : 'INTEGER'
+			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL ELSE CAST(${sourceColumn} AS ${castType}) END`
+		}
+	}
+
+	if (target.kind === 'boolean') {
+		if (source.kind === 'number' || source.kind === 'timestamp' || source.kind === 'boolean') {
+			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL WHEN CAST(${sourceColumn} AS REAL) = 0 THEN 0 ELSE 1 END`
+		}
+
+		if (source.kind === 'string' || source.kind === 'enum') {
+			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL WHEN LOWER(TRIM(CAST(${sourceColumn} AS TEXT))) IN ('1','true','t','yes','y','on') THEN 1 WHEN LOWER(TRIM(CAST(${sourceColumn} AS TEXT))) IN ('0','false','f','no','n','off') THEN 0 ELSE ${projectionFallback(target)} END`
+		}
+	}
+
+	if (target.kind === 'enum' && target.enumValues && target.enumValues.length > 0) {
+		if (source.kind === 'string' || source.kind === 'enum') {
+			const allowed = target.enumValues.map((value) => sqlLiteral(value)).join(', ')
+			return `CASE WHEN ${sourceColumn} IN (${allowed}) THEN ${sourceColumn} ELSE ${projectionFallback(target)} END`
+		}
+	}
+
+	if (target.kind === 'array' && source.kind === 'array' && source.itemKind === target.itemKind) {
+		return sourceColumn
+	}
+
+	if (target.auto && target.kind === 'timestamp') {
+		return "CAST(strftime('%s','now') AS INTEGER) * 1000"
+	}
+
+	return projectionFallback(target)
+}
+
+function canTransformField(source: FieldDescriptor, target: FieldDescriptor): boolean {
+	if (source.kind === target.kind && source.itemKind === target.itemKind) {
+		return true
+	}
+
+	if (target.kind === 'string') {
+		return true
+	}
+
+	if (target.kind === 'number' || target.kind === 'timestamp') {
+		return (
+			source.kind === 'string' ||
+			source.kind === 'enum' ||
+			source.kind === 'number' ||
+			source.kind === 'timestamp' ||
+			source.kind === 'boolean'
+		)
+	}
+
+	if (target.kind === 'boolean') {
+		return (
+			source.kind === 'number' ||
+			source.kind === 'timestamp' ||
+			source.kind === 'boolean' ||
+			source.kind === 'string' ||
+			source.kind === 'enum'
+		)
+	}
+
+	if (target.kind === 'enum') {
+		return source.kind === 'string' || source.kind === 'enum'
+	}
+
+	if (target.kind === 'array') {
+		return source.kind === 'array' && source.itemKind === target.itemKind
+	}
+
+	if (target.kind === 'richtext') {
+		return source.kind === 'richtext'
+	}
+
+	return false
+}
+
+function projectionFallback(target: FieldDescriptor): string {
+	if (target.auto && target.kind === 'timestamp') {
+		return "CAST(strftime('%s','now') AS INTEGER) * 1000"
+	}
+
+	if (target.defaultValue !== undefined) {
+		return sqlLiteral(target.defaultValue)
 	}
 
 	return 'NULL'

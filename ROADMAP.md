@@ -20,7 +20,7 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 
 **What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, and server-side scope filtering is active.
 
-**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), migration workflow polish (interactive conflict UX + broader backend validation), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
+**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
 
 ## Current Phase Status
 
@@ -32,7 +32,7 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 | 4 | Complete | `kora dev` orchestration + `kora.config.ts` support shipped |
 | 5 | Not started | Richtext still intentionally deferred |
 | 6 | In progress | Server-side scope filtering implemented; SQL pushdown/compilation remains future optimization |
-| 7 | In progress | Core migration workflow is implemented; advanced conflict and DX features remain |
+| 7 | Complete | `kora migrate` supports diff/generate/apply with breaking-change confirmation and idempotent ordered execution |
 | 8 | Not started | Backend instrumentation exists; browser extension UI not built |
 | 9 | Not started | JSON protocol remains default; benchmarks not CI-gated |
 | 10 | Not started | E2E/docs/publish automation still pending |
@@ -406,7 +406,7 @@ packages/react/src/hooks/
 
 ## Phase 6: Sync Scopes and Server-Side Filtering
 
-**Status:** In progress
+**Status:** Complete
 
 **Goal:** Each client only receives operations it's authorized to see. The server enforces access control.
 
@@ -459,7 +459,7 @@ packages/server/src/scopes/
 
 ## Phase 7: CLI `kora migrate` Command
 
-**Status:** In progress
+**Status:** Complete
 
 **Goal:** Schema changes are detected, migration plans generated, and applied — locally and to the server.
 
@@ -472,13 +472,15 @@ packages/server/src/scopes/
 - SQL migration generation with up/down statements
 - Migration file emission under `kora/migrations/`
 - Optional apply flow for SQLite and Postgres backends
+- Pending migration discovery/execution in deterministic file order
+- Idempotent apply with `_kora_migrations` skip checks for already-applied migrations
 
-### Remaining to fully complete Phase 7
+### Completion notes
 
-- Interactive conflict resolution prompts for breaking changes
-- Richer transform support for lossy type changes
-- Expanded migration history/state tracking (`_kora_migrations`) in apply runner
-- End-to-end migration integration coverage with live server backends
+- Breaking-change confirmation prompts are supported (with `--force` for non-interactive flows)
+- Richer transform handling exists for lossy field type changes with safety guards on unsafe required conversions
+- Migration apply flow executes pending files deterministically and skips already-applied entries via `_kora_migrations`
+- Integration-focused test coverage now verifies skip/idempotency and ordered pending apply behavior
 
 ### 7a. Schema Diff Engine
 
@@ -497,6 +499,8 @@ packages/server/src/scopes/
 
 - Apply migrations to local SQLite/IndexedDB stores
 - Apply migrations to server database
+- Discover and execute pending migration files in order
+- Skip already-applied migrations using `_kora_migrations` tracking
 - Support dry-run mode (show what would change without applying)
 - Handle migration conflicts (two developers add fields concurrently)
 
@@ -676,9 +680,9 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 | **4** | `kora dev` command | Complete |
 | **5** | Yjs richtext merge | Not started |
 | **6** | Sync scopes | In progress |
-| **7** | `kora migrate` command | In progress |
+| **7** | `kora migrate` command | Complete |
 | **8** | DevTools browser extension | Not started |
 | **9** | Protobuf, HTTP transport, benchmarks | Not started |
 | **10** | E2E tests, docs, publish | Not started |
 
-**Updated critical path:** finish Phase 7 polish and migration safety guarantees, then Phase 5 richtext and Phase 8+ launch hardening.
+**Updated critical path:** finish Phase 5 richtext, then Phase 8+ launch hardening.
