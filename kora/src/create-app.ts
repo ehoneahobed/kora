@@ -56,7 +56,7 @@ export function createApp(config: KoraConfig): KoraApp {
 	// Wire DevTools instrumentation immediately (emitter exists synchronously)
 	if (config.devtools) {
 		instrumenter = new Instrumenter(emitter, {
-			bridgeEnabled: typeof window !== 'undefined',
+			bridgeEnabled: typeof globalThis !== 'undefined' && 'window' in globalThis,
 		})
 	}
 

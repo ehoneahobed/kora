@@ -38,6 +38,7 @@ export type { TokenAuthProviderOptions } from './auth/token-auth'
 
 // === Classes ===
 export { MemoryServerStore } from './store/memory-server-store'
+export { SqliteServerStore } from './store/sqlite-server-store'
 export { WsServerTransport } from './transport/ws-server-transport'
 export { ClientSession } from './session/client-session'
 export { KoraSyncServer } from './server/kora-sync-server'
@@ -46,3 +47,4 @@ export { TokenAuthProvider } from './auth/token-auth'
 
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'
+export { createSqliteServerStore } from './store/sqlite-server-store'

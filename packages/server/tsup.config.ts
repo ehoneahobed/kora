@@ -6,5 +6,5 @@ export default defineConfig({
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['ws'],
+	external: ['ws', 'better-sqlite3', 'drizzle-orm'],
 })
