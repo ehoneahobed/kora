@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /Users/ehoneahobed/Work/Kora/packages/react && npx vitest run 2>&1 | grep -E \"passed|failed\" | tail -3)",
+      "Bash(cd /Users/ehoneahobed/Work/Kora/packages/devtools && npx vitest run 2>&1 | grep -E \"passed|failed\" | tail -3)",
+      "Bash(cd /Users/ehoneahobed/Work/Kora/packages/cli && npx vitest run 2>&1 | grep -E \"passed|failed\" | tail -3)",
+      "Bash(cd /Users/ehoneahobed/Work/Kora/kora && npx vitest run 2>&1 | grep -E \"passed|failed\" | tail -3)"
+    ]
+  }
+}

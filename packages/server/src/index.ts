@@ -5,6 +5,8 @@
 export type {
 	AuthContext,
 	AuthProvider,
+	HttpSyncRequest,
+	HttpSyncResponse,
 	KoraSyncServerConfig,
 	ServerStatus,
 } from './types'
@@ -17,6 +19,10 @@ export type {
 	ServerMessageHandler,
 	ServerTransport,
 } from './transport/server-transport'
+
+export type {
+	HttpPollResponse,
+} from './transport/http-server-transport'
 
 export type {
 	WsWebSocket,
@@ -40,6 +46,7 @@ export type { TokenAuthProviderOptions } from './auth/token-auth'
 export { MemoryServerStore } from './store/memory-server-store'
 export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
+export { HttpServerTransport } from './transport/http-server-transport'
 export { WsServerTransport } from './transport/ws-server-transport'
 export { ClientSession } from './session/client-session'
 export { KoraSyncServer } from './server/kora-sync-server'

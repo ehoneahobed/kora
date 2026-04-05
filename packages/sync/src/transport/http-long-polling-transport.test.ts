@@ -80,11 +80,12 @@ describe('HttpLongPollingTransport', () => {
 	test('decodes protobuf poll responses', async () => {
 		const protobuf = new ProtobufMessageSerializer()
 		const payload = protobuf.encode(handshakeResponse())
+		const body = toArrayBuffer(payload)
 
 		const fetchImpl = vi
 			.fn<typeof fetch>()
 			.mockResolvedValueOnce(
-				new Response(payload, {
+				new Response(body, {
 					status: 200,
 					headers: { 'content-type': 'application/x-protobuf' },
 				}),
@@ -141,3 +142,9 @@ describe('HttpLongPollingTransport', () => {
 		expect(disconnect).toHaveBeenCalledOnce()
 	})
 })
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+	const copied = new Uint8Array(data.byteLength)
+	copied.set(data)
+	return copied.buffer
+}

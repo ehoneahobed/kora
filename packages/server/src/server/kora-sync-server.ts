@@ -4,9 +4,16 @@ import type { MessageSerializer } from '@kora/sync'
 import { JsonMessageSerializer } from '@kora/sync'
 import { ClientSession } from '../session/client-session'
 import type { ServerStore } from '../store/server-store'
+import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
 import { WsServerTransport } from '../transport/ws-server-transport'
-import type { AuthProvider, KoraSyncServerConfig, ServerStatus } from '../types'
+import type {
+	AuthProvider,
+	HttpSyncRequest,
+	HttpSyncResponse,
+	KoraSyncServerConfig,
+	ServerStatus,
+} from '../types'
 
 const DEFAULT_MAX_CONNECTIONS = 0 // unlimited
 const DEFAULT_BATCH_SIZE = 100
@@ -55,6 +62,8 @@ export class KoraSyncServer {
 	private readonly path: string
 
 	private readonly sessions = new Map<string, ClientSession>()
+	private readonly httpClients = new Map<string, { sessionId: string; transport: HttpServerTransport }>()
+	private readonly httpSessionToClient = new Map<string, string>()
 	private wsServer: WsServerLike | null = null
 	private running = false
 
@@ -126,6 +135,8 @@ export class KoraSyncServer {
 			session.close('server shutting down')
 		}
 		this.sessions.clear()
+		this.httpClients.clear()
+		this.httpSessionToClient.clear()
 
 		// Close WebSocket server (standalone mode only)
 		if (this.wsServer) {
@@ -136,6 +147,43 @@ export class KoraSyncServer {
 		}
 
 		this.running = false
+	}
+
+	/**
+	 * Handle one HTTP sync request for a long-polling client.
+	 *
+	 * A stable `clientId` identifies the logical connection across requests.
+	 */
+	async handleHttpRequest(request: HttpSyncRequest): Promise<HttpSyncResponse> {
+		if (!request.clientId || request.clientId.trim().length === 0) {
+			return { status: 400 }
+		}
+
+		const client = this.getOrCreateHttpClient(request.clientId)
+
+		if (request.method === 'POST') {
+			if (request.body === undefined) {
+				return { status: 400 }
+			}
+
+			const payload = normalizeHttpBody(request.body, request.contentType)
+			client.transport.receive(payload)
+			return { status: 202 }
+		}
+
+		if (request.method === 'GET') {
+			const polled = client.transport.poll(request.ifNoneMatch)
+			return {
+				status: polled.status,
+				body: polled.body,
+				headers: polled.headers,
+			}
+		}
+
+		return {
+			status: 405,
+			headers: { allow: 'GET, POST' },
+		}
 	}
 
 	/**
@@ -217,5 +265,39 @@ export class KoraSyncServer {
 
 	private handleSessionClose(sessionId: string): void {
 		this.sessions.delete(sessionId)
+
+		const clientId = this.httpSessionToClient.get(sessionId)
+		if (clientId) {
+			this.httpSessionToClient.delete(sessionId)
+			this.httpClients.delete(clientId)
+		}
 	}
+
+	private getOrCreateHttpClient(clientId: string): { sessionId: string; transport: HttpServerTransport } {
+		const existing = this.httpClients.get(clientId)
+		if (existing) {
+			return existing
+		}
+
+		const transport = new HttpServerTransport(this.serializer)
+		const sessionId = this.handleConnection(transport)
+		const client = { sessionId, transport }
+
+		this.httpClients.set(clientId, client)
+		this.httpSessionToClient.set(sessionId, clientId)
+
+		return client
+	}
+}
+
+function normalizeHttpBody(body: string | Uint8Array, contentType?: string): string | Uint8Array {
+	if (body instanceof Uint8Array) {
+		return body
+	}
+
+	if (contentType?.includes('application/x-protobuf')) {
+		return new TextEncoder().encode(body)
+	}
+
+	return body
 }

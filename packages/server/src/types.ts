@@ -54,6 +54,34 @@ export interface KoraSyncServerConfig {
 }
 
 /**
+ * Request envelope for the server-side HTTP sync endpoint.
+ */
+export interface HttpSyncRequest {
+	/** Stable client identifier for binding HTTP requests to a server session */
+	clientId: string
+	/** HTTP method */
+	method: 'GET' | 'POST'
+	/** Optional raw request payload for POST */
+	body?: string | Uint8Array
+	/** Value of the Content-Type header for POST payloads */
+	contentType?: string
+	/** Value of the If-None-Match header for GET polling */
+	ifNoneMatch?: string
+}
+
+/**
+ * Response envelope for the server-side HTTP sync endpoint.
+ */
+export interface HttpSyncResponse {
+	/** HTTP status code */
+	status: 200 | 202 | 204 | 304 | 400 | 405 | 410
+	/** Optional raw response payload */
+	body?: string | Uint8Array
+	/** Optional response headers */
+	headers?: Record<string, string>
+}
+
+/**
  * Runtime status of a KoraSyncServer.
  */
 export interface ServerStatus {

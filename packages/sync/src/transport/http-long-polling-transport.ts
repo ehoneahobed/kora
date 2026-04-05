@@ -151,10 +151,12 @@ export class HttpLongPollingTransport implements SyncTransport {
 		headers.set('content-type', isBinary ? 'application/x-protobuf' : 'application/json')
 
 		try {
+			const requestBody = isBinary ? toArrayBuffer(encoded) : encoded
+
 			const response = await this.fetchImpl(this.url, {
 				method: 'POST',
 				headers,
-				body: isBinary ? encoded : encoded,
+				body: requestBody,
 			})
 
 			if (!response.ok) {
@@ -178,6 +180,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 				})
 
 				if (response.status === 204) {
+					await sleep(this.retryDelayMs)
 					continue
 				}
 
@@ -279,4 +282,10 @@ function isAbortError(error: unknown): boolean {
 		'name' in error &&
 		(error as { name?: string }).name === 'AbortError'
 	)
+}
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+	const copied = new Uint8Array(data.byteLength)
+	copied.set(data)
+	return copied.buffer
 }

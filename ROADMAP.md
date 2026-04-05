@@ -4,23 +4,29 @@
 
 ## Where We Are
 
-Core platform packages and meta-package are implemented, with **1033 tests passing** across the monorepo.
+Core platform packages and meta-package are implemented, with **1123 tests passing** across the monorepo.
 
 | Package | Tests | Status |
 |---------|-------|--------|
-| @kora/core | 209 | Complete — HLC, operations, schema, version vectors, events |
-| @kora/store | 198 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback |
-| @kora/merge | 93 | Three-tier merge working, including Yjs richtext CRDT merge strategy |
-| @kora/sync | 170 | Engine, transports, protocol complete. JSON wire format |
-| @kora/server | 112 | Memory + SQLite + PostgreSQL stores; server-side scope filtering enforced |
-| @kora/react | 56 | Hooks + query-store integration complete |
-| @kora/devtools | 46 | Instrumentation backend + browser DevTools extension UI complete |
-| @kora/cli | 109 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
-| kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped |
+| @kora/core | 231 | Complete — HLC, operations, schema, version vectors, events, type inference utilities |
+| @kora/store | 222 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback, relational `.include()` queries |
+| @kora/merge | 97 | Three-tier merge working, including Yjs richtext CRDT merge strategy |
+| @kora/sync | 180 | Engine, transports, protocol complete. Negotiated JSON/protobuf + HTTP long-polling fallback |
+| @kora/server | 118 | Memory + SQLite + PostgreSQL stores (both using Drizzle ORM); server-side scope filtering and HTTP sync endpoint support |
+| @kora/react | 60 | Hooks + query-store integration complete (generic type threading) |
+| @kora/devtools | 49 | Instrumentation backend + browser DevTools extension UI complete |
+| @kora/cli | 120 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
+| kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped, with typed overload for full schema inference |
 
-**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution.
+**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends (both using Drizzle ORM query builders), server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution. Full end-to-end type inference flows from `defineSchema()` through `createApp()` to collection accessors and React hooks. Relational queries via `.include()` resolve many-to-one and one-to-many relations.
 
-**What does not work today:** Remaining major gaps are protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
+**What does not work today:** Remaining major gaps are chaos/e2e/publish pipeline completion.
+
+### Known Issues
+
+- **`@kora/merge` DTS build failure:** `field-merger.ts:188` has a type error (`unknown` not assignable to `RichtextValue`). The runtime JS build succeeds but declaration file generation fails, which blocks downstream DTS builds.
+- **`@kora/react` test environment:** All 60 React tests pass when run within the package (`cd packages/react && npx vitest run`), but 45 fail when run from the monorepo root due to missing `jsdom` environment configuration in the root vitest setup.
+- **`@kora/react` `useRichText` DTS:** The `use-rich-text.ts` hook references Node.js `Buffer` type, causing DTS build failure if exported from the package's `index.ts`. Currently not exported.
 
 ## Current Phase Status
 
@@ -28,14 +34,15 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 |-------|--------|-------|
 | 1 | Complete | Browser adapter durability flow is implemented, including binary snapshot restore + logical dump fallback |
 | 2 | Complete | `createApp` + meta-package shipped with pre-`ready` query semantics aligned and tested |
-| 3 | Complete | Persistent server stores implemented (SQLite + PostgreSQL), production-ready baseline |
+| 3 | Complete | Persistent server stores implemented (SQLite + PostgreSQL) using Drizzle ORM query builders, production-ready baseline |
 | 4 | Complete | `kora dev` orchestration + `kora.config.ts` support shipped |
 | 5 | Complete | Richtext fields merge with Yjs CRDTs, serialize as binary updates, and expose React hook bindings with undo/redo |
 | 6 | Complete | Server-side scope filtering enforced for delta, relay, and inbound operation paths |
 | 7 | Complete | `kora migrate` supports diff/generate/apply with breaking-change confirmation and idempotent ordered execution |
 | 8 | Complete | DevTools extension routes instrumented events into a multi-panel browser UI in real time |
-| 9 | In progress | Protobuf wire serializer + negotiation landed; HTTP fallback and benchmark gates remain |
+| 9 | In progress | Protobuf wire serializer + negotiation + HTTP fallback + benchmark gates landed; chaos CI wiring remains |
 | 10 | Not started | E2E/docs/publish automation still pending |
+| Cross-cutting | Complete | End-to-end type inference, relational `.include()` queries, full Drizzle ORM migration |
 
 ---
 
@@ -212,21 +219,21 @@ export type { SchemaDefinition, FieldDescriptor } from '@kora/core'
 
 **Why third:** With the client fully functional, the server becomes the bottleneck. An in-memory server is fine for development but unusable for any real deployment.
 
-### 3a. Drizzle ORM Server Store
+### 3a. Drizzle ORM Server Stores
 
 **Architecture:**
-- `DrizzleServerStore` implements the same `ServerStore` interface as `MemoryServerStore`
-- Drizzle ORM handles the SQL abstraction — supports PostgreSQL, MySQL, and SQLite
+- `SqliteServerStore` and `PostgresServerStore` both implement the `ServerStore` interface using Drizzle ORM typed query builders
+- Drizzle ORM handles the SQL abstraction — both stores use `insert().values().onConflictDoNothing()` and `onConflictDoUpdate()` for atomic writes
 - Schema: two tables — `operations` (the operation log) and `sync_state` (version vectors per node)
-- Content-addressed deduplication: `INSERT ... ON CONFLICT (id) DO NOTHING`
-- Causal ordering maintained by storing `causalDeps` as JSON array and using topological sort on query
+- Content-addressed deduplication: `insert(...).onConflictDoNothing({ target: operations.id })`
+- DDL stays as raw SQL via Drizzle's `sql` template (standard practice without drizzle-kit)
 
 **Tables:**
 ```sql
 CREATE TABLE operations (
   id TEXT PRIMARY KEY,                    -- Content-addressed hash
   node_id TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('insert', 'update', 'delete')),
+  type TEXT NOT NULL,
   collection TEXT NOT NULL,
   record_id TEXT NOT NULL,
   data TEXT,                              -- JSON
@@ -251,23 +258,28 @@ CREATE TABLE sync_state (
 ```
 
 **Implementation details:**
-- Batch inserts for efficiency during initial sync (INSERT ... VALUES (...), (...), ...)
-- Version vector reconstruction from `sync_state` table on server start
-- Operation range queries for delta computation: `WHERE node_id = ? AND sequence_number BETWEEN ? AND ?`
-- Connection pooling via Drizzle's built-in pool management
+- All reads use Drizzle query builder: `db.select().from(operations).where(and(eq(...), between(...)))`
+- All writes use Drizzle insert builder: `db.insert(operations).values(row).onConflictDoNothing()`
+- Version vector upsert: `db.insert(syncState).values(...).onConflictDoUpdate({ target: syncState.nodeId, set: { maxSequenceNumber: sql\`MAX/GREATEST(...)\` } })`
+- PostgresServerStore: in-memory version vector cache hydrated on init, `createPostgresServerStore()` factory dynamically imports `postgres` + `drizzle-orm/postgres-js`
+- SqliteServerStore: synchronous Drizzle calls via `.all()` / `.run()` (better-sqlite3 is synchronous)
+- Operation range queries for delta computation via Drizzle `between()` operator
 
 **Database support:**
 - PostgreSQL (recommended for production — best JSON support, robust replication)
 - SQLite (development and single-server deployments)
-- MySQL (supported but not prioritized)
 
 **Files:**
 ```
 packages/server/src/store/
-  drizzle-server-store.ts
-  drizzle-server-store.test.ts
-  schema.ts                        # Drizzle table definitions
-  migrations/                      # SQL migration files
+  sqlite-server-store.ts           # SQLite store using Drizzle (BetterSQLite3Database)
+  sqlite-server-store.test.ts
+  postgres-server-store.ts         # PostgreSQL store using Drizzle (PostgresJsDatabase)
+  postgres-server-store.test.ts
+  drizzle-schema.ts                # Drizzle SQLite table definitions (sqliteTable)
+  drizzle-pg-schema.ts             # Drizzle PostgreSQL table definitions (pgTable)
+  server-store.ts                  # ServerStore interface
+  memory-server-store.ts           # In-memory store (testing)
 ```
 
 ### 3b. Server Configuration
@@ -604,6 +616,67 @@ packages/devtools/src/
 
 ---
 
+## Cross-Cutting: Type Inference, Relational Queries, and Drizzle Migration
+
+**Status:** Complete
+
+These three features span multiple packages and were implemented as a unified effort after Phase 8.
+
+### End-to-End Type Inference
+
+Full compile-time type inference from `defineSchema()` through `createApp()` to collection accessors and React hooks. Zero code generation, zero runtime changes — pure TypeScript generics (same pattern as Drizzle ORM, Zod, tRPC).
+
+**What it provides:**
+- `defineSchema<const T>()` preserves the literal schema shape at the type level via `const` type parameter + phantom `__input` brand
+- `FieldBuilder<Kind, Req, Auto>`, `EnumFieldBuilder<Values, Req, Auto>`, `ArrayFieldBuilder<ItemKind, Req, Auto>` carry full type information
+- `InferRecord<Fields>` maps field builders → TypeScript types (string, number, boolean, enum literals, typed arrays)
+- `InferInsertInput<Fields>` produces correct required/optional keys (auto fields excluded, defaulted/optional fields optional)
+- `InferUpdateInput<Fields>` makes all non-auto fields optional
+- `TypedKoraApp<S>` provides typed collection accessors: `app.todos.insert({...})` gets full autocomplete and type checking
+- `QueryBuilder<T>` threads the generic through `useQuery<T>()` in React hooks
+
+**Files:**
+```
+packages/core/src/schema/infer.ts          # InferFieldType, InferRecord, InferInsertInput, InferUpdateInput
+packages/core/src/schema/infer.test.ts     # 19 type-level tests with expectTypeOf
+packages/core/src/schema/types.ts          # FieldBuilder generic upgrades (Req, Auto params)
+packages/core/src/schema/define.ts         # defineSchema<const T>, TypedSchemaDefinition
+kora/src/types.ts                          # TypedKoraApp, TypedCollectionAccessor, TypedKoraConfig
+kora/src/create-app.ts                     # Typed overload for createApp
+packages/store/src/query/query-builder.ts  # QueryBuilder<T> generic
+packages/react/src/hooks/use-query.ts      # useQuery<T> generic threading
+packages/react/src/query-store/query-store.ts  # QueryStore<T> generic
+```
+
+### Relational Queries (`.include()`)
+
+Separate-queries pattern (like Prisma) — primary query runs first, then batch-fetches related records. No SQL JOINs. Works with all adapters.
+
+**What it provides:**
+- `app.todos.where({ completed: false }).include('project').exec()` resolves many-to-one relations
+- `app.projects.where({}).include('todos').exec()` resolves one-to-many relations
+- Null FK values produce `null` relation property
+- Subscription manager re-evaluates when included collections mutate
+- FK REFERENCES in SQL generation with auto-indexing of FK columns
+
+**Files:**
+```
+packages/store/src/query/query-builder.ts  # include(), resolveIncludes(), resolveManyToOneInclude(), resolveOneToManyInclude()
+packages/store/src/query/pluralize.ts      # pluralize() / singularize() utilities
+packages/store/src/query/pluralize.test.ts # 10 tests
+packages/store/src/query/include.test.ts   # 9 integration tests
+packages/store/src/types.ts                # include/includeCollections in QueryDescriptor
+packages/store/src/subscription/subscription-manager.ts  # Include-aware flush
+packages/core/src/schema/sql-gen.ts        # FK REFERENCES + auto-index generation
+packages/core/src/schema/sql-gen.test.ts   # 3 new FK tests
+```
+
+### Full Drizzle ORM for Server Stores
+
+Both `SqliteServerStore` and `PostgresServerStore` now use Drizzle ORM typed query builders for all reads and writes. See Phase 3 for details.
+
+---
+
 ## Phase 9: Protocol and Performance Hardening
 
 **Status:** In progress
@@ -616,6 +689,9 @@ packages/devtools/src/
 - Runtime wire-format negotiation (`json` / `protobuf`) via handshake `supportedWireFormats` and `selectedWireFormat`
 - Negotiated serializer support in sync engine and server sessions, with JSON compatibility fallback
 - WebSocket client/server transports updated to send/receive string or binary payloads
+- HTTP long-polling client transport in `@kora/sync` (POST send + GET receive + optional WebSocket upgrade)
+- Server-side HTTP sync request handling in `@kora/server` with long-poll queueing and ETag support
+- Performance benchmark gates implemented for `@kora/store`, `@kora/merge`, and `@kora/sync`, plus CI workflow execution
 
 ### 9a. Protobuf Wire Format
 
@@ -704,13 +780,14 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 |-------|-------|--------|
 | **1** | Browser storage (SQLite WASM + IndexedDB) | Complete |
 | **2** | `createApp` factory + meta-package | Complete |
-| **3** | Server persistence | Complete |
+| **3** | Server persistence (Drizzle ORM) | Complete |
 | **4** | `kora dev` command | Complete |
 | **5** | Yjs richtext merge | Complete |
 | **6** | Sync scopes | Complete |
 | **7** | `kora migrate` command | Complete |
 | **8** | DevTools browser extension | Complete |
+| **Cross-cutting** | Type inference, relational queries, Drizzle migration | Complete |
 | **9** | Protobuf, HTTP transport, benchmarks | In progress |
 | **10** | E2E tests, docs, publish | Not started |
 
-**Updated critical path:** Phase 9+ launch hardening.
+**Updated critical path:** Phase 9 remaining (benchmark CI gates) → Phase 10 (E2E, docs, publish).
