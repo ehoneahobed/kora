@@ -86,13 +86,13 @@ async function loadTypeScriptConfig(configPath: string, projectRoot: string): Pr
 		)
 	}
 
-	const script = [
-		"import { pathToFileURL } from 'node:url'",
-		'const configPath = process.argv[process.argv.length - 1]',
-		'const mod = await import(pathToFileURL(configPath).href)',
-		'const value = mod.default ?? mod',
-		'process.stdout.write(JSON.stringify(value))',
-	].join(';')
+	// Use dynamic import() and .then() to avoid top-level await,
+	// which fails when tsx treats --eval as CJS.
+	const script =
+		'const configPath = process.argv[process.argv.length - 1];' +
+		"import('node:url').then(u => import(u.pathToFileURL(configPath).href))" +
+		'.then(mod => { const v = mod.default ?? mod; process.stdout.write(JSON.stringify(v)) })' +
+		'.catch(e => { process.stderr.write(String(e)); process.exit(1) })'
 
 	const output = await runCommand(tsxBinary, ['--eval', script, configPath], projectRoot)
 
@@ -109,6 +109,7 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
+			shell: process.platform === 'win32',
 		})
 
 		let stdout = ''

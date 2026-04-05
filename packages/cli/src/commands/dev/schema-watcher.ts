@@ -83,6 +83,7 @@ async function spawnCommand(command: string, args: string[], cwd: string): Promi
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
+			shell: process.platform === 'win32',
 		})
 
 		child.stdout?.on('data', (chunk: Buffer) => {

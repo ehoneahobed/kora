@@ -55,13 +55,11 @@ async function loadTypeScriptModule(schemaPath: string, projectRoot: string): Pr
 		)
 	}
 
-	const script = [
-		"import { pathToFileURL } from 'node:url'",
-		'const modulePath = process.argv[process.argv.length - 1]',
-		'const mod = await import(pathToFileURL(modulePath).href)',
-		'const value = mod.default ?? mod',
-		'process.stdout.write(JSON.stringify(value))',
-	].join(';')
+	const script =
+		'const modulePath = process.argv[process.argv.length - 1];' +
+		"import('node:url').then(u => import(u.pathToFileURL(modulePath).href))" +
+		'.then(mod => { const v = mod.default ?? mod; process.stdout.write(JSON.stringify(v)) })' +
+		'.catch(e => { process.stderr.write(String(e)); process.exit(1) })'
 
 	const output = await runCommand(tsxBinary, ['--eval', script, schemaPath], projectRoot)
 
@@ -78,6 +76,7 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
 			cwd,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env: process.env,
+			shell: process.platform === 'win32',
 		})
 
 		let stdout = ''
