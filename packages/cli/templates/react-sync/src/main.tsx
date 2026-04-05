@@ -10,6 +10,9 @@ const app = createApp({
   sync: {
     url: 'ws://localhost:3001',
   },
+  store: {
+    workerUrl: new URL('./kora-worker.ts', import.meta.url),
+  },
 })
 
 // Connect to sync server once the app is ready
@@ -17,7 +20,7 @@ app.ready.then(() => app.sync?.connect())
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <KoraProvider app={app}>
+    <KoraProvider app={app} fallback={<div>Loading...</div>}>
       <App />
     </KoraProvider>
   </StrictMode>,

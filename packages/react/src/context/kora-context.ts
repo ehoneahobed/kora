@@ -40,20 +40,37 @@ function KoraProvider({
 	)
 	// If no app prop, we're using the store prop and are ready immediately
 	const [ready, setReady] = useState(!app)
+	const [initError, setInitError] = useState<Error | null>(null)
 
 	useEffect(() => {
 		if (!app) return
 		let cancelled = false
-		app.ready.then(() => {
-			if (cancelled) return
-			setResolvedStore(app.getStore())
-			setResolvedSync(app.getSyncEngine())
-			setReady(true)
-		})
+		app.ready
+			.then(() => {
+				if (cancelled) return
+				setResolvedStore(app.getStore())
+				setResolvedSync(app.getSyncEngine())
+				setReady(true)
+			})
+			.catch((error: unknown) => {
+				if (cancelled) return
+				const err = error instanceof Error ? error : new Error(String(error))
+				console.error('[Kora] Initialization failed:', err)
+				setInitError(err)
+			})
 		return () => {
 			cancelled = true
 		}
 	}, [app])
+
+	if (initError) {
+		return createElement(
+			'div',
+			{ style: { color: 'red', padding: '1rem', fontFamily: 'monospace' } },
+			createElement('strong', null, 'Kora initialization error: '),
+			initError.message,
+		)
+	}
 
 	if (!ready) {
 		return (fallback ?? null) as ReactNode

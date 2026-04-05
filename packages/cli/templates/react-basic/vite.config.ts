@@ -3,4 +3,7 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react()],
+  optimizeDeps: {
+    exclude: ['@sqlite.org/sqlite-wasm', '@korajs/store'],
+  },
 })

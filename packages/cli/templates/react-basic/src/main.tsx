@@ -5,11 +5,16 @@ import { createRoot } from 'react-dom/client'
 import schema from './schema'
 import { App } from './App'
 
-const app = createApp({ schema })
+const app = createApp({
+  schema,
+  store: {
+    workerUrl: new URL('./kora-worker.ts', import.meta.url),
+  },
+})
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <KoraProvider app={app}>
+    <KoraProvider app={app} fallback={<div>Loading...</div>}>
       <App />
     </KoraProvider>
   </StrictMode>,

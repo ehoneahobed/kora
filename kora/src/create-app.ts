@@ -230,7 +230,7 @@ async function initializeAsync(
 	// Resolve adapter
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	const dbName = config.store?.name ?? 'kora-db'
-	const adapter: StorageAdapter = await createAdapter(adapterType, dbName)
+	const adapter: StorageAdapter = await createAdapter(adapterType, dbName, config.store?.workerUrl)
 
 	// Create and open the store
 	const store = new Store({

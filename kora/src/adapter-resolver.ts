@@ -35,19 +35,25 @@ export function detectAdapterType(): AdapterType {
  * @param dbName - Database name (used by all adapters)
  * @returns A configured StorageAdapter instance
  */
-export async function createAdapter(type: AdapterType, dbName: string): Promise<StorageAdapter> {
+export async function createAdapter(
+	type: AdapterType,
+	dbName: string,
+	workerUrl?: string | URL,
+): Promise<StorageAdapter> {
 	switch (type) {
 		case 'better-sqlite3': {
-			const { BetterSqlite3Adapter } = await import('@korajs/store/better-sqlite3')
+			const { BetterSqlite3Adapter } = await import(
+				/* @vite-ignore */ '@korajs/store/better-sqlite3'
+			)
 			return new BetterSqlite3Adapter(dbName)
 		}
 		case 'sqlite-wasm': {
 			const { SqliteWasmAdapter } = await import('@korajs/store/sqlite-wasm')
-			return new SqliteWasmAdapter({ dbName })
+			return new SqliteWasmAdapter({ dbName, workerUrl })
 		}
 		case 'indexeddb': {
 			const { IndexedDbAdapter } = await import('@korajs/store/indexeddb')
-			return new IndexedDbAdapter({ dbName })
+			return new IndexedDbAdapter({ dbName, workerUrl })
 		}
 		default: {
 			const _exhaustive: never = type

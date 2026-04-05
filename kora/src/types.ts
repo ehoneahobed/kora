@@ -26,6 +26,8 @@ export interface StoreOptions {
 	adapter?: AdapterType
 	/** Database name. Defaults to 'kora-db'. */
 	name?: string
+	/** URL to the SQLite WASM worker script. Required for browser adapters (sqlite-wasm, indexeddb). */
+	workerUrl?: string | URL
 }
 
 /**

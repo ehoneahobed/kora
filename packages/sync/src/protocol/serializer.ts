@@ -1,6 +1,12 @@
 import { SyncError } from '@korajs/core'
 import type { Operation, VersionVector } from '@korajs/core'
-import { Reader, Writer } from 'protobufjs/minimal'
+// protobufjs/minimal is CJS — named ESM imports fail in some runtimes (tsx, Node ESM).
+// Use a default import for the runtime values and type aliases for annotations.
+import protobuf from 'protobufjs/minimal'
+
+type Reader = protobuf.Reader
+type Writer = protobuf.Writer
+const { Reader, Writer } = protobuf
 import type {
 	AcknowledgmentMessage,
 	ErrorMessage,
