@@ -1,4 +1,4 @@
-import type { Operation, SchemaDefinition } from '@kora/core'
+import type { KoraEventEmitter, Operation, SchemaDefinition } from '@kora/core'
 
 /**
  * Transaction interface for executing multiple operations atomically.
@@ -48,6 +48,8 @@ export interface StoreConfig {
 	adapter: StorageAdapter
 	/** Optional node ID. If omitted, one is generated or loaded from the database. */
 	nodeId?: string
+	/** Optional event emitter. When provided, local mutations emit 'operation:created' events. */
+	emitter?: KoraEventEmitter
 }
 
 /**

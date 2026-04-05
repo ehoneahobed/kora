@@ -1,5 +1,11 @@
 import { HybridLogicalClock, createVersionVector, generateUUIDv7 } from '@kora/core'
-import type { Operation, OperationLog, SchemaDefinition, VersionVector } from '@kora/core'
+import type {
+	KoraEventEmitter,
+	Operation,
+	OperationLog,
+	SchemaDefinition,
+	VersionVector,
+} from '@kora/core'
 import { Collection } from '../collection/collection'
 import { StoreNotOpenError } from '../errors'
 import { QueryBuilder } from '../query/query-builder'
@@ -46,11 +52,13 @@ export class Store implements OperationLog {
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
 	private readonly configNodeId: string | undefined
+	private readonly emitter: KoraEventEmitter | null
 
 	constructor(config: StoreConfig) {
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.configNodeId = config.nodeId
+		this.emitter = config.emitter ?? null
 	}
 
 	/**
@@ -80,6 +88,9 @@ export class Store implements OperationLog {
 				() => this.nextSequenceNumber(),
 				(collectionName, operation) => {
 					this.subscriptionManager.notify(collectionName, operation)
+					if (this.emitter) {
+						this.emitter.emit({ type: 'operation:created', operation })
+					}
 				},
 			)
 			this.collections.set(name, col)
