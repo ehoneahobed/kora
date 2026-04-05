@@ -1,6 +1,6 @@
 {
   "name": "@korajs/devtools",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Kora.js devtools package",
   "type": "module",
   "main": "./dist/index.cjs",

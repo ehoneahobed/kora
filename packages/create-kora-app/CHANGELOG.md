@@ -1,5 +1,13 @@
 # create-kora-app
 
+## 0.1.3
+
+### Patch Changes
+
+- Fix template path resolution in create-kora-app and add package READMEs
+- Updated dependencies
+  - @korajs/cli@0.1.2
+
 ## 0.1.2
 
 ### Patch Changes
