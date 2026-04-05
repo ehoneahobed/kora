@@ -1,5 +1,7 @@
 import { execSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineCommand } from 'citty'
 import { ProjectExistsError } from '../../errors'
 import { PACKAGE_MANAGERS, TEMPLATES, TEMPLATE_INFO } from '../../types'
@@ -87,12 +89,15 @@ export const createCommand = defineCommand({
 			throw new ProjectExistsError(projectName)
 		}
 
+		// Resolve kora version from this package's own package.json
+		const koraVersion = resolveKoraVersion()
+
 		// Scaffold
 		logger.step(`Creating ${projectName} with ${template} template...`)
 		await scaffoldTemplate(template, targetDir, {
 			projectName,
 			packageManager: pm,
-			koraVersion: '0.0.0',
+			koraVersion,
 		})
 		logger.success('Project scaffolded')
 
@@ -123,4 +128,18 @@ function isValidTemplate(value: string): value is TemplateName {
 
 function isValidPackageManager(value: string): value is PackageManager {
 	return (PACKAGE_MANAGERS as readonly string[]).includes(value)
+}
+
+/**
+ * Reads the version from @kora/cli's own package.json.
+ * Scaffolded projects pin their kora dependencies to this version.
+ */
+function resolveKoraVersion(): string {
+	try {
+		const cliDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+		const pkg = JSON.parse(readFileSync(resolve(cliDir, 'package.json'), 'utf-8')) as { version: string }
+		return pkg.version === '0.0.0' ? 'latest' : `^${pkg.version}`
+	} catch {
+		return 'latest'
+	}
 }
