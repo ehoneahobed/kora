@@ -134,7 +134,7 @@ export class Store implements OperationLog {
 			update: (id: string, data: Record<string, unknown>) => col.update(id, data),
 			delete: (id: string) => col.delete(id),
 			where: (conditions) =>
-				new QueryBuilder(name, definition, this.adapter, this.subscriptionManager, conditions),
+				new QueryBuilder(name, definition, this.adapter, this.subscriptionManager, conditions, this.schema),
 		}
 	}
 

@@ -1,5 +1,7 @@
 import type { HLCTimestamp, OperationType } from '@kora/core'
 
+export type WireFormat = 'json' | 'protobuf'
+
 /**
  * Wire-format operation. Plain object (no Map) for JSON serialization.
  * Maps 1:1 with Operation, but uses Record instead of Map for version vectors.
@@ -29,6 +31,7 @@ export interface HandshakeMessage {
 	versionVector: Record<string, number>
 	schemaVersion: number
 	authToken?: string
+	supportedWireFormats?: WireFormat[]
 }
 
 /**
@@ -42,6 +45,7 @@ export interface HandshakeResponseMessage {
 	schemaVersion: number
 	accepted: boolean
 	rejectReason?: string
+	selectedWireFormat?: WireFormat
 }
 
 /**

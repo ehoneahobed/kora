@@ -16,7 +16,7 @@ import type {
  */
 export interface WebSocketLike {
 	readonly readyState: number
-	send(data: string): void
+	send(data: string | Uint8Array): void
 	close(code?: number, reason?: string): void
 	onopen: ((event: unknown) => void) | null
 	onmessage: ((event: { data: unknown }) => void) | null
@@ -88,8 +88,15 @@ export class WebSocketTransport implements SyncTransport {
 				}
 
 				ws.onmessage = (event: { data: unknown }) => {
-					if (typeof event.data !== 'string') return
 					try {
+						if (
+							typeof event.data !== 'string' &&
+							!(event.data instanceof Uint8Array) &&
+							!(event.data instanceof ArrayBuffer)
+						) {
+							return
+						}
+
 						const message = this.serializer.decode(event.data)
 						this.messageHandler?.(message)
 					} catch {

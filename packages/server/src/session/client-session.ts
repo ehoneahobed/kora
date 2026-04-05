@@ -6,8 +6,13 @@ import type {
 	MessageSerializer,
 	OperationBatchMessage,
 	SyncMessage,
+	WireFormat,
 } from '@kora/sync'
-import { JsonMessageSerializer, versionVectorToWire, wireToVersionVector } from '@kora/sync'
+import {
+	NegotiatedMessageSerializer,
+	versionVectorToWire,
+	wireToVersionVector,
+} from '@kora/sync'
 import type { ServerStore } from '../store/server-store'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerTransport } from '../transport/server-transport'
@@ -87,7 +92,7 @@ export class ClientSession {
 		this.transport = options.transport
 		this.store = options.store
 		this.auth = options.auth ?? null
-		this.serializer = options.serializer ?? new JsonMessageSerializer()
+		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
 		this.schemaVersion = options.schemaVersion ?? DEFAULT_SCHEMA_VERSION
@@ -211,6 +216,8 @@ export class ClientSession {
 
 		// Send handshake response with server's version vector
 		const serverVector = this.store.getVersionVector()
+		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
+		this.setSerializerWireFormat(selectedWireFormat)
 		const response: SyncMessage = {
 			type: 'handshake-response',
 			messageId: generateUUIDv7(),
@@ -218,6 +225,7 @@ export class ClientSession {
 			versionVector: versionVectorToWire(serverVector),
 			schemaVersion: this.schemaVersion,
 			accepted: true,
+			selectedWireFormat,
 		}
 		this.transport.send(response)
 
@@ -334,10 +342,24 @@ export class ClientSession {
 		this.transport.send(errorMsg)
 	}
 
+	private setSerializerWireFormat(format: WireFormat): void {
+		if (typeof this.serializer.setWireFormat === 'function') {
+			this.serializer.setWireFormat(format)
+		}
+	}
+
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
 		this.emitter?.emit({ type: 'sync:disconnected', reason: 'transport closed' })
 		this.onClose?.(this.sessionId)
 	}
+}
+
+function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
+	if (supportedWireFormats?.includes('protobuf')) {
+		return 'protobuf'
+	}
+
+	return 'json'
 }

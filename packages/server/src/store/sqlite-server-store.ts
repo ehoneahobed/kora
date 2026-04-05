@@ -44,19 +44,32 @@ export class SqliteServerStore implements ServerStore {
 
 		// Use a transaction for atomicity: insert op + update version vector
 		const result = this.db.transaction((tx) => {
-			// Content-addressed dedup: INSERT ... ON CONFLICT(id) DO NOTHING
-			const insertResult = tx.run(
-				sql`INSERT INTO operations (id, node_id, type, collection, record_id, data, previous_data, wall_time, logical, timestamp_node_id, sequence_number, causal_deps, schema_version, received_at) VALUES (${row.id}, ${row.nodeId}, ${row.type}, ${row.collection}, ${row.recordId}, ${row.data}, ${row.previousData}, ${row.wallTime}, ${row.logical}, ${row.timestampNodeId}, ${row.sequenceNumber}, ${row.causalDeps}, ${row.schemaVersion}, ${row.receivedAt}) ON CONFLICT(id) DO NOTHING`,
-			)
+			// Content-addressed dedup via onConflictDoNothing
+			const insertResult = tx
+				.insert(operations)
+				.values(row)
+				.onConflictDoNothing({ target: operations.id })
+				.run()
 
 			if (insertResult.changes === 0) {
 				return 'duplicate' as const
 			}
 
-			// Advance version vector: only update if new sequence > existing max
-			tx.run(
-				sql`INSERT INTO sync_state (node_id, max_sequence_number, last_seen_at) VALUES (${op.nodeId}, ${op.sequenceNumber}, ${now}) ON CONFLICT(node_id) DO UPDATE SET max_sequence_number = MAX(sync_state.max_sequence_number, ${op.sequenceNumber}), last_seen_at = ${now}`,
-			)
+			// Advance version vector: upsert with MAX to ensure monotonic progress
+			tx.insert(syncState)
+				.values({
+					nodeId: op.nodeId,
+					maxSequenceNumber: op.sequenceNumber,
+					lastSeenAt: now,
+				})
+				.onConflictDoUpdate({
+					target: syncState.nodeId,
+					set: {
+						maxSequenceNumber: sql`MAX(${syncState.maxSequenceNumber}, ${op.sequenceNumber})`,
+						lastSeenAt: sql`${now}`,
+					},
+				})
+				.run()
 
 			return 'applied' as const
 		})
@@ -90,7 +103,7 @@ export class SqliteServerStore implements ServerStore {
 
 	/**
 	 * Create the operations and sync_state tables if they don't exist.
-	 * Uses raw SQL for simplicity — these are internal infrastructure tables.
+	 * Uses raw SQL via Drizzle's sql template — standard practice for DDL without drizzle-kit.
 	 */
 	private ensureTables(): void {
 		this.db.run(sql`
@@ -136,22 +149,7 @@ export class SqliteServerStore implements ServerStore {
 	private serializeOperation(
 		op: Operation,
 		receivedAt: number,
-	): {
-		id: string
-		nodeId: string
-		type: string
-		collection: string
-		recordId: string
-		data: string | null
-		previousData: string | null
-		wallTime: number
-		logical: number
-		timestampNodeId: string
-		sequenceNumber: number
-		causalDeps: string
-		schemaVersion: number
-		receivedAt: number
-	} {
+	): typeof operations.$inferInsert {
 		return {
 			id: op.id,
 			nodeId: op.nodeId,

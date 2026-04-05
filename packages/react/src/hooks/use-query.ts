@@ -7,13 +7,11 @@ import type { UseQueryOptions } from '../types'
  * Frozen empty array returned when the query is disabled or before data loads.
  * Same reference prevents unnecessary re-renders.
  */
-const EMPTY_ARRAY: readonly CollectionRecord[] = Object.freeze([])
+const EMPTY_ARRAY: readonly unknown[] = Object.freeze([])
 
 const noopSubscribe = (_onStoreChange: () => void): (() => void) => {
 	return () => {}
 }
-
-const disabledGetSnapshot = (): readonly CollectionRecord[] => EMPTY_ARRAY
 
 /**
  * React hook for reactive queries against the local Kora store.
@@ -22,26 +20,30 @@ const disabledGetSnapshot = (): readonly CollectionRecord[] => EMPTY_ARRAY
  * Re-renders automatically when the query results change due to mutations.
  * Uses `useSyncExternalStore` for React 18+ concurrent mode safety.
  *
- * @param query - A QueryBuilder instance (e.g., `store.collection('todos').where({ done: false })`)
+ * The generic parameter `T` is inferred from the QueryBuilder, providing
+ * full type safety when used with typed collection accessors.
+ *
+ * @param query - A QueryBuilder instance (e.g., `app.todos.where({ done: false })`)
  * @param options - Optional configuration (e.g., `{ enabled: false }` to skip the query)
  * @returns Readonly array of matching records
  *
  * @example
  * ```typescript
  * const todos = useQuery(app.todos.where({ completed: false }).orderBy('createdAt'))
+ * // todos is typed as readonly InferRecord<typeof todoFields>[]
  * ```
  */
-export function useQuery(
-	query: QueryBuilder,
+export function useQuery<T = CollectionRecord>(
+	query: QueryBuilder<T>,
 	options?: UseQueryOptions,
-): readonly CollectionRecord[] {
+): readonly T[] {
 	const enabled = options?.enabled !== false
 
 	// Compute a stable key from the query descriptor
 	const descriptorKey = JSON.stringify(query.getDescriptor())
 
 	// Track the current QueryStore instance
-	const queryStoreRef = useRef<QueryStore | null>(null)
+	const queryStoreRef = useRef<QueryStore<T> | null>(null)
 	const prevKeyRef = useRef<string | null>(null)
 
 	// Create or reuse a QueryStore when the descriptor changes
@@ -61,7 +63,7 @@ export function useQuery(
 			if (queryStoreRef.current) {
 				queryStoreRef.current.destroy()
 			}
-			const newStore = new QueryStore(query)
+			const newStore = new QueryStore<T>(query)
 			queryStoreRef.current = newStore
 			prevKeyRef.current = descriptorKey
 			return newStore
@@ -79,6 +81,8 @@ export function useQuery(
 			}
 		}
 	}, [])
+
+	const disabledGetSnapshot = (): readonly T[] => EMPTY_ARRAY as readonly T[]
 
 	return useSyncExternalStore(
 		queryStore ? queryStore.subscribe : noopSubscribe,

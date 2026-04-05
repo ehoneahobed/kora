@@ -9,7 +9,13 @@ import type {
 	OperationBatchMessage,
 	SerializedOperation,
 } from './messages'
-import { JsonMessageSerializer, versionVectorToWire, wireToVersionVector } from './serializer'
+import {
+	JsonMessageSerializer,
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
+	versionVectorToWire,
+	wireToVersionVector,
+} from './serializer'
 
 function makeOperation(overrides?: Partial<Operation>): Operation {
 	return {
@@ -40,6 +46,73 @@ describe('versionVectorToWire', () => {
 			['node-2', 3],
 		])
 		expect(versionVectorToWire(vector)).toEqual({ 'node-1': 5, 'node-2': 3 })
+	})
+})
+
+describe('ProtobufMessageSerializer', () => {
+	const serializer = new ProtobufMessageSerializer()
+
+	test('roundtrips handshake with supported formats', () => {
+		const message: HandshakeMessage = {
+			type: 'handshake',
+			messageId: 'msg-1',
+			nodeId: 'node-1',
+			versionVector: { 'node-1': 2 },
+			schemaVersion: 1,
+			supportedWireFormats: ['json', 'protobuf'],
+		}
+
+		const encoded = serializer.encode(message)
+		expect(encoded).toBeInstanceOf(Uint8Array)
+		expect(serializer.decode(encoded)).toEqual(message)
+	})
+
+	test('roundtrips operation batch', () => {
+		const operation = serializer.encodeOperation(makeOperation())
+		const message: OperationBatchMessage = {
+			type: 'operation-batch',
+			messageId: 'msg-batch',
+			operations: [operation],
+			isFinal: true,
+			batchIndex: 0,
+		}
+
+		const decoded = serializer.decode(serializer.encode(message))
+		expect(decoded).toEqual(message)
+	})
+
+	test('roundtrips handshake response selected format', () => {
+		const message: HandshakeResponseMessage = {
+			type: 'handshake-response',
+			messageId: 'resp-1',
+			nodeId: 'server-1',
+			versionVector: { 'node-1': 2 },
+			schemaVersion: 1,
+			accepted: true,
+			selectedWireFormat: 'protobuf',
+		}
+
+		expect(serializer.decode(serializer.encode(message))).toEqual(message)
+	})
+})
+
+describe('NegotiatedMessageSerializer', () => {
+	test('switches encode mode after negotiation', () => {
+		const serializer = new NegotiatedMessageSerializer('json')
+		const message: AcknowledgmentMessage = {
+			type: 'acknowledgment',
+			messageId: 'ack-1',
+			acknowledgedMessageId: 'msg-1',
+			lastSequenceNumber: 4,
+		}
+
+		const jsonEncoded = serializer.encode(message)
+		expect(typeof jsonEncoded).toBe('string')
+
+		serializer.setWireFormat('protobuf')
+		const protoEncoded = serializer.encode(message)
+		expect(protoEncoded).toBeInstanceOf(Uint8Array)
+		expect(serializer.decode(protoEncoded as Uint8Array)).toEqual(message)
 	})
 })
 

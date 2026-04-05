@@ -1,6 +1,7 @@
 import type { FieldDescriptor, HLCTimestamp, Operation } from '@kora/core'
 import { describe, expect, test } from 'vitest'
 import { mergeField } from './field-merger'
+import { richtextToString, stringToRichtextUpdate } from '../strategies/yjs-richtext'
 
 function makeOp(overrides: Partial<Operation> = {}): Operation {
 	return {
@@ -284,21 +285,30 @@ describe('mergeField', () => {
 	})
 
 	describe('richtext field', () => {
-		test('throws informative error for richtext merge', () => {
+		test('merges concurrent richtext updates with Yjs strategy', () => {
 			const local = makeOp({
-				data: { notes: 'local text' },
-				previousData: { notes: 'base' },
+				data: { notes: stringToRichtextUpdate('base local') },
+				previousData: { notes: stringToRichtextUpdate('base') },
 			})
 			const remote = makeOp({
 				id: 'op-2',
 				nodeId: 'node-b',
-				data: { notes: 'remote text' },
-				previousData: { notes: 'base' },
+				data: { notes: stringToRichtextUpdate('base remote') },
+				previousData: { notes: stringToRichtextUpdate('base') },
 			})
 
-			expect(() => mergeField('notes', local, remote, { notes: 'base' }, richtextField)).toThrow(
-				'Yjs CRDT integration is not yet available',
+			const result = mergeField(
+				'notes',
+				local,
+				remote,
+				{ notes: stringToRichtextUpdate('base') },
+				richtextField,
 			)
+
+			expect(result.value).toBeInstanceOf(Uint8Array)
+			expect(richtextToString(result.value as Uint8Array)).toContain('base')
+			expect(result.trace.strategy).toBe('crdt-text')
+			expect(result.trace.tier).toBe(1)
 		})
 	})
 

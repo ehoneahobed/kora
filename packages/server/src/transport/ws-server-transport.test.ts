@@ -1,4 +1,8 @@
-import type { SyncMessage } from '@kora/sync'
+import {
+	type SyncMessage,
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
+} from '@kora/sync'
 import { describe, expect, test, vi } from 'vitest'
 import type { WsWebSocket } from './ws-server-transport'
 import { WsServerTransport } from './ws-server-transport'
@@ -65,6 +69,19 @@ describe('WsServerTransport', () => {
 		ws.trigger('message', JSON.stringify(handshakeMsg))
 
 		expect(handler).toHaveBeenCalledOnce()
+		expect(handler).toHaveBeenCalledWith(handshakeMsg)
+	})
+
+	test('handles protobuf payloads with negotiated serializer', () => {
+		const ws = createMockWs()
+		const serializer = new NegotiatedMessageSerializer('protobuf')
+		const transport = new WsServerTransport(ws, { serializer })
+		const handler = vi.fn()
+		transport.onMessage(handler)
+
+		const payload = new ProtobufMessageSerializer().encode(handshakeMsg)
+		ws.trigger('message', payload)
+
 		expect(handler).toHaveBeenCalledWith(handshakeMsg)
 	})
 

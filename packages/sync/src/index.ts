@@ -25,6 +25,7 @@ export type {
 	OperationBatchMessage,
 	SerializedOperation,
 	SyncMessage,
+	WireFormat,
 } from './protocol/messages'
 
 export {
@@ -41,6 +42,8 @@ export type { MessageSerializer } from './protocol/serializer'
 
 export {
 	JsonMessageSerializer,
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
 	versionVectorToWire,
 	wireToVersionVector,
 } from './protocol/serializer'
@@ -60,7 +63,10 @@ export type {
 	WebSocketTransportOptions,
 } from './transport/websocket-transport'
 
+export type { HttpLongPollingTransportOptions } from './transport/http-long-polling-transport'
+
 export { WebSocketTransport } from './transport/websocket-transport'
+export { HttpLongPollingTransport } from './transport/http-long-polling-transport'
 
 export type { ChaosConfig } from './transport/chaos-transport'
 

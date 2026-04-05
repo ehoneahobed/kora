@@ -51,10 +51,25 @@ export {
 
 // === Schema ===
 export { defineSchema } from './schema/define'
-export type { CollectionInput, ConstraintInput, RelationInput, SchemaInput } from './schema/define'
+export type {
+	CollectionInput,
+	ConstraintInput,
+	RelationInput,
+	SchemaInput,
+	TypedSchemaDefinition,
+} from './schema/define'
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
 export { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './schema/types'
 export { validateRecord } from './schema/validation'
+
+// === Type Inference ===
+export type {
+	FieldKindToType,
+	InferFieldType,
+	InferInsertInput,
+	InferRecord,
+	InferUpdateInput,
+} from './schema/infer'
 
 // === Version Vectors ===
 export {

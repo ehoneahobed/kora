@@ -1,5 +1,6 @@
 import type { CollectionDefinition, Constraint, Operation } from '@kora/core'
 import { describe, expect, test } from 'vitest'
+import { richtextToString, stringToRichtextUpdate } from '../strategies/yjs-richtext'
 import type { ConstraintContext } from '../types'
 import { MergeEngine } from './merge-engine'
 
@@ -214,6 +215,44 @@ describe('MergeEngine', () => {
 			expect(result.mergedData.tags).toEqual(['urgent'])
 			// priority: only local → local's value
 			expect(result.mergedData.priority).toBe('high')
+		})
+
+		test('conflicting richtext field uses crdt-text strategy', async () => {
+			const richtextCollection = makeCollectionDef({
+				fields: {
+					notes: {
+						kind: 'richtext',
+						required: false,
+						defaultValue: undefined,
+						auto: false,
+						enumValues: null,
+						itemKind: null,
+					},
+				},
+			})
+
+			const base = stringToRichtextUpdate('hello')
+			const local = makeOp({
+				data: { notes: stringToRichtextUpdate('A hello') },
+				previousData: { notes: base },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { notes: stringToRichtextUpdate('hello B') },
+				previousData: { notes: base },
+			})
+
+			const result = await engine.merge({
+				local,
+				remote,
+				baseState: { notes: base },
+				collectionDef: richtextCollection,
+			})
+
+			expect(result.mergedData.notes).toBeInstanceOf(Uint8Array)
+			expect(richtextToString(result.mergedData.notes as Uint8Array)).toContain('hello')
+			expect(result.traces[0]?.strategy).toBe('crdt-text')
 		})
 	})
 

@@ -18,7 +18,7 @@ const WS_OPEN = 1
  */
 export interface WsWebSocket {
 	readyState: number
-	send(data: string, callback?: (err?: Error) => void): void
+	send(data: string | Uint8Array, callback?: (err?: Error) => void): void
 	close(code?: number, reason?: string): void
 	on(event: string, listener: (...args: unknown[]) => void): void
 	removeAllListeners(): void
@@ -84,7 +84,17 @@ export class WsServerTransport implements ServerTransport {
 	private setupListeners(): void {
 		this.ws.on('message', (data: unknown) => {
 			try {
-				const decoded = this.serializer.decode(String(data))
+				if (
+					typeof data !== 'string' &&
+					!(data instanceof Uint8Array) &&
+					!(data instanceof ArrayBuffer)
+				) {
+					throw new SyncError('Unsupported WebSocket payload type', {
+						payloadType: typeof data,
+					})
+				}
+
+				const decoded = this.serializer.decode(data)
 				this.messageHandler?.(decoded)
 			} catch (err) {
 				this.errorHandler?.(err instanceof Error ? err : new Error(String(err)))

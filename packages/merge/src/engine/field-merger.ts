@@ -2,6 +2,7 @@ import type { CustomResolver, FieldDescriptor, HLCTimestamp, Operation } from '@
 import type { MergeTrace } from '@kora/core'
 import { addWinsSet } from '../strategies/add-wins-set'
 import { lastWriteWins } from '../strategies/lww'
+import { mergeRichtext } from '../strategies/yjs-richtext'
 import type { FieldMergeResult } from '../types'
 
 /**
@@ -10,7 +11,7 @@ import type { FieldMergeResult } from '../types'
  * Dispatches to the appropriate strategy based on field kind:
  * - string, number, boolean, enum, timestamp → LWW (Last-Write-Wins via HLC)
  * - array → add-wins set (union of additions, only mutual removals)
- * - richtext → throws (Yjs integration deferred)
+ * - richtext → Yjs CRDT merge
  *
  * If a custom resolver (Tier 3) is provided, it overrides the default strategy.
  *
@@ -183,12 +184,21 @@ function autoMerge(
 			)
 		}
 
-		case 'richtext':
-			// Yjs integration is deferred. The architecture supports it, but the
-			// implementation requires the yjs dependency. For now, throw a clear error.
-			throw new Error(
-				`Richtext field "${fieldName}" cannot be merged yet. Yjs CRDT integration is not yet available. This will be supported in a future release.`,
+		case 'richtext': {
+			const merged = mergeRichtext(localValue, remoteValue, baseValue)
+			return createResult(
+				merged,
+				fieldName,
+				localOp,
+				remoteOp,
+				localValue,
+				remoteValue,
+				baseValue,
+				'crdt-text',
+				1,
+				startTime,
 			)
+		}
 	}
 }
 

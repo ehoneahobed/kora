@@ -33,6 +33,7 @@ function sendHandshake(
 		nodeId: 'client-1',
 		versionVector: {},
 		schemaVersion: 1,
+		supportedWireFormats: ['json', 'protobuf'],
 		...overrides,
 	})
 }
@@ -95,6 +96,7 @@ describe('ClientSession', () => {
 				expect(response.accepted).toBe(true)
 				expect(response.versionVector).toEqual({ 'node-a': 5 })
 				expect(response.nodeId).toBe('server-1')
+				expect(response.selectedWireFormat).toBe('protobuf')
 			}
 		})
 

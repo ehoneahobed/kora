@@ -64,6 +64,14 @@ describe('serializeRecord', () => {
 		expect(result.notes).toBe(bytes)
 	})
 
+	test('encodes richtext strings to binary updates', () => {
+		const fields: Record<string, FieldDescriptor> = {
+			notes: field('richtext'),
+		}
+		const result = serializeRecord({ notes: 'hello' }, fields)
+		expect(result.notes).toBeInstanceOf(Uint8Array)
+	})
+
 	test('handles null values', () => {
 		const fields: Record<string, FieldDescriptor> = {
 			title: field('string'),

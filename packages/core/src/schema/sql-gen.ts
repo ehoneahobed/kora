@@ -1,18 +1,47 @@
-import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '../types'
+import type {
+	CollectionDefinition,
+	FieldDescriptor,
+	RelationDefinition,
+	SchemaDefinition,
+} from '../types'
 
 /**
  * Generate CREATE TABLE and CREATE INDEX SQL for a single collection.
  *
  * @param collectionName - The collection name
  * @param collection - The collection definition
+ * @param relations - Optional relations for FK references
  * @returns An array of SQL statements (CREATE TABLE + CREATE INDEX)
  */
-export function generateSQL(collectionName: string, collection: CollectionDefinition): string[] {
+export function generateSQL(
+	collectionName: string,
+	collection: CollectionDefinition,
+	relations?: Record<string, RelationDefinition>,
+): string[] {
 	const statements: string[] = []
 	const columns: string[] = ['id TEXT PRIMARY KEY NOT NULL']
 
+	// Track which fields already have indexes
+	const indexedFields = new Set(collection.indexes)
+
+	// Collect FK fields for auto-indexing
+	const fkFields: string[] = []
+
 	for (const [fieldName, descriptor] of Object.entries(collection.fields)) {
-		columns.push(columnDefinition(fieldName, descriptor))
+		let colDef = columnDefinition(fieldName, descriptor)
+
+		// Add FK reference if a relation exists for this field
+		if (relations) {
+			for (const rel of Object.values(relations)) {
+				if (rel.from === collectionName && rel.field === fieldName) {
+					colDef += ` REFERENCES ${rel.to}(id)`
+					fkFields.push(fieldName)
+					break
+				}
+			}
+		}
+
+		columns.push(colDef)
 	}
 
 	// Auto metadata columns
@@ -27,6 +56,15 @@ export function generateSQL(collectionName: string, collection: CollectionDefini
 		statements.push(
 			`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${indexField} ON ${collectionName} (${indexField})`,
 		)
+	}
+
+	// Auto-create indexes on FK columns not already indexed
+	for (const fkField of fkFields) {
+		if (!indexedFields.has(fkField)) {
+			statements.push(
+				`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${fkField} ON ${collectionName} (${fkField})`,
+			)
+		}
 	}
 
 	// Per-collection operations log table
@@ -74,7 +112,7 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 	)
 
 	for (const [name, collection] of Object.entries(schema.collections)) {
-		statements.push(...generateSQL(name, collection))
+		statements.push(...generateSQL(name, collection, schema.relations))
 	}
 
 	return statements

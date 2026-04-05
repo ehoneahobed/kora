@@ -1,41 +1,25 @@
 import type { Operation, VersionVector } from '@kora/core'
 import { generateUUIDv7 } from '@kora/core'
 import type { ApplyResult } from '@kora/sync'
+import { and, asc, between, count, eq, sql } from 'drizzle-orm'
+import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import type { ServerStore } from './server-store'
 
-interface PostgresClient {
-	unsafe<T = unknown[]>(query: string, params?: unknown[]): Promise<T>
-	end?: () => Promise<void> | void
-}
-
-interface OperationRow {
-	id: string
-	node_id: string
-	type: string
-	collection: string
-	record_id: string
-	data: string | null
-	previous_data: string | null
-	wall_time: number
-	logical: number
-	timestamp_node_id: string
-	sequence_number: number
-	causal_deps: string
-	schema_version: number
-}
-
 /**
- * PostgreSQL-backed server store.
+ * PostgreSQL-backed server store using Drizzle ORM.
+ * All reads and writes go through Drizzle's typed query builder.
+ * DDL stays as raw SQL via Drizzle's sql template (standard practice without drizzle-kit).
  */
 export class PostgresServerStore implements ServerStore {
 	private readonly nodeId: string
-	private readonly client: PostgresClient
+	private readonly db: PostgresJsDatabase
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
 	private closed = false
 
-	constructor(client: PostgresClient, nodeId?: string) {
-		this.client = client
+	constructor(db: PostgresJsDatabase, nodeId?: string) {
+		this.db = db
 		this.nodeId = nodeId ?? generateUUIDv7()
 		this.ready = this.initialize()
 	}
@@ -53,63 +37,45 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const existing = await this.client.unsafe<{ id: string }[]>(
-			'SELECT id FROM operations WHERE id = $1 LIMIT 1',
-			[op.id],
-		)
+		// Content-addressed dedup check
+		const existing = await this.db
+			.select({ id: pgOperations.id })
+			.from(pgOperations)
+			.where(eq(pgOperations.id, op.id))
+			.limit(1)
+
 		if (existing.length > 0) {
 			return 'duplicate'
 		}
 
 		const now = Date.now()
-		const row = this.serializeOperation(op)
+		const row = this.serializeOperation(op, now)
 
-		await this.client.unsafe('BEGIN')
-		try {
-			await this.client.unsafe(
-				`INSERT INTO operations (
-					id, node_id, type, collection, record_id, data, previous_data,
-					wall_time, logical, timestamp_node_id, sequence_number,
-					causal_deps, schema_version, received_at
-				) VALUES (
-					$1, $2, $3, $4, $5, $6, $7,
-					$8, $9, $10, $11,
-					$12, $13, $14
-				)`,
-				[
-					row.id,
-					row.nodeId,
-					row.type,
-					row.collection,
-					row.recordId,
-					row.data,
-					row.previousData,
-					row.wallTime,
-					row.logical,
-					row.timestampNodeId,
-					row.sequenceNumber,
-					row.causalDeps,
-					row.schemaVersion,
-					now,
-				],
-			)
+		await this.db.transaction(async (tx) => {
+			// Insert operation with dedup
+			await tx
+				.insert(pgOperations)
+				.values(row)
+				.onConflictDoNothing({ target: pgOperations.id })
 
-			await this.client.unsafe(
-				`INSERT INTO sync_state (node_id, max_sequence_number, last_seen_at)
-				 VALUES ($1, $2, $3)
-				 ON CONFLICT (node_id)
-				 DO UPDATE SET
-					max_sequence_number = GREATEST(sync_state.max_sequence_number, EXCLUDED.max_sequence_number),
-					last_seen_at = EXCLUDED.last_seen_at`,
-				[op.nodeId, op.sequenceNumber, now],
-			)
+			// Upsert version vector: advance max sequence number with GREATEST
+			await tx
+				.insert(pgSyncState)
+				.values({
+					nodeId: op.nodeId,
+					maxSequenceNumber: op.sequenceNumber,
+					lastSeenAt: now,
+				})
+				.onConflictDoUpdate({
+					target: pgSyncState.nodeId,
+					set: {
+						maxSequenceNumber: sql`GREATEST(${pgSyncState.maxSequenceNumber}, ${op.sequenceNumber})`,
+						lastSeenAt: sql`${now}`,
+					},
+				})
+		})
 
-			await this.client.unsafe('COMMIT')
-		} catch (error) {
-			await this.client.unsafe('ROLLBACK')
-			throw error
-		}
-
+		// Update in-memory version vector cache
 		const currentMax = this.versionVector.get(op.nodeId) ?? 0
 		if (op.sequenceNumber > currentMax) {
 			this.versionVector.set(op.nodeId, op.sequenceNumber)
@@ -122,26 +88,16 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const rows = await this.client.unsafe<OperationRow[]>(
-			`SELECT
-				id,
-				node_id,
-				type,
-				collection,
-				record_id,
-				data,
-				previous_data,
-				wall_time,
-				logical,
-				timestamp_node_id,
-				sequence_number,
-				causal_deps,
-				schema_version
-			 FROM operations
-			 WHERE node_id = $1 AND sequence_number BETWEEN $2 AND $3
-			 ORDER BY sequence_number ASC`,
-			[nodeId, fromSeq, toSeq],
-		)
+		const rows = await this.db
+			.select()
+			.from(pgOperations)
+			.where(
+				and(
+					eq(pgOperations.nodeId, nodeId),
+					between(pgOperations.sequenceNumber, fromSeq, toSeq),
+				),
+			)
+			.orderBy(asc(pgOperations.sequenceNumber))
 
 		return rows.map((row) => this.deserializeOperation(row))
 	}
@@ -150,34 +106,36 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const rows = await this.client.unsafe<{ count: number | string }[]>(
-			'SELECT COUNT(*)::int AS count FROM operations',
-		)
-		const value = rows[0]?.count ?? 0
-		return typeof value === 'string' ? Number(value) : value
+		const result = await this.db.select({ value: count() }).from(pgOperations)
+		return result[0]?.value ?? 0
 	}
 
 	async close(): Promise<void> {
 		this.closed = true
-		if (this.client.end) {
-			await this.client.end()
-		}
 	}
 
 	private async initialize(): Promise<void> {
 		await this.ensureTables()
 
-		const rows = await this.client.unsafe<{ node_id: string; max_sequence_number: number }[]>(
-			'SELECT node_id, max_sequence_number FROM sync_state',
-		)
+		// Hydrate in-memory version vector cache via Drizzle query
+		const rows = await this.db
+			.select({
+				nodeId: pgSyncState.nodeId,
+				maxSequenceNumber: pgSyncState.maxSequenceNumber,
+			})
+			.from(pgSyncState)
 
 		for (const row of rows) {
-			this.versionVector.set(row.node_id, row.max_sequence_number)
+			this.versionVector.set(row.nodeId, row.maxSequenceNumber)
 		}
 	}
 
+	/**
+	 * Create tables if they don't exist.
+	 * Uses raw SQL via Drizzle's sql template — standard DDL practice without drizzle-kit.
+	 */
 	private async ensureTables(): Promise<void> {
-		await this.client.unsafe(`
+		await this.db.execute(sql`
 			CREATE TABLE IF NOT EXISTS operations (
 				id TEXT PRIMARY KEY,
 				node_id TEXT NOT NULL,
@@ -196,13 +154,17 @@ export class PostgresServerStore implements ServerStore {
 			)
 		`)
 
-		await this.client.unsafe(
-			'CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)',
+		await this.db.execute(
+			sql`CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)`,
 		)
-		await this.client.unsafe('CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)')
-		await this.client.unsafe('CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)')
+		await this.db.execute(
+			sql`CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)`,
+		)
+		await this.db.execute(
+			sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`,
+		)
 
-		await this.client.unsafe(`
+		await this.db.execute(sql`
 			CREATE TABLE IF NOT EXISTS sync_state (
 				node_id TEXT PRIMARY KEY,
 				max_sequence_number INTEGER NOT NULL,
@@ -211,21 +173,10 @@ export class PostgresServerStore implements ServerStore {
 		`)
 	}
 
-	private serializeOperation(op: Operation): {
-		id: string
-		nodeId: string
-		type: string
-		collection: string
-		recordId: string
-		data: string | null
-		previousData: string | null
-		wallTime: number
-		logical: number
-		timestampNodeId: string
-		sequenceNumber: number
-		causalDeps: string
-		schemaVersion: number
-	} {
+	private serializeOperation(
+		op: Operation,
+		receivedAt: number,
+	): typeof pgOperations.$inferInsert {
 		return {
 			id: op.id,
 			nodeId: op.nodeId,
@@ -240,26 +191,27 @@ export class PostgresServerStore implements ServerStore {
 			sequenceNumber: op.sequenceNumber,
 			causalDeps: JSON.stringify(op.causalDeps),
 			schemaVersion: op.schemaVersion,
+			receivedAt,
 		}
 	}
 
-	private deserializeOperation(row: OperationRow): Operation {
+	private deserializeOperation(row: typeof pgOperations.$inferSelect): Operation {
 		return {
 			id: row.id,
-			nodeId: row.node_id,
+			nodeId: row.nodeId,
 			type: row.type as Operation['type'],
 			collection: row.collection,
-			recordId: row.record_id,
+			recordId: row.recordId,
 			data: row.data !== null ? JSON.parse(row.data) : null,
-			previousData: row.previous_data !== null ? JSON.parse(row.previous_data) : null,
+			previousData: row.previousData !== null ? JSON.parse(row.previousData) : null,
 			timestamp: {
-				wallTime: row.wall_time,
+				wallTime: row.wallTime,
 				logical: row.logical,
-				nodeId: row.timestamp_node_id,
+				nodeId: row.timestampNodeId,
 			},
-			sequenceNumber: row.sequence_number,
-			causalDeps: JSON.parse(row.causal_deps),
-			schemaVersion: row.schema_version,
+			sequenceNumber: row.sequenceNumber,
+			causalDeps: JSON.parse(row.causalDeps),
+			schemaVersion: row.schemaVersion,
 		}
 	}
 
@@ -274,28 +226,38 @@ export class PostgresServerStore implements ServerStore {
  * Creates a PostgresServerStore from a PostgreSQL connection string.
  *
  * Uses runtime dynamic imports so projects that do not use PostgreSQL
- * do not need to install `postgres`.
+ * do not need to install `postgres`. Wraps the postgres client with
+ * Drizzle ORM for typed query building.
  */
 export async function createPostgresServerStore(options: {
 	connectionString: string
 	nodeId?: string
 }): Promise<PostgresServerStore> {
-	const postgresModule = await loadPostgresModule()
-	const postgresClient = postgresModule.default(options.connectionString)
+	const { postgresClient, drizzleFn } = await loadPostgresDeps()
+	const client = postgresClient(options.connectionString)
+	const db = drizzleFn(client)
 
-	return new PostgresServerStore(postgresClient, options.nodeId)
+	return new PostgresServerStore(db, options.nodeId)
 }
 
-async function loadPostgresModule(): Promise<{ default: (connectionString: string) => PostgresClient }> {
+async function loadPostgresDeps(): Promise<{
+	postgresClient: (connectionString: string) => unknown
+	drizzleFn: (client: unknown) => PostgresJsDatabase
+}> {
 	try {
 		const dynamicImport = new Function('specifier', 'return import(specifier)') as (
 			specifier: string,
 		) => Promise<unknown>
-		const mod = await dynamicImport('postgres')
-		if (typeof mod === 'object' && mod !== null && 'default' in mod) {
-			return mod as { default: (connectionString: string) => PostgresClient }
+
+		const postgresMod = (await dynamicImport('postgres')) as { default: (cs: string) => unknown }
+		const drizzleMod = (await dynamicImport('drizzle-orm/postgres-js')) as {
+			drizzle: (client: unknown) => PostgresJsDatabase
 		}
-		throw new Error('Invalid postgres module shape')
+
+		return {
+			postgresClient: postgresMod.default,
+			drizzleFn: drizzleMod.drizzle,
+		}
 	} catch {
 		throw new Error(
 			'PostgreSQL backend requires the "postgres" package. Install it in your project dependencies.',

@@ -20,7 +20,7 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node ./scripts/build-extension-assets.mjs",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -6,9 +6,10 @@ import type {
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	SyncMessage,
+	WireFormat,
 } from '../protocol/messages'
 import {
-	JsonMessageSerializer,
+	NegotiatedMessageSerializer,
 	versionVectorToWire,
 	wireToVersionVector,
 } from '../protocol/serializer'
@@ -89,7 +90,7 @@ export class SyncEngine {
 		this.transport = options.transport
 		this.store = options.store
 		this.config = options.config
-		this.serializer = options.serializer ?? new JsonMessageSerializer()
+		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
 
@@ -131,6 +132,7 @@ export class SyncEngine {
 				versionVector: versionVectorToWire(localVector),
 				schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 				authToken,
+				supportedWireFormats: ['json', 'protobuf'],
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -248,6 +250,11 @@ export class SyncEngine {
 		}
 
 		this.remoteVector = wireToVersionVector(msg.versionVector)
+
+		if (msg.selectedWireFormat) {
+			this.setSerializerWireFormat(msg.selectedWireFormat)
+		}
+
 		this.emitter?.emit({ type: 'sync:connected', nodeId: this.store.getNodeId() })
 
 		this.transitionTo('syncing')
@@ -450,5 +457,11 @@ export class SyncEngine {
 			})
 		}
 		this.state = newState
+	}
+
+	private setSerializerWireFormat(format: WireFormat): void {
+		if (typeof this.serializer.setWireFormat === 'function') {
+			this.serializer.setWireFormat(format)
+		}
 	}
 }

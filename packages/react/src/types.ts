@@ -1,6 +1,7 @@
 import type { Store } from '@kora/store'
 import type { SyncEngine } from '@kora/sync'
 import type { ReactNode } from 'react'
+import type * as Y from 'yjs'
 
 /**
  * A Kora application instance returned by createApp().
@@ -66,4 +67,26 @@ export interface UseMutationResult<TData, TArgs extends unknown[]> {
 	error: Error | null
 	/** Reset isLoading and error state */
 	reset: () => void
+}
+
+/**
+ * Result from the useRichText hook.
+ */
+export interface UseRichTextResult {
+	/** Shared Yjs document backing this field. */
+	doc: Y.Doc
+	/** Y.Text instance to bind to editor integrations. */
+	text: Y.Text
+	/** Undo local changes made to this richtext field. */
+	undo: () => void
+	/** Redo previously undone local changes. */
+	redo: () => void
+	/** True when undo can be applied. */
+	canUndo: boolean
+	/** True when redo can be applied. */
+	canRedo: boolean
+	/** True once the record field has been loaded into the Y.Doc. */
+	ready: boolean
+	/** Last hook error (load/persist), if any. */
+	error: Error | null
 }

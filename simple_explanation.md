@@ -173,3 +173,183 @@ so if i am building a platform, will i be able to also have a cloud database? an
   5. (Optional) your main cloud DB for analytics, reporting, admin, billing, etc.
 
   So yes — you can absolutely build a real web platform with domain access, cloud backend, auth, and shared identity across devices.
+
+
+
+  What Kora Is (The Big Picture)                                                             
+                                                                                                
+  Think of Kora like a personal assistant that sits between your app and your data. Its job is
+  to make sure your app works even when there's no internet — and when the internet comes back,
+  it quietly syncs everything up across all your devices without you (the developer) having to
+  write any of that complicated code yourself.
+
+  ---
+  What's Built and Working Today (Phases 1–4, 6–7)
+
+  The Foundation (Core) — Done
+
+  The "brain" of the system is fully built. This includes:
+  - A smart clock that keeps track of "what happened when" across multiple devices, even if
+  their clocks disagree
+  - A unique ID system so every piece of data and every change gets a fingerprint that can never
+   collide
+  - A schema system — a way for developers to describe their data (like "a todo has a title and
+  a completed flag") and get automatic type-checking in their code editor
+  - An operation system — every time data changes, that change is recorded as an immutable
+  "receipt" that can never be altered
+
+  Saving Data in the Browser (Store) — Done
+
+  Your app can save data locally in the browser using:
+  - SQLite in the browser (the primary, high-performance option using cutting-edge web tech
+  called OPFS)
+  - IndexedDB (a backup option for older browsers)
+  - SQLite on the server (for Node.js environments)
+
+  Data survives page refreshes. Queries are reactive — meaning if data changes, any part of your
+   UI watching that data gets updated automatically.
+
+  Conflict Resolution (Merge) — Done
+
+  When two people edit the same data offline and then sync, the system resolves conflicts
+  automatically using a three-tier approach:
+  1. Auto-merge — simple "last write wins" for most fields, smart set-union for arrays
+  2. Constraint checks — rules like "only one person can book this slot" are enforced after
+  merging
+  3. Custom resolvers — for special cases (like inventory counts), developers can write their
+  own merge logic
+
+  Syncing Data Between Devices (Sync) — Done
+
+  The protocol for sending changes between clients and a server is fully built:
+  - Clients exchange only the changes the other side is missing (efficient)
+  - If the connection drops mid-sync, it picks up where it left off (resumable)
+  - There's even a "chaos transport" for testing what happens when messages get lost,
+  duplicated, or arrive out of order
+
+  The Server (Server) — Done
+
+  A self-hosted sync server that:
+  - Stores data in Memory (for dev), SQLite (for simple deployments), or PostgreSQL (for
+  production)
+  - Handles authentication (token-based)
+  - Filters data so each user only sees what they're allowed to see (scope filtering)
+  - Relays changes from one client to all other connected clients
+
+  React Integration (React) — Done
+
+  React developers get hooks like:
+  - useQuery() — automatically re-renders your component when data changes
+  - useMutation() — fire-and-forget data writes
+  - useSyncStatus() — shows whether you're online, syncing, or offline
+
+  Developer Tooling Backbone (DevTools) — Partially Done
+
+  The behind-the-scenes plumbing is built: every operation, merge decision, and sync event is
+  tracked and can be forwarded to a debugging panel. But the actual visual panel you'd see in
+  Chrome DevTools doesn't exist yet.
+
+  CLI Tools (CLI) — Done
+
+  - kora create — scaffolds a new project from templates
+  - kora dev — starts your app + sync server + file watcher in one command
+  - kora generate types — generates TypeScript types from your schema
+  - kora migrate — detects schema changes, generates migration files, and applies them
+
+  The Main Entry Point (Meta-Package) — Done
+
+  import { createApp, defineSchema, t } from 'kora' works. It wires everything together
+  automatically.
+
+  ---
+  What's NOT Built Yet (Phases 5, 8, 9, 10)
+
+  Phase 5: Rich Text Collaboration — Not Started
+
+  If two people are editing the same document (like Google Docs), you need character-level
+  merging. The t.richtext() field type exists in the schema system, but the actual Yjs CRDT
+  integration that would power real-time collaborative text editing is not implemented. Right
+  now, rich text fields would just use "last write wins" which means one person's edits would
+  overwrite the other's.
+
+  Phase 8: DevTools Browser Extension UI — Not Started
+
+  All the data collection and event tracking is working behind the scenes, but there's no visual
+   interface yet. The plan is a Chrome/Firefox extension with:
+  - A timeline showing every operation and sync event
+  - A conflict inspector showing every merge decision
+  - A searchable operation log with time-travel debugging
+  - A network status panel
+
+  None of these UI panels exist yet.
+
+  Phase 9: Protocol & Performance Hardening — Not Started
+
+  Three things are missing here:
+  1. Protobuf wire format — Currently sync uses JSON (readable but bulky). Switching to Protocol
+   Buffers would cut bandwidth by 40–60%.
+  2. HTTP fallback transport — Currently only WebSocket works. Some corporate networks block
+  WebSockets, so an HTTP long-polling fallback is needed.
+  3. CI-enforced benchmarks — Performance targets exist on paper but aren't being automatically
+  measured and enforced in the build pipeline.
+  4. Chaos test suite in CI — The chaos transport exists, but the full 10-client convergence
+  stress test isn't running automatically.
+
+  Phase 10: Launch Readiness — Not Started
+
+  The "last mile" for public release:
+  1. End-to-end tests — Automated browser tests (using Playwright) that verify the full flow:
+  open two browser tabs, edit in one, see changes in the other, go offline, come back, etc.
+  2. Documentation site — No docs website, getting-started guide, or API reference yet.
+  3. Publish pipeline — No automated npm publishing, versioning, or release automation.
+
+  ---
+  Smaller Gaps Worth Noting
+
+  - Relational queries (app.todos.include('project')) — described in the design docs but not
+  implemented
+  - Full type inference — The schema system generates types, but app.todos.insert({...}) doesn't
+   fully type-check field names in your editor yet (it uses generic Record<string, unknown>
+  internally)
+  - Drizzle ORM — The server stores use raw SQL instead of Drizzle, even though Drizzle was
+  specified in the tech stack
+
+  ---
+  Summary Scorecard
+
+  ┌──────────────────────────────────────┬─────────────┐
+  │                 Area                 │   Status    │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Core data types, clocks, schema      │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Local browser storage                │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Conflict resolution engine           │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Sync protocol & engine               │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Sync server (Memory/SQLite/Postgres) │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ React hooks                          │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ CLI (create/dev/migrate/generate)    │ Done        │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Rich text (collaborative editing)    │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ DevTools visual UI                   │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Protobuf + HTTP transport            │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Performance benchmarks in CI         │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ End-to-end browser tests             │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ Documentation website                │ Not started │
+  ├──────────────────────────────────────┼─────────────┤
+  │ npm publish automation               │ Not started │
+  └──────────────────────────────────────┴─────────────┘
+
+  Bottom line: The core engine is solid — you can build an offline-first app that saves data
+  locally, syncs across devices, and resolves conflicts automatically. What's missing is the
+  polish layer: collaborative text editing, visual debugging tools, production-grade wire
+  format, docs, and release automation.

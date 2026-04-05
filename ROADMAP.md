@@ -10,17 +10,17 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 |---------|-------|--------|
 | @kora/core | 209 | Complete — HLC, operations, schema, version vectors, events |
 | @kora/store | 198 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback |
-| @kora/merge | 93 | Three-tier merge working. Yjs richtext integration deferred |
+| @kora/merge | 93 | Three-tier merge working, including Yjs richtext CRDT merge strategy |
 | @kora/sync | 170 | Engine, transports, protocol complete. JSON wire format |
 | @kora/server | 112 | Memory + SQLite + PostgreSQL stores; server-side scope filtering enforced |
 | @kora/react | 56 | Hooks + query-store integration complete |
-| @kora/devtools | 46 | Instrumentation and event capture complete. No browser UI extension yet |
-| @kora/cli | 109 | `kora dev` implemented; `kora migrate` core diff/generate/apply workflow shipped |
+| @kora/devtools | 46 | Instrumentation backend + browser DevTools extension UI complete |
+| @kora/cli | 109 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
 | kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped |
 
-**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, and server-side scope filtering is active.
+**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution.
 
-**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
+**What does not work today:** Remaining major gaps are protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
 
 ## Current Phase Status
 
@@ -30,11 +30,11 @@ Core platform packages and meta-package are implemented, with **1033 tests passi
 | 2 | Complete | `createApp` + meta-package shipped with pre-`ready` query semantics aligned and tested |
 | 3 | Complete | Persistent server stores implemented (SQLite + PostgreSQL), production-ready baseline |
 | 4 | Complete | `kora dev` orchestration + `kora.config.ts` support shipped |
-| 5 | Not started | Richtext still intentionally deferred |
-| 6 | In progress | Server-side scope filtering implemented; SQL pushdown/compilation remains future optimization |
+| 5 | Complete | Richtext fields merge with Yjs CRDTs, serialize as binary updates, and expose React hook bindings with undo/redo |
+| 6 | Complete | Server-side scope filtering enforced for delta, relay, and inbound operation paths |
 | 7 | Complete | `kora migrate` supports diff/generate/apply with breaking-change confirmation and idempotent ordered execution |
-| 8 | Not started | Backend instrumentation exists; browser extension UI not built |
-| 9 | Not started | JSON protocol remains default; benchmarks not CI-gated |
+| 8 | Complete | DevTools extension routes instrumented events into a multi-panel browser UI in real time |
+| 9 | In progress | Protobuf wire serializer + negotiation landed; HTTP fallback and benchmark gates remain |
 | 10 | Not started | E2E/docs/publish automation still pending |
 
 ---
@@ -352,11 +352,21 @@ export default defineConfig({
 
 ## Phase 5: Yjs Rich Text Integration
 
-**Status:** Not started
+**Status:** Complete
 
 **Goal:** `t.richtext()` fields merge at the character level using Yjs CRDTs, not LWW.
 
-**Why fifth:** Rich text is a headline feature of offline-first apps (collaborative documents, notes, comments). The merge engine currently throws on richtext fields. This phase makes them work.
+**Why fifth:** Rich text is a headline feature of offline-first apps (collaborative documents, notes, comments). Phase 5 moves richtext from basic support into fully polished editor/sync workflows.
+
+### Implemented
+
+- Yjs-backed richtext merge strategy (`crdt-text`) in `@kora/merge`
+- Richtext serialization helpers for string/Uint8Array/Buffer handling in `@kora/store`
+- Initial `useRichText(collection, recordId, field)` hook in `@kora/react` with persistence wiring
+- Undo/redo controls exposed through `useRichText` via Yjs `UndoManager`
+- Incremental Yjs update tracking with periodic in-memory compaction before persistence
+- Focused tests for strategy merge behavior, serializer correctness, and hook load/persist flow
+- Merge engine integration coverage now includes conflicting richtext-field scenarios
 
 ### 5a. Yjs Field Merger
 
@@ -435,22 +445,24 @@ const app = createApp({
 - Scope evaluation is cached per session — re-evaluated on reconnect or explicit scope change
 
 **Implementation:**
-- Scope predicates compile to SQL WHERE clauses on the server store
-- The server maintains a scope cache per client session
-- When a new operation arrives, the server evaluates it against all connected clients' scopes and pushes to matching clients only
+- Scope predicates are enforced from auth context for each client session
+- Delta sync payloads are filtered before they are sent to clients
+- Relayed operations are filtered against each session's scope map
+- Inbound out-of-scope operations are dropped before persistence/relay
 - Scope changes (e.g., user role changes) require a re-handshake
 
 **Files:**
 ```
-packages/sync/src/scopes/
-  scope-evaluator.ts
-  scope-evaluator.test.ts
-  scope-compiler.ts                # Converts scope predicates to SQL
-  scope-compiler.test.ts
+packages/sync/src/
+  types.ts                         # Client-side scope function typing
 
 packages/server/src/scopes/
   server-scope-filter.ts
   server-scope-filter.test.ts
+
+packages/server/src/session/
+  client-session.ts                # Scope enforcement for delta/relay/inbound flows
+  client-session.test.ts
 ```
 
 **Deliverable:** After Phase 6, multi-tenant applications can use Kora with proper data isolation. Each user only sees and syncs their own data.
@@ -537,13 +549,21 @@ packages/cli/src/commands/migrate/
 
 ## Phase 8: DevTools Browser Extension
 
-**Status:** Not started
+**Status:** Complete
 
 **Goal:** A Chrome/Firefox DevTools panel that visualizes sync, merges, operations, and connection state in real time.
 
 **Why eighth:** The instrumentation backend exists (Phase 0 — already built). This phase builds the visual layer. It's last because the framework is fully functional without it, but the developer experience is significantly better with it.
 
-### 8a. DevTools UI (Preact + HTM)
+### Implemented
+
+- Extension routing pipeline from page `window.postMessage` events → content script → background router → DevTools panel
+- Panel-state model builder for timeline/conflicts/operations/network views
+- DevTools panel renderer with live updates across all core event categories
+- Extension scaffold files (`manifest.json`, background/content/devtools scripts, panel host HTML)
+- Unit/integration coverage for panel-state derivation and per-tab port routing behavior
+
+### 8a. DevTools UI
 
 **Panels (as specified in CLAUDE.md):**
 
@@ -556,23 +576,24 @@ packages/cli/src/commands/migrate/
 4. **Network Status** — Real-time connection quality indicator. Pending operation count with progress bar. Bandwidth graph (operations/second in and out). Last sync timestamp. Version vector visualization.
 
 **Architecture:**
-- Preact + HTM for zero-build UI (no bundler needed in the extension)
+- Lightweight module-based panel UI rendered from derived event state
 - `MessageBridge` (already built in @kora/devtools) connects page context to extension panel
 - Extension manifest v3 (Chrome) with content script injection
 - Event stream from `Instrumenter` → `MessageBridge` → DevTools panel
-- Panel state management: local Preact state, no external state library
+- Panel state management: local in-panel event state, no external state library
 
 **Files:**
 ```
 packages/devtools/src/
   ui/
-    panel.tsx                      # Main DevTools panel
-    timeline/                      # Sync timeline components
-    conflicts/                     # Conflict inspector components
-    operations/                    # Operation log components
-    network/                       # Network status components
-    shared/                        # Common UI components
+    panel.ts                       # Main DevTools panel renderer
+    panel-state.ts                 # Timeline/conflict/operation/network model builder
+    panel-state.test.ts
   extension/
+    devtools.ts                    # Registers the DevTools panel
+    panel.ts                       # Panel runtime wiring
+    port-router.ts                 # Background per-tab routing logic
+    port-router.test.ts
     manifest.json                  # Chrome extension manifest v3
     content-script.ts              # Injects bridge into page
     devtools-page.html             # DevTools panel host
@@ -585,9 +606,16 @@ packages/devtools/src/
 
 ## Phase 9: Protocol and Performance Hardening
 
-**Status:** Not started
+**Status:** In progress
 
 **Goal:** Production-grade wire format and validated performance targets.
+
+### Implemented so far
+
+- Protobuf message serializer in `@kora/sync` (`ProtobufMessageSerializer`) with operation/message roundtrip coverage
+- Runtime wire-format negotiation (`json` / `protobuf`) via handshake `supportedWireFormats` and `selectedWireFormat`
+- Negotiated serializer support in sync engine and server sessions, with JSON compatibility fallback
+- WebSocket client/server transports updated to send/receive string or binary payloads
 
 ### 9a. Protobuf Wire Format
 
@@ -678,11 +706,11 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 | **2** | `createApp` factory + meta-package | Complete |
 | **3** | Server persistence | Complete |
 | **4** | `kora dev` command | Complete |
-| **5** | Yjs richtext merge | Not started |
-| **6** | Sync scopes | In progress |
+| **5** | Yjs richtext merge | Complete |
+| **6** | Sync scopes | Complete |
 | **7** | `kora migrate` command | Complete |
-| **8** | DevTools browser extension | Not started |
-| **9** | Protobuf, HTTP transport, benchmarks | Not started |
+| **8** | DevTools browser extension | Complete |
+| **9** | Protobuf, HTTP transport, benchmarks | In progress |
 | **10** | E2E tests, docs, publish | Not started |
 
-**Updated critical path:** finish Phase 5 richtext, then Phase 8+ launch hardening.
+**Updated critical path:** Phase 9+ launch hardening.

@@ -13,6 +13,7 @@ export type {
 // === Strategies ===
 export { lastWriteWins, type LWWResult } from './strategies/lww'
 export { addWinsSet } from './strategies/add-wins-set'
+export { mergeRichtext, richtextToString, stringToRichtextUpdate } from './strategies/yjs-richtext'
 
 // === Field Merger ===
 export { mergeField } from './engine/field-merger'

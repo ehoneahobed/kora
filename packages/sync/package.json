@@ -42,7 +42,8 @@
   },
   "dependencies": {
     "@kora/core": "workspace:*",
-    "@kora/merge": "workspace:*"
+    "@kora/merge": "workspace:*",
+    "protobufjs": "^8.0.1"
   },
   "devDependencies": {
     "@fast-check/vitest": "0.2.0",

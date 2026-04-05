@@ -310,6 +310,52 @@ describe('SyncEngine handshake', () => {
 		expect(firstMsg?.nodeId).toBe('node-a')
 		expect(firstMsg?.versionVector).toEqual({ 'node-a': 5, 'node-b': 3 })
 		expect(firstMsg?.schemaVersion).toBe(2)
+		expect(firstMsg?.supportedWireFormats).toEqual(['json', 'protobuf'])
+	})
+
+	test('negotiates selected wire format from handshake response', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const serverMsgs: HandshakeMessage[] = []
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				serverMsgs.push(msg as HandshakeMessage)
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+					selectedWireFormat: 'protobuf',
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: 'ack',
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(serverMsgs[0]?.supportedWireFormats).toContain('protobuf')
 	})
 
 	test('sends auth token when auth is provided', async () => {

@@ -40,3 +40,9 @@ export { SubscriptionManager } from './subscription/subscription-manager'
 
 // === Collection ===
 export { Collection } from './collection/collection'
+
+// === Richtext Serialization ===
+export { decodeRichtext, encodeRichtext, richtextToPlainText } from './serialization/richtext-serializer'
+
+// === Query Utilities ===
+export { pluralize, singularize } from './query/pluralize'

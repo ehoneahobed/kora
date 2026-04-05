@@ -1,7 +1,11 @@
 import { SyncError } from '@kora/core'
 import { describe, expect, test, vi } from 'vitest'
 import type { HandshakeMessage, SyncMessage } from '../protocol/messages'
-import { JsonMessageSerializer } from '../protocol/serializer'
+import {
+	JsonMessageSerializer,
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
+} from '../protocol/serializer'
 import type { WebSocketConstructor, WebSocketLike } from './websocket-transport'
 import { WebSocketTransport } from './websocket-transport'
 
@@ -16,7 +20,7 @@ class MockWebSocket implements WebSocketLike {
 	onerror: ((event: unknown) => void) | null = null
 
 	readonly url: string
-	readonly sentData: string[] = []
+	readonly sentData: Array<string | Uint8Array> = []
 
 	constructor(url: string) {
 		this.url = url
@@ -29,7 +33,7 @@ class MockWebSocket implements WebSocketLike {
 		})
 	}
 
-	send(data: string): void {
+	send(data: string | Uint8Array): void {
 		this.sentData.push(data)
 	}
 
@@ -39,7 +43,7 @@ class MockWebSocket implements WebSocketLike {
 
 	// --- Test helpers ---
 
-	simulateMessage(data: string): void {
+	simulateMessage(data: unknown): void {
 		this.onmessage?.({ data })
 	}
 
@@ -146,7 +150,7 @@ describe('WebSocketTransport', () => {
 			expect(ws?.sentData).toHaveLength(1)
 			const sentData = ws?.sentData[0]
 			expect(sentData).toBeDefined()
-			const parsed = JSON.parse(sentData ?? '{}')
+			const parsed = JSON.parse(String(sentData ?? '{}'))
 			expect(parsed.type).toBe('handshake')
 			expect(parsed.nodeId).toBe('node-1')
 		})
@@ -188,6 +192,40 @@ describe('WebSocketTransport', () => {
 			expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'handshake-response' }))
 		})
 
+		test('sends and receives protobuf payloads when serializer is negotiated', async () => {
+			const { factory, lastInstance } = createMockWSFactory()
+			const serializer = new NegotiatedMessageSerializer('protobuf')
+			const transport = new WebSocketTransport({ WebSocketImpl: factory, serializer })
+			const handler = vi.fn()
+			transport.onMessage(handler)
+
+			await transport.connect('ws://test')
+
+			const outgoing: HandshakeMessage = {
+				type: 'handshake',
+				messageId: 'msg-1',
+				nodeId: 'node-1',
+				versionVector: {},
+				schemaVersion: 1,
+			}
+			transport.send(outgoing)
+
+			expect(lastInstance()?.sentData[0]).toBeInstanceOf(Uint8Array)
+
+			const incoming: SyncMessage = {
+				type: 'handshake-response',
+				messageId: 'resp-1',
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			}
+			const bytes = new ProtobufMessageSerializer().encode(incoming)
+			lastInstance()?.simulateMessage(bytes)
+
+			expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'handshake-response' }))
+		})
+
 		test('calls error handler on malformed incoming message', async () => {
 			const { factory, lastInstance } = createMockWSFactory()
 			const transport = new WebSocketTransport({ WebSocketImpl: factory })
@@ -203,15 +241,15 @@ describe('WebSocketTransport', () => {
 			expect(firstCall?.[0]).toBeInstanceOf(SyncError)
 		})
 
-		test('ignores non-string message data', async () => {
+		test('ignores unsupported incoming message data', async () => {
 			const { factory, lastInstance } = createMockWSFactory()
 			const transport = new WebSocketTransport({ WebSocketImpl: factory })
 			const handler = vi.fn()
 			transport.onMessage(handler)
 
 			await transport.connect('ws://test')
-			// Simulate binary data
-			lastInstance()?.onmessage?.({ data: new ArrayBuffer(10) })
+			// Simulate unsupported payload
+			lastInstance()?.onmessage?.({ data: 123 as unknown })
 
 			expect(handler).not.toHaveBeenCalled()
 		})

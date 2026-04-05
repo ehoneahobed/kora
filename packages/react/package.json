@@ -18,7 +18,9 @@
       }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -39,7 +41,8 @@
   "dependencies": {
     "@kora/core": "workspace:*",
     "@kora/store": "workspace:*",
-    "@kora/sync": "workspace:*"
+    "@kora/sync": "workspace:*",
+    "yjs": "^13.6.30"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.0.0",

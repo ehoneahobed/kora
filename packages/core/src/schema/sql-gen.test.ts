@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest'
 import { FULL_SCHEMA, MINIMAL_SCHEMA } from '../../tests/fixtures/schemas'
 import { defineSchema } from './define'
 import { generateFullDDL, generateSQL } from './sql-gen'
+import { t } from './types'
 
 describe('generateSQL', () => {
 	test('generates CREATE TABLE for minimal collection', () => {
@@ -71,6 +72,66 @@ describe('generateSQL', () => {
 		expect(opsTable).toContain('record_id TEXT NOT NULL')
 		expect(opsTable).toContain('sequence_number INTEGER NOT NULL')
 		expect(opsTable).toContain('causal_deps TEXT NOT NULL')
+	})
+
+	test('adds REFERENCES for FK fields when relations provided', () => {
+		const schema = defineSchema(FULL_SCHEMA)
+		const todos = schema.collections.todos
+		if (!todos) return
+		const stmts = generateSQL('todos', todos, schema.relations)
+		const createTable = stmts[0] ?? ''
+
+		expect(createTable).toContain('project_id TEXT REFERENCES projects(id)')
+	})
+
+	test('auto-creates index on FK field not already indexed', () => {
+		const schema = defineSchema(FULL_SCHEMA)
+		const todos = schema.collections.todos
+		if (!todos) return
+		const stmts = generateSQL('todos', todos, schema.relations)
+
+		// project_id is not in the explicit indexes array, so an auto-index should be created
+		const fkIndex = stmts.find((s) => s.includes('idx_todos_project_id'))
+		expect(fkIndex).toBeDefined()
+		expect(fkIndex).toContain('ON todos (project_id)')
+	})
+
+	test('does not duplicate index for FK field already indexed', () => {
+		// Create a schema where the FK field is also in the indexes array
+		const schemaInput = {
+			version: 1,
+			collections: {
+				tasks: {
+					fields: {
+						title: t.string(),
+						user_id: t.string(),
+					},
+					indexes: ['user_id'],
+				},
+				users: {
+					fields: {
+						name: t.string(),
+					},
+				},
+			},
+			relations: {
+				taskBelongsToUser: {
+					from: 'tasks' as const,
+					to: 'users' as const,
+					type: 'many-to-one' as const,
+					field: 'user_id',
+					onDelete: 'cascade' as const,
+				},
+			},
+		}
+		const schema = defineSchema(schemaInput)
+		const tasks = schema.collections.tasks
+		if (!tasks) return
+		const stmts = generateSQL('tasks', tasks, schema.relations)
+
+		// Count how many index statements reference user_id
+		const userIdIndexes = stmts.filter((s) => s.includes('idx_tasks_user_id'))
+		expect(userIdIndexes).toHaveLength(1) // Only the explicit one, no duplicate
 	})
 })
 

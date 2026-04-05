@@ -28,7 +28,7 @@ export interface SchemaInput {
 }
 
 export interface CollectionInput {
-	fields: Record<string, FieldBuilder>
+	fields: Record<string, FieldBuilder<any, any, any>>
 	indexes?: string[]
 	constraints?: ConstraintInput[]
 	resolve?: Record<string, CustomResolver>
@@ -81,7 +81,15 @@ export interface RelationInput {
  * })
  * ```
  */
-export function defineSchema(input: SchemaInput): SchemaDefinition {
+/**
+ * Schema definition with a phantom type brand preserving the original input shape.
+ * The `__input` property exists only at the type level for inference — no runtime cost.
+ */
+export type TypedSchemaDefinition<T extends SchemaInput = SchemaInput> = SchemaDefinition & {
+	readonly __input: T
+}
+
+export function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinition<T> {
 	validateVersion(input.version)
 
 	const collections: Record<string, CollectionDefinition> = {}
@@ -103,7 +111,7 @@ export function defineSchema(input: SchemaInput): SchemaDefinition {
 		}
 	}
 
-	return { version: input.version, collections, relations }
+	return { version: input.version, collections, relations } as TypedSchemaDefinition<T>
 }
 
 function validateVersion(version: number): void {

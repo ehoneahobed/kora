@@ -1,4 +1,4 @@
-import type { KoraEventEmitter, Operation } from '@kora/core'
+import type { KoraEventEmitter, Operation, SchemaInput } from '@kora/core'
 import { SimpleEventEmitter } from '@kora/core/internal'
 import { Instrumenter } from '@kora/devtools'
 import { MergeEngine } from '@kora/merge'
@@ -9,7 +9,7 @@ import { ConnectionMonitor, ReconnectionManager, SyncEngine, WebSocketTransport 
 import type { SyncStatusInfo } from '@kora/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
-import type { KoraApp, KoraConfig, SyncControl } from './types'
+import type { KoraApp, KoraConfig, SyncControl, TypedKoraApp, TypedKoraConfig } from './types'
 
 /**
  * Creates a new Kora application instance.
@@ -41,6 +41,16 @@ import type { KoraApp, KoraConfig, SyncControl } from './types'
  * const todo = await app.todos.insert({ title: 'Hello' })
  * ```
  */
+/**
+ * Creates a new typed Kora application instance.
+ * When the schema is created with `defineSchema()`, full type inference flows through
+ * to collection accessors, providing autocomplete and type checking for all CRUD operations.
+ */
+export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
+/**
+ * Creates a new Kora application instance (untyped fallback).
+ */
+export function createApp(config: KoraConfig): KoraApp
 export function createApp(config: KoraConfig): KoraApp {
 	const emitter: KoraEventEmitter & { clear(): void } = new SimpleEventEmitter()
 	const mergeEngine = new MergeEngine()

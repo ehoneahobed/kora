@@ -102,11 +102,19 @@ export class SubscriptionManager {
 		this.pendingCollections.clear()
 		this.flushScheduled = false
 
-		// Find affected subscriptions
+		// Find affected subscriptions (including those with related collection includes)
 		const affected: Subscription[] = []
 		for (const sub of this.subscriptions.values()) {
 			if (collections.has(sub.descriptor.collection)) {
 				affected.push(sub)
+			} else if (sub.descriptor.includeCollections) {
+				// Re-evaluate if a mutation affects an included (related) collection
+				for (const incCol of sub.descriptor.includeCollections) {
+					if (collections.has(incCol)) {
+						affected.push(sub)
+						break
+					}
+				}
 			}
 		}
 

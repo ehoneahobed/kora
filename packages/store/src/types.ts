@@ -92,6 +92,10 @@ export interface QueryDescriptor {
 	orderBy: OrderByClause[]
 	limit?: number
 	offset?: number
+	/** Relation names to include in results (for relational queries). */
+	include?: string[]
+	/** Resolved collection names for included relations (for subscription tracking). */
+	includeCollections?: string[]
 }
 
 /**

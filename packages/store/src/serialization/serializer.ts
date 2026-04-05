@@ -1,10 +1,11 @@
 import { HybridLogicalClock } from '@kora/core'
 import type { CollectionDefinition, FieldDescriptor, Operation } from '@kora/core'
 import type { CollectionRecord, OperationRow, RawCollectionRow } from '../types'
+import { decodeRichtext, encodeRichtext } from './richtext-serializer'
 
 /**
  * Serialize a JS record to SQL-compatible values for INSERT/UPDATE.
- * Transforms: boolean → 0/1, array → JSON string, richtext → kept as-is (Uint8Array).
+ * Transforms: boolean → 0/1, array → JSON string, richtext → Yjs binary update.
  *
  * @param data - The record data with JS-native types
  * @param fields - The field descriptors from the schema
@@ -123,8 +124,7 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 		case 'array':
 			return JSON.stringify(value)
 		case 'richtext':
-			// Uint8Array stored as-is (BLOB) in SQLite
-			return value
+			return encodeRichtext(value as string | Uint8Array | ArrayBuffer)
 		default:
 			return value
 	}
@@ -140,12 +140,7 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 			}
 			return value
 		case 'richtext':
-			// BLOB comes back as Buffer in Node.js — convert to Uint8Array.
-			// Buffer is not available in browsers, so guard the check.
-			if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
-				return new Uint8Array(value)
-			}
-			return value
+			return decodeRichtext(value)
 		default:
 			return value
 	}

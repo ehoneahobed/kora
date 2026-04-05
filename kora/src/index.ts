@@ -12,6 +12,9 @@ export type {
 	StoreOptions,
 	SyncControl,
 	SyncOptions,
+	TypedCollectionAccessor,
+	TypedKoraApp,
+	TypedKoraConfig,
 } from './types'
 
 // === @kora/core re-exports ===
@@ -25,7 +28,12 @@ export type {
 	ConnectionQuality,
 	Constraint,
 	FieldDescriptor,
+	FieldKindToType,
 	HLCTimestamp,
+	InferFieldType,
+	InferInsertInput,
+	InferRecord,
+	InferUpdateInput,
 	KoraEvent,
 	KoraEventEmitter,
 	KoraEventListener,
@@ -34,6 +42,8 @@ export type {
 	MergeTrace,
 	Operation,
 	SchemaDefinition,
+	SchemaInput,
+	TypedSchemaDefinition,
 	VersionVector,
 } from '@kora/core'
 
