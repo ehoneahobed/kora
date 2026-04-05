@@ -67,6 +67,27 @@ export async function findSchemaFile(projectRoot: string): Promise<string | null
 	return null
 }
 
+/**
+ * Resolves a binary from a project's local node_modules/.bin directory.
+ *
+ * @param projectRoot - The project root directory
+ * @param binaryName - Binary filename (for example: vite, tsx, kora)
+ * @returns Absolute path to the binary, or null if not found
+ */
+export async function resolveProjectBinary(
+	projectRoot: string,
+	binaryName: string,
+): Promise<string | null> {
+	const binaryPath = join(projectRoot, 'node_modules', '.bin', binaryName)
+
+	try {
+		await access(binaryPath)
+		return binaryPath
+	} catch {
+		return null
+	}
+}
+
 function isKoraProject(pkg: unknown): boolean {
 	if (typeof pkg !== 'object' || pkg === null) return false
 	const record = pkg as Record<string, unknown>

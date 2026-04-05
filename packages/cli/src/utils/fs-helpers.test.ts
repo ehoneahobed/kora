@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { createTempDir } from '../../tests/fixtures/test-helpers'
-import { directoryExists, findProjectRoot, findSchemaFile } from './fs-helpers'
+import { directoryExists, findProjectRoot, findSchemaFile, resolveProjectBinary } from './fs-helpers'
 
 describe('directoryExists', () => {
 	let tempDir: { path: string; cleanup: () => Promise<void> }
@@ -98,6 +98,32 @@ describe('findSchemaFile', () => {
 
 	test('returns null when no schema file found', async () => {
 		const result = await findSchemaFile(tempDir.path)
+		expect(result).toBeNull()
+	})
+})
+
+describe('resolveProjectBinary', () => {
+	let tempDir: { path: string; cleanup: () => Promise<void> }
+
+	beforeEach(async () => {
+		tempDir = await createTempDir()
+	})
+
+	afterEach(async () => {
+		await tempDir.cleanup()
+	})
+
+	test('finds existing binary in node_modules/.bin', async () => {
+		const binaryDir = join(tempDir.path, 'node_modules', '.bin')
+		await mkdir(binaryDir, { recursive: true })
+		await writeFile(join(binaryDir, 'vite'), '')
+
+		const result = await resolveProjectBinary(tempDir.path, 'vite')
+		expect(result).toBe(join(binaryDir, 'vite'))
+	})
+
+	test('returns null for missing binary', async () => {
+		const result = await resolveProjectBinary(tempDir.path, 'tsx')
 		expect(result).toBeNull()
 	})
 })

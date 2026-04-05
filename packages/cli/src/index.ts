@@ -8,6 +8,7 @@ export { PACKAGE_MANAGERS, TEMPLATES, TEMPLATE_INFO } from './types'
 // === Errors ===
 export {
 	CliError,
+	DevServerError,
 	InvalidProjectError,
 	ProjectExistsError,
 	SchemaNotFoundError,

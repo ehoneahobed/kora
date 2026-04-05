@@ -51,3 +51,20 @@ export class InvalidProjectError extends KoraError {
 		this.name = 'InvalidProjectError'
 	}
 }
+
+/**
+ * Thrown when a required local dev server binary cannot be found.
+ */
+export class DevServerError extends KoraError {
+	constructor(
+		public readonly binary: string,
+		public readonly searchPath: string,
+	) {
+		super(
+			`Could not find required binary "${binary}" at ${searchPath}. Install project dependencies and try again.`,
+			'DEV_SERVER_ERROR',
+			{ binary, searchPath },
+		)
+		this.name = 'DevServerError'
+	}
+}
