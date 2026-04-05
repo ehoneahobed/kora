@@ -5,5 +5,9 @@ export default defineConfig({
   plugins: [react()],
   optimizeDeps: {
     exclude: ['@sqlite.org/sqlite-wasm', '@korajs/store'],
+    include: ['yjs'],
+  },
+  resolve: {
+    dedupe: ['yjs'],
   },
 })

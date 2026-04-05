@@ -12,8 +12,8 @@ import type { FieldBuilder } from './types'
 /** Valid collection name pattern: lowercase, alphanumeric + underscore, starting with letter */
 const COLLECTION_NAME_RE = /^[a-z][a-z0-9_]*$/
 
-/** Valid field name pattern: same as collection name */
-const FIELD_NAME_RE = /^[a-z][a-z0-9_]*$/
+/** Valid field name pattern: camelCase allowed (e.g. createdAt, dueDate) */
+const FIELD_NAME_RE = /^[a-z][a-zA-Z0-9_]*$/
 
 /** Reserved field names that cannot be used in schemas */
 const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_deleted'])
@@ -194,7 +194,7 @@ function validateFieldName(collection: string, fieldName: string): void {
 	}
 	if (!FIELD_NAME_RE.test(fieldName)) {
 		throw new SchemaValidationError(
-			`Field name "${fieldName}" in collection "${collection}" is invalid. Must be lowercase, start with a letter, and contain only letters, numbers, and underscores.`,
+			`Field name "${fieldName}" in collection "${collection}" is invalid. Must start with a lowercase letter and contain only letters, numbers, and underscores.`,
 			{ collection, field: fieldName },
 		)
 	}
