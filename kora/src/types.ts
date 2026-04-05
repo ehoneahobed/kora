@@ -36,6 +36,12 @@ export interface SyncOptions {
 	batchSize?: number
 	/** Schema version of this client. */
 	schemaVersion?: number
+	/** Enable auto-reconnection on unexpected disconnect. Defaults to true. */
+	autoReconnect?: boolean
+	/** Initial reconnection delay in ms. Defaults to 1000. */
+	reconnectInterval?: number
+	/** Maximum reconnection delay in ms. Defaults to 30000. */
+	maxReconnectInterval?: number
 }
 
 /**

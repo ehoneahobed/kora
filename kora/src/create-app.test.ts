@@ -203,4 +203,96 @@ describe('createApp', () => {
 		const store = app.getStore()
 		expect(store).toBeDefined()
 	})
+
+	test('creates reconnection manager when sync configured', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: {
+				url: 'wss://localhost:9999',
+				reconnectInterval: 500,
+				maxReconnectInterval: 5000,
+			},
+		})
+		await app.ready
+
+		// Sync control should be available and not crash
+		expect(app.sync).not.toBeNull()
+		expect(app.sync?.getStatus().status).toBe('offline')
+	})
+
+	test('autoReconnect false is accepted without error', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: {
+				url: 'wss://localhost:9999',
+				autoReconnect: false,
+			},
+		})
+		await app.ready
+
+		expect(app.sync).not.toBeNull()
+	})
+
+	test('disconnect prevents auto-reconnection', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'wss://localhost:9999' },
+		})
+		await app.ready
+
+		// Disconnect sets intentional flag — should not throw
+		await app.sync?.disconnect()
+		expect(app.sync?.getStatus().status).toBe('offline')
+	})
+
+	test('devtools true wires instrumenter', async () => {
+		const events: KoraEvent[] = []
+
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			devtools: true,
+		})
+
+		// Instrumenter is wired synchronously, events still flow
+		app.events.on('operation:created', (e) => events.push(e))
+		await app.ready
+
+		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		await todos.insert({ title: 'DevTools Test' })
+
+		expect(events.length).toBe(1)
+	})
+
+	test('devtools false does not affect functionality', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			devtools: false,
+		})
+		await app.ready
+
+		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		const record = await todos.insert({ title: 'No DevTools' })
+		expect(record.title).toBe('No DevTools')
+	})
+
+	test('close cleans up reconnection and devtools resources', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'wss://localhost:9999' },
+			devtools: true,
+		})
+		await app.ready
+
+		// Close should clean up without hanging or throwing
+		await app.close()
+
+		// Second close should still be safe
+		await app.close()
+	})
 })

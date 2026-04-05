@@ -33,3 +33,8 @@ pnpm-debug.log*
 # Temp
 tmp/
 temp/
+
+# SQLite database files
+kora-db
+kora-db-*
+*.sqlite

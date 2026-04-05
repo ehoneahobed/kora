@@ -65,7 +65,7 @@ describe('create command flow', () => {
 		}
 	})
 
-	test('scaffolds react-sync project with kora.config.ts', async () => {
+	test('scaffolds react-sync project with server.ts', async () => {
 		const targetDir = join(tempDir.path, 'sync-app')
 		await scaffoldTemplate('react-sync', targetDir, {
 			projectName: 'sync-app',
@@ -74,11 +74,11 @@ describe('create command flow', () => {
 		})
 
 		const files = await readdir(targetDir)
-		expect(files).toContain('kora.config.ts')
+		expect(files).toContain('server.ts')
 
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync')
-		expect(main).toContain('ws://localhost:3001/kora')
+		expect(main).toContain('ws://localhost:3001')
 	})
 
 	test('skip-install flag prevents dependency installation', async () => {

@@ -79,7 +79,7 @@ describe('scaffoldTemplate', () => {
 		expect(srcFiles).toContain('App.tsx')
 	})
 
-	test('scaffolds react-sync template with kora.config.ts', async () => {
+	test('scaffolds react-sync template with server.ts', async () => {
 		const targetDir = join(tempDir.path, 'sync-app')
 		await scaffoldTemplate('react-sync', targetDir, {
 			projectName: 'sync-app',
@@ -88,7 +88,7 @@ describe('scaffoldTemplate', () => {
 		})
 
 		const files = await readdir(targetDir)
-		expect(files).toContain('kora.config.ts')
+		expect(files).toContain('server.ts')
 		expect(files).toContain('package.json')
 
 		// Check sync-specific content in package.json

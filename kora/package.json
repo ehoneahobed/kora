@@ -31,7 +31,8 @@
     "@kora/core": "workspace:*",
     "@kora/store": "workspace:*",
     "@kora/merge": "workspace:*",
-    "@kora/sync": "workspace:*"
+    "@kora/sync": "workspace:*",
+    "@kora/devtools": "workspace:*"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

@@ -8,9 +8,12 @@ import { App } from './App'
 const app = createApp({
   schema,
   sync: {
-    url: 'ws://localhost:3001/kora',
+    url: 'ws://localhost:3001',
   },
 })
+
+// Connect to sync server once the app is ready
+app.ready.then(() => app.sync?.connect())
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

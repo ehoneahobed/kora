@@ -1,9 +1,10 @@
 import type { KoraEventEmitter, Operation } from '@kora/core'
 import { SimpleEventEmitter } from '@kora/core/internal'
+import { Instrumenter } from '@kora/devtools'
 import { MergeEngine } from '@kora/merge'
 import { Store } from '@kora/store'
 import type { CollectionAccessor, StorageAdapter } from '@kora/store'
-import { SyncEngine, WebSocketTransport } from '@kora/sync'
+import { ConnectionMonitor, ReconnectionManager, SyncEngine, WebSocketTransport } from '@kora/sync'
 import type { SyncStatusInfo } from '@kora/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
@@ -46,12 +47,75 @@ export function createApp(config: KoraConfig): KoraApp {
 	let store: Store | null = null
 	let syncEngine: SyncEngine | null = null
 	let unsubscribeSync: (() => void) | null = null
+	let reconnectionManager: ReconnectionManager | null = null
+	let connectionMonitor: ConnectionMonitor | null = null
+	let instrumenter: Instrumenter | null = null
+	let intentionalDisconnect = false
+	let qualityInterval: ReturnType<typeof setInterval> | null = null
+
+	// Wire DevTools instrumentation immediately (emitter exists synchronously)
+	if (config.devtools) {
+		instrumenter = new Instrumenter(emitter, {
+			bridgeEnabled: typeof window !== 'undefined',
+		})
+	}
 
 	// Build the ready promise — resolves when the store is open and wired
 	const ready = initializeAsync(config, emitter, mergeEngine).then((result) => {
 		store = result.store
 		syncEngine = result.syncEngine
 		unsubscribeSync = result.unsubscribeSync
+
+		// Wire reconnection and connection quality after sync engine is ready
+		if (config.sync && syncEngine) {
+			connectionMonitor = new ConnectionMonitor()
+			reconnectionManager = new ReconnectionManager({
+				initialDelay: config.sync.reconnectInterval,
+				maxDelay: config.sync.maxReconnectInterval,
+			})
+
+			// Track activity for connection quality
+			emitter.on('sync:sent', () => connectionMonitor?.recordActivity())
+			emitter.on('sync:received', () => connectionMonitor?.recordActivity())
+			emitter.on('sync:acknowledged', () => connectionMonitor?.recordActivity())
+
+			// Emit quality on timer while connected
+			emitter.on('sync:connected', () => {
+				if (qualityInterval !== null) clearInterval(qualityInterval)
+				qualityInterval = setInterval(() => {
+					if (connectionMonitor) {
+						emitter.emit({ type: 'connection:quality', quality: connectionMonitor.getQuality() })
+					}
+				}, 5000)
+			})
+
+			// Reset monitor and clear timer on disconnect
+			emitter.on('sync:disconnected', () => {
+				connectionMonitor?.reset()
+				if (qualityInterval !== null) {
+					clearInterval(qualityInterval)
+					qualityInterval = null
+				}
+			})
+
+			// Auto-reconnect on unexpected disconnect
+			if (config.sync.autoReconnect !== false) {
+				const engine = syncEngine
+				emitter.on('sync:disconnected', () => {
+					if (intentionalDisconnect) return
+					// Guard: stop any in-progress reconnection before starting a new one
+					reconnectionManager?.stop()
+					reconnectionManager?.start(async () => {
+						try {
+							await engine.start()
+							return true
+						} catch {
+							return false
+						}
+					})
+				})
+			}
+		}
 	})
 
 	// Build sync control
@@ -60,12 +124,17 @@ export function createApp(config: KoraConfig): KoraApp {
 				async connect(): Promise<void> {
 					await ready
 					if (syncEngine) {
+						intentionalDisconnect = false
+						reconnectionManager?.stop()
+						reconnectionManager?.reset()
 						await syncEngine.start()
 					}
 				},
 				async disconnect(): Promise<void> {
 					await ready
 					if (syncEngine) {
+						intentionalDisconnect = true
+						reconnectionManager?.stop()
 						await syncEngine.stop()
 					}
 				},
@@ -94,6 +163,16 @@ export function createApp(config: KoraConfig): KoraApp {
 		},
 		async close(): Promise<void> {
 			await ready
+			intentionalDisconnect = true
+			if (qualityInterval !== null) {
+				clearInterval(qualityInterval)
+				qualityInterval = null
+			}
+			reconnectionManager?.stop()
+			if (instrumenter) {
+				instrumenter.destroy()
+				instrumenter = null
+			}
 			if (unsubscribeSync) {
 				unsubscribeSync()
 				unsubscribeSync = null

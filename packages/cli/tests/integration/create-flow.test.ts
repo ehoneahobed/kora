@@ -56,12 +56,12 @@ describe('create-kora-app flow', () => {
 		})
 
 		const files = await readdir(targetDir)
-		expect(files).toContain('kora.config.ts')
+		expect(files).toContain('server.ts')
 
 		// Verify sync config in main.tsx
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync:')
-		expect(main).toContain('ws://localhost:3001/kora')
+		expect(main).toContain('ws://localhost:3001')
 
 		// Verify @kora/server in devDependencies
 		const pkgContent = await readFile(join(targetDir, 'package.json'), 'utf-8')

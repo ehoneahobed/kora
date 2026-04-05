@@ -32,6 +32,9 @@ importers:
       '@kora/core':
         specifier: workspace:*
         version: link:../packages/core
+      '@kora/devtools':
+        specifier: workspace:*
+        version: link:../packages/devtools
       '@kora/merge':
         specifier: workspace:*
         version: link:../packages/merge
