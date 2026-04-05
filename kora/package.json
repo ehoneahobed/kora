@@ -1,6 +1,6 @@
 {
   "name": "korajs",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Kora.js — offline-first application framework",
   "type": "module",
   "main": "./dist/index.cjs",

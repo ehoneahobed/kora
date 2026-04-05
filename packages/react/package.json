@@ -1,6 +1,6 @@
 {
   "name": "@korajs/react",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Kora.js React hooks and bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",
