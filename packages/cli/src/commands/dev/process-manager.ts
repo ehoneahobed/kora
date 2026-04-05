@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn as spawnChild } from 'node:child_process'
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
 
 export interface ManagedProcessConfig {
@@ -28,9 +28,11 @@ export class ProcessManager {
 			cwd: config.cwd,
 			env: { ...process.env, ...config.env },
 			stdio: ['ignore', 'pipe', 'pipe'],
+			// On Windows, .cmd shims require shell to execute
+			shell: process.platform === 'win32',
 		}
 
-		const child = spawn(config.command, config.args, options)
+		const child = spawnChild(config.command, config.args, options)
 		let resolveExit: (() => void) | undefined
 
 		const runningProcess: RunningProcess = {

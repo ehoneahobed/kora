@@ -97,7 +97,7 @@ export const devCommand = defineCommand({
 
 		if (shouldStartSync && syncServerFile === null && managedSyncStore) {
 			const hasServerPackage = await fileExists(
-				join(projectRoot, 'node_modules', '@kora', 'server', 'package.json'),
+				join(projectRoot, 'node_modules', '@korajs', 'server', 'package.json'),
 			)
 			if (!hasServerPackage) {
 				logger.warn(

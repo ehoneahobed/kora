@@ -69,6 +69,7 @@ export async function findSchemaFile(projectRoot: string): Promise<string | null
 
 /**
  * Resolves a binary from a project's local node_modules/.bin directory.
+ * On Windows, npm creates .cmd shims instead of extensionless files.
  *
  * @param projectRoot - The project root directory
  * @param binaryName - Binary filename (for example: vite, tsx, kora)
@@ -78,14 +79,22 @@ export async function resolveProjectBinary(
 	projectRoot: string,
 	binaryName: string,
 ): Promise<string | null> {
-	const binaryPath = join(projectRoot, 'node_modules', '.bin', binaryName)
+	const binDir = join(projectRoot, 'node_modules', '.bin')
+	// On Windows, try .cmd first (npm/pnpm create .cmd shims)
+	const candidates =
+		process.platform === 'win32'
+			? [join(binDir, `${binaryName}.cmd`), join(binDir, binaryName)]
+			: [join(binDir, binaryName)]
 
-	try {
-		await access(binaryPath)
-		return binaryPath
-	} catch {
-		return null
+	for (const candidate of candidates) {
+		try {
+			await access(candidate)
+			return candidate
+		} catch {
+			// continue
+		}
 	}
+	return null
 }
 
 function isKoraProject(pkg: unknown): boolean {
