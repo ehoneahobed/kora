@@ -134,6 +134,30 @@ describe('SqliteWasmAdapter', () => {
 		})
 	})
 
+	describe('snapshot import/export', () => {
+		test('exports and imports database snapshots', async () => {
+			await adapter.execute(
+				'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+				['rec-export', 'Exported', 0, 1000, 1000],
+			)
+
+			const snapshot = await adapter.exportDatabase()
+			expect(snapshot).toBeInstanceOf(Uint8Array)
+
+			const restored = new SqliteWasmAdapter({ bridge: new MockWorkerBridge() })
+			await restored.open(minimalSchema)
+			await restored.importDatabase(snapshot)
+
+			const rows = await restored.query<{ id: string; title: string }>(
+				'SELECT id, title FROM todos WHERE id = ?',
+				['rec-export'],
+			)
+			expect(rows[0]?.title).toBe('Exported')
+
+			await restored.close()
+		})
+	})
+
 	describe('guard: operations before open', () => {
 		test('throws StoreNotOpenError on execute before open', async () => {
 			const fresh = new SqliteWasmAdapter({ bridge: new MockWorkerBridge() })

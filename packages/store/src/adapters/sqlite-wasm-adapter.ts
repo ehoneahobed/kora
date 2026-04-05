@@ -200,6 +200,17 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		return response.data as Uint8Array
 	}
 
+	/**
+	 * Import a serialized database snapshot.
+	 */
+	async importDatabase(data: Uint8Array): Promise<void> {
+		this.guardOpen()
+		const response = await this.sendRequest({ id: 0, type: 'import', data })
+		if (response.type === 'error') {
+			throw new AdapterError(`Import failed: ${response.message}`)
+		}
+	}
+
 	private guardOpen(): void {
 		if (!this.opened || !this.bridge) {
 			throw new StoreNotOpenError()

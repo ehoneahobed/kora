@@ -1,25 +1,41 @@
 # Kora.js — Implementation Roadmap
 
-> Last updated: 2026-04-04
+> Last updated: 2026-04-05
 
 ## Where We Are
 
-Eight packages built. 790+ tests passing across the monorepo.
+Core platform packages and meta-package are implemented, with **1033 tests passing** across the monorepo.
 
 | Package | Tests | Status |
 |---------|-------|--------|
-| @kora/core | 200 | Complete — HLC, operations, schema, version vectors, events |
-| @kora/store | 152 | Node.js complete (BetterSqlite3). Browser adapters not implemented. |
-| @kora/merge | 93 | Three-tier merge working. Yjs richtext integration deferred. |
-| @kora/sync | 170 | Engine, transports, protocol complete. JSON wire format. |
-| @kora/server | 82 | In-memory operation store. No persistent backend. |
-| @kora/react | 47 | All hooks complete. Concurrent-mode safe. |
-| @kora/devtools | 46 | Instrumentation and event capture complete. No UI. |
-| @kora/cli | 77 | Scaffolding and type generation complete. dev/migrate stubbed. |
+| @kora/core | 209 | Complete — HLC, operations, schema, version vectors, events |
+| @kora/store | 198 | Browser + Node adapter stack complete, including IndexedDB restore durability fallback |
+| @kora/merge | 93 | Three-tier merge working. Yjs richtext integration deferred |
+| @kora/sync | 170 | Engine, transports, protocol complete. JSON wire format |
+| @kora/server | 112 | Memory + SQLite + PostgreSQL stores; server-side scope filtering enforced |
+| @kora/react | 56 | Hooks + query-store integration complete |
+| @kora/devtools | 46 | Instrumentation and event capture complete. No browser UI extension yet |
+| @kora/cli | 103 | `kora dev` implemented with config, managed sync, schema watch; `migrate` still stubbed |
+| kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped |
 
-**What works end-to-end today:** A Node.js test can create a store with BetterSqlite3, perform CRUD, run reactive queries, merge concurrent operations, and sync between two clients through an in-memory server. React hooks bind to all of this.
+**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends, and server-side scope filtering is active.
 
-**What does not work today:** A developer cannot `npx create-kora-app my-app && cd my-app && pnpm dev` and see a working app in the browser. Three things block this: no browser storage adapter, no `createApp` factory in the `kora` meta-package, and no `kora dev` command.
+**What does not work today:** Remaining major gaps are richtext CRDT merging (Yjs), migration workflow (`kora migrate`), DevTools browser extension UI, protocol hardening (protobuf + HTTP fallback), and benchmark/e2e/publish pipeline completion.
+
+## Current Phase Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 1 | Complete | Browser adapter durability flow is implemented, including binary snapshot restore + logical dump fallback |
+| 2 | Complete | `createApp` + meta-package shipped with pre-`ready` query semantics aligned and tested |
+| 3 | Complete | Persistent server stores implemented (SQLite + PostgreSQL), production-ready baseline |
+| 4 | Complete | `kora dev` orchestration + `kora.config.ts` support shipped |
+| 5 | Not started | Richtext still intentionally deferred |
+| 6 | In progress | Server-side scope filtering implemented; SQL pushdown/compilation remains future optimization |
+| 7 | Not started | `kora migrate` still stubbed |
+| 8 | Not started | Backend instrumentation exists; browser extension UI not built |
+| 9 | Not started | JSON protocol remains default; benchmarks not CI-gated |
+| 10 | Not started | E2E/docs/publish automation still pending |
 
 ---
 
@@ -30,6 +46,8 @@ Every phase below produces a **shippable increment** — something a developer c
 ---
 
 ## Phase 1: Browser Storage Layer
+
+**Status:** Complete
 
 **Goal:** Kora apps persist data in the browser with the same guarantees as the Node.js adapter.
 
@@ -111,6 +129,8 @@ function detectAdapter(): 'sqlite-wasm' | 'indexeddb' | 'memory' {
 
 ## Phase 2: The `createApp` Factory and Meta-Package
 
+**Status:** Complete
+
 **Goal:** `import { createApp, defineSchema, t } from 'kora'` works and wires everything together.
 
 **Why second:** With storage working, we can build the orchestration layer that connects store + sync + merge into a single developer-facing object.
@@ -185,6 +205,8 @@ export type { SchemaDefinition, FieldDescriptor } from '@kora/core'
 ---
 
 ## Phase 3: Server Persistence
+
+**Status:** Complete
 
 **Goal:** The sync server persists operations to a real database. Server restarts do not lose data.
 
@@ -267,6 +289,8 @@ const server = createKoraServer({
 
 ## Phase 4: CLI `kora dev` Command
 
+**Status:** Complete
+
 **Goal:** `pnpm dev` starts a complete development environment with hot reload, sync server, and DevTools.
 
 **Why fourth:** With client storage and server persistence working, the dev command can wire them together into a seamless development experience.
@@ -279,11 +303,11 @@ const server = createKoraServer({
 3. **Schema file watcher** — watches `src/schema.ts` (configurable), regenerates types on change via `kora generate types`
 4. **DevTools injection** — injects a script tag for the DevTools panel (Ctrl+Shift+K)
 
-**Architecture:**
-- Use Node.js `child_process.fork` for the sync server (separate process, clean shutdown)
-- Use Vite's Node API (`createServer`) for programmatic control, not spawning a subprocess
-- Use `fs.watch` (or `chokidar` if cross-platform edge cases arise — evaluate at implementation time) for schema watching
-- Unified process manager: handles SIGINT/SIGTERM gracefully, tears down all children, prints exit summary
+**Architecture (implemented):**
+- Uses managed child processes (`spawn`) to run project-local binaries (Vite, tsx, kora)
+- Supports sync startup via either `server.ts/server.js` or managed sync mode from `kora.config.ts`
+- Uses `fs.watch` with debounce for schema watching + type regeneration
+- Unified process manager handles SIGINT/SIGTERM and coordinated shutdown
 
 **Graceful shutdown sequence:**
 1. Signal received → stop accepting new connections
@@ -327,6 +351,8 @@ export default defineConfig({
 ---
 
 ## Phase 5: Yjs Rich Text Integration
+
+**Status:** Not started
 
 **Goal:** `t.richtext()` fields merge at the character level using Yjs CRDTs, not LWW.
 
@@ -380,6 +406,8 @@ packages/react/src/hooks/
 
 ## Phase 6: Sync Scopes and Server-Side Filtering
 
+**Status:** In progress
+
 **Goal:** Each client only receives operations it's authorized to see. The server enforces access control.
 
 **Why sixth:** Without scopes, every client sees every operation — a security and performance problem. This phase adds the authorization boundary.
@@ -430,6 +458,8 @@ packages/server/src/scopes/
 ---
 
 ## Phase 7: CLI `kora migrate` Command
+
+**Status:** Not started
 
 **Goal:** Schema changes are detected, migration plans generated, and applied — locally and to the server.
 
@@ -488,6 +518,8 @@ packages/cli/src/commands/migrate/
 
 ## Phase 8: DevTools Browser Extension
 
+**Status:** Not started
+
 **Goal:** A Chrome/Firefox DevTools panel that visualizes sync, merges, operations, and connection state in real time.
 
 **Why eighth:** The instrumentation backend exists (Phase 0 — already built). This phase builds the visual layer. It's last because the framework is fully functional without it, but the developer experience is significantly better with it.
@@ -533,6 +565,8 @@ packages/devtools/src/
 ---
 
 ## Phase 9: Protocol and Performance Hardening
+
+**Status:** Not started
 
 **Goal:** Production-grade wire format and validated performance targets.
 
@@ -588,6 +622,8 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 
 ## Phase 10: End-to-End Integration and Launch Readiness
 
+**Status:** Not started
+
 **Goal:** The full `npx create-kora-app` to production deployment path works flawlessly.
 
 ### 10a. End-to-End Test Suite
@@ -617,17 +653,17 @@ The CLAUDE.md-specified chaos test: 10 clients, 1,000 operations each, 10% messa
 
 ## Phase Summary
 
-| Phase | Scope | Unblocks |
-|-------|-------|----------|
-| **1** | Browser storage (SQLite WASM + IndexedDB) | Browser apps can persist data |
-| **2** | `createApp` factory + meta-package | Single import, zero config |
-| **3** | Server persistence (Drizzle ORM) | Server survives restarts |
-| **4** | `kora dev` command | `pnpm dev` works out of the box |
-| **5** | Yjs richtext merge | Collaborative text editing |
-| **6** | Sync scopes | Multi-tenant data isolation |
-| **7** | `kora migrate` command | Schema evolution workflow |
-| **8** | DevTools browser extension | Visual debugging |
-| **9** | Protobuf, HTTP transport, benchmarks | Production performance |
-| **10** | E2E tests, docs, publish | Launch |
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **1** | Browser storage (SQLite WASM + IndexedDB) | Complete |
+| **2** | `createApp` factory + meta-package | Complete |
+| **3** | Server persistence | Complete |
+| **4** | `kora dev` command | Complete |
+| **5** | Yjs richtext merge | Not started |
+| **6** | Sync scopes | In progress |
+| **7** | `kora migrate` command | Not started |
+| **8** | DevTools browser extension | Not started |
+| **9** | Protobuf, HTTP transport, benchmarks | Not started |
+| **10** | E2E tests, docs, publish | Not started |
 
-**Phases 1–4 are the critical path.** After Phase 4, Kora delivers on its core promise: offline-first apps as simple as Next.js apps. Phases 5–10 build on that foundation to make it production-hardened and feature-complete.
+**Updated critical path:** complete Phase 7 migration workflow, then Phase 5 richtext and Phase 8+ launch hardening.

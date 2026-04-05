@@ -17,6 +17,7 @@ export type WorkerRequest =
 	| { id: number; type: 'rollback' }
 	| { id: number; type: 'migrate'; from: number; to: number; statements: string[] }
 	| { id: number; type: 'export' }
+	| { id: number; type: 'import'; data: Uint8Array }
 
 /**
  * Response message sent from the worker back to the main thread.

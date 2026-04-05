@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Database as BetterSqlite3Database } from 'better-sqlite3'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 
@@ -11,6 +14,7 @@ export class MockWorkerBridge implements WorkerBridge {
 	private db: BetterSqlite3Database | null = null
 	private createDb: BetterSqlite3Constructor | null = null
 	private terminated = false
+	private tempDir: string | null = null
 
 	async send(request: WorkerRequest): Promise<WorkerResponse> {
 		if (this.terminated) {
@@ -42,6 +46,8 @@ export class MockWorkerBridge implements WorkerBridge {
 					return this.handleMigrate(request.id, request.statements)
 				case 'export':
 					return this.handleExport(request.id)
+				case 'import':
+					return await this.handleImport(request.id, request.data)
 				default:
 					return {
 						id: (request as WorkerRequest).id,
@@ -63,10 +69,7 @@ export class MockWorkerBridge implements WorkerBridge {
 	terminate(): void {
 		if (this.terminated) return
 		this.terminated = true
-		if (this.db) {
-			this.db.close()
-			this.db = null
-		}
+		void this.cleanup()
 	}
 
 	private async handleOpen(id: number, ddlStatements: string[]): Promise<WorkerResponse> {
@@ -86,10 +89,7 @@ export class MockWorkerBridge implements WorkerBridge {
 	}
 
 	private handleClose(id: number): WorkerResponse {
-		if (this.db) {
-			this.db.close()
-			this.db = null
-		}
+		void this.cleanup()
 		return { id, type: 'success' }
 	}
 
@@ -133,5 +133,47 @@ export class MockWorkerBridge implements WorkerBridge {
 		}
 		const data = this.db.serialize()
 		return { id, type: 'success', data: new Uint8Array(data) }
+	}
+
+	private async handleImport(id: number, data: Uint8Array): Promise<WorkerResponse> {
+		if (!this.createDb) {
+			return { id, type: 'error', message: 'Database constructor unavailable', code: 'DB_NOT_OPEN' }
+		}
+
+		try {
+			if (this.db) {
+				this.db.close()
+				this.db = null
+			}
+
+			if (!this.tempDir) {
+				this.tempDir = await mkdtemp(join(tmpdir(), 'kora-mock-sqlite-'))
+			}
+
+			const filename = join(this.tempDir, 'imported.db')
+			await writeFile(filename, Buffer.from(data))
+			this.db = this.createDb(filename)
+			return { id, type: 'success' }
+		} catch (error) {
+			return {
+				id,
+				type: 'error',
+				message: (error as Error).message,
+				code: 'IMPORT_ERROR',
+			}
+		}
+	}
+
+	private async cleanup(): Promise<void> {
+		if (this.db) {
+			this.db.close()
+			this.db = null
+		}
+
+		if (this.tempDir) {
+			const dir = this.tempDir
+			this.tempDir = null
+			await rm(dir, { recursive: true, force: true })
+		}
 	}
 }

@@ -4,6 +4,7 @@ import { Instrumenter } from '@kora/devtools'
 import { MergeEngine } from '@kora/merge'
 import { Store } from '@kora/store'
 import type { CollectionAccessor, StorageAdapter } from '@kora/store'
+import type { QueryBuilder } from '@kora/store'
 import { ConnectionMonitor, ReconnectionManager, SyncEngine, WebSocketTransport } from '@kora/sync'
 import type { SyncStatusInfo } from '@kora/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
@@ -189,17 +190,12 @@ export function createApp(config: KoraConfig): KoraApp {
 		},
 	}
 
-	// Define collection accessors via Object.defineProperty
-	// Before ready resolves, accessing a collection throws a helpful error.
+	// Define collection accessors via Object.defineProperty.
+	// Before ready resolves, query methods return empty results.
 	for (const collectionName of Object.keys(config.schema.collections)) {
 		Object.defineProperty(app, collectionName, {
 			get(): CollectionAccessor {
-				if (!store) {
-					throw new Error(
-						`Cannot access collection "${collectionName}" before app.ready resolves. Use: await app.ready`,
-					)
-				}
-				return store.collection(collectionName)
+				return createCollectionAccessor(collectionName, () => store)
 			},
 			enumerable: true,
 			configurable: false,
@@ -264,4 +260,89 @@ async function initializeAsync(
 	}
 
 	return { store, syncEngine, unsubscribeSync }
+}
+
+function createCollectionAccessor(
+	collectionName: string,
+	getStore: () => Store | null,
+): CollectionAccessor {
+	return {
+		async insert(data: Record<string, unknown>) {
+			const currentStore = getStore()
+			if (!currentStore) {
+				throw new Error(`Cannot mutate collection "${collectionName}" before app.ready resolves.`)
+			}
+			return currentStore.collection(collectionName).insert(data)
+		},
+		async findById(id: string) {
+			const currentStore = getStore()
+			if (!currentStore) return null
+			return currentStore.collection(collectionName).findById(id)
+		},
+		async update(id: string, data: Record<string, unknown>) {
+			const currentStore = getStore()
+			if (!currentStore) {
+				throw new Error(`Cannot mutate collection "${collectionName}" before app.ready resolves.`)
+			}
+			return currentStore.collection(collectionName).update(id, data)
+		},
+		async delete(id: string) {
+			const currentStore = getStore()
+			if (!currentStore) {
+				throw new Error(`Cannot mutate collection "${collectionName}" before app.ready resolves.`)
+			}
+			return currentStore.collection(collectionName).delete(id)
+		},
+		where(conditions: Record<string, unknown>) {
+			const currentStore = getStore()
+			if (!currentStore) {
+				return createPendingQueryBuilder(conditions)
+			}
+			return currentStore.collection(collectionName).where(conditions)
+		},
+	}
+}
+
+function createPendingQueryBuilder(initialWhere: Record<string, unknown>): QueryBuilder {
+	const descriptor = {
+		collection: '__pending__',
+		where: { ...initialWhere },
+		orderBy: [] as Array<{ field: string; direction: 'asc' | 'desc' }>,
+		limit: undefined as number | undefined,
+		offset: undefined as number | undefined,
+	}
+
+	const builder = {
+		where(conditions: Record<string, unknown>) {
+			descriptor.where = { ...descriptor.where, ...conditions }
+			return this
+		},
+		orderBy(field: string, direction: 'asc' | 'desc' = 'asc') {
+			descriptor.orderBy.push({ field, direction })
+			return this
+		},
+		limit(n: number) {
+			descriptor.limit = n
+			return this
+		},
+		offset(n: number) {
+			descriptor.offset = n
+			return this
+		},
+		async exec() {
+			return []
+		},
+		async count() {
+			return 0
+		},
+		subscribe(callback: (results: Array<Record<string, unknown>>) => void) {
+			void callback([])
+			return () => {}
+		},
+		getDescriptor() {
+			return { ...descriptor, where: { ...descriptor.where }, orderBy: [...descriptor.orderBy] }
+		},
+	}
+
+	return builder as unknown as QueryBuilder
 }

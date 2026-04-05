@@ -3,7 +3,20 @@ import { AdapterError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
-import { loadFromIndexedDB, saveToIndexedDB } from './sqlite-wasm-persistence'
+import {
+	loadDumpFromIndexedDB,
+	loadFromIndexedDB,
+	saveDumpToIndexedDB,
+	saveToIndexedDB,
+} from './sqlite-wasm-persistence'
+
+interface DatabaseDump {
+	tables: Array<{
+		name: string
+		columns: string[]
+		rows: Array<Record<string, unknown>>
+	}>
+}
 
 /**
  * Options for creating an IndexedDbAdapter.
@@ -56,26 +69,24 @@ export class IndexedDbAdapter implements StorageAdapter {
 	async open(schema: SchemaDefinition): Promise<void> {
 		await this.inner.open(schema)
 
-		// If there's existing data in IndexedDB, we can't easily restore it
-		// into an in-memory database via the mock bridge. In a real browser
-		// environment with WASM, the worker would handle deserialization.
-		// For now, the adapter starts fresh each time.
+		const persisted = await loadFromIndexedDB(this.dbName)
+		if (!persisted) return
+
+		try {
+			await this.inner.importDatabase(persisted)
+		} catch {
+			await this.restoreFromDumpFallback()
+		}
 	}
 
 	async close(): Promise<void> {
-		// Persist before closing
-		try {
-			const data = await this.inner.exportDatabase()
-			await saveToIndexedDB(this.dbName, data)
-		} catch {
-			// Export may not be supported (e.g., in browser worker).
-			// Persistence is best-effort on close.
-		}
+		await this.persistSnapshot()
 		await this.inner.close()
 	}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
-		return this.inner.execute(sql, params)
+		await this.inner.execute(sql, params)
+		await this.persistSnapshot()
 	}
 
 	async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
@@ -84,26 +95,77 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		await this.inner.transaction(fn)
-
-		// Persist after successful transaction commit
-		try {
-			const data = await this.inner.exportDatabase()
-			await saveToIndexedDB(this.dbName, data)
-		} catch {
-			// Persistence failure after commit is non-fatal.
-			// Data is still in memory and will be persisted on next transaction or close.
-		}
+		await this.persistSnapshot()
 	}
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		await this.inner.migrate(from, to, migration)
+		await this.persistSnapshot()
+	}
 
-		// Persist after successful migration
+	private async persistSnapshot(): Promise<void> {
 		try {
 			const data = await this.inner.exportDatabase()
 			await saveToIndexedDB(this.dbName, data)
+			const dump = await this.exportDump()
+			await saveDumpToIndexedDB(this.dbName, dump)
 		} catch {
-			// Non-fatal persistence failure
+			// Non-fatal persistence failure. Next write/close retries persistence.
 		}
 	}
+
+	private async restoreFromDumpFallback(): Promise<void> {
+		const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
+		if (!dump) return
+
+		for (const table of dump.tables) {
+			const name = ensureSafeIdentifier(table.name)
+			await this.inner.execute(`DELETE FROM ${name}`)
+
+			if (table.rows.length === 0) continue
+
+			for (const row of table.rows) {
+				const columns = table.columns.filter((column) => Object.prototype.hasOwnProperty.call(row, column))
+				if (columns.length === 0) continue
+
+				const placeholders = columns.map(() => '?').join(', ')
+				const quotedColumns = columns.map((column) => ensureSafeIdentifier(column)).join(', ')
+				const values = columns.map((column) => row[column])
+
+				await this.inner.execute(
+					`INSERT INTO ${name} (${quotedColumns}) VALUES (${placeholders})`,
+					values,
+				)
+			}
+		}
+	}
+
+	private async exportDump(): Promise<DatabaseDump> {
+		const tableRows = await this.inner.query<{ name: string }>(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+		)
+
+		const tables: DatabaseDump['tables'] = []
+		for (const tableRow of tableRows) {
+			const tableName = ensureSafeIdentifier(tableRow.name)
+			const columns = await this.inner.query<{ name: string }>(`PRAGMA table_info(${tableName})`)
+			const columnNames = columns.map((column) => column.name)
+			const rows = await this.inner.query<Record<string, unknown>>(`SELECT * FROM ${tableName}`)
+
+			tables.push({
+				name: tableName,
+				columns: columnNames,
+				rows,
+			})
+		}
+
+		return { tables }
+	}
+}
+
+function ensureSafeIdentifier(identifier: string): string {
+	if (!/^[a-zA-Z0-9_]+$/.test(identifier)) {
+		throw new AdapterError(`Unsafe SQL identifier: ${identifier}`)
+	}
+	return identifier
 }

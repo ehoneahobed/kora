@@ -58,11 +58,67 @@ describe('IndexedDbAdapter', () => {
 		expect(data?.length).toBeGreaterThan(0)
 	})
 
+	test('reopens from persisted snapshot', async () => {
+		await adapter.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-restore', 'Restored', 0, 1000, 1000],
+		)
+
+		await adapter.close()
+
+		const reopened = new IndexedDbAdapter({ bridge: new MockWorkerBridge(), dbName: DB_NAME })
+		await reopened.open(minimalSchema)
+
+		const rows = await reopened.query<{ id: string; title: string }>('SELECT id, title FROM todos')
+		expect(rows.some((row) => row.id === 'rec-restore' && row.title === 'Restored')).toBe(true)
+
+		await reopened.close()
+	})
+
+	test('restores from logical dump when binary import is unavailable', async () => {
+		const first = new IndexedDbAdapter({ bridge: new MockWorkerBridge(), dbName: DB_NAME })
+		await first.open(minimalSchema)
+		await first.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-dump', 'Dump Restore', 0, 1000, 1000],
+		)
+		await first.close()
+
+		const bridgeWithoutImport = new NoImportWorkerBridge()
+		const reopened = new IndexedDbAdapter({ bridge: bridgeWithoutImport, dbName: DB_NAME })
+		await reopened.open(minimalSchema)
+
+		const rows = await reopened.query<{ id: string; title: string }>(
+			'SELECT id, title FROM todos WHERE id = ?',
+			['rec-dump'],
+		)
+		expect(rows[0]?.title).toBe('Dump Restore')
+
+		await reopened.close()
+	})
+
 	test('throws StoreNotOpenError before open', async () => {
 		const fresh = new IndexedDbAdapter({ bridge: new MockWorkerBridge(), dbName: 'fresh-db' })
 		await expect(fresh.execute('SELECT 1')).rejects.toThrow(StoreNotOpenError)
 	})
 })
+
+class NoImportWorkerBridge extends MockWorkerBridge {
+	override async send(
+		request: import('./sqlite-wasm-channel').WorkerRequest,
+	): Promise<import('./sqlite-wasm-channel').WorkerResponse> {
+		if (request.type === 'import') {
+			return {
+				id: request.id,
+				type: 'error',
+				message: 'Import intentionally unsupported in this bridge',
+				code: 'IMPORT_NOT_SUPPORTED',
+			}
+		}
+
+		return await super.send(request)
+	}
+}
 
 describe('IDB persistence helpers', () => {
 	const KEY = 'test-persistence-helper'

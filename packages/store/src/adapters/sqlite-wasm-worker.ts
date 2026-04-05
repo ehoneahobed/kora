@@ -21,11 +21,13 @@ interface SqliteDb {
 		callback?: (row: Record<string, unknown>) => void
 	}): void
 	close(): void
+	deserialize?: (data: Uint8Array) => void
 }
 
 declare const self: DedicatedWorkerGlobalScope
 
 let db: SqliteDb | null = null
+let sqlite3Api: unknown = null
 
 function sendResponse(response: WorkerResponse): void {
 	self.postMessage(response)
@@ -69,6 +71,7 @@ async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
 	try {
 		const sqlite3InitModule = (await import('@sqlite.org/sqlite-wasm')).default
 		const sqlite3 = await sqlite3InitModule()
+		sqlite3Api = sqlite3
 
 		// Try OPFS persistence first
 		let useOpfs = false
@@ -113,6 +116,49 @@ function handleClose(id: number): void {
 		db = null
 	}
 	sendResponse({ id, type: 'success' })
+}
+
+function handleImport(id: number, data: Uint8Array): void {
+	if (!db) {
+		sendResponse({ id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' })
+		return
+	}
+
+	const dbWithDeserialize = db as SqliteDb & { deserialize?: (bytes: Uint8Array) => void }
+	if (typeof dbWithDeserialize.deserialize === 'function') {
+		try {
+			dbWithDeserialize.deserialize(data)
+			sendResponse({ id, type: 'success' })
+			return
+		} catch (error) {
+			sendResponse({ id, type: 'error', message: (error as Error).message, code: 'IMPORT_ERROR' })
+			return
+		}
+	}
+
+	const sqlite3 = sqlite3Api as
+		| {
+				oo1?: { DB?: new (...args: unknown[]) => SqliteDb }
+				capi?: { sqlite3_deserialize?: unknown }
+			}
+		| null
+
+	if (!sqlite3 || typeof sqlite3.capi?.sqlite3_deserialize === 'undefined') {
+		sendResponse({
+			id,
+			type: 'error',
+			message: 'Import not supported in this SQLite WASM runtime',
+			code: 'IMPORT_NOT_SUPPORTED',
+		})
+		return
+	}
+
+	sendResponse({
+		id,
+		type: 'error',
+		message: 'Import requires runtime-specific deserialize wiring and is unavailable in this worker build',
+		code: 'IMPORT_NOT_SUPPORTED',
+	})
 }
 
 function handleMessage(request: WorkerRequest): void {
@@ -173,6 +219,9 @@ function handleMessage(request: WorkerRequest): void {
 					message: 'Export not yet supported in browser worker',
 					code: 'EXPORT_NOT_SUPPORTED',
 				})
+				return
+			case 'import':
+				handleImport(request.id, request.data)
 				return
 			default:
 				sendResponse({

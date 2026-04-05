@@ -67,15 +67,16 @@ describe('createApp', () => {
 		expect(typeof todos.where).toBe('function')
 	})
 
-	test('collection accessors throw before ready', () => {
+	test('query methods return empty results before ready', async () => {
 		app = createApp({
 			schema,
 			store: { adapter: 'better-sqlite3', name: ':memory:' },
 		})
 
-		expect(() => (app as Record<string, unknown>).todos).toThrow(
-			'Cannot access collection "todos" before app.ready resolves',
-		)
+		const todos = (app as Record<string, unknown>).todos as import('@kora/store').CollectionAccessor
+		expect(await todos.findById('missing')).toBeNull()
+		expect(await todos.where({ completed: false }).exec()).toEqual([])
+		expect(await todos.where({ completed: false }).count()).toBe(0)
 	})
 
 	test('defines accessors for all collections in schema', async () => {
