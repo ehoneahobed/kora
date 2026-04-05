@@ -1,5 +1,11 @@
 # @korajs/cli
 
+## 0.1.3
+
+### Patch Changes
+
+- Fix Windows compatibility for kora dev command (resolve .cmd shims, spawn with shell)
+
 ## 0.1.2
 
 ### Patch Changes

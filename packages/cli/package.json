@@ -1,6 +1,6 @@
 {
   "name": "@korajs/cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Kora.js CLI tooling and project scaffolding",
   "type": "module",
   "main": "./dist/index.cjs",
