@@ -7,8 +7,9 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { operations, syncState } from './drizzle-schema'
 import type { ServerStore } from './server-store'
 
-// createRequire provides a CJS require() function that works in ESM contexts.
-// better-sqlite3 is a native CJS addon that cannot be loaded via import().
+// better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
+// createRequire provides a CJS require() that works in both ESM and CJS contexts.
+// tsup's shims option ensures import.meta.url is available in CJS builds.
 const esmRequire = createRequire(import.meta.url)
 
 /**
