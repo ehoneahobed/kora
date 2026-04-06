@@ -25,21 +25,20 @@ await server.start()
 ## Production Setup with PostgreSQL
 
 ```typescript
-import { createKoraServer, PostgresServerStore } from '@korajs/server'
+import { createKoraServer, PostgresServerStore, TokenAuthProvider } from '@korajs/server'
 
 const server = createKoraServer({
   store: new PostgresServerStore({
     connectionString: process.env.DATABASE_URL,
   }),
   port: 4567,
-  auth: async (token) => {
-    // Validate JWT or session token
-    const user = await verifyToken(token)
-    return { userId: user.id }
-  },
-  scopes: {
-    todos: (ctx) => ({ where: { userId: ctx.userId } }),
-  },
+  auth: new TokenAuthProvider({
+    validate: async (token) => {
+      // Validate JWT or session token
+      const user = await verifyToken(token)
+      return { userId: user.id, scopes: { todos: { userId: user.id } } }
+    },
+  }),
 })
 
 await server.start()
@@ -59,9 +58,9 @@ await server.start()
 createKoraServer({
   store: serverStore,         // Required: storage backend
   port: 4567,                 // Default: 4567
-  auth: async (token) => {},  // Optional: authentication handler
-  scopes: {},                 // Optional: per-collection data scoping
-  maxBatchSize: 1000,         // Optional: max operations per sync batch
+  auth: authProvider,         // Optional: authentication provider
+  batchSize: 1000,            // Optional: max operations per sync batch
+  maxConnections: 0,          // Optional: 0 = unlimited
 })
 ```
 

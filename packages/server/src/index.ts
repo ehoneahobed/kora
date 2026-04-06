@@ -40,6 +40,11 @@ export type {
 	WsServerLike,
 } from './server/kora-sync-server'
 
+export type {
+	ProductionServerConfig,
+	ProductionServer,
+} from './server/production-server'
+
 export type { TokenAuthProviderOptions } from './auth/token-auth'
 
 // === Classes ===
@@ -55,5 +60,6 @@ export { TokenAuthProvider } from './auth/token-auth'
 
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'
+export { createProductionServer } from './server/production-server'
 export { createPostgresServerStore } from './store/postgres-server-store'
 export { createSqliteServerStore } from './store/sqlite-server-store'
