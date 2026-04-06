@@ -1,5 +1,13 @@
 # create-kora-app
 
+## 0.1.12
+
+### Patch Changes
+
+- Add Tailwind CSS templates, polished dark-themed UI, --yes/--tailwind/--sync flags, devtools enabled by default, and persistent SQLite server stores in sync templates.
+- Updated dependencies
+  - @korajs/cli@0.1.11
+
 ## 0.1.4
 
 ### Patch Changes

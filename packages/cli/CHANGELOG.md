@@ -1,5 +1,11 @@
 # @korajs/cli
 
+## 0.1.11
+
+### Patch Changes
+
+- Add Tailwind CSS templates, polished dark-themed UI, --yes/--tailwind/--sync flags, devtools enabled by default, and persistent SQLite server stores in sync templates.
+
 ## 0.1.3
 
 ### Patch Changes
