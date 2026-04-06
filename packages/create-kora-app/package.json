@@ -10,7 +10,7 @@
     "bin.js"
   ],
   "dependencies": {
-    "@korajs/cli": "workspace:*"
+    "@korajs/cli": "^0.1.11"
   },
   "license": "MIT"
 }
