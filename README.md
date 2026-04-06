@@ -94,6 +94,9 @@ const app = createApp({
   schema,
   sync: { url: 'wss://my-server.com/kora' }
 })
+
+await app.ready
+await app.sync?.connect()
 ```
 
 ### React hooks
@@ -410,7 +413,7 @@ Covers:
 - [Getting Started](https://ehoneahobed.github.io/kora/getting-started) — Zero to working app in 5 minutes
 - [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design) — Field types, relations, versioning
 - [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration) — Client and server storage, multiple apps, PostgreSQL
-- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, scopes, encryption, transports
+- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, reconnection, and runtime behavior
 - [React Hooks](https://ehoneahobed.github.io/kora/guide/react-hooks) — useQuery, useMutation, useSyncStatus
 - [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution) — Three-tier merge engine
 - [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Self-hosting, Docker, scaling

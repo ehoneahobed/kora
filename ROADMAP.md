@@ -871,3 +871,68 @@ Sync templates ship with SQLite persistence by default (`createSqliteServerStore
 | **9** | Protobuf, HTTP transport, benchmarks, chaos | Complete |
 | **10** | E2E tests, docs, publish | Complete |
 | **11** | Developer experience & launch polish | Complete |
+
+
+
+## What Makes Kora a Household Name (2026+)
+
+  ### 1) Make production as easy as local
+
+  - Ship kora deploy with first-class targets: Railway, Fly, Render, ECS, Kubernetes.
+  - Generate infra + secrets + health checks + migrations in one command.
+  - Include “push-button” starter for Postgres + managed SSL + domain.
+  - Outcome: “From npx create-kora-app to internet URL in <15 minutes.”
+
+  ### 2) Launch Kora Cloud (managed sync)
+
+  - Hosted sync with auto-scaling, backups, observability, auth integration.
+  - Bring-your-own Postgres or fully managed tier.
+  - Free tier for hobby apps, paid SLA tiers for teams.
+  - This removes the #1 adoption blocker: “I don’t want to run sync infra.”
+
+  ### 3) Close runtime/docs contract gaps fast
+
+  - Wire sync.transport selection in createApp.
+  - Either wire sync.scopes/encryption end-to-end or remove from top-level API until
+    ready.
+  - Add “production-ready matrix” in docs: Available / Beta / Planned.
+  - Trust = adoption multiplier.
+
+  ### 4) Build deployment primitives for teams
+
+  - Official Helm chart + Terraform modules.
+  - Built-in server metrics endpoint + OpenTelemetry hooks.
+  - Blue/green deploy + schema compatibility checks.
+  - Disaster recovery docs (backup, restore, regional failover).
+
+  ### 5) Win through ecosystem gravity
+
+  - Official integrations: Next.js, Expo/React Native, Electron, Tauri.
+  - Auth adapters: Clerk/Auth0/Supabase/Firebase.
+  - Turnkey examples: Slack-like chat, Notion-like docs, POS/offline field app.
+  - “Copy this architecture” beats theoretical docs.
+
+  ### 6) Product-led growth + proof
+
+  - Publish benchmark dashboards + chaos/convergence reports monthly.
+  - “Kora Certified” case studies with real offline-heavy teams.
+  - Create a migration path from Firebase/Supabase/REST apps.
+
+  ———
+
+  ## 12-Month Execution Plan (Practical)
+
+  - Q2 2026: kora deploy (Railway/Fly), transport wiring parity, production docs.
+  - Q3 2026: Kora Cloud private beta + observability + auth adapters.
+  - Q4 2026: Kora Cloud GA + enterprise controls + Kubernetes package.
+  - Q1 2027: ecosystem expansion + flagship open-source reference apps.
+
+  ———
+
+  ## Success Metrics to Track
+
+  - Time-to-production (TTFP): target < 15 minutes.
+  - “Runs in production after 30 days” rate.
+  - Weekly active projects using sync in production.
+  - Support tickets per deploy (should drop sharply after kora deploy/Cloud).
+  - NPS from first-time deployers.

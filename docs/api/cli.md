@@ -47,8 +47,7 @@ kora create [name] [options]
 | `--yes`, `-y` | `boolean` | `false` | Accept all defaults (recommended template + auto-detected package manager). |
 | `--tailwind` / `--no-tailwind` | `boolean` | -- | Use Tailwind CSS or plain CSS. Skips styling prompt. |
 | `--sync` / `--no-sync` | `boolean` | -- | Include sync server or not. Skips sync prompt. |
-| `--no-install` | `boolean` | `false` | Skip installing dependencies. |
-| `--no-git` | `boolean` | `false` | Skip initializing a git repository. |
+| `--skip-install` | `boolean` | `false` | Skip installing dependencies. |
 
 ### Templates
 
@@ -109,11 +108,10 @@ npx create-kora-app my-app --tailwind --no-sync --pm npm
 my-app/
   src/
     schema.ts           # Your schema definition
-    app.ts              # Kora app initialization
     main.tsx            # Application entry point
-    components/         # React components
-  server/               # (react-sync template only)
-    index.ts            # Sync server entry point
+    App.tsx             # Example UI
+    kora-worker.ts      # SQLite WASM worker entry
+  server.ts             # (sync templates) sync server entry point
   kora/
     generated/
       types.ts          # Auto-generated TypeScript types
@@ -141,16 +139,15 @@ kora dev [options]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--port` | `number` | `5173` | Vite dev server port. |
-| `--sync-port` | `number` | `4567` | Sync server port (if sync is configured). |
+| `--sync-port` | `number` | `3001` | Sync server port (if sync is configured). |
 | `--no-sync` | `boolean` | `false` | Disable the sync server even if configured. |
-| `--no-devtools` | `boolean` | `false` | Disable embedded DevTools. |
+| `--no-watch` | `boolean` | `false` | Disable schema file watching. |
 
 ### What it starts
 
 1. **Vite dev server** -- Serves your application with hot module replacement (HMR).
 2. **Kora sync server** -- Starts automatically if `sync` is configured in `kora.config.ts`. Not started for local-only apps.
 3. **Schema watcher** -- Watches your schema file for changes and automatically regenerates TypeScript types.
-4. **DevTools** -- Embedded DevTools accessible via `Ctrl+Shift+K` (or `Cmd+Shift+K` on macOS) in the browser.
 
 ### Example
 
@@ -160,8 +157,7 @@ $ kora dev
   Kora.js Dev Server
 
   App:      http://localhost:5173
-  Sync:     ws://localhost:4567/kora
-  DevTools:  Ctrl+Shift+K
+  Sync:     ws://localhost:3001
 
   Watching schema for changes...
 ```
@@ -176,12 +172,17 @@ import { defineConfig } from 'korajs/config'
 
 export default defineConfig({
   schema: './src/schema.ts',
-  sync: {
-    port: 4567,
-  },
-  devtools: true,
-  generate: {
-    output: './kora/generated/types.ts',
+  dev: {
+    port: 5173,
+    sync: {
+      enabled: true,
+      port: 3001,
+      store: { type: 'sqlite', filename: './kora-dev.db' },
+    },
+    watch: {
+      enabled: true,
+      debounceMs: 300,
+    },
   },
 })
 ```
@@ -204,7 +205,10 @@ kora migrate [options]
 |--------|------|---------|-------------|
 | `--dry-run` | `boolean` | `false` | Show what would change without generating or applying migrations. |
 | `--apply` | `boolean` | `false` | Apply the migration immediately without prompting. |
-| `--generate-only` | `boolean` | `false` | Generate the migration file but do not apply it. |
+| `--schema` | `string` | Auto-detected | Path to schema file. |
+| `--db` | `string` | From config/default | SQLite path to use for `--apply`. |
+| `--output-dir` | `string` | `kora/migrations` | Migration output directory. |
+| `--force` | `boolean` | `false` | Skip breaking-change confirmation prompts. |
 
 ### Workflow
 

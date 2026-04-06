@@ -353,3 +353,111 @@ so if i am building a platform, will i be able to also have a cloud database? an
   locally, syncs across devices, and resolves conflicts automatically. What's missing is the
   polish layer: collaborative text editing, visual debugging tools, production-grade wire
   format, docs, and release automation.
+
+
+Plain-English Review
+
+  - Kora is trying to be “the easy button” for apps that still work when internet is
+    bad: save locally first, sync later, and auto-resolve edit clashes.
+  - Big promise: developers shouldn’t need deep database/sync expertise to build
+    offline-capable apps.
+  - From the repo, the core engine looks serious and broad (storage, sync, merge, React
+    hooks, CLI, devtools, tests).
+
+  What It Promises (to normal people)
+
+  - “Your app still works offline.”
+  - “Changes sync when connection returns.”
+  - “If two devices edit the same thing, we merge safely.”
+  - “Developers can scaffold quickly and ship fast.”
+
+  Where It’s Strong
+
+  - Strong technical coverage and testing culture (roadmap claims 1,100+ tests).
+  - Good architecture choices: operation log, causal ordering, merge layers, local-
+    first storage.
+  - Nice developer onboarding via templates and CLI.
+
+  How It Fails / Can Break Today
+
+  - Some docs and actual behavior don’t fully match:
+      - Docs suggest sync is automatic after adding sync, but templates still manually
+        call app.sync?.connect().
+      - Docs advertise HTTP transport and encryption options, but createApp currently
+        always instantiates WebSocket transport.
+      - Browser worker export/import durability paths are still partly unsupported in
+        worker runtime.
+  - In plain terms: core idea is strong, but “it just works” has some edge-case cracks
+    and documentation drift.
+
+  DX (Developer Experience) Today
+
+  - Good: scaffolding, typed APIs, React hooks, one-command local dev.
+  - Friction: setup details (like worker URL), behavior inconsistencies across docs, and
+    a few “advanced features promised vs wired” gaps.
+  - Overall DX rating: promising and usable for builders, but not yet “boringly
+    reliable” for every production team.
+
+  Current Gaps to Improve
+
+  - Align docs with reality (or wire missing features now).
+  - Make sync transport selection real (websocket vs http) at app layer.
+  - Clarify and complete encryption/scoping story.
+  - Improve startup expectations (ready, sync auto-connect behavior, browser storage
+    fallback clarity).
+
+  - Phase 1: Truth pass on docs + examples (fast trust win).
+  - Phase 2: Finish/verify missing runtime wiring (HTTP transport, encryption/scopes
+    path).
+  - Phase 3: Hardening pass on browser durability and failure recovery.
+  - Phase 4: “Production readiness checklist” and confidence badges (what is stable
+    vs experimental).
+
+  Evidence I used
+
+  - README.md:7
+  - ROADMAP.md:25
+  - kora/src/create-app.ts:248
+  - kora/src/create-app.ts:283
+  - kora/src/types.ts:43
+  - docs/guide/sync-configuration.md:48
+  - packages/store/src/adapters/sqlite-wasm-worker.ts:219
+  - packages/cli/templates/react-tailwind-sync/src/main.tsx:22
+  - docs/index.md:13
+  - kora/package.json:3
+
+  If you want, I can next turn this into a prioritized 30/60/90-day execution plan for
+  the team (non-technical, leadership-friendly).
+
+
+› - Phase 1: Truth pass on docs + examples (fast trust win).
+
+
+• Perfect choice — this is the highest-leverage move.
+
+  Phase 1: Truth Pass on Docs + Examples (Fast Trust Win)
+  Goal: make sure what people read is exactly what works today.
+
+  - 1) Audit claims vs real behavior
+      - Check every “you can do X” statement in docs against current code.
+      - Flag mismatches (example: options documented but not fully wired in createApp).
+  - 2) Fix high-impact mismatches first
+      - Sync setup wording (auto vs manual app.sync?.connect() behavior).
+      - Transport wording (http vs current runtime wiring).
+      - Encryption/scopes wording (what is implemented vs planned).
+      - Browser durability/export-import wording (avoid overpromising).
+  - 3) Update examples to be copy-paste safe
+      - Ensure each snippet includes required bits (like worker URL in browser
+        templates).
+      - Keep “minimal working example” and “advanced example” clearly separated.
+  - 4) Add a clear “Stability/Support Matrix” page
+      - Simple table: Available now / Partially available / Planned.
+      - This prevents confusion and reduces support questions.
+  - 5) Add “Last verified” tags
+      - Each major guide gets a small line like: “Last verified against v0.1.4”.
+
+  Definition of done
+
+  - No feature claim in docs contradicts runtime behavior.
+  - New users can follow getting-started without hidden steps.
+  - Team can point to one honest status page for stakeholders.

@@ -70,7 +70,26 @@ function handleQuery(id: number, sql: string, params?: unknown[]): void {
 async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
 	try {
 		const sqlite3InitModule = (await import('@sqlite.org/sqlite-wasm')).default
-		const sqlite3 = await sqlite3InitModule()
+
+		// In production builds, Vite hashes asset filenames (e.g. sqlite3-[hash].wasm).
+		// The sqlite3 module's default locateFile resolves the unhashed name, causing a 404.
+		// Templates set __KORA_SQLITE_WASM_URL via `import wasmUrl from '...sqlite3.wasm?url'`
+		// so we can override locateFile with the correct hashed URL.
+		const wasmUrl = (globalThis as Record<string, unknown>).__KORA_SQLITE_WASM_URL as
+			| string
+			| undefined
+		const initOptions = wasmUrl
+			? {
+					locateFile: (file: string) => {
+						if (file.endsWith('.wasm')) return wasmUrl
+						return file
+					},
+				}
+			: undefined
+
+		// sqlite3InitModule accepts Emscripten Module overrides but the types don't reflect this
+		const initFn = sqlite3InitModule as unknown as (opts?: Record<string, unknown>) => Promise<unknown>
+		const sqlite3 = (await initFn(initOptions)) as Awaited<ReturnType<typeof sqlite3InitModule>>
 		sqlite3Api = sqlite3
 
 		// Try OPFS persistence first

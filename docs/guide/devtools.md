@@ -25,7 +25,7 @@ pnpm --filter @korajs/devtools build
 
 ## Enabling DevTools
 
-DevTools connects to your Kora app automatically in development. Enable it explicitly in your app config:
+DevTools connects to your Kora app when `devtools: true` is enabled and the extension is installed. Enable it in your app config:
 
 ```typescript
 const app = createApp({
@@ -156,7 +156,7 @@ Real-time monitoring of the sync connection.
 
 1. Open the **Network Status** panel and check bandwidth.
 2. Check the operation count. A large number of operations means more data to sync.
-3. Consider adding [sync scopes](/guide/sync-configuration#sync-scopes) to reduce the amount of data each client syncs.
+3. Consider adding server-side auth scopes in your sync server auth context to reduce the amount of data each client receives.
 4. Check whether operation compaction has been run on the server to reduce historical operations.
 
 ## Performance Overhead

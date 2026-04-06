@@ -190,7 +190,7 @@ function TodoList() {
 
 ## Enable Sync
 
-To sync data across devices, add a single `sync` property to your app config:
+To sync data across devices, add a `sync` property to your app config:
 
 ```typescript
 import { createApp } from 'korajs'
@@ -202,9 +202,12 @@ export const app = createApp({
     url: 'wss://my-server.com/kora',
   },
 })
+
+await app.ready
+await app.sync?.connect()
 ```
 
-That is it. Kora handles connection management, conflict resolution, and operation syncing automatically. When the device is offline, operations queue locally and sync when connectivity returns.
+Kora handles connection management, conflict resolution, and operation syncing after `connect()` is called. When the device is offline, operations queue locally and sync when connectivity returns.
 
 For details on running the sync server, see [Deployment](/guide/deployment).
 
@@ -214,5 +217,5 @@ For details on running the sync server, see [Deployment](/guide/deployment).
 - [Offline Patterns](/guide/offline-patterns) — Building UIs that embrace offline-first
 - [Conflict Resolution](/guide/conflict-resolution) — How Kora handles concurrent edits
 - [React Hooks](/guide/react-hooks) — Full reference for all React bindings
-- [Sync Configuration](/guide/sync-configuration) — Auth, scopes, encryption, and transports
+- [Sync Configuration](/guide/sync-configuration) — Auth, reconnection, and runtime sync behavior
 - [DevTools](/guide/devtools) — Debugging with the Kora browser extension

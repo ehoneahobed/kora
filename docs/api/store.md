@@ -327,7 +327,7 @@ interface Transaction {
 |---------|------------|-------------|-------------|
 | SQLite WASM + OPFS | `'sqlite-wasm'` | Browser | Primary adapter. Runs SQLite in a Web Worker with OPFS persistence. Best performance. |
 | IndexedDB | `'indexeddb'` | Browser | Fallback adapter. Used automatically when WASM/OPFS is unavailable. |
-| Native SQLite | `'sqlite-native'` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
+| Native SQLite | `'better-sqlite3'` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
 
 ### Selecting an adapter
 
@@ -335,7 +335,7 @@ interface Transaction {
 const app = createApp({
   schema,
   store: {
-    adapter: 'sqlite-wasm',  // or 'indexeddb', 'sqlite-native'
+    adapter: 'sqlite-wasm',  // or 'indexeddb', 'better-sqlite3'
     name: 'my-app-db',       // Database name (used for OPFS directory / IndexedDB name)
   },
 })
@@ -344,7 +344,7 @@ const app = createApp({
 If no adapter is specified, Kora automatically selects the best available adapter for the current environment:
 
 1. In browsers: `sqlite-wasm` if OPFS is available, otherwise `indexeddb`
-2. In Node.js: `sqlite-native`
+2. In Node.js: `better-sqlite3`
 
 ---
 
@@ -355,7 +355,7 @@ Configuration options for the store, passed to `createApp()`.
 ```typescript
 interface StoreConfig {
   /** Storage adapter to use. Auto-detected if omitted. */
-  adapter?: 'sqlite-wasm' | 'indexeddb' | 'sqlite-native'
+  adapter?: 'sqlite-wasm' | 'indexeddb' | 'better-sqlite3'
 
   /** Database name. Defaults to 'kora-db'. */
   name?: string

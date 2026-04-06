@@ -53,7 +53,7 @@ const app = createApp({
   store: {
     adapter: 'sqlite-wasm',   // Browser: SQLite WASM + OPFS
     // adapter: 'indexeddb',   // Browser: IndexedDB fallback
-    // adapter: 'sqlite-native', // Node.js: better-sqlite3
+    // adapter: 'better-sqlite3', // Node.js: better-sqlite3
     name: 'my-app',
     workerUrl: new URL('./kora-worker.ts', import.meta.url),
   },
@@ -68,7 +68,7 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `adapter` | `'sqlite-wasm' \| 'indexeddb' \| 'sqlite-native'` | Auto-detected | Storage backend to use. |
+| `adapter` | `'sqlite-wasm' \| 'indexeddb' \| 'better-sqlite3'` | Auto-detected | Storage backend to use. |
 | `name` | `string` | `'kora-db'` | Database name. Must be unique per app on the same origin. |
 | `workerUrl` | `string \| URL` | -- | URL to the SQLite WASM worker script. Required for `sqlite-wasm` adapter in browsers. |
 

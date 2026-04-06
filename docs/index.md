@@ -10,7 +10,7 @@ hero:
       link: /getting-started
     - theme: alt
       text: View on GitHub
-      link: https://github.com/anthropics/kora
+      link: https://github.com/ehoneahobed/kora
 features:
   - title: Offline by Default
     details: Every code path works without a network connection. Connectivity enables sync, not functionality.
