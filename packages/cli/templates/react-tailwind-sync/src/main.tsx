@@ -5,14 +5,21 @@ import { createRoot } from 'react-dom/client'
 import schema from './schema'
 import { App } from './App'
 import './index.css'
+import koraWorkerUrl from './kora-worker.ts?worker&url'
+
+// Build sync URL: use env var if set, otherwise derive from current page host.
+// This allows the Vite proxy (/kora-sync → ws://localhost:3001) to work in dev,
+// and also works through any tunnel (ngrok, cloudflared) without extra configuration.
+const syncUrl = import.meta.env.VITE_SYNC_URL
+  || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/kora-sync`
 
 const app = createApp({
   schema,
   sync: {
-    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001',
+    url: syncUrl,
   },
   store: {
-    workerUrl: new URL('./kora-worker.ts', import.meta.url),
+    workerUrl: koraWorkerUrl,
   },
   devtools: true,
 })

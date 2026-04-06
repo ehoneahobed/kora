@@ -5,11 +5,12 @@ import { createRoot } from 'react-dom/client'
 import schema from './schema'
 import { App } from './App'
 import './index.css'
+import koraWorkerUrl from './kora-worker.ts?worker&url'
 
 const app = createApp({
   schema,
   store: {
-    workerUrl: new URL('./kora-worker.ts', import.meta.url),
+    workerUrl: koraWorkerUrl,
   },
   devtools: true,
 })

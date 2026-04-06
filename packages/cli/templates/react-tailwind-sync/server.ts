@@ -1,4 +1,4 @@
-import { createKoraServer, createSqliteServerStore } from '@korajs/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
 // SQLite persists data to disk — survives server restarts
 const store = createSqliteServerStore({ filename: './kora-server.db' })
@@ -12,11 +12,15 @@ const store = createSqliteServerStore({ filename: './kora-server.db' })
 //   connectionString: 'postgresql://user:password@localhost:5432/mydb',
 // })
 
-const server = createKoraServer({
+// Production server: serves static files + WebSocket sync on a single port.
+// One port means one tunnel (ngrok, cloudflared) handles everything.
+const server = createProductionServer({
   store,
   port: Number(process.env.PORT) || 3001,
+  staticDir: './dist',
+  syncPath: '/kora-sync',
 })
 
-server.start().then(() => {
-  console.log('Kora sync server running on ws://localhost:3001')
+server.start().then((url) => {
+  console.log(`Kora app running at ${url}`)
 })
