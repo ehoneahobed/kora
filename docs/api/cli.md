@@ -44,15 +44,22 @@ kora create [name] [options]
 |--------|------|---------|-------------|
 | `--template` | `string` | -- | Template to use. Skips the template selection prompt. |
 | `--pm` | `string` | -- | Package manager (`pnpm`, `npm`, `yarn`, `bun`). Skips the package manager prompt. |
+| `--yes`, `-y` | `boolean` | `false` | Accept all defaults (recommended template + auto-detected package manager). |
+| `--tailwind` / `--no-tailwind` | `boolean` | -- | Use Tailwind CSS or plain CSS. Skips styling prompt. |
+| `--sync` / `--no-sync` | `boolean` | -- | Include sync server or not. Skips sync prompt. |
 | `--no-install` | `boolean` | `false` | Skip installing dependencies. |
 | `--no-git` | `boolean` | `false` | Skip initializing a git repository. |
 
 ### Templates
 
-| Template | Description |
-|----------|-------------|
-| `react` | React application with local-only storage. No sync server. |
-| `react-sync` | React application with a pre-configured sync server. Includes server setup and WebSocket transport. |
+| Template | Styling | Sync | Description |
+|----------|---------|------|-------------|
+| `react-tailwind-sync` | Tailwind CSS | Yes | **Recommended.** Polished dark-themed UI with real-time sync. |
+| `react-tailwind` | Tailwind CSS | No | Tailwind CSS with local-only storage. |
+| `react-sync` | Plain CSS | Yes | Clean CSS with sync server. |
+| `react-basic` | Plain CSS | No | Minimal setup with local-only storage. |
+
+All templates include DevTools enabled by default, SQLite WASM persistence, and a todo app with stats, filters, and a polished UI.
 
 ### Interactive flow
 
@@ -64,8 +71,10 @@ $ npx create-kora-app my-app
   Kora.js - Offline-first application framework
 
   ? Select a template:
-    > React (basic)
-      React (with sync)
+    > React + Tailwind (with sync)    (Recommended)
+      React + Tailwind (local-only)
+      React + CSS (with sync)
+      React + CSS (local-only)
 
   ? Package manager:
     > pnpm
@@ -84,7 +93,14 @@ $ npx create-kora-app my-app
 ### Non-interactive usage
 
 ```bash
-npx create-kora-app my-app --template react-sync --pm pnpm
+# Use a specific template
+npx create-kora-app my-app --template react-tailwind-sync --pm pnpm
+
+# Accept all defaults (react-tailwind-sync + detected package manager)
+npx create-kora-app my-app --yes
+
+# Mix flags: Tailwind without sync
+npx create-kora-app my-app --tailwind --no-sync --pm npm
 ```
 
 ### Generated project structure

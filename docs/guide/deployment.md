@@ -15,12 +15,13 @@ pnpm add @korajs/server
 Create a server file (`server.ts`):
 
 ```typescript
-import { createServer } from '@korajs/server'
-import schema from './schema'
+import { createKoraServer, createSqliteServerStore } from '@korajs/server'
 
-const server = createServer({
-  schema,
-  port: 3000,
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+
+const server = createKoraServer({
+  store,
+  port: 3001,
 })
 
 server.start()
@@ -32,13 +33,13 @@ Run it:
 npx tsx server.ts
 ```
 
-Your sync server is now running at `ws://localhost:3000`. Point your client at it:
+Your sync server is now running at `ws://localhost:3001`. Point your client at it:
 
 ```typescript
 const app = createApp({
   schema,
   sync: {
-    url: 'ws://localhost:3000',
+    url: 'ws://localhost:3001',
   },
 })
 ```
@@ -46,23 +47,24 @@ const app = createApp({
 ### Server Configuration
 
 ```typescript
-import { createServer, PostgresStore, TokenAuthProvider } from '@korajs/server'
-import schema from './schema'
+import {
+  createKoraServer,
+  createPostgresServerStore,
+  TokenAuthProvider,
+} from '@korajs/server'
 
-const server = createServer({
-  // Required: same schema as the client
-  schema,
+const store = await createPostgresServerStore({
+  connectionString: process.env.DATABASE_URL,
+})
 
-  // Port to listen on (default: 3000)
-  port: 3000,
+const server = createKoraServer({
+  store,
+
+  // Port to listen on (default: 4567)
+  port: 3001,
 
   // Host to bind to (default: '0.0.0.0')
   host: '0.0.0.0',
-
-  // Server-side storage backend
-  store: new PostgresStore({
-    connectionString: process.env.DATABASE_URL,
-  }),
 
   // Authentication provider
   auth: new TokenAuthProvider({
@@ -75,11 +77,6 @@ const server = createServer({
     },
   }),
 
-  // Sync scopes (server-side filtering)
-  scopes: {
-    todos: (ctx) => ({ where: { userId: ctx.userId } }),
-  },
-
   // Logging level
   logLevel: 'info',  // 'debug' | 'info' | 'warn' | 'error'
 })
@@ -91,60 +88,63 @@ server.start()
 
 The server needs a storage backend to persist the operation log and relay operations to clients. Kora provides three built-in options.
 
-### MemoryStore
+### MemoryServerStore
 
 Stores operations in memory. All data is lost when the server restarts. Use only for development and testing.
 
 ```typescript
-import { MemoryStore } from '@korajs/server'
+import { createKoraServer, MemoryServerStore } from '@korajs/server'
 
-const server = createServer({
-  schema,
-  store: new MemoryStore(),
+const server = createKoraServer({
+  store: new MemoryServerStore(),
 })
 ```
 
 This is the default if no `store` is specified.
 
-### SQLiteStore
+### SQLite (createSqliteServerStore)
 
-Stores operations in a local SQLite database file. Good for single-server deployments and prototyping.
-
-```typescript
-import { SQLiteStore } from '@korajs/server'
-
-const server = createServer({
-  schema,
-  store: new SQLiteStore({
-    path: './data/kora.db',
-  }),
-})
-```
-
-### PostgresStore
-
-Stores operations in PostgreSQL. Recommended for production deployments.
+Stores operations in a local SQLite database file. Good for single-server deployments and prototyping. Data survives server restarts.
 
 ```typescript
-import { PostgresStore } from '@korajs/server'
+import { createKoraServer, createSqliteServerStore } from '@korajs/server'
 
-const server = createServer({
-  schema,
-  store: new PostgresStore({
-    connectionString: 'postgresql://user:pass@localhost:5432/kora',
-  }),
+const store = createSqliteServerStore({
+  filename: './data/kora.db',
 })
+
+const server = createKoraServer({ store })
 ```
 
-The `PostgresStore` uses Drizzle ORM under the hood. It creates the necessary tables automatically on first run.
+### PostgreSQL (createPostgresServerStore)
+
+Stores operations in PostgreSQL. Recommended for production deployments. Requires the `postgres` package:
+
+```bash
+npm install postgres
+```
+
+```typescript
+import { createKoraServer, createPostgresServerStore } from '@korajs/server'
+
+const store = await createPostgresServerStore({
+  connectionString: 'postgresql://user:pass@localhost:5432/kora',
+})
+
+const server = createKoraServer({ store })
+```
+
+Tables are created automatically on first connection.
 
 ### Choosing a Store
 
 | Store | Persistence | Performance | Use Case |
 |-------|-------------|-------------|----------|
-| `MemoryStore` | None | Fastest | Development, tests |
-| `SQLiteStore` | File | Fast | Single-server, prototyping |
-| `PostgresStore` | Database | Production-grade | Production, multi-instance |
+| `MemoryServerStore` | None | Fastest | Development, tests |
+| `createSqliteServerStore` | File | Fast | Single-server, prototyping |
+| `createPostgresServerStore` | Database | Production-grade | Production, multi-instance |
+
+For a detailed guide on storage configuration, multiple apps, and switching databases, see [Storage Configuration](/guide/storage-configuration).
 
 ## Authentication
 
@@ -222,9 +222,9 @@ Run the Kora server behind a reverse proxy (Nginx, Caddy, Cloudflare) that termi
 
 Never run without authentication in production. Use `TokenAuthProvider` with a proper token verification strategy (JWT, OAuth, session tokens).
 
-### Use PostgresStore
+### Use PostgreSQL
 
-For production, use `PostgresStore` for durable, scalable storage. Back up the database regularly.
+For production, use `createPostgresServerStore` for durable, scalable storage. Back up the database regularly.
 
 ### Set Sync Scopes
 
@@ -261,9 +261,12 @@ Integrate these events with your logging and alerting infrastructure.
 For large deployments, configure resource limits:
 
 ```typescript
-const server = createServer({
-  schema,
-  store: new PostgresStore({ connectionString: process.env.DATABASE_URL }),
+const store = await createPostgresServerStore({
+  connectionString: process.env.DATABASE_URL,
+})
+
+const server = createKoraServer({
+  store,
   maxConnections: 10000,
   maxBatchSize: 1000,       // Max operations per sync batch
   heartbeatInterval: 30000, // Milliseconds between keepalive pings
@@ -321,7 +324,7 @@ volumes:
 
 ### Horizontal Scaling
 
-The Kora server is stateless once configured with `PostgresStore`. You can run multiple instances behind a load balancer. Use sticky sessions (based on client node ID) to minimize reconnection overhead, but the protocol works correctly without them since all state is in the database.
+The Kora server is stateless once configured with `createPostgresServerStore`. You can run multiple instances behind a load balancer. Use sticky sessions (based on client node ID) to minimize reconnection overhead, but the protocol works correctly without them since all state is in the database.
 
 ### Operation Compaction
 

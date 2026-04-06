@@ -3,12 +3,13 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'Kora.js',
   description: 'Offline-first application framework',
+  base: '/kora/',
   themeConfig: {
     nav: [
       { text: 'Guide', link: '/getting-started' },
       { text: 'API', link: '/api/' },
       { text: 'Examples', link: '/examples/todo-app' },
-      { text: 'GitHub', link: 'https://github.com/anthropics/kora' },
+      { text: 'GitHub', link: 'https://github.com/ehoneahobed/kora' },
     ],
     sidebar: [
       {
@@ -21,6 +22,7 @@ export default defineConfig({
         text: 'Guide',
         items: [
           { text: 'Schema Design', link: '/guide/schema-design' },
+          { text: 'Storage Configuration', link: '/guide/storage-configuration' },
           { text: 'Offline Patterns', link: '/guide/offline-patterns' },
           { text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
           { text: 'Sync Configuration', link: '/guide/sync-configuration' },
@@ -49,7 +51,7 @@ export default defineConfig({
       },
     ],
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/anthropics/kora' },
+      { icon: 'github', link: 'https://github.com/ehoneahobed/kora' },
     ],
     search: {
       provider: 'local',

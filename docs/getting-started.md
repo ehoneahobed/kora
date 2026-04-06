@@ -16,14 +16,22 @@ You will be prompted to choose a template and package manager:
 Kora.js - Offline-first application framework
 
 ? Select a template:
-  > React (basic)         # Local-only, no sync
-    React (with sync)     # Includes sync server setup
+  > React + Tailwind (with sync)    # Recommended — polished UI with real-time sync
+    React + Tailwind (local-only)   # Tailwind CSS, no sync server
+    React + CSS (with sync)         # Plain CSS with sync server
+    React + CSS (local-only)        # Plain CSS, local-only
 
 ? Package manager:
   > pnpm
     npm
     yarn
     bun
+```
+
+You can also skip the prompts entirely:
+
+```bash
+npx create-kora-app my-app --yes  # Uses recommended defaults
 ```
 
 Once scaffolding completes:

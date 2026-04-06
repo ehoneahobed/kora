@@ -140,50 +140,53 @@ const server = createKoraServer({
 })
 ```
 
-### PostgresServerStore
+### createPostgresServerStore()
 
-Stores operations in PostgreSQL using Drizzle ORM. Recommended for production deployments.
+Creates a PostgreSQL-backed server store using Drizzle ORM. Recommended for production deployments. Requires the `postgres` package (`npm install postgres`).
 
 ```typescript
-new PostgresServerStore(options: PostgresServerStoreOptions)
+async function createPostgresServerStore(options: {
+  connectionString: string
+  nodeId?: string
+}): Promise<PostgresServerStore>
 ```
-
-#### PostgresServerStoreOptions
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `connectionString` | `string` | Yes | PostgreSQL connection URL. |
-| `schema` | `string` | No | Database schema name. Defaults to `'public'`. |
-| `pool` | `PoolConfig` | No | Connection pool configuration (min, max connections). |
+| `nodeId` | `string` | No | Server node ID. Auto-generated if omitted. |
 
 ```typescript
-const store = new PostgresServerStore({
+import { createPostgresServerStore } from '@korajs/server'
+
+const store = await createPostgresServerStore({
   connectionString: 'postgresql://user:pass@localhost:5432/kora',
-  schema: 'kora',
-  pool: { min: 2, max: 10 },
 })
 ```
 
-The store automatically creates the required tables (`kora_operations`, `kora_version_vectors`) on first connection. No manual migration is needed for the server-side schema.
+Tables are created automatically on first connection. No manual migration is needed.
 
-### SqliteServerStore
+### createSqliteServerStore()
 
-Stores operations in a SQLite database file. Suitable for single-node deployments and development.
+Creates a SQLite-backed server store. Suitable for single-node deployments and development. Data persists to disk and survives server restarts.
 
 ```typescript
-new SqliteServerStore(options: SqliteServerStoreOptions)
+function createSqliteServerStore(options: {
+  filename?: string
+  nodeId?: string
+}): SqliteServerStore
 ```
 
-#### SqliteServerStoreOptions
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | `string` | Yes | Path to the SQLite database file. Created if it does not exist. |
-| `wal` | `boolean` | No | Enable WAL mode for better concurrent performance. Defaults to `true`. |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `filename` | `string` | No | `':memory:'` | Path to the SQLite database file. Created if it does not exist. |
+| `nodeId` | `string` | No | Auto-generated | Server node ID. |
 
 ```typescript
-const store = new SqliteServerStore({
-  path: './data/kora.db',
+import { createSqliteServerStore } from '@korajs/server'
+
+const store = createSqliteServerStore({
+  filename: './data/kora.db',
 })
 ```
 
@@ -371,33 +374,19 @@ A complete production-ready server setup:
 ```typescript
 import {
   createKoraServer,
-  PostgresServerStore,
+  createPostgresServerStore,
   TokenAuthProvider,
   WsServerTransport,
   HttpServerTransport,
 } from '@korajs/server'
-import { defineSchema, t } from 'korajs'
 
-const schema = defineSchema({
-  version: 1,
-  collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        completed: t.boolean().default(false),
-        assignee: t.string().optional(),
-        createdAt: t.timestamp().auto(),
-      },
-    },
-  },
+const store = await createPostgresServerStore({
+  connectionString: process.env.DATABASE_URL,
 })
 
 const server = createKoraServer({
-  schema,
+  store,
   port: Number(process.env.PORT) || 4567,
-  store: new PostgresServerStore({
-    connectionString: process.env.DATABASE_URL,
-  }),
   auth: new TokenAuthProvider({
     verify: async (token) => {
       const user = await verifyToken(token)
