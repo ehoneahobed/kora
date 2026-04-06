@@ -8,7 +8,7 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Feature-complete** — all 9 packages implemented with 1128+ tests. Includes E2E tests, documentation site, and CI/CD pipelines.
+**Feature-complete** — all 9 packages implemented with 1138+ tests. Includes E2E tests, documentation site, and CI/CD pipelines.
 
 | Package | Tests | Description |
 |---------|-------|-------------|
@@ -19,7 +19,7 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 | `@korajs/server` | 118 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
 | `@korajs/react` | 60 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
 | `@korajs/devtools` | 49 | Browser DevTools extension with sync timeline, conflict inspector |
-| `@korajs/cli` | 120 | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
+| `@korajs/cli` | 130 | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
 | `kora` | 46 | Meta-package with `createApp`, full type inference from schema to hooks |
 
 ## What It Does
@@ -45,7 +45,13 @@ cd my-app
 pnpm dev
 ```
 
-This gives you a React app with local persistence, reactive queries, and optional sync — all working out of the box.
+Choose from 4 templates: **React + Tailwind (with sync)** (recommended), React + Tailwind (local-only), React + CSS (with sync), or React + CSS (local-only). Or skip the prompts:
+
+```bash
+npx create-kora-app my-app --yes    # Recommended defaults
+```
+
+This gives you a polished dark-themed React app with local persistence, reactive queries, DevTools, and optional sync — all working out of the box.
 
 ### Or start from scratch
 
@@ -175,7 +181,7 @@ pnpm test
 
 ```bash
 pnpm build              # Build all packages
-pnpm test               # Run all unit/integration tests (1128+ tests)
+pnpm test               # Run all unit/integration tests (1138+ tests)
 pnpm typecheck          # TypeScript strict mode check
 pnpm lint               # Biome lint and format check
 pnpm lint:fix           # Auto-fix lint/format issues
@@ -299,10 +305,9 @@ After this, all packages are live on npm. The scaffolded project will pin its ko
 Once packages are on npm, share these instructions:
 
 ```bash
-npx create-kora-app my-app --template react-sync
+npx create-kora-app my-app --template react-tailwind-sync
 cd my-app
 pnpm install
-pnpm dev:server &
 pnpm dev
 # Open http://localhost:5173 in two browser tabs
 ```
@@ -399,13 +404,19 @@ Share the web app tunnel URL. Testers open it in their browsers and their change
 
 ## Documentation
 
-Full documentation is available at the docs site. To run locally:
+Full documentation is available at **[ehoneahobed.github.io/kora](https://ehoneahobed.github.io/kora/)**.
 
-```bash
-pnpm docs:dev
-```
+Covers:
+- [Getting Started](https://ehoneahobed.github.io/kora/getting-started) — Zero to working app in 5 minutes
+- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design) — Field types, relations, versioning
+- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration) — Client and server storage, multiple apps, PostgreSQL
+- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, scopes, encryption, transports
+- [React Hooks](https://ehoneahobed.github.io/kora/guide/react-hooks) — useQuery, useMutation, useSyncStatus
+- [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution) — Three-tier merge engine
+- [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Self-hosting, Docker, scaling
+- [API Reference](https://ehoneahobed.github.io/kora/api/) — Complete reference for all packages
 
-Covers: getting started, schema design, offline patterns, conflict resolution, sync configuration, React hooks, DevTools, deployment, and complete API reference.
+To run docs locally: `pnpm docs:dev`
 
 ## License
 
