@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module'
 import type { Operation, VersionVector } from '@korajs/core'
 import { generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
@@ -5,6 +6,10 @@ import { and, asc, between, count, eq, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { operations, syncState } from './drizzle-schema'
 import type { ServerStore } from './server-store'
+
+// createRequire provides a CJS require() function that works in ESM contexts.
+// better-sqlite3 is a native CJS addon that cannot be loaded via import().
+const esmRequire = createRequire(import.meta.url)
 
 /**
  * SQLite-backed server store using Drizzle ORM.
@@ -216,11 +221,10 @@ export function createSqliteServerStore(options: {
 	filename?: string
 	nodeId?: string
 }): SqliteServerStore {
-	// Dynamic imports avoided — better-sqlite3 is synchronous and Node-only.
-	// Consumer is responsible for having better-sqlite3 installed.
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
-	const Database = require('better-sqlite3')
-	const { drizzle } = require('drizzle-orm/better-sqlite3')
+	// better-sqlite3 is a native CJS addon — use esmRequire (from createRequire)
+	// so this works in both ESM and CJS contexts.
+	const Database = esmRequire('better-sqlite3')
+	const { drizzle } = esmRequire('drizzle-orm/better-sqlite3')
 
 	const filename = options.filename ?? ':memory:'
 	const sqlite = new Database(filename)
