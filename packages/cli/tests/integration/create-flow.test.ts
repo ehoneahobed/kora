@@ -35,6 +35,7 @@ describe('create-kora-app flow', () => {
 		expect(srcFiles).toContain('schema.ts')
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
+		expect(srcFiles).toContain('index.css')
 
 		// Verify package.json has correct name
 		const pkgContent = await readFile(join(targetDir, 'package.json'), 'utf-8')
@@ -45,6 +46,10 @@ describe('create-kora-app flow', () => {
 		const schema = await readFile(join(targetDir, 'src', 'schema.ts'), 'utf-8')
 		expect(schema).toContain('defineSchema')
 		expect(schema).toContain('todos')
+
+		// Verify devtools enabled
+		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		expect(main).toContain('devtools: true')
 	})
 
 	test('react-sync: includes sync-specific files', async () => {
@@ -62,15 +67,91 @@ describe('create-kora-app flow', () => {
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync:')
 		expect(main).toContain('ws://localhost:3001')
+		expect(main).toContain('devtools: true')
 
 		// Verify @korajs/server in devDependencies
 		const pkgContent = await readFile(join(targetDir, 'package.json'), 'utf-8')
 		expect(pkgContent).toContain('@korajs/server')
+
+		// Verify SQLite server store
+		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
+		expect(server).toContain('createSqliteServerStore')
+	})
+
+	test('react-tailwind: Tailwind setup without sync', async () => {
+		const targetDir = join(tempDir.path, 'tw-app')
+		await scaffoldTemplate('react-tailwind', targetDir, {
+			projectName: 'tw-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.1.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('vite.config.ts')
+		expect(files).not.toContain('server.ts')
+
+		// Tailwind deps present
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).toContain('@tailwindcss/vite')
+		expect(pkg).toContain('lucide-react')
+		expect(pkg).not.toContain('@korajs/server')
+
+		// CSS file uses Tailwind
+		const css = await readFile(join(targetDir, 'src', 'index.css'), 'utf-8')
+		expect(css).toContain('@import "tailwindcss"')
+
+		// Vite config uses Tailwind plugin
+		const vite = await readFile(join(targetDir, 'vite.config.ts'), 'utf-8')
+		expect(vite).toContain('tailwindcss')
+
+		// No sync config
+		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		expect(main).not.toContain('sync:')
+		expect(main).toContain('devtools: true')
+	})
+
+	test('react-tailwind-sync: full featured template', async () => {
+		const targetDir = join(tempDir.path, 'tw-sync-app')
+		await scaffoldTemplate('react-tailwind-sync', targetDir, {
+			projectName: 'tw-sync-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.3.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('server.ts')
+		expect(files).toContain('vite.config.ts')
+		expect(files).toContain('kora.config.ts')
+		expect(files).toContain('index.html')
+
+		// Tailwind + sync deps
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).toContain('lucide-react')
+		expect(pkg).toContain('@korajs/server')
+		expect(pkg).toContain('"tw-sync-app"')
+
+		// Sync + devtools in main
+		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		expect(main).toContain('sync:')
+		expect(main).toContain('devtools: true')
+
+		// SQLite server store
+		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
+		expect(server).toContain('createSqliteServerStore')
+
+		// App uses sync status and lucide icons
+		const app = await readFile(join(targetDir, 'src', 'App.tsx'), 'utf-8')
+		expect(app).toContain('useSyncStatus')
+		expect(app).toContain('lucide-react')
 	})
 
 	test('variable substitution applied correctly in all .hbs files', async () => {
 		const targetDir = join(tempDir.path, 'subst-test')
-		await scaffoldTemplate('react-basic', targetDir, {
+		await scaffoldTemplate('react-tailwind-sync', targetDir, {
 			projectName: 'subst-test',
 			packageManager: 'yarn',
 			koraVersion: '3.0.0',

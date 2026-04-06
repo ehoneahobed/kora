@@ -38,6 +38,18 @@ describe('getTemplatePath', () => {
 		expect(path).toContain('templates')
 		expect(path).toContain('react-sync')
 	})
+
+	test('returns path for react-tailwind template', () => {
+		const path = getTemplatePath('react-tailwind')
+		expect(path).toContain('templates')
+		expect(path).toContain('react-tailwind')
+	})
+
+	test('returns path for react-tailwind-sync template', () => {
+		const path = getTemplatePath('react-tailwind-sync')
+		expect(path).toContain('templates')
+		expect(path).toContain('react-tailwind-sync')
+	})
 })
 
 describe('scaffoldTemplate', () => {
@@ -79,6 +91,7 @@ describe('scaffoldTemplate', () => {
 		expect(srcFiles).toContain('schema.ts')
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
+		expect(srcFiles).toContain('index.css')
 	})
 
 	test('scaffolds react-sync template with server.ts', async () => {
@@ -102,5 +115,88 @@ describe('scaffoldTemplate', () => {
 		// Check sync config in main.tsx
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync')
+
+		// Check devtools enabled
+		expect(main).toContain('devtools: true')
+
+		// Check server uses SQLite
+		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
+		expect(server).toContain('createSqliteServerStore')
+	})
+
+	test('scaffolds react-tailwind template with Tailwind config', async () => {
+		const targetDir = join(tempDir.path, 'tw-app')
+		await scaffoldTemplate('react-tailwind', targetDir, {
+			projectName: 'tw-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.1.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('vite.config.ts')
+		expect(files).not.toContain('server.ts')
+
+		// Check Tailwind deps in package.json
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).toContain('@tailwindcss/vite')
+		expect(pkg).toContain('lucide-react')
+		expect(pkg).not.toContain('@korajs/server')
+
+		// Check Tailwind plugin in vite config
+		const vite = await readFile(join(targetDir, 'vite.config.ts'), 'utf-8')
+		expect(vite).toContain('tailwindcss')
+		expect(vite).toContain('@tailwindcss/vite')
+
+		// Check CSS imports Tailwind
+		const css = await readFile(join(targetDir, 'src', 'index.css'), 'utf-8')
+		expect(css).toContain('@import "tailwindcss"')
+
+		// Check devtools enabled
+		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		expect(main).toContain('devtools: true')
+		expect(main).not.toContain('sync')
+	})
+
+	test('scaffolds react-tailwind-sync template with all features', async () => {
+		const targetDir = join(tempDir.path, 'tw-sync-app')
+		await scaffoldTemplate('react-tailwind-sync', targetDir, {
+			projectName: 'tw-sync-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.2.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('server.ts')
+		expect(files).toContain('vite.config.ts')
+		expect(files).toContain('kora.config.ts')
+
+		// Check Tailwind + sync deps
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).toContain('@tailwindcss/vite')
+		expect(pkg).toContain('lucide-react')
+		expect(pkg).toContain('@korajs/server')
+
+		// Check sync + devtools in main.tsx
+		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		expect(main).toContain('sync')
+		expect(main).toContain('ws://localhost:3001')
+		expect(main).toContain('devtools: true')
+
+		// Check server uses SQLite
+		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
+		expect(server).toContain('createSqliteServerStore')
+
+		// Check CSS imports Tailwind
+		const css = await readFile(join(targetDir, 'src', 'index.css'), 'utf-8')
+		expect(css).toContain('@import "tailwindcss"')
+
+		// Check App.tsx uses lucide-react
+		const app = await readFile(join(targetDir, 'src', 'App.tsx'), 'utf-8')
+		expect(app).toContain('lucide-react')
+		expect(app).toContain('useSyncStatus')
 	})
 })

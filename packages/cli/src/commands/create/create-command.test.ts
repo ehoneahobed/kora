@@ -40,6 +40,7 @@ describe('create command flow', () => {
 		expect(srcFiles).toContain('schema.ts')
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
+		expect(srcFiles).toContain('index.css')
 	})
 
 	test('substitutes project name in package.json', async () => {
@@ -99,5 +100,78 @@ describe('create command flow', () => {
 		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
 		expect(pkg).toContain('2.3.4')
 		expect(pkg).not.toContain('{{koraVersion}}')
+	})
+
+	test('scaffolds react-tailwind-sync project with Tailwind and sync', async () => {
+		const targetDir = join(tempDir.path, 'tw-sync-app')
+		await scaffoldTemplate('react-tailwind-sync', targetDir, {
+			projectName: 'tw-sync-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.1.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('server.ts')
+		expect(files).toContain('vite.config.ts')
+
+		const srcFiles = await readdir(join(targetDir, 'src'))
+		expect(srcFiles).toContain('index.css')
+		expect(srcFiles).toContain('App.tsx')
+
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).toContain('lucide-react')
+		expect(pkg).toContain('@korajs/server')
+	})
+
+	test('scaffolds react-tailwind project without sync', async () => {
+		const targetDir = join(tempDir.path, 'tw-app')
+		await scaffoldTemplate('react-tailwind', targetDir, {
+			projectName: 'tw-app',
+			packageManager: 'npm',
+			koraVersion: '0.1.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).not.toContain('server.ts')
+
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('tailwindcss')
+		expect(pkg).not.toContain('@korajs/server')
+	})
+
+	test('all templates include devtools: true', async () => {
+		const templates = [
+			'react-basic',
+			'react-sync',
+			'react-tailwind',
+			'react-tailwind-sync',
+		] as const
+		for (const template of templates) {
+			const targetDir = join(tempDir.path, `devtools-${template}`)
+			await scaffoldTemplate(template, targetDir, {
+				projectName: `devtools-${template}`,
+				packageManager: 'pnpm',
+				koraVersion: '0.1.0',
+			})
+			const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+			expect(main).toContain('devtools: true')
+		}
+	})
+
+	test('sync templates use SQLite server store', async () => {
+		for (const template of ['react-sync', 'react-tailwind-sync'] as const) {
+			const targetDir = join(tempDir.path, `sqlite-${template}`)
+			await scaffoldTemplate(template, targetDir, {
+				projectName: `sqlite-${template}`,
+				packageManager: 'pnpm',
+				koraVersion: '0.1.0',
+			})
+			const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
+			expect(server).toContain('createSqliteServerStore')
+			expect(server).not.toContain('MemoryServerStore')
+		}
 	})
 })

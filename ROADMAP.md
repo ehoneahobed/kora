@@ -4,7 +4,7 @@
 
 ## Where We Are
 
-Core platform packages and meta-package are implemented, with **1123 tests passing** across the monorepo.
+Core platform packages and meta-package are implemented, with **1133 tests passing** across the monorepo.
 
 | Package | Tests | Status |
 |---------|-------|--------|
@@ -15,10 +15,10 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 | @korajs/server | 118 | Memory + SQLite + PostgreSQL stores (both using Drizzle ORM); server-side scope filtering and HTTP sync endpoint support |
 | @korajs/react | 60 | Hooks + query-store integration complete (generic type threading) |
 | @korajs/devtools | 49 | Instrumentation backend + browser DevTools extension UI complete |
-| @korajs/cli | 120 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete (ordered idempotent apply + breaking-change confirmation) |
+| @korajs/cli | 130 | `kora dev` implemented; `kora migrate` diff/generate/apply workflow complete; 4-template system with Tailwind CSS, polished UI, `--yes`/`--tailwind`/`--sync` flags |
 | kora (meta-package) | 46 | `createApp` + typed `kora/config` entrypoint shipped, with typed overload for full schema inference |
 
-**What works end-to-end today:** A developer can scaffold an app and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Sync server persistence is available for memory, SQLite, and PostgreSQL backends (both using Drizzle ORM query builders), server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution. Full end-to-end type inference flows from `defineSchema()` through `createApp()` to collection accessors and React hooks. Relational queries via `.include()` resolve many-to-one and one-to-many relations.
+**What works end-to-end today:** A developer can scaffold an app via `npx create-kora-app` (with 4 template choices: Tailwind/CSS x sync/local-only) and run `pnpm dev` via `kora dev`, with Vite + optional sync server + schema watcher in one command. Templates ship with polished dark-themed UIs, DevTools enabled by default, and persistent SQLite server stores. CLI supports `--yes`/`--tailwind`/`--sync` flags for fast scaffolding. Sync server persistence is available for memory, SQLite, and PostgreSQL backends (both using Drizzle ORM query builders), server-side scope filtering is active, and `kora migrate` supports end-to-end diff/generate/apply with ordered idempotent execution. Full end-to-end type inference flows from `defineSchema()` through `createApp()` to collection accessors and React hooks. Relational queries via `.include()` resolve many-to-one and one-to-many relations.
 
 **What works today:** E2E Playwright test suite, VitePress documentation site, and CI/CD pipelines (main CI, release via Changesets, canary snapshots, E2E, docs deployment) are all in place.
 
@@ -41,6 +41,7 @@ Core platform packages and meta-package are implemented, with **1123 tests passi
 | 9 | Complete | Protobuf negotiation, HTTP fallback, benchmark gates, and nightly chaos convergence gating are in place |
 | 10 | Complete | E2E Playwright suite, VitePress docs site, CI/CD pipelines (main, release, canary, e2e, docs) |
 | Cross-cutting | Complete | End-to-end type inference, relational `.include()` queries, full Drizzle ORM migration |
+| **11** | **Complete** | Developer experience & launch polish — 4-template system, Tailwind support, polished UI, persistent server stores, 130 CLI tests |
 
 ---
 
@@ -781,6 +782,79 @@ GitHub Actions CI/CD workflows:
 
 ---
 
+## Phase 11: Developer Experience & Launch Polish
+
+**Status:** Complete
+
+**Goal:** Make `npx create-kora-app` produce a polished, impressive app out of the box. Expand the template system with Tailwind CSS support, improve default styling, enable DevTools by default, and ship persistent server stores in sync templates.
+
+**Why now:** All 10 technical phases are complete, but the first-impression developer experience has gaps. Templates ship with bare inline styles, no CSS framework choice, memory-only sync servers, and no quick-start flags. This phase bridges the gap between "technically correct" and "delightful to use."
+
+### 11a. Template System Upgrade (4 Templates)
+
+Expand from 2 templates to 4, adding Tailwind CSS variants:
+
+| Template | Sync? | Styling | Default? |
+|----------|-------|---------|----------|
+| `react-tailwind-sync` | Yes | Tailwind CSS + lucide-react | **Recommended** |
+| `react-tailwind` | No | Tailwind CSS + lucide-react | |
+| `react-sync` | Yes | Plain CSS (dark theme) | |
+| `react-basic` | No | Plain CSS (dark theme) | |
+
+**New CLI flags:**
+- `--yes` / `-y` — accept all defaults (react-tailwind-sync + detected PM)
+- `--tailwind` / `--no-tailwind` — skip styling prompt
+- `--sync` / `--no-sync` — skip sync prompt
+
+**Updated interactive flow:**
+1. Project name (unchanged)
+2. Template — 4 options with `React + Tailwind (with sync)` recommended
+3. Package manager (unchanged)
+
+### 11b. Polished Template UI
+
+All templates get a visual overhaul:
+
+**Tailwind templates (`react-tailwind-sync`, `react-tailwind`):**
+- Dark theme with Tailwind CSS utility classes
+- `lucide-react` icons (CheckCircle2, Circle, Plus, Trash2, Wifi, WifiOff, etc.)
+- Stat cards (Total / Remaining / Done)
+- Filter tabs (All / Active / Completed) with badge counts
+- Styled add form with loading state
+- Todo list with toggle icons, strikethrough, timestamp, hover-delete
+- Sync status indicator (sync variants only)
+- "Powered by Kora" footer
+
+**Plain CSS templates (`react-sync`, `react-basic`):**
+- New `src/index.css` with CSS custom properties, system font stack, dark theme reset
+- Rewritten `App.tsx` with proper CSS class-based styling (no inline styles)
+- Same features as Tailwind but simpler presentation
+
+### 11c. DevTools Enabled by Default
+
+All 4 templates include `devtools: true` in `createApp` config. The instrumenter is lightweight — only emits events when the browser extension is installed.
+
+### 11d. Persistent Server Stores
+
+Sync templates ship with SQLite persistence by default (`createSqliteServerStore`) instead of `MemoryServerStore`. Server data survives restarts. Comments in `server.ts` show how to switch to PostgreSQL.
+
+### Implementation Steps
+
+| Step | What | Status |
+|------|------|--------|
+| 1 | Update `types.ts` — 4 templates, new flags | Complete |
+| 2 | Update `create-command.ts` — new prompt flow, flag handling | Complete |
+| 3 | Create `react-tailwind-sync` template | Complete |
+| 4 | Create `react-tailwind` template | Complete |
+| 5 | Upgrade `react-sync` template — CSS, devtools, SQLite store | Complete |
+| 6 | Upgrade `react-basic` template — CSS, devtools | Complete |
+| 7 | Update tests for all 4 templates | Complete |
+| 8 | Build and verify — 130 tests passing (up from 120) | Complete |
+
+**Deliverable:** After Phase 11, `npx create-kora-app my-app` produces a visually polished, dark-themed todo app with Tailwind CSS, sync status, DevTools enabled, and persistent server storage — all with zero configuration.
+
+---
+
 ## Phase Summary
 
 | Phase | Scope | Status |
@@ -796,5 +870,4 @@ GitHub Actions CI/CD workflows:
 | **Cross-cutting** | Type inference, relational queries, Drizzle migration | Complete |
 | **9** | Protobuf, HTTP transport, benchmarks, chaos | Complete |
 | **10** | E2E tests, docs, publish | Complete |
-
-**All phases complete.** Kora.js is launch-ready.
+| **11** | Developer experience & launch polish | Complete |

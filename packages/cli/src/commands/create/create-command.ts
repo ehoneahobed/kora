@@ -33,7 +33,8 @@ export const createCommand = defineCommand({
 		},
 		template: {
 			type: 'string',
-			description: 'Project template (react-basic, react-sync)',
+			description:
+				'Project template (react-tailwind-sync, react-tailwind, react-sync, react-basic)',
 		},
 		pm: {
 			type: 'string',
@@ -44,13 +45,30 @@ export const createCommand = defineCommand({
 			description: 'Skip installing dependencies',
 			default: false,
 		},
+		yes: {
+			type: 'boolean',
+			alias: 'y',
+			description: 'Accept all defaults (react-tailwind-sync + detected package manager)',
+			default: false,
+		},
+		tailwind: {
+			type: 'boolean',
+			description: 'Use Tailwind CSS (use --no-tailwind to skip)',
+		},
+		sync: {
+			type: 'boolean',
+			description: 'Include sync server (use --no-sync to skip)',
+		},
 	},
 	async run({ args }) {
 		const logger = createLogger()
 		logger.banner()
 
+		const useDefaults = args.yes === true
+
 		// Resolve project name
-		const projectName = args.name || (await promptText('Project name', 'my-kora-app'))
+		const projectName =
+			args.name || (useDefaults ? 'my-kora-app' : await promptText('Project name', 'my-kora-app'))
 		if (!projectName) {
 			logger.error('Project name is required')
 			process.exitCode = 1
@@ -60,7 +78,14 @@ export const createCommand = defineCommand({
 		// Resolve template
 		let template: TemplateName
 		if (args.template && isValidTemplate(args.template)) {
+			// Explicit --template flag takes priority
 			template = args.template
+		} else if (useDefaults) {
+			// --yes defaults to recommended template
+			template = 'react-tailwind-sync'
+		} else if (args.tailwind !== undefined || args.sync !== undefined) {
+			// Derive template from --tailwind and --sync flags
+			template = resolveTemplateFromFlags(args.tailwind, args.sync)
 		} else {
 			template = await promptSelect(
 				'Select a template:',
@@ -72,6 +97,8 @@ export const createCommand = defineCommand({
 		let pm: PackageManager
 		if (args.pm && isValidPackageManager(args.pm)) {
 			pm = args.pm
+		} else if (useDefaults) {
+			pm = detectPackageManager()
 		} else {
 			const detected = detectPackageManager()
 			pm = await promptSelect(
@@ -128,6 +155,22 @@ function isValidTemplate(value: string): value is TemplateName {
 
 function isValidPackageManager(value: string): value is PackageManager {
 	return (PACKAGE_MANAGERS as readonly string[]).includes(value)
+}
+
+/**
+ * Derives the template name from --tailwind and --sync boolean flags.
+ * Unspecified flags default to true (tailwind and sync are the recommended defaults).
+ */
+function resolveTemplateFromFlags(
+	tailwind: boolean | undefined,
+	sync: boolean | undefined,
+): TemplateName {
+	const useTailwind = tailwind !== false
+	const useSync = sync !== false
+	if (useTailwind && useSync) return 'react-tailwind-sync'
+	if (useTailwind && !useSync) return 'react-tailwind'
+	if (!useTailwind && useSync) return 'react-sync'
+	return 'react-basic'
 }
 
 /**

@@ -22,7 +22,7 @@ app.ready.then(() => app.sync?.connect())
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <KoraProvider app={app} fallback={<div>Loading...</div>}>
+    <KoraProvider app={app} fallback={<div className="flex items-center justify-center h-screen bg-gray-950 text-gray-400">Loading...</div>}>
       <App />
     </KoraProvider>
   </StrictMode>,
