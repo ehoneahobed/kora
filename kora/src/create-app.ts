@@ -114,15 +114,23 @@ export function createApp(config: KoraConfig): KoraApp {
 				const engine = syncEngine
 				emitter.on('sync:disconnected', () => {
 					if (intentionalDisconnect) return
-					// Guard: stop any in-progress reconnection before starting a new one
+					// Ignore cascading disconnect events from failed reconnection attempts.
+					// The reconnection manager is already retrying — don't restart it.
+					if (reconnectionManager?.isRunning()) return
+
+					engine.setReconnecting(true)
 					reconnectionManager?.stop()
 					reconnectionManager?.start(async () => {
 						try {
 							await engine.start()
+							engine.setReconnecting(false)
 							return true
 						} catch {
 							return false
 						}
+					}).then(() => {
+						// If reconnection exhausted max attempts without success, clear flag
+						engine.setReconnecting(false)
 					})
 				})
 			}

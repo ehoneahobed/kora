@@ -37,6 +37,8 @@ export interface WebSocketTransportOptions {
 	serializer?: MessageSerializer
 	/** Injectable WebSocket constructor for testing. Defaults to globalThis.WebSocket. */
 	WebSocketImpl?: WebSocketConstructor
+	/** Connection timeout in ms. Defaults to 10000 (10s). */
+	connectTimeout?: number
 }
 
 // WebSocket readyState constants
@@ -52,9 +54,11 @@ export class WebSocketTransport implements SyncTransport {
 	private errorHandler: TransportErrorHandler | null = null
 	private readonly serializer: MessageSerializer
 	private readonly WebSocketImpl: WebSocketConstructor
+	private readonly connectTimeout: number
 
 	constructor(options?: WebSocketTransportOptions) {
 		this.serializer = options?.serializer ?? new JsonMessageSerializer()
+		this.connectTimeout = options?.connectTimeout ?? 10000
 
 		if (options?.WebSocketImpl) {
 			this.WebSocketImpl = options.WebSocketImpl
@@ -74,6 +78,38 @@ export class WebSocketTransport implements SyncTransport {
 		}
 
 		return new Promise<void>((resolve, reject) => {
+			let settled = false
+
+			const settle = (fn: () => void): void => {
+				if (settled) return
+				settled = true
+				clearTimeout(timer)
+				fn()
+			}
+
+			// Connection timeout — prevents hanging for 30+ seconds on mobile when offline
+			const timer = setTimeout(() => {
+				settle(() => {
+					const err = new SyncError('WebSocket connection timed out', {
+						url,
+						timeout: this.connectTimeout,
+					})
+					// Close the pending WebSocket
+					if (this.ws) {
+						try {
+							this.ws.onclose = null
+							this.ws.onerror = null
+							this.ws.close()
+						} catch {
+							// Ignore close errors
+						}
+						this.ws = null
+					}
+					this.errorHandler?.(err)
+					reject(err)
+				})
+			}, this.connectTimeout)
+
 			try {
 				// Append auth token as query param if provided
 				const connectUrl = options?.authToken
@@ -84,7 +120,7 @@ export class WebSocketTransport implements SyncTransport {
 				this.ws = ws
 
 				ws.onopen = () => {
-					resolve()
+					settle(() => resolve())
 				}
 
 				ws.onmessage = (event: { data: unknown }) => {
@@ -117,17 +153,19 @@ export class WebSocketTransport implements SyncTransport {
 					// If we haven't connected yet, reject the connect promise
 					if (!this.isConnected()) {
 						this.ws = null
-						reject(err)
+						settle(() => reject(err))
 					}
 				}
 			} catch (err) {
-				reject(
-					err instanceof SyncError
-						? err
-						: new SyncError('Failed to create WebSocket', {
-								url,
-								error: String(err),
-							}),
+				settle(() =>
+					reject(
+						err instanceof SyncError
+							? err
+							: new SyncError('Failed to create WebSocket', {
+									url,
+									error: String(err),
+								}),
+					),
 				)
 			}
 		})

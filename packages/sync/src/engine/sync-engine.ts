@@ -80,6 +80,7 @@ export class SyncEngine {
 	private remoteVector: VersionVector = new Map()
 	private lastSyncedAt: number | null = null
 	private currentBatch: OutboundBatch | null = null
+	private reconnecting = false
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -136,8 +137,9 @@ export class SyncEngine {
 			}
 			this.transport.send(handshake)
 		} catch (err) {
-			this.transitionTo('error')
-			this.transitionTo('disconnected')
+			// Transport error/close handlers may have already transitioned to disconnected.
+			// Guard against invalid state transitions.
+			this.ensureDisconnected()
 			throw err
 		}
 	}
@@ -181,6 +183,16 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Mark the engine as being in a reconnection loop. When reconnecting,
+	 * `getStatus()` returns 'offline' instead of 'syncing' for intermediate
+	 * states (connecting, handshaking, syncing), since the user is effectively
+	 * disconnected until reconnection succeeds.
+	 */
+	setReconnecting(value: boolean): void {
+		this.reconnecting = value
+	}
+
+	/**
 	 * Get the current developer-facing sync status.
 	 */
 	getStatus(): SyncStatusInfo {
@@ -191,7 +203,13 @@ export class SyncEngine {
 			case 'connecting':
 			case 'handshaking':
 			case 'syncing':
-				return { status: 'syncing', pendingOperations, lastSyncedAt: this.lastSyncedAt }
+				// During reconnection attempts, show 'offline' instead of 'syncing'
+				// since the user is disconnected and reconnection is in progress.
+				return {
+					status: this.reconnecting ? 'offline' : 'syncing',
+					pendingOperations,
+					lastSyncedAt: this.lastSyncedAt,
+				}
 			case 'streaming':
 				return {
 					status: pendingOperations > 0 ? 'syncing' : 'synced',

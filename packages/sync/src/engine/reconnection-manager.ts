@@ -36,6 +36,7 @@ export class ReconnectionManager {
 	private attempt = 0
 	private timer: ReturnType<typeof setTimeout> | null = null
 	private stopped = false
+	private running = false
 	private waitResolve: (() => void) | null = null
 
 	constructor(config?: ReconnectionConfig) {
@@ -55,32 +56,37 @@ export class ReconnectionManager {
 	 */
 	async start(onReconnect: () => Promise<boolean>): Promise<boolean> {
 		this.stopped = false
+		this.running = true
 		this.attempt = 0
 
-		while (!this.stopped) {
-			if (this.maxAttempts > 0 && this.attempt >= this.maxAttempts) {
-				return false
-			}
-
-			const delay = this.getNextDelay()
-			this.attempt++
-
-			await this.wait(delay)
-
-			if (this.stopped) return false
-
-			try {
-				const success = await onReconnect()
-				if (success) {
-					this.reset()
-					return true
+		try {
+			while (!this.stopped) {
+				if (this.maxAttempts > 0 && this.attempt >= this.maxAttempts) {
+					return false
 				}
-			} catch {
-				// Continue retrying on failure
-			}
-		}
 
-		return false
+				const delay = this.getNextDelay()
+				this.attempt++
+
+				await this.wait(delay)
+
+				if (this.stopped) return false
+
+				try {
+					const success = await onReconnect()
+					if (success) {
+						this.reset()
+						return true
+					}
+				} catch {
+					// Continue retrying on failure
+				}
+			}
+
+			return false
+		} finally {
+			this.running = false
+		}
 	}
 
 	/**
@@ -118,6 +124,13 @@ export class ReconnectionManager {
 		const jitterRange = baseDelay * this.jitter
 		const jitterOffset = (this.random() - 0.5) * 2 * jitterRange
 		return Math.max(0, Math.round(baseDelay + jitterOffset))
+	}
+
+	/**
+	 * Whether the reconnection loop is currently running.
+	 */
+	isRunning(): boolean {
+		return this.running
 	}
 
 	/**

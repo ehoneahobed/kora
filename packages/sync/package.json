@@ -1,6 +1,6 @@
 {
   "name": "@korajs/sync",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "Kora.js sync package",
   "type": "module",
   "main": "./dist/index.cjs",
