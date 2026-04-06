@@ -16,8 +16,8 @@ type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
   const todos = useCollection('todos')
-  const allTodos = useQuery(todos.orderBy('createdAt', 'desc'))
-  const { mutate: addTodo, isPending: isAdding } = useMutation(
+  const allTodos = useQuery(todos.where({}).orderBy('createdAt', 'desc'))
+  const { mutate: addTodo, isLoading: isAdding } = useMutation(
     (data: { title: string }) => todos.insert(data)
   )
   const { mutate: toggleTodo } = useMutation(
