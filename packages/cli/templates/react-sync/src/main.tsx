@@ -9,7 +9,7 @@ import './index.css'
 const app = createApp({
   schema,
   sync: {
-    url: 'ws://localhost:3001',
+    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001',
   },
   store: {
     workerUrl: new URL('./kora-worker.ts', import.meta.url),

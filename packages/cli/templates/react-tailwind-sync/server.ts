@@ -14,7 +14,7 @@ const store = createSqliteServerStore({ filename: './kora-server.db' })
 
 const server = createKoraServer({
   store,
-  port: 3001,
+  port: Number(process.env.PORT) || 3001,
 })
 
 server.start().then(() => {

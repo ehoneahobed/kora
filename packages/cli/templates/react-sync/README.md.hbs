@@ -1,0 +1,63 @@
+# {{projectName}}
+
+An offline-first application built with [Kora.js](https://ehoneahobed.github.io/kora/).
+
+## Getting Started
+
+```bash
+npm run dev
+```
+
+This starts both the Vite dev server and the Kora sync server.
+
+- **App**: http://localhost:5173
+- **Sync server**: ws://localhost:3001
+
+## Project Structure
+
+```
+src/
+  schema.ts        # Data schema definition
+  main.tsx         # App initialization and Kora setup
+  App.tsx          # Main application component
+  kora-worker.ts   # SQLite WASM web worker
+  index.css        # Styles
+server.ts          # Kora sync server
+kora.config.ts     # Kora configuration
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_SYNC_URL` | `ws://localhost:3001` | WebSocket URL for the sync server |
+| `PORT` | `3001` | Sync server port |
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm run dev` | Start dev server + sync server |
+| `npm run dev:server` | Start sync server only |
+| `npm run build` | Build for production |
+| `npm run preview` | Preview production build |
+
+## Deployment
+
+The client and sync server must be deployed separately:
+
+- **Client**: Any static host (Vercel, Netlify, Cloudflare Pages)
+- **Sync server**: Any Node.js host with WebSocket support (Railway, Render, Fly.io)
+
+Set `VITE_SYNC_URL` to your deployed sync server URL when building:
+
+```bash
+VITE_SYNC_URL=wss://your-server.example.com npm run build
+```
+
+## Learn More
+
+- [Documentation](https://ehoneahobed.github.io/kora/)
+- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration)
+- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration)
+- [Deployment Guide](https://ehoneahobed.github.io/kora/guide/deployment)
