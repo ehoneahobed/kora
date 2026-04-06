@@ -1,16 +1,7 @@
-interface DevtoolsLike {
-	panels: {
-		create(
-			title: string,
-			iconPath: string,
-			pagePath: string,
-			callback: () => void,
-		): void
-	}
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare const chrome: any
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
-const devtools = (globalThis as { chrome?: { devtools?: DevtoolsLike } }).chrome?.devtools
-
-if (devtools?.panels) {
-	devtools.panels.create('Kora', '', 'devtools-page.html', () => {})
+if (chrome?.devtools?.panels) {
+	chrome.devtools.panels.create('Kora', '', 'devtools-page.html', () => {})
 }

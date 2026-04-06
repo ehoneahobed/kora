@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder } from '@korajs/store'
-import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { useMemo, useRef, useSyncExternalStore } from 'react'
 import { QueryStore } from '../query-store/query-store'
 import type { UseQueryOptions } from '../types'
 
@@ -72,15 +72,10 @@ export function useQuery<T = CollectionRecord>(
 		return queryStoreRef.current
 	}, [descriptorKey, enabled, query])
 
-	// Clean up on unmount
-	useEffect(() => {
-		return () => {
-			if (queryStoreRef.current) {
-				queryStoreRef.current.destroy()
-				queryStoreRef.current = null
-			}
-		}
-	}, [])
+	// No useEffect cleanup needed: QueryStore's subscribe/unsubscribe cycle
+	// manages the underlying subscription lifetime. When the last listener
+	// detaches (on unmount), the subscription auto-stops. This also makes
+	// the hook resilient to React StrictMode's double-mount cycle.
 
 	const disabledGetSnapshot = (): readonly T[] => EMPTY_ARRAY as readonly T[]
 

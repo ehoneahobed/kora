@@ -10,8 +10,11 @@ const EMPTY_ARRAY: readonly unknown[] = Object.freeze([])
  * Bridges the async QueryBuilder.subscribe() API with the synchronous
  * getSnapshot() required by React's useSyncExternalStore.
  *
- * Starts the underlying subscription eagerly on construction, so that
- * the snapshot is populated by the time useSyncExternalStore reads it.
+ * Uses a lazy subscription model: the underlying query subscription starts
+ * when the first listener attaches (via useSyncExternalStore's subscribe)
+ * and stops when the last listener detaches. This makes QueryStore resilient
+ * to React StrictMode's double-mount cycle, where useEffect cleanup fires
+ * between mount and remount.
  *
  * Generic parameter `T` defaults to `CollectionRecord` for backward compatibility.
  */
@@ -19,29 +22,37 @@ export class QueryStore<T = CollectionRecord> {
 	private snapshot: readonly T[] = EMPTY_ARRAY as readonly T[]
 	private listeners = new Set<() => void>()
 	private unsubscribeQuery: (() => void) | null = null
-	private destroyed = false
+	private active = false
+	private readonly queryBuilder: QueryBuilder<T>
 
 	constructor(queryBuilder: QueryBuilder<T>) {
-		// Start subscription eagerly so snapshot is populated before first getSnapshot() call
-		this.unsubscribeQuery = queryBuilder.subscribe((results) => {
-			if (this.destroyed) return
-
-			const newSnapshot = Object.freeze([...results])
-			this.snapshot = newSnapshot
-			this.notifyListeners()
-		})
+		this.queryBuilder = queryBuilder
 	}
 
 	/**
 	 * Subscribe to snapshot changes. Compatible with useSyncExternalStore.
+	 *
+	 * Lazily starts the underlying query subscription when the first listener
+	 * attaches, and stops it when the last listener detaches. This allows
+	 * React StrictMode to unmount/remount without permanently killing the subscription.
 	 *
 	 * @returns Unsubscribe function
 	 */
 	subscribe = (onStoreChange: () => void): (() => void) => {
 		this.listeners.add(onStoreChange)
 
+		// Start the underlying query subscription when the first listener attaches
+		if (!this.active) {
+			this.startSubscription()
+		}
+
 		return () => {
 			this.listeners.delete(onStoreChange)
+			// Stop the underlying subscription when the last listener detaches.
+			// This ensures cleanup on unmount without needing a useEffect.
+			if (this.listeners.size === 0) {
+				this.stopSubscription()
+			}
 		}
 	}
 
@@ -55,15 +66,30 @@ export class QueryStore<T = CollectionRecord> {
 
 	/**
 	 * Clean up the underlying subscription and release resources.
+	 * Called by useMemo when the query descriptor changes.
 	 */
 	destroy(): void {
-		this.destroyed = true
+		this.stopSubscription()
+		this.listeners.clear()
+		this.snapshot = EMPTY_ARRAY as readonly T[]
+	}
+
+	private startSubscription(): void {
+		this.active = true
+		this.unsubscribeQuery = this.queryBuilder.subscribe((results) => {
+			if (!this.active) return
+			const newSnapshot = Object.freeze([...results])
+			this.snapshot = newSnapshot
+			this.notifyListeners()
+		})
+	}
+
+	private stopSubscription(): void {
+		this.active = false
 		if (this.unsubscribeQuery) {
 			this.unsubscribeQuery()
 			this.unsubscribeQuery = null
 		}
-		this.listeners.clear()
-		this.snapshot = EMPTY_ARRAY as readonly T[]
 	}
 
 	private notifyListeners(): void {

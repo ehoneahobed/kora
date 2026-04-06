@@ -9,7 +9,7 @@
     "service_worker": "background.js",
     "type": "module"
   },
-  "devtools_page": "devtools.js",
+  "devtools_page": "devtools.html",
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

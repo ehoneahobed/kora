@@ -1,40 +1,29 @@
 import type { TimestampedEvent } from '../types'
 import { renderDevtoolsPanel } from '../ui/panel'
 
-interface RuntimePort {
-	onMessage: {
-		addListener(callback: (message: unknown) => void): void
-	}
-	postMessage(message: unknown): void
-}
-
-interface RuntimeLike {
-	connect(info: { name: string }): RuntimePort
-}
-
-interface DevtoolsLike {
-	inspectedWindow: { tabId: number }
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare const chrome: any
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 const extensionRoot = document.getElementById('kora-devtools-root')
 if (!extensionRoot) {
 	throw new Error('Missing #kora-devtools-root element')
 }
 
-const runtime = (globalThis as { chrome?: { runtime?: RuntimeLike } }).chrome?.runtime
-const devtools = (globalThis as { chrome?: { devtools?: DevtoolsLike } }).chrome?.devtools
-
 const events: TimestampedEvent[] = []
 
+const runtime = chrome?.runtime
+const devtools = chrome?.devtools
+
 if (runtime && devtools) {
+	const tabId = devtools.inspectedWindow.tabId
 	const port = runtime.connect({ name: 'kora-panel' })
-	port.postMessage({ type: 'panel-init', tabId: devtools.inspectedWindow.tabId })
+	port.postMessage({ type: 'panel-init', tabId })
 
-	port.onMessage.addListener((message) => {
-		const typed = message as { type?: string; payload?: TimestampedEvent } | undefined
-		if (!typed || typed.type !== 'kora-event' || !typed.payload) return
+	port.onMessage.addListener((message: { type?: string; payload?: TimestampedEvent }) => {
+		if (!message || message.type !== 'kora-event' || !message.payload) return
 
-		events.push(typed.payload)
+		events.push(message.payload)
 		renderDevtoolsPanel(extensionRoot, events)
 	})
 }

@@ -1,16 +1,14 @@
 import { PortRouter, type ExtensionPort } from './port-router'
 
-interface RuntimeLike {
-	onConnect?: {
-		addListener(callback: (port: ExtensionPort) => void): void
-	}
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare const chrome: any
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
-const runtime = (globalThis as { chrome?: { runtime?: RuntimeLike } }).chrome?.runtime
+const runtime = chrome?.runtime
 
 if (runtime?.onConnect) {
 	const router = new PortRouter()
-	runtime.onConnect.addListener((port) => {
+	runtime.onConnect.addListener((port: ExtensionPort) => {
 		router.handleConnection(port)
 	})
 }

@@ -1,14 +1,10 @@
 import type { TimestampedEvent } from '../types'
 
-interface RuntimePort {
-	postMessage(message: unknown): void
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+declare const chrome: any
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
-interface RuntimeLike {
-	connect(info: { name: string }): RuntimePort
-}
-
-const runtime = (globalThis as { chrome?: { runtime?: RuntimeLike } }).chrome?.runtime
+const runtime = chrome?.runtime
 
 if (runtime) {
 	const port = runtime.connect({ name: 'kora-content' })
