@@ -8,7 +8,22 @@ describe('bundleServer', () => {
 	test('writes server-bundled.js when server entry exists', async () => {
 		const tempDir = await createTempDir()
 		try {
-			await writeFile(join(tempDir.path, 'server.ts'), 'export {}', 'utf-8')
+			await writeFile(
+				join(tempDir.path, 'server.ts'),
+				[
+					"import { createServer } from 'node:http'",
+					'',
+					'const server = createServer((_, response) => {',
+					'\tresponse.statusCode = 200',
+					"\tresponse.end('ok')",
+					'})',
+					'',
+					'const port = Number(process.env.PORT ?? 3000)',
+					'server.listen(port)',
+					'',
+				].join('\n'),
+				'utf-8',
+			)
 			const deployDir = join(tempDir.path, '.kora', 'deploy')
 			const result = await bundleServer({
 				projectRoot: tempDir.path,
@@ -17,6 +32,10 @@ describe('bundleServer', () => {
 
 			expect(result.entryFilePath).toContain(join(tempDir.path, 'server.ts'))
 			expect(result.outputFilePath).toContain(join(deployDir, 'server-bundled.js'))
+			const bundleContent = await import('node:fs/promises').then(({ readFile }) =>
+				readFile(result.outputFilePath, 'utf-8'),
+			)
+			expect(bundleContent).toContain('createServer')
 		} finally {
 			await tempDir.cleanup()
 		}

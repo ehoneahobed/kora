@@ -21,6 +21,7 @@ export {
 	DEPLOY_PLATFORMS,
 	isDeployPlatform,
 	type DeployAdapter,
+	type ContextAwareDeployAdapter,
 	type BuildArtifacts,
 	type DeployPlatform,
 	type DeployResult,
@@ -30,6 +31,14 @@ export {
 	type ProjectConfig,
 	type ProvisionResult,
 } from './commands/deploy/adapters/adapter'
+export {
+	FlyAdapter,
+	NodeFlyCommandRunner,
+	type FlyAdapterContext,
+	type FlyAdapterOptions,
+	type FlyCommandResult,
+	type FlyCommandRunner,
+} from './commands/deploy/adapters/fly-adapter'
 export {
 	readDeployState,
 	resetDeployState,

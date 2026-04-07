@@ -62,6 +62,18 @@ export interface DeployAdapter {
 }
 
 /**
+ * Optional adapter extension for commands that require runtime context
+ * (project root, app name, region) outside an initial provisioning run.
+ */
+export interface ContextAwareDeployAdapter extends DeployAdapter {
+	setContext(context: {
+		projectRoot: string
+		appName: string
+		region: string | null
+	}): void
+}
+
+/**
  * Checks whether the provided value is a known deploy platform.
  */
 export function isDeployPlatform(value: string): value is DeployPlatform {

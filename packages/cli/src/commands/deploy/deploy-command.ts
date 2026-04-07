@@ -4,14 +4,19 @@ import { InvalidProjectError } from '../../errors'
 import { createPromptClient } from '../../prompts/prompt-client'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
-import { DEPLOY_PLATFORMS, type DeployPlatform, isDeployPlatform } from './adapters/adapter'
+import {
+	type ContextAwareDeployAdapter,
+	DEPLOY_PLATFORMS,
+	type DeployAdapter,
+	type DeployPlatform,
+	type ProjectConfig,
+	isDeployPlatform,
+} from './adapters/adapter'
+import { FlyAdapter } from './adapters/fly-adapter'
 import {
 	writeDockerIgnoreArtifact,
 	writeDockerfileArtifact,
 } from './artifacts/dockerfile-generator'
-import { writeFlyTomlArtifact } from './artifacts/fly-toml-generator'
-import { buildClient } from './builder/client-builder'
-import { bundleServer } from './builder/server-bundler'
 import {
 	readDeployState,
 	resetDeployState,
@@ -21,15 +26,12 @@ import {
 } from './state/deploy-state'
 
 /**
- * The `deploy` command scaffold for Phase 13.
+ * The `deploy` command for Phase 13.
  *
- * This command currently performs the foundational deployment workflow:
- * - resolves/stores deployment state
- * - generates deterministic deploy artifacts
- * - builds the client and prepares a server bundle placeholder
- *
- * Platform-specific provisioning/deployment adapters are wired in subsequent
- * Phase 13 iterations.
+ * This command orchestrates:
+ * - deploy state resolution and persistence
+ * - artifact generation
+ * - adapter-driven provision/build/deploy flows
  */
 export const deployCommand = defineCommand({
 	meta: {
@@ -92,7 +94,7 @@ export const deployCommand = defineCommand({
 		rollback: defineCommand({
 			meta: {
 				name: 'rollback',
-				description: 'Rollback command stub (adapter wiring pending)',
+				description: 'Rollback the current deployment',
 			},
 			args: {
 				id: {
@@ -110,19 +112,24 @@ export const deployCommand = defineCommand({
 					return
 				}
 
+				const adapter = createDeployAdapter(state.platform)
+				configureAdapterContext(adapter, {
+					projectRoot,
+					appName: state.appName,
+					region: state.region,
+				})
 				const deploymentId =
 					typeof args.id === 'string' && args.id.length > 0
 						? args.id
 						: (state.lastDeploymentId ?? 'latest')
-				logger.warn(
-					`Rollback support for "${state.platform}" is not wired yet. Planned target deployment: ${deploymentId}.`,
-				)
+				await adapter.rollback(deploymentId)
+				logger.success(`Rolled back ${state.platform} deployment to ${deploymentId}.`)
 			},
 		}),
 		logs: defineCommand({
 			meta: {
 				name: 'logs',
-				description: 'Log streaming stub (adapter wiring pending)',
+				description: 'Read deployment logs',
 			},
 			async run() {
 				const logger = createLogger()
@@ -132,7 +139,22 @@ export const deployCommand = defineCommand({
 					logger.warn('No deployment state found. Run `kora deploy` first.')
 					return
 				}
-				logger.warn(`Log streaming for "${state.platform}" is not wired yet.`)
+
+				const adapter = createDeployAdapter(state.platform)
+				configureAdapterContext(adapter, {
+					projectRoot,
+					appName: state.appName,
+					region: state.region,
+				})
+				const logLines = adapter.logs({ tail: 200 })
+				let hasLines = false
+				for await (const line of logLines) {
+					hasLines = true
+					logger.step(`[${line.level}] ${line.message}`)
+				}
+				if (!hasLines) {
+					logger.warn(`No logs returned from ${state.platform}.`)
+				}
 			},
 		}),
 	},
@@ -148,40 +170,49 @@ export const deployCommand = defineCommand({
 		}
 
 		const existingState = await readDeployState(projectRoot)
+		const confirmMode = args.confirm === true
 		const platform = await resolvePlatform({
 			promptClient: prompts,
 			platformArg: args.platform,
 			storedPlatform: existingState?.platform,
-			confirm: args.confirm === true,
+			confirm: confirmMode,
 		})
-		const appName = resolveAppName(args.app, existingState?.appName, projectRoot)
-		const region = resolveRegion(args.region, existingState?.region)
+		const appName = resolveAppName(args.app, existingState?.appName, projectRoot, confirmMode)
+		const region = resolveRegion(args.region, existingState?.region, confirmMode)
 		const deployDirectory = resolveDeployDirectory(projectRoot)
-		const clientOutputDirectory = join(deployDirectory, 'dist')
 		const environment = args.prod === true ? 'production' : 'preview'
+		const config: ProjectConfig = {
+			projectRoot,
+			appName,
+			region,
+			environment,
+			confirm: confirmMode,
+		}
+		const adapter = createDeployAdapter(platform)
+		configureAdapterContext(adapter, {
+			projectRoot,
+			appName,
+			region,
+		})
 
 		logger.banner()
 		logger.info(
-			`Preparing deploy artifacts for ${platform} (${appName}${region ? `, ${region}` : ''}, ${environment})`,
+			`Deploying to ${platform} (${appName}${region ? `, ${region}` : ''}, ${environment})`,
 		)
+		if (confirmMode) {
+			logger.step('Running in --confirm mode (non-interactive, fail-fast).')
+		}
 
 		await writeDockerfileArtifact(deployDirectory)
 		await writeDockerIgnoreArtifact(deployDirectory)
-		if (platform === 'fly') {
-			await writeFlyTomlArtifact(deployDirectory, {
-				appName,
-				region: region ?? 'iad',
-			})
+		const detected = await adapter.detect()
+		if (!detected) {
+			await adapter.install()
 		}
-		await bundleServer({
-			projectRoot,
-			deployDirectory,
-		})
-		await buildClient({
-			projectRoot,
-			outDir: clientOutputDirectory,
-			mode: 'production',
-		})
+		await adapter.authenticate()
+		const provisionResult = await adapter.provision(config)
+		const artifacts = await adapter.build(config)
+		const deployResult = await adapter.deploy(artifacts)
 
 		if (existingState) {
 			await updateDeployState(projectRoot, {
@@ -189,6 +220,10 @@ export const deployCommand = defineCommand({
 				appName,
 				region,
 				projectRoot,
+				liveUrl: deployResult.liveUrl,
+				syncUrl: deployResult.syncUrl,
+				databaseId: provisionResult.databaseId,
+				lastDeploymentId: deployResult.deploymentId,
 			})
 		} else {
 			await writeDeployState(projectRoot, {
@@ -196,13 +231,17 @@ export const deployCommand = defineCommand({
 				appName,
 				region,
 				projectRoot,
+				liveUrl: deployResult.liveUrl,
+				syncUrl: deployResult.syncUrl,
+				databaseId: provisionResult.databaseId,
+				lastDeploymentId: deployResult.deploymentId,
 			})
 		}
 
-		logger.success('Generated deploy artifacts and persisted deploy state.')
-		logger.warn(
-			`Platform provisioning/deployment for "${platform}" is planned next. This run completed local build and artifact generation.`,
-		)
+		logger.success(`Deployment completed: ${deployResult.liveUrl}`)
+		if (deployResult.syncUrl) {
+			logger.step(`Sync endpoint: ${deployResult.syncUrl}`)
+		}
 	},
 })
 
@@ -228,7 +267,9 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 	}
 
 	if (options.confirm || !isInteractiveTerminal()) {
-		return 'fly'
+		throw new Error(
+			'Missing deploy platform in --confirm mode. Provide --platform or run an interactive deploy first.',
+		)
 	}
 
 	return await options.promptClient.select('Where do you want to deploy?', [
@@ -259,6 +300,7 @@ function resolveAppName(
 	argValue: unknown,
 	storedValue: string | undefined,
 	projectRoot: string,
+	confirm: boolean,
 ): string {
 	if (typeof argValue === 'string' && argValue.length > 0) {
 		return sanitizeAppName(argValue)
@@ -268,12 +310,27 @@ function resolveAppName(
 		return storedValue
 	}
 
+	if (confirm) {
+		throw new Error(
+			'Missing app name in --confirm mode. Provide --app or run an interactive deploy first.',
+		)
+	}
+
 	return sanitizeAppName(basename(projectRoot))
 }
 
-function resolveRegion(argValue: unknown, storedValue: string | null | undefined): string | null {
+function resolveRegion(
+	argValue: unknown,
+	storedValue: string | null | undefined,
+	confirm: boolean,
+): string | null {
 	if (typeof argValue === 'string' && argValue.length > 0) return argValue
 	if (storedValue !== undefined) return storedValue
+	if (confirm) {
+		throw new Error(
+			'Missing region in --confirm mode. Provide --region or run an interactive deploy first.',
+		)
+	}
 	return 'iad'
 }
 
@@ -300,4 +357,35 @@ async function requireProjectRoot(): Promise<string> {
 
 function isInteractiveTerminal(): boolean {
 	return process.stdin.isTTY === true && process.stdout.isTTY === true
+}
+
+function createDeployAdapter(platform: DeployPlatform): DeployAdapter {
+	switch (platform) {
+		case 'fly':
+			return new FlyAdapter()
+		case 'railway':
+		case 'render':
+		case 'docker':
+		case 'kora-cloud':
+			throw new Error(
+				`Deploy adapter "${platform}" is not implemented yet. Start with --platform fly for now.`,
+			)
+		default: {
+			const exhaustiveCheck: never = platform
+			return exhaustiveCheck
+		}
+	}
+}
+
+function configureAdapterContext(
+	adapter: DeployAdapter,
+	context: { projectRoot: string; appName: string; region: string | null },
+): void {
+	if (hasContextSetter(adapter)) {
+		adapter.setContext(context)
+	}
+}
+
+function hasContextSetter(adapter: DeployAdapter): adapter is ContextAwareDeployAdapter {
+	return typeof (adapter as ContextAwareDeployAdapter).setContext === 'function'
 }

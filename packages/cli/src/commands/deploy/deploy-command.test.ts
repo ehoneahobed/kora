@@ -15,6 +15,16 @@ const mockWriteDockerIgnoreArtifact = vi.fn()
 const mockWriteFlyTomlArtifact = vi.fn()
 const mockBuildClient = vi.fn()
 const mockBundleServer = vi.fn()
+const mockDetect = vi.fn()
+const mockInstall = vi.fn()
+const mockAuthenticate = vi.fn()
+const mockProvision = vi.fn()
+const mockAdapterBuild = vi.fn()
+const mockDeploy = vi.fn()
+const mockRollback = vi.fn()
+const mockLogs = vi.fn()
+const mockStatus = vi.fn()
+const mockSetContext = vi.fn()
 let loggerMock: {
 	banner: ReturnType<typeof vi.fn>
 	info: ReturnType<typeof vi.fn>
@@ -62,6 +72,22 @@ vi.mock('./builder/server-bundler', () => ({
 	bundleServer: mockBundleServer,
 }))
 
+vi.mock('./adapters/fly-adapter', () => ({
+	FlyAdapter: vi.fn().mockImplementation(() => ({
+		name: 'fly',
+		detect: mockDetect,
+		install: mockInstall,
+		authenticate: mockAuthenticate,
+		provision: mockProvision,
+		build: mockAdapterBuild,
+		deploy: mockDeploy,
+		rollback: mockRollback,
+		logs: mockLogs,
+		status: mockStatus,
+		setContext: mockSetContext,
+	})),
+}))
+
 interface DeployArgs {
 	_: string[]
 	platform: string
@@ -93,6 +119,16 @@ describe('deployCommand', () => {
 		mockWriteFlyTomlArtifact.mockReset()
 		mockBuildClient.mockReset()
 		mockBundleServer.mockReset()
+		mockDetect.mockReset()
+		mockInstall.mockReset()
+		mockAuthenticate.mockReset()
+		mockProvision.mockReset()
+		mockAdapterBuild.mockReset()
+		mockDeploy.mockReset()
+		mockRollback.mockReset()
+		mockLogs.mockReset()
+		mockStatus.mockReset()
+		mockSetContext.mockReset()
 
 		loggerMock = {
 			banner: vi.fn(),
@@ -128,11 +164,44 @@ describe('deployCommand', () => {
 		mockUpdateDeployState.mockResolvedValue({
 			platform: 'fly',
 		})
+		mockDetect.mockResolvedValue(true)
+		mockInstall.mockResolvedValue(undefined)
+		mockAuthenticate.mockResolvedValue(undefined)
+		mockProvision.mockResolvedValue({
+			applicationId: 'my-app',
+			databaseId: 'db-1',
+			secretsSet: ['PORT'],
+		})
+		mockAdapterBuild.mockResolvedValue({
+			clientDirectory: '/project/.kora/deploy/dist',
+			serverBundlePath: '/project/.kora/deploy/server-bundled.js',
+			deployDirectory: '/project/.kora/deploy',
+		})
+		mockDeploy.mockResolvedValue({
+			deploymentId: 'dep-1',
+			liveUrl: 'https://my-app.fly.dev',
+			syncUrl: 'wss://my-app.fly.dev/kora-sync',
+		})
+		mockRollback.mockResolvedValue(undefined)
+		mockLogs.mockReturnValue(
+			(async function* logs() {
+				yield {
+					timestamp: new Date().toISOString(),
+					level: 'info',
+					message: 'hello',
+				} as const
+			})(),
+		)
+		mockStatus.mockResolvedValue({
+			state: 'healthy',
+			message: 'ok',
+		})
+		mockSetContext.mockReturnValue(undefined)
 	})
 
 	test('resets deploy state when --reset is enabled', async () => {
 		const { deployCommand } = await import('./deploy-command')
-		await deployCommand.run?.({
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
 			args: {
 				_: [],
 				platform: 'fly',
@@ -152,7 +221,7 @@ describe('deployCommand', () => {
 
 	test('creates initial deploy state and artifacts', async () => {
 		const { deployCommand } = await import('./deploy-command')
-		await deployCommand.run?.({
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
 			args: {
 				_: [],
 				platform: 'fly',
@@ -168,24 +237,36 @@ describe('deployCommand', () => {
 
 		expect(mockWriteDockerfileArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
 		expect(mockWriteDockerIgnoreArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
-		expect(mockWriteFlyTomlArtifact).toHaveBeenCalledWith('/project/.kora/deploy', {
+		expect(mockDetect).toHaveBeenCalledTimes(1)
+		expect(mockAuthenticate).toHaveBeenCalledTimes(1)
+		expect(mockProvision).toHaveBeenCalledWith({
+			projectRoot: '/project',
 			appName: 'my-app',
 			region: 'iad',
+			environment: 'preview',
+			confirm: false,
 		})
-		expect(mockBundleServer).toHaveBeenCalledWith({
+		expect(mockAdapterBuild).toHaveBeenCalledWith({
 			projectRoot: '/project',
+			appName: 'my-app',
+			region: 'iad',
+			environment: 'preview',
+			confirm: false,
+		})
+		expect(mockDeploy).toHaveBeenCalledWith({
+			clientDirectory: '/project/.kora/deploy/dist',
+			serverBundlePath: '/project/.kora/deploy/server-bundled.js',
 			deployDirectory: '/project/.kora/deploy',
-		})
-		expect(mockBuildClient).toHaveBeenCalledWith({
-			projectRoot: '/project',
-			outDir: '/project/.kora/deploy/dist',
-			mode: 'production',
 		})
 		expect(mockWriteDeployState).toHaveBeenCalledWith('/project', {
 			platform: 'fly',
 			appName: 'my-app',
 			region: 'iad',
 			projectRoot: '/project',
+			liveUrl: 'https://my-app.fly.dev',
+			syncUrl: 'wss://my-app.fly.dev/kora-sync',
+			databaseId: 'db-1',
+			lastDeploymentId: 'dep-1',
 		})
 		expect(mockUpdateDeployState).not.toHaveBeenCalled()
 	})
@@ -197,7 +278,7 @@ describe('deployCommand', () => {
 			region: 'lhr',
 		})
 		const { deployCommand } = await import('./deploy-command')
-		await deployCommand.run?.({
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
 			args: {
 				_: [],
 				platform: 'fly',
@@ -216,8 +297,65 @@ describe('deployCommand', () => {
 			appName: 'existing-app',
 			region: 'lhr',
 			projectRoot: '/project',
+			liveUrl: 'https://my-app.fly.dev',
+			syncUrl: 'wss://my-app.fly.dev/kora-sync',
+			databaseId: 'db-1',
+			lastDeploymentId: 'dep-1',
 		})
 		expect(mockWriteDeployState).not.toHaveBeenCalled()
+	})
+
+	test('fails fast in confirm mode when app and region are missing', async () => {
+		const { deployCommand } = await import('./deploy-command')
+		await expect(
+			(deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
+				args: {
+					_: [],
+					platform: 'fly',
+					app: '',
+					region: '',
+					reset: false,
+					confirm: true,
+					prod: false,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			} as DeployRunContext),
+		).rejects.toThrow(/Missing app name in --confirm mode/)
+	})
+
+	test('rollback uses adapter with saved state context', async () => {
+		mockReadDeployState.mockResolvedValue({
+			platform: 'fly',
+			appName: 'my-app',
+			region: 'iad',
+			lastDeploymentId: 'dep-prev',
+		})
+		const { deployCommand } = await import('./deploy-command')
+		const subCommands = deployCommand.subCommands as Record<
+			string,
+			{ run?: (ctx: unknown) => Promise<void> }
+		>
+		await subCommands.rollback?.run?.({
+			args: {
+				_: [],
+				platform: 'fly',
+				app: 'my-app',
+				region: 'iad',
+				reset: false,
+				confirm: false,
+				prod: false,
+				id: '',
+			},
+			rawArgs: [],
+			cmd: subCommands.rollback,
+		} as unknown as DeployRunContext)
+		expect(mockSetContext).toHaveBeenCalledWith({
+			projectRoot: '/project',
+			appName: 'my-app',
+			region: 'iad',
+		})
+		expect(mockRollback).toHaveBeenCalledWith('dep-prev')
 	})
 
 	test('status subcommand logs warning without state', async () => {
