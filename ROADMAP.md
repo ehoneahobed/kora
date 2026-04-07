@@ -1003,11 +1003,48 @@ packages/cli/templates/db/{sqlite,postgres/...}/
 
 ## Phase 13: `kora deploy` — The Game Changer
 
-**Status:** Planned
+**Status:** In Progress
 
 **Goal:** A single command takes a Kora project from local development to a live production URL on the developer's chosen platform — including infrastructure, database, secrets, and SSL.
 
 **Why now:** This is the single most impactful feature Kora can ship after Phase 11. It is what separates a library from a platform. No competing offline-first framework has it.
+
+### Phase 13 implementation progress (updated)
+
+**Completed so far:**
+- `deploy` command wired into `kora` CLI (`packages/cli/src/bin.ts`)
+- deploy state persistence (`.kora/deploy/deploy.json`) with tests
+  - read/write/update/reset flows
+- generated artifact foundation:
+  - Dockerfile
+  - `.dockerignore`
+  - Fly config generation (`fly.toml`)
+- server bundling now uses **esbuild** (replaces placeholder artifact)
+- adapter contract (`DeployAdapter`) implemented and used by command flow
+- concrete **Fly adapter** implemented and integrated:
+  - detect/install/authenticate/provision/build/deploy
+  - rollback/logs/status methods wired into command surface
+- `--confirm` mode now fails fast when required values are missing
+- deploy subcommands currently wired:
+  - `kora deploy status`
+  - `kora deploy logs`
+  - `kora deploy rollback`
+
+**Still to build for Phase 13 completion:**
+- full Railway adapter implementation
+- full Render adapter implementation
+- Docker adapter implementation (self-hosted deploy workflow)
+- Kora Cloud adapter stub-to-real transition deferred to Phase 21
+- CI-centric polish for `--confirm` end-to-end flows and docs examples
+- remaining deploy subcommands:
+  - `kora deploy env list`
+  - `kora deploy env set KEY value`
+  - `kora deploy db shell`
+  - `kora deploy db backup`
+- platform-specific artifact generators not yet added:
+  - `railway-json-generator.ts`
+  - `render-yaml-generator.ts`
+  - `docker-compose-generator.ts`
 
 ### 13a. Platform Adapter Architecture
 

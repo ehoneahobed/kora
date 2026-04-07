@@ -88,6 +88,22 @@ vi.mock('./adapters/fly-adapter', () => ({
 	})),
 }))
 
+vi.mock('./adapters/factory', () => ({
+	createDeployAdapter: vi.fn().mockImplementation((_platform: string) => ({
+		name: 'fly',
+		detect: mockDetect,
+		install: mockInstall,
+		authenticate: mockAuthenticate,
+		provision: mockProvision,
+		build: mockAdapterBuild,
+		deploy: mockDeploy,
+		rollback: mockRollback,
+		logs: mockLogs,
+		status: mockStatus,
+		setContext: mockSetContext,
+	})),
+}))
+
 interface DeployArgs {
 	_: string[]
 	platform: string
@@ -102,6 +118,12 @@ interface DeployRunContext {
 	args: DeployArgs
 	rawArgs: string[]
 	cmd: unknown
+}
+
+type UnknownRunContext = { [key: string]: unknown }
+
+function asRunContext(value: DeployRunContext): UnknownRunContext {
+	return value as unknown as UnknownRunContext
 }
 
 describe('deployCommand', () => {
@@ -201,19 +223,21 @@ describe('deployCommand', () => {
 
 	test('resets deploy state when --reset is enabled', async () => {
 		const { deployCommand } = await import('./deploy-command')
-		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
-			args: {
-				_: [],
-				platform: 'fly',
-				app: 'my-app',
-				region: 'iad',
-				reset: true,
-				confirm: false,
-				prod: false,
-			},
-			rawArgs: [],
-			cmd: deployCommand,
-		} as DeployRunContext)
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+			asRunContext({
+				args: {
+					_: [],
+					platform: 'fly',
+					app: 'my-app',
+					region: 'iad',
+					reset: true,
+					confirm: false,
+					prod: false,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			}),
+		)
 
 		expect(mockResetDeployState).toHaveBeenCalledWith('/project')
 		expect(mockWriteDockerfileArtifact).not.toHaveBeenCalled()
@@ -221,19 +245,21 @@ describe('deployCommand', () => {
 
 	test('creates initial deploy state and artifacts', async () => {
 		const { deployCommand } = await import('./deploy-command')
-		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
-			args: {
-				_: [],
-				platform: 'fly',
-				app: 'my-app',
-				region: 'iad',
-				reset: false,
-				confirm: false,
-				prod: false,
-			},
-			rawArgs: [],
-			cmd: deployCommand,
-		} as DeployRunContext)
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+			asRunContext({
+				args: {
+					_: [],
+					platform: 'fly',
+					app: 'my-app',
+					region: 'iad',
+					reset: false,
+					confirm: false,
+					prod: false,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			}),
+		)
 
 		expect(mockWriteDockerfileArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
 		expect(mockWriteDockerIgnoreArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
@@ -278,19 +304,21 @@ describe('deployCommand', () => {
 			region: 'lhr',
 		})
 		const { deployCommand } = await import('./deploy-command')
-		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
-			args: {
-				_: [],
-				platform: 'fly',
-				app: 'existing-app',
-				region: 'lhr',
-				reset: false,
-				confirm: true,
-				prod: true,
-			},
-			rawArgs: [],
-			cmd: deployCommand,
-		} as DeployRunContext)
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+			asRunContext({
+				args: {
+					_: [],
+					platform: 'fly',
+					app: 'existing-app',
+					region: 'lhr',
+					reset: false,
+					confirm: true,
+					prod: true,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			}),
+		)
 
 		expect(mockUpdateDeployState).toHaveBeenCalledWith('/project', {
 			platform: 'fly',
@@ -308,19 +336,21 @@ describe('deployCommand', () => {
 	test('fails fast in confirm mode when app and region are missing', async () => {
 		const { deployCommand } = await import('./deploy-command')
 		await expect(
-			(deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.({
-				args: {
-					_: [],
-					platform: 'fly',
-					app: '',
-					region: '',
-					reset: false,
-					confirm: true,
-					prod: false,
-				},
-				rawArgs: [],
-				cmd: deployCommand,
-			} as DeployRunContext),
+			(deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+				asRunContext({
+					args: {
+						_: [],
+						platform: 'fly',
+						app: '',
+						region: '',
+						reset: false,
+						confirm: true,
+						prod: false,
+					},
+					rawArgs: [],
+					cmd: deployCommand,
+				}),
+			),
 		).rejects.toThrow(/Missing app name in --confirm mode/)
 	})
 
@@ -411,7 +441,44 @@ describe('deployCommand', () => {
 		} as DeployRunContext)
 		expect(loggerMock.info).toHaveBeenCalledWith('Platform: fly')
 		expect(loggerMock.step).toHaveBeenCalledWith('App: my-app')
+		expect(loggerMock.step).toHaveBeenCalledWith('Status: healthy')
+		expect(loggerMock.step).toHaveBeenCalledWith('Message: ok')
 		expect(loggerMock.step).toHaveBeenCalledWith('Live URL: https://my-app.fly.dev')
+	})
+
+	test('status subcommand falls back to state live URL when adapter omits it', async () => {
+		mockReadDeployState.mockResolvedValue({
+			platform: 'fly',
+			appName: 'my-app',
+			region: 'iad',
+			lastDeploymentId: 'dep-123',
+			liveUrl: 'https://state-only.fly.dev',
+			syncUrl: 'wss://my-app.fly.dev/kora-sync',
+		})
+		mockStatus.mockResolvedValue({
+			state: 'healthy',
+			message: 'ok',
+			liveUrl: undefined,
+		})
+		const { deployCommand } = await import('./deploy-command')
+		const subCommands = deployCommand.subCommands as Record<
+			string,
+			{ run?: (ctx: unknown) => Promise<void> }
+		>
+		await subCommands.status?.run?.({
+			args: {
+				_: [],
+				platform: 'fly',
+				app: 'status-app',
+				region: 'iad',
+				reset: false,
+				confirm: false,
+				prod: false,
+			},
+			rawArgs: [],
+			cmd: subCommands.status,
+		} as DeployRunContext)
+		expect(loggerMock.step).toHaveBeenCalledWith('Live URL: https://state-only.fly.dev')
 	})
 })
 

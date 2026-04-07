@@ -20,12 +20,12 @@ export { deployCommand } from './commands/deploy/deploy-command'
 export {
 	DEPLOY_PLATFORMS,
 	isDeployPlatform,
-	type DeployAdapter,
 	type ContextAwareDeployAdapter,
 	type BuildArtifacts,
+	type DeployAdapter,
 	type DeployPlatform,
-	type DeployResult,
 	type DeploymentStatus,
+	type DeployResult,
 	type LogLine,
 	type LogOptions,
 	type ProjectConfig,
@@ -39,6 +39,8 @@ export {
 	type FlyCommandResult,
 	type FlyCommandRunner,
 } from './commands/deploy/adapters/fly-adapter'
+export { createDeployAdapter } from './commands/deploy/adapters/factory'
+export { StubDeployAdapter } from './commands/deploy/adapters/stub-adapter'
 export {
 	readDeployState,
 	resetDeployState,

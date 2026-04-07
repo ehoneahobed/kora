@@ -12,7 +12,7 @@ import {
 	type ProjectConfig,
 	isDeployPlatform,
 } from './adapters/adapter'
-import { FlyAdapter } from './adapters/fly-adapter'
+import { createDeployAdapter } from './adapters/factory'
 import {
 	writeDockerIgnoreArtifact,
 	writeDockerfileArtifact,
@@ -71,7 +71,7 @@ export const deployCommand = defineCommand({
 		status: defineCommand({
 			meta: {
 				name: 'status',
-				description: 'Show current local deploy state',
+				description: 'Show current deployment status',
 			},
 			async run() {
 				const logger = createLogger()
@@ -87,7 +87,17 @@ export const deployCommand = defineCommand({
 				logger.step(`App: ${state.appName}`)
 				logger.step(`Region: ${state.region ?? 'n/a'}`)
 				logger.step(`Last deployment: ${state.lastDeploymentId ?? 'n/a'}`)
-				logger.step(`Live URL: ${state.liveUrl ?? 'n/a'}`)
+
+				const adapter = createDeployAdapter(state.platform)
+				configureAdapterContext(adapter, {
+					projectRoot,
+					appName: state.appName,
+					region: state.region,
+				})
+				const adapterStatus = await adapter.status()
+				logger.step(`Status: ${adapterStatus.state}`)
+				logger.step(`Message: ${adapterStatus.message}`)
+				logger.step(`Live URL: ${adapterStatus.liveUrl ?? state.liveUrl ?? 'n/a'}`)
 				logger.step(`Sync URL: ${state.syncUrl ?? 'n/a'}`)
 			},
 		}),
@@ -357,24 +367,6 @@ async function requireProjectRoot(): Promise<string> {
 
 function isInteractiveTerminal(): boolean {
 	return process.stdin.isTTY === true && process.stdout.isTTY === true
-}
-
-function createDeployAdapter(platform: DeployPlatform): DeployAdapter {
-	switch (platform) {
-		case 'fly':
-			return new FlyAdapter()
-		case 'railway':
-		case 'render':
-		case 'docker':
-		case 'kora-cloud':
-			throw new Error(
-				`Deploy adapter "${platform}" is not implemented yet. Start with --platform fly for now.`,
-			)
-		default: {
-			const exhaustiveCheck: never = platform
-			return exhaustiveCheck
-		}
-	}
 }
 
 function configureAdapterContext(
