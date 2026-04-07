@@ -1,6 +1,11 @@
 import { describe, expect, test, vi } from 'vitest'
 import * as promptUtils from '../utils/prompt'
-import { createPromptClient, ReadlinePromptClient } from './prompt-client'
+import {
+	ClackPromptClient,
+	createPromptClient,
+	PromptCancelledError,
+	ReadlinePromptClient,
+} from './prompt-client'
 
 describe('ReadlinePromptClient', () => {
 	test('delegates text prompts to promptText', async () => {
@@ -43,6 +48,17 @@ describe('ReadlinePromptClient', () => {
 describe('createPromptClient', () => {
 	test('returns a ReadlinePromptClient instance', () => {
 		const client = createPromptClient()
+		if (process.stdin.isTTY && process.stdout.isTTY) {
+			expect(client).toBeInstanceOf(ClackPromptClient)
+			return
+		}
 		expect(client).toBeInstanceOf(ReadlinePromptClient)
+	})
+})
+
+describe('PromptCancelledError', () => {
+	test('uses a stable error name', () => {
+		const error = new PromptCancelledError()
+		expect(error.name).toBe('PromptCancelledError')
 	})
 })

@@ -16,11 +16,14 @@ export {
 
 // === Type Generation (programmatic use) ===
 export { generateTypes } from './commands/generate/type-generator'
+export { validateProjectName, type ProjectNameValidationResult } from './commands/create/project-name'
 
 // === Prompt Abstractions ===
 export {
 	createPromptClient,
+	ClackPromptClient,
 	ReadlinePromptClient,
+	PromptCancelledError,
 	type PromptClient,
 	type SelectOption,
 } from './prompts/prompt-client'

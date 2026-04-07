@@ -13,7 +13,8 @@ import {
 	getInstallCommand,
 	getRunDevCommand,
 } from '../../utils/package-manager'
-import { createPromptClient } from '../../prompts/prompt-client'
+import { createPromptClient, PromptCancelledError } from '../../prompts/prompt-client'
+import { validateProjectName } from './project-name'
 import { scaffoldTemplate } from './template-engine'
 
 /**
@@ -64,89 +65,114 @@ export const createCommand = defineCommand({
 		const logger = createLogger()
 		const prompts = createPromptClient()
 		logger.banner()
-
-		const useDefaults = args.yes === true
-
-		// Resolve project name
-		const projectName =
-			args.name || (useDefaults ? 'my-kora-app' : await prompts.text('Project name', 'my-kora-app'))
-		if (!projectName) {
-			logger.error('Project name is required')
-			process.exitCode = 1
-			return
-		}
-
-		// Resolve template
-		let template: TemplateName
-		if (args.template && isValidTemplate(args.template)) {
-			// Explicit --template flag takes priority
-			template = args.template
-		} else if (useDefaults) {
-			// --yes defaults to recommended template
-			template = 'react-tailwind-sync'
-		} else if (args.tailwind !== undefined || args.sync !== undefined) {
-			// Derive template from --tailwind and --sync flags
-			template = resolveTemplateFromFlags(args.tailwind, args.sync)
-		} else {
-			template = await prompts.select(
-				'Select a template:',
-				TEMPLATE_INFO.map((t) => ({ label: `${t.label} — ${t.description}`, value: t.name })),
-			)
-		}
-
-		// Resolve package manager
-		let pm: PackageManager
-		if (args.pm && isValidPackageManager(args.pm)) {
-			pm = args.pm
-		} else if (useDefaults) {
-			pm = detectPackageManager()
-		} else {
-			const detected = detectPackageManager()
-			pm = await prompts.select(
-				'Package manager:',
-				PACKAGE_MANAGERS.map((p) => ({
-					label: p === detected ? `${p} (detected)` : p,
-					value: p,
-				})),
-			)
-		}
-
-		// Validate target directory
-		const targetDir = resolve(process.cwd(), projectName)
-		if (await directoryExists(targetDir)) {
-			throw new ProjectExistsError(projectName)
-		}
-
-		// Resolve kora version from this package's own package.json
-		const koraVersion = resolveKoraVersion()
-
-		// Scaffold
-		logger.step(`Creating ${projectName} with ${template} template...`)
-		await scaffoldTemplate(template, targetDir, {
-			projectName,
-			packageManager: pm,
-			koraVersion,
-		})
-		logger.success('Project scaffolded')
-
-		// Install dependencies
-		if (!args['skip-install']) {
-			logger.step('Installing dependencies...')
-			try {
-				execSync(getInstallCommand(pm), { cwd: targetDir, stdio: 'inherit' })
-				logger.success('Dependencies installed')
-			} catch {
-				logger.warn('Failed to install dependencies. Run install manually.')
+		try {
+			const useDefaults = args.yes === true
+			if (!useDefaults) {
+				prompts.intro('Kora.js — Offline-first application framework')
 			}
-		}
 
-		// Print next steps
-		logger.blank()
-		logger.info('Done! Next steps:')
-		logger.blank()
-		logger.step(`  cd ${projectName}`)
-		logger.step(`  ${getRunDevCommand(pm)}`)
-		logger.blank()
+			// Resolve project name
+			const projectName =
+				args.name || (useDefaults ? 'my-kora-app' : await prompts.text('Project name', 'my-kora-app'))
+			if (!projectName) {
+				logger.error('Project name is required')
+				process.exitCode = 1
+				return
+			}
+			const nameValidation = validateProjectName(projectName)
+			if (!nameValidation.valid) {
+				logger.error('Invalid project name.')
+				for (const issue of nameValidation.issues) {
+					logger.step(`- ${issue}`)
+				}
+				if (!useDefaults) {
+					prompts.outro('Project creation aborted.')
+				}
+				process.exitCode = 1
+				return
+			}
+
+			// Resolve template
+			let template: TemplateName
+			if (args.template && isValidTemplate(args.template)) {
+				// Explicit --template flag takes priority
+				template = args.template
+			} else if (useDefaults) {
+				// --yes defaults to recommended template
+				template = 'react-tailwind-sync'
+			} else if (args.tailwind !== undefined || args.sync !== undefined) {
+				// Derive template from --tailwind and --sync flags
+				template = resolveTemplateFromFlags(args.tailwind, args.sync)
+			} else {
+				template = await prompts.select(
+					'Select a template:',
+					TEMPLATE_INFO.map((t) => ({ label: `${t.label} — ${t.description}`, value: t.name })),
+				)
+			}
+
+			// Resolve package manager
+			let pm: PackageManager
+			if (args.pm && isValidPackageManager(args.pm)) {
+				pm = args.pm
+			} else if (useDefaults) {
+				pm = detectPackageManager()
+			} else {
+				const detected = detectPackageManager()
+				pm = await prompts.select(
+					'Package manager:',
+					PACKAGE_MANAGERS.map((p) => ({
+						label: p === detected ? `${p} (detected)` : p,
+						value: p,
+					})),
+				)
+			}
+
+			// Validate target directory
+			const targetDir = resolve(process.cwd(), projectName)
+			if (await directoryExists(targetDir)) {
+				throw new ProjectExistsError(projectName)
+			}
+
+			// Resolve kora version from this package's own package.json
+			const koraVersion = resolveKoraVersion()
+
+			// Scaffold
+			logger.step(`Creating ${projectName} with ${template} template...`)
+			await scaffoldTemplate(template, targetDir, {
+				projectName,
+				packageManager: pm,
+				koraVersion,
+			})
+			logger.success('Project scaffolded')
+
+			// Install dependencies
+			if (!args['skip-install']) {
+				logger.step('Installing dependencies...')
+				try {
+					execSync(getInstallCommand(pm), { cwd: targetDir, stdio: 'inherit' })
+					logger.success('Dependencies installed')
+				} catch {
+					logger.warn('Failed to install dependencies. Run install manually.')
+				}
+			}
+
+			// Print next steps
+			logger.blank()
+			logger.info('Done! Next steps:')
+			logger.blank()
+			logger.step(`  cd ${projectName}`)
+			logger.step(`  ${getRunDevCommand(pm)}`)
+			logger.blank()
+			if (!useDefaults) {
+				prompts.outro('Project ready. Happy building with Kora!')
+			}
+		} catch (error) {
+			if (error instanceof PromptCancelledError) {
+				process.exitCode = 1
+				return
+			}
+			throw error
+		}
 	},
 })
 
