@@ -17,6 +17,18 @@ export {
 // === Type Generation (programmatic use) ===
 export { generateTypes } from './commands/generate/type-generator'
 export { validateProjectName, type ProjectNameValidationResult } from './commands/create/project-name'
+export {
+	determineTemplateFromSelections,
+	isAuthValue,
+	isDatabaseProviderValue,
+	isDatabaseValue,
+	isFrameworkValue,
+	type AuthOption,
+	type DatabaseOption,
+	type DatabaseProviderOption,
+	type FrameworkOption,
+	type TemplateSelectionInput,
+} from './commands/create/options'
 
 // === Prompt Abstractions ===
 export {

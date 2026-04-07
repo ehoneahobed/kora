@@ -12,6 +12,8 @@ import { promptConfirm, promptSelect, promptText } from '../utils/prompt'
 export interface SelectOption<T extends string> {
 	label: string
 	value: T
+	hint?: string
+	disabled?: boolean
 }
 
 type ClackSelectOption<T extends string> = {
@@ -52,7 +54,12 @@ export class ReadlinePromptClient implements PromptClient {
 		message: string,
 		options: readonly SelectOption<T>[],
 	): Promise<T> {
-		return promptSelect(message, options)
+		return promptSelect(
+			message,
+			options
+				.filter((option) => option.disabled !== true)
+				.map((option) => ({ label: option.label, value: option.value })),
+		)
 	}
 
 	public async confirm(message: string, defaultValue = false): Promise<boolean> {
@@ -110,6 +117,8 @@ export class ClackPromptClient implements PromptClient {
 		const mappedOptions: ClackSelectOption<T>[] = options.map((option) => ({
 			label: option.label,
 			value: option.value,
+			hint: option.hint,
+			disabled: option.disabled,
 		}))
 		const result = await clackSelect({
 			message,
