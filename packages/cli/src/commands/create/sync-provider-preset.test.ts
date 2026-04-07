@@ -34,9 +34,12 @@ describe('applySyncProviderPreset', () => {
 
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
 		const env = await readFile(join(targetDir, '.env.example'), 'utf-8')
+		const readme = await readFile(join(targetDir, 'README.md'), 'utf-8')
 		expect(server).toContain('createPostgresServerStore')
 		expect(server).toContain('DATABASE_URL is required')
 		expect(server).toContain('PostgreSQL provider preset: Neon')
+		expect(readme).toContain('Selected DB provider: neon')
+		expect(readme).toContain('createPostgresServerStore')
 		expect(env).toContain('DATABASE_URL=')
 		expect(env).toContain('neon.tech')
 	})

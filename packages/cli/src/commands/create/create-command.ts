@@ -191,6 +191,11 @@ export const createCommand = defineCommand({
 				db: selection.db,
 				dbProvider: selection.dbProvider,
 			})
+			if (selection.db === 'postgres' && isSyncTemplate(template)) {
+				logger.info(
+					`Applied PostgreSQL sync preset (${formatDbProviderForLog(selection.dbProvider)}). Update DATABASE_URL in .env.example before running the sync server.`,
+				)
+			}
 			logger.success('Project scaffolded')
 
 			if (shouldSavePreferences(preferenceFlags)) {
@@ -250,6 +255,31 @@ function isValidTemplate(value: string): value is TemplateName {
 
 function isValidPackageManager(value: string): value is PackageManager {
 	return (PACKAGE_MANAGERS as readonly string[]).includes(value)
+}
+
+function isSyncTemplate(template: TemplateName): boolean {
+	return template === 'react-sync' || template === 'react-tailwind-sync'
+}
+
+function formatDbProviderForLog(dbProvider: string): string {
+	switch (dbProvider) {
+		case 'supabase':
+			return 'Supabase'
+		case 'neon':
+			return 'Neon'
+		case 'railway':
+			return 'Railway'
+		case 'vercel-postgres':
+			return 'Vercel Postgres'
+		case 'custom':
+			return 'Custom'
+		case 'local':
+			return 'Local Postgres'
+		case 'none':
+			return 'PostgreSQL'
+		default:
+			return dbProvider
+	}
 }
 
 /**

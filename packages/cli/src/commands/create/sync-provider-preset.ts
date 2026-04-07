@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TemplateName } from '../../types'
 import type { DatabaseOption, DatabaseProviderOption } from './options'
@@ -28,6 +28,7 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 	const providerConnectionString = getProviderConnectionStringExample(options.dbProvider)
 	const serverPath = join(options.targetDir, 'server.ts')
 	const envPath = join(options.targetDir, '.env.example')
+	const readmePath = join(options.targetDir, 'README.md')
 
 	const serverTemplate = [
 		"import { createPostgresServerStore, createProductionServer } from '@korajs/server'",
@@ -71,8 +72,22 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 		'',
 	].join('\n')
 
+	const existingReadme = await readFile(readmePath, 'utf-8')
+	const trimmedReadme = existingReadme.trimEnd()
+	const readmeSuffix = [
+		'',
+		'## PostgreSQL Provider Preset',
+		'',
+		`Selected DB provider: ${options.dbProvider}`,
+		'',
+		'This scaffold uses `createPostgresServerStore` in `server.ts` and reads `DATABASE_URL` from the environment. See `.env.example` for provider-specific examples.',
+		'',
+	].join('\n')
+	const readmeTemplate = `${trimmedReadme}${readmeSuffix}`
+
 	await writeFile(serverPath, serverTemplate, 'utf-8')
 	await writeFile(envPath, envTemplate, 'utf-8')
+	await writeFile(readmePath, readmeTemplate, 'utf-8')
 }
 
 function isSyncTemplate(template: TemplateName): boolean {
