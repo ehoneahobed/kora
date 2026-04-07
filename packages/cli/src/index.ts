@@ -29,6 +29,13 @@ export {
 	type FrameworkOption,
 	type TemplateSelectionInput,
 } from './commands/create/options'
+export {
+	resolveCreatePreferencesFlow,
+	saveResolvedPreferences,
+	shouldSavePreferences,
+	type CreateFlags,
+	type PreferenceResolutionResult,
+} from './commands/create/preferences-flow'
 
 // === Prompt Abstractions ===
 export {
@@ -39,3 +46,9 @@ export {
 	type PromptClient,
 	type SelectOption,
 } from './prompts/prompt-client'
+export {
+	getDefaultCreatePreferences,
+	getCreatePreferencesOrDefault,
+	PreferenceStore,
+	type CreatePreferences,
+} from './prompts/preferences'

@@ -3,30 +3,21 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineCommand } from 'citty'
+import { createPromptClient, PromptCancelledError } from '../../prompts/prompt-client'
+import { PreferenceStore } from '../../prompts/preferences'
 import { ProjectExistsError } from '../../errors'
-import { PACKAGE_MANAGERS, TEMPLATES, TEMPLATE_INFO } from '../../types'
+import { PACKAGE_MANAGERS, TEMPLATES } from '../../types'
 import type { PackageManager, TemplateName } from '../../types'
-import type { SelectOption } from '../../prompts/prompt-client'
 import { directoryExists } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
-import {
-	detectPackageManager,
-	getInstallCommand,
-	getRunDevCommand,
-} from '../../utils/package-manager'
-import { createPromptClient, PromptCancelledError } from '../../prompts/prompt-client'
+import { detectPackageManager, getInstallCommand, getRunDevCommand } from '../../utils/package-manager'
 import { validateProjectName } from './project-name'
 import {
-	determineTemplateFromSelections,
-	isAuthValue,
-	isDatabaseProviderValue,
-	isDatabaseValue,
-	isFrameworkValue,
-	type AuthOption,
-	type DatabaseOption,
-	type DatabaseProviderOption,
-	type FrameworkOption,
-} from './options'
+	resolveCreatePreferencesFlow,
+	saveResolvedPreferences,
+	shouldSavePreferences,
+	type CreateFlags,
+} from './preferences-flow'
 import { scaffoldTemplate } from './template-engine'
 
 /**
@@ -92,6 +83,7 @@ export const createCommand = defineCommand({
 	async run({ args }) {
 		const logger = createLogger()
 		const prompts = createPromptClient()
+		const preferenceStore = new PreferenceStore()
 		logger.banner()
 		try {
 			const useDefaults = args.yes === true
@@ -120,13 +112,31 @@ export const createCommand = defineCommand({
 				return
 			}
 
-			const selectedFramework = await resolveFrameworkSelection(
-				typeof args.framework === 'string' ? args.framework : undefined,
+			const preferenceFlags: CreateFlags = {
+				framework: typeof args.framework === 'string' ? args.framework : undefined,
+				auth: typeof args.auth === 'string' ? args.auth : undefined,
+				db: typeof args.db === 'string' ? args.db : undefined,
+				dbProvider: typeof args['db-provider'] === 'string' ? args['db-provider'] : undefined,
+				tailwind: args.tailwind,
+				sync: args.sync,
 				useDefaults,
+			}
+
+			const selection = await resolveCreatePreferencesFlow({
+				flags: preferenceFlags,
 				prompts,
-			)
-			if (selectedFramework !== 'react') {
-				logger.error(`Framework "${selectedFramework}" is not available yet. Use "react".`)
+				store: preferenceStore,
+			})
+			if (selection.framework !== 'react') {
+				logger.error(`Framework "${selection.framework}" is not available yet. Use "react".`)
+				if (!useDefaults) {
+					prompts.outro('Project creation aborted.')
+				}
+				process.exitCode = 1
+				return
+			}
+			if (selection.auth !== 'none') {
+				logger.error(`Auth mode "${selection.auth}" is not available yet. Use "none".`)
 				if (!useDefaults) {
 					prompts.outro('Project creation aborted.')
 				}
@@ -134,56 +144,9 @@ export const createCommand = defineCommand({
 				return
 			}
 
-			const selectedAuth = await resolveAuthSelection(
-				typeof args.auth === 'string' ? args.auth : undefined,
-				useDefaults,
-				prompts,
-			)
-			if (selectedAuth !== 'none') {
-				logger.error(`Auth mode "${selectedAuth}" is not available yet. Use "none".`)
-				if (!useDefaults) {
-					prompts.outro('Project creation aborted.')
-				}
-				process.exitCode = 1
-				return
-			}
-
-			const selectedDb = await resolveDatabaseSelection(
-				typeof args.db === 'string' ? args.db : undefined,
-				args.sync,
-				useDefaults,
-				prompts,
-			)
-			const selectedDbProvider = await resolveDatabaseProviderSelection(
-				typeof args['db-provider'] === 'string' ? args['db-provider'] : undefined,
-				selectedDb,
-				useDefaults,
-				prompts,
-			)
-
-			// Resolve template
-			let template: TemplateName
-			if (args.template && isValidTemplate(args.template)) {
-				// Explicit --template flag takes priority
-				template = args.template
-			} else if (args.tailwind !== undefined || args.sync !== undefined) {
-				// Derive template from --tailwind and --sync flags
-				template = resolveTemplateFromFlags(args.tailwind, args.sync)
-			} else if (useDefaults) {
-				// --yes defaults to recommended template
-				template = 'react-tailwind-sync'
-			} else {
-				const selectedTailwind = await prompts.confirm('Use Tailwind CSS?', true)
-				template = resolveTemplateFromSelections({
-					tailwind: selectedTailwind,
-					sync: selectedDb !== 'none',
-					db: selectedDb,
-				})
-			}
-
-			// This value is intentionally unused for now.
-			// Phase 12 template composition will consume provider-specific layers.
-			void selectedDbProvider
+			// Resolve template (explicit --template still overrides all selections).
+			const template: TemplateName =
+				args.template && isValidTemplate(args.template) ? args.template : selection.template
 
 			// Resolve package manager
 			let pm: PackageManager
@@ -191,6 +154,8 @@ export const createCommand = defineCommand({
 				pm = args.pm
 			} else if (useDefaults) {
 				pm = detectPackageManager()
+			} else if (selection.usedStoredPreferences) {
+				pm = preferenceStore.getCreatePreferences()?.packageManager ?? detectPackageManager()
 			} else {
 				const detected = detectPackageManager()
 				pm = await prompts.select(
@@ -220,6 +185,18 @@ export const createCommand = defineCommand({
 			})
 			logger.success('Project scaffolded')
 
+			if (shouldSavePreferences(preferenceFlags)) {
+				saveResolvedPreferences(preferenceStore, {
+					framework: selection.framework,
+					auth: selection.auth,
+					db: selection.db,
+					dbProvider: selection.dbProvider,
+					tailwind: selection.tailwind,
+					sync: selection.sync,
+					packageManager: pm,
+				})
+			}
+
 			// Install dependencies
 			if (!args['skip-install']) {
 				logger.step('Installing dependencies...')
@@ -246,6 +223,14 @@ export const createCommand = defineCommand({
 				process.exitCode = 1
 				return
 			}
+			if (error instanceof Error && error.message.startsWith('Invalid --')) {
+				logger.error(error.message)
+				if (!args.yes) {
+					prompts.outro('Project creation aborted.')
+				}
+				process.exitCode = 1
+				return
+			}
 			throw error
 		}
 	},
@@ -257,136 +242,6 @@ function isValidTemplate(value: string): value is TemplateName {
 
 function isValidPackageManager(value: string): value is PackageManager {
 	return (PACKAGE_MANAGERS as readonly string[]).includes(value)
-}
-
-/**
- * Derives the template name from --tailwind and --sync boolean flags.
- * Unspecified flags default to true (tailwind and sync are the recommended defaults).
- */
-function resolveTemplateFromFlags(
-	tailwind: boolean | undefined,
-	sync: boolean | undefined,
-): TemplateName {
-	const useTailwind = tailwind !== false
-	const useSync = sync !== false
-	if (useTailwind && useSync) return 'react-tailwind-sync'
-	if (useTailwind && !useSync) return 'react-tailwind'
-	if (!useTailwind && useSync) return 'react-sync'
-	return 'react-basic'
-}
-
-async function resolveFrameworkSelection(
-	flagFramework: string | undefined,
-	useDefaults: boolean,
-	prompts: {
-		select<T extends string>(message: string, options: readonly SelectOption<T>[]): Promise<T>
-	},
-): Promise<FrameworkOption> {
-	if (flagFramework !== undefined) {
-		if (!isFrameworkValue(flagFramework)) {
-			throw new Error(`Invalid --framework value "${flagFramework}". Expected one of: react, vue, svelte, solid.`)
-		}
-		return flagFramework
-	}
-	if (useDefaults) {
-		return 'react'
-	}
-	return prompts.select('UI framework:', [
-		{ label: 'React', value: 'react' },
-		{ label: 'Vue (coming soon)', value: 'vue', disabled: true },
-		{ label: 'Svelte (coming soon)', value: 'svelte', disabled: true },
-		{ label: 'Solid (coming soon)', value: 'solid', disabled: true },
-	])
-}
-
-async function resolveAuthSelection(
-	flagAuth: string | undefined,
-	useDefaults: boolean,
-	prompts: {
-		select<T extends string>(message: string, options: readonly SelectOption<T>[]): Promise<T>
-	},
-): Promise<AuthOption> {
-	if (flagAuth !== undefined) {
-		if (!isAuthValue(flagAuth)) {
-			throw new Error(
-				`Invalid --auth value "${flagAuth}". Expected one of: none, email-password, oauth.`,
-			)
-		}
-		return flagAuth
-	}
-	if (useDefaults) {
-		return 'none'
-	}
-	return prompts.select('Authentication:', [
-		{ label: 'None', value: 'none' },
-		{ label: 'Email + Password (coming soon)', value: 'email-password', disabled: true },
-		{ label: 'OAuth (coming soon)', value: 'oauth', disabled: true },
-	])
-}
-
-async function resolveDatabaseSelection(
-	flagDb: string | undefined,
-	syncFlag: boolean | undefined,
-	useDefaults: boolean,
-	prompts: {
-		confirm(message: string, defaultValue?: boolean): Promise<boolean>
-		select<T extends string>(message: string, options: readonly SelectOption<T>[]): Promise<T>
-	},
-): Promise<DatabaseOption> {
-	if (flagDb !== undefined) {
-		if (!isDatabaseValue(flagDb)) {
-			throw new Error(`Invalid --db value "${flagDb}". Expected one of: none, sqlite, postgres.`)
-		}
-		return flagDb
-	}
-
-	const syncEnabled = syncFlag ?? (useDefaults ? true : await prompts.confirm('Enable multi-device sync?', true))
-	if (!syncEnabled) {
-		return 'none'
-	}
-
-	if (useDefaults) {
-		return 'sqlite'
-	}
-
-	return prompts.select('Server-side database:', [
-		{ label: 'SQLite (zero-config)', value: 'sqlite' },
-		{ label: 'PostgreSQL (production-scale)', value: 'postgres' },
-	])
-}
-
-async function resolveDatabaseProviderSelection(
-	flagProvider: string | undefined,
-	db: DatabaseOption,
-	useDefaults: boolean,
-	prompts: {
-		select<T extends string>(message: string, options: readonly SelectOption<T>[]): Promise<T>
-	},
-): Promise<DatabaseProviderOption> {
-	if (flagProvider !== undefined) {
-		if (!isDatabaseProviderValue(flagProvider)) {
-			throw new Error(
-				`Invalid --db-provider value "${flagProvider}". Expected one of: none, local, supabase, neon, railway, vercel-postgres, custom.`,
-			)
-		}
-		return flagProvider
-	}
-
-	if (db !== 'postgres') {
-		return 'none'
-	}
-	if (useDefaults) {
-		return 'local'
-	}
-
-	return prompts.select('Database provider:', [
-		{ label: 'Local Postgres', value: 'local' },
-		{ label: 'Supabase', value: 'supabase' },
-		{ label: 'Neon', value: 'neon' },
-		{ label: 'Railway', value: 'railway' },
-		{ label: 'Vercel Postgres', value: 'vercel-postgres' },
-		{ label: 'Custom connection string', value: 'custom' },
-	])
 }
 
 /**

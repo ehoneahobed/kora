@@ -43,6 +43,7 @@
     "@clack/prompts": "^1.2.0",
     "@korajs/core": "workspace:*",
     "citty": "^0.1.6",
+    "conf": "^15.1.0",
     "validate-npm-package-name": "^7.0.2"
   },
   "devDependencies": {
