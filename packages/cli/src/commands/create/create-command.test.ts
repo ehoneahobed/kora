@@ -1,10 +1,13 @@
-import { readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { ProjectExistsError } from '../../errors'
 import { directoryExists } from '../../utils/fs-helpers'
+import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
+import { createCommand } from './create-command'
 
 // Test the scaffolding logic directly rather than citty's arg parsing,
 // since citty handles that internally. We verify the core flow:
@@ -85,7 +88,6 @@ describe('create command flow', () => {
 	test('skip-install flag prevents dependency installation', async () => {
 		// The skip-install flag is a boolean arg handled by citty.
 		// We verify the arg definition accepts it by checking the command imports compile.
-		const { createCommand } = await import('./create-command')
 		expect(createCommand).toBeDefined()
 	})
 
@@ -172,6 +174,71 @@ describe('create command flow', () => {
 			const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
 			expect(server).toContain('createSqliteServerStore')
 			expect(server).not.toContain('MemoryServerStore')
+		}
+	})
+
+	test('postgres preset injects provider-specific README and env details', async () => {
+		const targetDir = join(tempDir.path, 'postgres-preset')
+		await scaffoldTemplate('react-sync', targetDir, {
+			projectName: 'postgres-preset',
+			packageManager: 'pnpm',
+			koraVersion: '0.1.0',
+			dbProvider: 'neon',
+		})
+		await applySyncProviderPreset({
+			targetDir,
+			template: 'react-sync',
+			db: 'postgres',
+			dbProvider: 'neon',
+		})
+
+		const readme = await readFile(join(targetDir, 'README.md'), 'utf-8')
+		const env = await readFile(join(targetDir, '.env.example'), 'utf-8')
+		expect(readme).toContain('Selected DB provider: neon')
+		expect(readme).toContain('createPostgresServerStore')
+		expect(env).toContain('neon.tech')
+		expect(env).toContain('DATABASE_URL=')
+	})
+
+	test('create command logs postgres preset note', async () => {
+		const cwdSpy = vi.spyOn(process, 'cwd')
+		const originalExitCode = process.exitCode
+		const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
+		cwdSpy.mockReturnValue(tempRoot)
+
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+		try {
+			await createCommand.run({
+				args: {
+					_: [],
+					name: 'postgres-log-app',
+					framework: 'react',
+					auth: 'none',
+					db: 'postgres',
+					'db-provider': 'supabase',
+					tailwind: false,
+					sync: true,
+					pm: 'pnpm',
+					'skip-install': true,
+					yes: false,
+				},
+				rawArgs: [],
+				cmd: createCommand,
+			})
+
+			const logged = logSpy.mock.calls.map((call) => String(call[0] ?? '')).join('\n')
+			expect(logged).toContain('Applied PostgreSQL sync preset (Supabase)')
+			expect(logged).toContain('DATABASE_URL')
+		} finally {
+			process.exitCode = originalExitCode
+			cwdSpy.mockRestore()
+			logSpy.mockRestore()
+			warnSpy.mockRestore()
+			errorSpy.mockRestore()
+			await rm(tempRoot, { recursive: true, force: true })
 		}
 	})
 })

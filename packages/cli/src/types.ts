@@ -47,4 +47,5 @@ export interface TemplateContext {
 	projectName: string
 	packageManager: PackageManager
 	koraVersion: string
+	dbProvider?: string
 }
