@@ -60,6 +60,7 @@ export async function scaffoldTemplate(
 		projectName: context.projectName,
 		packageManager: context.packageManager,
 		koraVersion: context.koraVersion,
+		dbProvider: context.dbProvider ?? 'none',
 	}
 	await copyDirectory(templateDir, targetDir, vars)
 }

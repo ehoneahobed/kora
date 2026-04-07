@@ -36,6 +36,7 @@ export {
 	type CreateFlags,
 	type PreferenceResolutionResult,
 } from './commands/create/preferences-flow'
+export { applySyncProviderPreset } from './commands/create/sync-provider-preset'
 
 // === Prompt Abstractions ===
 export {

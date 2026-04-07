@@ -18,6 +18,7 @@ import {
 	shouldSavePreferences,
 	type CreateFlags,
 } from './preferences-flow'
+import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
 
 /**
@@ -182,6 +183,13 @@ export const createCommand = defineCommand({
 				projectName,
 				packageManager: pm,
 				koraVersion,
+				dbProvider: selection.dbProvider,
+			})
+			await applySyncProviderPreset({
+				targetDir,
+				template,
+				db: selection.db,
+				dbProvider: selection.dbProvider,
 			})
 			logger.success('Project scaffolded')
 
