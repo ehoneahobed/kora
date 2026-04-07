@@ -16,3 +16,11 @@ export {
 
 // === Type Generation (programmatic use) ===
 export { generateTypes } from './commands/generate/type-generator'
+
+// === Prompt Abstractions ===
+export {
+	createPromptClient,
+	ReadlinePromptClient,
+	type PromptClient,
+	type SelectOption,
+} from './prompts/prompt-client'

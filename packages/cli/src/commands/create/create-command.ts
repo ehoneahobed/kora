@@ -13,7 +13,7 @@ import {
 	getInstallCommand,
 	getRunDevCommand,
 } from '../../utils/package-manager'
-import { promptSelect, promptText } from '../../utils/prompt'
+import { createPromptClient } from '../../prompts/prompt-client'
 import { scaffoldTemplate } from './template-engine'
 
 /**
@@ -62,13 +62,14 @@ export const createCommand = defineCommand({
 	},
 	async run({ args }) {
 		const logger = createLogger()
+		const prompts = createPromptClient()
 		logger.banner()
 
 		const useDefaults = args.yes === true
 
 		// Resolve project name
 		const projectName =
-			args.name || (useDefaults ? 'my-kora-app' : await promptText('Project name', 'my-kora-app'))
+			args.name || (useDefaults ? 'my-kora-app' : await prompts.text('Project name', 'my-kora-app'))
 		if (!projectName) {
 			logger.error('Project name is required')
 			process.exitCode = 1
@@ -87,7 +88,7 @@ export const createCommand = defineCommand({
 			// Derive template from --tailwind and --sync flags
 			template = resolveTemplateFromFlags(args.tailwind, args.sync)
 		} else {
-			template = await promptSelect(
+			template = await prompts.select(
 				'Select a template:',
 				TEMPLATE_INFO.map((t) => ({ label: `${t.label} — ${t.description}`, value: t.name })),
 			)
@@ -101,7 +102,7 @@ export const createCommand = defineCommand({
 			pm = detectPackageManager()
 		} else {
 			const detected = detectPackageManager()
-			pm = await promptSelect(
+			pm = await prompts.select(
 				'Package manager:',
 				PACKAGE_MANAGERS.map((p) => ({
 					label: p === detected ? `${p} (detected)` : p,
