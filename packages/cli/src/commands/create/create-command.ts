@@ -3,21 +3,32 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineCommand } from 'citty'
-import { createPromptClient, PromptCancelledError } from '../../prompts/prompt-client'
-import { PreferenceStore } from '../../prompts/preferences'
 import { ProjectExistsError } from '../../errors'
+import { PreferenceStore } from '../../prompts/preferences'
+import { PromptCancelledError, createPromptClient } from '../../prompts/prompt-client'
 import { PACKAGE_MANAGERS, TEMPLATES } from '../../types'
 import type { PackageManager, TemplateName } from '../../types'
 import { directoryExists } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
-import { detectPackageManager, getInstallCommand, getRunDevCommand } from '../../utils/package-manager'
-import { validateProjectName } from './project-name'
 import {
+	detectPackageManager,
+	getInstallCommand,
+	getRunDevCommand,
+} from '../../utils/package-manager'
+import {
+	applyEditorWorkspacePreset,
+	detectEditorFromEnvironment,
+	detectGitContext,
+	detectMonorepoContext,
+	resolveMonorepoTargetDirectory,
+} from './environment-detection'
+import {
+	type CreateFlags,
 	resolveCreatePreferencesFlow,
 	saveResolvedPreferences,
 	shouldSavePreferences,
-	type CreateFlags,
 } from './preferences-flow'
+import { validateProjectName } from './project-name'
 import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
 
@@ -55,7 +66,8 @@ export const createCommand = defineCommand({
 		},
 		'db-provider': {
 			type: 'string',
-			description: 'Database provider for postgres (local, supabase, neon, railway, vercel-postgres, custom)',
+			description:
+				'Database provider for postgres (local, supabase, neon, railway, vercel-postgres, custom)',
 		},
 		auth: {
 			type: 'string',
@@ -94,7 +106,8 @@ export const createCommand = defineCommand({
 
 			// Resolve project name
 			const projectName =
-				args.name || (useDefaults ? 'my-kora-app' : await prompts.text('Project name', 'my-kora-app'))
+				args.name ||
+				(useDefaults ? 'my-kora-app' : await prompts.text('Project name', 'my-kora-app'))
 			if (!projectName) {
 				logger.error('Project name is required')
 				process.exitCode = 1
@@ -168,8 +181,22 @@ export const createCommand = defineCommand({
 				)
 			}
 
+			const editorDetection = detectEditorFromEnvironment()
+			const gitContext = await detectGitContext(process.cwd())
+			const monorepoContext = await detectMonorepoContext(process.cwd())
+
+			let targetDir = resolve(process.cwd(), projectName)
+			if (!useDefaults && monorepoContext.isMonorepo && monorepoContext.root !== null) {
+				const useWorkspaceTarget = await prompts.confirm(
+					`Detected ${formatMonorepoKind(monorepoContext.kind)} at ${monorepoContext.root}. Create app under packages/${projectName}?`,
+					true,
+				)
+				if (useWorkspaceTarget) {
+					targetDir = resolveMonorepoTargetDirectory(monorepoContext.root, projectName)
+				}
+			}
+
 			// Validate target directory
-			const targetDir = resolve(process.cwd(), projectName)
 			if (await directoryExists(targetDir)) {
 				throw new ProjectExistsError(projectName)
 			}
@@ -191,9 +218,31 @@ export const createCommand = defineCommand({
 				db: selection.db,
 				dbProvider: selection.dbProvider,
 			})
+			if (!useDefaults && editorDetection.editor !== 'unknown') {
+				const shouldApplyEditorPreset = await prompts.confirm(
+					`Detected ${formatEditor(editorDetection.editor)}. Add workspace recommendations for ${formatEditor(editorDetection.editor)}?`,
+					true,
+				)
+				if (shouldApplyEditorPreset) {
+					const appliedPreset = await applyEditorWorkspacePreset({
+						targetDir,
+						editor: editorDetection.editor,
+					})
+					if (appliedPreset.applied) {
+						logger.step(
+							`Added editor recommendations at ${relativeToTarget(targetDir, appliedPreset.filePath)}`,
+						)
+					}
+				}
+			}
 			if (selection.db === 'postgres' && isSyncTemplate(template)) {
 				logger.info(
 					`Applied PostgreSQL sync preset (${formatDbProviderForLog(selection.dbProvider)}). Update DATABASE_URL in .env.example before running the sync server.`,
+				)
+			}
+			if (gitContext.hasRepository) {
+				logger.step(
+					`Detected existing git repository at ${gitContext.repositoryRoot}. Skipping git initialization.`,
 				)
 			}
 			logger.success('Project scaffolded')
@@ -225,7 +274,7 @@ export const createCommand = defineCommand({
 			logger.blank()
 			logger.info('Done! Next steps:')
 			logger.blank()
-			logger.step(`  cd ${projectName}`)
+			logger.step(`  cd ${targetDir}`)
 			logger.step(`  ${getRunDevCommand(pm)}`)
 			logger.blank()
 			if (!useDefaults) {
@@ -280,6 +329,46 @@ function formatDbProviderForLog(dbProvider: string): string {
 		default:
 			return dbProvider
 	}
+}
+
+function formatEditor(editor: string): string {
+	switch (editor) {
+		case 'vscode':
+			return 'VS Code'
+		case 'cursor':
+			return 'Cursor'
+		case 'windsurf':
+			return 'Windsurf'
+		case 'zed':
+			return 'Zed'
+		default:
+			return editor
+	}
+}
+
+function formatMonorepoKind(kind: string): string {
+	switch (kind) {
+		case 'pnpm-workspace':
+			return 'pnpm workspace'
+		case 'npm-workspaces':
+			return 'npm workspace'
+		case 'turborepo':
+			return 'Turborepo'
+		default:
+			return 'monorepo'
+	}
+}
+
+function relativeToTarget(targetDir: string, filePath: string | null): string {
+	if (filePath === null) return '.'
+	const normalizedTarget = targetDir.endsWith('/') ? targetDir : `${targetDir}/`
+	if (filePath.startsWith(normalizedTarget)) {
+		return filePath.slice(normalizedTarget.length)
+	}
+	if (filePath === targetDir) {
+		return '.'
+	}
+	return filePath
 }
 
 /**
