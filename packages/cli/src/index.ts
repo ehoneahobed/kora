@@ -16,7 +16,81 @@ export {
 
 // === Type Generation (programmatic use) ===
 export { generateTypes } from './commands/generate/type-generator'
-export { validateProjectName, type ProjectNameValidationResult } from './commands/create/project-name'
+export { deployCommand } from './commands/deploy/deploy-command'
+export {
+	DEPLOY_PLATFORMS,
+	isDeployPlatform,
+	type ContextAwareDeployAdapter,
+	type BuildArtifacts,
+	type DeployAdapter,
+	type DeployPlatform,
+	type DeploymentStatus,
+	type DeployResult,
+	type LogLine,
+	type LogOptions,
+	type ProjectConfig,
+	type ProvisionResult,
+} from './commands/deploy/adapters/adapter'
+export {
+	FlyAdapter,
+	NodeFlyCommandRunner,
+	type FlyAdapterContext,
+	type FlyAdapterOptions,
+	type FlyCommandResult,
+	type FlyCommandRunner,
+} from './commands/deploy/adapters/fly-adapter'
+export { createDeployAdapter } from './commands/deploy/adapters/factory'
+export {
+	NodeRailwayCommandRunner,
+	RailwayAdapter,
+	type RailwayAdapterContext,
+	type RailwayAdapterOptions,
+	type RailwayCommandResult,
+	type RailwayCommandRunner,
+} from './commands/deploy/adapters/railway-adapter'
+export { StubDeployAdapter } from './commands/deploy/adapters/stub-adapter'
+export {
+	readDeployState,
+	resetDeployState,
+	resolveDeployDirectory,
+	resolveDeployStatePath,
+	updateDeployState,
+	writeDeployState,
+	type DeployState,
+	type DeployStateCreateInput,
+	type DeployStatePatch,
+} from './commands/deploy/state/deploy-state'
+export {
+	generateDockerIgnore,
+	generateDockerfile,
+	writeDockerIgnoreArtifact,
+	writeDockerfileArtifact,
+	type DockerfileOptions,
+} from './commands/deploy/artifacts/dockerfile-generator'
+export {
+	generateFlyToml,
+	writeFlyTomlArtifact,
+	type FlyTomlOptions,
+} from './commands/deploy/artifacts/fly-toml-generator'
+export {
+	generateRailwayJson,
+	writeRailwayJsonArtifact,
+	type RailwayJsonConfig,
+} from './commands/deploy/artifacts/railway-json-generator'
+export {
+	buildClient,
+	type ClientBuildOptions,
+	type ClientBuildResult,
+} from './commands/deploy/builder/client-builder'
+export {
+	bundleServer,
+	type ServerBundleOptions,
+	type ServerBundleResult,
+} from './commands/deploy/builder/server-bundler'
+export {
+	validateProjectName,
+	type ProjectNameValidationResult,
+} from './commands/create/project-name'
 export {
 	determineTemplateFromSelections,
 	isAuthValue,
