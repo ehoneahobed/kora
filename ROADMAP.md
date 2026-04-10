@@ -1031,7 +1031,7 @@ packages/cli/templates/db/{sqlite,postgres/...}/
   - `kora deploy rollback`
 
 **Still to build for Phase 13 completion:**
-- full Railway adapter implementation
+- full Railway adapter implementation (**in progress**: adapter + `railway.json` generator scaffolded)
 - full Render adapter implementation
 - Docker adapter implementation (self-hosted deploy workflow)
 - Kora Cloud adapter stub-to-real transition deferred to Phase 21

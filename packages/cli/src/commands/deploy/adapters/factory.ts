@@ -1,5 +1,6 @@
 import type { DeployAdapter, DeployPlatform } from './adapter'
 import { FlyAdapter } from './fly-adapter'
+import { RailwayAdapter } from './railway-adapter'
 import { StubDeployAdapter } from './stub-adapter'
 
 /**
@@ -10,6 +11,7 @@ export function createDeployAdapter(platform: DeployPlatform): DeployAdapter {
 		case 'fly':
 			return new FlyAdapter()
 		case 'railway':
+			return new RailwayAdapter()
 		case 'render':
 		case 'docker':
 		case 'kora-cloud':

@@ -40,6 +40,14 @@ export {
 	type FlyCommandRunner,
 } from './commands/deploy/adapters/fly-adapter'
 export { createDeployAdapter } from './commands/deploy/adapters/factory'
+export {
+	NodeRailwayCommandRunner,
+	RailwayAdapter,
+	type RailwayAdapterContext,
+	type RailwayAdapterOptions,
+	type RailwayCommandResult,
+	type RailwayCommandRunner,
+} from './commands/deploy/adapters/railway-adapter'
 export { StubDeployAdapter } from './commands/deploy/adapters/stub-adapter'
 export {
 	readDeployState,
@@ -64,6 +72,11 @@ export {
 	writeFlyTomlArtifact,
 	type FlyTomlOptions,
 } from './commands/deploy/artifacts/fly-toml-generator'
+export {
+	generateRailwayJson,
+	writeRailwayJsonArtifact,
+	type RailwayJsonConfig,
+} from './commands/deploy/artifacts/railway-json-generator'
 export {
 	buildClient,
 	type ClientBuildOptions,

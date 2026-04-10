@@ -7,8 +7,13 @@ describe('createDeployAdapter', () => {
 		expect(adapter.name).toBe('fly')
 	})
 
-	test('returns StubDeployAdapter for remaining platforms', async () => {
-		const platforms = ['railway', 'render', 'docker', 'kora-cloud'] as const
+	test('returns RailwayAdapter for railway platform', () => {
+		const adapter = createDeployAdapter('railway')
+		expect(adapter.name).toBe('railway')
+	})
+
+	test('returns StubDeployAdapter for non-implemented platforms', async () => {
+		const platforms = ['render', 'docker', 'kora-cloud'] as const
 		for (const platform of platforms) {
 			const adapter = createDeployAdapter(platform)
 			expect(adapter.name).toBe(platform)
