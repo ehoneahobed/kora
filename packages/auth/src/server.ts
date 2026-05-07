@@ -94,5 +94,29 @@ export type {
 	InvitationStatus,
 } from './org/org-types'
 
+// === RBAC (Role-Based Access Control) ===
+export { RbacEngine, defineRoles } from './rbac/rbac-engine'
+export {
+	BUILT_IN_ROLES,
+	parsePermission,
+	permissionCovers,
+	RbacError,
+	InvalidPermissionError,
+	RoleNotFoundError,
+	CircularInheritanceError,
+} from './rbac/rbac-types'
+export type {
+	Permission,
+	RoleDefinition,
+	RbacConfig,
+	SyncScopes,
+	ScopeFilter,
+	ScopeContext,
+	CollectionScopeResolver,
+} from './rbac/rbac-types'
+
+// === Org Scope Resolver ===
+export { OrgScopeResolver } from './rbac/scope-resolver'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'
