@@ -7,7 +7,7 @@ import {
 } from '../../device/device-identity'
 import { hashPassword, verifyPassword } from './password-hash'
 import {
-	InMemoryUserStore,
+	type UserStore,
 	type AuthUser,
 	type AuthDevice,
 } from './user-store'
@@ -159,7 +159,7 @@ export class InMemoryRateLimiter implements RateLimiter {
  */
 export interface AuthRoutesConfig {
 	/** The user/device store backing the auth routes */
-	userStore: InMemoryUserStore
+	userStore: UserStore
 	/** The token manager for issuing and validating JWTs */
 	tokenManager: TokenManager
 	/**
@@ -278,7 +278,7 @@ function sanitizeName(name: string): string {
  * ```
  */
 export class BuiltInAuthRoutes {
-	private readonly userStore: InMemoryUserStore
+	private readonly userStore: UserStore
 	private readonly tokenManager: TokenManager
 	private readonly challengeStore: ChallengeStore
 	private readonly rateLimiter: RateLimiter

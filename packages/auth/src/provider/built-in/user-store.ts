@@ -63,14 +63,82 @@ export class DuplicateEmailError extends KoraError {
 }
 
 /**
+ * Generic interface for user and device persistence.
+ *
+ * Implement this interface to provide database-backed user storage for
+ * the built-in auth provider. All methods are async to support both
+ * synchronous (in-memory, SQLite) and asynchronous (PostgreSQL) backends.
+ *
+ * Built-in implementations:
+ * - {@link InMemoryUserStore} — development and testing (no persistence)
+ * - `SqliteUserStore` — SQLite via better-sqlite3 (from `@korajs/auth/server`)
+ * - `PostgresUserStore` — PostgreSQL via postgres-js (from `@korajs/auth/server`)
+ *
+ * @example
+ * ```typescript
+ * import { BuiltInAuthRoutes, SqliteUserStore } from '@korajs/auth/server'
+ *
+ * const userStore = await createSqliteUserStore({ filename: './auth.db' })
+ * const routes = new BuiltInAuthRoutes({ userStore, tokenManager })
+ * ```
+ */
+export interface UserStore {
+	/** Create a new user account. Throws DuplicateEmailError if email exists. */
+	createUser(params: {
+		email: string
+		passwordHash: string
+		salt: string
+		name: string
+	}): Promise<AuthUser>
+
+	/** Find a user by email address (case-insensitive). */
+	findByEmail(email: string): Promise<StoredUser | null>
+
+	/** Find a user by ID. */
+	findById(id: string): Promise<StoredUser | null>
+
+	/** Register a device for a user. Idempotent if device already exists and is not revoked. */
+	registerDevice(params: {
+		id: string
+		userId: string
+		publicKey: string
+		name: string
+	}): Promise<AuthDevice>
+
+	/** Find a device by its ID. */
+	findDevice(deviceId: string): Promise<AuthDevice | null>
+
+	/** List all devices registered for a user (includes revoked). */
+	listDevices(userId: string): Promise<AuthDevice[]>
+
+	/** Soft-revoke a device. No-op if device does not exist. */
+	revokeDevice(deviceId: string): Promise<void>
+
+	/** Set a user's email verification status. */
+	setEmailVerified(userId: string, verified: boolean): Promise<void>
+
+	/** Update a user's password hash and salt. */
+	updatePassword(userId: string, passwordHash: string, salt: string): Promise<void>
+
+	/** List all users. For admin/development use. */
+	listAll(): Promise<StoredUser[]>
+
+	/** Update a stored user record. */
+	update(user: StoredUser): Promise<void>
+
+	/** Delete a user and all associated devices. */
+	delete(userId: string): Promise<void>
+
+	/** Update the last-seen timestamp for a device. No-op if device does not exist. */
+	touchDevice(deviceId: string): Promise<void>
+}
+
+/**
  * In-memory user and device store for the built-in auth provider.
  *
  * This is a simple implementation suitable for development and testing.
- * Production applications should replace this with a database-backed store
- * implementing the same interface.
- *
- * All methods are async to match the interface that a real database store
- * would expose, even though the in-memory operations are synchronous.
+ * Production applications should use {@link SqliteUserStore} or
+ * {@link PostgresUserStore} for persistent storage.
  *
  * @example
  * ```typescript
@@ -83,7 +151,7 @@ export class DuplicateEmailError extends KoraError {
  * })
  * ```
  */
-export class InMemoryUserStore {
+export class InMemoryUserStore implements UserStore {
 	/** Users indexed by ID */
 	private readonly usersById = new Map<string, StoredUser>()
 

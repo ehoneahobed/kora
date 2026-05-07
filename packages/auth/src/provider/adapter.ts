@@ -1,7 +1,6 @@
 import type { AuthTokens } from '../types'
 import type { TokenManager } from '../tokens/token-manager'
-import type { AuthUser, AuthDevice } from './built-in/user-store'
-import type { InMemoryUserStore } from './built-in/user-store'
+import type { AuthUser, AuthDevice, UserStore } from './built-in/user-store'
 import { BuiltInAuthRoutes, type AuthRoutesConfig } from './built-in/auth-routes'
 
 /**
@@ -164,7 +163,7 @@ export class AuthProviderError extends Error {
 export class BuiltInProvider implements AuthProviderAdapter {
 	private readonly routes: BuiltInAuthRoutes
 	private readonly tokenManager: TokenManager
-	private readonly userStore: InMemoryUserStore
+	private readonly userStore: UserStore
 
 	constructor(config: AuthRoutesConfig) {
 		this.routes = new BuiltInAuthRoutes(config)

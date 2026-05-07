@@ -1,6 +1,5 @@
 import { KoraError } from '@korajs/core'
-import type { AuthUser, StoredUser } from '../provider/built-in/user-store'
-import type { InMemoryUserStore } from '../provider/built-in/user-store'
+import type { AuthUser, StoredUser, UserStore } from '../provider/built-in/user-store'
 import type { Session, SessionStore } from '../session/session'
 import type { AuditLogger, AuditAction } from './audit-log'
 
@@ -13,7 +12,7 @@ import type { AuditLogger, AuditAction } from './audit-log'
  */
 export interface AdminApiConfig {
 	/** User store for managing users */
-	userStore: InMemoryUserStore
+	userStore: UserStore
 	/** Session store for managing sessions (optional) */
 	sessionStore?: SessionStore
 	/** Audit logger (optional) */
@@ -105,7 +104,7 @@ export class AdminUnauthorizedError extends AdminApiError {
  * ```
  */
 export class AdminApi {
-	private readonly userStore: InMemoryUserStore
+	private readonly userStore: UserStore
 	private readonly sessionStore: SessionStore | null
 	private readonly auditLogger: AuditLogger | null
 

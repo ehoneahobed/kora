@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import type { InMemoryUserStore } from './user-store'
+import type { UserStore } from './user-store'
 import { hashPassword } from './password-hash'
 
 // ============================================================================
@@ -49,7 +49,7 @@ export interface PasswordResetStore {
  */
 export interface PasswordResetConfig {
 	/** User store for looking up users and updating passwords */
-	userStore: InMemoryUserStore
+	userStore: UserStore
 	/** Store for reset tokens. Defaults to InMemoryPasswordResetStore. */
 	resetStore?: PasswordResetStore
 	/** Token TTL in milliseconds. Defaults to 1 hour. */
@@ -175,7 +175,7 @@ const MAX_PASSWORD_LENGTH = 128
  * ```
  */
 export class PasswordResetManager {
-	private readonly userStore: InMemoryUserStore
+	private readonly userStore: UserStore
 	private readonly resetStore: PasswordResetStore
 	private readonly tokenTtlMs: number
 	private readonly maxRequestsPerEmail: number

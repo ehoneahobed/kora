@@ -46,7 +46,13 @@ export type {
 
 // === User Store ===
 export { InMemoryUserStore, DuplicateEmailError } from './provider/built-in/user-store'
-export type { AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
+export type { UserStore, AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
+
+// === SQLite User Store ===
+export { SqliteUserStore, createSqliteUserStore } from './provider/built-in/sqlite-user-store'
+
+// === PostgreSQL User Store ===
+export { PostgresUserStore, createPostgresUserStore } from './provider/built-in/postgres-user-store'
 
 // === Provider Adapter ===
 export { BuiltInProvider, AuthProviderError } from './provider/adapter'

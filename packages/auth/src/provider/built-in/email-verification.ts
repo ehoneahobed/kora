@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import type { InMemoryUserStore } from './user-store'
+import type { UserStore } from './user-store'
 
 // ============================================================================
 // Types
@@ -48,7 +48,7 @@ export interface EmailVerificationStore {
  */
 export interface EmailVerificationConfig {
 	/** User store for looking up users */
-	userStore: InMemoryUserStore
+	userStore: UserStore
 	/** Store for verification tokens. Defaults to InMemoryEmailVerificationStore. */
 	verificationStore?: EmailVerificationStore
 	/** Token TTL in milliseconds. Defaults to 24 hours. */
@@ -162,7 +162,7 @@ const DEFAULT_MAX_REQUESTS = 3
  * ```
  */
 export class EmailVerificationManager {
-	private readonly userStore: InMemoryUserStore
+	private readonly userStore: UserStore
 	private readonly verificationStore: EmailVerificationStore
 	private readonly tokenTtlMs: number
 	private readonly maxRequestsPerUser: number
