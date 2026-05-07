@@ -157,7 +157,7 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 		// Build Docker image locally
 		this.logger.step('Building Docker image...')
 		const dockerBuild = await this.runner.run('docker', [
-			'build', '-t', imageTag, '.',
+			'build', '--platform', 'linux/amd64', '-t', imageTag, '.',
 		], artifacts.deployDirectory)
 
 		if (dockerBuild.exitCode !== 0) {

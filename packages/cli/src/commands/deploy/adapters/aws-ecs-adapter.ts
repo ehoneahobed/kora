@@ -196,7 +196,7 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		// Build Docker image
 		this.logger.step('Building Docker image...')
 		const dockerBuild = await this.runner.run('docker', [
-			'build', '-t', imageUri, '.',
+			'build', '--platform', 'linux/amd64', '-t', imageUri, '.',
 		], artifacts.deployDirectory)
 
 		if (dockerBuild.exitCode !== 0) {
