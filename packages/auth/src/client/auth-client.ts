@@ -224,6 +224,7 @@ export class AuthClient {
 	private _state: AuthState = 'loading'
 	private _user: AuthUser | null = null
 	private _refreshPromise: Promise<string | null> | null = null
+	private _initialized = false
 
 	/**
 	 * Creates a new AuthClient.
@@ -268,6 +269,12 @@ export class AuthClient {
 	 * Safe to call multiple times -- subsequent calls are no-ops once initialized.
 	 */
 	async initialize(): Promise<void> {
+		// Guard against double initialization (e.g., React StrictMode double-mount)
+		if (this._initialized) {
+			return
+		}
+		this._initialized = true
+
 		const accessToken = this.storage.getAccessToken()
 		const refreshToken = this.storage.getRefreshToken()
 
@@ -346,13 +353,31 @@ export class AuthClient {
 	/**
 	 * Sign out the current user.
 	 *
-	 * Clears local tokens and state. Does not make a network request to the
-	 * server -- tokens are simply discarded locally.
+	 * Clears local tokens and attempts to revoke the refresh token on the server
+	 * (best-effort — succeeds even if the server is unreachable). This ensures that
+	 * stolen refresh tokens cannot be used after the user explicitly signs out.
 	 */
 	async signOut(): Promise<void> {
+		const accessToken = this.storage.getAccessToken()
+		const refreshToken = this.storage.getRefreshToken()
+
+		// Clear local state immediately (don't wait for server)
 		this.storage.clear()
 		this._refreshPromise = null
 		this.setState('unauthenticated', null)
+
+		// Best-effort server-side revocation
+		if (accessToken) {
+			try {
+				await this.request('/auth/signout', {
+					method: 'POST',
+					body: { refreshToken: refreshToken ?? undefined },
+					token: accessToken,
+				})
+			} catch {
+				// Server may be unreachable (offline) — local sign-out still succeeds
+			}
+		}
 	}
 
 	// -----------------------------------------------------------------------

@@ -51,11 +51,10 @@ export interface AuthDevice {
  * Thrown when a user account already exists with the given email.
  */
 export class DuplicateEmailError extends KoraError {
-	constructor(email: string) {
+	constructor() {
 		super(
-			`A user with email "${email}" already exists. Use a different email address or sign in to the existing account.`,
+			'A user with this email already exists.',
 			'DUPLICATE_EMAIL',
-			{ email },
 		)
 		this.name = 'DuplicateEmailError'
 	}
@@ -115,7 +114,7 @@ export class InMemoryUserStore {
 		const normalizedEmail = params.email.toLowerCase()
 
 		if (this.usersByEmail.has(normalizedEmail)) {
-			throw new DuplicateEmailError(params.email)
+			throw new DuplicateEmailError()
 		}
 
 		const now = Date.now()

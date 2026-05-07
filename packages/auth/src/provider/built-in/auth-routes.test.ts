@@ -1,19 +1,28 @@
 import { describe, expect, test, beforeEach } from 'vitest'
-import { BuiltInAuthRoutes } from './auth-routes'
+import { BuiltInAuthRoutes, InMemoryChallengeStore } from './auth-routes'
 import { InMemoryUserStore } from './user-store'
-import { TokenManager } from '../../tokens/token-manager'
+import { TokenManager, InMemoryTokenRevocationStore } from '../../tokens/token-manager'
+import {
+	generateDeviceKeyPair,
+	exportPublicKeyJwk,
+	signChallenge,
+} from '../../device/device-identity'
 
-const TEST_SECRET = 'test-secret-key-for-auth-routes-tests'
+// Must be at least 32 characters for HMAC-SHA256 security
+const TEST_SECRET = 'test-secret-key-for-auth-routes-tests-min-32-chars'
 
 function createTestRoutes(): {
 	routes: BuiltInAuthRoutes
 	userStore: InMemoryUserStore
 	tokenManager: TokenManager
+	challengeStore: InMemoryChallengeStore
 } {
 	const userStore = new InMemoryUserStore()
-	const tokenManager = new TokenManager({ secret: TEST_SECRET })
-	const routes = new BuiltInAuthRoutes({ userStore, tokenManager })
-	return { routes, userStore, tokenManager }
+	const revocationStore = new InMemoryTokenRevocationStore()
+	const tokenManager = new TokenManager({ secret: TEST_SECRET, revocationStore })
+	const challengeStore = new InMemoryChallengeStore()
+	const routes = new BuiltInAuthRoutes({ userStore, tokenManager, challengeStore })
+	return { routes, userStore, tokenManager, challengeStore }
 }
 
 describe('handleSignUp', () => {
@@ -596,5 +605,296 @@ describe('toSyncAuthProvider', () => {
 
 		// Token is valid but user doesn't exist in the new store
 		expect(context).toBeNull()
+	})
+})
+
+describe('handleDeviceRegister', () => {
+	test('registers a device with a valid access token and returns device credential', async () => {
+		const { routes } = createTestRoutes()
+
+		// Sign up a user to get an access token
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		// Generate a real key pair and export the public key as JWK
+		const keyPair = await generateDeviceKeyPair()
+		const publicKeyJwk = await exportPublicKeyJwk(keyPair)
+		const publicKeyJson = JSON.stringify(publicKeyJwk)
+
+		const result = await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-register-001',
+			publicKey: publicKeyJson,
+			name: 'Test Device',
+		})
+
+		expect(result.status).toBe(201)
+		expect('data' in result.body).toBe(true)
+		if ('data' in result.body) {
+			expect(result.body.data.device.id).toBe('device-register-001')
+			expect(result.body.data.device.name).toBe('Test Device')
+			expect(result.body.data.device.revoked).toBe(false)
+			expect(result.body.data.deviceCredential).toBeDefined()
+			// Device credential is a valid JWT (three dot-separated segments)
+			expect(result.body.data.deviceCredential.split('.')).toHaveLength(3)
+		}
+	})
+
+	test('rejects device registration with an invalid access token', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleDeviceRegister('not-a-valid-token', {
+			deviceId: 'device-register-002',
+			publicKey: '{"kty":"EC","crv":"P-256","x":"a","y":"b"}',
+			name: 'Test Device',
+		})
+
+		expect(result.status).toBe(401)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('Invalid or expired access token')
+		}
+	})
+
+	test('rejects device registration with invalid public key JSON', async () => {
+		const { routes } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const result = await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-register-003',
+			publicKey: 'not-valid-json',
+			name: 'Test Device',
+		})
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('Invalid public key format')
+		}
+	})
+})
+
+describe('handleDeviceVerify', () => {
+	test('verifies a device with a valid challenge and signature', async () => {
+		const { routes, challengeStore } = createTestRoutes()
+
+		// Sign up and register a device with a real key pair
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const keyPair = await generateDeviceKeyPair()
+		const publicKeyJwk = await exportPublicKeyJwk(keyPair)
+		const publicKeyJson = JSON.stringify(publicKeyJwk)
+
+		await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-verify-001',
+			publicKey: publicKeyJson,
+			name: 'Verify Test Device',
+		})
+
+		// Request a challenge via the server-side endpoint
+		const challengeResult = await routes.handleDeviceChallenge(accessToken, 'device-verify-001')
+		expect(challengeResult.status).toBe(200)
+		if (!('data' in challengeResult.body)) return
+		const challenge = challengeResult.body.data.challenge
+
+		// Sign it with the device's private key
+		const signature = await signChallenge(keyPair.privateKey, challenge)
+
+		const result = await routes.handleDeviceVerify({
+			deviceId: 'device-verify-001',
+			challenge,
+			signature,
+		})
+
+		expect(result.status).toBe(200)
+		expect('data' in result.body).toBe(true)
+		if ('data' in result.body) {
+			expect(result.body.data.tokens.accessToken).toBeDefined()
+			expect(result.body.data.tokens.refreshToken).toBeDefined()
+			expect(result.body.data.tokens.deviceCredential).toBeDefined()
+			expect(result.body.data.tokens.accessToken.split('.')).toHaveLength(3)
+			expect(result.body.data.tokens.refreshToken.split('.')).toHaveLength(3)
+		}
+	})
+
+	test('challenge is single-use (replay protection)', async () => {
+		const { routes } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const keyPair = await generateDeviceKeyPair()
+		const publicKeyJwk = await exportPublicKeyJwk(keyPair)
+		const publicKeyJson = JSON.stringify(publicKeyJwk)
+
+		await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-replay-001',
+			publicKey: publicKeyJson,
+			name: 'Replay Test Device',
+		})
+
+		const challengeResult = await routes.handleDeviceChallenge(accessToken, 'device-replay-001')
+		if (!('data' in challengeResult.body)) return
+		const challenge = challengeResult.body.data.challenge
+		const signature = await signChallenge(keyPair.privateKey, challenge)
+
+		// First use: succeeds
+		const result1 = await routes.handleDeviceVerify({
+			deviceId: 'device-replay-001',
+			challenge,
+			signature,
+		})
+		expect(result1.status).toBe(200)
+
+		// Second use (replay): rejected
+		const result2 = await routes.handleDeviceVerify({
+			deviceId: 'device-replay-001',
+			challenge,
+			signature,
+		})
+		expect(result2.status).toBe(401)
+		if ('error' in result2.body) {
+			expect(result2.body.error).toContain('Invalid or expired challenge')
+		}
+	})
+
+	test('rejects verification with an invalid signature', async () => {
+		const { routes } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const keyPair = await generateDeviceKeyPair()
+		const publicKeyJwk = await exportPublicKeyJwk(keyPair)
+		const publicKeyJson = JSON.stringify(publicKeyJwk)
+
+		await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-verify-002',
+			publicKey: publicKeyJson,
+			name: 'Verify Test Device',
+		})
+
+		// Get a server-issued challenge
+		const challengeResult = await routes.handleDeviceChallenge(accessToken, 'device-verify-002')
+		if (!('data' in challengeResult.body)) return
+		const challenge = challengeResult.body.data.challenge
+
+		// Sign it with a DIFFERENT key pair
+		const otherKeyPair = await generateDeviceKeyPair()
+		const wrongSignature = await signChallenge(otherKeyPair.privateKey, challenge)
+
+		const result = await routes.handleDeviceVerify({
+			deviceId: 'device-verify-002',
+			challenge,
+			signature: wrongSignature,
+		})
+
+		expect(result.status).toBe(401)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('Invalid signature')
+		}
+	})
+
+	test('rejects verification for a revoked device', async () => {
+		const { routes, challengeStore } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const keyPair = await generateDeviceKeyPair()
+		const publicKeyJwk = await exportPublicKeyJwk(keyPair)
+		const publicKeyJson = JSON.stringify(publicKeyJwk)
+
+		await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-verify-003',
+			publicKey: publicKeyJson,
+			name: 'Revokable Device',
+		})
+
+		// Get a challenge BEFORE revoking
+		const challengeResult = await routes.handleDeviceChallenge(accessToken, 'device-verify-003')
+		if (!('data' in challengeResult.body)) return
+		const challenge = challengeResult.body.data.challenge
+
+		// Revoke the device
+		await routes.handleRevokeDevice(accessToken, 'device-verify-003')
+
+		// Attempt to verify the revoked device using the pre-revocation challenge
+		const signature = await signChallenge(keyPair.privateKey, challenge)
+
+		const result = await routes.handleDeviceVerify({
+			deviceId: 'device-verify-003',
+			challenge,
+			signature,
+		})
+
+		expect(result.status).toBe(403)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('revoked')
+		}
+	})
+
+	test('rejects verification with an unknown challenge', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleDeviceVerify({
+			deviceId: 'nonexistent-device',
+			challenge: 'not-a-server-issued-challenge',
+			signature: 'some-signature',
+		})
+
+		expect(result.status).toBe(401)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('Invalid or expired challenge')
+		}
+	})
+})
+
+describe('generateChallenge', () => {
+	test('returns a 64-character hex string', () => {
+		const challenge = BuiltInAuthRoutes.generateChallenge()
+
+		expect(challenge).toHaveLength(64)
+		// Verify it is valid hex
+		expect(/^[0-9a-f]{64}$/.test(challenge)).toBe(true)
+	})
+
+	test('generates unique challenges on each call', () => {
+		const challenge1 = BuiltInAuthRoutes.generateChallenge()
+		const challenge2 = BuiltInAuthRoutes.generateChallenge()
+
+		expect(challenge1).not.toBe(challenge2)
 	})
 })

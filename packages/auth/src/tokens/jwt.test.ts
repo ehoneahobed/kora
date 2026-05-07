@@ -203,15 +203,19 @@ describe('isExpired', () => {
 		vi.useRealTimers()
 	})
 
-	test('returns true when exp is in the past', () => {
+	test('returns true when exp is in the past (beyond clock skew tolerance)', () => {
 		const nowSeconds = Math.floor(Date.now() / 1000)
-		expect(isExpired({ exp: nowSeconds - 1 })).toBe(true)
+		// isExpired includes a 5-second clock skew tolerance, so tokens expired
+		// within the tolerance window are not yet considered expired.
+		expect(isExpired({ exp: nowSeconds - 6 })).toBe(true)
 		expect(isExpired({ exp: nowSeconds - 3600 })).toBe(true)
 	})
 
-	test('returns true when exp equals current time (boundary: expired at the exact second)', () => {
+	test('returns false within clock skew tolerance window', () => {
 		const nowSeconds = Math.floor(Date.now() / 1000)
-		expect(isExpired({ exp: nowSeconds })).toBe(true)
+		// Tokens that expired 0-4 seconds ago are within the 5-second tolerance
+		expect(isExpired({ exp: nowSeconds })).toBe(false)
+		expect(isExpired({ exp: nowSeconds - 4 })).toBe(false)
 	})
 
 	test('returns false when exp is in the future', () => {

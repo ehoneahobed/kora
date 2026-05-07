@@ -154,6 +154,12 @@ export function verifyJwt(token: string, secret: string): Record<string, unknown
 		return null
 	}
 
+	// Validate the header to prevent algorithm confusion attacks.
+	// Only HS256 is supported; reject any token claiming a different algorithm.
+	if (headerSegment !== ENCODED_HEADER) {
+		return null
+	}
+
 	// Recompute signature and compare
 	const signingInput = `${headerSegment}.${payloadSegment}`
 	const expectedSignature = hmacSha256Base64url(signingInput, secret)
@@ -187,11 +193,18 @@ export function verifyJwt(token: string, secret: string): Record<string, unknown
 }
 
 /**
+ * Clock skew tolerance in seconds. Allows for minor clock differences
+ * between servers in multi-server deployments.
+ */
+const CLOCK_SKEW_TOLERANCE_SECONDS = 5
+
+/**
  * Checks whether a token payload has expired based on its `exp` claim.
  *
  * The `exp` claim is expected to be in seconds since the Unix epoch (per JWT spec).
- * If the `exp` claim is missing or is not a number, the token is considered
- * non-expiring and this function returns false.
+ * Includes a small clock skew tolerance (5 seconds) to handle minor time
+ * differences between servers. If the `exp` claim is missing or is not a number,
+ * the token is considered non-expiring and this function returns false.
  *
  * @param payload - An object with an optional `exp` field (seconds since epoch)
  * @returns true if the token has expired, false otherwise
@@ -209,5 +222,5 @@ export function isExpired(payload: { exp?: number }): boolean {
 		return false
 	}
 	const nowSeconds = Math.floor(Date.now() / 1000)
-	return nowSeconds >= payload.exp
+	return nowSeconds >= payload.exp + CLOCK_SKEW_TOLERANCE_SECONDS
 }

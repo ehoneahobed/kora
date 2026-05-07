@@ -57,6 +57,8 @@ export type TokenType = 'access' | 'refresh' | 'device_credential'
  * Fields follow standard JWT claim names.
  */
 export interface TokenPayload {
+	/** JWT ID: unique identifier for this specific token (for revocation and replay detection) */
+	jti: string
 	/** Subject: the user ID */
 	sub: string
 	/** Device ID that this token was issued to */
@@ -232,11 +234,10 @@ export class InvalidCredentialsError extends AuthError {
  * Thrown when a user tries to sign up with an email that already exists.
  */
 export class EmailAlreadyExistsError extends AuthError {
-	constructor(email: string) {
+	constructor() {
 		super(
-			`An account with email "${email}" already exists.`,
+			'An account with this email already exists.',
 			'AUTH_EMAIL_EXISTS',
-			{ email },
 		)
 		this.name = 'EmailAlreadyExistsError'
 	}
