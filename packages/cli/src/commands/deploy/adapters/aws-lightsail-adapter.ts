@@ -183,11 +183,19 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 
 		// Create deployment
 		this.logger.step('Creating Lightsail deployment...')
+		const environment: Record<string, string> = { PORT: '3001' }
+		// Pass through deployment-relevant env vars
+		for (const key of PASSTHROUGH_ENV_VARS) {
+			const value = process.env[key]
+			if (value) {
+				environment[key] = value
+			}
+		}
 		const containers = JSON.stringify({
 			[serviceName]: {
 				image: lightsailImage,
 				ports: { '3001': 'HTTP' },
-				environment: { PORT: '3001' },
+				environment,
 			},
 		})
 		const publicEndpoint = JSON.stringify({
@@ -392,6 +400,16 @@ export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner 
 		})
 	}
 }
+
+/**
+ * Environment variables automatically forwarded from the host to the Lightsail container.
+ */
+const PASSTHROUGH_ENV_VARS = [
+	'DATABASE_URL',
+	'AUTH_SECRET',
+	'PUBLIC_URL',
+	'NODE_ENV',
+] as const
 
 /**
  * Lightsail service names must be 2-255 chars, lowercase alphanumeric and hyphens only.
