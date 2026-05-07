@@ -30,6 +30,7 @@ export type KoraEvent =
 	| { type: 'constraint:violated'; constraint: string; trace: MergeTrace }
 	| { type: 'sync:connected'; nodeId: string }
 	| { type: 'sync:disconnected'; reason: string }
+	| { type: 'sync:auth-failed'; reason: string }
 	| { type: 'sync:sent'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:received'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:acknowledged'; sequenceNumber: number }

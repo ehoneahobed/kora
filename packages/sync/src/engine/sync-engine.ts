@@ -402,6 +402,9 @@ export class SyncEngine {
 
 	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
 		this.transitionTo('error')
+		if (msg.code === 'AUTH_FAILED') {
+			this.emitter?.emit({ type: 'sync:auth-failed', reason: msg.message })
+		}
 		this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
 		this.transitionTo('disconnected')
 	}
