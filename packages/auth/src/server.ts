@@ -147,5 +147,67 @@ export type {
 // === Org Scope Resolver ===
 export { OrgScopeResolver } from './rbac/scope-resolver'
 
+// === OAuth / Social Login ===
+export {
+	OAuthManager,
+	InMemoryOAuthStateStore,
+	googleProvider,
+	githubProvider,
+	microsoftProvider,
+} from './provider/oauth/oauth-flow'
+export type { OAuthManagerConfig } from './provider/oauth/oauth-flow'
+export {
+	OAuthError,
+	OAuthStateMismatchError,
+	OAuthCodeExchangeError,
+	OAuthUserInfoError,
+	OAuthProviderNotFoundError,
+} from './provider/oauth/oauth-types'
+export type {
+	OAuthProviderConfig,
+	OAuthTokens,
+	OAuthUserInfo,
+	OAuthState,
+	OAuthStateStore,
+	LinkedIdentity,
+} from './provider/oauth/oauth-types'
+
+// === Session Management ===
+export {
+	SessionManager,
+	InMemorySessionStore,
+	SessionError,
+	SessionNotFoundError,
+	SessionExpiredError,
+	SessionLimitExceededError,
+	SessionMfaRequiredError,
+} from './session/session'
+export type {
+	Session,
+	SessionManagerConfig,
+	CreateSessionParams,
+	SessionStore,
+} from './session/session'
+
+// === TOTP MFA ===
+export {
+	TotpManager,
+	InMemoryTotpStore,
+	base32Encode,
+	base32Decode,
+	TotpError,
+	TotpInvalidCodeError,
+	TotpNotEnabledError,
+	TotpAlreadyEnabledError,
+	TotpNotVerifiedError,
+	TotpRecoveryExhaustedError,
+} from './mfa/totp'
+export type {
+	TotpConfig,
+	TotpSecret,
+	TotpSetupResult,
+	TotpStore,
+} from './mfa/totp'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'
