@@ -1,4 +1,4 @@
-import { index, integer, pgTable, text } from 'drizzle-orm/pg-core'
+import { bigint, index, integer, pgTable, text } from 'drizzle-orm/pg-core'
 
 /**
  * Drizzle schema for the Kora sync server's PostgreSQL database.
@@ -20,13 +20,13 @@ export const pgOperations = pgTable(
 		recordId: text('record_id').notNull(),
 		data: text('data'), // JSON-serialized, null for deletes
 		previousData: text('previous_data'), // JSON-serialized, null for insert/delete
-		wallTime: integer('wall_time').notNull(),
+		wallTime: bigint('wall_time', { mode: 'number' }).notNull(),
 		logical: integer('logical').notNull(),
 		timestampNodeId: text('timestamp_node_id').notNull(),
 		sequenceNumber: integer('sequence_number').notNull(),
 		causalDeps: text('causal_deps').notNull().default('[]'), // JSON array of op IDs
 		schemaVersion: integer('schema_version').notNull(),
-		receivedAt: integer('received_at').notNull(),
+		receivedAt: bigint('received_at', { mode: 'number' }).notNull(),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_pg_node_seq').on(table.nodeId, table.sequenceNumber),
@@ -38,5 +38,5 @@ export const pgOperations = pgTable(
 export const pgSyncState = pgTable('sync_state', {
 	nodeId: text('node_id').primaryKey(),
 	maxSequenceNumber: integer('max_sequence_number').notNull(),
-	lastSeenAt: integer('last_seen_at').notNull(),
+	lastSeenAt: bigint('last_seen_at', { mode: 'number' }).notNull(),
 })

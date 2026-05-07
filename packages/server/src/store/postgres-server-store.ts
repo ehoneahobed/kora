@@ -144,13 +144,13 @@ export class PostgresServerStore implements ServerStore {
 				record_id TEXT NOT NULL,
 				data TEXT,
 				previous_data TEXT,
-				wall_time INTEGER NOT NULL,
+				wall_time BIGINT NOT NULL,
 				logical INTEGER NOT NULL,
 				timestamp_node_id TEXT NOT NULL,
 				sequence_number INTEGER NOT NULL,
 				causal_deps TEXT NOT NULL DEFAULT '[]',
 				schema_version INTEGER NOT NULL,
-				received_at INTEGER NOT NULL
+				received_at BIGINT NOT NULL
 			)
 		`)
 
@@ -168,7 +168,7 @@ export class PostgresServerStore implements ServerStore {
 			CREATE TABLE IF NOT EXISTS sync_state (
 				node_id TEXT PRIMARY KEY,
 				max_sequence_number INTEGER NOT NULL,
-				last_seen_at INTEGER NOT NULL
+				last_seen_at BIGINT NOT NULL
 			)
 		`)
 	}
