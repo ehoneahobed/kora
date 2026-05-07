@@ -229,7 +229,8 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 			'--region', region,
 		], context.projectRoot)
 
-		const serviceUrl = parseLightsailUrl(serviceInfo.stdout) ?? `https://${serviceName}.${region}.cs.amazonlightsail.com`
+		const rawUrl = parseLightsailUrl(serviceInfo.stdout) ?? `https://${serviceName}.${region}.cs.amazonlightsail.com`
+		const serviceUrl = rawUrl.replace(/\/+$/, '')
 		const deploymentId = new Date().toISOString()
 
 		return {
