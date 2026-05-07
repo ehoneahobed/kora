@@ -480,8 +480,8 @@ kora deploy rollback
 |----------|-------------|
 | Fly.io | Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly auth login` |
 | Railway | Install [@railway/cli](https://docs.railway.com/guides/cli), run `railway login` |
-| AWS ECS | Install [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
-| AWS Lightsail | Install [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
+| AWS ECS | Install [Docker Desktop](https://www.docker.com/get-started/), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
+| AWS Lightsail | Install [Docker Desktop](https://www.docker.com/get-started/), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [lightsailctl plugin](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software), run `aws configure` |
 
 ### Project Requirements
 

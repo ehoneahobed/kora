@@ -213,7 +213,19 @@ Kora supports two AWS deployment targets: **Lightsail Containers** (simpler, che
 
 ### Prerequisites (both AWS options)
 
-1. **Install the AWS CLI:**
+1. **Install Docker Desktop:**
+
+   Both AWS options build a Docker container image locally before pushing to AWS. You need Docker running on your machine.
+
+   Download from [docker.com/get-started](https://www.docker.com/get-started/) and make sure Docker Desktop is **running** (not just installed) before deploying.
+
+   Verify:
+
+   ```bash
+   docker --version
+   ```
+
+2. **Install the AWS CLI:**
 
    **macOS:**
 
@@ -233,7 +245,7 @@ Kora supports two AWS deployment targets: **Lightsail Containers** (simpler, che
 
    Download and run the installer from [AWS CLI install page](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
-2. **Configure credentials:**
+3. **Configure credentials:**
 
    ```bash
    aws configure
@@ -241,7 +253,7 @@ Kora supports two AWS deployment targets: **Lightsail Containers** (simpler, che
 
    Enter your AWS Access Key ID, Secret Access Key, and preferred region (e.g., `us-east-1`). You can create an access key in the [AWS IAM console](https://console.aws.amazon.com/iam/).
 
-3. **Verify it works:**
+4. **Verify it works:**
 
    ```bash
    aws sts get-caller-identity
@@ -253,6 +265,37 @@ Kora supports two AWS deployment targets: **Lightsail Containers** (simpler, che
 
 **Best for:** Simple deployments, side projects, and small-to-medium apps. Lightsail has predictable pricing starting at $7/month for a nano container.
 
+#### Additional prerequisite: lightsailctl plugin
+
+Lightsail requires the `lightsailctl` plugin to push container images. Install it once:
+
+**macOS:**
+
+```bash
+brew install aws/tap/lightsailctl
+```
+
+**Linux:**
+
+```bash
+curl "https://s3.us-west-2.amazonaws.com/lightsailctl/latest/linux-amd64/lightsailctl" -o "/usr/local/bin/lightsailctl"
+chmod +x /usr/local/bin/lightsailctl
+```
+
+**Windows:**
+
+```powershell
+Invoke-WebRequest -Uri "https://s3.us-west-2.amazonaws.com/lightsailctl/latest/windows-amd64/lightsailctl.exe" -OutFile "C:\Program Files\Amazon\lightsailctl\lightsailctl.exe"
+```
+
+Verify:
+
+```bash
+aws lightsail push-container-image --help
+```
+
+#### Deploy
+
 ```bash
 kora deploy --platform=aws-lightsail
 ```
@@ -262,9 +305,29 @@ Or select "AWS Lightsail Containers" when prompted interactively.
 Kora will:
 1. Create a Lightsail container service (nano size, 1 instance)
 2. Build your Docker image locally
-3. Push the image to Lightsail
+3. Push the image to Lightsail via `lightsailctl`
 4. Create a deployment with health check configuration
 5. Return your live URL
+
+#### Environment variables
+
+Kora automatically forwards these environment variables from your machine to the Lightsail container:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | For PostgreSQL | Connection string (e.g., `postgres://user:pass@host/db?sslmode=require`) |
+| `AUTH_SECRET` | For auth | Secret key for signing JWT tokens. Generate with `openssl rand -base64 32` |
+| `PUBLIC_URL` | Optional | Public URL of your app (for OG meta tags, email links, etc.) |
+
+Set them before deploying:
+
+```bash
+export DATABASE_URL="postgres://user:pass@ep-xxx.us-east-2.aws.neon.tech/neondb?sslmode=require"
+export AUTH_SECRET="$(openssl rand -base64 32)"
+kora deploy --platform=aws-lightsail --confirm
+```
+
+You can also update environment variables after deployment via the [Lightsail console](https://lightsail.aws.amazon.com/) under your container service's deployment settings.
 
 **Example output:**
 
@@ -317,11 +380,11 @@ aws ecs create-service \
 After the service is created, subsequent deploys with `kora deploy` work automatically.
 
 ::: tip Using PostgreSQL with AWS
-For production AWS deployments, use Amazon RDS PostgreSQL instead of SQLite. Set the `DATABASE_URL` environment variable:
+For production AWS deployments, use a managed PostgreSQL service (Amazon RDS, Neon, Supabase) instead of SQLite. Set the `DATABASE_URL` environment variable before deploying:
 
-**Lightsail** — set it in the container environment via the AWS console or pass it in the deployment config.
+**Lightsail** — Kora automatically forwards `DATABASE_URL` from your shell to the container. See [Environment variables](#environment-variables) above. You can also update it later via the Lightsail console.
 
-**ECS** — add it to the task definition's environment variables or use AWS Secrets Manager.
+**ECS** — add `DATABASE_URL` to the task definition's environment variables or use AWS Secrets Manager.
 
 See [Storage backends](#storage-backends) below for server code examples.
 :::
@@ -501,6 +564,33 @@ kora deploy --app=my-unique-app-name
 ### App deploys but shows a blank page
 
 Check that your `server.ts` uses `createProductionServer` with `staticDir: './dist'`. The production server needs to know where your built frontend files are.
+
+### "Cannot connect to the Docker daemon"
+
+Docker Desktop must be **running** (not just installed) before deploying to AWS. Open Docker Desktop and wait for the engine to start, then retry `kora deploy`. You can verify Docker is ready with:
+
+```bash
+docker info
+```
+
+### "lightsailctl plugin was not found"
+
+The Lightsail adapter uses the `lightsailctl` plugin to push container images. Install it before deploying:
+
+**macOS:**
+
+```bash
+brew install aws/tap/lightsailctl
+```
+
+**Linux:**
+
+```bash
+curl "https://s3.us-west-2.amazonaws.com/lightsailctl/latest/linux-amd64/lightsailctl" -o "/usr/local/bin/lightsailctl"
+chmod +x /usr/local/bin/lightsailctl
+```
+
+See [Lightsail prerequisites](#additional-prerequisite-lightsailctl-plugin) for all platforms.
 
 ### "AWS CLI is not authenticated"
 
