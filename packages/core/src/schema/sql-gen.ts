@@ -51,6 +51,13 @@ export function generateSQL(
 
 	statements.push(`CREATE TABLE IF NOT EXISTS ${collectionName} (\n  ${columns.join(',\n  ')}\n)`)
 
+	// Add ALTER TABLE statements so new columns are added to existing tables.
+	// These are tagged with --kora:safe-alter so the runtime can ignore "duplicate column" errors.
+	for (const [fieldName, descriptor] of Object.entries(collection.fields)) {
+		const colDef = columnDefinition(fieldName, descriptor)
+		statements.push(`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN ${colDef}`)
+	}
+
 	// Create indexes
 	for (const indexField of collection.indexes) {
 		statements.push(

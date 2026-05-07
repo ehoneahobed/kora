@@ -35,7 +35,19 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 
 		const statements = generateFullDDL(schema)
 		for (const sql of statements) {
-			this.db.exec(sql)
+			if (sql.startsWith('--kora:safe-alter')) {
+				// Safe ALTER TABLE — ignore "duplicate column name" errors for existing columns
+				try {
+					this.db.exec(sql.replace('--kora:safe-alter\n', ''))
+				} catch (e) {
+					const msg = (e as Error).message || ''
+					if (!msg.includes('duplicate column name')) {
+						throw e
+					}
+				}
+			} else {
+				this.db.exec(sql)
+			}
 		}
 	}
 

@@ -115,7 +115,19 @@ async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
 
 		// Execute DDL statements
 		for (const sql of ddlStatements) {
-			db?.exec({ sql })
+			if (sql.startsWith('--kora:safe-alter')) {
+				// Safe ALTER TABLE — ignore "duplicate column name" errors for existing columns
+				try {
+					db?.exec({ sql: sql.replace('--kora:safe-alter\n', '') })
+				} catch (e) {
+					const msg = (e as Error).message || ''
+					if (!msg.includes('duplicate column name')) {
+						throw e
+					}
+				}
+			} else {
+				db?.exec({ sql })
+			}
 		}
 
 		sendResponse({ id, type: 'success' })

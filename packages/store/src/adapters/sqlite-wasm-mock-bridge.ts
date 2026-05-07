@@ -83,7 +83,18 @@ export class MockWorkerBridge implements WorkerBridge {
 		database.pragma('journal_mode = WAL')
 		database.pragma('foreign_keys = ON')
 		for (const sql of ddlStatements) {
-			database.exec(sql)
+			if (sql.startsWith('--kora:safe-alter')) {
+				try {
+					database.exec(sql.replace('--kora:safe-alter\n', ''))
+				} catch (e) {
+					const msg = (e as Error).message || ''
+					if (!msg.includes('duplicate column name')) {
+						throw e
+					}
+				}
+			} else {
+				database.exec(sql)
+			}
 		}
 		return { id, type: 'success' }
 	}
