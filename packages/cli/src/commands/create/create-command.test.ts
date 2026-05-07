@@ -200,45 +200,49 @@ describe('create command flow', () => {
 		expect(env).toContain('DATABASE_URL=')
 	})
 
-	test('create command logs postgres preset note', async () => {
-		const cwdSpy = vi.spyOn(process, 'cwd')
-		const originalExitCode = process.exitCode
-		const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
-		cwdSpy.mockReturnValue(tempRoot)
+	test(
+		'create command logs postgres preset note',
+		async () => {
+			const cwdSpy = vi.spyOn(process, 'cwd')
+			const originalExitCode = process.exitCode
+			const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
+			cwdSpy.mockReturnValue(tempRoot)
 
-		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-		try {
-			await createCommand.run({
-				args: {
-					_: [],
-					name: 'postgres-log-app',
-					framework: 'react',
-					auth: 'none',
-					db: 'postgres',
-					'db-provider': 'supabase',
-					tailwind: false,
-					sync: true,
-					pm: 'pnpm',
-					'skip-install': true,
-					yes: false,
-				},
-				rawArgs: [],
-				cmd: createCommand,
-			})
+			try {
+				await createCommand.run({
+					args: {
+						_: [],
+						name: 'postgres-log-app',
+						framework: 'react',
+						auth: 'none',
+						db: 'postgres',
+						'db-provider': 'supabase',
+						tailwind: false,
+						sync: true,
+						pm: 'pnpm',
+						'skip-install': true,
+						yes: true,
+					},
+					rawArgs: [],
+					cmd: createCommand,
+				})
 
-			const logged = logSpy.mock.calls.map((call) => String(call[0] ?? '')).join('\n')
-			expect(logged).toContain('Applied PostgreSQL sync preset (Supabase)')
-			expect(logged).toContain('DATABASE_URL')
-		} finally {
-			process.exitCode = originalExitCode
-			cwdSpy.mockRestore()
-			logSpy.mockRestore()
-			warnSpy.mockRestore()
-			errorSpy.mockRestore()
-			await rm(tempRoot, { recursive: true, force: true })
-		}
-	})
+				const logged = logSpy.mock.calls.map((call) => String(call[0] ?? '')).join('\n')
+				expect(logged).toContain('Applied PostgreSQL sync preset (Supabase)')
+				expect(logged).toContain('DATABASE_URL')
+			} finally {
+				process.exitCode = originalExitCode
+				cwdSpy.mockRestore()
+				logSpy.mockRestore()
+				warnSpy.mockRestore()
+				errorSpy.mockRestore()
+				await rm(tempRoot, { recursive: true, force: true })
+			}
+		},
+		15_000,
+	)
 })

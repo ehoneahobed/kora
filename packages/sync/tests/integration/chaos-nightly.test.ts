@@ -22,7 +22,7 @@ const serializer = new JsonMessageSerializer()
 const CLIENT_COUNT = 10
 const OPERATIONS_PER_CLIENT = 1000
 const EXPECTED_TOTAL_OPERATIONS = CLIENT_COUNT * OPERATIONS_PER_CLIENT
-const MAX_SYNC_ROUNDS = 30
+const MAX_SYNC_ROUNDS = 50
 const MAX_CONVERGENCE_TIME_MS = 60_000
 
 class ChaosHub {

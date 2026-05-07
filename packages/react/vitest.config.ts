@@ -1,12 +1,18 @@
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, mergeConfig } from 'vitest/config'
 import shared from '../../vitest.shared'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 export default mergeConfig(
 	shared,
 	defineConfig({
 		test: {
-			root: '.',
+			name: '@korajs/react',
+			root: __dirname,
 			environment: 'jsdom',
+			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
 		},
 	}),
 )

@@ -75,7 +75,7 @@ export {
 export {
 	generateRailwayJson,
 	writeRailwayJsonArtifact,
-	type RailwayJsonConfig,
+	type RailwayJsonOptions,
 } from './commands/deploy/artifacts/railway-json-generator'
 export {
 	buildClient,
