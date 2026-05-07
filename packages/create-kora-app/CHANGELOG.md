@@ -1,5 +1,12 @@
 # create-kora-app
 
+## 0.1.18
+
+### Patch Changes
+
+- Updated dependencies [6fb50fd]
+  - @korajs/cli@0.2.0
+
 ## 0.1.12
 
 ### Patch Changes
