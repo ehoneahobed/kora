@@ -9,6 +9,9 @@ hero:
       text: Get Started
       link: /getting-started
     - theme: alt
+      text: Deploy Guide
+      link: /guide/deployment
+    - theme: alt
       text: View on GitHub
       link: https://github.com/ehoneahobed/kora
 features:
@@ -20,6 +23,8 @@ features:
     details: Auto-merge with LWW and CRDTs, declarative constraints, and custom resolvers — from simple to sophisticated.
   - title: Built for React
     details: First-class React hooks with reactive queries, optimistic mutations, and concurrent mode safety.
+  - title: Deploy in One Command
+    details: "Run `kora deploy` to ship to Fly.io or Railway. Dockerfile, bundling, and platform config are handled for you."
   - title: DevTools Included
     details: Inspect operations, trace conflicts, monitor sync status — all from a browser extension.
   - title: Type-Safe by Design

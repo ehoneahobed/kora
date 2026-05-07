@@ -261,7 +261,12 @@ describe('deployCommand', () => {
 			}),
 		)
 
-		expect(mockWriteDockerfileArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
+		expect(mockWriteDockerfileArtifact).toHaveBeenCalledWith('/project/.kora/deploy', {
+			nativeDependencies: {
+				'better-sqlite3': '^11.0.0',
+				'drizzle-orm': '^0.45.2',
+			},
+		})
 		expect(mockWriteDockerIgnoreArtifact).toHaveBeenCalledWith('/project/.kora/deploy')
 		expect(mockDetect).toHaveBeenCalledTimes(1)
 		expect(mockAuthenticate).toHaveBeenCalledTimes(1)

@@ -62,6 +62,7 @@ export {
 } from './commands/deploy/state/deploy-state'
 export {
 	generateDockerIgnore,
+	generateDeployPackageJson,
 	generateDockerfile,
 	writeDockerIgnoreArtifact,
 	writeDockerfileArtifact,

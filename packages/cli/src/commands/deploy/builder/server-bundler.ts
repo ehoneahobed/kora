@@ -50,8 +50,9 @@ export async function bundleServer(options: ServerBundleOptions): Promise<Server
 		target: ['node20'],
 		sourcemap: false,
 		logLevel: 'silent',
+		external: ['better-sqlite3'],
 		banner: {
-			js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);",
+			js: "import { createRequire as __createRequire } from 'module'; const require = __createRequire(import.meta.url);",
 		},
 	})
 

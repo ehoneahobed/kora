@@ -385,6 +385,10 @@ When using `kora dev`, types are regenerated automatically whenever your schema 
 
 Deploys your Kora application to a cloud platform. Handles Dockerfile generation, server bundling, client building, and platform-specific configuration in a single command.
 
+::: tip Looking for a step-by-step walkthrough?
+See the [Deployment guide](/guide/deployment) for a beginner-friendly tutorial that covers everything from installing the Fly CLI to verifying sync works.
+:::
+
 ### Usage
 
 ```bash

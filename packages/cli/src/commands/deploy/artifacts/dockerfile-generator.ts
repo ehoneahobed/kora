@@ -11,6 +11,8 @@ export interface DockerfileOptions {
 	port?: number
 	clientDirectory?: string
 	serverBundleFile?: string
+	/** Native modules that must be installed at runtime (externalized from bundle). */
+	nativeDependencies?: Record<string, string>
 }
 
 /**
@@ -19,14 +21,17 @@ export interface DockerfileOptions {
  * The generated image expects artifacts produced under `.kora/deploy`:
  * - `dist/` for client assets
  * - `server-bundled.js` for server runtime entry
+ * - `package.json` (if native dependencies are needed)
  */
 export function generateDockerfile(options: DockerfileOptions = {}): string {
 	const nodeVersion = options.nodeVersion ?? '20-alpine'
 	const port = options.port ?? 3000
 	const clientDirectory = options.clientDirectory ?? 'dist'
 	const serverBundleFile = options.serverBundleFile ?? 'server-bundled.js'
+	const hasNativeDeps =
+		options.nativeDependencies && Object.keys(options.nativeDependencies).length > 0
 
-	return [
+	const lines: string[] = [
 		GENERATED_HEADER,
 		'',
 		`FROM node:${nodeVersion} AS runtime`,
@@ -34,13 +39,42 @@ export function generateDockerfile(options: DockerfileOptions = {}): string {
 		'ENV NODE_ENV=production',
 		`ENV PORT=${String(port)}`,
 		'',
-		`COPY ${clientDirectory} ./dist`,
-		`COPY ${serverBundleFile} ./server-bundled.js`,
-		'',
-		'EXPOSE 3000',
-		'CMD ["node", "./server-bundled.js"]',
-		'',
-	].join('\n')
+	]
+
+	if (hasNativeDeps) {
+		// Alpine needs build tools for native modules like better-sqlite3
+		lines.push('# Install build tools for native modules')
+		lines.push('RUN apk add --no-cache python3 make g++')
+		lines.push('')
+		lines.push('COPY package.json ./package.json')
+		lines.push('RUN npm install --omit=dev')
+		lines.push('')
+	}
+
+	lines.push(`COPY ${clientDirectory} ./dist`)
+	lines.push(`COPY ${serverBundleFile} ./server-bundled.js`)
+	lines.push('')
+	lines.push(`EXPOSE ${String(port)}`)
+	lines.push('CMD ["node", "./server-bundled.js"]')
+	lines.push('')
+
+	return lines.join('\n')
+}
+
+/**
+ * Generates a minimal package.json for native dependencies in the deploy container.
+ */
+export function generateDeployPackageJson(
+	nativeDependencies: Record<string, string>,
+): string {
+	const pkg = {
+		name: 'kora-deploy',
+		version: '1.0.0',
+		private: true,
+		type: 'module',
+		dependencies: nativeDependencies,
+	}
+	return JSON.stringify(pkg, null, 2) + '\n'
 }
 
 /**
@@ -67,7 +101,7 @@ export function generateDockerIgnore(): string {
 }
 
 /**
- * Writes the generated Dockerfile to `.kora/deploy/Dockerfile`.
+ * Writes the generated Dockerfile (and package.json if needed) to `.kora/deploy/`.
  */
 export async function writeDockerfileArtifact(
 	deployDirectory: string,
@@ -76,6 +110,12 @@ export async function writeDockerfileArtifact(
 	await mkdir(deployDirectory, { recursive: true })
 	const dockerfilePath = join(deployDirectory, 'Dockerfile')
 	await writeFile(dockerfilePath, generateDockerfile(options), 'utf-8')
+
+	if (options.nativeDependencies && Object.keys(options.nativeDependencies).length > 0) {
+		const pkgJsonPath = join(deployDirectory, 'package.json')
+		await writeFile(pkgJsonPath, generateDeployPackageJson(options.nativeDependencies), 'utf-8')
+	}
+
 	return dockerfilePath
 }
 

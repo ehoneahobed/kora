@@ -211,8 +211,19 @@ Kora handles connection management, conflict resolution, and operation syncing a
 
 For details on running the sync server, see [Deployment](/guide/deployment).
 
+## Deploy Your App
+
+Ready to share your app with the world? One command deploys to a cloud platform:
+
+```bash
+kora deploy
+```
+
+See the [Deployment guide](/guide/deployment) for a full step-by-step walkthrough, including Fly.io setup and troubleshooting.
+
 ## What's Next
 
+- [Deployment](/guide/deployment) — Deploy your app to Fly.io or Railway in 10 minutes
 - [Schema Design](/guide/schema-design) — Field types, relations, and versioning
 - [Offline Patterns](/guide/offline-patterns) — Building UIs that embrace offline-first
 - [Conflict Resolution](/guide/conflict-resolution) — How Kora handles concurrent edits

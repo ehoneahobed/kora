@@ -21,14 +21,14 @@ export default defineConfig({
       {
         text: 'Guide',
         items: [
+          { text: 'Deployment', link: '/guide/deployment' },
           { text: 'Schema Design', link: '/guide/schema-design' },
-          { text: 'Storage Configuration', link: '/guide/storage-configuration' },
+          { text: 'React Hooks', link: '/guide/react-hooks' },
           { text: 'Offline Patterns', link: '/guide/offline-patterns' },
           { text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
           { text: 'Sync Configuration', link: '/guide/sync-configuration' },
-          { text: 'React Hooks', link: '/guide/react-hooks' },
+          { text: 'Storage Configuration', link: '/guide/storage-configuration' },
           { text: 'DevTools', link: '/guide/devtools' },
-          { text: 'Deployment', link: '/guide/deployment' },
         ],
       },
       {

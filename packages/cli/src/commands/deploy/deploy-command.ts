@@ -220,7 +220,12 @@ export const deployCommand = defineCommand({
 			logger.step('Running in --confirm mode (non-interactive, fail-fast).')
 		}
 
-		await writeDockerfileArtifact(deployDirectory)
+		await writeDockerfileArtifact(deployDirectory, {
+			nativeDependencies: {
+				'better-sqlite3': '^11.0.0',
+				'drizzle-orm': '^0.45.2',
+			},
+		})
 		await writeDockerIgnoreArtifact(deployDirectory)
 		const detected = await adapter.detect()
 		if (!detected) {

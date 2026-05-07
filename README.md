@@ -19,7 +19,7 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 | `@korajs/server` | 118 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
 | `@korajs/react` | 60 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
 | `@korajs/devtools` | 49 | Browser DevTools extension with sync timeline, conflict inspector |
-| `@korajs/cli` | 130 | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
+| `@korajs/cli` | 213 | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
 | `kora` | 46 | Meta-package with `createApp`, full type inference from schema to hooks |
 
 ## What It Does
@@ -98,6 +98,14 @@ const app = createApp({
 await app.ready
 await app.sync?.connect()
 ```
+
+### Deploy (one command)
+
+```bash
+kora deploy
+```
+
+Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io or Railway. See the [Deployment guide](https://ehoneahobed.github.io/kora/guide/deployment) for a full walkthrough.
 
 ### React hooks
 
@@ -416,7 +424,7 @@ Covers:
 - [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, reconnection, and runtime behavior
 - [React Hooks](https://ehoneahobed.github.io/kora/guide/react-hooks) — useQuery, useMutation, useSyncStatus
 - [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution) — Three-tier merge engine
-- [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Self-hosting, Docker, scaling
+- [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Deploy to Fly.io or Railway in 10 minutes with `kora deploy`
 - [API Reference](https://ehoneahobed.github.io/kora/api/) — Complete reference for all packages
 
 To run docs locally: `pnpm docs:dev`
