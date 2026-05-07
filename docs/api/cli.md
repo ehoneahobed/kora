@@ -381,6 +381,112 @@ When using `kora dev`, types are regenerated automatically whenever your schema 
 
 ---
 
+## kora deploy
+
+Deploys your Kora application to a cloud platform. Handles Dockerfile generation, server bundling, client building, and platform-specific configuration in a single command.
+
+### Usage
+
+```bash
+kora deploy [options]
+kora deploy status
+kora deploy logs
+kora deploy rollback [deployment-id]
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `render`, `docker`, `kora-cloud` |
+| `--app` | string | *(directory name)* | Application name on the platform |
+| `--region` | string | `iad` | Deployment region (e.g., `iad`, `lhr`, `syd`, `nrt`) |
+| `--prod` | boolean | `false` | Deploy to production environment |
+| `--confirm` | boolean | `false` | Non-interactive mode — fails fast on missing data |
+| `--reset` | boolean | `false` | Delete all deploy state and generated artifacts |
+
+### Subcommands
+
+#### `kora deploy status`
+
+Shows the current deployment health, platform, app name, region, live URL, and sync URL.
+
+#### `kora deploy logs`
+
+Fetches recent logs from the deployed application.
+
+#### `kora deploy rollback [id]`
+
+Reverts the deployment to a previous version. If no `id` is provided, rolls back to the last known deployment.
+
+### Deployment Flow
+
+When you run `kora deploy`, the following steps execute in order:
+
+1. **Artifact generation** — Creates `Dockerfile`, `.dockerignore` in `.kora/deploy/`
+2. **CLI detection** — Verifies the platform CLI is installed (e.g., `flyctl`)
+3. **Authentication** — Checks login state, prompts if needed
+4. **Provisioning** — Creates the app on the platform (idempotent — skips if exists)
+5. **Server bundle** — Bundles `server.ts` into a single `server-bundled.js` using esbuild
+6. **Client build** — Runs `vite build` to produce static assets in `.kora/deploy/dist/`
+7. **Platform config** — Generates `fly.toml` or `railway.json`
+8. **Deploy** — Pushes to the platform and returns live URLs
+
+### Deploy State
+
+State is persisted in `.kora/deploy/deploy.json`. On subsequent deploys, stored values (platform, app name, region) are reused automatically.
+
+Reset with:
+
+```bash
+kora deploy --reset
+```
+
+### Examples
+
+```bash
+# Interactive first deploy
+kora deploy
+
+# Non-interactive (CI/CD)
+kora deploy --platform=fly --app=my-kora-app --region=iad --confirm
+
+# Production deploy
+kora deploy --prod --confirm
+
+# Check status after deployment
+kora deploy status
+
+# View logs
+kora deploy logs
+
+# Rollback
+kora deploy rollback
+```
+
+### Prerequisites
+
+| Platform | Requirement |
+|----------|-------------|
+| Fly.io | Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly auth login` |
+| Railway | Install [@railway/cli](https://docs.railway.com/guides/cli), run `railway login` |
+
+### Project Requirements
+
+Your project must have:
+- A `package.json` with any `@korajs/*` dependency
+- A server entry file: `server.ts`, `server.js`, `src/server.ts`, or `src/server.js`
+- `vite` installed as a dev dependency (for client builds)
+
+::: tip
+The deploy command stores all generated artifacts in `.kora/deploy/`. Add this to your `.gitignore`:
+```
+.kora/deploy/
+```
+:::
+
+---
+
 ## Global options
 
 These options are available on all commands:

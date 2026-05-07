@@ -51,6 +51,55 @@ kora migrate
 # Detects changes, generates migration file, prompts to apply
 ```
 
+### kora deploy
+
+Deploy your Kora app to a cloud platform with a single command:
+
+```bash
+kora deploy
+```
+
+Supported platforms: **Fly.io**, **Railway** (Render, Docker, Kora Cloud coming soon).
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--platform` | Target platform: `fly`, `railway`, `render`, `docker`, `kora-cloud` |
+| `--app` | Application name on the platform |
+| `--region` | Deployment region (e.g., `iad`, `lhr`, `syd`) |
+| `--prod` | Deploy to production environment (default: preview) |
+| `--confirm` | Non-interactive mode — fail fast if required data is missing |
+| `--reset` | Delete `.kora/deploy/` state and generated artifacts |
+
+#### Subcommands
+
+```bash
+kora deploy status      # Show deployment health, URLs, and metadata
+kora deploy logs        # View recent deployment logs
+kora deploy rollback    # Revert to the previous deployment
+```
+
+#### Non-interactive (CI/CD)
+
+```bash
+kora deploy --platform=fly --app=my-app --region=iad --confirm
+```
+
+#### What it does
+
+1. Generates a `Dockerfile` and `.dockerignore` in `.kora/deploy/`
+2. Bundles your server entry (`server.ts`) with esbuild into a single file
+3. Builds your client with Vite
+4. Generates platform config (`fly.toml` or `railway.json`)
+5. Provisions the app on the platform (creates it if new)
+6. Deploys and returns your live URL and sync WebSocket endpoint
+
+#### Prerequisites
+
+- **Fly.io**: Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/) and run `fly auth login`
+- **Railway**: Install [@railway/cli](https://docs.railway.com/guides/cli) and run `railway login`
+
 ### kora generate types
 
 Generate TypeScript types from your schema:
