@@ -50,6 +50,9 @@ export async function bundleServer(options: ServerBundleOptions): Promise<Server
 		target: ['node20'],
 		sourcemap: false,
 		logLevel: 'silent',
+		banner: {
+			js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);",
+		},
 	})
 
 	return {
