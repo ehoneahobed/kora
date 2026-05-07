@@ -220,6 +220,7 @@ export class BuiltInProvider implements AuthProviderAdapter {
 			id: stored.id,
 			email: stored.email,
 			name: stored.name,
+			emailVerified: stored.emailVerified,
 			createdAt: stored.createdAt,
 		}
 	}

@@ -12,6 +12,8 @@ export interface AuthUser {
 	email: string
 	/** User's display name */
 	name: string
+	/** Whether the user's email has been verified */
+	emailVerified: boolean
 	/** Timestamp when the user was created (milliseconds since epoch) */
 	createdAt: number
 }
@@ -124,6 +126,7 @@ export class InMemoryUserStore {
 			id,
 			email: normalizedEmail,
 			name: params.name,
+			emailVerified: false,
 			createdAt: now,
 			passwordHash: params.passwordHash,
 			salt: params.salt,
@@ -252,6 +255,37 @@ export class InMemoryUserStore {
 	}
 
 	/**
+	 * Set a user's email verification status.
+	 *
+	 * @param userId - The user whose email to verify
+	 * @param verified - Whether the email is verified
+	 */
+	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
+		const user = this.usersById.get(userId)
+		if (!user) return
+
+		const updated: StoredUser = { ...user, emailVerified: verified }
+		this.usersById.set(userId, updated)
+		this.usersByEmail.set(user.email, updated)
+	}
+
+	/**
+	 * Update a user's password hash and salt.
+	 *
+	 * @param userId - The user whose password to update
+	 * @param passwordHash - New hex-encoded PBKDF2 derived key
+	 * @param salt - New hex-encoded salt
+	 */
+	async updatePassword(userId: string, passwordHash: string, salt: string): Promise<void> {
+		const user = this.usersById.get(userId)
+		if (!user) return
+
+		const updated: StoredUser = { ...user, passwordHash, salt }
+		this.usersById.set(userId, updated)
+		this.usersByEmail.set(user.email, updated)
+	}
+
+	/**
 	 * Update the last-seen timestamp for a device.
 	 *
 	 * Called when a device authenticates or syncs to track activity.
@@ -276,6 +310,7 @@ function toAuthUser(stored: StoredUser): AuthUser {
 		id: stored.id,
 		email: stored.email,
 		name: stored.name,
+		emailVerified: stored.emailVerified,
 		createdAt: stored.createdAt,
 	}
 }

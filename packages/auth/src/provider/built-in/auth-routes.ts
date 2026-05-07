@@ -474,6 +474,7 @@ export class BuiltInAuthRoutes {
 			id: storedUser.id,
 			email: storedUser.email,
 			name: storedUser.name,
+			emailVerified: storedUser.emailVerified,
 			createdAt: storedUser.createdAt,
 		}
 
@@ -582,6 +583,7 @@ export class BuiltInAuthRoutes {
 			id: storedUser.id,
 			email: storedUser.email,
 			name: storedUser.name,
+			emailVerified: storedUser.emailVerified,
 			createdAt: storedUser.createdAt,
 		}
 

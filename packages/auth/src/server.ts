@@ -15,6 +15,35 @@ export { encodeJwt, decodeJwt, verifyJwt, isExpired } from './tokens/jwt'
 // === Password Hashing ===
 export { hashPassword, verifyPassword } from './provider/built-in/password-hash'
 
+// === Password Reset ===
+export {
+	PasswordResetManager,
+	InMemoryPasswordResetStore,
+	PasswordResetError,
+	ResetTokenExpiredError,
+	ResetTokenNotFoundError,
+	ResetRateLimitedError,
+} from './provider/built-in/password-reset'
+export type {
+	PasswordResetToken,
+	PasswordResetStore,
+	PasswordResetConfig,
+} from './provider/built-in/password-reset'
+
+// === Email Verification ===
+export {
+	EmailVerificationManager,
+	InMemoryEmailVerificationStore,
+	EmailVerificationError,
+	VerificationTokenExpiredError,
+	VerificationTokenNotFoundError,
+} from './provider/built-in/email-verification'
+export type {
+	EmailVerificationToken,
+	EmailVerificationStore,
+	EmailVerificationConfig,
+} from './provider/built-in/email-verification'
+
 // === User Store ===
 export { InMemoryUserStore, DuplicateEmailError } from './provider/built-in/user-store'
 export type { AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
