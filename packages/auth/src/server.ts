@@ -55,5 +55,13 @@ export type {
 	AuthenticationVerificationResult,
 } from './passkey/passkey-server'
 
+// === E2E Operation Encryption (server-side: detect encrypted fields) ===
+export {
+	OperationEncryptor,
+	OperationEncryptionError,
+	isEncryptedField,
+} from './encryption/operation-encryptor'
+export type { OperationEncryptorConfig } from './encryption/operation-encryptor'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'

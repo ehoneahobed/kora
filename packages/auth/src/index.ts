@@ -77,3 +77,11 @@ export {
 
 export { AutoLockManager } from './encryption/auto-lock'
 export type { AutoLockConfig } from './encryption/auto-lock'
+
+// === E2E Operation Encryption (encrypt data fields for sync) ===
+export {
+	OperationEncryptor,
+	OperationEncryptionError,
+	isEncryptedField,
+} from './encryption/operation-encryptor'
+export type { OperationEncryptorConfig } from './encryption/operation-encryptor'
