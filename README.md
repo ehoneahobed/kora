@@ -8,18 +8,19 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Feature-complete** — all 9 packages implemented with 1138+ tests. Includes E2E tests, documentation site, and CI/CD pipelines.
+**Feature-complete** — all 10 packages implemented with 2,100+ tests. Includes E2E tests, documentation site, and CI/CD pipelines.
 
 | Package | Tests | Description |
 |---------|-------|-------------|
 | `@korajs/core` | 231 | Schema, operations, HLC, version vectors, type inference |
 | `@korajs/store` | 225 | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
 | `@korajs/merge` | 99 | Three-tier conflict resolution with Yjs CRDT richtext merge |
-| `@korajs/sync` | 180 | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
-| `@korajs/server` | 118 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
-| `@korajs/react` | 60 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
-| `@korajs/devtools` | 49 | Browser DevTools extension with sync timeline, conflict inspector |
+| `@korajs/sync` | 183 | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
+| `@korajs/server` | 126 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
+| `@korajs/react` | 65 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
+| `@korajs/devtools` | 71 | Browser DevTools extension with sync timeline, conflict inspector |
 | `@korajs/cli` | 213 | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
+| `@korajs/auth` | 912 | Authentication, sessions, MFA, organizations, RBAC, passkeys, encryption |
 | `kora` | 46 | Meta-package with `createApp`, full type inference from schema to hooks |
 
 ## What It Does
@@ -31,6 +32,7 @@ Kora sits alongside your UI layer (React, Vue, Svelte) and owns the entire data 
 - **Conflict resolution** — Three-tier merge: auto-merge (LWW/CRDT), constraints, custom resolvers
 - **Synchronization** — Causal ordering via HLC, delta sync via version vectors, protobuf wire format
 - **Offline by default** — Every code path works without network. Sync is a bonus, not a requirement.
+- **Authentication** — Built-in auth with sessions, TOTP MFA, organizations, RBAC, passkeys, and encrypted tokens
 - **Full type inference** — Schema types flow through `createApp` to collection accessors and React hooks
 - **DevTools** — Real-time operation inspector, conflict tracer, sync timeline in a browser extension
 - **Schema migrations** — Diff, generate, and apply schema changes with `kora migrate`
@@ -164,6 +166,7 @@ packages/
   sync/       @korajs/sync     — Sync protocol and transports
   server/     @korajs/server   — Self-hosted sync server
   react/      @korajs/react    — React hooks and bindings
+  auth/       @korajs/auth     — Authentication, sessions, MFA, RBAC
   devtools/   @korajs/devtools — Browser DevTools extension
   cli/        @korajs/cli      — CLI tooling and scaffolding
 kora/         Meta-package re-exporting core, store, merge, sync
@@ -192,7 +195,7 @@ pnpm test
 
 ```bash
 pnpm build              # Build all packages
-pnpm test               # Run all unit/integration tests (1138+ tests)
+pnpm test               # Run all unit/integration tests (2100+ tests)
 pnpm typecheck          # TypeScript strict mode check
 pnpm lint               # Biome lint and format check
 pnpm lint:fix           # Auto-fix lint/format issues
@@ -424,6 +427,7 @@ Covers:
 - [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, reconnection, and runtime behavior
 - [React Hooks](https://ehoneahobed.github.io/kora/guide/react-hooks) — useQuery, useMutation, useSyncStatus
 - [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution) — Three-tier merge engine
+- [Authentication](https://ehoneahobed.github.io/kora/guide/authentication) — Sessions, MFA, organizations, RBAC, passkeys
 - [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Deploy to Fly.io or Railway in 10 minutes with `kora deploy`
 - [API Reference](https://ehoneahobed.github.io/kora/api/) — Complete reference for all packages
 

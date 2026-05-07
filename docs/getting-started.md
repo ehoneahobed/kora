@@ -228,5 +228,8 @@ See the [Deployment guide](/guide/deployment) for a full step-by-step walkthroug
 - [Offline Patterns](/guide/offline-patterns) — Building UIs that embrace offline-first
 - [Conflict Resolution](/guide/conflict-resolution) — How Kora handles concurrent edits
 - [React Hooks](/guide/react-hooks) — Full reference for all React bindings
-- [Sync Configuration](/guide/sync-configuration) — Auth, reconnection, and runtime sync behavior
+- [Sync Configuration](/guide/sync-configuration) — Transports, reconnection, and runtime sync behavior
+- [Authentication](/guide/authentication) — Sessions, MFA, organizations, RBAC, and passkeys
+- [Storage Configuration](/guide/storage-configuration) — Client and server storage backends
 - [DevTools](/guide/devtools) — Debugging with the Kora browser extension
+- [API Reference](/api/) — Complete reference for all packages

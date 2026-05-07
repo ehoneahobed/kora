@@ -1,7 +1,7 @@
 {
   "name": "@korajs/core",
   "version": "0.1.3",
-  "description": "Kora.js core package",
+  "description": "Schema definitions, operations, Hybrid Logical Clock, version vectors, and type inference for Kora.js",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
