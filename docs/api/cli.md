@@ -402,7 +402,7 @@ kora deploy rollback [deployment-id]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `render`, `docker`, `kora-cloud` |
+| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `aws-ecs`, `aws-lightsail`, `render`, `docker`, `kora-cloud` |
 | `--app` | string | *(directory name)* | Application name on the platform |
 | `--region` | string | `iad` | Deployment region (e.g., `iad`, `lhr`, `syd`, `nrt`) |
 | `--prod` | boolean | `false` | Deploy to production environment |
@@ -455,6 +455,12 @@ kora deploy
 # Non-interactive (CI/CD)
 kora deploy --platform=fly --app=my-kora-app --region=iad --confirm
 
+# Deploy to AWS Lightsail
+kora deploy --platform=aws-lightsail --app=my-app --region=us-east-1 --confirm
+
+# Deploy to AWS ECS Fargate
+kora deploy --platform=aws-ecs --app=my-app --region=us-east-1 --confirm
+
 # Production deploy
 kora deploy --prod --confirm
 
@@ -474,6 +480,8 @@ kora deploy rollback
 |----------|-------------|
 | Fly.io | Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly auth login` |
 | Railway | Install [@railway/cli](https://docs.railway.com/guides/cli), run `railway login` |
+| AWS ECS | Install [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
+| AWS Lightsail | Install [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
 
 ### Project Requirements
 

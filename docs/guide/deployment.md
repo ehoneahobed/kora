@@ -207,6 +207,141 @@ The flow is the same as Fly.io — Kora handles Dockerfile generation, bundling,
 
 ---
 
+## Deploy to AWS
+
+Kora supports two AWS deployment targets: **Lightsail Containers** (simpler, cheaper) and **ECS Fargate** (production-grade, scalable). Both use Docker containers and require the AWS CLI.
+
+### Prerequisites (both AWS options)
+
+1. **Install the AWS CLI:**
+
+   **macOS:**
+
+   ```bash
+   brew install awscli
+   ```
+
+   **Linux:**
+
+   ```bash
+   curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+   unzip awscliv2.zip
+   sudo ./aws/install
+   ```
+
+   **Windows:**
+
+   Download and run the installer from [AWS CLI install page](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
+
+2. **Configure credentials:**
+
+   ```bash
+   aws configure
+   ```
+
+   Enter your AWS Access Key ID, Secret Access Key, and preferred region (e.g., `us-east-1`). You can create an access key in the [AWS IAM console](https://console.aws.amazon.com/iam/).
+
+3. **Verify it works:**
+
+   ```bash
+   aws sts get-caller-identity
+   ```
+
+   You should see your account ID and ARN.
+
+### Option A: AWS Lightsail Containers
+
+**Best for:** Simple deployments, side projects, and small-to-medium apps. Lightsail has predictable pricing starting at $7/month for a nano container.
+
+```bash
+kora deploy --platform=aws-lightsail
+```
+
+Or select "AWS Lightsail Containers" when prompted interactively.
+
+Kora will:
+1. Create a Lightsail container service (nano size, 1 instance)
+2. Build your Docker image locally
+3. Push the image to Lightsail
+4. Create a deployment with health check configuration
+5. Return your live URL
+
+**Example output:**
+
+```
+✓ Deployment completed: https://my-app.abc123.us-east-1.cs.amazonlightsail.com
+  Sync endpoint: wss://my-app.abc123.us-east-1.cs.amazonlightsail.com/kora-sync
+```
+
+::: tip Scaling Lightsail
+To change the container size or instance count after your first deploy, use the AWS console or CLI:
+```bash
+aws lightsail update-container-service \
+  --service-name my-app \
+  --power small \
+  --scale 2
+```
+Available powers: `nano`, `micro`, `small`, `medium`, `large`, `xlarge`.
+:::
+
+### Option B: AWS ECS Fargate
+
+**Best for:** Production deployments that need auto-scaling, load balancing, and fine-grained control. ECS Fargate runs your containers without managing servers.
+
+```bash
+kora deploy --platform=aws-ecs
+```
+
+Or select "AWS ECS Fargate" when prompted interactively.
+
+Kora will:
+1. Create an ECR repository for your Docker image
+2. Create an ECS cluster and CloudWatch log group
+3. Build and push your Docker image to ECR
+4. Register an ECS task definition with health checks
+5. Update or create the ECS service
+
+**First-time setup note:** ECS Fargate requires networking configuration (VPC, subnets, security groups) that varies by AWS account. On the first deploy, if no service exists yet, Kora registers the task definition and provides the `aws ecs create-service` command you need to run with your specific VPC settings:
+
+```bash
+aws ecs create-service \
+  --cluster my-app \
+  --service-name my-app \
+  --task-definition my-app \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx],securityGroups=[sg-xxx],assignPublicIp=ENABLED}" \
+  --region us-east-1
+```
+
+After the service is created, subsequent deploys with `kora deploy` work automatically.
+
+::: tip Using PostgreSQL with AWS
+For production AWS deployments, use Amazon RDS PostgreSQL instead of SQLite. Set the `DATABASE_URL` environment variable:
+
+**Lightsail** — set it in the container environment via the AWS console or pass it in the deployment config.
+
+**ECS** — add it to the task definition's environment variables or use AWS Secrets Manager.
+
+See [Storage backends](#storage-backends) below for server code examples.
+:::
+
+### CI/CD with AWS
+
+Both AWS adapters work in non-interactive mode:
+
+```bash
+# Lightsail
+kora deploy --platform=aws-lightsail --app=my-app --region=us-east-1 --confirm
+
+# ECS Fargate
+kora deploy --platform=aws-ecs --app=my-app --region=us-east-1 --confirm
+```
+
+Make sure your CI environment has AWS credentials configured (e.g., via `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables).
+
+---
+
 ## What `kora deploy` Does Under the Hood
 
 You don't need to know this to use it, but if you're curious:
@@ -214,7 +349,7 @@ You don't need to know this to use it, but if you're curious:
 1. **Generates a Dockerfile** in `.kora/deploy/` — a recipe for building your app's container image
 2. **Bundles your server** — combines `server.ts` and its dependencies into a single `server-bundled.js` file using esbuild
 3. **Builds your client** — runs `vite build` to create optimized HTML, CSS, and JavaScript for the browser
-4. **Generates platform config** — creates `fly.toml` (for Fly.io) or `railway.json` (for Railway) with the right settings
+4. **Generates platform config** — creates `fly.toml` (Fly.io), `railway.json` (Railway), or configures AWS resources (ECS/Lightsail) with the right settings
 5. **Provisions the app** — creates the app on the platform if it doesn't exist yet
 6. **Deploys** — pushes the container image and starts your app
 
@@ -338,7 +473,7 @@ CMD ["node", "--import", "tsx", "server.ts"]
 
 Before sharing your app publicly:
 
-- [ ] **Use HTTPS/WSS** — Fly.io and Railway provide this automatically. If self-hosting, put a reverse proxy (nginx, Caddy) in front of your server.
+- [ ] **Use HTTPS/WSS** — Fly.io, Railway, and AWS Lightsail/ECS provide this automatically. If self-hosting, put a reverse proxy (nginx, Caddy) in front of your server.
 - [ ] **Add authentication** — The default server accepts all connections. See [Sync Configuration](/guide/sync-configuration) for setting up token-based auth.
 - [ ] **Use PostgreSQL for production** — SQLite works great for development and small deployments, but PostgreSQL is better for production workloads.
 - [ ] **Add `.kora/deploy/` to `.gitignore`** — Generated deployment files shouldn't be committed.
@@ -366,6 +501,38 @@ kora deploy --app=my-unique-app-name
 ### App deploys but shows a blank page
 
 Check that your `server.ts` uses `createProductionServer` with `staticDir: './dist'`. The production server needs to know where your built frontend files are.
+
+### "AWS CLI is not authenticated"
+
+Run `aws configure` and enter your credentials, or set the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables. Verify with:
+
+```bash
+aws sts get-caller-identity
+```
+
+### Lightsail deploy stuck on "DEPLOYING"
+
+Lightsail container deployments can take 2-5 minutes. Check status with:
+
+```bash
+kora deploy status
+```
+
+Or directly:
+
+```bash
+aws lightsail get-container-services --service-name my-app
+```
+
+If the deployment fails, check the container logs:
+
+```bash
+kora deploy logs
+```
+
+### ECS service won't start
+
+ECS Fargate requires proper networking. Make sure your security group allows inbound traffic on port 3001 and your subnets have internet access (either public subnets with `assignPublicIp=ENABLED` or private subnets with a NAT gateway).
 
 ### Sync not working after deploy
 
