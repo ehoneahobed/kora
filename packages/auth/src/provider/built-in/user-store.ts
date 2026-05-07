@@ -286,6 +286,50 @@ export class InMemoryUserStore {
 	}
 
 	/**
+	 * List all users. For admin/development use.
+	 */
+	async listAll(): Promise<StoredUser[]> {
+		return [...this.usersById.values()]
+	}
+
+	/**
+	 * Update a stored user record.
+	 */
+	async update(user: StoredUser): Promise<void> {
+		const existing = this.usersById.get(user.id)
+		if (!existing) return
+
+		// If email changed, update the email index
+		if (existing.email !== user.email) {
+			this.usersByEmail.delete(existing.email)
+			this.usersByEmail.set(user.email, user)
+		} else {
+			this.usersByEmail.set(user.email, user)
+		}
+		this.usersById.set(user.id, user)
+	}
+
+	/**
+	 * Delete a user and all associated devices.
+	 */
+	async delete(userId: string): Promise<void> {
+		const user = this.usersById.get(userId)
+		if (!user) return
+
+		this.usersById.delete(userId)
+		this.usersByEmail.delete(user.email)
+
+		// Clean up devices
+		const deviceIds = this.devicesByUserId.get(userId)
+		if (deviceIds) {
+			for (const deviceId of deviceIds) {
+				this.devicesById.delete(deviceId)
+			}
+			this.devicesByUserId.delete(userId)
+		}
+	}
+
+	/**
 	 * Update the last-seen timestamp for a device.
 	 *
 	 * Called when a device authenticates or syncs to track activity.

@@ -209,5 +209,48 @@ export type {
 	TotpStore,
 } from './mfa/totp'
 
+// === Admin API ===
+export {
+	AdminApi,
+	AdminApiError,
+	AdminUserNotFoundError,
+	AdminUnauthorizedError,
+} from './admin/admin-api'
+export type {
+	AdminApiConfig,
+	PaginatedResult,
+	UserListQuery,
+	AdminUserUpdate,
+} from './admin/admin-api'
+
+// === Audit Logging ===
+export {
+	AuditLogger,
+	InMemoryAuditLogStore,
+	AuditLogError,
+} from './admin/audit-log'
+export type {
+	AuditAction,
+	AuditEntry,
+	AuditLogQuery,
+	AuditLogStore,
+} from './admin/audit-log'
+
+// === Webhooks ===
+export {
+	WebhookManager,
+	InMemoryWebhookStore,
+	verifyWebhookSignature,
+	WebhookError,
+	WebhookEndpointNotFoundError,
+} from './admin/webhooks'
+export type {
+	WebhookEvent,
+	WebhookEndpoint,
+	WebhookDelivery,
+	WebhookPayload,
+	WebhookStore,
+} from './admin/webhooks'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'
