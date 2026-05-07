@@ -5,6 +5,15 @@
 export { AuthClient, AuthError } from './client/auth-client'
 export type { AuthClientConfig, AuthUser, AuthState } from './client/auth-client'
 
+// === Organization Client ===
+export { OrgClient, OrgClientError } from './client/org-client'
+export type {
+	OrgClientConfig,
+	ClientOrganization,
+	ClientMembership,
+	ClientInvitation,
+} from './client/org-client'
+
 // === Token Types ===
 export type {
 	AuthTokens,
