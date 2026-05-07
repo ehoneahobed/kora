@@ -41,6 +41,24 @@ export type { DeviceKeyStore } from './device/device-store'
 // === Token Store (client-side persistence) ===
 export { TokenStore } from './tokens/token-store'
 
+// === Encrypted Token Store (AES-256-GCM encrypted localStorage) ===
+export { EncryptedTokenStore, EncryptedTokenStoreError } from './tokens/encrypted-token-store'
+export type { EncryptedTokenStoreConfig } from './tokens/encrypted-token-store'
+
+// === Passkey / WebAuthn (client-side credential creation and assertion) ===
+export {
+	isPasskeySupported,
+	isPlatformAuthenticatorAvailable,
+	createPasskeyCredential,
+	authenticateWithPasskey,
+	PasskeyError,
+	PasskeyUnsupportedError,
+} from './passkey/passkey-client'
+export type {
+	PasskeyRegistrationResponse,
+	PasskeyAuthenticationResponse,
+} from './passkey/passkey-client'
+
 // === Encryption (Phase 2: local data protection) ===
 export {
 	generateEncryptionKey,

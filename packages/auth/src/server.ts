@@ -23,5 +23,37 @@ export type { AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-
 export { BuiltInProvider, AuthProviderError } from './provider/adapter'
 export type { AuthProviderAdapter, SignUpParams, SignInParams } from './provider/adapter'
 
+// === External Auth Provider Adapters ===
+export {
+	ExternalJwtProvider,
+	ExternalAuthOperationNotSupportedError,
+	ExternalTokenValidationError,
+} from './provider/external/external-jwt-provider'
+export type {
+	ExternalJwtProviderConfig,
+	ExternalUserInfo,
+} from './provider/external/external-jwt-provider'
+
+export { createClerkAdapter } from './provider/external/clerk-adapter'
+export type { ClerkAdapterConfig } from './provider/external/clerk-adapter'
+
+export { createSupabaseAdapter } from './provider/external/supabase-adapter'
+export type { SupabaseAdapterConfig } from './provider/external/supabase-adapter'
+
+// === Passkey / WebAuthn (server-side verification) ===
+export {
+	generateRegistrationOptions,
+	verifyRegistrationResponse,
+	generateAuthenticationOptions,
+	verifyAuthenticationResponse,
+	PasskeyVerificationError,
+} from './passkey/passkey-server'
+export type {
+	RegistrationOptions,
+	RegistrationVerificationResult,
+	AuthenticationOptions,
+	AuthenticationVerificationResult,
+} from './passkey/passkey-server'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'
