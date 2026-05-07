@@ -106,10 +106,6 @@ export class FlyAdapter implements ContextAwareDeployAdapter {
 		}
 
 		const appCreateArgs = ['apps', 'create', config.appName]
-		if (this.currentContext.region) {
-			appCreateArgs.push('--region', this.currentContext.region)
-		}
-		appCreateArgs.push('--machines')
 
 		const createApp = await this.runFlyCommand(appCreateArgs, config.projectRoot, false)
 		if (createApp.exitCode !== 0 && !isAlreadyExistsResponse(createApp.stderr, createApp.stdout)) {
@@ -217,12 +213,9 @@ export class FlyAdapter implements ContextAwareDeployAdapter {
 	 */
 	public async *logs(options: LogOptions): AsyncIterable<LogLine> {
 		const context = this.requireContext()
-		const args = ['logs', '--app', context.appName]
+		const args = ['logs', '--app', context.appName, '--no-tail']
 		if (typeof options.since === 'string' && options.since.length > 0) {
-			args.push('--since', options.since)
-		}
-		if (typeof options.tail === 'number' && options.tail > 0) {
-			args.push('--max-lines', String(options.tail))
+			args.push('--region', options.since)
 		}
 		const result = await this.runFlyCommand(args, context.projectRoot, false)
 		if (result.exitCode !== 0) {
@@ -423,5 +416,5 @@ function normalizeError(stderr: string, stdout: string): string {
 
 function isAlreadyExistsResponse(stderr: string, stdout: string): boolean {
 	const text = `${stderr}\n${stdout}`.toLowerCase()
-	return text.includes('already exists')
+	return text.includes('already exists') || text.includes('already been taken')
 }

@@ -132,7 +132,7 @@ class ChaosHub {
 	}
 }
 
-describe('Chaos Nightly Convergence', () => {
+describe.skipIf(!process.env.NIGHTLY)('Chaos Nightly Convergence', () => {
 	test(
 		'10 clients × 1,000 ops converge within 60s under 10% drop and 5% duplicate',
 		async () => {

@@ -168,7 +168,14 @@ export const deployCommand = defineCommand({
 			},
 		}),
 	},
-	async run({ args }) {
+	async run({ args, rawArgs }) {
+		// Citty calls run() even after subcommand execution.
+		// Guard against double-execution when a subcommand was invoked.
+		const subCommandNames = ['status', 'rollback', 'logs']
+		if (rawArgs.some((arg) => subCommandNames.includes(arg))) {
+			return
+		}
+
 		const logger = createLogger()
 		const prompts = createPromptClient()
 		const projectRoot = await requireProjectRoot()
