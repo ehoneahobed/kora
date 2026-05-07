@@ -4,8 +4,9 @@ import type { Operation } from '../types'
 
 /**
  * Topological sort of operations based on their causal dependency DAG.
- * Uses Kahn's algorithm with deterministic tie-breaking via HLC timestamp.
- * Time complexity: O(V + E) where V = operations, E = causal dependency edges.
+ * Uses Kahn's algorithm with a binary heap for O(V log V + E) performance.
+ * Deterministic tie-breaking via HLC timestamp ensures identical output
+ * regardless of input order.
  *
  * @param operations - The operations to sort
  * @returns Operations in causal order (dependencies before dependents)
@@ -46,40 +47,30 @@ export function topologicalSort(operations: Operation[]): Operation[] {
 		}
 	}
 
-	// Initialize queue with nodes that have no in-set dependencies
-	// Use a sorted array for deterministic ordering (by HLC timestamp)
-	const queue: Operation[] = []
+	// Initialize min-heap with nodes that have no in-set dependencies
+	const heap = new MinHeap(compareByTimestamp)
 	for (const op of operations) {
 		if ((inDegree.get(op.id) ?? 0) === 0) {
-			queue.push(op)
+			heap.push(op)
 		}
 	}
-	queue.sort(compareByTimestamp)
 
 	const result: Operation[] = []
 
-	while (queue.length > 0) {
-		// Take the earliest operation (deterministic tie-breaking by HLC)
-		const current = queue.shift()
-		if (!current) break
+	while (heap.size > 0) {
+		// Extract the earliest operation (deterministic tie-breaking by HLC)
+		const current = heap.pop()
 		result.push(current)
 
 		const deps = dependents.get(current.id) ?? []
-		const newlyReady: Operation[] = []
 
 		for (const depId of deps) {
 			const deg = (inDegree.get(depId) ?? 0) - 1
 			inDegree.set(depId, deg)
 			if (deg === 0) {
 				const op = opMap.get(depId)
-				if (op) newlyReady.push(op)
+				if (op) heap.push(op)
 			}
-		}
-
-		// Sort newly ready operations and merge into queue maintaining sort order
-		if (newlyReady.length > 0) {
-			newlyReady.sort(compareByTimestamp)
-			mergeIntoSorted(queue, newlyReady)
 		}
 	}
 
@@ -100,16 +91,69 @@ function compareByTimestamp(a: Operation, b: Operation): number {
 	return HybridLogicalClock.compare(a.timestamp, b.timestamp)
 }
 
-/** Merge sorted `items` into an already-sorted `target` array, maintaining sort order. */
-function mergeIntoSorted(target: Operation[], items: Operation[]): void {
-	let insertIndex = 0
-	for (const item of items) {
-		while (insertIndex < target.length) {
-			const existing = target[insertIndex]
-			if (existing && compareByTimestamp(item, existing) <= 0) break
-			insertIndex++
+/**
+ * Binary min-heap for efficient priority queue operations.
+ * push: O(log n), pop: O(log n) — replaces the O(n) sorted array approach.
+ */
+class MinHeap {
+	private readonly data: Operation[] = []
+	private readonly cmp: (a: Operation, b: Operation) => number
+
+	constructor(comparator: (a: Operation, b: Operation) => number) {
+		this.cmp = comparator
+	}
+
+	get size(): number {
+		return this.data.length
+	}
+
+	push(item: Operation): void {
+		this.data.push(item)
+		this.bubbleUp(this.data.length - 1)
+	}
+
+	pop(): Operation {
+		const top = this.data[0] as Operation
+		const last = this.data.pop() as Operation
+		if (this.data.length > 0) {
+			this.data[0] = last
+			this.sinkDown(0)
 		}
-		target.splice(insertIndex, 0, item)
-		insertIndex++
+		return top
+	}
+
+	private bubbleUp(index: number): void {
+		while (index > 0) {
+			const parentIndex = (index - 1) >> 1
+			if (this.cmp(this.data[index] as Operation, this.data[parentIndex] as Operation) >= 0) break
+			this.swap(index, parentIndex)
+			index = parentIndex
+		}
+	}
+
+	private sinkDown(index: number): void {
+		const length = this.data.length
+		while (true) {
+			let smallest = index
+			const left = 2 * index + 1
+			const right = 2 * index + 2
+
+			if (left < length && this.cmp(this.data[left] as Operation, this.data[smallest] as Operation) < 0) {
+				smallest = left
+			}
+			if (right < length && this.cmp(this.data[right] as Operation, this.data[smallest] as Operation) < 0) {
+				smallest = right
+			}
+
+			if (smallest === index) break
+			this.swap(index, smallest)
+			index = smallest
+		}
+	}
+
+	private swap(i: number, j: number): void {
+		const tmp = this.data[i] as Operation
+		this.data[i] = this.data[j] as Operation
+		this.data[j] = tmp
 	}
 }
