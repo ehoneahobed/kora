@@ -402,7 +402,7 @@ kora deploy rollback [deployment-id]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `aws-ecs`, `aws-lightsail`, `render`, `docker`, `kora-cloud` |
+| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `aws-ecs`, `aws-lightsail`. Coming soon: `render`, `docker`, `kora-cloud` |
 | `--app` | string | *(directory name)* | Application name on the platform |
 | `--region` | string | `iad` | Deployment region (e.g., `iad`, `lhr`, `syd`, `nrt`) |
 | `--prod` | boolean | `false` | Deploy to production environment |
@@ -480,8 +480,11 @@ kora deploy rollback
 |----------|-------------|
 | Fly.io | Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly auth login` |
 | Railway | Install [@railway/cli](https://docs.railway.com/guides/cli), run `railway login` |
-| AWS ECS | Install [Docker Desktop](https://www.docker.com/get-started/), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
-| AWS Lightsail | Install [Docker Desktop](https://www.docker.com/get-started/), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [lightsailctl plugin](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software), run `aws configure` |
+| AWS ECS | Install [Docker Desktop](https://www.docker.com/get-started/) (must be running), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
+| AWS Lightsail | Install [Docker Desktop](https://www.docker.com/get-started/) (must be running), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [lightsailctl plugin](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software), run `aws configure` |
+| Render | *Coming soon* |
+| Docker (self-hosted) | *Coming soon* |
+| Kora Cloud | *Coming soon* |
 
 ### Project Requirements
 

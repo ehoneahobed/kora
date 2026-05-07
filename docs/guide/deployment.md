@@ -405,6 +405,18 @@ Make sure your CI environment has AWS credentials configured (e.g., via `AWS_ACC
 
 ---
 
+## More Platforms (Coming Soon)
+
+The following platforms appear in the `kora deploy` interactive prompt but are not yet implemented:
+
+- **Render** — Web service deployment with automatic HTTPS
+- **Docker (self-hosted)** — Generate a production Docker image for any hosting environment
+- **Kora Cloud** — Managed hosting optimized for Kora apps
+
+Selecting these will show a "not implemented yet" message. For now, use Fly.io, Railway, or one of the AWS options. If you need to deploy to an unsupported platform, see [Manual Server Setup](#advanced-manual-server-setup) below.
+
+---
+
 ## What `kora deploy` Does Under the Hood
 
 You don't need to know this to use it, but if you're curious:
@@ -619,6 +631,18 @@ If the deployment fails, check the container logs:
 ```bash
 kora deploy logs
 ```
+
+### "image does not provide linux/amd64 platform"
+
+This happens on Apple Silicon Macs (M1/M2/M3/M4). AWS requires `linux/amd64` images, but Docker on Apple Silicon builds `linux/arm64` by default.
+
+The `kora deploy` command handles this automatically for AWS adapters. If you're building manually, add the platform flag:
+
+```bash
+docker build --platform linux/amd64 -t my-app .
+```
+
+Note: Cross-platform builds are slower than native builds. This is normal on Apple Silicon.
 
 ### ECS service won't start
 
