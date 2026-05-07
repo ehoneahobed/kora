@@ -65,7 +65,11 @@ export function buildPanelModel(events: readonly TimestampedEvent[]): DevtoolsPa
 
 	const conflicts = events
 		.flatMap((entry) => {
-			if (entry.event.type !== 'merge:completed' && entry.event.type !== 'merge:conflict') {
+			if (
+				entry.event.type !== 'merge:completed' &&
+				entry.event.type !== 'merge:conflict' &&
+				entry.event.type !== 'constraint:violated'
+			) {
 				return []
 			}
 

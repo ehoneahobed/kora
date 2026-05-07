@@ -28,4 +28,5 @@ if (runtime && devtools) {
 	})
 }
 
+// Initial render
 renderDevtoolsPanel(extensionRoot, events)
