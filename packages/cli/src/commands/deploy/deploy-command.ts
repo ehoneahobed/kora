@@ -304,6 +304,14 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 			value: 'railway',
 		},
 		{
+			label: 'AWS ECS Fargate (production multi-instance)',
+			value: 'aws-ecs',
+		},
+		{
+			label: 'AWS Lightsail Containers (simple, cost-effective)',
+			value: 'aws-lightsail',
+		},
+		{
 			label: 'Render',
 			value: 'render',
 		},

@@ -93,6 +93,14 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
 
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
+
+				// Health check endpoint (required by AWS ALB/ECS/Lightsail, GCP, etc.)
+				if (url.pathname === '/health') {
+					res.writeHead(200, { 'Content-Type': 'application/json' })
+					res.end(JSON.stringify({ status: 'ok', timestamp: Date.now() }))
+					return
+				}
+
 				let filePath = join(distDir, url.pathname)
 
 				// SPA fallback: serve index.html for non-file routes

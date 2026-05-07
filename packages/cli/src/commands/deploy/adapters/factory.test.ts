@@ -12,6 +12,16 @@ describe('createDeployAdapter', () => {
 		expect(adapter.name).toBe('railway')
 	})
 
+	test('returns AwsEcsAdapter for aws-ecs platform', () => {
+		const adapter = createDeployAdapter('aws-ecs')
+		expect(adapter.name).toBe('aws-ecs')
+	})
+
+	test('returns AwsLightsailAdapter for aws-lightsail platform', () => {
+		const adapter = createDeployAdapter('aws-lightsail')
+		expect(adapter.name).toBe('aws-lightsail')
+	})
+
 	test('returns StubDeployAdapter for non-implemented platforms', async () => {
 		const platforms = ['render', 'docker', 'kora-cloud'] as const
 		for (const platform of platforms) {
