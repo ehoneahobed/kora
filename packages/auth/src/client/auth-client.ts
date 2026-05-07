@@ -61,6 +61,14 @@ interface AuthTokensResponse {
 }
 
 /**
+ * Sign-up and sign-in responses include user data alongside tokens.
+ */
+interface AuthSignInResponse {
+	user: { id: string; email: string; name: string }
+	tokens: AuthTokensResponse
+}
+
+/**
  * User profile returned by the /auth/me endpoint.
  */
 interface UserProfileResponse {
@@ -318,14 +326,15 @@ export class AuthClient {
 	 * @throws {AuthError} If the request fails or the server returns an error
 	 */
 	async signUp(params: { email: string; password: string; name?: string }): Promise<AuthUser> {
-		const response = await this.request<AuthTokensResponse>('/auth/signup', {
+		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signup', {
 			method: 'POST',
 			body: params,
 		})
 
-		this.storage.setTokens(response.accessToken, response.refreshToken)
+		const tokens = 'tokens' in response ? response.tokens : response
+		this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
 
-		const user = await this.fetchUserProfile(response.accessToken)
+		const user = await this.fetchUserProfile(tokens.accessToken)
 		this.setState('authenticated', user)
 		return user
 	}
@@ -338,14 +347,15 @@ export class AuthClient {
 	 * @throws {AuthError} If the credentials are invalid or the request fails
 	 */
 	async signIn(params: { email: string; password: string }): Promise<AuthUser> {
-		const response = await this.request<AuthTokensResponse>('/auth/signin', {
+		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signin', {
 			method: 'POST',
 			body: params,
 		})
 
-		this.storage.setTokens(response.accessToken, response.refreshToken)
+		const tokens = 'tokens' in response ? response.tokens : response
+		this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
 
-		const user = await this.fetchUserProfile(response.accessToken)
+		const user = await this.fetchUserProfile(tokens.accessToken)
 		this.setState('authenticated', user)
 		return user
 	}
@@ -618,7 +628,11 @@ export class AuthClient {
 			)
 		}
 
-		const data = (await response.json()) as T
+		const json = (await response.json()) as Record<string, unknown>
+
+		// The BuiltInAuthRoutes server wraps success responses in { data: T }.
+		// Unwrap the envelope so callers get the inner payload directly.
+		const data = (json['data'] !== undefined ? json['data'] : json) as T
 		return data
 	}
 }
