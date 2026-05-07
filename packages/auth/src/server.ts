@@ -63,5 +63,36 @@ export {
 } from './encryption/operation-encryptor'
 export type { OperationEncryptorConfig } from './encryption/operation-encryptor'
 
+// === Organizations & Memberships ===
+export { OrgRoutes } from './org/org-routes'
+export type { OrgRouteResponse, OrgRoutesConfig } from './org/org-routes'
+export { InMemoryOrgStore } from './org/org-store'
+export type { OrgStore } from './org/org-store'
+export {
+	OrgError,
+	OrgNotFoundError,
+	OrgSlugTakenError,
+	MembershipNotFoundError,
+	MemberAlreadyExistsError,
+	InsufficientRoleError,
+	CannotRemoveOwnerError,
+	InvitationNotFoundError,
+	InvitationExpiredError,
+	hasRoleLevel,
+	ROLE_HIERARCHY,
+	ORG_ROLES,
+	INVITATION_STATUSES,
+} from './org/org-types'
+export type {
+	Organization,
+	CreateOrgParams,
+	UpdateOrgParams,
+	Membership,
+	OrgRole,
+	OrgInvitation,
+	CreateInvitationParams,
+	InvitationStatus,
+} from './org/org-types'
+
 // === Device Identity (verification on server) ===
 export { verifyChallenge, computePublicKeyThumbprint } from './device/device-identity'
