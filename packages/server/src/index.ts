@@ -11,7 +11,7 @@ export type {
 	ServerStatus,
 } from './types'
 
-export type { ServerStore, MaterializedRecord } from './store/server-store'
+export type { ServerStore, MaterializedRecord, CollectionQueryOptions } from './store/server-store'
 
 export type {
 	ServerCloseHandler,

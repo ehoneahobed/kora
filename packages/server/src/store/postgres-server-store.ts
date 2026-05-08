@@ -1,21 +1,32 @@
-import type { Operation, VersionVector } from '@korajs/core'
+import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
 import { generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
+import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
-import type { MaterializedRecord, ServerStore } from './server-store'
+import {
+	deserializeFieldValue,
+	generateAllCollectionDDL,
+	replayOperationsForRecord,
+	serializeFieldValue,
+	validateFieldName,
+} from './materialization'
+import type { CollectionQueryOptions, MaterializedRecord, ServerStore } from './server-store'
 
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
  * All reads and writes go through Drizzle's typed query builder.
- * DDL stays as raw SQL via Drizzle's sql template (standard practice without drizzle-kit).
+ *
+ * When a schema is set via setSchema(), also maintains materialized
+ * collection tables for efficient indexed queries (dual-write).
  */
 export class PostgresServerStore implements ServerStore {
 	private readonly nodeId: string
 	private readonly db: PostgresJsDatabase
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
+	private schema: SchemaDefinition | null = null
 	private closed = false
 
 	constructor(db: PostgresJsDatabase, nodeId?: string) {
@@ -31,6 +42,39 @@ export class PostgresServerStore implements ServerStore {
 
 	getNodeId(): string {
 		return this.nodeId
+	}
+
+	async setSchema(schema: SchemaDefinition): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		this.schema = schema
+
+		// Generate and execute DDL for all collection tables
+		const ddlStatements = generateAllCollectionDDL(schema, 'postgres')
+		for (const stmt of ddlStatements) {
+			if (stmt.startsWith('--kora:safe-alter')) {
+				const alterSql = stmt.replace('--kora:safe-alter\n', '')
+				try {
+					await this.db.execute(sql.raw(alterSql))
+				} catch (e) {
+					// Ignore "already exists" errors from safe ALTER TABLE
+					if (
+						!(
+							e instanceof Error &&
+							(e.message.includes('already exists') ||
+								e.message.includes('duplicate column'))
+						)
+					) {
+						throw e
+					}
+				}
+			} else {
+				await this.db.execute(sql.raw(stmt))
+			}
+		}
+
+		// Backfill materialized tables from existing operations
+		await this.backfillAllCollections()
 	}
 
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
@@ -73,6 +117,11 @@ export class PostgresServerStore implements ServerStore {
 						lastSeenAt: sql`${now}`,
 					},
 				})
+
+			// Dual-write: update materialized collection table if schema is set
+			if (this.schema && this.schema.collections[op.collection]) {
+				await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+			}
 		})
 
 		// Update in-memory version vector cache
@@ -114,14 +163,354 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		// Fetch all operations for this collection, ordered by causal time
+		// Fast path: if schema is set, read directly from the materialized table
+		if (this.schema && this.schema.collections[collection]) {
+			return this.queryCollection(collection)
+		}
+
+		// Fallback: replay operations (legacy path when schema is not set)
+		return this.materializeFromOpsLog(collection)
+	}
+
+	async queryCollection(
+		collection: string,
+		options?: CollectionQueryOptions,
+	): Promise<MaterializedRecord[]> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+
+		const collectionDef = this.schema!.collections[collection]!
+
+		// Validate field names in options
+		if (options?.where) {
+			for (const key of Object.keys(options.where)) {
+				validateFieldName(collection, key, this.schema!)
+			}
+		}
+		if (options?.orderBy) {
+			validateFieldName(collection, options.orderBy, this.schema!)
+		}
+
+		const query = this.buildSelectQuery(collection, options)
+		const rows = (await this.db.execute(query)) as unknown as Record<string, unknown>[]
+
+		return rows.map((row) => this.deserializeRow(row, collectionDef))
+	}
+
+	async findRecord(collection: string, id: string): Promise<MaterializedRecord | null> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+
+		const collectionDef = this.schema!.collections[collection]!
+		const query = sql`SELECT * FROM ${sql.raw(collection)} WHERE id = ${id} AND _deleted = 0`
+		const rows = (await this.db.execute(query)) as unknown as Record<string, unknown>[]
+
+		if (rows.length === 0) return null
+		return this.deserializeRow(rows[0]!, collectionDef)
+	}
+
+	async countCollection(collection: string, where?: Record<string, unknown>): Promise<number> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+
+		if (where) {
+			for (const key of Object.keys(where)) {
+				validateFieldName(collection, key, this.schema!)
+			}
+		}
+
+		const whereClause = this.buildWhereClause(where ?? {}, false)
+		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(collection)} WHERE ${whereClause}`
+		const rows = (await this.db.execute(query)) as unknown as Array<{ cnt: number | string }>
+		const cnt = rows[0]?.cnt
+		return typeof cnt === 'string' ? Number.parseInt(cnt, 10) : (cnt ?? 0)
+	}
+
+	async close(): Promise<void> {
+		this.closed = true
+	}
+
+	// ---------------------------------------------------------------------------
+	// Materialization internals
+	// ---------------------------------------------------------------------------
+
+	/**
+	 * Rebuild a single record in the materialized collection table by replaying
+	 * all operations for that record.
+	 */
+	private async rebuildMaterializedRecord(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+	): Promise<void> {
+		const collectionDef = this.schema!.collections[collection]
+		if (!collectionDef) return
+
+		// Fetch all ops for this specific record, ordered by HLC
+		const ops = await txOrDb
+			.select({
+				type: pgOperations.type,
+				data: pgOperations.data,
+				wallTime: pgOperations.wallTime,
+			})
+			.from(pgOperations)
+			.where(
+				and(
+					eq(pgOperations.collection, collection),
+					eq(pgOperations.recordId, recordId),
+				),
+			)
+			.orderBy(
+				asc(pgOperations.wallTime),
+				asc(pgOperations.logical),
+				asc(pgOperations.sequenceNumber),
+			)
+
+		// Replay to get current state
+		const parsedOps = ops.map((op) => ({
+			type: op.type,
+			data: op.data !== null ? JSON.parse(op.data) : null,
+		}))
+		const recordData = replayOperationsForRecord(parsedOps)
+
+		const fieldNames = Object.keys(collectionDef.fields)
+
+		if (recordData) {
+			const createdAt = ops.length > 0 ? ops[0]!.wallTime : Date.now()
+			const updatedAt = ops.length > 0 ? ops[ops.length - 1]!.wallTime : Date.now()
+
+			await this.upsertMaterializedRecord(
+				txOrDb,
+				collection,
+				recordId,
+				recordData,
+				fieldNames,
+				collectionDef,
+				createdAt,
+				updatedAt,
+			)
+		} else {
+			await txOrDb.execute(
+				sql`UPDATE ${sql.raw(collection)} SET _deleted = 1, _updated_at = ${Date.now()} WHERE id = ${recordId}`,
+			)
+		}
+	}
+
+	/**
+	 * UPSERT a record into the materialized collection table.
+	 */
+	private async upsertMaterializedRecord(
+		txOrDb: PostgresJsDatabase,
+		tableName: string,
+		recordId: string,
+		recordData: Record<string, unknown>,
+		fieldNames: string[],
+		collectionDef: { fields: Record<string, import('@korajs/core').FieldDescriptor> },
+		createdAt: number,
+		updatedAt: number,
+	): Promise<void> {
+		const allColumns = ['id', ...fieldNames, '_created_at', '_updated_at', '_deleted']
+		const values: unknown[] = [
+			recordId,
+			...fieldNames.map((f) => {
+				const descriptor = collectionDef.fields[f]
+				return descriptor
+					? serializeFieldValue(recordData[f] ?? null, descriptor)
+					: null
+			}),
+			createdAt,
+			updatedAt,
+			0,
+		]
+
+		const columnsSql = sql.raw(allColumns.join(', '))
+		const valuesSql = sql.join(
+			values.map((v) => sql`${v}`),
+			sql.raw(', '),
+		)
+		const updateSet = sql.raw(
+			allColumns.slice(1).map((c) => `${c} = excluded.${c}`).join(', '),
+		)
+
+		await txOrDb.execute(
+			sql`INSERT INTO ${sql.raw(tableName)} (${columnsSql}) VALUES (${valuesSql}) ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
+		)
+	}
+
+	/**
+	 * Backfill all materialized collection tables from the existing operation log.
+	 */
+	private async backfillAllCollections(): Promise<void> {
+		if (!this.schema) return
+
+		for (const collectionName of Object.keys(this.schema.collections)) {
+			await this.backfillCollection(collectionName)
+		}
+	}
+
+	/**
+	 * Backfill a single collection's materialized table from operations.
+	 */
+	private async backfillCollection(collectionName: string): Promise<void> {
+		const collectionDef = this.schema!.collections[collectionName]
+		if (!collectionDef) return
+
+		const allOps = await this.db
+			.select({
+				recordId: pgOperations.recordId,
+				type: pgOperations.type,
+				data: pgOperations.data,
+				wallTime: pgOperations.wallTime,
+			})
+			.from(pgOperations)
+			.where(eq(pgOperations.collection, collectionName))
+			.orderBy(
+				asc(pgOperations.wallTime),
+				asc(pgOperations.logical),
+				asc(pgOperations.sequenceNumber),
+			)
+
+		if (allOps.length === 0) return
+
+		// Group by recordId
+		const grouped = new Map<string, typeof allOps>()
+		for (const op of allOps) {
+			let group = grouped.get(op.recordId)
+			if (!group) {
+				group = []
+				grouped.set(op.recordId, group)
+			}
+			group.push(op)
+		}
+
+		const fieldNames = Object.keys(collectionDef.fields)
+
+		// Rebuild each record
+		for (const [recordId, recordOps] of grouped) {
+			const parsedOps = recordOps.map((op) => ({
+				type: op.type,
+				data: op.data !== null ? JSON.parse(op.data) : null,
+			}))
+			const recordData = replayOperationsForRecord(parsedOps)
+
+			if (recordData) {
+				const createdAt = recordOps[0]!.wallTime
+				const updatedAt = recordOps[recordOps.length - 1]!.wallTime
+				await this.upsertMaterializedRecord(
+					this.db,
+					collectionName,
+					recordId,
+					recordData,
+					fieldNames,
+					collectionDef,
+					createdAt,
+					updatedAt,
+				)
+			} else {
+				await this.db.execute(
+					sql`INSERT INTO ${sql.raw(collectionName)} (id, _deleted, _created_at, _updated_at) VALUES (${recordId}, 1, ${Date.now()}, ${Date.now()}) ON CONFLICT (id) DO UPDATE SET _deleted = 1, _updated_at = ${Date.now()}`,
+				)
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Query building
+	// ---------------------------------------------------------------------------
+
+	private buildSelectQuery(
+		collection: string,
+		options?: CollectionQueryOptions,
+	): SQL {
+		const whereClause = this.buildWhereClause(
+			options?.where ?? {},
+			options?.includeDeleted ?? false,
+		)
+
+		const parts: SQL[] = [
+			sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`,
+		]
+
+		if (options?.orderBy) {
+			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
+			parts.push(sql.raw(` ORDER BY ${options.orderBy} ${dir}`))
+		}
+
+		if (options?.limit !== undefined) {
+			parts.push(sql` LIMIT ${options.limit}`)
+		}
+
+		if (options?.offset !== undefined) {
+			parts.push(sql` OFFSET ${options.offset}`)
+		}
+
+		return sql.join(parts, sql.raw(''))
+	}
+
+	private buildWhereClause(
+		where: Record<string, unknown>,
+		includeDeleted: boolean,
+	): SQL {
+		const conditions: SQL[] = []
+
+		if (!includeDeleted) {
+			conditions.push(sql.raw('_deleted = 0'))
+		}
+
+		for (const [key, value] of Object.entries(where)) {
+			conditions.push(sql`${sql.raw(key)} = ${value}`)
+		}
+
+		if (conditions.length === 0) {
+			return sql.raw('1 = 1')
+		}
+
+		return sql.join(conditions, sql.raw(' AND '))
+	}
+
+	// ---------------------------------------------------------------------------
+	// Row deserialization
+	// ---------------------------------------------------------------------------
+
+	private deserializeRow(
+		row: Record<string, unknown>,
+		collectionDef: { fields: Record<string, import('@korajs/core').FieldDescriptor> },
+	): MaterializedRecord {
+		const record: MaterializedRecord = { id: row.id as string }
+
+		for (const [fieldName, descriptor] of Object.entries(collectionDef.fields)) {
+			if (fieldName in row) {
+				record[fieldName] = deserializeFieldValue(row[fieldName], descriptor)
+			}
+		}
+
+		if ('_created_at' in row) record._created_at = row._created_at
+		if ('_updated_at' in row) record._updated_at = row._updated_at
+
+		return record
+	}
+
+	// ---------------------------------------------------------------------------
+	// Fallback materialization (operation replay, no schema)
+	// ---------------------------------------------------------------------------
+
+	private async materializeFromOpsLog(collection: string): Promise<MaterializedRecord[]> {
 		const rows = await this.db
 			.select()
 			.from(pgOperations)
 			.where(eq(pgOperations.collection, collection))
-			.orderBy(asc(pgOperations.wallTime), asc(pgOperations.logical), asc(pgOperations.sequenceNumber))
+			.orderBy(
+				asc(pgOperations.wallTime),
+				asc(pgOperations.logical),
+				asc(pgOperations.sequenceNumber),
+			)
 
-		// Replay operations to reconstruct current state
 		const records = new Map<string, Record<string, unknown>>()
 		const deleted = new Set<string>()
 
@@ -149,7 +538,6 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
-		// Remove deleted records
 		for (const id of deleted) {
 			records.delete(id)
 		}
@@ -157,14 +545,14 @@ export class PostgresServerStore implements ServerStore {
 		return Array.from(records.values()) as MaterializedRecord[]
 	}
 
-	async close(): Promise<void> {
-		this.closed = true
-	}
+	// ---------------------------------------------------------------------------
+	// Initialization
+	// ---------------------------------------------------------------------------
 
 	private async initialize(): Promise<void> {
 		await this.ensureTables()
 
-		// Hydrate in-memory version vector cache via Drizzle query
+		// Hydrate in-memory version vector cache
 		const rows = await this.db
 			.select({
 				nodeId: pgSyncState.nodeId,
@@ -177,10 +565,6 @@ export class PostgresServerStore implements ServerStore {
 		}
 	}
 
-	/**
-	 * Create tables if they don't exist.
-	 * Uses raw SQL via Drizzle's sql template — standard DDL practice without drizzle-kit.
-	 */
 	private async ensureTables(): Promise<void> {
 		await this.db.execute(sql`
 			CREATE TABLE IF NOT EXISTS operations (
@@ -210,6 +594,10 @@ export class PostgresServerStore implements ServerStore {
 		await this.db.execute(
 			sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`,
 		)
+		// Index for efficient per-record operation lookups during materialization
+		await this.db.execute(
+			sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
+		)
 
 		await this.db.execute(sql`
 			CREATE TABLE IF NOT EXISTS sync_state (
@@ -219,6 +607,10 @@ export class PostgresServerStore implements ServerStore {
 			)
 		`)
 	}
+
+	// ---------------------------------------------------------------------------
+	// Operation serialization
+	// ---------------------------------------------------------------------------
 
 	private serializeOperation(
 		op: Operation,
@@ -262,19 +654,35 @@ export class PostgresServerStore implements ServerStore {
 		}
 	}
 
+	// ---------------------------------------------------------------------------
+	// Assertions
+	// ---------------------------------------------------------------------------
+
 	private assertOpen(): void {
 		if (this.closed) {
 			throw new Error('PostgresServerStore is closed')
+		}
+	}
+
+	private assertSchema(): void {
+		if (!this.schema) {
+			throw new Error(
+				'Schema not set. Call setSchema() before using queryCollection/findRecord/countCollection.',
+			)
+		}
+	}
+
+	private assertCollection(collection: string): void {
+		if (!this.schema!.collections[collection]) {
+			throw new Error(
+				`Unknown collection "${collection}". Available: ${Object.keys(this.schema!.collections).join(', ')}`,
+			)
 		}
 	}
 }
 
 /**
  * Creates a PostgresServerStore from a PostgreSQL connection string.
- *
- * Uses runtime dynamic imports so projects that do not use PostgreSQL
- * do not need to install `postgres`. Wraps the postgres client with
- * Drizzle ORM for typed query building.
  */
 export async function createPostgresServerStore(options: {
 	connectionString: string
