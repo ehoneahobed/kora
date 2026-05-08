@@ -380,15 +380,13 @@ export class BuiltInAuthRoutes {
 		// Use provided deviceId or generate a placeholder
 		const deviceId = body.deviceId ?? `device-${user.id}`
 
-		// Register device if device info was provided
-		if (body.deviceId !== undefined && body.devicePublicKey !== undefined) {
-			await this.userStore.registerDevice({
-				id: body.deviceId,
-				userId: user.id,
-				publicKey: body.devicePublicKey,
-				name: 'Primary Device',
-			})
-		}
+		// Always register a device — use provided info or create a basic record
+		await this.userStore.registerDevice({
+			id: deviceId,
+			userId: user.id,
+			publicKey: body.devicePublicKey ?? '',
+			name: body.deviceId ? 'Primary Device' : 'Browser',
+		})
 
 		// Issue tokens
 		const tokens = this.tokenManager.issueTokens(user.id, deviceId)
@@ -458,15 +456,13 @@ export class BuiltInAuthRoutes {
 		// Use provided deviceId or generate a placeholder
 		const deviceId = body.deviceId ?? `device-${storedUser.id}`
 
-		// Register device if device info was provided
-		if (body.deviceId !== undefined && body.devicePublicKey !== undefined) {
-			await this.userStore.registerDevice({
-				id: body.deviceId,
-				userId: storedUser.id,
-				publicKey: body.devicePublicKey,
-				name: 'Device',
-			})
-		}
+		// Always register a device — use provided info or create a basic record
+		await this.userStore.registerDevice({
+			id: deviceId,
+			userId: storedUser.id,
+			publicKey: body.devicePublicKey ?? '',
+			name: body.deviceId ? 'Device' : 'Browser',
+		})
 
 		const tokens = this.tokenManager.issueTokens(storedUser.id, deviceId)
 

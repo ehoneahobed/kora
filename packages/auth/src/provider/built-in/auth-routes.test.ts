@@ -421,7 +421,7 @@ describe('handleListDevices', () => {
 		}
 	})
 
-	test('returns empty array when no devices registered', async () => {
+	test('always registers a device even without explicit device info', async () => {
 		const { routes } = createTestRoutes()
 
 		const signUpResult = await routes.handleSignUp({
@@ -436,7 +436,8 @@ describe('handleListDevices', () => {
 
 		expect(result.status).toBe(200)
 		if ('data' in result.body) {
-			expect(result.body.data).toHaveLength(0)
+			expect(result.body.data).toHaveLength(1)
+			expect(result.body.data[0]?.name).toBe('Browser')
 		}
 	})
 
