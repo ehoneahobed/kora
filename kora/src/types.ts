@@ -15,8 +15,9 @@ import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
  * - 'sqlite-wasm': SQLite WASM with OPFS (browser, primary)
  * - 'indexeddb': IndexedDB fallback (browser, when OPFS unavailable)
  * - 'better-sqlite3': Native SQLite (Node.js, server-side, Electron)
+ * - 'tauri-sqlite': Native SQLite via Tauri plugin (Tauri desktop/mobile apps)
  */
-export type AdapterType = 'sqlite-wasm' | 'indexeddb' | 'better-sqlite3'
+export type AdapterType = 'sqlite-wasm' | 'indexeddb' | 'better-sqlite3' | 'tauri-sqlite'
 
 /**
  * Store configuration within createApp.

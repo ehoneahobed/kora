@@ -1,0 +1,19 @@
+[package]
+name = "tauri-plugin-kora"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri plugin providing native SQLite storage for Kora.js applications"
+license = "MIT"
+repository = "https://github.com/nicholasgriffintn/kora"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+log = "0.4"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

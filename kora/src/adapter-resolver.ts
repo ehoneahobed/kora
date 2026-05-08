@@ -4,11 +4,20 @@ import type { AdapterType } from './types'
 /**
  * Detect the best storage adapter for the current environment.
  *
+ * - Tauri app: 'tauri-sqlite' (native SQLite via Tauri plugin)
  * - Node.js: 'better-sqlite3'
  * - Browser with OPFS: 'sqlite-wasm'
  * - Browser without OPFS: 'indexeddb'
  */
 export function detectAdapterType(): AdapterType {
+	// Tauri environment — detected via __TAURI_INTERNALS__ injected by the Tauri runtime
+	if (
+		typeof globalThis !== 'undefined' &&
+		typeof (globalThis as Record<string, unknown>).__TAURI_INTERNALS__ !== 'undefined'
+	) {
+		return 'tauri-sqlite'
+	}
+
 	// Node.js environment
 	if (typeof process !== 'undefined' && process.versions?.node) {
 		return 'better-sqlite3'
@@ -41,6 +50,12 @@ export async function createAdapter(
 	workerUrl?: string | URL,
 ): Promise<StorageAdapter> {
 	switch (type) {
+		case 'tauri-sqlite': {
+			const { TauriSqliteAdapter } = await import(
+				/* @vite-ignore */ '@korajs/tauri'
+			)
+			return new TauriSqliteAdapter({ path: `${dbName}.db` })
+		}
 		case 'better-sqlite3': {
 			const { BetterSqlite3Adapter } = await import(
 				/* @vite-ignore */ '@korajs/store/better-sqlite3'

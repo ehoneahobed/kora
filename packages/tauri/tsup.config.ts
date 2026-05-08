@@ -1,10 +1,10 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-	entry: ['src/index.ts', 'src/config.ts'],
+	entry: ['src/index.ts'],
 	format: ['esm', 'cjs'],
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['@korajs/tauri'],
+	external: ['@tauri-apps/api'],
 })
