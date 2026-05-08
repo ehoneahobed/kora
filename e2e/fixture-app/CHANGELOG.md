@@ -1,5 +1,12 @@
 # kora-e2e-fixture
 
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [d6f6289]
+  - korajs@0.3.5
+
 ## 0.1.3
 
 ### Patch Changes
