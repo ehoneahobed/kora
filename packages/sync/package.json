@@ -1,6 +1,6 @@
 {
   "name": "@korajs/sync",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Sync protocol and transports for Kora.js with delta sync, causal ordering, and automatic reconnection",
   "type": "module",
   "main": "./dist/index.cjs",

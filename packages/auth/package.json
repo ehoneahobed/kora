@@ -1,6 +1,6 @@
 {
   "name": "@korajs/auth",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Offline-first authentication for Kora.js",
   "type": "module",
   "main": "./dist/index.cjs",
