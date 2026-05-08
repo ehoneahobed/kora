@@ -15,11 +15,16 @@ You will be prompted to choose a template and package manager:
 ```
 Kora.js - Offline-first application framework
 
-? Select a template:
-  > React + Tailwind (with sync)    # Recommended — polished UI with real-time sync
-    React + Tailwind (local-only)   # Tailwind CSS, no sync server
-    React + CSS (with sync)         # Plain CSS with sync server
-    React + CSS (local-only)        # Plain CSS, local-only
+? Platform:
+  > Web (browser)
+    Desktop (Tauri — native SQLite)
+
+? UI framework:
+  > React
+
+? Use Tailwind CSS? Yes
+
+? Enable multi-device sync? Yes
 
 ? Package manager:
   > pnpm
@@ -27,6 +32,8 @@ Kora.js - Offline-first application framework
     yarn
     bun
 ```
+
+Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite — see the [Tauri Desktop guide](/guide/tauri-desktop) for details.
 
 You can also skip the prompts entirely:
 
@@ -231,5 +238,6 @@ See the [Deployment guide](/guide/deployment) for a full step-by-step walkthroug
 - [Sync Configuration](/guide/sync-configuration) — Transports, reconnection, and runtime sync behavior
 - [Authentication](/guide/authentication) — Sessions, MFA, organizations, RBAC, and passkeys
 - [Storage Configuration](/guide/storage-configuration) — Client and server storage backends
+- [Tauri Desktop Apps](/guide/tauri-desktop) — Build native desktop apps with native SQLite
 - [DevTools](/guide/devtools) — Debugging with the Kora browser extension
 - [API Reference](/api/) — Complete reference for all packages

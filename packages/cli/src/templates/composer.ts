@@ -114,6 +114,18 @@ export function createCompatibilityLayerPlan(templateName: TemplateName): Templa
 					authLayer,
 				],
 			}
+		case 'tauri-react':
+			return {
+				compatibilityTarget: templateName,
+				layers: [
+					{ category: 'base', name: 'tauri', sourceTemplate: 'tauri-react' },
+					uiLayer,
+					{ category: 'style', name: 'plain', sourceTemplate: null },
+					{ category: 'sync', name: 'disabled', sourceTemplate: null },
+					{ category: 'db', name: 'tauri-sqlite', sourceTemplate: null },
+					authLayer,
+				],
+			}
 	}
 }
 

@@ -47,10 +47,14 @@ export const createCommand = defineCommand({
 			description: 'Project directory name',
 			required: false,
 		},
+		platform: {
+			type: 'string',
+			description: 'Target platform (web, desktop-tauri)',
+		},
 		template: {
 			type: 'string',
 			description:
-				'Project template (react-tailwind-sync, react-tailwind, react-sync, react-basic)',
+				'Project template (react-tailwind-sync, react-tailwind, react-sync, react-basic, tauri-react)',
 		},
 		pm: {
 			type: 'string',
@@ -127,6 +131,7 @@ export const createCommand = defineCommand({
 			}
 
 			const preferenceFlags: CreateFlags = {
+				platform: typeof args.platform === 'string' ? args.platform : undefined,
 				framework: typeof args.framework === 'string' ? args.framework : undefined,
 				auth: typeof args.auth === 'string' ? args.auth : undefined,
 				db: typeof args.db === 'string' ? args.db : undefined,
@@ -249,6 +254,7 @@ export const createCommand = defineCommand({
 
 			if (shouldSavePreferences(preferenceFlags)) {
 				saveResolvedPreferences(preferenceStore, {
+					platform: selection.platform,
 					framework: selection.framework,
 					auth: selection.auth,
 					db: selection.db,
@@ -307,7 +313,7 @@ function isValidPackageManager(value: string): value is PackageManager {
 }
 
 function isSyncTemplate(template: TemplateName): boolean {
-	return template === 'react-sync' || template === 'react-tailwind-sync'
+	return template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
 }
 
 function formatDbProviderForLog(dbProvider: string): string {

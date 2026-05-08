@@ -1,8 +1,9 @@
 import Conf from 'conf'
-import type { AuthOption, DatabaseOption, DatabaseProviderOption, FrameworkOption } from '../commands/create/options'
+import type { AuthOption, DatabaseOption, DatabaseProviderOption, FrameworkOption, PlatformOption } from '../commands/create/options'
 import type { PackageManager } from '../types'
 
 export interface CreatePreferences {
+	platform: PlatformOption
 	framework: FrameworkOption
 	tailwind: boolean
 	sync: boolean
@@ -13,6 +14,7 @@ export interface CreatePreferences {
 }
 
 const DEFAULT_PREFERENCES: CreatePreferences = {
+	platform: 'web',
 	framework: 'react',
 	tailwind: true,
 	sync: true,

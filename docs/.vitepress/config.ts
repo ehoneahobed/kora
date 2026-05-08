@@ -30,6 +30,7 @@ export default defineConfig({
           { text: 'Storage Configuration', link: '/guide/storage-configuration' },
           { text: 'Authentication', link: '/guide/authentication' },
           { text: 'Common Patterns', link: '/guide/common-patterns' },
+          { text: 'Tauri Desktop Apps', link: '/guide/tauri-desktop' },
           { text: 'DevTools', link: '/guide/devtools' },
         ],
       },

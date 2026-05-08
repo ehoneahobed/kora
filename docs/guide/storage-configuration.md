@@ -8,9 +8,10 @@ Kora uses two separate storage systems: **client-side storage** for the browser 
 
 When you call `createApp()`, Kora automatically sets up a local database for your app. By default, it uses:
 
-1. **SQLite WASM + OPFS** (browsers with OPFS support) -- best performance
-2. **IndexedDB** (fallback when OPFS is unavailable)
-3. **Native SQLite** (Node.js and Electron via `better-sqlite3`)
+1. **Tauri native SQLite** (Tauri desktop apps via `@korajs/tauri`) -- best performance, auto-detected
+2. **SQLite WASM + OPFS** (browsers with OPFS support)
+3. **IndexedDB** (fallback when OPFS is unavailable)
+4. **Native SQLite** (Node.js and Electron via `better-sqlite3`)
 
 You don't need to configure anything for the default case:
 
@@ -54,6 +55,7 @@ const app = createApp({
     adapter: 'sqlite-wasm',   // Browser: SQLite WASM + OPFS
     // adapter: 'indexeddb',   // Browser: IndexedDB fallback
     // adapter: 'better-sqlite3', // Node.js: better-sqlite3
+    // adapter: 'tauri-sqlite',   // Tauri desktop: native SQLite (auto-detected)
     name: 'my-app',
     workerUrl: new URL('./kora-worker.ts', import.meta.url),
   },
@@ -68,7 +70,7 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `adapter` | `'sqlite-wasm' \| 'indexeddb' \| 'better-sqlite3'` | Auto-detected | Storage backend to use. |
+| `adapter` | `'sqlite-wasm' \| 'indexeddb' \| 'better-sqlite3' \| 'tauri-sqlite'` | Auto-detected | Storage backend to use. |
 | `name` | `string` | `'kora-db'` | Database name. Must be unique per app on the same origin. |
 | `workerUrl` | `string \| URL` | -- | URL to the SQLite WASM worker script. Required for `sqlite-wasm` adapter in browsers. |
 

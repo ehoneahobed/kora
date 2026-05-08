@@ -5,11 +5,13 @@ import {
 	isDatabaseProviderValue,
 	isDatabaseValue,
 	isFrameworkValue,
+	isPlatformValue,
 } from './options'
 
 describe('determineTemplateFromSelections', () => {
 	test('returns sync tailwind template when enabled', () => {
 		const template = determineTemplateFromSelections({
+			platform: 'web',
 			tailwind: true,
 			sync: true,
 			db: 'sqlite',
@@ -19,6 +21,7 @@ describe('determineTemplateFromSelections', () => {
 
 	test('returns local-only template when sync disabled', () => {
 		const template = determineTemplateFromSelections({
+			platform: 'web',
 			tailwind: false,
 			sync: false,
 			db: 'none',
@@ -28,15 +31,42 @@ describe('determineTemplateFromSelections', () => {
 
 	test('treats db none as local-only even if sync true', () => {
 		const template = determineTemplateFromSelections({
+			platform: 'web',
 			tailwind: false,
 			sync: true,
 			db: 'none',
 		})
 		expect(template).toBe('react-basic')
 	})
+
+	test('returns tauri-react for desktop-tauri platform', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'desktop-tauri',
+			tailwind: true,
+			sync: true,
+			db: 'sqlite',
+		})
+		expect(template).toBe('tauri-react')
+	})
+
+	test('tauri-react ignores tailwind and sync settings', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'desktop-tauri',
+			tailwind: false,
+			sync: false,
+			db: 'none',
+		})
+		expect(template).toBe('tauri-react')
+	})
 })
 
 describe('value guards', () => {
+	test('platform guard accepts known values', () => {
+		expect(isPlatformValue('web')).toBe(true)
+		expect(isPlatformValue('desktop-tauri')).toBe(true)
+		expect(isPlatformValue('mobile')).toBe(false)
+	})
+
 	test('framework guard accepts known values', () => {
 		expect(isFrameworkValue('react')).toBe(true)
 		expect(isFrameworkValue('vue')).toBe(true)

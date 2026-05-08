@@ -1,5 +1,6 @@
 import type { TemplateName } from '../../types'
 
+export type PlatformOption = 'web' | 'desktop-tauri'
 export type FrameworkOption = 'react' | 'vue' | 'svelte' | 'solid'
 export type AuthOption = 'none' | 'email-password' | 'oauth'
 export type DatabaseOption = 'none' | 'sqlite' | 'postgres'
@@ -13,6 +14,7 @@ export type DatabaseProviderOption =
 	| 'custom'
 
 export interface TemplateSelectionInput {
+	platform: PlatformOption
 	tailwind: boolean
 	sync: boolean
 	db: DatabaseOption
@@ -23,11 +25,16 @@ export interface TemplateSelectionInput {
  * concrete template names.
  */
 export function determineTemplateFromSelections(input: TemplateSelectionInput): TemplateName {
+	if (input.platform === 'desktop-tauri') return 'tauri-react'
 	const shouldSync = input.sync && input.db !== 'none'
 	if (input.tailwind && shouldSync) return 'react-tailwind-sync'
 	if (input.tailwind && !shouldSync) return 'react-tailwind'
 	if (!input.tailwind && shouldSync) return 'react-sync'
 	return 'react-basic'
+}
+
+export function isPlatformValue(value: string): value is PlatformOption {
+	return value === 'web' || value === 'desktop-tauri'
 }
 
 export function isFrameworkValue(value: string): value is FrameworkOption {

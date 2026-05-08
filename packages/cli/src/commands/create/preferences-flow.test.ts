@@ -87,6 +87,7 @@ function ensureTtyForPreferencePrompt(): () => void {
 describe('resolveCreatePreferencesFlow', () => {
 	test('uses hard defaults for --yes flow', async () => {
 		const store = new MockPreferenceStore({
+			platform: 'web',
 			framework: 'react',
 			tailwind: false,
 			sync: false,
@@ -102,6 +103,7 @@ describe('resolveCreatePreferencesFlow', () => {
 			store,
 		})
 
+		expect(result.platform).toBe('web')
 		expect(result.framework).toBe('react')
 		expect(result.tailwind).toBe(true)
 		expect(result.sync).toBe(true)
@@ -114,6 +116,7 @@ describe('resolveCreatePreferencesFlow', () => {
 		const restoreTty = ensureTtyForPreferencePrompt()
 		try {
 			const store = new MockPreferenceStore({
+				platform: 'web',
 				framework: 'react',
 				tailwind: false,
 				sync: true,
@@ -141,6 +144,7 @@ describe('resolveCreatePreferencesFlow', () => {
 
 	test('explicit flags override stored values', async () => {
 		const store = new MockPreferenceStore({
+			platform: 'web',
 			framework: 'react',
 			tailwind: true,
 			sync: true,
@@ -165,6 +169,41 @@ describe('resolveCreatePreferencesFlow', () => {
 		expect(result.sync).toBe(false)
 		expect(result.tailwind).toBe(false)
 		expect(result.template).toBe('react-basic')
+	})
+
+	test('desktop-tauri platform flag produces tauri-react template', async () => {
+		const store = new MockPreferenceStore(null)
+
+		const result = await resolveCreatePreferencesFlow({
+			flags: {
+				useDefaults: false,
+				platform: 'desktop-tauri',
+			},
+			prompts: new MockPromptClient(),
+			store,
+		})
+
+		expect(result.platform).toBe('desktop-tauri')
+		expect(result.template).toBe('tauri-react')
+		expect(result.framework).toBe('react')
+		expect(result.tailwind).toBe(false)
+		expect(result.sync).toBe(true)
+		expect(result.db).toBe('sqlite')
+	})
+
+	test('--yes with --platform desktop-tauri defaults to tauri-react', async () => {
+		const store = new MockPreferenceStore(null)
+
+		const result = await resolveCreatePreferencesFlow({
+			flags: {
+				useDefaults: true,
+				platform: 'desktop-tauri',
+			},
+			prompts: new MockPromptClient(),
+			store,
+		})
+
+		expect(result.template).toBe('tauri-react')
 	})
 
 })

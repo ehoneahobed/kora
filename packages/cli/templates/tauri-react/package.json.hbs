@@ -1,0 +1,40 @@
+{
+  "name": "{{projectName}}",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "dev:server": "tsx server.ts",
+    "start:server": "node --import tsx server.ts"
+  },
+  "dependencies": {
+    "korajs": "{{koraVersion}}",
+    "@korajs/core": "{{koraVersion}}",
+    "@korajs/react": "{{koraVersion}}",
+    "@korajs/tauri": "{{koraVersion}}",
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@korajs/server": "{{koraVersion}}",
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "better-sqlite3": "^12.9.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "ws": "^8.18.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

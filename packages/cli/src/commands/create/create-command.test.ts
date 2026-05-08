@@ -144,6 +144,35 @@ describe('create command flow', () => {
 		expect(pkg).not.toContain('@korajs/server')
 	})
 
+	test('scaffolds tauri-react project with Rust source', async () => {
+		const targetDir = join(tempDir.path, 'tauri-app')
+		await scaffoldTemplate('tauri-react', targetDir, {
+			projectName: 'tauri-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.1.0',
+		})
+
+		const files = await readdir(targetDir)
+		expect(files).toContain('package.json')
+		expect(files).toContain('tsconfig.json')
+		expect(files).toContain('vite.config.ts')
+		expect(files).toContain('src-tauri')
+		expect(files).toContain('server.ts')
+
+		const srcFiles = await readdir(join(targetDir, 'src'))
+		expect(srcFiles).toContain('schema.ts')
+		expect(srcFiles).toContain('main.tsx')
+		expect(srcFiles).toContain('App.tsx')
+
+		const tauriFiles = await readdir(join(targetDir, 'src-tauri', 'src'))
+		expect(tauriFiles).toContain('main.rs')
+		expect(tauriFiles).toContain('lib.rs')
+
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('@korajs/tauri')
+		expect(pkg).toContain('@tauri-apps/cli')
+	})
+
 	test('all templates include devtools: true', async () => {
 		const templates = [
 			'react-basic',

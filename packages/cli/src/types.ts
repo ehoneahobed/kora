@@ -8,6 +8,7 @@ export const TEMPLATES = [
 	'react-tailwind',
 	'react-sync',
 	'react-basic',
+	'tauri-react',
 ] as const
 export type TemplateName = (typeof TEMPLATES)[number]
 
@@ -39,6 +40,11 @@ export const TEMPLATE_INFO: readonly TemplateInfo[] = [
 		name: 'react-basic',
 		label: 'React + CSS (local-only)',
 		description: 'Clean CSS app — no sync server',
+	},
+	{
+		name: 'tauri-react',
+		label: 'Tauri Desktop (native SQLite)',
+		description: 'Desktop app with native SQLite — no WASM, includes sync server',
 	},
 ] as const
 
