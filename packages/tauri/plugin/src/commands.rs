@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use tauri::{AppHandle, Manager, Runtime, State};
 

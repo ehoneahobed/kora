@@ -1,10 +1,11 @@
 [package]
-name = "tauri-plugin-kora"
+name = "tauri-plugin-kora-sqlite"
 version = "0.1.0"
 edition = "2021"
 description = "Tauri plugin providing native SQLite storage for Kora.js applications"
 license = "MIT"
 repository = "https://github.com/nicholasgriffintn/kora"
+links = "tauri-plugin-kora-sqlite"
 
 [dependencies]
 tauri = { version = "2", features = [] }
