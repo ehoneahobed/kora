@@ -51,13 +51,13 @@ export async function createAdapter(
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
-			// Use Function-based import to prevent bundlers (Vite/Rollup/webpack)
-			// from resolving @korajs/tauri at build time. This package is only
-			// available in Tauri environments and must not be bundled for web.
-			const dynamicImport = new Function('specifier', 'return import(specifier)') as (
-				s: string,
-			) => Promise<{ TauriSqliteAdapter: new (opts: { path: string }) => StorageAdapter }>
-			const { TauriSqliteAdapter } = await dynamicImport('@korajs/tauri')
+			// @korajs/tauri is only installed in Tauri projects (optional peer dep).
+			// This code path only runs when __TAURI_INTERNALS__ is detected.
+			// Using @vite-ignore so Vite doesn't statically analyze this import —
+			// it will still resolve it at runtime through Vite's dev server.
+			const { TauriSqliteAdapter } = await import(
+				/* @vite-ignore */ '@korajs/tauri'
+			)
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {
