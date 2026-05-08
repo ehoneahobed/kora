@@ -57,13 +57,18 @@ export class PostgresServerStore implements ServerStore {
 				try {
 					await this.db.execute(sql.raw(alterSql))
 				} catch (e) {
-					// Ignore "already exists" errors from safe ALTER TABLE
+					// Ignore "already exists" errors from safe ALTER TABLE.
+					// Drizzle wraps the actual DB error in e.cause, so check both.
+					const msg = e instanceof Error ? e.message : ''
+					const causeMsg =
+						e instanceof Error && e.cause instanceof Error
+							? e.cause.message
+							: ''
 					if (
-						!(
-							e instanceof Error &&
-							(e.message.includes('already exists') ||
-								e.message.includes('duplicate column'))
-						)
+						!msg.includes('already exists') &&
+						!msg.includes('duplicate column') &&
+						!causeMsg.includes('already exists') &&
+						!causeMsg.includes('duplicate column')
 					) {
 						throw e
 					}
