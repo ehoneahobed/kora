@@ -5,7 +5,7 @@ import type { ApplyResult } from '@korajs/sync'
 import { and, asc, between, count, eq, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { operations, syncState } from './drizzle-schema'
-import type { ServerStore } from './server-store'
+import type { MaterializedRecord, ServerStore } from './server-store'
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -101,6 +101,53 @@ export class SqliteServerStore implements ServerStore {
 
 		const result = this.db.select({ value: count() }).from(operations).all()
 		return result[0]?.value ?? 0
+	}
+
+	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
+		this.assertOpen()
+
+		// Fetch all operations for this collection, ordered by causal time
+		const rows = this.db
+			.select()
+			.from(operations)
+			.where(eq(operations.collection, collection))
+			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.sequenceNumber))
+			.all()
+
+		// Replay operations to reconstruct current state
+		const records = new Map<string, Record<string, unknown>>()
+		const deleted = new Set<string>()
+
+		for (const row of rows) {
+			const recordId = row.recordId
+			const data = row.data !== null ? JSON.parse(row.data) : null
+
+			switch (row.type) {
+				case 'insert':
+					if (data) {
+						records.set(recordId, { id: recordId, ...data })
+						deleted.delete(recordId)
+					}
+					break
+				case 'update':
+					if (data) {
+						const existing = records.get(recordId) ?? { id: recordId }
+						records.set(recordId, { ...existing, ...data })
+						deleted.delete(recordId)
+					}
+					break
+				case 'delete':
+					deleted.add(recordId)
+					break
+			}
+		}
+
+		// Remove deleted records
+		for (const id of deleted) {
+			records.delete(id)
+		}
+
+		return Array.from(records.values()) as MaterializedRecord[]
 	}
 
 	async close(): Promise<void> {

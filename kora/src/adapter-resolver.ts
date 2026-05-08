@@ -51,9 +51,13 @@ export async function createAdapter(
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
-			const { TauriSqliteAdapter } = await import(
-				/* @vite-ignore */ '@korajs/tauri'
-			)
+			// Use Function-based import to prevent bundlers (Vite/Rollup/webpack)
+			// from resolving @korajs/tauri at build time. This package is only
+			// available in Tauri environments and must not be bundled for web.
+			const dynamicImport = new Function('specifier', 'return import(specifier)') as (
+				s: string,
+			) => Promise<{ TauriSqliteAdapter: new (opts: { path: string }) => StorageAdapter }>
+			const { TauriSqliteAdapter } = await dynamicImport('@korajs/tauri')
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {

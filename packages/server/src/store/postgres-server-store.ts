@@ -4,7 +4,7 @@ import type { ApplyResult } from '@korajs/sync'
 import { and, asc, between, count, eq, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
-import type { ServerStore } from './server-store'
+import type { MaterializedRecord, ServerStore } from './server-store'
 
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
@@ -108,6 +108,53 @@ export class PostgresServerStore implements ServerStore {
 
 		const result = await this.db.select({ value: count() }).from(pgOperations)
 		return result[0]?.value ?? 0
+	}
+
+	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
+		this.assertOpen()
+		await this.ready
+
+		// Fetch all operations for this collection, ordered by causal time
+		const rows = await this.db
+			.select()
+			.from(pgOperations)
+			.where(eq(pgOperations.collection, collection))
+			.orderBy(asc(pgOperations.wallTime), asc(pgOperations.logical), asc(pgOperations.sequenceNumber))
+
+		// Replay operations to reconstruct current state
+		const records = new Map<string, Record<string, unknown>>()
+		const deleted = new Set<string>()
+
+		for (const row of rows) {
+			const recordId = row.recordId
+			const data = row.data !== null ? JSON.parse(row.data) : null
+
+			switch (row.type) {
+				case 'insert':
+					if (data) {
+						records.set(recordId, { id: recordId, ...data })
+						deleted.delete(recordId)
+					}
+					break
+				case 'update':
+					if (data) {
+						const existing = records.get(recordId) ?? { id: recordId }
+						records.set(recordId, { ...existing, ...data })
+						deleted.delete(recordId)
+					}
+					break
+				case 'delete':
+					deleted.add(recordId)
+					break
+			}
+		}
+
+		// Remove deleted records
+		for (const id of deleted) {
+			records.delete(id)
+		}
+
+		return Array.from(records.values()) as MaterializedRecord[]
 	}
 
 	async close(): Promise<void> {

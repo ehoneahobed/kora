@@ -1,7 +1,7 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import { generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
-import type { ServerStore } from './server-store'
+import type { MaterializedRecord, ServerStore } from './server-store'
 
 /**
  * In-memory server store for testing and quick prototyping.
@@ -59,6 +59,50 @@ export class MemoryServerStore implements ServerStore {
 	async getOperationCount(): Promise<number> {
 		this.assertOpen()
 		return this.operations.length
+	}
+
+	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
+		this.assertOpen()
+
+		// Filter and sort operations for this collection
+		const collectionOps = this.operations
+			.filter((op) => op.collection === collection)
+			.sort((a, b) => {
+				if (a.timestamp.wallTime !== b.timestamp.wallTime) return a.timestamp.wallTime - b.timestamp.wallTime
+				if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
+				return a.sequenceNumber - b.sequenceNumber
+			})
+
+		// Replay operations to reconstruct current state
+		const records = new Map<string, Record<string, unknown>>()
+		const deleted = new Set<string>()
+
+		for (const op of collectionOps) {
+			switch (op.type) {
+				case 'insert':
+					if (op.data) {
+						records.set(op.recordId, { id: op.recordId, ...op.data })
+						deleted.delete(op.recordId)
+					}
+					break
+				case 'update':
+					if (op.data) {
+						const existing = records.get(op.recordId) ?? { id: op.recordId }
+						records.set(op.recordId, { ...existing, ...op.data })
+						deleted.delete(op.recordId)
+					}
+					break
+				case 'delete':
+					deleted.add(op.recordId)
+					break
+			}
+		}
+
+		for (const id of deleted) {
+			records.delete(id)
+		}
+
+		return Array.from(records.values()) as MaterializedRecord[]
 	}
 
 	async close(): Promise<void> {
