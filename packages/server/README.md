@@ -52,6 +52,39 @@ await server.start()
 | `SqliteServerStore` | Built-in | Small deployments, prototyping |
 | `PostgresServerStore` | Built-in | Production |
 
+## Mixed Auth (Authenticated + Anonymous)
+
+For apps where some users are authenticated and others are anonymous:
+
+```typescript
+import { MixedAuthProvider } from '@korajs/server'
+
+const server = createKoraServer({
+  store: serverStore,
+  auth: new MixedAuthProvider({
+    primary: authRoutes.toSyncAuthProvider(),
+    anonymousScopes: { responses: {} },
+  }),
+})
+```
+
+## Materialized Collections
+
+Enable server-side queries on your data:
+
+```typescript
+await store.setSchema(schema)
+
+// Query with filters
+const forms = await store.queryCollection('forms', {
+  where: { status: 'published' },
+  limit: 10,
+})
+
+// Count records
+const count = await store.countCollection('responses', { formId: 'abc' })
+```
+
 ## Configuration
 
 ```typescript

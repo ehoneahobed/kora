@@ -47,6 +47,7 @@ export type {
 
 export type { TokenAuthProviderOptions } from './auth/token-auth'
 export type { KoraAuthProviderOptions } from './auth/kora-auth-provider'
+export type { MixedAuthProviderOptions } from './auth/mixed-auth-provider'
 
 // === Classes ===
 export { MemoryServerStore } from './store/memory-server-store'
@@ -59,6 +60,7 @@ export { KoraSyncServer } from './server/kora-sync-server'
 export { NoAuthProvider } from './auth/no-auth'
 export { TokenAuthProvider } from './auth/token-auth'
 export { KoraAuthProvider } from './auth/kora-auth-provider'
+export { MixedAuthProvider } from './auth/mixed-auth-provider'
 
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'

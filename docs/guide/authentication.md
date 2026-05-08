@@ -244,6 +244,36 @@ const app = createApp({
 
 The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
 
+### Mixed Auth (Authenticated + Anonymous)
+
+If your app needs both authenticated and anonymous sync (e.g., signed-in users create forms, anyone can submit responses), use `MixedAuthProvider`:
+
+```typescript
+import { MixedAuthProvider } from '@korajs/server'
+
+const syncServer = new KoraSyncServer({
+  store,
+  auth: new MixedAuthProvider({
+    primary: authRoutes.toSyncAuthProvider(),
+    anonymousScopes: {
+      responses: {},  // anonymous users can only sync 'responses'
+    },
+  }),
+})
+```
+
+On the client, return an empty token for unauthenticated users:
+
+```typescript
+sync: {
+  auth: async () => ({
+    token: (await authClient.getAccessToken()) ?? '',
+  }),
+}
+```
+
+See the [Common Patterns guide](/guide/common-patterns#anonymous-public-data-access) for a full walkthrough.
+
 ---
 
 ## Email Verification

@@ -7,6 +7,7 @@
 ```typescript
 import {
   createKoraServer,
+  createProductionServer,
   KoraSyncServer,
   MemoryServerStore,
   SqliteServerStore,
@@ -15,6 +16,8 @@ import {
   createPostgresServerStore,
   NoAuthProvider,
   TokenAuthProvider,
+  MixedAuthProvider,
+  KoraAuthProvider,
 } from '@korajs/server'
 ```
 
@@ -84,9 +87,15 @@ Main server class.
 
 ## Stores
 
+All stores implement the `ServerStore` interface which extends the sync protocol's `SyncStore` with materialization support.
+
 ### `MemoryServerStore`
 
-In-memory only (testing/development).
+In-memory only (testing/development). Data is lost when the process restarts.
+
+```typescript
+const store = new MemoryServerStore()
+```
 
 ### `createSqliteServerStore(options)` / `SqliteServerStore`
 
@@ -106,15 +115,120 @@ const store = await createPostgresServerStore({
 })
 ```
 
+---
+
+## Materialized Collections
+
+By default, the server stores data as an append-only operation log. For efficient queries (e.g., looking up records by field values), enable **materialized collections** by calling `setSchema()`. This creates actual SQL tables for each collection, with proper indexes, and dual-writes every synced operation to both the log and the collection table.
+
+### `store.setSchema(schema)`
+
+Creates collection tables and indexes from your schema definition. If operations already exist in the log, backfills the materialized tables automatically.
+
+```typescript
+import { defineSchema, t } from '@korajs/core'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        userId: t.string(),
+      },
+      indexes: ['userId', 'completed'],
+    },
+  },
+})
+
+// Call after creating the store, before starting the server
+await store.setSchema(schema)
+```
+
+::: tip
+Always call `setSchema()` before starting the sync server. The schema enables materialized tables to be created and backfilled before clients connect.
+:::
+
+### `store.queryCollection(collection, options?)`
+
+Query records from a materialized collection with filtering, ordering, and pagination. Returns an array of `MaterializedRecord` objects.
+
+```typescript
+// Get all published forms
+const forms = await store.queryCollection('forms', {
+  where: { status: 'published' },
+  orderBy: 'createdAt',
+  orderDirection: 'desc',
+  limit: 10,
+  offset: 0,
+})
+```
+
+#### `CollectionQueryOptions`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `where` | `Record<string, unknown>` | -- | Exact-match filters on field values |
+| `orderBy` | `string` | -- | Field name to sort by |
+| `orderDirection` | `'asc' \| 'desc'` | `'asc'` | Sort direction |
+| `limit` | `number` | -- | Maximum records to return |
+| `offset` | `number` | -- | Records to skip (for pagination) |
+| `includeDeleted` | `boolean` | `false` | Include soft-deleted records |
+
+### `store.findRecord(collection, id)`
+
+Find a single record by ID. Returns `null` if not found or deleted.
+
+```typescript
+const form = await store.findRecord('forms', 'form-123')
+if (form) {
+  console.log(form.title)
+}
+```
+
+### `store.countCollection(collection, where?)`
+
+Count records, optionally filtered.
+
+```typescript
+// Total responses
+const total = await store.countCollection('responses')
+
+// Responses for a specific form
+const formResponses = await store.countCollection('responses', {
+  formId: 'form-123',
+})
+```
+
+### `store.materializeCollection(collection)`
+
+Get all records from a collection. When schema is set, reads from the collection table. Otherwise falls back to replaying the operation log.
+
+```typescript
+const allTodos = await store.materializeCollection('todos')
+```
+
+::: warning
+`materializeCollection()` returns ALL records. For large collections, use `queryCollection()` with `limit` and `offset` for pagination.
+:::
+
+---
+
 ## Authentication
 
 ### `NoAuthProvider`
 
-Accepts all connections.
+Accepts all connections. Every connection gets `userId: 'anonymous'`. Use for development/testing or apps that don't need auth.
+
+```typescript
+const server = createKoraServer({ store })
+// NoAuthProvider is the default when no auth is specified
+```
 
 ### `TokenAuthProvider`
 
-Validates token with your `validate` function.
+Validates tokens with your custom function. Returns `null` to reject a connection.
 
 ```typescript
 const auth = new TokenAuthProvider({
@@ -125,8 +239,78 @@ const auth = new TokenAuthProvider({
 })
 ```
 
-Return shape:
+### `MixedAuthProvider`
 
-- `userId` (required)
-- `scopes` (optional, server-side filtering context)
-- `metadata` (optional)
+Accepts both authenticated and anonymous connections. Authenticated users get full access; anonymous users get restricted access via scoped collections.
+
+**This is the recommended provider for apps with public-facing features** — for example, a form builder where authenticated users create forms but anyone can submit responses.
+
+```typescript
+import { MixedAuthProvider } from '@korajs/server'
+
+const auth = new MixedAuthProvider({
+  // Primary auth validates tokens for authenticated users
+  primary: authRoutes.toSyncAuthProvider(),
+
+  // Anonymous users can only sync the 'responses' collection
+  anonymousScopes: {
+    responses: {},
+  },
+})
+
+const server = new KoraSyncServer({ store, auth })
+```
+
+On the client side, return an empty token for unauthenticated users:
+
+```typescript
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora',
+    auth: async () => ({
+      token: (await authClient.getAccessToken()) ?? '',
+    }),
+  },
+})
+```
+
+#### Options
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `primary` | `AuthProvider` | -- | Auth provider for authenticated users |
+| `anonymousScopes` | `Record<string, Record<string, unknown>>` | -- | Collections anonymous users can sync. Use `{}` for unrestricted access to a collection. |
+| `anonymousPrefix` | `string` | `'anon'` | Prefix for generated anonymous user IDs |
+
+See the [Common Patterns guide](/guide/common-patterns#anonymous-public-data-access) for a complete walkthrough.
+
+### `KoraAuthProvider`
+
+Bridges `@korajs/auth` with the sync server. Validates JWTs issued by `TokenManager`, checks user existence, updates device timestamps, and resolves sync scopes.
+
+```typescript
+import { KoraAuthProvider } from '@korajs/server'
+import { TokenManager } from '@korajs/auth/server'
+
+const auth = new KoraAuthProvider({
+  tokenValidator: tokenManager,
+  userLookup: userStore,
+  deviceTracker: userStore,    // optional
+  resolveScopes: async (userId) => ({
+    todos: { userId },
+  }),
+})
+```
+
+### `AuthContext`
+
+The return type from `authenticate()`:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `userId` | `string` | Yes | Unique user identifier |
+| `scopes` | `Record<string, Record<string, unknown>>` | No | Per-collection sync scope filters |
+| `metadata` | `Record<string, unknown>` | No | Arbitrary metadata (device info, email, etc.) |
+
+When `scopes` is provided, the server only sends/accepts operations matching the scope filters. For example, `{ todos: { userId: 'user-1' } }` means the user only syncs todos where `userId` equals `'user-1'`.

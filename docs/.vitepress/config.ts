@@ -29,6 +29,7 @@ export default defineConfig({
           { text: 'Sync Configuration', link: '/guide/sync-configuration' },
           { text: 'Storage Configuration', link: '/guide/storage-configuration' },
           { text: 'Authentication', link: '/guide/authentication' },
+          { text: 'Common Patterns', link: '/guide/common-patterns' },
           { text: 'DevTools', link: '/guide/devtools' },
         ],
       },

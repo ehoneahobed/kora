@@ -104,6 +104,38 @@ const server = createKoraServer({
 
 See the [Authentication Guide](/guide/authentication) for the full setup.
 
+### Anonymous Sync (Mixed Auth)
+
+For apps where some users are authenticated and others are anonymous (e.g., public form respondents), use `MixedAuthProvider`:
+
+```typescript
+import { MixedAuthProvider } from '@korajs/server'
+
+const auth = new MixedAuthProvider({
+  primary: authRoutes.toSyncAuthProvider(),
+  anonymousScopes: {
+    responses: {},  // anonymous users can only sync this collection
+  },
+})
+
+const server = createKoraServer({ store, port: 3001, auth })
+```
+
+On the client, return an empty token for unauthenticated users:
+
+```typescript
+sync: {
+  url: 'wss://my-server.com/kora',
+  auth: async () => ({
+    token: (await authClient.getAccessToken()) ?? '',
+  }),
+}
+```
+
+Anonymous connections get full offline-first capabilities — data saves locally and syncs when connected — but are restricted to the collections listed in `anonymousScopes`.
+
+See the [Common Patterns guide](/guide/common-patterns#anonymous-public-data-access) for a complete walkthrough.
+
 ## Connection Lifecycle
 
 ### Initial Sync
@@ -287,20 +319,27 @@ Operations created while disconnected remain in the local queue and are sent on 
 Listen to sync events programmatically for logging or custom behavior:
 
 ```typescript
-app.on('sync:connected', (event) => {
+app.events.on('sync:connected', (event) => {
   console.log('Connected to sync server')
 })
 
-app.on('sync:disconnected', (event) => {
+app.events.on('sync:disconnected', (event) => {
   console.log('Disconnected:', event.reason)
 })
 
-app.on('sync:sent', (event) => {
+app.events.on('sync:sent', (event) => {
   console.log('Sent', event.operations.length, 'operations')
 })
 
-app.on('sync:received', (event) => {
+app.events.on('sync:received', (event) => {
   console.log('Received', event.operations.length, 'operations')
+})
+
+app.events.on('sync:auth-failed', () => {
+  // Token rejected by the server (expired, revoked, or database reset).
+  // Sign out the user so they can re-authenticate.
+  console.warn('Auth token rejected — signing out')
+  authClient.signOut()
 })
 ```
 
