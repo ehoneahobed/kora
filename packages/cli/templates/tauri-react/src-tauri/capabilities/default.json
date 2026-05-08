@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "kora-sqlite:default"
+    "kora-sqlite:default",
+    "updater:default"
   ]
 }

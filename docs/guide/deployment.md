@@ -405,6 +405,49 @@ Make sure your CI environment has AWS credentials configured (e.g., via `AWS_ACC
 
 ---
 
+## Deploy a Tauri Desktop App's Sync Server
+
+Tauri desktop apps store data locally in native SQLite. To sync across multiple devices, you deploy the **sync server** — the desktop binary is distributed separately.
+
+### How it differs from web deployment
+
+| | Web App | Tauri Desktop App |
+|---|---------|-------------------|
+| **Client** | Deployed with the server (static files) | Distributed as a native binary (.dmg, .msi, .deb) |
+| **Sync server** | Same deployment serves both | Deployed independently |
+| **`staticDir`** | Points to `./dist` (built frontend) | Not needed (desktop doesn't serve HTML) |
+| **Sync URL** | Derived from page host | Set via `VITE_SYNC_URL` at build time |
+
+### Step 1: Deploy the sync server
+
+From your Tauri project directory:
+
+```bash
+pnpm deploy:server
+```
+
+This is the same `kora deploy` command used for web apps. It works with all supported platforms (Fly.io, Railway, AWS).
+
+::: tip
+The sync server for a Tauri app is identical to a web app's server — it's just a Node.js process with WebSocket support. Any deployment method in this guide works.
+:::
+
+### Step 2: Build the desktop binary with the server URL
+
+Once deployed, build the desktop app pointing to your server:
+
+```bash
+VITE_SYNC_URL=wss://my-app.fly.dev/kora-sync pnpm build
+```
+
+### Step 3: Distribute
+
+Share the built installers from `src-tauri/target/release/bundle/` with your users. Every installed copy syncs through your deployed server.
+
+For the full Tauri workflow, see the [Tauri Desktop Guide](/guide/tauri-desktop).
+
+---
+
 ## More Platforms (Coming Soon)
 
 The following platforms appear in the `kora deploy` interactive prompt but are not yet implemented:

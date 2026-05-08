@@ -7,11 +7,22 @@ import {
   Loader2,
   Plus,
   Trash2,
+  Wifi,
+  WifiOff,
+  Settings,
+  AlertTriangle,
 } from 'lucide-react'
+import { testConnection } from './sync-config'
 
 type Filter = 'all' | 'active' | 'completed'
 
-export function App() {
+interface AppProps {
+  syncUrl: string | null
+  onChangeServer: (newUrl: string | null) => void
+  onFactoryReset: () => void
+}
+
+export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
   const todos = useCollection('todos')
   const allTodos = useQuery(todos.where({}).orderBy('createdAt', 'desc'))
   const { mutate: addTodo, isLoading: isAdding } = useMutation(
@@ -26,6 +37,7 @@ export function App() {
 
   const [filter, setFilter] = useState<Filter>('all')
   const [input, setInput] = useState('')
+  const [showSettings, setShowSettings] = useState(false)
 
   const activeTodos = allTodos.filter((t) => !t.completed)
   const completedTodos = allTodos.filter((t) => !!t.completed)
@@ -56,10 +68,50 @@ export function App() {
             <Monitor style={{ width: '32px', height: '32px', color: '#818cf8' }} />
             <h1 style={{ fontSize: '24px', fontWeight: 'bold' }}>Desktop Tasks</h1>
           </div>
-          <span style={{ fontSize: '12px', color: '#6b7280', background: '#1f2937', padding: '4px 12px', borderRadius: '9999px' }}>
-            Native SQLite
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '12px',
+              color: syncUrl ? '#34d399' : '#6b7280',
+              background: '#1f2937',
+              padding: '4px 12px',
+              borderRadius: '9999px',
+            }}>
+              {syncUrl ? (
+                <Wifi style={{ width: '12px', height: '12px' }} />
+              ) : (
+                <WifiOff style={{ width: '12px', height: '12px' }} />
+              )}
+              {syncUrl ? 'Syncing' : 'Local only'}
+            </span>
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              style={{
+                background: showSettings ? '#374151' : '#1f2937',
+                border: 'none',
+                borderRadius: '9999px',
+                padding: '6px',
+                cursor: 'pointer',
+                color: showSettings ? '#f3f4f6' : '#6b7280',
+                display: 'flex',
+              }}
+            >
+              <Settings style={{ width: '14px', height: '14px' }} />
+            </button>
+          </div>
         </div>
+
+        {/* Settings panel */}
+        {showSettings && (
+          <SettingsPanel
+            syncUrl={syncUrl}
+            onChangeServer={onChangeServer}
+            onFactoryReset={onFactoryReset}
+            onClose={() => setShowSettings(false)}
+          />
+        )}
 
         {/* Stats */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '32px' }}>
@@ -222,6 +274,290 @@ export function App() {
     </div>
   )
 }
+
+// ---------------------------------------------------------------------------
+// Settings Panel
+// ---------------------------------------------------------------------------
+
+interface SettingsPanelProps {
+  syncUrl: string | null
+  onChangeServer: (newUrl: string | null) => void
+  onFactoryReset: () => void
+  onClose: () => void
+}
+
+function SettingsPanel({ syncUrl, onChangeServer, onFactoryReset, onClose }: SettingsPanelProps) {
+  const [editing, setEditing] = useState(false)
+  const [newUrl, setNewUrl] = useState(syncUrl ?? '')
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<'success' | 'failure' | null>(null)
+  const [showResetConfirm, setShowResetConfirm] = useState(false)
+  const [showChangeConfirm, setShowChangeConfirm] = useState(false)
+
+  const handleTestConnection = async () => {
+    const url = editing ? newUrl.trim() : syncUrl
+    if (!url) return
+    setTesting(true)
+    setTestResult(null)
+    const ok = await testConnection(url)
+    setTestResult(ok ? 'success' : 'failure')
+    setTesting(false)
+  }
+
+  const handleSaveUrl = () => {
+    const trimmed = newUrl.trim()
+    if (trimmed === syncUrl) {
+      setEditing(false)
+      return
+    }
+    // If there's existing data and the URL is changing, warn about data isolation
+    setShowChangeConfirm(true)
+  }
+
+  const confirmChangeServer = (keepData: boolean) => {
+    setShowChangeConfirm(false)
+    if (keepData) {
+      onChangeServer(newUrl.trim() || null)
+    } else {
+      // Factory reset + change server
+      // Store the new URL so it's picked up after reload
+      if (newUrl.trim()) {
+        localStorage.setItem('kora-sync-url', newUrl.trim())
+        localStorage.setItem('kora-sync-configured', 'true')
+      }
+      onFactoryReset()
+    }
+  }
+
+  const handleDisconnect = () => {
+    onChangeServer(null)
+  }
+
+  const handleConnect = () => {
+    setEditing(true)
+    setNewUrl('')
+  }
+
+  return (
+    <div style={{
+      marginBottom: '24px',
+      borderRadius: '8px',
+      border: '1px solid #1f2937',
+      background: '#111827',
+      overflow: 'hidden',
+    }}>
+      {/* Server URL section */}
+      <div style={{ padding: '16px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+          <p style={{ fontSize: '14px', fontWeight: '500', color: '#d1d5db' }}>Sync Server</p>
+          <button
+            onClick={onClose}
+            style={{ fontSize: '12px', color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer' }}
+          >
+            Close
+          </button>
+        </div>
+
+        {editing ? (
+          <div>
+            <input
+              type="text"
+              value={newUrl}
+              onChange={(e) => { setNewUrl(e.target.value); setTestResult(null) }}
+              placeholder="wss://your-server.example.com/kora-sync"
+              autoFocus
+              style={{
+                width: '100%',
+                borderRadius: '6px',
+                border: '1px solid #374151',
+                background: '#0a0a0a',
+                padding: '8px 12px',
+                color: '#f3f4f6',
+                outline: 'none',
+                fontSize: '13px',
+                boxSizing: 'border-box',
+                marginBottom: '8px',
+              }}
+            />
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button onClick={handleSaveUrl} disabled={!newUrl.trim()} style={btnStyle('#4f46e5', !newUrl.trim())}>
+                Save
+              </button>
+              <button onClick={handleTestConnection} disabled={testing || !newUrl.trim()} style={btnStyle('#374151', testing || !newUrl.trim())}>
+                {testing ? 'Testing...' : 'Test'}
+              </button>
+              <button onClick={() => { setEditing(false); setTestResult(null) }} style={btnStyle('#374151', false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <p style={{ fontSize: '13px', color: '#9ca3af', marginBottom: '8px', wordBreak: 'break-all' }}>
+              {syncUrl ?? 'Not connected — running in local-only mode'}
+            </p>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              {syncUrl ? (
+                <>
+                  <button onClick={() => { setEditing(true); setNewUrl(syncUrl) }} style={btnStyle('#374151', false)}>
+                    Change URL
+                  </button>
+                  <button onClick={handleTestConnection} disabled={testing} style={btnStyle('#374151', testing)}>
+                    {testing ? 'Testing...' : 'Test Connection'}
+                  </button>
+                  <button onClick={handleDisconnect} style={btnStyle('#7f1d1d', false, '#ef4444')}>
+                    Disconnect
+                  </button>
+                </>
+              ) : (
+                <button onClick={handleConnect} style={btnStyle('#4f46e5', false)}>
+                  Connect to Server
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Test result */}
+        {testResult && (
+          <p style={{
+            fontSize: '12px',
+            marginTop: '8px',
+            color: testResult === 'success' ? '#34d399' : '#fbbf24',
+          }}>
+            {testResult === 'success' ? 'Connection successful' : 'Server unreachable — it may be down temporarily'}
+          </p>
+        )}
+      </div>
+
+      {/* Danger zone */}
+      <div style={{ padding: '12px 16px', borderTop: '1px solid #1f2937', background: '#0a0a0a' }}>
+        {showResetConfirm ? (
+          <div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', marginBottom: '8px' }}>
+              <AlertTriangle style={{ width: '16px', height: '16px', color: '#ef4444', flexShrink: 0, marginTop: '1px' }} />
+              <p style={{ fontSize: '13px', color: '#fca5a5' }}>
+                This will delete all local data and reset the app to its initial state. This cannot be undone.
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button onClick={onFactoryReset} style={btnStyle('#7f1d1d', false, '#ef4444')}>
+                Confirm Reset
+              </button>
+              <button onClick={() => setShowResetConfirm(false)} style={btnStyle('#374151', false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => setShowResetConfirm(true)} style={{ fontSize: '13px', color: '#6b7280', background: 'none', border: 'none', cursor: 'pointer' }}>
+            Reset app (clear all local data)
+          </button>
+        )}
+      </div>
+
+      {/* Server change confirmation dialog */}
+      {showChangeConfirm && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0,0,0,0.7)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 100,
+        }}>
+          <div style={{
+            maxWidth: '420px',
+            width: '100%',
+            margin: '0 16px',
+            borderRadius: '12px',
+            border: '1px solid #374151',
+            background: '#111827',
+            padding: '24px',
+          }}>
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start', marginBottom: '16px' }}>
+              <AlertTriangle style={{ width: '20px', height: '20px', color: '#fbbf24', flexShrink: 0, marginTop: '2px' }} />
+              <div>
+                <p style={{ fontSize: '15px', fontWeight: '500', color: '#f3f4f6', marginBottom: '8px' }}>
+                  Changing sync servers
+                </p>
+                <p style={{ fontSize: '13px', color: '#9ca3af', lineHeight: '1.6' }}>
+                  Existing local data was created for the current server. Keeping it and connecting to a different server may sync this data to the wrong place.
+                </p>
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button
+                onClick={() => confirmChangeServer(false)}
+                style={{
+                  width: '100%',
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: '1px solid #374151',
+                  background: '#4f46e5',
+                  color: 'white',
+                  fontSize: '14px',
+                  cursor: 'pointer',
+                  fontWeight: '500',
+                }}
+              >
+                Clear data and switch (recommended)
+              </button>
+              <button
+                onClick={() => confirmChangeServer(true)}
+                style={{
+                  width: '100%',
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: '1px solid #374151',
+                  background: '#1f2937',
+                  color: '#9ca3af',
+                  fontSize: '14px',
+                  cursor: 'pointer',
+                }}
+              >
+                Keep data and switch
+              </button>
+              <button
+                onClick={() => setShowChangeConfirm(false)}
+                style={{
+                  width: '100%',
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  background: 'transparent',
+                  color: '#6b7280',
+                  fontSize: '14px',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function btnStyle(bg: string, disabled: boolean, color = '#d1d5db'): React.CSSProperties {
+  return {
+    fontSize: '13px',
+    color,
+    background: bg,
+    border: 'none',
+    borderRadius: '6px',
+    padding: '6px 12px',
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.5 : 1,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared components
+// ---------------------------------------------------------------------------
 
 function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
   return (

@@ -33,7 +33,7 @@ Kora.js - Offline-first application framework
     bun
 ```
 
-Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite — see the [Tauri Desktop guide](/guide/tauri-desktop) for details.
+Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite and sync enabled — see the [Tauri Desktop guide](/guide/tauri-desktop) for details.
 
 You can also skip the prompts entirely:
 

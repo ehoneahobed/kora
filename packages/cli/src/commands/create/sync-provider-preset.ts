@@ -91,7 +91,7 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 }
 
 function isSyncTemplate(template: TemplateName): boolean {
-	return template === 'react-sync' || template === 'react-tailwind-sync'
+	return template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
 }
 
 function getProviderDisplayName(provider: DatabaseProviderOption): string {

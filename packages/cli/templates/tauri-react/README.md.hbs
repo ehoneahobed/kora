@@ -1,0 +1,148 @@
+# {{projectName}}
+
+A native desktop application built with [Kora.js](https://ehoneahobed.github.io/kora/) and [Tauri](https://tauri.app). Uses native SQLite for fast local storage and syncs data across devices via a lightweight sync server.
+
+## Getting Started
+
+```bash
+pnpm dev
+```
+
+This starts both the sync server and the Tauri desktop app. The first launch compiles the Rust backend (2-5 minutes). Subsequent launches are fast.
+
+On first launch, you'll see a setup screen to enter your sync server URL. For local development, use `ws://localhost:3001/kora-sync` (the local sync server started by `pnpm dev`). You can also skip setup to use the app in local-only mode.
+
+## Project Structure
+
+```
+src/
+  schema.ts          # Data schema definition
+  main.tsx           # Entry point
+  AppShell.tsx       # Setup flow + Kora initialization
+  App.tsx            # Main application UI
+  SetupScreen.tsx    # First-launch server configuration
+  sync-config.ts     # Runtime sync URL storage
+  updater.ts         # Auto-update checker
+src-tauri/
+  Cargo.toml         # Rust dependencies (Kora SQLite + updater plugins)
+  tauri.conf.json    # Window, bundle, and updater config
+  capabilities/      # Tauri security permissions
+  src/
+    main.rs          # Rust entry point
+    lib.rs           # Plugin registration
+server.ts            # Kora sync server
+dev.ts               # Dev orchestrator (starts sync + Tauri together)
+kora.config.ts       # Kora configuration
+.github/workflows/
+  release-desktop.yml  # CI/CD for cross-platform builds
+```
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `pnpm dev` | Start sync server + Tauri app together |
+| `pnpm dev:app` | Start Tauri app only (no sync server) |
+| `pnpm dev:server` | Start sync server only |
+| `pnpm build` | Build desktop app for distribution |
+| `pnpm deploy:server` | Deploy sync server to the cloud |
+
+## Distributing to Organizations
+
+This app is designed to be distributed to multiple organizations. Each organization gets the **same binary** and connects to their own sync server.
+
+### 1. Deploy a sync server for each organization
+
+```bash
+pnpm deploy:server
+```
+
+Or deploy manually to any Node.js host. Each org gets their own server (or share one with multi-tenant scoping).
+
+### 2. Build the desktop binary
+
+```bash
+pnpm build
+```
+
+No need to bake in a sync URL — users configure it on first launch.
+
+If you want to pre-configure the URL (e.g., for a specific org):
+
+```bash
+VITE_SYNC_URL=wss://acme-corp.example.com/kora-sync pnpm build
+```
+
+### 3. Set up auto-updates
+
+1. Generate signing keys:
+   ```bash
+   pnpm tauri signer generate -w ~/.tauri/myapp.key
+   ```
+
+2. Add the public key to `src-tauri/tauri.conf.json` under `plugins.updater.pubkey`.
+
+3. Set the update endpoint:
+   ```json
+   "endpoints": ["https://github.com/YOUR_ORG/YOUR_REPO/releases/latest/download/latest.json"]
+   ```
+
+4. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to your GitHub repo secrets.
+
+5. Push a version tag to trigger a release:
+   ```bash
+   git tag v1.0.0 && git push origin v1.0.0
+   ```
+
+The GitHub Actions workflow builds for macOS, Windows, and Linux, creating a draft release with all installers.
+
+### 4. Distribute installers
+
+Built installers are in `src-tauri/target/release/bundle/`:
+
+| Platform | Output |
+|----------|--------|
+| macOS | `.dmg` and `.app` bundle |
+| Windows | `.msi` and `.exe` installer |
+| Linux | `.deb`, `.rpm`, `.AppImage` |
+
+Share these with your users. Installed apps auto-update when you push new releases.
+
+## First-Launch Experience
+
+When users install and open the app:
+
+1. **Setup screen** asks for the sync server URL
+2. User enters the URL provided by their organization admin
+3. App connects, verifies the server, and saves the URL locally
+4. On subsequent launches, the app connects automatically
+
+Users can also skip setup and use the app offline — they can connect later from the settings gear icon.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_SYNC_URL` | (none) | Pre-configure sync URL at build time |
+| `PORT` | `3001` | Sync server port |
+
+## Code Signing
+
+### macOS
+
+For distribution outside the Mac App Store, you need a Developer ID certificate from Apple:
+
+1. Enroll in the [Apple Developer Program](https://developer.apple.com/programs/)
+2. Create a "Developer ID Application" certificate
+3. Add the certificate and credentials to your GitHub secrets (see `.github/workflows/release-desktop.yml`)
+
+### Windows
+
+For SmartScreen trust, get an EV code signing certificate from a provider like DigiCert or Sectigo. Set the certificate in your CI environment.
+
+## Learn More
+
+- [Tauri Desktop Guide](https://ehoneahobed.github.io/kora/guide/tauri-desktop)
+- [Deployment Guide](https://ehoneahobed.github.io/kora/guide/deployment)
+- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration)
+- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design)

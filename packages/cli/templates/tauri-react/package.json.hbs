@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "dev": "tsx dev.ts",
+    "dev:app": "tauri dev",
     "dev:server": "tsx server.ts",
-    "start:server": "node --import tsx server.ts"
+    "build": "tauri build",
+    "start:server": "node --import tsx server.ts",
+    "deploy:server": "kora deploy"
   },
   "dependencies": {
     "korajs": "{{koraVersion}}",
@@ -15,11 +17,13 @@
     "@korajs/react": "{{koraVersion}}",
     "@korajs/tauri": "{{koraVersion}}",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-updater": "^2.0.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@korajs/cli": "{{koraVersion}}",
     "@korajs/server": "{{koraVersion}}",
     "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^19.0.0",

@@ -1,0 +1,107 @@
+# Build and release desktop binaries for macOS, Windows, and Linux.
+#
+# Trigger: Push a version tag (e.g., v1.0.0) or run manually.
+#
+# Prerequisites:
+#   1. Generate Tauri signing keys:
+#      pnpm tauri signer generate -w ~/.tauri/myapp.key
+#   2. Add secrets to your GitHub repo:
+#      - TAURI_SIGNING_PRIVATE_KEY: Contents of ~/.tauri/myapp.key
+#      - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: Password used during generation
+#   3. (Optional) For macOS notarization:
+#      - APPLE_CERTIFICATE: Base64-encoded .p12 certificate
+#      - APPLE_CERTIFICATE_PASSWORD: Certificate password
+#      - APPLE_SIGNING_IDENTITY: e.g., "Developer ID Application: Your Name (TEAM_ID)"
+#      - APPLE_ID: Apple ID email
+#      - APPLE_PASSWORD: App-specific password
+#      - APPLE_TEAM_ID: Your Apple Developer Team ID
+#
+# After the workflow runs, a GitHub Release is created with installers
+# for all platforms plus an update manifest (latest.json) for auto-updates.
+
+name: Release Desktop
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust_target: aarch64-apple-darwin
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            rust_target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ''
+            rust_target: ''
+          - platform: windows-latest
+            args: ''
+            rust_target: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing (optional)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name || github.event.inputs.tag }}
+          releaseName: '${{ github.ref_name || github.event.inputs.tag }}'
+          releaseBody: 'See the assets below to download and install.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

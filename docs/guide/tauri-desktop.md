@@ -37,20 +37,20 @@ Then:
 ```bash
 cd my-desktop-app
 pnpm install
-pnpm tauri dev
+pnpm dev
 ```
 
-This opens a native window with your Kora app running inside. The first build takes a few minutes while Rust compiles — subsequent builds are fast.
+This starts both the **sync server** and the **Tauri desktop app**. The first build takes a few minutes while Rust compiles — subsequent builds are fast.
+
+Once the native window opens, you have a working offline-first app with sync ready to go.
 
 ## Project Structure
-
-A Tauri project has the same structure as a web Kora project, plus a `src-tauri/` directory for the native shell:
 
 ```
 my-desktop-app/
   src/
     schema.ts          # Data schema (same as web)
-    main.tsx           # Kora app entry point
+    main.tsx           # Kora app entry (sync enabled)
     App.tsx            # React UI
   src-tauri/
     Cargo.toml         # Rust dependencies
@@ -60,7 +60,9 @@ my-desktop-app/
     src/
       main.rs          # Rust entry point
       lib.rs           # Plugin registration
-  server.ts            # Sync server (optional)
+  server.ts            # Sync server
+  dev.ts               # Dev orchestrator (starts sync + Tauri)
+  kora.config.ts       # Kora configuration
   package.json
   vite.config.ts
 ```
@@ -73,7 +75,7 @@ On the web, Kora runs SQLite compiled to WebAssembly inside a Web Worker. In a T
 
 - No WASM compilation overhead
 - No Web Worker communication latency
-- Direct filesystem access via OPFS or app data directories
+- Direct filesystem access via app data directories
 - Faster queries, especially for large datasets
 
 The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically — no configuration needed:
@@ -106,23 +108,41 @@ function TodoList() {
 }
 ```
 
-### Sync Server
+### Built-In Sync
 
-The Tauri template includes a `server.ts` for multi-device sync. Start it separately:
-
-```bash
-npx tsx server.ts
-```
-
-Then uncomment the sync configuration in `src/main.tsx`:
+The Tauri template comes with sync **enabled by default**. When you run `pnpm dev`, both the desktop app and a local sync server start together. The app connects to the server automatically.
 
 ```typescript
+// src/main.tsx — sync is configured out of the box
+const syncUrl = import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001/kora-sync'
+
 const app = createApp({
   schema,
-  sync: {
-    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001',
-  },
+  sync: { url: syncUrl },
 })
+
+app.ready.then(() => app.sync?.connect())
+```
+
+To test sync locally, open two instances of the app (run `pnpm dev:app` in a second terminal). Changes in one window appear in the other instantly.
+
+## Development
+
+### Single Command
+
+```bash
+pnpm dev
+```
+
+Starts both the sync server (port 3001) and the Tauri app together. This is the recommended way to develop.
+
+### Individual Commands
+
+If you need to start components separately:
+
+```bash
+pnpm dev:server    # Start sync server only
+pnpm dev:app       # Start Tauri app only
 ```
 
 ## Configuration
@@ -174,18 +194,203 @@ Tauri uses a capability system for security. The default capabilities in `src-ta
 
 `kora-sqlite:default` grants the Kora SQLite plugin permission to read and write the local database.
 
+## First-Launch Setup
+
+On first launch, the app shows a setup screen where users enter their sync server URL:
+
+1. **User enters the URL** provided by their organization admin (e.g., `wss://acme-corp.example.com/kora-sync`)
+2. **App tests the connection** and saves the URL locally
+3. **Subsequent launches** connect automatically — no repeated setup
+
+Users can also skip setup to use the app in local-only mode. They can connect later from the settings gear icon in the header.
+
+This means you can **distribute one binary to multiple organizations**. Each organization deploys their own sync server, and users configure it on first launch.
+
+### Pre-configuring the Sync URL
+
+If you're building for a specific organization, you can bake in the URL at build time:
+
+```bash
+VITE_SYNC_URL=wss://acme-corp.example.com/kora-sync pnpm build
+```
+
+When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects automatically.
+
+## Deploying for Multi-Device Sync
+
+A desktop app that syncs across devices needs two things:
+
+1. **A sync server** deployed to the internet
+2. **The desktop binary** distributed to users
+
+### Step 1: Deploy the sync server
+
+The sync server is a lightweight Node.js process. Deploy it the same way you'd deploy a web Kora app:
+
+```bash
+pnpm deploy:server
+```
+
+This runs `kora deploy`, which supports:
+
+| Platform | Command |
+|----------|---------|
+| Fly.io (recommended) | `kora deploy --platform=fly` |
+| Railway | `kora deploy --platform=railway` |
+| AWS Lightsail | `kora deploy --platform=aws-lightsail` |
+| AWS ECS Fargate | `kora deploy --platform=aws-ecs` |
+
+Follow the interactive prompts. When done, you'll get a URL like `https://my-app.fly.dev`.
+
+::: tip First time deploying?
+See the [Deployment Guide](/guide/deployment) for detailed step-by-step instructions, including how to install the Fly.io CLI and create an account.
+:::
+
+### Step 2: Build the desktop binary
+
+```bash
+pnpm build
+```
+
+Users configure the sync server on first launch — no need to bake in a URL. If you want to pre-configure it for a specific organization:
+
+```bash
+VITE_SYNC_URL=wss://my-app.fly.dev/kora-sync pnpm build
+```
+
+::: warning Use `wss://` (not `ws://`) for production
+Production servers should always use HTTPS/WSS. Fly.io, Railway, and AWS provide TLS automatically.
+:::
+
+### Step 3: Distribute the binary
+
+The built installers are in `src-tauri/target/release/bundle/`:
+
+| Platform | Output |
+|----------|--------|
+| macOS | `.dmg` and `.app` bundle |
+| Windows | `.msi` and `.exe` installer |
+| Linux | `.deb`, `.rpm`, `.AppImage` |
+
+Share these with your users. On first launch, each user enters the sync server URL provided by their admin.
+
+### Step 4: Verify sync works
+
+Install the app on two devices. Enter the same sync server URL on both. Create data on one device — it should appear on the other within a second or two. Data also works completely offline — changes sync when connectivity returns.
+
+### Managing the deployed server
+
+```bash
+pnpm deploy:server status     # Check health and URL
+pnpm deploy:server logs       # View server logs
+pnpm deploy:server rollback   # Revert to previous deploy
+```
+
+### Using PostgreSQL in production
+
+For production deployments, PostgreSQL is recommended over SQLite. Update your `server.ts`:
+
+```typescript
+import { createPostgresServerStore, createProductionServer } from '@korajs/server'
+
+const store = await createPostgresServerStore({
+  connectionString: process.env.DATABASE_URL,
+})
+
+const server = createProductionServer({
+  store,
+  port: Number(process.env.PORT) || 3001,
+  syncPath: '/kora-sync',
+})
+
+server.start()
+```
+
+Set `DATABASE_URL` in your deployment environment. Most cloud platforms (Neon, Supabase, Railway) provide managed PostgreSQL with a connection string.
+
+## Auto-Updates
+
+The template includes `tauri-plugin-updater` for automatic updates. When you release a new version, installed apps detect and install the update automatically.
+
+### Setup
+
+1. **Generate signing keys** (one-time):
+
+   ```bash
+   pnpm tauri signer generate -w ~/.tauri/myapp.key
+   ```
+
+2. **Add the public key** to `src-tauri/tauri.conf.json`:
+
+   ```json
+   "plugins": {
+     "updater": {
+       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ...",
+       "endpoints": [
+         "https://github.com/YOUR_ORG/YOUR_REPO/releases/latest/download/latest.json"
+       ]
+     }
+   }
+   ```
+
+3. **Add secrets** to your GitHub repo:
+   - `TAURI_SIGNING_PRIVATE_KEY` — contents of `~/.tauri/myapp.key`
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — password used during generation
+
+### Releasing
+
+Push a version tag to trigger the CI/CD workflow:
+
+```bash
+# Update version in src-tauri/tauri.conf.json and package.json
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The included GitHub Actions workflow (`.github/workflows/release-desktop.yml`) builds for macOS (ARM + Intel), Windows, and Linux, then creates a GitHub Release with all installers plus an `latest.json` update manifest.
+
+### How it works
+
+On each app launch, the updater checks the endpoint for a newer version. If found, it downloads and installs the update. The app restarts with the new version. If the network is unavailable, the check is silently skipped — the app works fully offline.
+
+## CI/CD for Desktop Releases
+
+The template includes a GitHub Actions workflow at `.github/workflows/release-desktop.yml` that automates cross-platform builds.
+
+### What it does
+
+1. Builds for macOS (aarch64 + x86_64), Windows, and Linux
+2. Signs the binaries (if signing secrets are configured)
+3. Creates a draft GitHub Release with all installers
+4. Generates the `latest.json` manifest for auto-updates
+
+### Code Signing
+
+For professional distribution, you'll want to sign your binaries:
+
+**macOS** — Requires an Apple Developer ID certificate ($99/year):
+- Prevents Gatekeeper from blocking your app
+- Required for notarization (recommended for all distributed macOS apps)
+- Add `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` to GitHub secrets
+
+**Windows** — An EV code signing certificate ($200-400/year from DigiCert, Sectigo, etc.):
+- Prevents SmartScreen warnings
+- Builds user trust
+
+Without code signing, users will see "unidentified developer" warnings. The app still works — users just have to click through the warning.
+
 ## Building for Distribution
 
 ### Development
 
 ```bash
-pnpm tauri dev
+pnpm dev
 ```
 
 ### Production Build
 
 ```bash
-pnpm tauri build
+pnpm build
 ```
 
 This produces platform-specific installers:
@@ -209,12 +414,14 @@ The built binaries are in `src-tauri/target/release/bundle/`.
 | Auto-updates | N/A | Tauri updater plugin |
 | File system access | Limited | Full (with permissions) |
 | System tray | No | Yes (Tauri plugin) |
+| Sync | Same | Same |
+| Deploy target | Web host + sync server | Binary distribution + sync server |
 
 ## Troubleshooting
 
 ### First build is slow
 
-The first `pnpm tauri dev` compiles the Rust backend, which takes 2-5 minutes. Subsequent builds only recompile changed code and are much faster.
+The first `pnpm dev` compiles the Rust backend, which takes 2-5 minutes. Subsequent builds only recompile changed code and are much faster.
 
 ### `tauri-plugin-kora` not found
 
@@ -223,6 +430,12 @@ Make sure you've run `pnpm install` — the Tauri plugin is referenced from `nod
 ### Window is blank
 
 Check that Vite is running on port 5173. Tauri's dev config expects the frontend at `http://localhost:5173`. If Vite uses a different port, update `devUrl` in `tauri.conf.json`.
+
+### Sync not connecting
+
+1. Make sure the sync server is running (`pnpm dev` starts it automatically)
+2. Check the console for connection errors
+3. Verify `VITE_SYNC_URL` in `.env` matches the sync server address
 
 ### Database location
 
@@ -235,6 +448,6 @@ In development, the database is stored in Tauri's app data directory:
 ## What's Next
 
 - [Schema Design](/guide/schema-design) — Field types and relations
-- [Sync Configuration](/guide/sync-configuration) — Connect desktop apps to a sync server
-- [Deployment](/guide/deployment) — Deploy the sync server
+- [Sync Configuration](/guide/sync-configuration) — Advanced sync options
+- [Deployment](/guide/deployment) — Full deployment guide with platform details
 - [Common Patterns](/guide/common-patterns) — Real-world patterns for offline-first apps
