@@ -1,5 +1,25 @@
 # @korajs/sync
 
+## 0.3.1
+
+### Patch Changes
+
+- fix(server): use BIGINT for PostgreSQL timestamp columns to prevent overflow
+
+  - **server**: Fixed critical bug where PostgreSQL `INTEGER` columns overflowed for millisecond timestamps (wall_time, received_at, last_seen_at). Now uses `BIGINT`.
+  - **server**: Added `/health` endpoint to production server.
+  - **auth**: Added `UserStore` interface with `createSqliteUserStore` and `createPostgresUserStore` factory functions.
+  - **core**: Added `sync:auth-failed` event for detecting stale auth tokens.
+  - **sync**: Sync engine now emits `sync:auth-failed` when the server rejects authentication.
+  - **cli**: Added AWS ECS Fargate and Lightsail Container deploy adapters.
+  - **cli**: Docker builds now use `--platform linux/amd64` for Apple Silicon compatibility.
+  - **cli**: Lightsail adapter forwards `DATABASE_URL`, `AUTH_SECRET`, `PUBLIC_URL` environment variables to containers.
+  - **cli**: Fixed trailing slash in Lightsail URLs causing double-slash in sync endpoint.
+
+- Updated dependencies
+  - @korajs/core@0.3.1
+  - @korajs/merge@0.3.1
+
 ## 0.3.0
 
 ### Patch Changes

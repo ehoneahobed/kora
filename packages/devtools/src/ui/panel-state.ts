@@ -197,6 +197,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `sync connected ${event.nodeId}`
 		case 'sync:disconnected':
 			return `sync disconnected`
+		case 'sync:auth-failed':
+			return `sync auth failed`
 		case 'sync:sent':
 			return `sync sent ${event.batchSize}`
 		case 'sync:received':

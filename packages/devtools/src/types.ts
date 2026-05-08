@@ -23,6 +23,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'constraint:violated': 'merge',
 	'sync:connected': 'sync',
 	'sync:disconnected': 'sync',
+	'sync:auth-failed': 'sync',
 	'sync:sent': 'sync',
 	'sync:received': 'sync',
 	'sync:acknowledged': 'sync',

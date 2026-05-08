@@ -1,5 +1,14 @@
 # @korajs/react
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies
+  - @korajs/core@0.3.1
+  - @korajs/sync@0.3.1
+  - @korajs/store@0.3.1
+
 ## 0.3.0
 
 ### Patch Changes

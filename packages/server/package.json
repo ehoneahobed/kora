@@ -1,6 +1,6 @@
 {
   "name": "@korajs/server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Kora.js self-hosted sync server",
   "type": "module",
   "main": "./dist/index.cjs",
