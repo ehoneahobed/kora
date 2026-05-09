@@ -28,6 +28,7 @@ export default defineConfig({
           { text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
           { text: 'Sync Configuration', link: '/guide/sync-configuration' },
           { text: 'Storage Configuration', link: '/guide/storage-configuration' },
+          { text: 'Backup and Restore', link: '/guide/backup-restore' },
           { text: 'Authentication', link: '/guide/authentication' },
           { text: 'State Machines', link: '/guide/state-machines' },
           { text: 'Sync Encryption', link: '/guide/sync-encryption' },

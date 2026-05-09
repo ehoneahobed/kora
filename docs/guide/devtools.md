@@ -25,7 +25,7 @@ pnpm --filter @korajs/devtools build
 
 ## Enabling DevTools
 
-DevTools connects to your Kora app when `devtools: true` is enabled and the extension is installed. Enable it in your app config:
+DevTools connects to your Kora app when `devtools: true` is enabled and the extension is installed. New projects created with `create-kora-app` enable this by default. In an existing app, enable it in your app config:
 
 ```typescript
 const app = createApp({
@@ -35,6 +35,10 @@ const app = createApp({
 ```
 
 When `devtools` is `true`, Kora emits instrumentation events that the DevTools extension consumes. In production builds, set this to `false` to eliminate the overhead.
+
+::: tip
+DevTools is for browser-based inspection. Desktop and mobile apps still emit the same Kora events, and React/Tauri templates enable instrumentation, but you inspect them through a Chromium WebView/dev build or by listening to `app.events` programmatically.
+:::
 
 ## Opening DevTools
 
@@ -174,15 +178,15 @@ Always disable DevTools in production builds for the cleanest performance.
 Kora DevTools consumes events emitted by the core instrumentation layer. You can also listen to these events programmatically:
 
 ```typescript
-app.on('operation:created', (event) => {
+app.events.on('operation:created', (event) => {
   console.log('New operation:', event.operation)
 })
 
-app.on('merge:conflict', (event) => {
+app.events.on('merge:conflict', (event) => {
   console.log('Conflict resolved:', event.trace)
 })
 
-app.on('sync:sent', (event) => {
+app.events.on('sync:sent', (event) => {
   console.log('Sent', event.operations.length, 'operations')
 })
 ```

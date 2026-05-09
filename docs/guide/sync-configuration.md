@@ -331,21 +331,30 @@ See the [Sync Encryption guide](/guide/sync-encryption) for setup details.
 The sync engine exposes real-time diagnostics for monitoring connection health:
 
 ```typescript
-const diagnostics = app.sync?.getDiagnostics()
+const diagnostics = app.sync?.exportDiagnostics()
 // {
-//   rttMs: 45,              // round-trip time in ms
-//   rttP95: 120,            // 95th percentile RTT
-//   effectiveBandwidth: 102400, // bytes per second
-//   operationsSent: 1547,
-//   operationsReceived: 2103,
-//   bytesSent: 245760,
-//   bytesReceived: 340992,
-//   connectionUptime: 3600000,
-//   reconnectCount: 2,
+//   state: 'streaming',
+//   status: { status: 'synced', pendingOperations: 0, ... },
+//   pendingOperations: 0,
+//   lastSyncedAt: 1715097600000,
+//   lastSuccessfulPush: 1715097600000,
+//   lastSuccessfulPull: 1715097600000,
+//   conflicts: 0,
+//   reconnecting: false,
 // }
 ```
 
-Diagnostics events are also emitted and visible in [DevTools](/guide/devtools).
+For lower-level observability, listen to diagnostics events:
+
+```typescript
+app.events.on('sync:diagnostics', (event) => {
+  console.log(event.diagnostics.quality)
+  console.log(event.diagnostics.rttP95Ms)
+  console.log(event.diagnostics.effectiveBandwidth)
+})
+```
+
+Diagnostics events are also visible in [DevTools](/guide/devtools).
 
 ## Manual Disconnect and Reconnect
 

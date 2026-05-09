@@ -295,6 +295,7 @@ See the [Deployment guide](/guide/deployment) for a full step-by-step walkthroug
 - [Sync Encryption](/guide/sync-encryption) — End-to-end encryption for sync
 - [Authentication](/guide/authentication) — Sessions, MFA, organizations, RBAC, and passkeys
 - [Storage Configuration](/guide/storage-configuration) — Client and server storage backends
+- [Backup and Restore](/guide/backup-restore) — Local app backups and sync server backups
 - [Testing](/guide/testing) — Test harness for offline-first apps
 - [Tauri Desktop Apps](/guide/tauri-desktop) — Build native desktop apps with native SQLite
 - [DevTools](/guide/devtools) — Debugging with the Kora browser extension
