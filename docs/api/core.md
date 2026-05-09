@@ -794,3 +794,624 @@ try {
   }
 }
 ```
+
+---
+
+## State Machine Constraints {#state-machine}
+
+State machine constraints enforce valid transitions on enum fields. When a state machine is declared on an enum field, mutations and merges verify that the field only moves along allowed transitions. This prevents invalid state changes such as moving an order directly from `'draft'` to `'shipped'`.
+
+```typescript
+import { validateTransition, buildStateMachineConstraints, getTransitionMap } from '@korajs/core'
+```
+
+### .transitions() on EnumFieldBuilder
+
+The `.transitions()` method is available on `t.enum()` fields. It accepts a map of source states to allowed target states and returns a new `EnumFieldBuilder` with the transition rules attached.
+
+```typescript
+t.enum(['draft', 'pending', 'confirmed', 'cancelled']).transitions({
+  draft: ['pending', 'cancelled'],
+  pending: ['confirmed', 'cancelled'],
+  confirmed: [],
+  cancelled: [],
+})
+```
+
+Both the source and target states in the map must be valid enum values. The method throws a `SchemaValidationError` if any state in the map is not one of the declared enum values.
+
+#### Full schema example
+
+```typescript
+import { defineSchema, t } from 'korajs'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    orders: {
+      fields: {
+        title: t.string(),
+        status: t.enum(['draft', 'submitted', 'approved', 'cancelled'])
+          .default('draft')
+          .transitions({
+            draft: ['submitted', 'cancelled'],
+            submitted: ['approved', 'cancelled'],
+            approved: [],
+            cancelled: [],
+          }),
+      },
+    },
+  },
+})
+```
+
+### validateTransition()
+
+Validates whether a transition from one state to another is allowed by a given state machine constraint.
+
+#### Signature
+
+```typescript
+function validateTransition(
+  constraint: StateMachineConstraint,
+  fromValue: unknown,
+  toValue: unknown
+): TransitionValidationResult
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `constraint` | `StateMachineConstraint` | The state machine constraint defining allowed transitions. |
+| `fromValue` | `unknown` | The current state value (before the transition). Coerced to string. |
+| `toValue` | `unknown` | The target state value (after the transition). Coerced to string. |
+
+#### Returns
+
+`TransitionValidationResult` -- An object describing whether the transition is valid, along with the source state, target state, field name, collection name, and the full list of allowed targets from the source state.
+
+#### Example
+
+```typescript
+import { validateTransition } from '@korajs/core'
+
+const constraint = {
+  field: 'status',
+  collection: 'orders',
+  transitions: {
+    draft: ['submitted', 'cancelled'],
+    submitted: ['approved'],
+    approved: [],
+    cancelled: [],
+  },
+}
+
+const result = validateTransition(constraint, 'draft', 'submitted')
+// { valid: true, from: 'draft', to: 'submitted', field: 'status',
+//   collection: 'orders', allowedTargets: ['submitted', 'cancelled'] }
+
+const invalid = validateTransition(constraint, 'draft', 'approved')
+// { valid: false, from: 'draft', to: 'approved', field: 'status',
+//   collection: 'orders', allowedTargets: ['submitted', 'cancelled'] }
+```
+
+### buildStateMachineConstraints()
+
+Extracts all state machine constraints from a schema definition. Scans every collection for enum fields that have transition rules declared via the `.transitions()` builder method.
+
+#### Signature
+
+```typescript
+function buildStateMachineConstraints(schema: SchemaDefinition): StateMachineConstraint[]
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
+
+#### Returns
+
+`StateMachineConstraint[]` -- An array of constraint objects, one per enum field with transitions declared. Returns an empty array if no fields have transitions.
+
+#### Example
+
+```typescript
+import { defineSchema, t, buildStateMachineConstraints } from '@korajs/core'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    orders: {
+      fields: {
+        status: t.enum(['draft', 'submitted']).transitions({
+          draft: ['submitted'],
+          submitted: [],
+        }),
+        title: t.string(),
+      },
+    },
+  },
+})
+
+const constraints = buildStateMachineConstraints(schema)
+// [{ field: 'status', collection: 'orders', transitions: { draft: ['submitted'], submitted: [] } }]
+```
+
+### getTransitionMap()
+
+Finds the transition map for a specific field in a specific collection, if one exists.
+
+#### Signature
+
+```typescript
+function getTransitionMap(
+  schema: SchemaDefinition,
+  collection: string,
+  field: string
+): TransitionMap | null
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
+| `collection` | `string` | The collection name to search. |
+| `field` | `string` | The field name to look up. |
+
+#### Returns
+
+`TransitionMap | null` -- The transition map if the field has transitions declared, or `null` if the collection does not exist, the field does not exist, the field is not an enum, or no transitions are declared.
+
+#### Example
+
+```typescript
+const transitions = getTransitionMap(schema, 'orders', 'status')
+// { draft: ['submitted'], submitted: [] }
+
+const none = getTransitionMap(schema, 'orders', 'title')
+// null (title is a string field, not an enum with transitions)
+```
+
+### validateStateMachineDefinition()
+
+Validates a state machine definition against a collection's fields during schema building. Called internally by `defineSchema()` to ensure the state machine is well-formed. You can also call it directly for custom validation logic.
+
+#### Signature
+
+```typescript
+function validateStateMachineDefinition(
+  collectionName: string,
+  sm: { field: string; transitions: Record<string, string[]>; onInvalidTransition: string },
+  fields: Record<string, FieldDescriptor>
+): void
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `collectionName` | `string` | Name of the collection (for error messages). |
+| `sm` | `object` | The state machine input definition with `field`, `transitions`, and `onInvalidTransition`. |
+| `fields` | `Record<string, FieldDescriptor>` | The built field descriptors for the collection. |
+
+#### Errors
+
+- Throws `SchemaValidationError` if the referenced field does not exist in the collection.
+- Throws `SchemaValidationError` if the referenced field is not an enum.
+- Throws `SchemaValidationError` if the enum field has no values defined.
+- Throws `SchemaValidationError` if a source or target state in the transition map is not a valid enum value.
+- Throws `SchemaValidationError` if `onInvalidTransition` is not `'reject'` or `'last-valid-state'`.
+
+### State machine types
+
+#### StateMachineConstraint
+
+A state machine constraint extracted from the schema. Used by merge and validation to enforce valid state transitions.
+
+```typescript
+interface StateMachineConstraint {
+  /** The enum field this constraint controls */
+  field: string
+  /** The collection this constraint applies to */
+  collection: string
+  /** Map of state to allowed next states */
+  transitions: TransitionMap
+}
+```
+
+#### TransitionMap
+
+Map of state names to allowed next states.
+
+```typescript
+type TransitionMap = Record<string, string[]>
+```
+
+#### TransitionValidationResult
+
+Result of validating a state transition.
+
+```typescript
+interface TransitionValidationResult {
+  /** Whether the transition is allowed */
+  valid: boolean
+  /** The source state */
+  from: string
+  /** The target state */
+  to: string
+  /** The field being transitioned */
+  field: string
+  /** The collection containing the field */
+  collection: string
+  /** All allowed target states from the source state */
+  allowedTargets: string[]
+}
+```
+
+#### StateMachineDefinition
+
+Defines a state machine on an enum field at the collection level, constraining valid state transitions. Used as the `stateMachine` property in a `CollectionDefinition`.
+
+```typescript
+interface StateMachineDefinition {
+  /** The enum field this state machine controls */
+  field: string
+  /** Map of state to allowed next states */
+  transitions: Record<string, string[]>
+  /** What to do when an invalid transition is attempted */
+  onInvalidTransition: 'reject' | 'last-valid-state'
+}
+```
+
+| `onInvalidTransition` value | Behavior |
+|------------------------------|----------|
+| `'reject'` | The mutation is rejected and an error is thrown. |
+| `'last-valid-state'` | The field retains its previous value instead of transitioning. |
+
+---
+
+## Migration Rollbacks {#migration-rollbacks}
+
+Migration rollbacks allow you to reverse schema migrations, either automatically (when the inverse is deterministic) or via explicit rollback steps. This builds on top of the `migrate()` / `MigrationBuilder` API documented [above](#migrations).
+
+```typescript
+import { canAutoRollback, generateRollbackSteps, createReversibleMigration } from '@korajs/core'
+```
+
+### canAutoRollback()
+
+Determines whether a single forward migration step can be automatically rolled back without explicit developer-provided down steps.
+
+#### Signature
+
+```typescript
+function canAutoRollback(step: MigrationStep): boolean
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `step` | `MigrationStep` | The forward migration step to check. |
+
+#### Returns
+
+`boolean` -- `true` if the step can be auto-rolled back, `false` if it requires an explicit `.down()` definition.
+
+#### Auto-rollback support by step type
+
+| Step type | Auto-rollback | Inverse operation |
+|-----------|---------------|-------------------|
+| `addField` | Yes | `removeField` (drops the added column) |
+| `addIndex` | Yes | `removeIndex` (drops the added index) |
+| `removeIndex` | Yes | `addIndex` (re-creates the index) |
+| `renameField` | Yes | `renameField` (swaps from/to names) |
+| `removeField` | No | Requires the field descriptor to re-create the column. Provide a `FieldBuilder` to `removeField()` or use `.down()`. |
+| `backfill` | No | Data transforms are not reversible. Provide a `reverseTransform` on the step or use `.down()`. |
+
+#### Example
+
+```typescript
+import { canAutoRollback } from '@korajs/core'
+
+canAutoRollback({ type: 'addField', collection: 'todos', field: 'priority', descriptor: /* ... */ })
+// true
+
+canAutoRollback({ type: 'backfill', collection: 'todos', transform: (r) => r })
+// false
+```
+
+### generateRollbackSteps()
+
+Generates rollback steps for a list of forward migration steps. Steps are reversed in order: the last forward step becomes the first rollback step.
+
+#### Signature
+
+```typescript
+function generateRollbackSteps(forwardSteps: readonly MigrationStep[]): MigrationStep[]
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `forwardSteps` | `readonly MigrationStep[]` | The forward migration steps to generate rollbacks for. |
+
+#### Returns
+
+`MigrationStep[]` -- Array of rollback steps in reverse execution order.
+
+#### Errors
+
+Throws `MigrationRollbackError` if any step cannot be auto-rolled back. Use `canAutoRollback()` to check before calling, or provide explicit down steps via the MigrationBuilder `.down()` API instead.
+
+#### Example
+
+```typescript
+import { migrate, generateRollbackSteps } from '@korajs/core'
+
+const migration = migrate()
+  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+  .addIndex('todos', 'priority')
+
+const rollbackSteps = generateRollbackSteps(migration.steps)
+// [
+//   { type: 'removeIndex', collection: 'todos', field: 'priority' },
+//   { type: 'removeField', collection: 'todos', field: 'priority' },
+// ]
+```
+
+### createReversibleMigration()
+
+Creates a `ReversibleMigration` from forward steps, optional explicit down steps, and version information. If explicit down steps are provided, they are used as-is. Otherwise, auto-generation is attempted via `generateRollbackSteps()`.
+
+#### Signature
+
+```typescript
+function createReversibleMigration(
+  upSteps: readonly MigrationStep[],
+  downSteps: readonly MigrationStep[] | null,
+  fromVersion: number,
+  toVersion: number
+): ReversibleMigration
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `upSteps` | `readonly MigrationStep[]` | The forward migration steps. |
+| `downSteps` | `readonly MigrationStep[] \| null` | Optional explicit rollback steps. Pass `null` to auto-generate. |
+| `fromVersion` | `number` | The schema version before the migration. |
+| `toVersion` | `number` | The schema version after the migration. |
+
+#### Returns
+
+`ReversibleMigration` -- A complete reversible migration with both `up` and `down` steps.
+
+#### Errors
+
+Throws `MigrationRollbackError` if `downSteps` is `null` and auto-generation fails for any step.
+
+#### Example
+
+```typescript
+import { migrate, createReversibleMigration, t } from '@korajs/core'
+
+const migration = migrate()
+  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+  .addIndex('todos', 'priority')
+
+// Auto-generated rollback
+const reversible = createReversibleMigration(migration.steps, null, 1, 2)
+console.log(reversible.fromVersion) // 1
+console.log(reversible.toVersion)   // 2
+console.log(reversible.down)
+// [
+//   { type: 'removeIndex', collection: 'todos', field: 'priority' },
+//   { type: 'removeField', collection: 'todos', field: 'priority' },
+// ]
+```
+
+### MigrationBuilder .down()
+
+The `.down()` method on `MigrationBuilder` lets you define explicit rollback steps. This is required when a migration contains steps that cannot be auto-rolled back (such as `removeField` without a descriptor, or `backfill` without a `reverseTransform`).
+
+#### Signature
+
+```typescript
+down(fn: (rollback: RollbackBuilder) => void): MigrationBuilder
+```
+
+The `RollbackBuilder` passed to the callback provides the same step methods as `MigrationBuilder`: `addField()`, `removeField()`, `renameField()`, `addIndex()`, `removeIndex()`, and `backfill()`.
+
+#### Example
+
+```typescript
+import { migrate, t } from '@korajs/core'
+
+const migration = migrate()
+  .removeField('todos', 'legacyFlag')
+  .backfill('todos', (record) => ({
+    priority: record.urgency === 'high' ? 'high' : 'medium',
+  }))
+  .down((rollback) => {
+    rollback
+      .addField('todos', 'legacyFlag', t.boolean().default(false))
+      .backfill('todos', (record) => ({
+        urgency: record.priority === 'high' ? 'high' : 'normal',
+      }))
+  })
+
+console.log(migration.safelyReversible) // true
+```
+
+### MigrationRollbackError
+
+Error thrown when a migration step cannot be automatically rolled back and no explicit down step has been provided. Extends `KoraError` with code `'MIGRATION_ROLLBACK'`.
+
+```typescript
+class MigrationRollbackError extends KoraError {
+  constructor(step: MigrationStep)
+}
+```
+
+The error message includes the step type and collection name, telling you exactly which step needs an explicit `.down()` definition.
+
+### ReversibleMigration
+
+A migration that includes both forward (up) and backward (down) steps, along with version metadata.
+
+```typescript
+interface ReversibleMigration {
+  readonly up: readonly MigrationStep[]
+  readonly down: readonly MigrationStep[]
+  readonly fromVersion: number
+  readonly toVersion: number
+}
+```
+
+---
+
+## Protobuf Code Generation {#proto-codegen}
+
+Generates Protocol Buffer definitions from a Kora schema. Useful for producing `.proto` files for external tooling, type-safe binary serialization, or runtime protobufjs usage without parsing `.proto` text.
+
+```typescript
+import { generateProtoDefinitions } from '@korajs/core'
+```
+
+### generateProtoDefinitions()
+
+Converts a validated schema into Protocol Buffer definitions. Produces three outputs: the `.proto` file text, a type map linking Kora field paths to protobuf types, and a JSON descriptor compatible with protobufjs `Root.fromJSON()`.
+
+#### Signature
+
+```typescript
+function generateProtoDefinitions(schema: SchemaDefinition): ProtoOutput
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema` | `SchemaDefinition` | A validated schema from `defineSchema()`. |
+
+#### Returns
+
+`ProtoOutput` -- An object containing:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `proto` | `string` | The generated `.proto` file content as a string (proto3 syntax). |
+| `typeMap` | `Map<string, string>` | Maps Kora field paths (`"collection.field"`) to protobuf type strings. |
+| `jsonDescriptor` | `Record<string, unknown>` | JSON descriptor for runtime protobufjs usage via `Root.fromJSON()`. |
+
+#### Generated messages
+
+The output includes the following protobuf messages:
+
+| Message | Description |
+|---------|-------------|
+| `{Collection}Record` | Per-collection record message (e.g., `TodosRecord` for a `todos` collection). Includes an `id` field and all schema-defined fields. |
+| `KoraOperation` | Wire format for individual operations in the sync protocol. |
+| `OperationBatch` | Batches operations for sync transfer with an `is_final` flag. |
+| `HandshakeMessage` | Initiates a sync session with version vector and schema version. |
+| `HandshakeResponse` | Server acknowledges with its own version vector. |
+| `Acknowledgment` | Confirms receipt of an operation batch. |
+
+#### Type mapping
+
+Kora field kinds are mapped to protobuf scalar types as follows:
+
+| Kora field kind | Protobuf type |
+|-----------------|---------------|
+| `string` | `string` |
+| `number` | `double` |
+| `boolean` | `bool` |
+| `timestamp` | `int64` |
+| `richtext` | `bytes` |
+| `enum` | Generated nested enum (e.g., `TodosRecordPriority`) |
+| `array` | `repeated` of the item's scalar type |
+
+Enum fields produce a nested protobuf enum inside the parent message. A sentinel `_UNSPECIFIED = 0` value is always added as the first entry, following proto3 conventions.
+
+Collection names are converted to PascalCase for message names (e.g., `todo_items` becomes `TodoItemsRecord`). Field names are converted to snake_case for protobuf field names (e.g., `dueDate` becomes `due_date`).
+
+#### Example
+
+```typescript
+import { defineSchema, t, generateProtoDefinitions } from '@korajs/core'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        priority: t.enum(['low', 'medium', 'high']).default('medium'),
+        tags: t.array(t.string()).default([]),
+      },
+    },
+  },
+})
+
+const { proto, typeMap, jsonDescriptor } = generateProtoDefinitions(schema)
+```
+
+The `proto` string for this schema produces:
+
+```protobuf
+syntax = "proto3";
+
+package kora;
+
+// Collection record messages
+
+message TodosRecord {
+  string id = 1;
+  string title = 2;
+  bool completed = 3;
+  TodosRecordPriority priority = 4;
+  repeated string tags = 5;
+
+  enum TodosRecordPriority {
+    TODOSRECORDPRIORITY_UNSPECIFIED = 0;
+    TODOSRECORDPRIORITY_LOW = 1;
+    TODOSRECORDPRIORITY_MEDIUM = 2;
+    TODOSRECORDPRIORITY_HIGH = 3;
+  }
+}
+
+// Sync protocol messages
+
+message KoraOperation { ... }
+message OperationBatch { ... }
+message HandshakeMessage { ... }
+message HandshakeResponse { ... }
+message Acknowledgment { ... }
+```
+
+The `typeMap` contains:
+
+```typescript
+typeMap.get('todos.id')        // 'string'
+typeMap.get('todos.title')     // 'string'
+typeMap.get('todos.completed') // 'bool'
+typeMap.get('todos.priority')  // 'TodosRecordPriority'
+typeMap.get('todos.tags')      // 'repeated string'
+```
+
+The `jsonDescriptor` can be loaded directly with protobufjs for runtime encoding and decoding:
+
+```typescript
+import protobuf from 'protobufjs'
+
+const root = protobuf.Root.fromJSON(jsonDescriptor)
+const TodosRecord = root.lookupType('kora.TodosRecord')
+```

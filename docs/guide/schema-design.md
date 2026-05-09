@@ -212,6 +212,44 @@ const todosWithProject = await app.todos
 // Each todo now has a `project` property with the related record
 ```
 
+## State Machine Fields
+
+Enum fields can be turned into state machines by declaring allowed transitions. This constrains which state changes are valid, both for local mutations and during merge conflict resolution.
+
+```typescript
+status: t.enum(['draft', 'submitted', 'approved', 'shipped', 'cancelled'])
+  .default('draft')
+  .transitions({
+    draft: ['submitted', 'cancelled'],
+    submitted: ['approved', 'cancelled'],
+    approved: ['shipped', 'cancelled'],
+    shipped: [],       // terminal state
+    cancelled: [],     // terminal state
+  })
+```
+
+When a state machine is defined:
+
+- **Local mutations** are validated: attempting `draft → shipped` throws `InvalidStateTransitionError`
+- **Merge conflicts** are resolved intelligently: valid transitions beat invalid ones, and both-valid conflicts use LWW
+- **`onInvalidTransition`** controls behavior: `'reject'` (default) throws an error, `'last-valid-state'` silently keeps the current state
+
+See the [State Machines guide](/guide/state-machines) for full details.
+
+## Merge Strategies
+
+You can override the default merge behavior for any field using `.merge()`:
+
+```typescript
+fields: {
+  quantity: t.number().merge('counter'),       // additive merge
+  highScore: t.number().merge('max'),          // keep maximum
+  auditLog: t.array(t.string()).merge('append-only'), // no removals
+}
+```
+
+See [Conflict Resolution](/guide/conflict-resolution#schema-level-merge-strategies) for all available strategies.
+
 ## Schema Versioning
 
 Every schema has a `version` number. When you change your schema, increment the version:
@@ -252,6 +290,51 @@ Generated migration: kora/migrations/002-add-priority.ts
 ```
 
 Kora tracks the schema version on every operation. When syncing with clients on different schema versions, operations are transformed to maintain compatibility.
+
+### Programmatic Migrations
+
+You can define migrations in code using the `MigrationBuilder`:
+
+```typescript
+import { defineSchema, t, migrate } from 'korajs'
+
+export default defineSchema({
+  version: 2,
+  collections: { /* ... */ },
+  migrations: {
+    2: migrate()
+      .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+      .addIndex('todos', 'priority')
+      .backfill('todos', (record) => ({
+        ...record,
+        priority: record.urgent ? 'high' : 'medium',
+      })),
+  },
+})
+```
+
+### Migration Rollbacks
+
+Kora can auto-generate rollback steps for most migration operations:
+
+| Forward Step | Auto-Rollback |
+|-------------|---------------|
+| `addField` | `removeField` |
+| `addIndex` | `removeIndex` |
+| `removeIndex` | `addIndex` |
+| `renameField` | `renameField` (swapped) |
+| `removeField` | Requires explicit `.down()` |
+| `backfill` | Requires explicit `.down()` |
+
+For steps that cannot be auto-reversed, provide an explicit rollback:
+
+```typescript
+migrate()
+  .removeField('todos', 'legacyNotes')
+  .down((rollback) =>
+    rollback.addField('todos', 'legacyNotes', t.string().optional())
+  )
+```
 
 ### Migration Safety
 

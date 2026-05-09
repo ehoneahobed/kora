@@ -365,3 +365,64 @@ function TodoList() {
 ```
 
 Every piece of this example works offline. Data loads instantly, mutations are optimistic, and sync happens automatically in the background.
+
+## Presence Hooks
+
+For collaborative features, Kora provides hooks that share ephemeral user state (presence) across connected clients.
+
+### `usePresence(user)`
+
+Broadcasts the current user's presence to all connected clients. Cleans up automatically on unmount.
+
+```tsx
+import { usePresence } from '@korajs/react'
+
+function Editor() {
+  usePresence({
+    name: 'Alice',
+    color: '#e91e63',
+    avatar: 'https://example.com/alice.png',  // optional
+  })
+
+  return <div>...</div>
+}
+```
+
+Pass `null` to clear presence (e.g., when the user is idle).
+
+### `useCollaborators()`
+
+Returns a reactive list of all connected collaborators and their presence state:
+
+```tsx
+import { useCollaborators } from '@korajs/react'
+
+function ActiveUsers() {
+  const collaborators = useCollaborators()
+
+  return (
+    <div className="avatars">
+      {collaborators.map((c) => (
+        <span
+          key={c.clientId}
+          style={{ borderColor: c.user.color }}
+          title={c.user.name}
+        >
+          {c.user.name[0]}
+        </span>
+      ))}
+    </div>
+  )
+}
+```
+
+Each collaborator includes:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `clientId` | `number` | Unique identifier for the connection |
+| `user` | `AwarenessUser` | Name, color, avatar |
+| `cursor` | `CursorInfo \| undefined` | Cursor position (if set) |
+| `lastSeen` | `number` | Timestamp of last update |
+
+See the [Presence guide](/guide/presence) for a full walkthrough.

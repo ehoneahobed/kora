@@ -302,6 +302,51 @@ const scopes = await scopeResolver.resolve(userId, orgId, ['todos', 'projects'])
 
 See the [Authentication Guide](/guide/authentication) for the full RBAC setup.
 
+## End-to-End Encryption
+
+Kora supports encrypting operation data before it leaves the device. When enabled, the server only sees encrypted payloads -- it cannot read your users' data.
+
+```typescript
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora',
+    encryption: {
+      enabled: true,
+      key: userPassphrase,  // or a key provider function
+    },
+  },
+})
+```
+
+- Uses AES-256-GCM with PBKDF2 key derivation (600,000 iterations)
+- Operation metadata (timestamps, IDs) remains unencrypted for sync protocol
+- Operation data (field values) is encrypted end-to-end
+- Supports key rotation with versioned keys
+
+See the [Sync Encryption guide](/guide/sync-encryption) for setup details.
+
+## Sync Diagnostics
+
+The sync engine exposes real-time diagnostics for monitoring connection health:
+
+```typescript
+const diagnostics = app.sync?.getDiagnostics()
+// {
+//   rttMs: 45,              // round-trip time in ms
+//   rttP95: 120,            // 95th percentile RTT
+//   effectiveBandwidth: 102400, // bytes per second
+//   operationsSent: 1547,
+//   operationsReceived: 2103,
+//   bytesSent: 245760,
+//   bytesReceived: 340992,
+//   connectionUptime: 3600000,
+//   reconnectCount: 2,
+// }
+```
+
+Diagnostics events are also emitted and visible in [DevTools](/guide/devtools).
+
 ## Manual Disconnect and Reconnect
 
 ```typescript

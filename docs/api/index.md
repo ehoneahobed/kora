@@ -25,9 +25,11 @@ kora                        Meta-package (re-exports core, store, merge, sync)
   @korajs/sync                Sync protocol and transports
 @korajs/server                Self-hosted sync server
 @korajs/auth                  Authentication, sessions, MFA, RBAC
-@korajs/react                 React hooks and bindings
+@korajs/react                 React hooks and bindings (incl. presence)
 @korajs/devtools              Browser DevTools extension
-@korajs/cli                   CLI tooling and scaffolding
+@korajs/test                  Testing harness for offline-first apps
+@korajs/tauri                 Native SQLite for Tauri desktop apps
+@korajs/cli                   CLI tooling, scaffolding, and deployment
 ```
 
 ## Dependency graph
@@ -47,15 +49,16 @@ kora                        Meta-package (re-exports core, store, merge, sync)
 
 | Page | Contents |
 |------|----------|
-| [Core](/api/core) | `defineSchema`, `t` type builders, `HybridLogicalClock`, `Operation`, `HLCTimestamp`, `MergeTrace`, `KoraError` |
-| [Store](/api/store) | Collection methods (`insert`, `update`, `delete`, `where`, `subscribe`), `StorageAdapter` interface, query builder |
-| [Merge](/api/merge) | `MergeEngine`, strategies (`lastWriteWins`, `addWinsSet`, `mergeRichtext`), constraint checking |
-| [Sync](/api/sync) | `SyncEngine`, transports (WebSocket, HTTP, Chaos), protocol messages, `OutboundQueue` |
-| [Server](/api/server) | `createKoraServer`, server stores (Memory, Postgres, SQLite), auth providers, transports |
+| [Core](/api/core) | `defineSchema`, `t` type builders, `HybridLogicalClock`, `Operation`, state machines, migration rollbacks, protobuf codegen |
+| [Store](/api/store) | Collection methods (`insert`, `update`, `delete`, `where`, `subscribe`), state machine validation, bloom filter subscriptions |
+| [Merge](/api/merge) | `MergeEngine`, strategies, constraint checking, referential integrity, state machine merge resolution |
+| [Sync](/api/sync) | `SyncEngine`, transports, E2E encryption, diagnostics/metrics, awareness/presence, scope filtering |
+| [Server](/api/server) | `createKoraServer`, server stores (Memory, Postgres, SQLite), auth providers, awareness relay |
 | [Auth](/api/auth) | `AuthClient`, `BuiltInAuthRoutes`, `TokenManager`, sessions, MFA, orgs, RBAC, passkeys |
-| [React](/api/react) | `KoraProvider`, `useQuery`, `useMutation`, `useSyncStatus`, `useCollection`, `useRichText` |
+| [React](/api/react) | `KoraProvider`, `useQuery`, `useMutation`, `useSyncStatus`, `usePresence`, `useCollaborators`, `useRichText` |
 | [DevTools](/api/devtools) | `Instrumenter`, `EventBuffer`, `MessageBridge`, filtering, panel state |
-| [CLI](/api/cli) | `kora create`, `kora dev`, `kora migrate`, `kora generate` |
+| [Test](/api/test) | `createTestNetwork`, `TestDevice`, `TestServer`, `expectConverged`, `ChaosTransport` |
+| [CLI](/api/cli) | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
 
 ## Imports
 

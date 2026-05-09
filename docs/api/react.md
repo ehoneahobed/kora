@@ -10,6 +10,8 @@ import {
   useSyncStatus,
   useCollection,
   useRichText,
+  usePresence,
+  useCollaborators,
 } from '@korajs/react'
 ```
 
@@ -403,6 +405,185 @@ function NoteEditor({ noteId }: { noteId: string }) {
 - Changes to the Yjs document are automatically persisted and synced.
 - When multiple devices edit the same rich text field concurrently, Yjs handles character-level merging automatically.
 - The hook cleans up the Yjs binding on unmount.
+
+---
+
+## usePresence()
+
+Sets the local user's collaborative presence state. When this hook is active, other connected clients will see this user's presence information (name, color, and optional avatar). Presence is ephemeral -- it is not persisted, only shared with currently connected peers.
+
+Automatically clears presence on unmount.
+
+### Signature
+
+```typescript
+function usePresence(
+  user: { name: string; color: string; avatar?: string } | null,
+): void
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `user` | `{ name: string; color: string; avatar?: string } \| null` | User identity for presence display. Pass `null` to clear presence. |
+
+| User Property | Type | Required | Description |
+|---------------|------|----------|-------------|
+| `name` | `string` | Yes | Display name shown to other collaborators. |
+| `color` | `string` | Yes | Hex color for cursor/avatar rendering (e.g., `'#e91e63'`). |
+| `avatar` | `string` | No | URL to an avatar image. |
+
+### Example
+
+```tsx
+import { usePresence } from '@korajs/react'
+
+function Editor({ currentUser }: { currentUser: { name: string; color: string } }) {
+  // Set presence when this component mounts, clear on unmount
+  usePresence({ name: currentUser.name, color: currentUser.color })
+
+  return <div>Editing document...</div>
+}
+```
+
+### Conditional presence
+
+Pass `null` to disable presence broadcasting without unmounting the component:
+
+```tsx
+function CollaborativeEditor({ user, isActive }: { user: User; isActive: boolean }) {
+  usePresence(isActive ? { name: user.name, color: user.color } : null)
+
+  return <div>...</div>
+}
+```
+
+### Behavior
+
+- Requires a sync engine to be configured (via `sync.url` in `createApp`). If no sync engine is available, the hook is a no-op.
+- Presence state is set on the sync engine's `AwarenessManager`, which broadcasts it to all connected peers.
+- Presence is automatically cleared when the component unmounts.
+- Changing the `user` properties causes the presence state to be updated.
+
+---
+
+## useCollaborators()
+
+Returns all currently connected collaborators' awareness states. Excludes the local user -- only returns remote peers. Re-renders only when the set of collaborators or their states change.
+
+### Signature
+
+```typescript
+function useCollaborators(): AwarenessState[]
+```
+
+### Returns
+
+`AwarenessState[]` -- An array of awareness states for all connected remote users. Returns an empty array if no peers are connected or sync is not configured.
+
+#### AwarenessState
+
+```typescript
+interface AwarenessState {
+  /** User identity information */
+  user: {
+    /** Display name */
+    name: string
+    /** Hex color for cursor/selection rendering */
+    color: string
+    /** Optional avatar URL */
+    avatar?: string
+  }
+
+  /** Current cursor position, if any */
+  cursor?: {
+    /** Collection containing the record being edited */
+    collection: string
+    /** ID of the record being edited */
+    recordId: string
+    /** Field name of the richtext field */
+    field: string
+    /** Cursor anchor position (start of selection) */
+    anchor: number
+    /** Cursor head position (end of selection) */
+    head: number
+  }
+}
+```
+
+### Example
+
+```tsx
+import { useCollaborators } from '@korajs/react'
+
+function CollaboratorList() {
+  const collaborators = useCollaborators()
+
+  if (collaborators.length === 0) {
+    return <span>No one else is here</span>
+  }
+
+  return (
+    <div className="collaborators">
+      {collaborators.map((c) => (
+        <span
+          key={c.user.name}
+          className="collaborator-badge"
+          style={{ backgroundColor: c.user.color }}
+          title={c.user.name}
+        >
+          {c.user.avatar ? (
+            <img src={c.user.avatar} alt={c.user.name} />
+          ) : (
+            c.user.name[0]
+          )}
+        </span>
+      ))}
+    </div>
+  )
+}
+```
+
+### Combined presence and collaborators
+
+A typical pattern uses both hooks together:
+
+```tsx
+import { usePresence, useCollaborators } from '@korajs/react'
+
+function CollaborativeDocument({ currentUser }: { currentUser: User }) {
+  // Announce our presence
+  usePresence({ name: currentUser.name, color: currentUser.color })
+
+  // See who else is here
+  const collaborators = useCollaborators()
+
+  return (
+    <div>
+      <header>
+        <span>{collaborators.length} other editor{collaborators.length !== 1 ? 's' : ''} online</span>
+        <div className="avatars">
+          {collaborators.map((c) => (
+            <span key={c.user.name} style={{ color: c.user.color }}>
+              {c.user.name}
+            </span>
+          ))}
+        </div>
+      </header>
+      <Editor />
+    </div>
+  )
+}
+```
+
+### Behavior
+
+- Uses `useSyncExternalStore` internally for concurrent-mode safety (no tearing).
+- Only re-renders when the collaborator list actually changes (deep comparison via JSON serialization).
+- Returns an empty array if the sync engine is not configured or not connected.
+- Automatically subscribes to the sync engine's `AwarenessManager` on mount and unsubscribes on unmount.
+- Works correctly with React.StrictMode (double-mount safe).
 
 ---
 

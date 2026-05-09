@@ -320,6 +320,83 @@ resolve: {
 }
 ```
 
+## State Machine Constraints
+
+Enum fields with declared transitions act as state machines. The merge engine enforces valid transitions even during concurrent modifications.
+
+### Defining a State Machine
+
+```typescript
+export default defineSchema({
+  version: 1,
+  collections: {
+    orders: {
+      fields: {
+        status: t.enum(['draft', 'submitted', 'approved', 'shipped', 'delivered', 'cancelled'])
+          .default('draft')
+          .transitions({
+            draft: ['submitted', 'cancelled'],
+            submitted: ['approved', 'cancelled'],
+            approved: ['shipped', 'cancelled'],
+            shipped: ['delivered'],
+            delivered: [],
+            cancelled: [],
+          }),
+      },
+    },
+  },
+})
+```
+
+### How Concurrent State Transitions Merge
+
+When two devices concurrently change a state machine field from the same base state, the merge engine applies these rules:
+
+| Scenario | Result |
+|----------|--------|
+| Both transitions valid | LWW (later HLC timestamp wins) |
+| One valid, one invalid | The valid transition wins (regardless of timestamp) |
+| Both transitions invalid | Base state is kept, constraint violation emitted |
+| Only one side changed | The change is applied if the transition is valid |
+
+```
+Base state:    "submitted"
+Device A:      "approved"     (valid: submitted → approved)
+Device B:      "cancelled"    (valid: submitted → cancelled)
+
+Both valid → LWW decides. If A has later timestamp:
+Merged:        "approved"
+```
+
+```
+Base state:    "submitted"
+Device A:      "approved"     (valid: submitted → approved)
+Device B:      "delivered"    (INVALID: submitted → delivered)
+
+One valid, one invalid → valid wins:
+Merged:        "approved"
+```
+
+See the [State Machines guide](/guide/state-machines) for more details.
+
+## Referential Integrity During Merge
+
+When relations are defined in your schema, the merge engine enforces referential integrity during concurrent operations. A common conflict pattern is a concurrent delete and insert:
+
+```
+Device A: Deletes project "proj-1"
+Device B: Inserts todo with projectId = "proj-1"
+```
+
+The resolution depends on the relation's `onDelete` policy:
+
+| `onDelete` | Behavior |
+|------------|----------|
+| `'cascade'` | The insert is rejected (child follows parent deletion) |
+| `'set-null'` | The insert succeeds but `projectId` is set to `null` |
+| `'restrict'` | The delete is rejected (child record prevents parent deletion) |
+| `'no-action'` | Both operations apply (orphan record allowed) |
+
 ## Merge Determinism
 
 A critical property of Kora's merge engine: **given the same set of operations, every device produces the identical merged state.** This is guaranteed by:

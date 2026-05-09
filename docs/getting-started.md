@@ -231,13 +231,17 @@ See the [Deployment guide](/guide/deployment) for a full step-by-step walkthroug
 ## What's Next
 
 - [Deployment](/guide/deployment) — Deploy your app to Fly.io or Railway in 10 minutes
-- [Schema Design](/guide/schema-design) — Field types, relations, and versioning
+- [Schema Design](/guide/schema-design) — Field types, relations, state machines, and versioning
+- [State Machines](/guide/state-machines) — Constrained enum transitions for workflows
 - [Offline Patterns](/guide/offline-patterns) — Building UIs that embrace offline-first
 - [Conflict Resolution](/guide/conflict-resolution) — How Kora handles concurrent edits
 - [React Hooks](/guide/react-hooks) — Full reference for all React bindings
-- [Sync Configuration](/guide/sync-configuration) — Transports, reconnection, and runtime sync behavior
+- [Presence & Awareness](/guide/presence) — Real-time collaborative presence
+- [Sync Configuration](/guide/sync-configuration) — Transports, encryption, diagnostics, and reconnection
+- [Sync Encryption](/guide/sync-encryption) — End-to-end encryption for sync
 - [Authentication](/guide/authentication) — Sessions, MFA, organizations, RBAC, and passkeys
 - [Storage Configuration](/guide/storage-configuration) — Client and server storage backends
+- [Testing](/guide/testing) — Test harness for offline-first apps
 - [Tauri Desktop Apps](/guide/tauri-desktop) — Build native desktop apps with native SQLite
 - [DevTools](/guide/devtools) — Debugging with the Kora browser extension
 - [API Reference](/api/) — Complete reference for all packages

@@ -441,6 +441,196 @@ await app.sequences.reset('order', { to: 100 })  // Next .next() returns 'order-
 
 ---
 
+## State Machine Validation
+
+The store validates state machine transitions during local mutations, preventing invalid transitions before operations are created. State machines are defined in the schema with a set of allowed transitions between states.
+
+### validateStateTransition(collectionName, recordId, stateMachine, currentState, newState)
+
+Validates whether a state transition is allowed by the state machine definition. Called during update operations to enforce transition rules.
+
+```typescript
+function validateStateTransition(
+  collectionName: string,
+  recordId: string,
+  stateMachine: StateMachineDefinition,
+  currentState: string | null,
+  newState: string,
+): { valid: boolean; allowedStates: string[] }
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `collectionName` | `string` | Name of the collection (for error messages). |
+| `recordId` | `string` | The record being mutated (for error messages). |
+| `stateMachine` | `StateMachineDefinition` | The state machine definition with transitions and `onInvalidTransition` policy. |
+| `currentState` | `string \| null` | The current state field value. `null` for inserts. |
+| `newState` | `string` | The new state value being set. |
+
+**Returns:** `{ valid: boolean; allowedStates: string[] }` -- Whether the transition is valid, plus the list of allowed target states from the current state.
+
+**Behavior:**
+
+| Scenario | Result |
+|----------|--------|
+| Insert (`currentState` is `null`) | Always valid. Schema validation ensures the value is a valid enum. |
+| Same-state transition | Always valid (idempotent). |
+| Valid transition | Returns `{ valid: true }` with allowed states. |
+| Invalid transition, mode `'reject'` | Throws `InvalidStateTransitionError`. |
+| Invalid transition, mode `'last-valid-state'` | Returns `{ valid: false }` so the caller can suppress the field update. |
+
+```typescript
+import { validateStateTransition } from '@korajs/store'
+
+const result = validateStateTransition(
+  'orders',
+  'order-123',
+  {
+    field: 'status',
+    onInvalidTransition: 'reject',
+    transitions: {
+      pending: ['shipped', 'cancelled'],
+      shipped: ['delivered'],
+      cancelled: [],
+      delivered: [],
+    },
+  },
+  'pending',
+  'shipped',
+)
+// result.valid === true
+// result.allowedStates === ['shipped', 'cancelled']
+```
+
+### validateUpdateStateMachine(collectionName, recordId, collectionDef, currentRecord, updateData)
+
+Higher-level validation that checks whether an update data object contains a change to the state machine field, and if so, validates the transition. This is the function called internally by the store during `.update()` operations.
+
+```typescript
+function validateUpdateStateMachine(
+  collectionName: string,
+  recordId: string,
+  collectionDef: CollectionDefinition,
+  currentRecord: Record<string, unknown>,
+  updateData: Record<string, unknown>,
+): Record<string, unknown>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `collectionName` | `string` | Name of the collection. |
+| `recordId` | `string` | The record being updated. |
+| `collectionDef` | `CollectionDefinition` | The collection definition from the schema. |
+| `currentRecord` | `Record<string, unknown>` | The current record data (must include the state field). |
+| `updateData` | `Record<string, unknown>` | The partial update data. |
+
+**Returns:** `Record<string, unknown>` -- The update data, potentially with the state field removed if the transition is invalid and the mode is `'last-valid-state'`.
+
+**Behavior:**
+
+- If the collection has no state machine, returns `updateData` unchanged.
+- If the state field is not in the update data, returns `updateData` unchanged.
+- If the transition is valid, returns `updateData` unchanged.
+- If the transition is invalid and mode is `'reject'`, throws `InvalidStateTransitionError`.
+- If the transition is invalid and mode is `'last-valid-state'`, returns a copy of `updateData` with the state field removed (silently suppresses the invalid change).
+
+```typescript
+import { validateUpdateStateMachine } from '@korajs/store'
+
+const filteredData = validateUpdateStateMachine(
+  'orders',
+  'order-123',
+  schema.collections.orders,
+  { id: 'order-123', status: 'delivered', total: 99 },
+  { status: 'pending', total: 150 },  // 'delivered' -> 'pending' is invalid
+)
+// With 'last-valid-state' mode: filteredData === { total: 150 }
+// (status change silently removed; total update preserved)
+```
+
+### InvalidStateTransitionError
+
+Error thrown when a local mutation attempts an invalid state transition (when the state machine's `onInvalidTransition` mode is `'reject'`). Extends `KoraError` with full context for debugging.
+
+```typescript
+class InvalidStateTransitionError extends KoraError {
+  readonly collection: string
+  readonly recordId: string
+  readonly field: string
+  readonly fromState: string
+  readonly toState: string
+  readonly allowedStates: string[]
+}
+```
+
+The error message includes the collection, field, current state, attempted state, and allowed transitions:
+
+```
+Invalid state transition in collection "orders": cannot transition field "status"
+from "delivered" to "pending". Allowed transitions from "delivered": (none -- terminal state)
+```
+
+The error code is `'INVALID_STATE_TRANSITION'`.
+
+---
+
+## Subscription Bloom Filter
+
+The `SubscriptionBloomFilter` is an internal optimization used by the `SubscriptionManager` to reduce the cost of checking which subscriptions are affected by a mutation. It is mostly transparent to application developers, but understanding it can help when reasoning about performance characteristics.
+
+### How it works
+
+When the store has many active subscriptions (e.g., 1,000+), every mutation must check whether each subscription's result set might have changed. The bloom filter provides a fast O(k) pre-check:
+
+- If the filter returns `false` for a collection/field combination, the subscription is **definitely not affected** and can be skipped entirely.
+- If the filter returns `true`, the subscription **might be affected** and requires the full precise check.
+
+This reduces the per-mutation subscription check cost from O(n) to approximately O(1) for unrelated mutations, where n is the number of active subscriptions.
+
+### SubscriptionBloomFilter
+
+```typescript
+class SubscriptionBloomFilter {
+  constructor(expectedItems: number, falsePositiveRate?: number)
+
+  /** Add a collection (and optional field) to the filter */
+  add(collection: string, field?: string): void
+
+  /** Check if a collection (and optional field) might be in the filter */
+  mightContain(collection: string, field?: string): boolean
+
+  /** Reset the filter, clearing all bits */
+  clear(): void
+
+  /** Estimate the current false positive rate */
+  estimatedFalsePositiveRate(): number
+}
+```
+
+| Constructor Parameter | Type | Default | Description |
+|-----------------------|------|---------|-------------|
+| `expectedItems` | `number` | -- | Expected number of subscription keys. |
+| `falsePositiveRate` | `number` | `0.01` | Desired false positive rate (0 to 1). |
+
+The filter uses FNV-1a hashing with Kirsch-Mitzenmacker double hashing to derive multiple hash functions from two base hashes. Bit count and hash count are computed optimally based on the expected items and desired false positive rate.
+
+```typescript
+const filter = new SubscriptionBloomFilter(100, 0.01)
+filter.add('todos')
+filter.add('todos', 'completed')
+
+filter.mightContain('todos')              // true (definitely added)
+filter.mightContain('projects')           // false (definitely not added)
+filter.mightContain('todos', 'completed') // true (definitely added)
+filter.mightContain('todos', 'title')     // false (probably not added)
+```
+
+::: tip
+You do not need to interact with the bloom filter directly. The `SubscriptionManager` creates and manages it automatically. It activates when the number of subscriptions exceeds the threshold where bloom filter pre-checking provides a performance benefit.
+:::
+
+---
+
 ## StorageAdapter
 
 The `StorageAdapter` interface defines the contract for storage backends. Kora ships with three implementations. You do not typically implement this yourself unless building a custom storage backend.

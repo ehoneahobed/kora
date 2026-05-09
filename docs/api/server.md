@@ -18,6 +18,7 @@ import {
   TokenAuthProvider,
   MixedAuthProvider,
   KoraAuthProvider,
+  AwarenessRelay,
 } from '@korajs/server'
 ```
 
@@ -314,3 +315,26 @@ The return type from `authenticate()`:
 | `metadata` | `Record<string, unknown>` | No | Arbitrary metadata (device info, email, etc.) |
 
 When `scopes` is provided, the server only sends/accepts operations matching the scope filters. For example, `{ todos: { userId: 'user-1' } }` means the user only syncs todos where `userId` equals `'user-1'`.
+
+## Awareness Relay
+
+`AwarenessRelay` broadcasts ephemeral presence/awareness state between connected clients. It does not persist any data -- awareness is purely real-time.
+
+### `AwarenessRelay`
+
+```typescript
+import { AwarenessRelay } from '@korajs/server'
+
+const relay = new AwarenessRelay()
+```
+
+The `KoraSyncServer` integrates the awareness relay automatically. When a client sends an awareness update, the server relays it to all other connected clients.
+
+| Method | Description |
+|--------|-------------|
+| `addClient(clientId, send)` | Register a client connection for awareness broadcasts |
+| `removeClient(clientId)` | Remove a client and broadcast their departure |
+| `handleUpdate(clientId, state)` | Process an awareness state update from a client |
+| `getStates()` | Get all current awareness states |
+
+Awareness messages are lightweight and bypass the operation log -- they are not persisted, not synced on reconnect, and do not affect the operation DAG. See the [Presence guide](/guide/presence) for the full client-server flow.

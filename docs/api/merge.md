@@ -21,6 +21,11 @@ import {
   mergeField,
   checkConstraints,
   resolveConstraintViolation,
+  checkReferentialIntegrityOnDelete,
+  resolveDeleteVsInsertConflict,
+  buildMergeRelationLookup,
+  resolveStateMachineMerge,
+  isStateMachineField,
 } from '@korajs/merge'
 
 import type {
@@ -31,6 +36,12 @@ import type {
   ConstraintViolation,
   ConstraintResolution,
   LWWResult,
+  ReferentialMergeContext,
+  ReferentialCheckResult,
+  SideEffectOp,
+  DeleteVsInsertResolution,
+  MergeIncomingRelation,
+  StateMachineMergeResult,
 } from '@korajs/merge'
 ```
 
@@ -521,6 +532,357 @@ interface ConstraintResolution {
 ### MergeTrace
 
 Records the full context of a merge decision. Defined in `@korajs/core` and re-used throughout the merge package. See the [Core API Reference](./core.md#types) for the full definition.
+
+---
+
+## Referential Integrity
+
+Functions for enforcing referential integrity during merge, specifically when delete operations affect records referenced by foreign keys in other collections.
+
+### buildMergeRelationLookup(schema)
+
+Pre-computes a lookup map from target collection name to all incoming relations. This allows the delete-side referential integrity checker to efficiently find all foreign key relationships that reference a given collection.
+
+The map is deterministic: relations are sorted by relation name within each target collection.
+
+```typescript
+function buildMergeRelationLookup(
+  schema: SchemaDefinition,
+): Map<string, MergeIncomingRelation[]>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema` | `SchemaDefinition` | The full schema definition including relations. |
+
+**Returns:** `Map<string, MergeIncomingRelation[]>` -- Map from target collection name to array of incoming relations.
+
+```typescript
+import { buildMergeRelationLookup } from '@korajs/merge'
+
+const lookup = buildMergeRelationLookup(schema)
+// lookup.get('projects') => [
+//   { relationName: 'todoBelongsToProject', sourceCollection: 'todos',
+//     foreignKeyField: 'projectId', onDelete: 'set-null' }
+// ]
+```
+
+### checkReferentialIntegrityOnDelete(deleteOp, schema, ctx, relationLookup?)
+
+Checks referential integrity when a delete operation is being applied. For each relation that targets the deleted record's collection, queries for referencing records and applies the relation's `onDelete` policy.
+
+Processing is deterministic: relations are processed in sorted order by name, and referencing records within each relation are processed in sorted order by ID.
+
+```typescript
+async function checkReferentialIntegrityOnDelete(
+  deleteOp: Operation,
+  schema: SchemaDefinition,
+  ctx: ReferentialMergeContext,
+  relationLookup?: Map<string, MergeIncomingRelation[]>,
+): Promise<ReferentialCheckResult>
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deleteOp` | `Operation` | Yes | The delete operation being evaluated. |
+| `schema` | `SchemaDefinition` | Yes | The full schema definition with relations. |
+| `ctx` | `ReferentialMergeContext` | Yes | Database lookup context for querying referencing records. |
+| `relationLookup` | `Map<string, MergeIncomingRelation[]>` | No | Pre-built relation lookup. Built automatically if not provided. |
+
+**Returns:** `Promise<ReferentialCheckResult>` -- Whether the delete is allowed, side-effect operations, and traces for DevTools.
+
+**onDelete policies:**
+
+| Policy | Behavior |
+|--------|----------|
+| `restrict` | Blocks the delete if any references exist. Returns immediately without processing further relations. |
+| `cascade` | Allows the delete and generates cascaded delete `SideEffectOp` entries for each referencing record. |
+| `set-null` | Allows the delete and generates update `SideEffectOp` entries to null out foreign key fields. |
+| `no-action` | Allows the delete with no side effects. Dangling references are permitted. |
+
+```typescript
+import { checkReferentialIntegrityOnDelete } from '@korajs/merge'
+
+const result = await checkReferentialIntegrityOnDelete(
+  deleteOp,
+  schema,
+  {
+    queryRecords: async (collection, where) => store.query(collection, where),
+    recordExists: async (collection, id) => (await store.findById(collection, id)) !== null,
+  },
+)
+
+if (!result.allowed) {
+  // Delete is blocked by a 'restrict' policy
+  console.log('Cannot delete: referenced by other records')
+} else {
+  // Apply the delete, then apply any side-effect operations
+  for (const sideEffect of result.sideEffectOps) {
+    if (sideEffect.type === 'delete') {
+      await store.delete(sideEffect.collection, sideEffect.recordId)
+    } else {
+      await store.update(sideEffect.collection, sideEffect.recordId, sideEffect.data)
+    }
+  }
+}
+```
+
+### resolveDeleteVsInsertConflict(deleteOp, insertOp, relation)
+
+Resolves a concurrent delete-vs-insert conflict: one node deletes a record while another concurrently inserts a record that references the deleted record via a foreign key.
+
+The resolution strategy depends on the relation's `onDelete` policy.
+
+```typescript
+function resolveDeleteVsInsertConflict(
+  deleteOp: Operation,
+  insertOp: Operation,
+  relation: MergeIncomingRelation,
+): DeleteVsInsertResolution
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `deleteOp` | `Operation` | The delete operation on the referenced (parent) record. |
+| `insertOp` | `Operation` | The concurrent insert operation that references the deleted record. |
+| `relation` | `MergeIncomingRelation` | The relation definition connecting the two collections. |
+
+**Returns:** `DeleteVsInsertResolution` -- The resolution action, side effects, and trace.
+
+**Resolution by onDelete policy:**
+
+| Policy | Resolution |
+|--------|------------|
+| `restrict` | Blocks the delete (the insert wins). Data integrity is preserved. |
+| `cascade` | Allows the delete and cascade-deletes the newly inserted record. |
+| `set-null` | Allows the delete and nulls out the FK on the newly inserted record. |
+| `no-action` | Allows the delete. The dangling reference is acceptable. |
+
+```typescript
+import { resolveDeleteVsInsertConflict } from '@korajs/merge'
+
+const resolution = resolveDeleteVsInsertConflict(deleteOp, insertOp, {
+  relationName: 'todoBelongsToProject',
+  sourceCollection: 'todos',
+  foreignKeyField: 'projectId',
+  onDelete: 'set-null',
+})
+
+if (resolution.action === 'block-delete') {
+  // The insert wins -- do not apply the delete
+} else {
+  // Apply the delete and any side-effect operations
+  for (const sideEffect of resolution.sideEffects) {
+    // Apply update or delete to the inserted record
+  }
+}
+```
+
+---
+
+## State Machine Merge
+
+Functions for resolving concurrent modifications to state-machine-controlled fields during merge.
+
+### isStateMachineField(collectionDef, fieldName)
+
+Checks whether a collection has a state machine defined and whether the given field is the state machine field. Used by the merge engine to intercept field-level merges for state machine fields.
+
+```typescript
+function isStateMachineField(
+  collectionDef: CollectionDefinition,
+  fieldName: string,
+): boolean
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `collectionDef` | `CollectionDefinition` | The schema definition for the collection. |
+| `fieldName` | `string` | The field name to check. |
+
+**Returns:** `boolean` -- `true` if the field is the state machine field for this collection.
+
+```typescript
+import { isStateMachineField } from '@korajs/merge'
+
+if (isStateMachineField(schema.collections.orders, 'status')) {
+  // Use state machine merge resolution instead of standard LWW
+}
+```
+
+### resolveStateMachineMerge(fieldName, localOp, remoteOp, baseState, stateMachine)
+
+Resolves concurrent state machine transitions during merge. When two operations concurrently modify a state-machine-controlled field, this function determines the correct resolved value based on transition validity.
+
+```typescript
+function resolveStateMachineMerge(
+  fieldName: string,
+  localOp: Operation,
+  remoteOp: Operation,
+  baseState: Record<string, unknown>,
+  stateMachine: StateMachineDefinition,
+): StateMachineMergeResult
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `fieldName` | `string` | The state machine field name. |
+| `localOp` | `Operation` | The local operation. |
+| `remoteOp` | `Operation` | The remote operation. |
+| `baseState` | `Record<string, unknown>` | The record state before either operation (must contain the base state value). |
+| `stateMachine` | `StateMachineDefinition` | The state machine definition with transitions. |
+
+**Returns:** `StateMachineMergeResult` -- The resolved state value and a trace for DevTools.
+
+**Resolution rules:**
+
+| Scenario | Resolution |
+|----------|------------|
+| Both transitions valid from base state | LWW via HLC timestamp picks the winner. |
+| One transition valid, one invalid | The valid transition wins regardless of timestamp. |
+| Both transitions invalid | Keeps the base state. Reports the constraint violation. |
+| Only one side changed | Validates that single transition. If invalid, keeps base state. |
+
+```typescript
+import { resolveStateMachineMerge } from '@korajs/merge'
+
+const result = resolveStateMachineMerge(
+  'status',
+  localOp,   // data: { status: 'shipped' }
+  remoteOp,  // data: { status: 'cancelled' }
+  { status: 'pending' },
+  {
+    field: 'status',
+    transitions: {
+      pending: ['shipped', 'cancelled'],
+      shipped: ['delivered'],
+      cancelled: [],
+      delivered: [],
+    },
+  },
+)
+
+console.log(result.value)       // Winner decided by LWW (both are valid from 'pending')
+console.log(result.trace.strategy) // 'state-machine-lww'
+```
+
+---
+
+## Referential Integrity Types
+
+### ReferentialMergeContext
+
+Pluggable database lookup interface for referential integrity checks during merge. The store layer provides the runtime implementation; the merge package depends only on this interface.
+
+```typescript
+interface ReferentialMergeContext {
+  /** Query records in a collection matching a where clause */
+  queryRecords(
+    collection: string,
+    where: Record<string, unknown>,
+  ): Promise<Record<string, unknown>[]>
+
+  /** Check if a record exists in a collection */
+  recordExists(collection: string, recordId: string): Promise<boolean>
+}
+```
+
+### ReferentialCheckResult
+
+Result of a referential integrity check on a delete operation.
+
+```typescript
+interface ReferentialCheckResult {
+  /** Whether the delete operation is allowed to proceed */
+  allowed: boolean
+
+  /** Side-effect operations generated by cascade/set-null policies */
+  sideEffectOps: SideEffectOp[]
+
+  /** MergeTraces for every decision made (feeds DevTools) */
+  traces: MergeTrace[]
+}
+```
+
+### SideEffectOp
+
+A side-effect operation generated during referential integrity enforcement. These describe mutations the caller must apply after the primary delete.
+
+```typescript
+interface SideEffectOp {
+  /** The type of mutation to apply */
+  type: 'delete' | 'update'
+
+  /** The collection containing the affected record */
+  collection: string
+
+  /** The ID of the affected record */
+  recordId: string
+
+  /** For updates: the new field values. null for deletes. */
+  data: Record<string, unknown> | null
+
+  /** For updates: the previous field values. null for deletes. */
+  previousData: Record<string, unknown> | null
+
+  /** The onDelete policy that produced this side effect */
+  policy: OnDeleteAction
+
+  /** The relation that triggered this side effect */
+  relationName: string
+}
+```
+
+### DeleteVsInsertResolution
+
+Result of resolving a concurrent delete-vs-insert conflict on a referenced record.
+
+```typescript
+interface DeleteVsInsertResolution {
+  /** Whether to block the delete or allow it */
+  action: 'block-delete' | 'allow-delete'
+
+  /** Any side-effect operations (for cascade/set-null after allowing delete) */
+  sideEffects: SideEffectOp[]
+
+  /** Trace of the resolution decision, or null if no trace needed */
+  trace: MergeTrace | null
+}
+```
+
+### MergeIncomingRelation
+
+Describes an incoming relation to a target collection. Used by the delete-side referential integrity checker to know which source collections reference the collection being deleted from.
+
+```typescript
+interface MergeIncomingRelation {
+  /** Name of the relation in the schema (e.g., 'todoBelongsToProject') */
+  relationName: string
+
+  /** The collection that holds the foreign key (source of the relation) */
+  sourceCollection: string
+
+  /** The foreign key field in the source collection */
+  foreignKeyField: string
+
+  /** What to do when the referenced record is deleted */
+  onDelete: OnDeleteAction
+}
+```
+
+### StateMachineMergeResult
+
+Result of state machine merge validation.
+
+```typescript
+interface StateMachineMergeResult {
+  /** The resolved value for the state field */
+  value: string
+
+  /** Trace for DevTools */
+  trace: MergeTrace
+}
+```
 
 ---
 
