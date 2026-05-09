@@ -54,6 +54,7 @@ export class MergeEngine {
 				mergedData: {},
 				traces: [],
 				appliedOperation: 'merged',
+				sideEffects: [],
 			}
 		}
 
@@ -78,6 +79,7 @@ export class MergeEngine {
 
 			let mergedData = fieldResult.mergedData
 			const allTraces = [...fieldResult.traces]
+			const allSideEffects = [...fieldResult.sideEffects]
 
 			for (const violation of violations) {
 				const resolution = resolveConstraintViolation(
@@ -89,12 +91,16 @@ export class MergeEngine {
 				)
 				mergedData = resolution.resolvedRecord
 				allTraces.push(resolution.trace)
+				if (resolution.sideEffects) {
+					allSideEffects.push(...resolution.sideEffects)
+				}
 			}
 
 			return {
 				mergedData,
 				traces: allTraces,
 				appliedOperation: determineAppliedOperation(allTraces),
+				sideEffects: allSideEffects,
 			}
 		}
 
@@ -167,6 +173,7 @@ export class MergeEngine {
 			mergedData,
 			traces,
 			appliedOperation: determineAppliedOperation(traces),
+			sideEffects: [],
 		}
 	}
 
@@ -183,25 +190,27 @@ export class MergeEngine {
 		if (comparison >= 0) {
 			// Local is later
 			if (local.type === 'delete') {
-				return { mergedData: {}, traces: [], appliedOperation: 'local' }
+				return { mergedData: {}, traces: [], appliedOperation: 'local', sideEffects: [] }
 			}
 			// Local is an update that's later than remote delete → local wins
 			return {
 				mergedData: { ...input.baseState, ...(local.data ?? {}) },
 				traces: [],
 				appliedOperation: 'local',
+				sideEffects: [],
 			}
 		}
 
 		// Remote is later
 		if (remote.type === 'delete') {
-			return { mergedData: {}, traces: [], appliedOperation: 'remote' }
+			return { mergedData: {}, traces: [], appliedOperation: 'remote', sideEffects: [] }
 		}
 		// Remote is an update that's later than local delete → remote wins
 		return {
 			mergedData: { ...input.baseState, ...(remote.data ?? {}) },
 			traces: [],
 			appliedOperation: 'remote',
+			sideEffects: [],
 		}
 	}
 }

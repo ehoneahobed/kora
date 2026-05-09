@@ -192,6 +192,9 @@ importers:
 
   packages/core:
     devDependencies:
+      '@fast-check/vitest':
+        specifier: 0.2.0
+        version: 0.2.0(vitest@3.2.4(@types/node@25.5.2)(jsdom@25.0.1)(tsx@4.21.0))
       fast-check:
         specifier: ^4.6.0
         version: 4.6.0

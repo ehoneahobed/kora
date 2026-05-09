@@ -39,8 +39,12 @@ export async function computeOperationId(
  * @returns A deterministic JSON string
  */
 export function canonicalize(obj: unknown): string {
-	if (obj === null || obj === undefined) {
-		return JSON.stringify(obj)
+	if (obj === null) {
+		return 'null'
+	}
+
+	if (obj === undefined) {
+		return 'null'
 	}
 
 	if (typeof obj !== 'object') {
@@ -55,7 +59,8 @@ export function canonicalize(obj: unknown): string {
 	const keys = Object.keys(obj as Record<string, unknown>).sort()
 	const pairs = keys.map((key) => {
 		const value = (obj as Record<string, unknown>)[key]
-		return `${JSON.stringify(key)}:${canonicalize(value)}`
+		// Serialize undefined values as null for deterministic output
+		return `${JSON.stringify(key)}:${canonicalize(value === undefined ? null : value)}`
 	})
 	return `{${pairs.join(',')}}`
 }

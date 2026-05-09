@@ -57,6 +57,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+						transitions: null,
 					},
 				},
 				indexes: [],
@@ -74,6 +75,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+						transitions: null,
 					},
 					projectId: {
 						kind: 'string',
@@ -83,6 +85,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+				transitions: null,
 					},
 				},
 				indexes: [],
@@ -100,6 +103,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+						transitions: null,
 					},
 					todoId: {
 						kind: 'string',
@@ -109,6 +113,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+						transitions: null,
 					},
 				},
 				indexes: [],
@@ -192,9 +197,9 @@ describe('buildMergeRelationLookup', () => {
 
 		// Need to fix the comment schema to have projectId
 		schema.collections.comments = {
-			...schema.collections.comments,
+			...schema.collections.comments!,
 			fields: {
-				...schema.collections.comments.fields,
+				...schema.collections.comments!.fields,
 				projectId: {
 					kind: 'string',
 					required: false,
@@ -203,6 +208,7 @@ describe('buildMergeRelationLookup', () => {
 					enumValues: null,
 					itemKind: null,
 					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 		}
@@ -235,9 +241,9 @@ describe('buildMergeRelationLookup', () => {
 		})
 
 		schema.collections.comments = {
-			...schema.collections.comments,
+			...schema.collections.comments!,
 			fields: {
-				...schema.collections.comments.fields,
+				...schema.collections.comments!.fields,
 				projectId: {
 					kind: 'string',
 					required: false,
@@ -246,6 +252,7 @@ describe('buildMergeRelationLookup', () => {
 					enumValues: null,
 					itemKind: null,
 					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 		}
@@ -421,9 +428,9 @@ describe('checkReferentialIntegrityOnDelete', () => {
 			})
 
 			schema.collections.comments = {
-				...schema.collections.comments,
+				...schema.collections.comments!,
 				fields: {
-					...schema.collections.comments.fields,
+					...schema.collections.comments!.fields,
 					projectId: {
 						kind: 'string',
 						required: false,
@@ -432,6 +439,7 @@ describe('checkReferentialIntegrityOnDelete', () => {
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
+						transitions: null,
 					},
 				},
 			}
@@ -595,9 +603,9 @@ describe('checkReferentialIntegrityOnDelete', () => {
 
 			// Fix comment schema for this test — FK is todoId pointing to projects
 			schema.collections.comments = {
-				...schema.collections.comments,
+				...schema.collections.comments!,
 				fields: {
-					...schema.collections.comments.fields,
+					...schema.collections.comments!.fields,
 				},
 			}
 

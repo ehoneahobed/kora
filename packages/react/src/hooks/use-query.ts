@@ -79,6 +79,14 @@ export function useQuery<T = CollectionRecord>(
 
 	const disabledGetSnapshot = (): readonly T[] => EMPTY_ARRAY as readonly T[]
 
+	// The query object is deliberately excluded from the dependency array.
+	// QueryBuilder instances are ephemeral (created on every render when
+	// developers use inline `app.todos.where({...})`). Using it as a dep
+	// would destroy and recreate the QueryStore on every render, causing
+	// subscription storms. Instead, we only react to the stable descriptor
+	// JSON key, which captures the actual query parameters.
+	//
+	// biome-ignore lint/correctness/useExhaustiveDependencies: See above.
 	return useSyncExternalStore(
 		queryStore ? queryStore.subscribe : noopSubscribe,
 		queryStore ? queryStore.getSnapshot : disabledGetSnapshot,

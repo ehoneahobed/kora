@@ -27,6 +27,8 @@ const stringField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const numberField: FieldDescriptor = {
@@ -36,6 +38,8 @@ const numberField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const booleanField: FieldDescriptor = {
@@ -45,6 +49,8 @@ const booleanField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const enumField: FieldDescriptor = {
@@ -54,6 +60,8 @@ const enumField: FieldDescriptor = {
 	auto: false,
 	enumValues: ['low', 'medium', 'high'],
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const timestampField: FieldDescriptor = {
@@ -63,6 +71,8 @@ const timestampField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const arrayField: FieldDescriptor = {
@@ -72,6 +82,8 @@ const arrayField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: 'string',
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const richtextField: FieldDescriptor = {
@@ -81,6 +93,8 @@ const richtextField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 describe('mergeField', () => {
@@ -459,6 +473,7 @@ describe('mergeField', () => {
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: 'counter',
+			transitions: null,
 		}
 
 		const maxField: FieldDescriptor = {
@@ -469,6 +484,7 @@ describe('mergeField', () => {
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: 'max',
+			transitions: null,
 		}
 
 		const minField: FieldDescriptor = {
@@ -479,6 +495,7 @@ describe('mergeField', () => {
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: 'min',
+			transitions: null,
 		}
 
 		const appendOnlyField: FieldDescriptor = {
@@ -489,6 +506,7 @@ describe('mergeField', () => {
 			enumValues: null,
 			itemKind: 'string',
 			mergeStrategy: 'append-only',
+			transitions: null,
 		}
 
 		const serverAuthField: FieldDescriptor = {
@@ -499,6 +517,7 @@ describe('mergeField', () => {
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: 'server-authoritative',
+			transitions: null,
 		}
 
 		test('counter strategy sums deltas from base', () => {
@@ -605,6 +624,7 @@ describe('mergeField', () => {
 				enumValues: null,
 				itemKind: null,
 				mergeStrategy: 'lww',
+				transitions: null,
 			}
 
 			const local = makeOp({
@@ -635,6 +655,7 @@ describe('mergeField', () => {
 				enumValues: null,
 				itemKind: 'string',
 				mergeStrategy: 'union',
+				transitions: null,
 			}
 
 			const local = makeOp({

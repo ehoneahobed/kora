@@ -407,15 +407,15 @@ describe('generateProtoDefinitions', () => {
 				todos: { fields: { title: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('TodosRecord')
 			const todosRecord = messages.TodosRecord as Record<string, unknown>
 			const fields = todosRecord.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.id).toEqual({ type: 'string', id: 1 })
-			expect(fields.title).toEqual({ type: 'string', id: 2 })
+			expect(fields.id!).toEqual({ type: 'string', id: 1 })
+			expect(fields.title!).toEqual({ type: 'string', id: 2 })
 		})
 
 		test('includes KoraOperation in descriptor', () => {
@@ -423,18 +423,18 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { name: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('KoraOperation')
 			const op = messages.KoraOperation as Record<string, unknown>
 			const fields = op.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.id.type).toBe('string')
-			expect(fields.node_id.type).toBe('string')
-			expect(fields.data.type).toBe('bytes')
-			expect(fields.wall_time.type).toBe('int64')
-			expect(fields.causal_deps.rule).toBe('repeated')
+			expect(fields.id!.type).toBe('string')
+			expect(fields.node_id!.type).toBe('string')
+			expect(fields.data!.type).toBe('bytes')
+			expect(fields.wall_time!.type).toBe('int64')
+			expect(fields.causal_deps!.rule).toBe('repeated')
 		})
 
 		test('includes OperationBatch in descriptor', () => {
@@ -442,16 +442,16 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { name: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('OperationBatch')
 			const batch = messages.OperationBatch as Record<string, unknown>
 			const fields = batch.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.operations.type).toBe('KoraOperation')
-			expect(fields.operations.rule).toBe('repeated')
-			expect(fields.is_final.type).toBe('bool')
+			expect(fields.operations!.type).toBe('KoraOperation')
+			expect(fields.operations!.rule).toBe('repeated')
+			expect(fields.is_final!.type).toBe('bool')
 		})
 
 		test('includes HandshakeMessage in descriptor', () => {
@@ -459,17 +459,17 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { name: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('HandshakeMessage')
 			const msg = messages.HandshakeMessage as Record<string, unknown>
 			const fields = msg.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.version_vector.keyType).toBe('string')
-			expect(fields.version_vector.type).toBe('int64')
-			expect(fields.schema_version.type).toBe('int32')
-			expect(fields.node_id.type).toBe('string')
+			expect(fields.version_vector!.keyType).toBe('string')
+			expect(fields.version_vector!.type).toBe('int64')
+			expect(fields.schema_version!.type).toBe('int32')
+			expect(fields.node_id!.type).toBe('string')
 		})
 
 		test('includes HandshakeResponse in descriptor', () => {
@@ -477,15 +477,15 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { name: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('HandshakeResponse')
 			const msg = messages.HandshakeResponse as Record<string, unknown>
 			const fields = msg.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.version_vector.keyType).toBe('string')
-			expect(fields.schema_version.type).toBe('int32')
+			expect(fields.version_vector!.keyType).toBe('string')
+			expect(fields.schema_version!.type).toBe('int32')
 		})
 
 		test('includes Acknowledgment in descriptor', () => {
@@ -493,15 +493,15 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { name: t.string() } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			expect(messages).toHaveProperty('Acknowledgment')
 			const msg = messages.Acknowledgment as Record<string, unknown>
 			const fields = msg.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.sequence_number.type).toBe('int64')
-			expect(fields.node_id.type).toBe('string')
+			expect(fields.sequence_number!.type).toBe('int64')
+			expect(fields.node_id!.type).toBe('string')
 		})
 
 		test('enum fields produce nested enum values in descriptor', () => {
@@ -513,7 +513,7 @@ describe('generateProtoDefinitions', () => {
 				},
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			const tasksRecord = messages.TasksRecord as Record<string, unknown>
@@ -522,7 +522,7 @@ describe('generateProtoDefinitions', () => {
 			const nested = tasksRecord.nested as Record<string, Record<string, unknown>>
 			expect(nested).toHaveProperty('TasksRecordPriority')
 
-			const enumDef = nested.TasksRecordPriority
+			const enumDef = nested.TasksRecordPriority!
 			expect(enumDef.values).toEqual({
 				TASKSRECORDPRIORITY_UNSPECIFIED: 0,
 				TASKSRECORDPRIORITY_LOW: 1,
@@ -535,14 +535,14 @@ describe('generateProtoDefinitions', () => {
 				items: { fields: { tags: t.array(t.string()) } },
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 
 			const itemsRecord = messages.ItemsRecord as Record<string, unknown>
 			const fields = itemsRecord.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.tags.type).toBe('string')
-			expect(fields.tags.rule).toBe('repeated')
+			expect(fields.tags!.type).toBe('string')
+			expect(fields.tags!.rule).toBe('repeated')
 		})
 	})
 
@@ -832,15 +832,15 @@ describe('generateProtoDefinitions', () => {
 				},
 			})
 			const { jsonDescriptor } = generateProtoDefinitions(schema)
-			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora
+			const kora = (jsonDescriptor.nested as Record<string, Record<string, unknown>>).kora!
 			const messages = kora.nested as Record<string, unknown>
 			const itemsRecord = messages.ItemsRecord as Record<string, unknown>
 			const fields = itemsRecord.fields as Record<string, Record<string, unknown>>
 
-			expect(fields.id.id).toBe(1)
-			expect(fields.title.id).toBe(2)
-			expect(fields.count.id).toBe(3)
-			expect(fields.active.id).toBe(4)
+			expect(fields.id!.id).toBe(1)
+			expect(fields.title!.id).toBe(2)
+			expect(fields.count!.id).toBe(3)
+			expect(fields.active!.id).toBe(4)
 		})
 	})
 })

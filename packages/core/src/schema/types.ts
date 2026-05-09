@@ -167,7 +167,7 @@ export class EnumFieldBuilder<
 	 * })
 	 * ```
 	 */
-	transitions(map: Record<Values[number], Values[number][]>): EnumFieldBuilder<Values, Req, Auto> {
+	transitions(map: Partial<Record<Values[number], Values[number][]>>): EnumFieldBuilder<Values, Req, Auto> {
 		// Validate that all source and target states are valid enum values
 		const validValues = new Set(this._enumValues as readonly string[])
 		for (const [state, targets] of Object.entries(map)) {

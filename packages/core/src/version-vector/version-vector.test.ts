@@ -176,7 +176,7 @@ describe('vectorsEqual', () => {
 })
 
 describe('computeDelta', () => {
-	test('returns operations the remote does not have', () => {
+	test('returns operations the remote does not have', async () => {
 		const localVector: VersionVector = new Map([['n1', 3]])
 		const remoteVector: VersionVector = new Map([['n1', 1]])
 
@@ -195,21 +195,21 @@ describe('computeDelta', () => {
 			},
 		}
 
-		const delta = computeDelta(localVector, remoteVector, log)
+		const delta = await computeDelta(localVector, remoteVector, log)
 		expect(delta).toHaveLength(2)
 		expect(delta[0]?.id).toBe('op-2')
 		expect(delta[1]?.id).toBe('op-3')
 	})
 
-	test('returns empty array when vectors are equal', () => {
+	test('returns empty array when vectors are equal', async () => {
 		const vector: VersionVector = new Map([['n1', 3]])
 		const log: OperationLog = { getRange: () => [] }
 
-		const delta = computeDelta(vector, vector, log)
+		const delta = await computeDelta(vector, vector, log)
 		expect(delta).toHaveLength(0)
 	})
 
-	test('returns operations from multiple nodes', () => {
+	test('returns operations from multiple nodes', async () => {
 		const localVector: VersionVector = new Map([
 			['n1', 2],
 			['n2', 1],
@@ -242,7 +242,7 @@ describe('computeDelta', () => {
 			},
 		}
 
-		const delta = computeDelta(localVector, remoteVector, log)
+		const delta = await computeDelta(localVector, remoteVector, log)
 		expect(delta).toHaveLength(2)
 	})
 })

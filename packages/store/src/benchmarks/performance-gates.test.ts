@@ -26,24 +26,27 @@ describe('Store performance gates', () => {
 	})
 
 	test('insert 10,000 records under target', async () => {
-		const todos = store.collection('todos')
-
 		const startMs = performance.now()
-		for (let index = 0; index < 10_000; index++) {
-			await todos.insert({ title: `todo-${index}`, completed: index % 10 === 0 })
-		}
+		await store.transaction(async (tx) => {
+			const todosTx = tx.collection('todos')
+			for (let index = 0; index < 10_000; index++) {
+				await todosTx.insert({ title: `todo-${index}`, completed: index % 10 === 0 })
+			}
+		})
 		const elapsedMs = performance.now() - startMs
 
 		expect(elapsedMs).toBeLessThan(INSERT_10K_LIMIT_MS)
 	}, 30_000)
 
 	test('query 1,000 records with WHERE under target', async () => {
+		await store.transaction(async (tx) => {
+			const todosTx = tx.collection('todos')
+			for (let index = 0; index < 10_000; index++) {
+				await todosTx.insert({ title: `todo-${index}`, completed: index % 10 === 0 })
+			}
+		})
+
 		const todos = store.collection('todos')
-
-		for (let index = 0; index < 10_000; index++) {
-			await todos.insert({ title: `todo-${index}`, completed: index % 10 === 0 })
-		}
-
 		const startMs = performance.now()
 		const results = await todos.where({ completed: true }).exec()
 		const elapsedMs = performance.now() - startMs

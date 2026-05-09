@@ -1,5 +1,5 @@
-import fc from 'fast-check'
-import { describe, expect, test } from 'vitest'
+import { fc, test } from '@fast-check/vitest'
+import { describe, expect } from 'vitest'
 import { HybridLogicalClock } from '../../src/clock/hlc'
 import type { HLCTimestamp } from '../../src/types'
 import { MockTimeSource } from '../fixtures/timestamps'
@@ -11,23 +11,21 @@ const hlcTimestampArb = fc.record({
 })
 
 describe('HLC property-based tests', () => {
-	test('now() is always monotonically increasing', () => {
-		fc.assert(
-			fc.property(fc.nat({ max: 500 }), (count) => {
-				const time = new MockTimeSource(1000)
-				const clock = new HybridLogicalClock('test', time)
+	test.prop([fc.nat({ max: 500 })], { numRuns: 50 })(
+		'now() is always monotonically increasing',
+		(count) => {
+			const time = new MockTimeSource(1000)
+			const clock = new HybridLogicalClock('test', time)
 
-				let prev = clock.now()
-				for (let i = 0; i < count; i++) {
-					if (Math.random() > 0.5) time.advance(1)
-					const curr = clock.now()
-					expect(HybridLogicalClock.compare(curr, prev)).toBeGreaterThan(0)
-					prev = curr
-				}
-			}),
-			{ numRuns: 50 },
-		)
-	})
+			let prev = clock.now()
+			for (let i = 0; i < count; i++) {
+				if (Math.random() > 0.5) time.advance(1)
+				const curr = clock.now()
+				expect(HybridLogicalClock.compare(curr, prev)).toBeGreaterThan(0)
+				prev = curr
+			}
+		},
+	)
 
 	test('compare is antisymmetric: compare(a,b) = -compare(b,a)', () => {
 		fc.assert(

@@ -62,6 +62,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				email: {
 					kind: 'string',
@@ -70,6 +72,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				active: {
 					kind: 'boolean',
@@ -78,11 +82,14 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: ['email'],
 			constraints: [constraint],
 			resolvers: {},
+			scope: [],
 		}
 
 		const local = makeOp({
@@ -138,6 +145,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				quantity: {
 					kind: 'number',
@@ -146,6 +155,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				name: {
 					kind: 'string',
@@ -154,6 +165,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: [],
@@ -166,6 +179,7 @@ describe('three-tier merge integration', () => {
 					return Math.max(0, b + (l - b) + (r - b))
 				},
 			},
+			scope: [],
 		}
 
 		const local = makeOp({
@@ -212,11 +226,14 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: [],
 			constraints: [],
 			resolvers: {},
+			scope: [],
 		}
 
 		// Local updates, remote deletes (remote is later → delete wins)
@@ -256,6 +273,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				tags: {
 					kind: 'array',
@@ -264,6 +283,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: 'string',
+					mergeStrategy: null,
+					transitions: null,
 				},
 				score: {
 					kind: 'number',
@@ -272,6 +293,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: [],
@@ -282,6 +305,7 @@ describe('three-tier merge integration', () => {
 					return Math.max(local as number, remote as number)
 				},
 			},
+			scope: [],
 		}
 
 		const local = makeOp({
@@ -322,6 +346,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				description: {
 					kind: 'string',
@@ -330,6 +356,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				completed: {
 					kind: 'boolean',
@@ -338,11 +366,14 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: [],
 			constraints: [],
 			resolvers: {},
+			scope: [],
 		}
 
 		const local = makeOp({
@@ -391,6 +422,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				name: {
 					kind: 'string',
@@ -399,6 +432,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 				score: {
 					kind: 'number',
@@ -407,6 +442,8 @@ describe('three-tier merge integration', () => {
 					auto: false,
 					enumValues: null,
 					itemKind: null,
+					mergeStrategy: null,
+					transitions: null,
 				},
 			},
 			indexes: ['email'],

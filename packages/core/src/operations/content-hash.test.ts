@@ -25,7 +25,7 @@ describe('canonicalize', () => {
 	})
 
 	test('handles undefined', () => {
-		expect(canonicalize(undefined)).toBe(undefined)
+		expect(canonicalize(undefined)).toBe('null')
 	})
 
 	test('handles primitives', () => {

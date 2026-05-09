@@ -62,6 +62,7 @@ export class HybridLogicalClock {
 	 */
 	receive(remote: HLCTimestamp): HLCTimestamp {
 		const physicalTime = this.timeSource.now()
+		const wasColdStart = this.wallTime === 0
 
 		if (physicalTime > this.wallTime && physicalTime > remote.wallTime) {
 			this.wallTime = physicalTime
@@ -76,7 +77,13 @@ export class HybridLogicalClock {
 			this.logical++
 		}
 
-		this.checkDrift(physicalTime)
+		// Skip drift check on cold start (wallTime was 0, uninitialized) to avoid
+		// false positives when the first event is a remote timestamp with a wallTime
+		// that differs significantly from local physical time. After initialization,
+		// all subsequent calls to now() and receive() enforce drift protection normally.
+		if (!wasColdStart) {
+			this.checkDrift(physicalTime)
+		}
 
 		return { wallTime: this.wallTime, logical: this.logical, nodeId: this.nodeId }
 	}

@@ -207,6 +207,9 @@ describe('HybridLogicalClock', () => {
 			const time = new MockTimeSource(1000)
 			const clock = new HybridLogicalClock('n', time, onDriftWarning)
 
+			// Initialize clock to avoid cold-start drift bypass
+			clock.now()
+
 			// Push HLC ahead via remote message
 			const remote: HLCTimestamp = {
 				wallTime: 1000 + 90_000, // 90 seconds ahead
@@ -222,6 +225,9 @@ describe('HybridLogicalClock', () => {
 		test('throws ClockDriftError when drift exceeds 5 minutes', () => {
 			const time = new MockTimeSource(1000)
 			const clock = new HybridLogicalClock('n', time)
+
+			// Initialize clock to avoid cold-start drift bypass
+			clock.now()
 
 			// Push HLC ahead via remote message
 			const remote: HLCTimestamp = {

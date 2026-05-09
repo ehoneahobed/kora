@@ -1,5 +1,6 @@
 import type { CollectionDefinition, Constraint, HLCTimestamp, Operation } from '@korajs/core'
 import type { MergeTrace } from '@korajs/core'
+import type { SideEffectOp } from './constraints/referential-integrity'
 
 /**
  * Input to the merge engine when two concurrent operations conflict.
@@ -25,6 +26,12 @@ export interface MergeResult {
 	traces: MergeTrace[]
 	/** Which operation's values dominate overall, or 'merged' if mixed */
 	appliedOperation: 'local' | 'remote' | 'merged'
+	/**
+	 * Side-effect operations generated during constraint resolution
+	 * (e.g., cascade deletes, set-null updates from referential integrity).
+	 * These must be applied by the caller after the merge.
+	 */
+	sideEffects: SideEffectOp[]
 }
 
 /**

@@ -17,6 +17,8 @@ function createCollectionDef(): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			completed: {
 				kind: 'boolean',
@@ -25,6 +27,8 @@ function createCollectionDef(): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			count: {
 				kind: 'number',
@@ -33,11 +37,14 @@ function createCollectionDef(): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 		},
 		indexes: [],
 		constraints: [],
 		resolvers: {},
+		scope: [],
 	}
 }
 

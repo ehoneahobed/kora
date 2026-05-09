@@ -54,9 +54,14 @@ export function vectorsEqual(a: VersionVector, b: VersionVector): boolean {
 
 /**
  * Operation log interface for computing deltas.
+ * getRange may be async (for DB-backed implementations) or sync (for in-memory).
  */
 export interface OperationLog {
-	getRange(nodeId: string, fromSeq: number, toSeq: number): Operation[]
+	getRange(
+		nodeId: string,
+		fromSeq: number,
+		toSeq: number,
+	): Operation[] | Promise<Operation[]>
 }
 
 /**
@@ -68,16 +73,17 @@ export interface OperationLog {
  * @param operationLog - The operation log to fetch operations from
  * @returns Operations sorted in causal order
  */
-export function computeDelta(
+export async function computeDelta(
 	localVector: VersionVector,
 	remoteVector: VersionVector,
 	operationLog: OperationLog,
-): Operation[] {
+): Promise<Operation[]> {
 	const missing: Operation[] = []
 	for (const [nodeId, localSeq] of localVector) {
 		const remoteSeq = remoteVector.get(nodeId) ?? 0
 		if (localSeq > remoteSeq) {
-			missing.push(...operationLog.getRange(nodeId, remoteSeq + 1, localSeq))
+			const ops = await operationLog.getRange(nodeId, remoteSeq + 1, localSeq)
+			missing.push(...ops)
 		}
 	}
 	return topologicalSort(missing)

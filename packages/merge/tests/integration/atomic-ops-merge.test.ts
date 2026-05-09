@@ -27,6 +27,8 @@ const numberField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: null,
+	mergeStrategy: null,
+	transitions: null,
 }
 
 const arrayField: FieldDescriptor = {
@@ -36,6 +38,8 @@ const arrayField: FieldDescriptor = {
 	auto: false,
 	enumValues: null,
 	itemKind: 'string',
+	mergeStrategy: null,
+	transitions: null,
 }
 
 describe('atomic ops in field-merger', () => {
@@ -220,6 +224,7 @@ describe('atomic ops in MergeEngine', () => {
 			indexes: [],
 			constraints: [],
 			resolvers: {},
+			scope: [],
 		}
 
 		const localOp = makeOp({
@@ -263,6 +268,8 @@ describe('atomic ops in MergeEngine', () => {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		}
 
 		const collectionDef = {
@@ -273,6 +280,7 @@ describe('atomic ops in MergeEngine', () => {
 			indexes: [],
 			constraints: [],
 			resolvers: {},
+			scope: [],
 		}
 
 		const localOp = makeOp({
@@ -309,6 +317,7 @@ describe('atomic ops in MergeEngine', () => {
 			indexes: [],
 			constraints: [],
 			resolvers: {},
+			scope: [],
 		}
 
 		const opA = makeOp({

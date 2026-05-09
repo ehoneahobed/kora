@@ -13,6 +13,8 @@ function makeCollectionDef(constraints: Constraint[]): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			name: {
 				kind: 'string',
@@ -21,6 +23,8 @@ function makeCollectionDef(constraints: Constraint[]): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			projectId: {
 				kind: 'string',
@@ -29,11 +33,14 @@ function makeCollectionDef(constraints: Constraint[]): CollectionDefinition {
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 		},
 		indexes: [],
 		constraints,
 		resolvers: {},
+		scope: [],
 	}
 }
 

@@ -88,12 +88,12 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 		}
 
 		// Compute what A needs to send to B
-		const deltaAtoB = computeDelta(vectorA, vectorB, log)
+		const deltaAtoB = await computeDelta(vectorA, vectorB, log)
 		expect(deltaAtoB).toHaveLength(3)
 		expect(deltaAtoB.every((op) => op.nodeId === 'node-a')).toBe(true)
 
 		// Compute what B needs to send to A
-		const deltaBtoA = computeDelta(vectorB, vectorA, log)
+		const deltaBtoA = await computeDelta(vectorB, vectorA, log)
 		expect(deltaBtoA).toHaveLength(2)
 		expect(deltaBtoA.every((op) => op.nodeId === 'node-b')).toBe(true)
 
@@ -103,7 +103,7 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 		expect(mergedVector.get('node-b')).toBe(2)
 
 		// Delta from merged to either should be empty
-		const emptyDelta = computeDelta(mergedVector, mergedVector, log)
+		const emptyDelta = await computeDelta(mergedVector, mergedVector, log)
 		expect(emptyDelta).toHaveLength(0)
 	})
 
@@ -143,7 +143,7 @@ describe('Clock → Operations → Version Vectors → Delta integration', () =>
 			},
 		}
 
-		const delta = computeDelta(localVector, remoteVector, log)
+		const delta = await computeDelta(localVector, remoteVector, log)
 		expect(delta).toHaveLength(3)
 		expect(delta[0]?.sequenceNumber).toBe(3)
 		expect(delta[1]?.sequenceNumber).toBe(4)

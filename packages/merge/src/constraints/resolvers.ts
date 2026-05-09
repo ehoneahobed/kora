@@ -1,6 +1,7 @@
 import { HybridLogicalClock } from '@korajs/core'
 import type { CollectionDefinition, Operation } from '@korajs/core'
 import type { MergeTrace } from '@korajs/core'
+import type { SideEffectOp } from './referential-integrity'
 import type { ConstraintViolation } from '../types'
 
 /**
@@ -11,6 +12,12 @@ export interface ConstraintResolution {
 	resolvedRecord: Record<string, unknown>
 	/** Trace of the resolution decision for DevTools */
 	trace: MergeTrace
+	/**
+	 * Side-effect operations generated during resolution
+	 * (e.g., referring record updates for referential integrity).
+	 * Empty unless the constraint resolver generates cascading actions.
+	 */
+	sideEffects?: SideEffectOp[]
 }
 
 /**

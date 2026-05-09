@@ -11,13 +11,22 @@ import type { SyncScopeMap } from '../types'
  * - Scope has field/value pairs: all must match in the operation's data snapshot.
  *
  * For updates, the snapshot is built by merging `previousData` and `data` (data wins),
- * which represents the record's state after the operation is applied.
+ * which represents the record's state after the operation is applied. When an optional
+ * `fullRecord` is provided (e.g., from the local store), its values fill in scope fields
+ * that weren't included in the operation's data (critical for update operations where
+ * `data` only contains changed fields).
  *
  * @param op - The operation to check
  * @param scopeMap - Per-collection scope filters, or undefined for no filtering
+ * @param fullRecord - Optional full record state from the store, used to fill in scope
+ *   fields not present in the operation's partial data
  * @returns true if the operation is within scope
  */
-export function operationMatchesScope(op: Operation, scopeMap: SyncScopeMap | undefined): boolean {
+export function operationMatchesScope(
+	op: Operation,
+	scopeMap: SyncScopeMap | undefined,
+	fullRecord?: Record<string, unknown> | null,
+): boolean {
 	if (!scopeMap) return true
 
 	const collectionScope = scopeMap[op.collection]
@@ -27,7 +36,7 @@ export function operationMatchesScope(op: Operation, scopeMap: SyncScopeMap | un
 	// Empty scope means no field restrictions
 	if (Object.keys(collectionScope).length === 0) return true
 
-	const snapshot = buildSnapshot(op)
+	const snapshot = buildSnapshot(op, fullRecord ?? undefined)
 	if (!snapshot) return false
 
 	for (const [field, expected] of Object.entries(collectionScope)) {
@@ -54,13 +63,17 @@ export function filterOperationsByScope(
 	return operations.filter((op) => operationMatchesScope(op, scopeMap))
 }
 
-function buildSnapshot(op: Operation): Record<string, unknown> | null {
+function buildSnapshot(
+	op: Operation,
+	fullRecord?: Record<string, unknown> | null,
+): Record<string, unknown> | null {
 	const previous = asRecord(op.previousData)
 	const next = asRecord(op.data)
 
-	if (!previous && !next) return null
+	if (!previous && !next && !fullRecord) return null
 
 	return {
+		...(fullRecord ?? {}),
 		...(previous ?? {}),
 		...(next ?? {}),
 	}

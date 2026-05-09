@@ -378,13 +378,31 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Compare two result sets. Uses length check + JSON comparison as pragmatic approach.
-	 * Sufficient for typical query results. Can be optimized to id-based diffing if profiling shows need.
+	 * Compare two result sets. Uses ID-based comparison first (same length, same IDs),
+	 * then deep comparison of remaining fields when IDs match.
+	 * Avoids JSON.stringify which is O(n) and fragile to field ordering differences.
 	 */
 	private resultsEqual(prev: CollectionRecord[], next: CollectionRecord[]): boolean {
 		if (prev.length !== next.length) return false
-		// Fast path: both empty
 		if (prev.length === 0) return true
-		return JSON.stringify(prev) === JSON.stringify(next)
+
+		// Fast ID-based check: same records in same order means same result set
+		for (let i = 0; i < prev.length; i++) {
+			if (prev[i]?.id !== next[i]?.id) return false
+		}
+
+		// IDs match — do a field-level comparison for safety
+		for (let i = 0; i < prev.length; i++) {
+			const a = prev[i] as Record<string, unknown>
+			const b = next[i] as Record<string, unknown>
+			const keysA = Object.keys(a)
+			const keysB = Object.keys(b)
+			if (keysA.length !== keysB.length) return false
+			for (const key of keysA) {
+				if (a[key] !== b[key]) return false
+			}
+		}
+
+		return true
 	}
 }

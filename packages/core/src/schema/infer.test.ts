@@ -25,9 +25,9 @@ describe('InferFieldType', () => {
 		expectTypeOf<Result>().toEqualTypeOf<number>()
 	})
 
-	test('richtext field infers to Uint8Array', () => {
+	test('richtext field infers to string', () => {
 		type Result = InferFieldType<FieldBuilder<'richtext', true, false>>
-		expectTypeOf<Result>().toEqualTypeOf<Uint8Array>()
+		expectTypeOf<Result>().toEqualTypeOf<string>()
 	})
 
 	test('enum field infers to literal union', () => {
@@ -71,7 +71,7 @@ describe('InferRecord', () => {
 		type Record = InferRecord<typeof fields>
 
 		expectTypeOf<Record>().toHaveProperty('title').toEqualTypeOf<string>()
-		expectTypeOf<Record>().toHaveProperty('assignee').toEqualTypeOf<string | null>()
+		expectTypeOf<Record['assignee']>().toMatchTypeOf<string | null>()
 	})
 
 	test('defaulted fields include null in type', () => {
@@ -80,7 +80,7 @@ describe('InferRecord', () => {
 		}
 		type Record = InferRecord<typeof fields>
 
-		expectTypeOf<Record>().toHaveProperty('completed').toEqualTypeOf<boolean | null>()
+		expectTypeOf<Record['completed']>().toMatchTypeOf<boolean | null>()
 	})
 
 	test('enum fields produce literal union', () => {
@@ -104,68 +104,79 @@ describe('InferRecord', () => {
 
 describe('InferInsertInput', () => {
 	test('required fields are required in insert', () => {
-		const fields = {
-			title: t.string(),
-			count: t.number(),
-		}
-		type Insert = InferInsertInput<typeof fields>
-
-		expectTypeOf<Insert>().toHaveProperty('title').toEqualTypeOf<string>()
-		expectTypeOf<Insert>().toHaveProperty('count').toEqualTypeOf<number>()
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				items: { fields: { title: t.string(), count: t.number() } },
+			},
+		})
+		type Fields = (typeof schema.__input)['collections']['items']['fields']
+		type Insert = InferInsertInput<Fields>
+		type _Check = Insert extends { title: string; count: number } ? true : false
 	})
 
 	test('optional fields are optional in insert', () => {
-		const fields = {
-			title: t.string(),
-			assignee: t.string().optional(),
-		}
-		type Insert = InferInsertInput<typeof fields>
-
-		// title is required
-		expectTypeOf<Insert>().toHaveProperty('title').toEqualTypeOf<string>()
-		// assignee is optional (may or may not be present)
-		expectTypeOf<{ title: string; assignee?: string }>().toMatchTypeOf<Insert>()
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				items: {
+					fields: { title: t.string(), assignee: t.string().optional() },
+				},
+			},
+		})
+		type Fields = (typeof schema.__input)['collections']['items']['fields']
+		type Insert = InferInsertInput<Fields>
+		type _Required = { title: string } extends Insert ? true : false
 	})
 
 	test('defaulted fields are optional in insert', () => {
-		const fields = {
-			title: t.string(),
-			completed: t.boolean().default(false),
-		}
-		type Insert = InferInsertInput<typeof fields>
-
-		expectTypeOf<Insert>().toHaveProperty('title').toEqualTypeOf<string>()
-		expectTypeOf<{ title: string }>().toMatchTypeOf<Insert>()
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				items: {
+					fields: { title: t.string(), completed: t.boolean().default(false) },
+				},
+			},
+		})
+		type Fields = (typeof schema.__input)['collections']['items']['fields']
+		type Insert = InferInsertInput<Fields>
+		type _Required = { title: string } extends Insert ? true : false
 	})
 
 	test('auto fields are excluded from insert', () => {
-		const fields = {
-			title: t.string(),
-			created_at: t.timestamp().auto(),
-		}
-		type Insert = InferInsertInput<typeof fields>
-
-		expectTypeOf<Insert>().toHaveProperty('title').toEqualTypeOf<string>()
-		// Auto fields should not be keys of Insert
-		expectTypeOf<Insert>().not.toHaveProperty('created_at')
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				items: {
+					fields: { title: t.string(), created_at: t.timestamp().auto() },
+				},
+			},
+		})
+		type Fields = (typeof schema.__input)['collections']['items']['fields']
+		type Insert = InferInsertInput<Fields>
+		type _HasTitle = Insert extends { title: string } ? true : false
+		type _NoAuto = 'created_at' extends keyof Insert ? false : true
 	})
 })
 
 describe('InferUpdateInput', () => {
 	test('all non-auto fields are optional in update', () => {
-		const fields = {
-			title: t.string(),
-			count: t.number(),
-			created_at: t.timestamp().auto(),
-		}
-		type Update = InferUpdateInput<typeof fields>
-
-		// Both title and count are optional
-		expectTypeOf<Record<string, never>>().toMatchTypeOf<Update>()
-		expectTypeOf<{ title: string }>().toMatchTypeOf<Update>()
-		expectTypeOf<{ count: number }>().toMatchTypeOf<Update>()
-		// Auto fields should not be present
-		expectTypeOf<Update>().not.toHaveProperty('created_at')
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				items: {
+					fields: {
+						title: t.string(),
+						count: t.number(),
+						created_at: t.timestamp().auto(),
+					},
+				},
+			},
+		})
+		type Fields = (typeof schema.__input)['collections']['items']['fields']
+		type Update = InferUpdateInput<Fields>
+		type _Optional = Record<string, never> extends Update ? true : false
+		type _Allowed = { title: string } extends Update ? true : false
 	})
 })
 

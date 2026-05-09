@@ -31,6 +31,8 @@ function makeCollectionDef(overrides: Partial<CollectionDefinition> = {}): Colle
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			completed: {
 				kind: 'boolean',
@@ -39,6 +41,8 @@ function makeCollectionDef(overrides: Partial<CollectionDefinition> = {}): Colle
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			tags: {
 				kind: 'array',
@@ -47,6 +51,8 @@ function makeCollectionDef(overrides: Partial<CollectionDefinition> = {}): Colle
 				auto: false,
 				enumValues: null,
 				itemKind: 'string',
+				mergeStrategy: null,
+				transitions: null,
 			},
 			priority: {
 				kind: 'enum',
@@ -55,6 +61,8 @@ function makeCollectionDef(overrides: Partial<CollectionDefinition> = {}): Colle
 				auto: false,
 				enumValues: ['low', 'medium', 'high'],
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 			count: {
 				kind: 'number',
@@ -63,12 +71,15 @@ function makeCollectionDef(overrides: Partial<CollectionDefinition> = {}): Colle
 				auto: false,
 				enumValues: null,
 				itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 			},
 		},
 		indexes: [],
 		constraints: [],
 		resolvers: {},
 		...overrides,
+		scope: overrides.scope ?? [],
 	}
 }
 
@@ -227,6 +238,8 @@ describe('MergeEngine', () => {
 						auto: false,
 						enumValues: null,
 						itemKind: null,
+				mergeStrategy: null,
+				transitions: null,
 					},
 				},
 			})

@@ -274,15 +274,12 @@ export class Store implements OperationLog {
 	 * Get operations from a node within a sequence number range.
 	 * Implements the OperationLog interface for computeDelta.
 	 */
-	getRange(nodeId: string, fromSeq: number, toSeq: number): Operation[] {
-		// This is synchronous per the OperationLog interface.
-		// We can't use async here, so this must be called with data already loaded.
-		// For now, this is a placeholder that the sync layer will call after awaiting.
-		return []
+	async getRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
+		return this.getOperationRange(nodeId, fromSeq, toSeq)
 	}
 
 	/**
-	 * Async version of getRange for use by the sync layer.
+	 * Get operations from a node within a sequence number range.
 	 */
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
 		this.ensureOpen()
@@ -415,7 +412,8 @@ export class Store implements OperationLog {
 			const sqlStatements = migrationStepsToSQL(migration.steps)
 
 			// Execute structural changes individually, tolerating "duplicate column" errors
-			// because generateFullDDL already runs safe-alter for the current schema's columns.
+			// because generateSQL already emits --kora:safe-alter ALTER TABLE statements
+			// for the current schema's columns (run via generateFullDDL in adapter.open()).
 			for (const sql of sqlStatements) {
 				try {
 					await this.adapter.execute(sql)
@@ -424,7 +422,7 @@ export class Store implements OperationLog {
 					if (!msg.includes('duplicate column name')) {
 						throw e
 					}
-					// Column already exists (added by generateFullDDL) — safe to skip
+					// Column already exists (added by safe-alter in generateSQL) — safe to skip
 				}
 			}
 

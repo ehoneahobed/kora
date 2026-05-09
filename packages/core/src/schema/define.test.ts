@@ -395,7 +395,7 @@ describe('defineSchema', () => {
 					},
 				},
 			})
-			expect(schema.collections.sales.scope).toEqual(['orgId', 'storeId'])
+			expect(schema.collections.sales!.scope).toEqual(['orgId', 'storeId'])
 		})
 
 		test('defaults scope to empty array when not specified', () => {
@@ -405,7 +405,7 @@ describe('defineSchema', () => {
 					todos: { fields: { title: t.string() } },
 				},
 			})
-			expect(schema.collections.todos.scope).toEqual([])
+			expect(schema.collections.todos!.scope).toEqual([])
 		})
 
 		test('rejects scope with non-existent field', () => {

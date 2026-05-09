@@ -13,6 +13,8 @@ export const simpleCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		completed: {
 			kind: 'boolean',
@@ -21,6 +23,8 @@ export const simpleCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		count: {
 			kind: 'number',
@@ -29,6 +33,8 @@ export const simpleCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		tags: {
 			kind: 'array',
@@ -37,6 +43,8 @@ export const simpleCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: 'string',
+			mergeStrategy: null,
+			transitions: null,
 		},
 		priority: {
 			kind: 'enum',
@@ -45,11 +53,14 @@ export const simpleCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: ['low', 'medium', 'high'],
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 	},
 	indexes: [],
 	constraints: [],
 	resolvers: {},
+	scope: [],
 }
 
 /**
@@ -64,6 +75,8 @@ export const constrainedCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		email: {
 			kind: 'string',
@@ -72,6 +85,8 @@ export const constrainedCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		completed: {
 			kind: 'boolean',
@@ -80,6 +95,8 @@ export const constrainedCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 	},
 	indexes: ['email'],
@@ -91,6 +108,7 @@ export const constrainedCollectionDef: CollectionDefinition = {
 		},
 	],
 	resolvers: {},
+	scope: [],
 }
 
 /**
@@ -105,6 +123,8 @@ export const resolverCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		quantity: {
 			kind: 'number',
@@ -113,6 +133,8 @@ export const resolverCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 		name: {
 			kind: 'string',
@@ -121,6 +143,8 @@ export const resolverCollectionDef: CollectionDefinition = {
 			auto: false,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: null,
+			transitions: null,
 		},
 	},
 	indexes: [],
@@ -134,4 +158,5 @@ export const resolverCollectionDef: CollectionDefinition = {
 			return Math.max(0, b + (l - b) + (r - b))
 		},
 	},
+	scope: [],
 }
