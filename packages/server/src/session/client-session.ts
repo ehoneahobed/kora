@@ -2,6 +2,7 @@ import type { KoraEventEmitter, Operation } from '@korajs/core'
 import { SyncError, generateUUIDv7 } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
+	AwarenessUpdateMessage,
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
@@ -28,6 +29,14 @@ export type SessionState = 'connected' | 'authenticated' | 'syncing' | 'streamin
 export type RelayCallback = (sourceSessionId: string, operations: Operation[]) => void
 
 /**
+ * Callback invoked when a session receives an awareness update to relay to other sessions.
+ */
+export type AwarenessRelayCallback = (
+	sourceSessionId: string,
+	message: AwarenessUpdateMessage,
+) => void
+
+/**
  * Options for creating a ClientSession.
  */
 export interface ClientSessionOptions {
@@ -49,6 +58,8 @@ export interface ClientSessionOptions {
 	schemaVersion?: number
 	/** Called when this session has operations to relay to other sessions */
 	onRelay?: RelayCallback
+	/** Called when this session receives an awareness update to broadcast */
+	onAwarenessUpdate?: AwarenessRelayCallback
 	/** Called when this session closes */
 	onClose?: (sessionId: string) => void
 }
@@ -81,6 +92,7 @@ export class ClientSession {
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly onRelay: RelayCallback | null
+	private readonly onAwarenessUpdate: AwarenessRelayCallback | null
 	private readonly onClose: ((sessionId: string) => void) | null
 
 	constructor(options: ClientSessionOptions) {
@@ -93,6 +105,7 @@ export class ClientSession {
 		this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
 		this.schemaVersion = options.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		this.onRelay = options.onRelay ?? null
+		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
 		this.onClose = options.onClose ?? null
 	}
 
@@ -170,6 +183,14 @@ export class ClientSession {
 		return this.state === 'streaming'
 	}
 
+	/**
+	 * Get the transport for this session.
+	 * Used by the awareness relay to send messages to this client.
+	 */
+	getTransport(): ServerTransport {
+		return this.transport
+	}
+
 	// --- Private protocol handlers ---
 
 	private handleMessage(message: SyncMessage): void {
@@ -184,6 +205,9 @@ export class ClientSession {
 			case 'acknowledgment':
 				break
 			case 'error':
+				break
+			case 'awareness-update':
+				this.handleAwarenessUpdate(message)
 				break
 		}
 	}
@@ -229,7 +253,7 @@ export class ClientSession {
 			}
 		}
 
-		// Send handshake response with server's version vector
+		// Send handshake response with server's version vector and accepted scope
 		const serverVector = this.store.getVersionVector()
 		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
 		this.setSerializerWireFormat(selectedWireFormat)
@@ -241,6 +265,9 @@ export class ClientSession {
 			schemaVersion: this.schemaVersion,
 			accepted: true,
 			selectedWireFormat,
+			// Confirm the accepted scope so the client knows what data will be synced.
+			// This may differ from what the client requested if auth scopes are narrower.
+			...(this.authContext?.scopes ? { acceptedScope: this.authContext.scopes } : {}),
 		}
 		this.transport.send(response)
 
@@ -258,15 +285,29 @@ export class ClientSession {
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
 		const applied: Operation[] = []
+		const rejected: Operation[] = []
 
 		for (const op of operations) {
 			if (!operationMatchesScopes(op, this.authContext?.scopes)) {
+				rejected.push(op)
 				continue
 			}
 
 			const result = await this.store.applyRemoteOperation(op)
 			if (result === 'applied') {
 				applied.push(op)
+			}
+		}
+
+		// Send scope violation errors for rejected operations so the client
+		// knows its writes were rejected rather than silently dropped.
+		if (rejected.length > 0) {
+			for (const op of rejected) {
+				this.sendError(
+					'SCOPE_VIOLATION',
+					`Operation "${op.id}" in collection "${op.collection}" is outside the client's sync scope`,
+					false,
+				)
 			}
 		}
 
@@ -344,6 +385,12 @@ export class ClientSession {
 				batchSize: batchOps.length,
 			})
 		}
+	}
+
+	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
+		// Relay awareness updates to the server for broadcasting to other clients.
+		// Awareness is purely ephemeral -- no persistence.
+		this.onAwarenessUpdate?.(this.sessionId, msg)
 	}
 
 	private sendError(code: string, message: string, retriable: boolean): void {

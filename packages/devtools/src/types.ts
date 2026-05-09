@@ -31,6 +31,12 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'query:invalidated': 'query',
 	'query:executed': 'query',
 	'connection:quality': 'connection',
+	'sync:diagnostics': 'sync',
+	'sync:bandwidth': 'sync',
+	'sync:initial-sync-progress': 'sync',
+	'awareness:updated': 'sync',
+	'state-machine:transition': 'operation',
+	'state-machine:rejected': 'operation',
 }
 
 /** Look up the category for a given event type */

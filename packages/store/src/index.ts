@@ -37,9 +37,21 @@ export { QueryBuilder } from './query/query-builder'
 
 // === Subscription ===
 export { SubscriptionManager } from './subscription/subscription-manager'
+export type {
+	SubscriptionManagerOptions,
+	SubscriptionStats,
+} from './subscription/subscription-manager'
+export { SubscriptionBloomFilter } from './subscription/bloom-filter'
 
 // === Collection ===
 export { Collection } from './collection/collection'
+
+// === State Machine Validation ===
+export {
+	InvalidStateTransitionError,
+	validateStateTransition,
+	validateUpdateStateMachine,
+} from './state-machine/state-validator'
 
 // === Transaction ===
 export { TransactionContext } from './transaction/transaction-context'

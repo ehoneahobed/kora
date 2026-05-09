@@ -1,4 +1,4 @@
-import type { ConnectionQuality, Operation } from '../types'
+import type { ConnectionQuality, Operation, SyncDiagnosticsSnapshot } from '../types'
 
 /**
  * Trace of a merge decision. Records all inputs and outputs for debugging and DevTools.
@@ -38,6 +38,35 @@ export type KoraEvent =
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
 	| { type: 'connection:quality'; quality: ConnectionQuality }
+	| { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
+	| {
+			type: 'sync:bandwidth'
+			bytesPerSecond: number
+			direction: 'in' | 'out'
+	  }
+	| {
+			type: 'sync:initial-sync-progress'
+			progress: number
+			totalBatches: number
+			receivedBatches: number
+	  }
+	| { type: 'awareness:updated'; states: Map<number, unknown> }
+	| {
+			type: 'state-machine:transition'
+			collection: string
+			recordId: string
+			from: string
+			to: string
+			valid: boolean
+	  }
+	| {
+			type: 'state-machine:rejected'
+			collection: string
+			recordId: string
+			from: string
+			to: string
+			allowed: string[]
+	  }
 
 /** Extract the event type string union from KoraEvent */
 export type KoraEventType = KoraEvent['type']

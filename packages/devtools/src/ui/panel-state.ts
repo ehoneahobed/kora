@@ -212,6 +212,18 @@ function timelineLabel(event: KoraEvent): string {
 			return `query executed ${event.queryId}`
 		case 'connection:quality':
 			return `connection ${event.quality}`
+		case 'sync:diagnostics':
+			return `sync diagnostics ${event.diagnostics.quality}`
+		case 'sync:bandwidth':
+			return `bandwidth ${event.direction} ${event.bytesPerSecond}B/s`
+		case 'sync:initial-sync-progress':
+			return `initial sync ${Math.round(event.progress * 100)}%`
+		case 'awareness:updated':
+			return `awareness ${event.states.size} peers`
+		case 'state-machine:transition':
+			return `transition ${event.collection} ${event.from} → ${event.to}`
+		case 'state-machine:rejected':
+			return `transition rejected ${event.collection} ${event.from} → ${event.to}`
 	}
 }
 

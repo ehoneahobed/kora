@@ -1,5 +1,6 @@
 import type { FieldDescriptor } from '../types'
-import type { MigrationStep } from './migration-builder'
+import type { MigrationDefinition, MigrationStep } from './migration-builder'
+import { generateRollbackSteps } from './migration-rollback'
 
 /**
  * Convert migration steps to SQL statements.
@@ -44,6 +45,34 @@ export function migrationStepsToSQL(steps: readonly MigrationStep[]): string[] {
 	}
 
 	return statements
+}
+
+/**
+ * Generate SQL statements to roll back a migration.
+ *
+ * Uses the migration's explicit rollback steps if available,
+ * otherwise auto-generates inverse steps from the forward steps.
+ *
+ * Backfill steps in the rollback are skipped (handled at the application layer).
+ *
+ * @param migration - The migration definition to generate rollback SQL for
+ * @returns Array of SQL statements that undo the migration's structural changes
+ *
+ * @example
+ * ```typescript
+ * const migration = migrate()
+ *   .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+ *   .addIndex('todos', 'priority')
+ *
+ * const rollbackSQL = rollbackStepsToSQL(migration)
+ * // ['DROP INDEX IF EXISTS idx_todos_priority',
+ * //  'ALTER TABLE todos DROP COLUMN priority']
+ * ```
+ */
+export function rollbackStepsToSQL(migration: MigrationDefinition): string[] {
+	// Use explicit rollback steps if provided, otherwise auto-generate from forward steps
+	const rollbackSteps = migration.rollbackSteps ?? generateRollbackSteps(migration.steps)
+	return migrationStepsToSQL(rollbackSteps)
 }
 
 /**

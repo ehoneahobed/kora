@@ -1,8 +1,20 @@
-import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
+import type {
+	KoraEventEmitter,
+	Operation,
+	SyncDiagnosticsSnapshot,
+	VersionVector,
+} from '@korajs/core'
 import { SyncError } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
+import { SyncMetricsCollector } from '../diagnostics/metrics-collector'
+import type { MetricsCollectorConfig } from '../diagnostics/metrics-collector'
+import type { SyncEncryptor } from '../encryption/sync-encryptor'
+import { AwarenessManager } from '../awareness/awareness-manager'
+import type { AwarenessMessage, AwarenessState } from '../awareness/types'
 import type {
 	AcknowledgmentMessage,
+	AwarenessStateWire,
+	AwarenessUpdateMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	SyncMessage,
@@ -14,9 +26,9 @@ import {
 	wireToVersionVector,
 } from '../protocol/serializer'
 import type { MessageSerializer } from '../protocol/serializer'
+import { operationMatchesScope } from '../scopes/scope-filter'
 import type { SyncTransport } from '../transport/transport'
-import type { SyncConfig, SyncState, SyncStatusInfo } from '../types'
-import type { QueueStorage } from '../types'
+import type { QueueStorage, SyncConfig, SyncScopeMap, SyncState, SyncStatusInfo } from '../types'
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
@@ -53,6 +65,14 @@ export interface SyncEngineOptions {
 	emitter?: KoraEventEmitter
 	/** Queue storage for persistent outbound queue. Defaults to in-memory. */
 	queueStorage?: QueueStorage
+	/**
+	 * Optional encryptor for end-to-end encryption.
+	 * When provided, `data` and `previousData` fields of operations are encrypted
+	 * before sending and decrypted after receiving. The server never sees plaintext data.
+	 */
+	encryptor?: SyncEncryptor
+	/** Optional configuration for the metrics collector. */
+	metricsConfig?: MetricsCollectorConfig
 }
 
 /**
@@ -95,6 +115,9 @@ export class SyncEngine {
 	private readonly emitter: KoraEventEmitter | null
 	private readonly outboundQueue: OutboundQueue
 	private readonly batchSize: number
+	private readonly encryptor: SyncEncryptor | null
+	private readonly awarenessManager: AwarenessManager
+	private readonly metricsCollector: SyncMetricsCollector
 
 	private remoteVector: VersionVector = new Map()
 	private lastSyncedAt: number | null = null
@@ -109,6 +132,13 @@ export class SyncEngine {
 	private deltaReceiveComplete = false
 	private deltaSendComplete = false
 
+	/**
+	 * The effective scope for this sync session.
+	 * Starts as the configured scopeMap. After handshake, may be replaced
+	 * with the server-accepted scope (server is authoritative).
+	 */
+	private activeScope: SyncScopeMap | undefined
+
 	constructor(options: SyncEngineOptions) {
 		this.transport = options.transport
 		this.store = options.store
@@ -116,9 +146,33 @@ export class SyncEngine {
 		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
+		this.encryptor = options.encryptor ?? null
+		this.activeScope = options.config.scopeMap
 
 		const queueStorage = options.queueStorage ?? new MemoryQueueStorage()
 		this.outboundQueue = new OutboundQueue(queueStorage)
+
+		this.metricsCollector = new SyncMetricsCollector(options.metricsConfig)
+		if (this.emitter) {
+			this.metricsCollector.attachEmitter(this.emitter)
+		}
+
+		this.awarenessManager = new AwarenessManager({
+			emitter: this.emitter ?? undefined,
+		})
+
+		// Wire awareness manager to send messages through the transport
+		this.awarenessManager.onSend((message: AwarenessMessage) => {
+			if (this.state !== 'streaming') return
+
+			const wireMessage: SyncMessage = {
+				type: 'awareness-update',
+				messageId: generateMessageId(),
+				clientId: message.clientId,
+				states: awarenessStatesToWire(message.states),
+			}
+			this.transport.send(wireMessage)
+		})
 	}
 
 	/**
@@ -173,6 +227,9 @@ export class SyncEngine {
 	async stop(): Promise<void> {
 		if (this.state === 'disconnected') return
 
+		// Stop awareness tracking
+		this.awarenessManager.stopCleanupTimer()
+
 		// Return any in-flight batch back to queue
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
@@ -197,8 +254,17 @@ export class SyncEngine {
 	/**
 	 * Push a local operation to the outbound queue.
 	 * If streaming, flushes immediately.
+	 *
+	 * Operations outside the configured sync scope are silently skipped
+	 * because they should remain local-only and not be sent to the server.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
+		// Only push operations that match the client's scope.
+		// Out-of-scope operations are local-only and should not be synced.
+		if (!operationMatchesScope(op, this.activeScope)) {
+			return
+		}
+
 		await this.outboundQueue.enqueue(op)
 		if (this.state === 'streaming') {
 			this.flushQueue()
@@ -298,6 +364,40 @@ export class SyncEngine {
 		return this.outboundQueue
 	}
 
+	/**
+	 * Update the sync scope map. Takes effect on the next connection attempt.
+	 *
+	 * When the scope changes (e.g., user switches organization), call this method
+	 * then reconnect. The new scope will be sent in the handshake, and the server
+	 * will send back data matching the new scope.
+	 *
+	 * Data that no longer matches the new scope is NOT deleted locally.
+	 * It simply stops being synced.
+	 *
+	 * @param scopeMap - New per-collection scope filters, or undefined to remove scope
+	 */
+	updateScope(scopeMap: SyncScopeMap | undefined): void {
+		this.activeScope = scopeMap
+		// Also update the config so that the next handshake sends the new scope
+		this.config.scopeMap = scopeMap
+	}
+
+	/**
+	 * Get the currently active scope map. Returns undefined if no scope is configured.
+	 */
+	getActiveScope(): SyncScopeMap | undefined {
+		return this.activeScope
+	}
+
+	/**
+	 * Get the awareness manager for collaborative presence.
+	 * Use this to set local presence, observe remote collaborators,
+	 * and track cursor positions in richtext fields.
+	 */
+	getAwarenessManager(): AwarenessManager {
+		return this.awarenessManager
+	}
+
 	// --- Private methods ---
 
 	private handleMessage(message: SyncMessage): void {
@@ -313,6 +413,9 @@ export class SyncEngine {
 				break
 			case 'error':
 				this.handleError(message)
+				break
+			case 'awareness-update':
+				this.handleAwarenessUpdate(message)
 				break
 		}
 	}
@@ -336,7 +439,17 @@ export class SyncEngine {
 			this.setSerializerWireFormat(msg.selectedWireFormat)
 		}
 
+		// If the server sent back an accepted scope, use it as the authoritative scope.
+		// The server may have narrowed or augmented the client's requested scope
+		// based on the auth context.
+		if (msg.acceptedScope) {
+			this.activeScope = msg.acceptedScope
+		}
+
 		this.emitter?.emit({ type: 'sync:connected', nodeId: this.store.getNodeId() })
+		this.metricsCollector.recordConnected()
+		this.metricsCollector.updateStatus('syncing')
+		this.metricsCollector.recordSyncStarted()
 
 		this.transitionTo('syncing')
 		this.deltaBatchesReceived = 0
@@ -349,7 +462,11 @@ export class SyncEngine {
 
 	private async sendDelta(): Promise<void> {
 		const localVector = this.store.getVersionVector()
-		const missingOps = await this.collectDelta(localVector, this.remoteVector)
+		const allMissingOps = await this.collectDelta(localVector, this.remoteVector)
+
+		// Only send operations that match the client's scope.
+		// Local-only operations outside scope should not be sent to the server.
+		const missingOps = allMissingOps.filter((op) => operationMatchesScope(op, this.activeScope))
 
 		if (missingOps.length === 0) {
 			// No ops to send — send empty final batch
@@ -373,7 +490,13 @@ export class SyncEngine {
 		for (let i = 0; i < totalBatches; i++) {
 			const start = i * this.batchSize
 			const batchOps = sorted.slice(start, start + this.batchSize)
-			const serializedOps = batchOps.map((op) => this.serializer.encodeOperation(op))
+
+			// Encrypt data fields before serialization if E2E encryption is enabled
+			const opsToSerialize = this.encryptor
+				? await this.encryptor.encryptBatch(batchOps)
+				: batchOps
+
+			const serializedOps = opsToSerialize.map((op) => this.serializer.encodeOperation(op))
 
 			const batchMsg: SyncMessage = {
 				type: 'operation-batch',
@@ -411,23 +534,32 @@ export class SyncEngine {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
-		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
+		const deserialized = msg.operations.map((s) => this.serializer.decodeOperation(s))
 
-		// Apply each operation to the local store
-		for (const op of operations) {
+		// Decrypt data fields after deserialization if E2E encryption is enabled
+		const operations = this.encryptor
+			? await this.encryptor.decryptBatch(deserialized)
+			: deserialized
+
+		// Defense in depth: validate received operations match our scope.
+		// The server should already filter, but we verify client-side as well.
+		const inScopeOps = operations.filter((op) => operationMatchesScope(op, this.activeScope))
+
+		// Apply each in-scope operation to the local store
+		for (const op of inScopeOps) {
 			await this.store.applyRemoteOperation(op)
 		}
 
-		if (operations.length > 0) {
+		if (inScopeOps.length > 0) {
 			this.lastSuccessfulPull = Date.now()
 			this.emitter?.emit({
 				type: 'sync:received',
-				operations,
-				batchSize: operations.length,
+				operations: inScopeOps,
+				batchSize: inScopeOps.length,
 			})
 		}
 
-		// Send acknowledgment
+		// Send acknowledgment for the original batch (server tracks by batch, not per-op)
 		const lastOp = operations[operations.length - 1]
 		const ack: SyncMessage = {
 			type: 'acknowledgment',
@@ -480,6 +612,15 @@ export class SyncEngine {
 			this.lastSyncedAt = Date.now()
 			this.transitionTo('streaming')
 
+			// Start awareness cleanup timer now that we're streaming
+			this.awarenessManager.startCleanupTimer()
+
+			// Re-broadcast local awareness state to the new connection
+			const localState = this.awarenessManager.getLocalState()
+			if (localState) {
+				this.awarenessManager.setLocalState(localState)
+			}
+
 			// Flush any queued operations accumulated during delta exchange
 			if (this.outboundQueue.hasOperations) {
 				this.flushQueue()
@@ -496,21 +637,62 @@ export class SyncEngine {
 
 		this.currentBatch = batch
 
-		const serializedOps = batch.operations.map((op) => this.serializer.encodeOperation(op))
-		const batchMsg: SyncMessage = {
-			type: 'operation-batch',
-			messageId: generateMessageId(),
-			operations: serializedOps,
-			isFinal: true,
-			batchIndex: 0,
-		}
-		this.transport.send(batchMsg)
+		if (this.encryptor) {
+			// Encryption is async — encrypt then send. Errors return the batch to the queue.
+			this.encryptor.encryptBatch(batch.operations).then(
+				(encrypted) => {
+					const serializedOps = encrypted.map((op) => this.serializer.encodeOperation(op))
+					const batchMsg: SyncMessage = {
+						type: 'operation-batch',
+						messageId: generateMessageId(),
+						operations: serializedOps,
+						isFinal: true,
+						batchIndex: 0,
+					}
+					this.transport.send(batchMsg)
 
-		this.emitter?.emit({
-			type: 'sync:sent',
-			operations: batch.operations,
-			batchSize: batch.operations.length,
-		})
+					this.emitter?.emit({
+						type: 'sync:sent',
+						operations: batch.operations,
+						batchSize: batch.operations.length,
+					})
+				},
+				(err) => {
+					// If encryption fails, return the batch to the queue so no data is lost
+					this.outboundQueue.returnBatch(batch.batchId)
+					this.currentBatch = null
+					this.emitter?.emit({
+						type: 'sync:disconnected',
+						reason: err instanceof Error ? err.message : 'Encryption failed',
+					})
+				},
+			)
+		} else {
+			const serializedOps = batch.operations.map((op) => this.serializer.encodeOperation(op))
+			const batchMsg: SyncMessage = {
+				type: 'operation-batch',
+				messageId: generateMessageId(),
+				operations: serializedOps,
+				isFinal: true,
+				batchIndex: 0,
+			}
+			this.transport.send(batchMsg)
+
+			this.emitter?.emit({
+				type: 'sync:sent',
+				operations: batch.operations,
+				batchSize: batch.operations.length,
+			})
+		}
+	}
+
+	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
+		const awarenessMessage: AwarenessMessage = {
+			type: 'awareness',
+			clientId: msg.clientId,
+			states: wireToAwarenessStates(msg.states),
+		}
+		this.awarenessManager.handleRemoteMessage(awarenessMessage)
 	}
 
 	private handleTransportClose(reason: string): void {
@@ -551,4 +733,52 @@ export class SyncEngine {
 			this.serializer.setWireFormat(format)
 		}
 	}
+}
+
+// --- Awareness wire format conversion helpers ---
+
+/**
+ * Convert internal awareness states to wire format for transport.
+ */
+function awarenessStatesToWire(
+	states: Record<number, AwarenessState | null>,
+): Record<string, AwarenessStateWire | null> {
+	const wire: Record<string, AwarenessStateWire | null> = {}
+	for (const [clientId, state] of Object.entries(states)) {
+		if (state === null) {
+			wire[clientId] = null
+		} else {
+			const wireState: AwarenessStateWire = {
+				user: { ...state.user },
+			}
+			if (state.cursor) {
+				wireState.cursor = { ...state.cursor }
+			}
+			wire[clientId] = wireState
+		}
+	}
+	return wire
+}
+
+/**
+ * Convert wire format awareness states to internal representation.
+ */
+function wireToAwarenessStates(
+	wire: Record<string, AwarenessStateWire | null>,
+): Record<number, AwarenessState | null> {
+	const states: Record<number, AwarenessState | null> = {}
+	for (const [clientId, wireState] of Object.entries(wire)) {
+		if (wireState === null) {
+			states[Number(clientId)] = null
+		} else {
+			const state: AwarenessState = {
+				user: { ...wireState.user },
+			}
+			if (wireState.cursor) {
+				state.cursor = { ...wireState.cursor }
+			}
+			states[Number(clientId)] = state
+		}
+	}
+	return states
 }

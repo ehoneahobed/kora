@@ -16,6 +16,7 @@ import { Collection } from '../collection/collection'
 import { StoreNotOpenError } from '../errors'
 import { QueryBuilder } from '../query/query-builder'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import { RelationEnforcer } from '../relations/relation-enforcer'
 import { SequenceManager } from '../sequences/sequence-manager'
 import {
 	deserializeOperationWithCollection,
@@ -91,6 +92,20 @@ export class Store implements OperationLog {
 		this.sequenceNumber = await this.loadSequenceNumber()
 		this.versionVector = await this.loadVersionVector()
 
+		// Create RelationEnforcer if the schema has relations.
+		// The enforcer is shared across all Collection instances so that
+		// cascading deletes can cross collection boundaries.
+		const hasRelations = Object.keys(this.schema.relations).length > 0
+		const relationEnforcer = hasRelations
+			? new RelationEnforcer({
+					schema: this.schema,
+					adapter: this.adapter,
+					clock: this.clock,
+					nodeId: this.nodeId,
+					getSequenceNumber: () => this.nextSequenceNumber(),
+				})
+			: undefined
+
 		// Create collection instances
 		for (const [name, definition] of Object.entries(this.schema.collections)) {
 			const col = new Collection(
@@ -107,6 +122,7 @@ export class Store implements OperationLog {
 						this.emitter.emit({ type: 'operation:created', operation })
 					}
 				},
+				relationEnforcer,
 			)
 			this.collections.set(name, col)
 		}

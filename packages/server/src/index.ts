@@ -28,6 +28,7 @@ export type {
 } from './transport/ws-server-transport'
 
 export type {
+	AwarenessRelayCallback,
 	ClientSessionOptions,
 	RelayCallback,
 	SessionState,
@@ -59,6 +60,9 @@ export { NoAuthProvider } from './auth/no-auth'
 export { TokenAuthProvider } from './auth/token-auth'
 export { KoraAuthProvider } from './auth/kora-auth-provider'
 export { MixedAuthProvider } from './auth/mixed-auth-provider'
+
+// === Awareness ===
+export { AwarenessRelay } from './awareness/awareness-relay'
 
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'

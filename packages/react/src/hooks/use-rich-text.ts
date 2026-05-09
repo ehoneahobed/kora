@@ -1,4 +1,5 @@
 import type { CollectionAccessor } from '@korajs/store'
+import type { AwarenessState, CursorInfo } from '@korajs/sync'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as Y from 'yjs'
 import { useKoraContext } from '../context/kora-context'
@@ -16,7 +17,7 @@ export function useRichText(
 	recordId: string,
 	fieldName: string,
 ): UseRichTextResult {
-	const { store } = useKoraContext()
+	const { store, syncEngine } = useKoraContext()
 	const collection = useMemo<CollectionAccessor>(
 		() => store.collection(collectionName),
 		[store, collectionName],
@@ -26,6 +27,7 @@ export function useRichText(
 	const [error, setError] = useState<Error | null>(null)
 	const [canUndo, setCanUndo] = useState(false)
 	const [canRedo, setCanRedo] = useState(false)
+	const [cursors, setCursors] = useState<CursorInfo[]>([])
 	const baseUpdateRef = useRef<Uint8Array | null>(null)
 	const pendingDeltasRef = useRef<Uint8Array[]>([])
 
@@ -116,7 +118,51 @@ export function useRichText(
 		}
 	}, [collection, doc, fieldName, recordId, syncHistoryState, undoManager])
 
-	return { doc, text, undo, redo, canUndo, canRedo, ready, error }
+	// Track remote collaborators' cursors for this specific field
+	useEffect(() => {
+		if (!syncEngine) return
+
+		const awareness = syncEngine.getAwarenessManager()
+		const localClientId = awareness.clientId
+
+		const updateCursors = (): void => {
+			const states = awareness.getStates()
+			const fieldCursors: CursorInfo[] = []
+
+			for (const [clientId, state] of states) {
+				if (clientId === localClientId) continue
+				if (!state.cursor) continue
+				// Only include cursors for this specific field
+				if (
+					state.cursor.collection !== collectionName ||
+					state.cursor.recordId !== recordId ||
+					state.cursor.field !== fieldName
+				) {
+					continue
+				}
+				fieldCursors.push({
+					clientId,
+					userName: state.user.name,
+					color: state.user.color,
+					anchor: state.cursor.anchor,
+					head: state.cursor.head,
+				})
+			}
+
+			setCursors(fieldCursors)
+		}
+
+		const unsubscribe = awareness.on('change', () => {
+			updateCursors()
+		})
+
+		// Initial check
+		updateCursors()
+
+		return unsubscribe
+	}, [syncEngine, collectionName, recordId, fieldName])
+
+	return { doc, text, undo, redo, canUndo, canRedo, ready, error, cursors }
 }
 
 function encodeRichtextInput(value: unknown): Uint8Array | null {

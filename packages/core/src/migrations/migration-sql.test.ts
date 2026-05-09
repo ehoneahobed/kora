@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { t } from '../schema/types'
 import { migrate } from './migration-builder'
-import { migrationStepsToSQL } from './migration-sql'
+import { migrationStepsToSQL, rollbackStepsToSQL } from './migration-sql'
 
 describe('migrationStepsToSQL', () => {
 	test('addField produces ALTER TABLE ADD COLUMN', () => {
@@ -114,5 +114,115 @@ describe('migrationStepsToSQL', () => {
 		const steps = migrate().addField('todos', 'status', t.string().default('pending')).steps
 		const sql = migrationStepsToSQL(steps)
 		expect(sql).toEqual(["ALTER TABLE todos ADD COLUMN status TEXT DEFAULT 'pending'"])
+	})
+})
+
+describe('rollbackStepsToSQL', () => {
+	test('generates DROP COLUMN for addField rollback', () => {
+		const migration = migrate().addField(
+			'todos',
+			'priority',
+			t.enum(['low', 'medium', 'high']).default('medium'),
+		)
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(['ALTER TABLE todos DROP COLUMN priority'])
+	})
+
+	test('generates ADD COLUMN for removeField rollback (with descriptor)', () => {
+		const migration = migrate().removeField('todos', 'oldField', t.string().default('hello'))
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(["ALTER TABLE todos ADD COLUMN oldField TEXT DEFAULT 'hello'"])
+	})
+
+	test('generates RENAME COLUMN for renameField rollback', () => {
+		const migration = migrate().renameField('products', 'cost', 'costPrice')
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(['ALTER TABLE products RENAME COLUMN costPrice TO cost'])
+	})
+
+	test('generates DROP INDEX for addIndex rollback', () => {
+		const migration = migrate().addIndex('todos', 'priority')
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(['DROP INDEX IF EXISTS idx_todos_priority'])
+	})
+
+	test('generates CREATE INDEX for removeIndex rollback', () => {
+		const migration = migrate().removeIndex('todos', 'priority')
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual([
+			'CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos (priority)',
+		])
+	})
+
+	test('skips backfill steps (handled at application layer)', () => {
+		const migration = migrate().backfill(
+			'products',
+			() => ({ computed: true }),
+			() => ({ computed: false }),
+		)
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual([])
+	})
+
+	test('multi-step rollback generates SQL in reverse order', () => {
+		const migration = migrate()
+			.addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+			.addIndex('todos', 'priority')
+			.renameField('todos', 'name', 'title')
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual([
+			'ALTER TABLE todos RENAME COLUMN title TO name',
+			'DROP INDEX IF EXISTS idx_todos_priority',
+			'ALTER TABLE todos DROP COLUMN priority',
+		])
+	})
+
+	test('uses explicit .down() steps for SQL generation', () => {
+		const migration = migrate()
+			.addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+			.addIndex('todos', 'priority')
+			.down((rb) => {
+				rb.removeIndex('todos', 'priority').removeField('todos', 'priority')
+			})
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual([
+			'DROP INDEX IF EXISTS idx_todos_priority',
+			'ALTER TABLE todos DROP COLUMN priority',
+		])
+	})
+
+	test('empty migration produces empty rollback SQL', () => {
+		const migration = migrate()
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual([])
+	})
+
+	test('rollback addField with boolean restores correct type', () => {
+		const migration = migrate().removeField('todos', 'active', t.boolean().default(true))
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(['ALTER TABLE todos ADD COLUMN active INTEGER DEFAULT 1'])
+	})
+
+	test('rollback addField with number restores correct type', () => {
+		const migration = migrate().removeField('products', 'price', t.number().default(9.99))
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(['ALTER TABLE products ADD COLUMN price REAL DEFAULT 9.99'])
+	})
+
+	test('rollback addField with array restores correct type', () => {
+		const migration = migrate().removeField('todos', 'tags', t.array(t.string()).default([]))
+
+		const sql = rollbackStepsToSQL(migration)
+		expect(sql).toEqual(["ALTER TABLE todos ADD COLUMN tags TEXT DEFAULT '[]'"])
 	})
 })

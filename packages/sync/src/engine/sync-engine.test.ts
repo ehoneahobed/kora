@@ -891,6 +891,335 @@ describe('SyncEngine scope', () => {
 		expect(receivedHandshake).not.toBeNull()
 		expect(receivedHandshake?.syncScope).toBeUndefined()
 	})
+
+	test('pushOperation skips out-of-scope operations', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const scopeMap = { todos: { userId: 'user-1' } }
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		client.clearSentMessages()
+
+		// Push an out-of-scope op (data has no userId field => no match for userId scope)
+		await engine.pushOperation(makeOp('out-of-scope', 10, 'node-1'))
+
+		// Should NOT have been sent
+		const sent = client.getSentMessages()
+		const opBatch = sent.find((m) => m.type === 'operation-batch') as
+			| OperationBatchMessage
+			| undefined
+		expect(opBatch).toBeUndefined()
+	})
+
+	test('pushOperation sends in-scope operations', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const scopeMap = { todos: { userId: 'user-1' } }
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		client.clearSentMessages()
+
+		// Push an in-scope op
+		const inScopeOp: Operation = {
+			...makeOp('in-scope', 10),
+			data: { userId: 'user-1', title: 'Test' },
+		}
+		await engine.pushOperation(inScopeOp)
+
+		const sent = client.getSentMessages()
+		const opBatch = sent.find((m) => m.type === 'operation-batch') as
+			| OperationBatchMessage
+			| undefined
+		expect(opBatch).toBeDefined()
+		expect(opBatch?.operations).toHaveLength(1)
+	})
+
+	test('incoming operations outside scope are filtered out (defense in depth)', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const applyFn = vi.fn(async (_op: Operation) => 'applied' as const)
+		const store = createMockStore({ applyRemoteOperation: applyFn })
+
+		const scopeMap = { todos: { userId: 'user-1' } }
+
+		// Server responds to handshake with the scope
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+					acceptedScope: scopeMap,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${msg.messageId}`,
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeMap },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		const serializer = new JsonMessageSerializer()
+
+		// Server sends ops: one in scope, one out of scope
+		const inScopeOp: Operation = {
+			...makeOp('in', 1, 'server-node'),
+			data: { userId: 'user-1', title: 'Mine' },
+		}
+		const outOfScopeOp: Operation = {
+			...makeOp('out', 2, 'server-node'),
+			data: { userId: 'user-2', title: 'Not mine' },
+		}
+
+		server.send({
+			type: 'operation-batch',
+			messageId: 'stream-1',
+			operations: [
+				serializer.encodeOperation(inScopeOp),
+				serializer.encodeOperation(outOfScopeOp),
+			],
+			isFinal: true,
+			batchIndex: 0,
+		})
+
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		// Only the in-scope op should be applied
+		const appliedOps = applyFn.mock.calls.map((call) => (call[0] as Operation).id)
+		expect(appliedOps).toContain('in')
+		expect(appliedOps).not.toContain('out')
+	})
+
+	test('accepted scope from handshake response overrides client scope', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const store = createMockStore()
+
+		// Client requests broad scope, server narrows it
+		const clientScope = { todos: { orgId: 'org-1' } }
+		const serverScope = { todos: { orgId: 'org-1', userId: 'user-1' } }
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+					acceptedScope: serverScope,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${msg.messageId}`,
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeMap: clientScope },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		// Active scope should now be the server's narrower scope
+		expect(engine.getActiveScope()).toEqual(serverScope)
+	})
+
+	test('delta only sends in-scope operations', async () => {
+		const { client, server } = createMemoryTransportPair()
+
+		const scopeMap = { todos: { userId: 'user-1' } }
+
+		// Store has ops from different users
+		const inScopeOp: Operation = {
+			...makeOp('in', 1),
+			data: { userId: 'user-1', title: 'Mine' },
+		}
+		const outOfScopeOp: Operation = {
+			...makeOp('out', 2),
+			data: { userId: 'user-2', title: 'Not mine' },
+		}
+
+		const store = createMockStore({
+			getVersionVector: () => new Map([['node-1', 2]]),
+			getOperationRange: vi.fn(async () => [inScopeOp, outOfScopeOp]),
+		})
+
+		const receivedBatches: OperationBatchMessage[] = []
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				receivedBatches.push(msg as OperationBatchMessage)
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${msg.messageId}`,
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeMap },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		// Only the in-scope op should have been sent
+		const allSentOps = receivedBatches.flatMap((b) => b.operations)
+		expect(allSentOps).toHaveLength(1)
+		expect(allSentOps[0]?.id).toBe('in')
+	})
+
+	test('updateScope changes the active scope for future operations', () => {
+		const { client } = createMemoryTransportPair()
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
+		})
+
+		expect(engine.getActiveScope()).toEqual({ todos: { userId: 'user-1' } })
+
+		// Update scope
+		engine.updateScope({ todos: { userId: 'user-2' } })
+		expect(engine.getActiveScope()).toEqual({ todos: { userId: 'user-2' } })
+
+		// Can also clear scope
+		engine.updateScope(undefined)
+		expect(engine.getActiveScope()).toBeUndefined()
+	})
+
+	test('pushOperation uses updated scope after updateScope', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		// Op for user-2 should be skipped with current scope
+		const user2Op: Operation = {
+			...makeOp('user2-op', 10),
+			data: { userId: 'user-2', title: 'Test' },
+		}
+
+		client.clearSentMessages()
+		await engine.pushOperation(user2Op)
+		let sent = client.getSentMessages()
+		expect(sent.filter((m) => m.type === 'operation-batch')).toHaveLength(0)
+
+		// Update scope to user-2
+		engine.updateScope({ todos: { userId: 'user-2' } })
+
+		// Now user-2 op should be sent
+		await engine.pushOperation(user2Op)
+		sent = client.getSentMessages()
+		expect(sent.filter((m) => m.type === 'operation-batch')).toHaveLength(1)
+	})
+
+	test('no scope means all operations are in scope', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			// No scopeMap — all ops should pass through
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		client.clearSentMessages()
+		await engine.pushOperation(makeOp('any-op', 10))
+
+		const sent = client.getSentMessages()
+		const opBatch = sent.find((m) => m.type === 'operation-batch') as
+			| OperationBatchMessage
+			| undefined
+		expect(opBatch).toBeDefined()
+	})
 })
 
 describe('SyncEngine enhanced status', () => {

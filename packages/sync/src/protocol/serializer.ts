@@ -305,6 +305,13 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				errorMessage: message.message,
 				retriable: message.retriable,
 			}
+		case 'awareness-update':
+			// Awareness messages are ephemeral and not sent via protobuf.
+			// They use JSON serialization only. Return a minimal envelope.
+			return {
+				type: message.type,
+				messageId: message.messageId,
+			}
 	}
 }
 

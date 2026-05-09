@@ -1,5 +1,6 @@
 import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
+import { validateStateMachineDefinition } from '../state-machine/state-machine'
 import type {
 	CollectionDefinition,
 	Constraint,
@@ -7,6 +8,7 @@ import type {
 	FieldDescriptor,
 	RelationDefinition,
 	SchemaDefinition,
+	StateMachineDefinition,
 } from '../types'
 import type { FieldBuilder } from './types'
 
@@ -30,6 +32,15 @@ export interface SchemaInput {
 	migrations?: Record<number, MigrationDefinition>
 }
 
+export interface StateMachineInput {
+	/** The enum field this state machine controls */
+	field: string
+	/** Map of state to allowed next states */
+	transitions: Record<string, string[]>
+	/** What to do when an invalid transition is attempted */
+	onInvalidTransition: 'reject' | 'last-valid-state'
+}
+
 export interface CollectionInput {
 	// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
 	fields: Record<string, FieldBuilder<any, any, any>>
@@ -38,6 +49,8 @@ export interface CollectionInput {
 	resolve?: Record<string, CustomResolver>
 	/** Scope fields for sync filtering. Only records matching the client's scope values are synced. */
 	scope?: string[]
+	/** State machine definition constraining transitions on an enum field */
+	stateMachine?: StateMachineInput
 }
 
 export interface ConstraintInput {
@@ -227,7 +240,13 @@ function buildCollection(name: string, input: CollectionInput): CollectionDefini
 		}
 	}
 
-	return { fields, indexes, constraints, resolvers, scope }
+	let stateMachine: StateMachineDefinition | undefined
+	if (input.stateMachine) {
+		validateStateMachineDefinition(name, input.stateMachine, fields)
+		stateMachine = { ...input.stateMachine }
+	}
+
+	return { fields, indexes, constraints, resolvers, scope, stateMachine }
 }
 
 function validateFieldName(collection: string, fieldName: string): void {

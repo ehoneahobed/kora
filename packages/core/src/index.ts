@@ -23,7 +23,12 @@ export type {
 	RelationType,
 	SchemaDefinition,
 	SequenceConfig,
+	StateMachineConstraint,
+	StateMachineDefinition,
+	SyncDiagnosticsSnapshot,
 	TimeSource,
+	TransitionMap,
+	TransitionValidationResult,
 	VersionVector,
 } from './types'
 
@@ -69,6 +74,7 @@ export type {
 	ConstraintInput,
 	RelationInput,
 	SchemaInput,
+	StateMachineInput,
 	TypedSchemaDefinition,
 } from './schema/define'
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
@@ -105,9 +111,23 @@ export type { ScopeMap } from './scopes/build-scope-map'
 export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence-format'
 
 // === Migrations ===
-export { MigrationBuilder, migrate } from './migrations/migration-builder'
+export { MigrationBuilder, RollbackBuilder, migrate } from './migrations/migration-builder'
 export type { MigrationDefinition, MigrationStep } from './migrations/migration-builder'
-export { migrationStepsToSQL } from './migrations/migration-sql'
+export { migrationStepsToSQL, rollbackStepsToSQL } from './migrations/migration-sql'
+export {
+	MigrationRollbackError,
+	canAutoRollback,
+	createReversibleMigration,
+	generateRollbackSteps,
+} from './migrations/migration-rollback'
+export type { ReversibleMigration } from './migrations/migration-rollback'
+
+// === State Machine ===
+export {
+	buildStateMachineConstraints,
+	getTransitionMap,
+	validateTransition,
+} from './state-machine/state-machine'
 
 // === Events ===
 export type {
@@ -118,3 +138,7 @@ export type {
 	KoraEventType,
 	MergeTrace,
 } from './events/events'
+
+// === Codegen ===
+export { generateProtoDefinitions } from './codegen/proto-generator'
+export type { ProtoOutput } from './codegen/proto-generator'

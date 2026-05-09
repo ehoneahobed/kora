@@ -3,6 +3,10 @@ import type { Operation } from '@korajs/core'
 import type { MergeTrace } from '@korajs/core'
 import { checkConstraints } from '../constraints/constraint-checker'
 import { resolveConstraintViolation } from '../constraints/resolvers'
+import {
+	isStateMachineField,
+	resolveStateMachineMerge,
+} from '../constraints/state-machine-constraint'
 import type { ConstraintContext, MergeInput, MergeResult } from '../types'
 import { mergeField } from './field-merger'
 
@@ -118,7 +122,29 @@ export class MergeEngine {
 		for (const fieldName of allFields) {
 			const fieldDef = collectionDef.fields[fieldName]
 			if (fieldDef === undefined) {
-				// Field not in schema — skip (could be a removed field from migration)
+				// Field not in schema -- skip (could be a removed field from migration)
+				continue
+			}
+
+			// State machine fields use dedicated merge logic that validates
+			// transitions from the base state rather than plain LWW.
+			if (
+				collectionDef.stateMachine !== undefined &&
+				isStateMachineField(collectionDef, fieldName)
+			) {
+				const smResult = resolveStateMachineMerge(
+					fieldName,
+					local,
+					remote,
+					baseState,
+					collectionDef.stateMachine,
+				)
+				mergedData[fieldName] = smResult.value
+
+				// Include trace unless it was a no-conflict-unchanged case
+				if (smResult.trace.strategy !== 'state-machine-no-conflict-unchanged') {
+					traces.push(smResult.trace)
+				}
 				continue
 			}
 

@@ -1,4 +1,9 @@
 import type { Operation } from '@korajs/core'
+import { KoraError } from '@korajs/core'
+import type { SyncEncryptionConfig } from './encryption/types'
+
+// Re-export for convenience — consumers can import from '@korajs/sync' types
+export type { SyncEncryptionConfig }
 
 /**
  * Internal sync engine states. Used for state machine transitions.
@@ -38,6 +43,13 @@ export interface SyncStatusInfo {
 }
 
 /**
+ * Per-collection sync scope map. Maps collection names to field-value filters.
+ * Empty filter `{}` means no restriction (all records visible).
+ * Missing collection means hidden (no records visible for that collection).
+ */
+export type SyncScopeMap = Record<string, Record<string, unknown>>
+
+/**
  * Sync configuration provided by the developer.
  */
 export interface SyncConfig {
@@ -53,7 +65,7 @@ export interface SyncConfig {
 	 * Pre-computed per-collection sync scope map. Sent to the server in the handshake.
 	 * Built automatically by createApp from schema scope declarations + flat scope values.
 	 */
-	scopeMap?: Record<string, Record<string, unknown>>
+	scopeMap?: SyncScopeMap
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
 	/** Initial reconnection delay in ms. Defaults to 1000. */
@@ -62,6 +74,12 @@ export interface SyncConfig {
 	maxReconnectInterval?: number
 	/** Schema version of this client. */
 	schemaVersion?: number
+	/**
+	 * End-to-end encryption configuration.
+	 * When enabled, `data` and `previousData` fields are encrypted before sending
+	 * over the wire. The server never sees plaintext user data.
+	 */
+	encryption?: SyncEncryptionConfig
 }
 
 /**
@@ -85,4 +103,37 @@ export interface QueueStorage {
 	dequeue(ids: string[]): Promise<void>
 	/** Return number of operations in storage */
 	count(): Promise<number>
+}
+
+/**
+ * Thrown when an operation violates sync scope constraints.
+ * This can happen when:
+ * - A client tries to push an operation outside its configured scope
+ * - The server rejects an operation because it falls outside the client's scope
+ */
+export class ScopeViolationError extends KoraError {
+	constructor(
+		public readonly operationId: string,
+		public readonly collection: string,
+		public readonly scope: Record<string, unknown>,
+		message?: string,
+	) {
+		super(
+			message ??
+				`Operation "${operationId}" in collection "${collection}" violates sync scope`,
+			'SCOPE_VIOLATION',
+			{ operationId, collection, scope },
+		)
+		this.name = 'ScopeViolationError'
+	}
+}
+
+/**
+ * Thrown when a sync scope configuration is invalid.
+ */
+export class InvalidScopeError extends KoraError {
+	constructor(message: string, context?: Record<string, unknown>) {
+		super(message, 'INVALID_SCOPE', context)
+		this.name = 'InvalidScopeError'
+	}
 }

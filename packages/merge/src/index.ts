@@ -35,5 +35,19 @@ export { mergeField } from './engine/field-merger'
 export { checkConstraints } from './constraints/constraint-checker'
 export { resolveConstraintViolation, type ConstraintResolution } from './constraints/resolvers'
 
+// === Referential Integrity ===
+export {
+	buildMergeRelationLookup,
+	checkReferentialIntegrityOnDelete,
+	resolveDeleteVsInsertConflict,
+} from './constraints/referential-integrity'
+export type {
+	DeleteVsInsertResolution,
+	MergeIncomingRelation,
+	ReferentialCheckResult,
+	ReferentialMergeContext,
+	SideEffectOp,
+} from './constraints/referential-integrity'
+
 // === Merge Engine ===
 export { MergeEngine } from './engine/merge-engine'

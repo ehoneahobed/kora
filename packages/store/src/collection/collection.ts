@@ -16,7 +16,9 @@ import {
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import type { RelationEnforcer } from '../relations/relation-enforcer'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
+import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../types'
 
 /**
@@ -27,8 +29,13 @@ export type MutationCallback = (collection: string, operation: Operation) => voi
 /**
  * Collection provides CRUD operations on a single schema collection.
  * Each mutation creates an Operation and persists both the data and the operation atomically.
+ *
+ * When a RelationEnforcer is provided, delete operations enforce referential integrity
+ * policies (cascade, set-null, restrict) defined in the schema's relations.
  */
 export class Collection {
+	private readonly relationEnforcer: RelationEnforcer | null
+
 	constructor(
 		private readonly name: string,
 		private readonly definition: CollectionDefinition,
@@ -38,7 +45,10 @@ export class Collection {
 		private readonly nodeId: string,
 		private readonly getSequenceNumber: () => number,
 		private readonly onMutation: MutationCallback,
-	) {}
+		relationEnforcer?: RelationEnforcer,
+	) {
+		this.relationEnforcer = relationEnforcer ?? null
+	}
 
 	/**
 	 * Insert a new record into the collection.
@@ -141,13 +151,33 @@ export class Collection {
 			throw new RecordNotFoundError(this.name, id)
 		}
 
-		const validated = validateRecord(this.name, this.definition, data, 'update')
+		let validated = validateRecord(this.name, this.definition, data, 'update')
 		const now = Date.now()
+
+		// Validate state machine transitions before proceeding.
+		// In 'last-valid-state' mode this may strip the state field from validated data.
+		// In 'reject' mode this will throw InvalidStateTransitionError.
+		const currentRecord = deserializeRecord(currentRow, this.definition.fields)
+		validated = validateUpdateStateMachine(
+			this.name,
+			id,
+			this.definition,
+			currentRecord,
+			validated,
+		)
+
+		// If state machine validation removed all fields, the update is a no-op.
+		if (Object.keys(validated).length === 0) {
+			const fullRecord = await this.findById(id)
+			if (!fullRecord) {
+				throw new RecordNotFoundError(this.name, id)
+			}
+			return fullRecord
+		}
 
 		// Build previousData from current row for the changed fields,
 		// and resolve any atomic op sentinels to concrete values.
 		const previousData: Record<string, unknown> = {}
-		const currentRecord = deserializeRecord(currentRow, this.definition.fields)
 		const resolvedData: Record<string, unknown> = {}
 		const atomicOps: Record<string, AtomicOp> = {}
 
@@ -216,8 +246,19 @@ export class Collection {
 	/**
 	 * Soft-delete a record by its ID.
 	 *
+	 * When a RelationEnforcer is configured, referential integrity policies
+	 * are enforced within the same transaction:
+	 * - **cascade**: Recursively deletes all referencing records
+	 * - **set-null**: Sets foreign keys to null on referencing records
+	 * - **restrict**: Throws ReferentialIntegrityError if references exist
+	 * - **no-action**: Does nothing (dangling references are left)
+	 *
+	 * All cascaded operations are created atomically within the same transaction
+	 * and share causal dependencies with the original delete.
+	 *
 	 * @param id - The record ID to delete
 	 * @throws {RecordNotFoundError} If the record doesn't exist or is already deleted
+	 * @throws {ReferentialIntegrityError} If a 'restrict' policy is violated
 	 */
 	async delete(id: string): Promise<void> {
 		const currentRows = await this.adapter.query<RawCollectionRow>(
@@ -252,7 +293,21 @@ export class Collection {
 			opRow as unknown as Record<string, unknown>,
 		)
 
+		const cascadedOps: Operation[] = []
+
 		await this.adapter.transaction(async (tx) => {
+			// Enforce referential integrity BEFORE the delete, within the transaction.
+			// This ensures restrict can block the delete, and cascade/set-null are atomic.
+			if (this.relationEnforcer) {
+				const enforcementResult = await this.relationEnforcer.enforceDelete(
+					this.name,
+					id,
+					tx,
+					[operation.id],
+				)
+				cascadedOps.push(...enforcementResult.operations)
+			}
+
 			await tx.execute(deleteQuery.sql, deleteQuery.params)
 			await tx.execute(opInsert.sql, opInsert.params)
 			await tx.execute(
@@ -261,7 +316,11 @@ export class Collection {
 			)
 		})
 
+		// Notify for the primary delete and all cascaded operations
 		this.onMutation(this.name, operation)
+		for (const cascadedOp of cascadedOps) {
+			this.onMutation(cascadedOp.collection, cascadedOp)
+		}
 	}
 
 	/** Get the collection name */

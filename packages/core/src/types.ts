@@ -95,6 +95,71 @@ export type FieldKind =
 	| 'enum'
 	| 'array'
 
+/**
+ * Comprehensive sync diagnostics snapshot.
+ * Provides connection, latency, throughput, queue, and error metrics
+ * for monitoring and DevTools integration.
+ */
+export interface SyncDiagnosticsSnapshot {
+	// Connection
+	/** Current developer-facing sync status */
+	status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error'
+	/** Timestamp when the current connection was established, or null if disconnected */
+	connectedAt: number | null
+	/** Timestamp when the last disconnection occurred, or null if never disconnected */
+	disconnectedAt: number | null
+	/** Number of reconnection attempts since last successful connection */
+	reconnectAttempts: number
+
+	// Latency
+	/** Current round-trip time in milliseconds */
+	rttMs: number
+	/** Median (50th percentile) RTT over the sliding window */
+	rttP50Ms: number
+	/** 95th percentile RTT over the sliding window */
+	rttP95Ms: number
+	/** 99th percentile RTT over the sliding window */
+	rttP99Ms: number
+
+	// Throughput
+	/** Total operations sent during this session */
+	operationsSent: number
+	/** Total operations received during this session */
+	operationsReceived: number
+	/** Total bytes sent during this session */
+	bytesSent: number
+	/** Total bytes received during this session */
+	bytesReceived: number
+
+	// Queue
+	/** Number of operations waiting to be sent */
+	pendingOperations: number
+	/** Estimated bytes in the outbound queue */
+	outboundQueueSize: number
+
+	// Sync Progress
+	/** Timestamp of the last successful sync, or null if never synced */
+	lastSyncedAt: number | null
+	/** Duration of the last complete sync cycle in ms, or null if no cycle completed */
+	syncDuration: number | null
+	/** Whether the initial sync (full delta exchange) has completed */
+	initialSyncComplete: boolean
+	/** Progress of the initial sync as a 0-1 ratio */
+	initialSyncProgress: number
+
+	// Errors
+	/** Description of the last error, or null if no error occurred */
+	lastError: string | null
+	/** Total number of errors during this session */
+	errorCount: number
+
+	// Connection Quality
+	/** Assessed connection quality level */
+	quality: 'excellent' | 'good' | 'fair' | 'poor' | 'offline'
+	/** Estimated effective bandwidth in bytes per second, or null if not yet measured */
+	effectiveBandwidth: number | null
+}
+
 /** Built-in field merge strategies that can be declared in the schema. */
 export type FieldMergeStrategy =
 	| 'lww'
@@ -104,6 +169,40 @@ export type FieldMergeStrategy =
 	| 'union'
 	| 'append-only'
 	| 'server-authoritative'
+
+/** Map of state to allowed next states for state machine constraints */
+export type TransitionMap = Record<string, string[]>
+
+/**
+ * A state machine constraint extracted from the schema.
+ * Used by merge and validation to enforce valid state transitions.
+ */
+export interface StateMachineConstraint {
+	/** The enum field this constraint controls */
+	field: string
+	/** The collection this constraint applies to */
+	collection: string
+	/** Map of state to allowed next states */
+	transitions: TransitionMap
+}
+
+/**
+ * Result of validating a state transition.
+ */
+export interface TransitionValidationResult {
+	/** Whether the transition is allowed */
+	valid: boolean
+	/** The source state */
+	from: string
+	/** The target state */
+	to: string
+	/** The field being transitioned */
+	field: string
+	/** The collection containing the field */
+	collection: string
+	/** All allowed target states from the source state */
+	allowedTargets: string[]
+}
 
 /**
  * Descriptor produced by the type builder (t.string(), t.number(), etc.).
@@ -118,6 +217,39 @@ export interface FieldDescriptor {
 	itemKind: FieldKind | null
 	/** Declared merge strategy. Defaults to kind-appropriate strategy when undefined. */
 	mergeStrategy: FieldMergeStrategy | null
+	/** State machine transition map for enum fields. Null if no transitions declared. */
+	transitions: TransitionMap | null
+}
+
+/**
+ * Defines a state machine on an enum field, constraining valid state transitions.
+ *
+ * When a state machine is defined on a collection, mutations and merges
+ * enforce that the controlled field only moves along declared transitions.
+ *
+ * @example
+ * ```typescript
+ * stateMachine: {
+ *   field: 'status',
+ *   transitions: {
+ *     draft: ['pending', 'cancelled'],
+ *     pending: ['confirmed', 'cancelled'],
+ *     confirmed: ['shipped'],
+ *     shipped: ['delivered'],
+ *     delivered: [],
+ *     cancelled: [],
+ *   },
+ *   onInvalidTransition: 'reject',
+ * }
+ * ```
+ */
+export interface StateMachineDefinition {
+	/** The enum field this state machine controls */
+	field: string
+	/** Map of state to allowed next states */
+	transitions: Record<string, string[]>
+	/** What to do when an invalid transition is attempted */
+	onInvalidTransition: 'reject' | 'last-valid-state'
 }
 
 /**
@@ -130,6 +262,8 @@ export interface CollectionDefinition {
 	resolvers: Record<string, CustomResolver>
 	/** Scope fields for sync filtering. Only records matching the client's scope values are synced. */
 	scope: string[]
+	/** Optional state machine constraining transitions on an enum field */
+	stateMachine?: StateMachineDefinition
 }
 
 /** Custom resolver function for tier 3 merge resolution */

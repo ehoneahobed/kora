@@ -1,4 +1,5 @@
-import type { FieldDescriptor, FieldKind, FieldMergeStrategy } from '../types'
+import { SchemaValidationError } from '../errors/errors'
+import type { FieldDescriptor, FieldKind, FieldMergeStrategy, TransitionMap } from '../types'
 
 /**
  * Base field builder implementing the builder pattern for schema field definitions.
@@ -90,6 +91,7 @@ export class FieldBuilder<
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
+			transitions: null,
 		}
 	}
 }
@@ -104,6 +106,7 @@ export class EnumFieldBuilder<
 	Auto extends boolean = false,
 > extends FieldBuilder<'enum', Req, Auto> {
 	private readonly _enumValues: Values
+	private readonly _transitions: TransitionMap | null
 
 	constructor(
 		values: Values,
@@ -111,9 +114,11 @@ export class EnumFieldBuilder<
 		defaultValue: unknown = undefined,
 		auto = false as unknown as Auto,
 		mergeStrategy: FieldMergeStrategy | null = null,
+		transitions: TransitionMap | null = null,
 	) {
 		super('enum', required, defaultValue, auto, mergeStrategy)
 		this._enumValues = values
+		this._transitions = transitions
 	}
 
 	override optional(): EnumFieldBuilder<Values, false, Auto> {
@@ -123,15 +128,16 @@ export class EnumFieldBuilder<
 			this._defaultValue,
 			this._auto,
 			this._mergeStrategy,
+			this._transitions,
 		)
 	}
 
 	override default(value: Values[number]): EnumFieldBuilder<Values, false, Auto> {
-		return new EnumFieldBuilder(this._enumValues, false, value, this._auto, this._mergeStrategy)
+		return new EnumFieldBuilder(this._enumValues, false, value, this._auto, this._mergeStrategy, this._transitions)
 	}
 
 	override auto(): EnumFieldBuilder<Values, false, true> {
-		return new EnumFieldBuilder(this._enumValues, false, undefined, true, this._mergeStrategy)
+		return new EnumFieldBuilder(this._enumValues, false, undefined, true, this._mergeStrategy, this._transitions)
 	}
 
 	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto> {
@@ -141,6 +147,52 @@ export class EnumFieldBuilder<
 			this._defaultValue,
 			this._auto as unknown as Auto,
 			strategy,
+			this._transitions,
+		)
+	}
+
+	/**
+	 * Declare allowed state transitions for this enum field.
+	 * Enables state machine validation during mutations and merges.
+	 *
+	 * @param map - Map of state to allowed next states
+	 *
+	 * @example
+	 * ```typescript
+	 * t.enum(['draft', 'pending', 'confirmed', 'cancelled']).transitions({
+	 *   draft: ['pending', 'cancelled'],
+	 *   pending: ['confirmed', 'cancelled'],
+	 *   confirmed: [],
+	 *   cancelled: [],
+	 * })
+	 * ```
+	 */
+	transitions(map: Record<Values[number], Values[number][]>): EnumFieldBuilder<Values, Req, Auto> {
+		// Validate that all source and target states are valid enum values
+		const validValues = new Set(this._enumValues as readonly string[])
+		for (const [state, targets] of Object.entries(map)) {
+			if (!validValues.has(state)) {
+				throw new SchemaValidationError(
+					`Invalid source state "${state}" in transition map. Valid values: ${[...validValues].join(', ')}`,
+					{ state, validValues: [...validValues] },
+				)
+			}
+			for (const target of targets as string[]) {
+				if (!validValues.has(target)) {
+					throw new SchemaValidationError(
+						`Invalid target state "${target}" in transition from "${state}". Valid values: ${[...validValues].join(', ')}`,
+						{ state, target, validValues: [...validValues] },
+					)
+				}
+			}
+		}
+		return new EnumFieldBuilder(
+			this._enumValues,
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			this._mergeStrategy,
+			map as TransitionMap,
 		)
 	}
 
@@ -153,6 +205,7 @@ export class EnumFieldBuilder<
 			enumValues: this._enumValues,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
+			transitions: this._transitions,
 		}
 	}
 }
@@ -228,6 +281,7 @@ export class ArrayFieldBuilder<
 			enumValues: null,
 			itemKind: this._itemKind,
 			mergeStrategy: this._mergeStrategy,
+			transitions: null,
 		}
 	}
 }

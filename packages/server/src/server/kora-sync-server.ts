@@ -1,7 +1,8 @@
 import type { KoraEventEmitter, Operation } from '@korajs/core'
 import { SyncError, generateUUIDv7 } from '@korajs/core'
-import type { MessageSerializer } from '@korajs/sync'
+import type { AwarenessUpdateMessage, MessageSerializer } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
+import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ClientSession } from '../session/client-session'
 import type { ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
@@ -61,6 +62,7 @@ export class KoraSyncServer {
 	private readonly host: string
 	private readonly path: string
 
+	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly sessions = new Map<string, ClientSession>()
 	private readonly httpClients = new Map<
 		string,
@@ -133,6 +135,9 @@ export class KoraSyncServer {
 	 * Stop the server. Closes all sessions and the WebSocket server.
 	 */
 	async stop(): Promise<void> {
+		// Clean up awareness relay
+		this.awarenessRelay.clear()
+
 		// Close all active sessions (works in both standalone and attach mode)
 		for (const session of this.sessions.values()) {
 			session.close('server shutting down')
@@ -227,6 +232,9 @@ export class KoraSyncServer {
 			onRelay: (sourceSessionId, operations) => {
 				this.handleRelay(sourceSessionId, operations)
 			},
+			onAwarenessUpdate: (sourceSessionId, message) => {
+				this.handleAwarenessRelay(sourceSessionId, message)
+			},
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
@@ -267,6 +275,9 @@ export class KoraSyncServer {
 	}
 
 	private handleSessionClose(sessionId: string): void {
+		// Clean up awareness state for this session and notify remaining clients
+		this.awarenessRelay.removeClient(sessionId)
+
 		this.sessions.delete(sessionId)
 
 		const clientId = this.httpSessionToClient.get(sessionId)
@@ -274,6 +285,22 @@ export class KoraSyncServer {
 			this.httpSessionToClient.delete(sessionId)
 			this.httpClients.delete(clientId)
 		}
+	}
+
+	private handleAwarenessRelay(
+		sourceSessionId: string,
+		message: AwarenessUpdateMessage,
+	): void {
+		// Register client with awareness relay if not already done
+		const session = this.sessions.get(sourceSessionId)
+		if (!session) return
+
+		const transport = session.getTransport()
+		if (!this.awarenessRelay.getClientCount() || !transport) {
+			// First awareness update from this client -- register
+		}
+		this.awarenessRelay.addClient(sourceSessionId, message.clientId, transport)
+		this.awarenessRelay.handleUpdate(sourceSessionId, message)
 	}
 
 	private getOrCreateHttpClient(clientId: string): {

@@ -1,5 +1,5 @@
 import type { Store } from '@korajs/store'
-import type { SyncEngine } from '@korajs/sync'
+import type { CursorInfo, SyncEngine } from '@korajs/sync'
 import type { ReactNode } from 'react'
 import type * as Y from 'yjs'
 
@@ -91,4 +91,6 @@ export interface UseRichTextResult {
 	ready: boolean
 	/** Last hook error (load/persist), if any. */
 	error: Error | null
+	/** Remote collaborators' cursor positions in this field. Empty if no sync engine. */
+	cursors: CursorInfo[]
 }

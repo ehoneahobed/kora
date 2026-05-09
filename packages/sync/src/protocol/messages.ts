@@ -54,6 +54,8 @@ export interface HandshakeResponseMessage {
 	accepted: boolean
 	rejectReason?: string
 	selectedWireFormat?: WireFormat
+	/** The server-accepted per-collection sync scope. Confirms what data will be synced. */
+	acceptedScope?: Record<string, Record<string, unknown>>
 }
 
 /**
@@ -91,6 +93,39 @@ export interface ErrorMessage {
 }
 
 /**
+ * Awareness state for a single client (cursor position, user info).
+ * Wire-format representation for JSON transport.
+ * Ephemeral -- not persisted, only shared with connected peers.
+ */
+export interface AwarenessStateWire {
+	user: {
+		name: string
+		color: string
+		avatar?: string
+	}
+	cursor?: {
+		collection: string
+		recordId: string
+		field: string
+		anchor: number
+		head: number
+	}
+}
+
+/**
+ * Awareness update message. Carries ephemeral presence data (cursors, user info).
+ * Processed separately from operation sync -- never persisted.
+ */
+export interface AwarenessUpdateMessage {
+	type: 'awareness-update'
+	messageId: string
+	/** Client ID of the sender */
+	clientId: number
+	/** Map of clientId -> state (null means removal) */
+	states: Record<string, AwarenessStateWire | null>
+}
+
+/**
  * Union of all sync protocol messages.
  */
 export type SyncMessage =
@@ -99,6 +134,7 @@ export type SyncMessage =
 	| OperationBatchMessage
 	| AcknowledgmentMessage
 	| ErrorMessage
+	| AwarenessUpdateMessage
 
 // --- Type Guards ---
 
@@ -120,6 +156,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isAcknowledgmentMessage(value)
 		case 'error':
 			return isErrorMessage(value)
+		case 'awareness-update':
+			return isAwarenessUpdateMessage(value)
 		default:
 			return false
 	}
@@ -201,5 +239,21 @@ export function isErrorMessage(value: unknown): value is ErrorMessage {
 		typeof msg.code === 'string' &&
 		typeof msg.message === 'string' &&
 		typeof msg.retriable === 'boolean'
+	)
+}
+
+/**
+ * Check if a value is an AwarenessUpdateMessage.
+ */
+export function isAwarenessUpdateMessage(value: unknown): value is AwarenessUpdateMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'awareness-update' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.clientId === 'number' &&
+		typeof msg.states === 'object' &&
+		msg.states !== null &&
+		!Array.isArray(msg.states)
 	)
 }
