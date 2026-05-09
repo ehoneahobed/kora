@@ -49,9 +49,15 @@ Once the native window opens, you have a working offline-first app with sync rea
 ```
 my-desktop-app/
   src/
-    schema.ts          # Data schema (same as web)
+    schema.ts          # Schema entry point
     main.tsx           # Kora app entry (sync enabled)
     App.tsx            # React UI
+    modules/
+      todos/
+        todo.schema.ts     # Collection definition
+        todo.queries.ts    # Query builders
+        todo.mutations.ts  # Mutation helpers
+        useTodos.ts        # React hook for the feature
   src-tauri/
     Cargo.toml         # Rust dependencies
     tauri.conf.json    # Window size, title, build config

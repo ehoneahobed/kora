@@ -66,7 +66,7 @@ A scaffolded Kora project looks like this:
 ```
 my-app/
   src/
-    schema.ts         # Your data schema
+    schema.ts         # Schema entry point
     app.ts            # Kora app instance
     main.tsx          # React entry point
     components/       # Your UI components
@@ -103,6 +103,60 @@ Key points:
 - **`t.string()`**, **`t.boolean()`**, etc. are field type builders that support chaining (`.default()`, `.optional()`, `.auto()`).
 - **`indexes`** improve query performance on the listed fields.
 - **`version`** tracks schema changes for migrations.
+
+For larger apps, keep `src/schema.ts` as the entry point and split collections by feature or domain
+module:
+
+```text
+src/
+  modules/
+    todos/
+      todo.schema.ts
+      todo.queries.ts
+      todo.mutations.ts
+      useTodos.ts
+      components/
+  schema.ts
+```
+
+```typescript
+// src/modules/todos/todo.schema.ts
+import { t } from 'korajs'
+
+export const todos = {
+  fields: {
+    title: t.string(),
+    completed: t.boolean().default(false),
+    createdAt: t.timestamp().auto(),
+  },
+  indexes: ['completed', 'createdAt'],
+}
+```
+
+```typescript
+// src/schema.ts
+import { defineSchema } from 'korajs'
+import { todos } from './modules/todos/todo.schema'
+
+export default defineSchema({
+  version: 1,
+  collections: { todos },
+})
+```
+
+The CLI and runtime still read one schema export, but your collection definitions can live close to
+the code that owns them:
+
+- `todo.schema.ts` defines the data shape.
+- `todo.queries.ts` contains reads only.
+- `todo.mutations.ts` contains writes: inserts, updates, deletes, and transactions.
+- `useTodos.ts` is the React binding that connects those reads and writes to components.
+- `components/` contains UI for the feature.
+
+The schema, query, and mutation files are framework-agnostic and apply across web, desktop, and
+mobile. The binding file is framework-specific; React templates use `useTodos.ts`. Kora does not
+require controllers, services, or a routing convention, so use the router and app structure that fits
+your framework.
 
 ## Create the App
 

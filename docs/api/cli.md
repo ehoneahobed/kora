@@ -107,9 +107,15 @@ npx create-kora-app my-app --tailwind --no-sync --pm npm
 ```
 my-app/
   src/
-    schema.ts           # Your schema definition
+    schema.ts           # Schema entry point
     main.tsx            # Application entry point
     App.tsx             # Example UI
+    modules/
+      todos/
+        todo.schema.ts     # Collection definition
+        todo.queries.ts    # Query builders
+        todo.mutations.ts  # Mutation helpers
+        useTodos.ts        # React hook for the feature
     kora-worker.ts      # SQLite WASM worker entry
   server.ts             # (sync templates) sync server entry point
   kora/

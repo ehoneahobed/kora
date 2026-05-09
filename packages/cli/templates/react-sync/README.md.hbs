@@ -17,14 +17,23 @@ This starts both the Vite dev server and the Kora sync server.
 
 ```
 src/
-  schema.ts        # Data schema definition
+  schema.ts        # Schema entry point
   main.tsx         # App initialization and Kora setup
   App.tsx          # Main application component
+  modules/
+    todos/
+      todo.schema.ts     # Todo collection definition
+      todo.queries.ts    # Reusable todo query builders
+      todo.mutations.ts  # Todo mutation helpers
+      useTodos.ts        # React hook connecting todos to the UI
   kora-worker.ts   # SQLite WASM web worker
   index.css        # Styles
 server.ts          # Kora sync server
 kora.config.ts     # Kora configuration
 ```
+
+In a feature module, `schema` defines data shape, `queries` contain reads only, `mutations` contain
+writes, and `useTodos.ts` is the React binding that exposes todo data and actions to components.
 
 ## Environment Variables
 

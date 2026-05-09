@@ -1,15 +1,9 @@
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema } from '@korajs/core'
+import { todos } from './modules/todos/todo.schema'
 
 export default defineSchema({
   version: 1,
   collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        completed: t.boolean().default(false),
-        createdAt: t.timestamp().auto(),
-      },
-      indexes: ['completed'],
-    },
+    todos,
   },
 })

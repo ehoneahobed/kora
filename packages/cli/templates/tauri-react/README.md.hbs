@@ -16,10 +16,16 @@ On first launch, you'll see a setup screen to enter your sync server URL. For lo
 
 ```
 src/
-  schema.ts          # Data schema definition
+  schema.ts          # Schema entry point
   main.tsx           # Entry point
   AppShell.tsx       # Setup flow + Kora initialization
   App.tsx            # Main application UI
+  modules/
+    todos/
+      todo.schema.ts     # Todo collection definition
+      todo.queries.ts    # Reusable todo query builders
+      todo.mutations.ts  # Todo mutation helpers
+      useTodos.ts        # React hook connecting todos to the UI
   SetupScreen.tsx    # First-launch server configuration
   sync-config.ts     # Runtime sync URL storage
   updater.ts         # Auto-update checker
@@ -36,6 +42,9 @@ kora.config.ts       # Kora configuration
 .github/workflows/
   release-desktop.yml  # CI/CD for cross-platform builds
 ```
+
+In a feature module, `schema` defines data shape, `queries` contain reads only, `mutations` contain
+writes, and `useTodos.ts` is the React binding that exposes todo data and actions to components.
 
 ## Scripts
 

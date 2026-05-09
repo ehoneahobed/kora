@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { useQuery, useMutation, useCollection } from '@korajs/react'
 import {
   CheckCircle2,
   Circle,
@@ -8,27 +7,17 @@ import {
   Plus,
   Trash2,
 } from 'lucide-react'
+import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
-  const todos = useCollection('todos')
-  const allTodos = useQuery(todos.where({}).orderBy('createdAt', 'desc'))
-  const { mutate: addTodo, isLoading: isAdding } = useMutation(
-    (data: { title: string }) => todos.insert(data)
-  )
-  const { mutate: toggleTodo } = useMutation(
-    (id: string, data: { completed: boolean }) => todos.update(id, data)
-  )
-  const { mutate: deleteTodo } = useMutation(
-    (id: string) => todos.delete(id)
-  )
+  const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+  const isAdding = addTodo.isLoading
 
   const [filter, setFilter] = useState<Filter>('all')
   const [input, setInput] = useState('')
 
-  const activeTodos = allTodos.filter((t) => !t.completed)
-  const completedTodos = allTodos.filter((t) => !!t.completed)
   const filteredTodos =
     filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
 
@@ -36,14 +25,14 @@ export function App() {
     e.preventDefault()
     const title = input.trim()
     if (title) {
-      addTodo({ title })
+      addTodo.mutate({ title })
       setInput('')
     }
   }
 
   const clearCompleted = () => {
     for (const todo of completedTodos) {
-      deleteTodo(todo.id)
+      deleteTodo.mutate(todo.id)
     }
   }
 
@@ -125,7 +114,7 @@ export function App() {
                 className="group flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 transition hover:border-gray-700"
               >
                 <button
-                  onClick={() => toggleTodo(todo.id, { completed: !todo.completed })}
+                  onClick={() => toggleTodo.mutate(todo.id, { completed: !todo.completed })}
                   className="shrink-0 text-gray-500 hover:text-indigo-400 transition"
                 >
                   {todo.completed ? (
@@ -147,7 +136,7 @@ export function App() {
                   </span>
                 )}
                 <button
-                  onClick={() => deleteTodo(todo.id)}
+                  onClick={() => deleteTodo.mutate(todo.id)}
                   className="shrink-0 text-gray-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
                 >
                   <Trash2 className="h-4 w-4" />

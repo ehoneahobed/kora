@@ -44,6 +44,13 @@ describe('create command flow', () => {
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
 		expect(srcFiles).toContain('index.css')
+		expect(srcFiles).toContain('modules')
+
+		const todoModuleFiles = await readdir(join(targetDir, 'src', 'modules', 'todos'))
+		expect(todoModuleFiles).toContain('todo.schema.ts')
+		expect(todoModuleFiles).toContain('todo.queries.ts')
+		expect(todoModuleFiles).toContain('todo.mutations.ts')
+		expect(todoModuleFiles).toContain('useTodos.ts')
 	})
 
 	test('substitutes project name in package.json', async () => {
@@ -163,6 +170,7 @@ describe('create command flow', () => {
 		expect(srcFiles).toContain('schema.ts')
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
+		expect(srcFiles).toContain('modules')
 
 		const tauriFiles = await readdir(join(targetDir, 'src-tauri', 'src'))
 		expect(tauriFiles).toContain('main.rs')
