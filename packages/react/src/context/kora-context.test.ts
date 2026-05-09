@@ -37,7 +37,7 @@ function createMockApp(options?: {
 }): { app: KoraAppLike; store: Store; resolve: () => void } {
 	const store = createMockStore()
 	const syncEngine = options?.syncEngine ?? null
-	let resolveReady: () => void
+	let resolveReady: (() => void) | undefined
 	const ready = new Promise<void>((resolve) => {
 		resolveReady = resolve
 	})
@@ -48,7 +48,10 @@ function createMockApp(options?: {
 		getSyncEngine: () => syncEngine,
 	}
 
-	return { app, store, resolve: resolveReady! }
+	// resolveReady is guaranteed to be assigned by the Promise constructor callback
+	const resolve = resolveReady as () => void
+
+	return { app, store, resolve }
 }
 
 /** Test component that reads from context and renders status */

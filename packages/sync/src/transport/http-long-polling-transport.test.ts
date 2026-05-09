@@ -1,8 +1,8 @@
 import { describe, expect, test, vi } from 'vitest'
 import type { SyncMessage } from '../protocol/messages'
 import { JsonMessageSerializer, ProtobufMessageSerializer } from '../protocol/serializer'
-import type { SyncTransport } from './transport'
 import { HttpLongPollingTransport } from './http-long-polling-transport'
+import type { SyncTransport } from './transport'
 
 function handshakeResponse(): SyncMessage {
 	return {
@@ -51,9 +51,7 @@ describe('HttpLongPollingTransport', () => {
 	})
 
 	test('posts outgoing message payloads', async () => {
-		const fetchImpl = vi
-			.fn<typeof fetch>()
-			.mockResolvedValue(new Response(null, { status: 204 }))
+		const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }))
 
 		const transport = new HttpLongPollingTransport({
 			fetchImpl,

@@ -1,16 +1,9 @@
 import { randomBytes } from 'node:crypto'
+import { computePublicKeyThumbprint, verifyChallenge } from '../../device/device-identity'
+import type { TokenManager } from '../../tokens/token-manager'
 import type { AuthTokens } from '../../types'
-import { TokenManager } from '../../tokens/token-manager'
-import {
-	computePublicKeyThumbprint,
-	verifyChallenge,
-} from '../../device/device-identity'
 import { hashPassword, verifyPassword } from './password-hash'
-import {
-	type UserStore,
-	type AuthUser,
-	type AuthDevice,
-} from './user-store'
+import type { AuthDevice, AuthUser, UserStore } from './user-store'
 
 // ============================================================================
 // Challenge Store
@@ -235,6 +228,7 @@ function isValidEmail(email: string): boolean {
  */
 function sanitizeName(name: string): string {
 	// Strip ASCII control characters (0x00-0x1F, 0x7F)
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally stripping ASCII control characters for sanitization
 	const cleaned = name.replace(/[\x00-\x1f\x7f]/g, '')
 	const trimmed = cleaned.trim()
 	if (trimmed.length > MAX_NAME_LENGTH) {
@@ -305,13 +299,16 @@ export class BuiltInAuthRoutes {
 	 * @param clientIp - Optional client IP for rate limiting
 	 * @returns Auth response with the created user and tokens, or an error
 	 */
-	async handleSignUp(body: {
-		email: string
-		password: string
-		name?: string
-		deviceId?: string
-		devicePublicKey?: string
-	}, clientIp?: string): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+	async handleSignUp(
+		body: {
+			email: string
+			password: string
+			name?: string
+			deviceId?: string
+			devicePublicKey?: string
+		},
+		clientIp?: string,
+	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
 		// Rate limiting
 		const rateLimitKey = clientIp ?? 'global'
 		if (!(await this.rateLimiter.isAllowed(rateLimitKey))) {
@@ -327,7 +324,8 @@ export class BuiltInAuthRoutes {
 			return {
 				status: 400,
 				body: {
-					error: 'Invalid email address. Please provide a valid email in the format user@domain.com.',
+					error:
+						'Invalid email address. Please provide a valid email in the format user@domain.com.',
 				},
 			}
 		}
@@ -411,12 +409,15 @@ export class BuiltInAuthRoutes {
 	 * @param clientIp - Optional client IP for rate limiting
 	 * @returns Auth response with the user and tokens, or an error
 	 */
-	async handleSignIn(body: {
-		email: string
-		password: string
-		deviceId?: string
-		devicePublicKey?: string
-	}, clientIp?: string): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+	async handleSignIn(
+		body: {
+			email: string
+			password: string
+			deviceId?: string
+			devicePublicKey?: string
+		},
+		clientIp?: string,
+	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
 		// Rate limiting (use email + IP composite key for per-account protection)
 		const rateLimitKey = clientIp
 			? `signin:${body.email.toLowerCase()}:${clientIp}`
@@ -597,9 +598,7 @@ export class BuiltInAuthRoutes {
 	 * @param accessToken - The JWT access token (without "Bearer " prefix)
 	 * @returns Auth response with the device list, or an error
 	 */
-	async handleListDevices(
-		accessToken: string,
-	): Promise<AuthRouteResponse<AuthDevice[]>> {
+	async handleListDevices(accessToken: string): Promise<AuthRouteResponse<AuthDevice[]>> {
 		const payload = this.tokenManager.validateToken(accessToken)
 		if (payload === null || payload.type !== 'access') {
 			return {
@@ -721,7 +720,9 @@ export class BuiltInAuthRoutes {
 		} catch {
 			return {
 				status: 400,
-				body: { error: 'Failed to compute public key thumbprint. Ensure the key is a valid EC P-256 JWK.' },
+				body: {
+					error: 'Failed to compute public key thumbprint. Ensure the key is a valid EC P-256 JWK.',
+				},
 			}
 		}
 
@@ -869,7 +870,10 @@ export class BuiltInAuthRoutes {
 		} catch {
 			return {
 				status: 400,
-				body: { error: 'Signature verification failed. The signature or public key format may be invalid.' },
+				body: {
+					error:
+						'Signature verification failed. The signature or public key format may be invalid.',
+				},
 			}
 		}
 
@@ -959,7 +963,7 @@ export class BuiltInAuthRoutes {
 
 				// Check device revocation status
 				const device = await userStore.findDevice(payload.dev)
-				if (device !== null && device.revoked) {
+				if (device?.revoked) {
 					return null
 				}
 

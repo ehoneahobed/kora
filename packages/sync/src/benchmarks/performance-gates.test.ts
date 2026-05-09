@@ -1,5 +1,6 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
+import { createMockSyncStore, createTestOperations } from '../../tests/fixtures/test-helpers'
 import { SyncEngine } from '../engine/sync-engine'
 import type {
 	AcknowledgmentMessage,
@@ -10,7 +11,6 @@ import type {
 } from '../protocol/messages'
 import { JsonMessageSerializer } from '../protocol/serializer'
 import { createMemoryTransportPair } from '../transport/memory-transport'
-import { createMockSyncStore, createTestOperations } from '../../tests/fixtures/test-helpers'
 
 const REGRESSION_FACTOR = 1.1
 const INITIAL_SYNC_LIMIT_MS = 5000 * REGRESSION_FACTOR
@@ -38,7 +38,9 @@ describe('Sync performance gates', () => {
 		const startMs = Date.now()
 		await engine.start()
 		await waitFor(
-			() => serverStore.getAllOperations().filter((operation) => operation.nodeId === 'client-node').length === 10_000,
+			() =>
+				serverStore.getAllOperations().filter((operation) => operation.nodeId === 'client-node')
+					.length === 10_000,
 			INITIAL_SYNC_LIMIT_MS,
 		)
 		const elapsedMs = Date.now() - startMs
@@ -70,7 +72,10 @@ describe('Sync performance gates', () => {
 		clientStore.addOperation(operation)
 		const startMs = Date.now()
 		await engine.pushOperation(operation)
-		await waitFor(() => serverStore.getAllOperations().some((item) => item.id === operation.id), INCREMENTAL_SYNC_LIMIT_MS)
+		await waitFor(
+			() => serverStore.getAllOperations().some((item) => item.id === operation.id),
+			INCREMENTAL_SYNC_LIMIT_MS,
+		)
 		const elapsedMs = Date.now() - startMs
 
 		await engine.stop()
@@ -132,7 +137,9 @@ async function handleHandshake(
 	}
 	server.send(response)
 
-	const clientVector = new Map(Object.entries(message.versionVector).map(([nodeId, sequence]) => [nodeId, sequence as number]))
+	const clientVector = new Map(
+		Object.entries(message.versionVector).map(([nodeId, sequence]) => [nodeId, sequence as number]),
+	)
 	const serverVector = store.getVersionVector()
 	const missing: Operation[] = []
 

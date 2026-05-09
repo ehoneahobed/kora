@@ -45,7 +45,7 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 		'\tconst store = await createPostgresServerStore({ connectionString })',
 		'\tconst server = createProductionServer({',
 		'\t\tstore,',
-		"\t\tport: Number(process.env.PORT) || 3001,",
+		'\t\tport: Number(process.env.PORT) || 3001,',
 		"\t\tstaticDir: './dist',",
 		"\t\tsyncPath: '/kora-sync',",
 		'\t})',
@@ -91,7 +91,9 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 }
 
 function isSyncTemplate(template: TemplateName): boolean {
-	return template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+	return (
+		template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+	)
 }
 
 function getProviderDisplayName(provider: DatabaseProviderOption): string {

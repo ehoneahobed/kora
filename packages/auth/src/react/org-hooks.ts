@@ -7,7 +7,12 @@ import {
 	useState,
 	useSyncExternalStore,
 } from 'react'
-import type { OrgClient, ClientOrganization, ClientMembership, ClientInvitation } from '../client/org-client'
+import type {
+	ClientInvitation,
+	ClientMembership,
+	ClientOrganization,
+	OrgClient,
+} from '../client/org-client'
 
 // ============================================================================
 // OrgContext

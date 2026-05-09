@@ -83,7 +83,8 @@ export class ReadlinePromptClient implements PromptClient {
  * Returns the default prompt client for interactive CLI flows.
  */
 export function createPromptClient(): PromptClient {
-	const canUseInteractiveClack = typeof process !== 'undefined' && process.stdin.isTTY && process.stdout.isTTY
+	const canUseInteractiveClack =
+		typeof process !== 'undefined' && process.stdin.isTTY && process.stdout.isTTY
 	if (canUseInteractiveClack) {
 		return new ClackPromptClient()
 	}

@@ -2,8 +2,8 @@ import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
-import { scaffoldTemplate } from './template-engine'
 import { applySyncProviderPreset } from './sync-provider-preset'
+import { scaffoldTemplate } from './template-engine'
 
 describe('applySyncProviderPreset', () => {
 	let tempDir: { path: string; cleanup: () => Promise<void> }

@@ -1,13 +1,9 @@
 import { KoraError } from '@korajs/core'
-import { verifyJwt, decodeJwt, isExpired } from '../../tokens/jwt'
-import type {
-	AuthProviderAdapter,
-	SignUpParams,
-	SignInParams,
-} from '../adapter'
+import { decodeJwt, isExpired, verifyJwt } from '../../tokens/jwt'
+import type { AuthTokens } from '../../types'
+import type { AuthProviderAdapter, SignInParams, SignUpParams } from '../adapter'
 import type { AuthUser } from '../built-in/user-store'
 import type { AuthDevice } from '../built-in/user-store'
-import type { AuthTokens } from '../../types'
 
 // ============================================================================
 // Error classes
@@ -23,8 +19,7 @@ import type { AuthTokens } from '../../types'
 export class ExternalAuthOperationNotSupportedError extends KoraError {
 	constructor(operation: string, provider: string) {
 		super(
-			`The "${operation}" operation is not supported by the external auth provider "${provider}". ` +
-			`Perform this operation through your external auth provider's SDK or dashboard instead.`,
+			`The "${operation}" operation is not supported by the external auth provider "${provider}". Perform this operation through your external auth provider's SDK or dashboard instead.`,
 			'AUTH_EXTERNAL_OPERATION_NOT_SUPPORTED',
 			{ operation, provider },
 		)
@@ -37,11 +32,7 @@ export class ExternalAuthOperationNotSupportedError extends KoraError {
  */
 export class ExternalTokenValidationError extends KoraError {
 	constructor(reason: string, context?: Record<string, unknown>) {
-		super(
-			`External token validation failed: ${reason}`,
-			'AUTH_EXTERNAL_TOKEN_INVALID',
-			context,
-		)
+		super(`External token validation failed: ${reason}`, 'AUTH_EXTERNAL_TOKEN_INVALID', context)
 		this.name = 'ExternalTokenValidationError'
 	}
 }
@@ -55,7 +46,7 @@ export class ExternalTokenValidationError extends KoraError {
  * Maps standard JWT claims to Kora's expected user format.
  */
 function defaultMapClaims(claims: Record<string, unknown>): ExternalUserInfo {
-	const sub = claims['sub']
+	const sub = claims.sub
 	if (typeof sub !== 'string' || sub.length === 0) {
 		throw new ExternalTokenValidationError(
 			'JWT is missing a valid "sub" (subject) claim. The "sub" claim must be a non-empty string identifying the user.',
@@ -65,8 +56,8 @@ function defaultMapClaims(claims: Record<string, unknown>): ExternalUserInfo {
 
 	return {
 		userId: sub,
-		email: typeof claims['email'] === 'string' ? claims['email'] : undefined,
-		name: typeof claims['name'] === 'string' ? claims['name'] : undefined,
+		email: typeof claims.email === 'string' ? claims.email : undefined,
+		name: typeof claims.name === 'string' ? claims.name : undefined,
 		metadata: undefined,
 	}
 }
@@ -226,7 +217,7 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 		if (config.validateToken === undefined && config.jwtSecret === undefined) {
 			throw new ExternalTokenValidationError(
 				'ExternalJwtProvider requires either a "jwtSecret" for HS256 verification ' +
-				'or a custom "validateToken" function. Provide at least one.',
+					'or a custom "validateToken" function. Provide at least one.',
 				{ providerName: config.providerName },
 			)
 		}
@@ -287,9 +278,7 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 	 * @param token - The JWT access token issued by the external provider
 	 * @returns User ID and device ID if the token is valid, or null if invalid/expired
 	 */
-	async validateAccessToken(
-		token: string,
-	): Promise<{ userId: string; deviceId: string } | null> {
+	async validateAccessToken(token: string): Promise<{ userId: string; deviceId: string } | null> {
 		const claims = await this.extractClaims(token)
 		if (claims === null) {
 			return null

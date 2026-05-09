@@ -46,10 +46,8 @@ function derInteger(bytes: Uint8Array): Uint8Array {
 	const trimmed = bytes.slice(start)
 
 	// If high bit is set, prepend 0x00 to keep it positive
-	const needsPadding = (trimmed[0]! & 0x80) !== 0
-	const intBytes = needsPadding
-		? new Uint8Array([0x00, ...trimmed])
-		: trimmed
+	const needsPadding = ((trimmed[0] as number) & 0x80) !== 0
+	const intBytes = needsPadding ? new Uint8Array([0x00, ...trimmed]) : trimmed
 
 	// INTEGER tag: 0x02 <length> <bytes>
 	const result = new Uint8Array(2 + intBytes.length)
@@ -265,9 +263,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode('not json').buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode('not json').buffer),
 					attestationObject: 'test-attestation',
 				},
 				expectedChallenge: 'test-challenge',
@@ -289,9 +285,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: 'test-attestation',
 				},
 				expectedChallenge: 'test-challenge',
@@ -313,9 +307,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: 'test-attestation',
 				},
 				expectedChallenge: 'expected-challenge',
@@ -337,9 +329,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: 'test-attestation',
 				},
 				expectedChallenge: 'test-challenge',
@@ -360,11 +350,35 @@ describe('verifyRegistrationResponse', () => {
 		// a3 63 666d74 66 7061636b6564 67 61747453746d74 a0 68 61757468 44617461 40
 		const attestationCbor = new Uint8Array([
 			0xa3, // map(3)
-			0x63, 0x66, 0x6d, 0x74, // "fmt"
-			0x66, 0x70, 0x61, 0x63, 0x6b, 0x65, 0x64, // "packed"
-			0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74, // "attStmt"
+			0x63,
+			0x66,
+			0x6d,
+			0x74, // "fmt"
+			0x66,
+			0x70,
+			0x61,
+			0x63,
+			0x6b,
+			0x65,
+			0x64, // "packed"
+			0x67,
+			0x61,
+			0x74,
+			0x74,
+			0x53,
+			0x74,
+			0x6d,
+			0x74, // "attStmt"
 			0xa0, // {}
-			0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61, // "authData"
+			0x68,
+			0x61,
+			0x75,
+			0x74,
+			0x68,
+			0x44,
+			0x61,
+			0x74,
+			0x61, // "authData"
 			0x40, // empty bytes
 		])
 
@@ -373,9 +387,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: toBase64Url(attestationCbor.buffer),
 				},
 				expectedChallenge: 'test-challenge',
@@ -404,10 +416,7 @@ describe('verifyRegistrationResponse', () => {
 
 		// Compute SHA-256 of rpId for rpIdHash
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode(expectedRpId),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)),
 		)
 
 		// Flags: UP (0x01) | AT (0x40) = 0x41
@@ -432,12 +441,19 @@ describe('verifyRegistrationResponse', () => {
 
 		const coseKey = new Uint8Array([
 			0xa5, // map(5)
-			0x01, 0x02, // 1: 2 (kty: EC2)
-			0x03, 0x26, // 3: -7 (alg: ES256)
-			0x20, 0x01, // -1: 1 (crv: P-256)
-			0x21, 0x58, 0x20, // -2: bytes(32)
+			0x01,
+			0x02, // 1: 2 (kty: EC2)
+			0x03,
+			0x26, // 3: -7 (alg: ES256)
+			0x20,
+			0x01, // -1: 1 (crv: P-256)
+			0x21,
+			0x58,
+			0x20, // -2: bytes(32)
 			...xCoord,
-			0x22, 0x58, 0x20, // -3: bytes(32)
+			0x22,
+			0x58,
+			0x20, // -3: bytes(32)
 			...yCoord,
 		])
 
@@ -459,15 +475,37 @@ describe('verifyRegistrationResponse', () => {
 		const attestationCbor = new Uint8Array([
 			0xa3, // map(3)
 			// "fmt"
-			0x63, 0x66, 0x6d, 0x74,
+			0x63,
+			0x66,
+			0x6d,
+			0x74,
 			// "none"
-			0x64, 0x6e, 0x6f, 0x6e, 0x65,
+			0x64,
+			0x6e,
+			0x6f,
+			0x6e,
+			0x65,
 			// "attStmt"
-			0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74,
+			0x67,
+			0x61,
+			0x74,
+			0x74,
+			0x53,
+			0x74,
+			0x6d,
+			0x74,
 			// {}
 			0xa0,
 			// "authData"
-			0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61,
+			0x68,
+			0x61,
+			0x75,
+			0x74,
+			0x68,
+			0x44,
+			0x61,
+			0x74,
+			0x61,
 			// byte string header
 			...authDataLengthBytes,
 			// authData bytes
@@ -481,9 +519,7 @@ describe('verifyRegistrationResponse', () => {
 			credential: {
 				credentialId: credentialIdBase64,
 				publicKey: publicKeyBase64,
-				clientDataJSON: toBase64Url(
-					new TextEncoder().encode(clientData).buffer,
-				),
+				clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 				attestationObject: toBase64Url(attestationCbor.buffer),
 			},
 			expectedChallenge,
@@ -513,9 +549,13 @@ describe('verifyRegistrationResponse', () => {
 		const authData = new Uint8Array([
 			...wrongRpIdHash,
 			0x41, // flags: UP | AT
-			0x00, 0x00, 0x00, 0x00, // signCount
+			0x00,
+			0x00,
+			0x00,
+			0x00, // signCount
 			...new Uint8Array(16), // aaguid
-			0x00, 0x10, // credentialIdLength = 16
+			0x00,
+			0x10, // credentialIdLength = 16
 			...new Uint8Array(16), // credentialId
 			0xa0, // empty COSE key (will fail before we check this)
 		])
@@ -523,11 +563,33 @@ describe('verifyRegistrationResponse', () => {
 		const authDataLengthBytes = encodeLength(authData.length)
 		const attestationCbor = new Uint8Array([
 			0xa3,
-			0x63, 0x66, 0x6d, 0x74,
-			0x64, 0x6e, 0x6f, 0x6e, 0x65,
-			0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74,
+			0x63,
+			0x66,
+			0x6d,
+			0x74,
+			0x64,
+			0x6e,
+			0x6f,
+			0x6e,
+			0x65,
+			0x67,
+			0x61,
+			0x74,
+			0x74,
+			0x53,
+			0x74,
+			0x6d,
+			0x74,
 			0xa0,
-			0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61,
+			0x68,
+			0x61,
+			0x75,
+			0x74,
+			0x68,
+			0x44,
+			0x61,
+			0x74,
+			0x61,
 			...authDataLengthBytes,
 			...authData,
 		])
@@ -537,9 +599,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: toBase64Url(attestationCbor.buffer),
 				},
 				expectedChallenge,
@@ -561,19 +621,20 @@ describe('verifyRegistrationResponse', () => {
 		})
 
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode(expectedRpId),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)),
 		)
 
 		// Flags: AT set (0x40) but UP NOT set
 		const authData = new Uint8Array([
 			...rpIdHash,
 			0x40, // flags: AT only, no UP
-			0x00, 0x00, 0x00, 0x00,
+			0x00,
+			0x00,
+			0x00,
+			0x00,
 			...new Uint8Array(16),
-			0x00, 0x10,
+			0x00,
+			0x10,
 			...new Uint8Array(16),
 			0xa0,
 		])
@@ -581,11 +642,33 @@ describe('verifyRegistrationResponse', () => {
 		const authDataLengthBytes = encodeLength(authData.length)
 		const attestationCbor = new Uint8Array([
 			0xa3,
-			0x63, 0x66, 0x6d, 0x74,
-			0x64, 0x6e, 0x6f, 0x6e, 0x65,
-			0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74,
+			0x63,
+			0x66,
+			0x6d,
+			0x74,
+			0x64,
+			0x6e,
+			0x6f,
+			0x6e,
+			0x65,
+			0x67,
+			0x61,
+			0x74,
+			0x74,
+			0x53,
+			0x74,
+			0x6d,
+			0x74,
 			0xa0,
-			0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61,
+			0x68,
+			0x61,
+			0x75,
+			0x74,
+			0x68,
+			0x44,
+			0x61,
+			0x74,
+			0x61,
 			...authDataLengthBytes,
 			...authData,
 		])
@@ -595,9 +678,7 @@ describe('verifyRegistrationResponse', () => {
 				credential: {
 					credentialId: 'test-id',
 					publicKey: 'test-key',
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					attestationObject: toBase64Url(attestationCbor.buffer),
 				},
 				expectedChallenge,
@@ -619,9 +700,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(new Uint8Array(37).buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode('not json').buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode('not json').buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -646,9 +725,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(new Uint8Array(37).buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -673,9 +750,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(new Uint8Array(37).buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -700,9 +775,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(new Uint8Array(37).buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -731,9 +804,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(wrongAuthData.buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -754,10 +825,7 @@ describe('verifyAuthenticationResponse', () => {
 		})
 
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode('example.com'),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode('example.com')),
 		)
 
 		// Construct authData with correct rpIdHash but no UP flag
@@ -770,9 +838,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(authData.buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -793,10 +859,7 @@ describe('verifyAuthenticationResponse', () => {
 		})
 
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode('example.com'),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode('example.com')),
 		)
 
 		// Construct authData with sign count = 5
@@ -814,9 +877,7 @@ describe('verifyAuthenticationResponse', () => {
 				assertion: {
 					credentialId: 'test-id',
 					authenticatorData: toBase64Url(authData.buffer),
-					clientDataJSON: toBase64Url(
-						new TextEncoder().encode(clientData).buffer,
-					),
+					clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 					signature: toBase64Url(new Uint8Array(64).buffer),
 					userHandle: null,
 				},
@@ -839,10 +900,7 @@ describe('verifyAuthenticationResponse', () => {
 		})
 
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode('example.com'),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode('example.com')),
 		)
 
 		// authData with signCount = 0, UP flag
@@ -864,12 +922,19 @@ describe('verifyAuthenticationResponse', () => {
 
 		const coseKey = new Uint8Array([
 			0xa5,
-			0x01, 0x02,
-			0x03, 0x26,
-			0x20, 0x01,
-			0x21, 0x58, 0x20,
+			0x01,
+			0x02,
+			0x03,
+			0x26,
+			0x20,
+			0x01,
+			0x21,
+			0x58,
+			0x20,
 			...xCoord,
-			0x22, 0x58, 0x20,
+			0x22,
+			0x58,
+			0x20,
 			...yCoord,
 		])
 
@@ -880,9 +945,14 @@ describe('verifyAuthenticationResponse', () => {
 		fakeR[0] = 0x01
 		fakeS[0] = 0x01
 		const derSignature = new Uint8Array([
-			0x30, 68, // SEQUENCE, length 68
-			0x02, 32, ...fakeR, // INTEGER r (32 bytes)
-			0x02, 32, ...fakeS, // INTEGER s (32 bytes)
+			0x30,
+			68, // SEQUENCE, length 68
+			0x02,
+			32,
+			...fakeR, // INTEGER r (32 bytes)
+			0x02,
+			32,
+			...fakeS, // INTEGER s (32 bytes)
 		])
 
 		// This will get past counter check but fail at signature verification
@@ -892,9 +962,7 @@ describe('verifyAuthenticationResponse', () => {
 			assertion: {
 				credentialId: 'test-id',
 				authenticatorData: toBase64Url(authData.buffer),
-				clientDataJSON: toBase64Url(
-					new TextEncoder().encode(clientData).buffer,
-				),
+				clientDataJSON: toBase64Url(new TextEncoder().encode(clientData).buffer),
 				signature: toBase64Url(derSignature.buffer),
 				userHandle: null,
 			},
@@ -928,11 +996,20 @@ describe('verifyAuthenticationResponse', () => {
 		// Build COSE key
 		const coseKey = new Uint8Array([
 			0xa5,
-			0x01, 0x02, // kty: EC2
-			0x03, 0x26, // alg: ES256
-			0x20, 0x01, // crv: P-256
-			0x21, 0x58, 0x20, ...xCoord, // x
-			0x22, 0x58, 0x20, ...yCoord, // y
+			0x01,
+			0x02, // kty: EC2
+			0x03,
+			0x26, // alg: ES256
+			0x20,
+			0x01, // crv: P-256
+			0x21,
+			0x58,
+			0x20,
+			...xCoord, // x
+			0x22,
+			0x58,
+			0x20,
+			...yCoord, // y
 		])
 
 		const expectedChallenge = 'dGVzdC1jaGFsbGVuZ2U'
@@ -948,10 +1025,7 @@ describe('verifyAuthenticationResponse', () => {
 
 		// Build authenticator data
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode(expectedRpId),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)),
 		)
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
@@ -963,9 +1037,7 @@ describe('verifyAuthenticationResponse', () => {
 		const clientDataHash = new Uint8Array(
 			await globalThis.crypto.subtle.digest('SHA-256', clientDataBytes),
 		)
-		const signedData = new Uint8Array(
-			authData.length + clientDataHash.length,
-		)
+		const signedData = new Uint8Array(authData.length + clientDataHash.length)
 		signedData.set(authData, 0)
 		signedData.set(clientDataHash, authData.length)
 
@@ -1017,11 +1089,20 @@ describe('verifyAuthenticationResponse', () => {
 
 		const coseKey = new Uint8Array([
 			0xa5,
-			0x01, 0x02,
-			0x03, 0x26,
-			0x20, 0x01,
-			0x21, 0x58, 0x20, ...xCoord,
-			0x22, 0x58, 0x20, ...yCoord,
+			0x01,
+			0x02,
+			0x03,
+			0x26,
+			0x20,
+			0x01,
+			0x21,
+			0x58,
+			0x20,
+			...xCoord,
+			0x22,
+			0x58,
+			0x20,
+			...yCoord,
 		])
 
 		const expectedChallenge = 'dGVzdA'
@@ -1036,10 +1117,7 @@ describe('verifyAuthenticationResponse', () => {
 		const clientDataBytes = new TextEncoder().encode(clientData)
 
 		const rpIdHash = new Uint8Array(
-			await globalThis.crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode(expectedRpId),
-			),
+			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)),
 		)
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
@@ -1129,9 +1207,11 @@ describe('challenge cryptographic randomness', () => {
 function encodeLength(length: number): Uint8Array {
 	if (length < 24) {
 		return new Uint8Array([0x40 | length])
-	} else if (length < 256) {
+	}
+	if (length < 256) {
 		return new Uint8Array([0x58, length])
-	} else if (length < 65536) {
+	}
+	if (length < 65536) {
 		return new Uint8Array([0x59, (length >> 8) & 0xff, length & 0xff])
 	}
 	throw new Error(`Length ${length} exceeds supported CBOR encoding`)

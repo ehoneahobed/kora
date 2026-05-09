@@ -1,7 +1,7 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { EmailVerificationManager, InMemoryEmailVerificationStore } from './email-verification'
-import { InMemoryUserStore } from './user-store'
 import { hashPassword } from './password-hash'
+import { InMemoryUserStore } from './user-store'
 
 describe('EmailVerificationManager', () => {
 	let userStore: InMemoryUserStore
@@ -36,7 +36,7 @@ describe('EmailVerificationManager', () => {
 			expect(result.status).toBe(200)
 			if ('data' in result.body) {
 				expect(result.body.data.token).toBeTruthy()
-				expect(result.body.data.token!.length).toBeGreaterThan(20)
+				expect(result.body.data.token?.length).toBeGreaterThan(20)
 			}
 		})
 
@@ -90,7 +90,7 @@ describe('EmailVerificationManager', () => {
 	describe('verifyEmail', () => {
 		test('verifies email with valid token', async () => {
 			const sendResult = await manager.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? sendResult.body.data.token! : ''
+			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
 
 			const result = await manager.verifyEmail(token)
 			expect(result.status).toBe(200)
@@ -101,12 +101,12 @@ describe('EmailVerificationManager', () => {
 
 			// Check that user is now verified
 			const user = await userStore.findById(userId)
-			expect(user!.emailVerified).toBe(true)
+			expect(user?.emailVerified).toBe(true)
 		})
 
 		test('rejects already consumed token', async () => {
 			const sendResult = await manager.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? sendResult.body.data.token! : ''
+			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
 
 			await manager.verifyEmail(token)
 			const result = await manager.verifyEmail(token)
@@ -121,7 +121,7 @@ describe('EmailVerificationManager', () => {
 			})
 
 			const sendResult = await mgr.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? sendResult.body.data.token! : ''
+			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
 
 			await new Promise((r) => setTimeout(r, 10))
 
@@ -187,23 +187,65 @@ describe('InMemoryEmailVerificationStore', () => {
 		})
 		await store.consume('abc')
 		const fetched = await store.get('abc')
-		expect(fetched!.consumed).toBe(true)
+		expect(fetched?.consumed).toBe(true)
 	})
 
 	test('counts active tokens for user', async () => {
 		const now = Date.now()
-		await store.store({ token: 'a', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: false })
-		await store.store({ token: 'b', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: false })
-		await store.store({ token: 'c', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: true })
-		await store.store({ token: 'd', userId: 'u2', email: 'b@b.com', createdAt: now, expiresAt: now + 60000, consumed: false })
+		await store.store({
+			token: 'a',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: false,
+		})
+		await store.store({
+			token: 'b',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: false,
+		})
+		await store.store({
+			token: 'c',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: true,
+		})
+		await store.store({
+			token: 'd',
+			userId: 'u2',
+			email: 'b@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: false,
+		})
 
 		expect(await store.countActiveForUser('u1')).toBe(2)
 	})
 
 	test('cleanExpired removes expired tokens', async () => {
 		const past = Date.now() - 1000
-		await store.store({ token: 'a', userId: 'u1', email: 'a@b.com', createdAt: past, expiresAt: past, consumed: false })
-		await store.store({ token: 'b', userId: 'u1', email: 'a@b.com', createdAt: Date.now(), expiresAt: Date.now() + 60000, consumed: false })
+		await store.store({
+			token: 'a',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: past,
+			expiresAt: past,
+			consumed: false,
+		})
+		await store.store({
+			token: 'b',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			consumed: false,
+		})
 
 		const count = await store.cleanExpired()
 		expect(count).toBe(1)

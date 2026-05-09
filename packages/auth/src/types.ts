@@ -235,10 +235,7 @@ export class InvalidCredentialsError extends AuthError {
  */
 export class EmailAlreadyExistsError extends AuthError {
 	constructor() {
-		super(
-			'An account with this email already exists.',
-			'AUTH_EMAIL_EXISTS',
-		)
+		super('An account with this email already exists.', 'AUTH_EMAIL_EXISTS')
 		this.name = 'EmailAlreadyExistsError'
 	}
 }
@@ -258,11 +255,9 @@ export class TokenError extends AuthError {
  */
 export class DeviceRevokedError extends AuthError {
 	constructor(deviceId: string) {
-		super(
-			`Device "${deviceId}" has been revoked and can no longer sync.`,
-			'AUTH_DEVICE_REVOKED',
-			{ deviceId },
-		)
+		super(`Device "${deviceId}" has been revoked and can no longer sync.`, 'AUTH_DEVICE_REVOKED', {
+			deviceId,
+		})
 		this.name = 'DeviceRevokedError'
 	}
 }

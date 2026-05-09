@@ -1,5 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import type { AuthUser, AuthState } from '../client/auth-client'
+import type { AuthState, AuthUser } from '../client/auth-client'
 import { AuthContext } from './auth-context'
 
 // ---------------------------------------------------------------------------
@@ -10,7 +10,11 @@ import { AuthContext } from './auth-context'
  * Internal hook that reads and validates the AuthContext.
  * Throws a descriptive error if used outside an AuthProvider.
  */
-function useAuthContext(): { client: import('../client/auth-client').AuthClient; state: AuthState; isLoading: boolean } {
+function useAuthContext(): {
+	client: import('../client/auth-client').AuthClient
+	state: AuthState
+	isLoading: boolean
+} {
 	const ctx = useContext(AuthContext)
 	if (ctx === null) {
 		throw new Error(

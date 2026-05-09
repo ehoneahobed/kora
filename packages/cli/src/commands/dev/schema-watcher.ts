@@ -49,7 +49,14 @@ export class SchemaWatcher {
 	async regenerate(): Promise<void> {
 		// Use process.execPath (node) + --import tsx to run kora generate,
 		// avoiding .cmd shim issues on Windows with paths containing spaces.
-		const koraBinJs = join(this.config.projectRoot, 'node_modules', '@korajs', 'cli', 'dist', 'bin.js')
+		const koraBinJs = join(
+			this.config.projectRoot,
+			'node_modules',
+			'@korajs',
+			'cli',
+			'dist',
+			'bin.js',
+		)
 		const hasTsx = await hasTsxInstalled(this.config.projectRoot)
 
 		const command = process.execPath

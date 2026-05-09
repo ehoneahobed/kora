@@ -113,7 +113,12 @@ export const devCommand = defineCommand({
 			}
 		}
 
-		if (syncAllowed && syncServerFile === null && managedSyncStore === null && postgresEnvRequested) {
+		if (
+			syncAllowed &&
+			syncServerFile === null &&
+			managedSyncStore === null &&
+			postgresEnvRequested
+		) {
 			logger.warn(
 				'Managed postgres sync requested but no connection string found. Set dev.sync.store.connectionString or DATABASE_URL.',
 			)
@@ -125,7 +130,9 @@ export const devCommand = defineCommand({
 			if (await fileExists(candidate)) {
 				configuredSchemaPath = candidate
 			} else {
-				logger.warn(`Configured schema file not found: ${candidate}. Falling back to auto-detection.`)
+				logger.warn(
+					`Configured schema file not found: ${candidate}. Falling back to auto-detection.`,
+				)
 			}
 		}
 
@@ -309,7 +316,8 @@ function isPostgresEnvRequested(config: KoraConfigFile | null): boolean {
 	const sync = config?.dev?.sync
 	if (typeof sync !== 'object' || sync === null) return false
 	if (sync.store === 'postgres') return true
-	if (typeof sync.store === 'object' && sync.store !== null && sync.store.type === 'postgres') return true
+	if (typeof sync.store === 'object' && sync.store !== null && sync.store.type === 'postgres')
+		return true
 	return false
 }
 

@@ -1,11 +1,19 @@
 import type {
+	AtomicOp,
 	CollectionDefinition,
 	HLCTimestamp,
 	HybridLogicalClock,
 	Operation,
 	SchemaDefinition,
 } from '@korajs/core'
-import { createOperation, generateUUIDv7, validateRecord } from '@korajs/core'
+import {
+	createOperation,
+	generateUUIDv7,
+	isAtomicOp,
+	resolveAtomicOp,
+	toAtomicOp,
+	validateRecord,
+} from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
@@ -136,12 +144,27 @@ export class Collection {
 		const validated = validateRecord(this.name, this.definition, data, 'update')
 		const now = Date.now()
 
-		// Build previousData from current row for the changed fields
+		// Build previousData from current row for the changed fields,
+		// and resolve any atomic op sentinels to concrete values.
 		const previousData: Record<string, unknown> = {}
 		const currentRecord = deserializeRecord(currentRow, this.definition.fields)
+		const resolvedData: Record<string, unknown> = {}
+		const atomicOps: Record<string, AtomicOp> = {}
+
 		for (const key of Object.keys(validated)) {
+			const value = validated[key]
 			previousData[key] = currentRecord[key]
+
+			if (isAtomicOp(value)) {
+				// Resolve the sentinel to a concrete value using the current record state
+				resolvedData[key] = resolveAtomicOp(currentRecord[key], value)
+				atomicOps[key] = toAtomicOp(value)
+			} else {
+				resolvedData[key] = value
+			}
 		}
+
+		const hasAtomicOps = Object.keys(atomicOps).length > 0
 
 		const sequenceNumber = this.getSequenceNumber()
 		const operation = await createOperation(
@@ -150,16 +173,17 @@ export class Collection {
 				type: 'update',
 				collection: this.name,
 				recordId: id,
-				data: { ...validated },
+				data: { ...resolvedData },
 				previousData,
 				sequenceNumber,
 				causalDeps: [],
 				schemaVersion: this.schema.version,
+				...(hasAtomicOps ? { atomicOps } : {}),
 			},
 			this.clock,
 		)
 
-		const serializedChanges = serializeRecord(validated, this.definition.fields)
+		const serializedChanges = serializeRecord(resolvedData, this.definition.fields)
 		const updateQuery = buildUpdateQuery(this.name, id, {
 			...serializedChanges,
 			_updated_at: now,

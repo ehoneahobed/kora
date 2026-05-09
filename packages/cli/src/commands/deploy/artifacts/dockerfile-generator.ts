@@ -64,9 +64,7 @@ export function generateDockerfile(options: DockerfileOptions = {}): string {
 /**
  * Generates a minimal package.json for native dependencies in the deploy container.
  */
-export function generateDeployPackageJson(
-	nativeDependencies: Record<string, string>,
-): string {
+export function generateDeployPackageJson(nativeDependencies: Record<string, string>): string {
 	const pkg = {
 		name: 'kora-deploy',
 		version: '1.0.0',
@@ -74,7 +72,7 @@ export function generateDeployPackageJson(
 		type: 'module',
 		dependencies: nativeDependencies,
 	}
-	return JSON.stringify(pkg, null, 2) + '\n'
+	return `${JSON.stringify(pkg, null, 2)}\n`
 }
 
 /**

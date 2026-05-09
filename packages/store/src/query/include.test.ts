@@ -48,16 +48,14 @@ describe('include() - many-to-one', () => {
 		const proj = await store.collection('projects').insert({ name: 'Project A' })
 		await store.collection('todos').insert({ title: 'Task 1', project_id: proj.id })
 
-		const todos = await store
-			.collection('todos')
-			.where({})
-			.include('projects')
-			.exec()
+		const todos = await store.collection('todos').where({}).include('projects').exec()
 
 		expect(todos).toHaveLength(1)
 		expect(todos[0]).toHaveProperty('project')
 		expect((todos[0] as Record<string, unknown>).project).toBeTruthy()
-		expect(((todos[0] as Record<string, unknown>).project as Record<string, unknown>).name).toBe('Project A')
+		expect(((todos[0] as Record<string, unknown>).project as Record<string, unknown>).name).toBe(
+			'Project A',
+		)
 
 		await store.close()
 	})
@@ -67,11 +65,7 @@ describe('include() - many-to-one', () => {
 
 		await store.collection('todos').insert({ title: 'Task 1' })
 
-		const todos = await store
-			.collection('todos')
-			.where({})
-			.include('projects')
-			.exec()
+		const todos = await store.collection('todos').where({}).include('projects').exec()
 
 		expect(todos).toHaveLength(1)
 		expect((todos[0] as Record<string, unknown>).project).toBeNull()
@@ -86,11 +80,7 @@ describe('include() - many-to-one', () => {
 		await store.collection('todos').insert({ title: 'Task 1', project_id: proj.id })
 		await store.collection('todos').insert({ title: 'Task 2', project_id: proj.id })
 
-		const todos = await store
-			.collection('todos')
-			.where({})
-			.include('projects')
-			.exec()
+		const todos = await store.collection('todos').where({}).include('projects').exec()
 
 		expect(todos).toHaveLength(2)
 		const p1 = (todos[0] as Record<string, unknown>).project as Record<string, unknown>
@@ -110,14 +100,12 @@ describe('include() - one-to-many', () => {
 		await store.collection('todos').insert({ title: 'Task 1', project_id: proj.id })
 		await store.collection('todos').insert({ title: 'Task 2', project_id: proj.id })
 
-		const projects = await store
-			.collection('projects')
-			.where({})
-			.include('todos')
-			.exec()
+		const projects = await store.collection('projects').where({}).include('todos').exec()
 
 		expect(projects).toHaveLength(1)
-		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<Record<string, unknown>>
+		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<
+			Record<string, unknown>
+		>
 		expect(todosArr).toHaveLength(2)
 		expect(todosArr.map((t) => t.title).sort()).toEqual(['Task 1', 'Task 2'])
 
@@ -129,14 +117,12 @@ describe('include() - one-to-many', () => {
 
 		await store.collection('projects').insert({ name: 'Empty Project' })
 
-		const projects = await store
-			.collection('projects')
-			.where({})
-			.include('todos')
-			.exec()
+		const projects = await store.collection('projects').where({}).include('todos').exec()
 
 		expect(projects).toHaveLength(1)
-		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<Record<string, unknown>>
+		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<
+			Record<string, unknown>
+		>
 		expect(todosArr).toEqual([])
 
 		await store.close()
@@ -163,13 +149,9 @@ describe('include() - edge cases', () => {
 
 		await store.collection('todos').insert({ title: 'Task 1' })
 
-		await expect(
-			store
-				.collection('todos')
-				.where({})
-				.include('nonexistent')
-				.exec(),
-		).rejects.toThrow('No relation found')
+		await expect(store.collection('todos').where({}).include('nonexistent').exec()).rejects.toThrow(
+			'No relation found',
+		)
 
 		await store.close()
 	})
@@ -184,14 +166,12 @@ describe('include() - edge cases', () => {
 		// Soft-delete task2
 		await store.collection('todos').delete(task2.id)
 
-		const projects = await store
-			.collection('projects')
-			.where({})
-			.include('todos')
-			.exec()
+		const projects = await store.collection('projects').where({}).include('todos').exec()
 
 		expect(projects).toHaveLength(1)
-		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<Record<string, unknown>>
+		const todosArr = (projects[0] as Record<string, unknown>).todos as Array<
+			Record<string, unknown>
+		>
 		expect(todosArr).toHaveLength(1)
 		expect(todosArr[0]?.title).toBe('Task 1')
 
@@ -201,10 +181,7 @@ describe('include() - edge cases', () => {
 	test('include descriptor tracks includeCollections for subscriptions', async () => {
 		const store = await createTestStore()
 
-		const qb = store
-			.collection('todos')
-			.where({})
-			.include('projects')
+		const qb = store.collection('todos').where({}).include('projects')
 
 		const descriptor = qb.getDescriptor()
 		expect(descriptor.include).toEqual(['projects'])

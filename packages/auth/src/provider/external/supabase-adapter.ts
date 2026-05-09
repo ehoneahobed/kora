@@ -74,39 +74,39 @@ export interface SupabaseAdapterConfig {
  * role/audience information into Kora metadata.
  */
 function defaultSupabaseClaimMapping(claims: Record<string, unknown>): ExternalUserInfo {
-	const sub = claims['sub']
+	const sub = claims.sub
 	if (typeof sub !== 'string' || sub.length === 0) {
 		return { userId: '' }
 	}
 
-	const email = typeof claims['email'] === 'string' ? claims['email'] : undefined
+	const email = typeof claims.email === 'string' ? claims.email : undefined
 
 	// Extract name from user_metadata (Supabase stores user profile data here)
 	let name: string | undefined
-	const userMetadata = claims['user_metadata']
+	const userMetadata = claims.user_metadata
 	if (typeof userMetadata === 'object' && userMetadata !== null && !Array.isArray(userMetadata)) {
 		const meta = userMetadata as Record<string, unknown>
-		if (typeof meta['full_name'] === 'string' && meta['full_name'].length > 0) {
-			name = meta['full_name']
-		} else if (typeof meta['name'] === 'string' && meta['name'].length > 0) {
-			name = meta['name']
+		if (typeof meta.full_name === 'string' && meta.full_name.length > 0) {
+			name = meta.full_name
+		} else if (typeof meta.name === 'string' && meta.name.length > 0) {
+			name = meta.name
 		}
 	}
 
 	// Collect metadata from Supabase-specific claims
 	const metadata: Record<string, unknown> = {}
-	if (typeof claims['role'] === 'string') {
-		metadata['role'] = claims['role']
+	if (typeof claims.role === 'string') {
+		metadata.role = claims.role
 	}
-	if (typeof claims['aud'] === 'string') {
-		metadata['aud'] = claims['aud']
+	if (typeof claims.aud === 'string') {
+		metadata.aud = claims.aud
 	}
 	if (
-		typeof claims['app_metadata'] === 'object'
-		&& claims['app_metadata'] !== null
-		&& !Array.isArray(claims['app_metadata'])
+		typeof claims.app_metadata === 'object' &&
+		claims.app_metadata !== null &&
+		!Array.isArray(claims.app_metadata)
 	) {
-		metadata['appMetadata'] = claims['app_metadata']
+		metadata.appMetadata = claims.app_metadata
 	}
 
 	return {

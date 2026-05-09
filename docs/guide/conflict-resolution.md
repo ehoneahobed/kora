@@ -63,6 +63,85 @@ notes: t.richtext()
 
 Two users can type in the same document simultaneously and their edits merge seamlessly, just like in Google Docs.
 
+## Schema-Level Merge Strategies
+
+For common merge patterns that go beyond simple LWW, you can declare a merge strategy directly on a field using the `.merge()` modifier. This replaces the default Tier 1 strategy without needing a Tier 3 custom resolver.
+
+### Counter
+
+Additive merge for numeric fields. Both sides' deltas from the base value are applied:
+
+```typescript
+quantity: t.number().merge('counter')
+```
+
+```
+Base:     100
+Device A: 97   (sold 3, delta: -3)
+Device B: 95   (sold 5, delta: -5)
+Merged:   92   (100 + (-3) + (-5))
+```
+
+This is the recommended approach for quantities, scores, vote counts, and any numeric field where concurrent changes should accumulate rather than overwrite.
+
+### Max / Min
+
+Keep the highest or lowest value:
+
+```typescript
+highScore: t.number().merge('max')     // keeps the highest value
+lowestBid: t.number().merge('min')     // keeps the lowest value
+```
+
+```
+Base:     50
+Device A: 75
+Device B: 60
+Max:      75   (max of all three)
+Min:      50   (min of all three)
+```
+
+### Append-Only
+
+For array fields where items should never be removed -- only added:
+
+```typescript
+auditLog: t.array(t.string()).merge('append-only')
+```
+
+```
+Base:     ["created"]
+Device A: ["created", "reviewed"]          (added "reviewed")
+Device B: ["reviewed"]                     (removed "created", added "reviewed")
+Merged:   ["created", "reviewed"]          (removal ignored, additions merged)
+```
+
+### Server-Authoritative
+
+The remote/server value always wins, regardless of timestamps:
+
+```typescript
+approvalStatus: t.string().merge('server-authoritative')
+```
+
+Useful for fields controlled by a server-side process (admin approval, moderation status, etc.).
+
+### When to Use What
+
+| Pattern | Use | Instead of |
+|---------|-----|------------|
+| `t.number().merge('counter')` | Quantities, scores, counters | Tier 3 additive resolver |
+| `t.number().merge('max')` | High scores, version numbers | Tier 3 max resolver |
+| `t.number().merge('min')` | Lowest bid, minimum stock | Tier 3 min resolver |
+| `t.array().merge('append-only')` | Audit logs, event history | Tier 3 custom array resolver |
+| `t.string().merge('server-authoritative')` | Admin-controlled fields | Tier 2 server-decides constraint |
+| Tier 3 `resolve` | Complex domain logic | -- |
+
+Schema-level strategies are preferred over Tier 3 resolvers when a built-in strategy fits, because they are:
+- Declarative (visible in the schema)
+- Tested and proven (commutative, idempotent)
+- Visible in DevTools as strategy names (e.g., `schema-counter`)
+
 ## Tier 2: Constraint Validation
 
 After auto-merge produces a candidate state, Tier 2 checks declarative constraints. If a constraint is violated, the specified resolution strategy is applied.
@@ -266,14 +345,17 @@ Use the [DevTools Conflict Inspector](/guide/devtools) to view these traces in r
 
 ## Choosing the Right Tier
 
-| Scenario | Recommended Tier |
-|----------|-----------------|
+| Scenario | Recommended Approach |
+|----------|---------------------|
 | Simple fields (names, booleans, dates) | Tier 1 (LWW) -- the default, no config |
 | Collaborative text editing | Tier 1 (richtext CRDT) -- use `t.richtext()` |
 | Tags, labels, categories | Tier 1 (add-wins set) -- use `t.array()` |
+| Counters, quantities, scores | `.merge('counter')` on the field |
+| High scores, version numbers | `.merge('max')` on the field |
+| Audit logs, append-only lists | `.merge('append-only')` on the field |
+| Server-controlled fields | `.merge('server-authoritative')` on the field |
 | Unique constraints (email, username, seat) | Tier 2 -- declare the constraint |
 | Capacity limits (max participants) | Tier 2 -- declare the constraint |
-| Counters, quantities, scores | Tier 3 -- write an additive resolver |
-| Domain-specific business logic | Tier 3 -- write a custom resolver |
+| Complex domain-specific business logic | Tier 3 -- write a custom resolver |
 
 Most applications work entirely with Tier 1 defaults. Add Tier 2 and 3 only where your domain requires it.

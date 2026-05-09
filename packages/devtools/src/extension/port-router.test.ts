@@ -1,7 +1,10 @@
 import { describe, expect, test, vi } from 'vitest'
-import { PortRouter, type ExtensionPort } from './port-router'
+import { type ExtensionPort, PortRouter } from './port-router'
 
-function createPort(name: string, tabId?: number): {
+function createPort(
+	name: string,
+	tabId?: number,
+): {
 	port: ExtensionPort
 	emitMessage: (message: unknown) => void
 	emitDisconnect: () => void

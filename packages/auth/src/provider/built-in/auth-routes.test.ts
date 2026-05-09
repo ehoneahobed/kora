@@ -1,12 +1,12 @@
-import { describe, expect, test, beforeEach } from 'vitest'
-import { BuiltInAuthRoutes, InMemoryChallengeStore } from './auth-routes'
-import { InMemoryUserStore } from './user-store'
-import { TokenManager, InMemoryTokenRevocationStore } from '../../tokens/token-manager'
+import { beforeEach, describe, expect, test } from 'vitest'
 import {
-	generateDeviceKeyPair,
 	exportPublicKeyJwk,
+	generateDeviceKeyPair,
 	signChallenge,
 } from '../../device/device-identity'
+import { InMemoryTokenRevocationStore, TokenManager } from '../../tokens/token-manager'
+import { BuiltInAuthRoutes, InMemoryChallengeStore } from './auth-routes'
+import { InMemoryUserStore } from './user-store'
 
 // Must be at least 32 characters for HMAC-SHA256 security
 const TEST_SECRET = 'test-secret-key-for-auth-routes-tests-min-32-chars'
@@ -495,7 +495,7 @@ describe('handleRevokeDevice', () => {
 		expect('error' in result.body).toBe(true)
 	})
 
-	test('rejects revoking another user\'s device', async () => {
+	test("rejects revoking another user's device", async () => {
 		const { routes } = createTestRoutes()
 
 		// User A signs up with a device
@@ -546,9 +546,7 @@ describe('toSyncAuthProvider', () => {
 		if (!('data' in signUpResult.body)) return
 
 		const authProvider = routes.toSyncAuthProvider()
-		const context = await authProvider.authenticate(
-			signUpResult.body.data.tokens.accessToken,
-		)
+		const context = await authProvider.authenticate(signUpResult.body.data.tokens.accessToken)
 
 		expect(context).not.toBeNull()
 		expect(context?.userId).toBe(signUpResult.body.data.user.id)
@@ -574,9 +572,7 @@ describe('toSyncAuthProvider', () => {
 		if (!('data' in signUpResult.body)) return
 
 		const authProvider = routes.toSyncAuthProvider()
-		const context = await authProvider.authenticate(
-			signUpResult.body.data.tokens.refreshToken,
-		)
+		const context = await authProvider.authenticate(signUpResult.body.data.tokens.refreshToken)
 
 		expect(context).toBeNull()
 	})

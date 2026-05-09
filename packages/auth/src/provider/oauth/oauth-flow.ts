@@ -1,15 +1,15 @@
 import type {
 	OAuthProviderConfig,
-	OAuthTokens,
-	OAuthUserInfo,
 	OAuthState,
 	OAuthStateStore,
+	OAuthTokens,
+	OAuthUserInfo,
 } from './oauth-types'
 import {
-	OAuthStateMismatchError,
 	OAuthCodeExchangeError,
-	OAuthUserInfoError,
 	OAuthProviderNotFoundError,
+	OAuthStateMismatchError,
+	OAuthUserInfoError,
 } from './oauth-types'
 
 // ============================================================================
@@ -165,7 +165,11 @@ export class OAuthManager {
 		providerId: string,
 		code: string,
 		state: string,
-	): Promise<{ tokens: OAuthTokens; userInfo: OAuthUserInfo; stateMetadata?: Record<string, unknown> }> {
+	): Promise<{
+		tokens: OAuthTokens
+		userInfo: OAuthUserInfo
+		stateMetadata?: Record<string, unknown>
+	}> {
 		const provider = this.getProvider(providerId)
 
 		// Validate state (CSRF protection)
@@ -226,9 +230,7 @@ export class OAuthManager {
 				body: body.toString(),
 			})
 		} catch (err) {
-			throw new OAuthCodeExchangeError(
-				err instanceof Error ? err.message : 'Network error',
-			)
+			throw new OAuthCodeExchangeError(err instanceof Error ? err.message : 'Network error')
 		}
 
 		if (!response.ok) {
@@ -245,12 +247,12 @@ export class OAuthManager {
 		const data = (await response.json()) as Record<string, unknown>
 
 		return {
-			accessToken: data['access_token'] as string,
-			tokenType: (data['token_type'] as string) ?? 'Bearer',
-			expiresIn: data['expires_in'] as number | undefined,
-			refreshToken: data['refresh_token'] as string | undefined,
-			idToken: data['id_token'] as string | undefined,
-			scope: data['scope'] as string | undefined,
+			accessToken: data.access_token as string,
+			tokenType: (data.token_type as string) ?? 'Bearer',
+			expiresIn: data.expires_in as number | undefined,
+			refreshToken: data.refresh_token as string | undefined,
+			idToken: data.id_token as string | undefined,
+			scope: data.scope as string | undefined,
 		}
 	}
 
@@ -267,9 +269,7 @@ export class OAuthManager {
 				},
 			})
 		} catch (err) {
-			throw new OAuthUserInfoError(
-				err instanceof Error ? err.message : 'Network error',
-			)
+			throw new OAuthUserInfoError(err instanceof Error ? err.message : 'Network error')
 		}
 
 		if (!response.ok) {
@@ -291,43 +291,43 @@ function normalizeUserInfo(providerId: string, profile: Record<string, unknown>)
 	switch (providerId) {
 		case 'google':
 			return {
-				providerId: profile['sub'] as string,
+				providerId: profile.sub as string,
 				provider: 'google',
-				email: (profile['email'] as string) ?? null,
-				emailVerified: (profile['email_verified'] as boolean) ?? false,
-				name: (profile['name'] as string) ?? null,
-				avatarUrl: (profile['picture'] as string) ?? null,
+				email: (profile.email as string) ?? null,
+				emailVerified: (profile.email_verified as boolean) ?? false,
+				name: (profile.name as string) ?? null,
+				avatarUrl: (profile.picture as string) ?? null,
 				rawProfile: profile,
 			}
 		case 'github':
 			return {
-				providerId: String(profile['id']),
+				providerId: String(profile.id),
 				provider: 'github',
-				email: (profile['email'] as string) ?? null,
+				email: (profile.email as string) ?? null,
 				emailVerified: false, // GitHub doesn't confirm in the profile response
-				name: (profile['name'] as string) ?? (profile['login'] as string) ?? null,
-				avatarUrl: (profile['avatar_url'] as string) ?? null,
+				name: (profile.name as string) ?? (profile.login as string) ?? null,
+				avatarUrl: (profile.avatar_url as string) ?? null,
 				rawProfile: profile,
 			}
 		case 'microsoft':
 			return {
-				providerId: profile['id'] as string,
+				providerId: profile.id as string,
 				provider: 'microsoft',
-				email: (profile['mail'] as string) ?? (profile['userPrincipalName'] as string) ?? null,
+				email: (profile.mail as string) ?? (profile.userPrincipalName as string) ?? null,
 				emailVerified: false,
-				name: (profile['displayName'] as string) ?? null,
+				name: (profile.displayName as string) ?? null,
 				avatarUrl: null,
 				rawProfile: profile,
 			}
 		default:
 			// Generic normalization
 			return {
-				providerId: String(profile['id'] ?? profile['sub'] ?? ''),
+				providerId: String(profile.id ?? profile.sub ?? ''),
 				provider: providerId,
-				email: (profile['email'] as string) ?? null,
-				emailVerified: (profile['email_verified'] as boolean) ?? false,
-				name: (profile['name'] as string) ?? null,
-				avatarUrl: (profile['picture'] as string) ?? (profile['avatar_url'] as string) ?? null,
+				email: (profile.email as string) ?? null,
+				emailVerified: (profile.email_verified as boolean) ?? false,
+				name: (profile.name as string) ?? null,
+				avatarUrl: (profile.picture as string) ?? (profile.avatar_url as string) ?? null,
 				rawProfile: profile,
 			}
 	}

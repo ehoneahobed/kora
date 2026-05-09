@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import { encryptData, decryptData } from '../encryption/database-encryption'
+import { decryptData, encryptData } from '../encryption/database-encryption'
 import type { AuthTokens } from '../types'
 
 // --- Errors ---
@@ -277,13 +277,13 @@ export class EncryptedTokenStore {
 			}
 
 			const record = parsed as Record<string, unknown>
-			if (typeof record['iv'] !== 'string' || typeof record['data'] !== 'string') {
+			if (typeof record.iv !== 'string' || typeof record.data !== 'string') {
 				return null
 			}
 
 			// Decode the base64url-encoded IV and ciphertext
-			const iv = fromBase64Url(record['iv'])
-			const ciphertext = fromBase64Url(record['data'])
+			const iv = fromBase64Url(record.iv)
+			const ciphertext = fromBase64Url(record.data)
 
 			// Decrypt with AES-256-GCM
 			const plaintextBytes = await decryptData(this.key, ciphertext, iv)
@@ -297,19 +297,19 @@ export class EncryptedTokenStore {
 
 			const tokenRecord = tokenData as Record<string, unknown>
 			if (
-				typeof tokenRecord['accessToken'] !== 'string'
-				|| typeof tokenRecord['refreshToken'] !== 'string'
+				typeof tokenRecord.accessToken !== 'string' ||
+				typeof tokenRecord.refreshToken !== 'string'
 			) {
 				return null
 			}
 
 			const tokens: AuthTokens = {
-				accessToken: tokenRecord['accessToken'],
-				refreshToken: tokenRecord['refreshToken'],
+				accessToken: tokenRecord.accessToken,
+				refreshToken: tokenRecord.refreshToken,
 			}
 
-			if (typeof tokenRecord['deviceCredential'] === 'string') {
-				tokens.deviceCredential = tokenRecord['deviceCredential']
+			if (typeof tokenRecord.deviceCredential === 'string') {
+				tokens.deviceCredential = tokenRecord.deviceCredential
 			}
 
 			return tokens

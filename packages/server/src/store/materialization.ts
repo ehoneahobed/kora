@@ -91,9 +91,7 @@ export function generateCollectionDDL(
 	}
 
 	// Always index _deleted for efficient soft-delete filtering
-	statements.push(
-		`CREATE INDEX IF NOT EXISTS idx_${name}__deleted ON ${name} (_deleted)`,
-	)
+	statements.push(`CREATE INDEX IF NOT EXISTS idx_${name}__deleted ON ${name} (_deleted)`)
 
 	return statements
 }
@@ -101,10 +99,7 @@ export function generateCollectionDDL(
 /**
  * Generate all collection table DDL from a full schema.
  */
-export function generateAllCollectionDDL(
-	schema: SchemaDefinition,
-	dialect: SqlDialect,
-): string[] {
+export function generateAllCollectionDDL(schema: SchemaDefinition, dialect: SqlDialect): string[] {
 	const statements: string[] = []
 	for (const [name, collection] of Object.entries(schema.collections)) {
 		statements.push(...generateCollectionDDL(name, collection, dialect))

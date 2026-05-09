@@ -1,13 +1,13 @@
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
-import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { ProjectExistsError } from '../../errors'
 import { directoryExists } from '../../utils/fs-helpers'
+import { createCommand } from './create-command'
 import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
-import { createCommand } from './create-command'
 
 // Test the scaffolding logic directly rather than citty's arg parsing,
 // since citty handles that internally. We verify the core flow:
@@ -229,49 +229,45 @@ describe('create command flow', () => {
 		expect(env).toContain('DATABASE_URL=')
 	})
 
-	test(
-		'create command logs postgres preset note',
-		async () => {
-			const cwdSpy = vi.spyOn(process, 'cwd')
-			const originalExitCode = process.exitCode
-			const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
-			cwdSpy.mockReturnValue(tempRoot)
+	test('create command logs postgres preset note', async () => {
+		const cwdSpy = vi.spyOn(process, 'cwd')
+		const originalExitCode = process.exitCode
+		const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
+		cwdSpy.mockReturnValue(tempRoot)
 
-			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-			try {
-				await createCommand.run({
-					args: {
-						_: [],
-						name: 'postgres-log-app',
-						framework: 'react',
-						auth: 'none',
-						db: 'postgres',
-						'db-provider': 'supabase',
-						tailwind: false,
-						sync: true,
-						pm: 'pnpm',
-						'skip-install': true,
-						yes: true,
-					},
-					rawArgs: [],
-					cmd: createCommand,
-				})
+		try {
+			await createCommand.run({
+				args: {
+					_: [],
+					name: 'postgres-log-app',
+					framework: 'react',
+					auth: 'none',
+					db: 'postgres',
+					'db-provider': 'supabase',
+					tailwind: false,
+					sync: true,
+					pm: 'pnpm',
+					'skip-install': true,
+					yes: true,
+				},
+				rawArgs: [],
+				cmd: createCommand,
+			})
 
-				const logged = logSpy.mock.calls.map((call) => String(call[0] ?? '')).join('\n')
-				expect(logged).toContain('Applied PostgreSQL sync preset (Supabase)')
-				expect(logged).toContain('DATABASE_URL')
-			} finally {
-				process.exitCode = originalExitCode
-				cwdSpy.mockRestore()
-				logSpy.mockRestore()
-				warnSpy.mockRestore()
-				errorSpy.mockRestore()
-				await rm(tempRoot, { recursive: true, force: true })
-			}
-		},
-		15_000,
-	)
+			const logged = logSpy.mock.calls.map((call) => String(call[0] ?? '')).join('\n')
+			expect(logged).toContain('Applied PostgreSQL sync preset (Supabase)')
+			expect(logged).toContain('DATABASE_URL')
+		} finally {
+			process.exitCode = originalExitCode
+			cwdSpy.mockRestore()
+			logSpy.mockRestore()
+			warnSpy.mockRestore()
+			errorSpy.mockRestore()
+			await rm(tempRoot, { recursive: true, force: true })
+		}
+	}, 15_000)
 })

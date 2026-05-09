@@ -13,7 +13,20 @@ export type {
 // === Strategies ===
 export { lastWriteWins, type LWWResult } from './strategies/lww'
 export { addWinsSet } from './strategies/add-wins-set'
+export {
+	mergeAtomicOps,
+	type AtomicMergeResult,
+	type AtomicMergeFallback,
+} from './strategies/atomic-merge'
 export { mergeRichtext, richtextToString, stringToRichtextUpdate } from './strategies/yjs-richtext'
+export {
+	appendOnlyMerge,
+	applySchemaStrategy,
+	counterMerge,
+	maxMerge,
+	minMerge,
+	serverAuthoritativeMerge,
+} from './strategies/schema-strategies'
 
 // === Field Merger ===
 export { mergeField } from './engine/field-merger'

@@ -52,9 +52,15 @@ describe('runMigration', () => {
 		expect(executed[1]).toBe(
 			'CREATE TABLE IF NOT EXISTS _kora_migrations (id TEXT PRIMARY KEY NOT NULL, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, applied_at INTEGER NOT NULL)',
 		)
-		expect(executed[2]).toBe('CREATE TABLE IF NOT EXISTS todos (id TEXT PRIMARY KEY, title TEXT NOT NULL)')
+		expect(executed[2]).toBe(
+			'CREATE TABLE IF NOT EXISTS todos (id TEXT PRIMARY KEY, title TEXT NOT NULL)',
+		)
 		expect(executed[3]).toBe("INSERT INTO todos (id, title) VALUES ('1', 'Hello')")
-		expect(executed[4]?.startsWith("INSERT OR REPLACE INTO _kora_migrations (id, from_version, to_version, applied_at) VALUES ('001-v1-v2', 1, 2, ")).toBe(true)
+		expect(
+			executed[4]?.startsWith(
+				"INSERT OR REPLACE INTO _kora_migrations (id, from_version, to_version, applied_at) VALUES ('001-v1-v2', 1, 2, ",
+			),
+		).toBe(true)
 		expect(executed[5]).toBe('COMMIT')
 	})
 

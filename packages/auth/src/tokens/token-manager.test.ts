@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TokenManager, InMemoryTokenRevocationStore } from './token-manager'
+import { InMemoryTokenRevocationStore, TokenManager } from './token-manager'
 
 // Must be at least 32 characters (256 bits) for HMAC-SHA256 security
 const TEST_SECRET = 'kora-test-secret-for-unit-tests-minimum-32-chars'
@@ -30,15 +30,11 @@ describe('TokenManager', () => {
 		})
 
 		it('rejects empty secrets', () => {
-			expect(() => new TokenManager({ secret: '' })).toThrow(
-				/must be at least 32 characters/,
-			)
+			expect(() => new TokenManager({ secret: '' })).toThrow(/must be at least 32 characters/)
 		})
 
 		it('rejects empty secret arrays', () => {
-			expect(() => new TokenManager({ secret: [] })).toThrow(
-				/requires at least one secret/,
-			)
+			expect(() => new TokenManager({ secret: [] })).toThrow(/requires at least one secret/)
 		})
 
 		it('accepts a valid secret string', () => {
@@ -81,7 +77,7 @@ describe('TokenManager', () => {
 			expect(payload?.type).toBe('access')
 			expect(payload?.iat).toBe(Math.floor(Date.now() / 1000))
 			// Default lifetime: 15 minutes = 900 seconds
-			expect(payload?.exp).toBe(payload!.iat + 900)
+			expect(payload?.exp).toBe(payload?.iat + 900)
 		})
 
 		it('generates unique jti for each token', () => {
@@ -107,7 +103,7 @@ describe('TokenManager', () => {
 			expect(payload?.type).toBe('refresh')
 			expect(payload?.iat).toBe(Math.floor(Date.now() / 1000))
 			// Default lifetime: 90 days = 7_776_000 seconds
-			expect(payload?.exp).toBe(payload!.iat + 90 * 24 * 60 * 60)
+			expect(payload?.exp).toBe(payload?.iat + 90 * 24 * 60 * 60)
 		})
 	})
 
@@ -148,7 +144,7 @@ describe('TokenManager', () => {
 			expect(tokens.refreshToken).toBeDefined()
 			expect(tokens.deviceCredential).toBeDefined()
 
-			const credPayload = manager.validateToken(tokens.deviceCredential!)
+			const credPayload = manager.validateToken(tokens.deviceCredential as string)
 			expect(credPayload?.type).toBe('device_credential')
 		})
 	})
@@ -184,7 +180,10 @@ describe('TokenManager', () => {
 		it('returns null for a token with missing claims', async () => {
 			// Manually craft a token without the required 'dev' claim
 			const { encodeJwt } = await import('./jwt')
-			const badToken = encodeJwt({ sub: USER_ID, type: 'access', iat: 0, exp: 9999999999 }, TEST_SECRET)
+			const badToken = encodeJwt(
+				{ sub: USER_ID, type: 'access', iat: 0, exp: 9999999999 },
+				TEST_SECRET,
+			)
 			expect(manager.validateToken(badToken)).toBeNull()
 		})
 	})
@@ -223,12 +222,12 @@ describe('TokenManager', () => {
 			const result = await manager.refreshAccessToken(originalRefresh)
 			expect(result).not.toBeNull()
 
-			const accessPayload = manager.validateToken(result!.accessToken)
+			const accessPayload = manager.validateToken(result?.accessToken)
 			expect(accessPayload?.type).toBe('access')
 			expect(accessPayload?.sub).toBe(USER_ID)
 			expect(accessPayload?.dev).toBe(DEVICE_ID)
 
-			const refreshPayload = manager.validateToken(result!.refreshToken)
+			const refreshPayload = manager.validateToken(result?.refreshToken)
 			expect(refreshPayload?.type).toBe('refresh')
 			expect(refreshPayload?.sub).toBe(USER_ID)
 			expect(refreshPayload?.dev).toBe(DEVICE_ID)
@@ -266,7 +265,7 @@ describe('TokenManager', () => {
 
 			const result = await manager.refreshAccessToken(originalRefresh)
 			expect(result).not.toBeNull()
-			expect(result!.refreshToken).not.toBe(originalRefresh)
+			expect(result?.refreshToken).not.toBe(originalRefresh)
 		})
 	})
 
@@ -279,7 +278,9 @@ describe('TokenManager', () => {
 			})
 
 			const token = revokeManager.issueAccessToken(USER_ID, DEVICE_ID)
-			const payload = revokeManager.validateToken(token)!
+			const payload = revokeManager.validateToken(token) as NonNullable<
+				ReturnType<TokenManager['validateToken']>
+			>
 
 			// Token is valid before revocation
 			expect(await revokeManager.validateTokenWithRevocation(token)).not.toBeNull()
@@ -323,7 +324,7 @@ describe('TokenManager', () => {
 			const payload = customManager.validateToken(token)
 			expect(payload).not.toBeNull()
 			// 5 minutes = 300 seconds
-			expect(payload!.exp - payload!.iat).toBe(300)
+			expect(payload?.exp - payload?.iat).toBe(300)
 
 			// Token should still be valid at 4 minutes
 			vi.advanceTimersByTime(4 * 60 * 1000)
@@ -344,7 +345,7 @@ describe('TokenManager', () => {
 			const payload = customManager.validateToken(token)
 			expect(payload).not.toBeNull()
 			// 7 days = 604_800 seconds
-			expect(payload!.exp - payload!.iat).toBe(604_800)
+			expect(payload?.exp - payload?.iat).toBe(604_800)
 		})
 
 		it('respects custom device credential lifetime', () => {
@@ -357,7 +358,7 @@ describe('TokenManager', () => {
 			const payload = customManager.validateToken(token)
 			expect(payload).not.toBeNull()
 			// 30 days = 2_592_000 seconds
-			expect(payload!.exp - payload!.iat).toBe(2_592_000)
+			expect(payload?.exp - payload?.iat).toBe(2_592_000)
 		})
 	})
 })

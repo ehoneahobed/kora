@@ -1,4 +1,5 @@
 import { SchemaValidationError } from '../errors/errors'
+import { isAtomicOp } from '../operations/atomic-ops'
 import type { CollectionDefinition, FieldDescriptor, OperationType } from '../types'
 
 /**
@@ -50,10 +51,16 @@ export function validateRecord(
 		// For updates, only validate fields that are present (partial updates)
 		if (operationType === 'update') {
 			if (hasValue) {
-				if (value !== undefined && value !== null) {
+				// Atomic op sentinels pass through validation — they are resolved
+				// to concrete values by Collection.update() before the Operation is created.
+				if (isAtomicOp(value)) {
+					result[fieldName] = value
+				} else if (value !== undefined && value !== null) {
 					validateFieldValue(collection, fieldName, descriptor, value)
+					result[fieldName] = value
+				} else {
+					result[fieldName] = value
 				}
-				result[fieldName] = value
 			}
 			continue
 		}

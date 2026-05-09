@@ -257,9 +257,9 @@ describe('AuthClient', () => {
 
 			mockFetchResponse({ error: 'Invalid email or password' }, 401)
 
-			await expect(
-				client.signIn({ email: 'bad@example.com', password: 'wrong' }),
-			).rejects.toThrow('Invalid email or password')
+			await expect(client.signIn({ email: 'bad@example.com', password: 'wrong' })).rejects.toThrow(
+				'Invalid email or password',
+			)
 
 			expect(client.state).toBe('unauthenticated')
 		})

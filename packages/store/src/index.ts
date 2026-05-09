@@ -41,8 +41,22 @@ export { SubscriptionManager } from './subscription/subscription-manager'
 // === Collection ===
 export { Collection } from './collection/collection'
 
+// === Transaction ===
+export { TransactionContext } from './transaction/transaction-context'
+export type {
+	TransactionCollectionAccessor,
+	TransactionContextConfig,
+} from './transaction/transaction-context'
+
+// === Sequences ===
+export { SequenceManager } from './sequences/sequence-manager'
+
 // === Richtext Serialization ===
-export { decodeRichtext, encodeRichtext, richtextToPlainText } from './serialization/richtext-serializer'
+export {
+	decodeRichtext,
+	encodeRichtext,
+	richtextToPlainText,
+} from './serialization/richtext-serializer'
 
 // === Query Utilities ===
 export { pluralize, singularize } from './query/pluralize'

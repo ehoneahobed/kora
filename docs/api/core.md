@@ -5,9 +5,9 @@
 All exports documented here are also available from the `kora` meta-package.
 
 ```typescript
-import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from '@korajs/core'
+import { defineSchema, t, op, migrate, HybridLogicalClock, createOperation, KoraError } from '@korajs/core'
 // or
-import { defineSchema, t, HybridLogicalClock, createOperation, KoraError } from 'korajs'
+import { defineSchema, t, op, migrate, HybridLogicalClock, createOperation, KoraError } from 'korajs'
 ```
 
 ---
@@ -204,6 +204,7 @@ All type builders (except `t.richtext()`) support these chainable modifiers:
 | `.optional()` | Makes the field nullable. Omitted fields default to `null`. |
 | `.default(value)` | Sets a default value applied on insert when the field is not provided. |
 | `.auto()` | Field is set automatically by Kora (e.g., `createdAt`). Cannot be provided by the developer. Only valid on `t.timestamp()`. |
+| `.merge(strategy)` | Declares the merge strategy for this field during conflict resolution. See [Conflict Resolution](/guide/conflict-resolution). Only valid on `t.number()`, `t.string()`, and `t.array()`. |
 
 Modifiers return a new `FieldDescriptor` and can be chained:
 
@@ -213,6 +214,49 @@ t.number().default(0)           // Valid
 t.timestamp().auto()            // Valid
 t.string().optional().default('n/a')  // Valid -- optional with a default
 ```
+
+### .merge(strategy)
+
+Declares how this field should be merged when concurrent edits conflict. Overrides the default Tier 1 auto-merge strategy.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `strategy` | `FieldMergeStrategy` | The merge strategy to use. |
+
+#### Available strategies
+
+| Strategy | Valid on | Behavior |
+|----------|---------|----------|
+| `'lww'` | All scalar types | Last-Write-Wins (default for scalars) |
+| `'counter'` | `t.number()` | Additive merge: both deltas are applied to the base value |
+| `'max'` | `t.number()` | Keeps the highest value across all sides |
+| `'min'` | `t.number()` | Keeps the lowest value across all sides |
+| `'union'` | `t.array()` | Add-wins set (default for arrays) |
+| `'append-only'` | `t.array()` | Append-only: additions are kept, removals are ignored |
+| `'server-authoritative'` | All types | Remote/server value always wins |
+
+```typescript
+import { defineSchema, t } from 'korajs'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    products: {
+      fields: {
+        name: t.string(),
+        quantity: t.number().merge('counter'),   // additive — both decrements apply
+        highScore: t.number().merge('max'),      // keep the highest value
+        tags: t.array(t.string()).merge('append-only'), // never lose tags
+        status: t.string().merge('server-authoritative'), // server decides
+      },
+    },
+  },
+})
+```
+
+::: tip
+Schema-level merge strategies replace Tier 3 custom resolvers for common patterns like counters, max/min, and append-only lists. Use `.merge()` when a built-in strategy fits; use Tier 3 `resolve` functions for complex domain logic.
+:::
 
 ---
 
@@ -391,6 +435,152 @@ In typical application code, you never call `createOperation` directly. The `Sto
 
 ---
 
+## op (Atomic Field Operations) {#atomic-ops}
+
+The `op` helper creates atomic field operations that are resolved against the current value at write time, rather than setting an absolute value. This prevents lost updates when multiple devices modify the same field concurrently.
+
+```typescript
+import { op } from '@korajs/core'
+// or
+import { op } from 'korajs'
+```
+
+### op.increment(amount)
+
+Increments a numeric field by the given amount.
+
+```typescript
+await app.products.update(id, { quantity: op.increment(1) })
+await app.products.update(id, { quantity: op.increment(-3) }) // decrement by 3
+```
+
+### op.decrement(amount)
+
+Decrements a numeric field by the given amount. Equivalent to `op.increment(-amount)`.
+
+```typescript
+await app.products.update(id, { quantity: op.decrement(5) })
+```
+
+### op.max(value)
+
+Sets the field to the given value only if it is greater than the current value.
+
+```typescript
+await app.players.update(id, { highScore: op.max(newScore) })
+```
+
+### op.min(value)
+
+Sets the field to the given value only if it is less than the current value.
+
+```typescript
+await app.auctions.update(id, { lowestBid: op.min(myBid) })
+```
+
+### op.append(item)
+
+Appends an item to an array field.
+
+```typescript
+await app.todos.update(id, { tags: op.append('urgent') })
+```
+
+### op.remove(item)
+
+Removes an item from an array field by value.
+
+```typescript
+await app.todos.update(id, { tags: op.remove('draft') })
+```
+
+::: warning
+Atomic operations are resolved locally before creating the operation. They do not provide distributed atomicity — concurrent `op.increment(1)` calls from two devices both apply their deltas correctly because the operation stores the resolved value and the previous value, enabling 3-way merge.
+:::
+
+---
+
+## buildScopeMap()
+
+Builds a scope map from a schema definition and a set of scope values. Used internally by sync scoping but available for custom scope logic.
+
+### Signature
+
+```typescript
+function buildScopeMap(
+  schema: SchemaDefinition,
+  scopeValues: Record<string, unknown>
+): ScopeMap
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
+| `scopeValues` | `Record<string, unknown>` | Flat key-value pairs used to populate scope filters. |
+
+### Returns
+
+`ScopeMap` — A `Record<string, Record<string, unknown>>` mapping collection names to their scope filter objects.
+
+---
+
+## migrate() / MigrationBuilder {#migrations}
+
+Creates a fluent migration builder for defining schema migration steps programmatically. The builder is immutable — each method returns a new instance.
+
+```typescript
+import { migrate, migrationStepsToSQL, t } from '@korajs/core'
+```
+
+### migrate()
+
+Returns a new empty `MigrationBuilder`.
+
+```typescript
+const migration = migrate()
+  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+  .removeField('todos', 'legacyFlag')
+  .renameField('todos', 'desc', 'description')
+  .addIndex('todos', 'priority')
+```
+
+### MigrationBuilder methods
+
+| Method | Description |
+|--------|-------------|
+| `.addField(collection, field, builder)` | Add a new field to a collection. |
+| `.removeField(collection, field)` | Remove a field from a collection. |
+| `.renameField(collection, from, to)` | Rename a field. |
+| `.addIndex(collection, field)` | Add an index on a field. |
+| `.removeIndex(collection, field)` | Remove an index. |
+| `.backfill(collection, transform)` | Apply a transform function to all existing records. |
+
+### .build()
+
+Returns a `MigrationDefinition` containing the ordered list of steps.
+
+```typescript
+const definition = migration.build()
+console.log(definition.steps) // Array of MigrationStep objects
+```
+
+### migrationStepsToSQL()
+
+Converts migration steps into SQL statements.
+
+```typescript
+function migrationStepsToSQL(steps: readonly MigrationStep[]): string[]
+```
+
+```typescript
+const sql = migrationStepsToSQL(definition.steps)
+// ['ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT \'medium\' CHECK(...)']
+```
+
+---
+
 ## Types
 
 ### Operation
@@ -483,6 +673,7 @@ interface FieldDescriptor {
   auto: boolean
   enumValues?: readonly string[]
   inner?: FieldDescriptor   // For array fields
+  mergeStrategy?: 'lww' | 'counter' | 'max' | 'min' | 'union' | 'append-only' | 'server-authoritative'
 }
 ```
 

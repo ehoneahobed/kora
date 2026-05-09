@@ -159,7 +159,7 @@ export class InMemoryWebhookStore implements WebhookStore {
 		}
 	}
 
-	async listDeliveries(endpointId: string, limit: number = 50): Promise<WebhookDelivery[]> {
+	async listDeliveries(endpointId: string, limit = 50): Promise<WebhookDelivery[]> {
 		return this.deliveries
 			.filter((d) => d.endpointId === endpointId)
 			.sort((a, b) => b.createdAt - a.createdAt)
@@ -284,14 +284,9 @@ export class WebhookManager {
 	 * Dispatch an event to all matching webhook endpoints.
 	 * Delivery is best-effort with retries.
 	 */
-	async dispatch(
-		event: WebhookEvent,
-		data: Record<string, unknown>,
-	): Promise<void> {
+	async dispatch(event: WebhookEvent, data: Record<string, unknown>): Promise<void> {
 		const endpoints = await this.store.listEndpoints()
-		const matching = endpoints.filter(
-			(ep) => ep.active && ep.events.includes(event),
-		)
+		const matching = endpoints.filter((ep) => ep.active && ep.events.includes(event))
 
 		const payload: WebhookPayload = {
 			id: generateId(),
@@ -302,9 +297,7 @@ export class WebhookManager {
 
 		const payloadJson = JSON.stringify(payload)
 
-		await Promise.allSettled(
-			matching.map((ep) => this.deliverToEndpoint(ep, payloadJson, event)),
-		)
+		await Promise.allSettled(matching.map((ep) => this.deliverToEndpoint(ep, payloadJson, event)))
 	}
 
 	// --- Private ---
@@ -378,7 +371,7 @@ function generateId(): string {
 	globalThis.crypto.getRandomValues(bytes)
 	let hex = ''
 	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i]!.toString(16).padStart(2, '0')
+		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
 	return hex
 }
@@ -388,7 +381,7 @@ function generateSecret(): string {
 	globalThis.crypto.getRandomValues(bytes)
 	let hex = ''
 	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i]!.toString(16).padStart(2, '0')
+		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
 	return `whsec_${hex}`
 }
@@ -405,15 +398,11 @@ async function signPayload(payload: string, secret: string): Promise<string> {
 		false,
 		['sign'],
 	)
-	const signature = await globalThis.crypto.subtle.sign(
-		'HMAC',
-		key,
-		encoder.encode(payload),
-	)
+	const signature = await globalThis.crypto.subtle.sign('HMAC', key, encoder.encode(payload))
 	const bytes = new Uint8Array(signature)
 	let hex = ''
 	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i]!.toString(16).padStart(2, '0')
+		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
 	return `sha256=${hex}`
 }

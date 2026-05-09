@@ -3,7 +3,9 @@ import { KoraAuthProvider } from './kora-auth-provider'
 
 // Minimal mock implementations matching the structural interfaces
 
-function createMockTokenValidator(payloads: Record<string, { sub: string; dev: string; type: string } | null>) {
+function createMockTokenValidator(
+	payloads: Record<string, { sub: string; dev: string; type: string } | null>,
+) {
 	return {
 		validateToken(token: string) {
 			return payloads[token] ?? null

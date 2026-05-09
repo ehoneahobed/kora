@@ -99,9 +99,11 @@ describe('AwsLightsailAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						containerServices: [{
-							url: 'https://my-app.abc123.us-east-1.cs.amazonlightsail.com',
-						}],
+						containerServices: [
+							{
+								url: 'https://my-app.abc123.us-east-1.cs.amazonlightsail.com',
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -133,11 +135,13 @@ describe('AwsLightsailAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						containerServices: [{
-							state: 'RUNNING',
-							url: 'https://my-app.abc.us-east-1.cs.amazonlightsail.com',
-							currentDeployment: { state: 'ACTIVE' },
-						}],
+						containerServices: [
+							{
+								state: 'RUNNING',
+								url: 'https://my-app.abc.us-east-1.cs.amazonlightsail.com',
+								currentDeployment: { state: 'ACTIVE' },
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -163,11 +167,13 @@ describe('AwsLightsailAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						containerServices: [{
-							state: 'DEPLOYING',
-							url: '',
-							currentDeployment: { state: 'ACTIVATING' },
-						}],
+						containerServices: [
+							{
+								state: 'DEPLOYING',
+								url: '',
+								currentDeployment: { state: 'ACTIVATING' },
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -269,11 +275,13 @@ describe('AwsLightsailAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						deployments: [{
-							state: 'ACTIVE',
-							containers: {},
-							publicEndpoint: {},
-						}],
+						deployments: [
+							{
+								state: 'ACTIVE',
+								containers: {},
+								publicEndpoint: {},
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -293,11 +301,13 @@ describe('AwsLightsailAdapter', () => {
 	test('requireContext throws when context not set', async () => {
 		const runner = createRunnerMock([])
 		const adapter = new AwsLightsailAdapter({ runner })
-		await expect(adapter.deploy({
-			clientDirectory: null,
-			serverBundlePath: null,
-			deployDirectory: '/tmp',
-		})).rejects.toThrow('context is not initialized')
+		await expect(
+			adapter.deploy({
+				clientDirectory: null,
+				serverBundlePath: null,
+				deployDirectory: '/tmp',
+			}),
+		).rejects.toThrow('context is not initialized')
 	})
 })
 

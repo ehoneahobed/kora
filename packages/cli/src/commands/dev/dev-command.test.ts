@@ -142,7 +142,9 @@ describe('dev command', () => {
 		const { devCommand } = await import('./dev-command')
 		findProjectRootMock.mockResolvedValue(null)
 
-		await expect(devCommand.run({ args: defaultArgs() })).rejects.toBeInstanceOf(InvalidProjectError)
+		await expect(devCommand.run({ args: defaultArgs() })).rejects.toBeInstanceOf(
+			InvalidProjectError,
+		)
 	})
 
 	test('throws DevServerError when vite binary is missing', async () => {
@@ -161,9 +163,7 @@ describe('dev command', () => {
 
 		await devCommand.run({ args: defaultArgs() })
 
-		expect(processManagerSpawnMock).toHaveBeenCalledWith(
-			expect.objectContaining({ label: 'vite' }),
-		)
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(expect.objectContaining({ label: 'vite' }))
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(
 			expect.objectContaining({
 				label: 'sync',
@@ -182,9 +182,7 @@ describe('dev command', () => {
 		await devCommand.run({ args: { ...defaultArgs(), 'no-sync': true } })
 
 		expect(processManagerSpawnMock).toHaveBeenCalledTimes(1)
-		expect(processManagerSpawnMock).toHaveBeenCalledWith(
-			expect.objectContaining({ label: 'vite' }),
-		)
+		expect(processManagerSpawnMock).toHaveBeenCalledWith(expect.objectContaining({ label: 'vite' }))
 	})
 
 	test('--no-watch skips schema watcher startup', async () => {

@@ -1,22 +1,22 @@
-import type { PromptClient } from '../../prompts/prompt-client'
 import {
-	getDefaultCreatePreferences,
-	getCreatePreferencesOrDefault,
 	type CreatePreferences,
 	type PreferenceStore,
+	getCreatePreferencesOrDefault,
+	getDefaultCreatePreferences,
 } from '../../prompts/preferences'
+import type { PromptClient } from '../../prompts/prompt-client'
 import {
+	type AuthOption,
+	type DatabaseOption,
+	type DatabaseProviderOption,
+	type FrameworkOption,
+	type PlatformOption,
 	determineTemplateFromSelections,
 	isAuthValue,
 	isDatabaseProviderValue,
 	isDatabaseValue,
 	isFrameworkValue,
 	isPlatformValue,
-	type AuthOption,
-	type DatabaseOption,
-	type DatabaseProviderOption,
-	type FrameworkOption,
-	type PlatformOption,
 } from './options'
 
 export interface CreateFlags {
@@ -144,7 +144,9 @@ export async function resolveCreatePreferencesFlow(params: {
 
 		if (flags.db !== undefined) {
 			if (!isDatabaseValue(flags.db)) {
-				throw new Error(`Invalid --db value "${flags.db}". Expected one of: none, sqlite, postgres.`)
+				throw new Error(
+					`Invalid --db value "${flags.db}". Expected one of: none, sqlite, postgres.`,
+				)
 			}
 			effective.db = flags.db
 		} else if (!effective.sync) {

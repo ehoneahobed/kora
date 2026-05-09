@@ -90,7 +90,7 @@ describe('decodeJwt', () => {
 	test('decodes without verifying signature (reads tampered tokens)', () => {
 		const token = encodeJwt({ sub: 'user-1' }, TEST_SECRET)
 		// Tamper with the signature
-		const tampered = token.slice(0, -4) + 'XXXX'
+		const tampered = `${token.slice(0, -4)}XXXX`
 		const decoded = decodeJwt(tampered)
 		// decodeJwt should still return the payload
 		expect(decoded).not.toBeNull()
@@ -327,7 +327,7 @@ describe('edge cases', () => {
 			negative: -1,
 			maxSafe: Number.MAX_SAFE_INTEGER,
 			minSafe: Number.MIN_SAFE_INTEGER,
-			float: 3.14159,
+			float: Math.PI,
 		}
 		const token = encodeJwt(payload, TEST_SECRET)
 		const verified = verifyJwt(token, TEST_SECRET)

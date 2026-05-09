@@ -143,10 +143,7 @@ describe('TokenStore', () => {
 		})
 
 		it('returns null for stored data missing required fields', () => {
-			mockStorage.setItem(
-				'kora_auth_tokens',
-				JSON.stringify({ accessToken: 'only-access' }),
-			)
+			mockStorage.setItem('kora_auth_tokens', JSON.stringify({ accessToken: 'only-access' }))
 
 			const store = new TokenStore()
 			expect(store.loadTokens()).toBeNull()

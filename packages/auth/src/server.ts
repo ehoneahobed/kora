@@ -2,8 +2,17 @@
 // Every export here is a public API commitment. Be explicit.
 
 // === Auth Routes (built-in email/password provider) ===
-export { BuiltInAuthRoutes, InMemoryChallengeStore, InMemoryRateLimiter } from './provider/built-in/auth-routes'
-export type { AuthRoutesConfig, AuthRouteResponse, ChallengeStore, RateLimiter } from './provider/built-in/auth-routes'
+export {
+	BuiltInAuthRoutes,
+	InMemoryChallengeStore,
+	InMemoryRateLimiter,
+} from './provider/built-in/auth-routes'
+export type {
+	AuthRoutesConfig,
+	AuthRouteResponse,
+	ChallengeStore,
+	RateLimiter,
+} from './provider/built-in/auth-routes'
 
 // === Token Manager ===
 export { TokenManager, InMemoryTokenRevocationStore } from './tokens/token-manager'

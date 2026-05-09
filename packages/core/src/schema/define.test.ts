@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { FULL_SCHEMA, MINIMAL_SCHEMA } from '../../tests/fixtures/schemas'
 import { SchemaValidationError } from '../errors/errors'
+import { migrate } from '../migrations/migration-builder'
 import { defineSchema } from './define'
 import { t } from './types'
 
@@ -284,5 +285,141 @@ describe('defineSchema', () => {
 				},
 			}),
 		).toThrow(SchemaValidationError)
+	})
+
+	describe('migration validation', () => {
+		test('accepts valid migrations', () => {
+			const schema = defineSchema({
+				version: 2,
+				collections: {
+					products: {
+						fields: {
+							name: t.string(),
+							taxInclusive: t.boolean().default(false),
+						},
+					},
+				},
+				migrations: {
+					2: migrate().addField('products', 'taxInclusive', t.boolean().default(false)),
+				},
+			})
+			expect(schema.migrations[2]).toBeDefined()
+			expect(schema.migrations[2]?.steps).toHaveLength(1)
+		})
+
+		test('defaults migrations to empty object when not specified', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					todos: { fields: { title: t.string() } },
+				},
+			})
+			expect(schema.migrations).toEqual({})
+		})
+
+		test('rejects migration with version < 2', () => {
+			expect(() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						todos: { fields: { title: t.string() } },
+					},
+					migrations: {
+						1: migrate().addField('todos', 'extra', t.string()),
+					},
+				}),
+			).toThrow(SchemaValidationError)
+		})
+
+		test('rejects migration with version > schema version', () => {
+			expect(() =>
+				defineSchema({
+					version: 2,
+					collections: {
+						todos: { fields: { title: t.string() } },
+					},
+					migrations: {
+						3: migrate().addField('todos', 'extra', t.string()),
+					},
+				}),
+			).toThrow(SchemaValidationError)
+		})
+
+		test('rejects migration with no steps', () => {
+			expect(() =>
+				defineSchema({
+					version: 2,
+					collections: {
+						todos: { fields: { title: t.string() } },
+					},
+					migrations: {
+						2: migrate(),
+					},
+				}),
+			).toThrow(SchemaValidationError)
+		})
+
+		test('accepts multiple migrations for different versions', () => {
+			const schema = defineSchema({
+				version: 3,
+				collections: {
+					products: {
+						fields: {
+							name: t.string(),
+							taxInclusive: t.boolean().default(false),
+							category: t.string().optional(),
+						},
+					},
+				},
+				migrations: {
+					2: migrate().addField('products', 'taxInclusive', t.boolean().default(false)),
+					3: migrate().addField('products', 'category', t.string().optional()),
+				},
+			})
+			expect(Object.keys(schema.migrations)).toEqual(['2', '3'])
+		})
+	})
+
+	describe('scope validation', () => {
+		test('accepts valid scope fields', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					sales: {
+						fields: {
+							total: t.number(),
+							orgId: t.string(),
+							storeId: t.string(),
+						},
+						scope: ['orgId', 'storeId'],
+					},
+				},
+			})
+			expect(schema.collections.sales.scope).toEqual(['orgId', 'storeId'])
+		})
+
+		test('defaults scope to empty array when not specified', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					todos: { fields: { title: t.string() } },
+				},
+			})
+			expect(schema.collections.todos.scope).toEqual([])
+		})
+
+		test('rejects scope with non-existent field', () => {
+			expect(() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						sales: {
+							fields: { total: t.number() },
+							scope: ['nonexistent'],
+						},
+					},
+				}),
+			).toThrow(SchemaValidationError)
+		})
 	})
 })

@@ -3,11 +3,18 @@ import type {
 	InferRecord,
 	InferUpdateInput,
 	KoraEventEmitter,
+	Operation,
 	SchemaDefinition,
 	SchemaInput,
+	SequenceConfig,
 } from '@korajs/core'
 import type { FieldBuilder } from '@korajs/core'
-import type { CollectionAccessor, CollectionRecord, QueryBuilder } from '@korajs/store'
+import type {
+	CollectionAccessor,
+	CollectionRecord,
+	QueryBuilder,
+	TransactionContext,
+} from '@korajs/store'
 import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
 
 /**
@@ -43,6 +50,22 @@ export interface SyncOptions {
 	auth?: () => Promise<{ token: string }>
 	/** Sync scopes per collection. */
 	scopes?: Record<string, (ctx: Record<string, unknown>) => Record<string, unknown>>
+	/**
+	 * Flat scope values. Combined with schema scope declarations to build
+	 * per-collection scope filters sent to the server during handshake.
+	 *
+	 * @example
+	 * ```typescript
+	 * createApp({
+	 *   schema,
+	 *   sync: {
+	 *     url: 'wss://server/kora',
+	 *     scope: { orgId: 'org-123', storeId: 'store-456' },
+	 *   },
+	 * })
+	 * ```
+	 */
+	scope?: Record<string, unknown>
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
 	/** Schema version of this client. */
@@ -93,6 +116,71 @@ export interface SyncControl {
 	disconnect(): Promise<void>
 	/** Get the current developer-facing sync status. */
 	getStatus(): SyncStatusInfo
+	/** Force an immediate reconnection attempt. No-op if already connected. */
+	retryNow(): Promise<void>
+	/** Export a diagnostics snapshot for debugging and support tickets. */
+	exportDiagnostics(): import('@korajs/sync').SyncDiagnostics
+}
+
+/**
+ * A transaction collection accessor providing insert, update, delete, and findById.
+ */
+export interface TransactionCollectionProxy {
+	insert(data: Record<string, unknown>): Promise<CollectionRecord>
+	update(id: string, data: Record<string, unknown>): Promise<CollectionRecord>
+	delete(id: string): Promise<void>
+	findById(id: string): Promise<CollectionRecord | null>
+}
+
+/**
+ * Transaction proxy passed to the transaction callback.
+ * Provides collection accessors as direct properties (e.g., tx.todos.insert(...)).
+ */
+export interface TransactionProxy {
+	/** Dynamic collection accessors for transaction operations. */
+	[collection: string]: TransactionCollectionProxy
+}
+
+/**
+ * Accessor for offline-safe sequences.
+ * Generates monotonically increasing, collision-free identifiers
+ * that work across offline devices.
+ */
+export interface SequenceAccessor {
+	/**
+	 * Get the next value in a sequence, atomically incrementing the counter.
+	 *
+	 * @param name - The sequence name (e.g., 'receipt', 'invoice')
+	 * @param config - Optional configuration for scope, format, and starting value
+	 * @returns The formatted sequence value
+	 *
+	 * @example
+	 * ```typescript
+	 * const receiptNo = await app.sequences.next('receipt', {
+	 *   scope: storeId,
+	 *   format: 'S-{date}-{node4}-{seq}',
+	 * })
+	 * // → "S-20260508-a1b2-0042"
+	 * ```
+	 */
+	next(name: string, config?: SequenceConfig): Promise<string>
+
+	/**
+	 * Get the current counter value without incrementing.
+	 *
+	 * @param name - The sequence name
+	 * @param config - Optional scope
+	 * @returns The current counter value, or 0 if never used
+	 */
+	current(name: string, config?: { scope?: string }): Promise<number>
+
+	/**
+	 * Reset a sequence counter.
+	 *
+	 * @param name - The sequence name
+	 * @param config - Optional scope and target value
+	 */
+	reset(name: string, config?: { scope?: string; to?: number }): Promise<void>
 }
 
 /**
@@ -106,12 +194,41 @@ export interface KoraApp {
 	events: KoraEventEmitter
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** Offline-safe sequence generation. */
+	sequences: SequenceAccessor
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
+	/**
+	 * Execute multiple mutations atomically within a transaction.
+	 * All operations are committed together or rolled back on error.
+	 * Subscription notifications are batched after commit.
+	 *
+	 * @example
+	 * ```typescript
+	 * await app.transaction(async (tx) => {
+	 *   await tx.sales.update(saleId, { status: 'completed' })
+	 *   await tx.payments.insert({ saleId, method: 'cash', amount: total })
+	 * })
+	 * ```
+	 */
+	transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/**
+	 * Execute a named mutation — a transaction with a human-readable name.
+	 * The mutation name is attached to all operations and visible in DevTools.
+	 *
+	 * @example
+	 * ```typescript
+	 * await app.mutation('complete-sale', async (tx) => {
+	 *   await tx.sales.update(saleId, { status: 'completed' })
+	 *   await tx.payments.insert({ saleId, method: 'cash', amount: total })
+	 * })
+	 * ```
+	 */
+	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
 	/** Dynamic collection accessors (e.g., app.todos). Typed via Object.defineProperty. */
 	[collection: string]: unknown
 }
@@ -144,14 +261,21 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	events: KoraEventEmitter
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** Offline-safe sequence generation. */
+	sequences: SequenceAccessor
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
+	/** Execute multiple mutations atomically within a transaction. */
+	transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/** Execute a named mutation — a transaction with a DevTools-visible name. */
+	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
 } & {
 	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
+		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
 		fields: infer F extends Record<string, FieldBuilder<any, any, any>>
 	}
 		? TypedCollectionAccessor<InferRecord<F>, InferInsertInput<F>, InferUpdateInput<F>>

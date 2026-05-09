@@ -1,9 +1,9 @@
-import { describe, expect, it } from 'vitest'
 import type { Operation } from '@korajs/core'
+import { describe, expect, it } from 'vitest'
 import { generateEncryptionKey } from './database-encryption'
 import {
-	OperationEncryptor,
 	OperationEncryptionError,
+	OperationEncryptor,
 	isEncryptedField,
 } from './operation-encryptor'
 
@@ -185,11 +185,11 @@ describe('OperationEncryptor', () => {
 
 			expect(encrypted.data).not.toBeNull()
 			const envelope = encrypted.data as Record<string, unknown>
-			expect(envelope['__kora_encrypted']).toBe(true)
-			expect(typeof envelope['ciphertext']).toBe('string')
-			expect(typeof envelope['iv']).toBe('string')
-			expect(envelope['algorithm']).toBe('AES-256-GCM')
-			expect(envelope['version']).toBe(1)
+			expect(envelope.__kora_encrypted).toBe(true)
+			expect(typeof envelope.ciphertext).toBe('string')
+			expect(typeof envelope.iv).toBe('string')
+			expect(envelope.algorithm).toBe('AES-256-GCM')
+			expect(envelope.version).toBe(1)
 		})
 
 		it('produces base64url-encoded strings (no +, /, or = padding)', async () => {
@@ -199,8 +199,8 @@ describe('OperationEncryptor', () => {
 			const encrypted = await encryptor.encryptOperation(makeInsertOp())
 			const envelope = encrypted.data as Record<string, unknown>
 
-			expect(envelope['ciphertext']).not.toMatch(/[+/=]/)
-			expect(envelope['iv']).not.toMatch(/[+/=]/)
+			expect(envelope.ciphertext).not.toMatch(/[+/=]/)
+			expect(envelope.iv).not.toMatch(/[+/=]/)
 		})
 
 		it('ciphertext does not contain plaintext values', async () => {
@@ -208,7 +208,7 @@ describe('OperationEncryptor', () => {
 			const encryptor = new OperationEncryptor({ key })
 
 			const encrypted = await encryptor.encryptOperation(makeInsertOp())
-			const ciphertext = (encrypted.data as Record<string, string>)['ciphertext']
+			const ciphertext = (encrypted.data as Record<string, string>).ciphertext
 
 			expect(ciphertext).not.toContain('Buy milk')
 			expect(ciphertext).not.toContain('completed')
@@ -223,8 +223,8 @@ describe('OperationEncryptor', () => {
 			const enc1 = await encryptor.encryptOperation(op)
 			const enc2 = await encryptor.encryptOperation(op)
 
-			const iv1 = (enc1.data as Record<string, string>)['iv']
-			const iv2 = (enc2.data as Record<string, string>)['iv']
+			const iv1 = (enc1.data as Record<string, string>).iv
+			const iv2 = (enc2.data as Record<string, string>).iv
 			expect(iv1).not.toBe(iv2)
 		})
 
@@ -236,8 +236,8 @@ describe('OperationEncryptor', () => {
 			const enc1 = await encryptor.encryptOperation(op)
 			const enc2 = await encryptor.encryptOperation(op)
 
-			const ct1 = (enc1.data as Record<string, string>)['ciphertext']
-			const ct2 = (enc2.data as Record<string, string>)['ciphertext']
+			const ct1 = (enc1.data as Record<string, string>).ciphertext
+			const ct2 = (enc2.data as Record<string, string>).ciphertext
 			expect(ct1).not.toBe(ct2)
 		})
 	})
@@ -292,9 +292,7 @@ describe('OperationEncryptor', () => {
 
 			const encrypted = await encryptorA.encryptOperation(makeInsertOp())
 
-			await expect(encryptorB.decryptOperation(encrypted)).rejects.toThrow(
-				OperationEncryptionError,
-			)
+			await expect(encryptorB.decryptOperation(encrypted)).rejects.toThrow(OperationEncryptionError)
 		})
 
 		it('error message mentions wrong key or tampered data', async () => {
@@ -322,16 +320,14 @@ describe('OperationEncryptor', () => {
 			const envelope = encrypted.data as Record<string, string>
 
 			// Flip a character in the ciphertext
-			const tamperedCt = envelope['ciphertext']
+			const tamperedCt = envelope.ciphertext
 			const flipped = (tamperedCt.charAt(0) === 'A' ? 'B' : 'A') + tamperedCt.slice(1)
 			const tamperedOp: Operation = {
 				...encrypted,
 				data: { ...envelope, ciphertext: flipped },
 			}
 
-			await expect(encryptor.decryptOperation(tamperedOp)).rejects.toThrow(
-				OperationEncryptionError,
-			)
+			await expect(encryptor.decryptOperation(tamperedOp)).rejects.toThrow(OperationEncryptionError)
 		})
 
 		it('throws when IV is tampered', async () => {
@@ -341,16 +337,14 @@ describe('OperationEncryptor', () => {
 			const encrypted = await encryptor.encryptOperation(makeInsertOp())
 			const envelope = encrypted.data as Record<string, string>
 
-			const tamperedIv = envelope['iv']
+			const tamperedIv = envelope.iv
 			const flipped = (tamperedIv.charAt(0) === 'A' ? 'B' : 'A') + tamperedIv.slice(1)
 			const tamperedOp: Operation = {
 				...encrypted,
 				data: { ...envelope, iv: flipped },
 			}
 
-			await expect(encryptor.decryptOperation(tamperedOp)).rejects.toThrow(
-				OperationEncryptionError,
-			)
+			await expect(encryptor.decryptOperation(tamperedOp)).rejects.toThrow(OperationEncryptionError)
 		})
 	})
 

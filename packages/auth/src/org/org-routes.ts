@@ -1,23 +1,23 @@
+import type { OrgStore } from './org-store'
 import type {
-	Organization,
+	CreateOrgParams,
 	Membership,
 	OrgInvitation,
 	OrgRole,
-	CreateOrgParams,
+	Organization,
 	UpdateOrgParams,
 } from './org-types'
 import {
+	CannotRemoveOwnerError,
+	InsufficientRoleError,
+	InvitationExpiredError,
+	InvitationNotFoundError,
+	MemberAlreadyExistsError,
+	MembershipNotFoundError,
 	OrgNotFoundError,
 	OrgSlugTakenError,
-	MembershipNotFoundError,
-	MemberAlreadyExistsError,
-	CannotRemoveOwnerError,
-	InvitationNotFoundError,
-	InvitationExpiredError,
-	InsufficientRoleError,
 	hasRoleLevel,
 } from './org-types'
-import type { OrgStore } from './org-store'
 
 // ============================================================================
 // Types
@@ -150,7 +150,12 @@ export class OrgRoutes {
 		}
 
 		// Validate metadata (optional)
-		if (params.metadata !== undefined && (typeof params.metadata !== 'object' || params.metadata === null || Array.isArray(params.metadata))) {
+		if (
+			params.metadata !== undefined &&
+			(typeof params.metadata !== 'object' ||
+				params.metadata === null ||
+				Array.isArray(params.metadata))
+		) {
 			return { status: 400, body: { error: 'Metadata must be a plain object.' } }
 		}
 
@@ -173,10 +178,7 @@ export class OrgRoutes {
 	/**
 	 * Get an organization by ID. Requires membership.
 	 */
-	async getOrg(
-		userId: string,
-		orgId: string,
-	): Promise<OrgRouteResponse<Organization>> {
+	async getOrg(userId: string, orgId: string): Promise<OrgRouteResponse<Organization>> {
 		const membership = await this.store.getMembership(orgId, userId)
 		if (!membership) {
 			return { status: 404, body: { error: 'Organization not found.' } }
@@ -245,7 +247,11 @@ export class OrgRoutes {
 
 		// Validate metadata
 		if (params.metadata !== undefined) {
-			if (typeof params.metadata !== 'object' || params.metadata === null || Array.isArray(params.metadata)) {
+			if (
+				typeof params.metadata !== 'object' ||
+				params.metadata === null ||
+				Array.isArray(params.metadata)
+			) {
 				return { status: 400, body: { error: 'Metadata must be a plain object.' } }
 			}
 			updateParams.metadata = params.metadata as Record<string, unknown>
@@ -268,10 +274,7 @@ export class OrgRoutes {
 	/**
 	 * Delete an organization. Requires owner.
 	 */
-	async deleteOrg(
-		userId: string,
-		orgId: string,
-	): Promise<OrgRouteResponse<{ deleted: true }>> {
+	async deleteOrg(userId: string, orgId: string): Promise<OrgRouteResponse<{ deleted: true }>> {
 		const authResult = await this.requireRole(orgId, userId, 'owner')
 		if (authResult) return authResult
 
@@ -311,12 +314,18 @@ export class OrgRoutes {
 			return { status: 400, body: { error: 'Target user ID is required.' } }
 		}
 		if (typeof params.role !== 'string' || !isValidRole(params.role)) {
-			return { status: 400, body: { error: 'A valid role is required (admin, member, viewer, billing).' } }
+			return {
+				status: 400,
+				body: { error: 'A valid role is required (admin, member, viewer, billing).' },
+			}
 		}
 
 		// Cannot assign owner role via addMember — use transferOwnership
 		if (params.role === 'owner') {
-			return { status: 400, body: { error: 'Cannot assign owner role directly. Use ownership transfer.' } }
+			return {
+				status: 400,
+				body: { error: 'Cannot assign owner role directly. Use ownership transfer.' },
+			}
 		}
 
 		// Admins cannot add other admins (only owner can)
@@ -326,7 +335,12 @@ export class OrgRoutes {
 		}
 
 		try {
-			const membership = await this.store.addMember(orgId, params.targetUserId, params.role as OrgRole, userId)
+			const membership = await this.store.addMember(
+				orgId,
+				params.targetUserId,
+				params.role as OrgRole,
+				userId,
+			)
 			return { status: 201, body: { data: membership } }
 		} catch (err) {
 			if (err instanceof OrgNotFoundError) {
@@ -394,10 +408,16 @@ export class OrgRoutes {
 			return { status: 400, body: { error: 'Target user ID is required.' } }
 		}
 		if (typeof params.role !== 'string' || !isValidRole(params.role)) {
-			return { status: 400, body: { error: 'A valid role is required (admin, member, viewer, billing).' } }
+			return {
+				status: 400,
+				body: { error: 'A valid role is required (admin, member, viewer, billing).' },
+			}
 		}
 		if (params.role === 'owner') {
-			return { status: 400, body: { error: 'Cannot assign owner role directly. Use ownership transfer.' } }
+			return {
+				status: 400,
+				body: { error: 'Cannot assign owner role directly. Use ownership transfer.' },
+			}
 		}
 
 		// Admins cannot promote to admin (only owner can)
@@ -407,7 +427,11 @@ export class OrgRoutes {
 		}
 
 		try {
-			const membership = await this.store.updateMemberRole(orgId, params.targetUserId, params.role as OrgRole)
+			const membership = await this.store.updateMemberRole(
+				orgId,
+				params.targetUserId,
+				params.role as OrgRole,
+			)
 			return { status: 200, body: { data: membership } }
 		} catch (err) {
 			if (err instanceof MembershipNotFoundError) {
@@ -420,10 +444,7 @@ export class OrgRoutes {
 	/**
 	 * List all members of an organization. Requires membership.
 	 */
-	async listMembers(
-		userId: string,
-		orgId: string,
-	): Promise<OrgRouteResponse<Membership[]>> {
+	async listMembers(userId: string, orgId: string): Promise<OrgRouteResponse<Membership[]>> {
 		const membership = await this.store.getMembership(orgId, userId)
 		if (!membership) {
 			return { status: 404, body: { error: 'Organization not found.' } }
@@ -490,10 +511,16 @@ export class OrgRoutes {
 			return { status: 400, body: { error: 'A valid email address is required.' } }
 		}
 		if (typeof params.role !== 'string' || !isValidRole(params.role)) {
-			return { status: 400, body: { error: 'A valid role is required (admin, member, viewer, billing).' } }
+			return {
+				status: 400,
+				body: { error: 'A valid role is required (admin, member, viewer, billing).' },
+			}
 		}
 		if (params.role === 'owner') {
-			return { status: 400, body: { error: 'Cannot invite with owner role. Use ownership transfer.' } }
+			return {
+				status: 400,
+				body: { error: 'Cannot invite with owner role. Use ownership transfer.' },
+			}
 		}
 
 		// Admins cannot invite admins
@@ -598,9 +625,7 @@ export class OrgRoutes {
 	/**
 	 * List pending invitations for the authenticated user's email.
 	 */
-	async listMyInvitations(
-		email: string,
-	): Promise<OrgRouteResponse<OrgInvitation[]>> {
+	async listMyInvitations(email: string): Promise<OrgRouteResponse<OrgInvitation[]>> {
 		if (!isValidEmail(email)) {
 			return { status: 400, body: { error: 'A valid email address is required.' } }
 		}

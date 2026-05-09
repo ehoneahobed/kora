@@ -102,34 +102,56 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const repoName = `kora/${config.appName}`
 
 		// Create ECR repository (idempotent)
-		const createRepo = await this.runner.run('aws', [
-			'ecr', 'create-repository',
-			'--repository-name', repoName,
-			'--region', region,
-			'--image-scanning-configuration', 'scanOnPush=true',
-		], config.projectRoot)
+		const createRepo = await this.runner.run(
+			'aws',
+			[
+				'ecr',
+				'create-repository',
+				'--repository-name',
+				repoName,
+				'--region',
+				region,
+				'--image-scanning-configuration',
+				'scanOnPush=true',
+			],
+			config.projectRoot,
+		)
 
-		if (createRepo.exitCode !== 0 && !createRepo.stderr.includes('RepositoryAlreadyExistsException')) {
+		if (
+			createRepo.exitCode !== 0 &&
+			!createRepo.stderr.includes('RepositoryAlreadyExistsException')
+		) {
 			throw new Error(`Failed to create ECR repository: ${createRepo.stderr}`)
 		}
 
 		// Get AWS account ID for ECR URI
-		const identity = await this.runner.run('aws', ['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'], config.projectRoot)
+		const identity = await this.runner.run(
+			'aws',
+			['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'],
+			config.projectRoot,
+		)
 		const accountId = identity.stdout.trim()
 
 		// Create ECS cluster (idempotent)
-		await this.runner.run('aws', [
-			'ecs', 'create-cluster',
-			'--cluster-name', config.appName,
-			'--region', region,
-		], config.projectRoot)
+		await this.runner.run(
+			'aws',
+			['ecs', 'create-cluster', '--cluster-name', config.appName, '--region', region],
+			config.projectRoot,
+		)
 
 		// Create CloudWatch log group
-		await this.runner.run('aws', [
-			'logs', 'create-log-group',
-			'--log-group-name', `/ecs/${config.appName}`,
-			'--region', region,
-		], config.projectRoot)
+		await this.runner.run(
+			'aws',
+			[
+				'logs',
+				'create-log-group',
+				'--log-group-name',
+				`/ecs/${config.appName}`,
+				'--region',
+				region,
+			],
+			config.projectRoot,
+		)
 
 		return {
 			applicationId: `${accountId}.dkr.ecr.${region}.amazonaws.com/${repoName}`,
@@ -171,33 +193,41 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const repoName = `kora/${context.appName}`
 
 		// Get ECR login token
-		const loginPassword = await this.runner.run('aws', [
-			'ecr', 'get-login-password', '--region', region,
-		], context.projectRoot)
+		const loginPassword = await this.runner.run(
+			'aws',
+			['ecr', 'get-login-password', '--region', region],
+			context.projectRoot,
+		)
 
 		if (loginPassword.exitCode !== 0) {
 			throw new Error(`ECR login failed: ${loginPassword.stderr}`)
 		}
 
 		// Get account ID
-		const identity = await this.runner.run('aws', [
-			'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text',
-		], context.projectRoot)
+		const identity = await this.runner.run(
+			'aws',
+			['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'],
+			context.projectRoot,
+		)
 		const accountId = identity.stdout.trim()
 		const ecrUri = `${accountId}.dkr.ecr.${region}.amazonaws.com`
 		const imageUri = `${ecrUri}/${repoName}:latest`
 
 		// Docker login to ECR
-		const dockerLogin = await this.runner.run('docker', [
-			'login', '--username', 'AWS', '--password-stdin', ecrUri,
-		], artifacts.deployDirectory)
+		const dockerLogin = await this.runner.run(
+			'docker',
+			['login', '--username', 'AWS', '--password-stdin', ecrUri],
+			artifacts.deployDirectory,
+		)
 		// Note: password is piped via stdin in real usage; for the adapter we use the password result
 
 		// Build Docker image
 		this.logger.step('Building Docker image...')
-		const dockerBuild = await this.runner.run('docker', [
-			'build', '--platform', 'linux/amd64', '-t', imageUri, '.',
-		], artifacts.deployDirectory)
+		const dockerBuild = await this.runner.run(
+			'docker',
+			['build', '--platform', 'linux/amd64', '-t', imageUri, '.'],
+			artifacts.deployDirectory,
+		)
 
 		if (dockerBuild.exitCode !== 0) {
 			throw new Error(`Docker build failed: ${dockerBuild.stderr}`)
@@ -205,9 +235,11 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 
 		// Push to ECR
 		this.logger.step('Pushing image to ECR...')
-		const dockerPush = await this.runner.run('docker', [
-			'push', imageUri,
-		], artifacts.deployDirectory)
+		const dockerPush = await this.runner.run(
+			'docker',
+			['push', imageUri],
+			artifacts.deployDirectory,
+		)
 
 		if (dockerPush.exitCode !== 0) {
 			throw new Error(`Docker push failed: ${dockerPush.stderr}`)
@@ -221,48 +253,59 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 			cpu: '256',
 			memory: '512',
 			executionRoleArn: `arn:aws:iam::${accountId}:role/ecsTaskExecutionRole`,
-			containerDefinitions: [{
-				name: context.appName,
-				image: imageUri,
-				essential: true,
-				portMappings: [{ containerPort: 3001, protocol: 'tcp' }],
-				logConfiguration: {
-					logDriver: 'awslogs',
-					options: {
-						'awslogs-group': `/ecs/${context.appName}`,
-						'awslogs-region': region,
-						'awslogs-stream-prefix': 'ecs',
+			containerDefinitions: [
+				{
+					name: context.appName,
+					image: imageUri,
+					essential: true,
+					portMappings: [{ containerPort: 3001, protocol: 'tcp' }],
+					logConfiguration: {
+						logDriver: 'awslogs',
+						options: {
+							'awslogs-group': `/ecs/${context.appName}`,
+							'awslogs-region': region,
+							'awslogs-stream-prefix': 'ecs',
+						},
+					},
+					healthCheck: {
+						command: ['CMD-SHELL', 'curl -f http://localhost:3001/health || exit 1'],
+						interval: 30,
+						timeout: 5,
+						retries: 3,
+						startPeriod: 60,
 					},
 				},
-				healthCheck: {
-					command: ['CMD-SHELL', 'curl -f http://localhost:3001/health || exit 1'],
-					interval: 30,
-					timeout: 5,
-					retries: 3,
-					startPeriod: 60,
-				},
-			}],
+			],
 		})
 
-		const registerTask = await this.runner.run('aws', [
-			'ecs', 'register-task-definition',
-			'--cli-input-json', taskDef,
-			'--region', region,
-		], context.projectRoot)
+		const registerTask = await this.runner.run(
+			'aws',
+			['ecs', 'register-task-definition', '--cli-input-json', taskDef, '--region', region],
+			context.projectRoot,
+		)
 
 		if (registerTask.exitCode !== 0) {
 			throw new Error(`Task definition registration failed: ${registerTask.stderr}`)
 		}
 
 		// Update or create ECS service
-		const updateService = await this.runner.run('aws', [
-			'ecs', 'update-service',
-			'--cluster', context.appName,
-			'--service', context.appName,
-			'--task-definition', context.appName,
-			'--force-new-deployment',
-			'--region', region,
-		], context.projectRoot)
+		const updateService = await this.runner.run(
+			'aws',
+			[
+				'ecs',
+				'update-service',
+				'--cluster',
+				context.appName,
+				'--service',
+				context.appName,
+				'--task-definition',
+				context.appName,
+				'--force-new-deployment',
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		const deploymentId = new Date().toISOString()
 
@@ -271,15 +314,7 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 			// Service doesn't exist — developer needs to create it with proper VPC/subnet/ALB config.
 			// We can't auto-create the full networking stack, so provide guidance.
 			this.logger.step(
-				'Task definition registered. Create the ECS service with:\n' +
-				`  aws ecs create-service \\\n` +
-				`    --cluster ${context.appName} \\\n` +
-				`    --service-name ${context.appName} \\\n` +
-				`    --task-definition ${context.appName} \\\n` +
-				`    --desired-count 1 \\\n` +
-				`    --launch-type FARGATE \\\n` +
-				`    --network-configuration "awsvpcConfiguration={subnets=[<subnet-id>],securityGroups=[<sg-id>],assignPublicIp=ENABLED}" \\\n` +
-				`    --region ${region}`,
+				`Task definition registered. Create the ECS service with:\n  aws ecs create-service \\\n    --cluster ${context.appName} \\\n    --service-name ${context.appName} \\\n    --task-definition ${context.appName} \\\n    --desired-count 1 \\\n    --launch-type FARGATE \\\n    --network-configuration "awsvpcConfiguration={subnets=[<subnet-id>],securityGroups=[<sg-id>],assignPublicIp=ENABLED}" \\\n    --region ${region}`,
 			)
 		}
 
@@ -295,14 +330,23 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const region = context.region ?? 'us-east-1'
 
 		// List task definition revisions and deploy the previous one
-		const result = await this.runner.run('aws', [
-			'ecs', 'update-service',
-			'--cluster', context.appName,
-			'--service', context.appName,
-			'--task-definition', `${context.appName}:${deploymentId}`,
-			'--force-new-deployment',
-			'--region', region,
-		], context.projectRoot)
+		const result = await this.runner.run(
+			'aws',
+			[
+				'ecs',
+				'update-service',
+				'--cluster',
+				context.appName,
+				'--service',
+				context.appName,
+				'--task-definition',
+				`${context.appName}:${deploymentId}`,
+				'--force-new-deployment',
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		if (result.exitCode !== 0) {
 			throw new Error(`ECS rollback failed: ${result.stderr}`)
@@ -314,10 +358,14 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const region = context.region ?? 'us-east-1'
 
 		const args = [
-			'logs', 'get-log-events',
-			'--log-group-name', `/ecs/${context.appName}`,
-			'--log-stream-name', 'ecs/latest',
-			'--region', region,
+			'logs',
+			'get-log-events',
+			'--log-group-name',
+			`/ecs/${context.appName}`,
+			'--log-stream-name',
+			'ecs/latest',
+			'--region',
+			region,
 		]
 
 		if (options.tail) {
@@ -330,7 +378,9 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		}
 
 		try {
-			const parsed = JSON.parse(result.stdout) as { events?: Array<{ timestamp: number; message: string }> }
+			const parsed = JSON.parse(result.stdout) as {
+				events?: Array<{ timestamp: number; message: string }>
+			}
 			for (const event of parsed.events ?? []) {
 				yield {
 					timestamp: new Date(event.timestamp).toISOString(),
@@ -350,12 +400,20 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const context = this.requireContext()
 		const region = context.region ?? 'us-east-1'
 
-		const result = await this.runner.run('aws', [
-			'ecs', 'describe-services',
-			'--cluster', context.appName,
-			'--services', context.appName,
-			'--region', region,
-		], context.projectRoot)
+		const result = await this.runner.run(
+			'aws',
+			[
+				'ecs',
+				'describe-services',
+				'--cluster',
+				context.appName,
+				'--services',
+				context.appName,
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		if (result.exitCode !== 0) {
 			return { state: 'failed', message: result.stderr }
@@ -408,8 +466,12 @@ export class NodeAwsCommandRunner implements AwsCommandRunner {
 
 			let stdout = ''
 			let stderr = ''
-			child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8') })
-			child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8') })
+			child.stdout?.on('data', (chunk: Buffer) => {
+				stdout += chunk.toString('utf-8')
+			})
+			child.stderr?.on('data', (chunk: Buffer) => {
+				stderr += chunk.toString('utf-8')
+			})
 			child.on('error', (error) => {
 				resolve({ exitCode: 1, stdout, stderr: `${stderr}\n${error.message}` })
 			})

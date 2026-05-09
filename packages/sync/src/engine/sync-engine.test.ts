@@ -793,3 +793,260 @@ describe('SyncEngine status', () => {
 		expect(engine.getStatus().status).toBe('offline')
 	})
 })
+
+describe('SyncEngine scope', () => {
+	test('includes syncScope in handshake when scopeMap is configured', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const store = createMockStore()
+		const scopeMap = {
+			sales: { orgId: 'org-123', storeId: 'store-456' },
+			products: {},
+		}
+
+		let receivedHandshake: HandshakeMessage | null = null
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				receivedHandshake = msg as HandshakeMessage
+				// Respond to complete the flow
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp-1',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-1',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: 'ack-1',
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeMap },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(receivedHandshake).not.toBeNull()
+		expect(receivedHandshake?.syncScope).toEqual(scopeMap)
+	})
+
+	test('does not include syncScope when scopeMap is not configured', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const store = createMockStore()
+
+		let receivedHandshake: HandshakeMessage | null = null
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				receivedHandshake = msg as HandshakeMessage
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp-1',
+					nodeId: 'server',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-1',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: 'ack-1',
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(receivedHandshake).not.toBeNull()
+		expect(receivedHandshake?.syncScope).toBeUndefined()
+	})
+})
+
+describe('SyncEngine enhanced status', () => {
+	test('getStatus includes new fields with defaults', () => {
+		const { client } = createMemoryTransportPair()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		const status = engine.getStatus()
+		expect(status.lastSuccessfulPush).toBeNull()
+		expect(status.lastSuccessfulPull).toBeNull()
+		expect(status.conflicts).toBe(0)
+	})
+
+	test('lastSuccessfulPull updates when operations are received', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		// Before receiving any ops, lastSuccessfulPull should be null
+		// (initial handshake may or may not have ops)
+		const beforePull = engine.getStatus().lastSuccessfulPull
+
+		// Server sends ops
+		const serializer = new JsonMessageSerializer()
+		server.send({
+			type: 'operation-batch',
+			messageId: 'pull-1',
+			operations: [serializer.encodeOperation(makeOp('pull-op', 5, 'other'))],
+			isFinal: true,
+			batchIndex: 0,
+		})
+
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		const afterPull = engine.getStatus().lastSuccessfulPull
+		expect(afterPull).not.toBeNull()
+		expect(afterPull).toBeGreaterThanOrEqual(beforePull ?? 0)
+	})
+
+	test('lastSuccessfulPush updates when acknowledgment is received', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		// Push an op and wait for ack
+		await engine.pushOperation(makeOp('push-op', 10))
+
+		// Server acknowledges
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		// The ack handler should update lastSuccessfulPush
+		// (if server responder acknowledges operation batches)
+		const status = engine.getStatus()
+		// lastSuccessfulPush is set on ack - if no ack response comes it stays null
+		// The setupServerResponder acknowledges operation batches, so this should be set
+		expect(status.lastSuccessfulPush).not.toBeNull()
+	})
+
+	test('recordConflict increments conflict count', () => {
+		const { client } = createMemoryTransportPair()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		expect(engine.getStatus().conflicts).toBe(0)
+		engine.recordConflict()
+		expect(engine.getStatus().conflicts).toBe(1)
+		engine.recordConflict()
+		engine.recordConflict()
+		expect(engine.getStatus().conflicts).toBe(3)
+	})
+
+	test('exportDiagnostics returns comprehensive snapshot', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', schemaVersion: 2 },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		const diag = engine.exportDiagnostics()
+		expect(diag.state).toBe('streaming')
+		expect(diag.status.status).toBe('synced')
+		expect(diag.nodeId).toBe('test-node')
+		expect(diag.url).toBe('ws://test')
+		expect(diag.schemaVersion).toBe(2)
+		expect(diag.timestamp).toBeGreaterThan(0)
+		expect(diag.hasInFlightBatch).toBe(false)
+		expect(diag.reconnecting).toBe(false)
+		expect(typeof diag.pendingOperations).toBe('number')
+		expect(typeof diag.conflicts).toBe('number')
+	})
+
+	test('retryNow starts engine when disconnected', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		expect(engine.getState()).toBe('disconnected')
+
+		await engine.retryNow()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		expect(engine.getState()).toBe('streaming')
+	})
+
+	test('retryNow is a no-op when already connected', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+
+		// Should not throw
+		await engine.retryNow()
+		expect(engine.getState()).toBe('streaming')
+	})
+})

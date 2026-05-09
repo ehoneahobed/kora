@@ -80,7 +80,7 @@ export interface ClerkAdapterConfig {
  * organization data into Kora metadata when available.
  */
 function defaultClerkClaimMapping(claims: Record<string, unknown>): ExternalUserInfo {
-	const sub = claims['sub']
+	const sub = claims.sub
 	if (typeof sub !== 'string' || sub.length === 0) {
 		// Delegate to the base provider's error handling by returning invalid data
 		// The ExternalJwtProvider will catch the missing userId
@@ -88,23 +88,23 @@ function defaultClerkClaimMapping(claims: Record<string, unknown>): ExternalUser
 	}
 
 	// Build display name from first_name and last_name if available
-	const firstName = typeof claims['first_name'] === 'string' ? claims['first_name'] : ''
-	const lastName = typeof claims['last_name'] === 'string' ? claims['last_name'] : ''
+	const firstName = typeof claims.first_name === 'string' ? claims.first_name : ''
+	const lastName = typeof claims.last_name === 'string' ? claims.last_name : ''
 	const fullName = [firstName, lastName].filter(Boolean).join(' ')
 
 	// Extract email (Clerk may include this in session claims)
-	const email = typeof claims['email'] === 'string' ? claims['email'] : undefined
+	const email = typeof claims.email === 'string' ? claims.email : undefined
 
 	// Extract organization metadata if present
 	const metadata: Record<string, unknown> = {}
-	if (typeof claims['org_id'] === 'string') {
-		metadata['orgId'] = claims['org_id']
+	if (typeof claims.org_id === 'string') {
+		metadata.orgId = claims.org_id
 	}
-	if (typeof claims['org_slug'] === 'string') {
-		metadata['orgSlug'] = claims['org_slug']
+	if (typeof claims.org_slug === 'string') {
+		metadata.orgSlug = claims.org_slug
 	}
-	if (typeof claims['org_role'] === 'string') {
-		metadata['orgRole'] = claims['org_role']
+	if (typeof claims.org_role === 'string') {
+		metadata.orgRole = claims.org_role
 	}
 
 	return {

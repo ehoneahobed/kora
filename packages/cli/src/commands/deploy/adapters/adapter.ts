@@ -1,4 +1,12 @@
-export const DEPLOY_PLATFORMS = ['fly', 'railway', 'aws-ecs', 'aws-lightsail', 'render', 'docker', 'kora-cloud'] as const
+export const DEPLOY_PLATFORMS = [
+	'fly',
+	'railway',
+	'aws-ecs',
+	'aws-lightsail',
+	'render',
+	'docker',
+	'kora-cloud',
+] as const
 
 export type DeployPlatform = (typeof DEPLOY_PLATFORMS)[number]
 

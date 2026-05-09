@@ -20,9 +20,7 @@ export type {
 	ServerTransport,
 } from './transport/server-transport'
 
-export type {
-	HttpPollResponse,
-} from './transport/http-server-transport'
+export type { HttpPollResponse } from './transport/http-server-transport'
 
 export type {
 	WsWebSocket,

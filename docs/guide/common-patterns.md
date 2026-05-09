@@ -145,6 +145,110 @@ For everything else, derive from the source data.
 
 ---
 
+## Transactions
+
+When you need to update multiple records or collections as a single atomic unit, use `app.transaction()`. All mutations within the transaction either succeed together or fail together.
+
+### Basic Transaction
+
+```typescript
+await app.transaction(async (tx) => {
+  const order = await tx.orders.insert({ status: 'pending', total: 0 })
+
+  for (const item of cartItems) {
+    await tx.lineItems.insert({
+      orderId: order.id,
+      product: item.name,
+      price: item.price,
+      qty: item.qty,
+    })
+  }
+
+  await tx.orders.update(order.id, {
+    total: cartItems.reduce((sum, i) => sum + i.price * i.qty, 0),
+  })
+})
+```
+
+### Named Mutations
+
+Use `app.mutation()` for transactions that should be identifiable in DevTools:
+
+```typescript
+await app.mutation('checkout', async (tx) => {
+  await tx.orders.update(orderId, { status: 'confirmed' })
+  await tx.inventory.update(productId, { reserved: true })
+})
+```
+
+The name appears in the DevTools operation timeline, making it easy to trace related operations.
+
+### When to Use Transactions
+
+- Creating a parent record and its children together
+- Updating multiple records that must stay consistent
+- Any multi-step mutation where partial completion would leave invalid data
+
+::: tip
+Transactions are local-only. They ensure atomicity on the device where they run. On other devices, the individual operations arrive via sync and are applied in causal order.
+:::
+
+---
+
+## Sequences
+
+Sequences generate formatted, ordered identifiers like invoice numbers, order codes, or receipt IDs. They are offline-safe — each device maintains its own counter.
+
+### Basic Usage
+
+```typescript
+const orderNo = await app.sequences.next('order')
+// 'order-0001', 'order-0002', ...
+```
+
+### Custom Formats
+
+```typescript
+const receipt = await app.sequences.next('receipt', {
+  format: 'REC-{date}-{seq:6}',
+})
+// 'REC-20260508-000001'
+```
+
+Available format tokens: `{seq}`, `{seq:N}` (zero-padded), `{date}` (YYYYMMDD), `{node4}`, `{node8}`.
+
+### Scoped Sequences
+
+Independent counters per scope — useful for per-store, per-tenant, or per-category numbering:
+
+```typescript
+// Each store gets its own sequence
+const storeAReceipt = await app.sequences.next('receipt', { scope: 'store-A' })
+const storeBReceipt = await app.sequences.next('receipt', { scope: 'store-B' })
+// Both return 'receipt-0001' — independent counters
+```
+
+### Using Sequences with Records
+
+```typescript
+await app.mutation('create-order', async (tx) => {
+  const orderNo = await app.sequences.next('order', {
+    format: 'ORD-{seq:4}',
+  })
+
+  await tx.orders.insert({
+    orderNumber: orderNo,
+    total: 99.99,
+  })
+})
+```
+
+::: tip
+Sequences are device-local. Two devices generating sequence values offline will produce different numbers. If globally unique sequential IDs are required, generate them on the server after sync.
+:::
+
+---
+
 ## Handling Auth Token Expiry
 
 When a user's session expires or the server resets, sync connections will fail authentication. Handle this gracefully with the `sync:auth-failed` event:

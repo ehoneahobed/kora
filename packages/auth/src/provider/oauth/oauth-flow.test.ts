@@ -1,16 +1,16 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import {
-	OAuthManager,
 	InMemoryOAuthStateStore,
-	googleProvider,
+	OAuthManager,
 	githubProvider,
+	googleProvider,
 	microsoftProvider,
 } from './oauth-flow'
 import {
-	OAuthStateMismatchError,
 	OAuthCodeExchangeError,
-	OAuthUserInfoError,
 	OAuthProviderNotFoundError,
+	OAuthStateMismatchError,
+	OAuthUserInfoError,
 } from './oauth-types'
 import type { OAuthProviderConfig } from './oauth-types'
 
@@ -67,13 +67,13 @@ describe('OAuthManager', () => {
 			const { state } = await manager.getAuthorizationUrl('test')
 			const stored = await stateStore.consume(state)
 			expect(stored).not.toBeNull()
-			expect(stored!.provider).toBe('test')
+			expect(stored?.provider).toBe('test')
 		})
 
 		test('includes metadata in state', async () => {
 			const { state } = await manager.getAuthorizationUrl('test', { returnTo: '/dashboard' })
 			const stored = await stateStore.consume(state)
-			expect(stored!.metadata).toEqual({ returnTo: '/dashboard' })
+			expect(stored?.metadata).toEqual({ returnTo: '/dashboard' })
 		})
 
 		test('throws for unknown provider', async () => {
@@ -140,9 +140,9 @@ describe('OAuthManager', () => {
 		})
 
 		test('rejects invalid state (CSRF protection)', async () => {
-			await expect(
-				manager.handleCallback('test', 'code', 'bogus-state'),
-			).rejects.toThrow(OAuthStateMismatchError)
+			await expect(manager.handleCallback('test', 'code', 'bogus-state')).rejects.toThrow(
+				OAuthStateMismatchError,
+			)
 		})
 
 		test('rejects state from different provider', async () => {
@@ -157,9 +157,9 @@ describe('OAuthManager', () => {
 
 			const { state } = await mgr.getAuthorizationUrl('provider-a')
 
-			await expect(
-				mgr.handleCallback('provider-b', 'code', state),
-			).rejects.toThrow(OAuthStateMismatchError)
+			await expect(mgr.handleCallback('provider-b', 'code', state)).rejects.toThrow(
+				OAuthStateMismatchError,
+			)
 		})
 
 		test('state is single-use', async () => {
@@ -178,9 +178,9 @@ describe('OAuthManager', () => {
 			await manager.handleCallback('test', 'code', state)
 
 			// Second use should fail
-			await expect(
-				manager.handleCallback('test', 'code', state),
-			).rejects.toThrow(OAuthStateMismatchError)
+			await expect(manager.handleCallback('test', 'code', state)).rejects.toThrow(
+				OAuthStateMismatchError,
+			)
 		})
 
 		test('throws on token exchange failure', async () => {
@@ -192,9 +192,9 @@ describe('OAuthManager', () => {
 				text: async () => '{"error":"invalid_grant"}',
 			})
 
-			await expect(
-				manager.handleCallback('test', 'bad-code', state),
-			).rejects.toThrow(OAuthCodeExchangeError)
+			await expect(manager.handleCallback('test', 'bad-code', state)).rejects.toThrow(
+				OAuthCodeExchangeError,
+			)
 		})
 
 		test('throws on user info fetch failure', async () => {
@@ -210,9 +210,9 @@ describe('OAuthManager', () => {
 					status: 401,
 				})
 
-			await expect(
-				manager.handleCallback('test', 'code', state),
-			).rejects.toThrow(OAuthUserInfoError)
+			await expect(manager.handleCallback('test', 'code', state)).rejects.toThrow(
+				OAuthUserInfoError,
+			)
 		})
 
 		test('throws on network error during token exchange', async () => {
@@ -220,9 +220,9 @@ describe('OAuthManager', () => {
 
 			mockFetch.mockRejectedValueOnce(new Error('network down'))
 
-			await expect(
-				manager.handleCallback('test', 'code', state),
-			).rejects.toThrow(OAuthCodeExchangeError)
+			await expect(manager.handleCallback('test', 'code', state)).rejects.toThrow(
+				OAuthCodeExchangeError,
+			)
 		})
 	})
 
@@ -254,18 +254,16 @@ describe('user info normalization', () => {
 
 		const { state } = await mgr.getAuthorizationUrl('google')
 
-		mockFn
-			.mockResolvedValueOnce(mockTokenResponse)
-			.mockResolvedValueOnce({
-				ok: true,
-				json: async () => ({
-					sub: 'google-123',
-					email: 'alice@gmail.com',
-					email_verified: true,
-					name: 'Alice Smith',
-					picture: 'https://lh3.google.com/photo',
-				}),
-			})
+		mockFn.mockResolvedValueOnce(mockTokenResponse).mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({
+				sub: 'google-123',
+				email: 'alice@gmail.com',
+				email_verified: true,
+				name: 'Alice Smith',
+				picture: 'https://lh3.google.com/photo',
+			}),
+		})
 
 		const { userInfo } = await mgr.handleCallback('google', 'code', state)
 		expect(userInfo.providerId).toBe('google-123')
@@ -287,18 +285,16 @@ describe('user info normalization', () => {
 
 		const { state } = await mgr.getAuthorizationUrl('github')
 
-		mockFn
-			.mockResolvedValueOnce(mockTokenResponse)
-			.mockResolvedValueOnce({
-				ok: true,
-				json: async () => ({
-					id: 12345,
-					login: 'alice',
-					name: 'Alice Smith',
-					email: 'alice@github.com',
-					avatar_url: 'https://avatars.github.com/u/12345',
-				}),
-			})
+		mockFn.mockResolvedValueOnce(mockTokenResponse).mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({
+				id: 12345,
+				login: 'alice',
+				name: 'Alice Smith',
+				email: 'alice@github.com',
+				avatar_url: 'https://avatars.github.com/u/12345',
+			}),
+		})
 
 		const { userInfo } = await mgr.handleCallback('github', 'code', state)
 		expect(userInfo.providerId).toBe('12345')
@@ -319,17 +315,15 @@ describe('user info normalization', () => {
 
 		const { state } = await mgr.getAuthorizationUrl('microsoft')
 
-		mockFn
-			.mockResolvedValueOnce(mockTokenResponse)
-			.mockResolvedValueOnce({
-				ok: true,
-				json: async () => ({
-					id: 'ms-abc',
-					displayName: 'Alice Smith',
-					mail: 'alice@company.com',
-					userPrincipalName: 'alice@company.onmicrosoft.com',
-				}),
-			})
+		mockFn.mockResolvedValueOnce(mockTokenResponse).mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({
+				id: 'ms-abc',
+				displayName: 'Alice Smith',
+				mail: 'alice@company.com',
+				userPrincipalName: 'alice@company.onmicrosoft.com',
+			}),
+		})
 
 		const { userInfo } = await mgr.handleCallback('microsoft', 'code', state)
 		expect(userInfo.providerId).toBe('ms-abc')

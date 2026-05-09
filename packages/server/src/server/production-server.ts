@@ -1,7 +1,7 @@
 import type { ServerStore } from '../store/server-store'
+import { WsServerTransport } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import { KoraSyncServer } from './kora-sync-server'
-import { WsServerTransport } from '../transport/ws-server-transport'
 
 /**
  * Configuration for the production server that serves both
@@ -153,7 +153,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			})
 
 			return new Promise<string>((resolve) => {
-				httpServer!.listen(port, '0.0.0.0', () => {
+				httpServer?.listen(port, '0.0.0.0', () => {
 					resolve(`http://localhost:${port}`)
 				})
 			})
@@ -163,7 +163,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			await syncServer.stop()
 			if (httpServer) {
 				await new Promise<void>((resolve) => {
-					httpServer!.close(() => resolve())
+					httpServer?.close(() => resolve())
 				})
 				httpServer = null
 			}

@@ -55,9 +55,7 @@ export async function createAdapter(
 			// This code path only runs when __TAURI_INTERNALS__ is detected.
 			// Using @vite-ignore so Vite doesn't statically analyze this import —
 			// it will still resolve it at runtime through Vite's dev server.
-			const { TauriSqliteAdapter } = await import(
-				/* @vite-ignore */ '@korajs/tauri'
-			)
+			const { TauriSqliteAdapter } = await import(/* @vite-ignore */ '@korajs/tauri')
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {

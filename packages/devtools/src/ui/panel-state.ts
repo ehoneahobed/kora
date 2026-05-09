@@ -63,32 +63,31 @@ export function buildPanelModel(events: readonly TimestampedEvent[]): DevtoolsPa
 		dependsOn: extractCausalDependencies(entry.event),
 	}))
 
-	const conflicts = events
-		.flatMap((entry) => {
-			if (
-				entry.event.type !== 'merge:completed' &&
-				entry.event.type !== 'merge:conflict' &&
-				entry.event.type !== 'constraint:violated'
-			) {
-				return []
-			}
+	const conflicts = events.flatMap((entry) => {
+		if (
+			entry.event.type !== 'merge:completed' &&
+			entry.event.type !== 'merge:conflict' &&
+			entry.event.type !== 'constraint:violated'
+		) {
+			return []
+		}
 
-			const trace = entry.event.trace
-			return [
-				{
-					id: entry.id,
-					timestamp: entry.receivedAt,
-					collection: trace.operationA.collection,
-					field: trace.field,
-					strategy: trace.strategy,
-					tier: trace.tier,
-					inputA: trace.inputA,
-					inputB: trace.inputB,
-					output: trace.output,
-					constraintViolated: trace.constraintViolated,
-				},
-			]
-		})
+		const trace = entry.event.trace
+		return [
+			{
+				id: entry.id,
+				timestamp: entry.receivedAt,
+				collection: trace.operationA.collection,
+				field: trace.field,
+				strategy: trace.strategy,
+				tier: trace.tier,
+				inputA: trace.inputA,
+				inputB: trace.inputB,
+				output: trace.output,
+				constraintViolated: trace.constraintViolated,
+			},
+		]
+	})
 
 	const operations = events
 		.map((entry) => {
@@ -196,9 +195,9 @@ function timelineLabel(event: KoraEvent): string {
 		case 'sync:connected':
 			return `sync connected ${event.nodeId}`
 		case 'sync:disconnected':
-			return `sync disconnected`
+			return 'sync disconnected'
 		case 'sync:auth-failed':
-			return `sync auth failed`
+			return 'sync auth failed'
 		case 'sync:sent':
 			return `sync sent ${event.batchSize}`
 		case 'sync:received':

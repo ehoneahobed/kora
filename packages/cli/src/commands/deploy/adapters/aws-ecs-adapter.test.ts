@@ -161,11 +161,13 @@ describe('AwsEcsAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						services: [{
-							status: 'ACTIVE',
-							runningCount: 2,
-							desiredCount: 2,
-						}],
+						services: [
+							{
+								status: 'ACTIVE',
+								runningCount: 2,
+								desiredCount: 2,
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -191,11 +193,13 @@ describe('AwsEcsAdapter', () => {
 				result: {
 					exitCode: 0,
 					stdout: JSON.stringify({
-						services: [{
-							status: 'ACTIVE',
-							runningCount: 0,
-							desiredCount: 1,
-						}],
+						services: [
+							{
+								status: 'ACTIVE',
+								runningCount: 0,
+								desiredCount: 1,
+							},
+						],
 					}),
 					stderr: '',
 				},
@@ -272,11 +276,13 @@ describe('AwsEcsAdapter', () => {
 	test('requireContext throws when context not set', async () => {
 		const runner = createRunnerMock([])
 		const adapter = new AwsEcsAdapter({ runner })
-		await expect(adapter.deploy({
-			clientDirectory: null,
-			serverBundlePath: null,
-			deployDirectory: '/tmp',
-		})).rejects.toThrow('context is not initialized')
+		await expect(
+			adapter.deploy({
+				clientDirectory: null,
+				serverBundlePath: null,
+				deployDirectory: '/tmp',
+			}),
+		).rejects.toThrow('context is not initialized')
 	})
 })
 

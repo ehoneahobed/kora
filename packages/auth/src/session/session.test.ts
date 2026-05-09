@@ -1,11 +1,11 @@
-import { describe, test, expect, beforeEach, vi, afterEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import {
-	SessionManager,
 	InMemorySessionStore,
-	SessionNotFoundError,
 	SessionExpiredError,
 	SessionLimitExceededError,
+	SessionManager,
 	SessionMfaRequiredError,
+	SessionNotFoundError,
 } from './session'
 import type { Session } from './session'
 
@@ -85,9 +85,7 @@ describe('SessionManager', () => {
 			await manager.create({ userId: 'user-1' })
 			await manager.create({ userId: 'user-1' })
 
-			await expect(manager.create({ userId: 'user-1' })).rejects.toThrow(
-				SessionLimitExceededError,
-			)
+			await expect(manager.create({ userId: 'user-1' })).rejects.toThrow(SessionLimitExceededError)
 		})
 
 		test('allows new session when existing sessions are expired', async () => {
@@ -313,7 +311,7 @@ describe('SessionManager', () => {
 
 			const sessions = await manager.listSessions('user-1')
 			expect(sessions).toHaveLength(1)
-			expect(sessions[0]!.id).toBe(s1.id)
+			expect(sessions[0]?.id).toBe(s1.id)
 		})
 	})
 
@@ -413,7 +411,7 @@ describe('InMemorySessionStore', () => {
 		session.mfaVerified = true
 		await store.update(session)
 		const retrieved = await store.getById(session.id)
-		expect(retrieved!.mfaVerified).toBe(true)
+		expect(retrieved?.mfaVerified).toBe(true)
 	})
 
 	test('delete removes session', async () => {
@@ -458,7 +456,7 @@ describe('InMemorySessionStore', () => {
 		expect(count).toBe(2)
 		const remaining = await store.listByUserId('user-1')
 		expect(remaining).toHaveLength(1)
-		expect(remaining[0]!.id).toBe(s2.id)
+		expect(remaining[0]?.id).toBe(s2.id)
 	})
 
 	test('cleanExpired removes expired sessions', async () => {
@@ -475,10 +473,10 @@ describe('InMemorySessionStore', () => {
 		await store.create(session)
 
 		const retrieved = await store.getById(session.id)
-		retrieved!.mfaVerified = true
+		;(retrieved as NonNullable<typeof retrieved>).mfaVerified = true
 
 		// Original stored value should not be mutated
 		const again = await store.getById(session.id)
-		expect(again!.mfaVerified).toBe(false)
+		expect(again?.mfaVerified).toBe(false)
 	})
 })

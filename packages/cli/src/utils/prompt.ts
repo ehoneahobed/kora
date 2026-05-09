@@ -108,8 +108,7 @@ export function promptConfirm(
 					resolve(false)
 					return
 				}
-
-				(options?.output ?? process.stdout).write('  Please answer with y or n\n')
+				;(options?.output ?? process.stdout).write('  Please answer with y or n\n')
 				ask()
 			})
 		}

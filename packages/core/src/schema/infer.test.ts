@@ -1,7 +1,8 @@
 import { describe, expectTypeOf, test } from 'vitest'
 import { defineSchema } from './define'
 import type { InferFieldType, InferInsertInput, InferRecord, InferUpdateInput } from './infer'
-import { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './types'
+import type { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder } from './types'
+import { t } from './types'
 
 describe('InferFieldType', () => {
 	test('string field infers to string', () => {
@@ -30,9 +31,7 @@ describe('InferFieldType', () => {
 	})
 
 	test('enum field infers to literal union', () => {
-		type Result = InferFieldType<
-			EnumFieldBuilder<readonly ['low', 'medium', 'high'], true, false>
-		>
+		type Result = InferFieldType<EnumFieldBuilder<readonly ['low', 'medium', 'high'], true, false>>
 		expectTypeOf<Result>().toEqualTypeOf<'low' | 'medium' | 'high'>()
 	})
 
@@ -90,9 +89,7 @@ describe('InferRecord', () => {
 		}
 		type Record = InferRecord<typeof fields>
 
-		expectTypeOf<Record>()
-			.toHaveProperty('priority')
-			.toEqualTypeOf<'low' | 'medium' | 'high'>()
+		expectTypeOf<Record>().toHaveProperty('priority').toEqualTypeOf<'low' | 'medium' | 'high'>()
 	})
 
 	test('array fields are typed', () => {
@@ -164,7 +161,7 @@ describe('InferUpdateInput', () => {
 		type Update = InferUpdateInput<typeof fields>
 
 		// Both title and count are optional
-		expectTypeOf<{}>().toMatchTypeOf<Update>()
+		expectTypeOf<Record<string, never>>().toMatchTypeOf<Update>()
 		expectTypeOf<{ title: string }>().toMatchTypeOf<Update>()
 		expectTypeOf<{ count: number }>().toMatchTypeOf<Update>()
 		// Auto fields should not be present

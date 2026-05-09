@@ -8,13 +8,9 @@ import type {
 	SyncMessage,
 	WireFormat,
 } from '@korajs/sync'
-import {
-	NegotiatedMessageSerializer,
-	versionVectorToWire,
-	wireToVersionVector,
-} from '@korajs/sync'
-import type { ServerStore } from '../store/server-store'
+import { NegotiatedMessageSerializer, versionVectorToWire, wireToVersionVector } from '@korajs/sync'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
+import type { ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider } from '../types'
 
@@ -212,6 +208,25 @@ export class ClientSession {
 			}
 			this.authContext = context
 			this.state = 'authenticated'
+		}
+
+		// Merge handshake sync scopes with auth scopes.
+		// Auth scopes take precedence (server-controlled).
+		// Handshake scopes provide client-requested filtering.
+		if (msg.syncScope) {
+			const mergedScopes = { ...msg.syncScope }
+			if (this.authContext?.scopes) {
+				// Auth scopes override handshake scopes per-collection
+				for (const [collection, authScope] of Object.entries(this.authContext.scopes)) {
+					mergedScopes[collection] = { ...(mergedScopes[collection] ?? {}), ...authScope }
+				}
+			}
+			if (this.authContext) {
+				this.authContext = { ...this.authContext, scopes: mergedScopes }
+			} else {
+				// No auth provider, but scope was provided in handshake
+				this.authContext = { userId: msg.nodeId, scopes: mergedScopes }
+			}
 		}
 
 		// Send handshake response with server's version vector

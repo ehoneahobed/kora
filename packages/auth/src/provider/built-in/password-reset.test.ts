@@ -1,7 +1,7 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest'
-import { PasswordResetManager, InMemoryPasswordResetStore } from './password-reset'
-import { InMemoryUserStore } from './user-store'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { hashPassword, verifyPassword } from './password-hash'
+import { InMemoryPasswordResetStore, PasswordResetManager } from './password-reset'
+import { InMemoryUserStore } from './user-store'
 
 describe('PasswordResetManager', () => {
 	let userStore: InMemoryUserStore
@@ -37,7 +37,7 @@ describe('PasswordResetManager', () => {
 			expect('data' in result.body).toBe(true)
 			if ('data' in result.body) {
 				expect(result.body.data.token).toBeTruthy()
-				expect(result.body.data.token!.length).toBeGreaterThan(20)
+				expect(result.body.data.token?.length).toBeGreaterThan(20)
 			}
 		})
 
@@ -107,7 +107,7 @@ describe('PasswordResetManager', () => {
 	describe('resetPassword', () => {
 		test('resets password with valid token', async () => {
 			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? reqResult.body.data.token! : ''
+			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
 
 			const result = await manager.resetPassword(token, 'newPassword456')
 			expect(result.status).toBe(200)
@@ -115,17 +115,17 @@ describe('PasswordResetManager', () => {
 			// Verify new password works
 			const user = await userStore.findByEmail('alice@example.com')
 			expect(user).not.toBeNull()
-			const isValid = await verifyPassword('newPassword456', user!.passwordHash, user!.salt)
+			const isValid = await verifyPassword('newPassword456', user?.passwordHash, user?.salt)
 			expect(isValid).toBe(true)
 
 			// Verify old password no longer works
-			const oldValid = await verifyPassword('oldPassword123', user!.passwordHash, user!.salt)
+			const oldValid = await verifyPassword('oldPassword123', user?.passwordHash, user?.salt)
 			expect(oldValid).toBe(false)
 		})
 
 		test('rejects already consumed token', async () => {
 			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? reqResult.body.data.token! : ''
+			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
 
 			await manager.resetPassword(token, 'newPassword456')
 			const result = await manager.resetPassword(token, 'anotherPassword789')
@@ -140,7 +140,7 @@ describe('PasswordResetManager', () => {
 			})
 
 			const reqResult = await mgr.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? reqResult.body.data.token! : ''
+			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
 
 			// Wait for expiry
 			await new Promise((r) => setTimeout(r, 10))
@@ -156,7 +156,7 @@ describe('PasswordResetManager', () => {
 
 		test('rejects short password', async () => {
 			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? reqResult.body.data.token! : ''
+			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
 
 			const result = await manager.resetPassword(token, 'short')
 			expect(result.status).toBe(400)
@@ -165,7 +165,7 @@ describe('PasswordResetManager', () => {
 
 		test('rejects excessively long password', async () => {
 			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? reqResult.body.data.token! : ''
+			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
 
 			const result = await manager.resetPassword(token, 'a'.repeat(129))
 			expect(result.status).toBe(400)
@@ -182,7 +182,7 @@ describe('PasswordResetManager', () => {
 
 			// Verify new password works
 			const user = await userStore.findByEmail('alice@example.com')
-			const isValid = await verifyPassword('newPassword456', user!.passwordHash, user!.salt)
+			const isValid = await verifyPassword('newPassword456', user?.passwordHash, user?.salt)
 			expect(isValid).toBe(true)
 		})
 
@@ -246,22 +246,57 @@ describe('InMemoryPasswordResetStore', () => {
 		await store.store(token)
 		await store.consume('abc')
 		const fetched = await store.get('abc')
-		expect(fetched!.consumed).toBe(true)
+		expect(fetched?.consumed).toBe(true)
 	})
 
 	test('counts active tokens for email', async () => {
 		const now = Date.now()
-		await store.store({ token: 'a', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: false })
-		await store.store({ token: 'b', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: false })
-		await store.store({ token: 'c', userId: 'u1', email: 'a@b.com', createdAt: now, expiresAt: now + 60000, consumed: true })
+		await store.store({
+			token: 'a',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: false,
+		})
+		await store.store({
+			token: 'b',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: false,
+		})
+		await store.store({
+			token: 'c',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: now,
+			expiresAt: now + 60000,
+			consumed: true,
+		})
 
 		expect(await store.countActiveForEmail('a@b.com')).toBe(2)
 	})
 
 	test('cleanExpired removes expired tokens', async () => {
 		const past = Date.now() - 1000
-		await store.store({ token: 'a', userId: 'u1', email: 'a@b.com', createdAt: past, expiresAt: past, consumed: false })
-		await store.store({ token: 'b', userId: 'u1', email: 'a@b.com', createdAt: Date.now(), expiresAt: Date.now() + 60000, consumed: false })
+		await store.store({
+			token: 'a',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: past,
+			expiresAt: past,
+			consumed: false,
+		})
+		await store.store({
+			token: 'b',
+			userId: 'u1',
+			email: 'a@b.com',
+			createdAt: Date.now(),
+			expiresAt: Date.now() + 60000,
+			consumed: false,
+		})
 
 		const count = await store.cleanExpired()
 		expect(count).toBe(1)

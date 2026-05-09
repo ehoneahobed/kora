@@ -123,31 +123,39 @@ class MinHeap {
 	}
 
 	private bubbleUp(index: number): void {
-		while (index > 0) {
-			const parentIndex = (index - 1) >> 1
-			if (this.cmp(this.data[index] as Operation, this.data[parentIndex] as Operation) >= 0) break
-			this.swap(index, parentIndex)
-			index = parentIndex
+		let current = index
+		while (current > 0) {
+			const parentIndex = (current - 1) >> 1
+			if (this.cmp(this.data[current] as Operation, this.data[parentIndex] as Operation) >= 0) break
+			this.swap(current, parentIndex)
+			current = parentIndex
 		}
 	}
 
 	private sinkDown(index: number): void {
 		const length = this.data.length
+		let current = index
 		while (true) {
-			let smallest = index
-			const left = 2 * index + 1
-			const right = 2 * index + 2
+			let smallest = current
+			const left = 2 * current + 1
+			const right = 2 * current + 2
 
-			if (left < length && this.cmp(this.data[left] as Operation, this.data[smallest] as Operation) < 0) {
+			if (
+				left < length &&
+				this.cmp(this.data[left] as Operation, this.data[smallest] as Operation) < 0
+			) {
 				smallest = left
 			}
-			if (right < length && this.cmp(this.data[right] as Operation, this.data[smallest] as Operation) < 0) {
+			if (
+				right < length &&
+				this.cmp(this.data[right] as Operation, this.data[smallest] as Operation) < 0
+			) {
 				smallest = right
 			}
 
-			if (smallest === index) break
-			this.swap(index, smallest)
-			index = smallest
+			if (smallest === current) break
+			this.swap(current, smallest)
+			current = smallest
 		}
 	}
 

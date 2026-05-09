@@ -361,7 +361,7 @@ export class TotpManager {
 	 */
 	async isEnabled(userId: string): Promise<boolean> {
 		const stored = await this.store.getByUserId(userId)
-		return stored !== null && stored.verified
+		return stored?.verified ?? false
 	}
 
 	/**
@@ -418,14 +418,14 @@ function generateTotpCode(
 	const hash = hmacSha(algorithm, secret, counterBytes)
 
 	// Dynamic truncation (RFC 4226 section 5.4)
-	const offset = hash[hash.length - 1]! & 0x0f
+	const offset = (hash[hash.length - 1] as number) & 0x0f
 	const binary =
-		((hash[offset]! & 0x7f) << 24) |
-		((hash[offset + 1]! & 0xff) << 16) |
-		((hash[offset + 2]! & 0xff) << 8) |
-		(hash[offset + 3]! & 0xff)
+		(((hash[offset] as number) & 0x7f) << 24) |
+		(((hash[offset + 1] as number) & 0xff) << 16) |
+		(((hash[offset + 2] as number) & 0xff) << 8) |
+		((hash[offset + 3] as number) & 0xff)
 
-	const otp = binary % Math.pow(10, digits)
+	const otp = binary % 10 ** digits
 	return otp.toString().padStart(digits, '0')
 }
 
@@ -448,7 +448,7 @@ function hmacSha(algorithm: string, key: Uint8Array, message: Uint8Array): Uint8
 	const ipad = new Uint8Array(blockSize)
 	const opad = new Uint8Array(blockSize)
 	for (let i = 0; i < blockSize; i++) {
-		const k = i < keyPad.length ? keyPad[i]! : 0
+		const k = i < keyPad.length ? (keyPad[i] as number) : 0
 		ipad[i] = k ^ 0x36
 		opad[i] = k ^ 0x5c
 	}
@@ -501,7 +501,14 @@ function sha1(data: Uint8Array): Uint8Array {
 		}
 
 		for (let i = 16; i < 80; i++) {
-			w[i] = rotl32((w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!) | 0, 1)
+			w[i] = rotl32(
+				((w[i - 3] as number) ^
+					(w[i - 8] as number) ^
+					(w[i - 14] as number) ^
+					(w[i - 16] as number)) |
+					0,
+				1,
+			)
 		}
 
 		let a = h0
@@ -528,7 +535,7 @@ function sha1(data: Uint8Array): Uint8Array {
 				k = 0xca62c1d6
 			}
 
-			const temp = (rotl32(a, 5) + f + e + k + w[i]!) | 0
+			const temp = (rotl32(a, 5) + f + e + k + (w[i] as number)) | 0
 			e = d
 			d = c
 			c = rotl32(b, 30)
@@ -555,7 +562,7 @@ function sha1(data: Uint8Array): Uint8Array {
 }
 
 function rotl32(value: number, shift: number): number {
-	return ((value << shift) | (value >>> (32 - shift))) | 0
+	return (value << shift) | (value >>> (32 - shift)) | 0
 }
 
 // ============================================================================
@@ -573,7 +580,7 @@ export function base32Encode(data: Uint8Array): string {
 	let buffer = 0
 
 	for (let i = 0; i < data.length; i++) {
-		buffer = (buffer << 8) | data[i]!
+		buffer = (buffer << 8) | (data[i] as number)
 		bits += 8
 		while (bits >= 5) {
 			bits -= 5
@@ -598,7 +605,7 @@ export function base32Decode(encoded: string): Uint8Array {
 	let buffer = 0
 
 	for (let i = 0; i < cleaned.length; i++) {
-		const char = cleaned[i]!
+		const char = cleaned[i] as string
 		const value = BASE32_ALPHABET.indexOf(char)
 		if (value === -1) continue // skip invalid chars
 
@@ -639,7 +646,7 @@ function generateRecoveryCodes(count: number, length: number): string[] {
 		globalThis.crypto.getRandomValues(bytes)
 		let code = ''
 		for (let j = 0; j < length; j++) {
-			code += chars[bytes[j]! % chars.length]
+			code += chars[(bytes[j] as number) % chars.length]
 		}
 		// Format as xxxxx-xxxxx for readability
 		codes.push(`${code.slice(0, 5)}-${code.slice(5)}`)
@@ -657,7 +664,7 @@ async function hashRecoveryCode(code: string): Promise<string> {
 	const bytes = new Uint8Array(hash)
 	let hex = ''
 	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i]!.toString(16).padStart(2, '0')
+		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
 	return hex
 }

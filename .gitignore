@@ -38,3 +38,6 @@ temp/
 kora-db
 kora-db-*
 *.sqlite
+
+# Local content directory
+content/

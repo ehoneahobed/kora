@@ -42,7 +42,11 @@ describe('buildPanelModel', () => {
 		const events: TimestampedEvent[] = [
 			{ id: 1, receivedAt: 1000, event: { type: 'sync:connected', nodeId: 'node-a' } },
 			{ id: 2, receivedAt: 1100, event: makeOperationEvent('operation:created') },
-			{ id: 3, receivedAt: 1200, event: { type: 'sync:sent', operations: [traceOperation], batchSize: 1 } },
+			{
+				id: 3,
+				receivedAt: 1200,
+				event: { type: 'sync:sent', operations: [traceOperation], batchSize: 1 },
+			},
 			{ id: 4, receivedAt: 1300, event: { type: 'sync:acknowledged', sequenceNumber: 3 } },
 			{
 				id: 5,

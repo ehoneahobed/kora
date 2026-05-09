@@ -2,9 +2,9 @@ import { describe, expect, test, vi } from 'vitest'
 import * as promptUtils from '../utils/prompt'
 import {
 	ClackPromptClient,
-	createPromptClient,
 	PromptCancelledError,
 	ReadlinePromptClient,
+	createPromptClient,
 } from './prompt-client'
 
 describe('ReadlinePromptClient', () => {

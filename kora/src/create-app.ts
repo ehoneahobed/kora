@@ -1,15 +1,29 @@
 import type { KoraEventEmitter, Operation, SchemaInput } from '@korajs/core'
+import { buildScopeMap } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { Instrumenter } from '@korajs/devtools'
 import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type { CollectionAccessor, StorageAdapter } from '@korajs/store'
 import type { QueryBuilder } from '@korajs/store'
-import { ConnectionMonitor, ReconnectionManager, SyncEngine, WebSocketTransport } from '@korajs/sync'
+import {
+	ConnectionMonitor,
+	ReconnectionManager,
+	SyncEngine,
+	WebSocketTransport,
+} from '@korajs/sync'
 import type { SyncStatusInfo } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
-import type { KoraApp, KoraConfig, SyncControl, TypedKoraApp, TypedKoraConfig } from './types'
+import type {
+	KoraApp,
+	KoraConfig,
+	SequenceAccessor,
+	SyncControl,
+	TransactionProxy,
+	TypedKoraApp,
+	TypedKoraConfig,
+} from './types'
 
 /**
  * Creates a new Kora application instance.
@@ -120,18 +134,20 @@ export function createApp(config: KoraConfig): KoraApp {
 
 					engine.setReconnecting(true)
 					reconnectionManager?.stop()
-					reconnectionManager?.start(async () => {
-						try {
-							await engine.start()
+					reconnectionManager
+						?.start(async () => {
+							try {
+								await engine.start()
+								engine.setReconnecting(false)
+								return true
+							} catch {
+								return false
+							}
+						})
+						.then(() => {
+							// If reconnection exhausted max attempts without success, clear flag
 							engine.setReconnecting(false)
-							return true
-						} catch {
-							return false
-						}
-					}).then(() => {
-						// If reconnection exhausted max attempts without success, clear flag
-						engine.setReconnecting(false)
-					})
+						})
 				})
 			}
 		}
@@ -161,16 +177,120 @@ export function createApp(config: KoraConfig): KoraApp {
 					if (syncEngine) {
 						return syncEngine.getStatus()
 					}
-					return { status: 'offline', pendingOperations: 0, lastSyncedAt: null }
+					return {
+						status: 'offline',
+						pendingOperations: 0,
+						lastSyncedAt: null,
+						lastSuccessfulPush: null,
+						lastSuccessfulPull: null,
+						conflicts: 0,
+					}
+				},
+				async retryNow(): Promise<void> {
+					await ready
+					if (syncEngine) {
+						await syncEngine.retryNow()
+					}
+				},
+				exportDiagnostics() {
+					if (syncEngine) {
+						return syncEngine.exportDiagnostics()
+					}
+					return {
+						state: 'disconnected' as const,
+						status: {
+							status: 'offline' as const,
+							pendingOperations: 0,
+							lastSyncedAt: null,
+							lastSuccessfulPush: null,
+							lastSuccessfulPull: null,
+							conflicts: 0,
+						},
+						nodeId: '',
+						url: config.sync?.url ?? '',
+						schemaVersion: config.schema.version,
+						lastSyncedAt: null,
+						lastSuccessfulPush: null,
+						lastSuccessfulPull: null,
+						conflicts: 0,
+						pendingOperations: 0,
+						hasInFlightBatch: false,
+						reconnecting: false,
+						timestamp: Date.now(),
+					}
 				},
 			}
 		: null
+
+	// Shared transaction executor for both transaction() and mutation()
+	async function executeTransaction(
+		fn: (tx: TransactionProxy) => Promise<void>,
+		mutationName?: string,
+	): Promise<Operation[]> {
+		await ready
+		if (!store) {
+			throw new Error('Store not initialized. Await app.ready before using transactions.')
+		}
+		const txContext = store.createTransaction()
+		if (mutationName !== undefined) {
+			txContext.setMutationName(mutationName)
+		}
+		const collectionNames = Object.keys(config.schema.collections)
+
+		// Build proxy with collection accessors as direct properties
+		const proxy: TransactionProxy = {} as TransactionProxy
+		for (const name of collectionNames) {
+			Object.defineProperty(proxy, name, {
+				get() {
+					return txContext.collection(name)
+				},
+				enumerable: true,
+				configurable: false,
+			})
+		}
+
+		try {
+			await fn(proxy)
+			const { operations } = await txContext.commit()
+
+			// Notify subscriptions and emit events after commit
+			for (const op of operations) {
+				store.getSubscriptionManager().notify(op.collection, op)
+				emitter.emit({ type: 'operation:created', operation: op })
+			}
+
+			return operations
+		} catch (error) {
+			txContext.rollback()
+			throw error
+		}
+	}
+
+	// Build sequences accessor (delegates to SequenceManager after ready)
+	const sequences: SequenceAccessor = {
+		async next(name, config) {
+			await ready
+			if (!store) throw new Error('Store not initialized. Await app.ready before using sequences.')
+			return store.getSequenceManager().next(name, config)
+		},
+		async current(name, config) {
+			await ready
+			if (!store) throw new Error('Store not initialized. Await app.ready before using sequences.')
+			return store.getSequenceManager().current(name, config)
+		},
+		async reset(name, config) {
+			await ready
+			if (!store) throw new Error('Store not initialized. Await app.ready before using sequences.')
+			return store.getSequenceManager().reset(name, config)
+		},
+	}
 
 	// Build the KoraApp object
 	const app: KoraApp = {
 		ready,
 		events: emitter,
 		sync: syncControl,
+		sequences,
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
@@ -179,6 +299,15 @@ export function createApp(config: KoraConfig): KoraApp {
 		},
 		getSyncEngine(): SyncEngine | null {
 			return syncEngine
+		},
+		async transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]> {
+			return executeTransaction(fn)
+		},
+		async mutation(
+			name: string,
+			fn: (tx: TransactionProxy) => Promise<void>,
+		): Promise<Operation[]> {
+			return executeTransaction(fn, name)
 		},
 		async close(): Promise<void> {
 			await ready
@@ -256,6 +385,9 @@ async function initializeAsync(
 		const transport = new WebSocketTransport()
 		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter)
 
+		// Build scope map from schema scope declarations + flat scope values
+		const scopeMap = config.sync.scope ? buildScopeMap(config.schema, config.sync.scope) : undefined
+
 		syncEngine = new SyncEngine({
 			transport,
 			store: mergeAwareStore,
@@ -265,6 +397,7 @@ async function initializeAsync(
 				auth: config.sync.auth,
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
+				scopeMap,
 			},
 			emitter,
 		})

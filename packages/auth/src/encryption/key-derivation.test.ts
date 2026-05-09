@@ -1,10 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import { encryptData, decryptData, exportKey } from './database-encryption'
-import {
-	KeyDerivationError,
-	deriveEncryptionKey,
-	generateSalt,
-} from './key-derivation'
+import { decryptData, encryptData, exportKey } from './database-encryption'
+import { KeyDerivationError, deriveEncryptionKey, generateSalt } from './key-derivation'
 
 describe('key-derivation', () => {
 	describe('generateSalt', () => {
@@ -126,13 +122,19 @@ describe('key-derivation', () => {
 		test('handles unicode passphrases', async () => {
 			const salt = generateSalt()
 
-			const { key } = await deriveEncryptionKey('\u00e9\u00e0\u00fc-\u4f60\u597d-\ud83d\udd11', salt)
+			const { key } = await deriveEncryptionKey(
+				'\u00e9\u00e0\u00fc-\u4f60\u597d-\ud83d\udd11',
+				salt,
+			)
 
 			expect(key).toBeDefined()
 			expect(key.type).toBe('secret')
 
 			// Verify determinism with unicode
-			const { key: sameKey } = await deriveEncryptionKey('\u00e9\u00e0\u00fc-\u4f60\u597d-\ud83d\udd11', salt)
+			const { key: sameKey } = await deriveEncryptionKey(
+				'\u00e9\u00e0\u00fc-\u4f60\u597d-\ud83d\udd11',
+				salt,
+			)
 			const rawA = await exportKey(key)
 			const rawB = await exportKey(sameKey)
 			expect(rawA).toEqual(rawB)

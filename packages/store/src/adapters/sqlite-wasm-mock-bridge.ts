@@ -88,7 +88,12 @@ export class MockWorkerBridge implements WorkerBridge {
 					database.exec(sql.replace('--kora:safe-alter\n', ''))
 				} catch (e) {
 					const msg = (e as Error).message || ''
-					if (!msg.includes('duplicate column name')) {
+					// Tolerate duplicate columns (already exists) and NOT NULL without defaults
+					// (column may be added or renamed by a migration step instead)
+					if (
+						!msg.includes('duplicate column name') &&
+						!msg.includes('Cannot add a NOT NULL column with default value NULL')
+					) {
 						throw e
 					}
 				}

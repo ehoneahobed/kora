@@ -172,8 +172,9 @@ export class InMemoryAuditLogStore implements AuditLogStore {
 		const initialLength = this.entries.length
 		let writeIndex = 0
 		for (let i = 0; i < this.entries.length; i++) {
-			if (this.entries[i]!.timestamp >= timestamp) {
-				this.entries[writeIndex] = this.entries[i]!
+			const entry = this.entries[i] as AuditEntry
+			if (entry.timestamp >= timestamp) {
+				this.entries[writeIndex] = entry
 				writeIndex++
 			}
 		}
@@ -227,9 +228,7 @@ export class AuditLogger {
 
 	constructor(config: { store: AuditLogStore; retentionDays?: number }) {
 		this.store = config.store
-		this.retentionMs = config.retentionDays
-			? config.retentionDays * 24 * 60 * 60 * 1000
-			: null
+		this.retentionMs = config.retentionDays ? config.retentionDays * 24 * 60 * 60 * 1000 : null
 	}
 
 	/**
@@ -293,7 +292,7 @@ export class AuditLogger {
 	/**
 	 * Get recent activity for a user.
 	 */
-	async getUserActivity(userId: string, limit: number = 50): Promise<AuditEntry[]> {
+	async getUserActivity(userId: string, limit = 50): Promise<AuditEntry[]> {
 		return this.store.query({ actorId: userId, limit })
 	}
 
@@ -319,7 +318,7 @@ function generateAuditId(): string {
 	globalThis.crypto.getRandomValues(bytes)
 	let hex = ''
 	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i]!.toString(16).padStart(2, '0')
+		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
 	return hex
 }

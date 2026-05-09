@@ -17,7 +17,10 @@ export function useRichText(
 	fieldName: string,
 ): UseRichTextResult {
 	const { store } = useKoraContext()
-	const collection = useMemo<CollectionAccessor>(() => store.collection(collectionName), [store, collectionName])
+	const collection = useMemo<CollectionAccessor>(
+		() => store.collection(collectionName),
+		[store, collectionName],
+	)
 	const [doc] = useState(() => new Y.Doc())
 	const [ready, setReady] = useState(false)
 	const [error, setError] = useState<Error | null>(null)
@@ -137,7 +140,9 @@ function encodeRichtextInput(value: unknown): Uint8Array | null {
 
 	// Handle Node.js Buffer without requiring @types/node
 	if (typeof globalThis !== 'undefined' && 'Buffer' in globalThis) {
-		const BufferCtor = (globalThis as Record<string, unknown>).Buffer as { isBuffer(v: unknown): v is { buffer: ArrayBuffer; byteOffset: number; byteLength: number } }
+		const BufferCtor = (globalThis as Record<string, unknown>).Buffer as {
+			isBuffer(v: unknown): v is { buffer: ArrayBuffer; byteOffset: number; byteLength: number }
+		}
 		if (BufferCtor.isBuffer(value)) {
 			return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
 		}

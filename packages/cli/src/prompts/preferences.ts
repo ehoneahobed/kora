@@ -1,5 +1,11 @@
 import Conf from 'conf'
-import type { AuthOption, DatabaseOption, DatabaseProviderOption, FrameworkOption, PlatformOption } from '../commands/create/options'
+import type {
+	AuthOption,
+	DatabaseOption,
+	DatabaseProviderOption,
+	FrameworkOption,
+	PlatformOption,
+} from '../commands/create/options'
 import type { PackageManager } from '../types'
 
 export interface CreatePreferences {

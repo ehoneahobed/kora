@@ -106,7 +106,7 @@ describe('database-encryption', () => {
 
 			// Tamper with the ciphertext by flipping a byte
 			const tampered = new Uint8Array(ciphertext)
-			tampered[0] = tampered[0]! ^ 0xff
+			tampered[0] = (tampered[0] as number) ^ 0xff
 
 			// AES-GCM authentication should detect the tampering
 			await expect(decryptData(key, tampered, iv)).rejects.toThrow(EncryptionError)

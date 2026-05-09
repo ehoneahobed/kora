@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { UserStore, AuthUser, StoredUser, AuthDevice } from './user-store'
+import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DuplicateEmailError } from './user-store'
 
 /**
@@ -9,10 +9,7 @@ import { DuplicateEmailError } from './user-store'
  */
 interface PostgresClient {
 	begin<T>(fn: (sql: PostgresClient) => Promise<T>): Promise<T>
-	(
-		template: TemplateStringsArray,
-		...args: unknown[]
-	): Promise<Record<string, unknown>[]>
+	(template: TemplateStringsArray, ...args: unknown[]): Promise<Record<string, unknown>[]>
 }
 
 /**
@@ -96,10 +93,10 @@ export class PostgresUserStore implements UserStore {
 				VALUES (${id}, ${normalizedEmail}, ${params.name}, FALSE, ${now}, ${params.passwordHash}, ${params.salt})
 			`
 		} catch (err: unknown) {
-			if (err instanceof Error && (
-				err.message.includes('unique constraint') ||
-				err.message.includes('duplicate key')
-			)) {
+			if (
+				err instanceof Error &&
+				(err.message.includes('unique constraint') || err.message.includes('duplicate key'))
+			) {
 				throw new DuplicateEmailError()
 			}
 			throw err
@@ -131,12 +128,12 @@ export class PostgresUserStore implements UserStore {
 		name: string
 	}): Promise<AuthDevice> {
 		await this.ready
-		const existingRows = await this.sql`
+		const existingRows = (await this.sql`
 			SELECT * FROM auth_devices WHERE id = ${params.id}
-		` as unknown as DeviceRow[]
+		`) as unknown as DeviceRow[]
 
-		if (existingRows.length > 0 && !existingRows[0]!.revoked) {
-			return rowToDevice(existingRows[0]!)
+		if (existingRows.length > 0 && !existingRows[0]?.revoked) {
+			return rowToDevice(existingRows[0] as DeviceRow)
 		}
 
 		const now = Date.now()
@@ -160,7 +157,7 @@ export class PostgresUserStore implements UserStore {
 			publicKey: params.publicKey,
 			name: params.name,
 			revoked: false,
-			createdAt: existingRows.length > 0 ? Number(existingRows[0]!.created_at) : now,
+			createdAt: existingRows.length > 0 ? Number(existingRows[0]?.created_at) : now,
 			lastSeenAt: now,
 		}
 	}
@@ -175,9 +172,9 @@ export class PostgresUserStore implements UserStore {
 
 	async listDevices(userId: string): Promise<AuthDevice[]> {
 		await this.ready
-		const rows = await this.sql`
+		const rows = (await this.sql`
 			SELECT * FROM auth_devices WHERE user_id = ${userId}
-		` as unknown as DeviceRow[]
+		`) as unknown as DeviceRow[]
 		return rows.map(rowToDevice)
 	}
 
@@ -201,7 +198,7 @@ export class PostgresUserStore implements UserStore {
 
 	async listAll(): Promise<StoredUser[]> {
 		await this.ready
-		const rows = await this.sql`SELECT * FROM auth_users` as unknown as UserRow[]
+		const rows = (await this.sql`SELECT * FROM auth_users`) as unknown as UserRow[]
 		return rows.map(rowToStoredUser)
 	}
 

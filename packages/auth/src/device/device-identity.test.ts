@@ -285,9 +285,7 @@ describe('device-identity', () => {
 				// Missing x and y
 			}
 
-			await expect(computePublicKeyThumbprint(incompleteJwk)).rejects.toThrow(
-				DeviceIdentityError,
-			)
+			await expect(computePublicKeyThumbprint(incompleteJwk)).rejects.toThrow(DeviceIdentityError)
 			await expect(computePublicKeyThumbprint(incompleteJwk)).rejects.toThrow(
 				/missing required EC fields/,
 			)

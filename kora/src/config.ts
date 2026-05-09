@@ -10,35 +10,35 @@ export interface KoraUserConfig {
 		sync?:
 			| boolean
 			| {
-				/** Enable or disable sync server startup in `kora dev`. */
-				enabled?: boolean
-				/** Sync server port (also exposed as PORT/KORA_SYNC_PORT env). */
-				port?: number
-				/** Sync server store backend for managed mode (without server.ts). */
-				store?:
-					| 'memory'
-					| 'sqlite'
-					| 'postgres'
-					| {
-						type: 'memory'
-					}
-					| {
-						type: 'sqlite'
-						filename?: string
-					}
-					| {
-						type: 'postgres'
-						connectionString: string
-					}
-			}
+					/** Enable or disable sync server startup in `kora dev`. */
+					enabled?: boolean
+					/** Sync server port (also exposed as PORT/KORA_SYNC_PORT env). */
+					port?: number
+					/** Sync server store backend for managed mode (without server.ts). */
+					store?:
+						| 'memory'
+						| 'sqlite'
+						| 'postgres'
+						| {
+								type: 'memory'
+						  }
+						| {
+								type: 'sqlite'
+								filename?: string
+						  }
+						| {
+								type: 'postgres'
+								connectionString: string
+						  }
+			  }
 		watch?:
 			| boolean
 			| {
-				/** Enable or disable schema watching. */
-				enabled?: boolean
-				/** Debounce duration for schema regeneration. */
-				debounceMs?: number
-			}
+					/** Enable or disable schema watching. */
+					enabled?: boolean
+					/** Debounce duration for schema regeneration. */
+					debounceMs?: number
+			  }
 	}
 }
 

@@ -1,7 +1,15 @@
-import type { CustomResolver, FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
+import type {
+	AtomicOp,
+	CustomResolver,
+	FieldDescriptor,
+	HLCTimestamp,
+	Operation,
+} from '@korajs/core'
 import type { MergeTrace } from '@korajs/core'
 import { addWinsSet } from '../strategies/add-wins-set'
+import { mergeAtomicOps } from '../strategies/atomic-merge'
 import { lastWriteWins } from '../strategies/lww'
+import { applySchemaStrategy } from '../strategies/schema-strategies'
 import { mergeRichtext } from '../strategies/yjs-richtext'
 import type { RichtextValue } from '../strategies/yjs-richtext'
 import type { FieldMergeResult } from '../types'
@@ -114,6 +122,61 @@ export function mergeField(
 			3,
 			startTime,
 		)
+	}
+
+	// Atomic ops: when both sides used atomic operations on this field,
+	// compose the intents instead of falling through to LWW.
+	const localAtomicOp = localOp.atomicOps?.[fieldName]
+	const remoteAtomicOp = remoteOp.atomicOps?.[fieldName]
+
+	if (localAtomicOp !== undefined && remoteAtomicOp !== undefined) {
+		const atomicResult = mergeAtomicOps(
+			localAtomicOp as AtomicOp,
+			remoteAtomicOp as AtomicOp,
+			baseValue,
+		)
+		if (atomicResult.merged) {
+			return createResult(
+				atomicResult.value,
+				fieldName,
+				localOp,
+				remoteOp,
+				localValue,
+				remoteValue,
+				baseValue,
+				atomicResult.strategy,
+				1,
+				startTime,
+			)
+		}
+		// If atomic merge fell back (mismatched types), continue to auto-merge
+	}
+
+	// Schema-declared merge strategy: overrides default kind-based auto-merge
+	if (fieldDescriptor.mergeStrategy !== null && fieldDescriptor.mergeStrategy !== undefined) {
+		const schemaResult = applySchemaStrategy(
+			fieldDescriptor.mergeStrategy,
+			localValue,
+			remoteValue,
+			baseValue,
+			localOp.timestamp,
+			remoteOp.timestamp,
+		)
+		if (schemaResult !== null) {
+			return createResult(
+				schemaResult.value,
+				fieldName,
+				localOp,
+				remoteOp,
+				localValue,
+				remoteValue,
+				baseValue,
+				schemaResult.strategyName,
+				1,
+				startTime,
+			)
+		}
+		// 'lww' and 'union' fall through to autoMerge (same behavior as defaults)
 	}
 
 	// Tier 1: Auto-merge based on field kind

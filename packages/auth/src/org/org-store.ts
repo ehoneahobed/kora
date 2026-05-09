@@ -1,21 +1,21 @@
 import type {
-	Organization,
-	CreateOrgParams,
-	UpdateOrgParams,
-	Membership,
-	OrgRole,
-	OrgInvitation,
 	CreateInvitationParams,
+	CreateOrgParams,
 	InvitationStatus,
+	Membership,
+	OrgInvitation,
+	OrgRole,
+	Organization,
+	UpdateOrgParams,
 } from './org-types'
 import {
+	CannotRemoveOwnerError,
+	InvitationExpiredError,
+	InvitationNotFoundError,
+	MemberAlreadyExistsError,
+	MembershipNotFoundError,
 	OrgNotFoundError,
 	OrgSlugTakenError,
-	MembershipNotFoundError,
-	MemberAlreadyExistsError,
-	CannotRemoveOwnerError,
-	InvitationNotFoundError,
-	InvitationExpiredError,
 } from './org-types'
 
 // ============================================================================
@@ -56,7 +56,12 @@ export interface OrgStore {
 	// --- Memberships ---
 
 	/** Add a user as a member of an organization. */
-	addMember(orgId: string, userId: string, role: OrgRole, invitedBy: string | null): Promise<Membership>
+	addMember(
+		orgId: string,
+		userId: string,
+		role: OrgRole,
+		invitedBy: string | null,
+	): Promise<Membership>
 
 	/** Remove a user from an organization. Cannot remove the owner. */
 	removeMember(orgId: string, userId: string): Promise<void>
@@ -76,7 +81,11 @@ export interface OrgStore {
 	// --- Invitations ---
 
 	/** Create an invitation to join an organization. */
-	createInvitation(orgId: string, invitedBy: string, params: CreateInvitationParams): Promise<OrgInvitation>
+	createInvitation(
+		orgId: string,
+		invitedBy: string,
+		params: CreateInvitationParams,
+	): Promise<OrgInvitation>
 
 	/** Look up an invitation by its single-use token. Returns null if not found or already consumed. */
 	getInvitationByToken(token: string): Promise<OrgInvitation | null>
@@ -178,9 +187,7 @@ export class InMemoryOrgStore implements OrgStore {
 			name: params.name ?? org.name,
 			slug: params.slug ?? org.slug,
 			updatedAt: Date.now(),
-			metadata: params.metadata
-				? { ...org.metadata, ...params.metadata }
-				: org.metadata,
+			metadata: params.metadata ? { ...org.metadata, ...params.metadata } : org.metadata,
 		}
 
 		this.orgs.set(orgId, updated)

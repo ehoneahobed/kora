@@ -428,6 +428,40 @@ importers:
         specifier: ^3.0.4
         version: 3.2.4(@types/node@25.5.2)(jsdom@25.0.1)(tsx@4.21.0)
 
+  packages/test:
+    dependencies:
+      '@korajs/core':
+        specifier: workspace:*
+        version: link:../core
+      '@korajs/merge':
+        specifier: workspace:*
+        version: link:../merge
+      '@korajs/server':
+        specifier: workspace:*
+        version: link:../server
+      '@korajs/store':
+        specifier: workspace:*
+        version: link:../store
+      '@korajs/sync':
+        specifier: workspace:*
+        version: link:../sync
+      better-sqlite3:
+        specifier: ^12.8.0
+        version: 12.8.0
+    devDependencies:
+      '@types/better-sqlite3':
+        specifier: ^7.6.13
+        version: 7.6.13
+      tsup:
+        specifier: ^8.3.6
+        version: 8.5.1(postcss@8.5.8)(tsx@4.21.0)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.4
+        version: 3.2.4(@types/node@25.5.2)(jsdom@25.0.1)(tsx@4.21.0)
+
 packages:
 
   '@adobe/css-tools@4.4.4':

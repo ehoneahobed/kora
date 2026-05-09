@@ -1,8 +1,7 @@
 import type { TimestampedEvent } from '../types'
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+// biome-ignore lint/suspicious/noExplicitAny: Chrome extension API global has no type definitions without @types/chrome
 declare const chrome: any
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 const runtime = chrome?.runtime
 

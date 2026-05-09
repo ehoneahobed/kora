@@ -1,7 +1,7 @@
-import type { AuthTokens } from '../types'
 import type { TokenManager } from '../tokens/token-manager'
-import type { AuthUser, AuthDevice, UserStore } from './built-in/user-store'
-import { BuiltInAuthRoutes, type AuthRoutesConfig } from './built-in/auth-routes'
+import type { AuthTokens } from '../types'
+import { type AuthRoutesConfig, BuiltInAuthRoutes } from './built-in/auth-routes'
+import type { AuthDevice, AuthUser, UserStore } from './built-in/user-store'
 
 /**
  * Parameters for signing up a new user.
@@ -199,9 +199,7 @@ export class BuiltInProvider implements AuthProviderAdapter {
 	}
 
 	/** @inheritdoc */
-	async validateAccessToken(
-		token: string,
-	): Promise<{ userId: string; deviceId: string } | null> {
+	async validateAccessToken(token: string): Promise<{ userId: string; deviceId: string } | null> {
 		const payload = this.tokenManager.validateToken(token)
 		if (payload === null || payload.type !== 'access') {
 			return null

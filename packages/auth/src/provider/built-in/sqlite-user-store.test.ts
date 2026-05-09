@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { SqliteUserStore } from './sqlite-user-store'
 import { DuplicateEmailError } from './user-store'
 
@@ -96,9 +96,9 @@ describe('SqliteUserStore', () => {
 
 			const found = await store.findByEmail('alice@example.com')
 			expect(found).not.toBeNull()
-			expect(found!.email).toBe('alice@example.com')
-			expect(found!.passwordHash).toBe('hash123')
-			expect(found!.salt).toBe('salt123')
+			expect(found?.email).toBe('alice@example.com')
+			expect(found?.passwordHash).toBe('hash123')
+			expect(found?.salt).toBe('salt123')
 		})
 
 		test('is case-insensitive', async () => {
@@ -111,7 +111,7 @@ describe('SqliteUserStore', () => {
 
 			const found = await store.findByEmail('ALICE@EXAMPLE.COM')
 			expect(found).not.toBeNull()
-			expect(found!.email).toBe('alice@example.com')
+			expect(found?.email).toBe('alice@example.com')
 		})
 
 		test('returns null for non-existent email', async () => {
@@ -131,8 +131,8 @@ describe('SqliteUserStore', () => {
 
 			const found = await store.findById(created.id)
 			expect(found).not.toBeNull()
-			expect(found!.id).toBe(created.id)
-			expect(found!.passwordHash).toBe('hash')
+			expect(found?.id).toBe(created.id)
+			expect(found?.passwordHash).toBe('hash')
 		})
 
 		test('returns null for non-existent ID', async () => {
@@ -221,7 +221,7 @@ describe('SqliteUserStore', () => {
 
 			const found = await store.findDevice('device-1')
 			expect(found).not.toBeNull()
-			expect(found!.id).toBe('device-1')
+			expect(found?.id).toBe('device-1')
 		})
 
 		test('findDevice returns null for non-existent device', async () => {
@@ -253,7 +253,7 @@ describe('SqliteUserStore', () => {
 			await store.revokeDevice('device-1')
 
 			const found = await store.findDevice('device-1')
-			expect(found!.revoked).toBe(true)
+			expect(found?.revoked).toBe(true)
 		})
 
 		test('revokeDevice is no-op for non-existent device', async () => {
@@ -276,7 +276,7 @@ describe('SqliteUserStore', () => {
 			await store.touchDevice('device-1')
 
 			const updated = await store.findDevice('device-1')
-			expect(updated!.lastSeenAt).toBeGreaterThanOrEqual(before)
+			expect(updated?.lastSeenAt).toBeGreaterThanOrEqual(before)
 		})
 	})
 
@@ -296,31 +296,31 @@ describe('SqliteUserStore', () => {
 		test('setEmailVerified updates verification status', async () => {
 			await store.setEmailVerified(userId, true)
 			const user = await store.findById(userId)
-			expect(user!.emailVerified).toBe(true)
+			expect(user?.emailVerified).toBe(true)
 
 			await store.setEmailVerified(userId, false)
 			const user2 = await store.findById(userId)
-			expect(user2!.emailVerified).toBe(false)
+			expect(user2?.emailVerified).toBe(false)
 		})
 
 		test('updatePassword changes hash and salt', async () => {
 			await store.updatePassword(userId, 'newHash', 'newSalt')
 			const user = await store.findById(userId)
-			expect(user!.passwordHash).toBe('newHash')
-			expect(user!.salt).toBe('newSalt')
+			expect(user?.passwordHash).toBe('newHash')
+			expect(user?.salt).toBe('newSalt')
 		})
 
 		test('update replaces all mutable fields', async () => {
 			const user = await store.findById(userId)
 			await store.update({
-				...user!,
+				...(user as NonNullable<typeof user>),
 				email: 'newemail@example.com',
 				name: 'New Name',
 			})
 
 			const updated = await store.findById(userId)
-			expect(updated!.email).toBe('newemail@example.com')
-			expect(updated!.name).toBe('New Name')
+			expect(updated?.email).toBe('newemail@example.com')
+			expect(updated?.name).toBe('New Name')
 		})
 
 		test('delete removes user and associated devices', async () => {

@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'vitest'
 import { encodeJwt } from '../../tokens/jwt'
+import { createClerkAdapter } from './clerk-adapter'
 import {
-	ExternalJwtProvider,
 	ExternalAuthOperationNotSupportedError,
+	ExternalJwtProvider,
 	ExternalTokenValidationError,
 } from './external-jwt-provider'
-import { createClerkAdapter } from './clerk-adapter'
 import { createSupabaseAdapter } from './supabase-adapter'
 
 // ============================================================================
@@ -15,10 +15,7 @@ import { createSupabaseAdapter } from './supabase-adapter'
 const TEST_SECRET = 'kora-external-test-secret-must-be-32-chars-long'
 
 /** Create a valid HS256 JWT with the given claims */
-function createTestToken(
-	claims: Record<string, unknown>,
-	secret: string = TEST_SECRET,
-): string {
+function createTestToken(claims: Record<string, unknown>, secret: string = TEST_SECRET): string {
 	return encodeJwt(claims, secret)
 }
 
@@ -237,10 +234,10 @@ describe('ExternalJwtProvider claim mapping', () => {
 			providerName: 'custom-claims',
 			jwtSecret: TEST_SECRET,
 			mapClaims: (claims) => ({
-				userId: `prefixed-${claims['sub'] as string}`,
-				email: claims['email_address'] as string,
-				name: `${claims['given_name'] as string} ${claims['family_name'] as string}`,
-				metadata: { tenant: claims['tenant_id'] },
+				userId: `prefixed-${claims.sub as string}`,
+				email: claims.email_address as string,
+				name: `${claims.given_name as string} ${claims.family_name as string}`,
+				metadata: { tenant: claims.tenant_id },
 			}),
 		})
 
@@ -318,27 +315,27 @@ describe('ExternalJwtProvider unsupported operations', () => {
 	})
 
 	test('refreshTokens throws ExternalAuthOperationNotSupportedError', async () => {
-		await expect(
-			provider.refreshTokens('some-refresh-token'),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(provider.refreshTokens('some-refresh-token')).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('getUser throws ExternalAuthOperationNotSupportedError', async () => {
-		await expect(
-			provider.getUser('user-123'),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(provider.getUser('user-123')).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('revokeDevice throws ExternalAuthOperationNotSupportedError', async () => {
-		await expect(
-			provider.revokeDevice('access-token', 'device-123'),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(provider.revokeDevice('access-token', 'device-123')).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('listDevices throws ExternalAuthOperationNotSupportedError', async () => {
-		await expect(
-			provider.listDevices('access-token'),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(provider.listDevices('access-token')).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('error messages include operation name and provider name', async () => {
@@ -428,7 +425,7 @@ describe('ExternalJwtProvider.toSyncAuthProvider', () => {
 			providerName: 'test-sync',
 			jwtSecret: TEST_SECRET,
 			mapClaims: (claims) => ({
-				userId: claims['sub'] as string,
+				userId: claims.sub as string,
 				email: 'custom@test.com',
 				name: 'Custom Name',
 				metadata: { role: 'admin', orgId: 'org-1' },
@@ -553,7 +550,7 @@ describe('createClerkAdapter', () => {
 		const syncAuth = adapter.toSyncAuthProvider()
 		const result = await syncAuth.authenticate('any')
 
-		expect(result?.metadata?.['name']).toBe('Alice')
+		expect(result?.metadata?.name).toBe('Alice')
 	})
 
 	test('custom mapClaims overrides default Clerk mapping', async () => {
@@ -563,8 +560,8 @@ describe('createClerkAdapter', () => {
 				custom_field: 'custom_value',
 			}),
 			mapClaims: (claims) => ({
-				userId: `clerk-${claims['sub'] as string}`,
-				metadata: { custom: claims['custom_field'] },
+				userId: `clerk-${claims.sub as string}`,
+				metadata: { custom: claims.custom_field },
 			}),
 		})
 
@@ -577,9 +574,9 @@ describe('createClerkAdapter', () => {
 			validateToken: async () => null,
 		})
 
-		await expect(
-			adapter.signUp({ email: 'test@test.com', password: 'pass1234' }),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(adapter.signUp({ email: 'test@test.com', password: 'pass1234' })).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 })
 
@@ -624,10 +621,7 @@ describe('createSupabaseAdapter', () => {
 			jwtSecret: TEST_SECRET,
 		})
 
-		const token = createValidToken(
-			{ sub: 'user-wrong' },
-			'different-secret-that-is-long-enough-32',
-		)
+		const token = createValidToken({ sub: 'user-wrong' }, 'different-secret-that-is-long-enough-32')
 		const result = await adapter.validateAccessToken(token)
 		expect(result).toBeNull()
 	})
@@ -706,7 +700,7 @@ describe('createSupabaseAdapter', () => {
 		const syncAuth = adapter.toSyncAuthProvider()
 		const result = await syncAuth.authenticate(token)
 
-		expect(result?.metadata?.['name']).toBe('Name Only')
+		expect(result?.metadata?.name).toBe('Name Only')
 	})
 
 	test('default claim mapping handles missing user_metadata', async () => {
@@ -744,8 +738,8 @@ describe('createSupabaseAdapter', () => {
 		const adapter = createSupabaseAdapter({
 			jwtSecret: TEST_SECRET,
 			mapClaims: (claims) => ({
-				userId: `sb-${claims['sub'] as string}`,
-				email: claims['email'] as string,
+				userId: `sb-${claims.sub as string}`,
+				email: claims.email as string,
 			}),
 		})
 
@@ -762,9 +756,9 @@ describe('createSupabaseAdapter', () => {
 			jwtSecret: TEST_SECRET,
 		})
 
-		await expect(
-			adapter.signUp({ email: 'test@test.com', password: 'pass1234' }),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(adapter.signUp({ email: 'test@test.com', password: 'pass1234' })).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('signIn throws for Supabase adapter', async () => {
@@ -772,9 +766,9 @@ describe('createSupabaseAdapter', () => {
 			jwtSecret: TEST_SECRET,
 		})
 
-		await expect(
-			adapter.signIn({ email: 'test@test.com', password: 'pass1234' }),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(adapter.signIn({ email: 'test@test.com', password: 'pass1234' })).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 
 	test('refreshTokens throws for Supabase adapter', async () => {
@@ -782,9 +776,9 @@ describe('createSupabaseAdapter', () => {
 			jwtSecret: TEST_SECRET,
 		})
 
-		await expect(
-			adapter.refreshTokens('refresh-token'),
-		).rejects.toThrow(ExternalAuthOperationNotSupportedError)
+		await expect(adapter.refreshTokens('refresh-token')).rejects.toThrow(
+			ExternalAuthOperationNotSupportedError,
+		)
 	})
 })
 

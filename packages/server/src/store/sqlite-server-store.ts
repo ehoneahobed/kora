@@ -69,12 +69,8 @@ export class SqliteServerStore implements ServerStore {
 					// Ignore "duplicate column" errors from safe ALTER TABLE.
 					// Drizzle wraps SQLite errors, so check both outer message and cause.
 					const msg = e instanceof Error ? e.message : ''
-					const causeMsg =
-						e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
-					if (
-						!msg.includes('duplicate column') &&
-						!causeMsg.includes('duplicate column')
-					) {
+					const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+					if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
 						throw e
 					}
 				}
@@ -123,7 +119,7 @@ export class SqliteServerStore implements ServerStore {
 				.run()
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema && this.schema.collections[op.collection]) {
+			if (this.schema?.collections[op.collection]) {
 				this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
 			}
 
@@ -157,7 +153,7 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 
 		// Fast path: if schema is set, read directly from the materialized table
-		if (this.schema && this.schema.collections[collection]) {
+		if (this.schema?.collections[collection]) {
 			return this.queryCollection(collection)
 		}
 
@@ -173,16 +169,19 @@ export class SqliteServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
-		const collectionDef = this.schema!.collections[collection]!
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
 
 		// Validate field names in options
 		if (options?.where) {
 			for (const key of Object.keys(options.where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 		if (options?.orderBy) {
-			validateFieldName(collection, options.orderBy, this.schema!)
+			validateFieldName(collection, options.orderBy, schema)
 		}
 
 		const query = this.buildSelectQuery(collection, options)
@@ -196,12 +195,15 @@ export class SqliteServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
-		const collectionDef = this.schema!.collections[collection]!
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
 		const query = sql`SELECT * FROM ${sql.raw(collection)} WHERE id = ${id} AND _deleted = 0`
 		const rows = this.db.all<Record<string, unknown>>(query)
 
 		if (rows.length === 0) return null
-		return this.deserializeRow(rows[0]!, collectionDef)
+		return this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
 	}
 
 	async countCollection(collection: string, where?: Record<string, unknown>): Promise<number> {
@@ -209,9 +211,10 @@ export class SqliteServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
+		const schema = this.schema as SchemaDefinition
 		if (where) {
 			for (const key of Object.keys(where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 
@@ -239,7 +242,7 @@ export class SqliteServerStore implements ServerStore {
 		collection: string,
 		recordId: string,
 	): void {
-		const collectionDef = this.schema!.collections[collection]
+		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
 
 		// Fetch all ops for this specific record, ordered by HLC
@@ -250,12 +253,7 @@ export class SqliteServerStore implements ServerStore {
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
-			.where(
-				and(
-					eq(operations.collection, collection),
-					eq(operations.recordId, recordId),
-				),
-			)
+			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
 			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.sequenceNumber))
 			.all()
 
@@ -270,8 +268,9 @@ export class SqliteServerStore implements ServerStore {
 
 		if (recordData) {
 			// Compute timestamps from operations
-			const createdAt = ops.length > 0 ? ops[0]!.wallTime : Date.now()
-			const updatedAt = ops.length > 0 ? ops[ops.length - 1]!.wallTime : Date.now()
+			const createdAt = ops.length > 0 ? (ops[0] as (typeof ops)[0]).wallTime : Date.now()
+			const updatedAt =
+				ops.length > 0 ? (ops[ops.length - 1] as (typeof ops)[0]).wallTime : Date.now()
 
 			this.upsertMaterializedRecord(
 				txOrDb,
@@ -310,9 +309,7 @@ export class SqliteServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor
-					? serializeFieldValue(recordData[f] ?? null, descriptor)
-					: null
+				return descriptor ? serializeFieldValue(recordData[f] ?? null, descriptor) : null
 			}),
 			createdAt,
 			updatedAt,
@@ -325,7 +322,10 @@ export class SqliteServerStore implements ServerStore {
 			sql.raw(', '),
 		)
 		const updateSet = sql.raw(
-			allColumns.slice(1).map((c) => `${c} = excluded.${c}`).join(', '),
+			allColumns
+				.slice(1)
+				.map((c) => `${c} = excluded.${c}`)
+				.join(', '),
 		)
 
 		txOrDb.run(
@@ -349,7 +349,7 @@ export class SqliteServerStore implements ServerStore {
 	 * Backfill a single collection's materialized table from operations.
 	 */
 	private backfillCollection(collectionName: string): void {
-		const collectionDef = this.schema!.collections[collectionName]
+		const collectionDef = this.schema?.collections[collectionName]
 		if (!collectionDef) return
 
 		// Fetch all ops for this collection, ordered by HLC
@@ -389,8 +389,8 @@ export class SqliteServerStore implements ServerStore {
 				const recordData = replayOperationsForRecord(parsedOps)
 
 				if (recordData) {
-					const createdAt = recordOps[0]!.wallTime
-					const updatedAt = recordOps[recordOps.length - 1]!.wallTime
+					const createdAt = (recordOps[0] as (typeof recordOps)[0]).wallTime
+					const updatedAt = (recordOps[recordOps.length - 1] as (typeof recordOps)[0]).wallTime
 					this.upsertMaterializedRecord(
 						tx,
 						collectionName,
@@ -414,18 +414,13 @@ export class SqliteServerStore implements ServerStore {
 	// Query building
 	// ---------------------------------------------------------------------------
 
-	private buildSelectQuery(
-		collection: string,
-		options?: CollectionQueryOptions,
-	): SQL {
+	private buildSelectQuery(collection: string, options?: CollectionQueryOptions): SQL {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
 		)
 
-		const parts: SQL[] = [
-			sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`,
-		]
+		const parts: SQL[] = [sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
@@ -443,10 +438,7 @@ export class SqliteServerStore implements ServerStore {
 		return sql.join(parts, sql.raw(''))
 	}
 
-	private buildWhereClause(
-		where: Record<string, unknown>,
-		includeDeleted: boolean,
-	): SQL {
+	private buildWhereClause(where: Record<string, unknown>, includeDeleted: boolean): SQL {
 		const conditions: SQL[] = []
 
 		if (!includeDeleted) {
@@ -590,10 +582,7 @@ export class SqliteServerStore implements ServerStore {
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
-	private serializeOperation(
-		op: Operation,
-		receivedAt: number,
-	): typeof operations.$inferInsert {
+	private serializeOperation(op: Operation, receivedAt: number): typeof operations.$inferInsert {
 		return {
 			id: op.id,
 			nodeId: op.nodeId,
@@ -651,9 +640,10 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	private assertCollection(collection: string): void {
-		if (!this.schema!.collections[collection]) {
+		const schema = this.schema as SchemaDefinition
+		if (!schema.collections[collection]) {
 			throw new Error(
-				`Unknown collection "${collection}". Available: ${Object.keys(this.schema!.collections).join(', ')}`,
+				`Unknown collection "${collection}". Available: ${Object.keys(schema.collections).join(', ')}`,
 			)
 		}
 	}

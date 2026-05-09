@@ -1,8 +1,14 @@
 import { SyncError } from '@korajs/core'
 import { NegotiatedMessageSerializer } from '../protocol/serializer'
 import type { MessageSerializer } from '../protocol/serializer'
+import type {
+	SyncTransport,
+	TransportCloseHandler,
+	TransportErrorHandler,
+	TransportMessageHandler,
+	TransportOptions,
+} from './transport'
 import { WebSocketTransport } from './websocket-transport'
-import type { SyncTransport, TransportCloseHandler, TransportErrorHandler, TransportMessageHandler, TransportOptions } from './transport'
 
 const DEFAULT_RETRY_DELAY_MS = 250
 
@@ -40,7 +46,8 @@ export class HttpLongPollingTransport implements SyncTransport {
 		this.fetchImpl = options?.fetchImpl ?? fetch
 		this.retryDelayMs = options?.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
 		this.preferWebSocket = options?.preferWebSocket ?? true
-		this.webSocketFactory = options?.webSocketFactory ?? (() => new WebSocketTransport({ serializer: this.serializer }))
+		this.webSocketFactory =
+			options?.webSocketFactory ?? (() => new WebSocketTransport({ serializer: this.serializer }))
 	}
 
 	async connect(url: string, options?: TransportOptions): Promise<void> {
@@ -122,7 +129,10 @@ export class HttpLongPollingTransport implements SyncTransport {
 		return this.connected
 	}
 
-	private async tryUpgradeToWebSocket(url: string, options?: TransportOptions): Promise<SyncTransport | null> {
+	private async tryUpgradeToWebSocket(
+		url: string,
+		options?: TransportOptions,
+	): Promise<SyncTransport | null> {
 		const wsTransport = this.webSocketFactory()
 
 		if (this.messageHandler) wsTransport.onMessage(this.messageHandler)

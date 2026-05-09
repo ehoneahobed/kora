@@ -8,9 +8,9 @@ export interface KoraConfigFile {
 	schema?: string
 	dev?: {
 		port?: number
-			sync?:
-				| boolean
-				| {
+		sync?:
+			| boolean
+			| {
 					enabled?: boolean
 					port?: number
 					store?:
@@ -18,23 +18,23 @@ export interface KoraConfigFile {
 						| 'sqlite'
 						| 'postgres'
 						| {
-							type: 'memory'
-						}
+								type: 'memory'
+						  }
 						| {
-							type: 'sqlite'
-							filename?: string
-						}
+								type: 'sqlite'
+								filename?: string
+						  }
 						| {
-							type: 'postgres'
-							connectionString: string
-						}
-				}
+								type: 'postgres'
+								connectionString: string
+						  }
+			  }
 		watch?:
 			| boolean
 			| {
-				enabled?: boolean
-				debounceMs?: number
-			}
+					enabled?: boolean
+					debounceMs?: number
+			  }
 	}
 }
 

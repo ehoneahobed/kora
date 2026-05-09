@@ -1,8 +1,5 @@
-import { describe, test, expect, beforeEach, vi, afterEach } from 'vitest'
-import {
-	AuditLogger,
-	InMemoryAuditLogStore,
-} from './audit-log'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { AuditLogger, InMemoryAuditLogStore } from './audit-log'
 import type { AuditEntry } from './audit-log'
 
 describe('AuditLogger', () => {
@@ -102,7 +99,13 @@ describe('AuditLogger', () => {
 			await logger.log({ action: 'user.signin', actorId: 'user-1', success: true })
 
 			vi.setSystemTime(new Date('2026-01-15T10:10:00Z'))
-			await logger.log({ action: 'user.signin', actorId: 'user-2', success: false, errorMessage: 'Invalid password', targetId: 'user-2' })
+			await logger.log({
+				action: 'user.signin',
+				actorId: 'user-2',
+				success: false,
+				errorMessage: 'Invalid password',
+				targetId: 'user-2',
+			})
 
 			vi.setSystemTime(new Date('2026-01-15T10:15:00Z'))
 			await logger.log({ action: 'session.create', actorId: 'user-1' })
@@ -121,7 +124,7 @@ describe('AuditLogger', () => {
 			await seedEntries()
 			const entries = await logger.query({})
 			for (let i = 1; i < entries.length; i++) {
-				expect(entries[i]!.timestamp).toBeLessThanOrEqual(entries[i - 1]!.timestamp)
+				expect(entries[i]?.timestamp).toBeLessThanOrEqual(entries[i - 1]?.timestamp)
 			}
 		})
 
@@ -138,7 +141,7 @@ describe('AuditLogger', () => {
 			await seedEntries()
 			const entries = await logger.query({ targetId: 'user-2' })
 			expect(entries).toHaveLength(1)
-			expect(entries[0]!.actorId).toBe('user-2')
+			expect(entries[0]?.actorId).toBe('user-2')
 		})
 
 		test('filters by actions', async () => {
@@ -151,7 +154,7 @@ describe('AuditLogger', () => {
 			await seedEntries()
 			const failures = await logger.query({ success: false })
 			expect(failures).toHaveLength(1)
-			expect(failures[0]!.actorId).toBe('user-2')
+			expect(failures[0]?.actorId).toBe('user-2')
 		})
 
 		test('filters by time range', async () => {
@@ -169,7 +172,7 @@ describe('AuditLogger', () => {
 
 			expect(page1).toHaveLength(2)
 			expect(page2).toHaveLength(2)
-			expect(page1[0]!.id).not.toBe(page2[0]!.id)
+			expect(page1[0]?.id).not.toBe(page2[0]?.id)
 		})
 
 		test('combines filters', async () => {
@@ -214,7 +217,7 @@ describe('AuditLogger', () => {
 
 			const remaining = await retentionLogger.query({})
 			expect(remaining).toHaveLength(1)
-			expect(remaining[0]!.actorId).toBe('u2')
+			expect(remaining[0]?.actorId).toBe('u2')
 		})
 
 		test('does nothing without retention policy', async () => {
@@ -322,10 +325,10 @@ describe('InMemoryAuditLogStore', () => {
 		const entry = makeEntry()
 		await store.append(entry)
 		const [retrieved] = await store.query({})
-		retrieved!.actorId = 'mutated'
+		;(retrieved as NonNullable<typeof retrieved>).actorId = 'mutated'
 
 		const [again] = await store.query({})
-		expect(again!.actorId).toBe('user-1')
+		expect(again?.actorId).toBe('user-1')
 	})
 
 	test('purgeOlderThan removes old entries', async () => {

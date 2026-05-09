@@ -44,10 +44,7 @@ const IV_LENGTH = 12
  * Asserts that `crypto.subtle` is available, throwing a clear error if not.
  */
 function assertCryptoAvailable(): void {
-	if (
-		typeof globalThis.crypto === 'undefined' ||
-		typeof globalThis.crypto.subtle === 'undefined'
-	) {
+	if (typeof globalThis.crypto === 'undefined' || typeof globalThis.crypto.subtle === 'undefined') {
 		throw new CryptoUnavailableError()
 	}
 }
@@ -261,8 +258,7 @@ export async function importKey(rawKey: Uint8Array): Promise<CryptoKey> {
 		return key
 	} catch (cause) {
 		throw new EncryptionError(
-			'Failed to import raw key bytes as AES-256-GCM key. ' +
-				'Ensure the key material is valid.',
+			'Failed to import raw key bytes as AES-256-GCM key. ' + 'Ensure the key material is valid.',
 			{ cause: cause instanceof Error ? cause.message : String(cause) },
 		)
 	}

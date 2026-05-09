@@ -9,6 +9,9 @@ const OFFLINE_STATUS: SyncStatusInfo = Object.freeze({
 	status: 'offline',
 	pendingOperations: 0,
 	lastSyncedAt: null,
+	lastSuccessfulPush: null,
+	lastSuccessfulPull: null,
+	conflicts: 0,
 })
 
 /**

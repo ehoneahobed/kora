@@ -100,6 +100,9 @@ export class JsonMessageSerializer implements MessageSerializer {
 			sequenceNumber: op.sequenceNumber,
 			causalDeps: [...op.causalDeps],
 			schemaVersion: op.schemaVersion,
+			...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
+			...(op.transactionId !== undefined ? { transactionId: op.transactionId } : {}),
+			...(op.mutationName !== undefined ? { mutationName: op.mutationName } : {}),
 		}
 	}
 
@@ -120,6 +123,11 @@ export class JsonMessageSerializer implements MessageSerializer {
 			sequenceNumber: serialized.sequenceNumber,
 			causalDeps: [...serialized.causalDeps],
 			schemaVersion: serialized.schemaVersion,
+			...(serialized.atomicOps !== undefined ? { atomicOps: serialized.atomicOps } : {}),
+			...(serialized.transactionId !== undefined
+				? { transactionId: serialized.transactionId }
+				: {}),
+			...(serialized.mutationName !== undefined ? { mutationName: serialized.mutationName } : {}),
 		}
 	}
 }
@@ -252,7 +260,10 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				type: message.type,
 				messageId: message.messageId,
 				nodeId: message.nodeId,
-				versionVector: Object.entries(message.versionVector).map(([key, value]) => ({ key, value })),
+				versionVector: Object.entries(message.versionVector).map(([key, value]) => ({
+					key,
+					value,
+				})),
 				schemaVersion: message.schemaVersion,
 				authToken: message.authToken,
 				supportedWireFormats: message.supportedWireFormats,
@@ -262,7 +273,10 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				type: message.type,
 				messageId: message.messageId,
 				nodeId: message.nodeId,
-				versionVector: Object.entries(message.versionVector).map(([key, value]) => ({ key, value })),
+				versionVector: Object.entries(message.versionVector).map(([key, value]) => ({
+					key,
+					value,
+				})),
 				schemaVersion: message.schemaVersion,
 				accepted: message.accepted,
 				rejectReason: message.rejectReason,
@@ -301,20 +315,23 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				type: 'handshake',
 				messageId: envelope.messageId,
 				nodeId: envelope.nodeId ?? '',
-				versionVector: Object.fromEntries((envelope.versionVector ?? []).map((entry) => [entry.key, entry.value])),
+				versionVector: Object.fromEntries(
+					(envelope.versionVector ?? []).map((entry) => [entry.key, entry.value]),
+				),
 				schemaVersion: envelope.schemaVersion ?? 0,
 				authToken: envelope.authToken,
-				supportedWireFormats:
-					envelope.supportedWireFormats?.filter(
-						(format): format is WireFormat => format === 'json' || format === 'protobuf',
-					),
+				supportedWireFormats: envelope.supportedWireFormats?.filter(
+					(format): format is WireFormat => format === 'json' || format === 'protobuf',
+				),
 			}
 		case 'handshake-response':
 			return {
 				type: 'handshake-response',
 				messageId: envelope.messageId,
 				nodeId: envelope.nodeId ?? '',
-				versionVector: Object.fromEntries((envelope.versionVector ?? []).map((entry) => [entry.key, entry.value])),
+				versionVector: Object.fromEntries(
+					(envelope.versionVector ?? []).map((entry) => [entry.key, entry.value]),
+				),
 				schemaVersion: envelope.schemaVersion ?? 0,
 				accepted: envelope.accepted ?? false,
 				rejectReason: envelope.rejectReason,
@@ -354,15 +371,37 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 }
 
 function serializeProtoOperation(operation: SerializedOperation): ProtoOperation {
+	// Embed metadata in the data JSON when present (piggyback on existing field)
+	const hasMetadata = operation.transactionId !== undefined || operation.mutationName !== undefined
+	let dataJson = ''
+	if (operation.data !== null) {
+		const dataPayload: Record<string, unknown> = { ...operation.data }
+		if (operation.atomicOps !== undefined && Object.keys(operation.atomicOps).length > 0) {
+			dataPayload.__kora_atomic_ops__ = operation.atomicOps
+		}
+		if (operation.transactionId !== undefined) {
+			dataPayload.__kora_tx_id__ = operation.transactionId
+		}
+		if (operation.mutationName !== undefined) {
+			dataPayload.__kora_mutation__ = operation.mutationName
+		}
+		dataJson = JSON.stringify(dataPayload)
+	} else if (hasMetadata) {
+		// For delete operations (data is null), still need to carry metadata
+		const meta: Record<string, unknown> = {}
+		if (operation.transactionId !== undefined) meta.__kora_tx_id__ = operation.transactionId
+		if (operation.mutationName !== undefined) meta.__kora_mutation__ = operation.mutationName
+		dataJson = JSON.stringify(meta)
+	}
+
 	return {
 		id: operation.id,
 		nodeId: operation.nodeId,
 		type: operation.type,
 		collection: operation.collection,
 		recordId: operation.recordId,
-		dataJson: operation.data === null ? '' : JSON.stringify(operation.data),
-		previousDataJson:
-			operation.previousData === null ? '' : JSON.stringify(operation.previousData),
+		dataJson,
+		previousDataJson: operation.previousData === null ? '' : JSON.stringify(operation.previousData),
 		timestamp: {
 			wallTime: operation.timestamp.wallTime,
 			logical: operation.timestamp.logical,
@@ -377,13 +416,33 @@ function serializeProtoOperation(operation: SerializedOperation): ProtoOperation
 }
 
 function deserializeProtoOperation(operation: ProtoOperation): SerializedOperation {
+	let data: Record<string, unknown> | null = null
+	let atomicOps: Record<string, unknown> | undefined
+	let transactionId: string | undefined
+	let mutationName: string | undefined
+
+	if (operation.hasData || operation.dataJson.length > 0) {
+		const parsed = JSON.parse(operation.dataJson) as Record<string, unknown>
+		if ('__kora_atomic_ops__' in parsed) {
+			atomicOps = parsed.__kora_atomic_ops__ as Record<string, unknown>
+		}
+		if ('__kora_tx_id__' in parsed) {
+			transactionId = parsed.__kora_tx_id__ as string
+		}
+		if ('__kora_mutation__' in parsed) {
+			mutationName = parsed.__kora_mutation__ as string
+		}
+		const { __kora_atomic_ops__: _a, __kora_tx_id__: _t, __kora_mutation__: _m, ...rest } = parsed
+		data = operation.hasData && Object.keys(rest).length > 0 ? rest : null
+	}
+
 	return {
 		id: operation.id,
 		nodeId: operation.nodeId,
 		type: operation.type as SerializedOperation['type'],
 		collection: operation.collection,
 		recordId: operation.recordId,
-		data: operation.hasData ? (JSON.parse(operation.dataJson) as Record<string, unknown>) : null,
+		data,
 		previousData: operation.hasPreviousData
 			? (JSON.parse(operation.previousDataJson) as Record<string, unknown>)
 			: null,
@@ -395,6 +454,11 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 		sequenceNumber: operation.sequenceNumber,
 		causalDeps: [...operation.causalDeps],
 		schemaVersion: operation.schemaVersion,
+		...(atomicOps !== undefined
+			? { atomicOps: atomicOps as SerializedOperation['atomicOps'] }
+			: {}),
+		...(transactionId !== undefined ? { transactionId } : {}),
+		...(mutationName !== undefined ? { mutationName } : {}),
 	}
 }
 
@@ -431,12 +495,14 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 		writer.ldelim()
 	}
 	if (envelope.schemaVersion !== undefined) writer.uint32(40).int32(envelope.schemaVersion)
-	if (envelope.authToken && envelope.authToken.length > 0) writer.uint32(50).string(envelope.authToken)
+	if (envelope.authToken && envelope.authToken.length > 0)
+		writer.uint32(50).string(envelope.authToken)
 	for (const format of envelope.supportedWireFormats ?? []) {
 		writer.uint32(58).string(format)
 	}
 	if (envelope.accepted !== undefined) writer.uint32(64).bool(envelope.accepted)
-	if (envelope.rejectReason && envelope.rejectReason.length > 0) writer.uint32(74).string(envelope.rejectReason)
+	if (envelope.rejectReason && envelope.rejectReason.length > 0)
+		writer.uint32(74).string(envelope.rejectReason)
 	if (envelope.selectedWireFormat && envelope.selectedWireFormat.length > 0) {
 		writer.uint32(82).string(envelope.selectedWireFormat)
 	}
@@ -450,8 +516,10 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.acknowledgedMessageId && envelope.acknowledgedMessageId.length > 0) {
 		writer.uint32(114).string(envelope.acknowledgedMessageId)
 	}
-	if (envelope.lastSequenceNumber !== undefined) writer.uint32(120).int64(envelope.lastSequenceNumber)
-	if (envelope.errorCode && envelope.errorCode.length > 0) writer.uint32(130).string(envelope.errorCode)
+	if (envelope.lastSequenceNumber !== undefined)
+		writer.uint32(120).int64(envelope.lastSequenceNumber)
+	if (envelope.errorCode && envelope.errorCode.length > 0)
+		writer.uint32(130).string(envelope.errorCode)
 	if (envelope.errorMessage && envelope.errorMessage.length > 0) {
 		writer.uint32(138).string(envelope.errorMessage)
 	}
@@ -476,7 +544,10 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				envelope.nodeId = reader.string()
 				break
 			case 4:
-				envelope.versionVector = [...(envelope.versionVector ?? []), decodeVectorEntry(reader, reader.uint32())]
+				envelope.versionVector = [
+					...(envelope.versionVector ?? []),
+					decodeVectorEntry(reader, reader.uint32()),
+				]
 				break
 			case 5:
 				envelope.schemaVersion = reader.int32()
@@ -497,7 +568,10 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				envelope.selectedWireFormat = reader.string()
 				break
 			case 11:
-				envelope.operations = [...(envelope.operations ?? []), decodeProtoOperation(reader, reader.uint32())]
+				envelope.operations = [
+					...(envelope.operations ?? []),
+					decodeProtoOperation(reader, reader.uint32()),
+				]
 				break
 			case 12:
 				envelope.isFinal = reader.bool()

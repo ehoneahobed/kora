@@ -265,7 +265,7 @@ describe('deployCommand', () => {
 			nativeDependencies: {
 				'better-sqlite3': '^11.0.0',
 				'drizzle-orm': '^0.45.2',
-				'postgres': '^3.4.0',
+				postgres: '^3.4.0',
 			},
 		})
 		expect(mockWriteDockerIgnoreArtifact).toHaveBeenCalledWith('/project/.kora/deploy')

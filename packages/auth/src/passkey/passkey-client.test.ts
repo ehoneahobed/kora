@@ -6,8 +6,8 @@ import {
 	authenticateWithPasskey,
 	createPasskeyCredential,
 	decodeCbor,
-	isPlatformAuthenticatorAvailable,
 	isPasskeySupported,
+	isPlatformAuthenticatorAvailable,
 } from './passkey-client'
 
 // ============================================================================
@@ -278,8 +278,15 @@ describe('decodeCbor', () => {
 		// Simplified: a1 63 666d74 64 6e6f6e65 = {"fmt": "none"}
 		const data = new Uint8Array([
 			0xa1, // map with 1 entry
-			0x63, 0x66, 0x6d, 0x74, // text "fmt"
-			0x64, 0x6e, 0x6f, 0x6e, 0x65, // text "none"
+			0x63,
+			0x66,
+			0x6d,
+			0x74, // text "fmt"
+			0x64,
+			0x6e,
+			0x6f,
+			0x6e,
+			0x65, // text "none"
 		])
 		const result = decodeCbor(data, 0)
 		const map = result.value as Map<string, unknown>
@@ -319,10 +326,19 @@ describe('decodeCbor', () => {
 		// CBOR: a2 63 617272 82 01 02 63 6e756d 18 2a
 		const data = new Uint8Array([
 			0xa2, // map with 2 entries
-			0x63, 0x61, 0x72, 0x72, // text "arr"
-			0x82, 0x01, 0x02, // array [1, 2]
-			0x63, 0x6e, 0x75, 0x6d, // text "num"
-			0x18, 0x2a, // unsigned int 42
+			0x63,
+			0x61,
+			0x72,
+			0x72, // text "arr"
+			0x82,
+			0x01,
+			0x02, // array [1, 2]
+			0x63,
+			0x6e,
+			0x75,
+			0x6d, // text "num"
+			0x18,
+			0x2a, // unsigned int 42
 		])
 		const result = decodeCbor(data, 0)
 		const map = result.value as Map<string, unknown>
@@ -437,12 +453,19 @@ describe('CBOR decoding of COSE key map', () => {
 
 		const cborData = new Uint8Array([
 			0xa5, // map(5)
-			0x01, 0x02, // 1: 2
-			0x03, 0x26, // 3: -7
-			0x20, 0x01, // -1: 1
-			0x21, 0x58, 0x20, // -2: bytes(32)
+			0x01,
+			0x02, // 1: 2
+			0x03,
+			0x26, // 3: -7
+			0x20,
+			0x01, // -1: 1
+			0x21,
+			0x58,
+			0x20, // -2: bytes(32)
 			...xCoord,
-			0x22, 0x58, 0x20, // -3: bytes(32)
+			0x22,
+			0x58,
+			0x20, // -3: bytes(32)
 			...yCoord,
 		])
 
@@ -468,14 +491,39 @@ describe('CBOR decoding of COSE key map', () => {
 		const cborData = new Uint8Array([
 			0xa3, // map(3)
 			// "fmt": "none"
-			0x63, 0x66, 0x6d, 0x74, // text "fmt"
-			0x64, 0x6e, 0x6f, 0x6e, 0x65, // text "none"
+			0x63,
+			0x66,
+			0x6d,
+			0x74, // text "fmt"
+			0x64,
+			0x6e,
+			0x6f,
+			0x6e,
+			0x65, // text "none"
 			// "attStmt": {}
-			0x67, 0x61, 0x74, 0x74, 0x53, 0x74, 0x6d, 0x74, // text "attStmt"
+			0x67,
+			0x61,
+			0x74,
+			0x74,
+			0x53,
+			0x74,
+			0x6d,
+			0x74, // text "attStmt"
 			0xa0, // empty map
 			// "authData": bytes
-			0x68, 0x61, 0x75, 0x74, 0x68, 0x44, 0x61, 0x74, 0x61, // text "authData"
-			0x43, 0xaa, 0xbb, 0xcc, // bytes(3) [0xaa, 0xbb, 0xcc]
+			0x68,
+			0x61,
+			0x75,
+			0x74,
+			0x68,
+			0x44,
+			0x61,
+			0x74,
+			0x61, // text "authData"
+			0x43,
+			0xaa,
+			0xbb,
+			0xcc, // bytes(3) [0xaa, 0xbb, 0xcc]
 		])
 
 		const result = decodeCbor(cborData, 0)

@@ -73,7 +73,7 @@ export type { ChaosConfig } from './transport/chaos-transport'
 export { ChaosTransport } from './transport/chaos-transport'
 
 // === Engine ===
-export type { SyncEngineOptions } from './engine/sync-engine'
+export type { SyncDiagnostics, SyncEngineOptions } from './engine/sync-engine'
 
 export { SyncEngine } from './engine/sync-engine'
 

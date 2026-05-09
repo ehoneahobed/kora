@@ -1,6 +1,6 @@
-import { describe, test, expect, vi } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
+import type { AuthContext, AuthProvider } from '../types'
 import { MixedAuthProvider } from './mixed-auth-provider'
-import type { AuthProvider, AuthContext } from '../types'
 
 function createMockPrimary(result: AuthContext | null): AuthProvider {
 	return {

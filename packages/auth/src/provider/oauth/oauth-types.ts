@@ -168,6 +168,8 @@ export class OAuthUserInfoError extends OAuthError {
 
 export class OAuthProviderNotFoundError extends OAuthError {
 	constructor(provider: string) {
-		super(`OAuth provider "${provider}" is not configured.`, 'OAUTH_PROVIDER_NOT_FOUND', { provider })
+		super(`OAuth provider "${provider}" is not configured.`, 'OAUTH_PROVIDER_NOT_FOUND', {
+			provider,
+		})
 	}
 }

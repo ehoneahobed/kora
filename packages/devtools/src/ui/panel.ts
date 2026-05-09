@@ -1,20 +1,20 @@
-import { h, render } from 'preact'
-import { useState, useCallback, useMemo } from 'preact/hooks'
 import htm from 'htm'
+import { h, render } from 'preact'
+import { useCallback, useMemo, useState } from 'preact/hooks'
 
-import type { TimestampedEvent, EventCategory } from '../types'
+import { filterEvents } from '../filter/event-filter'
+import { computeStatistics } from '../stats/event-stats'
+import type { EventCategory, TimestampedEvent } from '../types'
 import { eventTypeToCategory } from '../types'
+import { formatTime, formatValue, truncate } from './components'
 import { buildPanelModel } from './panel-state'
 import type {
-	DevtoolsPanelModel,
-	TimelineItem,
 	ConflictItem,
-	OperationItem,
+	DevtoolsPanelModel,
 	NetworkStatusModel,
+	OperationItem,
+	TimelineItem,
 } from './panel-state'
-import { computeStatistics } from '../stats/event-stats'
-import { filterEvents } from '../filter/event-filter'
-import { formatTime, truncate, formatValue } from './components'
 
 const html = htm.bind(h)
 
@@ -33,35 +33,27 @@ const ALL_CATEGORIES: EventCategory[] = ['operation', 'merge', 'sync', 'query', 
 function DevToolsPanel({ events }: { events: readonly TimestampedEvent[] }) {
 	const [activeTab, setActiveTab] = useState<ActiveTab>('timeline')
 	const [search, setSearch] = useState('')
-	const [categories, setCategories] = useState<Set<EventCategory>>(
-		() => new Set(ALL_CATEGORIES),
-	)
+	const [categories, setCategories] = useState<Set<EventCategory>>(() => new Set(ALL_CATEGORIES))
 	const [expanded, setExpanded] = useState<Set<number>>(() => new Set())
 	const [paused, setPaused] = useState(false)
 
-	const toggleCategory = useCallback(
-		(cat: EventCategory) => {
-			setCategories((prev) => {
-				const next = new Set(prev)
-				if (next.has(cat)) next.delete(cat)
-				else next.add(cat)
-				return next
-			})
-		},
-		[],
-	)
+	const toggleCategory = useCallback((cat: EventCategory) => {
+		setCategories((prev) => {
+			const next = new Set(prev)
+			if (next.has(cat)) next.delete(cat)
+			else next.add(cat)
+			return next
+		})
+	}, [])
 
-	const toggleExpand = useCallback(
-		(id: number) => {
-			setExpanded((prev) => {
-				const next = new Set(prev)
-				if (next.has(id)) next.delete(id)
-				else next.add(id)
-				return next
-			})
-		},
-		[],
-	)
+	const toggleExpand = useCallback((id: number) => {
+		setExpanded((prev) => {
+			const next = new Set(prev)
+			if (next.has(id)) next.delete(id)
+			else next.add(id)
+			return next
+		})
+	}, [])
 
 	const filtered = useMemo(
 		() => filterEvents(events, { categories: [...categories] }),
@@ -87,29 +79,37 @@ function DevToolsPanel({ events }: { events: readonly TimestampedEvent[] }) {
 				onToggleCategory=${toggleCategory}
 			/>
 			<div class="kora-content">
-				${activeTab === 'timeline' &&
-				html`<${TimelinePanel}
+				${
+					activeTab === 'timeline' &&
+					html`<${TimelinePanel}
 					items=${model.timeline}
 					search=${search}
 					expanded=${expanded}
 					onToggle=${toggleExpand}
-				/>`}
-				${activeTab === 'conflicts' &&
-				html`<${ConflictsPanel}
+				/>`
+				}
+				${
+					activeTab === 'conflicts' &&
+					html`<${ConflictsPanel}
 					items=${model.conflicts}
 					search=${search}
 					expanded=${expanded}
 					onToggle=${toggleExpand}
-				/>`}
-				${activeTab === 'operations' &&
-				html`<${OperationsPanel}
+				/>`
+				}
+				${
+					activeTab === 'operations' &&
+					html`<${OperationsPanel}
 					items=${model.operations}
 					search=${search}
 					expanded=${expanded}
 					onToggle=${toggleExpand}
-				/>`}
-				${activeTab === 'network' &&
-				html`<${NetworkPanel} network=${model.network} events=${events} />`}
+				/>`
+				}
+				${
+					activeTab === 'network' &&
+					html`<${NetworkPanel} network=${model.network} events=${events} />`
+				}
 			</div>
 		</div>
 	`
@@ -161,9 +161,11 @@ function Toolbar({
 							onClick=${() => onTabChange(tab.id)}
 						>
 							${tab.label}
-							${tab.badge != null && tab.badge > 0
-								? html`<span class="kora-badge">${tab.badge}</span>`
-								: null}
+							${
+								tab.badge != null && tab.badge > 0
+									? html`<span class="kora-badge">${tab.badge}</span>`
+									: null
+							}
 						</button>
 					`,
 				)}
@@ -214,8 +216,7 @@ function TimelinePanel({
 	const filtered = lowerSearch
 		? items.filter(
 				(i) =>
-					i.label.toLowerCase().includes(lowerSearch) ||
-					i.type.toLowerCase().includes(lowerSearch),
+					i.label.toLowerCase().includes(lowerSearch) || i.type.toLowerCase().includes(lowerSearch),
 			)
 		: items
 
@@ -240,12 +241,15 @@ function TimelinePanel({
 							<span class="kora-dot" style="background:${item.color}"></span>
 							<span class="kora-type">${item.type}</span>
 							<span class="kora-label">${item.label}</span>
-							${item.dependsOn.length > 0
-								? html`<span class="kora-deps">deps: ${item.dependsOn.length}</span>`
-								: null}
+							${
+								item.dependsOn.length > 0
+									? html`<span class="kora-deps">deps: ${item.dependsOn.length}</span>`
+									: null
+							}
 						</div>
-						${expanded.has(item.id)
-							? html`
+						${
+							expanded.has(item.id)
+								? html`
 									<div class="kora-detail">
 										<div>
 											<span class="kora-detail-label">Event ID:</span> ${item.id}
@@ -254,15 +258,18 @@ function TimelinePanel({
 											<span class="kora-detail-label">Received:</span>
 											${new Date(item.receivedAt).toISOString()}
 										</div>
-										${item.dependsOn.length > 0
-											? html`<div>
+										${
+											item.dependsOn.length > 0
+												? html`<div>
 													<span class="kora-detail-label">Causal deps:</span>
 													${item.dependsOn.join(', ')}
 												</div>`
-											: null}
+												: null
+										}
 									</div>
 								`
-							: null}
+								: null
+						}
 					`,
 				)}
 			</div>
@@ -334,8 +341,9 @@ function ConflictsPanel({
 								<td>${item.tier}</td>
 								<td class="kora-mono">${truncate(String(item.output), 30)}</td>
 							</tr>
-							${expanded.has(item.id)
-								? html`
+							${
+								expanded.has(item.id)
+									? html`
 										<tr class="kora-detail-row">
 											<td colspan="6">
 												<div class="kora-conflict-detail">
@@ -359,16 +367,19 @@ ${formatValue(item.output)}</pre
 															>
 														</div>
 													</div>
-													${item.constraintViolated
-														? html`<div class="kora-constraint-warning">
+													${
+														item.constraintViolated
+															? html`<div class="kora-constraint-warning">
 																Constraint violated: ${item.constraintViolated}
 															</div>`
-														: null}
+															: null
+													}
 												</div>
 											</td>
 										</tr>
 									`
-								: null}
+									: null
+							}
 						`,
 					)}
 				</tbody>
@@ -431,8 +442,9 @@ function OperationsPanel({
 							<span class="kora-op-node">node:${truncate(item.nodeId, 8)}</span>
 							<span class="kora-op-seq">#${item.sequenceNumber}</span>
 						</div>
-						${expanded.has(item.id)
-							? html`
+						${
+							expanded.has(item.id)
+								? html`
 									<div class="kora-op-detail">
 										<div>
 											<span class="kora-detail-label">Operation ID:</span>
@@ -446,25 +458,30 @@ function OperationsPanel({
 											<span class="kora-detail-label">Sequence:</span>
 											${item.sequenceNumber}
 										</div>
-										${item.causalDeps.length > 0
-											? html`<div>
+										${
+											item.causalDeps.length > 0
+												? html`<div>
 													<span class="kora-detail-label">Causal deps:</span>
 													<span class="kora-mono"
 														>${item.causalDeps.join(', ')}</span
 													>
 												</div>`
-											: null}
-										${item.data
-											? html`<div>
+												: null
+										}
+										${
+											item.data
+												? html`<div>
 													<div class="kora-detail-label">Data:</div>
 													<pre class="kora-value-code">
 ${JSON.stringify(item.data, null, 2)}</pre
 													>
 												</div>`
-											: null}
+												: null
+										}
 									</div>
 								`
-							: null}
+								: null
+						}
 					`,
 				)}
 			</div>
@@ -517,8 +534,9 @@ function NetworkPanel({
 				/>
 			</div>
 
-			${network.versionVector.length > 0
-				? html`
+			${
+				network.versionVector.length > 0
+					? html`
 						<div class="kora-vv-section">
 							<h3>Version Vector</h3>
 							<table class="kora-table kora-vv-table">
@@ -541,10 +559,12 @@ function NetworkPanel({
 							</table>
 						</div>
 					`
-				: null}
+					: null
+			}
 
-			${syncEvents.length > 0
-				? html`
+			${
+				syncEvents.length > 0
+					? html`
 						<div class="kora-sync-log">
 							<h3>Recent Sync Activity</h3>
 							<div class="kora-event-list">
@@ -561,7 +581,8 @@ function NetworkPanel({
 							</div>
 						</div>
 					`
-				: null}
+					: null
+			}
 		</div>
 	`
 }

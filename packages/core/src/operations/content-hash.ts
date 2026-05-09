@@ -12,14 +12,20 @@ export async function computeOperationId(
 	input: OperationInput,
 	timestamp: string,
 ): Promise<string> {
-	const canonical = canonicalize({
+	// Only include atomicOps when present — ensures backward compatibility
+	// (existing operations without atomicOps produce identical hashes).
+	const hashInput: Record<string, unknown> = {
 		type: input.type,
 		collection: input.collection,
 		recordId: input.recordId,
 		data: input.data,
 		timestamp,
 		nodeId: input.nodeId,
-	})
+	}
+	if (input.atomicOps !== undefined && Object.keys(input.atomicOps).length > 0) {
+		hashInput.atomicOps = input.atomicOps
+	}
+	const canonical = canonicalize(hashInput)
 	const encoded = new TextEncoder().encode(canonical)
 	const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', encoded)
 	return bufferToHex(hashBuffer)

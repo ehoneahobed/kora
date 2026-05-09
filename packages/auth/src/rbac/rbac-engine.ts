@@ -1,18 +1,18 @@
 import type { OrgStore } from '../org/org-store'
 import type {
-	Permission,
-	RoleDefinition,
-	RbacConfig,
-	SyncScopes,
-	ScopeFilter,
-	ScopeContext,
 	CollectionScopeResolver,
+	Permission,
+	RbacConfig,
+	RoleDefinition,
+	ScopeContext,
+	ScopeFilter,
+	SyncScopes,
 } from './rbac-types'
 import {
 	BUILT_IN_ROLES,
-	permissionCovers,
-	RoleNotFoundError,
 	CircularInheritanceError,
+	RoleNotFoundError,
+	permissionCovers,
 } from './rbac-types'
 
 // ============================================================================
@@ -159,17 +159,13 @@ export class RbacEngine {
 		const scopes: SyncScopes = {}
 
 		// Check if user has any data permissions at all
-		const hasAnyRead = permissions.some(
-			(p) => permissionCovers(p, '*:read' as Permission),
-		)
+		const hasAnyRead = permissions.some((p) => permissionCovers(p, '*:read' as Permission))
 		if (!hasAnyRead) {
 			// No data access (e.g., billing-only role)
 			return scopes
 		}
 
-		const isReadOnly = !permissions.some(
-			(p) => permissionCovers(p, '*:write' as Permission),
-		)
+		const isReadOnly = !permissions.some((p) => permissionCovers(p, '*:write' as Permission))
 
 		const collectionsToResolve = collections ?? [...this.collectionResolvers.keys()]
 
@@ -301,11 +297,7 @@ class RoleBuilder {
 	/**
 	 * Add a role definition.
 	 */
-	role(
-		name: string,
-		permissions: Permission[],
-		options?: { inherits?: string[] },
-	): RoleBuilder {
+	role(name: string, permissions: Permission[], options?: { inherits?: string[] }): RoleBuilder {
 		this.roles.push({
 			name,
 			permissions,

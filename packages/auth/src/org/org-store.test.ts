@@ -1,15 +1,15 @@
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import { InMemoryOrgStore } from './org-store'
 import {
+	CannotRemoveOwnerError,
+	InvitationExpiredError,
+	InvitationNotFoundError,
+	MemberAlreadyExistsError,
+	MembershipNotFoundError,
 	OrgNotFoundError,
 	OrgSlugTakenError,
-	MembershipNotFoundError,
-	MemberAlreadyExistsError,
-	CannotRemoveOwnerError,
-	InvitationNotFoundError,
-	InvitationExpiredError,
-	hasRoleLevel,
 	ROLE_HIERARCHY,
+	hasRoleLevel,
 } from './org-types'
 
 describe('InMemoryOrgStore', () => {
@@ -54,8 +54,8 @@ describe('InMemoryOrgStore', () => {
 			const membership = await store.getMembership(org.id, 'user-1')
 
 			expect(membership).not.toBeNull()
-			expect(membership!.role).toBe('owner')
-			expect(membership!.invitedBy).toBeNull()
+			expect(membership?.role).toBe('owner')
+			expect(membership?.invitedBy).toBeNull()
 		})
 
 		test('rejects duplicate slug', async () => {
@@ -227,9 +227,7 @@ describe('InMemoryOrgStore', () => {
 
 		test('throws if member not found', async () => {
 			const org = await store.createOrg('user-1', { name: 'Acme', slug: 'acme' })
-			await expect(store.removeMember(org.id, 'user-999')).rejects.toThrow(
-				MembershipNotFoundError,
-			)
+			await expect(store.removeMember(org.id, 'user-999')).rejects.toThrow(MembershipNotFoundError)
 		})
 
 		test('throws if org not found', async () => {
@@ -253,13 +251,13 @@ describe('InMemoryOrgStore', () => {
 			await store.updateMemberRole(org.id, 'user-2', 'owner')
 
 			const oldOwner = await store.getMembership(org.id, 'user-1')
-			expect(oldOwner!.role).toBe('admin')
+			expect(oldOwner?.role).toBe('admin')
 
 			const newOwner = await store.getMembership(org.id, 'user-2')
-			expect(newOwner!.role).toBe('owner')
+			expect(newOwner?.role).toBe('owner')
 
 			const updatedOrg = await store.getOrg(org.id)
-			expect(updatedOrg!.ownerId).toBe('user-2')
+			expect(updatedOrg?.ownerId).toBe('user-2')
 		})
 
 		test('throws if member not found', async () => {
@@ -290,7 +288,7 @@ describe('InMemoryOrgStore', () => {
 			const org = await store.createOrg('user-1', { name: 'Acme', slug: 'acme' })
 			const membership = await store.getMembership(org.id, 'user-1')
 			expect(membership).not.toBeNull()
-			expect(membership!.role).toBe('owner')
+			expect(membership?.role).toBe('owner')
 		})
 
 		test('returns null for non-member', async () => {
@@ -307,13 +305,13 @@ describe('InMemoryOrgStore', () => {
 			await store.transferOwnership(org.id, 'user-2')
 
 			const updatedOrg = await store.getOrg(org.id)
-			expect(updatedOrg!.ownerId).toBe('user-2')
+			expect(updatedOrg?.ownerId).toBe('user-2')
 
 			const oldOwner = await store.getMembership(org.id, 'user-1')
-			expect(oldOwner!.role).toBe('admin')
+			expect(oldOwner?.role).toBe('admin')
 
 			const newOwner = await store.getMembership(org.id, 'user-2')
-			expect(newOwner!.role).toBe('owner')
+			expect(newOwner?.role).toBe('owner')
 		})
 
 		test('throws if org not found', async () => {
@@ -377,7 +375,7 @@ describe('InMemoryOrgStore', () => {
 
 			const fetched = await store.getInvitationByToken(inv.token)
 			expect(fetched).not.toBeNull()
-			expect(fetched!.id).toBe(inv.id)
+			expect(fetched?.id).toBe(inv.id)
 		})
 
 		test('returns null for non-existent token', async () => {
@@ -433,9 +431,11 @@ describe('InMemoryOrgStore', () => {
 
 			// Manually expire the invitation by patching the store internals
 			// We access the private map through any cast for testing only
-			const invitations = (store as any).invitations as Map<string, any>
-			const stored = invitations.get(inv.id)!
-			invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
+			const invitations = (
+				store as unknown as { invitations: Map<string, Record<string, unknown>> }
+			).invitations
+			const stored = invitations.get(inv.id)
+			if (stored) invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
 
 			await expect(store.consumeInvitation(inv.token)).rejects.toThrow(InvitationExpiredError)
 		})
@@ -493,9 +493,11 @@ describe('InMemoryOrgStore', () => {
 			})
 
 			// Expire it
-			const invitations = (store as any).invitations as Map<string, any>
-			const stored = invitations.get(inv.id)!
-			invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
+			const invitations = (
+				store as unknown as { invitations: Map<string, Record<string, unknown>> }
+			).invitations
+			const stored = invitations.get(inv.id)
+			if (stored) invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
 
 			const pending = await store.listPendingInvitations(org.id)
 			expect(pending).toHaveLength(0)
@@ -537,9 +539,11 @@ describe('InMemoryOrgStore', () => {
 				role: 'member',
 			})
 
-			const invitations = (store as any).invitations as Map<string, any>
-			const stored = invitations.get(inv.id)!
-			invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
+			const invitations = (
+				store as unknown as { invitations: Map<string, Record<string, unknown>> }
+			).invitations
+			const stored = invitations.get(inv.id)
+			if (stored) invitations.set(inv.id, { ...stored, expiresAt: Date.now() - 1000 })
 
 			expect(await store.listInvitationsForEmail('bob@example.com')).toHaveLength(0)
 		})
@@ -555,9 +559,11 @@ describe('InMemoryOrgStore', () => {
 			await store.createInvitation(org.id, 'user-1', { email: 'c@d.com', role: 'member' })
 
 			// Expire one
-			const invitations = (store as any).invitations as Map<string, any>
-			const stored = invitations.get(inv1.id)!
-			invitations.set(inv1.id, { ...stored, expiresAt: Date.now() - 1000 })
+			const invitations = (
+				store as unknown as { invitations: Map<string, Record<string, unknown>> }
+			).invitations
+			const stored = invitations.get(inv1.id)
+			if (stored) invitations.set(inv1.id, { ...stored, expiresAt: Date.now() - 1000 })
 
 			const count = await store.cleanExpiredInvitations()
 			expect(count).toBe(1)

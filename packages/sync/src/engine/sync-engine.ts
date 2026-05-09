@@ -55,6 +55,25 @@ export interface SyncEngineOptions {
 	queueStorage?: QueueStorage
 }
 
+/**
+ * Diagnostics snapshot for debugging and support.
+ */
+export interface SyncDiagnostics {
+	state: SyncState
+	status: SyncStatusInfo
+	nodeId: string
+	url: string
+	schemaVersion: number
+	lastSyncedAt: number | null
+	lastSuccessfulPush: number | null
+	lastSuccessfulPull: number | null
+	conflicts: number
+	pendingOperations: number
+	hasInFlightBatch: boolean
+	reconnecting: boolean
+	timestamp: number
+}
+
 let nextMessageId = 0
 function generateMessageId(): string {
 	return `msg-${Date.now()}-${nextMessageId++}`
@@ -79,6 +98,9 @@ export class SyncEngine {
 
 	private remoteVector: VersionVector = new Map()
 	private lastSyncedAt: number | null = null
+	private lastSuccessfulPush: number | null = null
+	private lastSuccessfulPull: number | null = null
+	private conflictCount = 0
 	private currentBatch: OutboundBatch | null = null
 	private reconnecting = false
 
@@ -134,6 +156,7 @@ export class SyncEngine {
 				schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 				authToken,
 				supportedWireFormats: ['json', 'protobuf'],
+				...(this.config.scopeMap ? { syncScope: this.config.scopeMap } : {}),
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -197,27 +220,67 @@ export class SyncEngine {
 	 */
 	getStatus(): SyncStatusInfo {
 		const pendingOperations = this.outboundQueue.totalPending
+		const base = {
+			pendingOperations,
+			lastSyncedAt: this.lastSyncedAt,
+			lastSuccessfulPush: this.lastSuccessfulPush,
+			lastSuccessfulPull: this.lastSuccessfulPull,
+			conflicts: this.conflictCount,
+		}
 		switch (this.state) {
 			case 'disconnected':
-				return { status: 'offline', pendingOperations, lastSyncedAt: this.lastSyncedAt }
+				return { ...base, status: 'offline' }
 			case 'connecting':
 			case 'handshaking':
 			case 'syncing':
 				// During reconnection attempts, show 'offline' instead of 'syncing'
 				// since the user is disconnected and reconnection is in progress.
-				return {
-					status: this.reconnecting ? 'offline' : 'syncing',
-					pendingOperations,
-					lastSyncedAt: this.lastSyncedAt,
-				}
+				return { ...base, status: this.reconnecting ? 'offline' : 'syncing' }
 			case 'streaming':
-				return {
-					status: pendingOperations > 0 ? 'syncing' : 'synced',
-					pendingOperations,
-					lastSyncedAt: this.lastSyncedAt,
-				}
+				return { ...base, status: pendingOperations > 0 ? 'syncing' : 'synced' }
 			case 'error':
-				return { status: 'error', pendingOperations, lastSyncedAt: this.lastSyncedAt }
+				return { ...base, status: 'error' }
+		}
+	}
+
+	/**
+	 * Record a merge conflict. Called by the merge-aware sync store
+	 * to increment the conflict counter for status reporting.
+	 */
+	recordConflict(): void {
+		this.conflictCount++
+	}
+
+	/**
+	 * Force an immediate reconnection attempt. If the engine is disconnected
+	 * or in error state, restarts the sync. If already connected, no-op.
+	 */
+	async retryNow(): Promise<void> {
+		if (this.state === 'disconnected' || this.state === 'error') {
+			this.reconnecting = false
+			await this.start()
+		}
+	}
+
+	/**
+	 * Export a diagnostics snapshot for debugging and support tickets.
+	 * Contains connection state, timing info, and queue metrics.
+	 */
+	exportDiagnostics(): SyncDiagnostics {
+		return {
+			state: this.state,
+			status: this.getStatus(),
+			nodeId: this.store.getNodeId(),
+			url: this.config.url,
+			schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
+			lastSyncedAt: this.lastSyncedAt,
+			lastSuccessfulPush: this.lastSuccessfulPush,
+			lastSuccessfulPull: this.lastSuccessfulPull,
+			conflicts: this.conflictCount,
+			pendingOperations: this.outboundQueue.totalPending,
+			hasInFlightBatch: this.currentBatch !== null,
+			reconnecting: this.reconnecting,
+			timestamp: Date.now(),
 		}
 	}
 
@@ -356,6 +419,7 @@ export class SyncEngine {
 		}
 
 		if (operations.length > 0) {
+			this.lastSuccessfulPull = Date.now()
 			this.emitter?.emit({
 				type: 'sync:received',
 				operations,
@@ -391,7 +455,9 @@ export class SyncEngine {
 		if (this.currentBatch) {
 			this.outboundQueue.acknowledge(this.currentBatch.batchId)
 			this.currentBatch = null
-			this.lastSyncedAt = Date.now()
+			const now = Date.now()
+			this.lastSyncedAt = now
+			this.lastSuccessfulPush = now
 		}
 
 		// Continue flushing if more ops in queue

@@ -166,7 +166,11 @@ export class EmailVerificationManager {
 	private readonly verificationStore: EmailVerificationStore
 	private readonly tokenTtlMs: number
 	private readonly maxRequestsPerUser: number
-	private readonly onVerificationRequired?: (email: string, token: string, expiresAt: number) => void | Promise<void>
+	private readonly onVerificationRequired?: (
+		email: string,
+		token: string,
+		expiresAt: number,
+	) => void | Promise<void>
 
 	constructor(config: EmailVerificationConfig) {
 		this.userStore = config.userStore
@@ -183,13 +187,19 @@ export class EmailVerificationManager {
 	async sendVerification(
 		userId: string,
 		email: string,
-	): Promise<{ status: number; body: { data: { message: string; token?: string } } | { error: string } }> {
+	): Promise<{
+		status: number
+		body: { data: { message: string; token?: string } } | { error: string }
+	}> {
 		const normalizedEmail = email.toLowerCase().trim()
 
 		// Rate limit
 		const activeCount = await this.verificationStore.countActiveForUser(userId)
 		if (activeCount >= this.maxRequestsPerUser) {
-			return { status: 429, body: { error: 'Too many verification requests. Please try again later.' } }
+			return {
+				status: 429,
+				body: { error: 'Too many verification requests. Please try again later.' },
+			}
 		}
 
 		// Generate token
@@ -229,9 +239,10 @@ export class EmailVerificationManager {
 	/**
 	 * Verify an email using a verification token.
 	 */
-	async verifyEmail(
-		token: string,
-	): Promise<{ status: number; body: { data: { message: string; userId: string; email: string } } | { error: string } }> {
+	async verifyEmail(token: string): Promise<{
+		status: number
+		body: { data: { message: string; userId: string; email: string } } | { error: string }
+	}> {
 		const verificationToken = await this.verificationStore.get(token)
 		if (!verificationToken || verificationToken.consumed) {
 			return { status: 404, body: { error: 'Verification token not found or already used.' } }
@@ -264,9 +275,10 @@ export class EmailVerificationManager {
 	 * Resend verification email for a user.
 	 * Delegates to sendVerification with rate limiting.
 	 */
-	async resendVerification(
-		userId: string,
-	): Promise<{ status: number; body: { data: { message: string; token?: string } } | { error: string } }> {
+	async resendVerification(userId: string): Promise<{
+		status: number
+		body: { data: { message: string; token?: string } } | { error: string }
+	}> {
 		const user = await this.userStore.findById(userId)
 		if (!user) {
 			return { status: 404, body: { error: 'User not found.' } }

@@ -1,6 +1,6 @@
+import { EventEmitter } from 'node:events'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'

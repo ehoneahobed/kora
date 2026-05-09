@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { UserStore, AuthUser, StoredUser, AuthDevice } from './user-store'
+import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DuplicateEmailError } from './user-store'
 
 /**
@@ -108,10 +108,12 @@ export class SqliteUserStore implements UserStore {
 		const id = randomUUID()
 
 		try {
-			this.db.prepare(`
+			this.db
+				.prepare(`
 				INSERT INTO auth_users (id, email, name, email_verified, created_at, password_hash, salt)
 				VALUES (?, ?, ?, 0, ?, ?, ?)
-			`).run(id, normalizedEmail, params.name, now, params.passwordHash, params.salt)
+			`)
+				.run(id, normalizedEmail, params.name, now, params.passwordHash, params.salt)
 		} catch (err: unknown) {
 			if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
 				throw new DuplicateEmailError()
@@ -123,17 +125,17 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async findByEmail(email: string): Promise<StoredUser | null> {
-		const row = this.db.prepare(
-			'SELECT * FROM auth_users WHERE email = ?',
-		).get(email.toLowerCase()) as UserRow | undefined
+		const row = this.db
+			.prepare('SELECT * FROM auth_users WHERE email = ?')
+			.get(email.toLowerCase()) as UserRow | undefined
 
 		return row ? rowToStoredUser(row) : null
 	}
 
 	async findById(id: string): Promise<StoredUser | null> {
-		const row = this.db.prepare(
-			'SELECT * FROM auth_users WHERE id = ?',
-		).get(id) as UserRow | undefined
+		const row = this.db.prepare('SELECT * FROM auth_users WHERE id = ?').get(id) as
+			| UserRow
+			| undefined
 
 		return row ? rowToStoredUser(row) : null
 	}
@@ -144,9 +146,9 @@ export class SqliteUserStore implements UserStore {
 		publicKey: string
 		name: string
 	}): Promise<AuthDevice> {
-		const existing = this.db.prepare(
-			'SELECT * FROM auth_devices WHERE id = ?',
-		).get(params.id) as DeviceRow | undefined
+		const existing = this.db.prepare('SELECT * FROM auth_devices WHERE id = ?').get(params.id) as
+			| DeviceRow
+			| undefined
 
 		if (existing && !existing.revoked) {
 			return rowToDevice(existing)
@@ -156,15 +158,19 @@ export class SqliteUserStore implements UserStore {
 
 		if (existing) {
 			// Re-activate previously revoked device
-			this.db.prepare(`
+			this.db
+				.prepare(`
 				UPDATE auth_devices SET revoked = 0, public_key = ?, name = ?, last_seen_at = ?
 				WHERE id = ?
-			`).run(params.publicKey, params.name, now, params.id)
+			`)
+				.run(params.publicKey, params.name, now, params.id)
 		} else {
-			this.db.prepare(`
+			this.db
+				.prepare(`
 				INSERT INTO auth_devices (id, user_id, public_key, name, revoked, created_at, last_seen_at)
 				VALUES (?, ?, ?, ?, 0, ?, ?)
-			`).run(params.id, params.userId, params.publicKey, params.name, now, now)
+			`)
+				.run(params.id, params.userId, params.publicKey, params.name, now, now)
 		}
 
 		return {
@@ -179,17 +185,17 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async findDevice(deviceId: string): Promise<AuthDevice | null> {
-		const row = this.db.prepare(
-			'SELECT * FROM auth_devices WHERE id = ?',
-		).get(deviceId) as DeviceRow | undefined
+		const row = this.db.prepare('SELECT * FROM auth_devices WHERE id = ?').get(deviceId) as
+			| DeviceRow
+			| undefined
 
 		return row ? rowToDevice(row) : null
 	}
 
 	async listDevices(userId: string): Promise<AuthDevice[]> {
-		const rows = this.db.prepare(
-			'SELECT * FROM auth_devices WHERE user_id = ?',
-		).all(userId) as DeviceRow[]
+		const rows = this.db
+			.prepare('SELECT * FROM auth_devices WHERE user_id = ?')
+			.all(userId) as DeviceRow[]
 
 		return rows.map(rowToDevice)
 	}
@@ -199,15 +205,15 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
-		this.db.prepare(
-			'UPDATE auth_users SET email_verified = ? WHERE id = ?',
-		).run(verified ? 1 : 0, userId)
+		this.db
+			.prepare('UPDATE auth_users SET email_verified = ? WHERE id = ?')
+			.run(verified ? 1 : 0, userId)
 	}
 
 	async updatePassword(userId: string, passwordHash: string, salt: string): Promise<void> {
-		this.db.prepare(
-			'UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ?',
-		).run(passwordHash, salt, userId)
+		this.db
+			.prepare('UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ?')
+			.run(passwordHash, salt, userId)
 	}
 
 	async listAll(): Promise<StoredUser[]> {
@@ -216,11 +222,13 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async update(user: StoredUser): Promise<void> {
-		this.db.prepare(`
+		this.db
+			.prepare(`
 			UPDATE auth_users
 			SET email = ?, name = ?, email_verified = ?, password_hash = ?, salt = ?
 			WHERE id = ?
-		`).run(user.email, user.name, user.emailVerified ? 1 : 0, user.passwordHash, user.salt, user.id)
+		`)
+			.run(user.email, user.name, user.emailVerified ? 1 : 0, user.passwordHash, user.salt, user.id)
 	}
 
 	async delete(userId: string): Promise<void> {
@@ -232,9 +240,9 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async touchDevice(deviceId: string): Promise<void> {
-		this.db.prepare(
-			'UPDATE auth_devices SET last_seen_at = ? WHERE id = ?',
-		).run(Date.now(), deviceId)
+		this.db
+			.prepare('UPDATE auth_devices SET last_seen_at = ? WHERE id = ?')
+			.run(Date.now(), deviceId)
 	}
 }
 
@@ -259,7 +267,9 @@ async function loadBetterSqlite3(): Promise<new (filename: string) => unknown> {
 		// Use createRequire for CJS compatibility with better-sqlite3
 		const { createRequire } = await import('node:module')
 		const require = createRequire(import.meta.url)
-		return require('better-sqlite3') as new (filename: string) => unknown
+		return require('better-sqlite3') as new (
+			filename: string,
+		) => unknown
 	} catch {
 		throw new Error(
 			'SQLite backend requires the "better-sqlite3" package. Install it in your project dependencies.',

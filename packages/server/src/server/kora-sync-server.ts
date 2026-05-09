@@ -62,7 +62,10 @@ export class KoraSyncServer {
 	private readonly path: string
 
 	private readonly sessions = new Map<string, ClientSession>()
-	private readonly httpClients = new Map<string, { sessionId: string; transport: HttpServerTransport }>()
+	private readonly httpClients = new Map<
+		string,
+		{ sessionId: string; transport: HttpServerTransport }
+	>()
 	private readonly httpSessionToClient = new Map<string, string>()
 	private wsServer: WsServerLike | null = null
 	private running = false
@@ -273,7 +276,10 @@ export class KoraSyncServer {
 		}
 	}
 
-	private getOrCreateHttpClient(clientId: string): { sessionId: string; transport: HttpServerTransport } {
+	private getOrCreateHttpClient(clientId: string): {
+		sessionId: string
+		transport: HttpServerTransport
+	} {
 		const existing = this.httpClients.get(clientId)
 		if (existing) {
 			return existing

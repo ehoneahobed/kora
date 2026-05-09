@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import { OrgRoutes } from './org-routes'
 import { InMemoryOrgStore } from './org-store'
 
@@ -482,7 +482,7 @@ describe('OrgRoutes', () => {
 
 			// Verify new owner
 			const org = await store.getOrg(orgId)
-			expect(org!.ownerId).toBe('user-2')
+			expect(org?.ownerId).toBe('user-2')
 		})
 
 		test('admin cannot transfer ownership (403)', async () => {
@@ -646,9 +646,11 @@ describe('OrgRoutes', () => {
 			const token = 'data' in invResult.body ? invResult.body.data.token : ''
 
 			// Expire the invitation
-			const invitations = (store as any).invitations as Map<string, any>
-			const stored = invitations.get(invId)!
-			invitations.set(invId, { ...stored, expiresAt: Date.now() - 1000 })
+			const invitations = (
+				store as unknown as { invitations: Map<string, Record<string, unknown>> }
+			).invitations
+			const stored = invitations.get(invId)
+			if (stored) invitations.set(invId, { ...stored, expiresAt: Date.now() - 1000 })
 
 			const result = await routes.acceptInvitation('user-2', { token })
 			expect(result.status).toBe(410)

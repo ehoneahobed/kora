@@ -28,10 +28,12 @@ describe('generateMigration', () => {
 		const diff = diffSchemas(previous, current)
 		const generated = generateMigration(previous, current, diff)
 
-		expect(generated.up.some((statement) => statement.includes('CREATE TABLE IF NOT EXISTS todos'))).toBe(
-			true,
-		)
-		expect(generated.down.some((statement) => statement.includes('DROP TABLE IF EXISTS todos'))).toBe(true)
+		expect(
+			generated.up.some((statement) => statement.includes('CREATE TABLE IF NOT EXISTS todos')),
+		).toBe(true)
+		expect(
+			generated.down.some((statement) => statement.includes('DROP TABLE IF EXISTS todos')),
+		).toBe(true)
 	})
 
 	test('generates rebuild statements for changed collection', () => {
@@ -59,12 +61,14 @@ describe('generateMigration', () => {
 		const diff = diffSchemas(previous, current)
 		const generated = generateMigration(previous, current, diff)
 
-		expect(generated.up.some((statement) => statement.includes('CREATE TABLE _kora_mig_todos_new'))).toBe(
-			true,
-		)
-		expect(generated.up.some((statement) => statement.includes('ALTER TABLE _kora_mig_todos_new RENAME TO todos'))).toBe(
-			true,
-		)
+		expect(
+			generated.up.some((statement) => statement.includes('CREATE TABLE _kora_mig_todos_new')),
+		).toBe(true)
+		expect(
+			generated.up.some((statement) =>
+				statement.includes('ALTER TABLE _kora_mig_todos_new RENAME TO todos'),
+			),
+		).toBe(true)
 	})
 
 	test('adds conversion SQL for string-to-boolean field change', () => {
@@ -91,7 +95,7 @@ describe('generateMigration', () => {
 			statement.startsWith('INSERT INTO _kora_mig_todos_new'),
 		)
 
-		expect(insertStatement).toContain("LOWER(TRIM(CAST(done AS TEXT)))")
+		expect(insertStatement).toContain('LOWER(TRIM(CAST(done AS TEXT)))')
 		expect(insertStatement).toContain("IN ('1','true','t','yes','y','on')")
 	})
 

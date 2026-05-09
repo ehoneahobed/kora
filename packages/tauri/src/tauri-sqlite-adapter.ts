@@ -275,10 +275,10 @@ export class TauriSqliteAdapter implements StorageAdapter {
 								params: params ?? [],
 							})
 						} catch (error) {
-							throw new TauriAdapterError(
-								`Transaction query failed: ${(error as Error).message}`,
-								{ sql, params },
-							)
+							throw new TauriAdapterError(`Transaction query failed: ${(error as Error).message}`, {
+								sql,
+								params,
+							})
 						}
 					},
 				}

@@ -150,10 +150,9 @@ export class IndexedDBDeviceKeyStore implements DeviceKeyStore {
 			request.onerror = () => {
 				this.dbPromise = null
 				reject(
-					new DeviceKeyStoreError(
-						'Failed to open IndexedDB database for device key storage.',
-						{ error: request.error?.message },
-					),
+					new DeviceKeyStoreError('Failed to open IndexedDB database for device key storage.', {
+						error: request.error?.message,
+					}),
 				)
 			}
 
@@ -191,21 +190,18 @@ export class IndexedDBDeviceKeyStore implements DeviceKeyStore {
 
 				tx.onerror = () => {
 					reject(
-						new DeviceKeyStoreError(
-							`Failed to save key pair for device "${deviceId}".`,
-							{ deviceId, error: tx.error?.message },
-						),
+						new DeviceKeyStoreError(`Failed to save key pair for device "${deviceId}".`, {
+							deviceId,
+							error: tx.error?.message,
+						}),
 					)
 				}
 			} catch (cause) {
 				reject(
-					new DeviceKeyStoreError(
-						`Failed to save key pair for device "${deviceId}".`,
-						{
-							deviceId,
-							cause: cause instanceof Error ? cause.message : String(cause),
-						},
-					),
+					new DeviceKeyStoreError(`Failed to save key pair for device "${deviceId}".`, {
+						deviceId,
+						cause: cause instanceof Error ? cause.message : String(cause),
+					}),
 				)
 			}
 		})
@@ -228,21 +224,18 @@ export class IndexedDBDeviceKeyStore implements DeviceKeyStore {
 
 				request.onerror = () => {
 					reject(
-						new DeviceKeyStoreError(
-							`Failed to load key pair for device "${deviceId}".`,
-							{ deviceId, error: request.error?.message },
-						),
+						new DeviceKeyStoreError(`Failed to load key pair for device "${deviceId}".`, {
+							deviceId,
+							error: request.error?.message,
+						}),
 					)
 				}
 			} catch (cause) {
 				reject(
-					new DeviceKeyStoreError(
-						`Failed to load key pair for device "${deviceId}".`,
-						{
-							deviceId,
-							cause: cause instanceof Error ? cause.message : String(cause),
-						},
-					),
+					new DeviceKeyStoreError(`Failed to load key pair for device "${deviceId}".`, {
+						deviceId,
+						cause: cause instanceof Error ? cause.message : String(cause),
+					}),
 				)
 			}
 		})
@@ -264,21 +257,18 @@ export class IndexedDBDeviceKeyStore implements DeviceKeyStore {
 
 				tx.onerror = () => {
 					reject(
-						new DeviceKeyStoreError(
-							`Failed to delete key pair for device "${deviceId}".`,
-							{ deviceId, error: tx.error?.message },
-						),
+						new DeviceKeyStoreError(`Failed to delete key pair for device "${deviceId}".`, {
+							deviceId,
+							error: tx.error?.message,
+						}),
 					)
 				}
 			} catch (cause) {
 				reject(
-					new DeviceKeyStoreError(
-						`Failed to delete key pair for device "${deviceId}".`,
-						{
-							deviceId,
-							cause: cause instanceof Error ? cause.message : String(cause),
-						},
-					),
+					new DeviceKeyStoreError(`Failed to delete key pair for device "${deviceId}".`, {
+						deviceId,
+						cause: cause instanceof Error ? cause.message : String(cause),
+					}),
 				)
 			}
 		})
@@ -311,13 +301,10 @@ export class IndexedDBDeviceKeyStore implements DeviceKeyStore {
 				}
 			} catch (cause) {
 				reject(
-					new DeviceKeyStoreError(
-						`Failed to check if key pair exists for device "${deviceId}".`,
-						{
-							deviceId,
-							cause: cause instanceof Error ? cause.message : String(cause),
-						},
-					),
+					new DeviceKeyStoreError(`Failed to check if key pair exists for device "${deviceId}".`, {
+						deviceId,
+						cause: cause instanceof Error ? cause.message : String(cause),
+					}),
 				)
 			}
 		})

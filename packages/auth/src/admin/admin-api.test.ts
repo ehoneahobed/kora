@@ -1,14 +1,14 @@
-import { describe, test, expect, beforeEach } from 'vitest'
-import { AdminApi, AdminUserNotFoundError } from './admin-api'
-import { AuditLogger, InMemoryAuditLogStore } from './audit-log'
+import { beforeEach, describe, expect, test } from 'vitest'
 import { InMemoryUserStore } from '../provider/built-in/user-store'
 import { InMemorySessionStore } from '../session/session'
 import type { Session } from '../session/session'
+import { AdminApi, AdminUserNotFoundError } from './admin-api'
+import { AuditLogger, InMemoryAuditLogStore } from './audit-log'
 
 async function createTestUser(
 	store: InMemoryUserStore,
 	email: string,
-	name: string = 'Test User',
+	name = 'Test User',
 ): Promise<string> {
 	const user = await store.createUser({
 		email,
@@ -60,9 +60,7 @@ describe('AdminApi', () => {
 		})
 
 		test('throws for non-existent user', async () => {
-			await expect(admin.getUser('admin-1', 'nonexistent')).rejects.toThrow(
-				AdminUserNotFoundError,
-			)
+			await expect(admin.getUser('admin-1', 'nonexistent')).rejects.toThrow(AdminUserNotFoundError)
 		})
 
 		test('creates audit log entry', async () => {
@@ -71,8 +69,8 @@ describe('AdminApi', () => {
 
 			const entries = await auditLogger.query({ actions: ['admin.user_lookup'] })
 			expect(entries).toHaveLength(1)
-			expect(entries[0]!.actorId).toBe('admin-1')
-			expect(entries[0]!.targetId).toBe(userId)
+			expect(entries[0]?.actorId).toBe('admin-1')
+			expect(entries[0]?.targetId).toBe(userId)
 		})
 	})
 
@@ -94,7 +92,7 @@ describe('AdminApi', () => {
 
 			const result = await admin.listUsers({ email: 'example' })
 			expect(result.data).toHaveLength(1)
-			expect(result.data[0]!.email).toBe('alice@example.com')
+			expect(result.data[0]?.email).toBe('alice@example.com')
 		})
 
 		test('filters by email verified', async () => {
@@ -104,11 +102,11 @@ describe('AdminApi', () => {
 
 			const verified = await admin.listUsers({ emailVerified: true })
 			expect(verified.data).toHaveLength(1)
-			expect(verified.data[0]!.email).toBe('alice@example.com')
+			expect(verified.data[0]?.email).toBe('alice@example.com')
 
 			const unverified = await admin.listUsers({ emailVerified: false })
 			expect(unverified.data).toHaveLength(1)
-			expect(unverified.data[0]!.email).toBe('bob@example.com')
+			expect(unverified.data[0]?.email).toBe('bob@example.com')
 		})
 
 		test('paginates results', async () => {
@@ -159,9 +157,9 @@ describe('AdminApi', () => {
 		})
 
 		test('throws for non-existent user', async () => {
-			await expect(
-				admin.updateUser('admin-1', 'nonexistent', { name: 'X' }),
-			).rejects.toThrow(AdminUserNotFoundError)
+			await expect(admin.updateUser('admin-1', 'nonexistent', { name: 'X' })).rejects.toThrow(
+				AdminUserNotFoundError,
+			)
 		})
 
 		test('creates audit log entry', async () => {
@@ -170,7 +168,7 @@ describe('AdminApi', () => {
 
 			const entries = await auditLogger.query({ actions: ['user.update'] })
 			expect(entries).toHaveLength(1)
-			expect(entries[0]!.metadata).toEqual({ updates: { name: 'Updated' } })
+			expect(entries[0]?.metadata).toEqual({ updates: { name: 'Updated' } })
 		})
 	})
 

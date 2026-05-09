@@ -1,4 +1,5 @@
 import { SchemaValidationError } from '../errors/errors'
+import type { MigrationDefinition } from '../migrations/migration-builder'
 import type {
 	CollectionDefinition,
 	Constraint,
@@ -25,13 +26,18 @@ export interface SchemaInput {
 	version: number
 	collections: Record<string, CollectionInput>
 	relations?: Record<string, RelationInput>
+	/** Schema migrations keyed by target version number. */
+	migrations?: Record<number, MigrationDefinition>
 }
 
 export interface CollectionInput {
+	// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
 	fields: Record<string, FieldBuilder<any, any, any>>
 	indexes?: string[]
 	constraints?: ConstraintInput[]
 	resolve?: Record<string, CustomResolver>
+	/** Scope fields for sync filtering. Only records matching the client's scope values are synced. */
+	scope?: string[]
 }
 
 export interface ConstraintInput {
@@ -111,7 +117,33 @@ export function defineSchema<const T extends SchemaInput>(input: T): TypedSchema
 		}
 	}
 
-	return { version: input.version, collections, relations } as TypedSchemaDefinition<T>
+	const migrations: Record<number, MigrationDefinition> = {}
+	if (input.migrations) {
+		for (const [versionStr, migration] of Object.entries(input.migrations)) {
+			const version = Number(versionStr)
+			if (!Number.isInteger(version) || version < 2) {
+				throw new SchemaValidationError(
+					`Migration key "${versionStr}" is invalid. Must be an integer >= 2 (version 1 is the initial schema).`,
+					{ version: versionStr },
+				)
+			}
+			if (version > input.version) {
+				throw new SchemaValidationError(
+					`Migration version ${version} exceeds schema version ${input.version}. Migrations must target versions <= schema version.`,
+					{ migrationVersion: version, schemaVersion: input.version },
+				)
+			}
+			if (!migration.steps || migration.steps.length === 0) {
+				throw new SchemaValidationError(
+					`Migration for version ${version} has no steps. Use migrate() to define at least one step.`,
+					{ version },
+				)
+			}
+			migrations[version] = migration
+		}
+	}
+
+	return { version: input.version, collections, relations, migrations } as TypedSchemaDefinition<T>
 }
 
 function validateVersion(version: number): void {
@@ -182,7 +214,20 @@ function buildCollection(name: string, input: CollectionInput): CollectionDefini
 		}
 	}
 
-	return { fields, indexes, constraints, resolvers }
+	const scope: string[] = []
+	if (input.scope) {
+		for (const scopeField of input.scope) {
+			if (!(scopeField in fields)) {
+				throw new SchemaValidationError(
+					`Scope field "${scopeField}" does not exist in collection "${name}". Available fields: ${Object.keys(fields).join(', ')}`,
+					{ collection: name, field: scopeField },
+				)
+			}
+			scope.push(scopeField)
+		}
+	}
+
+	return { fields, indexes, constraints, resolvers, scope }
 }
 
 function validateFieldName(collection: string, fieldName: string): void {

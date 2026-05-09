@@ -3,13 +3,14 @@ import { defineSchema, t } from '@korajs/core'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { MemoryServerStore } from './memory-server-store'
-import { SqliteServerStore } from './sqlite-server-store'
 import {
 	generateAllCollectionDDL,
 	generateCollectionDDL,
 	replayOperationsForRecord,
 } from './materialization'
+import { MemoryServerStore } from './memory-server-store'
+import type { MaterializedRecord } from './server-store'
+import { SqliteServerStore } from './sqlite-server-store'
 
 // ---------------------------------------------------------------------------
 // Test schema
@@ -124,7 +125,7 @@ describe('replayOperationsForRecord', () => {
 describe('generateCollectionDDL', () => {
 	test('generates CREATE TABLE with correct columns', () => {
 		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
-		const createTable = ddl[0]!
+		const createTable = ddl[0] as string
 		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS forms')
 		expect(createTable).toContain('id TEXT PRIMARY KEY NOT NULL')
 		expect(createTable).toContain('title TEXT')
@@ -154,14 +155,14 @@ describe('generateCollectionDDL', () => {
 
 	test('postgres dialect uses correct types', () => {
 		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'postgres')
-		const createTable = ddl[0]!
+		const createTable = ddl[0] as string
 		expect(createTable).toContain('viewCount DOUBLE PRECISION')
 		expect(createTable).toContain('_created_at BIGINT NOT NULL DEFAULT 0')
 	})
 
 	test('generates enum CHECK constraints', () => {
 		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
-		const createTable = ddl[0]!
+		const createTable = ddl[0] as string
 		expect(createTable).toContain("CHECK (status IN ('draft', 'published', 'archived'))")
 	})
 })
@@ -203,22 +204,26 @@ describe('SqliteServerStore materialization', () => {
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).not.toBeNull()
-		expect(record!.title).toBe('My Form')
-		expect(record!.slug).toBe('my-form')
-		expect(record!.status).toBe('published')
+		expect((record as MaterializedRecord).title).toBe('My Form')
+		expect((record as MaterializedRecord).slug).toBe('my-form')
+		expect((record as MaterializedRecord).status).toBe('published')
 	})
 
 	test('materializeCollection reads from table when schema set', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Form 1', slug: 'form-1', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'Form 2', slug: 'form-2', status: 'draft' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Form 1', slug: 'form-1', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'Form 2', slug: 'form-2', status: 'draft' },
+			}),
+		)
 
 		const records = await store.materializeCollection('forms')
 		expect(records).toHaveLength(2)
@@ -227,31 +232,39 @@ describe('SqliteServerStore materialization', () => {
 
 	test('materializeCollection falls back to ops replay without schema', async () => {
 		// No setSchema() call
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Form 1', slug: 'form-1' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Form 1', slug: 'form-1' },
+			}),
+		)
 
 		const records = await store.materializeCollection('forms')
 		expect(records).toHaveLength(1)
-		expect(records[0]!.title).toBe('Form 1')
+		expect((records[0] as MaterializedRecord).title).toBe('Form 1')
 	})
 
 	test('queryCollection filters with WHERE', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Published', slug: 'pub', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'Draft', slug: 'dra', status: 'draft' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-3',
-			data: { title: 'Also Published', slug: 'pub2', status: 'published' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Published', slug: 'pub', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'Draft', slug: 'dra', status: 'draft' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-3',
+				data: { title: 'Also Published', slug: 'pub2', status: 'published' },
+			}),
+		)
 
 		const published = await store.queryCollection('forms', {
 			where: { status: 'published' },
@@ -263,37 +276,47 @@ describe('SqliteServerStore materialization', () => {
 	test('queryCollection supports multiple WHERE conditions', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Target', slug: 'target', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'Wrong Status', slug: 'target', status: 'draft' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Target', slug: 'target', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'Wrong Status', slug: 'target', status: 'draft' },
+			}),
+		)
 
 		const results = await store.queryCollection('forms', {
 			where: { slug: 'target', status: 'published' },
 		})
 		expect(results).toHaveLength(1)
-		expect(results[0]!.title).toBe('Target')
+		expect((results[0] as MaterializedRecord).title).toBe('Target')
 	})
 
 	test('queryCollection supports ORDER BY', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-a',
-			data: { title: 'B Form', slug: 'b' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-b',
-			data: { title: 'A Form', slug: 'a' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-c',
-			data: { title: 'C Form', slug: 'c' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-a',
+				data: { title: 'B Form', slug: 'b' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-b',
+				data: { title: 'A Form', slug: 'a' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-c',
+				data: { title: 'C Form', slug: 'c' },
+			}),
+		)
 
 		const asc = await store.queryCollection('forms', {
 			orderBy: 'title',
@@ -312,10 +335,12 @@ describe('SqliteServerStore materialization', () => {
 		await store.setSchema(testSchema)
 
 		for (let i = 1; i <= 5; i++) {
-			await store.applyRemoteOperation(createTestOp({
-				recordId: `form-${i}`,
-				data: { title: `Form ${i}`, slug: `form-${i}` },
-			}))
+			await store.applyRemoteOperation(
+				createTestOp({
+					recordId: `form-${i}`,
+					data: { title: `Form ${i}`, slug: `form-${i}` },
+				}),
+			)
 		}
 
 		const page1 = await store.queryCollection('forms', {
@@ -340,14 +365,16 @@ describe('SqliteServerStore materialization', () => {
 	test('findRecord returns single record', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Found', slug: 'found' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Found', slug: 'found' },
+			}),
+		)
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).not.toBeNull()
-		expect(record!.title).toBe('Found')
+		expect((record as MaterializedRecord).title).toBe('Found')
 	})
 
 	test('findRecord returns null for non-existent record', async () => {
@@ -360,18 +387,24 @@ describe('SqliteServerStore materialization', () => {
 	test('countCollection counts records', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'A', slug: 'a', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'B', slug: 'b', status: 'draft' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-3',
-			data: { title: 'C', slug: 'c', status: 'published' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'A', slug: 'a', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'B', slug: 'b', status: 'draft' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-3',
+				data: { title: 'C', slug: 'c', status: 'published' },
+			}),
+		)
 
 		expect(await store.countCollection('forms')).toBe(3)
 		expect(await store.countCollection('forms', { status: 'published' })).toBe(2)
@@ -381,38 +414,46 @@ describe('SqliteServerStore materialization', () => {
 	test('updates modify materialized records correctly', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			type: 'insert',
-			recordId: 'form-1',
-			data: { title: 'Original', slug: 'original', status: 'draft' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'insert',
+				recordId: 'form-1',
+				data: { title: 'Original', slug: 'original', status: 'draft' },
+			}),
+		)
 
-		await store.applyRemoteOperation(createTestOp({
-			type: 'update',
-			recordId: 'form-1',
-			data: { title: 'Updated', status: 'published' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'update',
+				recordId: 'form-1',
+				data: { title: 'Updated', status: 'published' },
+			}),
+		)
 
 		const record = await store.findRecord('forms', 'form-1')
-		expect(record!.title).toBe('Updated')
-		expect(record!.slug).toBe('original') // unchanged
-		expect(record!.status).toBe('published')
+		expect((record as MaterializedRecord).title).toBe('Updated')
+		expect((record as MaterializedRecord).slug).toBe('original') // unchanged
+		expect((record as MaterializedRecord).status).toBe('published')
 	})
 
 	test('deletes soft-delete materialized records', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			type: 'insert',
-			recordId: 'form-1',
-			data: { title: 'To Delete', slug: 'del' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'insert',
+				recordId: 'form-1',
+				data: { title: 'To Delete', slug: 'del' },
+			}),
+		)
 
-		await store.applyRemoteOperation(createTestOp({
-			type: 'delete',
-			recordId: 'form-1',
-			data: null,
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'delete',
+				recordId: 'form-1',
+				data: null,
+			}),
+		)
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).toBeNull()
@@ -427,60 +468,70 @@ describe('SqliteServerStore materialization', () => {
 
 	test('backfill works when schema is set after operations exist', async () => {
 		// Insert operations BEFORE setting schema
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Pre-Schema Form', slug: 'pre-schema', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			type: 'update',
-			recordId: 'form-1',
-			data: { title: 'Updated Pre-Schema' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Pre-Schema Form', slug: 'pre-schema', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'update',
+				recordId: 'form-1',
+				data: { title: 'Updated Pre-Schema' },
+			}),
+		)
 
 		// Now set schema — should backfill
 		await store.setSchema(testSchema)
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).not.toBeNull()
-		expect(record!.title).toBe('Updated Pre-Schema')
-		expect(record!.slug).toBe('pre-schema')
-		expect(record!.status).toBe('published')
+		expect((record as MaterializedRecord).title).toBe('Updated Pre-Schema')
+		expect((record as MaterializedRecord).slug).toBe('pre-schema')
+		expect((record as MaterializedRecord).status).toBe('published')
 	})
 
 	test('concurrent operations on same record produce correct state', async () => {
 		await store.setSchema(testSchema)
 
 		// Simulate two clients updating the same record concurrently
-		await store.applyRemoteOperation(createTestOp({
-			type: 'insert',
-			nodeId: 'node-a',
-			recordId: 'shared-1',
-			data: { title: 'Original', slug: 'shared', status: 'draft' },
-			timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'insert',
+				nodeId: 'node-a',
+				recordId: 'shared-1',
+				data: { title: 'Original', slug: 'shared', status: 'draft' },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
+			}),
+		)
 
 		// Client A updates title at HLC 1001
-		await store.applyRemoteOperation(createTestOp({
-			type: 'update',
-			nodeId: 'node-a',
-			recordId: 'shared-1',
-			data: { title: 'From A' },
-			timestamp: { wallTime: 1001, logical: 0, nodeId: 'node-a' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'update',
+				nodeId: 'node-a',
+				recordId: 'shared-1',
+				data: { title: 'From A' },
+				timestamp: { wallTime: 1001, logical: 0, nodeId: 'node-a' },
+			}),
+		)
 
 		// Client B updates status at HLC 1002 (later)
-		await store.applyRemoteOperation(createTestOp({
-			type: 'update',
-			nodeId: 'node-b',
-			recordId: 'shared-1',
-			data: { status: 'published' },
-			timestamp: { wallTime: 1002, logical: 0, nodeId: 'node-b' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'update',
+				nodeId: 'node-b',
+				recordId: 'shared-1',
+				data: { status: 'published' },
+				timestamp: { wallTime: 1002, logical: 0, nodeId: 'node-b' },
+			}),
+		)
 
 		const record = await store.findRecord('forms', 'shared-1')
-		expect(record!.title).toBe('From A') // From earlier update
-		expect(record!.status).toBe('published') // From later update
-		expect(record!.slug).toBe('shared') // From original insert
+		expect((record as MaterializedRecord).title).toBe('From A') // From earlier update
+		expect((record as MaterializedRecord).status).toBe('published') // From later update
+		expect((record as MaterializedRecord).slug).toBe('shared') // From original insert
 	})
 
 	test('queryCollection throws without schema', async () => {
@@ -494,20 +545,22 @@ describe('SqliteServerStore materialization', () => {
 
 	test('queryCollection validates field names', async () => {
 		await store.setSchema(testSchema)
-		await expect(
-			store.queryCollection('forms', { where: { invalid_field: 'x' } }),
-		).rejects.toThrow('Invalid field name')
+		await expect(store.queryCollection('forms', { where: { invalid_field: 'x' } })).rejects.toThrow(
+			'Invalid field name',
+		)
 	})
 
 	test('operations for collections not in schema skip materialization', async () => {
 		await store.setSchema(testSchema)
 
 		// Insert into a collection that's not in the schema
-		await store.applyRemoteOperation(createTestOp({
-			collection: 'unknown_collection',
-			recordId: 'rec-1',
-			data: { foo: 'bar' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				collection: 'unknown_collection',
+				recordId: 'rec-1',
+				data: { foo: 'bar' },
+			}),
+		)
 
 		// Operation is stored but no materialized table
 		expect(await store.getOperationCount()).toBe(1)
@@ -539,59 +592,71 @@ describe('MemoryServerStore materialization', () => {
 	test('dual-write materializes records on applyRemoteOperation', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Memory Form', slug: 'mem' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Memory Form', slug: 'mem' },
+			}),
+		)
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).not.toBeNull()
-		expect(record!.title).toBe('Memory Form')
+		expect((record as MaterializedRecord).title).toBe('Memory Form')
 	})
 
 	test('queryCollection filters and orders', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'B', slug: 'b', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'A', slug: 'a', status: 'draft' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'B', slug: 'b', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'A', slug: 'a', status: 'draft' },
+			}),
+		)
 
 		const published = await store.queryCollection('forms', {
 			where: { status: 'published' },
 		})
 		expect(published).toHaveLength(1)
-		expect(published[0]!.title).toBe('B')
+		expect((published[0] as MaterializedRecord).title).toBe('B')
 	})
 
 	test('backfill works when schema set after operations', async () => {
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'Early', slug: 'early' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'Early', slug: 'early' },
+			}),
+		)
 
 		await store.setSchema(testSchema)
 
 		const record = await store.findRecord('forms', 'form-1')
 		expect(record).not.toBeNull()
-		expect(record!.title).toBe('Early')
+		expect((record as MaterializedRecord).title).toBe('Early')
 	})
 
 	test('countCollection works', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-1',
-			data: { title: 'A', slug: 'a', status: 'published' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			recordId: 'form-2',
-			data: { title: 'B', slug: 'b', status: 'draft' },
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-1',
+				data: { title: 'A', slug: 'a', status: 'published' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				recordId: 'form-2',
+				data: { title: 'B', slug: 'b', status: 'draft' },
+			}),
+		)
 
 		expect(await store.countCollection('forms')).toBe(2)
 		expect(await store.countCollection('forms', { status: 'published' })).toBe(1)
@@ -600,16 +665,20 @@ describe('MemoryServerStore materialization', () => {
 	test('delete soft-deletes records', async () => {
 		await store.setSchema(testSchema)
 
-		await store.applyRemoteOperation(createTestOp({
-			type: 'insert',
-			recordId: 'form-1',
-			data: { title: 'Will Delete', slug: 'del' },
-		}))
-		await store.applyRemoteOperation(createTestOp({
-			type: 'delete',
-			recordId: 'form-1',
-			data: null,
-		}))
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'insert',
+				recordId: 'form-1',
+				data: { title: 'Will Delete', slug: 'del' },
+			}),
+		)
+		await store.applyRemoteOperation(
+			createTestOp({
+				type: 'delete',
+				recordId: 'form-1',
+				data: null,
+			}),
+		)
 
 		expect(await store.findRecord('forms', 'form-1')).toBeNull()
 		expect(await store.countCollection('forms')).toBe(0)

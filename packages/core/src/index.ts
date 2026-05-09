@@ -3,12 +3,15 @@
 
 // === Types ===
 export type {
+	AtomicOp,
+	AtomicOpType,
 	CollectionDefinition,
 	ConnectionQuality,
 	Constraint,
 	CustomResolver,
 	FieldDescriptor,
 	FieldKind,
+	FieldMergeStrategy,
 	HLCTimestamp,
 	MergeStrategy,
 	OnDeleteAction,
@@ -19,6 +22,7 @@ export type {
 	RelationDefinition,
 	RelationType,
 	SchemaDefinition,
+	SequenceConfig,
 	TimeSource,
 	VersionVector,
 } from './types'
@@ -48,6 +52,15 @@ export {
 	isValidOperation,
 	verifyOperationIntegrity,
 } from './operations/operation'
+
+// === Atomic Operations ===
+export {
+	isAtomicOp,
+	op,
+	resolveAtomicOp,
+	toAtomicOp,
+} from './operations/atomic-ops'
+export type { AtomicOpSentinel } from './operations/atomic-ops'
 
 // === Schema ===
 export { defineSchema } from './schema/define'
@@ -83,6 +96,18 @@ export {
 	vectorsEqual,
 } from './version-vector/version-vector'
 export type { OperationLog } from './version-vector/version-vector'
+
+// === Scopes ===
+export { buildScopeMap } from './scopes/build-scope-map'
+export type { ScopeMap } from './scopes/build-scope-map'
+
+// === Sequences ===
+export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence-format'
+
+// === Migrations ===
+export { MigrationBuilder, migrate } from './migrations/migration-builder'
+export type { MigrationDefinition, MigrationStep } from './migrations/migration-builder'
+export { migrationStepsToSQL } from './migrations/migration-sql'
 
 // === Events ===
 export type {

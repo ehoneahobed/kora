@@ -1,6 +1,6 @@
 import { KoraError } from '@korajs/core'
-import type { UserStore } from './user-store'
 import { hashPassword } from './password-hash'
+import type { UserStore } from './user-store'
 
 // ============================================================================
 // Types
@@ -179,7 +179,11 @@ export class PasswordResetManager {
 	private readonly resetStore: PasswordResetStore
 	private readonly tokenTtlMs: number
 	private readonly maxRequestsPerEmail: number
-	private readonly onResetRequested?: (email: string, token: string, expiresAt: number) => void | Promise<void>
+	private readonly onResetRequested?: (
+		email: string,
+		token: string,
+		expiresAt: number,
+	) => void | Promise<void>
 
 	constructor(config: PasswordResetConfig) {
 		this.userStore = config.userStore
@@ -196,13 +200,20 @@ export class PasswordResetManager {
 	 * If a callback is configured, invokes it with the token.
 	 * In development mode (no callback), returns the token in the response.
 	 */
-	async requestReset(email: string): Promise<{ status: number; body: { data: { message: string; token?: string } } | { error: string } }> {
+	async requestReset(email: string): Promise<{
+		status: number
+		body: { data: { message: string; token?: string } } | { error: string }
+	}> {
 		const normalizedEmail = email.toLowerCase().trim()
 
 		// Always return 200 to prevent email enumeration
 		const successResponse = {
 			status: 200,
-			body: { data: { message: 'If an account with that email exists, a password reset link has been sent.' } } as { data: { message: string; token?: string } },
+			body: {
+				data: {
+					message: 'If an account with that email exists, a password reset link has been sent.',
+				},
+			} as { data: { message: string; token?: string } },
 		}
 
 		// Look up user

@@ -1,14 +1,14 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest'
-import { buildPanelModel } from './panel-state'
-import type { DevtoolsPanelModel, TimelineItem, ConflictItem, OperationItem } from './panel-state'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import {
 	createSampleEvent,
 	createSampleMergeTrace,
-	createTimestampedEvent,
 	createSampleOperation,
+	createTimestampedEvent,
 } from '../../tests/fixtures/test-helpers'
 import type { TimestampedEvent } from '../types'
-import { formatTime, truncate, formatValue, formatDuration } from './components'
+import { formatDuration, formatTime, formatValue, truncate } from './components'
+import { buildPanelModel } from './panel-state'
+import type { ConflictItem, DevtoolsPanelModel, OperationItem, TimelineItem } from './panel-state'
 
 // ============================================================================
 // Components helpers tests
@@ -91,8 +91,8 @@ describe('buildPanelModel extended', () => {
 		const model = buildPanelModel(events)
 
 		expect(model.timeline).toHaveLength(5)
-		expect(model.timeline[0]!.type).toBe('operation:created')
-		expect(model.timeline[1]!.type).toBe('sync:connected')
+		expect(model.timeline[0]?.type).toBe('operation:created')
+		expect(model.timeline[1]?.type).toBe('sync:connected')
 	})
 
 	test('extracts conflicts from merge events', () => {
@@ -110,27 +110,23 @@ describe('buildPanelModel extended', () => {
 		const model = buildPanelModel(events)
 
 		expect(model.conflicts).toHaveLength(2)
-		expect(model.conflicts[1]!.field).toBe('title')
-		expect(model.conflicts[1]!.strategy).toBe('lww')
-		expect(model.conflicts[1]!.tier).toBe(1)
+		expect(model.conflicts[1]?.field).toBe('title')
+		expect(model.conflicts[1]?.strategy).toBe('lww')
+		expect(model.conflicts[1]?.tier).toBe(1)
 	})
 
 	test('extracts operations from operation events', () => {
 		const op = createSampleOperation({ id: 'op-1', collection: 'todos', type: 'insert' })
 		const events: TimestampedEvent[] = [
 			createTimestampedEvent(1, { type: 'operation:created', operation: op }, 1000),
-			createTimestampedEvent(
-				2,
-				{ type: 'operation:applied', operation: op, duration: 1.5 },
-				1001,
-			),
+			createTimestampedEvent(2, { type: 'operation:applied', operation: op, duration: 1.5 }, 1001),
 		]
 
 		const model = buildPanelModel(events)
 
 		expect(model.operations).toHaveLength(2)
-		expect(model.operations[0]!.opType).toBe('insert')
-		expect(model.operations[0]!.collection).toBe('todos')
+		expect(model.operations[0]?.opType).toBe('insert')
+		expect(model.operations[0]?.collection).toBe('todos')
 	})
 
 	test('builds network status from sync events', () => {
@@ -208,8 +204,8 @@ describe('buildPanelModel extended', () => {
 
 		const nodeA = vv.find((v) => v.nodeId === 'node-a')
 		const nodeB = vv.find((v) => v.nodeId === 'node-b')
-		expect(nodeA!.sequenceNumber).toBe(8) // Max of 5 and 8
-		expect(nodeB!.sequenceNumber).toBe(3)
+		expect(nodeA?.sequenceNumber).toBe(8) // Max of 5 and 8
+		expect(nodeB?.sequenceNumber).toBe(3)
 	})
 
 	test('assigns correct colors to event types', () => {
@@ -223,11 +219,11 @@ describe('buildPanelModel extended', () => {
 
 		const model = buildPanelModel(events)
 
-		expect(model.timeline[0]!.color).toBe('#22c55e') // operation = green
-		expect(model.timeline[1]!.color).toBe('#a855f7') // sync = purple
-		expect(model.timeline[2]!.color).toBe('#f59e0b') // merge = amber
-		expect(model.timeline[3]!.color).toBe('#0ea5e9') // query = blue
-		expect(model.timeline[4]!.color).toBe('#64748b') // connection = slate
+		expect(model.timeline[0]?.color).toBe('#22c55e') // operation = green
+		expect(model.timeline[1]?.color).toBe('#a855f7') // sync = purple
+		expect(model.timeline[2]?.color).toBe('#f59e0b') // merge = amber
+		expect(model.timeline[3]?.color).toBe('#0ea5e9') // query = blue
+		expect(model.timeline[4]?.color).toBe('#64748b') // connection = slate
 	})
 
 	test('extracts causal dependencies', () => {
@@ -237,7 +233,7 @@ describe('buildPanelModel extended', () => {
 		]
 
 		const model = buildPanelModel(events)
-		expect(model.timeline[0]!.dependsOn).toEqual(['dep-1', 'dep-2'])
+		expect(model.timeline[0]?.dependsOn).toEqual(['dep-1', 'dep-2'])
 	})
 
 	test('handles empty event list', () => {
@@ -267,7 +263,7 @@ describe('buildPanelModel extended', () => {
 
 		const model = buildPanelModel(events)
 		expect(model.conflicts).toHaveLength(1)
-		expect(model.conflicts[0]!.constraintViolated).toBe('unique:email')
-		expect(model.conflicts[0]!.tier).toBe(2)
+		expect(model.conflicts[0]?.constraintViolated).toBe('unique:email')
+		expect(model.conflicts[0]?.tier).toBe(2)
 	})
 })

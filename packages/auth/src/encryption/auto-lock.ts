@@ -47,8 +47,8 @@ export class AutoLockManager {
 	private readonly _timeout: number
 	private readonly _onLock: () => void
 	private _timerId: ReturnType<typeof setTimeout> | null = null
-	private _isLocked: boolean = false
-	private _isRunning: boolean = false
+	private _isLocked = false
+	private _isRunning = false
 
 	constructor(config: AutoLockConfig) {
 		if (config.timeout <= 0) {

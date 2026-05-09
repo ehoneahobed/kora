@@ -197,20 +197,14 @@ export class InvalidPermissionError extends RbacError {
 
 export class RoleNotFoundError extends RbacError {
 	constructor(role: string) {
-		super(
-			`Role "${role}" is not defined.`,
-			'ROLE_NOT_FOUND',
-			{ role },
-		)
+		super(`Role "${role}" is not defined.`, 'ROLE_NOT_FOUND', { role })
 	}
 }
 
 export class CircularInheritanceError extends RbacError {
 	constructor(chain: string[]) {
-		super(
-			`Circular role inheritance detected: ${chain.join(' → ')}.`,
-			'CIRCULAR_INHERITANCE',
-			{ chain },
-		)
+		super(`Circular role inheritance detected: ${chain.join(' → ')}.`, 'CIRCULAR_INHERITANCE', {
+			chain,
+		})
 	}
 }

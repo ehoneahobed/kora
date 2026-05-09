@@ -32,14 +32,13 @@ export interface FieldKindToType {
  * Infers the TypeScript type for a single FieldBuilder.
  * Handles base fields, enums (with literal union), and arrays (with typed items).
  */
-export type InferFieldType<F> =
-	F extends EnumFieldBuilder<infer V, infer _Req, infer _Auto>
-		? V[number]
-		: F extends ArrayFieldBuilder<infer K, infer _Req, infer _Auto>
-			? FieldKindToType[K][]
-			: F extends FieldBuilder<infer K, infer _Req, infer _Auto>
-				? FieldKindToType[K]
-				: unknown
+export type InferFieldType<F> = F extends EnumFieldBuilder<infer V, infer _Req, infer _Auto>
+	? V[number]
+	: F extends ArrayFieldBuilder<infer K, infer _Req, infer _Auto>
+		? FieldKindToType[K][]
+		: F extends FieldBuilder<infer K, infer _Req, infer _Auto>
+			? FieldKindToType[K]
+			: unknown
 
 // === Record Inference (full record type with id, createdAt, updatedAt) ===
 

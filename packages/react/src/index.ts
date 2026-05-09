@@ -15,6 +15,7 @@ export type {
 export { KoraProvider } from './context/kora-context'
 
 // === Hooks ===
+export { useApp } from './hooks/use-app'
 export { useQuery } from './hooks/use-query'
 export { useMutation } from './hooks/use-mutation'
 export { useSyncStatus } from './hooks/use-sync-status'

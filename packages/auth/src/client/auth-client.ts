@@ -112,11 +112,11 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
  */
 function isTokenExpired(token: string): boolean {
 	const payload = decodeJwtPayload(token)
-	if (!payload || typeof payload['exp'] !== 'number') {
+	if (!payload || typeof payload.exp !== 'number') {
 		return true
 	}
 	const nowSeconds = Math.floor(Date.now() / 1000)
-	return (payload['exp'] as number) <= nowSeconds + EXPIRY_BUFFER_SECONDS
+	return (payload.exp as number) <= nowSeconds + EXPIRY_BUFFER_SECONDS
 }
 
 /**
@@ -125,10 +125,10 @@ function isTokenExpired(token: string): boolean {
  */
 function getUserIdFromToken(token: string): string | null {
 	const payload = decodeJwtPayload(token)
-	if (!payload || typeof payload['sub'] !== 'string') {
+	if (!payload || typeof payload.sub !== 'string') {
 		return null
 	}
-	return payload['sub'] as string
+	return payload.sub as string
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +586,7 @@ export class AuthClient {
 			headers['Content-Type'] = 'application/json'
 		}
 		if (options.token) {
-			headers['Authorization'] = `Bearer ${options.token}`
+			headers.Authorization = `Bearer ${options.token}`
 		}
 
 		let response: Response
@@ -598,8 +598,7 @@ export class AuthClient {
 			})
 		} catch (cause) {
 			throw new AuthError(
-				`Network request to ${path} failed. The auth server at ${this.serverUrl} may be unreachable. ` +
-					'Check your network connection and serverUrl configuration.',
+				`Network request to ${path} failed. The auth server at ${this.serverUrl} may be unreachable. Check your network connection and serverUrl configuration.`,
 				'AUTH_NETWORK_ERROR',
 				{ path, cause: cause instanceof Error ? cause.message : String(cause) },
 			)
@@ -610,29 +609,29 @@ export class AuthClient {
 			let serverError: string | undefined
 			try {
 				const body = (await response.json()) as Record<string, unknown>
-				if (typeof body['error'] === 'string') {
-					errorMessage = body['error'] as string
+				if (typeof body.error === 'string') {
+					errorMessage = body.error as string
 					serverError = errorMessage
-				} else if (typeof body['message'] === 'string') {
-					errorMessage = body['message'] as string
+				} else if (typeof body.message === 'string') {
+					errorMessage = body.message as string
 					serverError = errorMessage
 				}
 			} catch {
 				// Response body is not JSON -- use the status text
 			}
 
-			throw new AuthError(
-				errorMessage,
-				'AUTH_SERVER_ERROR',
-				{ path, status: response.status, serverError },
-			)
+			throw new AuthError(errorMessage, 'AUTH_SERVER_ERROR', {
+				path,
+				status: response.status,
+				serverError,
+			})
 		}
 
 		const json = (await response.json()) as Record<string, unknown>
 
 		// The BuiltInAuthRoutes server wraps success responses in { data: T }.
 		// Unwrap the envelope so callers get the inner payload directly.
-		const data = (json['data'] !== undefined ? json['data'] : json) as T
+		const data = (json.data !== undefined ? json.data : json) as T
 		return data
 	}
 }

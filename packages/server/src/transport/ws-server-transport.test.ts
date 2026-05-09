@@ -1,7 +1,7 @@
 import {
-	type SyncMessage,
 	NegotiatedMessageSerializer,
 	ProtobufMessageSerializer,
+	type SyncMessage,
 } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import type { WsWebSocket } from './ws-server-transport'

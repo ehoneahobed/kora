@@ -1,7 +1,7 @@
 import { KoraError } from '@korajs/core'
 import type { AuthUser, StoredUser, UserStore } from '../provider/built-in/user-store'
 import type { Session, SessionStore } from '../session/session'
-import type { AuditLogger, AuditAction } from './audit-log'
+import type { AuditAction, AuditLogger } from './audit-log'
 
 // ============================================================================
 // Admin API Types

@@ -60,10 +60,7 @@ export class PostgresServerStore implements ServerStore {
 					// Ignore "already exists" errors from safe ALTER TABLE.
 					// Drizzle wraps the actual DB error in e.cause, so check both.
 					const msg = e instanceof Error ? e.message : ''
-					const causeMsg =
-						e instanceof Error && e.cause instanceof Error
-							? e.cause.message
-							: ''
+					const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
 					if (
 						!msg.includes('already exists') &&
 						!msg.includes('duplicate column') &&
@@ -102,10 +99,7 @@ export class PostgresServerStore implements ServerStore {
 
 		await this.db.transaction(async (tx) => {
 			// Insert operation with dedup
-			await tx
-				.insert(pgOperations)
-				.values(row)
-				.onConflictDoNothing({ target: pgOperations.id })
+			await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
 
 			// Upsert version vector: advance max sequence number with GREATEST
 			await tx
@@ -124,7 +118,7 @@ export class PostgresServerStore implements ServerStore {
 				})
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema && this.schema.collections[op.collection]) {
+			if (this.schema?.collections[op.collection]) {
 				await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
 			}
 		})
@@ -146,10 +140,7 @@ export class PostgresServerStore implements ServerStore {
 			.select()
 			.from(pgOperations)
 			.where(
-				and(
-					eq(pgOperations.nodeId, nodeId),
-					between(pgOperations.sequenceNumber, fromSeq, toSeq),
-				),
+				and(eq(pgOperations.nodeId, nodeId), between(pgOperations.sequenceNumber, fromSeq, toSeq)),
 			)
 			.orderBy(asc(pgOperations.sequenceNumber))
 
@@ -169,7 +160,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 
 		// Fast path: if schema is set, read directly from the materialized table
-		if (this.schema && this.schema.collections[collection]) {
+		if (this.schema?.collections[collection]) {
 			return this.queryCollection(collection)
 		}
 
@@ -186,16 +177,19 @@ export class PostgresServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
-		const collectionDef = this.schema!.collections[collection]!
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
 
 		// Validate field names in options
 		if (options?.where) {
 			for (const key of Object.keys(options.where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 		if (options?.orderBy) {
-			validateFieldName(collection, options.orderBy, this.schema!)
+			validateFieldName(collection, options.orderBy, schema)
 		}
 
 		const query = this.buildSelectQuery(collection, options)
@@ -210,12 +204,15 @@ export class PostgresServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
-		const collectionDef = this.schema!.collections[collection]!
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
 		const query = sql`SELECT * FROM ${sql.raw(collection)} WHERE id = ${id} AND _deleted = 0`
 		const rows = (await this.db.execute(query)) as unknown as Record<string, unknown>[]
 
 		if (rows.length === 0) return null
-		return this.deserializeRow(rows[0]!, collectionDef)
+		return this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
 	}
 
 	async countCollection(collection: string, where?: Record<string, unknown>): Promise<number> {
@@ -224,9 +221,10 @@ export class PostgresServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
+		const schema = this.schema as SchemaDefinition
 		if (where) {
 			for (const key of Object.keys(where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 
@@ -254,7 +252,7 @@ export class PostgresServerStore implements ServerStore {
 		collection: string,
 		recordId: string,
 	): Promise<void> {
-		const collectionDef = this.schema!.collections[collection]
+		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
 
 		// Fetch all ops for this specific record, ordered by HLC
@@ -265,12 +263,7 @@ export class PostgresServerStore implements ServerStore {
 				wallTime: pgOperations.wallTime,
 			})
 			.from(pgOperations)
-			.where(
-				and(
-					eq(pgOperations.collection, collection),
-					eq(pgOperations.recordId, recordId),
-				),
-			)
+			.where(and(eq(pgOperations.collection, collection), eq(pgOperations.recordId, recordId)))
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
@@ -287,8 +280,9 @@ export class PostgresServerStore implements ServerStore {
 		const fieldNames = Object.keys(collectionDef.fields)
 
 		if (recordData) {
-			const createdAt = ops.length > 0 ? ops[0]!.wallTime : Date.now()
-			const updatedAt = ops.length > 0 ? ops[ops.length - 1]!.wallTime : Date.now()
+			const createdAt = ops.length > 0 ? (ops[0] as (typeof ops)[0]).wallTime : Date.now()
+			const updatedAt =
+				ops.length > 0 ? (ops[ops.length - 1] as (typeof ops)[0]).wallTime : Date.now()
 
 			await this.upsertMaterializedRecord(
 				txOrDb,
@@ -325,9 +319,7 @@ export class PostgresServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor
-					? serializeFieldValue(recordData[f] ?? null, descriptor)
-					: null
+				return descriptor ? serializeFieldValue(recordData[f] ?? null, descriptor) : null
 			}),
 			createdAt,
 			updatedAt,
@@ -340,7 +332,10 @@ export class PostgresServerStore implements ServerStore {
 			sql.raw(', '),
 		)
 		const updateSet = sql.raw(
-			allColumns.slice(1).map((c) => `${c} = excluded.${c}`).join(', '),
+			allColumns
+				.slice(1)
+				.map((c) => `${c} = excluded.${c}`)
+				.join(', '),
 		)
 
 		await txOrDb.execute(
@@ -363,7 +358,7 @@ export class PostgresServerStore implements ServerStore {
 	 * Backfill a single collection's materialized table from operations.
 	 */
 	private async backfillCollection(collectionName: string): Promise<void> {
-		const collectionDef = this.schema!.collections[collectionName]
+		const collectionDef = this.schema?.collections[collectionName]
 		if (!collectionDef) return
 
 		const allOps = await this.db
@@ -405,8 +400,8 @@ export class PostgresServerStore implements ServerStore {
 			const recordData = replayOperationsForRecord(parsedOps)
 
 			if (recordData) {
-				const createdAt = recordOps[0]!.wallTime
-				const updatedAt = recordOps[recordOps.length - 1]!.wallTime
+				const createdAt = (recordOps[0] as (typeof recordOps)[0]).wallTime
+				const updatedAt = (recordOps[recordOps.length - 1] as (typeof recordOps)[0]).wallTime
 				await this.upsertMaterializedRecord(
 					this.db,
 					collectionName,
@@ -429,18 +424,13 @@ export class PostgresServerStore implements ServerStore {
 	// Query building
 	// ---------------------------------------------------------------------------
 
-	private buildSelectQuery(
-		collection: string,
-		options?: CollectionQueryOptions,
-	): SQL {
+	private buildSelectQuery(collection: string, options?: CollectionQueryOptions): SQL {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
 		)
 
-		const parts: SQL[] = [
-			sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`,
-		]
+		const parts: SQL[] = [sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
@@ -458,10 +448,7 @@ export class PostgresServerStore implements ServerStore {
 		return sql.join(parts, sql.raw(''))
 	}
 
-	private buildWhereClause(
-		where: Record<string, unknown>,
-		includeDeleted: boolean,
-	): SQL {
+	private buildWhereClause(where: Record<string, unknown>, includeDeleted: boolean): SQL {
 		const conditions: SQL[] = []
 
 		if (!includeDeleted) {
@@ -593,12 +580,8 @@ export class PostgresServerStore implements ServerStore {
 		await this.db.execute(
 			sql`CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)`,
 		)
-		await this.db.execute(
-			sql`CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)`,
-		)
-		await this.db.execute(
-			sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`,
-		)
+		await this.db.execute(sql`CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)`)
+		await this.db.execute(sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`)
 		// Index for efficient per-record operation lookups during materialization
 		await this.db.execute(
 			sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
@@ -617,10 +600,7 @@ export class PostgresServerStore implements ServerStore {
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
-	private serializeOperation(
-		op: Operation,
-		receivedAt: number,
-	): typeof pgOperations.$inferInsert {
+	private serializeOperation(op: Operation, receivedAt: number): typeof pgOperations.$inferInsert {
 		return {
 			id: op.id,
 			nodeId: op.nodeId,
@@ -678,9 +658,10 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	private assertCollection(collection: string): void {
-		if (!this.schema!.collections[collection]) {
+		const schema = this.schema as SchemaDefinition
+		if (!schema.collections[collection]) {
 			throw new Error(
-				`Unknown collection "${collection}". Available: ${Object.keys(this.schema!.collections).join(', ')}`,
+				`Unknown collection "${collection}". Available: ${Object.keys(schema.collections).join(', ')}`,
 			)
 		}
 	}

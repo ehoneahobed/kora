@@ -128,7 +128,8 @@ function isBreakingChange(change: SchemaChange): boolean {
 	if (change.type === 'field-changed') {
 		if (change.before.kind !== change.after.kind) return true
 		if (change.before.itemKind !== change.after.itemKind) return true
-		if (serializeEnum(change.before.enumValues) !== serializeEnum(change.after.enumValues)) return true
+		if (serializeEnum(change.before.enumValues) !== serializeEnum(change.after.enumValues))
+			return true
 		if (change.before.required !== change.after.required && change.after.required) return true
 		return false
 	}

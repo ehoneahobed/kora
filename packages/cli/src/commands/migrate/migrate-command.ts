@@ -9,8 +9,8 @@ import { promptConfirm } from '../../utils/prompt'
 import { loadKoraConfig } from '../dev/kora-config'
 import { generateMigration } from './migration-generator'
 import { runMigration } from './migration-runner'
-import { loadSchemaDefinition } from './schema-loader'
 import { diffSchemas } from './schema-differ'
+import { loadSchemaDefinition } from './schema-loader'
 
 const SNAPSHOT_PATH = 'kora/schema.snapshot.json'
 const MIGRATIONS_DIR = 'kora/migrations'
@@ -167,7 +167,12 @@ export const migrateCommand = defineCommand({
 
 		await mkdir(outputDir, { recursive: true })
 
-		const migrationPath = await writeMigrationFile(outputDir, diff.fromVersion, diff.toVersion, generated)
+		const migrationPath = await writeMigrationFile(
+			outputDir,
+			diff.fromVersion,
+			diff.toVersion,
+			generated,
+		)
 		await writeSchemaSnapshot(snapshotFile, currentSchema)
 
 		logger.blank()
@@ -243,7 +248,7 @@ async function writeMigrationFile(
 	const sequence = existing.filter((file) => /^\d{3}-/.test(file)).length + 1
 	const filename = `${String(sequence).padStart(3, '0')}-v${fromVersion}-to-v${toVersion}.ts`
 	const path = join(outputDir, filename)
-const migrationId = filename.replace(/\.ts$/, '')
+	const migrationId = filename.replace(/\.ts$/, '')
 
 	const fileContent = [
 		`export const up = ${JSON.stringify(generated.up, null, 2)} as const`,

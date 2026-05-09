@@ -1,4 +1,4 @@
-import { randomBytes, pbkdf2, timingSafeEqual } from 'node:crypto'
+import { pbkdf2, randomBytes, timingSafeEqual } from 'node:crypto'
 
 /** Number of PBKDF2 iterations. 600,000 per OWASP 2023 recommendations for SHA-512. */
 const PBKDF2_ITERATIONS = 600_000
@@ -38,13 +38,7 @@ interface HashResult {
 export async function hashPassword(password: string): Promise<HashResult> {
 	const salt = randomBytes(SALT_LENGTH)
 
-	const derivedKey = await pbkdf2Async(
-		password,
-		salt,
-		PBKDF2_ITERATIONS,
-		KEY_LENGTH,
-		PBKDF2_DIGEST,
-	)
+	const derivedKey = await pbkdf2Async(password, salt, PBKDF2_ITERATIONS, KEY_LENGTH, PBKDF2_DIGEST)
 
 	return {
 		hash: derivedKey.toString('hex'),

@@ -2,10 +2,10 @@ import { defineSchema, t } from '@korajs/core'
 import type Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import {
+	type InvokeFn,
 	TauriAdapterError,
 	TauriSqliteAdapter,
 	TauriStoreNotOpenError,
-	type InvokeFn,
 } from './tauri-sqlite-adapter'
 
 const minimalSchema = defineSchema({

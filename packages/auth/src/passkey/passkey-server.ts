@@ -88,10 +88,12 @@ export function generateRegistrationOptions(params: {
 }): RegistrationOptions {
 	// Generate a 32-byte cryptographically random challenge
 	const challengeBytes = randomBytes(32)
-	const challenge = toBase64Url(challengeBytes.buffer.slice(
-		challengeBytes.byteOffset,
-		challengeBytes.byteOffset + challengeBytes.byteLength,
-	))
+	const challenge = toBase64Url(
+		challengeBytes.buffer.slice(
+			challengeBytes.byteOffset,
+			challengeBytes.byteOffset + challengeBytes.byteLength,
+		),
+	)
 
 	return {
 		challenge,
@@ -278,8 +280,7 @@ export async function verifyRegistrationResponse(params: {
 	offset += 16
 
 	// credentialIdLength: 2 bytes, big-endian
-	const credentialIdLength =
-		((authData[offset] as number) << 8) | (authData[offset + 1] as number)
+	const credentialIdLength = ((authData[offset] as number) << 8) | (authData[offset + 1] as number)
 	offset += 2
 
 	// credentialId: credentialIdLength bytes
@@ -360,10 +361,12 @@ export function generateAuthenticationOptions(params: {
 	allowCredentialIds?: string[]
 }): AuthenticationOptions {
 	const challengeBytes = randomBytes(32)
-	const challenge = toBase64Url(challengeBytes.buffer.slice(
-		challengeBytes.byteOffset,
-		challengeBytes.byteOffset + challengeBytes.byteLength,
-	))
+	const challenge = toBase64Url(
+		challengeBytes.buffer.slice(
+			challengeBytes.byteOffset,
+			challengeBytes.byteOffset + challengeBytes.byteLength,
+		),
+	)
 
 	return {
 		challenge,
@@ -503,9 +506,7 @@ export async function verifyAuthenticationResponse(params: {
 
 	// Bit 0: User Present (UP) - must be set
 	if ((flags & 0x01) === 0) {
-		throw new PasskeyVerificationError(
-			'User Present flag is not set in authenticator data.',
-		)
+		throw new PasskeyVerificationError('User Present flag is not set in authenticator data.')
 	}
 
 	// Parse sign count (bytes 33-36, big-endian uint32)
@@ -522,8 +523,7 @@ export async function verifyAuthenticationResponse(params: {
 	if (previousSignCount > 0 || signCount > 0) {
 		if (signCount <= previousSignCount) {
 			throw new PasskeyVerificationError(
-				'Signature counter did not increase. This may indicate a cloned authenticator. ' +
-					`Previous count: ${previousSignCount}, received count: ${signCount}.`,
+				`Signature counter did not increase. This may indicate a cloned authenticator. Previous count: ${previousSignCount}, received count: ${signCount}.`,
 				{
 					previousSignCount,
 					receivedSignCount: signCount,
@@ -535,9 +535,7 @@ export async function verifyAuthenticationResponse(params: {
 	// Step 4: Verify the signature
 	// The signature is over: authData || SHA-256(clientDataJSON)
 	const clientDataHash = await sha256(clientDataBytes)
-	const signedData = new Uint8Array(
-		authDataBytes.length + clientDataHash.byteLength,
-	)
+	const signedData = new Uint8Array(authDataBytes.length + clientDataHash.byteLength)
 	signedData.set(authDataBytes, 0)
 	signedData.set(new Uint8Array(clientDataHash), authDataBytes.length)
 
@@ -622,10 +620,9 @@ export async function verifyAuthenticationResponse(params: {
 			signedData.buffer as unknown as ArrayBuffer,
 		)
 	} catch (error) {
-		throw new PasskeyVerificationError(
-			'Signature verification operation failed.',
-			{ cause: error instanceof Error ? error.message : String(error) },
-		)
+		throw new PasskeyVerificationError('Signature verification operation failed.', {
+			cause: error instanceof Error ? error.message : String(error),
+		})
 	}
 
 	if (!verified) {
@@ -674,18 +671,13 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
  * @param componentLength - The expected length of each component (32 for P-256)
  * @returns The P1363-formatted signature
  */
-function derToP1363(
-	derSignature: Uint8Array,
-	componentLength: number,
-): Uint8Array {
+function derToP1363(derSignature: Uint8Array, componentLength: number): Uint8Array {
 	// Parse the DER structure
 	let offset = 0
 
 	// SEQUENCE tag (0x30)
 	if (derSignature[offset] !== 0x30) {
-		throw new PasskeyVerificationError(
-			'Invalid DER signature: expected SEQUENCE tag (0x30).',
-		)
+		throw new PasskeyVerificationError('Invalid DER signature: expected SEQUENCE tag (0x30).')
 	}
 	offset += 1
 

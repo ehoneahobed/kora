@@ -25,11 +25,15 @@ function createFakeDrizzleDb(): unknown {
 		for (const method of methods) {
 			builder[method] = (..._args: unknown[]) => builder
 		}
-		// Terminal: resolves to empty array
-		builder.then = (resolve: (value: unknown[]) => void) => {
-			resolve([])
-			return Promise.resolve([])
-		}
+		// Terminal: resolves to empty array (Drizzle queries are thenable)
+		Object.defineProperty(builder, 'then', {
+			value: (resolve: (value: unknown[]) => void) => {
+				resolve([])
+				return Promise.resolve([])
+			},
+			writable: true,
+			configurable: true,
+		})
 		return builder
 	}
 

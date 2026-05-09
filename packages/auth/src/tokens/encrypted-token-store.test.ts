@@ -146,12 +146,12 @@ describe('EncryptedTokenStore', () => {
 			expect(raw).not.toBeNull()
 
 			const parsed = JSON.parse(raw as string) as Record<string, unknown>
-			expect(typeof parsed['iv']).toBe('string')
-			expect(typeof parsed['data']).toBe('string')
+			expect(typeof parsed.iv).toBe('string')
+			expect(typeof parsed.data).toBe('string')
 
 			// Verify these are base64url-encoded (no +, /, or = padding)
-			const ivStr = parsed['iv'] as string
-			const dataStr = parsed['data'] as string
+			const ivStr = parsed.iv as string
+			const dataStr = parsed.data as string
 			expect(ivStr).not.toMatch(/[+/=]/)
 			expect(dataStr).not.toMatch(/[+/=]/)
 		})
@@ -199,7 +199,7 @@ describe('EncryptedTokenStore', () => {
 			// Different keys must produce different ciphertext
 			const parsedA = JSON.parse(rawA) as Record<string, string>
 			const parsedB = JSON.parse(rawB) as Record<string, string>
-			expect(parsedA['data']).not.toBe(parsedB['data'])
+			expect(parsedA.data).not.toBe(parsedB.data)
 		})
 
 		it('encrypting same tokens twice with same key produces different ciphertext (random IV)', async () => {
@@ -218,9 +218,9 @@ describe('EncryptedTokenStore', () => {
 			const parsedB = JSON.parse(rawB) as Record<string, string>
 
 			// IVs should differ because they are randomly generated
-			expect(parsedA['iv']).not.toBe(parsedB['iv'])
+			expect(parsedA.iv).not.toBe(parsedB.iv)
 			// Ciphertext should differ because the IVs differ
-			expect(parsedA['data']).not.toBe(parsedB['data'])
+			expect(parsedA.data).not.toBe(parsedB.data)
 		})
 	})
 
@@ -275,11 +275,10 @@ describe('EncryptedTokenStore', () => {
 			const parsed = JSON.parse(raw) as Record<string, string>
 
 			// Flip characters in the ciphertext data to simulate tampering
-			const tamperedData = parsed['data'] as string
-			const flipped = tamperedData.charAt(0) === 'A'
-				? 'B' + tamperedData.slice(1)
-				: 'A' + tamperedData.slice(1)
-			parsed['data'] = flipped
+			const tamperedData = parsed.data as string
+			const flipped =
+				tamperedData.charAt(0) === 'A' ? `B${tamperedData.slice(1)}` : `A${tamperedData.slice(1)}`
+			parsed.data = flipped
 
 			mockStorage.setItem('kora_auth_encrypted', JSON.stringify(parsed))
 
@@ -297,11 +296,10 @@ describe('EncryptedTokenStore', () => {
 			const raw = mockStorage.getItem('kora_auth_encrypted') as string
 			const parsed = JSON.parse(raw) as Record<string, string>
 
-			const tamperedIv = parsed['iv'] as string
-			const flipped = tamperedIv.charAt(0) === 'A'
-				? 'B' + tamperedIv.slice(1)
-				: 'A' + tamperedIv.slice(1)
-			parsed['iv'] = flipped
+			const tamperedIv = parsed.iv as string
+			const flipped =
+				tamperedIv.charAt(0) === 'A' ? `B${tamperedIv.slice(1)}` : `A${tamperedIv.slice(1)}`
+			parsed.iv = flipped
 
 			mockStorage.setItem('kora_auth_encrypted', JSON.stringify(parsed))
 

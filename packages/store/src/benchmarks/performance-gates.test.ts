@@ -61,7 +61,10 @@ describe('Store performance gates', () => {
 		let latencyMs = Number.POSITIVE_INFINITY
 
 		const notified = new Promise<void>((resolve, reject) => {
-			const timeout = setTimeout(() => reject(new Error('Timed out waiting for reactive notification')), 2000)
+			const timeout = setTimeout(
+				() => reject(new Error('Timed out waiting for reactive notification')),
+				2000,
+			)
 
 			const unsubscribe = query.subscribe(() => {
 				notificationCount += 1

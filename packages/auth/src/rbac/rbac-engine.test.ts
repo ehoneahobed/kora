@@ -1,13 +1,13 @@
-import { describe, test, expect, beforeEach } from 'vitest'
-import { RbacEngine, defineRoles } from './rbac-engine'
+import { beforeEach, describe, expect, test } from 'vitest'
 import { InMemoryOrgStore } from '../org/org-store'
+import { RbacEngine, defineRoles } from './rbac-engine'
 import {
 	BUILT_IN_ROLES,
-	parsePermission,
-	permissionCovers,
-	RoleNotFoundError,
 	CircularInheritanceError,
 	InvalidPermissionError,
+	RoleNotFoundError,
+	parsePermission,
+	permissionCovers,
 } from './rbac-types'
 import type { Permission } from './rbac-types'
 
@@ -200,8 +200,8 @@ describe('RbacEngine', () => {
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'projects'])
 			expect(scopes).not.toBeNull()
-			expect(scopes!.todos).toEqual({ orgId: org.id })
-			expect(scopes!.projects).toEqual({ orgId: org.id })
+			expect(scopes?.todos).toEqual({ orgId: org.id })
+			expect(scopes?.projects).toEqual({ orgId: org.id })
 		})
 
 		test('viewer gets read-only scopes', async () => {
@@ -210,7 +210,7 @@ describe('RbacEngine', () => {
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos'])
 			expect(scopes).not.toBeNull()
-			expect(scopes!.todos).toEqual({ orgId: org.id, __readonly: true })
+			expect(scopes?.todos).toEqual({ orgId: org.id, __readonly: true })
 		})
 
 		test('billing gets empty scopes (no data access)', async () => {
@@ -238,8 +238,8 @@ describe('RbacEngine', () => {
 			}))
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'projects'])
-			expect(scopes!.todos).toEqual({ orgId: org.id, userId: 'user-2' })
-			expect(scopes!.projects).toEqual({ orgId: org.id }) // default
+			expect(scopes?.todos).toEqual({ orgId: org.id, userId: 'user-2' })
+			expect(scopes?.projects).toEqual({ orgId: org.id }) // default
 		})
 
 		test('custom resolver returning null excludes the collection', async () => {
@@ -249,8 +249,8 @@ describe('RbacEngine', () => {
 			rbac.registerScopeResolver('secret', () => null)
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'secret'])
-			expect(scopes!.todos).toBeDefined()
-			expect(scopes!.secret).toBeUndefined()
+			expect(scopes?.todos).toBeDefined()
+			expect(scopes?.secret).toBeUndefined()
 		})
 	})
 
@@ -258,8 +258,8 @@ describe('RbacEngine', () => {
 		test('returns role definition', () => {
 			const def = rbac.getRoleDefinition('admin')
 			expect(def).not.toBeNull()
-			expect(def!.name).toBe('admin')
-			expect(def!.inherits).toContain('member')
+			expect(def?.name).toBe('admin')
+			expect(def?.inherits).toContain('member')
 		})
 
 		test('returns null for unknown role', () => {

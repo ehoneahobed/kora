@@ -1,14 +1,14 @@
 import type { OrgStore } from '../org/org-store'
 import type { OrgRole } from '../org/org-types'
+import type { RbacEngine } from './rbac-engine'
 import type {
-	Permission,
-	SyncScopes,
-	ScopeFilter,
-	ScopeContext,
 	CollectionScopeResolver,
+	Permission,
+	ScopeContext,
+	ScopeFilter,
+	SyncScopes,
 } from './rbac-types'
 import { permissionCovers } from './rbac-types'
-import { RbacEngine } from './rbac-engine'
 
 // ============================================================================
 // OrgScopeResolver
@@ -67,11 +67,7 @@ export class OrgScopeResolver {
 	 * Returns null if the user is not a member of the organization.
 	 * Returns an empty object if the user has no data access (e.g., billing role).
 	 */
-	async resolve(
-		userId: string,
-		orgId: string,
-		collections: string[],
-	): Promise<SyncScopes | null> {
+	async resolve(userId: string, orgId: string, collections: string[]): Promise<SyncScopes | null> {
 		const membership = await this.orgStore.getMembership(orgId, userId)
 		if (!membership) return null
 
@@ -98,31 +94,15 @@ export class OrgScopeResolver {
 	/**
 	 * Check if a user can write to a specific collection in an org.
 	 */
-	async canWrite(
-		userId: string,
-		orgId: string,
-		collection: string,
-	): Promise<boolean> {
-		return this.rbac.hasPermission(
-			userId,
-			orgId,
-			`${collection}:write` as Permission,
-		)
+	async canWrite(userId: string, orgId: string, collection: string): Promise<boolean> {
+		return this.rbac.hasPermission(userId, orgId, `${collection}:write` as Permission)
 	}
 
 	/**
 	 * Check if a user can read from a specific collection in an org.
 	 */
-	async canRead(
-		userId: string,
-		orgId: string,
-		collection: string,
-	): Promise<boolean> {
-		return this.rbac.hasPermission(
-			userId,
-			orgId,
-			`${collection}:read` as Permission,
-		)
+	async canRead(userId: string, orgId: string, collection: string): Promise<boolean> {
+		return this.rbac.hasPermission(userId, orgId, `${collection}:read` as Permission)
 	}
 
 	// --- Private ---

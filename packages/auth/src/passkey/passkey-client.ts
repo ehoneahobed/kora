@@ -195,11 +195,9 @@ export async function createPasskeyCredential(options: {
 
 	// Build the authenticator selection criteria with sensible defaults
 	const authenticatorSelection: AuthenticatorSelectionCriteria = {
-		authenticatorAttachment:
-			options.authenticatorSelection?.authenticatorAttachment ?? 'platform',
+		authenticatorAttachment: options.authenticatorSelection?.authenticatorAttachment ?? 'platform',
 		residentKey: options.authenticatorSelection?.residentKey ?? 'preferred',
-		userVerification:
-			options.authenticatorSelection?.userVerification ?? 'required',
+		userVerification: options.authenticatorSelection?.userVerification ?? 'required',
 	}
 
 	// If residentKey is 'required', requireResidentKey must also be true
@@ -429,18 +427,14 @@ export async function authenticateWithPasskey(options: {
  *       - credentialId (credentialIdLength bytes)
  *       - credentialPublicKey (CBOR-encoded COSE_Key, remaining bytes)
  */
-function extractPublicKeyFromAttestationObject(
-	attestationObject: Uint8Array,
-): Uint8Array {
+function extractPublicKeyFromAttestationObject(attestationObject: Uint8Array): Uint8Array {
 	// Decode the top-level CBOR map to get authData
 	const decoded = decodeCbor(attestationObject, 0)
 	const topMap = decoded.value as Map<string, unknown>
 	const authData = topMap.get('authData')
 
 	if (!(authData instanceof Uint8Array)) {
-		throw new PasskeyError(
-			'Invalid attestation object: authData is missing or not a byte string.',
-		)
+		throw new PasskeyError('Invalid attestation object: authData is missing or not a byte string.')
 	}
 
 	// Parse authenticator data to find the credential public key
@@ -469,8 +463,7 @@ function extractPublicKeyFromAttestationObject(
 	offset += 16
 
 	// credentialIdLength: 2 bytes, big-endian
-	const credentialIdLength =
-		((authData[offset] as number) << 8) | (authData[offset + 1] as number)
+	const credentialIdLength = ((authData[offset] as number) << 8) | (authData[offset + 1] as number)
 	offset += 2
 
 	// credentialId: credentialIdLength bytes
@@ -510,67 +503,68 @@ interface CborDecodeResult {
 }
 
 function decodeCbor(data: Uint8Array, offset: number): CborDecodeResult {
-	if (offset >= data.length) {
+	let pos = offset
+
+	if (pos >= data.length) {
 		throw new PasskeyError('CBOR decode error: unexpected end of data.')
 	}
 
-	const initialByte = data[offset] as number
+	const initialByte = data[pos] as number
 	const majorType = initialByte >> 5
 	const additionalInfo = initialByte & 0x1f
-	offset += 1
+	pos += 1
 
 	// Decode the argument (length or value) based on additionalInfo
 	let argument: number
 	if (additionalInfo < 24) {
 		argument = additionalInfo
 	} else if (additionalInfo === 24) {
-		argument = data[offset] as number
-		offset += 1
+		argument = data[pos] as number
+		pos += 1
 	} else if (additionalInfo === 25) {
-		argument = ((data[offset] as number) << 8) | (data[offset + 1] as number)
-		offset += 2
+		argument = ((data[pos] as number) << 8) | (data[pos + 1] as number)
+		pos += 2
 	} else if (additionalInfo === 26) {
 		argument =
-			((data[offset] as number) << 24) |
-			((data[offset + 1] as number) << 16) |
-			((data[offset + 2] as number) << 8) |
-			(data[offset + 3] as number)
+			((data[pos] as number) << 24) |
+			((data[pos + 1] as number) << 16) |
+			((data[pos + 2] as number) << 8) |
+			(data[pos + 3] as number)
 		// Handle unsigned 32-bit properly (bitwise ops produce signed 32-bit in JS)
 		argument = argument >>> 0
-		offset += 4
+		pos += 4
 	} else {
 		throw new PasskeyError(
-			`CBOR decode error: unsupported additional info ${additionalInfo} at byte ${offset - 1}. ` +
-				'This CBOR decoder only supports definite-length encodings.',
+			`CBOR decode error: unsupported additional info ${additionalInfo} at byte ${pos - 1}. This CBOR decoder only supports definite-length encodings.`,
 		)
 	}
 
 	switch (majorType) {
 		// Major type 0: Unsigned integer
 		case 0:
-			return { value: argument, offset }
+			return { value: argument, offset: pos }
 
 		// Major type 1: Negative integer (-1 - argument)
 		case 1:
-			return { value: -1 - argument, offset }
+			return { value: -1 - argument, offset: pos }
 
 		// Major type 2: Byte string
 		case 2: {
-			const bytes = data.slice(offset, offset + argument)
-			return { value: bytes, offset: offset + argument }
+			const bytes = data.slice(pos, pos + argument)
+			return { value: bytes, offset: pos + argument }
 		}
 
 		// Major type 3: Text string (UTF-8)
 		case 3: {
-			const textBytes = data.slice(offset, offset + argument)
+			const textBytes = data.slice(pos, pos + argument)
 			const text = new TextDecoder().decode(textBytes)
-			return { value: text, offset: offset + argument }
+			return { value: text, offset: pos + argument }
 		}
 
 		// Major type 4: Array
 		case 4: {
 			const arr: unknown[] = []
-			let currentOffset = offset
+			let currentOffset = pos
 			for (let i = 0; i < argument; i++) {
 				const item = decodeCbor(data, currentOffset)
 				arr.push(item.value)
@@ -582,7 +576,7 @@ function decodeCbor(data: Uint8Array, offset: number): CborDecodeResult {
 		// Major type 5: Map
 		case 5: {
 			const map = new Map<string | number, unknown>()
-			let currentOffset = offset
+			let currentOffset = pos
 			for (let i = 0; i < argument; i++) {
 				const keyResult = decodeCbor(data, currentOffset)
 				const valResult = decodeCbor(data, keyResult.offset)
@@ -594,8 +588,7 @@ function decodeCbor(data: Uint8Array, offset: number): CborDecodeResult {
 
 		default:
 			throw new PasskeyError(
-				`CBOR decode error: unsupported major type ${majorType} at byte ${offset - 1}. ` +
-					'This CBOR decoder only supports types 0-5 (integers, byte/text strings, arrays, maps).',
+				`CBOR decode error: unsupported major type ${majorType} at byte ${pos - 1}. This CBOR decoder only supports types 0-5 (integers, byte/text strings, arrays, maps).`,
 			)
 	}
 }

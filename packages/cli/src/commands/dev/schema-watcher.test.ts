@@ -139,9 +139,13 @@ describe('SchemaWatcher', () => {
 		expect(spawnMock).toHaveBeenCalledWith(
 			process.execPath,
 			[
-				'--import', 'tsx',
+				'--import',
+				'tsx',
 				'/project/node_modules/@korajs/cli/dist/bin.js',
-				'generate', 'types', '--schema', '/project/src/schema.ts',
+				'generate',
+				'types',
+				'--schema',
+				'/project/src/schema.ts',
 			],
 			expect.objectContaining({ cwd: '/project' }),
 		)
@@ -169,7 +173,10 @@ describe('SchemaWatcher', () => {
 			process.execPath,
 			[
 				'/project/node_modules/@korajs/cli/dist/bin.js',
-				'generate', 'types', '--schema', '/project/src/schema.ts',
+				'generate',
+				'types',
+				'--schema',
+				'/project/src/schema.ts',
 			],
 			expect.objectContaining({ cwd: '/project' }),
 		)

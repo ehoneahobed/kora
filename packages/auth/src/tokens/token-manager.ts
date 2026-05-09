@@ -1,9 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import type {
-	AuthTokens,
-	DeviceCredentialPayload,
-	TokenPayload,
-} from '../types'
+import type { AuthTokens, DeviceCredentialPayload, TokenPayload } from '../types'
 import {
 	DEFAULT_ACCESS_TOKEN_LIFETIME,
 	DEFAULT_DEVICE_CREDENTIAL_LIFETIME,
@@ -181,7 +177,7 @@ export class TokenManager {
 			if (secret.length < MIN_SECRET_LENGTH) {
 				throw new Error(
 					`JWT secret must be at least ${MIN_SECRET_LENGTH} characters (256 bits) for HMAC-SHA256 security. ` +
-					`Received ${secret.length} characters. Use TokenManager.generateSecret() to generate a secure secret.`,
+						`Received ${secret.length} characters. Use TokenManager.generateSecret() to generate a secure secret.`,
 				)
 			}
 		}
@@ -266,11 +262,7 @@ export class TokenManager {
 	 * @param publicKeyThumbprint - SHA-256 thumbprint of the device's public key
 	 * @returns A signed JWT string with type 'device_credential'
 	 */
-	issueDeviceCredential(
-		userId: string,
-		deviceId: string,
-		publicKeyThumbprint: string,
-	): string {
+	issueDeviceCredential(userId: string, deviceId: string, publicKeyThumbprint: string): string {
 		const nowSeconds = Math.floor(Date.now() / 1000)
 		const lifetimeSeconds = Math.floor(this.deviceCredentialLifetime / 1000)
 		const payload: DeviceCredentialPayload = {
@@ -298,22 +290,14 @@ export class TokenManager {
 	 *   When provided, a device credential is included in the returned tokens.
 	 * @returns An {@link AuthTokens} object containing the issued tokens
 	 */
-	issueTokens(
-		userId: string,
-		deviceId: string,
-		publicKeyThumbprint?: string,
-	): AuthTokens {
+	issueTokens(userId: string, deviceId: string, publicKeyThumbprint?: string): AuthTokens {
 		const tokens: AuthTokens = {
 			accessToken: this.issueAccessToken(userId, deviceId),
 			refreshToken: this.issueRefreshToken(userId, deviceId),
 		}
 
 		if (publicKeyThumbprint !== undefined) {
-			tokens.deviceCredential = this.issueDeviceCredential(
-				userId,
-				deviceId,
-				publicKeyThumbprint,
-			)
+			tokens.deviceCredential = this.issueDeviceCredential(userId, deviceId, publicKeyThumbprint)
 		}
 
 		return tokens
@@ -353,28 +337,28 @@ export class TokenManager {
 
 		// Validate that all required base claims are present and correctly typed
 		if (
-			typeof decoded['jti'] !== 'string' ||
-			typeof decoded['sub'] !== 'string' ||
-			typeof decoded['dev'] !== 'string' ||
-			typeof decoded['type'] !== 'string' ||
-			typeof decoded['iat'] !== 'number' ||
-			typeof decoded['exp'] !== 'number'
+			typeof decoded.jti !== 'string' ||
+			typeof decoded.sub !== 'string' ||
+			typeof decoded.dev !== 'string' ||
+			typeof decoded.type !== 'string' ||
+			typeof decoded.iat !== 'number' ||
+			typeof decoded.exp !== 'number'
 		) {
 			return null
 		}
 
-		const type = decoded['type']
+		const type = decoded.type
 		if (type !== 'access' && type !== 'refresh' && type !== 'device_credential') {
 			return null
 		}
 
 		return {
-			jti: decoded['jti'] as string,
-			sub: decoded['sub'] as string,
-			dev: decoded['dev'] as string,
+			jti: decoded.jti as string,
+			sub: decoded.sub as string,
+			dev: decoded.dev as string,
 			type,
-			iat: decoded['iat'] as number,
-			exp: decoded['exp'] as number,
+			iat: decoded.iat as number,
+			exp: decoded.exp as number,
 		}
 	}
 

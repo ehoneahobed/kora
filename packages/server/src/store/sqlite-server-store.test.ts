@@ -124,9 +124,7 @@ describe('SqliteServerStore', () => {
 		await expect(store.applyRemoteOperation(createTestOp())).rejects.toThrow(
 			'SqliteServerStore is closed',
 		)
-		await expect(store.getOperationRange('a', 1, 1)).rejects.toThrow(
-			'SqliteServerStore is closed',
-		)
+		await expect(store.getOperationRange('a', 1, 1)).rejects.toThrow('SqliteServerStore is closed')
 		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
 	})
 

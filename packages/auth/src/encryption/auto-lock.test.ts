@@ -12,9 +12,7 @@ describe('auto-lock', () => {
 
 	describe('constructor', () => {
 		test('throws for non-positive timeout', () => {
-			expect(() => new AutoLockManager({ timeout: 0, onLock: vi.fn() })).toThrow(
-				/positive number/,
-			)
+			expect(() => new AutoLockManager({ timeout: 0, onLock: vi.fn() })).toThrow(/positive number/)
 			expect(() => new AutoLockManager({ timeout: -1000, onLock: vi.fn() })).toThrow(
 				/positive number/,
 			)

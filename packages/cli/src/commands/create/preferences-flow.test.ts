@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import type { SelectOption } from '../../prompts/prompt-client'
 import type { CreatePreferences } from '../../prompts/preferences'
+import type { SelectOption } from '../../prompts/prompt-client'
 import { resolveCreatePreferencesFlow } from './preferences-flow'
 
 class MockPreferenceStore {
@@ -205,5 +205,4 @@ describe('resolveCreatePreferencesFlow', () => {
 
 		expect(result.template).toBe('tauri-react')
 	})
-
 })

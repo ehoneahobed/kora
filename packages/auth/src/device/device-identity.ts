@@ -73,10 +73,7 @@ export function fromBase64Url(str: string): Uint8Array {
  * Asserts that `crypto.subtle` is available, throwing a clear error if not.
  */
 function assertCryptoAvailable(): void {
-	if (
-		typeof globalThis.crypto === 'undefined' ||
-		typeof globalThis.crypto.subtle === 'undefined'
-	) {
+	if (typeof globalThis.crypto === 'undefined' || typeof globalThis.crypto.subtle === 'undefined') {
 		throw new CryptoUnavailableError()
 	}
 }
@@ -295,8 +292,7 @@ export async function computePublicKeyThumbprint(publicKeyJwk: JsonWebKey): Prom
 	// For EC (kty: "EC"), the required members are: crv, kty, x, y.
 	if (publicKeyJwk.kty !== 'EC') {
 		throw new DeviceIdentityError(
-			`Expected JWK key type "EC" but received "${publicKeyJwk.kty ?? 'undefined'}". ` +
-				'Only ECDSA public keys are supported for device identity.',
+			`Expected JWK key type "EC" but received "${publicKeyJwk.kty ?? 'undefined'}". Only ECDSA public keys are supported for device identity.`,
 			{ kty: publicKeyJwk.kty },
 		)
 	}
@@ -327,9 +323,8 @@ export async function computePublicKeyThumbprint(publicKeyJwk: JsonWebKey): Prom
 		const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', encoded)
 		return toBase64Url(hashBuffer)
 	} catch (cause) {
-		throw new DeviceIdentityError(
-			'Failed to compute SHA-256 thumbprint of the public key JWK.',
-			{ cause: cause instanceof Error ? cause.message : String(cause) },
-		)
+		throw new DeviceIdentityError('Failed to compute SHA-256 thumbprint of the public key JWK.', {
+			cause: cause instanceof Error ? cause.message : String(cause),
+		})
 	}
 }

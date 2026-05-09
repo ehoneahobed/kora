@@ -1,5 +1,5 @@
-import { KoraError } from '@korajs/core'
 import { randomUUID } from 'node:crypto'
+import { KoraError } from '@korajs/core'
 
 /**
  * A user as visible to the application layer.
@@ -54,10 +54,7 @@ export interface AuthDevice {
  */
 export class DuplicateEmailError extends KoraError {
 	constructor() {
-		super(
-			'A user with this email already exists.',
-			'DUPLICATE_EMAIL',
-		)
+		super('A user with this email already exists.', 'DUPLICATE_EMAIL')
 		this.name = 'DuplicateEmailError'
 	}
 }

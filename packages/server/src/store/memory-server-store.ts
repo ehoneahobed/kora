@@ -73,7 +73,7 @@ export class MemoryServerStore implements ServerStore {
 		}
 
 		// Dual-write: update materialized records if schema is set
-		if (this.schema && this.schema.collections[op.collection]) {
+		if (this.schema?.collections[op.collection]) {
 			this.rebuildMaterializedRecord(op.collection, op.recordId)
 		}
 
@@ -99,7 +99,7 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 
 		// Fast path: if schema is set, read from materialized records
-		if (this.schema && this.schema.collections[collection]) {
+		if (this.schema?.collections[collection]) {
 			return this.queryCollection(collection)
 		}
 
@@ -116,13 +116,14 @@ export class MemoryServerStore implements ServerStore {
 		this.assertCollection(collection)
 
 		// Validate field names
+		const schema = this.schema as SchemaDefinition
 		if (options?.where) {
 			for (const key of Object.keys(options.where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 		if (options?.orderBy) {
-			validateFieldName(collection, options.orderBy, this.schema!)
+			validateFieldName(collection, options.orderBy, schema)
 		}
 
 		const collectionMap = this.materializedRecords.get(collection)
@@ -168,7 +169,9 @@ export class MemoryServerStore implements ServerStore {
 		// Return clean copies without internal fields
 		return records.map((r) => {
 			const clean: MaterializedRecord = { id: r.id }
-			const collectionDef = this.schema!.collections[collection]!
+			const collectionDef = (this.schema as SchemaDefinition).collections[
+				collection
+			] as NonNullable<SchemaDefinition['collections'][string]>
 			for (const fieldName of Object.keys(collectionDef.fields)) {
 				if (fieldName in r) {
 					clean[fieldName] = r[fieldName]
@@ -193,7 +196,9 @@ export class MemoryServerStore implements ServerStore {
 
 		// Return clean copy
 		const clean: MaterializedRecord = { id: record.id }
-		const collectionDef = this.schema!.collections[collection]!
+		const collectionDef = (this.schema as SchemaDefinition).collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
 		for (const fieldName of Object.keys(collectionDef.fields)) {
 			if (fieldName in record) {
 				clean[fieldName] = record[fieldName]
@@ -209,9 +214,10 @@ export class MemoryServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(collection)
 
+		const schema = this.schema as SchemaDefinition
 		if (where) {
 			for (const key of Object.keys(where)) {
-				validateFieldName(collection, key, this.schema!)
+				validateFieldName(collection, key, schema)
 			}
 		}
 
@@ -254,7 +260,7 @@ export class MemoryServerStore implements ServerStore {
 	// ---------------------------------------------------------------------------
 
 	private rebuildMaterializedRecord(collection: string, recordId: string): void {
-		const collectionDef = this.schema!.collections[collection]
+		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
 
 		// Get or create collection map
@@ -268,8 +274,10 @@ export class MemoryServerStore implements ServerStore {
 		const recordOps = this.operations
 			.filter((op) => op.collection === collection && op.recordId === recordId)
 			.sort((a, b) => {
-				if (a.timestamp.wallTime !== b.timestamp.wallTime) return a.timestamp.wallTime - b.timestamp.wallTime
-				if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
+				if (a.timestamp.wallTime !== b.timestamp.wallTime)
+					return a.timestamp.wallTime - b.timestamp.wallTime
+				if (a.timestamp.logical !== b.timestamp.logical)
+					return a.timestamp.logical - b.timestamp.logical
 				return a.sequenceNumber - b.sequenceNumber
 			})
 
@@ -280,8 +288,12 @@ export class MemoryServerStore implements ServerStore {
 		const recordData = replayOperationsForRecord(parsedOps)
 
 		if (recordData) {
-			const createdAt = recordOps.length > 0 ? recordOps[0]!.timestamp.wallTime : Date.now()
-			const updatedAt = recordOps.length > 0 ? recordOps[recordOps.length - 1]!.timestamp.wallTime : Date.now()
+			const createdAt =
+				recordOps.length > 0 ? (recordOps[0] as Operation).timestamp.wallTime : Date.now()
+			const updatedAt =
+				recordOps.length > 0
+					? (recordOps[recordOps.length - 1] as Operation).timestamp.wallTime
+					: Date.now()
 
 			const materialized: MaterializedRecord = {
 				id: recordId,
@@ -333,8 +345,10 @@ export class MemoryServerStore implements ServerStore {
 		const collectionOps = this.operations
 			.filter((op) => op.collection === collection)
 			.sort((a, b) => {
-				if (a.timestamp.wallTime !== b.timestamp.wallTime) return a.timestamp.wallTime - b.timestamp.wallTime
-				if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
+				if (a.timestamp.wallTime !== b.timestamp.wallTime)
+					return a.timestamp.wallTime - b.timestamp.wallTime
+				if (a.timestamp.logical !== b.timestamp.logical)
+					return a.timestamp.logical - b.timestamp.logical
 				return a.sequenceNumber - b.sequenceNumber
 			})
 
@@ -388,9 +402,10 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	private assertCollection(collection: string): void {
-		if (!this.schema!.collections[collection]) {
+		const schema = this.schema as SchemaDefinition
+		if (!schema.collections[collection]) {
 			throw new Error(
-				`Unknown collection "${collection}". Available: ${Object.keys(this.schema!.collections).join(', ')}`,
+				`Unknown collection "${collection}". Available: ${Object.keys(schema.collections).join(', ')}`,
 			)
 		}
 	}

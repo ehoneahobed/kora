@@ -48,6 +48,11 @@ export async function createOperation(
 		sequenceNumber: input.sequenceNumber,
 		causalDeps: [...input.causalDeps],
 		schemaVersion: input.schemaVersion,
+		...(input.atomicOps !== undefined && Object.keys(input.atomicOps).length > 0
+			? { atomicOps: { ...input.atomicOps } }
+			: {}),
+		...(input.transactionId !== undefined ? { transactionId: input.transactionId } : {}),
+		...(input.mutationName !== undefined ? { mutationName: input.mutationName } : {}),
 	}
 
 	return deepFreeze(operation)
@@ -147,6 +152,7 @@ export async function verifyOperationIntegrity(op: Operation): Promise<boolean> 
 		sequenceNumber: op.sequenceNumber,
 		causalDeps: op.causalDeps,
 		schemaVersion: op.schemaVersion,
+		...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
 	}
 	const serializedTs = HybridLogicalClock.serialize(op.timestamp)
 	const expectedId = await computeOperationId(input, serializedTs)

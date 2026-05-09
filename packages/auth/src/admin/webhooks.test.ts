@@ -1,8 +1,8 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import {
-	WebhookManager,
 	InMemoryWebhookStore,
 	WebhookEndpointNotFoundError,
+	WebhookManager,
 	verifyWebhookSignature,
 } from './webhooks'
 import type { WebhookPayload } from './webhooks'
@@ -144,9 +144,9 @@ describe('WebhookManager', () => {
 
 			const deliveries = await manager.getDeliveries(ep.id)
 			expect(deliveries).toHaveLength(1)
-			expect(deliveries[0]!.success).toBe(true)
-			expect(deliveries[0]!.responseStatus).toBe(200)
-			expect(deliveries[0]!.attempts).toBe(1)
+			expect(deliveries[0]?.success).toBe(true)
+			expect(deliveries[0]?.responseStatus).toBe(200)
+			expect(deliveries[0]?.attempts).toBe(1)
 		})
 
 		test('retries on failure and records delivery', async () => {
@@ -160,9 +160,9 @@ describe('WebhookManager', () => {
 
 			const deliveries = await manager.getDeliveries(ep.id)
 			expect(deliveries).toHaveLength(1)
-			expect(deliveries[0]!.success).toBe(false)
-			expect(deliveries[0]!.attempts).toBe(3)
-			expect(deliveries[0]!.error).toContain('500')
+			expect(deliveries[0]?.success).toBe(false)
+			expect(deliveries[0]?.attempts).toBe(3)
+			expect(deliveries[0]?.error).toContain('500')
 		}, 40000)
 
 		test('retries on network error', async () => {
@@ -175,8 +175,8 @@ describe('WebhookManager', () => {
 
 			const deliveries = await manager.getDeliveries(ep.id)
 			expect(deliveries).toHaveLength(1)
-			expect(deliveries[0]!.success).toBe(true)
-			expect(deliveries[0]!.attempts).toBe(2)
+			expect(deliveries[0]?.success).toBe(true)
+			expect(deliveries[0]?.attempts).toBe(2)
 		}, 10000)
 
 		test('includes signature header', async () => {
@@ -215,7 +215,7 @@ describe('verifyWebhookSignature', () => {
 		const bytes = new Uint8Array(sig)
 		let hex = ''
 		for (let i = 0; i < bytes.length; i++) {
-			hex += bytes[i]!.toString(16).padStart(2, '0')
+			hex += bytes[i]?.toString(16).padStart(2, '0')
 		}
 		const signature = `sha256=${hex}`
 
@@ -245,14 +245,12 @@ describe('verifyWebhookSignature', () => {
 		const bytes = new Uint8Array(sig)
 		let hex = ''
 		for (let i = 0; i < bytes.length; i++) {
-			hex += bytes[i]!.toString(16).padStart(2, '0')
+			hex += bytes[i]?.toString(16).padStart(2, '0')
 		}
 		const signature = `sha256=${hex}`
 
 		// Try verifying with tampered payload
-		expect(
-			await verifyWebhookSignature('{"event":"user.deleted"}', signature, secret),
-		).toBe(false)
+		expect(await verifyWebhookSignature('{"event":"user.deleted"}', signature, secret)).toBe(false)
 	})
 })
 
@@ -297,8 +295,22 @@ describe('InMemoryWebhookStore', () => {
 	})
 
 	test('lists all endpoints', async () => {
-		await store.saveEndpoint({ id: '1', url: 'a', events: [], secret: 's', active: true, createdAt: 0 })
-		await store.saveEndpoint({ id: '2', url: 'b', events: [], secret: 's', active: true, createdAt: 0 })
+		await store.saveEndpoint({
+			id: '1',
+			url: 'a',
+			events: [],
+			secret: 's',
+			active: true,
+			createdAt: 0,
+		})
+		await store.saveEndpoint({
+			id: '2',
+			url: 'b',
+			events: [],
+			secret: 's',
+			active: true,
+			createdAt: 0,
+		})
 		const all = await store.listEndpoints()
 		expect(all).toHaveLength(2)
 	})
@@ -332,7 +344,7 @@ describe('InMemoryWebhookStore', () => {
 		const deliveries = await store.listDeliveries('ep-1')
 		expect(deliveries).toHaveLength(2)
 		// Should be newest first
-		expect(deliveries[0]!.createdAt).toBe(2000)
+		expect(deliveries[0]?.createdAt).toBe(2000)
 	})
 
 	test('updates existing delivery on save', async () => {
@@ -364,16 +376,23 @@ describe('InMemoryWebhookStore', () => {
 
 		const deliveries = await store.listDeliveries('ep-1')
 		expect(deliveries).toHaveLength(1)
-		expect(deliveries[0]!.success).toBe(true)
-		expect(deliveries[0]!.attempts).toBe(2)
+		expect(deliveries[0]?.success).toBe(true)
+		expect(deliveries[0]?.attempts).toBe(2)
 	})
 
 	test('returns copies not references', async () => {
-		const ep = { id: '1', url: 'a', events: [] as string[], secret: 's', active: true, createdAt: 0 }
+		const ep = {
+			id: '1',
+			url: 'a',
+			events: [] as string[],
+			secret: 's',
+			active: true,
+			createdAt: 0,
+		}
 		await store.saveEndpoint(ep as import('./webhooks').WebhookEndpoint)
 		const retrieved = await store.getEndpoint('1')
-		retrieved!.url = 'mutated'
+		;(retrieved as NonNullable<typeof retrieved>).url = 'mutated'
 		const again = await store.getEndpoint('1')
-		expect(again!.url).toBe('a')
+		expect(again?.url).toBe('a')
 	})
 })

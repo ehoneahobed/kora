@@ -290,6 +290,157 @@ const recentActive = await app.todos
 
 ---
 
+## Transactions
+
+Transactions execute multiple mutations atomically. Either all operations succeed, or none do. Use transactions when you need to update multiple records or collections as a single unit.
+
+### app.transaction(fn)
+
+Executes a function within a transaction context. The transaction is committed when the function completes, or rolled back if it throws.
+
+```typescript
+transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `fn` | `(tx: TransactionProxy) => Promise<void>` | Function that performs mutations using the transaction proxy. |
+
+**Returns:** `Promise<Operation[]>` — The operations created by the transaction.
+
+```typescript
+const ops = await app.transaction(async (tx) => {
+  const order = await tx.orders.insert({ total: 99.99 })
+  await tx.lineItems.insert({ orderId: order.id, product: 'Widget', qty: 2 })
+  await tx.lineItems.insert({ orderId: order.id, product: 'Gadget', qty: 1 })
+})
+// All three inserts succeed or fail together
+```
+
+The transaction proxy (`tx`) provides the same collection accessors as the app (`tx.orders`, `tx.todos`, etc.), but mutations are buffered and only applied when the function completes successfully.
+
+### app.mutation(name, fn)
+
+A named transaction — identical to `app.transaction()` but with a name that appears in DevTools for easier debugging.
+
+```typescript
+mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | `string` | A descriptive name for this mutation (visible in DevTools). |
+| `fn` | `(tx: TransactionProxy) => Promise<void>` | Function that performs mutations using the transaction proxy. |
+
+```typescript
+await app.mutation('create-order', async (tx) => {
+  const order = await tx.orders.insert({ total: 150 })
+  await tx.lineItems.insert({ orderId: order.id, product: 'Widget', qty: 3 })
+})
+```
+
+### TransactionProxy
+
+The transaction proxy exposes collection accessors with the same API as the app-level accessors:
+
+| Method | Description |
+|--------|-------------|
+| `tx.<collection>.insert(data)` | Insert a record within the transaction. |
+| `tx.<collection>.update(id, data)` | Update a record within the transaction. |
+| `tx.<collection>.delete(id)` | Delete a record within the transaction. |
+| `tx.<collection>.findById(id)` | Read a record (sees uncommitted writes from this transaction). |
+
+::: tip
+Queries (`.where()`, `.exec()`) are not available inside transactions. Use `findById()` to look up records you need during the transaction.
+:::
+
+---
+
+## Sequences
+
+Sequences generate ordered, formatted identifiers (invoice numbers, order codes, receipt IDs). They are offline-safe — each device maintains its own counter that increments monotonically.
+
+### app.sequences.next(name, config?)
+
+Generates the next value in a named sequence.
+
+```typescript
+next(name: string, config?: SequenceConfig): Promise<string>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | `string` | Sequence name. Different names maintain independent counters. |
+| `config` | `SequenceConfig` | Optional. Format and scope options. |
+
+#### SequenceConfig
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `format` | `string` | `'{name}-{seq:4}'` | Format template. See format tokens below. |
+| `scope` | `string` | `undefined` | Scope key. Different scopes maintain independent counters for the same sequence name. |
+
+#### Format tokens
+
+| Token | Description | Example output |
+|-------|-------------|----------------|
+| `{seq}` | Counter without padding | `1`, `42`, `100` |
+| `{seq:N}` | Counter zero-padded to N digits | `{seq:4}` → `0001` |
+| `{date}` | Current date as `YYYYMMDD` | `20260508` |
+| `{node4}` | First 4 chars of node ID | `a1b2` |
+| `{node8}` | First 8 chars of node ID | `a1b2c3d4` |
+
+```typescript
+// Default format: name + zero-padded counter
+await app.sequences.next('order')        // 'order-0001'
+await app.sequences.next('order')        // 'order-0002'
+
+// Custom format
+await app.sequences.next('receipt', {
+  format: 'REC-{seq:6}',
+})                                        // 'REC-000001'
+
+// Scoped sequences (independent counters per scope)
+await app.sequences.next('receipt', { scope: 'store-A' })  // 'receipt-0001'
+await app.sequences.next('receipt', { scope: 'store-B' })  // 'receipt-0001'
+await app.sequences.next('receipt', { scope: 'store-A' })  // 'receipt-0002'
+```
+
+### app.sequences.current(name, config?)
+
+Returns the current counter value without incrementing it. Returns `0` for unused sequences.
+
+```typescript
+current(name: string, config?: { scope?: string }): Promise<number>
+```
+
+```typescript
+const count = await app.sequences.current('order')  // 0 (never used)
+await app.sequences.next('order')
+await app.sequences.next('order')
+const count2 = await app.sequences.current('order') // 2
+```
+
+### app.sequences.reset(name, config?)
+
+Resets a sequence counter. The next call to `.next()` starts from 1 (or from the specified value).
+
+```typescript
+reset(name: string, config?: { scope?: string; to?: number }): Promise<void>
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `config.scope` | `string` | `undefined` | Only reset the counter for this scope. |
+| `config.to` | `number` | `0` | Reset the counter to this value. |
+
+```typescript
+await app.sequences.reset('order')          // Next .next() returns 'order-0001'
+await app.sequences.reset('order', { to: 100 })  // Next .next() returns 'order-0101'
+```
+
+---
+
 ## StorageAdapter
 
 The `StorageAdapter` interface defines the contract for storage backends. Kora ships with three implementations. You do not typically implement this yourself unless building a custom storage backend.

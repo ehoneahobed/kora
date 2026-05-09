@@ -24,6 +24,8 @@ export interface KoraContextValue {
 	store: Store
 	/** Optional sync engine for remote synchronization */
 	syncEngine: SyncEngine | null
+	/** The KoraApp instance (when provided via app prop). */
+	app: KoraAppLike | null
 }
 
 /**

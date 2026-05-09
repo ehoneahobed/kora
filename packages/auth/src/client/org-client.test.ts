@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, vi, afterEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { OrgClient, OrgClientError } from './org-client'
 
 // Mock fetch globally
@@ -270,9 +270,7 @@ describe('OrgClient', () => {
 		})
 
 		test('throws OrgClientError on server error', async () => {
-			mockFetch.mockResolvedValue(
-				mockJsonResponse({ error: 'Organization not found.' }, 404),
-			)
+			mockFetch.mockResolvedValue(mockJsonResponse({ error: 'Organization not found.' }, 404))
 			await expect(client.getOrg('bogus')).rejects.toThrow('Organization not found.')
 		})
 

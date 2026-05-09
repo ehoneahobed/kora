@@ -1,9 +1,8 @@
 import type { TimestampedEvent } from '../types'
 import { renderDevtoolsPanel } from '../ui/panel'
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+// biome-ignore lint/suspicious/noExplicitAny: Chrome extension API global has no type definitions without @types/chrome
 declare const chrome: any
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 const extensionRoot = document.getElementById('kora-devtools-root')
 if (!extensionRoot) {

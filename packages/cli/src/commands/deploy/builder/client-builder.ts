@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { copyFile, readdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { copyFile, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { resolveProjectBinaryEntryPoint } from '../../../utils/fs-helpers'
 

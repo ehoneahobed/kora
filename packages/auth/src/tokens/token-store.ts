@@ -137,20 +137,17 @@ export class TokenStore {
 			const record = parsed as Record<string, unknown>
 
 			// Validate required fields are present and are strings
-			if (
-				typeof record['accessToken'] !== 'string'
-				|| typeof record['refreshToken'] !== 'string'
-			) {
+			if (typeof record.accessToken !== 'string' || typeof record.refreshToken !== 'string') {
 				return null
 			}
 
 			const tokens: AuthTokens = {
-				accessToken: record['accessToken'],
-				refreshToken: record['refreshToken'],
+				accessToken: record.accessToken,
+				refreshToken: record.refreshToken,
 			}
 
-			if (typeof record['deviceCredential'] === 'string') {
-				tokens.deviceCredential = record['deviceCredential']
+			if (typeof record.deviceCredential === 'string') {
+				tokens.deviceCredential = record.deviceCredential
 			}
 
 			return tokens

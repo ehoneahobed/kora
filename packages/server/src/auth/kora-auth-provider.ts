@@ -131,9 +131,7 @@ export class KoraAuthProvider implements AuthProvider {
 		}
 
 		// Compute sync scopes if a resolver is configured
-		const scopes = this.resolveScopes
-			? await this.resolveScopes(payload.sub)
-			: undefined
+		const scopes = this.resolveScopes ? await this.resolveScopes(payload.sub) : undefined
 
 		return {
 			userId: payload.sub,

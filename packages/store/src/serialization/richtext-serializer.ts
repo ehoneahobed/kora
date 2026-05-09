@@ -49,7 +49,9 @@ export function decodeRichtext(value: unknown): Uint8Array | null {
 		return new Uint8Array(value)
 	}
 
-	throw new Error('Richtext storage value must be Uint8Array, ArrayBuffer, Buffer, null, or undefined.')
+	throw new Error(
+		'Richtext storage value must be Uint8Array, ArrayBuffer, Buffer, null, or undefined.',
+	)
 }
 
 /**

@@ -29,6 +29,12 @@ export interface SyncStatusInfo {
 	pendingOperations: number
 	/** Timestamp of last successful sync (null if never synced) */
 	lastSyncedAt: number | null
+	/** Timestamp of last successful push to the server (null if never pushed) */
+	lastSuccessfulPush: number | null
+	/** Timestamp of last successful pull from the server (null if never pulled) */
+	lastSuccessfulPull: number | null
+	/** Number of merge conflicts encountered during this session */
+	conflicts: number
 }
 
 /**
@@ -43,6 +49,11 @@ export interface SyncConfig {
 	auth?: () => Promise<{ token: string }>
 	/** Sync scopes per collection. Limits which records sync to this client. */
 	scopes?: Record<string, (ctx: SyncScopeContext) => Record<string, unknown>>
+	/**
+	 * Pre-computed per-collection sync scope map. Sent to the server in the handshake.
+	 * Built automatically by createApp from schema scope declarations + flat scope values.
+	 */
+	scopeMap?: Record<string, Record<string, unknown>>
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
 	/** Initial reconnection delay in ms. Defaults to 1000. */

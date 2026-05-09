@@ -147,9 +147,9 @@ export function verifyJwt(token: string, secret: string): Record<string, unknown
 	const signatureSegment = parts[2]
 
 	if (
-		headerSegment === undefined
-		|| payloadSegment === undefined
-		|| signatureSegment === undefined
+		headerSegment === undefined ||
+		payloadSegment === undefined ||
+		signatureSegment === undefined
 	) {
 		return null
 	}

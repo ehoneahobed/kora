@@ -313,7 +313,9 @@ function isValidPackageManager(value: string): value is PackageManager {
 }
 
 function isSyncTemplate(template: TemplateName): boolean {
-	return template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+	return (
+		template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+	)
 }
 
 function formatDbProviderForLog(dbProvider: string): string {

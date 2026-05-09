@@ -29,5 +29,17 @@
 	},
 	"files": {
 		"ignore": ["node_modules", "dist", ".turbo", "coverage", "*.json"]
-	}
+	},
+	"overrides": [
+		{
+			"include": ["packages/core/src/schema/infer.ts"],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noExplicitAny": "off"
+					}
+				}
+			}
+		}
+	]
 }

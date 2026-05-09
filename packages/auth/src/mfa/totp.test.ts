@@ -1,18 +1,18 @@
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import {
-	TotpManager,
 	InMemoryTotpStore,
-	base32Encode,
-	base32Decode,
-	TotpInvalidCodeError,
-	TotpNotEnabledError,
 	TotpAlreadyEnabledError,
+	TotpInvalidCodeError,
+	TotpManager,
+	TotpNotEnabledError,
 	TotpNotVerifiedError,
+	base32Decode,
+	base32Encode,
 } from './totp'
 
 // Helper: extract a valid TOTP code from TotpManager's internal validation
 // We generate a code by using the same algorithm the manager uses
-function generateValidCode(base32Secret: string, period: number = 30, digits: number = 6): string {
+function generateValidCode(base32Secret: string, period = 30, digits = 6): string {
 	const secret = base32Decode(base32Secret)
 	const counter = Math.floor(Date.now() / 1000 / period)
 	return generateHotpCode(secret, counter, digits)
@@ -29,14 +29,14 @@ function generateHotpCode(secret: Uint8Array, counter: number, digits: number): 
 
 	const hash = hmacSha1(secret, counterBytes)
 
-	const offset = hash[hash.length - 1]! & 0x0f
+	const offset = (hash[hash.length - 1] as number) & 0x0f
 	const binary =
-		((hash[offset]! & 0x7f) << 24) |
-		((hash[offset + 1]! & 0xff) << 16) |
-		((hash[offset + 2]! & 0xff) << 8) |
-		(hash[offset + 3]! & 0xff)
+		(((hash[offset] as number) & 0x7f) << 24) |
+		(((hash[offset + 1] as number) & 0xff) << 16) |
+		(((hash[offset + 2] as number) & 0xff) << 8) |
+		((hash[offset + 3] as number) & 0xff)
 
-	const otp = binary % Math.pow(10, digits)
+	const otp = binary % 10 ** digits
 	return otp.toString().padStart(digits, '0')
 }
 
@@ -63,30 +63,56 @@ function sha1(data: Uint8Array): Uint8Array {
 			w[i] = view.getInt32(offset + i * 4, false)
 		}
 		for (let i = 16; i < 80; i++) {
-			w[i] = (((w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!) << 1) | ((w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!) >>> 31)) | 0
+			const xor =
+				(w[i - 3] as number) ^ (w[i - 8] as number) ^ (w[i - 14] as number) ^ (w[i - 16] as number)
+			w[i] = (xor << 1) | (xor >>> 31) | 0
 		}
 
-		let a = h0, b = h1, c = h2, d = h3, e = h4
+		let a = h0
+		let b = h1
+		let c = h2
+		let d = h3
+		let e = h4
 
 		for (let i = 0; i < 80; i++) {
-			let f: number, k: number
-			if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999 }
-			else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1 }
-			else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc }
-			else { f = b ^ c ^ d; k = 0xca62c1d6 }
+			let f: number
+			let k: number
+			if (i < 20) {
+				f = (b & c) | (~b & d)
+				k = 0x5a827999
+			} else if (i < 40) {
+				f = b ^ c ^ d
+				k = 0x6ed9eba1
+			} else if (i < 60) {
+				f = (b & c) | (b & d) | (c & d)
+				k = 0x8f1bbcdc
+			} else {
+				f = b ^ c ^ d
+				k = 0xca62c1d6
+			}
 
-			const temp = (((a << 5) | (a >>> 27)) + f + e + k + w[i]!) | 0
-			e = d; d = c; c = ((b << 30) | (b >>> 2)) | 0; b = a; a = temp
+			const temp = (((a << 5) | (a >>> 27)) + f + e + k + (w[i] as number)) | 0
+			e = d
+			d = c
+			c = (b << 30) | (b >>> 2) | 0
+			b = a
+			a = temp
 		}
 
-		h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0
-		h3 = (h3 + d) | 0; h4 = (h4 + e) | 0
+		h0 = (h0 + a) | 0
+		h1 = (h1 + b) | 0
+		h2 = (h2 + c) | 0
+		h3 = (h3 + d) | 0
+		h4 = (h4 + e) | 0
 	}
 
 	const result = new Uint8Array(20)
 	const rv = new DataView(result.buffer)
-	rv.setInt32(0, h0, false); rv.setInt32(4, h1, false); rv.setInt32(8, h2, false)
-	rv.setInt32(12, h3, false); rv.setInt32(16, h4, false)
+	rv.setInt32(0, h0, false)
+	rv.setInt32(4, h1, false)
+	rv.setInt32(8, h2, false)
+	rv.setInt32(12, h3, false)
+	rv.setInt32(16, h4, false)
 	return result
 }
 
@@ -98,7 +124,7 @@ function hmacSha1(key: Uint8Array, message: Uint8Array): Uint8Array {
 	const ipad = new Uint8Array(blockSize)
 	const opad = new Uint8Array(blockSize)
 	for (let i = 0; i < blockSize; i++) {
-		const k = i < keyPad.length ? keyPad[i]! : 0
+		const k = i < keyPad.length ? (keyPad[i] as number) : 0
 		ipad[i] = k ^ 0x36
 		opad[i] = k ^ 0x5c
 	}
@@ -156,8 +182,8 @@ describe('TotpManager', () => {
 
 			const stored = await store.getByUserId('user-1')
 			expect(stored).not.toBeNull()
-			expect(stored!.verified).toBe(false)
-			expect(stored!.verifiedAt).toBeNull()
+			expect(stored?.verified).toBe(false)
+			expect(stored?.verifiedAt).toBeNull()
 		})
 
 		test('throws if already enabled and verified', async () => {
@@ -200,21 +226,17 @@ describe('TotpManager', () => {
 			expect(result).toBe(true)
 
 			const stored = await store.getByUserId('user-1')
-			expect(stored!.verified).toBe(true)
-			expect(stored!.verifiedAt).toBeGreaterThan(0)
+			expect(stored?.verified).toBe(true)
+			expect(stored?.verifiedAt).toBeGreaterThan(0)
 		})
 
 		test('rejects invalid code', async () => {
 			await manager.enable('user-1', 'alice@example.com')
-			await expect(manager.verifySetup('user-1', '000000')).rejects.toThrow(
-				TotpInvalidCodeError,
-			)
+			await expect(manager.verifySetup('user-1', '000000')).rejects.toThrow(TotpInvalidCodeError)
 		})
 
 		test('throws if TOTP not enabled', async () => {
-			await expect(manager.verifySetup('user-1', '123456')).rejects.toThrow(
-				TotpNotEnabledError,
-			)
+			await expect(manager.verifySetup('user-1', '123456')).rejects.toThrow(TotpNotEnabledError)
 		})
 	})
 
@@ -242,16 +264,12 @@ describe('TotpManager', () => {
 		})
 
 		test('throws if TOTP not enabled', async () => {
-			await expect(manager.verify('user-1', '123456')).rejects.toThrow(
-				TotpNotEnabledError,
-			)
+			await expect(manager.verify('user-1', '123456')).rejects.toThrow(TotpNotEnabledError)
 		})
 
 		test('throws if TOTP not verified', async () => {
 			await manager.enable('user-1', 'alice@example.com')
-			await expect(manager.verify('user-1', '123456')).rejects.toThrow(
-				TotpNotVerifiedError,
-			)
+			await expect(manager.verify('user-1', '123456')).rejects.toThrow(TotpNotVerifiedError)
 		})
 	})
 
@@ -263,7 +281,7 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			const result = await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0]!)
+			const result = await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0] as string)
 			expect(result).toBe(true)
 		})
 
@@ -272,7 +290,7 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			const recoveryCode = setup.recoveryCodes[0]!
+			const recoveryCode = setup.recoveryCodes[0] as string
 			await manager.verifyRecoveryCode('user-1', recoveryCode)
 
 			// Second use should fail
@@ -290,9 +308,7 @@ describe('TotpManager', () => {
 		})
 
 		test('throws if TOTP not enabled', async () => {
-			await expect(manager.verifyRecoveryCode('user-1', 'abc')).rejects.toThrow(
-				TotpNotEnabledError,
-			)
+			await expect(manager.verifyRecoveryCode('user-1', 'abc')).rejects.toThrow(TotpNotEnabledError)
 		})
 
 		test('throws if TOTP not verified', async () => {
@@ -308,7 +324,7 @@ describe('TotpManager', () => {
 			await manager.verifySetup('user-1', code)
 
 			// Recovery codes are stored as xxxxx-xxxxx, should work with extra spaces
-			const recoveryCode = setup.recoveryCodes[1]!
+			const recoveryCode = setup.recoveryCodes[1] as string
 			const result = await manager.verifyRecoveryCode('user-1', ` ${recoveryCode} `)
 			expect(result).toBe(true)
 		})
@@ -339,7 +355,7 @@ describe('TotpManager', () => {
 			await manager.regenerateRecoveryCodes('user-1', newCode)
 
 			// Old codes should fail
-			const result = await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0]!)
+			const result = await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0] as string)
 			expect(result).toBe(false)
 		})
 
@@ -379,7 +395,7 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			await manager.disable('user-1', setup.recoveryCodes[0]!)
+			await manager.disable('user-1', setup.recoveryCodes[0] as string)
 			expect(await manager.isEnabled('user-1')).toBe(false)
 		})
 
@@ -388,15 +404,11 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			await expect(manager.disable('user-1', '000000')).rejects.toThrow(
-				TotpInvalidCodeError,
-			)
+			await expect(manager.disable('user-1', '000000')).rejects.toThrow(TotpInvalidCodeError)
 		})
 
 		test('throws if TOTP not enabled', async () => {
-			await expect(manager.disable('user-1', '123456')).rejects.toThrow(
-				TotpNotEnabledError,
-			)
+			await expect(manager.disable('user-1', '123456')).rejects.toThrow(TotpNotEnabledError)
 		})
 	})
 
@@ -439,7 +451,7 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0]!)
+			await manager.verifyRecoveryCode('user-1', setup.recoveryCodes[0] as string)
 			expect(await manager.remainingRecoveryCodes('user-1')).toBe(7)
 		})
 	})
@@ -565,8 +577,8 @@ describe('InMemoryTotpStore', () => {
 			verifiedAt: Date.now(),
 		})
 		const retrieved = await store.getByUserId('u1')
-		expect(retrieved!.secret).toBe('NEW')
-		expect(retrieved!.verified).toBe(true)
+		expect(retrieved?.secret).toBe('NEW')
+		expect(retrieved?.verified).toBe(true)
 	})
 })
 

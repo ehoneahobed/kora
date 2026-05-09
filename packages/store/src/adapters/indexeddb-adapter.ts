@@ -125,7 +125,9 @@ export class IndexedDbAdapter implements StorageAdapter {
 			if (table.rows.length === 0) continue
 
 			for (const row of table.rows) {
-				const columns = table.columns.filter((column) => Object.prototype.hasOwnProperty.call(row, column))
+				const columns = table.columns.filter((column) =>
+					Object.prototype.hasOwnProperty.call(row, column),
+				)
 				if (columns.length === 0) continue
 
 				const placeholders = columns.map(() => '?').join(', ')

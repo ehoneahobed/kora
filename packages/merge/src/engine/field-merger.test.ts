@@ -1,7 +1,7 @@
 import type { FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { mergeField } from './field-merger'
 import { richtextToString, stringToRichtextUpdate } from '../strategies/yjs-richtext'
+import { mergeField } from './field-merger'
 
 function makeOp(overrides: Partial<Operation> = {}): Operation {
 	return {
@@ -447,6 +447,253 @@ describe('mergeField', () => {
 
 			expect(result.value).toBe('update')
 			expect(result.trace.strategy).toBe('no-conflict-remote')
+		})
+	})
+
+	describe('schema-declared merge strategies', () => {
+		const counterField: FieldDescriptor = {
+			kind: 'number',
+			required: true,
+			defaultValue: 0,
+			auto: false,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: 'counter',
+		}
+
+		const maxField: FieldDescriptor = {
+			kind: 'number',
+			required: true,
+			defaultValue: 0,
+			auto: false,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: 'max',
+		}
+
+		const minField: FieldDescriptor = {
+			kind: 'number',
+			required: true,
+			defaultValue: 0,
+			auto: false,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: 'min',
+		}
+
+		const appendOnlyField: FieldDescriptor = {
+			kind: 'array',
+			required: false,
+			defaultValue: [],
+			auto: false,
+			enumValues: null,
+			itemKind: 'string',
+			mergeStrategy: 'append-only',
+		}
+
+		const serverAuthField: FieldDescriptor = {
+			kind: 'string',
+			required: true,
+			defaultValue: '',
+			auto: false,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: 'server-authoritative',
+		}
+
+		test('counter strategy sums deltas from base', () => {
+			const local = makeOp({
+				data: { count: 15 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { count: 12 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('count', local, remote, { count: 10 }, counterField)
+			expect(result.value).toBe(17) // 10 + 5 + 2
+			expect(result.trace.strategy).toBe('schema-counter')
+		})
+
+		test('max strategy keeps the maximum value', () => {
+			const local = makeOp({
+				data: { score: 15 },
+				previousData: { score: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { score: 20 },
+				previousData: { score: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('score', local, remote, { score: 10 }, maxField)
+			expect(result.value).toBe(20)
+			expect(result.trace.strategy).toBe('schema-max')
+		})
+
+		test('min strategy keeps the minimum value', () => {
+			const local = makeOp({
+				data: { price: 5 },
+				previousData: { price: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { price: 8 },
+				previousData: { price: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('price', local, remote, { price: 10 }, minField)
+			expect(result.value).toBe(5)
+			expect(result.trace.strategy).toBe('schema-min')
+		})
+
+		test('append-only strategy concatenates additions', () => {
+			const local = makeOp({
+				data: { tags: ['a', 'b'] },
+				previousData: { tags: ['a'] },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { tags: ['a', 'c'] },
+				previousData: { tags: ['a'] },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('tags', local, remote, { tags: ['a'] }, appendOnlyField)
+			expect(result.value).toEqual(['a', 'b', 'c'])
+			expect(result.trace.strategy).toBe('schema-append-only')
+		})
+
+		test('server-authoritative strategy always picks remote', () => {
+			const local = makeOp({
+				data: { status: 'local-value' },
+				previousData: { status: 'base' },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { status: 'remote-value' },
+				previousData: { status: 'base' },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('status', local, remote, { status: 'base' }, serverAuthField)
+			expect(result.value).toBe('remote-value')
+			expect(result.trace.strategy).toBe('schema-server-authoritative')
+		})
+
+		test('lww strategy falls through to autoMerge', () => {
+			const lwwField: FieldDescriptor = {
+				kind: 'number',
+				required: true,
+				defaultValue: 0,
+				auto: false,
+				enumValues: null,
+				itemKind: null,
+				mergeStrategy: 'lww',
+			}
+
+			const local = makeOp({
+				data: { count: 15 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { count: 12 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('count', local, remote, { count: 10 }, lwwField)
+			// Falls through to autoMerge → LWW by HLC → local wins (later timestamp)
+			expect(result.value).toBe(15)
+			expect(result.trace.strategy).toBe('lww')
+		})
+
+		test('union strategy falls through to autoMerge', () => {
+			const unionField: FieldDescriptor = {
+				kind: 'array',
+				required: false,
+				defaultValue: [],
+				auto: false,
+				enumValues: null,
+				itemKind: 'string',
+				mergeStrategy: 'union',
+			}
+
+			const local = makeOp({
+				data: { tags: ['a', 'b'] },
+				previousData: { tags: ['a'] },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { tags: ['a', 'c'] },
+				previousData: { tags: ['a'] },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = mergeField('tags', local, remote, { tags: ['a'] }, unionField)
+			// Falls through to autoMerge → add-wins-set
+			expect(result.trace.strategy).toBe('add-wins-set')
+		})
+
+		test('custom resolver (tier 3) takes precedence over schema strategy', () => {
+			const local = makeOp({
+				data: { count: 15 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { count: 12 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const resolver = (l: unknown, r: unknown, b: unknown) => 999
+
+			const result = mergeField('count', local, remote, { count: 10 }, counterField, resolver)
+			expect(result.value).toBe(999)
+			expect(result.trace.strategy).toBe('custom')
+			expect(result.trace.tier).toBe(3)
+		})
+
+		test('counter merge is commutative via mergeField', () => {
+			const opA = makeOp({
+				data: { count: 15 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const opB = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { count: 12 },
+				previousData: { count: 10 },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const resultAB = mergeField('count', opA, opB, { count: 10 }, counterField)
+			const resultBA = mergeField('count', opB, opA, { count: 10 }, counterField)
+			expect(resultAB.value).toBe(resultBA.value)
 		})
 	})
 })

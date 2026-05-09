@@ -202,11 +202,9 @@ export class MemberAlreadyExistsError extends OrgError {
 
 export class InsufficientRoleError extends OrgError {
 	constructor(required: OrgRole) {
-		super(
-			`This action requires at least the "${required}" role.`,
-			'INSUFFICIENT_ROLE',
-			{ requiredRole: required },
-		)
+		super(`This action requires at least the "${required}" role.`, 'INSUFFICIENT_ROLE', {
+			requiredRole: required,
+		})
 	}
 }
 

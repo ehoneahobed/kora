@@ -118,6 +118,17 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 			')',
 	)
 
+	// Sequence counters table (offline-safe sequences)
+	statements.push(
+		'CREATE TABLE IF NOT EXISTS _kora_sequences (\n' +
+			'  name TEXT NOT NULL,\n' +
+			"  scope TEXT NOT NULL DEFAULT '',\n" +
+			'  node_id TEXT NOT NULL,\n' +
+			'  counter INTEGER NOT NULL DEFAULT 0,\n' +
+			'  PRIMARY KEY (name, scope, node_id)\n' +
+			')',
+	)
+
 	for (const [name, collection] of Object.entries(schema.collections)) {
 		statements.push(...generateSQL(name, collection, schema.relations))
 	}

@@ -1,6 +1,12 @@
-import { HybridLogicalClock, createVersionVector, generateUUIDv7 } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	createVersionVector,
+	generateUUIDv7,
+	migrationStepsToSQL,
+} from '@korajs/core'
 import type {
 	KoraEventEmitter,
+	MigrationStep,
 	Operation,
 	OperationLog,
 	SchemaDefinition,
@@ -10,12 +16,14 @@ import { Collection } from '../collection/collection'
 import { StoreNotOpenError } from '../errors'
 import { QueryBuilder } from '../query/query-builder'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import { SequenceManager } from '../sequences/sequence-manager'
 import {
 	deserializeOperationWithCollection,
 	serializeOperation,
 	serializeRecord,
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
+import { TransactionContext } from '../transaction/transaction-context'
 import type {
 	ApplyResult,
 	MetaRow,
@@ -48,6 +56,7 @@ export class Store implements OperationLog {
 	private clock: HybridLogicalClock | null = null
 	private collections = new Map<string, Collection>()
 	private subscriptionManager = new SubscriptionManager()
+	private sequenceManager: SequenceManager | null = null
 
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
@@ -68,9 +77,15 @@ export class Store implements OperationLog {
 	async open(): Promise<void> {
 		await this.adapter.open(this.schema)
 
+		// Run schema migrations if needed
+		await this.runMigrationsIfNeeded()
+
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
 		this.clock = new HybridLogicalClock(this.nodeId)
+
+		// Initialize sequence manager
+		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
 
 		// Load sequence number and version vector
 		this.sequenceNumber = await this.loadSequenceNumber()
@@ -134,7 +149,14 @@ export class Store implements OperationLog {
 			update: (id: string, data: Record<string, unknown>) => col.update(id, data),
 			delete: (id: string) => col.delete(id),
 			where: (conditions) =>
-				new QueryBuilder(name, definition, this.adapter, this.subscriptionManager, conditions, this.schema),
+				new QueryBuilder(
+					name,
+					definition,
+					this.adapter,
+					this.subscriptionManager,
+					conditions,
+					this.schema,
+				),
 		}
 	}
 
@@ -277,10 +299,179 @@ export class Store implements OperationLog {
 		return this.subscriptionManager
 	}
 
+	/**
+	 * Get the sequence manager for offline-safe sequence generation.
+	 * @throws {StoreNotOpenError} If the store is not open
+	 */
+	getSequenceManager(): SequenceManager {
+		this.ensureOpen()
+		if (!this.sequenceManager) {
+			throw new StoreNotOpenError()
+		}
+		return this.sequenceManager
+	}
+
+	/**
+	 * Create a TransactionContext for atomic multi-collection operations.
+	 * The returned context buffers all mutations and commits them atomically.
+	 *
+	 * After commit, the caller is responsible for notifying subscriptions
+	 * and emitting events for each operation.
+	 */
+	createTransaction(): TransactionContext {
+		this.ensureOpen()
+		if (!this.clock) {
+			throw new StoreNotOpenError()
+		}
+		return new TransactionContext({
+			schema: this.schema,
+			adapter: this.adapter,
+			clock: this.clock,
+			nodeId: this.nodeId,
+			getSequenceNumber: () => this.nextSequenceNumber(),
+		})
+	}
+
+	/**
+	 * Execute a function within a transaction. All mutations performed on the
+	 * TransactionContext are committed atomically. Subscription notifications
+	 * are batched and fired after the commit.
+	 *
+	 * If the function throws, the transaction is rolled back and the error is re-thrown.
+	 *
+	 * @param fn - Function receiving a TransactionContext for buffered operations
+	 * @returns The operations that were committed
+	 */
+	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
+		const tx = this.createTransaction()
+		try {
+			await fn(tx)
+			const { operations, affectedCollections } = await tx.commit()
+
+			// Notify subscriptions and emit events after commit
+			for (const op of operations) {
+				this.subscriptionManager.notify(op.collection, op)
+				if (this.emitter) {
+					this.emitter.emit({ type: 'operation:created', operation: op })
+				}
+			}
+
+			return operations
+		} catch (error) {
+			tx.rollback()
+			throw error
+		}
+	}
+
 	private nextSequenceNumber(): number {
 		this.sequenceNumber++
 		this.versionVector.set(this.nodeId, this.sequenceNumber)
 		return this.sequenceNumber
+	}
+
+	/**
+	 * Check the stored schema version and run any pending migrations.
+	 * Migrations are applied in version order within a transaction.
+	 */
+	private async runMigrationsIfNeeded(): Promise<void> {
+		const storedVersion = await this.getStoredSchemaVersion()
+		const targetVersion = this.schema.version
+
+		if (storedVersion >= targetVersion) {
+			// Already up to date (or first run with version 1)
+			if (storedVersion === 0) {
+				// First open — store the initial version
+				await this.adapter.execute(
+					"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
+					[String(targetVersion)],
+				)
+			}
+			return
+		}
+
+		// Run each migration in order from storedVersion+1 to targetVersion
+		const migrations = this.schema.migrations ?? {}
+		for (let v = storedVersion + 1; v <= targetVersion; v++) {
+			const migration = migrations[v]
+			if (!migration) continue
+
+			// Generate SQL from structural steps
+			const sqlStatements = migrationStepsToSQL(migration.steps)
+
+			// Execute structural changes individually, tolerating "duplicate column" errors
+			// because generateFullDDL already runs safe-alter for the current schema's columns.
+			for (const sql of sqlStatements) {
+				try {
+					await this.adapter.execute(sql)
+				} catch (e) {
+					const msg = (e as Error).message || ''
+					if (!msg.includes('duplicate column name')) {
+						throw e
+					}
+					// Column already exists (added by generateFullDDL) — safe to skip
+				}
+			}
+
+			// Run backfills in a transaction
+			const backfillSteps = migration.steps.filter(
+				(s): s is Extract<MigrationStep, { type: 'backfill' }> => s.type === 'backfill',
+			)
+			for (const step of backfillSteps) {
+				await this.runBackfill(step.collection, step.transform)
+			}
+		}
+
+		// Update stored schema version
+		await this.adapter.execute(
+			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
+			[String(targetVersion)],
+		)
+	}
+
+	/**
+	 * Get the stored schema version from _kora_meta. Returns 0 if not set.
+	 */
+	private async getStoredSchemaVersion(): Promise<number> {
+		const rows = await this.adapter.query<MetaRow>(
+			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
+		)
+		return rows[0] ? Number(rows[0].value) : 0
+	}
+
+	/**
+	 * Run a backfill transform on all records in a collection.
+	 * Reads all rows, applies the transform, and updates changed fields.
+	 */
+	private async runBackfill(
+		collection: string,
+		transform: (record: Record<string, unknown>) => Record<string, unknown>,
+	): Promise<void> {
+		const rows = await this.adapter.query<RawCollectionRow>(
+			`SELECT * FROM ${collection} WHERE _deleted = 0`,
+		)
+
+		await this.adapter.transaction(async (tx) => {
+			for (const row of rows) {
+				const updates = transform(row as Record<string, unknown>)
+				const fields = Object.keys(updates)
+				if (fields.length === 0) continue
+
+				const setClauses = fields.map((f) => `${f} = ?`).join(', ')
+				const values = fields.map((f) => {
+					const val = updates[f]
+					// Serialize booleans to 0/1 for SQLite
+					if (typeof val === 'boolean') return val ? 1 : 0
+					// Serialize arrays/objects to JSON
+					if (Array.isArray(val) || (typeof val === 'object' && val !== null)) {
+						return JSON.stringify(val)
+					}
+					return val
+				})
+				values.push(row.id)
+
+				await tx.execute(`UPDATE ${collection} SET ${setClauses} WHERE id = ?`, values)
+			}
+		})
 	}
 
 	private async loadOrGenerateNodeId(): Promise<string> {

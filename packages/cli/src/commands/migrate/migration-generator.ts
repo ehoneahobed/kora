@@ -133,7 +133,11 @@ function validateRebuildSafety(
 		if (!sourceDescriptor) continue
 		if (canTransformField(sourceDescriptor, targetDescriptor)) continue
 
-		if (targetDescriptor.required && targetDescriptor.defaultValue === undefined && !targetDescriptor.auto) {
+		if (
+			targetDescriptor.required &&
+			targetDescriptor.defaultValue === undefined &&
+			!targetDescriptor.auto
+		) {
 			throw new Error(
 				`Cannot auto-migrate collection "${collection}": changed required field "${fieldName}" from ${sourceDescriptor.kind} to ${targetDescriptor.kind} without a safe transform/default.`,
 			)
@@ -146,7 +150,12 @@ function projectionForColumn(
 	fromFields: Record<string, FieldDescriptor>,
 	targetDescriptor: FieldDescriptor | null,
 ): string {
-	if (column === 'id' || column === '_created_at' || column === '_updated_at' || column === '_deleted') {
+	if (
+		column === 'id' ||
+		column === '_created_at' ||
+		column === '_updated_at' ||
+		column === '_deleted'
+	) {
 		return quoteIdentifier(column)
 	}
 

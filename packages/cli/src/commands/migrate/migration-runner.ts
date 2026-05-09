@@ -153,10 +153,10 @@ async function loadSqliteDriver(projectRoot?: string): Promise<{
 }> {
 	try {
 		const { createRequire } = await import('node:module')
-		const requireFrom = createRequire(
-			projectRoot ? `${projectRoot}/package.json` : import.meta.url,
-		)
-		const Database = requireFrom('better-sqlite3') as new (path: string) => {
+		const requireFrom = createRequire(projectRoot ? `${projectRoot}/package.json` : import.meta.url)
+		const Database = requireFrom('better-sqlite3') as new (
+			path: string,
+		) => {
 			exec(sql: string): void
 			prepare(sql: string): {
 				get(...params: unknown[]): { count?: number } | undefined

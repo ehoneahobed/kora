@@ -30,10 +30,7 @@ const DERIVED_KEY_LENGTH = 256
  * Asserts that `crypto.subtle` is available, throwing a clear error if not.
  */
 function assertCryptoAvailable(): void {
-	if (
-		typeof globalThis.crypto === 'undefined' ||
-		typeof globalThis.crypto.subtle === 'undefined'
-	) {
+	if (typeof globalThis.crypto === 'undefined' || typeof globalThis.crypto.subtle === 'undefined') {
 		throw new KeyDerivationError(
 			'Web Crypto API (crypto.subtle) is not available in this environment. ' +
 				'Key derivation requires crypto.subtle, which is available in modern browsers and Node.js 20+.',

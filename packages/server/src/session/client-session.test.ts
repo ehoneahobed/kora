@@ -596,15 +596,16 @@ describe('ClientSession', () => {
 
 			await vi.waitFor(() => {
 				const relayBatch = messages.find(
-					(m) =>
-						m.type === 'operation-batch' && m.operations.some((op) => op.id === 'visible'),
+					(m) => m.type === 'operation-batch' && m.operations.some((op) => op.id === 'visible'),
 				)
 				expect(relayBatch).toBeDefined()
 			})
 
 			const ids = messages
 				.filter((m) => m.type === 'operation-batch')
-				.flatMap((batch) => (batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : []))
+				.flatMap((batch) =>
+					batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : [],
+				)
 			expect(ids).toContain('visible')
 			expect(ids).not.toContain('hidden')
 		})
@@ -653,6 +654,115 @@ describe('ClientSession', () => {
 
 			expect(await store.getOperationCount()).toBe(0)
 			expect(onRelay).not.toHaveBeenCalled()
+		})
+	})
+
+	describe('handshake scopes (no auth)', () => {
+		test('uses syncScope from handshake when no auth provider', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-match',
+					nodeId: 'node-a',
+					sequenceNumber: 1,
+					data: { ownerId: 'user-1', title: 'Mine' },
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-nomatch',
+					nodeId: 'node-a',
+					sequenceNumber: 2,
+					data: { ownerId: 'user-2', title: 'Not mine' },
+				}),
+			)
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			// No auth provider
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+			})
+			session.start()
+
+			// Send handshake with syncScope
+			client.send({
+				type: 'handshake',
+				messageId: 'h-1',
+				nodeId: 'client-1',
+				versionVector: {},
+				schemaVersion: 1,
+				syncScope: { todos: { ownerId: 'user-1' } },
+			})
+
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			// Should have received the delta filtered by syncScope
+			const batches = messages.filter(
+				(m) => m.type === 'operation-batch',
+			) as OperationBatchMessage[]
+			const allOps = batches.flatMap((b) => b.operations)
+			const matchingOps = allOps.filter(
+				(op) => op.data !== null && (op.data as Record<string, unknown>).ownerId === 'user-1',
+			)
+			const nonMatchingOps = allOps.filter(
+				(op) => op.data !== null && (op.data as Record<string, unknown>).ownerId === 'user-2',
+			)
+
+			expect(matchingOps.length).toBe(1)
+			expect(nonMatchingOps.length).toBe(0)
+		})
+
+		test('merges handshake scope with auth scope (auth takes precedence)', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-auth-match',
+					nodeId: 'node-a',
+					sequenceNumber: 1,
+					data: { ownerId: 'user-1', title: 'Auth match' },
+				}),
+			)
+
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+
+			const { client, server } = createServerTransportPair()
+			collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				auth,
+			})
+			session.start()
+
+			// Client sends handshake with syncScope AND auth token
+			client.send({
+				type: 'handshake',
+				messageId: 'h-1',
+				nodeId: 'client-1',
+				versionVector: {},
+				schemaVersion: 1,
+				authToken: 'ok',
+				syncScope: { todos: { ownerId: 'user-2' } },
+			})
+
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			// Auth scopes override handshake scopes per-collection
+			// Auth says ownerId: 'user-1', handshake says ownerId: 'user-2'
+			// Auth wins, so scope is { todos: { ownerId: 'user-1' } }
+			const ctx = session.getAuthContext()
+			expect(ctx?.scopes?.todos?.ownerId).toBe('user-1')
 		})
 	})
 

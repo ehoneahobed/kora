@@ -1,4 +1,4 @@
-import type { FieldDescriptor, FieldKind } from '../types'
+import type { FieldDescriptor, FieldKind, FieldMergeStrategy } from '../types'
 
 /**
  * Base field builder implementing the builder pattern for schema field definitions.
@@ -26,27 +26,58 @@ export class FieldBuilder<
 	protected readonly _required: boolean
 	protected readonly _defaultValue: unknown
 	protected readonly _auto: boolean
+	protected readonly _mergeStrategy: FieldMergeStrategy | null
 
-	constructor(kind: Kind, required = true as unknown as Req, defaultValue: unknown = undefined, auto = false as unknown as Auto) {
+	constructor(
+		kind: Kind,
+		required = true as unknown as Req,
+		defaultValue: unknown = undefined,
+		auto = false as unknown as Auto,
+		mergeStrategy: FieldMergeStrategy | null = null,
+	) {
 		this._kind = kind
 		this._required = required as unknown as boolean
 		this._defaultValue = defaultValue
 		this._auto = auto as unknown as boolean
+		this._mergeStrategy = mergeStrategy
 	}
 
 	/** Mark this field as optional (not required on insert) */
 	optional(): FieldBuilder<Kind, false, Auto> {
-		return new FieldBuilder(this._kind, false, this._defaultValue, this._auto)
+		return new FieldBuilder(this._kind, false, this._defaultValue, this._auto, this._mergeStrategy)
 	}
 
 	/** Set a default value for this field. Implicitly makes the field optional. */
 	default(value: unknown): FieldBuilder<Kind, false, Auto> {
-		return new FieldBuilder(this._kind, false, value, this._auto)
+		return new FieldBuilder(this._kind, false, value, this._auto, this._mergeStrategy)
 	}
 
 	/** Mark this field as auto-populated (e.g., createdAt timestamps). Developers cannot set auto fields. */
 	auto(): FieldBuilder<Kind, false, true> {
-		return new FieldBuilder(this._kind, false, undefined, true)
+		return new FieldBuilder(this._kind, false, undefined, true, this._mergeStrategy)
+	}
+
+	/**
+	 * Declare a merge strategy for this field.
+	 * Controls how concurrent modifications are resolved during sync.
+	 *
+	 * @param strategy - The merge strategy to use:
+	 *   - `'lww'`: Last-write-wins (default for scalar fields)
+	 *   - `'counter'`: Sum of deltas from base (for numbers)
+	 *   - `'max'`: Keep the maximum value (for numbers/timestamps)
+	 *   - `'min'`: Keep the minimum value (for numbers/timestamps)
+	 *   - `'union'`: Set-union merge (default for arrays)
+	 *   - `'append-only'`: Concatenate additions (for arrays)
+	 *   - `'server-authoritative'`: Always prefer the remote/server value
+	 */
+	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto> {
+		return new FieldBuilder(
+			this._kind,
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
 	}
 
 	/** @internal Build the final FieldDescriptor. Used by defineSchema(). */
@@ -58,6 +89,7 @@ export class FieldBuilder<
 			auto: this._auto as unknown as boolean,
 			enumValues: null,
 			itemKind: null,
+			mergeStrategy: this._mergeStrategy,
 		}
 	}
 }
@@ -78,21 +110,38 @@ export class EnumFieldBuilder<
 		required = true as unknown as Req,
 		defaultValue: unknown = undefined,
 		auto = false as unknown as Auto,
+		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
-		super('enum', required, defaultValue, auto)
+		super('enum', required, defaultValue, auto, mergeStrategy)
 		this._enumValues = values
 	}
 
 	override optional(): EnumFieldBuilder<Values, false, Auto> {
-		return new EnumFieldBuilder(this._enumValues, false, this._defaultValue, this._auto)
+		return new EnumFieldBuilder(
+			this._enumValues,
+			false,
+			this._defaultValue,
+			this._auto,
+			this._mergeStrategy,
+		)
 	}
 
 	override default(value: Values[number]): EnumFieldBuilder<Values, false, Auto> {
-		return new EnumFieldBuilder(this._enumValues, false, value, this._auto)
+		return new EnumFieldBuilder(this._enumValues, false, value, this._auto, this._mergeStrategy)
 	}
 
 	override auto(): EnumFieldBuilder<Values, false, true> {
-		return new EnumFieldBuilder(this._enumValues, false, undefined, true)
+		return new EnumFieldBuilder(this._enumValues, false, undefined, true, this._mergeStrategy)
+	}
+
+	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto> {
+		return new EnumFieldBuilder(
+			this._enumValues,
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
 	}
 
 	override _build(): FieldDescriptor {
@@ -103,6 +152,7 @@ export class EnumFieldBuilder<
 			auto: this._auto as unknown as boolean,
 			enumValues: this._enumValues,
 			itemKind: null,
+			mergeStrategy: this._mergeStrategy,
 		}
 	}
 }
@@ -123,8 +173,9 @@ export class ArrayFieldBuilder<
 		required = true as unknown as Req,
 		defaultValue: unknown = undefined,
 		auto = false as unknown as Auto,
+		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
-		super('array', required, defaultValue, auto)
+		super('array', required, defaultValue, auto, mergeStrategy)
 		this._itemKind = itemBuilder._build().kind as ItemKind
 	}
 
@@ -134,15 +185,38 @@ export class ArrayFieldBuilder<
 			false,
 			this._defaultValue,
 			this._auto,
+			this._mergeStrategy,
 		)
 	}
 
 	override default(value: unknown[]): ArrayFieldBuilder<ItemKind, false, Auto> {
-		return new ArrayFieldBuilder(new FieldBuilder(this._itemKind), false, value, this._auto)
+		return new ArrayFieldBuilder(
+			new FieldBuilder(this._itemKind),
+			false,
+			value,
+			this._auto,
+			this._mergeStrategy,
+		)
 	}
 
 	override auto(): ArrayFieldBuilder<ItemKind, false, true> {
-		return new ArrayFieldBuilder(new FieldBuilder(this._itemKind), false, undefined, true)
+		return new ArrayFieldBuilder(
+			new FieldBuilder(this._itemKind),
+			false,
+			undefined,
+			true,
+			this._mergeStrategy,
+		)
+	}
+
+	override merge(strategy: FieldMergeStrategy): ArrayFieldBuilder<ItemKind, Req, Auto> {
+		return new ArrayFieldBuilder(
+			new FieldBuilder(this._itemKind),
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
 	}
 
 	override _build(): FieldDescriptor {
@@ -153,6 +227,7 @@ export class ArrayFieldBuilder<
 			auto: this._auto as unknown as boolean,
 			enumValues: null,
 			itemKind: this._itemKind,
+			mergeStrategy: this._mergeStrategy,
 		}
 	}
 }

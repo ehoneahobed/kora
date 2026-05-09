@@ -88,7 +88,9 @@ async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
 			: undefined
 
 		// sqlite3InitModule accepts Emscripten Module overrides but the types don't reflect this
-		const initFn = sqlite3InitModule as unknown as (opts?: Record<string, unknown>) => Promise<unknown>
+		const initFn = sqlite3InitModule as unknown as (
+			opts?: Record<string, unknown>,
+		) => Promise<unknown>
 		const sqlite3 = (await initFn(initOptions)) as Awaited<ReturnType<typeof sqlite3InitModule>>
 		sqlite3Api = sqlite3
 
@@ -167,12 +169,10 @@ function handleImport(id: number, data: Uint8Array): void {
 		}
 	}
 
-	const sqlite3 = sqlite3Api as
-		| {
-				oo1?: { DB?: new (...args: unknown[]) => SqliteDb }
-				capi?: { sqlite3_deserialize?: unknown }
-			}
-		| null
+	const sqlite3 = sqlite3Api as {
+		oo1?: { DB?: new (...args: unknown[]) => SqliteDb }
+		capi?: { sqlite3_deserialize?: unknown }
+	} | null
 
 	if (!sqlite3 || typeof sqlite3.capi?.sqlite3_deserialize === 'undefined') {
 		sendResponse({
@@ -187,7 +187,8 @@ function handleImport(id: number, data: Uint8Array): void {
 	sendResponse({
 		id,
 		type: 'error',
-		message: 'Import requires runtime-specific deserialize wiring and is unavailable in this worker build',
+		message:
+			'Import requires runtime-specific deserialize wiring and is unavailable in this worker build',
 		code: 'IMPORT_NOT_SUPPORTED',
 	})
 }

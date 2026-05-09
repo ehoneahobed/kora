@@ -14,6 +14,18 @@ export interface HLCTimestamp {
 /** The three mutation types an operation can represent */
 export type OperationType = 'insert' | 'update' | 'delete'
 
+/** Supported atomic operation types for intent-preserving field updates */
+export type AtomicOpType = 'increment' | 'max' | 'min' | 'append' | 'remove'
+
+/**
+ * Atomic operation stored in an Operation's atomicOps field.
+ * This is the serializable form that persists in the operation log.
+ */
+export interface AtomicOp {
+	readonly type: AtomicOpType
+	readonly value: unknown
+}
+
 /**
  * The atomic unit of the entire system. Every mutation produces an Operation.
  * Operations are IMMUTABLE and CONTENT-ADDRESSED.
@@ -41,6 +53,12 @@ export interface Operation {
 	causalDeps: string[]
 	/** Schema version at time of creation. Used for migration transforms. */
 	schemaVersion: number
+	/** Atomic operation intents for fields in data (e.g., increment, max). Present only when atomic ops were used. */
+	atomicOps?: Record<string, AtomicOp>
+	/** Groups this operation with others in an atomic transaction. Not part of the content hash. */
+	transactionId?: string
+	/** Human-readable name for the mutation group (e.g., 'complete-sale'). For DevTools display. */
+	mutationName?: string
 }
 
 /**
@@ -56,6 +74,12 @@ export interface OperationInput {
 	sequenceNumber: number
 	causalDeps: string[]
 	schemaVersion: number
+	/** Atomic operation intents for fields in data (e.g., increment, max). */
+	atomicOps?: Record<string, AtomicOp>
+	/** Groups this operation with others in an atomic transaction. Not part of the content hash. */
+	transactionId?: string
+	/** Human-readable name for the mutation group (e.g., 'complete-sale'). For DevTools display. */
+	mutationName?: string
 }
 
 /** Version vector: maps nodeId to the max sequence number seen from that node */
@@ -71,6 +95,16 @@ export type FieldKind =
 	| 'enum'
 	| 'array'
 
+/** Built-in field merge strategies that can be declared in the schema. */
+export type FieldMergeStrategy =
+	| 'lww'
+	| 'counter'
+	| 'max'
+	| 'min'
+	| 'union'
+	| 'append-only'
+	| 'server-authoritative'
+
 /**
  * Descriptor produced by the type builder (t.string(), t.number(), etc.).
  * Represents a fully configured field definition.
@@ -82,6 +116,8 @@ export interface FieldDescriptor {
 	auto: boolean
 	enumValues: readonly string[] | null
 	itemKind: FieldKind | null
+	/** Declared merge strategy. Defaults to kind-appropriate strategy when undefined. */
+	mergeStrategy: FieldMergeStrategy | null
 }
 
 /**
@@ -92,6 +128,8 @@ export interface CollectionDefinition {
 	indexes: string[]
 	constraints: Constraint[]
 	resolvers: Record<string, CustomResolver>
+	/** Scope fields for sync filtering. Only records matching the client's scope values are synced. */
+	scope: string[]
 }
 
 /** Custom resolver function for tier 3 merge resolution */
@@ -138,6 +176,8 @@ export interface SchemaDefinition {
 	version: number
 	collections: Record<string, CollectionDefinition>
 	relations: Record<string, RelationDefinition>
+	/** Schema migrations keyed by target version. */
+	migrations: Record<number, import('./migrations/migration-builder').MigrationDefinition>
 }
 
 /**
@@ -170,4 +210,36 @@ export interface TimeSource {
  */
 export interface RandomSource {
 	getRandomValues<T extends ArrayBufferView>(array: T): T
+}
+
+/**
+ * Configuration for an offline-safe sequence.
+ *
+ * Sequences produce monotonically increasing, collision-free identifiers
+ * that work across offline devices. Each device maintains its own counter
+ * scoped by (name, scope, nodeId).
+ *
+ * Format tokens available:
+ * - `{date}` → YYYYMMDD
+ * - `{node4}` → first 4 chars of nodeId
+ * - `{node8}` → first 8 chars of nodeId
+ * - `{seq}` → zero-padded counter (4 digits)
+ * - `{seq:N}` → zero-padded counter with N digits
+ *
+ * @example
+ * ```typescript
+ * await app.sequences.next('receipt', {
+ *   scope: storeId,
+ *   format: 'S-{date}-{node4}-{seq}',
+ * })
+ * // → "S-20260508-a1b2-0042"
+ * ```
+ */
+export interface SequenceConfig {
+	/** Namespace within the sequence (e.g., a storeId or orgId). Defaults to ''. */
+	scope?: string
+	/** Format template. Defaults to `{name}-{seq:4}`. */
+	format?: string
+	/** Starting counter value. Defaults to 1. */
+	startAt?: number
 }

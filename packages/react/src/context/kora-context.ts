@@ -32,12 +32,8 @@ function KoraProvider({
 	fallback,
 	children,
 }: KoraProviderProps): ReactNode {
-	const [resolvedStore, setResolvedStore] = useState<Store | null>(
-		store ?? null,
-	)
-	const [resolvedSync, setResolvedSync] = useState<SyncEngine | null>(
-		syncEngine ?? null,
-	)
+	const [resolvedStore, setResolvedStore] = useState<Store | null>(store ?? null)
+	const [resolvedSync, setResolvedSync] = useState<SyncEngine | null>(syncEngine ?? null)
 	// If no app prop, we're using the store prop and are ready immediately
 	const [ready, setReady] = useState(!app)
 	const [initError, setInitError] = useState<Error | null>(null)
@@ -86,6 +82,7 @@ function KoraProvider({
 	const value: KoraContextValue = {
 		store: resolvedStore,
 		syncEngine: resolvedSync,
+		app: app ?? null,
 	}
 	return createElement(KoraContext.Provider, { value }, children)
 }

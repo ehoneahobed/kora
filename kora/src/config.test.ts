@@ -4,13 +4,13 @@ import { defineConfig } from './config'
 describe('defineConfig', () => {
 	test('returns config unchanged', () => {
 		const config = defineConfig({
-		schema: './src/schema.ts',
-		dev: {
-			port: 5173,
-			sync: { enabled: true, port: 3001, store: { type: 'sqlite', filename: './kora-sync.db' } },
-			watch: { enabled: true, debounceMs: 300 },
-		},
-	})
+			schema: './src/schema.ts',
+			dev: {
+				port: 5173,
+				sync: { enabled: true, port: 3001, store: { type: 'sqlite', filename: './kora-sync.db' } },
+				watch: { enabled: true, debounceMs: 300 },
+			},
+		})
 
 		expect(config.schema).toBe('./src/schema.ts')
 		expect(config.dev?.port).toBe(5173)

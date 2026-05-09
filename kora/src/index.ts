@@ -12,18 +12,24 @@ export type {
 	StoreOptions,
 	SyncControl,
 	SyncOptions,
+	SequenceAccessor,
+	TransactionCollectionProxy,
+	TransactionProxy,
 	TypedCollectionAccessor,
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
 
 // === @korajs/core re-exports ===
-export { defineSchema, t } from '@korajs/core'
+export { defineSchema, migrate, t } from '@korajs/core'
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'
 export { KoraError } from '@korajs/core'
+export { op } from '@korajs/core'
 export type {
+	AtomicOp,
+	AtomicOpType,
 	CollectionDefinition,
 	ConnectionQuality,
 	Constraint,
@@ -40,20 +46,26 @@ export type {
 	KoraEventType,
 	MergeStrategy,
 	MergeTrace,
+	MigrationDefinition,
+	MigrationStep,
 	Operation,
 	SchemaDefinition,
 	SchemaInput,
+	SequenceConfig,
 	TypedSchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
 
 // === @korajs/store re-exports ===
-export { Store } from '@korajs/store'
+export { SequenceManager, Store } from '@korajs/store'
+export { TransactionContext } from '@korajs/store'
 export type {
 	CollectionAccessor,
 	CollectionRecord,
 	StorageAdapter,
 	StoreConfig,
+	TransactionCollectionAccessor,
+	TransactionContextConfig,
 } from '@korajs/store'
 
 // === @korajs/merge re-exports ===
@@ -64,6 +76,7 @@ export type { MergeInput, MergeResult } from '@korajs/merge'
 export { SyncEngine, WebSocketTransport } from '@korajs/sync'
 export type {
 	SyncConfig,
+	SyncDiagnostics,
 	SyncState,
 	SyncStatus,
 	SyncStatusInfo,

@@ -58,18 +58,59 @@ export function deserializeRecord(
 }
 
 /**
+ * Internal key used to embed atomicOps metadata in the data JSON column.
+ * This avoids adding a new column to the ops table (no migration needed).
+ */
+const ATOMIC_OPS_KEY = '__kora_atomic_ops__'
+
+/**
+ * Internal key used to embed transactionId in the data JSON column.
+ */
+const TX_ID_KEY = '__kora_tx_id__'
+
+/**
+ * Internal key used to embed mutationName in the data JSON column.
+ */
+const MUTATION_NAME_KEY = '__kora_mutation__'
+
+/**
  * Serialize an Operation to a row for the operations log table.
  *
  * @param op - The operation to serialize
  * @returns An OperationRow suitable for SQL INSERT
  */
 export function serializeOperation(op: Operation): OperationRow {
+	const hasMetadata = op.transactionId !== undefined || op.mutationName !== undefined
+	let dataPayload: Record<string, unknown> | null = null
+	if (op.data) {
+		// Embed metadata in the data JSON when present
+		dataPayload = { ...op.data }
+		if (op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0) {
+			dataPayload[ATOMIC_OPS_KEY] = op.atomicOps
+		}
+		if (op.transactionId !== undefined) {
+			dataPayload[TX_ID_KEY] = op.transactionId
+		}
+		if (op.mutationName !== undefined) {
+			dataPayload[MUTATION_NAME_KEY] = op.mutationName
+		}
+	} else if (hasMetadata) {
+		// For delete operations (data is null), we still need to store metadata
+		dataPayload = {}
+		if (op.transactionId !== undefined) {
+			dataPayload[TX_ID_KEY] = op.transactionId
+		}
+		if (op.mutationName !== undefined) {
+			dataPayload[MUTATION_NAME_KEY] = op.mutationName
+		}
+	}
+
 	return {
 		id: op.id,
 		node_id: op.nodeId,
 		type: op.type,
 		record_id: op.recordId,
-		data: op.data ? JSON.stringify(op.data) : null,
+		data: dataPayload ? JSON.stringify(dataPayload) : null,
 		previous_data: op.previousData ? JSON.stringify(op.previousData) : null,
 		timestamp: HybridLogicalClock.serialize(op.timestamp),
 		sequence_number: op.sequenceNumber,
@@ -85,13 +126,35 @@ export function serializeOperation(op: Operation): OperationRow {
  * @returns The deserialized Operation object
  */
 export function deserializeOperation(row: OperationRow): Operation {
+	let data: Record<string, unknown> | null = null
+	let atomicOps: Record<string, unknown> | undefined
+	let transactionId: string | undefined
+	let mutationName: string | undefined
+
+	if (row.data) {
+		const parsed = JSON.parse(row.data) as Record<string, unknown>
+		// Extract embedded metadata keys
+		if (ATOMIC_OPS_KEY in parsed) {
+			atomicOps = parsed[ATOMIC_OPS_KEY] as Record<string, unknown>
+		}
+		if (TX_ID_KEY in parsed) {
+			transactionId = parsed[TX_ID_KEY] as string
+		}
+		if (MUTATION_NAME_KEY in parsed) {
+			mutationName = parsed[MUTATION_NAME_KEY] as string
+		}
+		// Remove metadata keys from data
+		const { [ATOMIC_OPS_KEY]: _a, [TX_ID_KEY]: _t, [MUTATION_NAME_KEY]: _m, ...rest } = parsed
+		data = Object.keys(rest).length > 0 ? rest : null
+	}
+
 	return {
 		id: row.id,
 		nodeId: row.node_id,
 		type: row.type as Operation['type'],
 		collection: '', // Collection name is derived from the table name by the caller
 		recordId: row.record_id,
-		data: row.data ? (JSON.parse(row.data) as Record<string, unknown>) : null,
+		data,
 		previousData: row.previous_data
 			? (JSON.parse(row.previous_data) as Record<string, unknown>)
 			: null,
@@ -99,6 +162,9 @@ export function deserializeOperation(row: OperationRow): Operation {
 		sequenceNumber: row.sequence_number,
 		causalDeps: JSON.parse(row.causal_deps) as string[],
 		schemaVersion: row.schema_version,
+		...(atomicOps !== undefined ? { atomicOps: atomicOps as Operation['atomicOps'] } : {}),
+		...(transactionId !== undefined ? { transactionId } : {}),
+		...(mutationName !== undefined ? { mutationName } : {}),
 	}
 }
 

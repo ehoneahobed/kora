@@ -1,4 +1,4 @@
-import type { HLCTimestamp, OperationType } from '@korajs/core'
+import type { AtomicOp, HLCTimestamp, OperationType } from '@korajs/core'
 
 export type WireFormat = 'json' | 'protobuf'
 
@@ -18,6 +18,12 @@ export interface SerializedOperation {
 	sequenceNumber: number
 	causalDeps: string[]
 	schemaVersion: number
+	/** Atomic operation intents, present only when atomic ops were used. */
+	atomicOps?: Record<string, AtomicOp>
+	/** Groups this operation with others in an atomic transaction. */
+	transactionId?: string
+	/** Human-readable name for the mutation group. For DevTools display. */
+	mutationName?: string
 }
 
 /**
@@ -32,6 +38,8 @@ export interface HandshakeMessage {
 	schemaVersion: number
 	authToken?: string
 	supportedWireFormats?: WireFormat[]
+	/** Per-collection sync scope filters. Limits which records are synced to this client. */
+	syncScope?: Record<string, Record<string, unknown>>
 }
 
 /**

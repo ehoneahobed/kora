@@ -102,13 +102,22 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 		const serviceName = sanitizeLightsailName(config.appName)
 
 		// Create Lightsail container service (idempotent — errors if already exists)
-		const createService = await this.runner.run('aws', [
-			'lightsail', 'create-container-service',
-			'--service-name', serviceName,
-			'--power', 'nano',
-			'--scale', '1',
-			'--region', region,
-		], config.projectRoot)
+		const createService = await this.runner.run(
+			'aws',
+			[
+				'lightsail',
+				'create-container-service',
+				'--service-name',
+				serviceName,
+				'--power',
+				'nano',
+				'--scale',
+				'1',
+				'--region',
+				region,
+			],
+			config.projectRoot,
+		)
 
 		if (createService.exitCode !== 0 && !createService.stderr.includes('already exists')) {
 			throw new Error(`Failed to create Lightsail container service: ${createService.stderr}`)
@@ -156,9 +165,11 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 
 		// Build Docker image locally
 		this.logger.step('Building Docker image...')
-		const dockerBuild = await this.runner.run('docker', [
-			'build', '--platform', 'linux/amd64', '-t', imageTag, '.',
-		], artifacts.deployDirectory)
+		const dockerBuild = await this.runner.run(
+			'docker',
+			['build', '--platform', 'linux/amd64', '-t', imageTag, '.'],
+			artifacts.deployDirectory,
+		)
 
 		if (dockerBuild.exitCode !== 0) {
 			throw new Error(`Docker build failed: ${dockerBuild.stderr}`)
@@ -166,13 +177,22 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 
 		// Push image to Lightsail using lightsailctl plugin
 		this.logger.step('Pushing image to Lightsail...')
-		const pushImage = await this.runner.run('aws', [
-			'lightsail', 'push-container-image',
-			'--service-name', serviceName,
-			'--label', 'latest',
-			'--image', imageTag,
-			'--region', region,
-		], artifacts.deployDirectory)
+		const pushImage = await this.runner.run(
+			'aws',
+			[
+				'lightsail',
+				'push-container-image',
+				'--service-name',
+				serviceName,
+				'--label',
+				'latest',
+				'--image',
+				imageTag,
+				'--region',
+				region,
+			],
+			artifacts.deployDirectory,
+		)
 
 		if (pushImage.exitCode !== 0) {
 			throw new Error(`Lightsail image push failed: ${pushImage.stderr}`)
@@ -210,26 +230,37 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 			},
 		})
 
-		const createDeploy = await this.runner.run('aws', [
-			'lightsail', 'create-container-service-deployment',
-			'--service-name', serviceName,
-			'--containers', containers,
-			'--public-endpoint', publicEndpoint,
-			'--region', region,
-		], context.projectRoot)
+		const createDeploy = await this.runner.run(
+			'aws',
+			[
+				'lightsail',
+				'create-container-service-deployment',
+				'--service-name',
+				serviceName,
+				'--containers',
+				containers,
+				'--public-endpoint',
+				publicEndpoint,
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		if (createDeploy.exitCode !== 0) {
 			throw new Error(`Lightsail deployment failed: ${createDeploy.stderr}`)
 		}
 
 		// Get the service URL
-		const serviceInfo = await this.runner.run('aws', [
-			'lightsail', 'get-container-services',
-			'--service-name', serviceName,
-			'--region', region,
-		], context.projectRoot)
+		const serviceInfo = await this.runner.run(
+			'aws',
+			['lightsail', 'get-container-services', '--service-name', serviceName, '--region', region],
+			context.projectRoot,
+		)
 
-		const rawUrl = parseLightsailUrl(serviceInfo.stdout) ?? `https://${serviceName}.${region}.cs.amazonlightsail.com`
+		const rawUrl =
+			parseLightsailUrl(serviceInfo.stdout) ??
+			`https://${serviceName}.${region}.cs.amazonlightsail.com`
 		const serviceUrl = rawUrl.replace(/\/+$/, '')
 		const deploymentId = new Date().toISOString()
 
@@ -247,11 +278,18 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 
 		// Lightsail doesn't have a native rollback — get previous deployment version
 		// and redeploy. For now, we list deployments and use the previous container image.
-		const deployments = await this.runner.run('aws', [
-			'lightsail', 'get-container-service-deployments',
-			'--service-name', serviceName,
-			'--region', region,
-		], context.projectRoot)
+		const deployments = await this.runner.run(
+			'aws',
+			[
+				'lightsail',
+				'get-container-service-deployments',
+				'--service-name',
+				serviceName,
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		if (deployments.exitCode !== 0) {
 			throw new Error(`Lightsail rollback failed: ${deployments.stderr}`)
@@ -263,13 +301,22 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 			throw new Error('No previous deployment found to rollback to.')
 		}
 
-		const redeploy = await this.runner.run('aws', [
-			'lightsail', 'create-container-service-deployment',
-			'--service-name', serviceName,
-			'--containers', JSON.stringify(previousDeployment.containers),
-			'--public-endpoint', JSON.stringify(previousDeployment.publicEndpoint),
-			'--region', region,
-		], context.projectRoot)
+		const redeploy = await this.runner.run(
+			'aws',
+			[
+				'lightsail',
+				'create-container-service-deployment',
+				'--service-name',
+				serviceName,
+				'--containers',
+				JSON.stringify(previousDeployment.containers),
+				'--public-endpoint',
+				JSON.stringify(previousDeployment.publicEndpoint),
+				'--region',
+				region,
+			],
+			context.projectRoot,
+		)
 
 		if (redeploy.exitCode !== 0) {
 			throw new Error(`Lightsail rollback deployment failed: ${redeploy.stderr}`)
@@ -282,10 +329,14 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 		const serviceName = sanitizeLightsailName(context.appName)
 
 		const args = [
-			'lightsail', 'get-container-log',
-			'--service-name', serviceName,
-			'--container-name', serviceName,
-			'--region', region,
+			'lightsail',
+			'get-container-log',
+			'--service-name',
+			serviceName,
+			'--container-name',
+			serviceName,
+			'--region',
+			region,
 		]
 
 		if (options.since) {
@@ -298,7 +349,9 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 		}
 
 		try {
-			const parsed = JSON.parse(result.stdout) as { logEvents?: Array<{ createdAt: string; message: string }> }
+			const parsed = JSON.parse(result.stdout) as {
+				logEvents?: Array<{ createdAt: string; message: string }>
+			}
 			const events = parsed.logEvents ?? []
 			const limited = options.tail ? events.slice(-options.tail) : events
 			for (const event of limited) {
@@ -320,11 +373,11 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 		const region = context.region ?? 'us-east-1'
 		const serviceName = sanitizeLightsailName(context.appName)
 
-		const result = await this.runner.run('aws', [
-			'lightsail', 'get-container-services',
-			'--service-name', serviceName,
-			'--region', region,
-		], context.projectRoot)
+		const result = await this.runner.run(
+			'aws',
+			['lightsail', 'get-container-services', '--service-name', serviceName, '--region', region],
+			context.projectRoot,
+		)
 
 		if (result.exitCode !== 0) {
 			return { state: 'failed', message: result.stderr }
@@ -380,7 +433,11 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
  * Default subprocess-backed runner for AWS CLI commands.
  */
 export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner {
-	public async run(command: string, args: string[], cwd: string): Promise<AwsLightsailCommandResult> {
+	public async run(
+		command: string,
+		args: string[],
+		cwd: string,
+	): Promise<AwsLightsailCommandResult> {
 		return new Promise<AwsLightsailCommandResult>((resolve) => {
 			const child = spawn(command, args, {
 				cwd,
@@ -390,8 +447,12 @@ export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner 
 
 			let stdout = ''
 			let stderr = ''
-			child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8') })
-			child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8') })
+			child.stdout?.on('data', (chunk: Buffer) => {
+				stdout += chunk.toString('utf-8')
+			})
+			child.stderr?.on('data', (chunk: Buffer) => {
+				stderr += chunk.toString('utf-8')
+			})
 			child.on('error', (error) => {
 				resolve({ exitCode: 1, stdout, stderr: `${stderr}\n${error.message}` })
 			})
@@ -405,23 +466,20 @@ export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner 
 /**
  * Environment variables automatically forwarded from the host to the Lightsail container.
  */
-const PASSTHROUGH_ENV_VARS = [
-	'DATABASE_URL',
-	'AUTH_SECRET',
-	'PUBLIC_URL',
-	'NODE_ENV',
-] as const
+const PASSTHROUGH_ENV_VARS = ['DATABASE_URL', 'AUTH_SECRET', 'PUBLIC_URL', 'NODE_ENV'] as const
 
 /**
  * Lightsail service names must be 2-255 chars, lowercase alphanumeric and hyphens only.
  */
 function sanitizeLightsailName(name: string): string {
-	return name
-		.toLowerCase()
-		.replace(/[^a-z0-9-]/g, '-')
-		.replace(/-{2,}/g, '-')
-		.replace(/^-|-$/g, '')
-		.slice(0, 255) || 'kora-app'
+	return (
+		name
+			.toLowerCase()
+			.replace(/[^a-z0-9-]/g, '-')
+			.replace(/-{2,}/g, '-')
+			.replace(/^-|-$/g, '')
+			.slice(0, 255) || 'kora-app'
+	)
 }
 
 function parseLightsailImageRef(output: string): string | null {

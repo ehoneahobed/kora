@@ -224,11 +224,7 @@ export class OrgClient {
 	/**
 	 * Update a member's role.
 	 */
-	async updateMemberRole(
-		orgId: string,
-		userId: string,
-		role: string,
-	): Promise<ClientMembership> {
+	async updateMemberRole(orgId: string, userId: string, role: string): Promise<ClientMembership> {
 		return this.request<ClientMembership>(`/orgs/${orgId}/members/${userId}/role`, {
 			method: 'PATCH',
 			body: { role },
@@ -301,10 +297,9 @@ export class OrgClient {
 	 * List pending invitations for the current user's email.
 	 */
 	async listMyInvitations(email: string): Promise<ClientInvitation[]> {
-		return this.request<ClientInvitation[]>(
-			`/invitations?email=${encodeURIComponent(email)}`,
-			{ method: 'GET' },
-		)
+		return this.request<ClientInvitation[]>(`/invitations?email=${encodeURIComponent(email)}`, {
+			method: 'GET',
+		})
 	}
 
 	// --- Subscriptions ---
@@ -363,19 +358,18 @@ export class OrgClient {
 				body: options.body ? JSON.stringify(options.body) : undefined,
 			})
 		} catch (cause) {
-			throw new OrgClientError(
-				`Network request to ${path} failed.`,
-				'ORG_NETWORK_ERROR',
-				{ path, cause: cause instanceof Error ? cause.message : String(cause) },
-			)
+			throw new OrgClientError(`Network request to ${path} failed.`, 'ORG_NETWORK_ERROR', {
+				path,
+				cause: cause instanceof Error ? cause.message : String(cause),
+			})
 		}
 
 		if (!response.ok) {
 			let errorMessage = `Server returned HTTP ${response.status}`
 			try {
 				const body = (await response.json()) as Record<string, unknown>
-				if (typeof body['error'] === 'string') {
-					errorMessage = body['error'] as string
+				if (typeof body.error === 'string') {
+					errorMessage = body.error as string
 				}
 			} catch {
 				// not JSON

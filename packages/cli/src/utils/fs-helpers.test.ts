@@ -2,7 +2,12 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { createTempDir } from '../../tests/fixtures/test-helpers'
-import { directoryExists, findProjectRoot, findSchemaFile, resolveProjectBinary } from './fs-helpers'
+import {
+	directoryExists,
+	findProjectRoot,
+	findSchemaFile,
+	resolveProjectBinary,
+} from './fs-helpers'
 
 describe('directoryExists', () => {
 	let tempDir: { path: string; cleanup: () => Promise<void> }

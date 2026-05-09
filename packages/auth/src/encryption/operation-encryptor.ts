@@ -1,6 +1,6 @@
 import { KoraError } from '@korajs/core'
 import type { Operation } from '@korajs/core'
-import { encryptData, decryptData } from './database-encryption'
+import { decryptData, encryptData } from './database-encryption'
 
 // ============================================================================
 // Constants
@@ -267,14 +267,11 @@ export class OperationEncryptor {
 			if (cause instanceof OperationEncryptionError) {
 				throw cause
 			}
-			throw new OperationEncryptionError(
-				`Failed to encrypt operation ${fieldName} field.`,
-				{
-					operationId,
-					fieldName,
-					cause: cause instanceof Error ? cause.message : String(cause),
-				},
-			)
+			throw new OperationEncryptionError(`Failed to encrypt operation ${fieldName} field.`, {
+				operationId,
+				fieldName,
+				cause: cause instanceof Error ? cause.message : String(cause),
+			})
 		}
 	}
 
@@ -296,8 +293,7 @@ export class OperationEncryptor {
 
 		if (envelope.version > ENCRYPTION_VERSION) {
 			throw new OperationEncryptionError(
-				`Encrypted field uses version ${envelope.version}, but this client only supports version ${ENCRYPTION_VERSION}. ` +
-					'Update your @korajs/auth package to decrypt this operation.',
+				`Encrypted field uses version ${envelope.version}, but this client only supports version ${ENCRYPTION_VERSION}. Update your @korajs/auth package to decrypt this operation.`,
 				{ operationId, fieldName, version: envelope.version },
 			)
 		}
@@ -311,10 +307,10 @@ export class OperationEncryptor {
 			const parsed: unknown = JSON.parse(json)
 
 			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-				throw new OperationEncryptionError(
-					`Decrypted ${fieldName} is not a valid record object.`,
-					{ operationId, fieldName },
-				)
+				throw new OperationEncryptionError(`Decrypted ${fieldName} is not a valid record object.`, {
+					operationId,
+					fieldName,
+				})
 			}
 
 			return parsed as Record<string, unknown>
@@ -323,8 +319,7 @@ export class OperationEncryptor {
 				throw cause
 			}
 			throw new OperationEncryptionError(
-				`Failed to decrypt operation ${fieldName} field. ` +
-					'This may indicate a wrong encryption key or tampered data.',
+				`Failed to decrypt operation ${fieldName} field. This may indicate a wrong encryption key or tampered data.`,
 				{
 					operationId,
 					fieldName,
@@ -359,8 +354,8 @@ function isEncryptedEnvelope(field: Record<string, unknown> | null): boolean {
 	}
 	return (
 		field[ENCRYPTED_MARKER] === true &&
-		typeof field['ciphertext'] === 'string' &&
-		typeof field['iv'] === 'string' &&
-		field['algorithm'] === 'AES-256-GCM'
+		typeof field.ciphertext === 'string' &&
+		typeof field.iv === 'string' &&
+		field.algorithm === 'AES-256-GCM'
 	)
 }
