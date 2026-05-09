@@ -72,3 +72,18 @@ export {
 
 // === Query Utilities ===
 export { pluralize, singularize } from './query/pluralize'
+
+// === Backup/Restore ===
+export {
+	exportBackup,
+	readBackupManifest,
+	restoreBackup,
+	verifyBackupChecksum,
+} from './backup'
+export type {
+	BackupManifest,
+	BackupOptions,
+	BackupProgress,
+	RestoreOptions,
+	RestoreResult,
+} from './backup'

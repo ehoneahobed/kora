@@ -4,8 +4,14 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import { Instrumenter } from '@korajs/devtools'
 import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
-import type { CollectionAccessor, StorageAdapter } from '@korajs/store'
-import type { QueryBuilder } from '@korajs/store'
+import type {
+	BackupOptions,
+	CollectionAccessor,
+	QueryBuilder,
+	RestoreOptions,
+	RestoreResult,
+	StorageAdapter,
+} from '@korajs/store'
 import {
 	ConnectionMonitor,
 	ReconnectionManager,
@@ -334,6 +340,20 @@ export function createApp(config: KoraConfig): KoraApp {
 				store = null
 			}
 			emitter.clear()
+		},
+		async exportBackup(options?: BackupOptions): Promise<Uint8Array> {
+			await ready
+			if (!store) {
+				throw new Error('Store not initialized. Await app.ready before exporting backup.')
+			}
+			return store.exportBackup(options)
+		},
+		async importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult> {
+			await ready
+			if (!store) {
+				throw new Error('Store not initialized. Await app.ready before importing backup.')
+			}
+			return store.importBackup(data, options)
 		},
 	}
 

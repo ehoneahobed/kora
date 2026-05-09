@@ -4,6 +4,8 @@ import {
 	generateUUIDv7,
 	migrationStepsToSQL,
 } from '@korajs/core'
+import { readBackupManifest as readManifest } from '../backup/backup'
+import type { BackupOptions, RestoreOptions, RestoreResult, BackupManifest } from '../backup/types'
 import type {
 	KoraEventEmitter,
 	MigrationStep,
@@ -374,6 +376,45 @@ export class Store implements OperationLog {
 			tx.rollback()
 			throw error
 		}
+	}
+
+	/**
+	 * Export all data as a portable backup binary.
+	 * Includes operations, version vector, metadata, and optionally materialized records.
+	 *
+	 * @param options - Backup options (includeRecords, collections, onProgress)
+	 * @returns Backup as a Uint8Array
+	 */
+	async exportBackup(options?: BackupOptions): Promise<Uint8Array> {
+		this.ensureOpen()
+		const { exportBackup: doExport } = await import('../backup/backup')
+		return doExport(this.adapter, this.schema, this.nodeId, this.schema.version, options)
+	}
+
+	/**
+	 * Restore data from a backup binary.
+	 *
+	 * @param data - The backup data
+	 * @param options - Restore options (merge, collections, onProgress)
+	 * @returns Result of the restore operation
+	 */
+	async importBackup(
+		data: Uint8Array,
+		options?: RestoreOptions,
+	): Promise<RestoreResult> {
+		this.ensureOpen()
+		const { restoreBackup: doRestore } = await import('../backup/backup')
+		return doRestore(this.adapter, this.schema, data, options)
+	}
+
+	/**
+	 * Read backup manifest without loading the entire backup.
+	 *
+	 * @param data - The raw backup data
+	 * @returns The backup manifest
+	 */
+	static readBackupManifest(data: Uint8Array): BackupManifest {
+		return readManifest(data)
 	}
 
 	private nextSequenceNumber(): number {

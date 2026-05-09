@@ -34,6 +34,22 @@ export type {
 	SessionState,
 } from './session/client-session'
 
+// === Diagnostics ===
+export type {
+	ClientMetrics,
+	ServerMetricsCollector,
+	ServerMetricsSnapshot,
+} from './diagnostics/server-metrics-collector'
+
+// === Logging ===
+export type { LogEntry, LogLevel, Logger } from './logging/structured-logger'
+export {
+	createDefaultLogger,
+	createJsonLogger,
+	createPrettyLogger,
+	createSilentLogger,
+} from './logging/structured-logger'
+
 export type {
 	WsServerConstructor,
 	WsServerLike,

@@ -92,4 +92,20 @@ export interface ServerStore extends SyncStore {
 	 * @returns Number of matching records
 	 */
 	countCollection(collection: string, where?: Record<string, unknown>): Promise<number>
+
+	/**
+	 * Export all data as a portable backup binary.
+	 * Ships operations, version vector, and metadata in a self-describing format
+	 * with SHA-256 checksum.
+	 */
+	exportBackup(): Promise<Uint8Array>
+
+	/**
+	 * Restore data from a portable backup binary.
+	 * Operations are applied through applyRemoteOperation for safe merge.
+	 *
+	 * @param data - Backup binary
+	 * @param merge - If true, merge with existing operations; if false, replace all
+	 */
+	importBackup(data: Uint8Array, merge?: boolean): Promise<{ operationsRestored: number; success: boolean }>
 }

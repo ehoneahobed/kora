@@ -59,9 +59,20 @@ export type {
 // === @korajs/store re-exports ===
 export { SequenceManager, Store } from '@korajs/store'
 export { TransactionContext } from '@korajs/store'
+export {
+	exportBackup,
+	readBackupManifest,
+	restoreBackup,
+	verifyBackupChecksum,
+} from '@korajs/store'
 export type {
+	BackupManifest,
+	BackupOptions,
+	BackupProgress,
 	CollectionAccessor,
 	CollectionRecord,
+	RestoreOptions,
+	RestoreResult,
 	StorageAdapter,
 	StoreConfig,
 	TransactionCollectionAccessor,

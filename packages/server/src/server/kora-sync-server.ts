@@ -1,8 +1,12 @@
 import type { KoraEventEmitter, Operation } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { SyncError, generateUUIDv7 } from '@korajs/core'
 import type { AwarenessUpdateMessage, MessageSerializer } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
 import { AwarenessRelay } from '../awareness/awareness-relay'
+import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
+import type { Logger } from '../logging/structured-logger'
+import { createDefaultLogger } from '../logging/structured-logger'
 import { ClientSession } from '../session/client-session'
 import type { ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
@@ -61,6 +65,8 @@ export class KoraSyncServer {
 	private readonly port: number | undefined
 	private readonly host: string
 	private readonly path: string
+	private readonly logger: Logger
+	private readonly metrics: ServerMetricsCollector
 
 	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly sessions = new Map<string, ClientSession>()
@@ -69,6 +75,7 @@ export class KoraSyncServer {
 		{ sessionId: string; transport: HttpServerTransport }
 	>()
 	private readonly httpSessionToClient = new Map<string, string>()
+	private readonly serverVersion = '0.4.0'
 	private wsServer: WsServerLike | null = null
 	private running = false
 
@@ -83,6 +90,82 @@ export class KoraSyncServer {
 		this.port = config.port
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
+		this.logger = config.logger ?? createDefaultLogger()
+		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
+		this.metrics.setSchemaVersion(this.schemaVersion)
+
+		// If no external emitter was provided, create an internal one for
+		// subscribing to session events for metrics and logging.
+		if (!this.emitter) {
+			this.emitter = new SimpleEventEmitter()
+		}
+	}
+
+	/**
+	 * Subscribe to session-level events for metrics collection and logging.
+	 * Called when a new session is created.
+	 */
+	private attachSessionEvents(sessionId: string, sessionEmitter: KoraEventEmitter): void {
+		sessionEmitter.on('sync:connected', (event) => {
+			this.metrics.recordHandshake(sessionId, event.nodeId)
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'session.handshake',
+				sessionId,
+				nodeId: event.nodeId,
+			})
+		})
+
+		sessionEmitter.on('sync:received', (event) => {
+			const byteSize = estimateByteSize(event.operations)
+			this.metrics.recordReceived(sessionId, event.batchSize, byteSize)
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'operations.received',
+				sessionId,
+				count: event.batchSize,
+				bytes: byteSize,
+			})
+		})
+
+		sessionEmitter.on('sync:sent', (event) => {
+			const byteSize = estimateByteSize(event.operations)
+			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'operations.sent',
+				sessionId,
+				count: event.batchSize,
+				bytes: byteSize,
+			})
+		})
+
+		sessionEmitter.on('sync:disconnected', (event) => {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'session.disconnected',
+				sessionId,
+				details: { reason: event.reason },
+			})
+		})
+	}
+
+	/**
+	 * Get the metrics collector for external access (e.g., HTTP endpoints).
+	 */
+	getMetricsCollector(): ServerMetricsCollector {
+		return this.metrics
+	}
+
+	/**
+	 * Get the logger for external access (e.g., event streaming).
+	 */
+	getLogger(): Logger {
+		return this.logger
 	}
 
 	/**
@@ -129,12 +212,25 @@ export class KoraSyncServer {
 		})
 
 		this.running = true
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'server.started',
+			details: { port: this.port, host: this.host, path: this.path },
+		})
 	}
 
 	/**
 	 * Stop the server. Closes all sessions and the WebSocket server.
 	 */
 	async stop(): Promise<void> {
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'server.stopping',
+			details: { connectedClients: this.sessions.size },
+		})
+
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
 
@@ -155,6 +251,11 @@ export class KoraSyncServer {
 		}
 
 		this.running = false
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'server.stopped',
+		})
 	}
 
 	/**
@@ -212,6 +313,13 @@ export class KoraSyncServer {
 				retriable: true,
 			})
 			transport.close(4029, 'max connections reached')
+			this.metrics.recordError()
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'connection.rejected',
+				details: { reason: 'max_connections', max: this.maxConnections },
+			})
 			throw new SyncError('Maximum connections reached', {
 				current: this.sessions.size,
 				max: this.maxConnections,
@@ -219,6 +327,58 @@ export class KoraSyncServer {
 		}
 
 		const sessionId = generateUUIDv7()
+		this.metrics.recordConnection(sessionId)
+
+		// Create a per-session emitter so we can track events with session context.
+		// The session emits events on this emitter, and we listen here for metrics + logging.
+		const sessionEmitter = new SimpleEventEmitter()
+
+		sessionEmitter.on('sync:connected', (event) => {
+			this.metrics.recordHandshake(sessionId, event.nodeId)
+			this.metrics.updateSessionState(sessionId, 'authenticated')
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'session.handshake',
+				sessionId,
+				nodeId: event.nodeId,
+			})
+		})
+
+		sessionEmitter.on('sync:received', (event) => {
+			const byteSize = estimateOperationByteSize(event.operations)
+			this.metrics.recordReceived(sessionId, event.batchSize, byteSize)
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'operations.received',
+				sessionId,
+				count: event.batchSize,
+				bytes: byteSize,
+			})
+		})
+
+		sessionEmitter.on('sync:sent', (event) => {
+			const byteSize = estimateOperationByteSize(event.operations)
+			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'operations.sent',
+				sessionId,
+				count: event.batchSize,
+				bytes: byteSize,
+			})
+		})
+
+		sessionEmitter.on('sync:disconnected', () => {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'session.disconnected',
+				sessionId,
+			})
+		})
 
 		const session = new ClientSession({
 			sessionId,
@@ -226,7 +386,7 @@ export class KoraSyncServer {
 			store: this.store,
 			auth: this.auth ?? undefined,
 			serializer: this.serializer,
-			emitter: this.emitter ?? undefined,
+			emitter: sessionEmitter,
 			batchSize: this.batchSize,
 			schemaVersion: this.schemaVersion,
 			onRelay: (sourceSessionId, operations) => {
@@ -243,6 +403,14 @@ export class KoraSyncServer {
 		this.sessions.set(sessionId, session)
 		session.start()
 
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'session.connected',
+			sessionId,
+			details: { totalSessions: this.sessions.size },
+		})
+
 		return sessionId
 	}
 
@@ -250,11 +418,22 @@ export class KoraSyncServer {
 	 * Get the current server status.
 	 */
 	async getStatus(): Promise<ServerStatus> {
+		const totalOps = await this.store.getOperationCount()
+		const snapshot = this.metrics.getSnapshot(totalOps)
 		return {
 			running: this.running,
-			connectedClients: this.sessions.size,
+			connectedClients: snapshot.connectedClients,
 			port: this.port ?? null,
-			totalOperations: await this.store.getOperationCount(),
+			totalOperations: snapshot.totalOperations,
+			uptime: snapshot.uptime,
+			version: this.serverVersion,
+			schemaVersion: this.schemaVersion,
+			connectedNodeIds: snapshot.connectedNodeIds,
+			peakConnections: snapshot.peakConnections,
+			connectionsTotal: snapshot.connectionsTotal,
+			operationsReceived: snapshot.operationsReceived,
+			operationsSent: snapshot.operationsSent,
+			errorCount: snapshot.errorCount,
 		}
 	}
 
@@ -268,6 +447,19 @@ export class KoraSyncServer {
 	// --- Private ---
 
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
+		const targetCount = this.sessions.size - 1
+		const byteSize = estimateOperationByteSize(operations)
+		this.metrics.recordSent(sourceSessionId, operations.length * targetCount, byteSize * targetCount)
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'operations.relayed',
+			sessionId: sourceSessionId,
+			count: operations.length,
+			bytes: byteSize * targetCount,
+			details: { targetSessions: targetCount },
+		})
+
 		for (const [sessionId, session] of this.sessions) {
 			if (sessionId === sourceSessionId) continue
 			session.relayOperations(operations)
@@ -275,7 +467,7 @@ export class KoraSyncServer {
 	}
 
 	private handleSessionClose(sessionId: string): void {
-		// Clean up awareness state for this session and notify remaining clients
+		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
 
 		this.sessions.delete(sessionId)
@@ -321,6 +513,18 @@ export class KoraSyncServer {
 
 		return client
 	}
+}
+
+/**
+ * Estimate the total byte size of serialized operations.
+ * Used for bandwidth tracking.
+ */
+function estimateOperationByteSize(operations: Operation[]): number {
+	let total = 0
+	for (const op of operations) {
+		total += JSON.stringify(op).length
+	}
+	return total
 }
 
 function normalizeHttpBody(body: string | Uint8Array, contentType?: string): string | Uint8Array {

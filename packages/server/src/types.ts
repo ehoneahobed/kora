@@ -1,5 +1,7 @@
 import type { KoraEventEmitter } from '@korajs/core'
 import type { MessageSerializer } from '@korajs/sync'
+import type { Logger } from './logging/structured-logger'
+import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
 import type { ServerStore } from './store/server-store'
 
 /**
@@ -51,6 +53,12 @@ export interface KoraSyncServerConfig {
 	schemaVersion?: number
 	/** WebSocket path (standalone mode). Defaults to '/'. */
 	path?: string
+	/** Structured logger. Defaults to pretty-print in dev, JSON lines in production. */
+	logger?: Logger
+	/** Server metrics collector. Created automatically if omitted. */
+	metricsCollector?: ServerMetricsCollector
+	/** Enable built-in dashboard and metrics endpoints. Defaults to true. */
+	enableDashboard?: boolean
 }
 
 /**
@@ -82,6 +90,16 @@ export interface HttpSyncResponse {
 }
 
 /**
+ * Session state machine states.
+ * - connected: initial state after transport connects
+ * - authenticated: auth check passed (or skipped)
+ * - syncing: exchanging delta operations during handshake
+ * - streaming: steady state, real-time operation relay
+ * - closed: session terminated
+ */
+export type SessionState = 'connected' | 'authenticated' | 'syncing' | 'streaming' | 'closed'
+
+/**
  * Runtime status of a KoraSyncServer.
  */
 export interface ServerStatus {
@@ -93,4 +111,22 @@ export interface ServerStatus {
 	port: number | null
 	/** Total operations stored */
 	totalOperations: number
+	/** Server uptime in milliseconds */
+	uptime: number
+	/** Server package version */
+	version: string
+	/** Schema version the server expects */
+	schemaVersion: number
+	/** Array of connected node IDs */
+	connectedNodeIds: string[]
+	/** Peak connections since server start */
+	peakConnections: number
+	/** Total connections handled since server start */
+	connectionsTotal: number
+	/** Operations received since server start */
+	operationsReceived: number
+	/** Operations sent since server start */
+	operationsSent: number
+	/** Error count since server start */
+	errorCount: number
 }

@@ -228,6 +228,55 @@ export class SqliteServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async exportBackup(): Promise<Uint8Array> {
+		this.assertOpen()
+
+		const { buildServerBackup } = await import('./server-backup')
+		const rows = this.db.select().from(operations).all()
+		const deserialized = rows.map((row) => this.deserializeOperation(row))
+		const vv = this.getVersionVector()
+
+		return buildServerBackup(this.nodeId, deserialized, vv)
+	}
+
+	async importBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }> {
+		this.assertOpen()
+
+		const { parseServerBackup } = await import('./server-backup')
+		const { operations: ops, versionVector } = parseServerBackup(data)
+
+		if (merge) {
+			let restored = 0
+			for (const op of ops) {
+				const result = await this.applyRemoteOperation(op)
+				if (result === 'applied') restored++
+			}
+			return { operationsRestored: restored, success: true }
+		}
+
+		// Replace mode: DROP and recreate
+		this.db.transaction((tx) => {
+			tx.run(sql.raw('DELETE FROM operations'))
+			tx.run(sql.raw('DELETE FROM sync_state'))
+
+			for (const [nid, seq] of versionVector) {
+				tx.insert(syncState)
+					.values({ nodeId: nid, maxSequenceNumber: seq, lastSeenAt: Date.now() })
+					.run()
+			}
+
+			for (const op of ops) {
+				const row = this.serializeOperation(op, Date.now())
+				tx.insert(operations).values(row).run()
+			}
+		})
+
+		return { operationsRestored: ops.length, success: true }
+	}
+
 	// ---------------------------------------------------------------------------
 	// Materialization internals
 	// ---------------------------------------------------------------------------

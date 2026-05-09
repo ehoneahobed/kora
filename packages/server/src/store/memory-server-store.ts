@@ -246,6 +246,51 @@ export class MemoryServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async exportBackup(): Promise<Uint8Array> {
+		this.assertOpen()
+		const { buildServerBackup } = await import('./server-backup')
+		return buildServerBackup(this.nodeId, this.operations, this.versionVector)
+	}
+
+	async importBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }> {
+		this.assertOpen()
+		const { parseServerBackup } = await import('./server-backup')
+		const { operations, versionVector } = parseServerBackup(data)
+
+		if (merge) {
+			let restored = 0
+			for (const op of operations) {
+				const result = await this.applyRemoteOperation(op)
+				if (result === 'applied') restored++
+			}
+			return { operationsRestored: restored, success: true }
+		}
+
+		// Replace mode: clear and reload
+		this.operations.length = 0
+		this.operationIndex.clear()
+		this.versionVector.clear()
+
+		for (const [nid, seq] of versionVector) {
+			this.versionVector.set(nid, seq)
+		}
+
+		for (const op of operations) {
+			this.operations.push(op)
+			this.operationIndex.set(op.id, op)
+
+			// Update materialized records if schema is set
+			if (this.schema?.collections[op.collection]) {
+				this.rebuildMaterializedRecord(op.collection, op.recordId)
+			}
+		}
+
+		return { operationsRestored: operations.length, success: true }
+	}
+
 	// --- Testing helpers (not on interface) ---
 
 	/**

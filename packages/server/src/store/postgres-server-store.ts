@@ -239,6 +239,64 @@ export class PostgresServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async exportBackup(): Promise<Uint8Array> {
+		this.assertOpen()
+		await this.ready
+
+		const { buildServerBackup } = await import('./server-backup')
+
+		const rows = await this.db.select().from(pgOperations).orderBy(asc(pgOperations.sequenceNumber))
+		const operations = rows.map((row) => this.deserializeOperation(row))
+
+		return buildServerBackup(this.nodeId, operations, this.versionVector)
+	}
+
+	async importBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }> {
+		this.assertOpen()
+		await this.ready
+
+		const { parseServerBackup } = await import('./server-backup')
+		const { operations, versionVector } = parseServerBackup(data)
+
+		if (merge) {
+			let restored = 0
+			for (const op of operations) {
+				const result = await this.applyRemoteOperation(op)
+				if (result === 'applied') restored++
+			}
+			return { operationsRestored: restored, success: true }
+		}
+
+		const now = Date.now()
+		await this.db.transaction(async (tx) => {
+			await tx.delete(pgOperations)
+			await tx.delete(pgSyncState)
+
+			for (const [nid, seq] of versionVector) {
+				await tx
+					.insert(pgSyncState)
+					.values({ nodeId: nid, maxSequenceNumber: seq, lastSeenAt: now })
+					.onConflictDoNothing({ target: pgSyncState.nodeId })
+			}
+
+			for (const op of operations) {
+				const row = this.serializeOperation(op, now)
+				await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
+			}
+		})
+
+		// Rebuild in-memory version vector
+		this.versionVector.clear()
+		for (const [nid, seq] of versionVector) {
+			this.versionVector.set(nid, seq)
+		}
+
+		return { operationsRestored: operations.length, success: true }
+	}
+
 	// ---------------------------------------------------------------------------
 	// Materialization internals
 	// ---------------------------------------------------------------------------

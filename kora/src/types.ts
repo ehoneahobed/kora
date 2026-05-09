@@ -10,9 +10,13 @@ import type {
 } from '@korajs/core'
 import type { FieldBuilder } from '@korajs/core'
 import type {
+	BackupOptions,
+	BackupProgress,
 	CollectionAccessor,
 	CollectionRecord,
 	QueryBuilder,
+	RestoreOptions,
+	RestoreResult,
 	TransactionContext,
 } from '@korajs/store'
 import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
@@ -229,6 +233,23 @@ export interface KoraApp {
 	 * ```
 	 */
 	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/**
+	 * Export all data as a portable backup binary.
+	 * Delegates to the underlying store's exportBackup.
+	 *
+	 * @param options - Backup options (includeRecords, collections, onProgress)
+	 * @returns Backup as a Uint8Array
+	 */
+	exportBackup(options?: BackupOptions): Promise<Uint8Array>
+	/**
+	 * Restore data from a backup binary.
+	 * Delegates to the underlying store's importBackup.
+	 *
+	 * @param data - The backup data
+	 * @param options - Restore options (merge, collections, onProgress)
+	 * @returns Result of the restore operation
+	 */
+	importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult>
 	/** Dynamic collection accessors (e.g., app.todos). Typed via Object.defineProperty. */
 	[collection: string]: unknown
 }
@@ -273,6 +294,10 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
 	/** Execute a named mutation — a transaction with a DevTools-visible name. */
 	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/** Export all data as a portable backup binary. */
+	exportBackup(options?: BackupOptions): Promise<Uint8Array>
+	/** Restore data from a backup binary. */
+	importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult>
 } & {
 	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
 		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
