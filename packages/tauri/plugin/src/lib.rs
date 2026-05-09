@@ -9,10 +9,10 @@
 //!
 //! Add the plugin to your Tauri app:
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! fn main() {
 //!     tauri::Builder::default()
-//!         .plugin(tauri_plugin_kora::init())
+//!         .plugin(tauri_plugin_kora_sqlite::init())
 //!         .run(tauri::generate_context!())
 //!         .expect("error while running tauri application");
 //! }
