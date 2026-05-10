@@ -135,22 +135,7 @@ const auth = createKoraAuth({
 })
 ```
 
-The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store.
-
-To bind sessions to a stable offline device automatically, configure a device identity provider:
-
-```typescript
-const auth = new AuthClient({
-  serverUrl: 'https://acme.example.com',
-  storage: createAuthTokenStorage({ store: secureStore }),
-  deviceIdentity: createPersistentDeviceIdentity({
-    storage: secureStore,
-  }),
-})
-
-await auth.signIn({ email, password })
-// AuthClient sends deviceId and devicePublicKey with the sign-in request.
-```
+The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store. `createKoraAuth()` also binds sessions to a stable offline device automatically when persistent key storage exists.
 
 ### Lower-Level Storage Adapters
 
@@ -706,10 +691,10 @@ Must be placed above any component that uses `useAuth`, `useCurrentUser`, or `us
 #### Example
 
 ```typescript
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 import { AuthProvider } from '@korajs/auth/react'
 
-const authClient = new AuthClient({ serverUrl: 'http://localhost:3001' })
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 
 function App() {
   return (
@@ -905,17 +890,18 @@ const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
 })
 
-const result = await auth.handleRequest({
-  method: req.method,
-  path: req.path,
-  body: req.body,
-  headers: req.headers,
-  ip: req.ip,
+const server = createProductionServer({
+  store,
+  syncOptions: {
+    auth: auth.auth,
+  },
+  httpRoutes: [
+    {
+      path: '/auth',
+      handle: auth.handleRequest,
+    },
+  ],
 })
-
-syncOptions: {
-  auth: auth.auth,
-}
 ```
 
 | Field | Type | Required | Default |

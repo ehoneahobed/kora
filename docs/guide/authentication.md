@@ -57,27 +57,25 @@ const auth = createKoraAuthServer({
 Run `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` to create a 256-bit secret. Store it in `KORA_AUTH_SECRET`, never in source code.
 :::
 
-Wire all auth HTTP routes through `auth.handleRequest()`:
+Mount the auth routes on the Kora production server:
 
 ```typescript
-// Express example
-import express from 'express'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
-const app = express()
-app.use(express.json())
+const store = createSqliteServerStore({ filename: './kora.db' })
 
-app.all('/auth/*', async (req, res) => {
-  const result = await auth.handleRequest({
-    method: req.method,
-    path: req.path,
-    body: req.body,
-    headers: req.headers,
-    ip: req.ip,
-  })
-  res.status(result.status).json(result.body)
+const server = createProductionServer({
+  store,
+  syncOptions: {
+    auth: auth.auth,
+  },
+  httpRoutes: [
+    {
+      path: '/auth',
+      handle: auth.handleRequest,
+    },
+  ],
 })
-
-app.listen(3001, () => console.log('Auth server on :3001'))
 ```
 
 `createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `TokenManager`, and `UserStore` directly.
@@ -171,7 +169,7 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
 
 ## Connecting Auth to the Sync Server
 
-The auth server exposes a sync auth provider through `auth.auth`:
+The auth server exposes a sync auth provider through `auth.auth`. If you used the server setup above, sync is already protected. The explicit wiring looks like this:
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
@@ -222,12 +220,12 @@ The `getAccessToken()` method automatically refreshes an expired access token be
 The normal desktop setup is:
 
 1. Deploy a remote sync/auth server.
-2. Add the auth HTTP routes to that server.
-3. Create `AuthClient` in the Tauri frontend with the same server origin.
+2. Set `KORA_AUTH_SECRET` on that server to enable built-in `/auth/*` routes.
+3. Create a Kora auth client in the Tauri frontend with the same server origin.
 4. Pass `authClient.getAccessToken()` to `createApp({ sync: { auth } })`.
 
 ```typescript
-const authClient = new AuthClient({
+const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
 })
 
@@ -246,34 +244,28 @@ Email/password auth, token refresh, sync authorization, MFA, organizations, and 
 
 ### Secure token storage for desktop and mobile
 
-By default, `AuthClient` uses browser `localStorage` when it is available and falls back to memory storage when it is not. That is convenient for development and web apps, but desktop and mobile production apps should pass a storage adapter backed by the platform credential store.
+By default, `createKoraAuth()` uses browser `localStorage` when it is available. Desktop and mobile production apps should pass a credential store backed by the platform credential store.
 
 ```typescript
-import { AuthClient, createAuthTokenStorage } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-const authClient = new AuthClient({
+const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
-  storage: createAuthTokenStorage({ store: secureStore }),
+  credentialStore: secureStore,
 })
 ```
 
 Use Tauri secure storage on desktop, Expo SecureStore or React Native Keychain on mobile, and iOS Keychain or Android Keystore for native integrations. The adapter may be synchronous or asynchronous.
 
-Use `createPersistentDeviceIdentity()` to create a stable local device identity and have `AuthClient` send it automatically during sign-up and sign-in:
+`createKoraAuth()` creates a stable local device identity automatically when persistent key storage exists. For React Native and other runtimes without IndexedDB, pass a platform-backed `deviceKeyStore`:
 
 ```typescript
-import {
-  AuthClient,
-  createAuthTokenStorage,
-  createPersistentDeviceIdentity,
-} from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-const authClient = new AuthClient({
+const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
-  storage: createAuthTokenStorage({ store: secureStore }),
-  deviceIdentity: createPersistentDeviceIdentity({
-    storage: secureStore,
-  }),
+  credentialStore: secureStore,
+  deviceKeyStore,
 })
 
 await authClient.signIn({

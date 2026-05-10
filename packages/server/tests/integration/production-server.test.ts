@@ -49,4 +49,52 @@ describe('createProductionServer operational auth', () => {
 			await server.stop()
 		}
 	})
+
+	test('mounts custom HTTP routes before static file serving', async () => {
+		const port = 39218
+		const server = createProductionServer({
+			store: new MemoryServerStore('server-1'),
+			port,
+			httpRoutes: [
+				{
+					path: '/auth',
+					async handle(request) {
+						return {
+							status: 200,
+							body: {
+								method: request.method,
+								path: request.path,
+								body: request.body,
+								ip: request.ip,
+							},
+						}
+					},
+				},
+			],
+		})
+
+		await server.start()
+		try {
+			const response = await fetch(`http://localhost:${port}/auth/signin`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ email: 'alice@example.com' }),
+			})
+
+			expect(response.status).toBe(200)
+			const body = (await response.json()) as {
+				method: string
+				path: string
+				body: { email: string }
+			}
+			expect(body.method).toBe('POST')
+			expect(body.path).toBe('/auth/signin')
+			expect(body.body.email).toBe('alice@example.com')
+
+			const nonMatch = await fetch(`http://localhost:${port}/authentication/signin`)
+			expect(nonMatch.status).toBe(404)
+		} finally {
+			await server.stop()
+		}
+	})
 })

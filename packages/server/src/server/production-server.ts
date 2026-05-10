@@ -19,6 +19,14 @@ export interface ProductionServerConfig {
 	/** Additional KoraSyncServer options */
 	syncOptions?: Omit<KoraSyncServerConfig, 'store' | 'port' | 'host' | 'path'>
 	/**
+	 * Optional HTTP route handlers mounted before static file serving.
+	 *
+	 * This is intentionally framework-agnostic so packages such as
+	 * `@korajs/auth` can plug into the production server without requiring
+	 * Express, Hono, or another HTTP framework.
+	 */
+	httpRoutes?: ProductionHttpRoute[]
+	/**
 	 * Optional token protection for operational endpoints.
 	 *
 	 * When a token is omitted, the matching endpoint group remains public for
@@ -35,6 +43,26 @@ export interface ProductionOperationalAuth {
 	metricsToken?: string
 	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
 	backupToken?: string
+}
+
+export interface ProductionHttpRouteRequest {
+	method: string
+	path: string
+	body?: unknown
+	headers?: Record<string, string | string[] | undefined>
+	ip?: string
+}
+
+export interface ProductionHttpRouteResponse {
+	status: number
+	body?: unknown
+	headers?: Record<string, string>
+}
+
+export interface ProductionHttpRoute {
+	/** URL path prefix, for example `/auth`. */
+	path: string
+	handle(request: ProductionHttpRouteRequest): Promise<ProductionHttpRouteResponse>
 }
 
 /**
@@ -193,6 +221,46 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		})
 	}
 
+	async function readJsonBody(req: import('node:http').IncomingMessage): Promise<unknown> {
+		const buffer = await readBodyBuffer(req)
+		if (buffer.byteLength === 0) return undefined
+		try {
+			return JSON.parse(buffer.toString('utf8')) as unknown
+		} catch {
+			return undefined
+		}
+	}
+
+	function matchesRoutePrefix(pathname: string, prefix: string): boolean {
+		const normalizedPrefix = normalizeRoutePath(prefix)
+		return pathname === normalizedPrefix || pathname.startsWith(`${normalizedPrefix}/`)
+	}
+
+	function normalizeRoutePath(path: string): string {
+		const prefixed = path.startsWith('/') ? path : `/${path}`
+		return prefixed.length > 1 ? prefixed.replace(/\/+$/, '') : prefixed
+	}
+
+	function getClientIp(req: import('node:http').IncomingMessage): string | undefined {
+		const forwarded = req.headers['x-forwarded-for']
+		if (typeof forwarded === 'string' && forwarded.length > 0) {
+			return forwarded.split(',')[0]?.trim()
+		}
+		return req.socket.remoteAddress
+	}
+
+	function writeJsonResponse(
+		res: import('node:http').ServerResponse,
+		result: ProductionHttpRouteResponse,
+	): void {
+		const headers = {
+			'Content-Type': 'application/json',
+			...(result.headers ?? {}),
+		}
+		res.writeHead(result.status, headers)
+		res.end(JSON.stringify(result.body ?? null))
+	}
+
 	return {
 		async start(): Promise<string> {
 			const { createServer } = await import('node:http')
@@ -336,6 +404,22 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						res.writeHead(500, { 'Content-Type': 'application/json' })
 						res.end(JSON.stringify({ error: 'Restore failed', message: (error as Error).message }))
 					}
+					return
+				}
+
+				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
+				const customRoute = config.httpRoutes?.find((route) =>
+					matchesRoutePrefix(url.pathname, route.path),
+				)
+				if (customRoute) {
+					const result = await customRoute.handle({
+						method: req.method ?? 'GET',
+						path: url.pathname,
+						body: await readJsonBody(req),
+						headers: req.headers,
+						ip: getClientIp(req),
+					})
+					writeJsonResponse(res, result)
 					return
 				}
 

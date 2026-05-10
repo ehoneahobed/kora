@@ -44,9 +44,20 @@ writes, and `useTodos.ts` is the React binding that exposes todo data and action
 | `KORA_SERVER_DB` | `./kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
 | `DATABASE_URL` | (none) | PostgreSQL connection string for production sync server deployments |
 | `KORA_SYNC_PATH` | `/kora-sync` | WebSocket path exposed by the sync server |
+| `KORA_AUTH_SECRET` | (none) | Enables built-in `/auth/*` routes and authenticated sync when set |
 | `KORA_ADMIN_TOKEN` | (none) | Protects `/__kora`, `/__kora/status`, and `/__kora/events` |
 | `KORA_METRICS_TOKEN` | (none) | Protects `/__kora/metrics` |
 | `KORA_BACKUP_TOKEN` | (none) | Protects server backup and restore endpoints |
+
+## Authentication
+
+Set `KORA_AUTH_SECRET` to enable built-in auth on the sync server. Generate a secret with:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+Then create the client with `createKoraAuth({ serverUrl })` and pass `authClient.getAccessToken()` into `createApp({ sync: { auth } })`. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication).
 
 ## Scripts
 

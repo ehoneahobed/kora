@@ -137,16 +137,17 @@ Users can also skip setup and use the app offline — they can connect later fro
 | `KORA_SERVER_DB` | `./kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
 | `DATABASE_URL` | (none) | PostgreSQL connection string for production sync server deployments |
 | `KORA_SYNC_PATH` | `/kora-sync` | WebSocket path exposed by the sync server |
+| `KORA_AUTH_SECRET` | (none) | Enables built-in `/auth/*` routes and authenticated sync when set |
 | `KORA_ADMIN_TOKEN` | (none) | Protects `/__kora`, `/__kora/status`, and `/__kora/events` |
 | `KORA_METRICS_TOKEN` | (none) | Protects `/__kora/metrics` |
 | `KORA_BACKUP_TOKEN` | (none) | Protects server backup and restore endpoints |
 
 ## Authentication
 
-This template does not enable auth by default. Add it when your desktop app needs accounts, per-user sync scopes, organizations, or RBAC:
+Set `KORA_AUTH_SECRET` to enable built-in auth on the sync server. Generate a secret with:
 
 ```bash
-pnpm add @korajs/auth
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
 Use the same `@korajs/auth` client and React hooks as a web app. Create the client with `createKoraAuth({ serverUrl, credentialStore })`, then pass `authClient.getAccessToken()` into `createApp({ sync: { auth } })`. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication#desktop-and-tauri-apps).

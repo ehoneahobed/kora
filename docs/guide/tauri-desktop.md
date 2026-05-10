@@ -224,39 +224,26 @@ When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects au
 
 ## Authentication
 
-Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `AuthClient`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
-
-Install auth in the generated app:
-
-```bash
-pnpm add @korajs/auth
-```
+Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `createKoraAuth`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
 
 Create an auth client that points at the same remote server that hosts your auth routes:
 
 ```typescript
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-export const authClient = new AuthClient({
+export const authClient = createKoraAuth({
   serverUrl: 'https://acme-corp.example.com',
 })
 ```
 
-For production apps, pass `AuthClient` a storage adapter backed by secure desktop storage instead of relying on WebView `localStorage`:
+For production apps, pass a secure desktop credential store:
 
 ```typescript
-import {
-  AuthClient,
-  createAuthTokenStorage,
-  createPersistentDeviceIdentity,
-} from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-export const authClient = new AuthClient({
+export const authClient = createKoraAuth({
   serverUrl: 'https://acme-corp.example.com',
-  storage: createAuthTokenStorage({ store: tauriSecureStore }),
-  deviceIdentity: createPersistentDeviceIdentity({
-    storage: tauriSecureStore,
-  }),
+  credentialStore: tauriSecureStore,
 })
 ```
 
