@@ -273,7 +273,7 @@ const server = createProductionServer({
 })
 ```
 
-Email/password auth, session refresh, MFA, org membership, and RBAC apply to desktop and web clients the same way. Passkeys require WebAuthn support in the operating system WebView, so call `isPasskeySupported()` before showing passkey UI. OAuth is supported at the auth-provider level, but desktop apps need an app-specific redirect strategy such as a loopback callback, custom URL scheme, or hosted sign-in handoff.
+Email/password auth, OAuth sign-in, account linking, session refresh, MFA, org membership, and RBAC apply to desktop and web clients the same way. Passkeys require WebAuthn support in the operating system WebView, so call `isPasskeySupported()` before showing passkey UI. For OAuth, desktop apps need an app-specific redirect strategy such as a loopback callback, custom URL scheme, or hosted sign-in handoff, then should complete the flow with `POST /auth/oauth/:provider/callback`.
 
 ## Deploying for Multi-Device Sync
 

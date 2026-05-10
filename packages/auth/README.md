@@ -83,10 +83,19 @@ function MyApp() {
 ### Server-side
 
 ```typescript
-import { createKoraAuthServer } from '@korajs/auth/server'
+import { createKoraAuthServer, googleProvider } from '@korajs/auth/server'
 
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+  },
 })
 
 // Wire into your HTTP server:
@@ -96,6 +105,7 @@ app.all('/auth/*', async (req, res) => {
     path: req.path,
     body: req.body,
     headers: req.headers,
+    query: req.query,
     ip: req.ip,
   })
   res.status(result.status).json(result.body)
@@ -151,6 +161,8 @@ const syncServer = new KoraSyncServer({
 | `TokenManager` | JWT issuing, validation, refresh rotation, revocation |
 | `InMemoryUserStore` | Dev/test user store |
 | `InMemoryTokenRevocationStore` | Dev/test token revocation store |
+| `OAuthManager` / provider helpers | OAuth authorization code flow and provider configs |
+| `InMemoryLinkedIdentityStore` | Dev/test OAuth account-linking store |
 | `SessionManager` / `InMemorySessionStore` | Server-side session management |
 | `TotpManager` / `InMemoryTotpStore` | TOTP MFA with recovery codes |
 | `OrgRoutes` / `InMemoryOrgStore` | Organization CRUD, invitations, member management |

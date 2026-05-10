@@ -18,6 +18,7 @@ export type {
 	CreateKoraAuthServerOptions,
 	KoraAuthHttpRequest,
 	KoraAuthServer,
+	OAuthServerConfig,
 } from './provider/built-in/quickstart-server'
 
 // === Token Manager ===
@@ -177,6 +178,11 @@ export {
 	microsoftProvider,
 } from './provider/oauth/oauth-flow'
 export type { OAuthManagerConfig } from './provider/oauth/oauth-flow'
+export {
+	DuplicateLinkedIdentityError,
+	InMemoryLinkedIdentityStore,
+} from './provider/oauth/linked-identity-store'
+export type { LinkedIdentityStore } from './provider/oauth/linked-identity-store'
 export {
 	OAuthError,
 	OAuthStateMismatchError,

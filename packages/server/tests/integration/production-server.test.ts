@@ -65,6 +65,7 @@ describe('createProductionServer operational auth', () => {
 								method: request.method,
 								path: request.path,
 								body: request.body,
+								query: request.query,
 								ip: request.ip,
 							},
 						}
@@ -75,7 +76,7 @@ describe('createProductionServer operational auth', () => {
 
 		await server.start()
 		try {
-			const response = await fetch(`http://localhost:${port}/auth/signin`, {
+			const response = await fetch(`http://localhost:${port}/auth/signin?next=/dashboard`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ email: 'alice@example.com' }),
@@ -86,10 +87,12 @@ describe('createProductionServer operational auth', () => {
 				method: string
 				path: string
 				body: { email: string }
+				query: { next: string }
 			}
 			expect(body.method).toBe('POST')
 			expect(body.path).toBe('/auth/signin')
 			expect(body.body.email).toBe('alice@example.com')
+			expect(body.query.next).toBe('/dashboard')
 
 			const nonMatch = await fetch(`http://localhost:${port}/authentication/signin`)
 			expect(nonMatch.status).toBe(404)

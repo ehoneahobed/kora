@@ -46,10 +46,19 @@ For a standard Kora app, create the auth server with one call:
 
 ```typescript
 // server.ts
-import { createKoraAuthServer } from '@korajs/auth/server'
+import { createKoraAuthServer, googleProvider } from '@korajs/auth/server'
 
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+  },
 })
 ```
 
@@ -78,7 +87,7 @@ const server = createProductionServer({
 })
 ```
 
-`createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `TokenManager`, and `UserStore` directly.
+`createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, OAuth sign-in routes, account linking, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `OAuthManager`, `TokenManager`, and `UserStore` directly.
 
 ---
 
@@ -240,7 +249,24 @@ const app = createApp({
 })
 ```
 
-Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC all use HTTP plus WebSocket tokens and apply to web and desktop clients the same way. Passkeys depend on WebAuthn support in the platform WebView and should be feature-detected with `isPasskeySupported()`. OAuth works too, but desktop apps need an explicit redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app.
+Email/password auth, OAuth sign-in, account linking, token refresh, sync authorization, MFA, organizations, and RBAC all use HTTP plus WebSocket tokens and apply to web and desktop clients the same way. Passkeys depend on WebAuthn support in the platform WebView and should be feature-detected with `isPasskeySupported()`.
+
+For desktop and mobile OAuth, use an app redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app. After the provider returns `code` and `state`, send them to Kora:
+
+```typescript
+const response = await fetch('https://acme.example.com/auth/oauth/google/callback', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    code,
+    state,
+    deviceId,
+    devicePublicKey,
+  }),
+})
+```
+
+The response contains the normal Kora user and tokens, so the same token storage and sync auth flow works across web, desktop, and mobile.
 
 ### Secure token storage for desktop and mobile
 

@@ -888,6 +888,15 @@ Creates the built-in auth server with sensible defaults for Kora sync.
 ```typescript
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+  },
 })
 
 const server = createProductionServer({
@@ -911,6 +920,7 @@ const server = createProductionServer({
 | `tokenManager` | `TokenManager` | No | Created with revocation store |
 | `tokenManagerOptions` | `Omit<TokenManagerConfig, 'secret'>` | No | TokenManager defaults |
 | `path` | `string` | No | `'/auth'` |
+| `oauth` | `OAuthServerConfig` | No | OAuth routes disabled |
 | `challengeStore` | `ChallengeStore` | No | `InMemoryChallengeStore` |
 | `rateLimiter` | `RateLimiter` | No | `InMemoryRateLimiter` |
 
@@ -919,8 +929,33 @@ The returned object includes:
 - `routes` -- underlying `BuiltInAuthRoutes`
 - `userStore` -- configured user/device store
 - `tokenManager` -- configured token manager
+- `oauth` -- configured `OAuthManager`, when OAuth is enabled
+- `linkedIdentityStore` -- configured OAuth account-linking store, when OAuth is enabled
 - `auth` -- sync auth provider for `@korajs/server`
 - `handleRequest()` -- one HTTP handler for `/auth/*`
+
+When `oauth` is configured, `handleRequest()` also serves:
+
+| Route | Purpose |
+|-------|---------|
+| `GET /auth/oauth/:provider` | Create an authorization URL and state token. Returns `{ url, state }`. |
+| `GET /auth/oauth/:provider/callback` | Complete a browser OAuth callback from `code` and `state` query params. |
+| `POST /auth/oauth/:provider/callback` | Complete a desktop/mobile callback from JSON body `{ code, state, deviceId?, devicePublicKey? }`. |
+| `GET /auth/oauth/links` | List the signed-in user's linked OAuth identities. |
+| `POST /auth/oauth/:provider/link` | Link a provider to the signed-in user using `{ code, state }`. |
+| `DELETE /auth/oauth/:provider/link` | Unlink that provider from the signed-in user. |
+
+`OAuthServerConfig` accepts all `OAuthManagerConfig` fields plus:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `providers` | `OAuthProviderConfig[]` | Required |
+| `linkedIdentityStore` | `LinkedIdentityStore` | `InMemoryLinkedIdentityStore` |
+| `createNewUsers` | `boolean` | `true` |
+| `autoLinkVerifiedEmail` | `boolean` | `false` |
+| `allowUnlinkLastIdentity` | `boolean` | `false` |
+
+By default, Kora does not let a user unlink their last OAuth identity because OAuth-created accounts may not have another usable sign-in method. Enable `allowUnlinkLastIdentity` only when your app provides another recovery or sign-in path.
 
 ### `BuiltInAuthRoutes`
 
@@ -1255,6 +1290,7 @@ const scopes = await resolver.resolve('user-1', 'org-1', ['todos', 'projects'])
 ```typescript
 import {
   OAuthManager,
+  InMemoryLinkedIdentityStore,
   InMemoryOAuthStateStore,
   googleProvider,
   githubProvider,
@@ -1262,7 +1298,7 @@ import {
 } from '@korajs/auth/server'
 ```
 
-Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the full OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info.
+Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info. Most apps should configure OAuth through `createKoraAuthServer({ oauth })` so Kora also creates users, issues Kora tokens, registers devices, and stores linked identities.
 
 For desktop and mobile OAuth, enable PKCE and omit `clientSecret` for public native clients:
 
@@ -1279,6 +1315,8 @@ const oauth = new OAuthManager({
 ```
 
 When `pkce: true` is set, authorization URLs include an S256 `code_challenge` and token exchange includes the matching `code_verifier`.
+
+For production, provide durable stores for OAuth state and linked identities. The in-memory stores are for development and tests.
 
 ### Password Reset
 

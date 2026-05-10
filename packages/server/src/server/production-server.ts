@@ -50,6 +50,7 @@ export interface ProductionHttpRouteRequest {
 	path: string
 	body?: unknown
 	headers?: Record<string, string | string[] | undefined>
+	query?: Record<string, string | string[] | undefined>
 	ip?: string
 }
 
@@ -249,6 +250,21 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		return req.socket.remoteAddress
 	}
 
+	function getQuery(url: URL): Record<string, string | string[] | undefined> {
+		const query: Record<string, string | string[] | undefined> = {}
+		for (const [key, value] of url.searchParams) {
+			const existing = query[key]
+			if (existing === undefined) {
+				query[key] = value
+			} else if (Array.isArray(existing)) {
+				existing.push(value)
+			} else {
+				query[key] = [existing, value]
+			}
+		}
+		return query
+	}
+
 	function writeJsonResponse(
 		res: import('node:http').ServerResponse,
 		result: ProductionHttpRouteResponse,
@@ -417,6 +433,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						path: url.pathname,
 						body: await readJsonBody(req),
 						headers: req.headers,
+						query: getQuery(url),
 						ip: getClientIp(req),
 					})
 					writeJsonResponse(res, result)
