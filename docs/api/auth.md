@@ -14,6 +14,7 @@ The package exposes three entry points:
 
 ```typescript
 import {
+  createKoraAuth,
   AuthClient,
   AuthError,
   OrgClient,
@@ -39,9 +40,45 @@ import {
 
 Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic. Works in browser, Tauri desktop WebView, and mobile JavaScript environments with pluggable storage and fetch support.
 
+Most apps should start with `createKoraAuth()`:
+
+```typescript
+const auth = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+```
+
 ```typescript
 const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 ```
+
+### `createKoraAuth(options)`
+
+Creates an `AuthClient` with production-shaped defaults for offline-first apps.
+
+```typescript
+const auth = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+})
+```
+
+For desktop and mobile apps, pass one credential store and Kora adapts it for token storage and stable device identity:
+
+```typescript
+const auth = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+  deviceKeyStore,
+})
+```
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `serverUrl` | `string` | Yes | -- |
+| `credentialStore` | `AuthKeyValueStorage` | No | Browser `localStorage` when available |
+| `deviceKeyStore` | `DeviceKeyStore` | No | IndexedDB when available |
+| `deviceIdentity` | `AuthDeviceIdentityProvider \| false` | No | Auto-created when persistent storage exists |
+| `storage` | `AuthTokenStorage` | No | Derived from `credentialStore` |
+| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
+| `storageKey` | `string` | No | `'kora_auth'` |
 
 #### `AuthClientConfig`
 
@@ -86,14 +123,15 @@ const unsub = auth.onAuthChange((state) => {
 
 For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `auth.getAccessToken()` into Kora sync auth. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
 
-For desktop and mobile production apps, prefer a secure storage adapter instead of the default browser-style storage:
+For desktop and mobile production apps, prefer `createKoraAuth()` with a secure credential store:
 
 ```typescript
-import { AuthClient, createAuthTokenStorage } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-const auth = new AuthClient({
+const auth = createKoraAuth({
   serverUrl: 'https://acme.example.com',
-  storage: createAuthTokenStorage({ store: secureStore }),
+  credentialStore: secureStore,
+  deviceKeyStore,
 })
 ```
 
@@ -114,7 +152,7 @@ await auth.signIn({ email, password })
 // AuthClient sends deviceId and devicePublicKey with the sign-in request.
 ```
 
-### Storage Adapters
+### Lower-Level Storage Adapters
 
 - `createAuthTokenStorage({ store, prefix? })` -- adapts a sync or async key-value credential store to `AuthTokenStorage`.
 - `createMemoryAuthTokenStorage()` -- in-memory token storage for tests, demos, and SSR.
@@ -846,6 +884,7 @@ function AdminPanel() {
 
 ```typescript
 import {
+  createKoraAuthServer,
   BuiltInAuthRoutes,
   TokenManager,
   SessionManager,
@@ -857,9 +896,49 @@ import {
 } from '@korajs/auth/server'
 ```
 
+### `createKoraAuthServer(options)`
+
+Creates the built-in auth server with sensible defaults for Kora sync.
+
+```typescript
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+})
+
+const result = await auth.handleRequest({
+  method: req.method,
+  path: req.path,
+  body: req.body,
+  headers: req.headers,
+  ip: req.ip,
+})
+
+syncOptions: {
+  auth: auth.auth,
+}
+```
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `jwtSecret` | `string \| string[]` | Production | `KORA_AUTH_SECRET`, dev-only generated secret |
+| `userStore` | `UserStore` | No | `InMemoryUserStore` |
+| `tokenManager` | `TokenManager` | No | Created with revocation store |
+| `tokenManagerOptions` | `Omit<TokenManagerConfig, 'secret'>` | No | TokenManager defaults |
+| `path` | `string` | No | `'/auth'` |
+| `challengeStore` | `ChallengeStore` | No | `InMemoryChallengeStore` |
+| `rateLimiter` | `RateLimiter` | No | `InMemoryRateLimiter` |
+
+The returned object includes:
+
+- `routes` -- underlying `BuiltInAuthRoutes`
+- `userStore` -- configured user/device store
+- `tokenManager` -- configured token manager
+- `auth` -- sync auth provider for `@korajs/server`
+- `handleRequest()` -- one HTTP handler for `/auth/*`
+
 ### `BuiltInAuthRoutes`
 
-Server-side route handlers for email/password authentication. Transport-agnostic -- returns `{ status, body }` response objects to wire into any HTTP framework.
+Lower-level server-side route handlers for custom auth wiring. Transport-agnostic -- returns `{ status, body }` response objects to wire into any HTTP framework.
 
 ```typescript
 const routes = new BuiltInAuthRoutes(config)

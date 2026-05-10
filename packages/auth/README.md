@@ -23,20 +23,16 @@ The client APIs work in browser, Tauri desktop WebView, and mobile JavaScript en
 For production desktop and mobile apps, pass a custom token storage adapter backed by the platform credential store and attach a stable device identity:
 
 ```typescript
-import {
-  AuthClient,
-  createAuthTokenStorage,
-  createPersistentDeviceIdentity,
-} from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-const authClient = new AuthClient({
+const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
-  storage: createAuthTokenStorage({ store: secureStore }),
-  deviceIdentity: createPersistentDeviceIdentity({ storage: secureStore }),
+  credentialStore: secureStore,
+  deviceKeyStore,
 })
 ```
 
-`createPersistentDeviceIdentity()` uses IndexedDB for the device key pair when available. React Native and other runtimes without IndexedDB should pass a platform-backed `keyStore`.
+`createKoraAuth()` uses IndexedDB for the device key pair when available. React Native and other runtimes without IndexedDB should pass a platform-backed `deviceKeyStore`.
 
 ## Installation
 
@@ -49,10 +45,10 @@ pnpm add @korajs/auth
 ### Client-side (React)
 
 ```tsx
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 import { AuthProvider, useAuth } from '@korajs/auth/react'
 
-const authClient = new AuthClient({ serverUrl: 'http://localhost:3001' })
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 
 function App() {
   return (
@@ -87,38 +83,28 @@ function MyApp() {
 ### Server-side
 
 ```typescript
-import { BuiltInAuthRoutes, InMemoryUserStore, TokenManager } from '@korajs/auth/server'
+import { createKoraAuthServer } from '@korajs/auth/server'
 
-const userStore = new InMemoryUserStore()
-const tokenManager = new TokenManager({ secret: process.env.AUTH_SECRET! })
-const authRoutes = new BuiltInAuthRoutes({ userStore, tokenManager })
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+})
 
 // Wire into your HTTP server:
-app.post('/auth/signup', async (req, res) => {
-  const result = await authRoutes.handleSignUp(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signin', async (req, res) => {
-  const result = await authRoutes.handleSignIn(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/refresh', async (req, res) => {
-  const result = await authRoutes.handleRefresh(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.get('/auth/me', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleGetMe(token)
+app.all('/auth/*', async (req, res) => {
+  const result = await auth.handleRequest({
+    method: req.method,
+    path: req.path,
+    body: req.body,
+    headers: req.headers,
+    ip: req.ip,
+  })
   res.status(result.status).json(result.body)
 })
 
 // Bridge to Kora sync server:
 const syncServer = new KoraSyncServer({
   store,
-  auth: authRoutes.toSyncAuthProvider(),
+  auth: auth.auth,
 })
 ```
 
@@ -128,6 +114,7 @@ const syncServer = new KoraSyncServer({
 
 | Export | Description |
 |--------|-------------|
+| `createKoraAuth` | Quickstart client factory with storage and device identity defaults |
 | `AuthClient` | Client-side auth manager (sign-up, sign-in, sign-out, token refresh) |
 | `OrgClient` | Client-side organization management |
 | `TokenStore` | Client-side token persistence (localStorage) |
@@ -159,6 +146,7 @@ const syncServer = new KoraSyncServer({
 
 | Export | Description |
 |--------|-------------|
+| `createKoraAuthServer` | Quickstart server factory with auth routes and sync provider |
 | `BuiltInAuthRoutes` | HTTP route handlers for all auth operations |
 | `TokenManager` | JWT issuing, validation, refresh rotation, revocation |
 | `InMemoryUserStore` | Dev/test user store |

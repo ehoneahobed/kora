@@ -42,36 +42,22 @@ Install the auth package:
 pnpm add @korajs/auth
 ```
 
-Set up the three core server components: a user store, a token manager, and the auth routes.
+For a standard Kora app, create the auth server with one call:
 
 ```typescript
 // server.ts
-import {
-  BuiltInAuthRoutes,
-  InMemoryUserStore,
-  TokenManager,
-  InMemoryTokenRevocationStore,
-} from '@korajs/auth/server'
+import { createKoraAuthServer } from '@korajs/auth/server'
 
-// 1. User store — holds user accounts and device registrations
-const userStore = new InMemoryUserStore()
-
-// 2. Token manager — issues and validates JWTs
-const tokenManager = new TokenManager({
-  secret: process.env.AUTH_SECRET!,     // At least 32 characters
-  revocationStore: new InMemoryTokenRevocationStore(),
-  // Defaults: accessTokenLifetime = 15 min, refreshTokenLifetime = 90 days
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
 })
-
-// 3. Auth routes — framework-agnostic HTTP handlers
-const authRoutes = new BuiltInAuthRoutes({ userStore, tokenManager })
 ```
 
 ::: tip Generating a secret
-Use `TokenManager.generateSecret()` to create a cryptographically random 256-bit secret. Store it in an environment variable, never in source code.
+Run `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` to create a 256-bit secret. Store it in `KORA_AUTH_SECRET`, never in source code.
 :::
 
-Wire the route handlers into your HTTP server. The handlers accept parsed request bodies and return `{ status, body }` response objects:
+Wire all auth HTTP routes through `auth.handleRequest()`:
 
 ```typescript
 // Express example
@@ -80,51 +66,34 @@ import express from 'express'
 const app = express()
 app.use(express.json())
 
-app.post('/auth/signup', async (req, res) => {
-  const result = await authRoutes.handleSignUp(req.body, req.ip)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signin', async (req, res) => {
-  const result = await authRoutes.handleSignIn(req.body, req.ip)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/refresh', async (req, res) => {
-  const result = await authRoutes.handleRefresh(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signout', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleSignOut(token, req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.get('/auth/me', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleGetMe(token)
+app.all('/auth/*', async (req, res) => {
+  const result = await auth.handleRequest({
+    method: req.method,
+    path: req.path,
+    body: req.body,
+    headers: req.headers,
+    ip: req.ip,
+  })
   res.status(result.status).json(result.body)
 })
 
 app.listen(3001, () => console.log('Auth server on :3001'))
 ```
 
-The `handleSignUp` and `handleSignIn` methods accept an optional `clientIp` parameter for per-IP rate limiting. Pass `req.ip` (or your reverse proxy's real IP header) for best protection against brute-force attacks.
+`createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `TokenManager`, and `UserStore` directly.
 
 ---
 
 ## Quick Start: Client-Side Setup
 
-Create an `AuthClient` instance and wrap your React app with `AuthProvider`:
+Create a Kora auth client and wrap your React app with `AuthProvider`:
 
 ```typescript
 // auth.ts
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-export const authClient = new AuthClient({
+export const authClient = createKoraAuth({
   serverUrl: 'http://localhost:3001',
-  // storageKey: 'my_app_auth',  // optional prefix for localStorage keys
 })
 ```
 
@@ -202,7 +171,7 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
 
 ## Connecting Auth to the Sync Server
 
-The `BuiltInAuthRoutes` class provides a `toSyncAuthProvider()` method that bridges authentication with the Kora sync server. This method returns an object implementing the `AuthProvider` interface expected by `@korajs/server`.
+The auth server exposes a sync auth provider through `auth.auth`:
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
@@ -215,7 +184,7 @@ const syncServer = createProductionServer({
   staticDir: './dist',
   syncPath: '/kora-sync',
   syncOptions: {
-    auth: authRoutes.toSyncAuthProvider(),
+    auth: auth.auth,
   },
 })
 ```

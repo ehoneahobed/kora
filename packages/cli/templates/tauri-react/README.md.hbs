@@ -149,7 +149,7 @@ This template does not enable auth by default. Add it when your desktop app need
 pnpm add @korajs/auth
 ```
 
-Use the same `@korajs/auth` client and React hooks as a web app. Point `AuthClient` at your remote auth server, then pass `authClient.getAccessToken()` into `createApp({ sync: { auth } })`. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication#desktop-and-tauri-apps).
+Use the same `@korajs/auth` client and React hooks as a web app. Create the client with `createKoraAuth({ serverUrl, credentialStore })`, then pass `authClient.getAccessToken()` into `createApp({ sync: { auth } })`. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication#desktop-and-tauri-apps).
 
 ## Code Signing
 

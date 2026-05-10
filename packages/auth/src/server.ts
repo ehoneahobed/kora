@@ -13,6 +13,12 @@ export type {
 	ChallengeStore,
 	RateLimiter,
 } from './provider/built-in/auth-routes'
+export { createKoraAuthServer } from './provider/built-in/quickstart-server'
+export type {
+	CreateKoraAuthServerOptions,
+	KoraAuthHttpRequest,
+	KoraAuthServer,
+} from './provider/built-in/quickstart-server'
 
 // === Token Manager ===
 export { TokenManager, InMemoryTokenRevocationStore } from './tokens/token-manager'
