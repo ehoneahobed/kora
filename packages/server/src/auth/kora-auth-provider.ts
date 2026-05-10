@@ -11,6 +11,11 @@ interface TokenValidator {
 		dev: string
 		type: string
 	} | null
+	validateTokenWithRevocation?(token: string): Promise<{
+		sub: string
+		dev: string
+		type: string
+	} | null>
 }
 
 /**
@@ -40,6 +45,8 @@ export interface KoraAuthProviderOptions {
 	/**
 	 * Token validator that verifies JWT signatures and returns claims.
 	 * Typically a `TokenManager` instance from `@korajs/auth/server`.
+	 * If the validator also implements `validateTokenWithRevocation`, the sync
+	 * server uses it so signed-out sessions and revoked devices are rejected.
 	 */
 	tokenValidator: TokenValidator
 
@@ -109,7 +116,9 @@ export class KoraAuthProvider implements AuthProvider {
 
 	async authenticate(token: string): Promise<AuthContext | null> {
 		// Validate the JWT signature and expiration
-		const payload = this.tokenValidator.validateToken(token)
+		const payload = this.tokenValidator.validateTokenWithRevocation
+			? await this.tokenValidator.validateTokenWithRevocation(token)
+			: this.tokenValidator.validateToken(token)
 		if (payload === null) {
 			return null
 		}

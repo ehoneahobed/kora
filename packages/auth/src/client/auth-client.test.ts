@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AuthClient } from './auth-client'
 import type { AuthState } from './auth-client'
+import type { AuthTokenStorage } from './auth-client'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -115,6 +116,30 @@ describe('AuthClient', () => {
 			serverUrl: config?.serverUrl ?? 'http://localhost:3001',
 			storageKey: config?.storageKey ?? 'kora_auth',
 		})
+	}
+
+	function createAsyncStorage(): AuthTokenStorage & {
+		accessToken: string | null
+		refreshToken: string | null
+	} {
+		return {
+			accessToken: null,
+			refreshToken: null,
+			async getAccessToken() {
+				return this.accessToken
+			},
+			async getRefreshToken() {
+				return this.refreshToken
+			},
+			async setTokens(access: string, refresh: string) {
+				this.accessToken = access
+				this.refreshToken = refresh
+			},
+			async clear() {
+				this.accessToken = null
+				this.refreshToken = null
+			},
+		}
 	}
 
 	function mockFetchResponse(body: unknown, status = 200): void {
@@ -249,6 +274,29 @@ describe('AuthClient', () => {
 			expect(user).toEqual(USER_PROFILE)
 			expect(client.state).toBe('authenticated')
 			expect(client.isAuthenticated).toBe(true)
+		})
+
+		it('passes device identity fields to the auth server', async () => {
+			const client = createClient()
+			await client.initialize()
+
+			mockFetchResponse(TOKEN_RESPONSE)
+			mockFetchResponse(USER_PROFILE)
+
+			await client.signIn({
+				email: 'test@example.com',
+				password: 'password123',
+				deviceId: 'device-1',
+				devicePublicKey: '{"kty":"EC"}',
+			})
+
+			const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+			expect(JSON.parse(init.body as string)).toMatchObject({
+				email: 'test@example.com',
+				password: 'password123',
+				deviceId: 'device-1',
+				devicePublicKey: '{"kty":"EC"}',
+			})
 		})
 
 		it('throws AuthError on invalid credentials', async () => {
@@ -415,6 +463,22 @@ describe('AuthClient', () => {
 			const result = await client.getAccessToken()
 			expect(result).toBeNull()
 		})
+
+		it('supports async custom token storage for mobile runtimes', async () => {
+			const storage = createAsyncStorage()
+			storage.accessToken = validAccessToken()
+			storage.refreshToken = validRefreshToken()
+			mockFetchResponse(USER_PROFILE)
+
+			const client = new AuthClient({
+				serverUrl: 'http://localhost:3001',
+				storage,
+			})
+			await client.initialize()
+
+			expect(client.state).toBe('authenticated')
+			expect(await client.getAccessToken()).toBe(storage.accessToken)
+		})
 	})
 
 	// -----------------------------------------------------------------------
@@ -473,6 +537,33 @@ describe('AuthClient', () => {
 
 			const calledUrl = fetchMock.mock.calls[0]?.[0] as string
 			expect(calledUrl).toBe('http://localhost:3001/auth/signin')
+		})
+
+		it('uses custom fetch implementation when provided', async () => {
+			const customFetch = vi
+				.fn<typeof fetch>()
+				.mockResolvedValueOnce(
+					new Response(JSON.stringify({ data: TOKEN_RESPONSE }), {
+						status: 200,
+						headers: { 'Content-Type': 'application/json' },
+					}),
+				)
+				.mockResolvedValueOnce(
+					new Response(JSON.stringify({ data: USER_PROFILE }), {
+						status: 200,
+						headers: { 'Content-Type': 'application/json' },
+					}),
+				)
+
+			const client = new AuthClient({
+				serverUrl: 'http://localhost:3001',
+				fetch: customFetch,
+			})
+			await client.initialize()
+			await client.signIn({ email: 'test@example.com', password: 'password123' })
+
+			expect(customFetch).toHaveBeenCalled()
+			expect(fetchMock).not.toHaveBeenCalled()
 		})
 
 		it('works offline during initialize with valid unexpired token', async () => {

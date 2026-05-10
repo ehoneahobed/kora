@@ -24,6 +24,7 @@ describe('fly-toml-generator', () => {
 		expect(source).toContain('app = "demo-kora-app"')
 		expect(source).toContain('primary_region = "iad"')
 		expect(source).toContain('internal_port = 3000')
+		expect(source).toContain('path = "/health"')
 	})
 
 	test('writeFlyTomlArtifact writes fly.toml into deploy directory', async () => {

@@ -1,26 +1,42 @@
-import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import {
+  createPostgresServerStore,
+  createProductionServer,
+  createSqliteServerStore,
+} from '@korajs/server'
+import schema from './src/schema'
 
-// SQLite persists data to disk — survives server restarts
-const store = createSqliteServerStore({ filename: './kora-server.db' })
+async function createStore() {
+  if (process.env.DATABASE_URL) {
+    return createPostgresServerStore({
+      connectionString: process.env.DATABASE_URL,
+    })
+  }
 
-// To use PostgreSQL instead:
-// 1. Install: pnpm add postgres
-// 2. Replace the store above with:
-//
-// import { createPostgresServerStore } from '@korajs/server'
-// const store = await createPostgresServerStore({
-//   connectionString: 'postgresql://user:password@localhost:5432/mydb',
-// })
+  return createSqliteServerStore({
+    filename: process.env.KORA_SERVER_DB || './kora-server.db',
+  })
+}
 
-// Production server: serves static files + WebSocket sync on a single port.
-// One port means one tunnel (ngrok, cloudflared) handles everything.
-const server = createProductionServer({
-  store,
-  port: Number(process.env.PORT) || 3001,
-  staticDir: './dist',
-  syncPath: '/kora-sync',
-})
+async function start() {
+  const store = await createStore()
+  await store.setSchema(schema)
 
-server.start().then((url) => {
+  const syncPath = process.env.KORA_SYNC_PATH || '/kora-sync'
+  const server = createProductionServer({
+    store,
+    port: Number(process.env.PORT) || 3001,
+    staticDir: './dist',
+    syncPath,
+    operationalAuth: {
+      adminToken: process.env.KORA_ADMIN_TOKEN,
+      metricsToken: process.env.KORA_METRICS_TOKEN,
+      backupToken: process.env.KORA_BACKUP_TOKEN,
+    },
+  })
+
+  const url = await server.start()
   console.log(`Kora app running at ${url}`)
-})
+  console.log(`  Sync endpoint: ${url.replace('http', 'ws')}${syncPath}`)
+}
+
+void start()

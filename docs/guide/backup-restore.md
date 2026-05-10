@@ -77,6 +77,12 @@ For synced apps, back up the server operation log with the CLI:
 kora backup create --url http://localhost:3001 --out ./backup.kora
 ```
 
+If the server has `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN` configured, pass the token explicitly or expose it in your shell:
+
+```bash
+kora backup create --url https://sync.example.com --token "$KORA_BACKUP_TOKEN"
+```
+
 Restore it later:
 
 ```bash
@@ -101,6 +107,7 @@ The CLI talks to the sync server backup endpoints:
 - `POST /__kora/backup/import?merge=true|false`
 
 Your sync server must be running and reachable from the machine running the CLI.
+Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`.
 
 ## Recommended Practice
 

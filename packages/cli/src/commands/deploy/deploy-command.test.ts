@@ -262,6 +262,7 @@ describe('deployCommand', () => {
 		)
 
 		expect(mockWriteDockerfileArtifact).toHaveBeenCalledWith('/project/.kora/deploy', {
+			clientDirectory: undefined,
 			nativeDependencies: {
 				'better-sqlite3': '^11.0.0',
 				'drizzle-orm': '^0.45.2',
@@ -277,6 +278,7 @@ describe('deployCommand', () => {
 			region: 'iad',
 			environment: 'preview',
 			confirm: false,
+			deployTarget: 'full-stack',
 		})
 		expect(mockAdapterBuild).toHaveBeenCalledWith({
 			projectRoot: '/project',
@@ -284,6 +286,7 @@ describe('deployCommand', () => {
 			region: 'iad',
 			environment: 'preview',
 			confirm: false,
+			deployTarget: 'full-stack',
 		})
 		expect(mockDeploy).toHaveBeenCalledWith({
 			clientDirectory: '/project/.kora/deploy/dist',

@@ -43,10 +43,21 @@ interface UseAuthResult {
 	isLoading: boolean
 
 	/** Sign up a new user account */
-	signUp: (params: { email: string; password: string; name?: string }) => Promise<void>
+	signUp: (params: {
+		email: string
+		password: string
+		name?: string
+		deviceId?: string
+		devicePublicKey?: string
+	}) => Promise<void>
 
 	/** Sign in with email and password */
-	signIn: (params: { email: string; password: string }) => Promise<void>
+	signIn: (params: {
+		email: string
+		password: string
+		deviceId?: string
+		devicePublicKey?: string
+	}) => Promise<void>
 
 	/** Sign out the current user */
 	signOut: () => Promise<void>
@@ -133,7 +144,13 @@ function useAuth(): UseAuthResult {
 	const user = useSyncExternalStore(subscribe, getSnapshot)
 
 	const signUp = useCallback(
-		async (params: { email: string; password: string; name?: string }): Promise<void> => {
+		async (params: {
+			email: string
+			password: string
+			name?: string
+			deviceId?: string
+			devicePublicKey?: string
+		}): Promise<void> => {
 			setError(null)
 			try {
 				await client.signUp(params)
@@ -146,7 +163,12 @@ function useAuth(): UseAuthResult {
 	)
 
 	const signIn = useCallback(
-		async (params: { email: string; password: string }): Promise<void> => {
+		async (params: {
+			email: string
+			password: string
+			deviceId?: string
+			devicePublicKey?: string
+		}): Promise<void> => {
 			setError(null)
 			try {
 				await client.signIn(params)

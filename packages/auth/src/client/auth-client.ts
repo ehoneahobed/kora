@@ -50,7 +50,24 @@ export interface AuthClientConfig {
 
 	/** Storage key prefix for tokens. Defaults to 'kora_auth' */
 	storageKey?: string
+
+	/**
+	 * Optional token storage adapter.
+	 *
+	 * Use this for runtimes where localStorage is not the right place for
+	 * credentials, such as React Native/Expo SecureStore, iOS Keychain,
+	 * Android Keystore, or a Tauri secure storage plugin.
+	 */
+	storage?: AuthTokenStorage
+
+	/**
+	 * Optional fetch implementation. Defaults to globalThis.fetch.
+	 * Useful for tests, SSR adapters, and mobile runtimes with a custom fetch.
+	 */
+	fetch?: typeof fetch
 }
+
+type MaybePromise<T> = T | Promise<T>
 
 /**
  * Token pair returned by the auth server on sign-up, sign-in, and refresh.
@@ -131,18 +148,30 @@ function getUserIdFromToken(token: string): string | null {
 	return payload.sub as string
 }
 
+function getDefaultFetch(): typeof fetch {
+	if (typeof globalThis.fetch !== 'function') {
+		return async () => {
+			throw new AuthError(
+				'No fetch implementation is available in this runtime. Pass `fetch` to AuthClientConfig.',
+				'AUTH_FETCH_UNAVAILABLE',
+			)
+		}
+	}
+	return globalThis.fetch.bind(globalThis)
+}
+
 // ---------------------------------------------------------------------------
 // Simple token storage backed by localStorage (browser) or in-memory fallback
 // ---------------------------------------------------------------------------
 
-interface TokenStorage {
-	getAccessToken(): string | null
-	getRefreshToken(): string | null
-	setTokens(access: string, refresh: string): void
-	clear(): void
+export interface AuthTokenStorage {
+	getAccessToken(): MaybePromise<string | null>
+	getRefreshToken(): MaybePromise<string | null>
+	setTokens(access: string, refresh: string): MaybePromise<void>
+	clear(): MaybePromise<void>
 }
 
-function createTokenStorage(prefix: string): TokenStorage {
+function createTokenStorage(prefix: string): AuthTokenStorage {
 	// Try localStorage; fall back to in-memory if unavailable (SSR, Web Worker, etc.)
 	let useLocalStorage = false
 	try {
@@ -226,7 +255,8 @@ function createTokenStorage(prefix: string): TokenStorage {
  */
 export class AuthClient {
 	private readonly serverUrl: string
-	private readonly storage: TokenStorage
+	private readonly storage: AuthTokenStorage
+	private readonly fetchFn: typeof fetch
 	private readonly listeners: Set<(state: AuthState) => void> = new Set()
 
 	private _state: AuthState = 'loading'
@@ -243,7 +273,8 @@ export class AuthClient {
 		// Strip trailing slash to normalize URLs
 		this.serverUrl = config.serverUrl.replace(/\/+$/, '')
 		const prefix = config.storageKey ?? 'kora_auth'
-		this.storage = createTokenStorage(prefix)
+		this.storage = config.storage ?? createTokenStorage(prefix)
+		this.fetchFn = config.fetch ?? getDefaultFetch()
 	}
 
 	// -----------------------------------------------------------------------
@@ -283,8 +314,8 @@ export class AuthClient {
 		}
 		this._initialized = true
 
-		const accessToken = this.storage.getAccessToken()
-		const refreshToken = this.storage.getRefreshToken()
+		const accessToken = await this.storage.getAccessToken()
+		const refreshToken = await this.storage.getRefreshToken()
 
 		// No stored tokens -- stay unauthenticated
 		if (!accessToken || !refreshToken) {
@@ -310,7 +341,7 @@ export class AuthClient {
 		}
 
 		// Could not restore session
-		this.storage.clear()
+		await this.storage.clear()
 		this.setState('unauthenticated', null)
 	}
 
@@ -325,14 +356,20 @@ export class AuthClient {
 	 * @returns The newly created AuthUser
 	 * @throws {AuthError} If the request fails or the server returns an error
 	 */
-	async signUp(params: { email: string; password: string; name?: string }): Promise<AuthUser> {
+	async signUp(params: {
+		email: string
+		password: string
+		name?: string
+		deviceId?: string
+		devicePublicKey?: string
+	}): Promise<AuthUser> {
 		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signup', {
 			method: 'POST',
 			body: params,
 		})
 
 		const tokens = 'tokens' in response ? response.tokens : response
-		this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
+		await this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
 
 		const user = await this.fetchUserProfile(tokens.accessToken)
 		this.setState('authenticated', user)
@@ -346,14 +383,19 @@ export class AuthClient {
 	 * @returns The authenticated AuthUser
 	 * @throws {AuthError} If the credentials are invalid or the request fails
 	 */
-	async signIn(params: { email: string; password: string }): Promise<AuthUser> {
+	async signIn(params: {
+		email: string
+		password: string
+		deviceId?: string
+		devicePublicKey?: string
+	}): Promise<AuthUser> {
 		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signin', {
 			method: 'POST',
 			body: params,
 		})
 
 		const tokens = 'tokens' in response ? response.tokens : response
-		this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
+		await this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
 
 		const user = await this.fetchUserProfile(tokens.accessToken)
 		this.setState('authenticated', user)
@@ -368,11 +410,11 @@ export class AuthClient {
 	 * stolen refresh tokens cannot be used after the user explicitly signs out.
 	 */
 	async signOut(): Promise<void> {
-		const accessToken = this.storage.getAccessToken()
-		const refreshToken = this.storage.getRefreshToken()
+		const accessToken = await this.storage.getAccessToken()
+		const refreshToken = await this.storage.getRefreshToken()
 
 		// Clear local state immediately (don't wait for server)
-		this.storage.clear()
+		await this.storage.clear()
 		this._refreshPromise = null
 		this.setState('unauthenticated', null)
 
@@ -401,14 +443,14 @@ export class AuthClient {
 	 *          authenticated and refresh is not possible
 	 */
 	async getAccessToken(): Promise<string | null> {
-		const accessToken = this.storage.getAccessToken()
+		const accessToken = await this.storage.getAccessToken()
 
 		if (accessToken && !isTokenExpired(accessToken)) {
 			return accessToken
 		}
 
 		// Attempt refresh
-		const refreshToken = this.storage.getRefreshToken()
+		const refreshToken = await this.storage.getRefreshToken()
 		if (!refreshToken) {
 			return null
 		}
@@ -502,7 +544,7 @@ export class AuthClient {
 					name: null,
 				})
 			} else {
-				this.storage.clear()
+				await this.storage.clear()
 				this.setState('unauthenticated', null)
 			}
 		}
@@ -553,11 +595,11 @@ export class AuthClient {
 				body: { refreshToken },
 			})
 
-			this.storage.setTokens(response.accessToken, response.refreshToken)
+			await this.storage.setTokens(response.accessToken, response.refreshToken)
 			return response.accessToken
 		} catch {
 			// Refresh failed -- clear tokens to avoid infinite retry loops
-			this.storage.clear()
+			await this.storage.clear()
 			this.setState('unauthenticated', null)
 			return null
 		}
@@ -591,7 +633,7 @@ export class AuthClient {
 
 		let response: Response
 		try {
-			response = await fetch(url, {
+			response = await this.fetchFn(url, {
 				method: options.method,
 				headers,
 				body: options.body ? JSON.stringify(options.body) : undefined,

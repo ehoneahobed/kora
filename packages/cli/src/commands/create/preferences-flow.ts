@@ -91,13 +91,58 @@ export async function resolveCreatePreferencesFlow(params: {
 	const isTauri = effective.platform === 'desktop-tauri'
 
 	if (isTauri) {
-		// Tauri uses fixed settings: React, plain CSS, native SQLite
+		// Tauri currently uses React and native SQLite on the client.
+		// The sync server remains configurable so the same desktop scaffold can
+		// run local-only, LAN sync, or cloud sync without switching templates.
 		effective.framework = 'react'
 		effective.tailwind = false
-		effective.sync = true
-		effective.db = 'sqlite'
-		effective.dbProvider = 'none'
 		effective.auth = 'none'
+
+		if (flags.sync !== undefined) {
+			effective.sync = flags.sync
+		} else if (!flags.useDefaults && !usedStoredPreferences) {
+			effective.sync = await prompts.confirm('Enable multi-device sync?', true)
+		}
+
+		if (flags.db !== undefined) {
+			if (!isDatabaseValue(flags.db)) {
+				throw new Error(
+					`Invalid --db value "${flags.db}". Expected one of: none, sqlite, postgres.`,
+				)
+			}
+			effective.db = flags.db
+		} else if (!effective.sync) {
+			effective.db = 'none'
+		} else if (!flags.useDefaults && !usedStoredPreferences) {
+			effective.db = await prompts.select('Sync server database:', [
+				{ label: 'SQLite (zero-config; local, LAN, small teams)', value: 'sqlite' },
+				{ label: 'PostgreSQL (production-scale)', value: 'postgres' },
+			])
+		}
+
+		if (effective.db === 'none') {
+			effective.sync = false
+		}
+
+		if (effective.db !== 'postgres') {
+			effective.dbProvider = 'none'
+		} else if (flags.dbProvider !== undefined) {
+			if (!isDatabaseProviderValue(flags.dbProvider)) {
+				throw new Error(
+					`Invalid --db-provider value "${flags.dbProvider}". Expected one of: none, local, supabase, neon, railway, vercel-postgres, custom.`,
+				)
+			}
+			effective.dbProvider = flags.dbProvider
+		} else if (!flags.useDefaults && !usedStoredPreferences) {
+			effective.dbProvider = await prompts.select('Database provider:', [
+				{ label: 'Local Postgres', value: 'local' },
+				{ label: 'Supabase', value: 'supabase' },
+				{ label: 'Neon', value: 'neon' },
+				{ label: 'Railway', value: 'railway' },
+				{ label: 'Vercel Postgres', value: 'vercel-postgres' },
+				{ label: 'Custom connection string', value: 'custom' },
+			])
+		}
 	} else {
 		if (flags.framework !== undefined) {
 			if (!isFrameworkValue(flags.framework)) {

@@ -310,6 +310,27 @@ describe('TokenManager', () => {
 			vi.advanceTimersByTime(1000)
 			const result2 = await revokeManager.refreshAccessToken(refresh)
 			expect(result2).toBeNull()
+
+			// Any token for that device is rejected after token-family revocation.
+			const accessToken = result1?.accessToken as string
+			expect(await revokeManager.validateTokenWithRevocation(accessToken)).toBeNull()
+			expect(await store.isDeviceRevoked(DEVICE_ID)).toBe(true)
+		})
+
+		it('rejects tokens for a revoked device', async () => {
+			const store = new InMemoryTokenRevocationStore()
+			const revokeManager = new TokenManager({
+				secret: TEST_SECRET,
+				revocationStore: store,
+			})
+
+			const token = revokeManager.issueAccessToken(USER_ID, DEVICE_ID)
+
+			expect(await revokeManager.validateTokenWithRevocation(token)).not.toBeNull()
+
+			await revokeManager.revokeDeviceTokens(DEVICE_ID)
+
+			expect(await revokeManager.validateTokenWithRevocation(token)).toBeNull()
 		})
 	})
 

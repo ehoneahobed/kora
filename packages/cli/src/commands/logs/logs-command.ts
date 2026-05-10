@@ -28,20 +28,28 @@ export const logsCommand = defineCommand({
 			type: 'string',
 			description: 'Filter by log level (info, warn, error)',
 		},
+		token: {
+			type: 'string',
+			description: 'Admin token (defaults to KORA_ADMIN_TOKEN)',
+		},
 	},
 	async run({ args }) {
 		const logger = createLogger()
 		const url = typeof args.url === 'string' ? args.url : `http://localhost:${DEFAULT_SYNC_PORT}`
 		const follow = args.follow !== false
 		const levelFilter = typeof args.level === 'string' ? args.level : null
-		const eventsUrl = url.replace(/\/$/, '') + EVENTS_ENDPOINT
+		const token =
+			typeof args.token === 'string' ? args.token : (process.env.KORA_ADMIN_TOKEN ?? undefined)
+		const eventsUrl = `${url.replace(/\/$/, '')}${EVENTS_ENDPOINT}`
 
 		logger.banner()
 		logger.info(`Connecting to ${eventsUrl}...`)
 		logger.blank()
 
 		try {
-			const response = await fetch(eventsUrl)
+			const response = await fetch(eventsUrl, {
+				headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+			})
 
 			if (!response.ok) {
 				throw new Error(
@@ -79,14 +87,9 @@ export const logsCommand = defineCommand({
 						const count = parsed.count ? ` (${parsed.count})` : ''
 						const error = parsed.error ? ` — ${parsed.error}` : ''
 
-						const prefix =
-							level === 'error' ? '✗' : level === 'warn' ? '⚠' : '●'
+						const prefix = level === 'error' ? '✗' : level === 'warn' ? '⚠' : '●'
 						const color =
-							level === 'error'
-								? '\x1b[31m'
-								: level === 'warn'
-									? '\x1b[33m'
-									: '\x1b[36m'
+							level === 'error' ? '\x1b[31m' : level === 'warn' ? '\x1b[33m' : '\x1b[36m'
 
 						console.log(
 							`${color}${prefix}${'\x1b[0m'} ${timestamp.slice(11, 23)} ${event}${nodeId}${session}${count}${error}`,

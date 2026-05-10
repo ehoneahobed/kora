@@ -35,7 +35,7 @@ import {
 
 ### `AuthClient`
 
-Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic.
+Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic. Works in browser, Tauri desktop WebView, and mobile JavaScript environments with pluggable storage and fetch support.
 
 ```typescript
 const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
@@ -47,6 +47,8 @@ const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 |-------|------|----------|---------|
 | `serverUrl` | `string` | Yes | -- |
 | `storageKey` | `string` | No | `'kora_auth'` |
+| `storage` | `AuthTokenStorage` | No | Browser `localStorage`, then memory fallback |
+| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
 
 #### Properties
 
@@ -57,8 +59,8 @@ const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 #### Methods
 
 - `initialize(): Promise<void>` -- Restore session from stored tokens. Safe to call multiple times.
-- `signUp(params: { email: string; password: string; name?: string }): Promise<AuthUser>` -- Register a new account.
-- `signIn(params: { email: string; password: string }): Promise<AuthUser>` -- Sign in with email/password.
+- `signUp(params: { email: string; password: string; name?: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Register a new account.
+- `signIn(params: { email: string; password: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Sign in with email/password.
 - `signOut(): Promise<void>` -- Sign out. Clears local tokens and attempts server-side revocation (best-effort).
 - `getAccessToken(): Promise<string | null>` -- Get a valid access token, auto-refreshing if expired.
 - `getSyncToken(): Promise<string | null>` -- Alias for `getAccessToken()`. Used by the sync engine handshake.
@@ -78,6 +80,30 @@ const unsub = auth.onAuthChange((state) => {
   console.log('Auth state:', state)
 })
 ```
+
+For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `auth.getAccessToken()` into Kora sync auth. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
+
+For desktop and mobile production apps, prefer a secure storage adapter instead of the default browser-style storage:
+
+```typescript
+const auth = new AuthClient({
+  serverUrl: 'https://acme.example.com',
+  storage: {
+    getAccessToken: () => secureStore.getItem('kora_access_token'),
+    getRefreshToken: () => secureStore.getItem('kora_refresh_token'),
+    setTokens: async (accessToken, refreshToken) => {
+      await secureStore.setItem('kora_access_token', accessToken)
+      await secureStore.setItem('kora_refresh_token', refreshToken)
+    },
+    clear: async () => {
+      await secureStore.removeItem('kora_access_token')
+      await secureStore.removeItem('kora_refresh_token')
+    },
+  },
+})
+```
+
+The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store.
 
 ### `AuthUser`
 

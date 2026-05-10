@@ -22,7 +22,7 @@ The architecture follows a clean client-server split:
 Client                                Server
 +-----------------------+            +---------------------------+
 | AuthClient            |            | BuiltInAuthRoutes         |
-|   +- TokenStorage     | -- HTTP -> |   +- InMemoryUserStore    |
+|   +- AuthTokenStorage | -- HTTP -> |   +- InMemoryUserStore    |
 |   +- AuthState        |            |   +- TokenManager         |
 |                       |            |   +- PasswordHash (PBKDF2)|
 | React Hooks           |            |                           |
@@ -211,10 +211,12 @@ const store = createSqliteServerStore({ filename: './kora.db' })
 
 const syncServer = createProductionServer({
   store,
-  auth: authRoutes.toSyncAuthProvider(),
   port: 3001,
   staticDir: './dist',
   syncPath: '/kora-sync',
+  syncOptions: {
+    auth: authRoutes.toSyncAuthProvider(),
+  },
 })
 ```
 
@@ -243,6 +245,70 @@ const app = createApp({
 ```
 
 The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
+
+### Desktop and Tauri apps
+
+`@korajs/auth` works in desktop apps built with the Kora Tauri template. A Tauri app runs the Kora frontend inside a WebView, so the auth client can use the same `AuthClient`, React hooks, `fetch`, and sync-token flow used by web apps.
+
+The normal desktop setup is:
+
+1. Deploy a remote sync/auth server.
+2. Add the auth HTTP routes to that server.
+3. Create `AuthClient` in the Tauri frontend with the same server origin.
+4. Pass `authClient.getAccessToken()` to `createApp({ sync: { auth } })`.
+
+```typescript
+const authClient = new AuthClient({
+  serverUrl: 'https://acme.example.com',
+})
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://acme.example.com/kora-sync',
+    auth: async () => ({
+      token: (await authClient.getAccessToken()) ?? '',
+    }),
+  },
+})
+```
+
+Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC all use HTTP plus WebSocket tokens and apply to web and desktop clients the same way. Passkeys depend on WebAuthn support in the platform WebView and should be feature-detected with `isPasskeySupported()`. OAuth works too, but desktop apps need an explicit redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app.
+
+### Secure token storage for desktop and mobile
+
+By default, `AuthClient` uses browser `localStorage` when it is available and falls back to memory storage when it is not. That is convenient for development and web apps, but desktop and mobile production apps should pass a storage adapter backed by the platform credential store.
+
+```typescript
+const authClient = new AuthClient({
+  serverUrl: 'https://acme.example.com',
+  storage: {
+    getAccessToken: () => secureStore.getItem('kora_access_token'),
+    getRefreshToken: () => secureStore.getItem('kora_refresh_token'),
+    setTokens: async (accessToken, refreshToken) => {
+      await secureStore.setItem('kora_access_token', accessToken)
+      await secureStore.setItem('kora_refresh_token', refreshToken)
+    },
+    clear: async () => {
+      await secureStore.removeItem('kora_access_token')
+      await secureStore.removeItem('kora_refresh_token')
+    },
+  },
+})
+```
+
+Use Tauri secure storage on desktop, Expo SecureStore or React Native Keychain on mobile, and iOS Keychain or Android Keystore for native integrations. The adapter may be synchronous or asynchronous.
+
+When your app has a stable local device identity, pass it during sign-up or sign-in so the server can bind tokens to that device:
+
+```typescript
+await authClient.signIn({
+  email: 'alice@example.com',
+  password: 'correct-horse-battery-staple',
+  deviceId,
+  devicePublicKey,
+})
+```
 
 ### Mixed Auth (Authenticated + Anonymous)
 

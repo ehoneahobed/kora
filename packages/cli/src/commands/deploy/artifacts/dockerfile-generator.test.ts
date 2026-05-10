@@ -60,6 +60,12 @@ describe('dockerfile-generator', () => {
 		expect(content).toContain('COPY server-bundled.js ./server-bundled.js')
 	})
 
+	test('generates server-only Dockerfile when client directory is null', () => {
+		const content = generateDockerfile({ clientDirectory: null })
+		expect(content).not.toContain('COPY dist ./dist')
+		expect(content).toContain('COPY server-bundled.js ./server-bundled.js')
+	})
+
 	test('generates deploy package.json for native dependencies', () => {
 		const content = generateDeployPackageJson({ 'better-sqlite3': '^11.0.0' })
 		const parsed = JSON.parse(content)

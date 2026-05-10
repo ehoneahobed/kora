@@ -166,6 +166,29 @@ kora deploy logs
 
 Shows recent output from your deployed app. Useful for debugging issues.
 
+### Observability endpoints
+
+`createProductionServer` exposes these operational endpoints:
+
+- `GET /health` for public platform health checks.
+- `GET /__kora/status` for server status.
+- `GET /__kora/metrics` for Prometheus-format metrics.
+- `GET /__kora/events` for live Server-Sent Events.
+- `GET /__kora` for the built-in dashboard.
+
+Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, and `KORA_BACKUP_TOKEN` in production. Then call protected endpoints with:
+
+```bash
+curl -H "Authorization: Bearer $KORA_ADMIN_TOKEN" https://your-app.example.com/__kora/status
+```
+
+The CLI reads the same token from `KORA_ADMIN_TOKEN`, or you can pass it directly:
+
+```bash
+kora status --url https://your-app.example.com --token "$KORA_ADMIN_TOKEN"
+kora logs --url https://your-app.example.com --token "$KORA_ADMIN_TOKEN"
+```
+
 ### Roll back
 
 ```bash
@@ -495,14 +518,21 @@ Create `server.ts` in your project root:
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import schema from './src/schema'
 
 const store = createSqliteServerStore({ filename: './kora-server.db' })
+await store.setSchema(schema)
 
 const server = createProductionServer({
   store,
   port: Number(process.env.PORT) || 3001,
   staticDir: './dist',
   syncPath: '/kora-sync',
+  operationalAuth: {
+    adminToken: process.env.KORA_ADMIN_TOKEN,
+    metricsToken: process.env.KORA_METRICS_TOKEN,
+    backupToken: process.env.KORA_BACKUP_TOKEN,
+  },
 })
 
 server.start().then((url) => {
@@ -510,7 +540,7 @@ server.start().then((url) => {
 })
 ```
 
-`createProductionServer` serves both your built frontend files and the WebSocket sync endpoint on a single port.
+`createProductionServer` serves both your built frontend files and the WebSocket sync endpoint on a single port. `/health` is public for deploy platform health checks. `/__kora/*` operational endpoints are token-protected when you set the matching token environment variables.
 
 ### Build and run
 
