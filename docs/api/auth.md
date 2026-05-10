@@ -30,6 +30,8 @@ import {
   createDeviceKeyStore,
   IndexedDBDeviceKeyStore,
   InMemoryDeviceKeyStore,
+  createAuthTokenStorage,
+  createPersistentDeviceIdentity,
 } from '@korajs/auth'
 ```
 
@@ -49,6 +51,7 @@ const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 | `storageKey` | `string` | No | `'kora_auth'` |
 | `storage` | `AuthTokenStorage` | No | Browser `localStorage`, then memory fallback |
 | `fetch` | `typeof fetch` | No | `globalThis.fetch` |
+| `deviceIdentity` | `AuthDeviceIdentityProvider` | No | -- |
 
 #### Properties
 
@@ -86,24 +89,50 @@ For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `au
 For desktop and mobile production apps, prefer a secure storage adapter instead of the default browser-style storage:
 
 ```typescript
+import { AuthClient, createAuthTokenStorage } from '@korajs/auth'
+
 const auth = new AuthClient({
   serverUrl: 'https://acme.example.com',
-  storage: {
-    getAccessToken: () => secureStore.getItem('kora_access_token'),
-    getRefreshToken: () => secureStore.getItem('kora_refresh_token'),
-    setTokens: async (accessToken, refreshToken) => {
-      await secureStore.setItem('kora_access_token', accessToken)
-      await secureStore.setItem('kora_refresh_token', refreshToken)
-    },
-    clear: async () => {
-      await secureStore.removeItem('kora_access_token')
-      await secureStore.removeItem('kora_refresh_token')
-    },
-  },
+  storage: createAuthTokenStorage({ store: secureStore }),
 })
 ```
 
 The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store.
+
+To bind sessions to a stable offline device automatically, configure a device identity provider:
+
+```typescript
+const auth = new AuthClient({
+  serverUrl: 'https://acme.example.com',
+  storage: createAuthTokenStorage({ store: secureStore }),
+  deviceIdentity: createPersistentDeviceIdentity({
+    storage: secureStore,
+  }),
+})
+
+await auth.signIn({ email, password })
+// AuthClient sends deviceId and devicePublicKey with the sign-in request.
+```
+
+### Storage Adapters
+
+- `createAuthTokenStorage({ store, prefix? })` -- adapts a sync or async key-value credential store to `AuthTokenStorage`.
+- `createMemoryAuthTokenStorage()` -- in-memory token storage for tests, demos, and SSR.
+- `createWebStorageAuthTokenStorage(storage, prefix?)` -- adapts `localStorage` or `sessionStorage`.
+
+```typescript
+interface AuthKeyValueStorage {
+  getItem(key: string): string | null | Promise<string | null>
+  setItem(key: string, value: string): void | Promise<void>
+  removeItem(key: string): void | Promise<void>
+}
+```
+
+### Device Identity Provider
+
+- `createPersistentDeviceIdentity({ storage, keyStore?, deviceIdKey?, generateDeviceId? })` -- stores a stable device ID and a non-extractable ECDSA P-256 key pair, then returns the public key during sign-up/sign-in.
+
+By default, the device key pair uses IndexedDB when available. Runtimes without IndexedDB, such as React Native, must pass an explicit `keyStore` backed by the platform's secure key storage.
 
 ### `AuthUser`
 
@@ -1169,6 +1198,22 @@ import {
 ```
 
 Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the full OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info.
+
+For desktop and mobile OAuth, enable PKCE and omit `clientSecret` for public native clients:
+
+```typescript
+const oauth = new OAuthManager({
+  providers: [
+    googleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      redirectUri: 'com.acme.app:/oauth/callback',
+      pkce: true,
+    }),
+  ],
+})
+```
+
+When `pkce: true` is set, authorization URLs include an S256 `code_challenge` and token exchange includes the matching `code_verifier`.
 
 ### Password Reset
 

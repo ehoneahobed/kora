@@ -299,6 +299,35 @@ describe('AuthClient', () => {
 			})
 		})
 
+		it('uses configured device identity when credentials omit device fields', async () => {
+			const client = new AuthClient({
+				serverUrl: 'http://localhost:3001',
+				deviceIdentity: {
+					async getDeviceIdentity() {
+						return {
+							deviceId: 'stable-device',
+							devicePublicKey: '{"kty":"EC","crv":"P-256"}',
+						}
+					},
+				},
+			})
+			await client.initialize()
+
+			mockFetchResponse(TOKEN_RESPONSE)
+			mockFetchResponse(USER_PROFILE)
+
+			await client.signIn({
+				email: 'test@example.com',
+				password: 'password123',
+			})
+
+			const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+			expect(JSON.parse(init.body as string)).toMatchObject({
+				deviceId: 'stable-device',
+				devicePublicKey: '{"kty":"EC","crv":"P-256"}',
+			})
+		})
+
 		it('throws AuthError on invalid credentials', async () => {
 			const client = createClient()
 			await client.initialize()

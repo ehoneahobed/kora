@@ -20,25 +20,23 @@ Offline-first authentication for Kora.js applications.
 
 The client APIs work in browser, Tauri desktop WebView, and mobile JavaScript environments. For desktop apps, run auth routes on your remote sync/auth server and point `AuthClient.serverUrl` at that server. Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC work across web and desktop clients. Passkeys should be feature-detected because WebAuthn support depends on the operating system WebView.
 
-For production desktop and mobile apps, pass a custom token storage adapter backed by the platform credential store:
+For production desktop and mobile apps, pass a custom token storage adapter backed by the platform credential store and attach a stable device identity:
 
 ```typescript
+import {
+  AuthClient,
+  createAuthTokenStorage,
+  createPersistentDeviceIdentity,
+} from '@korajs/auth'
+
 const authClient = new AuthClient({
   serverUrl: 'https://acme.example.com',
-  storage: {
-    getAccessToken: () => secureStore.getItem('kora_access_token'),
-    getRefreshToken: () => secureStore.getItem('kora_refresh_token'),
-    setTokens: async (accessToken, refreshToken) => {
-      await secureStore.setItem('kora_access_token', accessToken)
-      await secureStore.setItem('kora_refresh_token', refreshToken)
-    },
-    clear: async () => {
-      await secureStore.removeItem('kora_access_token')
-      await secureStore.removeItem('kora_refresh_token')
-    },
-  },
+  storage: createAuthTokenStorage({ store: secureStore }),
+  deviceIdentity: createPersistentDeviceIdentity({ storage: secureStore }),
 })
 ```
+
+`createPersistentDeviceIdentity()` uses IndexedDB for the device key pair when available. React Native and other runtimes without IndexedDB should pass a platform-backed `keyStore`.
 
 ## Installation
 

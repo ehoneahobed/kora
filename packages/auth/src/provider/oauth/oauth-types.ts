@@ -12,8 +12,8 @@ export interface OAuthProviderConfig {
 	providerId: string
 	/** OAuth client ID */
 	clientId: string
-	/** OAuth client secret */
-	clientSecret: string
+	/** OAuth client secret. Required for confidential server-side clients. */
+	clientSecret?: string
 	/** Authorization endpoint URL */
 	authorizationUrl: string
 	/** Token exchange endpoint URL */
@@ -24,6 +24,13 @@ export interface OAuthProviderConfig {
 	scopes: string[]
 	/** Redirect URI for the callback */
 	redirectUri: string
+	/**
+	 * Enable PKCE (Proof Key for Code Exchange).
+	 *
+	 * Required for public clients such as desktop and mobile apps, and recommended
+	 * whenever the provider supports it.
+	 */
+	pkce?: boolean
 }
 
 // ============================================================================
@@ -92,6 +99,8 @@ export interface OAuthState {
 	expiresAt: number
 	/** Optional: user-defined data to pass through the flow */
 	metadata?: Record<string, unknown>
+	/** PKCE code verifier, stored server-side until the callback is consumed. */
+	codeVerifier?: string
 }
 
 /**

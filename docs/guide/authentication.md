@@ -280,35 +280,40 @@ Email/password auth, token refresh, sync authorization, MFA, organizations, and 
 By default, `AuthClient` uses browser `localStorage` when it is available and falls back to memory storage when it is not. That is convenient for development and web apps, but desktop and mobile production apps should pass a storage adapter backed by the platform credential store.
 
 ```typescript
+import { AuthClient, createAuthTokenStorage } from '@korajs/auth'
+
 const authClient = new AuthClient({
   serverUrl: 'https://acme.example.com',
-  storage: {
-    getAccessToken: () => secureStore.getItem('kora_access_token'),
-    getRefreshToken: () => secureStore.getItem('kora_refresh_token'),
-    setTokens: async (accessToken, refreshToken) => {
-      await secureStore.setItem('kora_access_token', accessToken)
-      await secureStore.setItem('kora_refresh_token', refreshToken)
-    },
-    clear: async () => {
-      await secureStore.removeItem('kora_access_token')
-      await secureStore.removeItem('kora_refresh_token')
-    },
-  },
+  storage: createAuthTokenStorage({ store: secureStore }),
 })
 ```
 
 Use Tauri secure storage on desktop, Expo SecureStore or React Native Keychain on mobile, and iOS Keychain or Android Keystore for native integrations. The adapter may be synchronous or asynchronous.
 
-When your app has a stable local device identity, pass it during sign-up or sign-in so the server can bind tokens to that device:
+Use `createPersistentDeviceIdentity()` to create a stable local device identity and have `AuthClient` send it automatically during sign-up and sign-in:
 
 ```typescript
+import {
+  AuthClient,
+  createAuthTokenStorage,
+  createPersistentDeviceIdentity,
+} from '@korajs/auth'
+
+const authClient = new AuthClient({
+  serverUrl: 'https://acme.example.com',
+  storage: createAuthTokenStorage({ store: secureStore }),
+  deviceIdentity: createPersistentDeviceIdentity({
+    storage: secureStore,
+  }),
+})
+
 await authClient.signIn({
   email: 'alice@example.com',
   password: 'correct-horse-battery-staple',
-  deviceId,
-  devicePublicKey,
 })
 ```
+
+The device identity provider stores a stable device ID and a non-extractable ECDSA P-256 key pair. The server receives `deviceId` and `devicePublicKey`, so token claims and device revocation apply to the actual offline device. Browsers and Tauri WebViews use IndexedDB for the key pair by default; React Native and other runtimes without IndexedDB should pass a platform-backed `keyStore`.
 
 ### Mixed Auth (Authenticated + Anonymous)
 

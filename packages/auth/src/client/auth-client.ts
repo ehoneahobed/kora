@@ -1,4 +1,5 @@
 import { KoraError } from '@korajs/core'
+import type { AuthDeviceIdentityProvider } from './device-session'
 
 // ---------------------------------------------------------------------------
 // Auth-specific error
@@ -65,6 +66,14 @@ export interface AuthClientConfig {
 	 * Useful for tests, SSR adapters, and mobile runtimes with a custom fetch.
 	 */
 	fetch?: typeof fetch
+
+	/**
+	 * Optional local device identity provider.
+	 *
+	 * When configured, sign-up and sign-in automatically include stable
+	 * `deviceId` and `devicePublicKey` fields unless the caller provides them.
+	 */
+	deviceIdentity?: AuthDeviceIdentityProvider
 }
 
 type MaybePromise<T> = T | Promise<T>
@@ -257,6 +266,7 @@ export class AuthClient {
 	private readonly serverUrl: string
 	private readonly storage: AuthTokenStorage
 	private readonly fetchFn: typeof fetch
+	private readonly deviceIdentity: AuthDeviceIdentityProvider | undefined
 	private readonly listeners: Set<(state: AuthState) => void> = new Set()
 
 	private _state: AuthState = 'loading'
@@ -275,6 +285,7 @@ export class AuthClient {
 		const prefix = config.storageKey ?? 'kora_auth'
 		this.storage = config.storage ?? createTokenStorage(prefix)
 		this.fetchFn = config.fetch ?? getDefaultFetch()
+		this.deviceIdentity = config.deviceIdentity
 	}
 
 	// -----------------------------------------------------------------------
@@ -363,9 +374,10 @@ export class AuthClient {
 		deviceId?: string
 		devicePublicKey?: string
 	}): Promise<AuthUser> {
+		const body = await this.withDeviceIdentity(params)
 		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signup', {
 			method: 'POST',
-			body: params,
+			body,
 		})
 
 		const tokens = 'tokens' in response ? response.tokens : response
@@ -389,9 +401,10 @@ export class AuthClient {
 		deviceId?: string
 		devicePublicKey?: string
 	}): Promise<AuthUser> {
+		const body = await this.withDeviceIdentity(params)
 		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signin', {
 			method: 'POST',
-			body: params,
+			body,
 		})
 
 		const tokens = 'tokens' in response ? response.tokens : response
@@ -562,6 +575,21 @@ export class AuthClient {
 			id: profile.id,
 			email: profile.email,
 			name: profile.name ?? null,
+		}
+	}
+
+	private async withDeviceIdentity<T extends { deviceId?: string; devicePublicKey?: string }>(
+		params: T,
+	): Promise<T> {
+		if (!this.deviceIdentity || (params.deviceId && params.devicePublicKey)) {
+			return params
+		}
+
+		const identity = await this.deviceIdentity.getDeviceIdentity()
+		return {
+			...params,
+			deviceId: params.deviceId ?? identity.deviceId,
+			devicePublicKey: params.devicePublicKey ?? identity.devicePublicKey,
 		}
 	}
 

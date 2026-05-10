@@ -245,9 +245,18 @@ export const authClient = new AuthClient({
 For production apps, pass `AuthClient` a storage adapter backed by secure desktop storage instead of relying on WebView `localStorage`:
 
 ```typescript
+import {
+  AuthClient,
+  createAuthTokenStorage,
+  createPersistentDeviceIdentity,
+} from '@korajs/auth'
+
 export const authClient = new AuthClient({
   serverUrl: 'https://acme-corp.example.com',
-  storage: tauriSecureStorageAdapter,
+  storage: createAuthTokenStorage({ store: tauriSecureStore }),
+  deviceIdentity: createPersistentDeviceIdentity({
+    storage: tauriSecureStore,
+  }),
 })
 ```
 

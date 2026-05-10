@@ -4,6 +4,18 @@
 // === Client ===
 export { AuthClient, AuthError } from './client/auth-client'
 export type { AuthClientConfig, AuthTokenStorage, AuthUser, AuthState } from './client/auth-client'
+export { AuthDeviceIdentityError, createPersistentDeviceIdentity } from './client/device-session'
+export type {
+	AuthDeviceIdentity,
+	AuthDeviceIdentityProvider,
+	PersistentDeviceIdentityOptions,
+} from './client/device-session'
+export {
+	createAuthTokenStorage,
+	createMemoryAuthTokenStorage,
+	createWebStorageAuthTokenStorage,
+} from './client/storage'
+export type { AuthKeyValueStorage, AuthTokenStorageOptions } from './client/storage'
 
 // === Organization Client ===
 export { OrgClient, OrgClientError } from './client/org-client'
