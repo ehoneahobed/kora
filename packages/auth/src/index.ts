@@ -3,7 +3,16 @@
 
 // === Client ===
 export { AuthClient, AuthError } from './client/auth-client'
-export type { AuthClientConfig, AuthTokenStorage, AuthUser, AuthState } from './client/auth-client'
+export type {
+	AuthClientConfig,
+	AuthTokenStorage,
+	AuthUser,
+	AuthState,
+	LinkedOAuthAccount,
+	OAuthAuthorizationOptions,
+	OAuthAuthorizationResult,
+	OAuthCallbackParams,
+} from './client/auth-client'
 export { createKoraAuth } from './client/quickstart'
 export type { CreateKoraAuthOptions } from './client/quickstart'
 export { AuthDeviceIdentityError, createPersistentDeviceIdentity } from './client/device-session'

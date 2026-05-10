@@ -101,6 +101,12 @@ const auth = createKoraAuth({
 - `initialize(): Promise<void>` -- Restore session from stored tokens. Safe to call multiple times.
 - `signUp(params: { email: string; password: string; name?: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Register a new account.
 - `signIn(params: { email: string; password: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Sign in with email/password.
+- `signInWithOAuth(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL and redirect the current browser window by default.
+- `getOAuthAuthorizationUrl(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL without redirecting. Use this for desktop/mobile handoff flows.
+- `completeOAuthSignIn(provider: string, params: { code: string; state: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Complete an OAuth callback and store Kora tokens.
+- `linkOAuth(provider: string, params: { code: string; state: string }): Promise<LinkedOAuthAccount>` -- Link an OAuth provider to the signed-in user.
+- `listLinkedAccounts(): Promise<LinkedOAuthAccount[]>` -- List OAuth accounts linked to the signed-in user.
+- `unlinkOAuth(provider: string): Promise<void>` -- Unlink an OAuth provider from the signed-in user.
 - `signOut(): Promise<void>` -- Sign out. Clears local tokens and attempts server-side revocation (best-effort).
 - `getAccessToken(): Promise<string | null>` -- Get a valid access token, auto-refreshing if expired.
 - `getSyncToken(): Promise<string | null>` -- Alias for `getAccessToken()`. Used by the sync engine handshake.
@@ -118,6 +124,25 @@ if (!auth.isAuthenticated) {
 
 const unsub = auth.onAuthChange((state) => {
   console.log('Auth state:', state)
+})
+```
+
+OAuth sign-in for web apps:
+
+```typescript
+await auth.signInWithOAuth('google')
+```
+
+OAuth sign-in for desktop and mobile apps:
+
+```typescript
+const { url } = await auth.getOAuthAuthorizationUrl('google')
+await openSystemBrowser(url)
+
+// After your loopback server or custom URL scheme receives the provider callback:
+await auth.completeOAuthSignIn('google', {
+  code,
+  state,
 })
 ```
 

@@ -59,15 +59,20 @@ function App() {
 }
 
 function MyApp() {
-  const { user, isAuthenticated, isLoading, signIn, signOut, error } = useAuth()
+  const { user, isAuthenticated, isLoading, signIn, signInWithOAuth, signOut, error } = useAuth()
 
   if (isLoading) return <div>Loading...</div>
 
   if (!isAuthenticated) {
     return (
-      <button onClick={() => signIn({ email: 'user@example.com', password: 'password' })}>
-        Sign In
-      </button>
+      <>
+        <button onClick={() => signIn({ email: 'user@example.com', password: 'password' })}>
+          Sign In
+        </button>
+        <button onClick={() => signInWithOAuth('google')}>
+          Sign In with Google
+        </button>
+      </>
     )
   }
 

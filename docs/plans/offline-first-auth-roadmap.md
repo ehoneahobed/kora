@@ -70,7 +70,7 @@ const auth = createKoraAuthServer({
 
 OAuth server routes are now wired, but users should not have to manually call `/auth/oauth/:provider`.
 
-Add client helpers:
+Add client helpers - implemented for the framework-agnostic and React clients:
 
 ```ts
 await auth.signInWithOAuth('google')
@@ -348,8 +348,8 @@ Sensitive actions that should be audited:
 
 The next best step is not another broad feature. The highest-leverage sequence is:
 
-1. Add durable auth stores for OAuth state and linked identities.
-2. Add client OAuth helpers.
+1. Add durable auth stores for OAuth state and linked identities. - implemented
+2. Add client OAuth helpers. - implemented
 3. Add desktop/mobile OAuth recipes into scaffolded apps.
 4. Add password reset and email verification routes to `createKoraAuthServer`.
 5. Add offline session policy as a first-class API.

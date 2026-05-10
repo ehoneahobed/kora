@@ -128,7 +128,16 @@ function App() {
 }
 
 function Main() {
-  const { user, isAuthenticated, isLoading, signIn, signUp, signOut, error } = useAuth()
+  const {
+    user,
+    isAuthenticated,
+    isLoading,
+    signIn,
+    signInWithOAuth,
+    signUp,
+    signOut,
+    error,
+  } = useAuth()
 
   if (isLoading) return <div>Restoring session...</div>
 
@@ -139,6 +148,9 @@ function Main() {
         {error && <p style={{ color: 'red' }}>{error}</p>}
         <button onClick={() => signIn({ email: 'alice@example.com', password: 'secret123' })}>
           Sign In
+        </button>
+        <button onClick={() => signInWithOAuth('google')}>
+          Sign In with Google
         </button>
         <button onClick={() => signUp({ email: 'alice@example.com', password: 'secret123', name: 'Alice' })}>
           Sign Up
@@ -162,11 +174,23 @@ The `AuthProvider` calls `authClient.initialize()` on mount, which restores any 
 
 | Hook | Purpose |
 |------|---------|
-| `useAuth()` | Full auth: `user`, `isAuthenticated`, `isLoading`, `signIn`, `signUp`, `signOut`, `error` |
+| `useAuth()` | Full auth: `user`, `isAuthenticated`, `isLoading`, email/password methods, OAuth methods, `signOut`, `error` |
 | `useCurrentUser()` | Lightweight alternative returning just the `AuthUser` or `null` |
 | `useAuthStatus()` | Returns `{ state, isAuthenticated, isLoading }` for route guards |
 
 All hooks use `useSyncExternalStore` under the hood for React 18+ concurrent mode safety.
+
+For desktop and mobile OAuth, create the provider URL without redirecting, open it with the platform browser API, then complete the callback:
+
+```typescript
+const { url } = await authClient.getOAuthAuthorizationUrl('google')
+await openSystemBrowser(url)
+
+await authClient.completeOAuthSignIn('google', {
+  code,
+  state,
+})
+```
 
 **Route guard example:**
 

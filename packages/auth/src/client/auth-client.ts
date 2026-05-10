@@ -42,6 +42,45 @@ export interface AuthUser {
 	name: string | null
 }
 
+export interface LinkedOAuthAccount {
+	id: string
+	userId: string
+	provider: string
+	providerUserId: string
+	email: string | null
+	linkedAt: number
+}
+
+export interface OAuthAuthorizationResult {
+	url: string
+	state: string
+}
+
+export interface OAuthAuthorizationOptions {
+	/**
+	 * Redirect the current browser window to the provider after creating the URL.
+	 * Defaults to true when `window.location.assign` is available.
+	 */
+	redirect?: boolean
+	/**
+	 * Optional app-specific return path stored in OAuth state metadata.
+	 */
+	returnTo?: string
+	/**
+	 * Optional extra metadata stored in OAuth state. Use this for app handoff data.
+	 */
+	metadata?: Record<string, unknown>
+	deviceId?: string
+	devicePublicKey?: string
+}
+
+export interface OAuthCallbackParams {
+	code: string
+	state: string
+	deviceId?: string
+	devicePublicKey?: string
+}
+
 /**
  * Configuration for the AuthClient.
  */
@@ -90,8 +129,12 @@ interface AuthTokensResponse {
  * Sign-up and sign-in responses include user data alongside tokens.
  */
 interface AuthSignInResponse {
-	user: { id: string; email: string; name: string }
+	user: { id: string; email: string; name: string | null }
 	tokens: AuthTokensResponse
+}
+
+interface OAuthSignInResponse extends AuthSignInResponse {
+	identity: LinkedOAuthAccount
 }
 
 /**
@@ -167,6 +210,31 @@ function getDefaultFetch(): typeof fetch {
 		}
 	}
 	return globalThis.fetch.bind(globalThis)
+}
+
+function normalizeAuthUser(user: { id: string; email: string; name?: string | null }): AuthUser {
+	return {
+		id: user.id,
+		email: user.email,
+		name: user.name ?? null,
+	}
+}
+
+function canRedirectCurrentWindow(): boolean {
+	return (
+		typeof globalThis.window !== 'undefined' &&
+		typeof globalThis.window.location?.assign === 'function'
+	)
+}
+
+function redirectCurrentWindow(url: string): void {
+	if (!canRedirectCurrentWindow()) {
+		throw new AuthError(
+			'OAuth redirect is not available in this runtime. Pass redirect: false and open the returned URL with your platform browser API.',
+			'AUTH_OAUTH_REDIRECT_UNAVAILABLE',
+		)
+	}
+	globalThis.window.location.assign(url)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +484,90 @@ export class AuthClient {
 	}
 
 	/**
+	 * Create an OAuth authorization URL and optionally redirect the current window.
+	 *
+	 * For web apps, call this from a button click and keep the default redirect behavior.
+	 * For desktop/mobile, pass `redirect: false`, open the returned URL with the runtime's
+	 * browser API, then call `completeOAuthSignIn()` after receiving the callback.
+	 */
+	async signInWithOAuth(
+		provider: string,
+		options: OAuthAuthorizationOptions = {},
+	): Promise<OAuthAuthorizationResult> {
+		const result = await this.createOAuthAuthorization(provider, options)
+		if (options.redirect ?? canRedirectCurrentWindow()) {
+			redirectCurrentWindow(result.url)
+		}
+		return result
+	}
+
+	/**
+	 * Complete an OAuth sign-in callback and store the issued Kora tokens.
+	 */
+	async completeOAuthSignIn(provider: string, params: OAuthCallbackParams): Promise<AuthUser> {
+		const body = await this.withDeviceIdentity(params)
+		const response = await this.request<OAuthSignInResponse>(
+			`/auth/oauth/${encodeURIComponent(provider)}/callback`,
+			{
+				method: 'POST',
+				body: { ...body },
+			},
+		)
+
+		await this.storage.setTokens(response.tokens.accessToken, response.tokens.refreshToken)
+		const user = normalizeAuthUser(response.user)
+		this.setState('authenticated', user)
+		return user
+	}
+
+	/**
+	 * Create an OAuth authorization URL for linking another provider to the current user.
+	 */
+	async getOAuthAuthorizationUrl(
+		provider: string,
+		options: OAuthAuthorizationOptions = {},
+	): Promise<OAuthAuthorizationResult> {
+		return this.createOAuthAuthorization(provider, { ...options, redirect: false })
+	}
+
+	/**
+	 * Link an OAuth provider to the current authenticated user.
+	 */
+	async linkOAuth(provider: string, params: OAuthCallbackParams): Promise<LinkedOAuthAccount> {
+		const token = await this.requireAccessToken()
+		return this.request<LinkedOAuthAccount>(`/auth/oauth/${encodeURIComponent(provider)}/link`, {
+			method: 'POST',
+			body: {
+				code: params.code,
+				state: params.state,
+			},
+			token,
+		})
+	}
+
+	/**
+	 * List OAuth accounts linked to the current authenticated user.
+	 */
+	async listLinkedAccounts(): Promise<LinkedOAuthAccount[]> {
+		const token = await this.requireAccessToken()
+		return this.request<LinkedOAuthAccount[]>('/auth/oauth/links', {
+			method: 'GET',
+			token,
+		})
+	}
+
+	/**
+	 * Unlink an OAuth provider from the current authenticated user.
+	 */
+	async unlinkOAuth(provider: string): Promise<void> {
+		const token = await this.requireAccessToken()
+		await this.request<{ ok: true }>(`/auth/oauth/${encodeURIComponent(provider)}/link`, {
+			method: 'DELETE',
+			token,
+		})
+	}
+
+	/**
 	 * Sign out the current user.
 	 *
 	 * Clears local tokens and attempts to revoke the refresh token on the server
@@ -571,11 +723,43 @@ export class AuthClient {
 			method: 'GET',
 			token: accessToken,
 		})
-		return {
-			id: profile.id,
-			email: profile.email,
-			name: profile.name ?? null,
+		return normalizeAuthUser(profile)
+	}
+
+	private async createOAuthAuthorization(
+		provider: string,
+		options: OAuthAuthorizationOptions,
+	): Promise<OAuthAuthorizationResult> {
+		const params = new URLSearchParams()
+		const withIdentity = await this.withDeviceIdentity({
+			deviceId: options.deviceId,
+			devicePublicKey: options.devicePublicKey,
+		})
+
+		if (options.returnTo) {
+			params.set('returnTo', options.returnTo)
 		}
+		if (withIdentity.deviceId) {
+			params.set('deviceId', withIdentity.deviceId)
+		}
+		if (withIdentity.devicePublicKey) {
+			params.set('devicePublicKey', withIdentity.devicePublicKey)
+		}
+		if (options.metadata) {
+			for (const [key, value] of Object.entries(options.metadata)) {
+				if (value !== undefined && value !== null) {
+					params.set(key, String(value))
+				}
+			}
+		}
+
+		const query = params.toString()
+		return this.request<OAuthAuthorizationResult>(
+			`/auth/oauth/${encodeURIComponent(provider)}${query ? `?${query}` : ''}`,
+			{
+				method: 'GET',
+			},
+		)
 	}
 
 	private async withDeviceIdentity<T extends { deviceId?: string; devicePublicKey?: string }>(
@@ -613,6 +797,14 @@ export class AuthClient {
 		}
 	}
 
+	private async requireAccessToken(): Promise<string> {
+		const token = await this.getAccessToken()
+		if (!token) {
+			throw new AuthError('You must be signed in to perform this action.', 'AUTH_REQUIRED')
+		}
+		return token
+	}
+
 	/**
 	 * Execute the token refresh network request.
 	 */
@@ -644,7 +836,7 @@ export class AuthClient {
 	private async request<T>(
 		path: string,
 		options: {
-			method: 'GET' | 'POST'
+			method: 'GET' | 'POST' | 'DELETE'
 			body?: Record<string, unknown>
 			token?: string
 		},

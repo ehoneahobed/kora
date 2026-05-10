@@ -357,6 +357,138 @@ describe('AuthClient', () => {
 	})
 
 	// -----------------------------------------------------------------------
+	// OAuth
+	// -----------------------------------------------------------------------
+
+	describe('OAuth', () => {
+		it('creates an OAuth authorization URL with device metadata', async () => {
+			const client = new AuthClient({
+				serverUrl: 'http://localhost:3001',
+				deviceIdentity: {
+					async getDeviceIdentity() {
+						return {
+							deviceId: 'stable-device',
+							devicePublicKey: '{"kty":"EC"}',
+						}
+					},
+				},
+			})
+			await client.initialize()
+
+			mockFetchResponse({
+				url: 'https://accounts.example/authorize?state=state-1',
+				state: 'state-1',
+			})
+
+			const result = await client.signInWithOAuth('google', {
+				redirect: false,
+				returnTo: '/dashboard',
+				metadata: { tenant: 'acme' },
+			})
+
+			expect(result).toEqual({
+				url: 'https://accounts.example/authorize?state=state-1',
+				state: 'state-1',
+			})
+
+			const calledUrl = fetchMock.mock.calls[0]?.[0] as string
+			expect(calledUrl).toContain('/auth/oauth/google?')
+			const parsed = new URL(calledUrl)
+			expect(parsed.searchParams.get('returnTo')).toBe('/dashboard')
+			expect(parsed.searchParams.get('tenant')).toBe('acme')
+			expect(parsed.searchParams.get('deviceId')).toBe('stable-device')
+			expect(parsed.searchParams.get('devicePublicKey')).toBe('{"kty":"EC"}')
+		})
+
+		it('completes OAuth sign-in and stores Kora tokens', async () => {
+			const client = createClient()
+			await client.initialize()
+
+			mockFetchResponse({
+				user: USER_PROFILE,
+				tokens: TOKEN_RESPONSE,
+				identity: {
+					id: 'identity-1',
+					userId: USER_PROFILE.id,
+					provider: 'google',
+					providerUserId: 'google-1',
+					email: USER_PROFILE.email,
+					linkedAt: Date.now(),
+				},
+			})
+
+			const user = await client.completeOAuthSignIn('google', {
+				code: 'code-1',
+				state: 'state-1',
+				deviceId: 'device-1',
+				devicePublicKey: 'public-key',
+			})
+
+			expect(user).toEqual(USER_PROFILE)
+			expect(client.state).toBe('authenticated')
+			expect(mockStorage.getItem('kora_auth_access_token')).toBeTruthy()
+
+			const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+			expect(JSON.parse(init.body as string)).toMatchObject({
+				code: 'code-1',
+				state: 'state-1',
+				deviceId: 'device-1',
+				devicePublicKey: 'public-key',
+			})
+		})
+
+		it('lists, links, and unlinks OAuth accounts with the current access token', async () => {
+			mockStorage.setItem('kora_auth_access_token', validAccessToken())
+			mockStorage.setItem('kora_auth_refresh_token', validRefreshToken())
+			mockFetchResponse(USER_PROFILE)
+
+			const client = createClient()
+			await client.initialize()
+
+			const account = {
+				id: 'identity-1',
+				userId: USER_PROFILE.id,
+				provider: 'github',
+				providerUserId: 'github-1',
+				email: USER_PROFILE.email,
+				linkedAt: Date.now(),
+			}
+
+			mockFetchResponse([account])
+			await expect(client.listLinkedAccounts()).resolves.toEqual([account])
+
+			mockFetchResponse(account, 201)
+			await expect(
+				client.linkOAuth('github', { code: 'code-1', state: 'state-1' }),
+			).resolves.toEqual(account)
+
+			mockFetchResponse({ ok: true })
+			await expect(client.unlinkOAuth('github')).resolves.toBeUndefined()
+
+			expect(fetchMock).toHaveBeenCalledWith(
+				'http://localhost:3001/auth/oauth/github/link',
+				expect.objectContaining({
+					method: 'DELETE',
+					headers: expect.objectContaining({
+						Authorization: expect.stringMatching(/^Bearer /),
+					}),
+				}),
+			)
+		})
+
+		it('requires authentication before account linking operations', async () => {
+			const client = createClient()
+			await client.initialize()
+
+			await expect(client.listLinkedAccounts()).rejects.toThrow(/signed in/)
+			await expect(client.linkOAuth('google', { code: 'code', state: 'state' })).rejects.toThrow(
+				/signed in/,
+			)
+			await expect(client.unlinkOAuth('google')).rejects.toThrow(/signed in/)
+		})
+	})
+
+	// -----------------------------------------------------------------------
 	// signOut()
 	// -----------------------------------------------------------------------
 

@@ -1,5 +1,12 @@
 import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import type { AuthState, AuthUser } from '../client/auth-client'
+import type {
+	AuthState,
+	AuthUser,
+	LinkedOAuthAccount,
+	OAuthAuthorizationOptions,
+	OAuthAuthorizationResult,
+	OAuthCallbackParams,
+} from '../client/auth-client'
 import { AuthContext } from './auth-context'
 
 // ---------------------------------------------------------------------------
@@ -58,6 +65,30 @@ interface UseAuthResult {
 		deviceId?: string
 		devicePublicKey?: string
 	}) => Promise<void>
+
+	/** Start OAuth sign-in. Web apps can redirect; desktop/mobile can open the returned URL. */
+	signInWithOAuth: (
+		provider: string,
+		options?: OAuthAuthorizationOptions,
+	) => Promise<OAuthAuthorizationResult>
+
+	/** Complete an OAuth sign-in callback with code and state. */
+	completeOAuthSignIn: (provider: string, params: OAuthCallbackParams) => Promise<void>
+
+	/** Create an OAuth authorization URL without redirecting. */
+	getOAuthAuthorizationUrl: (
+		provider: string,
+		options?: OAuthAuthorizationOptions,
+	) => Promise<OAuthAuthorizationResult>
+
+	/** Link an OAuth provider to the current user. */
+	linkOAuth: (provider: string, params: OAuthCallbackParams) => Promise<LinkedOAuthAccount | null>
+
+	/** List OAuth accounts linked to the current user. */
+	listLinkedAccounts: () => Promise<LinkedOAuthAccount[]>
+
+	/** Unlink an OAuth provider from the current user. */
+	unlinkOAuth: (provider: string) => Promise<void>
 
 	/** Sign out the current user */
 	signOut: () => Promise<void>
@@ -180,6 +211,91 @@ function useAuth(): UseAuthResult {
 		[client],
 	)
 
+	const signInWithOAuth = useCallback(
+		async (
+			provider: string,
+			options?: OAuthAuthorizationOptions,
+		): Promise<OAuthAuthorizationResult> => {
+			setError(null)
+			try {
+				return await client.signInWithOAuth(provider, options)
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err)
+				setError(message)
+				throw err
+			}
+		},
+		[client],
+	)
+
+	const completeOAuthSignIn = useCallback(
+		async (provider: string, params: OAuthCallbackParams): Promise<void> => {
+			setError(null)
+			try {
+				await client.completeOAuthSignIn(provider, params)
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err)
+				setError(message)
+			}
+		},
+		[client],
+	)
+
+	const getOAuthAuthorizationUrl = useCallback(
+		async (
+			provider: string,
+			options?: OAuthAuthorizationOptions,
+		): Promise<OAuthAuthorizationResult> => {
+			setError(null)
+			try {
+				return await client.getOAuthAuthorizationUrl(provider, options)
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err)
+				setError(message)
+				throw err
+			}
+		},
+		[client],
+	)
+
+	const linkOAuth = useCallback(
+		async (provider: string, params: OAuthCallbackParams): Promise<LinkedOAuthAccount | null> => {
+			setError(null)
+			try {
+				return await client.linkOAuth(provider, params)
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err)
+				setError(message)
+				return null
+			}
+		},
+		[client],
+	)
+
+	const listLinkedAccounts = useCallback(async (): Promise<LinkedOAuthAccount[]> => {
+		setError(null)
+		try {
+			return await client.listLinkedAccounts()
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err)
+			setError(message)
+			return []
+		}
+	}, [client])
+
+	const unlinkOAuth = useCallback(
+		async (provider: string): Promise<void> => {
+			setError(null)
+			try {
+				await client.unlinkOAuth(provider)
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err)
+				setError(message)
+			}
+		},
+		[client],
+	)
+
 	const signOut = useCallback(async (): Promise<void> => {
 		setError(null)
 		try {
@@ -196,6 +312,12 @@ function useAuth(): UseAuthResult {
 		isLoading,
 		signUp,
 		signIn,
+		signInWithOAuth,
+		completeOAuthSignIn,
+		getOAuthAuthorizationUrl,
+		linkOAuth,
+		listLinkedAccounts,
+		unlinkOAuth,
 		signOut,
 		error,
 	}
