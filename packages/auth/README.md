@@ -83,7 +83,15 @@ function MyApp() {
 ### Server-side
 
 ```typescript
-import { createKoraAuthServer, googleProvider } from '@korajs/auth/server'
+import {
+  createKoraAuthServer,
+  createSqliteOAuthStores,
+  googleProvider,
+} from '@korajs/auth/server'
+
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
+})
 
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
@@ -95,6 +103,8 @@ const auth = createKoraAuthServer({
         redirectUri: 'https://app.example.com/auth/oauth/google/callback',
       }),
     ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
   },
 })
 
@@ -163,6 +173,7 @@ const syncServer = new KoraSyncServer({
 | `InMemoryTokenRevocationStore` | Dev/test token revocation store |
 | `OAuthManager` / provider helpers | OAuth authorization code flow and provider configs |
 | `InMemoryLinkedIdentityStore` | Dev/test OAuth account-linking store |
+| `createSqliteOAuthStores` / `createPostgresOAuthStores` | Durable OAuth state and linked identity stores |
 | `SessionManager` / `InMemorySessionStore` | Server-side session management |
 | `TotpManager` / `InMemoryTotpStore` | TOTP MFA with recovery codes |
 | `OrgRoutes` / `InMemoryOrgStore` | Organization CRUD, invitations, member management |

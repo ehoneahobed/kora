@@ -870,6 +870,7 @@ function AdminPanel() {
 ```typescript
 import {
   createKoraAuthServer,
+  createSqliteOAuthStores,
   BuiltInAuthRoutes,
   TokenManager,
   SessionManager,
@@ -886,6 +887,10 @@ import {
 Creates the built-in auth server with sensible defaults for Kora sync.
 
 ```typescript
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
+})
+
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
   oauth: {
@@ -896,6 +901,8 @@ const auth = createKoraAuthServer({
         redirectUri: 'https://app.example.com/auth/oauth/google/callback',
       }),
     ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
   },
 })
 
@@ -951,6 +958,7 @@ When `oauth` is configured, `handleRequest()` also serves:
 |-------|------|---------|
 | `providers` | `OAuthProviderConfig[]` | Required |
 | `linkedIdentityStore` | `LinkedIdentityStore` | `InMemoryLinkedIdentityStore` |
+| `stateStore` | `OAuthStateStore` | `InMemoryOAuthStateStore` |
 | `createNewUsers` | `boolean` | `true` |
 | `autoLinkVerifiedEmail` | `boolean` | `false` |
 | `allowUnlinkLastIdentity` | `boolean` | `false` |
@@ -1292,6 +1300,12 @@ import {
   OAuthManager,
   InMemoryLinkedIdentityStore,
   InMemoryOAuthStateStore,
+  SqliteLinkedIdentityStore,
+  SqliteOAuthStateStore,
+  PostgresLinkedIdentityStore,
+  PostgresOAuthStateStore,
+  createSqliteOAuthStores,
+  createPostgresOAuthStores,
   googleProvider,
   githubProvider,
   microsoftProvider,
@@ -1317,6 +1331,21 @@ const oauth = new OAuthManager({
 When `pkce: true` is set, authorization URLs include an S256 `code_challenge` and token exchange includes the matching `code_verifier`.
 
 For production, provide durable stores for OAuth state and linked identities. The in-memory stores are for development and tests.
+
+```typescript
+const oauthStores = await createPostgresOAuthStores({
+  connectionString: process.env.DATABASE_URL!,
+})
+
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [googleProvider({ clientId, clientSecret, redirectUri })],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
+  },
+})
+```
 
 ### Password Reset
 

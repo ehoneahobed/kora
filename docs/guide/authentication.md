@@ -46,7 +46,15 @@ For a standard Kora app, create the auth server with one call:
 
 ```typescript
 // server.ts
-import { createKoraAuthServer, googleProvider } from '@korajs/auth/server'
+import {
+  createKoraAuthServer,
+  createSqliteOAuthStores,
+  googleProvider,
+} from '@korajs/auth/server'
+
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
+})
 
 const auth = createKoraAuthServer({
   jwtSecret: process.env.KORA_AUTH_SECRET!,
@@ -58,6 +66,8 @@ const auth = createKoraAuthServer({
         redirectUri: 'https://app.example.com/auth/oauth/google/callback',
       }),
     ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
   },
 })
 ```

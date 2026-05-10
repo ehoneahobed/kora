@@ -184,6 +184,20 @@ export {
 } from './provider/oauth/linked-identity-store'
 export type { LinkedIdentityStore } from './provider/oauth/linked-identity-store'
 export {
+	SqliteLinkedIdentityStore,
+	SqliteOAuthStateStore,
+	createSqliteLinkedIdentityStore,
+	createSqliteOAuthStateStore,
+	createSqliteOAuthStores,
+} from './provider/oauth/sqlite-oauth-store'
+export {
+	PostgresLinkedIdentityStore,
+	PostgresOAuthStateStore,
+	createPostgresLinkedIdentityStore,
+	createPostgresOAuthStateStore,
+	createPostgresOAuthStores,
+} from './provider/oauth/postgres-oauth-store'
+export {
 	OAuthError,
 	OAuthStateMismatchError,
 	OAuthCodeExchangeError,
