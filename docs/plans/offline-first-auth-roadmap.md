@@ -350,7 +350,7 @@ The next best step is not another broad feature. The highest-leverage sequence i
 
 1. Add durable auth stores for OAuth state and linked identities. - implemented
 2. Add client OAuth helpers. - implemented
-3. Add desktop/mobile OAuth recipes into scaffolded apps.
+3. Add desktop/mobile OAuth recipes into scaffolded apps. - implemented
 4. Add password reset and email verification routes to `createKoraAuthServer`.
 5. Add offline session policy as a first-class API.
 6. Add durable stores for sessions, MFA, audit logs, webhooks, and rate limiting.

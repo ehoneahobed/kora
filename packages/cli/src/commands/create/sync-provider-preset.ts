@@ -47,6 +47,8 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 		'',
 		'This scaffold keeps one sync server entrypoint. When `DATABASE_URL` is set, `server.ts` uses PostgreSQL. When it is empty, the same server uses SQLite at `KORA_SERVER_DB`.',
 		'',
+		'The generated server uses `createPostgresServerStore` automatically when `DATABASE_URL` is present.',
+		'',
 	].join('\n')
 	const readmeTemplate = `${trimmedReadme}${readmeSuffix}`
 
