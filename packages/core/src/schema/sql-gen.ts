@@ -47,6 +47,7 @@ export function generateSQL(
 	// Auto metadata columns
 	columns.push('_created_at INTEGER NOT NULL')
 	columns.push('_updated_at INTEGER NOT NULL')
+	columns.push("_version TEXT NOT NULL DEFAULT ''")
 	columns.push('_deleted INTEGER NOT NULL DEFAULT 0')
 
 	statements.push(`CREATE TABLE IF NOT EXISTS ${collectionName} (\n  ${columns.join(',\n  ')}\n)`)
@@ -57,6 +58,9 @@ export function generateSQL(
 		const colDef = columnDefinition(fieldName, descriptor)
 		statements.push(`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN ${colDef}`)
 	}
+	statements.push(
+		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _version TEXT NOT NULL DEFAULT ''`,
+	)
 
 	// Create indexes
 	for (const indexField of collection.indexes) {

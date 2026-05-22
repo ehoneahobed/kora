@@ -1,4 +1,5 @@
-import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
+import type { HLCTimestamp, KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
+import { HybridLogicalClock } from '@korajs/core'
 import type { MergeEngine, MergeInput } from '@korajs/merge'
 import type { Store } from '@korajs/store'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
@@ -83,12 +84,19 @@ export class MergeAwareSyncStore implements SyncStore {
 		})
 
 		const baseState: Record<string, unknown> = { ...op.previousData }
+		const localTimestamp: HLCTimestamp = {
+			wallTime:
+				typeof currentRecord.updatedAt === 'number' ? currentRecord.updatedAt : op.timestamp.wallTime,
+			logical: 0,
+			nodeId: this.store.getNodeId(),
+		}
 		const localOp: Operation = {
 			...op,
 			// The "local" operation's data is the diff between base and current local state
 			data: buildLocalDiff(op.previousData, currentRecord, Object.keys(op.data)),
 			previousData: op.previousData,
 			nodeId: this.store.getNodeId(),
+			timestamp: localTimestamp,
 		}
 
 		const input: MergeInput = {
@@ -109,10 +117,11 @@ export class MergeAwareSyncStore implements SyncStore {
 			this.emitter?.emit({ type: 'merge:completed', trace: firstTrace })
 		}
 
-		// Create a modified operation with the merged data to apply
+		// Apply merged field values with the latest HLC so materialized _version does not regress
 		const mergedOp: Operation = {
 			...op,
 			data: result.mergedData,
+			timestamp: maxTimestamp(op.timestamp, localTimestamp),
 		}
 
 		return this.store.applyRemoteOperation(mergedOp)
@@ -139,6 +148,10 @@ function buildLocalDiff(
  * Simple deep equality check for comparing field values.
  * Handles primitives, arrays, and plain objects.
  */
+function maxTimestamp(a: HLCTimestamp, b: HLCTimestamp): HLCTimestamp {
+	return HybridLogicalClock.compare(a, b) >= 0 ? a : b
+}
+
 function deepEqual(a: unknown, b: unknown): boolean {
 	if (a === b) return true
 	if (a === null || b === null) return false

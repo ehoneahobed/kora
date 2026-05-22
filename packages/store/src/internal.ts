@@ -14,9 +14,16 @@ export {
 	buildCountQuery,
 	buildInsertQuery,
 	buildUpdateQuery,
+	buildLwwUpdateQuery,
 	buildSoftDeleteQuery,
+	buildLwwSoftDeleteQuery,
 	buildWhereClause,
 } from './query/sql-builder'
+export {
+	serializeRowVersion,
+	rowVersionFromRecord,
+	isIncomingNewerThanRow,
+} from './lww/row-version'
 export type { SqlQuery } from './query/sql-builder'
 
 export type {

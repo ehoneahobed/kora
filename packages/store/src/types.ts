@@ -137,6 +137,7 @@ export interface RawCollectionRow {
 	id: string
 	_created_at: number
 	_updated_at: number
+	_version?: string
 	_deleted: number
 	[key: string]: unknown
 }

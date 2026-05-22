@@ -129,6 +129,17 @@ export function createApp(config: KoraConfig): KoraApp {
 				}
 			})
 
+			// Reconnect immediately when the browser reports connectivity restored
+			if (typeof globalThis !== 'undefined' && 'addEventListener' in globalThis) {
+				const engine = syncEngine
+				globalThis.addEventListener('online', () => {
+					if (intentionalDisconnect || config.sync?.autoReconnect === false) return
+					reconnectionManager?.wake()
+					reconnectionManager?.reset()
+					void engine.retryNow()
+				})
+			}
+
 			// Auto-reconnect on unexpected disconnect
 			if (config.sync.autoReconnect !== false) {
 				const engine = syncEngine

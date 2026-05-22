@@ -16,6 +16,7 @@ import {
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import { serializeRowVersion } from '../lww/row-version'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
@@ -86,11 +87,13 @@ export class Collection {
 		)
 
 		const serializedData = serializeRecord(validated, this.definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const record: Record<string, unknown> = {
 			id: recordId,
 			...serializedData,
-			_created_at: now,
-			_updated_at: now,
+			_created_at: operation.timestamp.wallTime,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		}
 
 		const insertQuery = buildInsertQuery(this.name, record)
@@ -214,9 +217,11 @@ export class Collection {
 		)
 
 		const serializedChanges = serializeRecord(resolvedData, this.definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const updateQuery = buildUpdateQuery(this.name, id, {
 			...serializedChanges,
-			_updated_at: now,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		})
 		const opRow = serializeOperation(operation)
 		const opInsert = buildInsertQuery(
@@ -286,7 +291,13 @@ export class Collection {
 			this.clock,
 		)
 
-		const deleteQuery = buildSoftDeleteQuery(this.name, id, now)
+		const version = serializeRowVersion(operation.timestamp)
+		const deleteQuery = buildSoftDeleteQuery(
+			this.name,
+			id,
+			operation.timestamp.wallTime,
+			version,
+		)
 		const opRow = serializeOperation(operation)
 		const opInsert = buildInsertQuery(
 			`_kora_ops_${this.name}`,

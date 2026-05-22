@@ -1,5 +1,6 @@
 import type { CollectionDefinition, FieldDescriptor } from '@korajs/core'
 import { QueryError } from '../errors'
+import { lwwVersionWhereClause } from '../lww/row-version'
 import type { QueryDescriptor, WhereOperators } from '../types'
 
 /**
@@ -123,10 +124,54 @@ export function buildUpdateQuery(
  * @param updatedAt - The timestamp to set on _updated_at
  * @returns A parameterized SQL query
  */
-export function buildSoftDeleteQuery(collection: string, id: string, updatedAt: number): SqlQuery {
+export function buildSoftDeleteQuery(
+	collection: string,
+	id: string,
+	updatedAt: number,
+	version?: string,
+): SqlQuery {
+	if (version !== undefined) {
+		return {
+			sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ?`,
+			params: [updatedAt, version, id],
+		}
+	}
 	return {
 		sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ? WHERE id = ?`,
 		params: [updatedAt, id],
+	}
+}
+
+/**
+ * Build an UPDATE that applies only when the row is missing or older than `remoteVersion`
+ * (serialized HLC). Prevents stale remote sync from overwriting newer local materialized state.
+ */
+export function buildLwwUpdateQuery(
+	collection: string,
+	id: string,
+	changes: Record<string, unknown>,
+	remoteVersion: string,
+): SqlQuery {
+	const setClauses = Object.keys(changes).map((col) => `${col} = ?`)
+	const lww = lwwVersionWhereClause(remoteVersion)
+	const sql = `UPDATE ${collection} SET ${setClauses.join(', ')} WHERE id = ? AND ${lww.sql}`
+	const params = [...Object.values(changes), id, ...lww.params]
+	return { sql, params }
+}
+
+/**
+ * Build a soft-delete that applies only when the row is older than `remoteVersion`.
+ */
+export function buildLwwSoftDeleteQuery(
+	collection: string,
+	id: string,
+	updatedAt: number,
+	version: string,
+): SqlQuery {
+	const lww = lwwVersionWhereClause(version)
+	return {
+		sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ? AND ${lww.sql}`,
+		params: [updatedAt, version, id, ...lww.params],
 	}
 }
 

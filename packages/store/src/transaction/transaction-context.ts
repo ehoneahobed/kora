@@ -15,6 +15,7 @@ import {
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import { serializeRowVersion } from '../lww/row-version'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
 import type { CollectionRecord, RawCollectionRow, StorageAdapter, Transaction } from '../types'
 
@@ -219,11 +220,13 @@ export class TransactionContext {
 		)
 
 		const serializedData = serializeRecord(validated, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const record: Record<string, unknown> = {
 			id: recordId,
 			...serializedData,
-			_created_at: now,
-			_updated_at: now,
+			_created_at: operation.timestamp.wallTime,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		}
 
 		const insertQuery = buildInsertQuery(collectionName, record)
@@ -309,9 +312,11 @@ export class TransactionContext {
 		)
 
 		const serializedChanges = serializeRecord(resolvedData, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const updateQuery = buildUpdateQuery(collectionName, id, {
 			...serializedChanges,
-			_updated_at: now,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		})
 		const opRow = serializeOperation(operation)
 		const opInsert = buildInsertQuery(

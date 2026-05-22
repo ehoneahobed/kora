@@ -90,6 +90,21 @@ export class ReconnectionManager {
 	}
 
 	/**
+	 * Cancel the current backoff wait and proceed to the next reconnect attempt immediately.
+	 * No-op if not waiting.
+	 */
+	wake(): void {
+		if (this.timer !== null) {
+			clearTimeout(this.timer)
+			this.timer = null
+		}
+		if (this.waitResolve) {
+			this.waitResolve()
+			this.waitResolve = null
+		}
+	}
+
+	/**
 	 * Stop any pending reconnection attempt.
 	 */
 	stop(): void {

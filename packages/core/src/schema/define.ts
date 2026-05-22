@@ -19,7 +19,7 @@ const COLLECTION_NAME_RE = /^[a-z][a-z0-9_]*$/
 const FIELD_NAME_RE = /^[a-z][a-zA-Z0-9_]*$/
 
 /** Reserved field names that cannot be used in schemas */
-const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_deleted'])
+const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_version', '_deleted'])
 
 /**
  * Input shape for defineSchema() — what the developer writes.

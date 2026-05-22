@@ -1,4 +1,5 @@
 import {
+	ClockDriftError,
 	HybridLogicalClock,
 	createVersionVector,
 	generateUUIDv7,
@@ -17,7 +18,14 @@ import type {
 import { Collection } from '../collection/collection'
 import { StoreNotOpenError } from '../errors'
 import { QueryBuilder } from '../query/query-builder'
-import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import {
+	buildInsertQuery,
+	buildLwwSoftDeleteQuery,
+	buildLwwUpdateQuery,
+	buildSoftDeleteQuery,
+	buildUpdateQuery,
+} from '../query/sql-builder'
+import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import { RelationEnforcer } from '../relations/relation-enforcer'
 import { SequenceManager } from '../sequences/sequence-manager'
 import {
@@ -217,33 +225,58 @@ export class Store implements OperationLog {
 			return 'duplicate'
 		}
 
-		// Update the clock with the remote timestamp
+		// Advance the local HLC for causal ordering. Reject poison timestamps without persisting.
 		if (this.clock) {
-			this.clock.receive(op.timestamp)
+			try {
+				this.clock.receive(op.timestamp)
+			} catch (error) {
+				if (error instanceof ClockDriftError) {
+					return 'skipped'
+				}
+				throw error
+			}
 		}
 
-		// Apply the operation to the data table
+		const remoteVersion = serializeRowVersion(op.timestamp)
+		const wallTime = op.timestamp.wallTime
+
+		// Apply the operation to the data table (LWW-guarded; op log always appended below)
 		await this.adapter.transaction(async (tx) => {
 			if (op.type === 'insert' && op.data) {
-				const serializedData = serializeRecord(op.data, definition.fields)
-				const now = op.timestamp.wallTime
-				const record: Record<string, unknown> = {
-					id: op.recordId,
-					...serializedData,
-					_created_at: now,
-					_updated_at: now,
+				const existing = await tx.query<RawCollectionRow>(
+					`SELECT _updated_at, _version FROM ${collection} WHERE id = ?`,
+					[op.recordId],
+				)
+				const row = existing[0]
+				if (row && !isIncomingNewerThanRow(op.timestamp, row)) {
+					// Stale remote insert — skip materialization, still record op below
+				} else {
+					const serializedData = serializeRecord(op.data, definition.fields)
+					const record: Record<string, unknown> = {
+						id: op.recordId,
+						...serializedData,
+						_created_at: wallTime,
+						_updated_at: wallTime,
+						_version: remoteVersion,
+					}
+					const insertQuery = buildInsertQuery(collection, record)
+					await tx.execute(insertQuery.sql, insertQuery.params)
 				}
-				const insertQuery = buildInsertQuery(collection, record)
-				await tx.execute(insertQuery.sql, insertQuery.params)
 			} else if (op.type === 'update' && op.data) {
 				const serializedChanges = serializeRecord(op.data, definition.fields)
-				const updateQuery = buildUpdateQuery(collection, op.recordId, {
+				const updateQuery = buildLwwUpdateQuery(collection, op.recordId, {
 					...serializedChanges,
-					_updated_at: op.timestamp.wallTime,
-				})
+					_updated_at: wallTime,
+					_version: remoteVersion,
+				}, remoteVersion)
 				await tx.execute(updateQuery.sql, updateQuery.params)
 			} else if (op.type === 'delete') {
-				const deleteQuery = buildSoftDeleteQuery(collection, op.recordId, op.timestamp.wallTime)
+				const deleteQuery = buildLwwSoftDeleteQuery(
+					collection,
+					op.recordId,
+					wallTime,
+					remoteVersion,
+				)
 				await tx.execute(deleteQuery.sql, deleteQuery.params)
 			}
 

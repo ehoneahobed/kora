@@ -194,8 +194,14 @@ describe('Store', () => {
 			const col = store.collection('todos')
 			const record = await col.insert({ title: 'Local' })
 
-			// Then apply remote update
+			// Remote op must be HLC-newer than the materialized row to pass LWW guard
 			const clock = new HybridLogicalClock('remote-node')
+			clock.receive({
+				wallTime: record.updatedAt,
+				logical: 0,
+				nodeId: store.getNodeId(),
+			})
+
 			const op = await createOperation(
 				{
 					nodeId: 'remote-node',
@@ -222,6 +228,12 @@ describe('Store', () => {
 			const record = await col.insert({ title: 'To remote delete' })
 
 			const clock = new HybridLogicalClock('remote-node')
+			clock.receive({
+				wallTime: record.updatedAt,
+				logical: 0,
+				nodeId: store.getNodeId(),
+			})
+
 			const op = await createOperation(
 				{
 					nodeId: 'remote-node',

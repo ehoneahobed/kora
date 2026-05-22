@@ -188,7 +188,7 @@ export class SyncEngine {
 		await this.outboundQueue.initialize()
 
 		// Set up transport handlers
-		this.transport.onMessage((msg) => this.handleMessage(msg))
+		this.transport.onMessage((msg) => this.enqueueMessage(msg))
 		this.transport.onClose((reason) => this.handleTransportClose(reason))
 		this.transport.onError((err) => this.handleTransportError(err))
 
@@ -400,13 +400,21 @@ export class SyncEngine {
 
 	// --- Private methods ---
 
-	private handleMessage(message: SyncMessage): void {
+	private messageChain: Promise<void> = Promise.resolve()
+
+	private enqueueMessage(message: SyncMessage): void {
+		this.messageChain = this.messageChain
+			.then(() => this.handleMessageAsync(message))
+			.catch((error) => this.handleMessageFailure(error))
+	}
+
+	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		switch (message.type) {
 			case 'handshake-response':
 				this.handleHandshakeResponse(message)
 				break
 			case 'operation-batch':
-				this.handleOperationBatch(message)
+				await this.handleOperationBatch(message)
 				break
 			case 'acknowledgment':
 				this.handleAcknowledgment(message)
@@ -418,6 +426,11 @@ export class SyncEngine {
 				this.handleAwarenessUpdate(message)
 				break
 		}
+	}
+
+	private handleMessageFailure(error: unknown): void {
+		const reason = error instanceof Error ? error.message : 'Message handling failed'
+		this.handleTransportClose(reason)
 	}
 
 	private handleHandshakeResponse(msg: HandshakeResponseMessage): void {
@@ -545,9 +558,13 @@ export class SyncEngine {
 		// The server should already filter, but we verify client-side as well.
 		const inScopeOps = operations.filter((op) => operationMatchesScope(op, this.activeScope))
 
-		// Apply each in-scope operation to the local store
+		// Apply each in-scope operation; per-op failures must not block batch ACK
 		for (const op of inScopeOps) {
-			await this.store.applyRemoteOperation(op)
+			try {
+				await this.store.applyRemoteOperation(op)
+			} catch {
+				// Isolated failure (storage, validation, etc.) — continue remaining ops
+			}
 		}
 
 		if (inScopeOps.length > 0) {

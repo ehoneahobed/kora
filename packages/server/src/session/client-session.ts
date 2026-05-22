@@ -10,6 +10,7 @@ import type {
 	WireFormat,
 } from '@korajs/sync'
 import { NegotiatedMessageSerializer, versionVectorToWire, wireToVersionVector } from '@korajs/sync'
+import { isOperationTimestampValid } from './operation-validation'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
@@ -113,7 +114,7 @@ export class ClientSession {
 	 * Start handling messages from the client transport.
 	 */
 	start(): void {
-		this.transport.onMessage((msg) => this.handleMessage(msg))
+		this.transport.onMessage((msg) => this.enqueueMessage(msg))
 		this.transport.onClose((_code, _reason) => this.handleTransportClose())
 		this.transport.onError((_err) => {
 			// Transport errors during active session cause close
@@ -193,15 +194,22 @@ export class ClientSession {
 
 	// --- Private protocol handlers ---
 
-	private handleMessage(message: SyncMessage): void {
+	private messageChain: Promise<void> = Promise.resolve()
+
+	private enqueueMessage(message: SyncMessage): void {
+		this.messageChain = this.messageChain
+			.then(() => this.handleMessageAsync(message))
+			.catch((error) => this.handleMessageFailure(error))
+	}
+
+	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		switch (message.type) {
 			case 'handshake':
-				this.handleHandshake(message)
+				await this.handleHandshake(message)
 				break
 			case 'operation-batch':
-				this.handleOperationBatch(message)
+				await this.handleOperationBatch(message)
 				break
-			// Acknowledgments from clients are noted but no action needed on server
 			case 'acknowledgment':
 				break
 			case 'error':
@@ -210,6 +218,12 @@ export class ClientSession {
 				this.handleAwarenessUpdate(message)
 				break
 		}
+	}
+
+	private handleMessageFailure(error: unknown): void {
+		const reason = error instanceof Error ? error.message : 'Message handling failed'
+		this.sendError('SYNC_ERROR', reason, true)
+		this.close(reason)
 	}
 
 	private async handleHandshake(msg: HandshakeMessage): Promise<void> {
@@ -293,9 +307,22 @@ export class ClientSession {
 				continue
 			}
 
-			const result = await this.store.applyRemoteOperation(op)
-			if (result === 'applied') {
-				applied.push(op)
+			if (!isOperationTimestampValid(op)) {
+				this.sendError(
+					'INVALID_TIMESTAMP',
+					`Operation "${op.id}" timestamp is too far in the future`,
+					false,
+				)
+				continue
+			}
+
+			try {
+				const result = await this.store.applyRemoteOperation(op)
+				if (result === 'applied') {
+					applied.push(op)
+				}
+			} catch {
+				// Per-op failure must not block batch acknowledgment
 			}
 		}
 
