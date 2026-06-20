@@ -1,3 +1,4 @@
+import { createKoraAuthSync } from '@korajs/auth'
 import { AuthProvider } from '@korajs/auth/react'
 import { KoraProvider } from '@korajs/react'
 import { createApp } from 'korajs'
@@ -96,9 +97,7 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 				? {
 						sync: {
 							url: syncUrl,
-							auth: async () => ({
-								token: (await authClient.getAccessToken()) ?? '',
-							}),
+							authClient: createKoraAuthSync({ authClient, schema }),
 						},
 					}
 				: {}),

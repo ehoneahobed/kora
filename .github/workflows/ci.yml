@@ -27,7 +27,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: CI=true pnpm install --frozen-lockfile
 
       - name: Lint
         run: pnpm lint
@@ -37,6 +37,9 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Release gate (production-path, reconnect, chaos, benchmarks)
+        run: pnpm test:release-gate
 
       - name: Typecheck
         run: pnpm typecheck

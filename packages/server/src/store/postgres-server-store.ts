@@ -44,6 +44,10 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	getSchema(): SchemaDefinition | null {
+		return this.schema
+	}
+
 	async setSchema(schema: SchemaDefinition): Promise<void> {
 		this.assertOpen()
 		await this.ready

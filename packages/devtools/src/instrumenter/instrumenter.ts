@@ -7,7 +7,7 @@ const DEFAULT_BUFFER_SIZE = 10_000
 const DEFAULT_CHANNEL_NAME = 'kora-devtools'
 
 /** All event types the instrumenter subscribes to */
-const ALL_EVENT_TYPES: readonly KoraEventType[] = [
+export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'operation:created',
 	'operation:applied',
 	'merge:started',
@@ -16,9 +16,18 @@ const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'constraint:violated',
 	'sync:connected',
 	'sync:disconnected',
+	'sync:schema-mismatch',
+	'sync:auth-failed',
+	'sync:apply-failed',
 	'sync:sent',
 	'sync:received',
 	'sync:acknowledged',
+	'sync:diagnostics',
+	'sync:bandwidth',
+	'sync:initial-sync-progress',
+	'store:persistence-error',
+	'store:quota-exceeded',
+	'replay:completed',
 	'query:subscribed',
 	'query:invalidated',
 	'query:executed',

@@ -32,6 +32,7 @@
   },
   "dependencies": {
     "@korajs/core": "workspace:*",
+    "lib0": "^0.2.100",
     "yjs": "^13.6.30"
   },
   "devDependencies": {

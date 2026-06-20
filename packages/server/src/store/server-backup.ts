@@ -106,7 +106,7 @@ export async function buildServerBackup(
 	addSection('version_vector', encodeJsonSection('version_vector', vvObj))
 
 	// Operations
-	const opLines = operations.map((op) => JSON.stringify(op)).join('\n') + '\n'
+	const opLines = `${operations.map((op) => JSON.stringify(op)).join('\n')}\n`
 	addSection('operations', encodeSection('operations', new TextEncoder().encode(opLines)))
 
 	// Checksum
@@ -142,9 +142,7 @@ export async function buildServerBackup(
 /**
  * Parse a backup and return the operations and version vector.
  */
-export function parseServerBackup(
-	data: Uint8Array,
-): {
+export function parseServerBackup(data: Uint8Array): {
 	operations: Operation[]
 	versionVector: Map<string, number>
 } {
@@ -155,7 +153,10 @@ export function parseServerBackup(
 	let operations: Operation[] = []
 	if (opsContent) {
 		const text = new TextDecoder().decode(opsContent)
-		const lines = text.trim().split('\n').filter((l) => l.length > 0)
+		const lines = text
+			.trim()
+			.split('\n')
+			.filter((l) => l.length > 0)
 		operations = lines.map((line) => JSON.parse(line) as Operation)
 	}
 

@@ -35,6 +35,7 @@ function makeCollectionDef(sm?: StateMachineDefinition): CollectionDefinition {
 				enumValues: ['draft', 'pending', 'confirmed', 'shipped', 'delivered', 'cancelled'],
 				itemKind: null,
 				mergeStrategy: null,
+				transitions: null,
 			},
 			total: {
 				kind: 'number',
@@ -44,6 +45,7 @@ function makeCollectionDef(sm?: StateMachineDefinition): CollectionDefinition {
 				enumValues: null,
 				itemKind: null,
 				mergeStrategy: null,
+				transitions: null,
 			},
 		},
 		indexes: [],

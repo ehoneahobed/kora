@@ -135,6 +135,36 @@ describe('useMutation', () => {
 		expect(screen.getByTestId('error').textContent).toBe('silent error')
 	})
 
+	it('calls onRollback when mutation fails after onMutate', async () => {
+		const onMutate = vi.fn().mockReturnValue('rollback-token')
+		const onRollback = vi.fn()
+		const fn = vi.fn().mockRejectedValue(new Error('fail'))
+
+		function RollbackTester(): ReturnType<typeof createElement> {
+			const { mutate, error } = useMutation(fn, { onMutate, onRollback })
+			return createElement(
+				'div',
+				null,
+				createElement('button', {
+					type: 'button',
+					'data-testid': 'mutate',
+					onClick: () => mutate('x'),
+				}),
+				createElement('span', { 'data-testid': 'error' }, error ? error.message : 'null'),
+			)
+		}
+
+		render(createElement(RollbackTester))
+
+		await act(async () => {
+			screen.getByTestId('mutate').click()
+		})
+
+		expect(onMutate).toHaveBeenCalledWith('x')
+		expect(onRollback).toHaveBeenCalledWith('rollback-token', 'x')
+		expect(screen.getByTestId('error').textContent).toBe('fail')
+	})
+
 	it('does not update state after unmount', async () => {
 		let resolveFn: (value: string) => void = () => {}
 		const fn = vi.fn().mockImplementation(

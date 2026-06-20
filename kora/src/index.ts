@@ -7,6 +7,7 @@ export { createApp } from './create-app'
 // === App types ===
 export type {
 	AdapterType,
+	AuthSyncBinding,
 	KoraApp,
 	KoraConfig,
 	StoreOptions,
@@ -19,6 +20,19 @@ export type {
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
+
+export type { ReplaySnapshot } from '@korajs/store'
+export type {
+	AuditExportManifest,
+	AuditExportOptions,
+	AuditExportPayload,
+	PersistedAuditTrace,
+} from '@korajs/store'
+export {
+	decodeAuditExport,
+	readAuditExportManifest,
+	verifyAuditExportChecksum,
+} from '@korajs/store'
 
 // === @korajs/core re-exports ===
 export { defineSchema, migrate, t } from '@korajs/core'
@@ -52,6 +66,7 @@ export type {
 	SchemaDefinition,
 	SchemaInput,
 	SequenceConfig,
+	SyncRuleDefinition,
 	TypedSchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
@@ -88,6 +103,7 @@ export { SyncEngine, WebSocketTransport } from '@korajs/sync'
 export type {
 	SyncConfig,
 	SyncDiagnostics,
+	SyncEncryptionConfig,
 	SyncState,
 	SyncStatus,
 	SyncStatusInfo,

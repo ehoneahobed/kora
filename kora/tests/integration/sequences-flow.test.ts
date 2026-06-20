@@ -1,4 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
+import type { CollectionAccessor } from '@korajs/store'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { createApp } from '../../src/create-app'
 import type { KoraApp } from '../../src/types'
@@ -81,7 +82,12 @@ describe('Sequences via createApp', () => {
 			format: 'ORD-{seq:4}',
 		})
 
-		const order = await (app as Record<string, unknown>).orders.insert({
+		const orders = (app as Record<string, CollectionAccessor>).orders
+		if (!orders) {
+			throw new Error('expected orders collection')
+		}
+
+		const order = await orders.insert({
 			orderNumber: orderNo,
 			total: 99.99,
 		})
@@ -96,14 +102,19 @@ describe('Sequences via createApp', () => {
 		})
 
 		await app.transaction(async (tx) => {
-			await tx.orders.insert({
+			await tx.orders!.insert({
 				orderNumber: orderNo,
 				total: 50,
 			})
 		})
 
-		const found = await (app as Record<string, unknown>).orders.where({}).exec()
+		const orders = (app as Record<string, CollectionAccessor>).orders
+		if (!orders) {
+			throw new Error('expected orders collection')
+		}
+
+		const found = await orders.where({}).exec()
 		expect(found).toHaveLength(1)
-		expect(found[0].orderNumber).toBe('ORD-0001')
+		expect(found[0]?.orderNumber).toBe('ORD-0001')
 	})
 })

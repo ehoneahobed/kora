@@ -1,12 +1,13 @@
 import type { KoraEventEmitter, Operation } from '@korajs/core'
-import { SimpleEventEmitter } from '@korajs/core/internal'
 import { SyncError, generateUUIDv7 } from '@korajs/core'
-import type { AwarenessUpdateMessage, MessageSerializer } from '@korajs/sync'
+import { SimpleEventEmitter } from '@korajs/core/internal'
+import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
 import type { ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
@@ -62,6 +63,7 @@ export class KoraSyncServer {
 	private readonly maxConnections: number
 	private readonly batchSize: number
 	private readonly schemaVersion: number
+	private readonly supportedSchemaVersions: { min: number; max: number }
 	private readonly port: number | undefined
 	private readonly host: string
 	private readonly path: string
@@ -69,6 +71,7 @@ export class KoraSyncServer {
 	private readonly metrics: ServerMetricsCollector
 
 	private readonly awarenessRelay = new AwarenessRelay()
+	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly sessions = new Map<string, ClientSession>()
 	private readonly httpClients = new Map<
 		string,
@@ -87,6 +90,10 @@ export class KoraSyncServer {
 		this.maxConnections = config.maxConnections ?? DEFAULT_MAX_CONNECTIONS
 		this.batchSize = config.batchSize ?? DEFAULT_BATCH_SIZE
 		this.schemaVersion = config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		this.supportedSchemaVersions = config.supportedSchemaVersions ?? {
+			min: this.schemaVersion,
+			max: this.schemaVersion,
+		}
 		this.port = config.port
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
@@ -233,6 +240,7 @@ export class KoraSyncServer {
 
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
+		this.yjsDocRelay.clear()
 
 		// Close all active sessions (works in both standalone and attach mode)
 		for (const session of this.sessions.values()) {
@@ -389,11 +397,15 @@ export class KoraSyncServer {
 			emitter: sessionEmitter,
 			batchSize: this.batchSize,
 			schemaVersion: this.schemaVersion,
+			supportedSchemaVersions: this.supportedSchemaVersions,
 			onRelay: (sourceSessionId, operations) => {
 				this.handleRelay(sourceSessionId, operations)
 			},
 			onAwarenessUpdate: (sourceSessionId, message) => {
 				this.handleAwarenessRelay(sourceSessionId, message)
+			},
+			onYjsDocUpdate: (sourceSessionId, message) => {
+				this.handleYjsDocRelay(sourceSessionId, message)
 			},
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
@@ -401,6 +413,7 @@ export class KoraSyncServer {
 		})
 
 		this.sessions.set(sessionId, session)
+		this.yjsDocRelay.addClient(sessionId, transport)
 		session.start()
 
 		this.logger.log({
@@ -449,7 +462,11 @@ export class KoraSyncServer {
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
-		this.metrics.recordSent(sourceSessionId, operations.length * targetCount, byteSize * targetCount)
+		this.metrics.recordSent(
+			sourceSessionId,
+			operations.length * targetCount,
+			byteSize * targetCount,
+		)
 		this.logger.log({
 			timestamp: Date.now(),
 			level: 'info',
@@ -469,6 +486,7 @@ export class KoraSyncServer {
 	private handleSessionClose(sessionId: string): void {
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
+		this.yjsDocRelay.removeClient(sessionId)
 
 		this.sessions.delete(sessionId)
 
@@ -479,10 +497,7 @@ export class KoraSyncServer {
 		}
 	}
 
-	private handleAwarenessRelay(
-		sourceSessionId: string,
-		message: AwarenessUpdateMessage,
-	): void {
+	private handleAwarenessRelay(sourceSessionId: string, message: AwarenessUpdateMessage): void {
 		// Register client with awareness relay if not already done
 		const session = this.sessions.get(sourceSessionId)
 		if (!session) return
@@ -493,6 +508,13 @@ export class KoraSyncServer {
 		}
 		this.awarenessRelay.addClient(sourceSessionId, message.clientId, transport)
 		this.awarenessRelay.handleUpdate(sourceSessionId, message)
+	}
+
+	private handleYjsDocRelay(sourceSessionId: string, message: YjsDocUpdateMessage): void {
+		if (!this.sessions.has(sourceSessionId)) {
+			return
+		}
+		this.yjsDocRelay.handleUpdate(sourceSessionId, message)
 	}
 
 	private getOrCreateHttpClient(clientId: string): {

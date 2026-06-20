@@ -1,5 +1,5 @@
 import type { Operation, SchemaDefinition } from '@korajs/core'
-import { SyncError, generateProtoSchema } from '@korajs/core'
+import { SyncError, generateProtoDefinitions } from '@korajs/core'
 import protobuf from 'protobufjs'
 import type {
 	AcknowledgmentMessage,
@@ -68,7 +68,7 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			return this.compiled
 		}
 
-		const protoSource = generateProtoSchema(this.schema)
+		const protoSource = generateProtoDefinitions(this.schema).proto
 		const parsed = protobuf.parse(protoSource)
 		const root = parsed.root
 
@@ -193,6 +193,10 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			syncScopeJson: message.syncScope
 				? new TextEncoder().encode(JSON.stringify(message.syncScope))
 				: new Uint8Array(0),
+			deltaCursor: message.deltaCursor ?? '',
+			syncQueriesJson: message.syncQueries
+				? new TextEncoder().encode(JSON.stringify(message.syncQueries))
+				: new Uint8Array(0),
 		}
 	}
 
@@ -217,6 +221,8 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			operations: message.operations.map((op) => this.serializeOperation(op)),
 			isFinal: message.isFinal,
 			batchIndex: message.batchIndex,
+			cursor: message.cursor ?? '',
+			totalBatches: message.totalBatches ?? 0,
 		}
 	}
 
@@ -357,6 +363,22 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			}
 		}
 
+		let syncQueries: HandshakeMessage['syncQueries']
+		const syncQueriesJson = payload.syncQueriesJson as string | undefined
+		if (syncQueriesJson && syncQueriesJson.length > 0) {
+			try {
+				const decoded = atob(syncQueriesJson)
+				syncQueries = JSON.parse(decoded) as HandshakeMessage['syncQueries']
+			} catch {
+				// Ignore invalid query subset JSON
+			}
+		}
+
+		const deltaCursor =
+			typeof payload.deltaCursor === 'string' && payload.deltaCursor.length > 0
+				? payload.deltaCursor
+				: undefined
+
 		return {
 			type: 'handshake',
 			messageId: payload.messageId as string,
@@ -368,6 +390,8 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 				: {}),
 			...(supportedWireFormats && supportedWireFormats.length > 0 ? { supportedWireFormats } : {}),
 			...(syncScope ? { syncScope } : {}),
+			...(syncQueries && syncQueries.length > 0 ? { syncQueries } : {}),
+			...(deltaCursor ? { deltaCursor } : {}),
 		}
 	}
 
@@ -404,12 +428,21 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 
 	private fromOperationBatchPayload(payload: Record<string, unknown>): OperationBatchMessage {
 		const operations = (payload.operations as Array<Record<string, unknown>> | undefined) ?? []
+		const cursor =
+			typeof payload.cursor === 'string' && payload.cursor.length > 0 ? payload.cursor : undefined
+		const totalBatches =
+			typeof payload.totalBatches === 'number' && payload.totalBatches > 0
+				? payload.totalBatches
+				: undefined
+
 		return {
 			type: 'operation-batch',
 			messageId: payload.messageId as string,
 			operations: operations.map((op) => this.deserializeOperation(op)),
 			isFinal: (payload.isFinal as boolean) ?? false,
 			batchIndex: (payload.batchIndex as number) ?? 0,
+			...(cursor ? { cursor } : {}),
+			...(totalBatches !== undefined ? { totalBatches } : {}),
 		}
 	}
 

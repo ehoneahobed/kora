@@ -65,3 +65,15 @@ export function richtextToPlainText(value: RichtextInput): string {
 	Y.applyUpdate(doc, encoded)
 	return doc.getText(TEXT_KEY).toString()
 }
+
+/**
+ * Compares two richtext values by decoded plain text.
+ * Yjs update bytes are not stable across separate encodes of the same string.
+ */
+export function richtextStatesEqual(a: unknown, b: unknown): boolean {
+	try {
+		return richtextToPlainText(a as RichtextInput) === richtextToPlainText(b as RichtextInput)
+	} catch {
+		return false
+	}
+}

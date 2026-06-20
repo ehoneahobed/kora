@@ -20,6 +20,8 @@ function field(
 		auto: false,
 		enumValues: null,
 		itemKind: null,
+		mergeStrategy: null,
+		transitions: null,
 		...overrides,
 	}
 }

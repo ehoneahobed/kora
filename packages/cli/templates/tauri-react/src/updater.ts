@@ -19,20 +19,20 @@ let updateChecked = false
  * Silently skips if the updater is not configured (empty endpoints/pubkey).
  */
 export async function checkForUpdates(): Promise<void> {
-  if (updateChecked) return
-  updateChecked = true
+	if (updateChecked) return
+	updateChecked = true
 
-  try {
-    const { check } = await import('@tauri-apps/plugin-updater')
-    const update = await check()
-    if (update) {
-      console.log(`Update available: v${update.version}`)
-      // Download and install — the app will restart automatically
-      await update.downloadAndInstall()
-    }
-  } catch (err) {
-    // Updater not configured or network unavailable — this is fine.
-    // The app works fully offline; updates are best-effort.
-    console.debug('Update check skipped:', err)
-  }
+	try {
+		const { check } = await import('@tauri-apps/plugin-updater')
+		const update = await check()
+		if (update) {
+			console.log(`Update available: v${update.version}`)
+			// Download and install — the app will restart automatically
+			await update.downloadAndInstall()
+		}
+	} catch (err) {
+		// Updater not configured or network unavailable — this is fine.
+		// The app works fully offline; updates are best-effort.
+		console.debug('Update check skipped:', err)
+	}
 }

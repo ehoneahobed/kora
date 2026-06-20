@@ -67,7 +67,32 @@ function handleQuery(id: number, sql: string, params?: unknown[]): void {
 	}
 }
 
-async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
+function opfsDatabaseFilename(dbName: string): string {
+	const base = dbName.replace(/[^a-zA-Z0-9._-]/g, '_')
+	return base.endsWith('.db') ? base : `${base}.db`
+}
+
+/** Headless browsers and some profiles hang on OPFS VFS install; fall back to memory. */
+const OPFS_INIT_TIMEOUT_MS = 10_000
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<T>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+					timeoutMs,
+				)
+			}),
+		])
+	} finally {
+		if (timer !== undefined) clearTimeout(timer)
+	}
+}
+
+async function handleOpen(id: number, ddlStatements: string[], dbName?: string): Promise<void> {
 	try {
 		const sqlite3InitModule = (await import('@sqlite.org/sqlite-wasm')).default
 
@@ -91,18 +116,26 @@ async function handleOpen(id: number, ddlStatements: string[]): Promise<void> {
 		const initFn = sqlite3InitModule as unknown as (
 			opts?: Record<string, unknown>,
 		) => Promise<unknown>
-		const sqlite3 = (await initFn(initOptions)) as Awaited<ReturnType<typeof sqlite3InitModule>>
+		const sqlite3 = (await withTimeout(
+			initFn(initOptions),
+			60_000,
+			'SQLite3 module init',
+		)) as Awaited<ReturnType<typeof sqlite3InitModule>>
 		sqlite3Api = sqlite3
 
 		// Try OPFS persistence first
 		let useOpfs = false
 		if (sqlite3.installOpfsSAHPoolVfs) {
 			try {
-				const pool = await sqlite3.installOpfsSAHPoolVfs({ name: 'kora-opfs' })
-				db = new pool.OpfsSAHPoolDb('kora.db')
+				const pool = await withTimeout(
+					sqlite3.installOpfsSAHPoolVfs({ name: 'kora-opfs' }),
+					OPFS_INIT_TIMEOUT_MS,
+					'OPFS VFS install',
+				)
+				db = new pool.OpfsSAHPoolDb(opfsDatabaseFilename(dbName ?? 'kora-db'))
 				useOpfs = true
 			} catch {
-				// OPFS unavailable, fall back to in-memory
+				// OPFS unavailable or too slow (common in headless CI), fall back to in-memory
 				console.warn('[kora] OPFS unavailable, falling back to in-memory SQLite')
 			}
 		}
@@ -198,7 +231,7 @@ function handleMessage(request: WorkerRequest): void {
 		switch (request.type) {
 			case 'open':
 				// open is async due to WASM loading
-				handleOpen(request.id, request.ddlStatements)
+				handleOpen(request.id, request.ddlStatements, request.dbName)
 				return
 			case 'close':
 				handleClose(request.id)

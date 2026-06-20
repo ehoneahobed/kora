@@ -307,6 +307,19 @@ describe('JsonMessageSerializer', () => {
 			serialized.causalDeps.push('dep-2')
 			expect(decoded.causalDeps).toEqual(['dep-1'])
 		})
+
+		test('roundtrips richtext Uint8Array fields in data and previousData', () => {
+			const bytes = new Uint8Array([1, 2, 3, 99])
+			const op = makeOperation({
+				type: 'update',
+				data: { body: bytes },
+				previousData: { body: new Uint8Array([1, 2, 3]) },
+			})
+			const decoded = serializer.decodeOperation(serializer.encodeOperation(op))
+			expect(decoded.data?.body).toBeInstanceOf(Uint8Array)
+			expect(decoded.previousData?.body).toBeInstanceOf(Uint8Array)
+			expect(Array.from(decoded.data?.body as Uint8Array)).toEqual([1, 2, 3, 99])
+		})
 	})
 
 	describe('large batch', () => {

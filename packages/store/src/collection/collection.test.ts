@@ -24,8 +24,11 @@ describe('Collection', () => {
 			adapter,
 			clock,
 			nodeId,
-			() => ++seq,
+			async () => ++seq,
 			(col, op) => mutations.push({ collection: col, operation: op }),
+			null,
+			null,
+			null,
 		)
 	}
 

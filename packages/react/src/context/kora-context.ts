@@ -83,6 +83,8 @@ function KoraProvider({
 		store: resolvedStore,
 		syncEngine: resolvedSync,
 		app: app ?? null,
+		events: app?.events ?? null,
+		subscribeSyncStatus: app?.sync?.subscribeStatus ?? null,
 	}
 	return createElement(KoraContext.Provider, { value }, children)
 }

@@ -1,5 +1,14 @@
+import type { KoraEventEmitter } from '@korajs/core'
 import type { StorageAdapter } from '@korajs/store'
 import type { AdapterType } from './types'
+
+/** Dynamic import that bundlers cannot statically analyze (optional peer packages). */
+function importOptionalPeer<T>(specifier: string): Promise<T> {
+	const dynamicImport = new Function('specifier', 'return import(specifier)') as (
+		s: string,
+	) => Promise<T>
+	return dynamicImport(specifier)
+}
 
 /**
  * Detect the best storage adapter for the current environment.
@@ -48,14 +57,17 @@ export async function createAdapter(
 	type: AdapterType,
 	dbName: string,
 	workerUrl?: string | URL,
+	emitter?: KoraEventEmitter,
+	workerResponseTimeoutMs?: number,
+	sharedWorkerUrl?: string | URL,
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
 			// @korajs/tauri is only installed in Tauri projects (optional peer dep).
-			// This code path only runs when __TAURI_INTERNALS__ is detected.
-			// Using @vite-ignore so Vite doesn't statically analyze this import —
-			// it will still resolve it at runtime through Vite's dev server.
-			const { TauriSqliteAdapter } = await import(/* @vite-ignore */ '@korajs/tauri')
+			// Runtime import via Function so Vite/Rollup do not pre-bundle or resolve the module.
+			const { TauriSqliteAdapter } = await importOptionalPeer<{
+				TauriSqliteAdapter: new (options: { path: string }) => StorageAdapter
+			}>('@korajs/tauri')
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {
@@ -66,11 +78,11 @@ export async function createAdapter(
 		}
 		case 'sqlite-wasm': {
 			const { SqliteWasmAdapter } = await import('@korajs/store/sqlite-wasm')
-			return new SqliteWasmAdapter({ dbName, workerUrl })
+			return new SqliteWasmAdapter({ dbName, workerUrl, sharedWorkerUrl, workerResponseTimeoutMs })
 		}
 		case 'indexeddb': {
 			const { IndexedDbAdapter } = await import('@korajs/store/indexeddb')
-			return new IndexedDbAdapter({ dbName, workerUrl })
+			return new IndexedDbAdapter({ dbName, workerUrl, emitter, workerResponseTimeoutMs })
 		}
 		default: {
 			const _exhaustive: never = type

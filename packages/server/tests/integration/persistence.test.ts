@@ -1,9 +1,9 @@
-import type { Operation } from '@korajs/core'
-import Database from 'better-sqlite3'
-import { drizzle } from 'drizzle-orm/better-sqlite3'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import type { Operation } from '@korajs/core'
+import Database from 'better-sqlite3'
+import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { SqliteServerStore } from '../../src/store/sqlite-server-store'
 
@@ -37,7 +37,10 @@ describe('SqliteServerStore persistence', () => {
 		fs.rmSync(tmpDir, { recursive: true, force: true })
 	})
 
-	function openStore(nodeId?: string): { store: SqliteServerStore; sqlite: InstanceType<typeof Database> } {
+	function openStore(nodeId?: string): {
+		store: SqliteServerStore
+		sqlite: InstanceType<typeof Database>
+	} {
 		const sqlite = new Database(dbPath)
 		sqlite.pragma('journal_mode = WAL')
 		const db = drizzle(sqlite)

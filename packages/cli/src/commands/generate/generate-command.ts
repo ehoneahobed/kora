@@ -5,6 +5,8 @@ import { defineCommand } from 'citty'
 import { InvalidProjectError, SchemaNotFoundError } from '../../errors'
 import { findProjectRoot, findSchemaFile } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
+import { loadSchemaDefinition } from '../migrate/schema-loader'
+import { generateCollectionHooks } from './hook-generator'
 import { generateTypes } from './type-generator'
 
 /**
@@ -80,6 +82,71 @@ export const generateCommand = defineCommand({
 				await writeFile(outputPath, output, 'utf-8')
 
 				logger.success(`Generated types at ${outputPath}`)
+			},
+		}),
+		hooks: defineCommand({
+			meta: {
+				name: 'hooks',
+				description: 'Generate per-collection React hook stubs',
+			},
+			args: {
+				schema: {
+					type: 'string',
+					description: 'Path to schema file',
+				},
+				output: {
+					type: 'string',
+					description: 'Output directory for hooks',
+					default: 'kora/generated/hooks',
+				},
+				types: {
+					type: 'string',
+					description: 'Relative import path to generated types from hook files',
+					default: '../types',
+				},
+			},
+			async run({ args }) {
+				const logger = createLogger()
+				const projectRoot = await findProjectRoot()
+				if (!projectRoot) {
+					throw new InvalidProjectError(process.cwd())
+				}
+
+				let schemaPath: string
+				if (args.schema && typeof args.schema === 'string') {
+					schemaPath = resolve(projectRoot, args.schema)
+				} else {
+					const found = await findSchemaFile(projectRoot)
+					if (!found) {
+						throw new SchemaNotFoundError([
+							'src/schema.ts',
+							'schema.ts',
+							'src/schema.js',
+							'schema.js',
+						])
+					}
+					schemaPath = found
+				}
+
+				const schema = await loadSchemaDefinition(schemaPath, projectRoot)
+				const outputDir =
+					typeof args.output === 'string'
+						? resolve(projectRoot, args.output)
+						: resolve(projectRoot, 'kora/generated/hooks')
+
+				const files = generateCollectionHooks(schema)
+				for (const [name, content] of files) {
+					const adjusted =
+						typeof args.types === 'string' && args.types !== '../types'
+							? content.replace("from '../types'", `from '${args.types}'`)
+							: content
+					const filePath = resolve(outputDir, name)
+					await mkdir(dirname(filePath), { recursive: true })
+					await writeFile(filePath, adjusted, 'utf-8')
+				}
+
+				logger.success(`Generated ${String(files.size)} hook file(s) at ${outputDir}`)
+				logger.step('Run `kora generate types` first if ../types is missing.')
 			},
 		}),
 	},

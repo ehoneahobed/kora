@@ -36,20 +36,18 @@ const syncServer = new KoraSyncServer({ store, auth })
 
 ### Client Setup
 
-Return an empty token when the user isn't signed in. The server accepts empty tokens as anonymous connections:
+Return an empty token when the user isn't signed in. The server accepts empty tokens as anonymous connections. **`createKoraAuthSync`** handles this automatically:
 
 ```typescript
 import { createApp } from 'korajs'
+import { createKoraAuthSync } from '@korajs/auth'
 import { authClient } from './auth'
 
 const app = createApp({
   schema,
   sync: {
     url: syncUrl,
-    auth: async () => ({
-      // Returns token if authenticated, empty string for anonymous sync
-      token: (await authClient.getAccessToken()) ?? '',
-    }),
+    authClient: createKoraAuthSync({ authClient, schema }),
   },
 })
 ```

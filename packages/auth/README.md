@@ -17,6 +17,7 @@ Offline-first authentication for Kora.js applications.
 - **Passkeys (WebAuthn)** -- passwordless authentication with platform authenticators
 - **Encrypted token storage** -- AES-256-GCM encryption for sensitive environments
 - **End-to-end encryption** -- encrypt operation data before sync with `OperationEncryptor`
+- **Sync auth binding** -- `createKoraAuthSync()` wires tokens, JWT scopes, and device node ids to `createApp`
 
 The client APIs work in browser, Tauri desktop WebView, and mobile JavaScript environments. For desktop apps, run auth routes on your remote sync/auth server and point `AuthClient.serverUrl` at that server. Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC work across web and desktop clients. Passkeys should be feature-detected because WebAuthn support depends on the operating system WebView.
 
@@ -85,6 +86,21 @@ function MyApp() {
 }
 ```
 
+### Sync integration
+
+```tsx
+import { createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'ws://localhost:3001/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
 ### Server-side
 
 ```typescript
@@ -140,6 +156,7 @@ const syncServer = new KoraSyncServer({
 | Export | Description |
 |--------|-------------|
 | `createKoraAuth` | Quickstart client factory with storage and device identity defaults |
+| `createKoraAuthSync` | Sync auth binding for `createApp({ sync: { authClient } })` |
 | `AuthClient` | Client-side auth manager (sign-up, sign-in, sign-out, token refresh) |
 | `OrgClient` | Client-side organization management |
 | `TokenStore` | Client-side token persistence (localStorage) |

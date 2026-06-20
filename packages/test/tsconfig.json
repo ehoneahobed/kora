@@ -2,7 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "."
+    "rootDirs": [".", "../../kora/src"],
+    "paths": {
+      "korajs": ["../../kora/src/index.ts"],
+      "korajs/testing": ["../../kora/src/testing.ts"]
+    }
   },
   "include": ["src", "tests"]
 }

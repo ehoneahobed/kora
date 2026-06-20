@@ -4,19 +4,19 @@
  * Tests the flow: create org → invite member → accept invitation → role checks →
  * scope resolution for sync filtering.
  */
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import {
-	BuiltInAuthRoutes,
-	InMemoryUserStore,
-	TokenManager,
-	OrgRoutes,
-	InMemoryOrgStore,
-	RbacEngine,
-	OrgScopeResolver,
 	BUILT_IN_ROLES,
+	BuiltInAuthRoutes,
+	InMemoryOrgStore,
+	InMemoryUserStore,
+	OrgRoutes,
+	OrgScopeResolver,
+	RbacEngine,
+	TokenManager,
 } from '../../src/server'
 import type { OrgStore } from '../../src/server'
-import type { Organization, OrgInvitation, Membership } from '../../src/server'
+import type { Membership, OrgInvitation, Organization } from '../../src/server'
 
 describe('Organization + RBAC integration', () => {
 	let userStore: InstanceType<typeof InMemoryUserStore>
@@ -258,8 +258,8 @@ describe('Organization + RBAC integration', () => {
 		// Owner should have scopes
 		expect(scopes).not.toBeNull()
 		// Scopes include orgId-based filtering
-		expect(scopes!['todos']).toBeDefined()
-		expect(scopes!['projects']).toBeDefined()
+		expect(scopes!.todos).toBeDefined()
+		expect(scopes!.projects).toBeDefined()
 	})
 
 	test('OrgScopeResolver returns null for non-member', async () => {

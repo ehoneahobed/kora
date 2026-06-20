@@ -1,5 +1,5 @@
 import { HybridLogicalClock, createOperation, defineSchema, t } from '@korajs/core'
-import { describe, expect, test, beforeEach, afterEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from './store'
 

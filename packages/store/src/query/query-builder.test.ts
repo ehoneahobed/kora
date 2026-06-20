@@ -31,8 +31,11 @@ describe('QueryBuilder', () => {
 			adapter,
 			clock,
 			nodeId,
-			() => ++seq,
+			async () => ++seq,
 			(col, op) => subManager.notify(col, op),
+			null,
+			null,
+			null,
 		)
 	})
 

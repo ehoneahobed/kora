@@ -150,6 +150,20 @@ describe('OutboundQueue', () => {
 		await queue.acknowledge('unknown-batch')
 	})
 
+	test('removeByIds drops ops from queue and storage', async () => {
+		const storage = new MemoryQueueStorage()
+		const queue = new OutboundQueue(storage)
+		await queue.initialize()
+
+		await queue.enqueue(makeOp('op-1', 1))
+		await queue.enqueue(makeOp('op-2', 2))
+		await queue.removeByIds(['op-1'])
+
+		expect(queue.size).toBe(1)
+		expect(queue.peek(1)[0]?.id).toBe('op-2')
+		expect(await storage.count()).toBe(1)
+	})
+
 	test('returnBatch restores operations to queue', async () => {
 		const queue = new OutboundQueue(new MemoryQueueStorage())
 		await queue.initialize()

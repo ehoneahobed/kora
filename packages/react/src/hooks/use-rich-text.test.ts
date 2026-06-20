@@ -1,4 +1,6 @@
 import type { CollectionAccessor, Store } from '@korajs/store'
+import type { SyncEngine } from '@korajs/sync'
+import { AwarenessManager } from '@korajs/sync'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { createElement, useEffect } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
@@ -20,6 +22,30 @@ function decodeText(value: Uint8Array): string {
 	const doc = new Y.Doc()
 	Y.applyUpdate(doc, value)
 	return doc.getText('content').toString()
+}
+
+function createQueryBuilderMock(initialResults: Array<Record<string, unknown>> = []) {
+	return {
+		where: vi.fn(function where() {
+			return this
+		}),
+		orderBy: vi.fn(function orderBy() {
+			return this
+		}),
+		limit: vi.fn(function limit() {
+			return this
+		}),
+		offset: vi.fn(function offset() {
+			return this
+		}),
+		exec: vi.fn(async () => initialResults),
+		count: vi.fn(async () => initialResults.length),
+		subscribe: vi.fn((callback: (results: Array<Record<string, unknown>>) => void) => {
+			callback(initialResults)
+			return () => {}
+		}),
+		getDescriptor: vi.fn(),
+	}
 }
 
 function createMockStore(collections: Record<string, CollectionAccessor>): Store {
@@ -44,7 +70,7 @@ describe('useRichText', () => {
 			update: vi.fn(),
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: encodeText('Hello') }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -68,7 +94,7 @@ describe('useRichText', () => {
 			update: updateSpy,
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -102,7 +128,7 @@ describe('useRichText', () => {
 			update: vi.fn(async () => ({ id: 'rec-1' })),
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -142,7 +168,7 @@ describe('useRichText', () => {
 			update: updateSpy,
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -176,5 +202,56 @@ describe('useRichText', () => {
 		const body = lastCall?.[1] as { body?: Uint8Array }
 		expect(body.body).toBeInstanceOf(Uint8Array)
 		expect(decodeText(body.body as Uint8Array)).toBe('x'.repeat(25))
+	})
+
+	test('setCursor publishes awareness state for the active field', async () => {
+		const awareness = new AwarenessManager()
+		const setLocalState = vi.spyOn(awareness, 'setLocalState')
+		const syncEngine = { getAwarenessManager: () => awareness } as unknown as SyncEngine
+
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: encodeText('') })),
+			update: vi.fn(async () => ({ id: 'rec-1' })),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: encodeText('') }])),
+		} as unknown as CollectionAccessor
+
+		const store = createMockStore({ notes })
+
+		function Probe(): ReturnType<typeof createElement> {
+			const { ready, setCursor } = useRichText('notes', 'rec-1', 'body', {
+				user: { name: 'Ada', color: '#ff0000' },
+			})
+
+			useEffect(() => {
+				if (!ready) return
+				setCursor(2, 4)
+			}, [ready, setCursor])
+
+			return createElement('span', { 'data-testid': 'ready' }, ready ? 'yes' : 'no')
+		}
+
+		render(createElement(KoraProvider, { store, syncEngine }, createElement(Probe)))
+
+		await waitFor(
+			() => {
+				expect(screen.getByTestId('ready').textContent).toBe('yes')
+			},
+			{ timeout: 5000 },
+		)
+
+		expect(setLocalState).toHaveBeenCalledWith(
+			expect.objectContaining({
+				user: { name: 'Ada', color: '#ff0000' },
+				cursor: {
+					collection: 'notes',
+					recordId: 'rec-1',
+					field: 'body',
+					anchor: 2,
+					head: 4,
+				},
+			}),
+		)
 	})
 })

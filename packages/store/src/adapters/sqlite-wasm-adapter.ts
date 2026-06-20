@@ -1,6 +1,13 @@
 import { generateFullDDL } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 import { AdapterError, StoreNotOpenError } from '../errors'
+import { SharedWorkerClientBridge } from '../multi-tab/shared-worker-bridge'
+import {
+	FollowerBroadcastBridge,
+	acquireTabStorageSession,
+	isSharedWorkerStorageSupported,
+	startLeaderRpcRelay,
+} from '../multi-tab/tab-storage'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
 import { Mutex } from './sqlite-wasm-channel'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -24,6 +31,16 @@ export interface SqliteWasmAdapterOptions {
 	 * URL to the sqlite-wasm-worker script. Required in browsers if no bridge is provided.
 	 */
 	workerUrl?: string | URL
+
+	/** Timeout for worker / follower RPC responses. Defaults to 30000ms. */
+	workerResponseTimeoutMs?: number
+
+	/**
+	 * Optional SharedWorker host script (`sqlite-wasm-shared-host`). When set and
+	 * {@link isSharedWorkerStorageSupported}, one DedicatedWorker per `dbName` is pooled per origin.
+	 * Requires `workerUrl` for the inner SQLite worker. Falls back to leader election when omitted.
+	 */
+	sharedWorkerUrl?: string | URL
 }
 
 /**
@@ -48,11 +65,17 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly mutex = new Mutex()
 	private readonly injectedBridge: WorkerBridge | undefined
 	private readonly workerUrl: string | URL | undefined
+	private readonly sharedWorkerUrl: string | URL | undefined
+	private readonly workerResponseTimeoutMs: number
 	private readonly dbName: string
+	private tabSession: Awaited<ReturnType<typeof acquireTabStorageSession>> | null = null
+	private sharedWorker: SharedWorker | null = null
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
 		this.workerUrl = options.workerUrl
+		this.sharedWorkerUrl = options.sharedWorkerUrl
+		this.workerResponseTimeoutMs = options.workerResponseTimeoutMs ?? 30_000
 		this.dbName = options.dbName ?? 'kora-db'
 	}
 
@@ -61,10 +84,27 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 		if (this.injectedBridge) {
 			this.bridge = this.injectedBridge
+		} else if (this.sharedWorkerUrl && this.workerUrl && isSharedWorkerStorageSupported()) {
+			const workerUrlString =
+				typeof this.workerUrl === 'string' ? this.workerUrl : this.workerUrl.href
+			const sharedUrl =
+				typeof this.sharedWorkerUrl === 'string' ? this.sharedWorkerUrl : this.sharedWorkerUrl.href
+			this.sharedWorker = new SharedWorker(sharedUrl, { name: `kora-sw-${this.dbName}` })
+			this.bridge = new SharedWorkerClientBridge(this.sharedWorker, this.dbName, workerUrlString)
 		} else if (this.workerUrl) {
-			// Dynamic import to avoid loading WebWorkerBridge in Node.js
+			this.tabSession = await acquireTabStorageSession(this.dbName)
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
-			this.bridge = new WebWorkerBridge(this.workerUrl)
+
+			if (this.tabSession.role === 'leader') {
+				const workerBridge = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs)
+				this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
+				this.bridge = workerBridge
+			} else {
+				this.bridge = new FollowerBroadcastBridge(
+					this.tabSession.channelName,
+					this.workerResponseTimeoutMs,
+				)
+			}
 		} else {
 			throw new AdapterError(
 				'SqliteWasmAdapter requires either a bridge (for testing) or a workerUrl (for browsers). ' +
@@ -73,7 +113,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 
 		const ddlStatements = generateFullDDL(schema)
-		const response = await this.sendRequest({ id: 0, type: 'open', ddlStatements })
+		const response = await this.sendRequest({
+			id: 0,
+			type: 'open',
+			ddlStatements,
+			dbName: this.dbName,
+		})
 		if (response.type === 'error') {
 			throw new AdapterError(`Failed to open database: ${response.message}`, {
 				code: response.code,
@@ -89,6 +134,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		try {
 			await this.sendRequest({ id: 0, type: 'close' })
 		} finally {
+			this.tabSession?.stopRelay?.()
+			if (this.tabSession?.releaseLock) {
+				await this.tabSession.releaseLock()
+			}
+			this.tabSession = null
+			this.sharedWorker = null
 			this.bridge.terminate()
 			this.bridge = null
 			this.opened = false

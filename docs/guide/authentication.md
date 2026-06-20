@@ -236,7 +236,34 @@ The sync auth provider:
 - Checks device revocation status (revoked devices are rejected even if their tokens have not expired)
 - Updates the device's `lastSeenAt` timestamp on each connection
 
-On the client side, pass the auth client's token getter to the sync configuration:
+On the client side, wire auth to sync with **`createKoraAuthSync()`** (recommended):
+
+```typescript
+import { createApp } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { authClient } from './auth'
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+`createKoraAuthSync()` returns an `AuthSyncBinding` that `createApp` understands. It:
+
+- Calls `authClient.getAccessToken()` on every connection attempt (auto-refresh included)
+- Builds a per-collection **scope map** from JWT claims and your schema's `scope` declarations
+- Sets the store **sync node id** from the JWT `dev` claim (device), separate from the user id (`sub`)
+- Reconnects and refreshes scope when auth state changes (sign-in, sign-out, token refresh)
+
+When the user is signed out, the binding returns an empty token. Use this with `MixedAuthProvider` on the server for anonymous + authenticated sync.
+
+#### Manual auth wiring (advanced)
+
+If you need custom token logic, pass `sync.auth` directly:
 
 ```typescript
 import { createApp } from 'korajs'
@@ -248,13 +275,40 @@ const app = createApp({
     url: 'wss://my-server.com/kora-sync',
     auth: async () => {
       const token = await authClient.getAccessToken()
-      return token ? { token } : {}
+      return token ? { token } : { token: '' }
     },
   },
 })
 ```
 
+Do not pass both `auth` and `authClient` — `authClient` takes precedence when both are set.
+
 The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
+
+#### Automatic scope from JWT claims
+
+When you pass `schema` to `createKoraAuthSync()`, Kora extracts flat scope values from the access token using `extractScopeValuesFromClaims()` and builds the handshake scope map with `buildScopeMap()`:
+
+| Claim source | Maps to scope field |
+|--------------|---------------------|
+| Top-level claim matching a schema scope field (e.g. `orgId`) | That field |
+| Nested `claims.scope[field]` | That field |
+| JWT `sub` | `userId` when `userId` is a scope field |
+
+Override mapping with `scopeFromClaims`:
+
+```typescript
+createKoraAuthSync({
+  authClient,
+  schema,
+  scopeFromClaims: (claims) => ({
+    userId: claims.sub as string,
+    orgId: (claims.org_id as string) ?? 'default-org',
+  }),
+})
+```
+
+For static scope values unrelated to the token, use `sync.scope` instead (merged only when no auth binding resolves scope).
 
 ### Desktop and Tauri apps
 
@@ -265,9 +319,12 @@ The normal desktop setup is:
 1. Deploy a remote sync/auth server.
 2. Set `KORA_AUTH_SECRET` on that server to enable built-in `/auth/*` routes.
 3. Create a Kora auth client in the Tauri frontend with the same server origin.
-4. Pass `authClient.getAccessToken()` to `createApp({ sync: { auth } })`.
+4. Pass `createKoraAuthSync({ authClient, schema })` to `createApp({ sync: { authClient } })`.
 
 ```typescript
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
 const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
 })
@@ -276,9 +333,7 @@ const app = createApp({
   schema,
   sync: {
     url: 'wss://acme.example.com/kora-sync',
-    auth: async () => ({
-      token: (await authClient.getAccessToken()) ?? '',
-    }),
+    authClient: createKoraAuthSync({ authClient, schema }),
   },
 })
 ```
@@ -354,13 +409,13 @@ const syncServer = new KoraSyncServer({
 })
 ```
 
-On the client, return an empty token for unauthenticated users:
+On the client, return an empty token for unauthenticated users. `createKoraAuthSync` does this automatically; with manual wiring:
 
 ```typescript
 sync: {
-  auth: async () => ({
-    token: (await authClient.getAccessToken()) ?? '',
-  }),
+  authClient: createKoraAuthSync({ authClient, schema }),
+  // or manually:
+  // auth: async () => ({ token: (await authClient.getAccessToken()) ?? '' }),
 }
 ```
 

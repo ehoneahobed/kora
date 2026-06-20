@@ -1,7 +1,7 @@
 import { test } from '@fast-check/vitest'
 import { fc } from '@fast-check/vitest'
-import { describe, expect } from 'vitest'
 import type { Operation } from '@korajs/core'
+import { describe, expect } from 'vitest'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 
 // --- Arbitraries ---
@@ -32,20 +32,23 @@ const operationArb = fc
 const operationsArb = fc.array(operationArb, { minLength: 1, maxLength: 50 })
 
 describe('Property-based server correctness', () => {
-	test.prop([operationArb])('dedup idempotency: applying same op multiple times equals once', async (op) => {
-		const store = new MemoryServerStore('server-1')
+	test.prop([operationArb])(
+		'dedup idempotency: applying same op multiple times equals once',
+		async (op) => {
+			const store = new MemoryServerStore('server-1')
 
-		const result1 = await store.applyRemoteOperation(op)
-		expect(result1).toBe('applied')
+			const result1 = await store.applyRemoteOperation(op)
+			expect(result1).toBe('applied')
 
-		const result2 = await store.applyRemoteOperation(op)
-		expect(result2).toBe('duplicate')
+			const result2 = await store.applyRemoteOperation(op)
+			expect(result2).toBe('duplicate')
 
-		const result3 = await store.applyRemoteOperation(op)
-		expect(result3).toBe('duplicate')
+			const result3 = await store.applyRemoteOperation(op)
+			expect(result3).toBe('duplicate')
 
-		expect(await store.getOperationCount()).toBe(1)
-	})
+			expect(await store.getOperationCount()).toBe(1)
+		},
+	)
 
 	test.prop([operationsArb])('version vector never regresses', async (ops) => {
 		const store = new MemoryServerStore('server-1')

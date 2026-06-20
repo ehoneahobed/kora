@@ -47,6 +47,7 @@ for (const { name, factory, freshFactory } of adapters) {
 			const names = tables.map((t) => t.name)
 			expect(names).toContain('_kora_meta')
 			expect(names).toContain('_kora_version_vector')
+			expect(names).toContain('_kora_audit_traces')
 			expect(names).toContain('todos')
 			expect(names).toContain('_kora_ops_todos')
 		})

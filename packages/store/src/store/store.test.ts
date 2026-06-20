@@ -293,4 +293,43 @@ describe('Store', () => {
 			expect(ops[0]?.collection).toBe('todos')
 		})
 	})
+
+	describe('getLatestOperationForRecord', () => {
+		test('returns op with greatest HLC across all nodes', async () => {
+			const recordId = 'rec-latest-op-test'
+			const localInsert = {
+				id: 'local-insert-op-id',
+				nodeId: 'test-node',
+				type: 'insert' as const,
+				collection: 'todos',
+				recordId,
+				data: { title: 'Local', completed: false },
+				previousData: null,
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'test-node' },
+				sequenceNumber: 1,
+				causalDeps: [] as string[],
+				schemaVersion: 1,
+			}
+			await store.applyRemoteOperation(localInsert)
+
+			const remoteUpdate = {
+				id: 'remote-update-op-id',
+				nodeId: 'remote-node',
+				type: 'update' as const,
+				collection: 'todos',
+				recordId,
+				data: { title: 'Remote later' },
+				previousData: { title: 'Local', completed: false },
+				timestamp: { wallTime: 5000, logical: 0, nodeId: 'remote-node' },
+				sequenceNumber: 1,
+				causalDeps: [] as string[],
+				schemaVersion: 1,
+			}
+			await store.applyRemoteOperation(remoteUpdate)
+
+			const latest = await store.getLatestOperationForRecord('todos', recordId)
+			expect(latest?.nodeId).toBe('remote-node')
+			expect(latest?.type).toBe('update')
+		})
+	})
 })

@@ -64,7 +64,7 @@ Set `KORA_AUTH_SECRET` to enable built-in auth on the sync server. Generate a se
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-The template already creates `src/auth.ts`, wraps the app in `AuthProvider`, and passes `authClient.getAccessToken()` into sync. To enable Google OAuth, set:
+The template already creates `src/auth.ts`, wraps the app in `AuthProvider`, and wires sync with `createKoraAuthSync({ authClient, schema })`. To enable Google OAuth, set:
 
 ```bash
 KORA_AUTH_SECRET=...

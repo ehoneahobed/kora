@@ -40,6 +40,25 @@
 					}
 				}
 			}
+		},
+		{
+			"include": [
+				"**/*.test.ts",
+				"**/*.test.tsx",
+				"**/tests/**",
+				"e2e/**",
+				"packages/cli/templates/**"
+			],
+			"linter": {
+				"rules": {
+					"style": {
+						"noNonNullAssertion": "off"
+					},
+					"a11y": {
+						"useButtonType": "off"
+					}
+				}
+			}
 		}
 	]
 }

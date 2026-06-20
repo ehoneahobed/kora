@@ -250,13 +250,13 @@ export const authClient = createKoraAuth({
 Pass the auth token into sync when creating the Kora app:
 
 ```typescript
+import { createKoraAuthSync } from '@korajs/auth'
+
 const app = createApp({
   schema,
   sync: {
     url: 'wss://acme-corp.example.com/kora-sync',
-    auth: async () => ({
-      token: (await authClient.getAccessToken()) ?? '',
-    }),
+    authClient: createKoraAuthSync({ authClient, schema }),
   },
 })
 ```

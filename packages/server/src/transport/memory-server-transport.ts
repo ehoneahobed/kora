@@ -49,7 +49,7 @@ export class MemoryServerTransport implements ServerTransport {
 
 	send(message: SyncMessage): void {
 		if (!this.connected) {
-			throw new Error('Cannot send message: server transport is not connected')
+			return
 		}
 		this.sentMessages.push(message)
 		this.sendToClient?.(message)

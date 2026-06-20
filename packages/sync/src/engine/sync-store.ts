@@ -1,9 +1,6 @@
-import type { Operation, VersionVector } from '@korajs/core'
+import type { ApplyFailureReason, ApplyResult, Operation, VersionVector } from '@korajs/core'
 
-/**
- * Result of applying a remote operation to the store.
- */
-export type ApplyResult = 'applied' | 'duplicate' | 'skipped'
+export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
 
 /**
  * Interface that the local store must implement for sync.

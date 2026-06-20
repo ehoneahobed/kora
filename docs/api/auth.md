@@ -15,6 +15,7 @@ The package exposes three entry points:
 ```typescript
 import {
   createKoraAuth,
+  createKoraAuthSync,
   AuthClient,
   AuthError,
   OrgClient,
@@ -146,7 +147,7 @@ await auth.completeOAuthSignIn('google', {
 })
 ```
 
-For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `auth.getAccessToken()` into Kora sync auth. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
+For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `createKoraAuthSync({ authClient, schema })` to `createApp({ sync: { authClient } })`. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
 
 For desktop and mobile production apps, prefer `createKoraAuth()` with a secure credential store:
 
@@ -161,6 +162,48 @@ const auth = createKoraAuth({
 ```
 
 The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store. `createKoraAuth()` also binds sessions to a stable offline device automatically when persistent key storage exists.
+
+### `createKoraAuthSync(options)`
+
+Creates an `AuthSyncBinding` for `createApp({ sync: { authClient } })`. Wires `@korajs/auth` to Kora sync with minimal boilerplate.
+
+```typescript
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://localhost:3001/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `authClient` | `AuthSyncClient` | Yes | Auth client with `getAccessToken()` (and optional `onAuthChange`) |
+| `schema` | `SchemaDefinition` | No | When set, builds scope map from JWT claims via `extractScopeValuesFromClaims()` |
+| `scopeFromClaims` | `(claims) => Record<string, unknown>` | No | Custom claim → flat scope value mapping |
+
+Returns `KoraAuthSyncBinding`:
+
+| Method | Description |
+|--------|-------------|
+| `auth()` | Returns `{ token }` for sync handshake; empty string when signed out |
+| `resolveScopeMap?()` | Builds per-collection scope map from current token + schema |
+| `resolveNodeId?()` | Returns JWT `dev` claim as device-bound sync node id |
+| `subscribe?(listener)` | Notifies on auth state change so `createApp` can reconnect |
+
+When `schema` is provided, scope values are extracted from:
+
+1. Top-level JWT claims matching schema scope field names
+2. Nested `claims.scope` object
+3. JWT `sub` → `userId` when `userId` is a declared scope field
+
+The store's sync node id is set from the token `dev` claim, keeping device identity separate from the user id (`sub`).
 
 ### Lower-Level Storage Adapters
 

@@ -50,6 +50,9 @@ export interface SubscriptionManagerOptions {
 	 * @default 0.01
 	 */
 	bloomFalsePositiveRate?: number
+
+	/** Called when a query subscription is registered (e.g. to register sync query subsets). */
+	onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 }
 
 /**
@@ -92,6 +95,7 @@ export class SubscriptionManager {
 	private subscriptions = new Map<string, Subscription>()
 	private pendingCollections = new Set<string>()
 	private flushScheduled = false
+	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 
 	// Bloom filter state
 	private bloomFilter: SubscriptionBloomFilter | null = null
@@ -112,6 +116,7 @@ export class SubscriptionManager {
 		this.bloomExpectedItems = options?.bloomExpectedItems ?? DEFAULT_BLOOM_EXPECTED_ITEMS
 		this.bloomFalsePositiveRate =
 			options?.bloomFalsePositiveRate ?? DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+		this.onQuerySubscribed = options?.onQuerySubscribed
 	}
 
 	/**
@@ -140,9 +145,12 @@ export class SubscriptionManager {
 		// Mark bloom filter as needing rebuild since dependencies changed
 		this.bloomDirty = true
 
+		const externalCleanup = this.onQuerySubscribed?.(descriptor)
+
 		return () => {
 			this.subscriptions.delete(id)
 			this.bloomDirty = true
+			externalCleanup?.()
 		}
 	}
 
@@ -171,6 +179,8 @@ export class SubscriptionManager {
 		// Mark bloom filter as needing rebuild since dependencies changed
 		this.bloomDirty = true
 
+		const externalCleanup = this.onQuerySubscribed?.(descriptor)
+
 		// Execute immediately, set lastResults, and call callback
 		executeFn().then((results) => {
 			// Guard: subscription may have been removed before the async fetch completes
@@ -183,6 +193,7 @@ export class SubscriptionManager {
 		return () => {
 			this.subscriptions.delete(id)
 			this.bloomDirty = true
+			externalCleanup?.()
 		}
 	}
 
@@ -254,8 +265,7 @@ export class SubscriptionManager {
 			bloomFilterHits: this.bloomFilterHits,
 			bloomFilterMisses: this.bloomFilterMisses,
 			falsePositives: this.falsePositives,
-			averageCheckTimeMs:
-				this.totalChecks > 0 ? this.totalCheckTimeMs / this.totalChecks : 0,
+			averageCheckTimeMs: this.totalChecks > 0 ? this.totalCheckTimeMs / this.totalChecks : 0,
 			bloomFilterActive: this.isBloomActive(),
 			subscriptionCount: this.subscriptions.size,
 		}
@@ -348,10 +358,7 @@ export class SubscriptionManager {
 	 * any included collection dependencies.
 	 */
 	private rebuildBloomFilter(): void {
-		const filter = new SubscriptionBloomFilter(
-			this.bloomExpectedItems,
-			this.bloomFalsePositiveRate,
-		)
+		const filter = new SubscriptionBloomFilter(this.bloomExpectedItems, this.bloomFalsePositiveRate)
 
 		for (const sub of this.subscriptions.values()) {
 			// Add the primary collection dependency

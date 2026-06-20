@@ -38,11 +38,20 @@
     "@korajs/server": "workspace:*",
     "better-sqlite3": "^12.8.0"
   },
+  "peerDependencies": {
+    "korajs": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "korajs": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.4"
+    "vitest": "^3.0.4",
+    "yjs": "^13.6.30"
   },
   "license": "MIT"
 }

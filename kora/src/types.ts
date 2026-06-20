@@ -2,6 +2,7 @@ import type {
 	InferInsertInput,
 	InferRecord,
 	InferUpdateInput,
+	KoraEvent,
 	KoraEventEmitter,
 	Operation,
 	SchemaDefinition,
@@ -10,11 +11,13 @@ import type {
 } from '@korajs/core'
 import type { FieldBuilder } from '@korajs/core'
 import type {
+	AuditExportOptions,
 	BackupOptions,
 	BackupProgress,
 	CollectionAccessor,
 	CollectionRecord,
 	QueryBuilder,
+	ReplaySnapshot,
 	RestoreOptions,
 	RestoreResult,
 	TransactionContext,
@@ -38,8 +41,35 @@ export interface StoreOptions {
 	adapter?: AdapterType
 	/** Database name. Defaults to 'kora-db'. */
 	name?: string
+	/**
+	 * `shared` (default): one sync node id per database.
+	 * `per-tab`: unique node id per browser tab (sessionStorage).
+	 */
+	isolation?: import('@korajs/store').StoreIsolation
 	/** URL to the SQLite WASM worker script. Required for browser adapters (sqlite-wasm, indexeddb). */
 	workerUrl?: string | URL
+	/** Optional SharedWorker host for multi-tab SQLite (see `@korajs/store/sqlite-wasm/shared-host`). */
+	sharedWorkerUrl?: string | URL
+	/** Max wait for a worker RPC (e.g. `open`). Defaults to 30000ms. */
+	workerResponseTimeoutMs?: number
+}
+
+/**
+ * Pre-built auth binding from `createKoraAuthSync()` in `@korajs/auth`.
+ * Wires token refresh, JWT scope maps, and device-bound sync node ids.
+ */
+export interface AuthSyncBinding {
+	/** Returns the access token for sync handshake (empty string when signed out). */
+	auth: () => Promise<{ token: string }>
+	/** Builds a scope map from the current token and schema. */
+	resolveScopeMap?: () => Promise<Record<string, Record<string, unknown>> | undefined>
+	/**
+	 * Returns the device-bound sync node id from the token `dev` claim.
+	 * Separate from the user id (`sub`).
+	 */
+	resolveNodeId?: () => Promise<string | undefined>
+	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
+	subscribe?: (listener: () => void) => () => void
 }
 
 /**
@@ -52,6 +82,11 @@ export interface SyncOptions {
 	transport?: 'websocket' | 'http'
 	/** Auth provider function. Called before each connection attempt. */
 	auth?: () => Promise<{ token: string }>
+	/**
+	 * Pre-built auth binding from `createKoraAuthSync({ authClient, schema })`.
+	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
+	 */
+	authClient?: AuthSyncBinding
 	/** Sync scopes per collection. */
 	scopes?: Record<string, (ctx: Record<string, unknown>) => Record<string, unknown>>
 	/**
@@ -74,12 +109,23 @@ export interface SyncOptions {
 	batchSize?: number
 	/** Schema version of this client. */
 	schemaVersion?: number
+	/** Connect to the sync server automatically after `app.ready`. Defaults to false. */
+	autoConnect?: boolean
+	/** Wait for server ACK on each handshake delta batch before streaming. Defaults to false. */
+	strictHandshake?: boolean
+	/** Rewrites legacy operations during sync when schema versions differ. */
+	operationTransforms?: import('@korajs/core').OperationTransform[]
 	/** Enable auto-reconnection on unexpected disconnect. Defaults to true. */
 	autoReconnect?: boolean
 	/** Initial reconnection delay in ms. Defaults to 1000. */
 	reconnectInterval?: number
 	/** Maximum reconnection delay in ms. Defaults to 30000. */
 	maxReconnectInterval?: number
+	/**
+	 * End-to-end encryption for operation payloads on the sync wire.
+	 * When enabled, `data` and `previousData` are encrypted before send.
+	 */
+	encryption?: import('@korajs/sync').SyncEncryptionConfig
 }
 
 /**
@@ -94,7 +140,12 @@ export interface KoraConfig {
 	sync?: SyncOptions
 	/** Enable DevTools instrumentation. Defaults to false. */
 	devtools?: boolean
+	/** Called for each sync-related framework event. */
+	onSyncEvent?: (event: Extract<KoraEvent, { type: `sync:${string}` }>) => void
 }
+
+/** Sync event types delivered to {@link KoraConfig.onSyncEvent}. */
+export type KoraSyncEvent = Extract<KoraEvent, { type: `sync:${string}` }>
 
 /**
  * Typed configuration passed to createApp() when using a TypedSchemaDefinition.
@@ -108,6 +159,8 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	sync?: SyncOptions
 	/** Enable DevTools instrumentation. Defaults to false. */
 	devtools?: boolean
+	/** Called for each sync-related framework event. */
+	onSyncEvent?: (event: KoraSyncEvent) => void
 }
 
 /**
@@ -118,10 +171,16 @@ export interface SyncControl {
 	connect(): Promise<void>
 	/** Disconnect from the sync server. */
 	disconnect(): Promise<void>
+	/** Current sync status snapshot (updates on sync events). */
+	readonly status: SyncStatusInfo
 	/** Get the current developer-facing sync status. */
 	getStatus(): SyncStatusInfo
+	/** Subscribe to status changes (event-driven, no polling). */
+	subscribeStatus(listener: (status: SyncStatusInfo) => void): () => void
 	/** Force an immediate reconnection attempt. No-op if already connected. */
 	retryNow(): Promise<void>
+	/** Clear schema-mismatch block after upgrading schema; then call `connect()`. */
+	clearSchemaBlock(): void
 	/** Export a diagnostics snapshot for debugging and support tickets. */
 	exportDiagnostics(): import('@korajs/sync').SyncDiagnostics
 }
@@ -250,6 +309,18 @@ export interface KoraApp {
 	 * @returns Result of the restore operation
 	 */
 	importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult>
+	/**
+	 * Rebuild an in-memory snapshot at a causal cut in the operation log.
+	 * Does not mutate live data — for DevTools time-travel and audit inspection.
+	 *
+	 * @param operationId - Content-addressed operation id to replay through (inclusive)
+	 */
+	replayTo(operationId: string): Promise<ReplaySnapshot>
+	/**
+	 * Export the operation log and persisted merge traces as a portable audit bundle.
+	 * Merge traces are recorded automatically when conflicts are resolved.
+	 */
+	exportAudit(options?: AuditExportOptions): Promise<Uint8Array>
 	/** Dynamic collection accessors (e.g., app.todos). Typed via Object.defineProperty. */
 	[collection: string]: unknown
 }
@@ -298,6 +369,10 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	exportBackup(options?: BackupOptions): Promise<Uint8Array>
 	/** Restore data from a backup binary. */
 	importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult>
+	/** Rebuild an in-memory snapshot at a causal cut in the operation log. */
+	replayTo(operationId: string): Promise<ReplaySnapshot>
+	/** Export the operation log and persisted merge traces as a portable audit bundle. */
+	exportAudit(options?: AuditExportOptions): Promise<Uint8Array>
 } & {
 	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
 		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference

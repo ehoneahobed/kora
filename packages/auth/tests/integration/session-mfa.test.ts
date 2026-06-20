@@ -4,17 +4,17 @@
  * Tests the flow: sign-in → session creation → MFA requirement →
  * TOTP verification → full access.
  */
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import {
 	BuiltInAuthRoutes,
-	InMemoryUserStore,
-	TokenManager,
-	InMemoryTokenRevocationStore,
-	SessionManager,
 	InMemorySessionStore,
-	TotpManager,
+	InMemoryTokenRevocationStore,
 	InMemoryTotpStore,
+	InMemoryUserStore,
+	SessionManager,
 	SessionMfaRequiredError,
+	TokenManager,
+	TotpManager,
 } from '../../src/server'
 
 describe('Session + MFA integration', () => {
@@ -94,7 +94,9 @@ describe('Session + MFA integration', () => {
 		await sessionManager.create({ userId: user.id })
 
 		// 4th should fail
-		await expect(sessionManager.create({ userId: user.id })).rejects.toThrow('Maximum concurrent sessions')
+		await expect(sessionManager.create({ userId: user.id })).rejects.toThrow(
+			'Maximum concurrent sessions',
+		)
 	})
 
 	test('sign-out everywhere revokes all sessions', async () => {
@@ -244,7 +246,9 @@ describe('Session + MFA integration', () => {
 		await totpManager.verifySetup(user.id, code)
 
 		// Second enable should throw
-		await expect(totpManager.enable(user.id, 'double-mfa@example.com')).rejects.toThrow('already enabled')
+		await expect(totpManager.enable(user.id, 'double-mfa@example.com')).rejects.toThrow(
+			'already enabled',
+		)
 	})
 })
 
@@ -347,16 +351,35 @@ function sha1(data: Uint8Array): Uint8Array {
 			w[i] = rotateLeft((w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!) >>> 0, 1)
 		}
 
-		let a = h0, b = h1, c = h2, d = h3, e = h4
+		let a = h0
+		let b = h1
+		let c = h2
+		let d = h3
+		let e = h4
 		for (let i = 0; i < 80; i++) {
-			let f: number, k: number
-			if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999 }
-			else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1 }
-			else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc }
-			else { f = b ^ c ^ d; k = 0xca62c1d6 }
+			let f: number
+			let k: number
+			if (i < 20) {
+				f = (b & c) | (~b & d)
+				k = 0x5a827999
+			} else if (i < 40) {
+				f = b ^ c ^ d
+				k = 0x6ed9eba1
+			} else if (i < 60) {
+				f = (b & c) | (b & d) | (c & d)
+				k = 0x8f1bbcdc
+			} else {
+				f = b ^ c ^ d
+				k = 0xca62c1d6
+			}
 
-			const temp = (rotateLeft(a >>> 0, 5) + (f >>> 0) + (e >>> 0) + (k >>> 0) + (w[i]! >>> 0)) >>> 0
-			e = d; d = c; c = rotateLeft(b >>> 0, 30); b = a; a = temp
+			const temp =
+				(rotateLeft(a >>> 0, 5) + (f >>> 0) + (e >>> 0) + (k >>> 0) + (w[i]! >>> 0)) >>> 0
+			e = d
+			d = c
+			c = rotateLeft(b >>> 0, 30)
+			b = a
+			a = temp
 		}
 
 		h0 = (h0 + a) >>> 0

@@ -4,7 +4,7 @@ import { createSampleEvent, createTimestampedEvent } from '../../tests/fixtures/
 import { filterEvents, getEventCategory } from './event-filter'
 
 describe('getEventCategory', () => {
-	test('maps all 15 event types to correct categories', () => {
+	test('maps all event types to correct categories', () => {
 		const expected: Record<KoraEventType, string> = {
 			'operation:created': 'operation',
 			'operation:applied': 'operation',
@@ -14,9 +14,21 @@ describe('getEventCategory', () => {
 			'constraint:violated': 'merge',
 			'sync:connected': 'sync',
 			'sync:disconnected': 'sync',
+			'sync:auth-failed': 'sync',
+			'sync:schema-mismatch': 'sync',
+			'sync:apply-failed': 'sync',
 			'sync:sent': 'sync',
 			'sync:received': 'sync',
 			'sync:acknowledged': 'sync',
+			'sync:diagnostics': 'sync',
+			'sync:bandwidth': 'sync',
+			'sync:initial-sync-progress': 'sync',
+			'awareness:updated': 'sync',
+			'state-machine:transition': 'operation',
+			'state-machine:rejected': 'operation',
+			'store:persistence-error': 'connection',
+			'store:quota-exceeded': 'connection',
+			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',
 			'query:executed': 'query',

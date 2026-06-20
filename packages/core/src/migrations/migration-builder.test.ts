@@ -260,9 +260,7 @@ describe('MigrationBuilder.safelyReversible', () => {
 	})
 
 	test('backfill without reverseTransform is not safely reversible', () => {
-		expect(
-			migrate().backfill('products', () => ({ computed: true })).safelyReversible,
-		).toBe(false)
+		expect(migrate().backfill('products', () => ({ computed: true })).safelyReversible).toBe(false)
 	})
 
 	test('backfill with reverseTransform is safely reversible', () => {

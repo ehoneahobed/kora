@@ -1,4 +1,5 @@
 import type { AtomicOp, HLCTimestamp, OperationType } from '@korajs/core'
+import type { SyncQuerySubset } from '../scopes/query-subset'
 
 export type WireFormat = 'json' | 'protobuf'
 
@@ -40,6 +41,10 @@ export interface HandshakeMessage {
 	supportedWireFormats?: WireFormat[]
 	/** Per-collection sync scope filters. Limits which records are synced to this client. */
 	syncScope?: Record<string, Record<string, unknown>>
+	/** Base64url-encoded delta cursor for resuming paginated initial sync */
+	deltaCursor?: string
+	/** Live query filters that further narrow synced data within auth/schema scope */
+	syncQueries?: SyncQuerySubset[]
 }
 
 /**
@@ -53,6 +58,10 @@ export interface HandshakeResponseMessage {
 	schemaVersion: number
 	accepted: boolean
 	rejectReason?: string
+	/** Inclusive minimum schema version the server accepts (present when rejected for schema mismatch). */
+	supportedSchemaMin?: number
+	/** Inclusive maximum schema version the server accepts (present when rejected for schema mismatch). */
+	supportedSchemaMax?: number
 	selectedWireFormat?: WireFormat
 	/** The server-accepted per-collection sync scope. Confirms what data will be synced. */
 	acceptedScope?: Record<string, Record<string, unknown>>
@@ -69,6 +78,10 @@ export interface OperationBatchMessage {
 	isFinal: boolean
 	/** Index of this batch (0-based) for ordering */
 	batchIndex: number
+	/** Base64url-encoded cursor marking the last operation in this batch */
+	cursor?: string
+	/** Total batches in this delta exchange (for progress reporting) */
+	totalBatches?: number
 }
 
 /**
@@ -126,6 +139,20 @@ export interface AwarenessUpdateMessage {
 }
 
 /**
+ * Incremental Yjs update for a richtext field. Ephemeral side channel for large documents.
+ * JSON transport only; not persisted on the server operation log.
+ */
+export interface YjsDocUpdateMessage {
+	type: 'yjs-doc-update'
+	messageId: string
+	collection: string
+	recordId: string
+	field: string
+	/** Base64-encoded Yjs update binary */
+	update: string
+}
+
+/**
  * Union of all sync protocol messages.
  */
 export type SyncMessage =
@@ -135,6 +162,7 @@ export type SyncMessage =
 	| AcknowledgmentMessage
 	| ErrorMessage
 	| AwarenessUpdateMessage
+	| YjsDocUpdateMessage
 
 // --- Type Guards ---
 
@@ -158,6 +186,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isErrorMessage(value)
 		case 'awareness-update':
 			return isAwarenessUpdateMessage(value)
+		case 'yjs-doc-update':
+			return isYjsDocUpdateMessage(value)
 		default:
 			return false
 	}
@@ -255,5 +285,21 @@ export function isAwarenessUpdateMessage(value: unknown): value is AwarenessUpda
 		typeof msg.states === 'object' &&
 		msg.states !== null &&
 		!Array.isArray(msg.states)
+	)
+}
+
+/**
+ * Check if a value is a YjsDocUpdateMessage.
+ */
+export function isYjsDocUpdateMessage(value: unknown): value is YjsDocUpdateMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'yjs-doc-update' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.collection === 'string' &&
+		typeof msg.recordId === 'string' &&
+		typeof msg.field === 'string' &&
+		typeof msg.update === 'string'
 	)
 }

@@ -526,6 +526,87 @@ function buildScopeMap(
 
 ---
 
+## Schema sync rules (partial sync DSL)
+
+Declare which collections sync and which fields filter data using root-level `sync` rules in `defineSchema()`:
+
+```typescript
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        userId: t.string(),
+        orgId: t.string(),
+      },
+    },
+    auditLog: {
+      fields: {
+        message: t.string(),
+      },
+    },
+  },
+  sync: {
+    todos: { where: { userId: true, orgId: true } },
+  },
+})
+```
+
+Each `where` entry binds a **record field** to a **scope value key**:
+
+| Value | Meaning |
+|-------|---------|
+| `true` | Bind field to a scope value with the same name (`userId` → `scopeValues.userId`) |
+| `'otherKey'` | Bind field to a different scope value key (`ownerId: 'userId'`) |
+
+When `schema.sync` is present, only collections listed in `sync` (or with legacy `collection.scope`) participate in sync. Other collections are omitted from the scope map (partial sync).
+
+Use with `buildScopeMap(schema, scopeValues)` or `createKoraAuthSync({ schema })` on the client, and `resolveSessionScopes()` on the server.
+
+---
+
+## extractScopeValuesFromClaims()
+
+Extracts flat scope values from JWT (or auth) claims using the scope field names declared on your schema collections.
+
+### Signature
+
+```typescript
+function extractScopeValuesFromClaims(
+  schema: SchemaDefinition,
+  claims: Record<string, unknown>
+): Record<string, unknown>
+
+function collectSchemaScopeFields(schema: SchemaDefinition): string[]
+```
+
+### Resolution order
+
+For each scope field declared on any collection:
+
+1. Top-level claim with the same name (e.g. `orgId`)
+2. Nested `claims.scope[field]`
+3. JWT `sub` → `userId` when `userId` is a scope field
+
+Pass the result to `buildScopeMap()` or use `createKoraAuthSync({ schema })` to apply automatically during sync handshake.
+
+### Example
+
+```typescript
+import { extractScopeValuesFromClaims, buildScopeMap } from '@korajs/core'
+
+const scopeValues = extractScopeValuesFromClaims(schema, {
+  sub: 'user-abc',
+  orgId: 'org-123',
+})
+
+const scopeMap = buildScopeMap(schema, scopeValues)
+// { todos: { userId: 'user-abc', orgId: 'org-123' }, ... }
+```
+
+---
+
 ## migrate() / MigrationBuilder {#migrations}
 
 Creates a fluent migration builder for defining schema migration steps programmatically. The builder is immutable — each method returns a new instance.

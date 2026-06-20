@@ -135,8 +135,7 @@ export class MigrationBuilder implements MigrationDefinition {
 		this.steps = steps
 		this.rollbackSteps = rollbackSteps
 		// Default: safely reversible if no backfill steps without reverseTransform
-		this.safelyReversible =
-			safelyReversible ?? this._computeSafelyReversible(steps, rollbackSteps)
+		this.safelyReversible = safelyReversible ?? this._computeSafelyReversible(steps, rollbackSteps)
 	}
 
 	/**

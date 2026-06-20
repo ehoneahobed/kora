@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'vitest'
-import { decodeRichtext, encodeRichtext, richtextToPlainText } from './richtext-serializer'
+import {
+	decodeRichtext,
+	encodeRichtext,
+	richtextStatesEqual,
+	richtextToPlainText,
+} from './richtext-serializer'
 
 describe('richtext serializer', () => {
 	test('encodes plain strings to Yjs binary state', () => {
@@ -26,5 +31,10 @@ describe('richtext serializer', () => {
 		expect(encodeRichtext(undefined)).toBeNull()
 		expect(decodeRichtext(null)).toBeNull()
 		expect(decodeRichtext(undefined)).toBeNull()
+	})
+
+	test('richtextStatesEqual compares decoded plain text', () => {
+		expect(richtextStatesEqual('hello', encodeRichtext('hello'))).toBe(true)
+		expect(richtextStatesEqual('hello', 'world')).toBe(false)
 	})
 })

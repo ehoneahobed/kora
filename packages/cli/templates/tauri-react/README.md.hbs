@@ -157,7 +157,7 @@ Set `KORA_AUTH_SECRET` to enable built-in auth on the sync server. Generate a se
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-The template creates a desktop auth client, wraps the app in `AuthProvider`, and passes `authClient.getAccessToken()` into sync. Google OAuth is enabled on the server when `KORA_GOOGLE_CLIENT_ID` and `KORA_GOOGLE_REDIRECT_URI` are set.
+The template creates a desktop auth client, wraps the app in `AuthProvider`, and wires sync with `createKoraAuthSync({ authClient, schema })`. Google OAuth is enabled on the server when `KORA_GOOGLE_CLIENT_ID` and `KORA_GOOGLE_REDIRECT_URI` are set.
 
 For production desktop OAuth, use a loopback callback, custom URL scheme, or hosted handoff that returns `code` and `state` to the app, then complete the flow with `authClient.completeOAuthSignIn('google', { code, state })`. The generated `src/auth.ts` includes the callback completion helper. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication#desktop-and-tauri-apps).
 

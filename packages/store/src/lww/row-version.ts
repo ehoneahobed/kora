@@ -1,4 +1,4 @@
-import { HybridLogicalClock, type HLCTimestamp } from '@korajs/core'
+import { type HLCTimestamp, HybridLogicalClock } from '@korajs/core'
 import type { RawCollectionRow } from '../types'
 
 /** Empty _version means legacy rows (compare by wallTime only via fallback). */
@@ -16,7 +16,9 @@ export function serializeRowVersion(timestamp: HLCTimestamp): string {
  * Read the version stamp stored on a materialized row.
  * Legacy rows without `_version` fall back to wallTime with logical 0.
  */
-export function rowVersionFromRecord(row: Pick<RawCollectionRow, '_updated_at' | '_version'>): HLCTimestamp {
+export function rowVersionFromRecord(
+	row: Pick<RawCollectionRow, '_updated_at' | '_version'>,
+): HLCTimestamp {
 	const version = row._version
 	if (typeof version === 'string' && version.length > 0) {
 		return HybridLogicalClock.deserialize(version)

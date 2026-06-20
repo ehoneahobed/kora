@@ -51,6 +51,103 @@ export function wireToVersionVector(wire: Record<string, number>): VersionVector
 	return new Map(Object.entries(wire))
 }
 
+const WIRE_BYTES_KEY = '__kora_bytes__'
+
+function toBase64(bytes: Uint8Array): string {
+	let binary = ''
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte)
+	}
+	return btoa(binary)
+}
+
+function fromBase64(value: string): Uint8Array {
+	const binary = atob(value)
+	const bytes = new Uint8Array(binary.length)
+	for (let index = 0; index < binary.length; index++) {
+		bytes[index] = binary.charCodeAt(index)
+	}
+	return bytes
+}
+
+function serializeWireRecord(
+	record: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+	if (!record) {
+		return null
+	}
+
+	const out: Record<string, unknown> = {}
+	for (const [key, value] of Object.entries(record)) {
+		out[key] = serializeWireValue(value)
+	}
+	return out
+}
+
+function serializeWireValue(value: unknown): unknown {
+	if (value instanceof Uint8Array) {
+		return { [WIRE_BYTES_KEY]: toBase64(value) }
+	}
+	if (value instanceof ArrayBuffer) {
+		return { [WIRE_BYTES_KEY]: toBase64(new Uint8Array(value)) }
+	}
+	return value
+}
+
+function deserializeWireRecord(
+	record: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+	if (!record) {
+		return null
+	}
+
+	const out: Record<string, unknown> = {}
+	for (const [key, value] of Object.entries(record)) {
+		out[key] = deserializeWireValue(value)
+	}
+	return out
+}
+
+function deserializeWireValue(value: unknown): unknown {
+	if (typeof value === 'object' && value !== null && WIRE_BYTES_KEY in value) {
+		const encoded = (value as Record<string, unknown>)[WIRE_BYTES_KEY]
+		if (typeof encoded === 'string') {
+			return fromBase64(encoded)
+		}
+	}
+
+	if (isLegacyIndexedByteRecord(value)) {
+		return legacyIndexedByteRecordToUint8Array(value)
+	}
+
+	return value
+}
+
+function isLegacyIndexedByteRecord(value: unknown): value is Record<string, number> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false
+	}
+
+	const entries = Object.entries(value)
+	if (entries.length === 0) {
+		return false
+	}
+
+	return entries.every(([key, entryValue]) => {
+		const index = Number(key)
+		return Number.isInteger(index) && index >= 0 && typeof entryValue === 'number'
+	})
+}
+
+function legacyIndexedByteRecordToUint8Array(value: Record<string, number>): Uint8Array {
+	const maxIndex = Math.max(...Object.keys(value).map((key) => Number(key)))
+	const bytes = new Uint8Array(maxIndex + 1)
+	for (const [key, entryValue] of Object.entries(value)) {
+		bytes[Number(key)] = entryValue
+	}
+	return bytes
+}
+
 /**
  * JSON-based message serializer.
  */
@@ -90,8 +187,8 @@ export class JsonMessageSerializer implements MessageSerializer {
 			type: op.type,
 			collection: op.collection,
 			recordId: op.recordId,
-			data: op.data,
-			previousData: op.previousData,
+			data: serializeWireRecord(op.data),
+			previousData: serializeWireRecord(op.previousData),
 			timestamp: {
 				wallTime: op.timestamp.wallTime,
 				logical: op.timestamp.logical,
@@ -113,8 +210,8 @@ export class JsonMessageSerializer implements MessageSerializer {
 			type: serialized.type,
 			collection: serialized.collection,
 			recordId: serialized.recordId,
-			data: serialized.data,
-			previousData: serialized.previousData,
+			data: deserializeWireRecord(serialized.data),
+			previousData: deserializeWireRecord(serialized.previousData),
 			timestamp: {
 				wallTime: serialized.timestamp.wallTime,
 				logical: serialized.timestamp.logical,
@@ -306,8 +403,8 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				retriable: message.retriable,
 			}
 		case 'awareness-update':
-			// Awareness messages are ephemeral and not sent via protobuf.
-			// They use JSON serialization only. Return a minimal envelope.
+		case 'yjs-doc-update':
+			// Ephemeral messages use JSON serialization only. Return a minimal envelope.
 			return {
 				type: message.type,
 				messageId: message.messageId,

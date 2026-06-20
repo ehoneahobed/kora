@@ -54,6 +54,10 @@ export class SqliteServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	getSchema(): SchemaDefinition | null {
+		return this.schema
+	}
+
 	async setSchema(schema: SchemaDefinition): Promise<void> {
 		this.assertOpen()
 		this.schema = schema

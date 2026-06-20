@@ -17,6 +17,16 @@
         "default": "./dist/index.cjs"
       }
     },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
+    },
     "./config": {
       "import": {
         "types": "./dist/config.d.ts",
@@ -35,6 +45,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:production-path": "vitest run -t PRODUCTION_PATH",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist .turbo coverage"
@@ -47,6 +58,7 @@
     "@korajs/devtools": "workspace:*"
   },
   "devDependencies": {
+    "@korajs/auth": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.8.0",
     "typescript": "^5.7.3",

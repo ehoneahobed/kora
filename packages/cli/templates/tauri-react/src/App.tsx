@@ -502,7 +502,6 @@ function SettingsPanel({ syncUrl, onChangeServer, onFactoryReset, onClose }: Set
 								setTestResult(null)
 							}}
 							placeholder="wss://your-server.example.com/kora-sync"
-							autoFocus
 							style={{
 								width: '100%',
 								borderRadius: '6px',

@@ -15,6 +15,12 @@ export type {
 } from './client/auth-client'
 export { createKoraAuth } from './client/quickstart'
 export type { CreateKoraAuthOptions } from './client/quickstart'
+export { createKoraAuthSync } from './client/auth-sync'
+export type {
+	AuthSyncClient,
+	CreateKoraAuthSyncOptions,
+	KoraAuthSyncBinding,
+} from './client/auth-sync'
 export { AuthDeviceIdentityError, createPersistentDeviceIdentity } from './client/device-session'
 export type {
 	AuthDeviceIdentity,

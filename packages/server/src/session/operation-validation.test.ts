@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'vitest'
 import type { Operation } from '@korajs/core'
-import { isOperationTimestampValid, SERVER_MAX_TIMESTAMP_FUTURE_MS } from './operation-validation'
+import { describe, expect, test } from 'vitest'
+import { SERVER_MAX_TIMESTAMP_FUTURE_MS, isOperationTimestampValid } from './operation-validation'
 
 function makeOp(wallTime: number): Operation {
 	return {

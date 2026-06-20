@@ -201,6 +201,8 @@ pnpm lint               # Biome lint and format check
 pnpm lint:fix           # Auto-fix lint/format issues
 pnpm test:e2e           # Run Playwright E2E tests (requires Chromium)
 pnpm benchmark:gates    # Run performance benchmark gates
+pnpm test:production-path  # PRODUCTION_PATH convergence tests (korajs)
+pnpm test:release-gate  # v0.5 gate: production-path + reconnect + chaos + benchmarks
 pnpm chaos:nightly      # Run chaos convergence test (10 clients, 1000 ops)
 pnpm docs:dev           # Start docs site dev server
 ```

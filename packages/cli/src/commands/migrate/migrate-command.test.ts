@@ -38,6 +38,24 @@ describe('migrate command', () => {
 		expect(snapshot).toContain('"todos"')
 	})
 
+	test('generates operation transform module alongside migration', async () => {
+		await writeFile(join(tempDir.path, 'src', 'schema.js'), schemaWithTitleOnly())
+
+		const { migrateCommand } = await import('./migrate-command')
+		await migrateCommand.run({ args: {} as never })
+
+		await writeFile(join(tempDir.path, 'src', 'schema.js'), schemaWithCompletedField())
+		await migrateCommand.run({ args: {} as never })
+
+		const transforms = await readFile(
+			join(tempDir.path, 'kora', 'migrations', '001-v1-to-v1.transforms.ts'),
+			'utf-8',
+		)
+		expect(transforms).toContain('OperationTransform')
+		expect(transforms).toContain('fromVersion: 1')
+		expect(transforms).toContain('toVersion: 1')
+	})
+
 	test('generates migration after schema change', async () => {
 		await writeFile(join(tempDir.path, 'src', 'schema.js'), schemaWithTitleOnly())
 

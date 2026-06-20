@@ -4,7 +4,7 @@ import { defineConfig } from 'tsup'
 export default defineConfig([
 	// Library build (for npm consumers)
 	{
-		entry: { index: 'src/index.ts' },
+		entry: { index: 'src/index.ts', overlay: 'src/overlay/embed-overlay.ts' },
 		format: ['esm', 'cjs'],
 		dts: true,
 		sourcemap: true,

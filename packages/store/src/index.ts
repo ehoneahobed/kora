@@ -3,13 +3,21 @@
 
 // === Types ===
 export type {
+	ApplyRemoteOptions,
 	ApplyResult,
+	LocalMutationHandler,
+	TransactionBufferedEntry,
+	TransactionCommitBatch,
+	TransactionCommitResult,
+	MaterializedRowSnapshot,
 	CollectionRecord,
+	ReplaySnapshot,
 	MigrationPlan,
 	OrderByClause,
 	OrderByDirection,
 	QueryDescriptor,
 	StoreConfig,
+	StoreIsolation,
 	StorageAdapter,
 	SubscriptionCallback,
 	Transaction,
@@ -27,6 +35,23 @@ export {
 	WorkerInitError,
 	WorkerTimeoutError,
 } from './errors'
+
+// === Operation log compaction ===
+export type { CompactionResult, CompactionStrategy } from './compaction/types'
+export { COMPACTION_BASELINE_META_KEY } from './compaction/types'
+export {
+	compactOperationLog,
+	computeAckCompactionWatermark,
+} from './compaction/compact-operation-log'
+
+// === Sync state helpers ===
+export {
+	collectOperationsAheadOfServer,
+	deserializeVersionVectorFromMeta,
+	LAST_ACKED_SERVER_VECTOR_META_KEY,
+	mergeVersionVectors,
+	serializeVersionVectorToMeta,
+} from './sync/sync-state'
 
 // === Store ===
 export { Store } from './store/store'
@@ -68,6 +93,7 @@ export {
 	decodeRichtext,
 	encodeRichtext,
 	richtextToPlainText,
+	richtextStatesEqual,
 } from './serialization/richtext-serializer'
 
 // === Query Utilities ===
@@ -87,3 +113,19 @@ export type {
 	RestoreOptions,
 	RestoreResult,
 } from './backup'
+
+// === Audit export ===
+export {
+	decodeAuditExport,
+	persistedAuditTraceFromEvent,
+	readAuditExportManifest,
+	verifyAuditExportChecksum,
+} from './audit'
+export type {
+	AuditExportManifest,
+	AuditExportOptions,
+	AuditExportPayload,
+	AuditExportProgress,
+	AuditTraceQuery,
+	PersistedAuditTrace,
+} from './audit'

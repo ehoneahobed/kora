@@ -85,6 +85,32 @@ export async function expectConverged(
 }
 
 /**
+ * Poll until all devices converge or timeout. Use after sync in integration tests
+ * where relay/apply work may still be in flight under parallel CI load.
+ */
+export async function expectConvergedEventually(
+	devices: TestDevice[],
+	schema: SchemaDefinition,
+	options?: { timeoutMs?: number; intervalMs?: number },
+): Promise<void> {
+	if (devices.length < 2) return
+
+	const timeoutMs = options?.timeoutMs ?? 5000
+	const intervalMs = options?.intervalMs ?? 25
+	const deadline = Date.now() + timeoutMs
+
+	while (Date.now() < deadline) {
+		const result = await checkConvergence(devices, schema)
+		if (result.converged) {
+			return
+		}
+		await new Promise<void>((resolve) => setTimeout(resolve, intervalMs))
+	}
+
+	await expectConverged(devices, schema)
+}
+
+/**
  * Check whether all devices have converged without throwing.
  *
  * @param devices - The devices to check

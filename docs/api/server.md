@@ -314,16 +314,16 @@ const auth = new MixedAuthProvider({
 const server = new KoraSyncServer({ store, auth })
 ```
 
-On the client side, return an empty token for unauthenticated users:
+On the client side, return an empty token for unauthenticated users (or use `createKoraAuthSync`):
 
 ```typescript
+import { createKoraAuthSync } from '@korajs/auth'
+
 const app = createApp({
   schema,
   sync: {
     url: 'wss://my-server.com/kora',
-    auth: async () => ({
-      token: (await authClient.getAccessToken()) ?? '',
-    }),
+    authClient: createKoraAuthSync({ authClient, schema }),
   },
 })
 ```

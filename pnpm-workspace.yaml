@@ -3,4 +3,5 @@ packages:
   - 'kora'
   - 'e2e'
   - 'e2e/fixture-app'
+  - 'examples/*'
   - 'docs'

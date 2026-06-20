@@ -1,9 +1,11 @@
-import type { SchemaDefinition } from '@korajs/core'
-import { AdapterError } from '../errors'
+import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
+import { PersistenceError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
+import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
 import {
+	isIndexedDbQuotaError,
 	loadDumpFromIndexedDB,
 	loadFromIndexedDB,
 	saveDumpToIndexedDB,
@@ -38,11 +40,24 @@ export interface IndexedDbAdapterOptions {
 	 * URL to the sqlite-wasm-worker script. Required in browsers if no bridge is provided.
 	 */
 	workerUrl?: string | URL
+
+	/** Timeout for worker / follower RPC responses. Defaults to 30000ms. */
+	workerResponseTimeoutMs?: number
+
+	/**
+	 * Debounce interval (ms) before writing snapshots to IndexedDB. Defaults to 500.
+	 */
+	persistenceDebounceMs?: number
+
+	/**
+	 * When set, persistence failures and quota errors are emitted on this emitter.
+	 */
+	emitter?: KoraEventEmitter
 }
 
 /**
  * IndexedDB-backed adapter that uses SQLite WASM in-memory and serializes
- * the entire database to IndexedDB after each transaction.
+ * the entire database to IndexedDB after mutations (coalesced/debounced).
  *
  * This is the fallback adapter for browsers where OPFS is not available.
  * It provides the same SQL interface as SqliteWasmAdapter, but persists by
@@ -56,13 +71,22 @@ export interface IndexedDbAdapterOptions {
 export class IndexedDbAdapter implements StorageAdapter {
 	private inner: SqliteWasmAdapter
 	private readonly dbName: string
+	private readonly emitter: KoraEventEmitter | undefined
+	private readonly scheduler: IndexedDbPersistenceScheduler
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
 		this.dbName = options.dbName ?? 'kora-db'
+		this.emitter = options.emitter
 		this.inner = new SqliteWasmAdapter({
 			bridge: options.bridge,
 			workerUrl: options.workerUrl,
 			dbName: this.dbName,
+			workerResponseTimeoutMs: options.workerResponseTimeoutMs,
+		})
+		this.scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: options.persistenceDebounceMs,
+			flush: () => this.writeSnapshot(),
+			onError: (error) => this.handlePersistenceError(error),
 		})
 	}
 
@@ -80,13 +104,14 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
-		await this.persistSnapshot()
+		await this.scheduler.flushNow()
+		this.scheduler.dispose()
 		await this.inner.close()
 	}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
 		await this.inner.execute(sql, params)
-		await this.persistSnapshot()
+		this.scheduler.schedule()
 	}
 
 	async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
@@ -95,23 +120,48 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		await this.inner.transaction(fn)
-		await this.persistSnapshot()
+		this.scheduler.schedule()
 	}
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		await this.inner.migrate(from, to, migration)
-		await this.persistSnapshot()
+		this.scheduler.schedule()
 	}
 
-	private async persistSnapshot(): Promise<void> {
-		try {
-			const data = await this.inner.exportDatabase()
-			await saveToIndexedDB(this.dbName, data)
-			const dump = await this.exportDump()
-			await saveDumpToIndexedDB(this.dbName, dump)
-		} catch {
-			// Non-fatal persistence failure. Next write/close retries persistence.
+	/**
+	 * Force an immediate snapshot write to IndexedDB (skips debounce).
+	 * Useful before tab unload or in tests.
+	 */
+	async flushPersistence(): Promise<void> {
+		await this.scheduler.flushNow()
+	}
+
+	private async writeSnapshot(): Promise<void> {
+		const data = await this.inner.exportDatabase()
+		await saveToIndexedDB(this.dbName, data)
+		const dump = await this.exportDump()
+		await saveDumpToIndexedDB(this.dbName, dump)
+	}
+
+	private handlePersistenceError(error: unknown): void {
+		const message = error instanceof Error ? error.message : 'IndexedDB persistence failed'
+		const code = error instanceof PersistenceError ? error.code : 'PERSISTENCE_FAILED'
+		const quotaExceeded = isIndexedDbQuotaError(error)
+
+		if (quotaExceeded) {
+			this.emitter?.emit({
+				type: 'store:quota-exceeded',
+				dbName: this.dbName,
+				message,
+			})
 		}
+
+		this.emitter?.emit({
+			type: 'store:persistence-error',
+			dbName: this.dbName,
+			message,
+			code: quotaExceeded ? 'QUOTA_EXCEEDED' : code,
+		})
 	}
 
 	private async restoreFromDumpFallback(): Promise<void> {
@@ -167,7 +217,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 function ensureSafeIdentifier(identifier: string): string {
 	if (!/^[a-zA-Z0-9_]+$/.test(identifier)) {
-		throw new AdapterError(`Unsafe SQL identifier: ${identifier}`)
+		throw new PersistenceError(`Unsafe SQL identifier: ${identifier}`, {
+			code: 'UNSAFE_IDENTIFIER',
+			identifier,
+		})
 	}
 	return identifier
 }

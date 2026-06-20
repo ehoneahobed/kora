@@ -47,6 +47,16 @@
         "default": "./dist/adapters/sqlite-wasm-worker.cjs"
       }
     },
+    "./sqlite-wasm/shared-host": {
+      "import": {
+        "types": "./dist/adapters/sqlite-wasm-shared-host.d.ts",
+        "default": "./dist/adapters/sqlite-wasm-shared-host.js"
+      },
+      "require": {
+        "types": "./dist/adapters/sqlite-wasm-shared-host.d.cts",
+        "default": "./dist/adapters/sqlite-wasm-shared-host.cjs"
+      }
+    },
     "./indexeddb": {
       "import": {
         "types": "./dist/adapters/indexeddb.d.ts",
@@ -55,6 +65,16 @@
       "require": {
         "types": "./dist/adapters/indexeddb.d.cts",
         "default": "./dist/adapters/indexeddb.cjs"
+      }
+    },
+    "./internal": {
+      "import": {
+        "types": "./dist/internal.d.ts",
+        "default": "./dist/internal.js"
+      },
+      "require": {
+        "types": "./dist/internal.d.cts",
+        "default": "./dist/internal.cjs"
       }
     }
   },
@@ -65,6 +85,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

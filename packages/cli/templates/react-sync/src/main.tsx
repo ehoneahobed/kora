@@ -1,3 +1,4 @@
+import { createKoraAuthSync } from '@korajs/auth'
 import { AuthProvider } from '@korajs/auth/react'
 import { KoraProvider } from '@korajs/react'
 import { createApp } from 'korajs'
@@ -20,9 +21,7 @@ const app = createApp({
 	schema,
 	sync: {
 		url: syncUrl,
-		auth: async () => ({
-			token: (await authClient.getAccessToken()) ?? '',
-		}),
+		authClient: createKoraAuthSync({ authClient, schema }),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,

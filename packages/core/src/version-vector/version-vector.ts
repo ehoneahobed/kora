@@ -57,11 +57,7 @@ export function vectorsEqual(a: VersionVector, b: VersionVector): boolean {
  * getRange may be async (for DB-backed implementations) or sync (for in-memory).
  */
 export interface OperationLog {
-	getRange(
-		nodeId: string,
-		fromSeq: number,
-		toSeq: number,
-	): Operation[] | Promise<Operation[]>
+	getRange(nodeId: string, fromSeq: number, toSeq: number): Operation[] | Promise<Operation[]>
 }
 
 /**

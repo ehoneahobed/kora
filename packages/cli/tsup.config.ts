@@ -6,6 +6,7 @@ export default defineConfig({
 	dts: { entry: ['src/index.ts'] },
 	sourcemap: true,
 	clean: true,
+	external: ['@korajs/store', '@korajs/store/better-sqlite3', '@korajs/core', 'korajs'],
 	banner: ({ format }) => {
 		if (format === 'esm') {
 			return { js: '#!/usr/bin/env node' }

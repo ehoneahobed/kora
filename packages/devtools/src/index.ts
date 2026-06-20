@@ -10,6 +10,7 @@ export { computeStatistics } from './stats/event-stats'
 // === DevTools UI / Extension ===
 export { buildPanelModel } from './ui/panel-state'
 export { renderDevtoolsPanel } from './ui/panel'
+export { mountKoraDevtoolsOverlay } from './overlay/embed-overlay'
 export { PortRouter } from './extension/port-router'
 
 // === Types ===

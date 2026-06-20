@@ -1,7 +1,7 @@
 import type { KoraEventType } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { filterEvents } from '../../src/filter/event-filter'
-import { Instrumenter } from '../../src/instrumenter/instrumenter'
+import { ALL_EVENT_TYPES, Instrumenter } from '../../src/instrumenter/instrumenter'
 import { computeStatistics } from '../../src/stats/event-stats'
 import {
 	createMockEmitter,
@@ -150,7 +150,7 @@ describe('full-flow integration', () => {
 	test('destroy cleans up everything: no listeners remain on emitter', () => {
 		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
 
-		expect(emitter.totalListenerCount()).toBe(15)
+		expect(emitter.totalListenerCount()).toBe(ALL_EVENT_TYPES.length)
 
 		inst.destroy()
 

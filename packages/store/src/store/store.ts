@@ -1,12 +1,10 @@
 import {
-	ClockDriftError,
+	CausalTracker,
 	HybridLogicalClock,
 	createVersionVector,
 	generateUUIDv7,
 	migrationStepsToSQL,
 } from '@korajs/core'
-import { readBackupManifest as readManifest } from '../backup/backup'
-import type { BackupOptions, RestoreOptions, RestoreResult, BackupManifest } from '../backup/types'
 import type {
 	KoraEventEmitter,
 	MigrationStep,
@@ -15,8 +13,14 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
+import { readBackupManifest as readManifest } from '../backup/backup'
+import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } from '../backup/types'
 import { Collection } from '../collection/collection'
+import { compactOperationLog } from '../compaction/compact-operation-log'
+import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { StoreNotOpenError } from '../errors'
+import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
+import type { LocalMutationContext } from '../mutations/types'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildInsertQuery,
@@ -25,25 +29,42 @@ import {
 	buildSoftDeleteQuery,
 	buildUpdateQuery,
 } from '../query/sql-builder'
-import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import { RelationEnforcer } from '../relations/relation-enforcer'
+import { buildReplaySnapshot } from '../replay/replay-to'
+import type { ReplaySnapshot } from '../replay/replay-to'
 import { SequenceManager } from '../sequences/sequence-manager'
 import {
 	deserializeOperationWithCollection,
+	deserializeRecord,
 	serializeOperation,
 	serializeRecord,
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
+import {
+	collectOperationsAheadOfServer,
+	loadDeltaCursor,
+	loadLastAckedServerVector,
+	mergeVersionVectors,
+	saveDeltaCursor,
+	saveLastAckedServerVector,
+} from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
+import { TransactionSequenceAllocator } from '../transaction/transaction-sequence'
 import type {
+	ApplyRemoteOptions,
 	ApplyResult,
+	LocalMutationHandler,
+	MaterializedRowSnapshot,
 	MetaRow,
 	OperationRow,
 	RawCollectionRow,
 	StorageAdapter,
 	StoreConfig,
+	StoreIsolation,
 	VersionVectorRow,
 } from '../types'
+import { allocateNextSequenceNumber } from './sequence-allocator'
+import { resolvePerTabNodeId } from './tab-node-id'
 
 /**
  * Store is the main orchestrator. It owns a schema, a storage adapter,
@@ -66,19 +87,30 @@ export class Store implements OperationLog {
 	private versionVector: VersionVector = createVersionVector()
 	private clock: HybridLogicalClock | null = null
 	private collections = new Map<string, Collection>()
-	private subscriptionManager = new SubscriptionManager()
+	private subscriptionManager: SubscriptionManager
 	private sequenceManager: SequenceManager | null = null
 
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
 	private readonly configNodeId: string | undefined
+	private readonly dbName: string
+	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
+	private localMutationHandler: LocalMutationHandler | null
+	private relationEnforcer: RelationEnforcer | null = null
+	private causalTracker: CausalTracker | null = null
 
 	constructor(config: StoreConfig) {
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.configNodeId = config.nodeId
+		this.dbName = config.dbName ?? 'kora-db'
+		this.isolation = config.isolation ?? 'shared'
 		this.emitter = config.emitter ?? null
+		this.localMutationHandler = config.localMutationHandler ?? null
+		this.subscriptionManager = new SubscriptionManager({
+			onQuerySubscribed: config.onQuerySubscribed,
+		})
 	}
 
 	/**
@@ -94,6 +126,7 @@ export class Store implements OperationLog {
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
 		this.clock = new HybridLogicalClock(this.nodeId)
+		this.causalTracker = new CausalTracker()
 
 		// Initialize sequence manager
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
@@ -106,15 +139,14 @@ export class Store implements OperationLog {
 		// The enforcer is shared across all Collection instances so that
 		// cascading deletes can cross collection boundaries.
 		const hasRelations = Object.keys(this.schema.relations).length > 0
-		const relationEnforcer = hasRelations
+		this.relationEnforcer = hasRelations
 			? new RelationEnforcer({
 					schema: this.schema,
 					adapter: this.adapter,
 					clock: this.clock,
 					nodeId: this.nodeId,
-					getSequenceNumber: () => this.nextSequenceNumber(),
 				})
-			: undefined
+			: null
 
 		// Create collection instances
 		for (const [name, definition] of Object.entries(this.schema.collections)) {
@@ -125,14 +157,17 @@ export class Store implements OperationLog {
 				this.adapter,
 				this.clock,
 				this.nodeId,
-				() => this.nextSequenceNumber(),
+				() => this.allocateSequenceNumber(),
 				(collectionName, operation) => {
+					this.recordOperationSequence(operation)
 					this.subscriptionManager.notify(collectionName, operation)
 					if (this.emitter) {
 						this.emitter.emit({ type: 'operation:created', operation })
 					}
 				},
-				relationEnforcer,
+				this.relationEnforcer,
+				this.localMutationHandler,
+				this.causalTracker,
 			)
 			this.collections.set(name, col)
 		}
@@ -207,7 +242,7 @@ export class Store implements OperationLog {
 	 * Checks for duplicates, applies to the data table, persists the operation,
 	 * and updates the version vector.
 	 */
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.ensureOpen()
 
 		const collection = op.collection
@@ -225,16 +260,9 @@ export class Store implements OperationLog {
 			return 'duplicate'
 		}
 
-		// Advance the local HLC for causal ordering. Reject poison timestamps without persisting.
+		// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
 		if (this.clock) {
-			try {
-				this.clock.receive(op.timestamp)
-			} catch (error) {
-				if (error instanceof ClockDriftError) {
-					return 'skipped'
-				}
-				throw error
-			}
+			this.clock.receive(op.timestamp)
 		}
 
 		const remoteVersion = serializeRowVersion(op.timestamp)
@@ -264,11 +292,20 @@ export class Store implements OperationLog {
 				}
 			} else if (op.type === 'update' && op.data) {
 				const serializedChanges = serializeRecord(op.data, definition.fields)
-				const updateQuery = buildLwwUpdateQuery(collection, op.recordId, {
+				const updatePayload: Record<string, unknown> = {
 					...serializedChanges,
 					_updated_at: wallTime,
 					_version: remoteVersion,
-				}, remoteVersion)
+				}
+				if (options?.reactivateIfDeleted) {
+					updatePayload._deleted = 0
+				}
+				const updateQuery = buildLwwUpdateQuery(
+					collection,
+					op.recordId,
+					updatePayload,
+					remoteVersion,
+				)
 				await tx.execute(updateQuery.sql, updateQuery.params)
 			} else if (op.type === 'delete') {
 				const deleteQuery = buildLwwSoftDeleteQuery(
@@ -336,10 +373,271 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Load every operation from the local append-only log across all collections.
+	 * Used by sync delta computation, backup export, and time-travel replay.
+	 */
+	async getAllOperations(): Promise<Operation[]> {
+		this.ensureOpen()
+		const allOps: Operation[] = []
+
+		for (const collectionName of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<OperationRow>(
+				`SELECT * FROM _kora_ops_${collectionName} ORDER BY sequence_number ASC`,
+			)
+			for (const row of rows) {
+				allOps.push(deserializeOperationWithCollection(row, collectionName))
+			}
+		}
+
+		return allOps
+	}
+
+	/**
+	 * Rebuild an in-memory snapshot of materialized state at a causal cut in the op log.
+	 * Does not mutate the live store — intended for DevTools time-travel inspection.
+	 *
+	 * @param operationId - Content-addressed id of the operation to replay through (inclusive)
+	 * @throws {OperationError} When the operation id is not present in the local log
+	 */
+	async replayTo(operationId: string): Promise<ReplaySnapshot> {
+		this.ensureOpen()
+		const start = Date.now()
+		const allOps = await this.getAllOperations()
+		const snapshot = buildReplaySnapshot(this.schema, allOps, operationId)
+
+		if (this.emitter) {
+			this.emitter.emit({
+				type: 'replay:completed',
+				targetOperationId: operationId,
+				operationsApplied: snapshot.operationsApplied.length,
+				duration: Date.now() - start,
+			})
+		}
+
+		return snapshot
+	}
+
+	/**
+	 * Persist a merge trace to the durable audit log.
+	 */
+	async appendAuditTrace(trace: import('../audit/types').PersistedAuditTrace): Promise<void> {
+		this.ensureOpen()
+		const { appendAuditTrace: append } = await import('../audit/audit-trace-store')
+		await append(this.adapter, trace)
+	}
+
+	/**
+	 * Read persisted audit traces with optional filters.
+	 */
+	async getAuditTraces(
+		query?: import('../audit/types').AuditTraceQuery,
+	): Promise<import('../audit/types').PersistedAuditTrace[]> {
+		this.ensureOpen()
+		const { readAuditTraces } = await import('../audit/audit-trace-store')
+		return readAuditTraces(this.adapter, query)
+	}
+
+	/**
+	 * Export operations and merge traces as a portable audit bundle.
+	 */
+	async exportAudit(options?: import('../audit/types').AuditExportOptions): Promise<Uint8Array> {
+		this.ensureOpen()
+		const { exportAudit: doExport } = await import('../audit/export-audit')
+		return doExport(this.adapter, this.schema, this.nodeId, this.schema.version, options)
+	}
+
+	/**
 	 * Get the schema definition.
 	 */
 	getSchema(): SchemaDefinition {
 		return this.schema
+	}
+
+	/**
+	 * Route local CRUD through the unified apply pipeline (korajs ApplyPipeline).
+	 */
+	setLocalMutationHandler(handler: LocalMutationHandler | null): void {
+		this.localMutationHandler = handler
+		for (const col of this.collections.values()) {
+			col.setMutationHandler(handler)
+		}
+	}
+
+	/**
+	 * Build mutation context for a collection (used by ApplyPipeline side effects).
+	 */
+	createMutationContext(
+		collection: string,
+		options?: { inTransaction?: boolean; extraCausalDeps?: string[] },
+	): LocalMutationContext {
+		this.ensureOpen()
+		const definition = this.schema.collections[collection]
+		if (!definition || !this.clock) {
+			throw new StoreNotOpenError()
+		}
+		return {
+			collection,
+			definition,
+			schema: this.schema,
+			adapter: this.adapter,
+			clock: this.clock,
+			nodeId: this.nodeId,
+			allocateSequenceNumber: () => this.allocateSequenceNumber(),
+			onMutation: (collectionName, operation) => {
+				this.recordOperationSequence(operation)
+				this.subscriptionManager.notify(collectionName, operation)
+				if (this.emitter) {
+					this.emitter.emit({ type: 'operation:created', operation })
+				}
+			},
+			relationEnforcer: this.relationEnforcer,
+			causalTracker: this.causalTracker,
+			inTransaction: options?.inTransaction ?? false,
+			extraCausalDeps: options?.extraCausalDeps,
+		}
+	}
+
+	/**
+	 * Load a materialized row by ID, including soft-deleted tombstones.
+	 */
+	async findMaterializedRow(
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRowSnapshot | null> {
+		this.ensureOpen()
+		const definition = this.schema.collections[collection]
+		if (!definition) {
+			return null
+		}
+
+		const rows = await this.adapter.query<RawCollectionRow>(
+			`SELECT * FROM ${collection} WHERE id = ?`,
+			[recordId],
+		)
+		const row = rows[0]
+		if (!row) {
+			return null
+		}
+
+		return {
+			record: deserializeRecord(row, definition.fields),
+			deleted: row._deleted === 1,
+		}
+	}
+
+	/**
+	 * Latest operation from this device for a record (used for delete-vs-update merge on sync).
+	 */
+	/**
+	 * Load the last server version vector acknowledged by this client (persisted in `_kora_meta`).
+	 */
+	async loadLastAckedServerVector(): Promise<VersionVector> {
+		this.ensureOpen()
+		return loadLastAckedServerVector(this.adapter)
+	}
+
+	/**
+	 * Persist the last server version vector this client believes the server has applied.
+	 */
+	async saveLastAckedServerVector(vector: VersionVector): Promise<void> {
+		this.ensureOpen()
+		await saveLastAckedServerVector(this.adapter, vector)
+	}
+
+	/**
+	 * Load persisted delta cursor for resuming paginated initial sync.
+	 */
+	async loadDeltaCursor(): Promise<string | null> {
+		this.ensureOpen()
+		return loadDeltaCursor(this.adapter)
+	}
+
+	/**
+	 * Persist or clear the delta cursor for paginated initial sync resume.
+	 */
+	async saveDeltaCursor(cursor: string | null): Promise<void> {
+		this.ensureOpen()
+		await saveDeltaCursor(this.adapter, cursor)
+	}
+
+	/**
+	 * Local operations not yet reflected on the server version vector.
+	 */
+	async getUnsyncedOperations(serverVector: VersionVector): Promise<Operation[]> {
+		this.ensureOpen()
+		return collectOperationsAheadOfServer(
+			this.getVersionVector(),
+			serverVector,
+			(nodeId, fromSeq, toSeq) => this.getOperationRange(nodeId, fromSeq, toSeq),
+		)
+	}
+
+	/**
+	 * Count of local operations ahead of the server version vector.
+	 */
+	async countUnsyncedOperations(serverVector: VersionVector): Promise<number> {
+		const ops = await this.getUnsyncedOperations(serverVector)
+		return ops.length
+	}
+
+	/**
+	 * Compact the local operation log using materialized rows as the baseline.
+	 * Only removes ops the server has acknowledged (per {@link CompactionStrategy}).
+	 */
+	async compact(strategy: CompactionStrategy): Promise<CompactionResult> {
+		this.ensureOpen()
+		if (strategy.mode === 'never') {
+			return compactOperationLog(this.adapter, this.schema, strategy, createVersionVector())
+		}
+
+		const serverVector = strategy.serverVector ?? (await loadLastAckedServerVector(this.adapter))
+		return compactOperationLog(this.adapter, this.schema, strategy, serverVector)
+	}
+
+	/**
+	 * Merge session remote vector with persisted last-acked vector (max per node).
+	 */
+	mergeServerVectors(sessionVector: VersionVector, persistedVector: VersionVector): VersionVector {
+		return mergeVersionVectors(persistedVector, sessionVector)
+	}
+
+	async getLatestLocalOperationForRecord(
+		collection: string,
+		recordId: string,
+	): Promise<Operation | null> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<OperationRow>(
+			`SELECT * FROM _kora_ops_${collection} WHERE node_id = ? AND record_id = ? ORDER BY sequence_number DESC LIMIT 1`,
+			[this.nodeId, recordId],
+		)
+		const row = rows[0]
+		if (!row) {
+			return null
+		}
+		return deserializeOperationWithCollection(row, collection)
+	}
+
+	/**
+	 * Latest operation for a record from any node (for 3-way merge when local op log is empty).
+	 */
+	async getLatestOperationForRecord(
+		collection: string,
+		recordId: string,
+	): Promise<Operation | null> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<OperationRow>(
+			`SELECT * FROM _kora_ops_${collection} WHERE record_id = ?`,
+			[recordId],
+		)
+
+		let latest: Operation | null = null
+		for (const row of rows) {
+			const op = deserializeOperationWithCollection(row, collection)
+			if (!latest || HybridLogicalClock.compare(op.timestamp, latest.timestamp) > 0) {
+				latest = op
+			}
+		}
+		return latest
 	}
 
 	/** Expose the subscription manager for direct access (e.g., by QueryBuilder) */
@@ -376,7 +674,10 @@ export class Store implements OperationLog {
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			getSequenceNumber: () => this.nextSequenceNumber(),
+			sequenceAllocator: new TransactionSequenceAllocator(this.adapter, this.nodeId),
+			relationEnforcer: this.relationEnforcer,
+			causalTracker: this.causalTracker,
+			localMutationHandler: this.localMutationHandler,
 		})
 	}
 
@@ -392,12 +693,16 @@ export class Store implements OperationLog {
 	 */
 	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
 		const tx = this.createTransaction()
+		this.causalTracker?.beginTransaction()
 		try {
 			await fn(tx)
-			const { operations, affectedCollections } = await tx.commit()
+			const { operations } = await tx.commit()
+
+			this.causalTracker?.clearTransaction()
 
 			// Notify subscriptions and emit events after commit
 			for (const op of operations) {
+				this.recordOperationSequence(op)
 				this.subscriptionManager.notify(op.collection, op)
 				if (this.emitter) {
 					this.emitter.emit({ type: 'operation:created', operation: op })
@@ -407,6 +712,7 @@ export class Store implements OperationLog {
 			return operations
 		} catch (error) {
 			tx.rollback()
+			this.causalTracker?.clearTransaction()
 			throw error
 		}
 	}
@@ -431,10 +737,7 @@ export class Store implements OperationLog {
 	 * @param options - Restore options (merge, collections, onProgress)
 	 * @returns Result of the restore operation
 	 */
-	async importBackup(
-		data: Uint8Array,
-		options?: RestoreOptions,
-	): Promise<RestoreResult> {
+	async importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult> {
 		this.ensureOpen()
 		const { restoreBackup: doRestore } = await import('../backup/backup')
 		return doRestore(this.adapter, this.schema, data, options)
@@ -450,10 +753,21 @@ export class Store implements OperationLog {
 		return readManifest(data)
 	}
 
-	private nextSequenceNumber(): number {
-		this.sequenceNumber++
-		this.versionVector.set(this.nodeId, this.sequenceNumber)
-		return this.sequenceNumber
+	private recordOperationSequence(operation: Operation): void {
+		const prev = this.versionVector.get(operation.nodeId) ?? 0
+		if (operation.sequenceNumber > prev) {
+			this.versionVector.set(operation.nodeId, operation.sequenceNumber)
+		}
+		if (operation.nodeId === this.nodeId) {
+			this.sequenceNumber = Math.max(this.sequenceNumber, operation.sequenceNumber)
+		}
+	}
+
+	private async allocateSequenceNumber(): Promise<number> {
+		const seq = await allocateNextSequenceNumber(this.adapter, this.nodeId)
+		this.sequenceNumber = seq
+		this.versionVector.set(this.nodeId, seq)
+		return seq
 	}
 
 	/**
@@ -564,12 +878,17 @@ export class Store implements OperationLog {
 
 	private async loadOrGenerateNodeId(): Promise<string> {
 		if (this.configNodeId) {
-			// Persist the configured node ID
-			await this.adapter.execute(
-				"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
-				[this.configNodeId],
-			)
+			if (this.isolation !== 'per-tab') {
+				await this.adapter.execute(
+					"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
+					[this.configNodeId],
+				)
+			}
 			return this.configNodeId
+		}
+
+		if (this.isolation === 'per-tab') {
+			return resolvePerTabNodeId(this.dbName)
 		}
 
 		// Try to load existing node ID

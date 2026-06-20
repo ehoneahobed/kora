@@ -2,13 +2,13 @@ import { describe, expect, test } from 'vitest'
 import { t } from '../schema/types'
 import { MigrationBuilder, RollbackBuilder, migrate } from './migration-builder'
 import type { MigrationStep } from './migration-builder'
-import { migrationStepsToSQL, rollbackStepsToSQL } from './migration-sql'
 import {
 	MigrationRollbackError,
 	canAutoRollback,
 	createReversibleMigration,
 	generateRollbackSteps,
 } from './migration-rollback'
+import { migrationStepsToSQL, rollbackStepsToSQL } from './migration-sql'
 
 describe('canAutoRollback', () => {
 	test('addField can be auto-rolled back', () => {
@@ -76,9 +76,7 @@ describe('generateRollbackSteps', () => {
 	})
 
 	test('addIndex auto-generates removeIndex rollback', () => {
-		const forward: MigrationStep[] = [
-			{ type: 'addIndex', collection: 'todos', field: 'dueDate' },
-		]
+		const forward: MigrationStep[] = [{ type: 'addIndex', collection: 'todos', field: 'dueDate' }]
 		const rollback = generateRollbackSteps(forward)
 		expect(rollback).toHaveLength(1)
 		expect(rollback[0]).toEqual({
@@ -131,9 +129,7 @@ describe('generateRollbackSteps', () => {
 	})
 
 	test('removeField without descriptor throws MigrationRollbackError', () => {
-		const forward: MigrationStep[] = [
-			{ type: 'removeField', collection: 'todos', field: 'old' },
-		]
+		const forward: MigrationStep[] = [{ type: 'removeField', collection: 'todos', field: 'old' }]
 		expect(() => generateRollbackSteps(forward)).toThrow(MigrationRollbackError)
 		expect(() => generateRollbackSteps(forward)).toThrow(
 			'Cannot auto-generate rollback for "removeField"',
@@ -246,9 +242,7 @@ describe('createReversibleMigration', () => {
 				transform: () => ({ priority: 'medium' }),
 			},
 		]
-		expect(() => createReversibleMigration(upSteps, null, 1, 2)).toThrow(
-			MigrationRollbackError,
-		)
+		expect(() => createReversibleMigration(upSteps, null, 1, 2)).toThrow(MigrationRollbackError)
 	})
 })
 
@@ -360,8 +354,7 @@ describe('MigrationBuilder removeField with descriptor', () => {
 
 describe('rollbackStepsToSQL', () => {
 	test('generates SQL for auto-generated rollback steps', () => {
-		const builder = migrate()
-			.addField('todos', 'priority', t.string().default('medium'))
+		const builder = migrate().addField('todos', 'priority', t.string().default('medium'))
 
 		const sql = rollbackStepsToSQL(builder)
 		expect(sql).toEqual(['ALTER TABLE todos DROP COLUMN priority'])
@@ -371,8 +364,7 @@ describe('rollbackStepsToSQL', () => {
 		const builder = migrate()
 			.addField('todos', 'priority', t.string().default('medium'))
 			.down((rb) => {
-				rb.removeField('todos', 'priority')
-					.backfill('todos', () => ({ status: 'default' }))
+				rb.removeField('todos', 'priority').backfill('todos', () => ({ status: 'default' }))
 			})
 		const sql = rollbackStepsToSQL(builder)
 		// backfill produces no SQL
@@ -402,9 +394,7 @@ describe('round-trip: up then down', () => {
 	})
 
 	test('addIndex followed by removeIndex rollback', () => {
-		const upSteps: MigrationStep[] = [
-			{ type: 'addIndex', collection: 'todos', field: 'dueDate' },
-		]
+		const upSteps: MigrationStep[] = [{ type: 'addIndex', collection: 'todos', field: 'dueDate' }]
 		const rollback = generateRollbackSteps(upSteps)
 
 		const upSQL = migrationStepsToSQL(upSteps)
@@ -465,8 +455,7 @@ describe('backward compatibility', () => {
 	})
 
 	test('MigrationBuilder implements MigrationDefinition', () => {
-		const builder = migrate()
-			.addField('todos', 'priority', t.string().default('medium'))
+		const builder = migrate().addField('todos', 'priority', t.string().default('medium'))
 		const steps: readonly MigrationStep[] = builder.steps
 		expect(steps).toHaveLength(1)
 	})
@@ -487,8 +476,7 @@ describe('backward compatibility', () => {
 
 describe('edge cases', () => {
 	test('removeField with descriptor for rollback via builder API', () => {
-		const builder = migrate()
-			.removeField('todos', 'active', t.boolean().default(true))
+		const builder = migrate().removeField('todos', 'active', t.boolean().default(true))
 
 		const rollback = generateRollbackSteps(builder.steps)
 		expect(rollback).toHaveLength(1)
@@ -500,15 +488,9 @@ describe('edge cases', () => {
 	})
 
 	test('single step migration round-trips through createReversibleMigration', () => {
-		const builder = migrate()
-			.addField('todos', 'x', t.number().default(0))
+		const builder = migrate().addField('todos', 'x', t.number().default(0))
 
-		const migration = createReversibleMigration(
-			[...builder.steps],
-			null,
-			1,
-			2,
-		)
+		const migration = createReversibleMigration([...builder.steps], null, 1, 2)
 
 		const upSQL = migrationStepsToSQL(migration.up)
 		const downSQL = migrationStepsToSQL(migration.down)
