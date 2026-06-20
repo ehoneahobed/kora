@@ -35,6 +35,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
     "test:chaos": "NIGHTLY=true vitest run tests/integration/chaos-nightly.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

@@ -5,8 +5,8 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "test": "turbo run test",
-    "benchmark:gates": "pnpm --filter @korajs/store test:benchmarks && pnpm --filter @korajs/merge test -- src/benchmarks/performance-gates.test.ts && pnpm --filter @korajs/sync test -- src/benchmarks/performance-gates.test.ts",
+    "test": "turbo run test --concurrency=6",
+    "benchmark:gates": "pnpm --filter @korajs/store test:benchmarks && pnpm --filter @korajs/merge test:benchmarks && pnpm --filter @korajs/sync test:benchmarks",
     "chaos:nightly": "pnpm --filter @korajs/sync test:chaos",
     "test:chaos:real-path": "pnpm --filter @korajs/test test -- tests/chaos-real-path.test.ts",
     "test:sync-reconnect": "pnpm --filter @korajs/test test -- tests/sync-reconnect.test.ts",

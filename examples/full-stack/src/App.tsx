@@ -117,6 +117,7 @@ export function App() {
 									: completedTodos.length
 						return (
 							<button
+								type="button"
 								key={f}
 								onClick={() => setFilter(f)}
 								className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition ${
@@ -149,6 +150,7 @@ export function App() {
 								className="group flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 transition hover:border-gray-700"
 							>
 								<button
+									type="button"
 									onClick={() => toggleTodo.mutate(todo.id, { completed: !todo.completed })}
 									className="shrink-0 text-gray-500 hover:text-indigo-400 transition"
 								>
@@ -171,6 +173,7 @@ export function App() {
 									</span>
 								)}
 								<button
+									type="button"
 									onClick={() => deleteTodo.mutate(todo.id)}
 									className="shrink-0 text-gray-600 opacity-0 transition hover:text-red-400 group-hover:opacity-100"
 								>
@@ -189,6 +192,7 @@ export function App() {
 						</span>
 						{completedTodos.length > 0 && (
 							<button
+								type="button"
 								onClick={clearCompleted}
 								className="text-gray-500 transition hover:text-gray-300"
 							>
@@ -218,7 +222,12 @@ function SyncBadge({ status }: { status: { status: string; pendingOperations?: n
 		error: { icon: AlertCircle, color: 'text-red-400', label: 'Error' },
 	}
 
-	const { icon: Icon, color, label } = config[s] ?? config.offline!
+	const fallback = config.offline ?? {
+		icon: WifiOff,
+		color: 'text-gray-500',
+		label: 'Offline',
+	}
+	const { icon: Icon, color, label } = config[s] ?? fallback
 
 	return (
 		<div className="flex items-center gap-2 rounded-full bg-gray-800 px-3 py-1.5 text-sm">

@@ -32,7 +32,11 @@ async function verifyLocalApp(): Promise<void> {
 	}
 
 	await app.transaction(async (tx) => {
-		await tx.todos!.insert({ title: 'Transaction insert' })
+		const todosTx = tx.todos
+		if (!todosTx) {
+			throw new Error('expected todos collection on transaction')
+		}
+		await todosTx.insert({ title: 'Transaction insert' })
 	})
 
 	const todos = await app.todos.where({}).exec()
@@ -53,7 +57,9 @@ async function verifyLocalApp(): Promise<void> {
 
 	const snapshot = await app.replayTo(todoInsert.id)
 	if ((snapshot.collections.todos ?? []).length !== 1) {
-		throw new Error(`replayTo expected 1 todo at insert cut, got ${(snapshot.collections.todos ?? []).length}`)
+		throw new Error(
+			`replayTo expected 1 todo at insert cut, got ${(snapshot.collections.todos ?? []).length}`,
+		)
 	}
 
 	const audit = await app.exportAudit()
