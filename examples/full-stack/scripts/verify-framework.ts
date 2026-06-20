@@ -40,14 +40,9 @@ async function verifyLocalApp(): Promise<void> {
 		throw new Error(`expected at least 2 todos, got ${todos.length}`)
 	}
 
-	try {
-		const backup = await app.exportBackup()
-		if (backup.byteLength === 0) {
-			throw new Error('exportBackup returned empty payload')
-		}
-		console.log('✓ exportBackup')
-	} catch (error) {
-		console.warn('⚠ exportBackup skipped:', error instanceof Error ? error.message : error)
+	const backup = await app.exportBackup()
+	if (backup.byteLength === 0) {
+		throw new Error('exportBackup returned empty payload')
 	}
 
 	const ops = await app.getStore().getOperationRange(app.getStore().getNodeId(), 1, 100)
@@ -61,14 +56,9 @@ async function verifyLocalApp(): Promise<void> {
 		throw new Error(`replayTo expected 1 todo at insert cut, got ${(snapshot.collections.todos ?? []).length}`)
 	}
 
-	try {
-		const audit = await app.exportAudit()
-		if (audit.byteLength === 0) {
-			throw new Error('exportAudit returned empty payload')
-		}
-		console.log('✓ exportAudit')
-	} catch (error) {
-		console.warn('⚠ exportAudit skipped:', error instanceof Error ? error.message : error)
+	const audit = await app.exportAudit()
+	if (audit.byteLength === 0) {
+		throw new Error('exportAudit returned empty payload')
 	}
 
 	await app.projects.delete(project.id)

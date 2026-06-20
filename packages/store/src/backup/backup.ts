@@ -1,6 +1,7 @@
 import { generateUUIDv7 } from '@korajs/core'
 import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import type { StorageAdapter } from '../types'
+import { deserializeOperationWithCollection } from '../serialization/serializer'
+import type { OperationRow, StorageAdapter } from '../types'
 import type {
 	BackupManifest,
 	BackupOptions,
@@ -527,19 +528,6 @@ async function readMeta(adapter: StorageAdapter): Promise<MetaRow[]> {
 	return adapter.query<MetaRow>('SELECT key, value FROM _kora_meta')
 }
 
-interface OperationRow {
-	id: string
-	node_id: string
-	type: string
-	record_id: string
-	data: string | null
-	previous_data: string | null
-	timestamp: string
-	sequence_number: number
-	causal_deps: string
-	schema_version: number
-}
-
 async function readAllOperations(
 	adapter: StorageAdapter,
 	schema: SchemaDefinition,
@@ -552,19 +540,7 @@ async function readAllOperations(
 		)
 
 		for (const row of rows) {
-			allOps.push({
-				id: row.id,
-				nodeId: row.node_id,
-				type: row.type as Operation['type'],
-				collection: collectionName,
-				recordId: row.record_id,
-				data: row.data !== null ? JSON.parse(row.data) : null,
-				previousData: row.previous_data !== null ? JSON.parse(row.previous_data) : null,
-				timestamp: JSON.parse(row.timestamp),
-				sequenceNumber: row.sequence_number,
-				causalDeps: JSON.parse(row.causal_deps),
-				schemaVersion: row.schema_version,
-			})
+			allOps.push(deserializeOperationWithCollection(row, collectionName))
 		}
 	}
 
