@@ -34,7 +34,7 @@ pnpm benchmark:gates
 
 | Gate | Target | CI limit (×1.1) | Test file |
 |------|--------|-----------------|-----------|
-| Initial sync 10,000 ops (mock store) | Completes | 22,000 ms | `performance-gates.test.ts` |
+| Initial sync 10,000 ops (mock store) | Completes | 38,500 ms | `performance-gates.test.ts` |
 | Incremental sync 1 op | &lt; 200 ms | 220 ms | same |
 | Version-vector delta (100 nodes) | &lt; 10 ms | 11 ms | same |
 
