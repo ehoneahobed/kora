@@ -1,6 +1,6 @@
 {
   "name": "@korajs/svelte",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Experimental Svelte bindings stub for Kora.js (context helpers)",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -18,7 +18,9 @@
       }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
