@@ -153,8 +153,10 @@ describe('Backup and restore flow', () => {
 		const backup = await store.exportBackup()
 		expect(backup.byteLength).toBeGreaterThan(100)
 
-		// Verify magic bytes
-		const magic = new TextDecoder().decode(backup.slice(0, 4))
-		expect(magic).toBe('KORA')
+		const emptyStore = new MemoryServerStore('server-empty')
+		await emptyStore.setSchema(itemsSchema)
+		const imported = await emptyStore.importBackup(backup, false)
+		expect(imported.success).toBe(true)
+		expect(imported.operationsRestored).toBe(10)
 	})
 })
