@@ -168,9 +168,7 @@ async function handleOperationBatch(
 	server: ReturnType<typeof createMemoryTransportPair>['server'],
 ): Promise<void> {
 	const operations = message.operations.map((operation) => serializer.decodeOperation(operation))
-	for (const operation of operations) {
-		await store.applyRemoteOperation(operation)
-	}
+	await Promise.all(operations.map((operation) => store.applyRemoteOperation(operation)))
 
 	const lastOperation = operations[operations.length - 1]
 	const acknowledgement: AcknowledgmentMessage = {

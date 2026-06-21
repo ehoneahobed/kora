@@ -35,11 +35,14 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Benchmark gates
+        run: pnpm benchmark:gates
+
       - name: Test
         run: pnpm test
 
-      - name: Release gate (production-path, reconnect, chaos, benchmarks)
-        run: pnpm test:release-gate
+      - name: Release gate (production-path, reconnect, chaos)
+        run: pnpm test:production-path && pnpm test:sync-reconnect && pnpm test:chaos:real-path
 
       - name: Typecheck
         run: pnpm typecheck
