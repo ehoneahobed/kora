@@ -29,9 +29,9 @@ export const compactCommand = defineCommand({
 			default: 'after-ack',
 		},
 		days: {
-			type: 'number',
+			type: 'string',
 			description: 'Age threshold when strategy is after-days',
-			default: 30,
+			default: '30',
 		},
 	},
 	async run({ args }) {
@@ -62,7 +62,7 @@ export const compactCommand = defineCommand({
 		const { Store } = await import('@korajs/store')
 
 		const strategyName = typeof args.strategy === 'string' ? args.strategy : 'after-ack'
-		const days = typeof args.days === 'number' ? args.days : 30
+		const days = Number.parseInt(typeof args.days === 'string' ? args.days : '30', 10)
 
 		const store = new Store({
 			schema,
@@ -70,7 +70,7 @@ export const compactCommand = defineCommand({
 		})
 		await store.open()
 
-		let result: Awaited<ReturnType<Store['compact']>>
+		let result: { deletedCount: number; watermark: Map<string, number> }
 		if (strategyName === 'never') {
 			result = await store.compact({ mode: 'never' })
 		} else if (strategyName === 'after-days') {

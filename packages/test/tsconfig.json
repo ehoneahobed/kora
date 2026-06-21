@@ -8,5 +8,6 @@
       "korajs/testing": ["../../kora/src/testing.ts"]
     }
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests"],
+  "exclude": ["dist", "node_modules", "tests"]
 }

@@ -344,9 +344,15 @@ function parseVersionsFromMigrationId(id: string): { fromVersion: number; toVers
 		throw new Error(`Migration id "${id}" does not include a vX-to-vY version suffix.`)
 	}
 
+	const fromVersionText = match[1]
+	const toVersionText = match[2]
+	if (fromVersionText === undefined || toVersionText === undefined) {
+		throw new Error(`Migration id "${id}" does not include a vX-to-vY version suffix.`)
+	}
+
 	return {
-		fromVersion: Number.parseInt(match[1], 10),
-		toVersion: Number.parseInt(match[2], 10),
+		fromVersion: Number.parseInt(fromVersionText, 10),
+		toVersion: Number.parseInt(toVersionText, 10),
 	}
 }
 

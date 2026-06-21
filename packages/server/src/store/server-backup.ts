@@ -73,7 +73,8 @@ function parseJsonSection<T>(sections: Section[], name: string): T | null {
 }
 
 async function computeSha256(data: Uint8Array): Promise<string> {
-	const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+	const digestInput = new Uint8Array(data)
+	const hashBuffer = await crypto.subtle.digest('SHA-256', digestInput)
 	const hashArray = Array.from(new Uint8Array(hashBuffer))
 	return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
 }

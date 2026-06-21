@@ -50,6 +50,9 @@ export async function validateIncomingOperationConstraints(
 	}
 
 	const first = violations[0]
+	if (first === undefined) {
+		return { valid: true }
+	}
 	return {
 		valid: false,
 		code: 'CONSTRAINT_VIOLATION',

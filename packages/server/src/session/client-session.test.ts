@@ -1,3 +1,4 @@
+import type { OperationBatchMessage } from '@korajs/sync'
 import type { Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { encodeDeltaCursor } from '@korajs/sync'

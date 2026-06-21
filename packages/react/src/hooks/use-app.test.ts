@@ -60,7 +60,7 @@ describe('useApp', () => {
 	it('throws when used outside KoraProvider', () => {
 		function Consumer(): ReturnType<typeof createElement> {
 			useApp()
-			return null
+			return createElement('div', null)
 		}
 
 		// Suppress React error boundary console output
@@ -87,9 +87,12 @@ describe('useApp', () => {
 
 		render(createElement(KoraProvider, { store }, createElement(Consumer)))
 
-		expect(thrownError).not.toBeNull()
-		expect(thrownError?.message).toContain('useApp()')
-		expect(thrownError?.message).toContain('app')
+		if (!thrownError) {
+			throw new Error('Expected useApp() to throw when KoraProvider has no app prop')
+		}
+		const contextError: Error = thrownError
+		expect(contextError.message).toContain('useApp()')
+		expect(contextError.message).toContain('app')
 	})
 
 	it('preserves the app identity across re-renders', async () => {
@@ -127,7 +130,7 @@ describe('useApp', () => {
 		}
 
 		const typedApp = app as unknown as TypedApp
-		;(typedApp as Record<string, unknown>).todos = {
+		;(typedApp as unknown as Record<string, unknown>).todos = {
 			insert: vi.fn().mockResolvedValue({ id: '1', title: 'test' }),
 		}
 
@@ -144,8 +147,11 @@ describe('useApp', () => {
 			resolve()
 		})
 
-		expect(capturedApp).not.toBeNull()
-		expect(capturedApp?.todos).toBeDefined()
-		expect(typeof capturedApp?.todos.insert).toBe('function')
+		if (!capturedApp) {
+			throw new Error('Expected useApp() to return the typed app instance')
+		}
+		const resolvedApp: TypedApp = capturedApp
+		expect(resolvedApp.todos).toBeDefined()
+		expect(typeof resolvedApp.todos.insert).toBe('function')
 	})
 })

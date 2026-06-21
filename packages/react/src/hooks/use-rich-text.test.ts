@@ -25,19 +25,11 @@ function decodeText(value: Uint8Array): string {
 }
 
 function createQueryBuilderMock(initialResults: Array<Record<string, unknown>> = []) {
-	return {
-		where: vi.fn(function where() {
-			return this
-		}),
-		orderBy: vi.fn(function orderBy() {
-			return this
-		}),
-		limit: vi.fn(function limit() {
-			return this
-		}),
-		offset: vi.fn(function offset() {
-			return this
-		}),
+	const builder = {
+		where: vi.fn(),
+		orderBy: vi.fn(),
+		limit: vi.fn(),
+		offset: vi.fn(),
 		exec: vi.fn(async () => initialResults),
 		count: vi.fn(async () => initialResults.length),
 		subscribe: vi.fn((callback: (results: Array<Record<string, unknown>>) => void) => {
@@ -46,6 +38,13 @@ function createQueryBuilderMock(initialResults: Array<Record<string, unknown>> =
 		}),
 		getDescriptor: vi.fn(),
 	}
+
+	builder.where.mockReturnValue(builder)
+	builder.orderBy.mockReturnValue(builder)
+	builder.limit.mockReturnValue(builder)
+	builder.offset.mockReturnValue(builder)
+
+	return builder
 }
 
 function createMockStore(collections: Record<string, CollectionAccessor>): Store {
@@ -117,9 +116,12 @@ describe('useRichText', () => {
 			expect(updateSpy).toHaveBeenCalledTimes(1)
 		})
 
-		const call = updateSpy.mock.calls[0]
-		expect(call?.[0]).toBe('rec-1')
-		expect(call?.[1]).toMatchObject({ body: expect.any(Uint8Array) })
+		const call = updateSpy.mock.calls[0] as unknown as [string, { body: Uint8Array }] | undefined
+		if (!call) {
+			throw new Error('Expected updateSpy to receive a call')
+		}
+		expect(call[0]).toBe('rec-1')
+		expect(call[1]).toMatchObject({ body: expect.any(Uint8Array) })
 	})
 
 	test('exposes undo/redo controls for local edits', async () => {
@@ -198,10 +200,13 @@ describe('useRichText', () => {
 			expect(updateSpy).toHaveBeenCalled()
 		})
 
-		const lastCall = updateSpy.mock.calls.at(-1)
-		const body = lastCall?.[1] as { body?: Uint8Array }
+		const lastCall = updateSpy.mock.calls.at(-1) as [string, { body: Uint8Array }] | undefined
+		if (!lastCall) {
+			throw new Error('Expected updateSpy to receive at least one call')
+		}
+		const body = lastCall[1]
 		expect(body.body).toBeInstanceOf(Uint8Array)
-		expect(decodeText(body.body as Uint8Array)).toBe('x'.repeat(25))
+		expect(decodeText(body.body)).toBe('x'.repeat(25))
 	})
 
 	test('setCursor publishes awareness state for the active field', async () => {
