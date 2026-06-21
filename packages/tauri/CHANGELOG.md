@@ -1,5 +1,12 @@
 # @korajs/tauri
 
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies [b909e5a]
+  - @korajs/core@1.0.0
+
 ## 0.3.4
 
 ### Patch Changes
