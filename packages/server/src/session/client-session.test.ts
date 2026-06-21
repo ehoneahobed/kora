@@ -1,6 +1,5 @@
-import type { OperationBatchMessage } from '@korajs/sync'
 import type { Operation } from '@korajs/core'
-import type { SyncMessage } from '@korajs/sync'
+import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { encodeDeltaCursor } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
