@@ -1,4 +1,4 @@
-import type { Operation } from '@korajs/core'
+import type { Operation, VersionVector } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import type { SyncEncryptionConfig } from './encryption/types'
 
@@ -21,7 +21,14 @@ export type SyncState = (typeof SYNC_STATES)[number]
 /**
  * Developer-facing sync status. Simplified view of the internal state.
  */
-export const SYNC_STATUSES = ['connected', 'syncing', 'synced', 'offline', 'error'] as const
+export const SYNC_STATUSES = [
+	'connected',
+	'syncing',
+	'synced',
+	'offline',
+	'error',
+	'schema-mismatch',
+] as const
 export type SyncStatus = (typeof SYNC_STATUSES)[number]
 
 /**
@@ -74,6 +81,20 @@ export interface SyncConfig {
 	maxReconnectInterval?: number
 	/** Schema version of this client. */
 	schemaVersion?: number
+	/** Start sync automatically when the engine is created. Defaults to false. */
+	autoConnect?: boolean
+	/**
+	 * When true, wait for server ACKs on all outbound handshake delta batches before
+	 * entering streaming. Improves backpressure for large initial syncs.
+	 */
+	strictHandshake?: boolean
+	/** Optional operation transforms for cross-schema-version sync. */
+	operationTransforms?: import('@korajs/core').OperationTransform[]
+	/**
+	 * Richtext snapshot size (bytes) at which the optional Yjs doc channel is used.
+	 * Defaults to 4096.
+	 */
+	richtextDocChannelThreshold?: number
 	/**
 	 * End-to-end encryption configuration.
 	 * When enabled, `data` and `previousData` fields are encrypted before sending
@@ -88,6 +109,27 @@ export interface SyncConfig {
 export interface SyncScopeContext {
 	userId?: string
 	[key: string]: unknown
+}
+
+/**
+ * Persists last-acked server version vector and computes unsynced operations from the op log.
+ */
+export interface DeltaCursor {
+	/** ID of the last fully applied operation in the previous delta stream */
+	lastOperationId: string
+	/** Zero-based batch index where the cursor was recorded */
+	batchIndex: number
+}
+
+export interface SyncStatePersistence {
+	loadLastAckedServerVector(): Promise<VersionVector>
+	saveLastAckedServerVector(vector: VersionVector): Promise<void>
+	mergeServerVectors(a: VersionVector, b: VersionVector): VersionVector
+	countUnsyncedOperations(serverVector: VersionVector): Promise<number>
+	getUnsyncedOperations(serverVector: VersionVector): Promise<Operation[]>
+	/** Resume position for paginated initial sync (optional). */
+	loadDeltaCursor?(): Promise<DeltaCursor | null>
+	saveDeltaCursor?(cursor: DeltaCursor | null): Promise<void>
 }
 
 /**
@@ -119,8 +161,7 @@ export class ScopeViolationError extends KoraError {
 		message?: string,
 	) {
 		super(
-			message ??
-				`Operation "${operationId}" in collection "${collection}" violates sync scope`,
+			message ?? `Operation "${operationId}" in collection "${collection}" violates sync scope`,
 			'SCOPE_VIOLATION',
 			{ operationId, collection, scope },
 		)

@@ -25,6 +25,7 @@ export type {
 	SequenceConfig,
 	StateMachineConstraint,
 	StateMachineDefinition,
+	SyncRuleDefinition,
 	SyncDiagnosticsSnapshot,
 	TimeSource,
 	TransitionMap,
@@ -44,14 +45,25 @@ export {
 	StorageError,
 	SyncError,
 } from './errors/errors'
+export { getKoraErrorFix, KORA_ERROR_FIX_SUGGESTIONS } from './errors/error-fixes'
 
 // === Clock ===
 export { HybridLogicalClock } from './clock/hlc'
+
+// === Causal tracking ===
+export { CausalTracker } from './causal/causal-tracker'
 
 // === Identifiers ===
 export { extractTimestamp, generateUUIDv7, isValidUUIDv7 } from './identifiers/uuid-v7'
 
 // === Operations ===
+export {
+	APPLY_FAILURE_CODES,
+	APPLY_RESULTS,
+	defaultApplyFailureReason,
+	isApplyFailure,
+} from './operations/apply-result'
+export type { ApplyFailureReason, ApplyResult } from './operations/apply-result'
 export {
 	createOperation,
 	isValidOperation,
@@ -106,11 +118,23 @@ export type { OperationLog } from './version-vector/version-vector'
 // === Scopes ===
 export { buildScopeMap } from './scopes/build-scope-map'
 export type { ScopeMap } from './scopes/build-scope-map'
+export {
+	collectSchemaScopeFields,
+	extractScopeValuesFromClaims,
+} from './scopes/extract-scope-from-claims'
+export {
+	collectSchemaScopeValueKeys,
+	getCollectionScopeBindings,
+	hasSchemaSyncRules,
+	isCollectionSyncScoped,
+} from './scopes/sync-scope-bindings'
 
 // === Sequences ===
 export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence-format'
 
 // === Migrations ===
+export type { OperationTransform } from './migration/operation-transform'
+export { applyOperationTransforms } from './migration/apply-operation-transforms'
 export { MigrationBuilder, RollbackBuilder, migrate } from './migrations/migration-builder'
 export type { MigrationDefinition, MigrationStep } from './migrations/migration-builder'
 export { migrationStepsToSQL, rollbackStepsToSQL } from './migrations/migration-sql'

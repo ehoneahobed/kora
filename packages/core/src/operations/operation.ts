@@ -181,6 +181,8 @@ export function isValidOperation(value: unknown): value is Operation {
 
 function deepFreeze<T>(obj: T): T {
 	if (typeof obj !== 'object' || obj === null) return obj
+	// Typed arrays (e.g. richtext Yjs blobs) cannot be frozen in JS engines.
+	if (ArrayBuffer.isView(obj)) return obj
 	Object.freeze(obj)
 	for (const value of Object.values(obj)) {
 		if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {

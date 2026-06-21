@@ -85,7 +85,7 @@ function makeSchema(relations: Record<string, RelationDefinition> = {}): SchemaD
 						enumValues: null,
 						itemKind: null,
 						mergeStrategy: null,
-				transitions: null,
+						transitions: null,
 					},
 				},
 				indexes: [],

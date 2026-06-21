@@ -16,7 +16,7 @@ describe('applySyncProviderPreset', () => {
 		await tempDir.cleanup()
 	})
 
-	test('rewrites sync server to postgres preset for postgres db', async () => {
+	test('adds postgres provider guidance without replacing the sync server', async () => {
 		const targetDir = join(tempDir.path, 'sync-postgres')
 		await scaffoldTemplate('react-sync', targetDir, {
 			projectName: 'sync-postgres',
@@ -25,6 +25,7 @@ describe('applySyncProviderPreset', () => {
 			dbProvider: 'neon',
 		})
 
+		const before = await readFile(join(targetDir, 'server.ts'), 'utf-8')
 		await applySyncProviderPreset({
 			targetDir,
 			template: 'react-sync',
@@ -35,12 +36,13 @@ describe('applySyncProviderPreset', () => {
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
 		const env = await readFile(join(targetDir, '.env.example'), 'utf-8')
 		const readme = await readFile(join(targetDir, 'README.md'), 'utf-8')
+		expect(server).toBe(before)
 		expect(server).toContain('createPostgresServerStore')
-		expect(server).toContain('DATABASE_URL is required')
-		expect(server).toContain('PostgreSQL provider preset: Neon')
+		expect(server).toContain('setSchema(schema)')
 		expect(readme).toContain('Selected DB provider: neon')
-		expect(readme).toContain('createPostgresServerStore')
+		expect(readme).toContain('When `DATABASE_URL` is set')
 		expect(env).toContain('DATABASE_URL=')
+		expect(env).toContain('PostgreSQL provider preset: Neon')
 		expect(env).toContain('neon.tech')
 	})
 

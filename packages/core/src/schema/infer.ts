@@ -36,20 +36,24 @@ export type InferFieldType<F> =
 	// EnumFieldBuilder (class instance — preserves literal union)
 	F extends EnumFieldBuilder<infer V, any, any>
 		? V[number]
-		// ArrayFieldBuilder (class instance)
-		: F extends ArrayFieldBuilder<infer K, any, any>
+		: // ArrayFieldBuilder (class instance)
+			F extends ArrayFieldBuilder<infer K, any, any>
 			? FieldKindToType[K][]
-			// Generic FieldBuilder (class instance — string, number, boolean, timestamp, richtext)
-			: F extends FieldBuilder<infer K, any, any>
-				? K extends keyof FieldKindToType ? FieldKindToType[K] : unknown
-				// FieldDescriptor enum (structural — enumValues should be readonly string[])
-				: F extends { kind: 'enum'; enumValues: infer V }
-					? V extends readonly (infer S)[] ? S : string
-					// FieldDescriptor array (structural)
-					: F extends { kind: 'array'; itemKind: infer K extends FieldKind }
+			: // Generic FieldBuilder (class instance — string, number, boolean, timestamp, richtext)
+				F extends FieldBuilder<infer K, any, any>
+				? K extends keyof FieldKindToType
+					? FieldKindToType[K]
+					: unknown
+				: // FieldDescriptor enum (structural — enumValues should be readonly string[])
+					F extends { kind: 'enum'; enumValues: infer V }
+					? V extends readonly (infer S)[]
+						? S
+						: string
+					: // FieldDescriptor array (structural)
+						F extends { kind: 'array'; itemKind: infer K extends FieldKind }
 						? FieldKindToType[K][]
-						// FieldDescriptor generic (structural — string, number, boolean, timestamp, richtext)
-						: F extends { kind: infer K extends FieldKind }
+						: // FieldDescriptor generic (structural — string, number, boolean, timestamp, richtext)
+							F extends { kind: infer K extends FieldKind }
 							? FieldKindToType[K]
 							: unknown
 
@@ -83,15 +87,13 @@ export type InferInsertInput<Fields extends Record<string, FieldBuilder<any, any
 		? never
 		: Fields[K] extends FieldBuilder<any, true, false>
 			? K
-			: never
-	]: InferFieldType<Fields[K]>
+			: never]: InferFieldType<Fields[K]>
 } & {
 	[K in keyof Fields as Fields[K] extends FieldBuilder<any, any, true>
 		? never
 		: Fields[K] extends FieldBuilder<any, true, false>
 			? never
-			: K
-	]?: InferFieldType<Fields[K]>
+			: K]?: InferFieldType<Fields[K]>
 }
 
 // === Update Input Inference ===
@@ -101,5 +103,7 @@ export type InferInsertInput<Fields extends Record<string, FieldBuilder<any, any
  * All non-auto fields are optional (partial update semantics).
  */
 export type InferUpdateInput<Fields extends Record<string, FieldBuilder<any, any, any>>> = {
-	[K in keyof Fields as Fields[K] extends FieldBuilder<any, any, true> ? never : K]?: InferFieldType<Fields[K]>
+	[K in keyof Fields as Fields[K] extends FieldBuilder<any, any, true>
+		? never
+		: K]?: InferFieldType<Fields[K]>
 }

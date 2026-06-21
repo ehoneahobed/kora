@@ -40,6 +40,10 @@ export class MemoryServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	getSchema(): SchemaDefinition | null {
+		return this.schema
+	}
+
 	async setSchema(schema: SchemaDefinition): Promise<void> {
 		this.assertOpen()
 		this.schema = schema
@@ -244,6 +248,18 @@ export class MemoryServerStore implements ServerStore {
 
 	async close(): Promise<void> {
 		this.closed = true
+	}
+
+	/**
+	 * Wipes all in-memory state. For tests and E2E isolation only.
+	 */
+	resetForTests(): void {
+		this.assertOpen()
+		this.operations.length = 0
+		this.operationIndex.clear()
+		this.versionVector.clear()
+		this.materializedRecords.clear()
+		this.schema = null
 	}
 
 	async exportBackup(): Promise<Uint8Array> {

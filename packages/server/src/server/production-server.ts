@@ -18,6 +18,52 @@ export interface ProductionServerConfig {
 	syncPath?: string
 	/** Additional KoraSyncServer options */
 	syncOptions?: Omit<KoraSyncServerConfig, 'store' | 'port' | 'host' | 'path'>
+	/**
+	 * Optional HTTP route handlers mounted before static file serving.
+	 *
+	 * This is intentionally framework-agnostic so packages such as
+	 * `@korajs/auth` can plug into the production server without requiring
+	 * Express, Hono, or another HTTP framework.
+	 */
+	httpRoutes?: ProductionHttpRoute[]
+	/**
+	 * Optional token protection for operational endpoints.
+	 *
+	 * When a token is omitted, the matching endpoint group remains public for
+	 * backward compatibility. Production apps should set at least adminToken and
+	 * backupToken.
+	 */
+	operationalAuth?: ProductionOperationalAuth
+}
+
+export interface ProductionOperationalAuth {
+	/** Protects /__kora, /__kora/status, and /__kora/events. */
+	adminToken?: string
+	/** Protects /__kora/metrics. Falls back to adminToken when omitted. */
+	metricsToken?: string
+	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
+	backupToken?: string
+}
+
+export interface ProductionHttpRouteRequest {
+	method: string
+	path: string
+	body?: unknown
+	headers?: Record<string, string | string[] | undefined>
+	query?: Record<string, string | string[] | undefined>
+	ip?: string
+}
+
+export interface ProductionHttpRouteResponse {
+	status: number
+	body?: unknown
+	headers?: Record<string, string>
+}
+
+export interface ProductionHttpRoute {
+	/** URL path prefix, for example `/auth`. */
+	path: string
+	handle(request: ProductionHttpRouteRequest): Promise<ProductionHttpRouteResponse>
 }
 
 /**
@@ -74,6 +120,49 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 	let httpServer: import('node:http').Server | null = null
 
+	function getOperationalToken(kind: 'admin' | 'metrics' | 'backup'): string | undefined {
+		const auth = config.operationalAuth
+		if (!auth) return undefined
+		if (kind === 'metrics') return auth.metricsToken || auth.adminToken
+		if (kind === 'backup') return auth.backupToken || auth.adminToken
+		return auth.adminToken
+	}
+
+	function extractRequestToken(req: import('node:http').IncomingMessage): string | null {
+		const authorization = req.headers.authorization
+		if (authorization?.startsWith('Bearer ')) {
+			return authorization.slice('Bearer '.length).trim()
+		}
+
+		const headerNames = ['x-kora-admin-token', 'x-kora-metrics-token', 'x-kora-backup-token']
+		for (const name of headerNames) {
+			const value = req.headers[name]
+			if (typeof value === 'string' && value.length > 0) return value
+			if (Array.isArray(value) && typeof value[0] === 'string' && value[0].length > 0) {
+				return value[0]
+			}
+		}
+
+		return null
+	}
+
+	function isOperationalRequestAllowed(
+		req: import('node:http').IncomingMessage,
+		kind: 'admin' | 'metrics' | 'backup',
+	): boolean {
+		const expected = getOperationalToken(kind)
+		if (!expected) return true
+		return extractRequestToken(req) === expected
+	}
+
+	function rejectUnauthorized(res: import('node:http').ServerResponse): void {
+		res.writeHead(401, {
+			'Content-Type': 'application/json',
+			'WWW-Authenticate': 'Bearer realm="kora"',
+		})
+		res.end(JSON.stringify({ error: 'Unauthorized' }))
+	}
+
 	/**
 	 * Format the metrics snapshot as Prometheus exposition format.
 	 * Zero-dependency — no prom-client needed.
@@ -125,23 +214,67 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		return lines.join('\n')
 	}
 
-	/**
-	 * Read the request body as a string (for POST endpoints).
-	 */
-	function readBody(req: import('node:http').IncomingMessage): Promise<string> {
-		return new Promise((resolve) => {
-			const chunks: Buffer[] = []
-			req.on('data', (chunk: Buffer) => chunks.push(chunk))
-			req.on('end', () => resolve(Buffer.concat(chunks).toString()))
-		})
-	}
-
 	function readBodyBuffer(req: import('node:http').IncomingMessage): Promise<Buffer> {
 		return new Promise((resolve) => {
 			const chunks: Buffer[] = []
 			req.on('data', (chunk: Buffer) => chunks.push(chunk))
 			req.on('end', () => resolve(Buffer.concat(chunks)))
 		})
+	}
+
+	async function readJsonBody(req: import('node:http').IncomingMessage): Promise<unknown> {
+		const buffer = await readBodyBuffer(req)
+		if (buffer.byteLength === 0) return undefined
+		try {
+			return JSON.parse(buffer.toString('utf8')) as unknown
+		} catch {
+			return undefined
+		}
+	}
+
+	function matchesRoutePrefix(pathname: string, prefix: string): boolean {
+		const normalizedPrefix = normalizeRoutePath(prefix)
+		return pathname === normalizedPrefix || pathname.startsWith(`${normalizedPrefix}/`)
+	}
+
+	function normalizeRoutePath(path: string): string {
+		const prefixed = path.startsWith('/') ? path : `/${path}`
+		return prefixed.length > 1 ? prefixed.replace(/\/+$/, '') : prefixed
+	}
+
+	function getClientIp(req: import('node:http').IncomingMessage): string | undefined {
+		const forwarded = req.headers['x-forwarded-for']
+		if (typeof forwarded === 'string' && forwarded.length > 0) {
+			return forwarded.split(',')[0]?.trim()
+		}
+		return req.socket.remoteAddress
+	}
+
+	function getQuery(url: URL): Record<string, string | string[] | undefined> {
+		const query: Record<string, string | string[] | undefined> = {}
+		for (const [key, value] of url.searchParams) {
+			const existing = query[key]
+			if (existing === undefined) {
+				query[key] = value
+			} else if (Array.isArray(existing)) {
+				existing.push(value)
+			} else {
+				query[key] = [existing, value]
+			}
+		}
+		return query
+	}
+
+	function writeJsonResponse(
+		res: import('node:http').ServerResponse,
+		result: ProductionHttpRouteResponse,
+	): void {
+		const headers = {
+			'Content-Type': 'application/json',
+			...(result.headers ?? {}),
+		}
+		res.writeHead(result.status, headers)
+		res.end(JSON.stringify(result.body ?? null))
 	}
 
 	return {
@@ -179,6 +312,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Status endpoint ───────────────────────────────────────────
 				if (url.pathname === '/__kora/status') {
+					if (!isOperationalRequestAllowed(req, 'admin')) {
+						rejectUnauthorized(res)
+						return
+					}
 					const status = await syncServer.getStatus()
 					res.writeHead(200, { 'Content-Type': 'application/json' })
 					res.end(JSON.stringify(status, null, 2))
@@ -187,6 +324,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Prometheus metrics endpoint ───────────────────────────────
 				if (url.pathname === '/__kora/metrics') {
+					if (!isOperationalRequestAllowed(req, 'metrics')) {
+						rejectUnauthorized(res)
+						return
+					}
 					res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' })
 					res.end(formatPrometheusMetrics())
 					return
@@ -194,6 +335,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Server-Sent Events endpoint ───────────────────────────────
 				if (url.pathname === '/__kora/events') {
+					if (!isOperationalRequestAllowed(req, 'admin')) {
+						rejectUnauthorized(res)
+						return
+					}
 					res.writeHead(200, {
 						'Content-Type': 'text/event-stream',
 						'Cache-Control': 'no-cache',
@@ -225,6 +370,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Dashboard HTML ────────────────────────────────────────────
 				if (url.pathname === '/__kora' || url.pathname === '/__kora/') {
+					if (!isOperationalRequestAllowed(req, 'admin')) {
+						rejectUnauthorized(res)
+						return
+					}
 					const status = await syncServer.getStatus()
 					res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
 					res.end(renderDashboardHtml(status))
@@ -233,6 +382,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Backup export ─────────────────────────────────────────────
 				if (url.pathname === '/__kora/backup/export' && req.method === 'POST') {
+					if (!isOperationalRequestAllowed(req, 'backup')) {
+						rejectUnauthorized(res)
+						return
+					}
 					try {
 						const backup = await config.store.exportBackup()
 						res.writeHead(200, {
@@ -249,19 +402,43 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				}
 
 				// ── Backup import ─────────────────────────────────────────────
-			if (url.pathname === '/__kora/backup/import' && req.method === 'POST') {
-				try {
-					const body = await readBodyBuffer(req)
-					const merge = url.searchParams.get('merge') === 'true'
-					const result = await config.store.importBackup(new Uint8Array(body.buffer, body.byteOffset, body.byteLength), merge)
-					res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' })
-					res.end(JSON.stringify(result))
-				} catch (error) {
-					res.writeHead(500, { 'Content-Type': 'application/json' })
-					res.end(JSON.stringify({ error: 'Restore failed', message: (error as Error).message }))
+				if (url.pathname === '/__kora/backup/import' && req.method === 'POST') {
+					if (!isOperationalRequestAllowed(req, 'backup')) {
+						rejectUnauthorized(res)
+						return
+					}
+					try {
+						const body = await readBodyBuffer(req)
+						const merge = url.searchParams.get('merge') === 'true'
+						const result = await config.store.importBackup(
+							new Uint8Array(body.buffer, body.byteOffset, body.byteLength),
+							merge,
+						)
+						res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' })
+						res.end(JSON.stringify(result))
+					} catch (error) {
+						res.writeHead(500, { 'Content-Type': 'application/json' })
+						res.end(JSON.stringify({ error: 'Restore failed', message: (error as Error).message }))
+					}
+					return
 				}
-				return
-			}
+
+				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
+				const customRoute = config.httpRoutes?.find((route) =>
+					matchesRoutePrefix(url.pathname, route.path),
+				)
+				if (customRoute) {
+					const result = await customRoute.handle({
+						method: req.method ?? 'GET',
+						path: url.pathname,
+						body: await readJsonBody(req),
+						headers: req.headers,
+						query: getQuery(url),
+						ip: getClientIp(req),
+					})
+					writeJsonResponse(res, result)
+					return
+				}
 
 				// ── Static file serving ───────────────────────────────────────
 				let filePath = join(distDir, url.pathname)

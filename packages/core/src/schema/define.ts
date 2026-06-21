@@ -1,5 +1,6 @@
 import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
+import { normalizeSyncRuleWhere } from '../scopes/sync-scope-bindings'
 import { validateStateMachineDefinition } from '../state-machine/state-machine'
 import type {
 	CollectionDefinition,
@@ -9,6 +10,7 @@ import type {
 	RelationDefinition,
 	SchemaDefinition,
 	StateMachineDefinition,
+	SyncRuleDefinition,
 } from '../types'
 import type { FieldBuilder } from './types'
 
@@ -19,7 +21,7 @@ const COLLECTION_NAME_RE = /^[a-z][a-z0-9_]*$/
 const FIELD_NAME_RE = /^[a-z][a-zA-Z0-9_]*$/
 
 /** Reserved field names that cannot be used in schemas */
-const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_deleted'])
+const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_version', '_deleted'])
 
 /**
  * Input shape for defineSchema() — what the developer writes.
@@ -30,6 +32,30 @@ export interface SchemaInput {
 	relations?: Record<string, RelationInput>
 	/** Schema migrations keyed by target version number. */
 	migrations?: Record<number, MigrationDefinition>
+	/**
+	 * Declarative partial-sync rules.
+	 *
+	 * @example
+	 * ```typescript
+	 * sync: {
+	 *   todos: { where: { userId: true, orgId: true } },
+	 *   projects: { where: { orgId: true } },
+	 * }
+	 * ```
+	 */
+	sync?: Record<string, SyncRuleInput>
+}
+
+/**
+ * Developer input for a collection sync rule.
+ */
+export interface SyncRuleInput {
+	/**
+	 * Field filters bound to scope values.
+	 * Use `true` to bind a field to a scope value with the same name.
+	 * Use a string to bind to a different scope value key.
+	 */
+	where: Record<string, boolean | string>
 }
 
 export interface StateMachineInput {
@@ -156,7 +182,16 @@ export function defineSchema<const T extends SchemaInput>(input: T): TypedSchema
 		}
 	}
 
-	return { version: input.version, collections, relations, migrations } as TypedSchemaDefinition<T>
+	const sync = buildSyncRules(input.sync, collections)
+	applySyncRulesToCollectionScope(collections, sync)
+
+	return {
+		version: input.version,
+		collections,
+		relations,
+		migrations,
+		...(sync ? { sync } : {}),
+	} as TypedSchemaDefinition<T>
 }
 
 function validateVersion(version: number): void {
@@ -247,6 +282,80 @@ function buildCollection(name: string, input: CollectionInput): CollectionDefini
 	}
 
 	return { fields, indexes, constraints, resolvers, scope, stateMachine }
+}
+
+function buildSyncRules(
+	syncInput: SchemaInput['sync'],
+	collections: Record<string, CollectionDefinition>,
+): Record<string, SyncRuleDefinition> | undefined {
+	if (!syncInput) {
+		return undefined
+	}
+
+	const sync: Record<string, SyncRuleDefinition> = {}
+
+	for (const [collectionName, ruleInput] of Object.entries(syncInput)) {
+		if (!(collectionName in collections)) {
+			throw new SchemaValidationError(
+				`Sync rule references collection "${collectionName}" which does not exist. Available collections: ${Object.keys(collections).join(', ')}`,
+				{ collection: collectionName },
+			)
+		}
+
+		if (!ruleInput.where || Object.keys(ruleInput.where).length === 0) {
+			throw new SchemaValidationError(
+				`Sync rule for collection "${collectionName}" must declare at least one where binding`,
+				{ collection: collectionName },
+			)
+		}
+
+		const collection = collections[collectionName]
+		if (!collection) {
+			continue
+		}
+
+		for (const fieldName of Object.keys(ruleInput.where)) {
+			if (!(fieldName in collection.fields)) {
+				throw new SchemaValidationError(
+					`Sync rule where field "${fieldName}" does not exist in collection "${collectionName}". Available fields: ${Object.keys(collection.fields).join(', ')}`,
+					{ collection: collectionName, field: fieldName },
+				)
+			}
+		}
+
+		try {
+			sync[collectionName] = { where: normalizeSyncRuleWhere(collectionName, ruleInput.where) }
+		} catch (error) {
+			throw new SchemaValidationError(
+				error instanceof Error ? error.message : 'Invalid sync rule',
+				{ collection: collectionName },
+			)
+		}
+	}
+
+	return sync
+}
+
+function applySyncRulesToCollectionScope(
+	collections: Record<string, CollectionDefinition>,
+	sync: Record<string, SyncRuleDefinition> | undefined,
+): void {
+	if (!sync) {
+		return
+	}
+
+	for (const [collectionName, rule] of Object.entries(sync)) {
+		const collection = collections[collectionName]
+		if (!collection) {
+			continue
+		}
+
+		for (const fieldName of Object.keys(rule.where)) {
+			if (!collection.scope.includes(fieldName)) {
+				collection.scope.push(fieldName)
+			}
+		}
+	}
 }
 
 function validateFieldName(collection: string, fieldName: string): void {

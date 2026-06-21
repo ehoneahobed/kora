@@ -174,14 +174,17 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 			deployDirectory,
 		})
 
-		const client = await buildClient({
-			projectRoot: config.projectRoot,
-			outDir: join(deployDirectory, 'dist'),
-			mode: 'production',
-		})
+		const client =
+			config.deployTarget === 'sync-server'
+				? null
+				: await buildClient({
+						projectRoot: config.projectRoot,
+						outDir: join(deployDirectory, 'dist'),
+						mode: 'production',
+					})
 
 		return {
-			clientDirectory: client.outDir,
+			clientDirectory: client?.outDir ?? null,
 			serverBundlePath: join(deployDirectory, 'server-bundled.js'),
 			deployDirectory,
 		}

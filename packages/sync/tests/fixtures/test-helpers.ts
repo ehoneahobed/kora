@@ -22,6 +22,7 @@ export function createMockSyncStore(options?: {
 } {
 	const nodeId = options?.nodeId ?? 'test-node'
 	const operations: Operation[] = [...(options?.initialOps ?? [])]
+	const operationIds = new Set(operations.map((operation) => operation.id))
 	const versionVector: VersionVector = options?.initialVector
 		? new Map(options.initialVector)
 		: new Map()
@@ -45,11 +46,12 @@ export function createMockSyncStore(options?: {
 
 		async applyRemoteOperation(op: Operation): Promise<'applied' | 'duplicate' | 'skipped'> {
 			// Content-addressed dedup
-			if (operations.some((existing) => existing.id === op.id)) {
+			if (operationIds.has(op.id)) {
 				return 'duplicate'
 			}
 
 			operations.push(op)
+			operationIds.add(op.id)
 			const current = versionVector.get(op.nodeId) ?? 0
 			if (op.sequenceNumber > current) {
 				versionVector.set(op.nodeId, op.sequenceNumber)
@@ -77,8 +79,9 @@ export function createMockSyncStore(options?: {
 		},
 
 		addOperation(op: Operation): void {
-			if (!operations.some((existing) => existing.id === op.id)) {
+			if (!operationIds.has(op.id)) {
 				operations.push(op)
+				operationIds.add(op.id)
 				const current = versionVector.get(op.nodeId) ?? 0
 				if (op.sequenceNumber > current) {
 					versionVector.set(op.nodeId, op.sequenceNumber)

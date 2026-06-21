@@ -131,6 +131,9 @@ describe('Integration: Atomic operations', () => {
 		expect(updateOps).toHaveLength(1)
 
 		const updateOp = updateOps[0]
+		if (!updateOp) {
+			throw new Error('expected one update operation in op log')
+		}
 		expect(updateOp.data).toEqual({ count: 15 })
 		expect(updateOp.previousData).toEqual({ count: 10 })
 		expect(updateOp.atomicOps).toEqual({

@@ -7,6 +7,7 @@ export type {
 	KoraContextValue,
 	KoraProviderProps,
 	UseQueryOptions,
+	UseMutationOptions,
 	UseMutationResult,
 	UseRichTextResult,
 } from './types'
@@ -21,3 +22,4 @@ export { useMutation } from './hooks/use-mutation'
 export { useSyncStatus } from './hooks/use-sync-status'
 export { useCollection } from './hooks/use-collection'
 export { useRichText } from './hooks/use-rich-text'
+export type { UseRichTextOptions } from './hooks/use-rich-text'

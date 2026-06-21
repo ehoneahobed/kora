@@ -133,11 +133,25 @@ export class EnumFieldBuilder<
 	}
 
 	override default(value: Values[number]): EnumFieldBuilder<Values, false, Auto> {
-		return new EnumFieldBuilder(this._enumValues, false, value, this._auto, this._mergeStrategy, this._transitions)
+		return new EnumFieldBuilder(
+			this._enumValues,
+			false,
+			value,
+			this._auto,
+			this._mergeStrategy,
+			this._transitions,
+		)
 	}
 
 	override auto(): EnumFieldBuilder<Values, false, true> {
-		return new EnumFieldBuilder(this._enumValues, false, undefined, true, this._mergeStrategy, this._transitions)
+		return new EnumFieldBuilder(
+			this._enumValues,
+			false,
+			undefined,
+			true,
+			this._mergeStrategy,
+			this._transitions,
+		)
 	}
 
 	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto> {
@@ -167,7 +181,9 @@ export class EnumFieldBuilder<
 	 * })
 	 * ```
 	 */
-	transitions(map: Partial<Record<Values[number], Values[number][]>>): EnumFieldBuilder<Values, Req, Auto> {
+	transitions(
+		map: Partial<Record<Values[number], Values[number][]>>,
+	): EnumFieldBuilder<Values, Req, Auto> {
 		// Validate that all source and target states are valid enum values
 		const validValues = new Set(this._enumValues as readonly string[])
 		for (const [state, targets] of Object.entries(map)) {

@@ -12,10 +12,7 @@ import { JsonMessageSerializer } from '../../src/protocol/serializer'
 import { ChaosTransport } from '../../src/transport/chaos-transport'
 import type { MemoryTransport } from '../../src/transport/memory-transport'
 import { createMemoryTransportPair } from '../../src/transport/memory-transport'
-import {
-	createMockSyncStore,
-	createTestOperations,
-} from '../fixtures/test-helpers'
+import { createMockSyncStore, createTestOperations } from '../fixtures/test-helpers'
 
 const serializer = new JsonMessageSerializer()
 
@@ -65,14 +62,21 @@ class ChaosHub {
 		safeSend(server, response)
 
 		const clientVector = new Map(
-			Object.entries(message.versionVector).map(([nodeId, sequence]) => [nodeId, sequence as number]),
+			Object.entries(message.versionVector).map(([nodeId, sequence]) => [
+				nodeId,
+				sequence as number,
+			]),
 		)
 
 		const missing: Operation[] = []
 		for (const [nodeId, hubSequence] of this.store.getVersionVector()) {
 			const clientSequence = clientVector.get(nodeId) ?? 0
 			if (hubSequence > clientSequence) {
-				const operations = await this.store.getOperationRange(nodeId, clientSequence + 1, hubSequence)
+				const operations = await this.store.getOperationRange(
+					nodeId,
+					clientSequence + 1,
+					hubSequence,
+				)
 				missing.push(...operations)
 			}
 		}
@@ -133,54 +137,53 @@ class ChaosHub {
 }
 
 describe.skipIf(!process.env.NIGHTLY)('Chaos Nightly Convergence', () => {
-	test(
-		'10 clients × 1,000 ops converge within 60s under 10% drop and 5% duplicate',
-		async () => {
-			const startedAt = Date.now()
-			const hub = new ChaosHub()
+	test('10 clients × 1,000 ops converge within 60s under 10% drop and 5% duplicate', async () => {
+		const startedAt = Date.now()
+		const hub = new ChaosHub()
 
-			const clients = Array.from({ length: CLIENT_COUNT }, (_, index) => {
-				const nodeId = `node-${index}`
-				return {
-					clientId: `client-${index}`,
+		const clients = Array.from({ length: CLIENT_COUNT }, (_, index) => {
+			const nodeId = `node-${index}`
+			return {
+				clientId: `client-${index}`,
+				nodeId,
+				store: createMockSyncStore({
 					nodeId,
-					store: createMockSyncStore({
-						nodeId,
-						initialOps: createTestOperations(OPERATIONS_PER_CLIENT, nodeId),
-					}),
-				}
-			})
+					initialOps: createTestOperations(OPERATIONS_PER_CLIENT, nodeId),
+				}),
+			}
+		})
 
-			for (let round = 0; round < MAX_SYNC_ROUNDS; round++) {
-				await Promise.all(
-					clients.map((client) =>
-						runChaosSyncAttempt(hub, client.clientId, client.store),
-					),
-				)
+		for (let round = 0; round < MAX_SYNC_ROUNDS; round++) {
+			await Promise.all(
+				clients.map((client) => runChaosSyncAttempt(hub, client.clientId, client.store)),
+			)
 
-				if (isFullyConverged(hub, clients)) {
-					break
-				}
-
-				if (Date.now() - startedAt > MAX_CONVERGENCE_TIME_MS) {
-					break
-				}
+			if (isFullyConverged(hub, clients)) {
+				break
 			}
 
-			const elapsedMs = Date.now() - startedAt
-			expect(elapsedMs).toBeLessThanOrEqual(MAX_CONVERGENCE_TIME_MS)
-
-			expect(hub.getStore().getAllOperations()).toHaveLength(EXPECTED_TOTAL_OPERATIONS)
-
-			const hubIds = new Set(hub.getStore().getAllOperations().map((operation) => operation.id))
-			for (const client of clients) {
-				const operations = client.store.getAllOperations()
-				expect(operations).toHaveLength(EXPECTED_TOTAL_OPERATIONS)
-				expect(new Set(operations.map((operation) => operation.id))).toEqual(hubIds)
+			if (Date.now() - startedAt > MAX_CONVERGENCE_TIME_MS) {
+				break
 			}
-		},
-		70_000,
-	)
+		}
+
+		const elapsedMs = Date.now() - startedAt
+		expect(elapsedMs).toBeLessThanOrEqual(MAX_CONVERGENCE_TIME_MS)
+
+		expect(hub.getStore().getAllOperations()).toHaveLength(EXPECTED_TOTAL_OPERATIONS)
+
+		const hubIds = new Set(
+			hub
+				.getStore()
+				.getAllOperations()
+				.map((operation) => operation.id),
+		)
+		for (const client of clients) {
+			const operations = client.store.getAllOperations()
+			expect(operations).toHaveLength(EXPECTED_TOTAL_OPERATIONS)
+			expect(new Set(operations.map((operation) => operation.id))).toEqual(hubIds)
+		}
+	}, 70_000)
 })
 
 function isFullyConverged(

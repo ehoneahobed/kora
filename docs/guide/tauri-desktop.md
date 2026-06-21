@@ -49,9 +49,15 @@ Once the native window opens, you have a working offline-first app with sync rea
 ```
 my-desktop-app/
   src/
-    schema.ts          # Data schema (same as web)
+    schema.ts          # Schema entry point
     main.tsx           # Kora app entry (sync enabled)
     App.tsx            # React UI
+    modules/
+      todos/
+        todo.schema.ts     # Collection definition
+        todo.queries.ts    # Query builders
+        todo.mutations.ts  # Mutation helpers
+        useTodos.ts        # React hook for the feature
   src-tauri/
     Cargo.toml         # Rust dependencies
     tauri.conf.json    # Window size, title, build config
@@ -216,6 +222,59 @@ VITE_SYNC_URL=wss://acme-corp.example.com/kora-sync pnpm build
 
 When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects automatically.
 
+## Authentication
+
+Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `createKoraAuth`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
+
+Create an auth client that points at the same remote server that hosts your auth routes:
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+export const authClient = createKoraAuth({
+  serverUrl: 'https://acme-corp.example.com',
+})
+```
+
+For production apps, pass a secure desktop credential store:
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+export const authClient = createKoraAuth({
+  serverUrl: 'https://acme-corp.example.com',
+  credentialStore: tauriSecureStore,
+})
+```
+
+Pass the auth token into sync when creating the Kora app:
+
+```typescript
+import { createKoraAuthSync } from '@korajs/auth'
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://acme-corp.example.com/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+On the server, wire `authRoutes.toSyncAuthProvider()` through `syncOptions.auth`:
+
+```typescript
+const server = createProductionServer({
+  store,
+  syncPath: '/kora-sync',
+  syncOptions: {
+    auth: authRoutes.toSyncAuthProvider(),
+  },
+})
+```
+
+Email/password auth, OAuth sign-in, account linking, session refresh, MFA, org membership, and RBAC apply to desktop and web clients the same way. Passkeys require WebAuthn support in the operating system WebView, so call `isPasskeySupported()` before showing passkey UI. For OAuth, desktop apps need an app-specific redirect strategy such as a loopback callback, custom URL scheme, or hosted sign-in handoff, then should complete the flow with `POST /auth/oauth/:provider/callback`.
+
 ## Deploying for Multi-Device Sync
 
 A desktop app that syncs across devices needs two things:
@@ -288,25 +347,37 @@ pnpm deploy:server rollback   # Revert to previous deploy
 
 ### Using PostgreSQL in production
 
-For production deployments, PostgreSQL is recommended over SQLite. Update your `server.ts`:
+For production deployments, PostgreSQL is recommended over SQLite. The generated `server.ts` already supports both stores: it uses SQLite when `DATABASE_URL` is empty and PostgreSQL when `DATABASE_URL` is set.
 
 ```typescript
-import { createPostgresServerStore, createProductionServer } from '@korajs/server'
+import {
+  createPostgresServerStore,
+  createProductionServer,
+  createSqliteServerStore,
+} from '@korajs/server'
+import schema from './src/schema'
 
-const store = await createPostgresServerStore({
-  connectionString: process.env.DATABASE_URL,
-})
+const store = process.env.DATABASE_URL
+  ? await createPostgresServerStore({ connectionString: process.env.DATABASE_URL })
+  : createSqliteServerStore({ filename: process.env.KORA_SERVER_DB || './kora-server.db' })
+
+await store.setSchema(schema)
 
 const server = createProductionServer({
   store,
   port: Number(process.env.PORT) || 3001,
   syncPath: '/kora-sync',
+  operationalAuth: {
+    adminToken: process.env.KORA_ADMIN_TOKEN,
+    metricsToken: process.env.KORA_METRICS_TOKEN,
+    backupToken: process.env.KORA_BACKUP_TOKEN,
+  },
 })
 
 server.start()
 ```
 
-Set `DATABASE_URL` in your deployment environment. Most cloud platforms (Neon, Supabase, Railway) provide managed PostgreSQL with a connection string.
+Set `DATABASE_URL` in your deployment environment. Most cloud platforms (Neon, Supabase, Railway) provide managed PostgreSQL with a connection string. Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, and `KORA_BACKUP_TOKEN` before exposing `/__kora/*` endpoints on the public internet.
 
 ## Auto-Updates
 

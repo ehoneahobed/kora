@@ -1,7 +1,7 @@
 import type { KoraEventType } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createMockEmitter, createSampleEvent } from '../../tests/fixtures/test-helpers'
-import { Instrumenter } from './instrumenter'
+import { ALL_EVENT_TYPES, Instrumenter } from './instrumenter'
 
 describe('Instrumenter', () => {
 	let emitter: ReturnType<typeof createMockEmitter>
@@ -132,7 +132,7 @@ describe('Instrumenter', () => {
 		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
 
 		// Should have registered 15 listeners (one per event type)
-		expect(emitter.totalListenerCount()).toBe(15)
+		expect(emitter.totalListenerCount()).toBe(ALL_EVENT_TYPES.length)
 
 		inst.destroy()
 
@@ -156,38 +156,20 @@ describe('Instrumenter', () => {
 		inst.destroy()
 	})
 
-	test('handles all 15 event types', () => {
+	test('handles all instrumented event types', () => {
 		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
 
-		const allTypes: KoraEventType[] = [
-			'operation:created',
-			'operation:applied',
-			'merge:started',
-			'merge:completed',
-			'merge:conflict',
-			'constraint:violated',
-			'sync:connected',
-			'sync:disconnected',
-			'sync:sent',
-			'sync:received',
-			'sync:acknowledged',
-			'query:subscribed',
-			'query:invalidated',
-			'query:executed',
-			'connection:quality',
-		]
-
-		for (const type of allTypes) {
+		for (const type of ALL_EVENT_TYPES) {
 			emitter.emit(createSampleEvent(type))
 		}
 
-		expect(inst.getBuffer().size).toBe(15)
+		expect(inst.getBuffer().size).toBe(ALL_EVENT_TYPES.length)
 
 		const recordedTypes = inst
 			.getBuffer()
 			.getAll()
 			.map((e) => e.event.type)
-		expect(recordedTypes).toEqual(allTypes)
+		expect(recordedTypes).toEqual([...ALL_EVENT_TYPES])
 
 		inst.destroy()
 	})

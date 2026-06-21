@@ -95,6 +95,7 @@ describe('Sync wiring', () => {
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 		await todos.insert({ title: 'Pending op' })
+		await app.getSyncEngine()?.refreshPendingCount()
 
 		const status = app.sync?.getStatus()
 		expect(status?.pendingOperations).toBe(1)

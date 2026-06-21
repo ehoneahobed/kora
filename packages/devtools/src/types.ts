@@ -24,6 +24,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:connected': 'sync',
 	'sync:disconnected': 'sync',
 	'sync:auth-failed': 'sync',
+	'sync:schema-mismatch': 'sync',
+	'sync:apply-failed': 'sync',
 	'sync:sent': 'sync',
 	'sync:received': 'sync',
 	'sync:acknowledged': 'sync',
@@ -37,6 +39,9 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'awareness:updated': 'sync',
 	'state-machine:transition': 'operation',
 	'state-machine:rejected': 'operation',
+	'store:persistence-error': 'connection',
+	'store:quota-exceeded': 'connection',
+	'replay:completed': 'operation',
 }
 
 /** Look up the category for a given event type */

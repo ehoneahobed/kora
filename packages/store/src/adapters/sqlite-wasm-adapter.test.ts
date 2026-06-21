@@ -18,6 +18,14 @@ describe('SqliteWasmAdapter', () => {
 	})
 
 	describe('open', () => {
+		test('passes dbName through worker open message', async () => {
+			const bridge = new MockWorkerBridge()
+			const named = new SqliteWasmAdapter({ bridge, dbName: 'my-app-data' })
+			await named.open(minimalSchema)
+			expect(bridge.lastOpenDbName).toBe('my-app-data')
+			await named.close()
+		})
+
 		test('creates metadata and collection tables', async () => {
 			const tables = await adapter.query<{ name: string }>(
 				"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",

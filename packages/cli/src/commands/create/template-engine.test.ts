@@ -92,6 +92,13 @@ describe('scaffoldTemplate', () => {
 		expect(srcFiles).toContain('main.tsx')
 		expect(srcFiles).toContain('App.tsx')
 		expect(srcFiles).toContain('index.css')
+		expect(srcFiles).toContain('modules')
+
+		const todoModuleFiles = await readdir(join(targetDir, 'src', 'modules', 'todos'))
+		expect(todoModuleFiles).toContain('todo.schema.ts')
+		expect(todoModuleFiles).toContain('todo.queries.ts')
+		expect(todoModuleFiles).toContain('todo.mutations.ts')
+		expect(todoModuleFiles).toContain('useTodos.ts')
 	})
 
 	test('scaffolds react-sync template with server.ts', async () => {

@@ -39,7 +39,7 @@ export function generateFlyToml(options: FlyTomlOptions): string {
 		'    interval = "30s"',
 		'    method = "GET"',
 		'    timeout = "5s"',
-		'    path = "/"',
+		'    path = "/health"',
 		'',
 	].join('\n')
 }

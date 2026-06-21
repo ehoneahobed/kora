@@ -16,6 +16,16 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./overlay": {
+      "import": {
+        "types": "./dist/overlay.d.ts",
+        "default": "./dist/overlay.js"
+      },
+      "require": {
+        "types": "./dist/overlay.d.cts",
+        "default": "./dist/overlay.cjs"
+      }
     }
   },
   "files": [

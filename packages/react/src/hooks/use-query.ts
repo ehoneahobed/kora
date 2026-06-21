@@ -3,6 +3,20 @@ import { useMemo, useRef, useSyncExternalStore } from 'react'
 import { QueryStore } from '../query-store/query-store'
 import type { UseQueryOptions } from '../types'
 
+const APP_NOT_READY_CODE = 'APP_NOT_READY'
+
+function assertQueryReady(query: QueryBuilder<unknown>): void {
+	const descriptor = query.getDescriptor()
+	if (descriptor.collection === '__pending__') {
+		const err = new Error(
+			'Cannot use useQuery() before app.ready. Await app.ready or wrap your UI in <KoraProvider app={app}>.',
+		)
+		err.name = 'AppNotReadyError'
+		Object.assign(err, { code: APP_NOT_READY_CODE })
+		throw err
+	}
+}
+
 /**
  * Frozen empty array returned when the query is disabled or before data loads.
  * Same reference prevents unnecessary re-renders.
@@ -38,6 +52,10 @@ export function useQuery<T = CollectionRecord>(
 	options?: UseQueryOptions,
 ): readonly T[] {
 	const enabled = options?.enabled !== false
+
+	if (enabled) {
+		assertQueryReady(query)
+	}
 
 	// Compute a stable key from the query descriptor
 	const descriptorKey = JSON.stringify(query.getDescriptor())
@@ -85,8 +103,6 @@ export function useQuery<T = CollectionRecord>(
 	// would destroy and recreate the QueryStore on every render, causing
 	// subscription storms. Instead, we only react to the stable descriptor
 	// JSON key, which captures the actual query parameters.
-	//
-	// biome-ignore lint/correctness/useExhaustiveDependencies: See above.
 	return useSyncExternalStore(
 		queryStore ? queryStore.subscribe : noopSubscribe,
 		queryStore ? queryStore.getSnapshot : disabledGetSnapshot,

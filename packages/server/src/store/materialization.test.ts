@@ -41,6 +41,11 @@ const testSchema = defineSchema({
 	},
 })
 
+const formsCollection = testSchema.collections.forms
+if (!formsCollection) {
+	throw new Error('Expected forms collection in test schema')
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -124,7 +129,7 @@ describe('replayOperationsForRecord', () => {
 
 describe('generateCollectionDDL', () => {
 	test('generates CREATE TABLE with correct columns', () => {
-		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
+		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const createTable = ddl[0] as string
 		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS forms')
 		expect(createTable).toContain('id TEXT PRIMARY KEY NOT NULL')
@@ -139,7 +144,7 @@ describe('generateCollectionDDL', () => {
 	})
 
 	test('generates indexes', () => {
-		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
+		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const indexStatements = ddl.filter((s) => s.includes('CREATE INDEX'))
 		expect(indexStatements.some((s) => s.includes('idx_forms_slug'))).toBe(true)
 		expect(indexStatements.some((s) => s.includes('idx_forms_status'))).toBe(true)
@@ -147,21 +152,21 @@ describe('generateCollectionDDL', () => {
 	})
 
 	test('generates safe ALTER TABLE statements', () => {
-		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
+		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const alterStatements = ddl.filter((s) => s.startsWith('--kora:safe-alter'))
 		expect(alterStatements.length).toBeGreaterThan(0)
 		expect(alterStatements.some((s) => s.includes('ADD COLUMN title'))).toBe(true)
 	})
 
 	test('postgres dialect uses correct types', () => {
-		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'postgres')
+		const ddl = generateCollectionDDL('forms', formsCollection, 'postgres')
 		const createTable = ddl[0] as string
 		expect(createTable).toContain('viewCount DOUBLE PRECISION')
 		expect(createTable).toContain('_created_at BIGINT NOT NULL DEFAULT 0')
 	})
 
 	test('generates enum CHECK constraints', () => {
-		const ddl = generateCollectionDDL('forms', testSchema.collections.forms, 'sqlite')
+		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const createTable = ddl[0] as string
 		expect(createTable).toContain("CHECK (status IN ('draft', 'published', 'archived'))")
 	})

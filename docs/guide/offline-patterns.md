@@ -185,9 +185,9 @@ If a particular action requires server confirmation (such as a payment), you can
 Most conflicts resolve automatically through Kora's merge engine. For cases where you want to inform the user that a conflict was resolved, listen for merge events:
 
 ```typescript
-app.on('merge:conflict', (trace) => {
+app.events.on('merge:conflict', (event) => {
   // Show a non-blocking notification
-  showToast(`"${trace.field}" was updated by another device`)
+  showToast(`"${event.trace.field}" was updated by another device`)
 })
 ```
 

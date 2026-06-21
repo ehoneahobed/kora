@@ -1,7 +1,7 @@
 import type { KoraEventEmitter } from '@korajs/core'
 import type { MessageSerializer } from '@korajs/sync'
-import type { Logger } from './logging/structured-logger'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
+import type { Logger } from './logging/structured-logger'
 import type { ServerStore } from './store/server-store'
 
 /**
@@ -51,6 +51,11 @@ export interface KoraSyncServerConfig {
 	batchSize?: number
 	/** Schema version the server expects. Defaults to 1. */
 	schemaVersion?: number
+	/**
+	 * Inclusive range of client schema versions accepted at handshake.
+	 * Defaults to `{ min: schemaVersion, max: schemaVersion }`.
+	 */
+	supportedSchemaVersions?: { min: number; max: number }
 	/** WebSocket path (standalone mode). Defaults to '/'. */
 	path?: string
 	/** Structured logger. Defaults to pretty-print in dev, JSON lines in production. */

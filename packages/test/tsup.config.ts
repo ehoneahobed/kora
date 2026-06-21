@@ -6,5 +6,5 @@ export default defineConfig({
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['better-sqlite3'],
+	external: ['better-sqlite3', 'korajs', 'korajs/testing'],
 })

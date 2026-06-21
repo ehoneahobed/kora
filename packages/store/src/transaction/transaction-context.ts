@@ -1,5 +1,6 @@
 import type {
 	AtomicOp,
+	CausalTracker,
 	CollectionDefinition,
 	HybridLogicalClock,
 	Operation,
@@ -14,9 +15,17 @@ import {
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
+import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import type { RelationEnforcer } from '../relations/relation-enforcer'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
-import type { CollectionRecord, RawCollectionRow, StorageAdapter, Transaction } from '../types'
+import type {
+	CollectionRecord,
+	LocalMutationHandler,
+	RawCollectionRow,
+	StorageAdapter,
+	Transaction,
+} from '../types'
 
 /**
  * A buffered SQL command to be executed during commit.
@@ -44,7 +53,10 @@ export interface TransactionContextConfig {
 	adapter: StorageAdapter
 	clock: HybridLogicalClock
 	nodeId: string
-	getSequenceNumber: () => number
+	sequenceAllocator: import('./transaction-sequence').TransactionSequenceAllocator
+	relationEnforcer: RelationEnforcer | null
+	causalTracker: CausalTracker | null
+	localMutationHandler: LocalMutationHandler | null
 }
 
 /**
@@ -141,17 +153,52 @@ export class TransactionContext {
 			return { operations: [], affectedCollections: new Set() }
 		}
 
+		const handler = this.config.localMutationHandler
+		if (handler?.commitTransaction) {
+			return handler.commitTransaction({
+				entries: this.buffer.map((entry) => ({
+					operation: entry.operation,
+					commands: entry.commands,
+					collection: entry.collection,
+				})),
+				transactionId: this.transactionId,
+				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
+			})
+		}
+
 		const operations: Operation[] = []
 		const affectedCollections = new Set<string>()
 
 		// Execute all buffered commands in a single adapter transaction
 		await this.config.adapter.transaction(async (tx: Transaction) => {
 			for (const entry of this.buffer) {
+				if (entry.operation.type === 'delete' && this.config.relationEnforcer) {
+					const cascadeResult = await this.config.relationEnforcer.enforceDelete(
+						entry.collection,
+						entry.operation.recordId,
+						tx,
+						[entry.operation.id],
+					)
+					for (const cascadedOp of cascadeResult.operations) {
+						operations.push(cascadedOp)
+						affectedCollections.add(cascadedOp.collection)
+						this.config.causalTracker?.afterOperation(cascadedOp.collection, cascadedOp.id, true)
+					}
+				}
+
 				for (const cmd of entry.commands) {
 					await tx.execute(cmd.sql, cmd.params)
 				}
 				operations.push(entry.operation)
 				affectedCollections.add(entry.collection)
+			}
+
+			const finalSeq = this.config.sequenceAllocator.getHighWaterMark()
+			if (finalSeq > 0) {
+				await tx.execute(
+					'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
+					[this.config.nodeId, finalSeq],
+				)
 			}
 		})
 
@@ -200,7 +247,8 @@ export class TransactionContext {
 			}
 		}
 
-		const sequenceNumber = this.config.getSequenceNumber()
+		const sequenceNumber = await this.config.sequenceAllocator.allocate()
+		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
 		const operation = await createOperation(
 			{
 				nodeId: this.config.nodeId,
@@ -210,20 +258,23 @@ export class TransactionContext {
 				data: { ...validated },
 				previousData: null,
 				sequenceNumber,
-				causalDeps: [],
+				causalDeps,
 				schemaVersion: this.config.schema.version,
 				transactionId: this.transactionId,
 				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
 			},
 			this.config.clock,
 		)
+		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
 
 		const serializedData = serializeRecord(validated, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const record: Record<string, unknown> = {
 			id: recordId,
 			...serializedData,
-			_created_at: now,
-			_updated_at: now,
+			_created_at: operation.timestamp.wallTime,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		}
 
 		const insertQuery = buildInsertQuery(collectionName, record)
@@ -239,10 +290,6 @@ export class TransactionContext {
 			commands: [
 				{ sql: insertQuery.sql, params: insertQuery.params },
 				{ sql: opInsert.sql, params: opInsert.params },
-				{
-					sql: 'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-					params: [this.config.nodeId, sequenceNumber],
-				},
 			],
 		})
 
@@ -289,7 +336,8 @@ export class TransactionContext {
 
 		const hasAtomicOps = Object.keys(atomicOps).length > 0
 
-		const sequenceNumber = this.config.getSequenceNumber()
+		const sequenceNumber = await this.config.sequenceAllocator.allocate()
+		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
 		const operation = await createOperation(
 			{
 				nodeId: this.config.nodeId,
@@ -299,7 +347,7 @@ export class TransactionContext {
 				data: { ...resolvedData },
 				previousData,
 				sequenceNumber,
-				causalDeps: [],
+				causalDeps,
 				schemaVersion: this.config.schema.version,
 				transactionId: this.transactionId,
 				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
@@ -307,11 +355,14 @@ export class TransactionContext {
 			},
 			this.config.clock,
 		)
+		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
 
 		const serializedChanges = serializeRecord(resolvedData, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
 		const updateQuery = buildUpdateQuery(collectionName, id, {
 			...serializedChanges,
-			_updated_at: now,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
 		})
 		const opRow = serializeOperation(operation)
 		const opInsert = buildInsertQuery(
@@ -325,10 +376,6 @@ export class TransactionContext {
 			commands: [
 				{ sql: updateQuery.sql, params: updateQuery.params },
 				{ sql: opInsert.sql, params: opInsert.params },
-				{
-					sql: 'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-					params: [this.config.nodeId, sequenceNumber],
-				},
 			],
 		})
 
@@ -353,7 +400,8 @@ export class TransactionContext {
 		}
 
 		const now = Date.now()
-		const sequenceNumber = this.config.getSequenceNumber()
+		const sequenceNumber = await this.config.sequenceAllocator.allocate()
+		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
 		const operation = await createOperation(
 			{
 				nodeId: this.config.nodeId,
@@ -363,13 +411,14 @@ export class TransactionContext {
 				data: null,
 				previousData: null,
 				sequenceNumber,
-				causalDeps: [],
+				causalDeps,
 				schemaVersion: this.config.schema.version,
 				transactionId: this.transactionId,
 				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
 			},
 			this.config.clock,
 		)
+		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
 
 		const deleteQuery = buildSoftDeleteQuery(collectionName, id, now)
 		const opRow = serializeOperation(operation)
@@ -384,10 +433,6 @@ export class TransactionContext {
 			commands: [
 				{ sql: deleteQuery.sql, params: deleteQuery.params },
 				{ sql: opInsert.sql, params: opInsert.params },
-				{
-					sql: 'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-					params: [this.config.nodeId, sequenceNumber],
-				},
 			],
 		})
 	}

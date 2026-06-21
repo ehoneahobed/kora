@@ -16,6 +16,7 @@ export interface ProjectConfig {
 	region: string | null
 	environment: 'preview' | 'production'
 	confirm: boolean
+	deployTarget?: 'full-stack' | 'sync-server'
 }
 
 export interface ProvisionResult {

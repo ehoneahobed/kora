@@ -17,21 +17,63 @@ This starts both the Vite dev server and the Kora sync server.
 
 ```
 src/
-  schema.ts        # Data schema definition
+  schema.ts        # Schema entry point
+  auth.ts          # Auth client and OAuth callback handling
   main.tsx         # App initialization and Kora setup
   App.tsx          # Main application component
+  modules/
+    todos/
+      todo.schema.ts     # Todo collection definition
+      todo.queries.ts    # Reusable todo query builders
+      todo.mutations.ts  # Todo mutation helpers
+      useTodos.ts        # React hook connecting todos to the UI
   kora-worker.ts   # SQLite WASM web worker
   index.css        # Styles
 server.ts          # Kora sync server
 kora.config.ts     # Kora configuration
 ```
 
+In a feature module, `schema` defines data shape, `queries` contain reads only, `mutations` contain
+writes, and `useTodos.ts` is the React binding that exposes todo data and actions to components.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VITE_SYNC_URL` | `ws://localhost:3001` | WebSocket URL for the sync server |
+| `VITE_AUTH_URL` | current origin | HTTP URL for `/auth/*` routes |
 | `PORT` | `3001` | Sync server port |
+| `KORA_SERVER_DB` | `./kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
+| `KORA_AUTH_DB` | `./kora-auth.db` | SQLite file used by OAuth state and linked identities when `DATABASE_URL` is empty |
+| `DATABASE_URL` | (none) | PostgreSQL connection string for production sync server deployments |
+| `KORA_SYNC_PATH` | `/kora-sync` | WebSocket path exposed by the sync server |
+| `KORA_AUTH_SECRET` | (none) | Enables built-in `/auth/*` routes and authenticated sync when set |
+| `KORA_GOOGLE_CLIENT_ID` | (none) | Enables Google OAuth when set with `KORA_GOOGLE_REDIRECT_URI` |
+| `KORA_GOOGLE_CLIENT_SECRET` | (none) | Google OAuth client secret for confidential web clients |
+| `KORA_GOOGLE_REDIRECT_URI` | (none) | OAuth callback URL, usually your app URL that handles `code` and `state` |
+| `KORA_OAUTH_PKCE` | `true` when no client secret | Enables PKCE for public desktop/mobile OAuth clients |
+| `KORA_ADMIN_TOKEN` | (none) | Protects `/__kora`, `/__kora/status`, and `/__kora/events` |
+| `KORA_METRICS_TOKEN` | (none) | Protects `/__kora/metrics` |
+| `KORA_BACKUP_TOKEN` | (none) | Protects server backup and restore endpoints |
+
+## Authentication
+
+Set `KORA_AUTH_SECRET` to enable built-in auth on the sync server. Generate a secret with:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+The template already creates `src/auth.ts`, wraps the app in `AuthProvider`, and wires sync with `createKoraAuthSync({ authClient, schema })`. To enable Google OAuth, set:
+
+```bash
+KORA_AUTH_SECRET=...
+KORA_GOOGLE_CLIENT_ID=...
+KORA_GOOGLE_CLIENT_SECRET=...
+KORA_GOOGLE_REDIRECT_URI=http://localhost:5173
+```
+
+Use `authClient.signInWithOAuth('google')` for web redirect sign-in, or `authClient.getOAuthAuthorizationUrl('google')` plus `authClient.completeOAuthSignIn('google', { code, state })` for custom handoff flows. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication).
 
 ## Scripts
 

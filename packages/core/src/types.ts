@@ -103,7 +103,7 @@ export type FieldKind =
 export interface SyncDiagnosticsSnapshot {
 	// Connection
 	/** Current developer-facing sync status */
-	status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error'
+	status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error' | 'schema-mismatch'
 	/** Timestamp when the current connection was established, or null if disconnected */
 	connectedAt: number | null
 	/** Timestamp when the last disconnection occurred, or null if never disconnected */
@@ -304,6 +304,16 @@ export interface RelationDefinition {
 }
 
 /**
+ * Declarative sync filter for a collection.
+ *
+ * `where` maps record field names to scope value keys. Use `true` to bind a field
+ * to a scope value with the same name (e.g. `{ userId: true }`).
+ */
+export interface SyncRuleDefinition {
+	where: Record<string, string>
+}
+
+/**
  * The complete schema definition produced by defineSchema().
  */
 export interface SchemaDefinition {
@@ -312,6 +322,11 @@ export interface SchemaDefinition {
 	relations: Record<string, RelationDefinition>
 	/** Schema migrations keyed by target version. */
 	migrations: Record<number, import('./migrations/migration-builder').MigrationDefinition>
+	/**
+	 * Declarative partial-sync rules per collection.
+	 * When present, only listed collections (plus legacy `scope` collections) sync.
+	 */
+	sync?: Record<string, SyncRuleDefinition>
 }
 
 /**

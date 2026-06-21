@@ -47,6 +47,13 @@ export interface TokenRevocationStore {
 	 * @param deviceId - The device ID whose tokens should be revoked
 	 */
 	revokeAllForDevice(deviceId: string): Promise<void>
+
+	/**
+	 * Check whether all tokens for a device have been revoked.
+	 * @param deviceId - The device ID to check
+	 * @returns true if the device's token family has been revoked
+	 */
+	isDeviceRevoked(deviceId: string): Promise<boolean>
 }
 
 /**
@@ -78,7 +85,7 @@ export class InMemoryTokenRevocationStore implements TokenRevocationStore {
 	/**
 	 * Check if a device has been revoked.
 	 */
-	isDeviceRevoked(deviceId: string): boolean {
+	async isDeviceRevoked(deviceId: string): Promise<boolean> {
 		return this.revokedDevices.has(deviceId)
 	}
 
@@ -366,7 +373,7 @@ export class TokenManager {
 	 * Validate a token and check it against the revocation store.
 	 *
 	 * Like {@link validateToken}, but also checks whether the token's `jti` has been
-	 * revoked. Requires a revocation store to be configured.
+	 * revoked or belongs to a revoked device. Requires a revocation store to be configured.
 	 *
 	 * @param token - The JWT string to validate
 	 * @returns The decoded {@link TokenPayload} if valid and not revoked, or null otherwise
@@ -380,6 +387,11 @@ export class TokenManager {
 		if (this.revocationStore) {
 			const revoked = await this.revocationStore.isRevoked(payload.jti)
 			if (revoked) {
+				return null
+			}
+
+			const deviceRevoked = await this.revocationStore.isDeviceRevoked(payload.dev)
+			if (deviceRevoked) {
 				return null
 			}
 		}

@@ -1,10 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import {
-	SubscriptionBloomFilter,
-	fnv1a32,
-	optimalBitCount,
-	optimalHashCount,
-} from './bloom-filter'
+import { SubscriptionBloomFilter, fnv1a32, optimalBitCount, optimalHashCount } from './bloom-filter'
 
 describe('fnv1a32', () => {
 	test('produces consistent hash for the same input', () => {
@@ -24,7 +19,7 @@ describe('fnv1a32', () => {
 		for (const input of inputs) {
 			const hash = fnv1a32(input)
 			expect(hash).toBeGreaterThanOrEqual(0)
-			expect(hash).toBeLessThanOrEqual(0xFFFFFFFF)
+			expect(hash).toBeLessThanOrEqual(0xffffffff)
 		}
 	})
 
@@ -81,7 +76,7 @@ describe('optimalBitCount', () => {
 			[50, 0.05],
 			[1000, 0.001],
 			[5000, 0.1],
-		]
+		] as const
 		for (const [n, p] of testCases) {
 			const bits = optimalBitCount(n, p)
 			expect(bits % 32).toBe(0)
@@ -115,7 +110,7 @@ describe('optimalHashCount', () => {
 	})
 
 	test('returns higher count when more bits per item', () => {
-		const k1 = optimalHashCount(1000, 1000)  // 1 bit per item
+		const k1 = optimalHashCount(1000, 1000) // 1 bit per item
 		const k2 = optimalHashCount(10000, 1000) // 10 bits per item
 		expect(k2).toBeGreaterThan(k1)
 	})
@@ -296,7 +291,11 @@ describe('SubscriptionBloomFilter', () => {
 
 		// Set bit count should be monotonically non-decreasing
 		for (let i = 1; i < counts.length; i++) {
-			expect(counts[i]).toBeGreaterThanOrEqual(counts[i - 1])
+			const current = counts[i]
+			const previous = counts[i - 1]
+			expect(current).toBeDefined()
+			expect(previous).toBeDefined()
+			expect(current as number).toBeGreaterThanOrEqual(previous as number)
 		}
 	})
 
@@ -344,6 +343,9 @@ describe('SubscriptionBloomFilter performance characteristics', () => {
 		const subscriptionCollections = new Map<string, string[]>()
 		for (let i = 0; i < 1000; i++) {
 			const col = collections[i % collectionCount]
+			if (!col) {
+				continue
+			}
 			if (!subscriptionCollections.has(col)) {
 				subscriptionCollections.set(col, [])
 			}
@@ -400,6 +402,6 @@ describe('SubscriptionBloomFilter performance characteristics', () => {
 			if (filter.mightContain(`absent_${i}`)) fps++
 		}
 		const actualFPR = fps / checks
-		expect(actualFPR).toBeLessThan(0.10)
+		expect(actualFPR).toBeLessThan(0.1)
 	})
 })

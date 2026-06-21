@@ -1,10 +1,8 @@
+import type { KoraEventType } from '@korajs/core'
 import type { SyncStatusInfo } from '@korajs/sync'
-import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
+import { useCallback, useRef, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 
-const POLL_INTERVAL_MS = 500
-
-/** Default status returned when no sync engine is configured */
 const OFFLINE_STATUS: SyncStatusInfo = Object.freeze({
 	status: 'offline',
 	pendingOperations: 0,
@@ -14,12 +12,24 @@ const OFFLINE_STATUS: SyncStatusInfo = Object.freeze({
 	conflicts: 0,
 })
 
+const SYNC_STATUS_EVENT_TYPES = [
+	'sync:connected',
+	'sync:disconnected',
+	'sync:schema-mismatch',
+	'sync:auth-failed',
+	'sync:sent',
+	'sync:received',
+	'sync:acknowledged',
+	'sync:apply-failed',
+	'sync:diagnostics',
+	'sync:initial-sync-progress',
+] as const satisfies readonly KoraEventType[]
+
 /**
  * React hook for monitoring the sync engine's connection status.
  *
- * Polls the SyncEngine at ~500ms intervals and re-renders only when
- * the status actually changes. Returns a default offline status when
- * no sync engine is configured.
+ * Subscribes to sync events via `app.sync.subscribeStatus` (or the sync engine
+ * emitter when using store-only mode) and re-renders only when status changes.
  *
  * @returns Current sync status information
  *
@@ -27,61 +37,59 @@ const OFFLINE_STATUS: SyncStatusInfo = Object.freeze({
  * ```typescript
  * const status = useSyncStatus()
  * // status.status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error'
- * // status.pendingOperations: number
- * // status.lastSyncedAt: number | null
  * ```
  */
 export function useSyncStatus(): SyncStatusInfo {
-	const { syncEngine } = useKoraContext()
-
-	// Cache the latest status snapshot for stable references
+	const { syncEngine, subscribeSyncStatus, events } = useKoraContext()
 	const snapshotRef = useRef<SyncStatusInfo>(OFFLINE_STATUS)
 	const serializedRef = useRef<string>(JSON.stringify(OFFLINE_STATUS))
 
 	const subscribe = useCallback(
 		(onStoreChange: () => void): (() => void) => {
-			if (!syncEngine) return () => {}
+			if (subscribeSyncStatus) {
+				return subscribeSyncStatus((status) => {
+					snapshotRef.current = status
+					serializedRef.current = JSON.stringify(status)
+					onStoreChange()
+				})
+			}
 
-			// Poll the sync engine status at regular intervals
-			const intervalId = setInterval(() => {
+			if (!syncEngine) {
+				return () => {}
+			}
+
+			const refresh = (): void => {
 				const newStatus = syncEngine.getStatus()
 				const newSerialized = JSON.stringify(newStatus)
-
-				// Only notify React if status actually changed
 				if (newSerialized !== serializedRef.current) {
 					snapshotRef.current = newStatus
 					serializedRef.current = newSerialized
 					onStoreChange()
 				}
-			}, POLL_INTERVAL_MS)
-
-			// Do an immediate check
-			const initialStatus = syncEngine.getStatus()
-			const initialSerialized = JSON.stringify(initialStatus)
-			if (initialSerialized !== serializedRef.current) {
-				snapshotRef.current = initialStatus
-				serializedRef.current = initialSerialized
-				onStoreChange()
 			}
 
-			return () => {
-				clearInterval(intervalId)
+			if (events) {
+				const unsubs = SYNC_STATUS_EVENT_TYPES.map((type) => events.on(type, refresh))
+				refresh()
+				return () => {
+					for (const unsub of unsubs) {
+						unsub()
+					}
+				}
 			}
+
+			refresh()
+			return () => {}
 		},
-		[syncEngine],
+		[syncEngine, subscribeSyncStatus, events],
 	)
 
 	const getSnapshot = useCallback((): SyncStatusInfo => {
-		return snapshotRef.current
-	}, [])
-
-	// Reset snapshot when syncEngine changes
-	useEffect(() => {
-		if (!syncEngine) {
-			snapshotRef.current = OFFLINE_STATUS
-			serializedRef.current = JSON.stringify(OFFLINE_STATUS)
+		if (subscribeSyncStatus) {
+			return snapshotRef.current
 		}
-	}, [syncEngine])
+		return syncEngine ? syncEngine.getStatus() : OFFLINE_STATUS
+	}, [syncEngine, subscribeSyncStatus])
 
 	return useSyncExternalStore(subscribe, getSnapshot)
 }

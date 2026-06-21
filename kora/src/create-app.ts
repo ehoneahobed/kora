@@ -5,31 +5,46 @@ import { Instrumenter } from '@korajs/devtools'
 import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type {
+	AuditExportOptions,
 	BackupOptions,
 	CollectionAccessor,
 	QueryBuilder,
+	ReplaySnapshot,
 	RestoreOptions,
 	RestoreResult,
 	StorageAdapter,
 } from '@korajs/store'
 import {
 	ConnectionMonitor,
+	HttpLongPollingTransport,
 	ReconnectionManager,
+	SyncEncryptor,
 	SyncEngine,
 	WebSocketTransport,
 } from '@korajs/sync'
+import type { SyncTransport } from '@korajs/sync'
 import type { SyncStatusInfo } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
+import { AppNotReadyError } from './app-not-ready-error'
+import { ApplyPipeline } from './apply-pipeline'
+import { wireAuditPersistence } from './audit-bridge'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
+import { StoreQueueStorage } from './store-queue-storage'
+import { StoreSyncStatePersistence } from './store-sync-state'
+import { createSyncQuerySubscriptionHook } from './sync-query-bridge'
+import { createSyncStatusBridge } from './sync-status-bridge'
 import type {
+	AuthSyncBinding,
 	KoraApp,
 	KoraConfig,
+	KoraSyncEvent,
 	SequenceAccessor,
 	SyncControl,
 	TransactionProxy,
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
+import { validateCreateAppConfig } from './validate-config'
 
 /**
  * Creates a new Kora application instance.
@@ -71,24 +86,64 @@ export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S
  * Creates a new Kora application instance (untyped fallback).
  */
 export function createApp(config: KoraConfig): KoraApp
-export function createApp(config: KoraConfig): KoraApp {
+export function createApp<const S extends SchemaInput>(
+	config: TypedKoraConfig<S> | KoraConfig,
+): TypedKoraApp<S> | KoraApp {
+	validateCreateAppConfig(config)
+
 	const emitter: KoraEventEmitter & { clear(): void } = new SimpleEventEmitter()
 	const mergeEngine = new MergeEngine()
+
+	if (config.onSyncEvent) {
+		const handler = config.onSyncEvent
+		const syncTypes = [
+			'sync:connected',
+			'sync:disconnected',
+			'sync:schema-mismatch',
+			'sync:auth-failed',
+			'sync:sent',
+			'sync:received',
+			'sync:acknowledged',
+			'sync:apply-failed',
+			'sync:diagnostics',
+			'sync:bandwidth',
+			'sync:initial-sync-progress',
+		] as const
+		for (const type of syncTypes) {
+			emitter.on(type, (event) => {
+				handler(event as KoraSyncEvent)
+			})
+		}
+	}
 
 	let store: Store | null = null
 	let syncEngine: SyncEngine | null = null
 	let unsubscribeSync: (() => void) | null = null
+	let unsubscribeAudit: (() => void) | null = null
 	let reconnectionManager: ReconnectionManager | null = null
 	let connectionMonitor: ConnectionMonitor | null = null
 	let instrumenter: Instrumenter | null = null
 	let intentionalDisconnect = false
 	let qualityInterval: ReturnType<typeof setInterval> | null = null
+	let syncStatusBridge: ReturnType<typeof createSyncStatusBridge> | null = null
+	let destroyDevtoolsOverlay: (() => void) | null = null
 
 	// Wire DevTools instrumentation immediately (emitter exists synchronously)
 	if (config.devtools) {
 		instrumenter = new Instrumenter(emitter, {
 			bridgeEnabled: typeof globalThis !== 'undefined' && 'window' in globalThis,
 		})
+		if (typeof globalThis !== 'undefined' && 'window' in globalThis) {
+			void import('@korajs/devtools/overlay')
+				.then(({ mountKoraDevtoolsOverlay }) => {
+					if (instrumenter) {
+						destroyDevtoolsOverlay = mountKoraDevtoolsOverlay(instrumenter)
+					}
+				})
+				.catch(() => {
+					// Overlay is optional; extension bridge still works.
+				})
+		}
 	}
 
 	// Build the ready promise — resolves when the store is open and wired
@@ -96,6 +151,41 @@ export function createApp(config: KoraConfig): KoraApp {
 		store = result.store
 		syncEngine = result.syncEngine
 		unsubscribeSync = result.unsubscribeSync
+		unsubscribeAudit = result.unsubscribeAudit
+		const authBinding = result.authBinding
+
+		if (config.sync) {
+			syncStatusBridge = createSyncStatusBridge(emitter, () => syncEngine)
+			syncStatusBridge.refresh()
+		}
+
+		if (config.sync && syncEngine && authBinding?.subscribe) {
+			authBinding.subscribe(() => {
+				const engine = syncEngine
+				if (!engine) {
+					return
+				}
+
+				void (async () => {
+					const headers = await authBinding.auth()
+					if (!headers.token) {
+						await engine.stop()
+						return
+					}
+
+					if (authBinding.resolveScopeMap) {
+						const nextScope = await authBinding.resolveScopeMap()
+						engine.updateScope(nextScope)
+					}
+
+					const status = engine.getStatus().status
+					if (status !== 'offline') {
+						await engine.stop()
+					}
+					await engine.start()
+				})()
+			})
+		}
 
 		// Wire reconnection and connection quality after sync engine is ready
 		if (config.sync && syncEngine) {
@@ -129,11 +219,30 @@ export function createApp(config: KoraConfig): KoraApp {
 				}
 			})
 
+			// Reconnect immediately when the browser reports connectivity restored
+			const browserGlobal = globalThis as typeof globalThis & {
+				addEventListener?: (type: string, listener: () => void) => void
+			}
+			if (typeof browserGlobal.addEventListener === 'function') {
+				const engine = syncEngine
+				browserGlobal.addEventListener('online', () => {
+					if (intentionalDisconnect || config.sync?.autoReconnect === false) return
+					reconnectionManager?.wake()
+					reconnectionManager?.reset()
+					void engine.retryNow()
+				})
+			}
+
+			emitter.on('sync:schema-mismatch', () => {
+				reconnectionManager?.stop()
+				intentionalDisconnect = true
+			})
+
 			// Auto-reconnect on unexpected disconnect
 			if (config.sync.autoReconnect !== false) {
 				const engine = syncEngine
 				emitter.on('sync:disconnected', () => {
-					if (intentionalDisconnect) return
+					if (intentionalDisconnect || engine.isSchemaBlocked()) return
 					// Ignore cascading disconnect events from failed reconnection attempts.
 					// The reconnection manager is already retrying — don't restart it.
 					if (reconnectionManager?.isRunning()) return
@@ -156,12 +265,37 @@ export function createApp(config: KoraConfig): KoraApp {
 						})
 				})
 			}
+
+			if (config.sync.autoConnect === true && syncEngine) {
+				void syncEngine.start().catch(() => {
+					// Errors surface via sync:disconnected / sync events; avoid unhandled rejection.
+				})
+			}
 		}
+	})
+
+	const offlineSyncStatus = (): SyncStatusInfo => ({
+		status: 'offline',
+		pendingOperations: 0,
+		lastSyncedAt: null,
+		lastSuccessfulPush: null,
+		lastSuccessfulPull: null,
+		conflicts: 0,
 	})
 
 	// Build sync control
 	const syncControl: SyncControl | null = config.sync
 		? {
+				get status(): SyncStatusInfo {
+					return syncStatusBridge?.status ?? offlineSyncStatus()
+				},
+				subscribeStatus(listener: (status: SyncStatusInfo) => void): () => void {
+					if (syncStatusBridge) {
+						return syncStatusBridge.subscribe(listener)
+					}
+					listener(offlineSyncStatus())
+					return () => {}
+				},
 				async connect(): Promise<void> {
 					await ready
 					if (syncEngine) {
@@ -169,6 +303,7 @@ export function createApp(config: KoraConfig): KoraApp {
 						reconnectionManager?.stop()
 						reconnectionManager?.reset()
 						await syncEngine.start()
+						syncStatusBridge?.refresh()
 					}
 				},
 				async disconnect(): Promise<void> {
@@ -177,26 +312,23 @@ export function createApp(config: KoraConfig): KoraApp {
 						intentionalDisconnect = true
 						reconnectionManager?.stop()
 						await syncEngine.stop()
+						syncStatusBridge?.refresh()
 					}
 				},
 				getStatus(): SyncStatusInfo {
 					if (syncEngine) {
 						return syncEngine.getStatus()
 					}
-					return {
-						status: 'offline',
-						pendingOperations: 0,
-						lastSyncedAt: null,
-						lastSuccessfulPush: null,
-						lastSuccessfulPull: null,
-						conflicts: 0,
-					}
+					return offlineSyncStatus()
 				},
 				async retryNow(): Promise<void> {
 					await ready
 					if (syncEngine) {
 						await syncEngine.retryNow()
 					}
+				},
+				clearSchemaBlock(): void {
+					syncEngine?.clearSchemaBlock()
 				},
 				exportDiagnostics() {
 					if (syncEngine) {
@@ -237,39 +369,24 @@ export function createApp(config: KoraConfig): KoraApp {
 		if (!store) {
 			throw new Error('Store not initialized. Await app.ready before using transactions.')
 		}
-		const txContext = store.createTransaction()
-		if (mutationName !== undefined) {
-			txContext.setMutationName(mutationName)
-		}
 		const collectionNames = Object.keys(config.schema.collections)
 
-		// Build proxy with collection accessors as direct properties
-		const proxy: TransactionProxy = {} as TransactionProxy
-		for (const name of collectionNames) {
-			Object.defineProperty(proxy, name, {
-				get() {
-					return txContext.collection(name)
-				},
-				enumerable: true,
-				configurable: false,
-			})
-		}
-
-		try {
-			await fn(proxy)
-			const { operations } = await txContext.commit()
-
-			// Notify subscriptions and emit events after commit
-			for (const op of operations) {
-				store.getSubscriptionManager().notify(op.collection, op)
-				emitter.emit({ type: 'operation:created', operation: op })
+		return store.transaction(async (tx) => {
+			if (mutationName !== undefined) {
+				tx.setMutationName(mutationName)
 			}
-
-			return operations
-		} catch (error) {
-			txContext.rollback()
-			throw error
-		}
+			const proxy: TransactionProxy = {} as TransactionProxy
+			for (const name of collectionNames) {
+				Object.defineProperty(proxy, name, {
+					get() {
+						return tx.collection(name)
+					},
+					enumerable: true,
+					configurable: false,
+				})
+			}
+			await fn(proxy)
+		})
 	}
 
 	// Build sequences accessor (delegates to SequenceManager after ready)
@@ -323,6 +440,10 @@ export function createApp(config: KoraConfig): KoraApp {
 				qualityInterval = null
 			}
 			reconnectionManager?.stop()
+			if (destroyDevtoolsOverlay) {
+				destroyDevtoolsOverlay()
+				destroyDevtoolsOverlay = null
+			}
 			if (instrumenter) {
 				instrumenter.destroy()
 				instrumenter = null
@@ -331,9 +452,17 @@ export function createApp(config: KoraConfig): KoraApp {
 				unsubscribeSync()
 				unsubscribeSync = null
 			}
+			if (unsubscribeAudit) {
+				unsubscribeAudit()
+				unsubscribeAudit = null
+			}
 			if (syncEngine) {
 				await syncEngine.stop()
 				syncEngine = null
+			}
+			if (syncStatusBridge) {
+				syncStatusBridge.destroy()
+				syncStatusBridge = null
 			}
 			if (store) {
 				await store.close()
@@ -354,6 +483,20 @@ export function createApp(config: KoraConfig): KoraApp {
 				throw new Error('Store not initialized. Await app.ready before importing backup.')
 			}
 			return store.importBackup(data, options)
+		},
+		async replayTo(operationId: string): Promise<ReplaySnapshot> {
+			await ready
+			if (!store) {
+				throw new Error('Store not initialized. Await app.ready before replaying operations.')
+			}
+			return store.replayTo(operationId)
+		},
+		async exportAudit(options?: AuditExportOptions): Promise<Uint8Array> {
+			await ready
+			if (!store) {
+				throw new Error('Store not initialized. Await app.ready before exporting audit data.')
+			}
+			return store.exportAudit(options)
 		},
 	}
 
@@ -383,30 +526,72 @@ async function initializeAsync(
 	store: Store
 	syncEngine: SyncEngine | null
 	unsubscribeSync: (() => void) | null
+	unsubscribeAudit: (() => void) | null
+	authBinding: AuthSyncBinding | null
 }> {
 	// Resolve adapter
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	const dbName = config.store?.name ?? 'kora-db'
-	const adapter: StorageAdapter = await createAdapter(adapterType, dbName, config.store?.workerUrl)
+	const adapter: StorageAdapter = await createAdapter(
+		adapterType,
+		dbName,
+		config.store?.workerUrl,
+		emitter,
+		config.store?.workerResponseTimeoutMs,
+		config.store?.sharedWorkerUrl,
+	)
 
-	// Create and open the store
+	// Device-bound sync node id from auth token (`dev` claim), separate from user id (`sub`).
+	const authBinding = config.sync?.authClient
+	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
+
+	// Create and open the store (sync query hook uses a ref filled after SyncEngine is created)
+	let syncEngine: SyncEngine | null = null
+
 	const store = new Store({
 		schema: config.schema,
 		adapter,
 		emitter,
+		dbName,
+		nodeId: authNodeId,
+		isolation: authNodeId ? 'shared' : config.store?.isolation,
+		...(config.sync
+			? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }
+			: {}),
 	})
 	await store.open()
 
+	let recordConflict: (() => void) | undefined
+	const applyPipeline = new ApplyPipeline({
+		store,
+		mergeEngine,
+		emitter,
+		onMergeConflict: () => recordConflict?.(),
+	})
+	store.setLocalMutationHandler(applyPipeline)
+	const unsubscribeAudit = wireAuditPersistence(store, emitter)
+
 	// Wire sync if configured
-	let syncEngine: SyncEngine | null = null
 	let unsubscribeSync: (() => void) | null = null
 
 	if (config.sync) {
-		const transport = new WebSocketTransport()
-		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter)
+		const transport = createSyncTransport(config.sync)
+		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter, {
+			onMergeConflict: () => recordConflict?.(),
+		})
 
-		// Build scope map from schema scope declarations + flat scope values
-		const scopeMap = config.sync.scope ? buildScopeMap(config.schema, config.sync.scope) : undefined
+		// Build scope map from auth binding, flat scope values, or static config
+		let scopeMap = config.sync.scope ? buildScopeMap(config.schema, config.sync.scope) : undefined
+		if (authBinding?.resolveScopeMap) {
+			scopeMap = (await authBinding.resolveScopeMap()) ?? scopeMap
+		}
+
+		const syncAuth = authBinding?.auth ?? config.sync.auth
+
+		const encryptor =
+			config.sync.encryption?.enabled === true
+				? await SyncEncryptor.create(config.sync.encryption)
+				: undefined
 
 		syncEngine = new SyncEngine({
 			transport,
@@ -414,13 +599,20 @@ async function initializeAsync(
 			config: {
 				url: config.sync.url,
 				transport: config.sync.transport,
-				auth: config.sync.auth,
+				auth: syncAuth,
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
 				scopeMap,
+				encryption: config.sync.encryption,
+				strictHandshake: config.sync.strictHandshake,
+				operationTransforms: config.sync.operationTransforms,
 			},
 			emitter,
+			queueStorage: new StoreQueueStorage(adapter),
+			syncState: new StoreSyncStatePersistence(store, scopeMap),
+			encryptor,
 		})
+		recordConflict = () => syncEngine?.recordConflict()
 
 		// Wire local mutations → sync outbound queue
 		unsubscribeSync = emitter.on('operation:created', (event) => {
@@ -430,7 +622,20 @@ async function initializeAsync(
 		})
 	}
 
-	return { store, syncEngine, unsubscribeSync }
+	return {
+		store,
+		syncEngine,
+		unsubscribeSync,
+		unsubscribeAudit,
+		authBinding: config.sync?.authClient ?? null,
+	}
+}
+
+function createSyncTransport(sync: NonNullable<KoraConfig['sync']>): SyncTransport {
+	if (sync.transport === 'http') {
+		return new HttpLongPollingTransport()
+	}
+	return new WebSocketTransport()
 }
 
 function createCollectionAccessor(
@@ -501,14 +706,19 @@ function createPendingQueryBuilder(initialWhere: Record<string, unknown>): Query
 			return this
 		},
 		async exec() {
-			return []
+			throw new AppNotReadyError(
+				'Cannot execute a query before app.ready. Await app.ready or use <KoraProvider app={app}>.',
+			)
 		},
 		async count() {
-			return 0
+			throw new AppNotReadyError(
+				'Cannot count query results before app.ready. Await app.ready or use <KoraProvider app={app}>.',
+			)
 		},
-		subscribe(callback: (results: Array<Record<string, unknown>>) => void) {
-			void callback([])
-			return () => {}
+		subscribe(_callback: (results: Array<Record<string, unknown>>) => void) {
+			throw new AppNotReadyError(
+				'Cannot subscribe to a query before app.ready. Await app.ready or use <KoraProvider app={app}>.',
+			)
 		},
 		getDescriptor() {
 			return { ...descriptor, where: { ...descriptor.where }, orderBy: [...descriptor.orderBy] }

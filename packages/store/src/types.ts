@@ -41,15 +41,59 @@ export interface StorageAdapter {
 }
 
 /**
- * Configuration for creating a Store instance.
+ * Buffered SQL + operation produced during a transaction (before commit).
  */
+export interface TransactionBufferedEntry {
+	operation: Operation
+	commands: Array<{ sql: string; params: unknown[] }>
+	collection: string
+}
+
+/**
+ * Batch passed to {@link LocalMutationHandler.commitTransaction} on commit.
+ */
+export interface TransactionCommitBatch {
+	entries: TransactionBufferedEntry[]
+	transactionId: string
+	mutationName?: string
+}
+
+export interface TransactionCommitResult {
+	operations: Operation[]
+	affectedCollections: Set<string>
+}
+
+export interface LocalMutationHandler {
+	insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord>
+	update(collection: string, id: string, data: Record<string, unknown>): Promise<CollectionRecord>
+	delete(collection: string, id: string): Promise<void>
+	/**
+	 * Commit a buffered transaction through the unified apply pipeline.
+	 * When omitted, the store uses the built-in SQL commit path.
+	 */
+	commitTransaction?(batch: TransactionCommitBatch): Promise<TransactionCommitResult>
+}
+
+export type StoreIsolation = 'shared' | 'per-tab'
+
 export interface StoreConfig {
 	schema: SchemaDefinition
 	adapter: StorageAdapter
+	/** Database name used for per-tab node id keys. Defaults to 'kora-db'. */
+	dbName?: string
+	/**
+	 * `shared` (default): one node id per database in `_kora_meta`.
+	 * `per-tab`: unique node id per browser tab via sessionStorage.
+	 */
+	isolation?: StoreIsolation
 	/** Optional node ID. If omitted, one is generated or loaded from the database. */
 	nodeId?: string
 	/** Optional event emitter. When provided, local mutations emit 'operation:created' events. */
 	emitter?: KoraEventEmitter
+	/** Routes local mutations through a unified apply pipeline when provided. */
+	localMutationHandler?: LocalMutationHandler
+	/** Called when a reactive query subscription is registered (for sync query subsets). */
+	onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 }
 
 /**
@@ -130,6 +174,8 @@ export interface CollectionRecord {
 	[key: string]: unknown
 }
 
+export type { ReplaySnapshot } from './replay/replay-to'
+
 /**
  * Internal row shape returned from SQL queries on collection tables.
  */
@@ -137,6 +183,7 @@ export interface RawCollectionRow {
 	id: string
 	_created_at: number
 	_updated_at: number
+	_version?: string
 	_deleted: number
 	[key: string]: unknown
 }
@@ -152,10 +199,25 @@ export interface Subscription<T = CollectionRecord> {
 	lastResults: T[]
 }
 
+export type { ApplyResult } from '@korajs/core'
+
 /**
- * Result of a remote operation application.
+ * Options for applying a remote operation to materialized storage.
  */
-export type ApplyResult = 'applied' | 'duplicate' | 'skipped'
+export interface ApplyRemoteOptions {
+	/** When true, a winning remote update clears soft-delete on the row. */
+	reactivateIfDeleted?: boolean
+}
+
+/**
+ * Snapshot of a materialized row, including soft-deleted records.
+ */
+export interface MaterializedRowSnapshot {
+	/** Deserialized application record (excludes tombstone metadata). */
+	record: CollectionRecord
+	/** Whether the row is soft-deleted (_deleted = 1). */
+	deleted: boolean
+}
 
 /**
  * Metadata row from _kora_meta table.

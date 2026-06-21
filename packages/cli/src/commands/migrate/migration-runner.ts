@@ -209,9 +209,9 @@ async function runPostgresMigration(
 		await sql.unsafe(
 			'CREATE TABLE IF NOT EXISTS _kora_migrations (id TEXT PRIMARY KEY, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, applied_at BIGINT NOT NULL)',
 		)
-		const existing = await sql.unsafe<{ count: number }[]>(
+		const existing = (await sql.unsafe(
 			`SELECT COUNT(*)::int AS count FROM _kora_migrations WHERE id = ${sqlLiteral(migrationId)}`,
-		)
+		)) as Array<{ count: number }>
 		if ((existing[0]?.count ?? 0) > 0) {
 			await sql.unsafe('COMMIT')
 			return {

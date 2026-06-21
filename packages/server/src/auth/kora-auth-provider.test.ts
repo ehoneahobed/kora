@@ -63,6 +63,22 @@ describe('KoraAuthProvider', () => {
 		expect(context).toBeNull()
 	})
 
+	it('uses revocation-aware validation when available', async () => {
+		const revocationAwareValidator = {
+			validateToken: vi.fn(() => ({ sub: 'user-1', dev: 'device-1', type: 'access' })),
+			validateTokenWithRevocation: vi.fn(async () => null),
+		}
+		const provider = new KoraAuthProvider({
+			tokenValidator: revocationAwareValidator,
+			userLookup,
+		})
+
+		const context = await provider.authenticate(VALID_TOKEN)
+		expect(context).toBeNull()
+		expect(revocationAwareValidator.validateTokenWithRevocation).toHaveBeenCalledWith(VALID_TOKEN)
+		expect(revocationAwareValidator.validateToken).not.toHaveBeenCalled()
+	})
+
 	it('rejects a refresh token (only access tokens allowed for sync)', async () => {
 		const provider = new KoraAuthProvider({ tokenValidator, userLookup })
 

@@ -1,5 +1,5 @@
-import { existsSync, readdirSync, copyFileSync } from 'node:fs'
-import { resolve, join } from 'node:path'
+import { copyFileSync, existsSync, readdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import type { Plugin } from 'vite'
@@ -11,23 +11,23 @@ import { defineConfig } from 'vite'
  * cannot be used and SQLite WASM falls back to in-memory storage (no persistence).
  */
 function crossOriginIsolation(): Plugin {
-  return {
-    name: 'cross-origin-isolation',
-    configureServer(server) {
-      server.middlewares.use((_req, res, next) => {
-        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
-        next()
-      })
-    },
-    configurePreviewServer(server) {
-      server.middlewares.use((_req, res, next) => {
-        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
-        next()
-      })
-    },
-  }
+	return {
+		name: 'cross-origin-isolation',
+		configureServer(server) {
+			server.middlewares.use((_req, res, next) => {
+				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				next()
+			})
+		},
+		configurePreviewServer(server) {
+			server.middlewares.use((_req, res, next) => {
+				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				next()
+			})
+		},
+	}
 }
 
 /**
@@ -37,40 +37,47 @@ function crossOriginIsolation(): Plugin {
  *    sqlite3 loads it dynamically) so the full OPFS VFS can initialize without errors
  */
 function sqliteWasmHotfix(): Plugin {
-  return {
-    name: 'sqlite-wasm-hotfix',
-    apply: 'build',
-    closeBundle() {
-      const assetsDir = resolve('dist', 'assets')
-      if (!existsSync(assetsDir)) return
+	return {
+		name: 'sqlite-wasm-hotfix',
+		apply: 'build',
+		closeBundle() {
+			const assetsDir = resolve('dist', 'assets')
+			if (!existsSync(assetsDir)) return
 
-      // Copy hashed sqlite3.wasm to unhashed name
-      for (const file of readdirSync(assetsDir)) {
-        if (/^sqlite3-.+\.wasm$/.test(file)) {
-          copyFileSync(join(assetsDir, file), join(assetsDir, 'sqlite3.wasm'))
-          break
-        }
-      }
+			// Copy hashed sqlite3.wasm to unhashed name
+			for (const file of readdirSync(assetsDir)) {
+				if (/^sqlite3-.+\.wasm$/.test(file)) {
+					copyFileSync(join(assetsDir, file), join(assetsDir, 'sqlite3.wasm'))
+					break
+				}
+			}
 
-      // Copy OPFS async proxy worker (dynamically loaded by sqlite3, not detected by Vite)
-      const proxyFile = resolve('node_modules', '@sqlite.org', 'sqlite-wasm', 'sqlite-wasm', 'jswasm', 'sqlite3-opfs-async-proxy.js')
-      if (existsSync(proxyFile)) {
-        copyFileSync(proxyFile, join(assetsDir, 'sqlite3-opfs-async-proxy.js'))
-      }
-    },
-  }
+			// Copy OPFS async proxy worker (dynamically loaded by sqlite3, not detected by Vite)
+			const proxyFile = resolve(
+				'node_modules',
+				'@sqlite.org',
+				'sqlite-wasm',
+				'sqlite-wasm',
+				'jswasm',
+				'sqlite3-opfs-async-proxy.js',
+			)
+			if (existsSync(proxyFile)) {
+				copyFileSync(proxyFile, join(assetsDir, 'sqlite3-opfs-async-proxy.js'))
+			}
+		},
+	}
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), crossOriginIsolation(), sqliteWasmHotfix()],
-  worker: {
-    format: 'es',
-  },
-  optimizeDeps: {
-    exclude: ['@sqlite.org/sqlite-wasm', '@korajs/store'],
-    include: ['yjs'],
-  },
-  resolve: {
-    dedupe: ['yjs'],
-  },
+	plugins: [react(), tailwindcss(), crossOriginIsolation(), sqliteWasmHotfix()],
+	worker: {
+		format: 'es',
+	},
+	optimizeDeps: {
+		exclude: ['@sqlite.org/sqlite-wasm', '@korajs/store'],
+		include: ['yjs'],
+	},
+	resolve: {
+		dedupe: ['yjs'],
+	},
 })

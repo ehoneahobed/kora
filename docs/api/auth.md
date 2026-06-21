@@ -14,6 +14,8 @@ The package exposes three entry points:
 
 ```typescript
 import {
+  createKoraAuth,
+  createKoraAuthSync,
   AuthClient,
   AuthError,
   OrgClient,
@@ -30,16 +32,54 @@ import {
   createDeviceKeyStore,
   IndexedDBDeviceKeyStore,
   InMemoryDeviceKeyStore,
+  createAuthTokenStorage,
+  createPersistentDeviceIdentity,
 } from '@korajs/auth'
 ```
 
 ### `AuthClient`
 
-Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic.
+Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic. Works in browser, Tauri desktop WebView, and mobile JavaScript environments with pluggable storage and fetch support.
+
+Most apps should start with `createKoraAuth()`:
+
+```typescript
+const auth = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+```
 
 ```typescript
 const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 ```
+
+### `createKoraAuth(options)`
+
+Creates an `AuthClient` with production-shaped defaults for offline-first apps.
+
+```typescript
+const auth = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+})
+```
+
+For desktop and mobile apps, pass one credential store and Kora adapts it for token storage and stable device identity:
+
+```typescript
+const auth = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+  deviceKeyStore,
+})
+```
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `serverUrl` | `string` | Yes | -- |
+| `credentialStore` | `AuthKeyValueStorage` | No | Browser `localStorage` when available |
+| `deviceKeyStore` | `DeviceKeyStore` | No | IndexedDB when available |
+| `deviceIdentity` | `AuthDeviceIdentityProvider \| false` | No | Auto-created when persistent storage exists |
+| `storage` | `AuthTokenStorage` | No | Derived from `credentialStore` |
+| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
+| `storageKey` | `string` | No | `'kora_auth'` |
 
 #### `AuthClientConfig`
 
@@ -47,6 +87,9 @@ const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 |-------|------|----------|---------|
 | `serverUrl` | `string` | Yes | -- |
 | `storageKey` | `string` | No | `'kora_auth'` |
+| `storage` | `AuthTokenStorage` | No | Browser `localStorage`, then memory fallback |
+| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
+| `deviceIdentity` | `AuthDeviceIdentityProvider` | No | -- |
 
 #### Properties
 
@@ -57,8 +100,14 @@ const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
 #### Methods
 
 - `initialize(): Promise<void>` -- Restore session from stored tokens. Safe to call multiple times.
-- `signUp(params: { email: string; password: string; name?: string }): Promise<AuthUser>` -- Register a new account.
-- `signIn(params: { email: string; password: string }): Promise<AuthUser>` -- Sign in with email/password.
+- `signUp(params: { email: string; password: string; name?: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Register a new account.
+- `signIn(params: { email: string; password: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Sign in with email/password.
+- `signInWithOAuth(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL and redirect the current browser window by default.
+- `getOAuthAuthorizationUrl(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL without redirecting. Use this for desktop/mobile handoff flows.
+- `completeOAuthSignIn(provider: string, params: { code: string; state: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Complete an OAuth callback and store Kora tokens.
+- `linkOAuth(provider: string, params: { code: string; state: string }): Promise<LinkedOAuthAccount>` -- Link an OAuth provider to the signed-in user.
+- `listLinkedAccounts(): Promise<LinkedOAuthAccount[]>` -- List OAuth accounts linked to the signed-in user.
+- `unlinkOAuth(provider: string): Promise<void>` -- Unlink an OAuth provider from the signed-in user.
 - `signOut(): Promise<void>` -- Sign out. Clears local tokens and attempts server-side revocation (best-effort).
 - `getAccessToken(): Promise<string | null>` -- Get a valid access token, auto-refreshing if expired.
 - `getSyncToken(): Promise<string | null>` -- Alias for `getAccessToken()`. Used by the sync engine handshake.
@@ -78,6 +127,103 @@ const unsub = auth.onAuthChange((state) => {
   console.log('Auth state:', state)
 })
 ```
+
+OAuth sign-in for web apps:
+
+```typescript
+await auth.signInWithOAuth('google')
+```
+
+OAuth sign-in for desktop and mobile apps:
+
+```typescript
+const { url } = await auth.getOAuthAuthorizationUrl('google')
+await openSystemBrowser(url)
+
+// After your loopback server or custom URL scheme receives the provider callback:
+await auth.completeOAuthSignIn('google', {
+  code,
+  state,
+})
+```
+
+For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `createKoraAuthSync({ authClient, schema })` to `createApp({ sync: { authClient } })`. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
+
+For desktop and mobile production apps, prefer `createKoraAuth()` with a secure credential store:
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+const auth = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+  deviceKeyStore,
+})
+```
+
+The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store. `createKoraAuth()` also binds sessions to a stable offline device automatically when persistent key storage exists.
+
+### `createKoraAuthSync(options)`
+
+Creates an `AuthSyncBinding` for `createApp({ sync: { authClient } })`. Wires `@korajs/auth` to Kora sync with minimal boilerplate.
+
+```typescript
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://localhost:3001/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `authClient` | `AuthSyncClient` | Yes | Auth client with `getAccessToken()` (and optional `onAuthChange`) |
+| `schema` | `SchemaDefinition` | No | When set, builds scope map from JWT claims via `extractScopeValuesFromClaims()` |
+| `scopeFromClaims` | `(claims) => Record<string, unknown>` | No | Custom claim → flat scope value mapping |
+
+Returns `KoraAuthSyncBinding`:
+
+| Method | Description |
+|--------|-------------|
+| `auth()` | Returns `{ token }` for sync handshake; empty string when signed out |
+| `resolveScopeMap?()` | Builds per-collection scope map from current token + schema |
+| `resolveNodeId?()` | Returns JWT `dev` claim as device-bound sync node id |
+| `subscribe?(listener)` | Notifies on auth state change so `createApp` can reconnect |
+
+When `schema` is provided, scope values are extracted from:
+
+1. Top-level JWT claims matching schema scope field names
+2. Nested `claims.scope` object
+3. JWT `sub` → `userId` when `userId` is a declared scope field
+
+The store's sync node id is set from the token `dev` claim, keeping device identity separate from the user id (`sub`).
+
+### Lower-Level Storage Adapters
+
+- `createAuthTokenStorage({ store, prefix? })` -- adapts a sync or async key-value credential store to `AuthTokenStorage`.
+- `createMemoryAuthTokenStorage()` -- in-memory token storage for tests, demos, and SSR.
+- `createWebStorageAuthTokenStorage(storage, prefix?)` -- adapts `localStorage` or `sessionStorage`.
+
+```typescript
+interface AuthKeyValueStorage {
+  getItem(key: string): string | null | Promise<string | null>
+  setItem(key: string, value: string): void | Promise<void>
+  removeItem(key: string): void | Promise<void>
+}
+```
+
+### Device Identity Provider
+
+- `createPersistentDeviceIdentity({ storage, keyStore?, deviceIdKey?, generateDeviceId? })` -- stores a stable device ID and a non-extractable ECDSA P-256 key pair, then returns the public key during sign-up/sign-in.
+
+By default, the device key pair uses IndexedDB when available. Runtimes without IndexedDB, such as React Native, must pass an explicit `keyStore` backed by the platform's secure key storage.
 
 ### `AuthUser`
 
@@ -613,10 +759,10 @@ Must be placed above any component that uses `useAuth`, `useCurrentUser`, or `us
 #### Example
 
 ```typescript
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 import { AuthProvider } from '@korajs/auth/react'
 
-const authClient = new AuthClient({ serverUrl: 'http://localhost:3001' })
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 
 function App() {
   return (
@@ -791,6 +937,8 @@ function AdminPanel() {
 
 ```typescript
 import {
+  createKoraAuthServer,
+  createSqliteOAuthStores,
   BuiltInAuthRoutes,
   TokenManager,
   SessionManager,
@@ -802,9 +950,92 @@ import {
 } from '@korajs/auth/server'
 ```
 
+### `createKoraAuthServer(options)`
+
+Creates the built-in auth server with sensible defaults for Kora sync.
+
+```typescript
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
+})
+
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
+  },
+})
+
+const server = createProductionServer({
+  store,
+  syncOptions: {
+    auth: auth.auth,
+  },
+  httpRoutes: [
+    {
+      path: '/auth',
+      handle: auth.handleRequest,
+    },
+  ],
+})
+```
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `jwtSecret` | `string \| string[]` | Production | `KORA_AUTH_SECRET`, dev-only generated secret |
+| `userStore` | `UserStore` | No | `InMemoryUserStore` |
+| `tokenManager` | `TokenManager` | No | Created with revocation store |
+| `tokenManagerOptions` | `Omit<TokenManagerConfig, 'secret'>` | No | TokenManager defaults |
+| `path` | `string` | No | `'/auth'` |
+| `oauth` | `OAuthServerConfig` | No | OAuth routes disabled |
+| `challengeStore` | `ChallengeStore` | No | `InMemoryChallengeStore` |
+| `rateLimiter` | `RateLimiter` | No | `InMemoryRateLimiter` |
+
+The returned object includes:
+
+- `routes` -- underlying `BuiltInAuthRoutes`
+- `userStore` -- configured user/device store
+- `tokenManager` -- configured token manager
+- `oauth` -- configured `OAuthManager`, when OAuth is enabled
+- `linkedIdentityStore` -- configured OAuth account-linking store, when OAuth is enabled
+- `auth` -- sync auth provider for `@korajs/server`
+- `handleRequest()` -- one HTTP handler for `/auth/*`
+
+When `oauth` is configured, `handleRequest()` also serves:
+
+| Route | Purpose |
+|-------|---------|
+| `GET /auth/oauth/:provider` | Create an authorization URL and state token. Returns `{ url, state }`. |
+| `GET /auth/oauth/:provider/callback` | Complete a browser OAuth callback from `code` and `state` query params. |
+| `POST /auth/oauth/:provider/callback` | Complete a desktop/mobile callback from JSON body `{ code, state, deviceId?, devicePublicKey? }`. |
+| `GET /auth/oauth/links` | List the signed-in user's linked OAuth identities. |
+| `POST /auth/oauth/:provider/link` | Link a provider to the signed-in user using `{ code, state }`. |
+| `DELETE /auth/oauth/:provider/link` | Unlink that provider from the signed-in user. |
+
+`OAuthServerConfig` accepts all `OAuthManagerConfig` fields plus:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `providers` | `OAuthProviderConfig[]` | Required |
+| `linkedIdentityStore` | `LinkedIdentityStore` | `InMemoryLinkedIdentityStore` |
+| `stateStore` | `OAuthStateStore` | `InMemoryOAuthStateStore` |
+| `createNewUsers` | `boolean` | `true` |
+| `autoLinkVerifiedEmail` | `boolean` | `false` |
+| `allowUnlinkLastIdentity` | `boolean` | `false` |
+
+By default, Kora does not let a user unlink their last OAuth identity because OAuth-created accounts may not have another usable sign-in method. Enable `allowUnlinkLastIdentity` only when your app provides another recovery or sign-in path.
+
 ### `BuiltInAuthRoutes`
 
-Server-side route handlers for email/password authentication. Transport-agnostic -- returns `{ status, body }` response objects to wire into any HTTP framework.
+Lower-level server-side route handlers for custom auth wiring. Transport-agnostic -- returns `{ status, body }` response objects to wire into any HTTP framework.
 
 ```typescript
 const routes = new BuiltInAuthRoutes(config)
@@ -1135,14 +1366,54 @@ const scopes = await resolver.resolve('user-1', 'org-1', ['todos', 'projects'])
 ```typescript
 import {
   OAuthManager,
+  InMemoryLinkedIdentityStore,
   InMemoryOAuthStateStore,
+  SqliteLinkedIdentityStore,
+  SqliteOAuthStateStore,
+  PostgresLinkedIdentityStore,
+  PostgresOAuthStateStore,
+  createSqliteOAuthStores,
+  createPostgresOAuthStores,
   googleProvider,
   githubProvider,
   microsoftProvider,
 } from '@korajs/auth/server'
 ```
 
-Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the full OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info.
+Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info. Most apps should configure OAuth through `createKoraAuthServer({ oauth })` so Kora also creates users, issues Kora tokens, registers devices, and stores linked identities.
+
+For desktop and mobile OAuth, enable PKCE and omit `clientSecret` for public native clients:
+
+```typescript
+const oauth = new OAuthManager({
+  providers: [
+    googleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      redirectUri: 'com.acme.app:/oauth/callback',
+      pkce: true,
+    }),
+  ],
+})
+```
+
+When `pkce: true` is set, authorization URLs include an S256 `code_challenge` and token exchange includes the matching `code_verifier`.
+
+For production, provide durable stores for OAuth state and linked identities. The in-memory stores are for development and tests.
+
+```typescript
+const oauthStores = await createPostgresOAuthStores({
+  connectionString: process.env.DATABASE_URL!,
+})
+
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [googleProvider({ clientId, clientSecret, redirectUri })],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
+  },
+})
+```
 
 ### Password Reset
 

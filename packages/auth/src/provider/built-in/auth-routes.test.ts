@@ -603,6 +603,27 @@ describe('toSyncAuthProvider', () => {
 		// Token is valid but user doesn't exist in the new store
 		expect(context).toBeNull()
 	})
+
+	test('rejects revoked access tokens', async () => {
+		const { routes, tokenManager } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+
+		const accessToken = signUpResult.body.data.tokens.accessToken
+		const payload = tokenManager.validateToken(accessToken)
+		expect(payload).not.toBeNull()
+
+		await tokenManager.revokeToken(payload?.jti as string, payload?.exp as number)
+
+		const authProvider = routes.toSyncAuthProvider()
+		const context = await authProvider.authenticate(accessToken)
+
+		expect(context).toBeNull()
+	})
 })
 
 describe('handleDeviceRegister', () => {

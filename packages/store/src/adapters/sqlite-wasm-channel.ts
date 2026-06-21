@@ -8,7 +8,7 @@ import { WorkerTimeoutError } from '../errors'
  * Each request carries a unique `id` for response correlation.
  */
 export type WorkerRequest =
-	| { id: number; type: 'open'; ddlStatements: string[] }
+	| { id: number; type: 'open'; ddlStatements: string[]; dbName?: string }
 	| { id: number; type: 'close' }
 	| { id: number; type: 'execute'; sql: string; params?: unknown[] }
 	| { id: number; type: 'query'; sql: string; params?: unknown[] }

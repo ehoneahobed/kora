@@ -17,6 +17,7 @@ describe('generateSQL', () => {
 		expect(createTable).toContain('title TEXT NOT NULL')
 		expect(createTable).toContain('_created_at INTEGER NOT NULL')
 		expect(createTable).toContain('_updated_at INTEGER NOT NULL')
+		expect(createTable).toContain("_version TEXT NOT NULL DEFAULT ''")
 		expect(createTable).toContain('_deleted INTEGER NOT NULL DEFAULT 0')
 	})
 

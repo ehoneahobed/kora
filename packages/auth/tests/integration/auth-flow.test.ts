@@ -4,14 +4,14 @@
  * Tests cross-module interactions: sign-up → sign-in → token refresh → sign-out,
  * device registration, email verification, password reset, and token revocation.
  */
-import { describe, test, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, test } from 'vitest'
 import {
 	BuiltInAuthRoutes,
-	InMemoryUserStore,
-	TokenManager,
-	InMemoryTokenRevocationStore,
 	EmailVerificationManager,
+	InMemoryTokenRevocationStore,
+	InMemoryUserStore,
 	PasswordResetManager,
+	TokenManager,
 } from '../../src/server'
 
 describe('Auth flow integration', () => {
@@ -42,7 +42,14 @@ describe('Auth flow integration', () => {
 			name: 'Alice',
 		})
 		expect(signUp.status).toBe(201)
-		const signUpData = (signUp.body as { data: { user: { id: string; email: string; name: string }; tokens: { accessToken: string; refreshToken: string } } }).data
+		const signUpData = (
+			signUp.body as {
+				data: {
+					user: { id: string; email: string; name: string }
+					tokens: { accessToken: string; refreshToken: string }
+				}
+			}
+		).data
 		expect(signUpData.user.email).toBe('alice@example.com')
 		expect(signUpData.user.name).toBe('Alice')
 		expect(signUpData.tokens.accessToken).toBeTruthy()
@@ -55,7 +62,11 @@ describe('Auth flow integration', () => {
 			password: 'securePassword123',
 		})
 		expect(signIn.status).toBe(200)
-		const signInData = (signIn.body as { data: { user: { id: string }; tokens: { accessToken: string; refreshToken: string } } }).data
+		const signInData = (
+			signIn.body as {
+				data: { user: { id: string }; tokens: { accessToken: string; refreshToken: string } }
+			}
+		).data
 		expect(signInData.user.id).toBe(userId)
 
 		// 3. Get current user with access token
@@ -66,10 +77,9 @@ describe('Auth flow integration', () => {
 		expect(meData.email).toBe('alice@example.com')
 
 		// 4. Sign out
-		const signOut = await routes.handleSignOut(
-			signInData.tokens.accessToken,
-			{ refreshToken: signInData.tokens.refreshToken },
-		)
+		const signOut = await routes.handleSignOut(signInData.tokens.accessToken, {
+			refreshToken: signInData.tokens.refreshToken,
+		})
 		expect(signOut.status).toBe(200)
 
 		// 5. Old access token should be revoked
@@ -86,7 +96,9 @@ describe('Auth flow integration', () => {
 			email: 'bob@example.com',
 			password: 'securePassword123',
 		})
-		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }).data
+		const { tokens } = (
+			signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		).data
 
 		// Refresh tokens
 		const refresh = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
@@ -112,7 +124,9 @@ describe('Auth flow integration', () => {
 			password: 'securePassword123',
 			deviceId: 'device-1',
 		})
-		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }).data
+		const { tokens } = (
+			signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		).data
 
 		// Use refresh token once (legitimate)
 		const firstRefresh = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
@@ -180,7 +194,9 @@ describe('Auth flow integration', () => {
 			deviceId: 'device-main',
 			devicePublicKey: '{"kty":"EC","crv":"P-256","x":"test","y":"test"}',
 		})
-		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }).data
+		const { tokens } = (
+			signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		).data
 
 		// List devices
 		const devices = await routes.handleListDevices(tokens.accessToken)
@@ -211,7 +227,8 @@ describe('Auth flow integration', () => {
 			email: 'verify@example.com',
 			password: 'securePassword123',
 		})
-		const { user } = (signUp.body as { data: { user: { id: string; emailVerified: boolean } } }).data
+		const { user } = (signUp.body as { data: { user: { id: string; emailVerified: boolean } } })
+			.data
 		expect(user.emailVerified).toBe(false)
 
 		// Request verification (dev mode returns token)
@@ -300,7 +317,9 @@ describe('Auth flow integration', () => {
 			email: 'sync@example.com',
 			password: 'securePassword123',
 		})
-		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }).data
+		const { tokens } = (
+			signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		).data
 
 		const syncAuth = routes.toSyncAuthProvider()
 
@@ -308,7 +327,7 @@ describe('Auth flow integration', () => {
 		const result = await syncAuth.authenticate(tokens.accessToken)
 		expect(result).not.toBeNull()
 		expect(result!.userId).toBeTruthy()
-		expect(result!.metadata!['email']).toBe('sync@example.com')
+		expect(result!.metadata!.email).toBe('sync@example.com')
 
 		// Refresh token is rejected (not an access token)
 		const refreshResult = await syncAuth.authenticate(tokens.refreshToken)
@@ -326,7 +345,9 @@ describe('Auth flow integration', () => {
 			deviceId: 'dev-sync-1',
 			devicePublicKey: '{"kty":"EC","crv":"P-256","x":"test","y":"test"}',
 		})
-		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }).data
+		const { tokens } = (
+			signUp.body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		).data
 
 		const syncAuth = routes.toSyncAuthProvider()
 

@@ -1,9 +1,11 @@
 import 'fake-indexeddb/auto'
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { SimpleEventEmitter } from '@korajs/core/internal'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
-import { StoreNotOpenError } from '../errors'
+import { PersistenceError, StoreNotOpenError } from '../errors'
 import { IndexedDbAdapter } from './indexeddb-adapter'
 import { MockWorkerBridge } from './sqlite-wasm-mock-bridge'
+import * as persistence from './sqlite-wasm-persistence'
 import { deleteFromIndexedDB, loadFromIndexedDB } from './sqlite-wasm-persistence'
 
 describe('IndexedDbAdapter', () => {
@@ -39,7 +41,7 @@ describe('IndexedDbAdapter', () => {
 			)
 		})
 
-		// Data should have been persisted to IndexedDB
+		await adapter.flushPersistence()
 		const data = await loadFromIndexedDB(DB_NAME)
 		expect(data).toBeInstanceOf(Uint8Array)
 		expect(data?.length).toBeGreaterThan(0)
@@ -95,6 +97,69 @@ describe('IndexedDbAdapter', () => {
 		expect(rows[0]?.title).toBe('Dump Restore')
 
 		await reopened.close()
+	})
+
+	test('coalesces rapid executes into one debounced persist', async () => {
+		const saveSpy = vi.spyOn(persistence, 'saveToIndexedDB')
+
+		const coalesced = new IndexedDbAdapter({
+			bridge: new MockWorkerBridge(),
+			dbName: 'coalesce-db',
+			persistenceDebounceMs: 500,
+		})
+		await coalesced.open(minimalSchema)
+
+		for (let index = 0; index < 5; index++) {
+			await coalesced.execute(
+				'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+				[`rec-${index}`, `Todo ${index}`, 0, 1000, 1000],
+			)
+		}
+
+		expect(saveSpy).not.toHaveBeenCalled()
+		await new Promise<void>((resolve) => setTimeout(resolve, 550))
+		expect(saveSpy.mock.calls.length).toBeGreaterThanOrEqual(1)
+
+		saveSpy.mockRestore()
+		await coalesced.close()
+		await deleteFromIndexedDB('coalesce-db').catch(() => {})
+	})
+
+	test('emits persistence-error and quota-exceeded on save failure', async () => {
+		const emitter = new SimpleEventEmitter()
+		const persistenceErrors: unknown[] = []
+		const quotaEvents: unknown[] = []
+		emitter.on('store:persistence-error', (event) => persistenceErrors.push(event))
+		emitter.on('store:quota-exceeded', (event) => quotaEvents.push(event))
+
+		const failing = new IndexedDbAdapter({
+			bridge: new MockWorkerBridge(),
+			dbName: 'fail-db',
+			persistenceDebounceMs: 10,
+			emitter,
+		})
+		await failing.open(minimalSchema)
+
+		const quotaError = new DOMException('quota', 'QuotaExceededError')
+		vi.spyOn(persistence, 'saveToIndexedDB').mockRejectedValue(
+			new PersistenceError('quota', {
+				dbName: 'fail-db',
+				quotaExceeded: true,
+				cause: quotaError.message,
+			}),
+		)
+
+		await failing.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-q', 'Q', 0, 1000, 1000],
+		)
+		await failing.close()
+
+		expect(persistenceErrors.length).toBeGreaterThanOrEqual(1)
+		expect(quotaEvents.length).toBeGreaterThanOrEqual(1)
+
+		vi.restoreAllMocks()
+		await deleteFromIndexedDB('fail-db').catch(() => {})
 	})
 
 	test('throws StoreNotOpenError before open', async () => {

@@ -30,10 +30,27 @@ export type KoraEvent =
 	| { type: 'constraint:violated'; constraint: string; trace: MergeTrace }
 	| { type: 'sync:connected'; nodeId: string }
 	| { type: 'sync:disconnected'; reason: string }
+	| {
+			type: 'sync:schema-mismatch'
+			clientSchemaVersion: number
+			serverSchemaVersion: number
+			supportedMin: number
+			supportedMax: number
+			reason: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| { type: 'sync:sent'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:received'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:acknowledged'; sequenceNumber: number }
+	| {
+			type: 'sync:apply-failed'
+			operationId: string
+			collection: string
+			recordId: string
+			code: string
+			message: string
+			retriable: boolean
+	  }
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
@@ -66,6 +83,23 @@ export type KoraEvent =
 			from: string
 			to: string
 			allowed: string[]
+	  }
+	| {
+			type: 'store:persistence-error'
+			dbName: string
+			message: string
+			code: string
+	  }
+	| {
+			type: 'store:quota-exceeded'
+			dbName: string
+			message: string
+	  }
+	| {
+			type: 'replay:completed'
+			targetOperationId: string
+			operationsApplied: number
+			duration: number
 	  }
 
 /** Extract the event type string union from KoraEvent */

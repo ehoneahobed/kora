@@ -196,4 +196,31 @@ describe('ReconnectionManager', () => {
 			expect(manager.getAttemptCount()).toBe(0)
 		})
 	})
+
+	describe('wake', () => {
+		test('wake skips pending backoff delay', async () => {
+			vi.useFakeTimers()
+			const manager = new ReconnectionManager({ initialDelay: 30_000, maxDelay: 30_000 })
+			let attempts = 0
+
+			const promise = manager.start(async () => {
+				attempts++
+				return attempts >= 2
+			})
+
+			await vi.advanceTimersByTimeAsync(0)
+			expect(attempts).toBe(0)
+
+			manager.wake()
+			await vi.advanceTimersByTimeAsync(0)
+			expect(attempts).toBe(1)
+
+			manager.wake()
+			await vi.advanceTimersByTimeAsync(0)
+			expect(attempts).toBe(2)
+
+			await expect(promise).resolves.toBe(true)
+			vi.useRealTimers()
+		})
+	})
 })

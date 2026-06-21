@@ -238,8 +238,8 @@ describe('MergeEngine', () => {
 						auto: false,
 						enumValues: null,
 						itemKind: null,
-				mergeStrategy: null,
-				transitions: null,
+						mergeStrategy: null,
+						transitions: null,
 					},
 				},
 			})

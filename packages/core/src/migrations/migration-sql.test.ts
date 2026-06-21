@@ -154,9 +154,7 @@ describe('rollbackStepsToSQL', () => {
 		const migration = migrate().removeIndex('todos', 'priority')
 
 		const sql = rollbackStepsToSQL(migration)
-		expect(sql).toEqual([
-			'CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos (priority)',
-		])
+		expect(sql).toEqual(['CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos (priority)'])
 	})
 
 	test('skips backfill steps (handled at application layer)', () => {

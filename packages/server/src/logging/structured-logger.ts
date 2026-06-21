@@ -52,10 +52,13 @@ function defaultPrettySerializer(entry: LogEntry): string {
  * Creates a JSON-lines logger that writes to stdout/stderr.
  * Suitable for production use where log aggregators (Datadog, Loki, etc.) consume JSON.
  */
-export function createJsonLogger(writer?: { info: (s: string) => void; error: (s: string) => void }): Logger {
+export function createJsonLogger(writer?: {
+	info: (s: string) => void
+	error: (s: string) => void
+}): Logger {
 	const out = writer ?? {
-		info: (s: string) => process.stdout.write(s + '\n'),
-		error: (s: string) => process.stderr.write(s + '\n'),
+		info: (s: string) => process.stdout.write(`${s}\n`),
+		error: (s: string) => process.stderr.write(`${s}\n`),
 	}
 
 	return {
@@ -75,7 +78,7 @@ export function createJsonLogger(writer?: { info: (s: string) => void; error: (s
  * Writes human-readable colored output to the terminal.
  */
 export function createPrettyLogger(writer?: { write: (s: string) => void }): Logger {
-	const out = writer ?? { write: (s: string) => process.stdout.write(s + '\n') }
+	const out = writer ?? { write: (s: string) => process.stdout.write(`${s}\n`) }
 
 	return {
 		log(entry: LogEntry): void {

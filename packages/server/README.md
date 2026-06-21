@@ -97,6 +97,16 @@ createKoraServer({
 })
 ```
 
+## Testing
+
+Integration tests include **store parity** coverage for `MemoryServerStore` and `SqliteServerStore`. To run the same parity suite against a live PostgreSQL database:
+
+```bash
+DATABASE_URL="postgres://user:pass@localhost:5432/kora_test" pnpm --filter @korajs/server test -- tests/integration/server-store-parity.test.ts
+```
+
+Postgres tests are skipped when `DATABASE_URL` is unset.
+
 ## License
 
 MIT

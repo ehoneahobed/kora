@@ -1,20 +1,45 @@
+import { defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
+
+const todosSchema = defineSchema({
+	version: 1,
+	collections: {
+		todos: {
+			fields: {
+				title: t.string(),
+				completed: t.boolean().default(false),
+			},
+		},
+	},
+})
+
+const todosTitleOnlySchema = defineSchema({
+	version: 1,
+	collections: {
+		todos: {
+			fields: {
+				title: t.string(),
+			},
+		},
+	},
+})
+
+const itemsSchema = defineSchema({
+	version: 1,
+	collections: {
+		items: {
+			fields: {
+				name: t.string(),
+			},
+		},
+	},
+})
 
 describe('Backup and restore flow', () => {
 	test('export and import backup preserves all operations', async () => {
 		const storeA = new MemoryServerStore('server-a')
-		await storeA.setSchema({
-			version: 1,
-			collections: {
-				todos: {
-					fields: {
-						title: { type: 'string' },
-						completed: { type: 'boolean' },
-					},
-				},
-			},
-		})
+		await storeA.setSchema(todosSchema)
 
 		// Insert some operations into store A
 		await storeA.applyRemoteOperation({
@@ -53,17 +78,7 @@ describe('Backup and restore flow', () => {
 
 		// Create store B and import
 		const storeB = new MemoryServerStore('server-b')
-		await storeB.setSchema({
-			version: 1,
-			collections: {
-				todos: {
-					fields: {
-						title: { type: 'string' },
-						completed: { type: 'boolean' },
-					},
-				},
-			},
-		})
+		await storeB.setSchema(todosSchema)
 
 		const result = await storeB.importBackup(backup, false)
 		expect(result.success).toBe(true)
@@ -80,16 +95,7 @@ describe('Backup and restore flow', () => {
 
 	test('merge mode does not duplicate operations', async () => {
 		const storeA = new MemoryServerStore('server-a')
-		await storeA.setSchema({
-			version: 1,
-			collections: {
-				todos: {
-					fields: {
-						title: { type: 'string' },
-					},
-				},
-			},
-		})
+		await storeA.setSchema(todosTitleOnlySchema)
 
 		// Insert one operation
 		await storeA.applyRemoteOperation({
@@ -109,16 +115,7 @@ describe('Backup and restore flow', () => {
 		const backup = await storeA.exportBackup()
 
 		const storeB = new MemoryServerStore('server-b')
-		await storeB.setSchema({
-			version: 1,
-			collections: {
-				todos: {
-					fields: {
-						title: { type: 'string' },
-					},
-				},
-			},
-		})
+		await storeB.setSchema(todosTitleOnlySchema)
 
 		// Import, then import again (idempotent)
 		const r1 = await storeB.importBackup(backup, true)
@@ -135,16 +132,7 @@ describe('Backup and restore flow', () => {
 
 	test('export from populated server is valid binary', async () => {
 		const store = new MemoryServerStore('server-test')
-		await store.setSchema({
-			version: 1,
-			collections: {
-				items: {
-					fields: {
-						name: { type: 'string' },
-					},
-				},
-			},
-		})
+		await store.setSchema(itemsSchema)
 
 		for (let i = 0; i < 10; i++) {
 			await store.applyRemoteOperation({
@@ -152,7 +140,7 @@ describe('Backup and restore flow', () => {
 				nodeId: 'client-1',
 				type: 'insert',
 				collection: 'items',
-				recordId: `item-${i}`,
+				recordId: `rec-${i}`,
 				data: { name: `item-${i}` },
 				previousData: null,
 				timestamp: { wallTime: 1000 + i, logical: 0, nodeId: 'client-1' },
@@ -165,18 +153,10 @@ describe('Backup and restore flow', () => {
 		const backup = await store.exportBackup()
 		expect(backup.byteLength).toBeGreaterThan(100)
 
-		// Verify section-based backup format: [4-byte nameLen][4-byte contentLen][name][content]
-		const view = new DataView(backup.buffer, backup.byteOffset, backup.byteLength)
-		const nameLen = view.getUint32(0, true)
-		const contentLen = view.getUint32(4, true)
-		const nameBytes = backup.slice(8, 8 + nameLen)
-		const name = new TextDecoder().decode(nameBytes)
-		expect(name).toBe('manifest')
-
-		// Parse manifest JSON
-		const contentBytes = backup.slice(8 + nameLen, 8 + nameLen + contentLen)
-		const manifest = JSON.parse(new TextDecoder().decode(contentBytes))
-		expect(manifest.schemaVersion).toBe(1)
-		expect(manifest.operationCount).toBe(10)
+		const emptyStore = new MemoryServerStore('server-empty')
+		await emptyStore.setSchema(itemsSchema)
+		const imported = await emptyStore.importBackup(backup, false)
+		expect(imported.success).toBe(true)
+		expect(imported.operationsRestored).toBe(10)
 	})
 })

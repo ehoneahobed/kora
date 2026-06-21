@@ -31,6 +31,23 @@ describe('Transaction flow (end-to-end)', () => {
 		if (app) await app.close()
 	})
 
+	test('transaction operations include causal dependencies within the txn', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		await app.ready
+
+		const ops = await app.transaction(async (tx: TransactionProxy) => {
+			await tx.todos!.insert({ title: 'First' })
+			await tx.todos!.insert({ title: 'Second' })
+		})
+
+		expect(ops.length).toBe(2)
+		expect(ops[0]?.causalDeps).toEqual([])
+		expect(ops[1]?.causalDeps).toContain(ops[0]?.id)
+	})
+
 	test('app.transaction() commits multiple operations atomically', async () => {
 		app = createApp({
 			schema,
@@ -42,9 +59,9 @@ describe('Transaction flow (end-to-end)', () => {
 		const projects = (app as Record<string, unknown>).projects as CollectionAccessor
 
 		const ops = await app.transaction(async (tx: TransactionProxy) => {
-			await tx.todos.insert({ title: 'Task 1' })
-			await tx.todos.insert({ title: 'Task 2' })
-			await tx.projects.insert({ name: 'Project A' })
+			await tx.todos!.insert({ title: 'Task 1' })
+			await tx.todos!.insert({ title: 'Task 2' })
+			await tx.projects!.insert({ name: 'Project A' })
 		})
 
 		expect(ops.length).toBe(3)
@@ -78,7 +95,7 @@ describe('Transaction flow (end-to-end)', () => {
 
 		await expect(
 			app.transaction(async (tx: TransactionProxy) => {
-				await tx.todos.insert({ title: 'Will be rolled back' })
+				await tx.todos!.insert({ title: 'Will be rolled back' })
 				throw new Error('Intentional error')
 			}),
 		).rejects.toThrow('Intentional error')
@@ -102,8 +119,8 @@ describe('Transaction flow (end-to-end)', () => {
 		})
 
 		await app.transaction(async (tx: TransactionProxy) => {
-			await tx.todos.insert({ title: 'Event test' })
-			await tx.projects.insert({ name: 'Event project' })
+			await tx.todos!.insert({ title: 'Event test' })
+			await tx.projects!.insert({ name: 'Event project' })
 		})
 
 		expect(events.length).toBe(2)
@@ -124,7 +141,7 @@ describe('Transaction flow (end-to-end)', () => {
 		const record = await todos.insert({ title: 'Original' })
 
 		await app.transaction(async (tx: TransactionProxy) => {
-			await tx.todos.update(record.id, { title: 'Updated', completed: true })
+			await tx.todos!.update(record.id, { title: 'Updated', completed: true })
 		})
 
 		const updated = await todos.findById(record.id)
@@ -143,7 +160,7 @@ describe('Transaction flow (end-to-end)', () => {
 		const record = await todos.insert({ title: 'To delete' })
 
 		await app.transaction(async (tx: TransactionProxy) => {
-			await tx.todos.delete(record.id)
+			await tx.todos!.delete(record.id)
 		})
 
 		const deleted = await todos.findById(record.id)
@@ -160,8 +177,8 @@ describe('Transaction flow (end-to-end)', () => {
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 
 		const ops = await app.transaction(async (tx: TransactionProxy) => {
-			const record = await tx.todos.insert({ title: 'New' })
-			await tx.todos.update(record.id, { completed: true })
+			const record = await tx.todos!.insert({ title: 'New' })
+			await tx.todos!.update(record.id, { completed: true })
 		})
 
 		expect(ops.length).toBe(2)
@@ -182,8 +199,8 @@ describe('Transaction flow (end-to-end)', () => {
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 
 		await app.transaction(async (tx: TransactionProxy) => {
-			const record = await tx.todos.insert({ title: 'Ephemeral' })
-			await tx.todos.delete(record.id)
+			const record = await tx.todos!.insert({ title: 'Ephemeral' })
+			await tx.todos!.delete(record.id)
 		})
 
 		// Record should not exist
@@ -199,8 +216,8 @@ describe('Transaction flow (end-to-end)', () => {
 		await app.ready
 
 		const ops = await app.mutation('create-todo-with-project', async (tx: TransactionProxy) => {
-			await tx.todos.insert({ title: 'Mutated task' })
-			await tx.projects.insert({ name: 'Mutated project' })
+			await tx.todos!.insert({ title: 'Mutated task' })
+			await tx.projects!.insert({ name: 'Mutated project' })
 		})
 
 		expect(ops.length).toBe(2)
@@ -218,7 +235,7 @@ describe('Transaction flow (end-to-end)', () => {
 		await app.ready
 
 		await app.mutation('test-mutation', async (tx: TransactionProxy) => {
-			await tx.todos.insert({ title: 'Named mutation' })
+			await tx.todos!.insert({ title: 'Named mutation' })
 		})
 
 		// Read back from store
@@ -241,7 +258,7 @@ describe('Transaction flow (end-to-end)', () => {
 		const record = await todos.insert({ title: 'Counter', count: 10 })
 
 		await app.transaction(async (tx: TransactionProxy) => {
-			await tx.todos.update(record.id, { count: op.increment(5) })
+			await tx.todos!.update(record.id, { count: op.increment(5) })
 		})
 
 		const updated = await todos.findById(record.id)

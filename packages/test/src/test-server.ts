@@ -7,16 +7,29 @@ import type { ServerTransport } from '@korajs/server'
  * In-memory test server wrapping KoraSyncServer with MemoryServerStore.
  * Handles client connections via memory transports.
  */
+export interface TestServerOptions {
+	/** Handshake schema version advertised by the server. Defaults to `schema.version`. */
+	schemaVersion?: number
+	/** Inclusive client schema versions accepted at handshake. */
+	supportedSchemaVersions?: { min: number; max: number }
+}
+
 export class TestServer {
 	readonly store: MemoryServerStore
 	private readonly syncServer: KoraSyncServer
 
-	constructor(schema: SchemaDefinition) {
+	constructor(schema: SchemaDefinition, options?: TestServerOptions) {
 		this.store = new MemoryServerStore()
+		const schemaVersion = options?.schemaVersion ?? schema.version
 		this.syncServer = new KoraSyncServer({
 			store: this.store,
-			schemaVersion: schema.version,
+			schemaVersion,
+			supportedSchemaVersions: options?.supportedSchemaVersions ?? {
+				min: schemaVersion,
+				max: schemaVersion,
+			},
 		})
+		void this.store.setSchema(schema)
 	}
 
 	/**

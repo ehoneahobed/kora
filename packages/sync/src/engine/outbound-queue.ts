@@ -146,4 +146,18 @@ export class OutboundQueue {
 	get isInitialized(): boolean {
 		return this.initialized
 	}
+
+	/**
+	 * Remove operations by id from queue and persistent storage.
+	 * Used when ops were already sent during handshake delta exchange.
+	 */
+	async removeByIds(ids: string[]): Promise<void> {
+		if (ids.length === 0) return
+		const idSet = new Set(ids)
+		this.queue = this.queue.filter((op) => !idSet.has(op.id))
+		for (const id of ids) {
+			this.seen.delete(id)
+		}
+		await this.storage.dequeue(ids)
+	}
 }

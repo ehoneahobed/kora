@@ -1,5 +1,6 @@
+import type { KoraEventEmitter } from '@korajs/core'
 import type { Store } from '@korajs/store'
-import type { CursorInfo, SyncEngine } from '@korajs/sync'
+import type { CursorInfo, SyncEngine, SyncStatusInfo } from '@korajs/sync'
 import type { ReactNode } from 'react'
 import type * as Y from 'yjs'
 
@@ -10,6 +11,12 @@ import type * as Y from 'yjs'
 export interface KoraAppLike {
 	/** Resolves when the store is open and collections are ready. */
 	ready: Promise<void>
+	/** Framework event emitter (sync, store, merge, query). */
+	events?: KoraEventEmitter
+	/** Sync control when sync is configured. */
+	sync?: {
+		subscribeStatus(listener: (status: SyncStatusInfo) => void): () => void
+	} | null
 	/** Get the underlying Store instance. */
 	getStore(): Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
@@ -26,6 +33,10 @@ export interface KoraContextValue {
 	syncEngine: SyncEngine | null
 	/** The KoraApp instance (when provided via app prop). */
 	app: KoraAppLike | null
+	/** App event emitter (when using app prop). */
+	events: KoraEventEmitter | null
+	/** Event-driven sync status subscription from app.sync. */
+	subscribeSyncStatus: ((listener: (status: SyncStatusInfo) => void) => () => void) | null
 }
 
 /**
@@ -53,6 +64,26 @@ export interface KoraProviderProps {
 export interface UseQueryOptions {
 	/** Set to false to disable the subscription (query won't execute). Defaults to true. */
 	enabled?: boolean
+}
+
+/**
+ * Options for optimistic updates and rollback in {@link useMutation}.
+ */
+export interface UseMutationOptions<TData, TArgs extends unknown[], TContext = void> {
+	/**
+	 * Runs before the mutation. Return a context value for rollback.
+	 */
+	onMutate?: (...args: TArgs) => TContext | Promise<TContext>
+	/**
+	 * Reverts optimistic changes when the mutation fails.
+	 */
+	onRollback?: (context: TContext, ...args: TArgs) => void | Promise<void>
+	/** Called when the mutation succeeds. */
+	onSuccess?: (data: TData, ...args: TArgs) => void
+	/** Called when the mutation fails (after optional rollback). */
+	onError?: (error: Error, ...args: TArgs) => void
+	/** Called after success or failure. */
+	onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
 }
 
 /**
@@ -93,4 +124,8 @@ export interface UseRichTextResult {
 	error: Error | null
 	/** Remote collaborators' cursor positions in this field. Empty if no sync engine. */
 	cursors: CursorInfo[]
+	/** Publish local cursor/selection to connected collaborators. No-op without sync. */
+	setCursor: (anchor: number, head: number) => void
+	/** Clear local cursor presence for this field. */
+	clearCursor: () => void
 }

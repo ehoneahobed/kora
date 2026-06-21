@@ -54,7 +54,7 @@ export class SlidingWindowPercentile {
 		// Nearest-rank method: index = ceil(p/100 * n) - 1, clamped to [0, n-1]
 		const rank = Math.ceil((p / 100) * sorted.length) - 1
 		const index = Math.max(0, Math.min(rank, sorted.length - 1))
-		return sorted[index]
+		return sorted[index] ?? 0
 	}
 
 	/**
@@ -64,7 +64,7 @@ export class SlidingWindowPercentile {
 		if (this.count === 0) return 0
 		// writeIndex points to the next write position, so the last written is one behind
 		const lastIndex = (this.writeIndex - 1 + this.maxSize) % this.maxSize
-		return this.samples[lastIndex]
+		return this.samples[lastIndex] ?? 0
 	}
 
 	/**

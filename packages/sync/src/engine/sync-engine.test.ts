@@ -1,7 +1,8 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import type { KoraEvent, KoraEventEmitter, KoraEventListener, KoraEventType } from '@korajs/core'
-import { SyncError } from '@korajs/core'
+import { APPLY_FAILURE_CODES, SyncError } from '@korajs/core'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { encodeDeltaCursor } from '../delta/delta-cursor'
 import type {
 	AcknowledgmentMessage,
 	HandshakeMessage,
@@ -99,6 +100,9 @@ function setupServerResponder(
 				schemaVersion: handshake.schemaVersion,
 				accepted: accept,
 				rejectReason: options?.rejectReason,
+				...(options?.rejectReason?.startsWith('SCHEMA_MISMATCH')
+					? { supportedSchemaMin: 1, supportedSchemaMax: 1 }
+					: {}),
 			}
 			server.send(response)
 
@@ -170,6 +174,46 @@ describe('SyncEngine state transitions', () => {
 		expect(engine.getState()).toBe('streaming')
 	})
 
+	test('tolerates duplicate final delta batches without invalid transition', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		server.onMessage((msg) => {
+			if (msg.type !== 'handshake') {
+				return
+			}
+			const handshake = msg as HandshakeMessage
+			const response: HandshakeResponseMessage = {
+				type: 'handshake-response',
+				messageId: `resp-${handshake.messageId}`,
+				nodeId: 'server-node',
+				versionVector: {},
+				schemaVersion: handshake.schemaVersion,
+				accepted: true,
+			}
+			server.send(response)
+
+			const finalBatch: OperationBatchMessage = {
+				type: 'operation-batch',
+				messageId: 'delta-final-1',
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+				totalBatches: 1,
+			}
+			server.send(finalBatch)
+			server.send({ ...finalBatch, messageId: 'delta-final-2' })
+		})
+
+		await expect(engine.start()).resolves.toBeUndefined()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.getState()).toBe('streaming')
+	})
+
 	test('transitions to error on rejected handshake', async () => {
 		const { client, server } = createMemoryTransportPair()
 		setupServerResponder(server, { accept: false, rejectReason: 'Schema mismatch' })
@@ -185,6 +229,133 @@ describe('SyncEngine state transitions', () => {
 
 		// After rejection, should end up disconnected (error → disconnected)
 		expect(engine.getState()).toBe('disconnected')
+	})
+
+	test('blocks sync on SCHEMA_MISMATCH handshake rejection', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		setupServerResponder(server, {
+			accept: false,
+			rejectReason: 'SCHEMA_MISMATCH: client schema version 99 not in supported range [1, 1]',
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', schemaVersion: 99 },
+			emitter,
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(engine.getState()).toBe('error')
+		expect(engine.isSchemaBlocked()).toBe(true)
+		expect(engine.getStatus().status).toBe('schema-mismatch')
+		expect(emitter.events.some((e) => e.type === 'sync:schema-mismatch')).toBe(true)
+		expect(emitter.events.some((e) => e.type === 'sync:disconnected')).toBe(false)
+
+		engine.clearSchemaBlock()
+		expect(engine.getState()).toBe('disconnected')
+		expect(engine.isSchemaBlocked()).toBe(false)
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.isSchemaBlocked()).toBe(true)
+		expect(engine.getState()).toBe('error')
+	})
+
+	test('strictHandshake waits for delta batch ACKs before streaming', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const store = createMockStore()
+		const sentBatchIds: string[] = []
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				const handshake = msg as HandshakeMessage
+				server.send({
+					type: 'handshake-response',
+					messageId: `resp-${handshake.messageId}`,
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: 1,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'server-delta',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				const batch = msg as OperationBatchMessage
+				sentBatchIds.push(batch.messageId)
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${batch.messageId}`,
+					acknowledgedMessageId: batch.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', strictHandshake: true },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 30))
+
+		expect(engine.getState()).toBe('streaming')
+		expect(sentBatchIds.length).toBeGreaterThan(0)
+	})
+
+	test('sendDelta removes reconciled ops from queue so flush does not resend', async () => {
+		const localNodeId = 'test-node'
+		const op1 = makeOp('op-1', 1, localNodeId)
+		const op2 = makeOp('op-2', 2, localNodeId)
+		const vector = new Map<string, number>([[localNodeId, 2]])
+
+		const syncState = {
+			loadLastAckedServerVector: async () => new Map<string, number>(),
+			saveLastAckedServerVector: async () => {},
+			mergeServerVectors: (a: VersionVector, b: VersionVector) => {
+				const merged = new Map(a)
+				for (const [nodeId, seq] of b) {
+					merged.set(nodeId, Math.max(merged.get(nodeId) ?? 0, seq))
+				}
+				return merged
+			},
+			getUnsyncedOperations: async () => [op1, op2],
+			countUnsyncedOperations: async () => 2,
+			loadDeltaCursor: async () => null,
+			saveDeltaCursor: async () => {},
+		}
+
+		const store = createMockStore({
+			getNodeId: () => localNodeId,
+			getVersionVector: () => vector,
+			getOperationRange: async () => [op1, op2],
+		})
+
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState,
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+
+		expect(engine.getState()).toBe('streaming')
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
 	})
 
 	test('throws when starting from non-disconnected state', async () => {
@@ -843,7 +1014,8 @@ describe('SyncEngine scope', () => {
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
 		expect(receivedHandshake).not.toBeNull()
-		expect(receivedHandshake?.syncScope).toEqual(scopeMap)
+		const handshake = receivedHandshake as unknown as HandshakeMessage
+		expect(handshake.syncScope).toEqual(scopeMap)
 	})
 
 	test('does not include syncScope when scopeMap is not configured', async () => {
@@ -889,7 +1061,8 @@ describe('SyncEngine scope', () => {
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
 		expect(receivedHandshake).not.toBeNull()
-		expect(receivedHandshake?.syncScope).toBeUndefined()
+		const handshake = receivedHandshake as unknown as HandshakeMessage
+		expect(handshake.syncScope).toBeUndefined()
 	})
 
 	test('pushOperation skips out-of-scope operations', async () => {
@@ -1013,10 +1186,7 @@ describe('SyncEngine scope', () => {
 		server.send({
 			type: 'operation-batch',
 			messageId: 'stream-1',
-			operations: [
-				serializer.encodeOperation(inScopeOp),
-				serializer.encodeOperation(outOfScopeOp),
-			],
+			operations: [serializer.encodeOperation(inScopeOp), serializer.encodeOperation(outOfScopeOp)],
 			isFinal: true,
 			batchIndex: 0,
 		})
@@ -1377,5 +1547,156 @@ describe('SyncEngine enhanced status', () => {
 		// Should not throw
 		await engine.retryNow()
 		expect(engine.getState()).toBe('streaming')
+	})
+})
+
+describe('SyncEngine query subsets', () => {
+	test('pushOperation skips ops outside registered query subsets', async () => {
+		const { client } = createMemoryTransportPair()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
+
+		await engine.pushOperation({
+			...makeOp('done', 1),
+			type: 'update',
+			data: { completed: true },
+			previousData: { completed: false, title: 'Op done' },
+		})
+
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
+
+		await engine.pushOperation({
+			...makeOp('active', 2),
+			type: 'update',
+			data: { completed: false },
+			previousData: { completed: true, title: 'Op active' },
+		})
+
+		expect(engine.getOutboundQueue().totalPending).toBe(1)
+	})
+
+	test('handshake includes active syncQueries', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		let capturedHandshake: HandshakeMessage | null = null
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				capturedHandshake = msg as HandshakeMessage
+			}
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		expect(capturedHandshake).not.toBeNull()
+		const handshake = capturedHandshake as unknown as HandshakeMessage
+		expect(handshake.syncQueries).toEqual([{ collection: 'todos', where: { completed: false } }])
+	})
+})
+
+describe('SyncEngine delta cursor', () => {
+	test('persists cursor during initial sync and clears on completion', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const saved: Array<{ lastOperationId: string; batchIndex: number } | null> = []
+		const serializer = new JsonMessageSerializer()
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				const handshake = msg as HandshakeMessage
+				server.send({
+					type: 'handshake-response',
+					messageId: 'resp-1',
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: handshake.schemaVersion,
+					accepted: true,
+				})
+
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-paginated',
+					operations: [serializer.encodeOperation(makeOp('remote-1', 1, 'server-node'))],
+					isFinal: true,
+					batchIndex: 0,
+					totalBatches: 1,
+					cursor: encodeDeltaCursor({ lastOperationId: 'remote-1', batchIndex: 0 }),
+				})
+			} else if (msg.type === 'operation-batch') {
+				server.send({
+					type: 'acknowledgment',
+					messageId: 'ack-1',
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const mockSyncState = {
+			loadLastAckedServerVector: vi.fn(async () => new Map()),
+			saveLastAckedServerVector: vi.fn(async () => {}),
+			mergeServerVectors: vi.fn((a: VersionVector, b: VersionVector) => new Map([...a, ...b])),
+			countUnsyncedOperations: vi.fn(async () => 0),
+			getUnsyncedOperations: vi.fn(async () => []),
+			loadDeltaCursor: vi.fn(async () => null),
+			saveDeltaCursor: vi.fn(async (cursor) => {
+				saved.push(cursor)
+			}),
+		}
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			syncState: mockSyncState,
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		expect(saved.some((cursor) => cursor?.lastOperationId === 'remote-1')).toBe(true)
+		expect(saved[saved.length - 1]).toBeNull()
+	})
+})
+
+describe('apply failure observability', () => {
+	test('emits sync:apply-failed when store returns rejected', async () => {
+		const emitter = createMockEmitter()
+		const remoteOp = makeOp('reject-op', 1, 'remote-node')
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server, { serverDelta: [remoteOp] })
+
+		const store = createMockStore({
+			applyRemoteOperation: vi.fn(async () => 'rejected' as const),
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test' },
+			emitter,
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+
+		const failures = emitter.events.filter((event) => event.type === 'sync:apply-failed')
+		expect(failures).toHaveLength(1)
+		expect(failures[0]).toMatchObject({
+			operationId: remoteOp.id,
+			code: APPLY_FAILURE_CODES.APPLY_REJECTED,
+		})
 	})
 })

@@ -38,6 +38,13 @@ temp/
 kora-db
 kora-db-*
 *.sqlite
+*.db
+*.db-shm
+*.db-wal
+kora/:memory:*
+
+# Playwright / test artifacts
+e2e/test-results/
 
 # Local content directory
 content/

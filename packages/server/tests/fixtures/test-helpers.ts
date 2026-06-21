@@ -1,8 +1,8 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import type { ApplyResult, SyncMessage } from '@korajs/sync'
+import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
-import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
 
 /**
@@ -67,7 +67,9 @@ export class MockClientStore {
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
 		return this.operations
-			.filter((op) => op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq)
+			.filter(
+				(op) => op.nodeId === nodeId && op.sequenceNumber >= fromSeq && op.sequenceNumber <= toSeq,
+			)
 			.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
 	}
 
@@ -83,9 +85,7 @@ export class MockClientStore {
 /**
  * Set up a test server with helper methods for connecting clients.
  */
-export function setupTestServer(
-	configOverrides?: Partial<KoraSyncServerConfig>,
-): {
+export function setupTestServer(configOverrides?: Partial<KoraSyncServerConfig>): {
 	server: KoraSyncServer
 	store: MemoryServerStore
 	connectClient: (nodeId: string, initialOps?: Operation[]) => Promise<TestClient>
@@ -127,12 +127,13 @@ export function setupTestServer(
 			},
 			async waitForStreaming() {
 				return new Promise<void>((resolve, reject) => {
-					const timeout = setTimeout(() => reject(new Error('Timed out waiting for streaming')), 5000)
+					const timeout = setTimeout(
+						() => reject(new Error('Timed out waiting for streaming')),
+						5000,
+					)
 					const check = () => {
 						const response = messages.find((m) => m.type === 'handshake-response')
-						const finalBatch = messages.find(
-							(m) => m.type === 'operation-batch' && m.isFinal,
-						)
+						const finalBatch = messages.find((m) => m.type === 'operation-batch' && m.isFinal)
 						if (response && finalBatch) {
 							clearTimeout(timeout)
 							resolve()

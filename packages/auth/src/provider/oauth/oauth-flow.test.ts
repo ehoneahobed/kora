@@ -76,6 +76,24 @@ describe('OAuthManager', () => {
 			expect(stored?.metadata).toEqual({ returnTo: '/dashboard' })
 		})
 
+		test('adds PKCE challenge for public native clients', async () => {
+			const pkceStore = new InMemoryOAuthStateStore()
+			const pkceManager = new OAuthManager({
+				providers: [createTestProvider({ clientSecret: undefined, pkce: true })],
+				stateStore: pkceStore,
+				fetch: mockFetch as unknown as typeof fetch,
+			})
+
+			const { url, state } = await pkceManager.getAuthorizationUrl('test')
+			const parsed = new URL(url)
+			const stored = await pkceStore.consume(state)
+
+			expect(parsed.searchParams.get('code_challenge')).toBeTruthy()
+			expect(parsed.searchParams.get('code_challenge_method')).toBe('S256')
+			expect(stored?.codeVerifier).toBeTruthy()
+			expect(stored?.codeVerifier).not.toBe(parsed.searchParams.get('code_challenge'))
+		})
+
 		test('throws for unknown provider', async () => {
 			await expect(manager.getAuthorizationUrl('unknown')).rejects.toThrow(
 				OAuthProviderNotFoundError,
@@ -137,6 +155,32 @@ describe('OAuthManager', () => {
 
 			const result = await manager.handleCallback('test', 'code', state)
 			expect(result.stateMetadata).toEqual({ returnTo: '/settings' })
+		})
+
+		test('sends PKCE verifier without client secret for public clients', async () => {
+			const pkceManager = new OAuthManager({
+				providers: [createTestProvider({ clientSecret: undefined, pkce: true })],
+				stateStore: new InMemoryOAuthStateStore(),
+				fetch: mockFetch as unknown as typeof fetch,
+			})
+			const { state } = await pkceManager.getAuthorizationUrl('test')
+
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({ access_token: 'at', token_type: 'Bearer' }),
+				})
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({ id: 'u1', email: 'a@b.com' }),
+				})
+
+			await pkceManager.handleCallback('test', 'code', state)
+
+			const [, init] = mockFetch.mock.calls[0] as [string, RequestInit]
+			const body = new URLSearchParams(init.body as string)
+			expect(body.get('code_verifier')).toBeTruthy()
+			expect(body.has('client_secret')).toBe(false)
 		})
 
 		test('rejects invalid state (CSRF protection)', async () => {

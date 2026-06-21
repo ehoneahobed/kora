@@ -2,7 +2,12 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "."
+    "rootDirs": [".", "../packages/test/src"],
+    "paths": {
+      "korajs": ["./src/index.ts"],
+      "korajs/testing": ["./src/testing.ts"],
+      "@korajs/test": ["../packages/test/src/index.ts"]
+    }
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "tests/typecheck"]
 }

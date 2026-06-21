@@ -137,7 +137,7 @@ describe('buildPanelModel extended', () => {
 			createTimestampedEvent(4, createSampleEvent('sync:acknowledged'), 1003),
 			createTimestampedEvent(
 				5,
-				createSampleEvent('connection:quality', { quality: 'excellent' } as { quality: 'good' }),
+				createSampleEvent('connection:quality', { quality: 'excellent' }),
 				1004,
 			),
 		]

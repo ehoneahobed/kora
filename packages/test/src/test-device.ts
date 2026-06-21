@@ -1,4 +1,5 @@
-import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
+import type { OperationTransform, SchemaDefinition } from '@korajs/core'
+import type { VersionVector } from '@korajs/core'
 import type { KoraEventEmitter } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
@@ -7,6 +8,12 @@ import type { CollectionAccessor, StorageAdapter } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { SyncEngine } from '@korajs/sync'
 import type { SyncTransport } from '@korajs/sync'
+import {
+	ApplyPipeline,
+	MergeAwareSyncStore,
+	StoreQueueStorage,
+	StoreSyncStatePersistence,
+} from 'korajs/testing'
 import type { TestServer } from './test-server'
 
 /**
@@ -26,6 +33,10 @@ export interface TestDeviceOptions {
 	}
 	/** Optional directory for temp DB files */
 	tmpDir: string
+	/** Client handshake schema version. Defaults to `schema.version`. */
+	syncSchemaVersion?: number
+	/** Transforms applied to inbound operations before local apply. */
+	operationTransforms?: OperationTransform[]
 }
 
 /**
@@ -44,7 +55,10 @@ export class TestDevice {
 	private readonly createTransportPair: TestDeviceOptions['createTransportPair']
 	private readonly adapter: StorageAdapter
 	private readonly dbPath: string
+	private readonly syncSchemaVersion: number
+	private readonly operationTransforms: OperationTransform[]
 
+	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
 	private currentTransport: SyncTransport | null = null
 	private unsubscribeSync: (() => void) | null = null
@@ -56,6 +70,8 @@ export class TestDevice {
 		this.server = options.server
 		this.createTransportPair = options.createTransportPair
 		this.dbPath = `${options.tmpDir}/test-device-${options.name}.db`
+		this.syncSchemaVersion = options.syncSchemaVersion ?? options.schema.version
+		this.operationTransforms = options.operationTransforms ?? []
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -72,6 +88,12 @@ export class TestDevice {
 	 */
 	async open(): Promise<void> {
 		await this.store.open()
+		this.applyPipeline = new ApplyPipeline({
+			store: this.store,
+			mergeEngine: this.mergeEngine,
+			emitter: this.emitter,
+		})
+		this.store.setLocalMutationHandler(this.applyPipeline)
 	}
 
 	/**
@@ -80,8 +102,9 @@ export class TestDevice {
 	 */
 	async sync(): Promise<void> {
 		if (this.syncEngine && this.currentTransport?.isConnected()) {
-			// Already connected — wait for pending operations to flush
+			// Already connected — flush outbound ops, then allow inbound relay to settle
 			await this.waitForPendingOps()
+			await this.waitForSettled()
 			return
 		}
 
@@ -89,15 +112,25 @@ export class TestDevice {
 		const { client, serverTransport } = this.createTransportPair()
 		this.currentTransport = client
 
-		// Create a MergeAwareSyncStore wrapper
-		const syncStore = this.createMergeAwareSyncStore()
+		const conflictHandler: { fn?: () => void } = {}
+		const syncStore = new MergeAwareSyncStore(this.store, this.mergeEngine, this.emitter, {
+			onMergeConflict: () => conflictHandler.fn?.(),
+		})
 
 		this.syncEngine = new SyncEngine({
 			transport: client,
 			store: syncStore,
-			config: { url: 'ws://test-network' },
+			queueStorage: new StoreQueueStorage(this.adapter),
+			syncState: new StoreSyncStatePersistence(this.store),
+			config: {
+				url: 'ws://test-network',
+				schemaVersion: this.syncSchemaVersion,
+				operationTransforms:
+					this.operationTransforms.length > 0 ? this.operationTransforms : undefined,
+			},
 			emitter: this.emitter,
 		})
+		conflictHandler.fn = () => this.syncEngine?.recordConflict()
 
 		// Wire local mutations to sync outbound queue
 		const engine = this.syncEngine
@@ -163,6 +196,11 @@ export class TestDevice {
 		return this.store.getNodeId()
 	}
 
+	/** Exposes the sync engine for integration tests (e.g. doc channel, chaos). */
+	getSyncEngine(): SyncEngine | null {
+		return this.syncEngine
+	}
+
 	/**
 	 * Get the device's version vector.
 	 */
@@ -188,44 +226,12 @@ export class TestDevice {
 	}
 
 	/**
-	 * Create a SyncStore wrapper that interposes merge resolution.
-	 * Simplified version of MergeAwareSyncStore from the kora meta-package.
-	 */
-	private createMergeAwareSyncStore(): import('@korajs/sync').SyncStore {
-		const store = this.store
-		const mergeEngine = this.mergeEngine
-		const emitter = this.emitter
-
-		return {
-			getVersionVector(): VersionVector {
-				return store.getVersionVector()
-			},
-			getNodeId(): string {
-				return store.getNodeId()
-			},
-			async getOperationRange(
-				nodeId: string,
-				fromSeq: number,
-				toSeq: number,
-			): Promise<Operation[]> {
-				return store.getOperationRange(nodeId, fromSeq, toSeq)
-			},
-			async applyRemoteOperation(op: Operation): Promise<import('@korajs/sync').ApplyResult> {
-				// For the test harness, delegate directly to store.
-				// Merge resolution happens inside the store's applyRemoteOperation.
-				return store.applyRemoteOperation(op)
-			},
-		}
-	}
-
-	/**
 	 * Wait for in-flight sync operations to settle.
-	 * In-memory transports are near-synchronous, so a microtask flush suffices.
+	 * In-memory transports are near-synchronous, but apply/relay work is async.
 	 */
 	private async waitForSettled(): Promise<void> {
-		// Multiple microtask flushes to allow async message processing to complete
-		for (let i = 0; i < 5; i++) {
-			await new Promise<void>((resolve) => setTimeout(resolve, 10))
+		for (let i = 0; i < 15; i++) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 20))
 		}
 	}
 

@@ -229,11 +229,7 @@ describe('Integration: app prop', () => {
 
 		function CollectionUser(): ReturnType<typeof createElement> {
 			const todos = useCollection('todos')
-			return createElement(
-				'div',
-				{ 'data-testid': 'has-collection' },
-				todos ? 'yes' : 'no',
-			)
+			return createElement('div', { 'data-testid': 'has-collection' }, todos ? 'yes' : 'no')
 		}
 
 		render(createElement(KoraProvider, { app }, createElement(CollectionUser)))

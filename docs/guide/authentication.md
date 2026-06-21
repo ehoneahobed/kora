@@ -22,7 +22,7 @@ The architecture follows a clean client-server split:
 Client                                Server
 +-----------------------+            +---------------------------+
 | AuthClient            |            | BuiltInAuthRoutes         |
-|   +- TokenStorage     | -- HTTP -> |   +- InMemoryUserStore    |
+|   +- AuthTokenStorage | -- HTTP -> |   +- InMemoryUserStore    |
 |   +- AuthState        |            |   +- TokenManager         |
 |                       |            |   +- PasswordHash (PBKDF2)|
 | React Hooks           |            |                           |
@@ -42,89 +42,75 @@ Install the auth package:
 pnpm add @korajs/auth
 ```
 
-Set up the three core server components: a user store, a token manager, and the auth routes.
+For a standard Kora app, create the auth server with one call:
 
 ```typescript
 // server.ts
 import {
-  BuiltInAuthRoutes,
-  InMemoryUserStore,
-  TokenManager,
-  InMemoryTokenRevocationStore,
+  createKoraAuthServer,
+  createSqliteOAuthStores,
+  googleProvider,
 } from '@korajs/auth/server'
 
-// 1. User store — holds user accounts and device registrations
-const userStore = new InMemoryUserStore()
-
-// 2. Token manager — issues and validates JWTs
-const tokenManager = new TokenManager({
-  secret: process.env.AUTH_SECRET!,     // At least 32 characters
-  revocationStore: new InMemoryTokenRevocationStore(),
-  // Defaults: accessTokenLifetime = 15 min, refreshTokenLifetime = 90 days
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
 })
 
-// 3. Auth routes — framework-agnostic HTTP handlers
-const authRoutes = new BuiltInAuthRoutes({ userStore, tokenManager })
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
+  },
+})
 ```
 
 ::: tip Generating a secret
-Use `TokenManager.generateSecret()` to create a cryptographically random 256-bit secret. Store it in an environment variable, never in source code.
+Run `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` to create a 256-bit secret. Store it in `KORA_AUTH_SECRET`, never in source code.
 :::
 
-Wire the route handlers into your HTTP server. The handlers accept parsed request bodies and return `{ status, body }` response objects:
+Mount the auth routes on the Kora production server:
 
 ```typescript
-// Express example
-import express from 'express'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
-const app = express()
-app.use(express.json())
+const store = createSqliteServerStore({ filename: './kora.db' })
 
-app.post('/auth/signup', async (req, res) => {
-  const result = await authRoutes.handleSignUp(req.body, req.ip)
-  res.status(result.status).json(result.body)
+const server = createProductionServer({
+  store,
+  syncOptions: {
+    auth: auth.auth,
+  },
+  httpRoutes: [
+    {
+      path: '/auth',
+      handle: auth.handleRequest,
+    },
+  ],
 })
-
-app.post('/auth/signin', async (req, res) => {
-  const result = await authRoutes.handleSignIn(req.body, req.ip)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/refresh', async (req, res) => {
-  const result = await authRoutes.handleRefresh(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signout', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleSignOut(token, req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.get('/auth/me', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleGetMe(token)
-  res.status(result.status).json(result.body)
-})
-
-app.listen(3001, () => console.log('Auth server on :3001'))
 ```
 
-The `handleSignUp` and `handleSignIn` methods accept an optional `clientIp` parameter for per-IP rate limiting. Pass `req.ip` (or your reverse proxy's real IP header) for best protection against brute-force attacks.
+`createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, OAuth sign-in routes, account linking, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `OAuthManager`, `TokenManager`, and `UserStore` directly.
 
 ---
 
 ## Quick Start: Client-Side Setup
 
-Create an `AuthClient` instance and wrap your React app with `AuthProvider`:
+Create a Kora auth client and wrap your React app with `AuthProvider`:
 
 ```typescript
 // auth.ts
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 
-export const authClient = new AuthClient({
+export const authClient = createKoraAuth({
   serverUrl: 'http://localhost:3001',
-  // storageKey: 'my_app_auth',  // optional prefix for localStorage keys
 })
 ```
 
@@ -142,7 +128,16 @@ function App() {
 }
 
 function Main() {
-  const { user, isAuthenticated, isLoading, signIn, signUp, signOut, error } = useAuth()
+  const {
+    user,
+    isAuthenticated,
+    isLoading,
+    signIn,
+    signInWithOAuth,
+    signUp,
+    signOut,
+    error,
+  } = useAuth()
 
   if (isLoading) return <div>Restoring session...</div>
 
@@ -153,6 +148,9 @@ function Main() {
         {error && <p style={{ color: 'red' }}>{error}</p>}
         <button onClick={() => signIn({ email: 'alice@example.com', password: 'secret123' })}>
           Sign In
+        </button>
+        <button onClick={() => signInWithOAuth('google')}>
+          Sign In with Google
         </button>
         <button onClick={() => signUp({ email: 'alice@example.com', password: 'secret123', name: 'Alice' })}>
           Sign Up
@@ -176,11 +174,23 @@ The `AuthProvider` calls `authClient.initialize()` on mount, which restores any 
 
 | Hook | Purpose |
 |------|---------|
-| `useAuth()` | Full auth: `user`, `isAuthenticated`, `isLoading`, `signIn`, `signUp`, `signOut`, `error` |
+| `useAuth()` | Full auth: `user`, `isAuthenticated`, `isLoading`, email/password methods, OAuth methods, `signOut`, `error` |
 | `useCurrentUser()` | Lightweight alternative returning just the `AuthUser` or `null` |
 | `useAuthStatus()` | Returns `{ state, isAuthenticated, isLoading }` for route guards |
 
 All hooks use `useSyncExternalStore` under the hood for React 18+ concurrent mode safety.
+
+For desktop and mobile OAuth, create the provider URL without redirecting, open it with the platform browser API, then complete the callback:
+
+```typescript
+const { url } = await authClient.getOAuthAuthorizationUrl('google')
+await openSystemBrowser(url)
+
+await authClient.completeOAuthSignIn('google', {
+  code,
+  state,
+})
+```
 
 **Route guard example:**
 
@@ -202,7 +212,7 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
 
 ## Connecting Auth to the Sync Server
 
-The `BuiltInAuthRoutes` class provides a `toSyncAuthProvider()` method that bridges authentication with the Kora sync server. This method returns an object implementing the `AuthProvider` interface expected by `@korajs/server`.
+The auth server exposes a sync auth provider through `auth.auth`. If you used the server setup above, sync is already protected. The explicit wiring looks like this:
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
@@ -211,10 +221,12 @@ const store = createSqliteServerStore({ filename: './kora.db' })
 
 const syncServer = createProductionServer({
   store,
-  auth: authRoutes.toSyncAuthProvider(),
   port: 3001,
   staticDir: './dist',
   syncPath: '/kora-sync',
+  syncOptions: {
+    auth: auth.auth,
+  },
 })
 ```
 
@@ -224,7 +236,34 @@ The sync auth provider:
 - Checks device revocation status (revoked devices are rejected even if their tokens have not expired)
 - Updates the device's `lastSeenAt` timestamp on each connection
 
-On the client side, pass the auth client's token getter to the sync configuration:
+On the client side, wire auth to sync with **`createKoraAuthSync()`** (recommended):
+
+```typescript
+import { createApp } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { authClient } from './auth'
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+`createKoraAuthSync()` returns an `AuthSyncBinding` that `createApp` understands. It:
+
+- Calls `authClient.getAccessToken()` on every connection attempt (auto-refresh included)
+- Builds a per-collection **scope map** from JWT claims and your schema's `scope` declarations
+- Sets the store **sync node id** from the JWT `dev` claim (device), separate from the user id (`sub`)
+- Reconnects and refreshes scope when auth state changes (sign-in, sign-out, token refresh)
+
+When the user is signed out, the binding returns an empty token. Use this with `MixedAuthProvider` on the server for anonymous + authenticated sync.
+
+#### Manual auth wiring (advanced)
+
+If you need custom token logic, pass `sync.auth` directly:
 
 ```typescript
 import { createApp } from 'korajs'
@@ -236,13 +275,121 @@ const app = createApp({
     url: 'wss://my-server.com/kora-sync',
     auth: async () => {
       const token = await authClient.getAccessToken()
-      return token ? { token } : {}
+      return token ? { token } : { token: '' }
     },
   },
 })
 ```
 
+Do not pass both `auth` and `authClient` — `authClient` takes precedence when both are set.
+
 The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
+
+#### Automatic scope from JWT claims
+
+When you pass `schema` to `createKoraAuthSync()`, Kora extracts flat scope values from the access token using `extractScopeValuesFromClaims()` and builds the handshake scope map with `buildScopeMap()`:
+
+| Claim source | Maps to scope field |
+|--------------|---------------------|
+| Top-level claim matching a schema scope field (e.g. `orgId`) | That field |
+| Nested `claims.scope[field]` | That field |
+| JWT `sub` | `userId` when `userId` is a scope field |
+
+Override mapping with `scopeFromClaims`:
+
+```typescript
+createKoraAuthSync({
+  authClient,
+  schema,
+  scopeFromClaims: (claims) => ({
+    userId: claims.sub as string,
+    orgId: (claims.org_id as string) ?? 'default-org',
+  }),
+})
+```
+
+For static scope values unrelated to the token, use `sync.scope` instead (merged only when no auth binding resolves scope).
+
+### Desktop and Tauri apps
+
+`@korajs/auth` works in desktop apps built with the Kora Tauri template. A Tauri app runs the Kora frontend inside a WebView, so the auth client can use the same `AuthClient`, React hooks, `fetch`, and sync-token flow used by web apps.
+
+The normal desktop setup is:
+
+1. Deploy a remote sync/auth server.
+2. Set `KORA_AUTH_SECRET` on that server to enable built-in `/auth/*` routes.
+3. Create a Kora auth client in the Tauri frontend with the same server origin.
+4. Pass `createKoraAuthSync({ authClient, schema })` to `createApp({ sync: { authClient } })`.
+
+```typescript
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
+const authClient = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+})
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://acme.example.com/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+Email/password auth, OAuth sign-in, account linking, token refresh, sync authorization, MFA, organizations, and RBAC all use HTTP plus WebSocket tokens and apply to web and desktop clients the same way. Passkeys depend on WebAuthn support in the platform WebView and should be feature-detected with `isPasskeySupported()`.
+
+For desktop and mobile OAuth, use an app redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app. After the provider returns `code` and `state`, send them to Kora:
+
+```typescript
+const response = await fetch('https://acme.example.com/auth/oauth/google/callback', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    code,
+    state,
+    deviceId,
+    devicePublicKey,
+  }),
+})
+```
+
+The response contains the normal Kora user and tokens, so the same token storage and sync auth flow works across web, desktop, and mobile.
+
+### Secure token storage for desktop and mobile
+
+By default, `createKoraAuth()` uses browser `localStorage` when it is available. Desktop and mobile production apps should pass a credential store backed by the platform credential store.
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+const authClient = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+})
+```
+
+Use Tauri secure storage on desktop, Expo SecureStore or React Native Keychain on mobile, and iOS Keychain or Android Keystore for native integrations. The adapter may be synchronous or asynchronous.
+
+`createKoraAuth()` creates a stable local device identity automatically when persistent key storage exists. For React Native and other runtimes without IndexedDB, pass a platform-backed `deviceKeyStore`:
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+const authClient = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+  deviceKeyStore,
+})
+
+await authClient.signIn({
+  email: 'alice@example.com',
+  password: 'correct-horse-battery-staple',
+})
+```
+
+The device identity provider stores a stable device ID and a non-extractable ECDSA P-256 key pair. The server receives `deviceId` and `devicePublicKey`, so token claims and device revocation apply to the actual offline device. Browsers and Tauri WebViews use IndexedDB for the key pair by default; React Native and other runtimes without IndexedDB should pass a platform-backed `keyStore`.
 
 ### Mixed Auth (Authenticated + Anonymous)
 
@@ -262,13 +409,13 @@ const syncServer = new KoraSyncServer({
 })
 ```
 
-On the client, return an empty token for unauthenticated users:
+On the client, return an empty token for unauthenticated users. `createKoraAuthSync` does this automatically; with manual wiring:
 
 ```typescript
 sync: {
-  auth: async () => ({
-    token: (await authClient.getAccessToken()) ?? '',
-  }),
+  authClient: createKoraAuthSync({ authClient, schema }),
+  // or manually:
+  // auth: async () => ({ token: (await authClient.getAccessToken()) ?? '' }),
 }
 ```
 

@@ -8,12 +8,36 @@ import type {
 	OperationBatchMessage,
 	SyncMessage,
 	WireFormat,
+	YjsDocUpdateMessage,
 } from '@korajs/sync'
-import { NegotiatedMessageSerializer, versionVectorToWire, wireToVersionVector } from '@korajs/sync'
+import {
+	type DeltaCursor,
+	NegotiatedMessageSerializer,
+	SCHEMA_MISMATCH_PREFIX,
+	type SyncQuerySubset,
+	createDeltaCursorFromBatch,
+	decodeDeltaCursor,
+	dedupeQuerySubsets,
+	encodeDeltaCursor,
+	isClientSchemaVersionSupported,
+	operationMatchesQuerySubsets,
+	sliceOperationsAfterCursor,
+	versionVectorToWire,
+	wireToVersionVector,
+} from '@korajs/sync'
+import { applyServerOperation } from '../apply/apply-server-operation'
+import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider } from '../types'
+import { isOperationTimestampValid } from './operation-validation'
+import {
+	DEFAULT_MAX_OPERATION_BYTES,
+	DEFAULT_MAX_OPS_PER_MINUTE,
+	SessionRateLimiter,
+	validateOperationSize,
+} from './session-operation-limits'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
@@ -37,6 +61,11 @@ export type AwarenessRelayCallback = (
 ) => void
 
 /**
+ * Callback invoked when a session receives a Yjs doc channel update to relay.
+ */
+export type YjsDocRelayCallback = (sourceSessionId: string, message: YjsDocUpdateMessage) => void
+
+/**
  * Options for creating a ClientSession.
  */
 export interface ClientSessionOptions {
@@ -56,12 +85,20 @@ export interface ClientSessionOptions {
 	batchSize?: number
 	/** Schema version the server expects */
 	schemaVersion?: number
+	/** Inclusive client schema versions accepted at handshake */
+	supportedSchemaVersions?: { min: number; max: number }
 	/** Called when this session has operations to relay to other sessions */
 	onRelay?: RelayCallback
 	/** Called when this session receives an awareness update to broadcast */
 	onAwarenessUpdate?: AwarenessRelayCallback
+	/** Called when this session receives a Yjs doc channel update to broadcast */
+	onYjsDocUpdate?: YjsDocRelayCallback
 	/** Called when this session closes */
 	onClose?: (sessionId: string) => void
+	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
+	maxOperationBytes?: number
+	/** Maximum operations accepted per minute for this session. Defaults to 600. */
+	maxOpsPerMinute?: number
 }
 
 /**
@@ -82,6 +119,8 @@ export class ClientSession {
 	private state: SessionState = 'connected'
 	private clientNodeId: string | null = null
 	private authContext: AuthContext | null = null
+	private syncQuerySubsets: SyncQuerySubset[] = []
+	private resumeDeltaCursor: DeltaCursor | null = null
 
 	private readonly sessionId: string
 	private readonly transport: ServerTransport
@@ -91,9 +130,14 @@ export class ClientSession {
 	private readonly emitter: KoraEventEmitter | null
 	private readonly batchSize: number
 	private readonly schemaVersion: number
+	private readonly supportedSchemaVersions: { min: number; max: number }
 	private readonly onRelay: RelayCallback | null
 	private readonly onAwarenessUpdate: AwarenessRelayCallback | null
+	private readonly onYjsDocUpdate: YjsDocRelayCallback | null
 	private readonly onClose: ((sessionId: string) => void) | null
+	private readonly maxOperationBytes: number
+	private readonly maxOpsPerMinute: number
+	private readonly rateLimiter: SessionRateLimiter
 
 	constructor(options: ClientSessionOptions) {
 		this.sessionId = options.sessionId
@@ -104,16 +148,25 @@ export class ClientSession {
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
 		this.schemaVersion = options.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		const supported = options.supportedSchemaVersions
+		this.supportedSchemaVersions = supported ?? {
+			min: this.schemaVersion,
+			max: this.schemaVersion,
+		}
 		this.onRelay = options.onRelay ?? null
 		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
+		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
 		this.onClose = options.onClose ?? null
+		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
+		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
+		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
 	}
 
 	/**
 	 * Start handling messages from the client transport.
 	 */
 	start(): void {
-		this.transport.onMessage((msg) => this.handleMessage(msg))
+		this.transport.onMessage((msg) => this.enqueueMessage(msg))
 		this.transport.onClose((_code, _reason) => this.handleTransportClose())
 		this.transport.onError((_err) => {
 			// Transport errors during active session cause close
@@ -131,9 +184,7 @@ export class ClientSession {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (operations.length === 0) return
 
-		const visibleOperations = operations.filter((op) =>
-			operationMatchesScopes(op, this.authContext?.scopes),
-		)
+		const visibleOperations = operations.filter((op) => this.operationVisibleToClient(op))
 		if (visibleOperations.length === 0) return
 
 		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
@@ -144,7 +195,7 @@ export class ClientSession {
 			isFinal: true,
 			batchIndex: 0,
 		}
-		this.transport.send(msg)
+		this.sendToClient(msg)
 	}
 
 	/**
@@ -193,15 +244,35 @@ export class ClientSession {
 
 	// --- Private protocol handlers ---
 
-	private handleMessage(message: SyncMessage): void {
+	private messageChain: Promise<void> = Promise.resolve()
+
+	/** Send to the client when the transport is still connected; no-op otherwise. */
+	private sendToClient(message: SyncMessage): boolean {
+		if (!this.transport.isConnected()) {
+			return false
+		}
+		try {
+			this.transport.send(message)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	private enqueueMessage(message: SyncMessage): void {
+		this.messageChain = this.messageChain
+			.then(() => this.handleMessageAsync(message))
+			.catch((error) => this.handleMessageFailure(error))
+	}
+
+	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		switch (message.type) {
 			case 'handshake':
-				this.handleHandshake(message)
+				await this.handleHandshake(message)
 				break
 			case 'operation-batch':
-				this.handleOperationBatch(message)
+				await this.handleOperationBatch(message)
 				break
-			// Acknowledgments from clients are noted but no action needed on server
 			case 'acknowledgment':
 				break
 			case 'error':
@@ -209,7 +280,16 @@ export class ClientSession {
 			case 'awareness-update':
 				this.handleAwarenessUpdate(message)
 				break
+			case 'yjs-doc-update':
+				this.handleYjsDocUpdate(message)
+				break
 		}
+	}
+
+	private handleMessageFailure(error: unknown): void {
+		const reason = error instanceof Error ? error.message : 'Message handling failed'
+		this.sendError('SYNC_ERROR', reason, true)
+		this.close(reason)
 	}
 
 	private async handleHandshake(msg: HandshakeMessage): Promise<void> {
@@ -234,29 +314,51 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
-		// Merge handshake sync scopes with auth scopes.
-		// Auth scopes take precedence (server-controlled).
-		// Handshake scopes provide client-requested filtering.
-		if (msg.syncScope) {
-			const mergedScopes = { ...msg.syncScope }
-			if (this.authContext?.scopes) {
-				// Auth scopes override handshake scopes per-collection
-				for (const [collection, authScope] of Object.entries(this.authContext.scopes)) {
-					mergedScopes[collection] = { ...(mergedScopes[collection] ?? {}), ...authScope }
-				}
-			}
+		// Merge handshake sync scopes with auth scopes using schema sync rules.
+		const resolvedScopes = resolveSessionScopes(this.store.getSchema(), {
+			handshakeScope: msg.syncScope,
+			authScopes: this.authContext?.scopes,
+		})
+
+		if (resolvedScopes) {
 			if (this.authContext) {
-				this.authContext = { ...this.authContext, scopes: mergedScopes }
+				this.authContext = { ...this.authContext, scopes: resolvedScopes }
 			} else {
-				// No auth provider, but scope was provided in handshake
-				this.authContext = { userId: msg.nodeId, scopes: mergedScopes }
+				this.authContext = { userId: msg.nodeId, scopes: resolvedScopes }
 			}
 		}
 
-		// Send handshake response with server's version vector and accepted scope
+		if (msg.syncQueries && msg.syncQueries.length > 0) {
+			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)
+		} else {
+			this.syncQuerySubsets = []
+		}
+
+		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
+
 		const serverVector = this.store.getVersionVector()
 		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
 		this.setSerializerWireFormat(selectedWireFormat)
+
+		if (!isClientSchemaVersionSupported(msg.schemaVersion, this.supportedSchemaVersions)) {
+			const { min, max } = this.supportedSchemaVersions
+			const response: SyncMessage = {
+				type: 'handshake-response',
+				messageId: generateUUIDv7(),
+				nodeId: this.store.getNodeId(),
+				versionVector: versionVectorToWire(serverVector),
+				schemaVersion: this.schemaVersion,
+				accepted: false,
+				rejectReason: `${SCHEMA_MISMATCH_PREFIX}: client schema version ${msg.schemaVersion} not in supported range [${min}, ${max}]`,
+				supportedSchemaMin: min,
+				supportedSchemaMax: max,
+			}
+			this.sendToClient(response)
+			this.close('schema version mismatch')
+			return
+		}
+
+		// Send handshake response with server's version vector and accepted scope
 		const response: SyncMessage = {
 			type: 'handshake-response',
 			messageId: generateUUIDv7(),
@@ -269,7 +371,7 @@ export class ClientSession {
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.scopes ? { acceptedScope: this.authContext.scopes } : {}),
 		}
-		this.transport.send(response)
+		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
 
@@ -288,14 +390,50 @@ export class ClientSession {
 		const rejected: Operation[] = []
 
 		for (const op of operations) {
-			if (!operationMatchesScopes(op, this.authContext?.scopes)) {
+			if (!this.operationVisibleToClient(op)) {
 				rejected.push(op)
 				continue
 			}
 
-			const result = await this.store.applyRemoteOperation(op)
-			if (result === 'applied') {
-				applied.push(op)
+			if (!isOperationTimestampValid(op)) {
+				this.sendError(
+					'INVALID_TIMESTAMP',
+					`Operation "${op.id}" timestamp is too far in the future`,
+					false,
+				)
+				continue
+			}
+
+			if (!this.rateLimiter.allow(1)) {
+				this.sendError(
+					'RATE_LIMIT',
+					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
+					true,
+				)
+				continue
+			}
+
+			const sizeCheck = validateOperationSize(op, this.maxOperationBytes)
+			if (!sizeCheck.valid) {
+				this.sendError(
+					'OPERATION_TOO_LARGE',
+					sizeCheck.message ?? `Operation "${op.id}" is too large`,
+					false,
+				)
+				continue
+			}
+
+			try {
+				const applyResult = await applyServerOperation(this.store, op)
+				if (applyResult.rejection) {
+					this.sendError(applyResult.rejection.code, applyResult.rejection.message, false)
+					continue
+				}
+				if (applyResult.result === 'applied') {
+					applied.push(...applyResult.appliedOperations)
+				}
+			} catch {
+				// Per-op failure must not block batch acknowledgment
 			}
 		}
 
@@ -327,7 +465,7 @@ export class ClientSession {
 			acknowledgedMessageId: msg.messageId,
 			lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
 		}
-		this.transport.send(ack)
+		this.sendToClient(ack)
 
 		// Relay only newly applied operations to other sessions
 		if (applied.length > 0) {
@@ -343,32 +481,46 @@ export class ClientSession {
 			const clientSeq = clientVector.get(nodeId) ?? 0
 			if (serverSeq > clientSeq) {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
-				const visible = ops.filter((op) => operationMatchesScopes(op, this.authContext?.scopes))
+				const visible = ops.filter((op) => this.operationVisibleToClient(op))
 				missing.push(...visible)
 			}
 		}
 
 		if (missing.length === 0) {
-			// Send empty final batch to signal delta is complete
 			const emptyBatch: SyncMessage = {
 				type: 'operation-batch',
 				messageId: generateUUIDv7(),
 				operations: [],
 				isFinal: true,
 				batchIndex: 0,
+				totalBatches: 1,
 			}
-			this.transport.send(emptyBatch)
+			this.sendToClient(emptyBatch)
 			return
 		}
 
-		// Sort causally and paginate
 		const sorted = topologicalSort(missing)
-		const totalBatches = Math.ceil(sorted.length / this.batchSize)
+		const afterCursor = sliceOperationsAfterCursor(sorted, this.resumeDeltaCursor)
+		const totalBatches = Math.ceil(afterCursor.length / this.batchSize)
+
+		if (afterCursor.length === 0) {
+			const emptyBatch: SyncMessage = {
+				type: 'operation-batch',
+				messageId: generateUUIDv7(),
+				operations: [],
+				isFinal: true,
+				batchIndex: this.resumeDeltaCursor?.batchIndex ?? 0,
+				totalBatches: 1,
+			}
+			this.sendToClient(emptyBatch)
+			return
+		}
 
 		for (let i = 0; i < totalBatches; i++) {
 			const start = i * this.batchSize
-			const batchOps = sorted.slice(start, start + this.batchSize)
+			const batchOps = afterCursor.slice(start, start + this.batchSize)
 			const serializedOps = batchOps.map((op) => this.serializer.encodeOperation(op))
+			const batchCursor = createDeltaCursorFromBatch(batchOps, i)
 
 			const batchMsg: SyncMessage = {
 				type: 'operation-batch',
@@ -376,8 +528,10 @@ export class ClientSession {
 				operations: serializedOps,
 				isFinal: i === totalBatches - 1,
 				batchIndex: i,
+				totalBatches,
+				...(batchCursor ? { cursor: encodeDeltaCursor(batchCursor) } : {}),
 			}
-			this.transport.send(batchMsg)
+			this.sendToClient(batchMsg)
 
 			this.emitter?.emit({
 				type: 'sync:sent',
@@ -387,10 +541,21 @@ export class ClientSession {
 		}
 	}
 
+	private operationVisibleToClient(op: Operation): boolean {
+		if (!operationMatchesScopes(op, this.authContext?.scopes)) {
+			return false
+		}
+		return operationMatchesQuerySubsets(op, this.syncQuerySubsets)
+	}
+
 	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
 		// Relay awareness updates to the server for broadcasting to other clients.
 		// Awareness is purely ephemeral -- no persistence.
 		this.onAwarenessUpdate?.(this.sessionId, msg)
+	}
+
+	private handleYjsDocUpdate(msg: YjsDocUpdateMessage): void {
+		this.onYjsDocUpdate?.(this.sessionId, msg)
 	}
 
 	private sendError(code: string, message: string, retriable: boolean): void {
@@ -401,7 +566,7 @@ export class ClientSession {
 			message,
 			retriable,
 		}
-		this.transport.send(errorMsg)
+		this.sendToClient(errorMsg)
 	}
 
 	private setSerializerWireFormat(format: WireFormat): void {

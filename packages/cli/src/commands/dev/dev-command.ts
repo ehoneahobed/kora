@@ -194,11 +194,16 @@ export const devCommand = defineCommand({
 		}
 		logger.blank()
 
+		logger.step('  Kora DevTools overlay: Ctrl+Shift+K (Cmd+Shift+K on macOS) when devtools: true')
+
 		processManager.spawn({
 			label: 'vite',
 			command: process.execPath,
 			args: [viteEntryPoint, '--port', String(vitePort)],
 			cwd: projectRoot,
+			env: {
+				KORA_DEV: '1',
+			},
 			onExit: onManagedProcessExit,
 		})
 

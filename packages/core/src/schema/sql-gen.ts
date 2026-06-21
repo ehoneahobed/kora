@@ -47,6 +47,7 @@ export function generateSQL(
 	// Auto metadata columns
 	columns.push('_created_at INTEGER NOT NULL')
 	columns.push('_updated_at INTEGER NOT NULL')
+	columns.push("_version TEXT NOT NULL DEFAULT ''")
 	columns.push('_deleted INTEGER NOT NULL DEFAULT 0')
 
 	statements.push(`CREATE TABLE IF NOT EXISTS ${collectionName} (\n  ${columns.join(',\n  ')}\n)`)
@@ -57,6 +58,9 @@ export function generateSQL(
 		const colDef = columnDefinition(fieldName, descriptor)
 		statements.push(`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN ${colDef}`)
 	}
+	statements.push(
+		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _version TEXT NOT NULL DEFAULT ''`,
+	)
 
 	// Create indexes
 	for (const indexField of collection.indexes) {
@@ -127,6 +131,36 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 			'  counter INTEGER NOT NULL DEFAULT 0,\n' +
 			'  PRIMARY KEY (name, scope, node_id)\n' +
 			')',
+	)
+
+	// Durable outbound sync queue (survives page refresh)
+	statements.push(
+		'CREATE TABLE IF NOT EXISTS _kora_sync_queue (\n' +
+			'  id TEXT PRIMARY KEY NOT NULL,\n' +
+			'  payload TEXT NOT NULL\n' +
+			')',
+	)
+
+	// Durable merge / constraint audit trail (enterprise audit export)
+	statements.push(
+		'CREATE TABLE IF NOT EXISTS _kora_audit_traces (\n' +
+			'  id TEXT PRIMARY KEY NOT NULL,\n' +
+			'  recorded_at INTEGER NOT NULL,\n' +
+			'  event_type TEXT NOT NULL,\n' +
+			'  collection TEXT NOT NULL,\n' +
+			'  record_id TEXT NOT NULL,\n' +
+			'  field TEXT NOT NULL,\n' +
+			'  strategy TEXT NOT NULL,\n' +
+			'  tier INTEGER NOT NULL,\n' +
+			'  constraint_name TEXT,\n' +
+			'  trace_json TEXT NOT NULL\n' +
+			')',
+	)
+	statements.push(
+		'CREATE INDEX IF NOT EXISTS idx_kora_audit_traces_recorded_at ON _kora_audit_traces (recorded_at)',
+	)
+	statements.push(
+		'CREATE INDEX IF NOT EXISTS idx_kora_audit_traces_collection ON _kora_audit_traces (collection)',
 	)
 
 	for (const [name, collection] of Object.entries(schema.collections)) {

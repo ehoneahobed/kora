@@ -13,8 +13,9 @@ interface SyncProviderPresetOptions {
 /**
  * Applies provider-specific sync scaffolding adjustments after template copy.
  *
- * This is a lightweight bridge until template-layer composition lands.
- * Today we only specialize the sync server template when Postgres is selected.
+ * The sync server template is environment-driven: SQLite is used when
+ * DATABASE_URL is absent, and PostgreSQL is used when DATABASE_URL is present.
+ * Provider presets only add provider-specific guidance.
  */
 export async function applySyncProviderPreset(options: SyncProviderPresetOptions): Promise<void> {
 	if (!isSyncTemplate(options.template)) {
@@ -26,67 +27,32 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 
 	const providerName = getProviderDisplayName(options.dbProvider)
 	const providerConnectionString = getProviderConnectionStringExample(options.dbProvider)
-	const serverPath = join(options.targetDir, 'server.ts')
 	const envPath = join(options.targetDir, '.env.example')
 	const readmePath = join(options.targetDir, 'README.md')
 
-	const serverTemplate = [
-		"import { createPostgresServerStore, createProductionServer } from '@korajs/server'",
-		'',
-		`// PostgreSQL provider preset: ${providerName}`,
-		'// Ensure DATABASE_URL is set in your environment.',
-		'',
-		'async function start(): Promise<void> {',
-		"\tconst connectionString = process.env.DATABASE_URL || ''",
-		'\tif (connectionString.length === 0) {',
-		"\t\tthrow new Error('DATABASE_URL is required for PostgreSQL sync server store.')",
-		'\t}',
-		'',
-		'\tconst store = await createPostgresServerStore({ connectionString })',
-		'\tconst server = createProductionServer({',
-		'\t\tstore,',
-		'\t\tport: Number(process.env.PORT) || 3001,',
-		"\t\tstaticDir: './dist',",
-		"\t\tsyncPath: '/kora-sync',",
-		'\t})',
-		'',
-		'\tconst url = await server.start()',
-		'\tconsole.log(`Kora app running at ${url}`)',
-		'}',
-		'',
-		'void start()',
-		'',
-	].join('\n')
-
-	const envTemplate = [
-		'# Kora Sync Server',
-		'# WebSocket URL for the sync server (used by the client)',
-		'VITE_SYNC_URL=ws://localhost:3001',
-		'',
-		'# Sync server port',
-		'PORT=3001',
-		'',
-		`# PostgreSQL connection string (${providerName})`,
-		`# Example: ${providerConnectionString}`,
-		'DATABASE_URL=',
-		'',
-	].join('\n')
-
 	const existingReadme = await readFile(readmePath, 'utf-8')
+	const existingEnv = await readFile(envPath, 'utf-8')
 	const trimmedReadme = existingReadme.trimEnd()
+	const trimmedEnv = existingEnv.trimEnd()
+	const envSuffix = [
+		'',
+		`# PostgreSQL provider preset: ${providerName}`,
+		`# Example: ${providerConnectionString}`,
+	].join('\n')
 	const readmeSuffix = [
 		'',
 		'## PostgreSQL Provider Preset',
 		'',
 		`Selected DB provider: ${options.dbProvider}`,
 		'',
-		'This scaffold uses `createPostgresServerStore` in `server.ts` and reads `DATABASE_URL` from the environment. See `.env.example` for provider-specific examples.',
+		'This scaffold keeps one sync server entrypoint. When `DATABASE_URL` is set, `server.ts` uses PostgreSQL. When it is empty, the same server uses SQLite at `KORA_SERVER_DB`.',
+		'',
+		'The generated server uses `createPostgresServerStore` automatically when `DATABASE_URL` is present.',
 		'',
 	].join('\n')
 	const readmeTemplate = `${trimmedReadme}${readmeSuffix}`
 
-	await writeFile(serverPath, serverTemplate, 'utf-8')
-	await writeFile(envPath, envTemplate, 'utf-8')
+	await writeFile(envPath, `${trimmedEnv}${envSuffix}\n`, 'utf-8')
 	await writeFile(readmePath, readmeTemplate, 'utf-8')
 }
 

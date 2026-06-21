@@ -15,6 +15,8 @@ export class MockWorkerBridge implements WorkerBridge {
 	private createDb: BetterSqlite3Constructor | null = null
 	private terminated = false
 	private tempDir: string | null = null
+	/** Last `dbName` from an `open` request (for tests). */
+	lastOpenDbName: string | undefined
 
 	async send(request: WorkerRequest): Promise<WorkerResponse> {
 		if (this.terminated) {
@@ -29,7 +31,7 @@ export class MockWorkerBridge implements WorkerBridge {
 		try {
 			switch (request.type) {
 				case 'open':
-					return await this.handleOpen(request.id, request.ddlStatements)
+					return await this.handleOpen(request.id, request.ddlStatements, request.dbName)
 				case 'close':
 					return this.handleClose(request.id)
 				case 'execute':
@@ -72,7 +74,12 @@ export class MockWorkerBridge implements WorkerBridge {
 		void this.cleanup()
 	}
 
-	private async handleOpen(id: number, ddlStatements: string[]): Promise<WorkerResponse> {
+	private async handleOpen(
+		id: number,
+		ddlStatements: string[],
+		dbName?: string,
+	): Promise<WorkerResponse> {
+		this.lastOpenDbName = dbName
 		if (!this.createDb) {
 			const mod = await import('better-sqlite3')
 			const Constructor = mod.default

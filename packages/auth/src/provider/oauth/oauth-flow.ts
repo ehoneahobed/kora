@@ -18,6 +18,7 @@ import {
 
 /** Default state TTL: 10 minutes */
 const DEFAULT_STATE_TTL_MS = 10 * 60 * 1000
+const PKCE_VERIFIER_BYTES = 32
 
 /**
  * In-memory OAuth state store for development.
@@ -126,6 +127,8 @@ export class OAuthManager {
 		const provider = this.getProvider(providerId)
 
 		const state = generateState()
+		const codeVerifier = provider.pkce ? generateCodeVerifier() : undefined
+		const codeChallenge = codeVerifier ? await createCodeChallenge(codeVerifier) : undefined
 		const now = Date.now()
 
 		const oauthState: OAuthState = {
@@ -135,6 +138,7 @@ export class OAuthManager {
 			createdAt: now,
 			expiresAt: now + this.stateTtlMs,
 			metadata,
+			codeVerifier,
 		}
 
 		await this.stateStore.store(oauthState)
@@ -146,6 +150,10 @@ export class OAuthManager {
 			scope: provider.scopes.join(' '),
 			state,
 		})
+		if (codeChallenge) {
+			params.set('code_challenge', codeChallenge)
+			params.set('code_challenge_method', 'S256')
+		}
 
 		const url = `${provider.authorizationUrl}?${params.toString()}`
 		return { url, state }
@@ -179,7 +187,7 @@ export class OAuthManager {
 		}
 
 		// Exchange code for tokens
-		const tokens = await this.exchangeCodeForTokens(provider, code)
+		const tokens = await this.exchangeCodeForTokens(provider, code, oauthState)
 
 		// Fetch user info
 		const userInfo = await this.fetchUserInfo(provider, tokens.accessToken)
@@ -210,14 +218,20 @@ export class OAuthManager {
 	private async exchangeCodeForTokens(
 		provider: OAuthProviderConfig,
 		code: string,
+		oauthState: OAuthState,
 	): Promise<OAuthTokens> {
 		const body = new URLSearchParams({
 			grant_type: 'authorization_code',
 			code,
 			redirect_uri: provider.redirectUri,
 			client_id: provider.clientId,
-			client_secret: provider.clientSecret,
 		})
+		if (provider.clientSecret) {
+			body.set('client_secret', provider.clientSecret)
+		}
+		if (oauthState.codeVerifier) {
+			body.set('code_verifier', oauthState.codeVerifier)
+		}
 
 		let response: Response
 		try {
@@ -339,9 +353,10 @@ function normalizeUserInfo(providerId: string, profile: Record<string, unknown>)
 
 interface ProviderFactoryConfig {
 	clientId: string
-	clientSecret: string
+	clientSecret?: string
 	redirectUri: string
 	scopes?: string[]
+	pkce?: boolean
 }
 
 /**
@@ -357,6 +372,7 @@ export function googleProvider(config: ProviderFactoryConfig): OAuthProviderConf
 		userInfoUrl: 'https://openidconnect.googleapis.com/v1/userinfo',
 		scopes: config.scopes ?? ['openid', 'email', 'profile'],
 		redirectUri: config.redirectUri,
+		pkce: config.pkce,
 	}
 }
 
@@ -373,6 +389,7 @@ export function githubProvider(config: ProviderFactoryConfig): OAuthProviderConf
 		userInfoUrl: 'https://api.github.com/user',
 		scopes: config.scopes ?? ['read:user', 'user:email'],
 		redirectUri: config.redirectUri,
+		pkce: config.pkce,
 	}
 }
 
@@ -392,6 +409,7 @@ export function microsoftProvider(
 		userInfoUrl: 'https://graph.microsoft.com/v1.0/me',
 		scopes: config.scopes ?? ['openid', 'email', 'profile', 'User.Read'],
 		redirectUri: config.redirectUri,
+		pkce: config.pkce,
 	}
 }
 
@@ -402,6 +420,22 @@ export function microsoftProvider(
 function generateState(): string {
 	const bytes = new Uint8Array(32)
 	globalThis.crypto.getRandomValues(bytes)
+	return toBase64Url(bytes)
+}
+
+function generateCodeVerifier(): string {
+	const bytes = new Uint8Array(PKCE_VERIFIER_BYTES)
+	globalThis.crypto.getRandomValues(bytes)
+	return toBase64Url(bytes)
+}
+
+async function createCodeChallenge(codeVerifier: string): Promise<string> {
+	const data = new TextEncoder().encode(codeVerifier)
+	const digest = await globalThis.crypto.subtle.digest('SHA-256', data)
+	return toBase64Url(new Uint8Array(digest))
+}
+
+function toBase64Url(bytes: Uint8Array): string {
 	let binary = ''
 	for (let i = 0; i < bytes.length; i++) {
 		binary += String.fromCharCode(bytes[i] as number)

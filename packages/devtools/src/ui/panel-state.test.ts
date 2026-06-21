@@ -1,43 +1,44 @@
-import type { KoraEvent } from '@korajs/core'
+import type { KoraEvent, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { TimestampedEvent } from '../types'
 import { buildPanelModel } from './panel-state'
 
+function makeSampleOperation(overrides?: Partial<Operation>): Operation {
+	return {
+		id: 'op-1',
+		nodeId: 'node-a',
+		type: 'update',
+		collection: 'todos',
+		recordId: 'rec-1',
+		data: { title: 'Hello' },
+		previousData: { title: 'Old' },
+		timestamp: { wallTime: 1, logical: 0, nodeId: 'node-a' },
+		sequenceNumber: 3,
+		causalDeps: ['op-0'],
+		schemaVersion: 1,
+		...overrides,
+	}
+}
+
 function makeOperationEvent(type: 'operation:created' | 'operation:applied'): KoraEvent {
 	return {
 		type,
-		operation: {
-			id: 'op-1',
-			nodeId: 'node-a',
-			type: 'update',
-			collection: 'todos',
-			recordId: 'rec-1',
-			data: { title: 'Hello' },
-			previousData: { title: 'Old' },
-			timestamp: { wallTime: 1, logical: 0, nodeId: 'node-a' },
-			sequenceNumber: 3,
-			causalDeps: ['op-0'],
-			schemaVersion: 1,
-		},
+		operation: makeSampleOperation(),
 		...(type === 'operation:applied' ? { duration: 2 } : {}),
 	} as KoraEvent
 }
 
 describe('buildPanelModel', () => {
 	test('builds timeline, operations, conflicts, and network state', () => {
-		const traceOperation = {
+		const traceOperation = makeSampleOperation({
 			id: 'op-2',
 			nodeId: 'node-b',
-			type: 'update' as const,
-			collection: 'todos',
-			recordId: 'rec-1',
 			data: { title: 'Remote' },
 			previousData: { title: 'Hello' },
 			timestamp: { wallTime: 2, logical: 0, nodeId: 'node-b' },
 			sequenceNumber: 2,
 			causalDeps: ['op-1'],
-			schemaVersion: 1,
-		}
+		})
 
 		const events: TimestampedEvent[] = [
 			{ id: 1, receivedAt: 1000, event: { type: 'sync:connected', nodeId: 'node-a' } },
@@ -54,7 +55,7 @@ describe('buildPanelModel', () => {
 				event: {
 					type: 'merge:conflict',
 					trace: {
-						operationA: makeOperationEvent('operation:created').operation,
+						operationA: makeSampleOperation(),
 						operationB: traceOperation,
 						field: 'title',
 						strategy: 'crdt-text',

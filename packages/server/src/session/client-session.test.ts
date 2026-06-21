@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
-import type { SyncMessage } from '@korajs/sync'
+import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
+import { encodeDeltaCursor } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
@@ -183,6 +184,36 @@ describe('ClientSession', () => {
 			if (batches[0]?.type === 'operation-batch') {
 				expect(batches[0].operations).toHaveLength(0)
 				expect(batches[0].isFinal).toBe(true)
+			}
+		})
+
+		test('rejects unsupported client schema version with SCHEMA_MISMATCH', async () => {
+			const store = new MemoryServerStore('server-1')
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-schema',
+				transport: server,
+				store,
+				schemaVersion: 2,
+				supportedSchemaVersions: { min: 2, max: 2 },
+			})
+			session.start()
+
+			sendHandshake(client, { schemaVersion: 1 })
+
+			await vi.waitFor(() => {
+				expect(messages.length).toBeGreaterThanOrEqual(1)
+			})
+
+			const response = messages[0]
+			expect(response?.type).toBe('handshake-response')
+			if (response?.type === 'handshake-response') {
+				expect(response.accepted).toBe(false)
+				expect(response.rejectReason).toMatch(/^SCHEMA_MISMATCH:/)
+				expect(response.supportedSchemaMin).toBe(2)
+				expect(response.supportedSchemaMax).toBe(2)
 			}
 		})
 
@@ -867,8 +898,84 @@ describe('ClientSession', () => {
 				if (batch?.type === 'operation-batch') {
 					expect(batch.isFinal).toBe(i === batches.length - 1)
 					expect(batch.batchIndex).toBe(i)
+					expect(batch.totalBatches).toBe(3)
+					expect(batch.cursor).toBeDefined()
 				}
 			}
+		})
+
+		test('syncQueries filter server delta', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-open',
+					data: { title: 'open', completed: false },
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-done',
+					data: { title: 'done', completed: true },
+				}),
+			)
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+			})
+			session.start()
+
+			sendHandshake(client, {
+				syncQueries: [{ collection: 'todos', where: { completed: false } }],
+			})
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			const batches = messages.filter((m) => m.type === 'operation-batch')
+			const opIds = batches.flatMap((batch) =>
+				batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : [],
+			)
+			expect(opIds).toContain('op-open')
+			expect(opIds).not.toContain('op-done')
+		})
+
+		test('deltaCursor resumes paginated delta after reconnect', async () => {
+			const store = new MemoryServerStore('server-1')
+			for (let i = 1; i <= 4; i++) {
+				await store.applyRemoteOperation(
+					createTestOp({
+						id: `op-${i}`,
+						nodeId: 'node-a',
+						sequenceNumber: i,
+						timestamp: { wallTime: 1000 + i, logical: 0, nodeId: 'node-a' },
+					}),
+				)
+			}
+
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				batchSize: 10,
+			})
+			session.start()
+
+			sendHandshake(client, {
+				deltaCursor: encodeDeltaCursor({ lastOperationId: 'op-2', batchIndex: 0 }),
+			})
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			const batches = messages.filter((m) => m.type === 'operation-batch')
+			const opIds = batches.flatMap((batch) =>
+				batch.type === 'operation-batch' ? batch.operations.map((op) => op.id) : [],
+			)
+			expect(opIds).toEqual(['op-3', 'op-4'])
 		})
 	})
 })

@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { defineCommand } from 'citty'
 import { InvalidProjectError } from '../../errors'
@@ -198,12 +199,14 @@ export const deployCommand = defineCommand({
 		const region = resolveRegion(args.region, existingState?.region, confirmMode)
 		const deployDirectory = resolveDeployDirectory(projectRoot)
 		const environment = args.prod === true ? 'production' : 'preview'
+		const deployTarget = detectDeployTarget(projectRoot)
 		const config: ProjectConfig = {
 			projectRoot,
 			appName,
 			region,
 			environment,
 			confirm: confirmMode,
+			deployTarget,
 		}
 		const adapter = createDeployAdapter(platform)
 		configureAdapterContext(adapter, {
@@ -216,11 +219,15 @@ export const deployCommand = defineCommand({
 		logger.info(
 			`Deploying to ${platform} (${appName}${region ? `, ${region}` : ''}, ${environment})`,
 		)
+		if (deployTarget === 'sync-server') {
+			logger.step('Detected Tauri project. Deploying the sync server only.')
+		}
 		if (confirmMode) {
 			logger.step('Running in --confirm mode (non-interactive, fail-fast).')
 		}
 
 		await writeDockerfileArtifact(deployDirectory, {
+			clientDirectory: deployTarget === 'sync-server' ? null : undefined,
 			nativeDependencies: {
 				'better-sqlite3': '^11.0.0',
 				'drizzle-orm': '^0.45.2',
@@ -397,6 +404,10 @@ function configureAdapterContext(
 	if (hasContextSetter(adapter)) {
 		adapter.setContext(context)
 	}
+}
+
+function detectDeployTarget(projectRoot: string): ProjectConfig['deployTarget'] {
+	return existsSync(join(projectRoot, 'src-tauri')) ? 'sync-server' : 'full-stack'
 }
 
 function hasContextSetter(adapter: DeployAdapter): adapter is ContextAwareDeployAdapter {

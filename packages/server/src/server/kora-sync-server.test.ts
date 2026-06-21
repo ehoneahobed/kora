@@ -1,5 +1,6 @@
-import type { Operation } from '@korajs/core'
+import { type Operation, generateUUIDv7 } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
+import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
@@ -174,6 +175,47 @@ describe('KoraSyncServer', () => {
 			(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'op-from-a'),
 		)
 		expect(relayedToA).toHaveLength(0)
+	})
+
+	test('relays yjs-doc-update from session A to session B', async () => {
+		const store = new MemoryServerStore('server-1')
+		const server = new KoraSyncServer({ store })
+
+		const pairA = createServerTransportPair()
+		const messagesA = collectClientMessages(pairA.client)
+		server.handleConnection(pairA.server)
+
+		const pairB = createServerTransportPair()
+		const messagesB = collectClientMessages(pairB.client)
+		server.handleConnection(pairB.server)
+
+		sendHandshake(pairA.client, 'client-a')
+		sendHandshake(pairB.client, 'client-b')
+
+		await vi.waitFor(() => {
+			expect(messagesA.some((m) => m.type === 'handshake-response')).toBe(true)
+			expect(messagesB.some((m) => m.type === 'handshake-response')).toBe(true)
+		})
+
+		const update = encodeYjsUpdate(new Uint8Array([1, 2, 3]))
+		pairA.client.send({
+			type: 'yjs-doc-update',
+			messageId: generateUUIDv7(),
+			collection: 'articles',
+			recordId: 'rec-1',
+			field: 'body',
+			update,
+		})
+
+		await vi.waitFor(() => {
+			expect(
+				messagesB.some(
+					(m) => m.type === 'yjs-doc-update' && m.collection === 'articles' && m.update === update,
+				),
+			).toBe(true)
+		})
+
+		expect(messagesA.filter((m) => m.type === 'yjs-doc-update')).toHaveLength(0)
 	})
 
 	test('relay only sends to streaming sessions', async () => {

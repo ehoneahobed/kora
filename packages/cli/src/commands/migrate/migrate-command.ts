@@ -9,6 +9,7 @@ import { promptConfirm } from '../../utils/prompt'
 import { loadKoraConfig } from '../dev/kora-config'
 import { generateMigration } from './migration-generator'
 import { runMigration } from './migration-runner'
+import { generateOperationTransformModule } from './operation-transform-generator'
 import { diffSchemas } from './schema-differ'
 import { loadSchemaDefinition } from './schema-loader'
 
@@ -262,6 +263,9 @@ async function writeMigrationFile(
 	].join('\n')
 
 	await writeFile(path, fileContent, 'utf-8')
+
+	const transformsPath = join(outputDir, `${migrationId}.transforms.ts`)
+	await writeFile(transformsPath, generateOperationTransformModule(fromVersion, toVersion), 'utf-8')
 	await writeMigrationManifest(join(outputDir, `${migrationId}.json`), {
 		id: migrationId,
 		fromVersion,
@@ -340,9 +344,15 @@ function parseVersionsFromMigrationId(id: string): { fromVersion: number; toVers
 		throw new Error(`Migration id "${id}" does not include a vX-to-vY version suffix.`)
 	}
 
+	const fromVersionText = match[1]
+	const toVersionText = match[2]
+	if (fromVersionText === undefined || toVersionText === undefined) {
+		throw new Error(`Migration id "${id}" does not include a vX-to-vY version suffix.`)
+	}
+
 	return {
-		fromVersion: Number.parseInt(match[1], 10),
-		toVersion: Number.parseInt(match[2], 10),
+		fromVersion: Number.parseInt(fromVersionText, 10),
+		toVersion: Number.parseInt(toVersionText, 10),
 	}
 }
 

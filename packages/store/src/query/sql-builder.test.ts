@@ -5,6 +5,8 @@ import type { QueryDescriptor } from '../types'
 import {
 	buildCountQuery,
 	buildInsertQuery,
+	buildLwwSoftDeleteQuery,
+	buildLwwUpdateQuery,
 	buildSelectQuery,
 	buildSoftDeleteQuery,
 	buildUpdateQuery,
@@ -22,6 +24,8 @@ function field(
 		auto: false,
 		enumValues: null,
 		itemKind: null,
+		mergeStrategy: null,
+		transitions: null,
 		...overrides,
 	}
 }
@@ -259,6 +263,30 @@ describe('buildSoftDeleteQuery', () => {
 		const result = buildSoftDeleteQuery('todos', 'rec-1', 3000)
 		expect(result.sql).toBe('UPDATE todos SET _deleted = 1, _updated_at = ? WHERE id = ?')
 		expect(result.params).toEqual([3000, 'rec-1'])
+	})
+})
+
+describe('buildLwwUpdateQuery', () => {
+	test('adds version guard to UPDATE', () => {
+		const remoteVersion = '000000000001000:00000:remote'
+		const result = buildLwwUpdateQuery(
+			'todos',
+			'rec-1',
+			{ title: 'B', _updated_at: 1000, _version: remoteVersion },
+			remoteVersion,
+		)
+		expect(result.sql).toContain('WHERE id = ? AND (_version = ? OR _version < ?)')
+		expect(result.params[result.params.length - 2]).toBe('')
+		expect(result.params[result.params.length - 1]).toBe(remoteVersion)
+	})
+})
+
+describe('buildLwwSoftDeleteQuery', () => {
+	test('adds version guard to soft delete', () => {
+		const remoteVersion = '000000000002000:00000:remote'
+		const result = buildLwwSoftDeleteQuery('todos', 'rec-1', 2000, remoteVersion)
+		expect(result.sql).toContain('_version = ?')
+		expect(result.sql).toContain('(_version = ? OR _version < ?)')
 	})
 })
 

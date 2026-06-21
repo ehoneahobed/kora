@@ -66,6 +66,7 @@ export class BandwidthEstimator {
 		const decayFactor = 0.9
 		for (let i = this.samples.length - 1; i >= 0; i--) {
 			const sample = this.samples[i]
+			if (!sample) continue
 			const bytesPerSec = (sample.bytes / sample.durationMs) * 1000
 			const age = this.samples.length - 1 - i
 			const weight = decayFactor ** age

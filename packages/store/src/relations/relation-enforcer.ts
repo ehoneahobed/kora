@@ -2,6 +2,7 @@ import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/co
 import { KoraError, createOperation } from '@korajs/core'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { serializeOperation, serializeRecord } from '../serialization/serializer'
+import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
 import type { StorageAdapter, Transaction } from '../types'
 import type { IncomingRelation } from './relation-lookup'
 import { buildRelationLookup, getIncomingRelations } from './relation-lookup'
@@ -42,7 +43,6 @@ export interface RelationEnforcerConfig {
 	adapter: StorageAdapter
 	clock: HybridLogicalClock
 	nodeId: string
-	getSequenceNumber: () => number
 }
 
 /**
@@ -74,7 +74,7 @@ export interface EnforcementResult {
  * ```typescript
  * const enforcer = new RelationEnforcer({
  *   schema, adapter, clock, nodeId,
- *   getSequenceNumber: () => ++seq,
+ *   allocateSequenceNumber: async () => ++seq,
  * })
  * const result = await enforcer.enforceDelete(
  *   'projects', 'proj-1', tx, ['delete-op-id']
@@ -88,14 +88,12 @@ export class RelationEnforcer {
 	private readonly adapter: StorageAdapter
 	private readonly clock: HybridLogicalClock
 	private readonly nodeId: string
-	private readonly getSequenceNumber: () => number
 
 	constructor(config: RelationEnforcerConfig) {
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.clock = config.clock
 		this.nodeId = config.nodeId
-		this.getSequenceNumber = config.getSequenceNumber
 		this.lookup = buildRelationLookup(config.schema)
 	}
 
@@ -186,7 +184,7 @@ export class RelationEnforcer {
 
 		for (const row of referencingRows) {
 			const now = Date.now()
-			const sequenceNumber = this.getSequenceNumber()
+			const sequenceNumber = await allocateNextSequenceInTransaction(tx, this.nodeId)
 
 			const operation = await createOperation(
 				{
@@ -203,23 +201,14 @@ export class RelationEnforcer {
 				this.clock,
 			)
 
-			// Soft-delete the record
 			const deleteQuery = buildSoftDeleteQuery(sourceCollection, row.id, now)
 			await tx.execute(deleteQuery.sql, deleteQuery.params)
 
-			// Persist the operation
-			const opRow = serializeOperation(operation)
 			const opInsert = buildInsertQuery(
 				`_kora_ops_${sourceCollection}`,
-				opRow as unknown as Record<string, unknown>,
+				serializeOperation(operation) as unknown as Record<string, unknown>,
 			)
 			await tx.execute(opInsert.sql, opInsert.params)
-
-			// Update version vector
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[this.nodeId, sequenceNumber],
-			)
 
 			operations.push(operation)
 
@@ -260,7 +249,7 @@ export class RelationEnforcer {
 
 		for (const row of referencingRows) {
 			const now = Date.now()
-			const sequenceNumber = this.getSequenceNumber()
+			const sequenceNumber = await allocateNextSequenceInTransaction(tx, this.nodeId)
 
 			const updateData: Record<string, unknown> = { [foreignKeyField]: null }
 			const previousData: Record<string, unknown> = { [foreignKeyField]: deletedRecordId }
@@ -295,12 +284,6 @@ export class RelationEnforcer {
 				opRow as unknown as Record<string, unknown>,
 			)
 			await tx.execute(opInsert.sql, opInsert.params)
-
-			// Update version vector
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[this.nodeId, sequenceNumber],
-			)
 
 			operations.push(operation)
 		}

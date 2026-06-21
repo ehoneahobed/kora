@@ -1,25 +1,22 @@
 import type {
-	AtomicOp,
+	CausalTracker,
 	CollectionDefinition,
-	HLCTimestamp,
 	HybridLogicalClock,
 	Operation,
 	SchemaDefinition,
 } from '@korajs/core'
-import {
-	createOperation,
-	generateUUIDv7,
-	isAtomicOp,
-	resolveAtomicOp,
-	toAtomicOp,
-	validateRecord,
-} from '@korajs/core'
-import { RecordNotFoundError } from '../errors'
-import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
+import { executeDelete } from '../mutations/execute-delete'
+import { executeInsert } from '../mutations/execute-insert'
+import { executeUpdate } from '../mutations/execute-update'
+import type { LocalMutationContext } from '../mutations/types'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
-import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
-import { validateUpdateStateMachine } from '../state-machine/state-validator'
-import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../types'
+import { deserializeRecord } from '../serialization/serializer'
+import type {
+	CollectionRecord,
+	LocalMutationHandler,
+	RawCollectionRow,
+	StorageAdapter,
+} from '../types'
 
 /**
  * Callback invoked after a mutation so the Store can notify subscriptions.
@@ -28,14 +25,10 @@ export type MutationCallback = (collection: string, operation: Operation) => voi
 
 /**
  * Collection provides CRUD operations on a single schema collection.
- * Each mutation creates an Operation and persists both the data and the operation atomically.
- *
- * When a RelationEnforcer is provided, delete operations enforce referential integrity
- * policies (cascade, set-null, restrict) defined in the schema's relations.
+ * Delegates to {@link LocalMutationHandler} when configured (unified apply pipeline),
+ * otherwise uses shared mutation executors directly.
  */
 export class Collection {
-	private readonly relationEnforcer: RelationEnforcer | null
-
 	constructor(
 		private readonly name: string,
 		private readonly definition: CollectionDefinition,
@@ -43,293 +36,71 @@ export class Collection {
 		private readonly adapter: StorageAdapter,
 		private readonly clock: HybridLogicalClock,
 		private readonly nodeId: string,
-		private readonly getSequenceNumber: () => number,
+		private readonly allocateSequenceNumber: () => Promise<number>,
 		private readonly onMutation: MutationCallback,
-		relationEnforcer?: RelationEnforcer,
-	) {
-		this.relationEnforcer = relationEnforcer ?? null
-	}
+		private readonly relationEnforcer: RelationEnforcer | null,
+		private mutationHandler: LocalMutationHandler | null,
+		private readonly causalTracker: CausalTracker | null,
+	) {}
 
-	/**
-	 * Insert a new record into the collection.
-	 * Generates a UUID v7 for the id, validates data, and persists atomically.
-	 *
-	 * @param data - The record data (auto fields and defaults are applied automatically)
-	 * @returns The inserted record with id, createdAt, updatedAt
-	 */
-	async insert(data: Record<string, unknown>): Promise<CollectionRecord> {
-		const validated = validateRecord(this.name, this.definition, data, 'insert')
-		const recordId = generateUUIDv7()
-		const now = Date.now()
-
-		// Set auto timestamp fields
-		for (const [fieldName, descriptor] of Object.entries(this.definition.fields)) {
-			if (descriptor.auto && descriptor.kind === 'timestamp') {
-				validated[fieldName] = now
-			}
-		}
-
-		const sequenceNumber = this.getSequenceNumber()
-		const operation = await createOperation(
-			{
-				nodeId: this.nodeId,
-				type: 'insert',
-				collection: this.name,
-				recordId,
-				data: { ...validated },
-				previousData: null,
-				sequenceNumber,
-				causalDeps: [],
-				schemaVersion: this.schema.version,
-			},
-			this.clock,
-		)
-
-		const serializedData = serializeRecord(validated, this.definition.fields)
-		const record: Record<string, unknown> = {
-			id: recordId,
-			...serializedData,
-			_created_at: now,
-			_updated_at: now,
-		}
-
-		const insertQuery = buildInsertQuery(this.name, record)
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${this.name}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		await this.adapter.transaction(async (tx) => {
-			await tx.execute(insertQuery.sql, insertQuery.params)
-			await tx.execute(opInsert.sql, opInsert.params)
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[this.nodeId, sequenceNumber],
-			)
-		})
-
-		this.onMutation(this.name, operation)
-
+	private mutationContext(): LocalMutationContext {
 		return {
-			id: recordId,
-			...validated,
-			createdAt: now,
-			updatedAt: now,
+			collection: this.name,
+			definition: this.definition,
+			schema: this.schema,
+			adapter: this.adapter,
+			clock: this.clock,
+			nodeId: this.nodeId,
+			allocateSequenceNumber: this.allocateSequenceNumber,
+			onMutation: this.onMutation,
+			relationEnforcer: this.relationEnforcer,
+			causalTracker: this.causalTracker,
+			inTransaction: false,
 		}
 	}
 
-	/**
-	 * Find a record by its ID. Returns null if not found or soft-deleted.
-	 */
+	async insert(data: Record<string, unknown>): Promise<CollectionRecord> {
+		if (this.mutationHandler) {
+			return this.mutationHandler.insert(this.name, data)
+		}
+		return executeInsert(this.mutationContext(), data)
+	}
+
 	async findById(id: string): Promise<CollectionRecord | null> {
 		const rows = await this.adapter.query<RawCollectionRow>(
 			`SELECT * FROM ${this.name} WHERE id = ? AND _deleted = 0`,
 			[id],
 		)
-
 		const row = rows[0]
 		if (!row) return null
 		return deserializeRecord(row, this.definition.fields)
 	}
 
-	/**
-	 * Update an existing record. Only the provided fields are changed.
-	 *
-	 * @param id - The record ID to update
-	 * @param data - Partial data with only the fields to change
-	 * @returns The updated record
-	 * @throws {RecordNotFoundError} If the record doesn't exist or is deleted
-	 */
 	async update(id: string, data: Record<string, unknown>): Promise<CollectionRecord> {
-		const currentRows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${this.name} WHERE id = ? AND _deleted = 0`,
-			[id],
-		)
-		const currentRow = currentRows[0]
-		if (!currentRow) {
-			throw new RecordNotFoundError(this.name, id)
+		if (this.mutationHandler) {
+			return this.mutationHandler.update(this.name, id, data)
 		}
-
-		let validated = validateRecord(this.name, this.definition, data, 'update')
-		const now = Date.now()
-
-		// Validate state machine transitions before proceeding.
-		// In 'last-valid-state' mode this may strip the state field from validated data.
-		// In 'reject' mode this will throw InvalidStateTransitionError.
-		const currentRecord = deserializeRecord(currentRow, this.definition.fields)
-		validated = validateUpdateStateMachine(
-			this.name,
-			id,
-			this.definition,
-			currentRecord,
-			validated,
-		)
-
-		// If state machine validation removed all fields, the update is a no-op.
-		if (Object.keys(validated).length === 0) {
-			const fullRecord = await this.findById(id)
-			if (!fullRecord) {
-				throw new RecordNotFoundError(this.name, id)
-			}
-			return fullRecord
-		}
-
-		// Build previousData from current row for the changed fields,
-		// and resolve any atomic op sentinels to concrete values.
-		const previousData: Record<string, unknown> = {}
-		const resolvedData: Record<string, unknown> = {}
-		const atomicOps: Record<string, AtomicOp> = {}
-
-		for (const key of Object.keys(validated)) {
-			const value = validated[key]
-			previousData[key] = currentRecord[key]
-
-			if (isAtomicOp(value)) {
-				// Resolve the sentinel to a concrete value using the current record state
-				resolvedData[key] = resolveAtomicOp(currentRecord[key], value)
-				atomicOps[key] = toAtomicOp(value)
-			} else {
-				resolvedData[key] = value
-			}
-		}
-
-		const hasAtomicOps = Object.keys(atomicOps).length > 0
-
-		const sequenceNumber = this.getSequenceNumber()
-		const operation = await createOperation(
-			{
-				nodeId: this.nodeId,
-				type: 'update',
-				collection: this.name,
-				recordId: id,
-				data: { ...resolvedData },
-				previousData,
-				sequenceNumber,
-				causalDeps: [],
-				schemaVersion: this.schema.version,
-				...(hasAtomicOps ? { atomicOps } : {}),
-			},
-			this.clock,
-		)
-
-		const serializedChanges = serializeRecord(resolvedData, this.definition.fields)
-		const updateQuery = buildUpdateQuery(this.name, id, {
-			...serializedChanges,
-			_updated_at: now,
-		})
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${this.name}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		await this.adapter.transaction(async (tx) => {
-			await tx.execute(updateQuery.sql, updateQuery.params)
-			await tx.execute(opInsert.sql, opInsert.params)
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[this.nodeId, sequenceNumber],
-			)
-		})
-
-		this.onMutation(this.name, operation)
-
-		// Return the full updated record
-		const updatedRow = await this.findById(id)
-		if (!updatedRow) {
-			throw new RecordNotFoundError(this.name, id)
-		}
-		return updatedRow
+		return executeUpdate(this.mutationContext(), id, data)
 	}
 
-	/**
-	 * Soft-delete a record by its ID.
-	 *
-	 * When a RelationEnforcer is configured, referential integrity policies
-	 * are enforced within the same transaction:
-	 * - **cascade**: Recursively deletes all referencing records
-	 * - **set-null**: Sets foreign keys to null on referencing records
-	 * - **restrict**: Throws ReferentialIntegrityError if references exist
-	 * - **no-action**: Does nothing (dangling references are left)
-	 *
-	 * All cascaded operations are created atomically within the same transaction
-	 * and share causal dependencies with the original delete.
-	 *
-	 * @param id - The record ID to delete
-	 * @throws {RecordNotFoundError} If the record doesn't exist or is already deleted
-	 * @throws {ReferentialIntegrityError} If a 'restrict' policy is violated
-	 */
 	async delete(id: string): Promise<void> {
-		const currentRows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${this.name} WHERE id = ? AND _deleted = 0`,
-			[id],
-		)
-		if (!currentRows[0]) {
-			throw new RecordNotFoundError(this.name, id)
+		if (this.mutationHandler) {
+			await this.mutationHandler.delete(this.name, id)
+			return
 		}
-
-		const now = Date.now()
-		const sequenceNumber = this.getSequenceNumber()
-		const operation = await createOperation(
-			{
-				nodeId: this.nodeId,
-				type: 'delete',
-				collection: this.name,
-				recordId: id,
-				data: null,
-				previousData: null,
-				sequenceNumber,
-				causalDeps: [],
-				schemaVersion: this.schema.version,
-			},
-			this.clock,
-		)
-
-		const deleteQuery = buildSoftDeleteQuery(this.name, id, now)
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${this.name}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		const cascadedOps: Operation[] = []
-
-		await this.adapter.transaction(async (tx) => {
-			// Enforce referential integrity BEFORE the delete, within the transaction.
-			// This ensures restrict can block the delete, and cascade/set-null are atomic.
-			if (this.relationEnforcer) {
-				const enforcementResult = await this.relationEnforcer.enforceDelete(
-					this.name,
-					id,
-					tx,
-					[operation.id],
-				)
-				cascadedOps.push(...enforcementResult.operations)
-			}
-
-			await tx.execute(deleteQuery.sql, deleteQuery.params)
-			await tx.execute(opInsert.sql, opInsert.params)
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[this.nodeId, sequenceNumber],
-			)
-		})
-
-		// Notify for the primary delete and all cascaded operations
-		this.onMutation(this.name, operation)
-		for (const cascadedOp of cascadedOps) {
-			this.onMutation(cascadedOp.collection, cascadedOp)
-		}
+		await executeDelete(this.mutationContext(), id)
 	}
 
-	/** Get the collection name */
 	getName(): string {
 		return this.name
 	}
 
-	/** Get the collection definition */
 	getDefinition(): CollectionDefinition {
 		return this.definition
+	}
+
+	/** Replace the mutation handler (e.g. after ApplyPipeline is wired in createApp). */
+	setMutationHandler(handler: LocalMutationHandler | null): void {
+		this.mutationHandler = handler
 	}
 }

@@ -1,9 +1,10 @@
 import { defineSchema, t } from '@korajs/core'
 import type { KoraEvent } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
+import type { SyncStatusInfo } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
-import type { KoraApp } from './types'
+import type { KoraApp, KoraSyncEvent } from './types'
 
 const schema = defineSchema({
 	version: 1,
@@ -68,7 +69,7 @@ describe('createApp', () => {
 		expect(typeof todos.where).toBe('function')
 	})
 
-	test('query methods return empty results before ready', async () => {
+	test('query methods throw AppNotReadyError before ready', async () => {
 		app = createApp({
 			schema,
 			store: { adapter: 'better-sqlite3', name: ':memory:' },
@@ -76,8 +77,8 @@ describe('createApp', () => {
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 		expect(await todos.findById('missing')).toBeNull()
-		expect(await todos.where({ completed: false }).exec()).toEqual([])
-		expect(await todos.where({ completed: false }).count()).toBe(0)
+		await expect(todos.where({ completed: false }).exec()).rejects.toThrow(/app\.ready/)
+		await expect(todos.where({ completed: false }).count()).rejects.toThrow(/app\.ready/)
 	})
 
 	test('defines accessors for all collections in schema', async () => {
@@ -195,6 +196,46 @@ describe('createApp', () => {
 		const status = app.sync?.getStatus()
 		expect(status?.status).toBe('offline')
 		expect(status?.pendingOperations).toBe(0)
+	})
+
+	test('sync.status getter and subscribeStatus are event-driven', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'wss://localhost:8080' },
+		})
+		await app.ready
+
+		expect(app.sync?.status.status).toBe('offline')
+
+		const snapshots: SyncStatusInfo[] = []
+		const unsubscribe = app.sync?.subscribeStatus((status) => {
+			snapshots.push(status)
+		})
+		expect(snapshots.length).toBeGreaterThan(0)
+		expect(snapshots[0]?.status).toBe('offline')
+
+		app.events.emit({ type: 'sync:connected', nodeId: 'test-node' })
+		expect(app.sync?.status.status).toBe('offline')
+
+		unsubscribe?.()
+	})
+
+	test('onSyncEvent receives sync framework events', async () => {
+		const syncEvents: KoraSyncEvent[] = []
+
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			onSyncEvent: (event) => {
+				syncEvents.push(event)
+			},
+		})
+		await app.ready
+
+		app.events.emit({ type: 'sync:sent', operations: [], batchSize: 0 })
+		expect(syncEvents).toHaveLength(1)
+		expect(syncEvents[0]?.type).toBe('sync:sent')
 	})
 
 	test('auto-detects adapter in Node.js environment', async () => {

@@ -1,3 +1,5 @@
+import { getKoraErrorFix } from './error-fixes'
+
 /**
  * Base error class for all Kora errors.
  * Every error includes a machine-readable code and optional context for debugging.
@@ -10,6 +12,17 @@ export class KoraError extends Error {
 	) {
 		super(message)
 		this.name = 'KoraError'
+	}
+
+	/**
+	 * Actionable hint for resolving this error (from registry or error context).
+	 */
+	get fix(): string | undefined {
+		const fromContext = this.context?.fix
+		if (typeof fromContext === 'string' && fromContext.length > 0) {
+			return fromContext
+		}
+		return getKoraErrorFix(this.code)
 	}
 }
 

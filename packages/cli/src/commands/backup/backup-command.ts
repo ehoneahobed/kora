@@ -1,4 +1,4 @@
-import { writeFile, readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { defineCommand } from 'citty'
 import { createLogger } from '../../utils/logger'
@@ -29,22 +29,30 @@ export const backupCommand = defineCommand({
 					type: 'string',
 					description: 'Output file path (default: kora-backup-<timestamp>.kora)',
 				},
+				token: {
+					type: 'string',
+					description: 'Backup token (defaults to KORA_BACKUP_TOKEN or KORA_ADMIN_TOKEN)',
+				},
 			},
 			async run({ args }) {
 				const logger = createLogger()
 				const url =
 					typeof args.url === 'string' ? args.url : `http://localhost:${DEFAULT_SYNC_PORT}`
-				const outFile =
-					typeof args.out === 'string'
-						? args.out
-						: `kora-backup-${Date.now()}.kora`
+				const outFile = typeof args.out === 'string' ? args.out : `kora-backup-${Date.now()}.kora`
+				const token =
+					typeof args.token === 'string'
+						? args.token
+						: (process.env.KORA_BACKUP_TOKEN ?? process.env.KORA_ADMIN_TOKEN)
 
 				logger.banner()
 				logger.info(`Exporting backup from ${url}...`)
 
 				try {
-					const backupUrl = url.replace(/\/$/, '') + '/__kora/backup/export'
-					const response = await fetch(backupUrl, { method: 'POST' })
+					const backupUrl = `${url.replace(/\/$/, '')}/__kora/backup/export`
+					const response = await fetch(backupUrl, {
+						method: 'POST',
+						headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+					})
 
 					if (!response.ok) {
 						const error = await response.json().catch(() => ({ message: response.statusText }))
@@ -89,6 +97,10 @@ export const backupCommand = defineCommand({
 					description: 'Merge with existing data instead of replacing',
 					default: false,
 				},
+				token: {
+					type: 'string',
+					description: 'Backup token (defaults to KORA_BACKUP_TOKEN or KORA_ADMIN_TOKEN)',
+				},
 			},
 			async run({ args }) {
 				const logger = createLogger()
@@ -96,17 +108,21 @@ export const backupCommand = defineCommand({
 				const url =
 					typeof args.url === 'string' ? args.url : `http://localhost:${DEFAULT_SYNC_PORT}`
 				const merge = args.merge === true
+				const token =
+					typeof args.token === 'string'
+						? args.token
+						: (process.env.KORA_BACKUP_TOKEN ?? process.env.KORA_ADMIN_TOKEN)
 
 				logger.banner()
 				logger.info(`Restoring backup from ${filePath} to ${url}...`)
 
 				try {
 					const data = await readFile(filePath)
-					const restoreUrl =
-						url.replace(/\/$/, '') + `/__kora/backup/import?merge=${merge}`
+					const restoreUrl = `${url.replace(/\/$/, '')}/__kora/backup/import?merge=${merge}`
 
 					const response = await fetch(restoreUrl, {
 						method: 'POST',
+						headers: token ? { Authorization: `Bearer ${token}` } : undefined,
 						body: data,
 					})
 
@@ -158,7 +174,9 @@ export const backupCommand = defineCommand({
 					const data = await readFile(filePath)
 					const { readBackupManifest } = await import('@korajs/store')
 
-					const manifest = readBackupManifest(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+					const manifest = readBackupManifest(
+						new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+					)
 
 					logger.banner()
 					logger.info(`Backup: ${filePath}`)

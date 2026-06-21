@@ -57,6 +57,9 @@ export type {
 
 export type {
 	ProductionServerConfig,
+	ProductionHttpRoute,
+	ProductionHttpRouteRequest,
+	ProductionHttpRouteResponse,
 	ProductionServer,
 } from './server/production-server'
 

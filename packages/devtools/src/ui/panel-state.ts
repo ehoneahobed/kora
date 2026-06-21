@@ -198,6 +198,10 @@ function timelineLabel(event: KoraEvent): string {
 			return 'sync disconnected'
 		case 'sync:auth-failed':
 			return 'sync auth failed'
+		case 'sync:schema-mismatch':
+			return `schema mismatch client ${event.clientSchemaVersion} server ${event.serverSchemaVersion}`
+		case 'sync:apply-failed':
+			return `sync apply failed ${event.operationId}`
 		case 'sync:sent':
 			return `sync sent ${event.batchSize}`
 		case 'sync:received':
@@ -224,6 +228,12 @@ function timelineLabel(event: KoraEvent): string {
 			return `transition ${event.collection} ${event.from} → ${event.to}`
 		case 'state-machine:rejected':
 			return `transition rejected ${event.collection} ${event.from} → ${event.to}`
+		case 'store:persistence-error':
+			return `store persistence error ${event.message}`
+		case 'store:quota-exceeded':
+			return 'store quota exceeded'
+		case 'replay:completed':
+			return `replay ${event.operationsApplied} ops`
 	}
 }
 

@@ -448,6 +448,7 @@ describe('three-tier merge integration', () => {
 			},
 			indexes: ['email'],
 			constraints: [constraint],
+			scope: [],
 			resolvers: {
 				score: (local: unknown, remote: unknown, base: unknown): unknown => {
 					return Math.max(local as number, remote as number)

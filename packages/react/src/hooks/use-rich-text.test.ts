@@ -1,4 +1,6 @@
 import type { CollectionAccessor, Store } from '@korajs/store'
+import type { SyncEngine } from '@korajs/sync'
+import { AwarenessManager } from '@korajs/sync'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { createElement, useEffect } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
@@ -20,6 +22,29 @@ function decodeText(value: Uint8Array): string {
 	const doc = new Y.Doc()
 	Y.applyUpdate(doc, value)
 	return doc.getText('content').toString()
+}
+
+function createQueryBuilderMock(initialResults: Array<Record<string, unknown>> = []) {
+	const builder = {
+		where: vi.fn(),
+		orderBy: vi.fn(),
+		limit: vi.fn(),
+		offset: vi.fn(),
+		exec: vi.fn(async () => initialResults),
+		count: vi.fn(async () => initialResults.length),
+		subscribe: vi.fn((callback: (results: Array<Record<string, unknown>>) => void) => {
+			callback(initialResults)
+			return () => {}
+		}),
+		getDescriptor: vi.fn(),
+	}
+
+	builder.where.mockReturnValue(builder)
+	builder.orderBy.mockReturnValue(builder)
+	builder.limit.mockReturnValue(builder)
+	builder.offset.mockReturnValue(builder)
+
+	return builder
 }
 
 function createMockStore(collections: Record<string, CollectionAccessor>): Store {
@@ -44,7 +69,7 @@ describe('useRichText', () => {
 			update: vi.fn(),
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: encodeText('Hello') }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -68,7 +93,7 @@ describe('useRichText', () => {
 			update: updateSpy,
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -91,9 +116,12 @@ describe('useRichText', () => {
 			expect(updateSpy).toHaveBeenCalledTimes(1)
 		})
 
-		const call = updateSpy.mock.calls[0]
-		expect(call?.[0]).toBe('rec-1')
-		expect(call?.[1]).toMatchObject({ body: expect.any(Uint8Array) })
+		const call = updateSpy.mock.calls[0] as unknown as [string, { body: Uint8Array }] | undefined
+		if (!call) {
+			throw new Error('Expected updateSpy to receive a call')
+		}
+		expect(call[0]).toBe('rec-1')
+		expect(call[1]).toMatchObject({ body: expect.any(Uint8Array) })
 	})
 
 	test('exposes undo/redo controls for local edits', async () => {
@@ -102,7 +130,7 @@ describe('useRichText', () => {
 			update: vi.fn(async () => ({ id: 'rec-1' })),
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -142,7 +170,7 @@ describe('useRichText', () => {
 			update: updateSpy,
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })
@@ -172,9 +200,63 @@ describe('useRichText', () => {
 			expect(updateSpy).toHaveBeenCalled()
 		})
 
-		const lastCall = updateSpy.mock.calls.at(-1)
-		const body = lastCall?.[1] as { body?: Uint8Array }
+		const lastCall = updateSpy.mock.calls.at(-1) as [string, { body: Uint8Array }] | undefined
+		if (!lastCall) {
+			throw new Error('Expected updateSpy to receive at least one call')
+		}
+		const body = lastCall[1]
 		expect(body.body).toBeInstanceOf(Uint8Array)
-		expect(decodeText(body.body as Uint8Array)).toBe('x'.repeat(25))
+		expect(decodeText(body.body)).toBe('x'.repeat(25))
+	})
+
+	test('setCursor publishes awareness state for the active field', async () => {
+		const awareness = new AwarenessManager()
+		const setLocalState = vi.spyOn(awareness, 'setLocalState')
+		const syncEngine = { getAwarenessManager: () => awareness } as unknown as SyncEngine
+
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: encodeText('') })),
+			update: vi.fn(async () => ({ id: 'rec-1' })),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: encodeText('') }])),
+		} as unknown as CollectionAccessor
+
+		const store = createMockStore({ notes })
+
+		function Probe(): ReturnType<typeof createElement> {
+			const { ready, setCursor } = useRichText('notes', 'rec-1', 'body', {
+				user: { name: 'Ada', color: '#ff0000' },
+			})
+
+			useEffect(() => {
+				if (!ready) return
+				setCursor(2, 4)
+			}, [ready, setCursor])
+
+			return createElement('span', { 'data-testid': 'ready' }, ready ? 'yes' : 'no')
+		}
+
+		render(createElement(KoraProvider, { store, syncEngine }, createElement(Probe)))
+
+		await waitFor(
+			() => {
+				expect(screen.getByTestId('ready').textContent).toBe('yes')
+			},
+			{ timeout: 5000 },
+		)
+
+		expect(setLocalState).toHaveBeenCalledWith(
+			expect.objectContaining({
+				user: { name: 'Ada', color: '#ff0000' },
+				cursor: {
+					collection: 'notes',
+					recordId: 'rec-1',
+					field: 'body',
+					anchor: 2,
+					head: 4,
+				},
+			}),
+		)
 	})
 })

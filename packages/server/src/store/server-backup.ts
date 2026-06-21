@@ -73,7 +73,8 @@ function parseJsonSection<T>(sections: Section[], name: string): T | null {
 }
 
 async function computeSha256(data: Uint8Array): Promise<string> {
-	const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+	const digestInput = new Uint8Array(data)
+	const hashBuffer = await crypto.subtle.digest('SHA-256', digestInput)
 	const hashArray = Array.from(new Uint8Array(hashBuffer))
 	return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
 }
@@ -106,7 +107,7 @@ export async function buildServerBackup(
 	addSection('version_vector', encodeJsonSection('version_vector', vvObj))
 
 	// Operations
-	const opLines = operations.map((op) => JSON.stringify(op)).join('\n') + '\n'
+	const opLines = `${operations.map((op) => JSON.stringify(op)).join('\n')}\n`
 	addSection('operations', encodeSection('operations', new TextEncoder().encode(opLines)))
 
 	// Checksum
@@ -142,9 +143,7 @@ export async function buildServerBackup(
 /**
  * Parse a backup and return the operations and version vector.
  */
-export function parseServerBackup(
-	data: Uint8Array,
-): {
+export function parseServerBackup(data: Uint8Array): {
 	operations: Operation[]
 	versionVector: Map<string, number>
 } {
@@ -155,7 +154,10 @@ export function parseServerBackup(
 	let operations: Operation[] = []
 	if (opsContent) {
 		const text = new TextDecoder().decode(opsContent)
-		const lines = text.trim().split('\n').filter((l) => l.length > 0)
+		const lines = text
+			.trim()
+			.split('\n')
+			.filter((l) => l.length > 0)
 		operations = lines.map((line) => JSON.parse(line) as Operation)
 	}
 

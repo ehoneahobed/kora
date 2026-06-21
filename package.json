@@ -5,9 +5,11 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "test": "turbo run test",
-    "benchmark:gates": "pnpm --filter @korajs/store test -- src/benchmarks/performance-gates.test.ts && pnpm --filter @korajs/merge test -- src/benchmarks/performance-gates.test.ts && pnpm --filter @korajs/sync test -- src/benchmarks/performance-gates.test.ts",
+    "test": "turbo run test --concurrency=6",
+    "benchmark:gates": "pnpm --filter @korajs/store test:benchmarks && pnpm --filter @korajs/merge test:benchmarks && pnpm --filter @korajs/sync test:benchmarks",
     "chaos:nightly": "pnpm --filter @korajs/sync test:chaos",
+    "test:chaos:real-path": "pnpm --filter @korajs/test test -- tests/chaos-real-path.test.ts",
+    "test:sync-reconnect": "pnpm --filter @korajs/test test -- tests/sync-reconnect.test.ts",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "turbo run typecheck",
@@ -16,6 +18,12 @@
     "version-packages": "changeset version",
     "release": "pnpm build && changeset publish",
     "test:e2e": "pnpm --filter kora-e2e test:e2e",
+    "test:production-path": "pnpm --filter korajs test:production-path",
+    "test:release-gate": "pnpm test:production-path && pnpm test:sync-reconnect && pnpm test:chaos:real-path && pnpm benchmark:gates",
+    "test:pre-release": "pnpm lint && pnpm build && pnpm test && pnpm typecheck && pnpm test:release-gate && pnpm --filter kora-e2e test:e2e:install && pnpm test:e2e",
+    "test:pre-release:core": "pnpm lint && pnpm build && pnpm test && pnpm test:release-gate",
+    "dev:full-stack": "pnpm --filter kora-full-stack dev",
+    "verify:full-stack": "pnpm --filter kora-full-stack verify",
     "docs:dev": "pnpm --filter kora-docs dev"
   },
   "devDependencies": {

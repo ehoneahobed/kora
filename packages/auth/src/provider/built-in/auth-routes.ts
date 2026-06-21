@@ -950,7 +950,7 @@ export class BuiltInAuthRoutes {
 
 		return {
 			async authenticate(token: string) {
-				const payload = tokenManager.validateToken(token)
+				const payload = await tokenManager.validateTokenWithRevocation(token)
 				if (payload === null || payload.type !== 'access') {
 					return null
 				}

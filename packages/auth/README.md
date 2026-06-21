@@ -17,6 +17,23 @@ Offline-first authentication for Kora.js applications.
 - **Passkeys (WebAuthn)** -- passwordless authentication with platform authenticators
 - **Encrypted token storage** -- AES-256-GCM encryption for sensitive environments
 - **End-to-end encryption** -- encrypt operation data before sync with `OperationEncryptor`
+- **Sync auth binding** -- `createKoraAuthSync()` wires tokens, JWT scopes, and device node ids to `createApp`
+
+The client APIs work in browser, Tauri desktop WebView, and mobile JavaScript environments. For desktop apps, run auth routes on your remote sync/auth server and point `AuthClient.serverUrl` at that server. Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC work across web and desktop clients. Passkeys should be feature-detected because WebAuthn support depends on the operating system WebView.
+
+For production desktop and mobile apps, pass a custom token storage adapter backed by the platform credential store and attach a stable device identity:
+
+```typescript
+import { createKoraAuth } from '@korajs/auth'
+
+const authClient = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  credentialStore: secureStore,
+  deviceKeyStore,
+})
+```
+
+`createKoraAuth()` uses IndexedDB for the device key pair when available. React Native and other runtimes without IndexedDB should pass a platform-backed `deviceKeyStore`.
 
 ## Installation
 
@@ -29,10 +46,10 @@ pnpm add @korajs/auth
 ### Client-side (React)
 
 ```tsx
-import { AuthClient } from '@korajs/auth'
+import { createKoraAuth } from '@korajs/auth'
 import { AuthProvider, useAuth } from '@korajs/auth/react'
 
-const authClient = new AuthClient({ serverUrl: 'http://localhost:3001' })
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 
 function App() {
   return (
@@ -43,15 +60,20 @@ function App() {
 }
 
 function MyApp() {
-  const { user, isAuthenticated, isLoading, signIn, signOut, error } = useAuth()
+  const { user, isAuthenticated, isLoading, signIn, signInWithOAuth, signOut, error } = useAuth()
 
   if (isLoading) return <div>Loading...</div>
 
   if (!isAuthenticated) {
     return (
-      <button onClick={() => signIn({ email: 'user@example.com', password: 'password' })}>
-        Sign In
-      </button>
+      <>
+        <button onClick={() => signIn({ email: 'user@example.com', password: 'password' })}>
+          Sign In
+        </button>
+        <button onClick={() => signInWithOAuth('google')}>
+          Sign In with Google
+        </button>
+      </>
     )
   }
 
@@ -64,41 +86,66 @@ function MyApp() {
 }
 ```
 
+### Sync integration
+
+```tsx
+import { createKoraAuthSync } from '@korajs/auth'
+import { createApp } from 'korajs'
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'ws://localhost:3001/kora-sync',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
 ### Server-side
 
 ```typescript
-import { BuiltInAuthRoutes, InMemoryUserStore, TokenManager } from '@korajs/auth/server'
+import {
+  createKoraAuthServer,
+  createSqliteOAuthStores,
+  googleProvider,
+} from '@korajs/auth/server'
 
-const userStore = new InMemoryUserStore()
-const tokenManager = new TokenManager({ secret: process.env.AUTH_SECRET! })
-const authRoutes = new BuiltInAuthRoutes({ userStore, tokenManager })
+const oauthStores = await createSqliteOAuthStores({
+  filename: './auth.db',
+})
+
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  oauth: {
+    providers: [
+      googleProvider({
+        clientId: process.env.GOOGLE_CLIENT_ID!,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
+      }),
+    ],
+    stateStore: oauthStores.stateStore,
+    linkedIdentityStore: oauthStores.linkedIdentityStore,
+  },
+})
 
 // Wire into your HTTP server:
-app.post('/auth/signup', async (req, res) => {
-  const result = await authRoutes.handleSignUp(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signin', async (req, res) => {
-  const result = await authRoutes.handleSignIn(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/refresh', async (req, res) => {
-  const result = await authRoutes.handleRefresh(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.get('/auth/me', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const result = await authRoutes.handleGetMe(token)
+app.all('/auth/*', async (req, res) => {
+  const result = await auth.handleRequest({
+    method: req.method,
+    path: req.path,
+    body: req.body,
+    headers: req.headers,
+    query: req.query,
+    ip: req.ip,
+  })
   res.status(result.status).json(result.body)
 })
 
 // Bridge to Kora sync server:
 const syncServer = new KoraSyncServer({
   store,
-  auth: authRoutes.toSyncAuthProvider(),
+  auth: auth.auth,
 })
 ```
 
@@ -108,6 +155,8 @@ const syncServer = new KoraSyncServer({
 
 | Export | Description |
 |--------|-------------|
+| `createKoraAuth` | Quickstart client factory with storage and device identity defaults |
+| `createKoraAuthSync` | Sync auth binding for `createApp({ sync: { authClient } })` |
 | `AuthClient` | Client-side auth manager (sign-up, sign-in, sign-out, token refresh) |
 | `OrgClient` | Client-side organization management |
 | `TokenStore` | Client-side token persistence (localStorage) |
@@ -139,10 +188,14 @@ const syncServer = new KoraSyncServer({
 
 | Export | Description |
 |--------|-------------|
+| `createKoraAuthServer` | Quickstart server factory with auth routes and sync provider |
 | `BuiltInAuthRoutes` | HTTP route handlers for all auth operations |
 | `TokenManager` | JWT issuing, validation, refresh rotation, revocation |
 | `InMemoryUserStore` | Dev/test user store |
 | `InMemoryTokenRevocationStore` | Dev/test token revocation store |
+| `OAuthManager` / provider helpers | OAuth authorization code flow and provider configs |
+| `InMemoryLinkedIdentityStore` | Dev/test OAuth account-linking store |
+| `createSqliteOAuthStores` / `createPostgresOAuthStores` | Durable OAuth state and linked identity stores |
 | `SessionManager` / `InMemorySessionStore` | Server-side session management |
 | `TotpManager` / `InMemoryTotpStore` | TOTP MFA with recovery codes |
 | `OrgRoutes` / `InMemoryOrgStore` | Organization CRUD, invitations, member management |

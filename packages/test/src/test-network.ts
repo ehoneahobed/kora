@@ -1,11 +1,13 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { SchemaDefinition } from '@korajs/core'
+import type { OperationTransform, SchemaDefinition } from '@korajs/core'
 import { createServerTransportPair } from '@korajs/server/internal'
+import type { ChaosConfig } from '@korajs/sync'
+import { ChaosTransport } from '@korajs/sync'
 import type { SyncTransport } from '@korajs/sync'
 import { TestDevice } from './test-device'
-import { TestServer } from './test-server'
+import { TestServer, type TestServerOptions } from './test-server'
 
 /**
  * Options for creating a test network.
@@ -15,6 +17,8 @@ export interface TestNetworkOptions {
 	devices?: number
 	/** Custom device names. If not provided, uses 'device-0', 'device-1', etc. */
 	deviceNames?: string[]
+	/** Optional chaos transport settings applied to each device link. */
+	chaos?: ChaosConfig
 }
 
 /**
@@ -79,6 +83,71 @@ export async function createTestNetwork(
 			server,
 			createTransportPair: () => {
 				const pair = createServerTransportPair()
+				const client = pair.client as unknown as SyncTransport
+				const chaos = options?.chaos
+				return {
+					client: chaos ? new ChaosTransport(client, chaos) : client,
+					serverTransport: pair.server,
+				}
+			},
+			tmpDir,
+		})
+		await device.open()
+		devices.push(device)
+	}
+
+	return {
+		server,
+		devices,
+		tmpDir,
+		async close(): Promise<void> {
+			for (const device of devices) {
+				await device.close()
+			}
+			await server.close()
+			// Clean up temp DB files
+			try {
+				const { rmSync } = await import('node:fs')
+				rmSync(tmpDir, { recursive: true, force: true })
+			} catch {
+				// Ignore cleanup errors
+			}
+		},
+	}
+}
+
+/**
+ * Per-device configuration when devices use different local schemas or sync settings.
+ */
+export interface MixedTestDeviceConfig {
+	name: string
+	schema: SchemaDefinition
+	syncSchemaVersion?: number
+	operationTransforms?: OperationTransform[]
+}
+
+/**
+ * Create a test network where devices may use different schema versions and transforms.
+ * The server uses `serverSchema` for materialization and handshake bounds.
+ */
+export async function createMixedTestNetwork(
+	serverSchema: SchemaDefinition,
+	serverOptions: TestServerOptions,
+	deviceConfigs: MixedTestDeviceConfig[],
+): Promise<TestNetwork> {
+	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
+	const server = new TestServer(serverSchema, serverOptions)
+
+	const devices: TestDevice[] = []
+	for (const config of deviceConfigs) {
+		const device = new TestDevice({
+			name: config.name,
+			schema: config.schema,
+			server,
+			syncSchemaVersion: config.syncSchemaVersion,
+			operationTransforms: config.operationTransforms,
+			createTransportPair: () => {
+				const pair = createServerTransportPair()
 				return {
 					client: pair.client as unknown as SyncTransport,
 					serverTransport: pair.server,
@@ -99,7 +168,6 @@ export async function createTestNetwork(
 				await device.close()
 			}
 			await server.close()
-			// Clean up temp DB files
 			try {
 				const { rmSync } = await import('node:fs')
 				rmSync(tmpDir, { recursive: true, force: true })

@@ -12,6 +12,8 @@ export default mergeConfig(
 			name: '@korajs/merge',
 			root: __dirname,
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+			// Performance gates run via `pnpm test:benchmarks`, not default `pnpm test`.
+			exclude: ['src/benchmarks/**'],
 		},
 	}),
 )

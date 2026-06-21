@@ -13,6 +13,13 @@ export type {
 	ChallengeStore,
 	RateLimiter,
 } from './provider/built-in/auth-routes'
+export { createKoraAuthServer } from './provider/built-in/quickstart-server'
+export type {
+	CreateKoraAuthServerOptions,
+	KoraAuthHttpRequest,
+	KoraAuthServer,
+	OAuthServerConfig,
+} from './provider/built-in/quickstart-server'
 
 // === Token Manager ===
 export { TokenManager, InMemoryTokenRevocationStore } from './tokens/token-manager'
@@ -171,6 +178,25 @@ export {
 	microsoftProvider,
 } from './provider/oauth/oauth-flow'
 export type { OAuthManagerConfig } from './provider/oauth/oauth-flow'
+export {
+	DuplicateLinkedIdentityError,
+	InMemoryLinkedIdentityStore,
+} from './provider/oauth/linked-identity-store'
+export type { LinkedIdentityStore } from './provider/oauth/linked-identity-store'
+export {
+	SqliteLinkedIdentityStore,
+	SqliteOAuthStateStore,
+	createSqliteLinkedIdentityStore,
+	createSqliteOAuthStateStore,
+	createSqliteOAuthStores,
+} from './provider/oauth/sqlite-oauth-store'
+export {
+	PostgresLinkedIdentityStore,
+	PostgresOAuthStateStore,
+	createPostgresLinkedIdentityStore,
+	createPostgresOAuthStateStore,
+	createPostgresOAuthStores,
+} from './provider/oauth/postgres-oauth-store'
 export {
 	OAuthError,
 	OAuthStateMismatchError,

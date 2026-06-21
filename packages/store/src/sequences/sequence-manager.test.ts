@@ -1,31 +1,20 @@
+import { defineSchema, t } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 import { SequenceManager } from './sequence-manager'
 
 // Minimal schema for testing (sequences don't need collections)
-const minimalSchema = {
+const minimalSchema = defineSchema({
 	version: 1,
 	collections: {
 		items: {
 			fields: {
-				name: {
-					kind: 'string' as const,
-					required: true,
-					defaultValue: undefined,
-					auto: false,
-					enumValues: null,
-					itemKind: null,
-					mergeStrategy: null,
-				},
+				name: t.string(),
 			},
-			indexes: [],
-			constraints: [],
-			resolvers: {},
 		},
 	},
-	relations: {},
-}
+})
 
 describe('SequenceManager', () => {
 	let store: Store

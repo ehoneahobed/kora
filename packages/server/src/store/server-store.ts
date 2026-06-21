@@ -49,6 +49,9 @@ export interface ServerStore extends SyncStore {
 	 */
 	setSchema(schema: SchemaDefinition): Promise<void>
 
+	/** Schema used for materialized tables and server-side validation, if set. */
+	getSchema(): SchemaDefinition | null
+
 	/**
 	 * Get all records from a materialized collection.
 	 * When schema is set, reads directly from the collection table (O(1) indexed).
@@ -107,5 +110,8 @@ export interface ServerStore extends SyncStore {
 	 * @param data - Backup binary
 	 * @param merge - If true, merge with existing operations; if false, replace all
 	 */
-	importBackup(data: Uint8Array, merge?: boolean): Promise<{ operationsRestored: number; success: boolean }>
+	importBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }>
 }

@@ -25,6 +25,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
@@ -32,6 +33,7 @@
   },
   "dependencies": {
     "@korajs/core": "workspace:*",
+    "lib0": "^0.2.100",
     "yjs": "^13.6.30"
   },
   "devDependencies": {

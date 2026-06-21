@@ -205,4 +205,24 @@ describe('resolveCreatePreferencesFlow', () => {
 
 		expect(result.template).toBe('tauri-react')
 	})
+
+	test('desktop-tauri supports postgres sync server configuration', async () => {
+		const store = new MockPreferenceStore(null)
+
+		const result = await resolveCreatePreferencesFlow({
+			flags: {
+				useDefaults: false,
+				platform: 'desktop-tauri',
+				db: 'postgres',
+				dbProvider: 'neon',
+			},
+			prompts: new MockPromptClient(),
+			store,
+		})
+
+		expect(result.template).toBe('tauri-react')
+		expect(result.sync).toBe(true)
+		expect(result.db).toBe('postgres')
+		expect(result.dbProvider).toBe('neon')
+	})
 })

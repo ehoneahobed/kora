@@ -4,7 +4,8 @@ The schema is the foundation of every Kora app. It defines your collections, fie
 
 ## Defining a Schema
 
-Use `defineSchema` to declare your data model:
+Use `defineSchema` to declare your data model. For small apps, keeping the whole schema in
+`src/schema.ts` is fine:
 
 ```typescript
 import { defineSchema, t } from 'korajs'
@@ -30,6 +31,170 @@ export default defineSchema({
 ```
 
 `defineSchema` validates your schema at app initialization time and produces full TypeScript type inference. Your IDE will autocomplete field names and type-check values on every collection operation.
+
+## Organizing Large Schemas
+
+For production apps, treat `src/schema.ts` as the schema entry point, not as the only place where
+collection definitions can live. Keep each collection near the feature or domain that owns it, then
+compose those collections in the schema entry point.
+
+```text
+src/
+  modules/
+    users/
+      user.schema.ts
+      user.queries.ts
+      user.mutations.ts
+      useUsers.ts
+      components/
+    posts/
+      post.schema.ts
+      post.queries.ts
+      post.mutations.ts
+      usePosts.ts
+      components/
+  schema.ts
+```
+
+Define each collection in its own file:
+
+```typescript
+// src/modules/users/user.schema.ts
+import { t } from 'korajs'
+
+export const users = {
+  fields: {
+    email: t.string(),
+    name: t.string(),
+    role: t.enum(['admin', 'member']).default('member'),
+    createdAt: t.timestamp().auto(),
+  },
+  indexes: ['email'],
+}
+```
+
+```typescript
+// src/modules/posts/post.schema.ts
+import { t } from 'korajs'
+
+export const posts = {
+  fields: {
+    userId: t.string(),
+    title: t.string(),
+    body: t.richtext(),
+    published: t.boolean().default(false),
+    createdAt: t.timestamp().auto(),
+  },
+  indexes: ['userId', 'published'],
+}
+```
+
+Then compose the final schema in `src/schema.ts`:
+
+```typescript
+import { defineSchema } from 'korajs'
+import { posts } from './modules/posts/post.schema'
+import { users } from './modules/users/user.schema'
+
+export default defineSchema({
+  version: 1,
+
+  collections: {
+    users,
+    posts,
+  },
+
+  relations: {
+    postAuthor: {
+      from: 'posts',
+      to: 'users',
+      type: 'many-to-one',
+      field: 'userId',
+      onDelete: 'cascade',
+    },
+  },
+})
+```
+
+This keeps Kora's type inference, migration tooling, and runtime validation working from one
+canonical schema export while letting a feature-based codebase split schemas by domain. The terms in
+this layout mean:
+
+- `schema`: the data shape for a collection
+- `queries`: reusable reads that do not change data
+- `mutations`: reusable writes, including inserts, updates, deletes, and transactions
+- `useUsers`, `usePosts`, or similar: framework-specific UI bindings; in React, these are hooks
+- `components`: UI for the feature
+
+Kora does not require controllers, services, or file-based routes. Use those patterns if your app
+framework already has them, but Kora's recommended module boundary is data shape, reads, writes, UI
+bindings, and components.
+
+Prefer explicit imports from collection modules over filesystem auto-discovery; explicit composition
+makes schema ownership and review diffs easier to understand.
+
+### Queries, Mutations, and UI
+
+Feature modules can also own reusable query builders, mutations, UI bindings, and components.
+Queries should only read data:
+
+```typescript
+// src/modules/todos/todo.queries.ts
+import type { CollectionAccessor } from 'korajs'
+
+export function orderedTodos(todos: CollectionAccessor) {
+  return todos.where({}).orderBy('createdAt', 'desc')
+}
+```
+
+Mutations should contain writes:
+
+```typescript
+// src/modules/todos/todo.mutations.ts
+import type { CollectionAccessor } from 'korajs'
+
+export function createTodo(todos: CollectionAccessor, title: string) {
+  return todos.insert({ title })
+}
+
+export function setTodoCompleted(
+  todos: CollectionAccessor,
+  id: string,
+  completed: boolean,
+) {
+  return todos.update(id, { completed })
+}
+```
+
+The React binding connects those reads and writes to components:
+
+```typescript
+// src/modules/todos/useTodos.ts
+import { useCollection, useMutation, useQuery } from '@korajs/react'
+import { createTodo, setTodoCompleted } from './todo.mutations'
+import { orderedTodos } from './todo.queries'
+
+export function useTodos() {
+  const todos = useCollection('todos')
+  const allTodos = useQuery(orderedTodos(todos))
+
+  return {
+    allTodos,
+    createTodo: useMutation((title: string) => createTodo(todos, title)),
+    setTodoCompleted: useMutation((id: string, completed: boolean) =>
+      setTodoCompleted(todos, id, completed),
+    ),
+  }
+}
+```
+
+The schema, query, and mutation files are framework-agnostic and can be reused across web, desktop,
+and mobile. The binding file is framework-specific: React templates use `useTodos.ts`, while another
+UI framework can use the naming convention that is idiomatic there.
+
+Kora does not own routing. Use Next.js, React Router, TanStack Router, Remix, Expo Router, or any
+other router your application needs. Route files can import feature module hooks and components, but
+Kora will not generate or interpret routes.
 
 ## Field Types
 

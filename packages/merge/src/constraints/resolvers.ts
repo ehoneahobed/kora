@@ -1,8 +1,8 @@
 import { HybridLogicalClock } from '@korajs/core'
 import type { CollectionDefinition, Operation } from '@korajs/core'
 import type { MergeTrace } from '@korajs/core'
-import type { SideEffectOp } from './referential-integrity'
 import type { ConstraintViolation } from '../types'
+import type { SideEffectOp } from './referential-integrity'
 
 /**
  * Result of resolving a constraint violation.

@@ -4,6 +4,7 @@
 // === Types ===
 export type {
 	QueueStorage,
+	SyncStatePersistence,
 	SyncConfig,
 	SyncEncryptionConfig,
 	SyncScopeContext,
@@ -11,15 +12,29 @@ export type {
 	SyncState,
 	SyncStatus,
 	SyncStatusInfo,
+	DeltaCursor,
 } from './types'
 
 export { InvalidScopeError, ScopeViolationError, SYNC_STATES, SYNC_STATUSES } from './types'
 
 // === Scope Filtering ===
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
+export {
+	dedupeQuerySubsets,
+	operationMatchesQuerySubsets,
+	type SyncQuerySubset,
+} from './scopes/query-subset'
+
+// === Delta Cursor ===
+export {
+	createDeltaCursorFromBatch,
+	decodeDeltaCursor,
+	encodeDeltaCursor,
+	sliceOperationsAfterCursor,
+} from './delta/delta-cursor'
 
 // === SyncStore Interface ===
-export type { ApplyResult, SyncStore } from './engine/sync-store'
+export type { ApplyFailureReason, ApplyResult, SyncStore } from './engine/sync-store'
 
 // === Protocol Messages ===
 export type {
@@ -32,6 +47,12 @@ export type {
 	SyncMessage,
 	WireFormat,
 } from './protocol/messages'
+
+export {
+	isClientSchemaVersionSupported,
+	isSchemaMismatchReject,
+	SCHEMA_MISMATCH_PREFIX,
+} from './protocol/schema-version'
 
 export {
 	isAcknowledgmentMessage,
@@ -114,6 +135,23 @@ export type {
 
 export { isAwarenessUpdateMessage } from './protocol/messages'
 
+// === Richtext doc channel (large documents) ===
+export type { YjsDocUpdateMessage } from './protocol/messages'
+
+export { isYjsDocUpdateMessage } from './protocol/messages'
+
+export {
+	DEFAULT_RICHTEXT_DOC_CHANNEL_THRESHOLD,
+	RichtextDocChannel,
+} from './richtext/richtext-doc-channel'
+
+export type {
+	RichtextDocChannelOptions,
+	RichtextDocListener,
+} from './richtext/richtext-doc-channel'
+
+export { decodeYjsUpdate, encodeYjsUpdate, richtextDocKey } from './richtext/doc-channel-wire'
+
 // === Encryption ===
 export type {
 	EncryptedPayload,
@@ -121,6 +159,16 @@ export type {
 	VersionedKey,
 } from './encryption/types'
 
-export { SyncEncryptor, EncryptionError, DecryptionError, isEncryptedPayload } from './encryption/sync-encryptor'
+export {
+	SyncEncryptor,
+	EncryptionError,
+	DecryptionError,
+	isEncryptedPayload,
+} from './encryption/sync-encryptor'
 
-export { KeyDerivationError, deriveKey, deriveVersionedKey, generateSalt } from './encryption/key-derivation'
+export {
+	KeyDerivationError,
+	deriveKey,
+	deriveVersionedKey,
+	generateSalt,
+} from './encryption/key-derivation'

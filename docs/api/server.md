@@ -73,6 +73,58 @@ const server = createKoraServer({ store, port: 3001, auth })
 await server.start()
 ```
 
+## `createProductionServer(config)`
+
+Creates one HTTP server for static frontend assets, WebSocket sync, health checks, observability, dashboard, and backup endpoints.
+
+```typescript
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import schema from './src/schema'
+
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+await store.setSchema(schema)
+
+const server = createProductionServer({
+  store,
+  port: Number(process.env.PORT) || 3001,
+  staticDir: './dist',
+  syncPath: '/kora-sync',
+  httpRoutes: [
+    // Example: mount @korajs/auth with createKoraAuthServer()
+    // { path: '/auth', handle: auth.handleRequest },
+  ],
+  operationalAuth: {
+    adminToken: process.env.KORA_ADMIN_TOKEN,
+    metricsToken: process.env.KORA_METRICS_TOKEN,
+    backupToken: process.env.KORA_BACKUP_TOKEN,
+  },
+})
+
+await server.start()
+```
+
+### `ProductionServerConfig`
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `store` | `ServerStore` | Yes | -- |
+| `port` | `number` | No | `3001` or `process.env.PORT` |
+| `staticDir` | `string` | No | `'./dist'` |
+| `syncPath` | `string` | No | `'/kora-sync'` |
+| `syncOptions` | `Omit<KoraSyncServerConfig, 'store' \| 'port' \| 'host' \| 'path'>` | No | -- |
+| `httpRoutes` | `ProductionHttpRoute[]` | No | -- |
+| `operationalAuth` | `ProductionOperationalAuth` | No | Public endpoints |
+
+`/health` is always public for hosting platform health checks. Operational endpoints under `/__kora/*` are protected when the matching token is configured. Send tokens with `Authorization: Bearer <token>`.
+
+`httpRoutes` are mounted before static file serving and are useful for auth routes, webhooks, and small app APIs without adding a separate HTTP framework.
+
+| Token | Protects |
+|-------|----------|
+| `adminToken` | `/__kora`, `/__kora/status`, `/__kora/events` |
+| `metricsToken` | `/__kora/metrics`; falls back to `adminToken` when omitted |
+| `backupToken` | `/__kora/backup/export`, `/__kora/backup/import`; falls back to `adminToken` when omitted |
+
 ## `KoraSyncServer`
 
 Main server class.
@@ -262,16 +314,16 @@ const auth = new MixedAuthProvider({
 const server = new KoraSyncServer({ store, auth })
 ```
 
-On the client side, return an empty token for unauthenticated users:
+On the client side, return an empty token for unauthenticated users (or use `createKoraAuthSync`):
 
 ```typescript
+import { createKoraAuthSync } from '@korajs/auth'
+
 const app = createApp({
   schema,
   sync: {
     url: 'wss://my-server.com/kora',
-    auth: async () => ({
-      token: (await authClient.getAccessToken()) ?? '',
-    }),
+    authClient: createKoraAuthSync({ authClient, schema }),
   },
 })
 ```

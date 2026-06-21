@@ -29,8 +29,11 @@ Kora then handles the handshake, delta exchange, retries, and conflict resolutio
 |--------|------|---------|-------------|
 | `url` | `string` | -- | WebSocket URL of your sync server (required) |
 | `auth` | `() => Promise<{ token: string }>` | -- | Async function that returns an auth token |
+| `authClient` | `AuthSyncBinding` | -- | Pre-built binding from `createKoraAuthSync()` in `@korajs/auth` |
+| `scope` | `Record<string, unknown>` | -- | Flat scope values combined with schema scope declarations |
 | `batchSize` | `number` | `100` | Max operations per sync batch |
 | `schemaVersion` | `number` | `1` | Schema version sent in handshake |
+| `autoConnect` | `boolean` | `false` | Connect automatically after `app.ready` |
 | `autoReconnect` | `boolean` | `true` | Automatically reconnect on disconnect |
 | `reconnectInterval` | `number` | `1000` | Initial reconnect delay in ms |
 | `maxReconnectInterval` | `number` | `30000` | Maximum reconnect delay in ms |
@@ -54,6 +57,29 @@ const app = createApp({
 
 ## Authentication
 
+### Recommended: `createKoraAuthSync`
+
+When using `@korajs/auth`, pass an auth sync binding instead of wiring tokens manually:
+
+```typescript
+import { createApp } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora',
+    authClient: createKoraAuthSync({ authClient, schema }),
+  },
+})
+```
+
+The binding handles token refresh, JWT → scope map resolution, device-bound sync node ids (`dev` claim), and reconnect-on-auth-change.
+
+### Manual `auth` function
+
 Provide an async `auth` function that returns a token. The token is sent during the WebSocket handshake:
 
 ```typescript
@@ -67,25 +93,7 @@ sync: {
 
 The `auth` function is called on every connection attempt, including reconnections. This allows you to refresh expired tokens automatically.
 
-### With @korajs/auth
-
-If you use `@korajs/auth`, pass the auth client's access token:
-
-```typescript
-import { AuthClient } from '@korajs/auth'
-
-const authClient = new AuthClient({ serverUrl: 'http://localhost:3001' })
-
-const app = createApp({
-  schema,
-  sync: {
-    url: 'wss://my-server.com/kora',
-    auth: async () => ({
-      token: await authClient.getAccessToken(),
-    }),
-  },
-})
-```
+### Server-side auth bridge
 
 On the server side, bridge auth to the sync server with `toSyncAuthProvider()`:
 
@@ -104,6 +112,59 @@ const server = createKoraServer({
 
 See the [Authentication Guide](/guide/authentication) for the full setup.
 
+### Client-side scope from JWT
+
+When `createKoraAuthSync({ schema })` is used, scope filters are built automatically from JWT claims:
+
+```typescript
+// Schema declares scope fields on collections
+const schema = defineSchema({
+  collections: {
+    todos: {
+      fields: { title: t.string(), userId: t.string() },
+      scope: ['userId'],
+    },
+  },
+})
+
+// Access token: { sub: 'user-1', dev: 'device-abc', ... }
+// Handshake scope map: { todos: { userId: 'user-1' } }
+```
+
+The store sync **node id** comes from the token's `dev` claim (device identity), not `sub` (user id). Each physical device gets its own operation log node while sharing user-scoped data.
+
+For static scope values not present in the token, use `sync.scope`:
+
+```typescript
+sync: {
+  url: 'wss://my-server.com/kora',
+  scope: { orgId: 'org-123' },
+}
+```
+
+### Declarative sync rules in schema
+
+Prefer schema-level sync rules for partial sync. Only listed collections sync:
+
+```typescript
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        userId: t.string(),
+      },
+    },
+  },
+  sync: {
+    todos: { where: { userId: true } },
+  },
+})
+```
+
+Combined with `createKoraAuthSync({ authClient, schema })`, scope maps are built automatically from JWT claims (`sub` → `userId`). See the [Core API `buildScopeMap()` reference](/api/core#buildscopemap) for details.
+
 ### Anonymous Sync (Mixed Auth)
 
 For apps where some users are authenticated and others are anonymous (e.g., public form respondents), use `MixedAuthProvider`:
@@ -121,14 +182,12 @@ const auth = new MixedAuthProvider({
 const server = createKoraServer({ store, port: 3001, auth })
 ```
 
-On the client, return an empty token for unauthenticated users:
+On the client, return an empty token for unauthenticated users (or use `createKoraAuthSync`, which does this automatically):
 
 ```typescript
 sync: {
   url: 'wss://my-server.com/kora',
-  auth: async () => ({
-    token: (await authClient.getAccessToken()) ?? '',
-  }),
+  authClient: createKoraAuthSync({ authClient, schema }),
 }
 ```
 
@@ -149,6 +208,23 @@ When a client connects for the first time (or after being offline):
 5. **Server response**: Server sends its version vector back.
 6. **Delta exchange**: Both sides compute which operations the other is missing and send them. Operations are sent in causal order (dependencies before dependents).
 7. **Streaming**: After the initial exchange, the connection enters real-time bidirectional streaming mode. New operations are sent as they happen.
+
+Large initial syncs are paginated into batches of `batchSize` (default 100). Each batch includes `batchIndex`, `totalBatches`, `isFinal`, and a `cursor` so the client can resume if the connection drops mid-sync. The cursor is persisted in `_kora_meta` and sent on the next handshake as `deltaCursor`.
+
+### Query-specific sync subsets
+
+When you subscribe to a reactive query, Kora automatically registers a sync subset for equality filters in the query's `where` clause:
+
+```typescript
+// Only incomplete todos for this user are synced (within auth/schema scope)
+app.todos.where({ completed: false }).subscribe((todos) => {
+  renderList(todos)
+})
+```
+
+Subsets are sent in the handshake as `syncQueries`. The server filters delta exchange and relay to match. Operator-based filters (`$gt`, `$in`, etc.) are not registered as sync subsets — use schema sync rules or auth scopes for those.
+
+Changing active subscriptions triggers a debounced reconnect so the server receives updated subsets.
 
 ### How Delta Sync Works
 
@@ -331,21 +407,30 @@ See the [Sync Encryption guide](/guide/sync-encryption) for setup details.
 The sync engine exposes real-time diagnostics for monitoring connection health:
 
 ```typescript
-const diagnostics = app.sync?.getDiagnostics()
+const diagnostics = app.sync?.exportDiagnostics()
 // {
-//   rttMs: 45,              // round-trip time in ms
-//   rttP95: 120,            // 95th percentile RTT
-//   effectiveBandwidth: 102400, // bytes per second
-//   operationsSent: 1547,
-//   operationsReceived: 2103,
-//   bytesSent: 245760,
-//   bytesReceived: 340992,
-//   connectionUptime: 3600000,
-//   reconnectCount: 2,
+//   state: 'streaming',
+//   status: { status: 'synced', pendingOperations: 0, ... },
+//   pendingOperations: 0,
+//   lastSyncedAt: 1715097600000,
+//   lastSuccessfulPush: 1715097600000,
+//   lastSuccessfulPull: 1715097600000,
+//   conflicts: 0,
+//   reconnecting: false,
 // }
 ```
 
-Diagnostics events are also emitted and visible in [DevTools](/guide/devtools).
+For lower-level observability, listen to diagnostics events:
+
+```typescript
+app.events.on('sync:diagnostics', (event) => {
+  console.log(event.diagnostics.quality)
+  console.log(event.diagnostics.rttP95Ms)
+  console.log(event.diagnostics.effectiveBandwidth)
+})
+```
+
+Diagnostics events are also visible in [DevTools](/guide/devtools).
 
 ## Manual Disconnect and Reconnect
 

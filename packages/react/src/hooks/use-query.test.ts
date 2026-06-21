@@ -1,6 +1,6 @@
 import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
-import { createElement, useState } from 'react'
+import { StrictMode, createElement, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useQuery } from './use-query'
 
@@ -165,5 +165,37 @@ describe('useQuery', () => {
 		render(createElement(QueryRenderer, { query: queryBuilder }))
 
 		expect(queryBuilder.subscribe).toHaveBeenCalledTimes(1)
+	})
+
+	it('keeps receiving updates through StrictMode remount', async () => {
+		const { queryBuilder, triggerCallback } = createMockQueryBuilder([createRecord('1')])
+
+		render(createElement(StrictMode, null, createElement(QueryRenderer, { query: queryBuilder })))
+
+		// StrictMode may tear down and re-subscribe; final mount must stay live.
+		expect(queryBuilder.subscribe).toHaveBeenCalled()
+
+		act(() => {
+			triggerCallback([createRecord('1'), createRecord('2')])
+		})
+
+		await waitFor(() => {
+			expect(screen.getByTestId('results').textContent).toBe('["1","2"]')
+		})
+	})
+
+	it('throws AppNotReadyError for pending queries', () => {
+		const { queryBuilder } = createMockQueryBuilder([], {
+			collection: '__pending__',
+			where: {},
+			orderBy: [],
+		})
+
+		function PendingQuery(): ReturnType<typeof createElement> {
+			useQuery(queryBuilder)
+			return createElement('div', null)
+		}
+
+		expect(() => render(createElement(PendingQuery))).toThrow(/app\.ready/)
 	})
 })

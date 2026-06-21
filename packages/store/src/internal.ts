@@ -14,9 +14,16 @@ export {
 	buildCountQuery,
 	buildInsertQuery,
 	buildUpdateQuery,
+	buildLwwUpdateQuery,
 	buildSoftDeleteQuery,
+	buildLwwSoftDeleteQuery,
 	buildWhereClause,
 } from './query/sql-builder'
+export {
+	serializeRowVersion,
+	rowVersionFromRecord,
+	isIncomingNewerThanRow,
+} from './lww/row-version'
 export type { SqlQuery } from './query/sql-builder'
 
 export type {
@@ -26,3 +33,10 @@ export type {
 	VersionVectorRow,
 	Subscription,
 } from './types'
+
+export { executeInsert } from './mutations/execute-insert'
+export { executeUpdate } from './mutations/execute-update'
+export { executeDelete } from './mutations/execute-delete'
+export { resolveCausalDeps } from './mutations/resolve-causal-deps'
+export type { ExecuteDeleteOptions } from './mutations/execute-delete'
+export type { LocalMutationContext } from './mutations/types'

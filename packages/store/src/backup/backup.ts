@@ -1,6 +1,7 @@
 import { generateUUIDv7 } from '@korajs/core'
 import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import type { StorageAdapter } from '../types'
+import { deserializeOperationWithCollection } from '../serialization/serializer'
+import type { OperationRow, StorageAdapter } from '../types'
 import type {
 	BackupManifest,
 	BackupOptions,
@@ -31,7 +32,7 @@ function encodeJsonSection(name: string, data: unknown): Uint8Array {
 }
 
 function encodeNdjsonSection(name: string, records: unknown[]): Uint8Array {
-	const lines = records.map((r) => JSON.stringify(r)).join('\n') + '\n'
+	const lines = `${records.map((r) => JSON.stringify(r)).join('\n')}\n`
 	return encodeSection(name, new TextEncoder().encode(lines))
 }
 
@@ -148,7 +149,7 @@ export async function exportBackup(
 	addSection('meta', encodeJsonSection('meta', metaObj))
 
 	// Operations section
-	const opLines = operations.map((op) => JSON.stringify(op)).join('\n') + '\n'
+	const opLines = `${operations.map((op) => JSON.stringify(op)).join('\n')}\n`
 	addSection('operations', encodeSection('operations', new TextEncoder().encode(opLines)))
 
 	// Records sections (optional)
@@ -157,7 +158,7 @@ export async function exportBackup(
 		for (const col of collections) {
 			const records = await readCollectionRecords(adapter, col)
 			if (records.length > 0) {
-				const lines = records.map((r) => JSON.stringify(r)).join('\n') + '\n'
+				const lines = `${records.map((r) => JSON.stringify(r)).join('\n')}\n`
 				const sectionName = `records:${col}`
 				addSection(sectionName, encodeSection(sectionName, new TextEncoder().encode(lines)))
 				totalRecords += records.length
@@ -187,15 +188,9 @@ export async function exportBackup(
 
 	// Merge manifest + all sections + checksum section
 	const manifestSection = encodeJsonSection('manifest', manifest)
-	const checksumSection = encodeSection(
-		'checksum',
-		new TextEncoder().encode(checksumHex),
-	)
+	const checksumSection = encodeSection('checksum', new TextEncoder().encode(checksumHex))
 
-	const totalLen =
-		manifestSection.length +
-		allContentForChecksum.length +
-		checksumSection.length
+	const totalLen = manifestSection.length + allContentForChecksum.length + checksumSection.length
 	const result = new Uint8Array(totalLen)
 	let pos = 0
 	result.set(manifestSection, pos)
@@ -250,9 +245,7 @@ export async function verifyBackupChecksum(data: Uint8Array): Promise<boolean> {
 		: new Uint8Array(0)
 
 	// Rebuild all content sections and hash them
-	const contentSections = sections.filter(
-		(s) => s.name !== 'manifest' && s.name !== 'checksum',
-	)
+	const contentSections = sections.filter((s) => s.name !== 'manifest' && s.name !== 'checksum')
 
 	let contentForHash = new Uint8Array(0)
 	for (const section of contentSections) {
@@ -333,7 +326,10 @@ export async function restoreBackup(
 	let operations: Operation[] = []
 	if (opsContent) {
 		const text = new TextDecoder().decode(opsContent)
-		const lines = text.trim().split('\n').filter((l) => l.length > 0)
+		const lines = text
+			.trim()
+			.split('\n')
+			.filter((l) => l.length > 0)
 		operations = lines.map((line) => JSON.parse(line) as Operation)
 	}
 
@@ -368,10 +364,10 @@ export async function restoreBackup(
 			// Import meta
 			if (metaData) {
 				for (const [key, value] of Object.entries(metaData)) {
-					await tx.execute(
-						"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)",
-						[key, value],
-					)
+					await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+						key,
+						value,
+					])
 				}
 			}
 
@@ -432,10 +428,7 @@ export async function restoreBackup(
 			// Import meta
 			if (metaData) {
 				for (const [key, value] of Object.entries(metaData)) {
-					await tx.execute(
-						"INSERT INTO _kora_meta (key, value) VALUES (?, ?)",
-						[key, value],
-					)
+					await tx.execute('INSERT INTO _kora_meta (key, value) VALUES (?, ?)', [key, value])
 				}
 			}
 
@@ -473,7 +466,10 @@ export async function restoreBackup(
 			if (!sectionContent) continue
 
 			const text = new TextDecoder().decode(sectionContent)
-			const lines = text.trim().split('\n').filter((l) => l.length > 0)
+			const lines = text
+				.trim()
+				.split('\n')
+				.filter((l) => l.length > 0)
 			const records = lines.map((line) => JSON.parse(line) as Record<string, unknown>)
 
 			if (records.length === 0) continue
@@ -512,9 +508,7 @@ export async function restoreBackup(
 
 // ── Reading helpers ──────────────────────────────────────────────────────────
 
-async function readVersionVector(
-	adapter: StorageAdapter,
-): Promise<Map<string, number>> {
+async function readVersionVector(adapter: StorageAdapter): Promise<Map<string, number>> {
 	const rows = await adapter.query<{ node_id: string; sequence_number: number }>(
 		'SELECT node_id, sequence_number FROM _kora_version_vector',
 	)
@@ -531,20 +525,7 @@ interface MetaRow {
 }
 
 async function readMeta(adapter: StorageAdapter): Promise<MetaRow[]> {
-	return adapter.query<MetaRow>("SELECT key, value FROM _kora_meta")
-}
-
-interface OperationRow {
-	id: string
-	node_id: string
-	type: string
-	record_id: string
-	data: string | null
-	previous_data: string | null
-	timestamp: string
-	sequence_number: number
-	causal_deps: string
-	schema_version: number
+	return adapter.query<MetaRow>('SELECT key, value FROM _kora_meta')
 }
 
 async function readAllOperations(
@@ -559,19 +540,7 @@ async function readAllOperations(
 		)
 
 		for (const row of rows) {
-			allOps.push({
-				id: row.id,
-				nodeId: row.node_id,
-				type: row.type as Operation['type'],
-				collection: collectionName,
-				recordId: row.record_id,
-				data: row.data !== null ? JSON.parse(row.data) : null,
-				previousData: row.previous_data !== null ? JSON.parse(row.previous_data) : null,
-				timestamp: JSON.parse(row.timestamp),
-				sequenceNumber: row.sequence_number,
-				causalDeps: JSON.parse(row.causal_deps),
-				schemaVersion: row.schema_version,
-			})
+			allOps.push(deserializeOperationWithCollection(row, collectionName))
 		}
 	}
 
@@ -582,9 +551,7 @@ async function readCollectionRecords(
 	adapter: StorageAdapter,
 	collection: string,
 ): Promise<Record<string, unknown>[]> {
-	return adapter.query<Record<string, unknown>>(
-		`SELECT * FROM ${collection} WHERE _deleted = 0`,
-	)
+	return adapter.query<Record<string, unknown>>(`SELECT * FROM ${collection} WHERE _deleted = 0`)
 }
 
 // ── Crypto helpers ───────────────────────────────────────────────────────────

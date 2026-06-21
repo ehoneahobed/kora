@@ -8,6 +8,42 @@ const IDB_VERSION = 1
 const DUMP_SUFFIX = '::dump'
 
 /**
+ * Returns true when an IndexedDB error indicates storage quota was exceeded.
+ */
+export function isIndexedDbQuotaError(error: unknown): boolean {
+	if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+		return true
+	}
+	if (error instanceof PersistenceError && error.context?.quotaExceeded === true) {
+		return true
+	}
+	if (error instanceof Error && /quota/i.test(error.message)) {
+		return true
+	}
+	return false
+}
+
+function rejectWithIdbError(
+	reject: (reason: unknown) => void,
+	message: string,
+	context: Record<string, unknown>,
+	event: Event,
+): void {
+	const domError = (event.target as IDBRequest | IDBTransaction | undefined)?.error
+	if (domError && isIndexedDbQuotaError(domError)) {
+		reject(
+			new PersistenceError(message, {
+				...context,
+				quotaExceeded: true,
+				cause: domError.message,
+			}),
+		)
+		return
+	}
+	reject(new PersistenceError(message, context))
+}
+
+/**
  * Open the IndexedDB database used for SQLite persistence.
  * Creates the object store on first access.
  */
@@ -45,8 +81,13 @@ export async function saveToIndexedDB(dbName: string, data: Uint8Array): Promise
 			const store = tx.objectStore(IDB_STORE_NAME)
 			store.put(data, dbName)
 			tx.oncomplete = () => resolve()
-			tx.onerror = () =>
-				reject(new PersistenceError(`Failed to save database "${dbName}" to IndexedDB`, { dbName }))
+			tx.onerror = (event) =>
+				rejectWithIdbError(
+					reject,
+					`Failed to save database "${dbName}" to IndexedDB`,
+					{ dbName },
+					event,
+				)
 		})
 	} finally {
 		idb.close()
@@ -64,8 +105,13 @@ export async function saveDumpToIndexedDB(dbName: string, dump: unknown): Promis
 			const store = tx.objectStore(IDB_STORE_NAME)
 			store.put(dump, `${dbName}${DUMP_SUFFIX}`)
 			tx.oncomplete = () => resolve()
-			tx.onerror = () =>
-				reject(new PersistenceError(`Failed to save dump for database "${dbName}"`, { dbName }))
+			tx.onerror = (event) =>
+				rejectWithIdbError(
+					reject,
+					`Failed to save dump for database "${dbName}"`,
+					{ dbName },
+					event,
+				)
 		})
 	} finally {
 		idb.close()
