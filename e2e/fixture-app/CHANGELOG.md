@@ -1,5 +1,13 @@
 # kora-e2e-fixture
 
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies [5d2afa8]
+  - @korajs/react@0.6.1
+  - korajs@0.6.1
+
 ## 0.1.7
 
 ### Patch Changes

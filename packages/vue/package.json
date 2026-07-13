@@ -1,6 +1,6 @@
 {
   "name": "@korajs/vue",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Kora.js Vue 3 composables for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",

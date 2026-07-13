@@ -1,5 +1,12 @@
 # @korajs/server
 
+## 0.6.1
+
+### Patch Changes
+
+- Updated dependencies [5d2afa8]
+  - @korajs/sync@0.6.1
+
 ## 0.6.0
 
 ### Minor Changes
