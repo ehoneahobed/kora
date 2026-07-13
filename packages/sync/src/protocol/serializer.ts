@@ -2,7 +2,10 @@ import { SyncError } from '@korajs/core'
 import type { Operation, VersionVector } from '@korajs/core'
 // protobufjs/minimal is CJS — named ESM imports fail in some runtimes (tsx, Node ESM).
 // Use a default import for the runtime values and type aliases for annotations.
-import protobuf from 'protobufjs/minimal'
+// The explicit .js extension is required: protobufjs has no "exports" map, so
+// Node ESM cannot resolve the extensionless "protobufjs/minimal" subpath
+// (bundlers tolerate it, which is why this only breaks in plain Node).
+import protobuf from 'protobufjs/minimal.js'
 
 type Reader = protobuf.Reader
 type Writer = protobuf.Writer
