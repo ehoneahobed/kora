@@ -1,6 +1,5 @@
 import type { QueryDescriptor } from '@korajs/store'
-import type { SyncEngine } from '@korajs/sync'
-import type { SyncQuerySubset } from '@korajs/sync'
+import type { SyncEngine, SyncQuerySubset } from '@korajs/sync'
 
 /**
  * Extract equality-only WHERE conditions for sync query subset registration.
@@ -8,6 +7,7 @@ import type { SyncQuerySubset } from '@korajs/sync'
  */
 export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQuerySubset | null {
 	const where: Record<string, unknown> = {}
+	const skippedFields: string[] = []
 
 	for (const [field, value] of Object.entries(descriptor.where)) {
 		if (value === null || value === undefined) {
@@ -16,7 +16,16 @@ export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQu
 		}
 		if (typeof value !== 'object' || Array.isArray(value)) {
 			where[field] = value
+			continue
 		}
+		skippedFields.push(field)
+	}
+
+	if (skippedFields.length > 0 && typeof console !== 'undefined') {
+		console.warn(
+			`[Kora] Sync query subset omitted non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. ` +
+				'Only plain equality WHERE clauses are registered for incremental sync.',
+		)
 	}
 
 	if (Object.keys(where).length === 0) {

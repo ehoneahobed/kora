@@ -6,5 +6,5 @@ export default defineConfig({
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['vue', '@korajs/core', '@korajs/store'],
+	external: ['vue', '@korajs/core', '@korajs/store', '@korajs/sync'],
 })

@@ -1,28 +1,5 @@
-import type { KoraEventEmitter, KoraEventType } from '@korajs/core'
-import type { SyncStatusInfo } from '@korajs/sync'
-
-const OFFLINE_STATUS: SyncStatusInfo = Object.freeze({
-	status: 'offline',
-	pendingOperations: 0,
-	lastSyncedAt: null,
-	lastSuccessfulPush: null,
-	lastSuccessfulPull: null,
-	conflicts: 0,
-})
-
-/** Sync-related events that may change {@link SyncStatusInfo}. */
-const SYNC_STATUS_EVENT_TYPES = [
-	'sync:connected',
-	'sync:disconnected',
-	'sync:schema-mismatch',
-	'sync:auth-failed',
-	'sync:sent',
-	'sync:received',
-	'sync:acknowledged',
-	'sync:apply-failed',
-	'sync:diagnostics',
-	'sync:initial-sync-progress',
-] as const satisfies readonly KoraEventType[]
+import type { KoraEventEmitter } from '@korajs/core'
+import { createSyncStatusController, type SyncStatusInfo } from '@korajs/sync'
 
 /**
  * Event-driven sync status snapshot for non-React consumers (`app.sync.status`).
@@ -41,50 +18,22 @@ export function createSyncStatusBridge(
 	emitter: KoraEventEmitter,
 	getSyncEngine: () => { getStatus(): SyncStatusInfo } | null,
 ): SyncStatusBridge {
-	let currentStatus: SyncStatusInfo = OFFLINE_STATUS
-	const listeners = new Set<(status: SyncStatusInfo) => void>()
+	const controller = createSyncStatusController({
+		getSyncEngine,
+		subscribeSyncStatus: null,
+		events: emitter,
+	})
 
-	const refresh = (): void => {
-		const engine = getSyncEngine()
-		const next = engine ? engine.getStatus() : OFFLINE_STATUS
-		const prevSerialized = JSON.stringify(currentStatus)
-		const nextSerialized = JSON.stringify(next)
-		if (prevSerialized === nextSerialized) {
-			return
-		}
-		currentStatus = next
-		for (const listener of listeners) {
-			listener(currentStatus)
-		}
-	}
-
-	const unsubs: Array<() => void> = []
-	for (const type of SYNC_STATUS_EVENT_TYPES) {
-		unsubs.push(emitter.on(type, refresh))
-	}
-
-	const bridge: SyncStatusBridge = {
+	return {
 		get status() {
-			return currentStatus
+			return controller.getSnapshot()
 		},
 		subscribe(listener: (status: SyncStatusInfo) => void): () => void {
-			listeners.add(listener)
-			listener(currentStatus)
-			return () => {
-				listeners.delete(listener)
-			}
+			return controller.subscribe(() => {
+				listener(controller.getSnapshot())
+			})
 		},
-		refresh,
-		destroy(): void {
-			for (const unsub of unsubs) {
-				unsub()
-			}
-			unsubs.length = 0
-			listeners.clear()
-		},
+		refresh: () => controller.refresh(),
+		destroy: () => controller.destroy(),
 	}
-
-	refresh()
-
-	return bridge
 }

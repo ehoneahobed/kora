@@ -1,0 +1,62 @@
+# {{projectName}}
+
+An offline-first application built with [Kora.js](https://ehoneahobed.github.io/kora/).
+
+## Getting Started
+
+```bash
+npm run dev
+```
+
+- **App**: http://localhost:5173
+
+## Project Structure
+
+```
+src/
+  schema.ts        # Schema entry point
+  main.tsx         # App initialization and Kora setup
+  App.tsx          # Main application component
+  modules/
+    todos/
+      todo.schema.ts     # Todo collection definition
+      todo.queries.ts    # Reusable todo query builders
+      todo.mutations.ts  # Todo mutation helpers
+      useTodos.ts        # React hook connecting todos to the UI
+  kora-worker.ts   # SQLite WASM web worker
+  index.css        # Styles
+kora.config.ts     # Kora configuration
+```
+
+In a feature module, `schema` defines data shape, `queries` contain reads only, `mutations` contain
+writes, and `useTodos.ts` is the React binding that exposes todo data and actions to components.
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm run dev` | Start dev server |
+| `npm run build` | Build for production |
+| `npm run preview` | Preview production build |
+
+## Adding Sync
+
+To enable real-time sync across devices, update `src/main.tsx`:
+
+```typescript
+const app = createApp({
+  schema,
+  sync: {
+    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001',
+  },
+  // ...
+})
+```
+
+Then create a `server.ts` and install `@korajs/server`. See the [Sync Configuration guide](https://ehoneahobed.github.io/kora/guide/sync-configuration).
+
+## Learn More
+
+- [Documentation](https://ehoneahobed.github.io/kora/)
+- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration)
+- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design)

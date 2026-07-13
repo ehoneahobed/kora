@@ -1,6 +1,7 @@
 import type { Store } from '@korajs/store'
+import { QueryStoreCache } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
-import { createContext, createElement, useContext, useEffect, useState } from 'react'
+import { createContext, createElement, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { KoraContextValue, KoraProviderProps } from '../types'
 
@@ -9,21 +10,6 @@ const KoraContext = createContext<KoraContextValue | null>(null)
 /**
  * Provides Kora store and optional sync engine to all child components.
  * Must wrap any component that uses Kora hooks (useQuery, useMutation, etc.).
- *
- * Accepts either an `app` prop (recommended) or explicit `store` + `syncEngine` props.
- *
- * When using the `app` prop, KoraProvider waits for `app.ready` before rendering
- * children. A `fallback` prop can be provided to show content while initializing.
- *
- * @example
- * ```typescript
- * // Recommended: pass the app object directly
- * const app = createApp({ schema })
- * <KoraProvider app={app}><App /></KoraProvider>
- *
- * // Advanced: pass store and syncEngine explicitly
- * <KoraProvider store={store} syncEngine={syncEngine}><App /></KoraProvider>
- * ```
  */
 function KoraProvider({
 	app,
@@ -34,9 +20,13 @@ function KoraProvider({
 }: KoraProviderProps): ReactNode {
 	const [resolvedStore, setResolvedStore] = useState<Store | null>(store ?? null)
 	const [resolvedSync, setResolvedSync] = useState<SyncEngine | null>(syncEngine ?? null)
-	// If no app prop, we're using the store prop and are ready immediately
 	const [ready, setReady] = useState(!app)
 	const [initError, setInitError] = useState<Error | null>(null)
+	const fallbackQueryStoreCache = useRef<QueryStoreCache | null>(null)
+
+	if (!fallbackQueryStoreCache.current) {
+		fallbackQueryStoreCache.current = new QueryStoreCache()
+	}
 
 	useEffect(() => {
 		if (!app) return
@@ -59,6 +49,31 @@ function KoraProvider({
 		}
 	}, [app])
 
+	useEffect(() => {
+		return () => {
+			if (!app) {
+				fallbackQueryStoreCache.current?.clear()
+			}
+		}
+	}, [app])
+
+	const contextValue = useMemo<KoraContextValue | null>(() => {
+		if (!resolvedStore) {
+			return null
+		}
+		return {
+			store: resolvedStore,
+			syncEngine: resolvedSync,
+			app: app ?? null,
+			events: app?.events ?? null,
+			subscribeSyncStatus: app?.sync?.subscribeStatus ?? null,
+			queryStoreCache:
+				app && typeof app.getQueryStoreCache === 'function'
+					? app.getQueryStoreCache()
+					: fallbackQueryStoreCache.current!,
+		}
+	}, [resolvedStore, resolvedSync, app])
+
 	if (initError) {
 		return createElement(
 			'div',
@@ -72,27 +87,16 @@ function KoraProvider({
 		return (fallback ?? null) as ReactNode
 	}
 
-	if (!resolvedStore) {
+	if (!contextValue) {
 		throw new Error(
 			'KoraProvider requires either an "app" or "store" prop. ' +
 				'Pass a KoraApp from createApp() or a Store instance.',
 		)
 	}
 
-	const value: KoraContextValue = {
-		store: resolvedStore,
-		syncEngine: resolvedSync,
-		app: app ?? null,
-		events: app?.events ?? null,
-		subscribeSyncStatus: app?.sync?.subscribeStatus ?? null,
-	}
-	return createElement(KoraContext.Provider, { value }, children)
+	return createElement(KoraContext.Provider, { value: contextValue }, children)
 }
 
-/**
- * Internal hook to access the Kora context.
- * Throws if used outside of a KoraProvider.
- */
 function useKoraContext(): KoraContextValue {
 	const context = useContext(KoraContext)
 	if (context === null) {

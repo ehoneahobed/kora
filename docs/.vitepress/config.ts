@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
 	title: 'Kora.js',
 	description: 'Offline-first application framework',
-	base: '/kora/',
+	base: '/',
 	themeConfig: {
 		nav: [
 			{ text: 'Guide', link: '/getting-started' },
@@ -48,6 +48,8 @@ export default defineConfig({
 					{ text: 'Server', link: '/api/server' },
 					{ text: 'Auth', link: '/api/auth' },
 					{ text: 'React', link: '/api/react' },
+					{ text: 'Vue', link: '/api/vue' },
+					{ text: 'Svelte', link: '/api/svelte' },
 					{ text: 'DevTools', link: '/api/devtools' },
 					{ text: 'Test', link: '/api/test' },
 					{ text: 'CLI', link: '/api/cli' },

@@ -1,26 +1,9 @@
 import type { CollectionRecord, QueryBuilder } from '@korajs/store'
-import { useMemo, useRef, useSyncExternalStore } from 'react'
-import { QueryStore } from '../query-store/query-store'
+import { assertQueryReady } from '@korajs/store'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useKoraContext } from '../context/kora-context'
 import type { UseQueryOptions } from '../types'
 
-const APP_NOT_READY_CODE = 'APP_NOT_READY'
-
-function assertQueryReady(query: QueryBuilder<unknown>): void {
-	const descriptor = query.getDescriptor()
-	if (descriptor.collection === '__pending__') {
-		const err = new Error(
-			'Cannot use useQuery() before app.ready. Await app.ready or wrap your UI in <KoraProvider app={app}>.',
-		)
-		err.name = 'AppNotReadyError'
-		Object.assign(err, { code: APP_NOT_READY_CODE })
-		throw err
-	}
-}
-
-/**
- * Frozen empty array returned when the query is disabled or before data loads.
- * Same reference prevents unnecessary re-renders.
- */
 const EMPTY_ARRAY: readonly unknown[] = Object.freeze([])
 
 const noopSubscribe = (_onStoreChange: () => void): (() => void) => {
@@ -29,80 +12,38 @@ const noopSubscribe = (_onStoreChange: () => void): (() => void) => {
 
 /**
  * React hook for reactive queries against the local Kora store.
- *
- * Returns data synchronously from the local store — no loading spinners needed.
- * Re-renders automatically when the query results change due to mutations.
- * Uses `useSyncExternalStore` for React 18+ concurrent mode safety.
- *
- * The generic parameter `T` is inferred from the QueryBuilder, providing
- * full type safety when used with typed collection accessors.
- *
- * @param query - A QueryBuilder instance (e.g., `app.todos.where({ done: false })`)
- * @param options - Optional configuration (e.g., `{ enabled: false }` to skip the query)
- * @returns Readonly array of matching records
- *
- * @example
- * ```typescript
- * const todos = useQuery(app.todos.where({ completed: false }).orderBy('createdAt'))
- * // todos is typed as readonly InferRecord<typeof todoFields>[]
- * ```
  */
 export function useQuery<T = CollectionRecord>(
 	query: QueryBuilder<T>,
 	options?: UseQueryOptions,
 ): readonly T[] {
+	const { queryStoreCache } = useKoraContext()
 	const enabled = options?.enabled !== false
-
-	if (enabled) {
-		assertQueryReady(query)
-	}
-
-	// Compute a stable key from the query descriptor
 	const descriptorKey = JSON.stringify(query.getDescriptor())
+	const queryRef = useRef(query)
+	queryRef.current = query
 
-	// Track the current QueryStore instance
-	const queryStoreRef = useRef<QueryStore<T> | null>(null)
-	const prevKeyRef = useRef<string | null>(null)
+	const [queryStore, setQueryStore] = useState<import('@korajs/store').QueryStore<T> | null>(null)
 
-	// Create or reuse a QueryStore when the descriptor changes
-	const queryStore = useMemo(() => {
+	useEffect(() => {
 		if (!enabled) {
-			// Destroy previous if it exists
-			if (queryStoreRef.current) {
-				queryStoreRef.current.destroy()
-				queryStoreRef.current = null
-			}
-			prevKeyRef.current = null
-			return null
+			setQueryStore(null)
+			return
 		}
 
-		// If descriptor changed, destroy previous and create new
-		if (prevKeyRef.current !== descriptorKey) {
-			if (queryStoreRef.current) {
-				queryStoreRef.current.destroy()
-			}
-			const newStore = new QueryStore<T>(query)
-			queryStoreRef.current = newStore
-			prevKeyRef.current = descriptorKey
-			return newStore
+		const currentQuery = queryRef.current
+		assertQueryReady(currentQuery)
+		const store = queryStoreCache.getOrCreate(currentQuery)
+		setQueryStore(store)
+
+		return () => {
+			queryStoreCache.release(currentQuery as QueryBuilder<unknown>)
+			setQueryStore(null)
 		}
-
-		return queryStoreRef.current
-	}, [descriptorKey, enabled, query])
-
-	// No useEffect cleanup needed: QueryStore's subscribe/unsubscribe cycle
-	// manages the underlying subscription lifetime. When the last listener
-	// detaches (on unmount), the subscription auto-stops. This also makes
-	// the hook resilient to React StrictMode's double-mount cycle.
+	}, [descriptorKey, enabled, queryStoreCache])
 
 	const disabledGetSnapshot = (): readonly T[] => EMPTY_ARRAY as readonly T[]
 
-	// The query object is deliberately excluded from the dependency array.
-	// QueryBuilder instances are ephemeral (created on every render when
-	// developers use inline `app.todos.where({...})`). Using it as a dep
-	// would destroy and recreate the QueryStore on every render, causing
-	// subscription storms. Instead, we only react to the stable descriptor
-	// JSON key, which captures the actual query parameters.
 	return useSyncExternalStore(
 		queryStore ? queryStore.subscribe : noopSubscribe,
 		queryStore ? queryStore.getSnapshot : disabledGetSnapshot,

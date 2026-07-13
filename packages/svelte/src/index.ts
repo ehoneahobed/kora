@@ -1,31 +1,27 @@
-import { KoraError } from '@korajs/core'
-import { getContext, setContext } from 'svelte'
-import type { KoraAppHandle } from './types'
+export type {
+	KoraAppHandle,
+	KoraAppLike,
+	KoraContextValue,
+	UseMutationOptions,
+	UseMutationResult,
+	UseQueryOptions,
+	UseRichTextResult,
+} from './types'
 
-export type { KoraAppHandle } from './types'
+export {
+	getKoraApp,
+	getKoraContext,
+	initKoraProvider,
+	setKoraAppContext,
+	setKoraContext,
+} from './context'
 
-const koraAppContextKey = Symbol('korajs-app')
-
-/**
- * Set the Kora app in Svelte context (call from a root layout or `+layout.svelte`).
- */
-export function setKoraAppContext(koraApp: KoraAppHandle): void {
-	setContext(koraAppContextKey, koraApp)
-}
-
-/**
- * Read the Kora app from Svelte context in child components.
- */
-export function getKoraApp(): KoraAppHandle {
-	const app = getContext<KoraAppHandle | undefined>(koraAppContextKey)
-	if (!app) {
-		throw new KoraError(
-			'getKoraApp() requires setKoraAppContext(koraApp) on an ancestor component.',
-			'KORA_NOT_PROVIDED',
-			{
-				fix: 'In +layout.svelte: setKoraAppContext(kora); await kora.ready before queries.',
-			},
-		)
-	}
-	return app
-}
+export { createQueryStore, useQuery } from './stores/query-store'
+export { createMutation, useMutation } from './composables/use-mutation'
+export { createSyncStatusStore, useSyncStatus } from './composables/use-sync-status'
+export { getApp, useApp } from './composables/use-app'
+export { getCollection, useCollection } from './composables/use-collection'
+export { createRichTextBinding, useRichText } from './composables/use-rich-text'
+export type { UseRichTextOptions } from './composables/use-rich-text'
+export { applyPresence, usePresence } from './composables/use-presence'
+export { createCollaboratorsStore, useCollaborators } from './composables/use-collaborators'

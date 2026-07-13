@@ -59,6 +59,12 @@ export type { CollectionAccessor } from './store/store'
 
 // === Query ===
 export { QueryBuilder } from './query/query-builder'
+export { QueryStore } from './reactivity/query-store'
+export { assertQueryReady } from './reactivity/assert-query-ready'
+export {
+	getSharedQueryStoreCache,
+	QueryStoreCache,
+} from './reactivity/query-store-cache'
 
 // === Subscription ===
 export { SubscriptionManager } from './subscription/subscription-manager'
@@ -87,6 +93,18 @@ export type {
 
 // === Sequences ===
 export { SequenceManager } from './sequences/sequence-manager'
+
+// === Richtext controller (framework bindings) ===
+export { createRichTextController } from './richtext/create-richtext-controller'
+export { asRichTextSyncEngine } from './richtext/as-rich-text-sync-engine'
+export type {
+	CreateRichTextControllerOptions,
+	RichTextAwarenessUser,
+	RichTextController,
+	RichTextControllerSnapshot,
+	RichTextCursorInfo,
+	RichTextSyncEngine,
+} from './richtext/types'
 
 // === Richtext Serialization ===
 export {

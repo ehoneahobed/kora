@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
@@ -205,5 +206,45 @@ describe('scaffoldTemplate', () => {
 		const app = await readFile(join(targetDir, 'src', 'App.tsx'), 'utf-8')
 		expect(app).toContain('lucide-react')
 		expect(app).toContain('useSyncStatus')
+	})
+
+	test('scaffolds vue-sync template with Vue composables', async () => {
+		const targetDir = join(tempDir.path, 'vue-sync-app')
+		await scaffoldTemplate('vue-sync', targetDir, {
+			projectName: 'vue-sync-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.6.0',
+		})
+
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('@korajs/vue')
+		expect(pkg).toContain('"vue"')
+
+		const main = await readFile(join(targetDir, 'src', 'main.ts'), 'utf-8')
+		expect(main).toContain('KoraProvider')
+		expect(main).toContain('sync')
+
+		expect(existsSync(join(targetDir, 'src', 'App.vue'))).toBe(true)
+		expect(existsSync(join(targetDir, 'server.ts'))).toBe(true)
+	})
+
+	test('scaffolds svelte-basic template with Svelte stores', async () => {
+		const targetDir = join(tempDir.path, 'svelte-basic-app')
+		await scaffoldTemplate('svelte-basic', targetDir, {
+			projectName: 'svelte-basic-app',
+			packageManager: 'pnpm',
+			koraVersion: '0.6.0',
+		})
+
+		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
+		expect(pkg).toContain('@korajs/svelte')
+		expect(pkg).toContain('"svelte"')
+
+		const main = await readFile(join(targetDir, 'src', 'main.ts'), 'utf-8')
+		expect(main).toContain('Root.svelte')
+		expect(main).not.toContain('sync')
+
+		expect(existsSync(join(targetDir, 'src', 'App.svelte'))).toBe(true)
+		expect(existsSync(join(targetDir, 'src', 'Root.svelte'))).toBe(true)
 	})
 })

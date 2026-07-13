@@ -520,7 +520,7 @@ flowchart LR
 - [x] 4.1.3 onSyncEvent callback
 - [x] 4.1.4 Actionable KoraError
 - [x] 4.1.5 Init validation
-- [x] 4.1.6 Vue/Svelte stub (`@korajs/vue`, `@korajs/svelte`)
+- [x] 4.1.6 Vue/Svelte bindings (`@korajs/vue`, `@korajs/svelte` — full composables + shared `QueryStore` / `createRichTextController`)
 - [x] 4.2.1 Event-driven useSyncStatus
 - [x] 4.2.2 useQuery ready behavior
 - [x] 4.2.3 Optimistic useMutation

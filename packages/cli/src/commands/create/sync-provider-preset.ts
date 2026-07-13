@@ -58,7 +58,13 @@ export async function applySyncProviderPreset(options: SyncProviderPresetOptions
 
 function isSyncTemplate(template: TemplateName): boolean {
 	return (
-		template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+		template === 'react-sync' ||
+		template === 'react-tailwind-sync' ||
+		template === 'vue-sync' ||
+		template === 'vue-tailwind-sync' ||
+		template === 'svelte-sync' ||
+		template === 'svelte-tailwind-sync' ||
+		template === 'tauri-react'
 	)
 }
 

@@ -12,6 +12,7 @@ describe('determineTemplateFromSelections', () => {
 	test('returns sync tailwind template when enabled', () => {
 		const template = determineTemplateFromSelections({
 			platform: 'web',
+			framework: 'react',
 			tailwind: true,
 			sync: true,
 			db: 'sqlite',
@@ -22,6 +23,7 @@ describe('determineTemplateFromSelections', () => {
 	test('returns local-only template when sync disabled', () => {
 		const template = determineTemplateFromSelections({
 			platform: 'web',
+			framework: 'react',
 			tailwind: false,
 			sync: false,
 			db: 'none',
@@ -32,6 +34,7 @@ describe('determineTemplateFromSelections', () => {
 	test('treats db none as local-only even if sync true', () => {
 		const template = determineTemplateFromSelections({
 			platform: 'web',
+			framework: 'react',
 			tailwind: false,
 			sync: true,
 			db: 'none',
@@ -39,9 +42,54 @@ describe('determineTemplateFromSelections', () => {
 		expect(template).toBe('react-basic')
 	})
 
+	test('returns vue-sync for vue with sync enabled', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'web',
+			framework: 'vue',
+			tailwind: false,
+			sync: true,
+			db: 'sqlite',
+		})
+		expect(template).toBe('vue-sync')
+	})
+
+	test('returns svelte-basic for svelte without sync', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'web',
+			framework: 'svelte',
+			tailwind: false,
+			sync: false,
+			db: 'none',
+		})
+		expect(template).toBe('svelte-basic')
+	})
+
+	test('returns vue-tailwind-sync when tailwind and sync enabled', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'web',
+			framework: 'vue',
+			tailwind: true,
+			sync: true,
+			db: 'sqlite',
+		})
+		expect(template).toBe('vue-tailwind-sync')
+	})
+
+	test('returns svelte-tailwind for svelte with tailwind only', () => {
+		const template = determineTemplateFromSelections({
+			platform: 'web',
+			framework: 'svelte',
+			tailwind: true,
+			sync: false,
+			db: 'none',
+		})
+		expect(template).toBe('svelte-tailwind')
+	})
+
 	test('returns tauri-react for desktop-tauri platform', () => {
 		const template = determineTemplateFromSelections({
 			platform: 'desktop-tauri',
+			framework: 'react',
 			tailwind: true,
 			sync: true,
 			db: 'sqlite',
@@ -52,6 +100,7 @@ describe('determineTemplateFromSelections', () => {
 	test('tauri-react ignores tailwind and sync settings', () => {
 		const template = determineTemplateFromSelections({
 			platform: 'desktop-tauri',
+			framework: 'react',
 			tailwind: false,
 			sync: false,
 			db: 'none',

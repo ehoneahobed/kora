@@ -21,6 +21,11 @@ export type {
 	CreateKoraAuthSyncOptions,
 	KoraAuthSyncBinding,
 } from './client/auth-sync'
+export type { AuthSyncBinding } from '@korajs/core/bindings'
+export { createAuthSession } from './bindings/create-auth-session'
+export type { AuthSession, AuthSessionSnapshot } from './bindings/create-auth-session'
+export { createOrgSession, checkOrgPermission } from './bindings/create-org-session'
+export type { OrgSession, OrgSnapshot } from './bindings/create-org-session'
 export { AuthDeviceIdentityError, createPersistentDeviceIdentity } from './client/device-session'
 export type {
 	AuthDeviceIdentity,

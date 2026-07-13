@@ -188,7 +188,7 @@ const app = createApp({
 | `schema` | `SchemaDefinition` | No | When set, builds scope map from JWT claims via `extractScopeValuesFromClaims()` |
 | `scopeFromClaims` | `(claims) => Record<string, unknown>` | No | Custom claim → flat scope value mapping |
 
-Returns `KoraAuthSyncBinding`:
+Returns `AuthSyncBinding` (alias: `KoraAuthSyncBinding`, deprecated):
 
 | Method | Description |
 |--------|-------------|

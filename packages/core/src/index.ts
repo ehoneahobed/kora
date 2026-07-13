@@ -37,6 +37,7 @@ export { CONNECTION_QUALITIES, MERGE_STRATEGIES } from './types'
 
 // === Errors ===
 export {
+	AppNotReadyError,
 	ClockDriftError,
 	KoraError,
 	MergeConflictError,

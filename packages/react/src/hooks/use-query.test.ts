@@ -1,12 +1,21 @@
 import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
+import type { Store } from '@korajs/store'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
-import { StrictMode, createElement, useState } from 'react'
+import { StrictMode, createElement, useState, type ReactElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { KoraProvider } from '../context/kora-context'
 import { useQuery } from './use-query'
 
 afterEach(() => {
 	cleanup()
 })
+
+function renderWithProvider(ui: ReactElement) {
+	const store = {
+		collection: vi.fn(),
+	} as unknown as Store
+	return render(createElement(KoraProvider, { store }, ui))
+}
 
 interface MockQueryBuilderResult {
 	queryBuilder: QueryBuilder
@@ -25,7 +34,6 @@ function createMockQueryBuilder(
 	const queryBuilder = {
 		subscribe: vi.fn((callback: SubscriptionCallback<CollectionRecord>) => {
 			capturedCallback = callback
-			// Simulate registerAndFetch: immediate callback with initial results
 			callback(initialResults)
 			return unsubscribeSpy
 		}),
@@ -45,7 +53,6 @@ function createRecord(id: string, data: Record<string, unknown> = {}): Collectio
 	return { id, createdAt: 1000, updatedAt: 1000, ...data }
 }
 
-/** Component that renders query results */
 function QueryRenderer({ query }: { query: QueryBuilder }): ReturnType<typeof createElement> {
 	const results = useQuery(query)
 	return createElement(
@@ -58,8 +65,7 @@ function QueryRenderer({ query }: { query: QueryBuilder }): ReturnType<typeof cr
 describe('useQuery', () => {
 	it('returns empty array initially before subscription fires', () => {
 		const { queryBuilder } = createMockQueryBuilder()
-		// With synchronous callback in subscribe mock, data appears immediately
-		render(createElement(QueryRenderer, { query: queryBuilder }))
+		renderWithProvider(createElement(QueryRenderer, { query: queryBuilder }))
 		expect(screen.getByTestId('results')).toBeDefined()
 	})
 
@@ -67,7 +73,7 @@ describe('useQuery', () => {
 		const records = [createRecord('1'), createRecord('2')]
 		const { queryBuilder } = createMockQueryBuilder(records)
 
-		render(createElement(QueryRenderer, { query: queryBuilder }))
+		renderWithProvider(createElement(QueryRenderer, { query: queryBuilder }))
 
 		expect(screen.getByTestId('results').textContent).toBe('["1","2"]')
 	})
@@ -75,7 +81,7 @@ describe('useQuery', () => {
 	it('re-renders when data changes', () => {
 		const { queryBuilder, triggerCallback } = createMockQueryBuilder([createRecord('1')])
 
-		render(createElement(QueryRenderer, { query: queryBuilder }))
+		renderWithProvider(createElement(QueryRenderer, { query: queryBuilder }))
 		expect(screen.getByTestId('results').textContent).toBe('["1"]')
 
 		act(() => {
@@ -94,20 +100,18 @@ describe('useQuery', () => {
 			return createElement('div', { 'data-testid': 'results' }, String(results.length))
 		}
 
-		render(createElement(DisabledQuery))
+		renderWithProvider(createElement(DisabledQuery))
 		expect(screen.getByTestId('results').textContent).toBe('0')
-		// Should not have subscribed
 		expect(queryBuilder.subscribe).not.toHaveBeenCalled()
 	})
 
 	it('cleans up subscription on unmount', () => {
 		const { queryBuilder, unsubscribeSpy } = createMockQueryBuilder([createRecord('1')])
 
-		const { unmount } = render(createElement(QueryRenderer, { query: queryBuilder }))
+		const { unmount } = renderWithProvider(createElement(QueryRenderer, { query: queryBuilder }))
 
 		unmount()
 
-		// The QueryStore should have been destroyed, which calls unsubscribe
 		expect(unsubscribeSpy).toHaveBeenCalled()
 	})
 
@@ -147,7 +151,7 @@ describe('useQuery', () => {
 			)
 		}
 
-		render(createElement(DynamicQuery))
+		renderWithProvider(createElement(DynamicQuery))
 		expect(screen.getByTestId('results').textContent).toBe('["1"]')
 
 		act(() => {
@@ -162,7 +166,7 @@ describe('useQuery', () => {
 	it('subscribes to QueryBuilder', () => {
 		const { queryBuilder } = createMockQueryBuilder([createRecord('1')])
 
-		render(createElement(QueryRenderer, { query: queryBuilder }))
+		renderWithProvider(createElement(QueryRenderer, { query: queryBuilder }))
 
 		expect(queryBuilder.subscribe).toHaveBeenCalledTimes(1)
 	})
@@ -170,9 +174,10 @@ describe('useQuery', () => {
 	it('keeps receiving updates through StrictMode remount', async () => {
 		const { queryBuilder, triggerCallback } = createMockQueryBuilder([createRecord('1')])
 
-		render(createElement(StrictMode, null, createElement(QueryRenderer, { query: queryBuilder })))
+		renderWithProvider(
+			createElement(StrictMode, null, createElement(QueryRenderer, { query: queryBuilder })),
+		)
 
-		// StrictMode may tear down and re-subscribe; final mount must stay live.
 		expect(queryBuilder.subscribe).toHaveBeenCalled()
 
 		act(() => {
@@ -196,6 +201,6 @@ describe('useQuery', () => {
 			return createElement('div', null)
 		}
 
-		expect(() => render(createElement(PendingQuery))).toThrow(/app\.ready/)
+		expect(() => renderWithProvider(createElement(PendingQuery))).toThrow(/app\.ready/)
 	})
 })

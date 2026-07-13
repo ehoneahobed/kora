@@ -85,6 +85,18 @@ export class StorageError extends KoraError {
 }
 
 /**
+ * Thrown when collection/query APIs are used before {@link KoraApp.ready} resolves.
+ */
+export class AppNotReadyError extends KoraError {
+	constructor(detail: string) {
+		super(detail, 'APP_NOT_READY', {
+			fix: 'Await app.ready, or wrap your UI in <KoraProvider app={app}> before calling useQuery().',
+		})
+		this.name = 'AppNotReadyError'
+	}
+}
+
+/**
  * Thrown when the HLC detects excessive clock drift.
  * Drift > 60s: warning. Drift > 5min: this error is thrown, refusing to generate timestamps.
  */

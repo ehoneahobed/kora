@@ -1,33 +1,43 @@
 import { KoraError } from '@korajs/core'
-import { type App, type InjectionKey, inject } from 'vue'
-import type { KoraAppHandle } from './types'
+import { type App, inject } from 'vue'
+import { koraAppInjectionKey } from './context'
+import type { KoraAppLike } from './types'
 
-export type { KoraAppHandle } from './types'
+export type { KoraAppHandle, KoraAppLike, KoraContextValue, KoraProviderProps } from './types'
+export type { UseMutationOptions, UseMutationResult, UseQueryOptions, UseRichTextResult } from './types'
 
-/** Vue injection key for the root Kora app instance. */
-export const koraAppInjectionKey: InjectionKey<KoraAppHandle> = Symbol('korajs-app')
+export { koraAppInjectionKey, koraContextKey, useKoraContext } from './context'
+export { KoraProvider } from './components/kora-provider'
+export { useQuery } from './composables/use-query'
+export { useMutation } from './composables/use-mutation'
+export { useSyncStatus } from './composables/use-sync-status'
+export { useApp } from './composables/use-app'
+export { useCollection } from './composables/use-collection'
+export { useRichText } from './composables/use-rich-text'
+export type { UseRichTextOptions } from './composables/use-rich-text'
+export { usePresence, useCollaborators } from './composables/use-presence'
 
 /**
  * Register a Kora app on a Vue application instance.
- * Call once after `createApp()` from korajs, typically in `main.ts`.
+ *
+ * @deprecated Prefer {@link KoraProvider} — `installKora` does not provide reactive
+ * hook context (`useQuery`, `useSyncStatus`, etc.) until you migrate to `KoraProvider`.
  */
-export function installKora(vueApp: App, koraApp: KoraAppHandle): void {
+export function installKora(vueApp: App, koraApp: KoraAppLike): void {
 	vueApp.provide(koraAppInjectionKey, koraApp)
 }
 
 /**
- * Access the Kora app from a component setup function.
- * Pair with {@link installKora} and `app.ready` before running queries.
+ * Access the Kora app from a component when using {@link installKora} only.
+ * For reactive hooks, use {@link useApp} inside {@link KoraProvider}.
  */
-export function useKoraApp(): KoraAppHandle {
+export function useKoraApp(): KoraAppLike {
 	const app = inject(koraAppInjectionKey)
 	if (!app) {
 		throw new KoraError(
-			'useKoraApp() requires installKora(vueApp, koraApp) on the Vue application.',
+			'useKoraApp() requires installKora(vueApp, koraApp) or <KoraProvider :app="app">.',
 			'KORA_NOT_PROVIDED',
-			{
-				fix: 'In main.ts: const kora = createApp({ schema }); installKora(vueApp, kora); await kora.ready',
-			},
+			{ fix: 'Use <KoraProvider :app="app"> and useApp() for full bindings.' },
 		)
 	}
 	return app

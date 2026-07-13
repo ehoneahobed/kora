@@ -45,6 +45,24 @@ describe('createCompatibilityLayerPlan', () => {
 			expect(plan.layers[0]?.category).toBe('base')
 		}
 	})
+
+	test('creates single-layer plans for vue and svelte templates', () => {
+		for (const template of [
+			'vue-sync',
+			'vue-basic',
+			'vue-tailwind-sync',
+			'vue-tailwind',
+			'svelte-sync',
+			'svelte-basic',
+			'svelte-tailwind-sync',
+			'svelte-tailwind',
+		] as const) {
+			const plan = createCompatibilityLayerPlan(template)
+			expect(plan.compatibilityTarget).toBe(template)
+			expect(plan.layers).toHaveLength(1)
+			expect(plan.layers[0]?.sourceTemplate).toBe(template)
+		}
+	})
 })
 
 describe('composeTemplateLayers', () => {

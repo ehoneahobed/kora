@@ -9,6 +9,7 @@ import type {
 	SchemaInput,
 	SequenceConfig,
 } from '@korajs/core'
+import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type { FieldBuilder } from '@korajs/core'
 import type {
 	AuditExportOptions,
@@ -56,21 +57,9 @@ export interface StoreOptions {
 
 /**
  * Pre-built auth binding from `createKoraAuthSync()` in `@korajs/auth`.
- * Wires token refresh, JWT scope maps, and device-bound sync node ids.
+ * Canonical definition lives in `@korajs/core/bindings`.
  */
-export interface AuthSyncBinding {
-	/** Returns the access token for sync handshake (empty string when signed out). */
-	auth: () => Promise<{ token: string }>
-	/** Builds a scope map from the current token and schema. */
-	resolveScopeMap?: () => Promise<Record<string, Record<string, unknown>> | undefined>
-	/**
-	 * Returns the device-bound sync node id from the token `dev` claim.
-	 * Separate from the user id (`sub`).
-	 */
-	resolveNodeId?: () => Promise<string | undefined>
-	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
-	subscribe?: (listener: () => void) => () => void
-}
+export type { AuthSyncBinding }
 
 /**
  * Sync configuration within createApp.
@@ -263,6 +252,8 @@ export interface KoraApp {
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
+	/** Per-app reference-counted cache for framework query subscriptions. */
+	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
 	/**
@@ -359,6 +350,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
 	getSyncEngine(): SyncEngine | null
+	/** Per-app reference-counted cache for framework query subscriptions. */
+	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
 	/** Execute multiple mutations atomically within a transaction. */

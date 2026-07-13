@@ -6,5 +6,5 @@ export default defineConfig({
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['svelte', '@korajs/core', '@korajs/store'],
+	external: ['svelte', 'svelte/store', '@korajs/core', '@korajs/store', '@korajs/sync'],
 })

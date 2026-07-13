@@ -49,29 +49,32 @@ Conflicts are resolved automatically. No distributed systems code required.
 
 ## React Integration
 
-Install `@korajs/react` alongside this package (`pnpm add @korajs/react`):
+Install `@korajs/react` or import from `korajs/react`:
 
 ```tsx
-import { KoraProvider, useQuery, useMutation } from '@korajs/react'
-
-function App() {
-  return (
-    <KoraProvider app={app}>
-      <TodoList />
-    </KoraProvider>
-  )
-}
-
-function TodoList() {
-  const todos = useQuery(app.todos.where({ completed: false }))
-  const addTodo = useMutation(app.todos.insert)
-  return todos.map((todo) => <div key={todo.id}>{todo.title}</div>)
-}
+import { KoraProvider, useQuery, useMutation } from 'korajs/react'
 ```
+
+## Vue 3 Integration
+
+```typescript
+import { KoraProvider, useQuery, useMutation } from 'korajs/vue'
+```
+
+Requires `vue` and `@korajs/vue` as peer dependencies.
+
+## Svelte Integration
+
+```typescript
+import { createQueryStore, useQuery, useMutation } from 'korajs/svelte'
+import KoraProvider from '@korajs/svelte/KoraProvider.svelte'
+```
+
+Requires `svelte` and `@korajs/svelte` as peer dependencies. Wrap your app with `<KoraProvider app={kora}>` (see `@korajs/svelte` README).
 
 ## Packages
 
-`@korajs/core` | `@korajs/store` | `@korajs/merge` | `@korajs/sync` | `@korajs/server` | `@korajs/react` | `@korajs/devtools` | `@korajs/cli`
+`@korajs/core` | `@korajs/store` | `@korajs/merge` | `@korajs/sync` | `@korajs/server` | `@korajs/react` | `@korajs/vue` | `@korajs/svelte` | `@korajs/devtools` | `@korajs/cli`
 
 ## License
 

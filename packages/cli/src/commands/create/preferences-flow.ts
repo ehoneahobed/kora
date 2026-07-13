@@ -154,8 +154,8 @@ export async function resolveCreatePreferencesFlow(params: {
 		} else if (!flags.useDefaults && !usedStoredPreferences) {
 			effective.framework = await prompts.select('UI framework:', [
 				{ label: 'React', value: 'react' },
-				{ label: 'Vue (coming soon)', value: 'vue', disabled: true },
-				{ label: 'Svelte (coming soon)', value: 'svelte', disabled: true },
+				{ label: 'Vue 3', value: 'vue' },
+				{ label: 'Svelte 5', value: 'svelte' },
 				{ label: 'Solid (coming soon)', value: 'solid', disabled: true },
 			])
 		}
@@ -226,6 +226,7 @@ export async function resolveCreatePreferencesFlow(params: {
 
 	const template = determineTemplateFromSelections({
 		platform: effective.platform,
+		framework: effective.framework,
 		tailwind: effective.tailwind,
 		sync: effective.sync,
 		db: effective.db,

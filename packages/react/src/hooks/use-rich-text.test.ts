@@ -64,12 +64,13 @@ function createMockStore(collections: Record<string, CollectionAccessor>): Store
 
 describe('useRichText', () => {
 	test('loads a record richtext field into Y.Text', async () => {
+		const helloBody = encodeText('Hello')
 		const notes = {
-			findById: vi.fn(async () => ({ id: 'rec-1', body: encodeText('Hello') })),
+			findById: vi.fn(async () => ({ id: 'rec-1', body: helloBody })),
 			update: vi.fn(),
 			insert: vi.fn(),
 			delete: vi.fn(),
-			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: encodeText('Hello') }])),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: helloBody }])),
 		} as unknown as CollectionAccessor
 
 		const store = createMockStore({ notes })

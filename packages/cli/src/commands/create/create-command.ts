@@ -28,6 +28,7 @@ import {
 	saveResolvedPreferences,
 	shouldSavePreferences,
 } from './preferences-flow'
+import { isSupportedWebFramework } from './options'
 import { validateProjectName } from './project-name'
 import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
@@ -54,7 +55,7 @@ export const createCommand = defineCommand({
 		template: {
 			type: 'string',
 			description:
-				'Project template (react-tailwind-sync, react-tailwind, react-sync, react-basic, tauri-react)',
+				'Project template (react-tailwind-sync, react-sync, vue-sync, svelte-sync, tauri-react, ...)',
 		},
 		pm: {
 			type: 'string',
@@ -146,8 +147,10 @@ export const createCommand = defineCommand({
 				prompts,
 				store: preferenceStore,
 			})
-			if (selection.framework !== 'react') {
-				logger.error(`Framework "${selection.framework}" is not available yet. Use "react".`)
+			if (!isSupportedWebFramework(selection.framework)) {
+				logger.error(
+					`Framework "${selection.framework}" is not available yet. Use react, vue, or svelte.`,
+				)
 				if (!useDefaults) {
 					prompts.outro('Project creation aborted.')
 				}
@@ -314,7 +317,13 @@ function isValidPackageManager(value: string): value is PackageManager {
 
 function isSyncTemplate(template: TemplateName): boolean {
 	return (
-		template === 'react-sync' || template === 'react-tailwind-sync' || template === 'tauri-react'
+		template === 'react-sync' ||
+		template === 'react-tailwind-sync' ||
+		template === 'vue-sync' ||
+		template === 'vue-tailwind-sync' ||
+		template === 'svelte-sync' ||
+		template === 'svelte-tailwind-sync' ||
+		template === 'tauri-react'
 	)
 }
 

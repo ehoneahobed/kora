@@ -1,44 +1,74 @@
 {
   "name": "@korajs/svelte",
-  "version": "0.5.0",
-  "description": "Experimental Svelte bindings stub for Kora.js (context helpers)",
+  "version": "0.6.0",
+  "description": "Kora.js Svelte bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "svelte": "./dist/index.js",
   "exports": {
     ".": {
-      "import": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "require": {
-        "types": "./dist/index.d.cts",
-        "default": "./dist/index.cjs"
-      }
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./KoraQuery.svelte": {
+      "svelte": "./src/components/KoraQuery.svelte",
+      "import": "./dist/components/KoraQuery.js",
+      "default": "./dist/components/KoraQuery.js"
+    },
+    "./KoraRichText.svelte": {
+      "svelte": "./src/components/KoraRichText.svelte",
+      "import": "./dist/components/KoraRichText.js",
+      "default": "./dist/components/KoraRichText.js"
+    },
+    "./KoraProvider.svelte": {
+      "svelte": "./src/components/KoraProvider.svelte",
+      "import": "./dist/components/KoraProvider.js",
+      "default": "./dist/components/KoraProvider.js"
+    },
+    "./KoraStoreProvider.svelte": {
+      "svelte": "./src/components/KoraStoreProvider.svelte",
+      "import": "./dist/components/KoraStoreProvider.js",
+      "default": "./dist/components/KoraStoreProvider.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src/components/KoraQuery.svelte",
+    "src/components/KoraRichText.svelte",
+    "src/components/KoraProvider.svelte",
+    "src/components/KoraStoreProvider.svelte"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/build-components.mjs",
     "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/",
-    "clean": "rm -rf dist .turbo"
+    "clean": "rm -rf dist .turbo coverage"
   },
   "peerDependencies": {
     "svelte": "^4.0.0 || ^5.0.0"
   },
   "dependencies": {
     "@korajs/core": "workspace:*",
-    "@korajs/store": "workspace:*"
+    "@korajs/store": "workspace:*",
+    "@korajs/sync": "workspace:*",
+    "yjs": "^13.6.30"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@testing-library/svelte": "^5.2.6",
+    "@testing-library/user-event": "^14.6.1",
+    "happy-dom": "^17.4.4",
+    "svelte": "^5.0.0",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
-    "svelte": "^5.0.0"
+    "vitest": "^3.0.4"
   },
   "license": "MIT"
 }

@@ -126,6 +126,48 @@ export function createCompatibilityLayerPlan(templateName: TemplateName): Templa
 					authLayer,
 				],
 			}
+		case 'vue-sync':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'vue-sync', sourceTemplate: 'vue-sync' }],
+			}
+		case 'vue-basic':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'vue-basic', sourceTemplate: 'vue-basic' }],
+			}
+		case 'svelte-sync':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'svelte-sync', sourceTemplate: 'svelte-sync' }],
+			}
+		case 'svelte-basic':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'svelte-basic', sourceTemplate: 'svelte-basic' }],
+			}
+		case 'vue-tailwind-sync':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'vue-tailwind-sync', sourceTemplate: 'vue-tailwind-sync' }],
+			}
+		case 'vue-tailwind':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'vue-tailwind', sourceTemplate: 'vue-tailwind' }],
+			}
+		case 'svelte-tailwind-sync':
+			return {
+				compatibilityTarget: templateName,
+				layers: [
+					{ category: 'base', name: 'svelte-tailwind-sync', sourceTemplate: 'svelte-tailwind-sync' },
+				],
+			}
+		case 'svelte-tailwind':
+			return {
+				compatibilityTarget: templateName,
+				layers: [{ category: 'base', name: 'svelte-tailwind', sourceTemplate: 'svelte-tailwind' }],
+			}
 	}
 }
 

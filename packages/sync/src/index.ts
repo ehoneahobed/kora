@@ -172,3 +172,18 @@ export {
 	deriveVersionedKey,
 	generateSalt,
 } from './encryption/key-derivation'
+
+export {
+	createSyncStatusController,
+	OFFLINE_SYNC_STATUS,
+} from './reactivity/sync-status-controller'
+export type {
+	SyncStatusController,
+	SyncStatusControllerOptions,
+} from './reactivity/sync-status-controller'
+
+export {
+	getRemoteAwarenessStates,
+	subscribeRemoteAwarenessStates,
+} from './reactivity/collaborators-snapshot'
+

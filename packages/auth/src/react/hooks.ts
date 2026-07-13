@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useContext, useSyncExternalStore } from 'react'
 import type {
 	AuthState,
 	AuthUser,
@@ -9,19 +9,7 @@ import type {
 } from '../client/auth-client'
 import { AuthContext } from './auth-context'
 
-// ---------------------------------------------------------------------------
-// Internal context accessor
-// ---------------------------------------------------------------------------
-
-/**
- * Internal hook that reads and validates the AuthContext.
- * Throws a descriptive error if used outside an AuthProvider.
- */
-function useAuthContext(): {
-	client: import('../client/auth-client').AuthClient
-	state: AuthState
-	isLoading: boolean
-} {
+function useAuthContext() {
 	const ctx = useContext(AuthContext)
 	if (ctx === null) {
 		throw new Error(
@@ -32,24 +20,10 @@ function useAuthContext(): {
 	return ctx
 }
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/**
- * Return value of the {@link useAuth} hook.
- */
 interface UseAuthResult {
-	/** Current authenticated user, or null if not signed in */
 	user: AuthUser | null
-
-	/** Whether the user is currently authenticated */
 	isAuthenticated: boolean
-
-	/** Whether the auth client is still initializing (restoring session) */
 	isLoading: boolean
-
-	/** Sign up a new user account */
 	signUp: (params: {
 		email: string
 		password: string
@@ -57,354 +31,78 @@ interface UseAuthResult {
 		deviceId?: string
 		devicePublicKey?: string
 	}) => Promise<void>
-
-	/** Sign in with email and password */
 	signIn: (params: {
 		email: string
 		password: string
 		deviceId?: string
 		devicePublicKey?: string
 	}) => Promise<void>
-
-	/** Start OAuth sign-in. Web apps can redirect; desktop/mobile can open the returned URL. */
 	signInWithOAuth: (
 		provider: string,
 		options?: OAuthAuthorizationOptions,
 	) => Promise<OAuthAuthorizationResult>
-
-	/** Complete an OAuth sign-in callback with code and state. */
 	completeOAuthSignIn: (provider: string, params: OAuthCallbackParams) => Promise<void>
-
-	/** Create an OAuth authorization URL without redirecting. */
 	getOAuthAuthorizationUrl: (
 		provider: string,
 		options?: OAuthAuthorizationOptions,
 	) => Promise<OAuthAuthorizationResult>
-
-	/** Link an OAuth provider to the current user. */
 	linkOAuth: (provider: string, params: OAuthCallbackParams) => Promise<LinkedOAuthAccount | null>
-
-	/** List OAuth accounts linked to the current user. */
 	listLinkedAccounts: () => Promise<LinkedOAuthAccount[]>
-
-	/** Unlink an OAuth provider from the current user. */
 	unlinkOAuth: (provider: string) => Promise<void>
-
-	/** Sign out the current user */
 	signOut: () => Promise<void>
-
-	/** Last error message from a sign-up, sign-in, or sign-out attempt, or null */
 	error: string | null
+	initError: Error | null
 }
 
-/**
- * Auth status information returned by {@link useAuthStatus}.
- */
 interface AuthStatus {
-	/** Current authentication state */
 	state: AuthState
-
-	/** Whether the user is currently authenticated */
 	isAuthenticated: boolean
-
-	/** Whether the auth client is still initializing */
 	isLoading: boolean
 }
 
-// ---------------------------------------------------------------------------
-// useAuth
-// ---------------------------------------------------------------------------
+function useAuthSessionSnapshot() {
+	const { session } = useAuthContext()
 
-/**
- * React hook providing full authentication functionality.
- *
- * Returns the current user, loading state, error state, and methods for
- * sign-up, sign-in, and sign-out. Re-renders when auth state changes.
- *
- * Must be used within an {@link AuthProvider}.
- *
- * @returns An object with user info, auth methods, and status flags
- *
- * @example
- * ```typescript
- * function LoginPage() {
- *   const { user, isAuthenticated, isLoading, signIn, error } = useAuth()
- *
- *   if (isLoading) return <div>Loading...</div>
- *   if (isAuthenticated) return <div>Welcome, {user?.name}</div>
- *
- *   return (
- *     <form onSubmit={async (e) => {
- *       e.preventDefault()
- *       await signIn({ email: 'user@example.com', password: 'secret' })
- *     }}>
- *       {error && <p>{error}</p>}
- *       <button type="submit">Sign In</button>
- *     </form>
- *   )
- * }
- * ```
- */
+	return useSyncExternalStore(
+		(onStoreChange) => session.subscribe(onStoreChange),
+		() => session.getSnapshot(),
+		() => session.getSnapshot(),
+	)
+}
+
 function useAuth(): UseAuthResult {
-	const { client, state, isLoading } = useAuthContext()
-	const [error, setError] = useState<string | null>(null)
-
-	// Use useSyncExternalStore to track the user reactively via auth state changes
-	const userSnapshotRef = useRef<AuthUser | null>(client.currentUser)
-	const stateSerializedRef = useRef<string>(JSON.stringify(client.currentUser))
-
-	const subscribe = useCallback(
-		(onStoreChange: () => void): (() => void) => {
-			return client.onAuthChange(() => {
-				const newUser = client.currentUser
-				const newSerialized = JSON.stringify(newUser)
-				if (newSerialized !== stateSerializedRef.current) {
-					userSnapshotRef.current = newUser
-					stateSerializedRef.current = newSerialized
-					onStoreChange()
-				}
-			})
-		},
-		[client],
-	)
-
-	const getSnapshot = useCallback((): AuthUser | null => {
-		return userSnapshotRef.current
-	}, [])
-
-	const user = useSyncExternalStore(subscribe, getSnapshot)
-
-	const signUp = useCallback(
-		async (params: {
-			email: string
-			password: string
-			name?: string
-			deviceId?: string
-			devicePublicKey?: string
-		}): Promise<void> => {
-			setError(null)
-			try {
-				await client.signUp(params)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-			}
-		},
-		[client],
-	)
-
-	const signIn = useCallback(
-		async (params: {
-			email: string
-			password: string
-			deviceId?: string
-			devicePublicKey?: string
-		}): Promise<void> => {
-			setError(null)
-			try {
-				await client.signIn(params)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-			}
-		},
-		[client],
-	)
-
-	const signInWithOAuth = useCallback(
-		async (
-			provider: string,
-			options?: OAuthAuthorizationOptions,
-		): Promise<OAuthAuthorizationResult> => {
-			setError(null)
-			try {
-				return await client.signInWithOAuth(provider, options)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-				throw err
-			}
-		},
-		[client],
-	)
-
-	const completeOAuthSignIn = useCallback(
-		async (provider: string, params: OAuthCallbackParams): Promise<void> => {
-			setError(null)
-			try {
-				await client.completeOAuthSignIn(provider, params)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-			}
-		},
-		[client],
-	)
-
-	const getOAuthAuthorizationUrl = useCallback(
-		async (
-			provider: string,
-			options?: OAuthAuthorizationOptions,
-		): Promise<OAuthAuthorizationResult> => {
-			setError(null)
-			try {
-				return await client.getOAuthAuthorizationUrl(provider, options)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-				throw err
-			}
-		},
-		[client],
-	)
-
-	const linkOAuth = useCallback(
-		async (provider: string, params: OAuthCallbackParams): Promise<LinkedOAuthAccount | null> => {
-			setError(null)
-			try {
-				return await client.linkOAuth(provider, params)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-				return null
-			}
-		},
-		[client],
-	)
-
-	const listLinkedAccounts = useCallback(async (): Promise<LinkedOAuthAccount[]> => {
-		setError(null)
-		try {
-			return await client.listLinkedAccounts()
-		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err)
-			setError(message)
-			return []
-		}
-	}, [client])
-
-	const unlinkOAuth = useCallback(
-		async (provider: string): Promise<void> => {
-			setError(null)
-			try {
-				await client.unlinkOAuth(provider)
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err)
-				setError(message)
-			}
-		},
-		[client],
-	)
-
-	const signOut = useCallback(async (): Promise<void> => {
-		setError(null)
-		try {
-			await client.signOut()
-		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err)
-			setError(message)
-		}
-	}, [client])
+	const { session } = useAuthContext()
+	const snapshot = useAuthSessionSnapshot()
 
 	return {
-		user,
-		isAuthenticated: state === 'authenticated',
-		isLoading,
-		signUp,
-		signIn,
-		signInWithOAuth,
-		completeOAuthSignIn,
-		getOAuthAuthorizationUrl,
-		linkOAuth,
-		listLinkedAccounts,
-		unlinkOAuth,
-		signOut,
-		error,
+		user: snapshot.user,
+		isAuthenticated: snapshot.isAuthenticated,
+		isLoading: snapshot.isLoading,
+		error: snapshot.error,
+		initError: snapshot.initError,
+		signUp: (params) => session.signUp(params),
+		signIn: (params) => session.signIn(params),
+		signInWithOAuth: (provider, options) => session.signInWithOAuth(provider, options),
+		completeOAuthSignIn: (provider, params) => session.completeOAuthSignIn(provider, params),
+		getOAuthAuthorizationUrl: (provider, options) =>
+			session.getOAuthAuthorizationUrl(provider, options),
+		linkOAuth: (provider, params) => session.linkOAuth(provider, params),
+		listLinkedAccounts: () => session.listLinkedAccounts(),
+		unlinkOAuth: (provider) => session.unlinkOAuth(provider),
+		signOut: () => session.signOut(),
 	}
 }
 
-// ---------------------------------------------------------------------------
-// useCurrentUser
-// ---------------------------------------------------------------------------
-
-/**
- * React hook that returns the currently authenticated user, or null.
- *
- * A lightweight alternative to {@link useAuth} when you only need the user
- * object and do not need auth methods or error state.
- *
- * Must be used within an {@link AuthProvider}.
- *
- * @returns The current AuthUser or null if not authenticated
- *
- * @example
- * ```typescript
- * function UserAvatar() {
- *   const user = useCurrentUser()
- *   if (!user) return null
- *   return <span>{user.name ?? user.email}</span>
- * }
- * ```
- */
 function useCurrentUser(): AuthUser | null {
-	const { client } = useAuthContext()
-
-	const userSnapshotRef = useRef<AuthUser | null>(client.currentUser)
-	const stateSerializedRef = useRef<string>(JSON.stringify(client.currentUser))
-
-	const subscribe = useCallback(
-		(onStoreChange: () => void): (() => void) => {
-			return client.onAuthChange(() => {
-				const newUser = client.currentUser
-				const newSerialized = JSON.stringify(newUser)
-				if (newSerialized !== stateSerializedRef.current) {
-					userSnapshotRef.current = newUser
-					stateSerializedRef.current = newSerialized
-					onStoreChange()
-				}
-			})
-		},
-		[client],
-	)
-
-	const getSnapshot = useCallback((): AuthUser | null => {
-		return userSnapshotRef.current
-	}, [])
-
-	return useSyncExternalStore(subscribe, getSnapshot)
+	return useAuthSessionSnapshot().user
 }
 
-// ---------------------------------------------------------------------------
-// useAuthStatus
-// ---------------------------------------------------------------------------
-
-/**
- * React hook that returns the current authentication status.
- *
- * Re-renders only when the auth state changes, not on every auth event.
- * Use this for status indicators, route guards, and conditional rendering.
- *
- * Must be used within an {@link AuthProvider}.
- *
- * @returns An AuthStatus object with state, isAuthenticated, and isLoading flags
- *
- * @example
- * ```typescript
- * function AuthGuard({ children }: { children: React.ReactNode }) {
- *   const { isAuthenticated, isLoading } = useAuthStatus()
- *   if (isLoading) return <Spinner />
- *   if (!isAuthenticated) return <Navigate to="/login" />
- *   return <>{children}</>
- * }
- * ```
- */
 function useAuthStatus(): AuthStatus {
-	const { state, isLoading } = useAuthContext()
-
+	const snapshot = useAuthSessionSnapshot()
 	return {
-		state,
-		isAuthenticated: state === 'authenticated',
-		isLoading,
+		state: snapshot.state,
+		isAuthenticated: snapshot.isAuthenticated,
+		isLoading: snapshot.isLoading,
 	}
 }
 

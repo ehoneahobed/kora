@@ -1,0 +1,228 @@
+--- a/packages/react/src/hooks/use-mutation.ts
++++ b/packages/react/src/hooks/use-mutation.ts
+@@ -1,6 +1,7 @@
+ import { createMutationController } from '@korajs/core/bindings'
+-import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
++import { useRef, useSyncExternalStore } from 'react'
+ import type { UseMutationOptions, UseMutationResult } from '../types'
++import { useController } from './use-controller'
+ 
+ /**
+  * React hook for performing mutations against the local Kora store.
+@@ -15,28 +16,27 @@
+ 	const optionsRef = useRef(options)
+ 	optionsRef.current = options
+ 
+-	const controller = useMemo(
++	const getController = useController(
+ 		() =>
+ 			createMutationController<TData, TArgs, TContext>({
+ 				mutationFn: (...args) => fnRef.current(...args),
+ 				resolveOptions: () => optionsRef.current,
+ 			}),
++		(controller) => controller.destroy(),
+ 		[],
+ 	)
+ 
+-	useEffect(() => () => controller.destroy(), [controller])
+-
+ 	const state = useSyncExternalStore(
+-		(onStoreChange) => controller.subscribe(onStoreChange),
+-		() => controller.getSnapshot(),
+-		() => controller.getSnapshot(),
++		(onStoreChange) => getController().subscribe(onStoreChange),
++		() => getController().getSnapshot(),
++		() => getController().getSnapshot(),
+ 	)
+ 
+ 	return {
+-		mutate: (...args: TArgs) => controller.mutate(...args),
+-		mutateAsync: (...args: TArgs) => controller.mutateAsync(...args),
++		mutate: (...args: TArgs) => getController().mutate(...args),
++		mutateAsync: (...args: TArgs) => getController().mutateAsync(...args),
+ 		isLoading: state.isLoading,
+ 		error: state.error,
+-		reset: () => controller.reset(),
++		reset: () => getController().reset(),
+ 	}
+ }
+--- a/packages/react/src/hooks/use-sync-status.ts
++++ b/packages/react/src/hooks/use-sync-status.ts
+@@ -1,28 +1,29 @@
+ import type { SyncStatusInfo } from '@korajs/sync'
+ import { createSyncStatusController } from '@korajs/sync'
+-import { useEffect, useMemo, useSyncExternalStore } from 'react'
++import { useSyncExternalStore } from 'react'
+ import { useKoraContext } from '../context/kora-context'
++import { useController } from './use-controller'
+ 
+ /**
+  * React hook for monitoring the sync engine's connection status.
+  */
+ export function useSyncStatus(): SyncStatusInfo {
+ 	const { syncEngine, subscribeSyncStatus, events } = useKoraContext()
+-	const controller = useMemo(
++
++	const getController = useController(
+ 		() =>
+ 			createSyncStatusController({
+ 				syncEngine,
+ 				subscribeSyncStatus,
+ 				events: subscribeSyncStatus ? null : events,
+ 			}),
++		(controller) => controller.destroy(),
+ 		[syncEngine, subscribeSyncStatus, events],
+ 	)
+ 
+-	useEffect(() => () => controller.destroy(), [controller])
+-
+ 	return useSyncExternalStore(
+-		(onStoreChange) => controller.subscribe(onStoreChange),
+-		() => controller.getSnapshot(),
+-		() => controller.getSnapshot(),
++		(onStoreChange) => getController().subscribe(onStoreChange),
++		() => getController().getSnapshot(),
++		() => getController().getSnapshot(),
+ 	)
+ }
+--- a/packages/react/src/hooks/use-rich-text.ts
++++ b/packages/react/src/hooks/use-rich-text.ts
+@@ -4,6 +4,7 @@
+ import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react'
+ import { useKoraContext } from '../context/kora-context'
+ import type { UseRichTextResult } from '../types'
++import { useController } from './use-controller'
+ 
+ export interface UseRichTextOptions {
+ 	user?: AwarenessUser
+@@ -20,12 +21,9 @@
+ 	options?: UseRichTextOptions,
+ ): UseRichTextResult {
+ 	const { store, syncEngine } = useKoraContext()
+-	const collection = useMemo(
+-		() => store.collection(collectionName),
+-		[store, collectionName],
+-	)
++	const collection = useMemo(() => store.collection(collectionName), [store, collectionName])
+ 
+-	const controller = useMemo(
++	const getController = useController(
+ 		() =>
+ 			createRichTextController({
+ 				collection,
+@@ -37,30 +35,33 @@
+ 				useDocChannel: options?.useDocChannel,
+ 				user: options?.user,
+ 			}),
++		(controller) => controller.destroy(),
+ 		[collection, collectionName, fieldName, options?.useDocChannel, recordId, store, syncEngine],
+ 	)
+ 
+ 	useEffect(() => {
+-		controller.setUser(options?.user)
+-	}, [controller, options?.user])
+-
+-	useEffect(() => () => controller.destroy(), [controller])
++		getController().setUser(options?.user)
++	}, [getController, options?.user])
+ 
+ 	const snapshot = useSyncExternalStore(
+-		(onStoreChange) => controller.subscribe(onStoreChange),
+-		() => controller.getSnapshot(),
+-		() => controller.getSnapshot(),
++		(onStoreChange) => getController().subscribe(onStoreChange),
++		() => getController().getSnapshot(),
++		() => getController().getSnapshot(),
+ 	)
+ 
+-	const undo = useCallback(() => controller.undo(), [controller])
+-	const redo = useCallback(() => controller.redo(), [controller])
++	const undo = useCallback(() => {
++		getController().undo()
++	}, [getController])
++	const redo = useCallback(() => {
++		getController().redo()
++	}, [getController])
+ 	const setCursor = useCallback(
+-		(anchor: number, head: number) => controller.setCursor(anchor, head),
+-		[controller],
++		(anchor: number, head: number) => getController().setCursor(anchor, head),
++		[getController],
+ 	)
+-	const clearCursor = useCallback(() => controller.clearCursor(), [controller])
++	const clearCursor = useCallback(() => getController().clearCursor(), [getController])
+ 
+-	return buildResult(controller, snapshot, undo, redo, setCursor, clearCursor)
++	return buildResult(getController(), snapshot, undo, redo, setCursor, clearCursor)
+ }
+ 
+ function buildResult(
+--- a/packages/sync/src/protocol/serializer.ts
++++ b/packages/sync/src/protocol/serializer.ts
+@@ -2,7 +2,10 @@
+ import type { Operation, VersionVector } from '@korajs/core'
+ // protobufjs/minimal is CJS — named ESM imports fail in some runtimes (tsx, Node ESM).
+ // Use a default import for the runtime values and type aliases for annotations.
+-import protobuf from 'protobufjs/minimal'
++// The explicit .js extension is required: protobufjs has no "exports" map, so
++// Node ESM cannot resolve the extensionless "protobufjs/minimal" subpath
++// (bundlers tolerate it, which is why this only breaks in plain Node).
++import protobuf from 'protobufjs/minimal.js'
+ 
+ type Reader = protobuf.Reader
+ type Writer = protobuf.Writer
+--- a/packages/react/src/hooks/use-controller.ts
++++ b/packages/react/src/hooks/use-controller.ts
+@@ -0,0 +1,52 @@
++import { useEffect, useReducer, useRef } from 'react'
++
++/**
++ * Manages the lifecycle of an external controller in a StrictMode-safe way.
++ *
++ * React 18+ StrictMode mounts, unmounts, and remounts components in development.
++ * The previous pattern (create in `useMemo`, destroy in effect cleanup) permanently
++ * destroyed the memoized controller on the simulated unmount, leaving every
++ * subsequent interaction against a disposed controller.
++ *
++ * This hook instead keeps the controller in a ref and recreates it lazily
++ * whenever it has been destroyed, so the effect cleanup / re-run cycle is safe.
++ *
++ * Returns a getter so subscribe/getSnapshot closures always reach a live controller.
++ */
++export function useController<C>(
++	create: () => C,
++	destroy: (controller: C) => void,
++	deps: readonly unknown[],
++): () => C {
++	const controllerRef = useRef<C | null>(null)
++	const createRef = useRef(create)
++	createRef.current = create
++
++	const [, forceRender] = useReducer((count: number) => count + 1, 0)
++
++	const getController = useRef((): C => {
++		if (controllerRef.current === null) {
++			controllerRef.current = createRef.current()
++		}
++		return controllerRef.current
++	}).current
++
++	// biome-ignore lint/correctness/useExhaustiveDependencies: deps are the caller's create() inputs
++	useEffect(() => {
++		if (controllerRef.current === null) {
++			controllerRef.current = createRef.current()
++			// A destroyed controller was recreated (StrictMode remount or deps
++			// change): re-render so useSyncExternalStore rebinds to the new one.
++			forceRender()
++		}
++		return () => {
++			const controller = controllerRef.current
++			controllerRef.current = null
++			if (controller !== null) {
++				destroy(controller)
++			}
++		}
++	}, deps)
++
++	return getController
++}

@@ -77,8 +77,9 @@ describe('createApp', () => {
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 		expect(await todos.findById('missing')).toBeNull()
-		await expect(todos.where({ completed: false }).exec()).rejects.toThrow(/app\.ready/)
-		await expect(todos.where({ completed: false }).count()).rejects.toThrow(/app\.ready/)
+		expect(() => todos.where({ completed: false })).toThrow(/app\.ready/)
+		await app.ready
+		await expect(todos.where({ completed: false }).exec()).resolves.toEqual([])
 	})
 
 	test('defines accessors for all collections in schema', async () => {

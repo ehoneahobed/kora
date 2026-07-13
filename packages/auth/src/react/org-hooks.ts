@@ -13,22 +13,20 @@ import type {
 	ClientOrganization,
 	OrgClient,
 } from '../client/org-client'
+import {
+	checkOrgPermission,
+	createOrgMembersActions,
+	createOrgSession,
+	loadOrgMembers,
+	type OrgSession,
+	type OrgSnapshot,
+} from '../bindings/create-org-session'
 
-// ============================================================================
-// OrgContext
-// ============================================================================
-
-/**
- * Shape of the OrgContext value.
- */
 export interface OrgContextValue {
-	/** The OrgClient instance */
 	client: OrgClient
+	session: OrgSession
 }
 
-/**
- * React context for organization state.
- */
 export const OrgContext = createContext<OrgContextValue | null>(null)
 
 function useOrgContext(): OrgContextValue {
@@ -42,84 +40,40 @@ function useOrgContext(): OrgContextValue {
 	return ctx
 }
 
-// ============================================================================
-// useOrg
-// ============================================================================
-
-/**
- * Return value of the {@link useOrg} hook.
- */
-export interface UseOrgResult {
-	/** Currently active organization, or null */
-	org: ClientOrganization | null
-	/** Current user's role in the active organization, or null */
-	role: string | null
-	/** Active organization ID, or null */
-	orgId: string | null
-	/** Switch to a different organization */
-	switchOrg: (orgId: string) => Promise<void>
-	/** Create a new organization */
-	createOrg: (params: { name: string; slug?: string }) => Promise<ClientOrganization>
-	/** Leave the active organization */
-	leaveOrg: () => Promise<void>
-	/** Clear the active organization */
-	clearOrg: () => void
-	/** List all organizations the user belongs to */
-	listOrgs: () => Promise<ClientOrganization[]>
-	/** Last error, or null */
-	error: string | null
-}
-
-/**
- * React hook for organization management and context switching.
- *
- * Re-renders when the active organization changes.
- *
- * @example
- * ```typescript
- * function OrgSwitcher() {
- *   const { org, switchOrg, listOrgs, error } = useOrg()
- *   const [orgs, setOrgs] = useState<ClientOrganization[]>([])
- *
- *   useEffect(() => { listOrgs().then(setOrgs) }, [listOrgs])
- *
- *   return (
- *     <select value={org?.id ?? ''} onChange={(e) => switchOrg(e.target.value)}>
- *       <option value="">Select org...</option>
- *       {orgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
- *     </select>
- *   )
- * }
- * ```
- */
-export function useOrg(): UseOrgResult {
-	const { client } = useOrgContext()
-	const [error, setError] = useState<string | null>(null)
-
-	// Track active org reactively
-	const orgSnapshotRef = useRef({
-		orgId: client.activeOrgId,
-		org: client.activeOrg,
-		role: client.activeRole,
-	})
+function useOrgSnapshot(session: OrgSession): OrgSnapshot {
+	const snapshotRef = useRef(session.getSnapshot())
 
 	const subscribe = useCallback(
 		(onStoreChange: () => void): (() => void) => {
-			return client.onOrgChange(() => {
-				orgSnapshotRef.current = {
-					orgId: client.activeOrgId,
-					org: client.activeOrg,
-					role: client.activeRole,
-				}
+			return session.subscribe(() => {
+				snapshotRef.current = session.getSnapshot()
 				onStoreChange()
 			})
 		},
-		[client],
+		[session],
 	)
 
-	const getSnapshot = useCallback(() => orgSnapshotRef.current, [])
+	const getSnapshot = useCallback(() => snapshotRef.current, [])
 
-	const { orgId, org, role } = useSyncExternalStore(subscribe, getSnapshot)
+	return useSyncExternalStore(subscribe, getSnapshot)
+}
+
+export interface UseOrgResult {
+	org: ClientOrganization | null
+	role: string | null
+	orgId: string | null
+	switchOrg: (orgId: string) => Promise<void>
+	createOrg: (params: { name: string; slug?: string }) => Promise<ClientOrganization>
+	leaveOrg: () => Promise<void>
+	clearOrg: () => void
+	listOrgs: () => Promise<ClientOrganization[]>
+	error: string | null
+}
+
+export function useOrg(): UseOrgResult {
+	const { client, session } = useOrgContext()
+	const { orgId, org, role } = useOrgSnapshot(session)
+	const [error, setError] = useState<string | null>(null)
 
 	const switchOrg = useCallback(
 		async (newOrgId: string): Promise<void> => {
@@ -173,37 +127,16 @@ export function useOrg(): UseOrgResult {
 	return { org, role, orgId, switchOrg, createOrg, leaveOrg, clearOrg, listOrgs, error }
 }
 
-// ============================================================================
-// useOrgMembers
-// ============================================================================
-
-/**
- * Return value of the {@link useOrgMembers} hook.
- */
 export interface UseOrgMembersResult {
-	/** Members of the organization (empty until loaded) */
 	members: ClientMembership[]
-	/** Whether members are being loaded */
 	isLoading: boolean
-	/** Reload the members list */
 	refresh: () => Promise<void>
-	/** Invite a user by email */
 	invite: (email: string, role: string) => Promise<ClientInvitation>
-	/** Remove a member */
 	removeMember: (userId: string) => Promise<void>
-	/** Update a member's role */
 	updateRole: (userId: string, role: string) => Promise<void>
-	/** Last error, or null */
 	error: string | null
 }
 
-/**
- * React hook for managing organization members.
- *
- * Automatically loads members when the orgId changes.
- *
- * @param orgId - Organization ID to manage members for
- */
 export function useOrgMembers(orgId: string): UseOrgMembersResult {
 	const { client } = useOrgContext()
 	const [members, setMembers] = useState<ClientMembership[]>([])
@@ -214,8 +147,7 @@ export function useOrgMembers(orgId: string): UseOrgMembersResult {
 		setIsLoading(true)
 		setError(null)
 		try {
-			const result = await client.listMembers(orgId)
-			setMembers(result)
+			setMembers(await loadOrgMembers(client, orgId))
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err))
 		} finally {
@@ -224,89 +156,54 @@ export function useOrgMembers(orgId: string): UseOrgMembersResult {
 	}, [client, orgId])
 
 	useEffect(() => {
-		refresh()
+		void refresh()
 	}, [refresh])
+
+	const actions = createOrgMembersActions(client, orgId, setError)
 
 	const invite = useCallback(
 		async (email: string, role: string): Promise<ClientInvitation> => {
-			setError(null)
-			try {
-				const result = await client.inviteMember(orgId, { email, role })
-				return result
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err)
-				setError(msg)
-				throw err
-			}
+			const result = await actions.invite(email, role)
+			await refresh()
+			return result
 		},
-		[client, orgId],
+		[actions, refresh],
 	)
 
 	const removeMember = useCallback(
 		async (userId: string): Promise<void> => {
-			setError(null)
-			try {
-				await client.removeMember(orgId, userId)
-				await refresh()
-			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err))
-			}
+			await actions.removeMember(userId)
+			await refresh()
 		},
-		[client, orgId, refresh],
+		[actions, refresh],
 	)
 
 	const updateRole = useCallback(
 		async (userId: string, role: string): Promise<void> => {
-			setError(null)
-			try {
-				await client.updateMemberRole(orgId, userId, role)
-				await refresh()
-			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err))
-			}
+			await actions.updateRole(userId, role)
+			await refresh()
 		},
-		[client, orgId, refresh],
+		[actions, refresh],
 	)
 
 	return { members, isLoading, refresh, invite, removeMember, updateRole, error }
 }
 
-// ============================================================================
-// usePermission
-// ============================================================================
-
-/**
- * React hook that checks if the current user has a specific role level
- * in the active organization.
- *
- * @param requiredRole - Minimum role required (uses ROLE_HIERARCHY from org-types)
- * @returns true if the user's role is at least requiredRole
- *
- * @example
- * ```typescript
- * function AdminPanel() {
- *   const canManage = usePermission('admin')
- *   if (!canManage) return <p>Access denied</p>
- *   return <AdminSettings />
- * }
- * ```
- */
 export function usePermission(requiredRole: string): boolean {
-	const { client } = useOrgContext()
-
-	const snapshotRef = useRef(checkPermission(client.activeRole, requiredRole))
+	const { session } = useOrgContext()
+	const snapshotRef = useRef(session.checkPermission(requiredRole))
 
 	const subscribe = useCallback(
 		(onStoreChange: () => void): (() => void) => {
-			return client.onOrgChange(() => {
-				const newValue = checkPermission(client.activeRole, requiredRole)
-				if (newValue !== snapshotRef.current) {
-					snapshotRef.current = newValue
+			return session.subscribe(() => {
+				const next = session.checkPermission(requiredRole)
+				if (next !== snapshotRef.current) {
+					snapshotRef.current = next
 					onStoreChange()
 				}
 			})
 		},
-		[client, requiredRole],
+		[session, requiredRole],
 	)
 
 	const getSnapshot = useCallback(() => snapshotRef.current, [])
@@ -314,18 +211,4 @@ export function usePermission(requiredRole: string): boolean {
 	return useSyncExternalStore(subscribe, getSnapshot)
 }
 
-// Simple role hierarchy check (mirrors ROLE_HIERARCHY from org-types)
-const ROLE_LEVELS: Record<string, number> = {
-	viewer: 10,
-	billing: 15,
-	member: 20,
-	admin: 30,
-	owner: 40,
-}
-
-function checkPermission(currentRole: string | null, requiredRole: string): boolean {
-	if (!currentRole) return false
-	const currentLevel = ROLE_LEVELS[currentRole] ?? 0
-	const requiredLevel = ROLE_LEVELS[requiredRole] ?? 0
-	return currentLevel >= requiredLevel
-}
+export { checkOrgPermission }

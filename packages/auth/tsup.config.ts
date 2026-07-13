@@ -1,11 +1,11 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-	entry: ['src/index.ts', 'src/react.ts', 'src/server.ts'],
+	entry: ['src/index.ts', 'src/react.ts', 'src/vue.ts', 'src/svelte.ts', 'src/server.ts'],
 	format: ['esm', 'cjs'],
 	dts: true,
 	sourcemap: true,
 	clean: true,
-	external: ['react', 'ws', 'better-sqlite3'],
+	external: ['react', 'vue', 'svelte', 'ws', 'better-sqlite3'],
 	shims: true,
 })

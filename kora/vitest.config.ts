@@ -16,6 +16,12 @@ export default mergeConfig(
 				'@korajs/server/internal': resolve(__dirname, '../packages/server/src/internal.ts'),
 				'@korajs/store/internal': resolve(__dirname, '../packages/store/src/internal.ts'),
 				'korajs/testing': resolve(__dirname, './src/testing.ts'),
+				'korajs/vue': resolve(__dirname, './src/vue.ts'),
+				'korajs/react': resolve(__dirname, './src/react.ts'),
+				'korajs/svelte': resolve(__dirname, './src/svelte.ts'),
+				'@korajs/react': resolve(__dirname, '../packages/react/src/index.ts'),
+				'@korajs/vue': resolve(__dirname, '../packages/vue/src/index.ts'),
+				'@korajs/svelte': resolve(__dirname, '../packages/svelte/src/index.ts'),
 			},
 		},
 		test: {

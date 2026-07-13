@@ -1,5 +1,16 @@
 # @korajs/devtools
 
+## 0.6.0
+
+### Minor Changes
+
+- Public beta 0.6.0: Vue 3 and Svelte 5 bindings with shared QueryStore, sync-status controller, and richtext controller; `@korajs/core/bindings` shared types; `@korajs/auth` org hooks and providers for React/Vue/Svelte; presence/collaboration hooks; CLI scaffolds; `korajs/vue` and `korajs/svelte` meta-package re-exports; Svelte component precompile and KoraProvider context bridge fix.
+
+### Patch Changes
+
+- Updated dependencies
+  - @korajs/core@0.6.0
+
 ## 0.5.0
 
 ### Minor Changes

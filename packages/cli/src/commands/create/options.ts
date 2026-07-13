@@ -15,18 +15,36 @@ export type DatabaseProviderOption =
 
 export interface TemplateSelectionInput {
 	platform: PlatformOption
+	framework: FrameworkOption
 	tailwind: boolean
 	sync: boolean
 	db: DatabaseOption
 }
 
 /**
- * Converts high-level scaffold selections into the currently supported
- * concrete template names.
+ * Converts high-level scaffold selections into a concrete template name.
  */
 export function determineTemplateFromSelections(input: TemplateSelectionInput): TemplateName {
 	if (input.platform === 'desktop-tauri') return 'tauri-react'
+
 	const shouldSync = input.sync && input.db !== 'none'
+
+	if (input.framework === 'vue') {
+		if (input.tailwind && shouldSync) return 'vue-tailwind-sync'
+		if (input.tailwind && !shouldSync) return 'vue-tailwind'
+		return shouldSync ? 'vue-sync' : 'vue-basic'
+	}
+
+	if (input.framework === 'svelte') {
+		if (input.tailwind && shouldSync) return 'svelte-tailwind-sync'
+		if (input.tailwind && !shouldSync) return 'svelte-tailwind'
+		return shouldSync ? 'svelte-sync' : 'svelte-basic'
+	}
+
+	if (input.framework === 'solid') {
+		throw new Error('Solid templates are not available yet. Use react, vue, or svelte.')
+	}
+
 	if (input.tailwind && shouldSync) return 'react-tailwind-sync'
 	if (input.tailwind && !shouldSync) return 'react-tailwind'
 	if (!input.tailwind && shouldSync) return 'react-sync'
@@ -59,4 +77,8 @@ export function isDatabaseProviderValue(value: string): value is DatabaseProvide
 		value === 'vercel-postgres' ||
 		value === 'custom'
 	)
+}
+
+export function isSupportedWebFramework(framework: FrameworkOption): boolean {
+	return framework === 'react' || framework === 'vue' || framework === 'svelte'
 }

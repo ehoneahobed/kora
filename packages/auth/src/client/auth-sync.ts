@@ -4,6 +4,7 @@ import {
 	buildScopeMap,
 	extractScopeValuesFromClaims,
 } from '@korajs/core'
+import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type { AuthState } from './auth-client'
 
 /**
@@ -18,20 +19,10 @@ export interface AuthSyncClient {
 /**
  * Sync binding returned by {@link createKoraAuthSync}.
  * Passed to `createApp({ sync: { authClient } })` in korajs.
+ *
+ * @deprecated Use {@link AuthSyncBinding} from `@korajs/core/bindings` or `@korajs/auth`.
  */
-export interface KoraAuthSyncBinding {
-	/** Returns the access token for sync handshake (empty string when signed out). */
-	auth: () => Promise<{ token: string }>
-	/** Builds a scope map from the current token and schema. */
-	resolveScopeMap?: () => Promise<ScopeMap | undefined>
-	/**
-	 * Returns the device-bound sync node id from the token `dev` claim.
-	 * Separate from the user id (`sub`).
-	 */
-	resolveNodeId?: () => Promise<string | undefined>
-	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
-	subscribe?: (listener: () => void) => () => void
-}
+export type KoraAuthSyncBinding = AuthSyncBinding
 
 /**
  * Configuration for {@link createKoraAuthSync}.
@@ -107,10 +98,10 @@ function readDeviceIdFromClaims(claims: Record<string, unknown>): string | undef
  * })
  * ```
  */
-export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): KoraAuthSyncBinding {
+export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSyncBinding {
 	const { authClient, schema, scopeFromClaims } = options
 
-	const binding: KoraAuthSyncBinding = {
+	const binding: AuthSyncBinding = {
 		auth: async () => {
 			const token = await authClient.getAccessToken()
 			return { token: token ?? '' }
