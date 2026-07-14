@@ -3,7 +3,10 @@ layout: home
 hero:
   name: Kora.js
   text: Offline-first application framework
-  tagline: Build apps that work anywhere — online, offline, and everything in between. Zero sync code required.
+  tagline: Build apps that work anywhere. Online, offline, and everything in between, with zero sync code required.
+  image:
+    src: /kora-emblem-color-transparent.png
+    alt: Kora.js emblem
   actions:
     - theme: brand
       text: Get Started

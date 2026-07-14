@@ -4,7 +4,34 @@ export default defineConfig({
 	title: 'Kora.js',
 	description: 'Offline-first application framework',
 	base: '/',
+	head: [
+		['link', { rel: 'icon', href: '/favicon.ico', sizes: '48x48' }],
+		['link', { rel: 'icon', href: '/favicon-32x32.png', type: 'image/png', sizes: '32x32' }],
+		['link', { rel: 'apple-touch-icon', href: '/favicon-180x180.png' }],
+		['meta', { name: 'theme-color', content: '#e63323' }],
+		['meta', { property: 'og:type', content: 'website' }],
+		['meta', { property: 'og:site_name', content: 'Kora.js' }],
+		['meta', { property: 'og:title', content: 'Kora.js: Offline-first application framework' }],
+		[
+			'meta',
+			{
+				property: 'og:description',
+				content:
+					'Build apps that work anywhere. Local-first storage, automatic conflict resolution, and sync with zero distributed-systems code.',
+			},
+		],
+		['meta', { property: 'og:image', content: 'https://korajs.dev/kora-app-icon-512x512.png' }],
+		['meta', { property: 'og:url', content: 'https://korajs.dev/' }],
+		['meta', { name: 'twitter:card', content: 'summary' }],
+	],
+	sitemap: {
+		hostname: 'https://korajs.dev',
+	},
 	themeConfig: {
+		logo: {
+			light: '/kora-emblem-color-transparent.png',
+			dark: '/kora-emblem-white-transparent.png',
+		},
 		nav: [
 			{ text: 'Guide', link: '/getting-started' },
 			{ text: 'API', link: '/api/' },
