@@ -75,10 +75,11 @@ export function useAuth(): UseAuthResult {
 		},
 		signUp: (params) => session.signUp(params).then(sync),
 		signIn: (params) => session.signIn(params).then(sync),
-		signInWithOAuth: (provider, options) => session.signInWithOAuth(provider, options).then((result) => {
-			sync()
-			return result
-		}),
+		signInWithOAuth: (provider, options) =>
+			session.signInWithOAuth(provider, options).then((result) => {
+				sync()
+				return result
+			}),
 		completeOAuthSignIn: (provider, params) =>
 			session.completeOAuthSignIn(provider, params).then(sync),
 		getOAuthAuthorizationUrl: (provider, options) =>
@@ -86,10 +87,11 @@ export function useAuth(): UseAuthResult {
 				sync()
 				return result
 			}),
-		linkOAuth: (provider, params) => session.linkOAuth(provider, params).then((result) => {
-			sync()
-			return result
-		}),
+		linkOAuth: (provider, params) =>
+			session.linkOAuth(provider, params).then((result) => {
+				sync()
+				return result
+			}),
 		listLinkedAccounts: () =>
 			session.listLinkedAccounts().then((result) => {
 				sync()

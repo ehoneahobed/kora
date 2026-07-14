@@ -1,16 +1,16 @@
 <script lang="ts">
-	import type { Store } from '@korajs/store'
-	import { createMutation } from '../../src/composables/use-mutation'
-	import { createQueryStore } from '../../src/stores/query-store'
+import type { Store } from '@korajs/store'
+import { createMutation } from '../../src/composables/use-mutation'
+import { createQueryStore } from '../../src/stores/query-store'
 
-	interface Props {
-		store: Store
-	}
+interface Props {
+	store: Store
+}
 
-	let { store }: Props = $props()
+const { store }: Props = $props()
 
-	const todos = createQueryStore(store.collection('todos').where({}))
-	const { mutate } = createMutation((title: string) => store.collection('todos').insert({ title }))
+const todos = createQueryStore(store.collection('todos').where({}))
+const { mutate } = createMutation((title: string) => store.collection('todos').insert({ title }))
 </script>
 
 <div>

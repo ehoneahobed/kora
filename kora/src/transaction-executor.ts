@@ -2,9 +2,10 @@ import type { Operation } from '@korajs/core'
 import type { Store } from '@korajs/store'
 import type { KoraConfig, TransactionProxy } from './types'
 
-export interface TransactionExecutor {
-	(fn: (tx: TransactionProxy) => Promise<void>, mutationName?: string): Promise<Operation[]>
-}
+export type TransactionExecutor = (
+	fn: (tx: TransactionProxy) => Promise<void>,
+	mutationName?: string,
+) => Promise<Operation[]>
 
 /**
  * Creates the shared executor used by {@link KoraApp.transaction} and {@link KoraApp.mutation}.

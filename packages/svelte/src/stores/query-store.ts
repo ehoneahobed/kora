@@ -1,6 +1,6 @@
 import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 import { assertQueryReady } from '@korajs/store'
-import { readable, type Readable } from 'svelte/store'
+import { type Readable, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
 import type { UseQueryOptions } from '../types'
 

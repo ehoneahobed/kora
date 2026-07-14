@@ -8,20 +8,25 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Feature-complete** — all 10 packages implemented with 2,100+ tests. Includes E2E tests, documentation site, and CI/CD pipelines.
+**Public beta (v0.6.x).** The full data plane is implemented and covered by 3,300+ automated tests (run `pnpm test` to verify the current count), plus a Playwright E2E suite, a documentation site, and CI pipelines.
 
-| Package | Tests | Description |
-|---------|-------|-------------|
-| `@korajs/core` | 231 | Schema, operations, HLC, version vectors, type inference |
-| `@korajs/store` | 225 | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
-| `@korajs/merge` | 99 | Three-tier conflict resolution with Yjs CRDT richtext merge |
-| `@korajs/sync` | 183 | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
-| `@korajs/server` | 126 | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
-| `@korajs/react` | 65 | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
-| `@korajs/devtools` | 71 | Browser DevTools extension with sync timeline, conflict inspector |
-| `@korajs/cli` | 213 | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
-| `@korajs/auth` | 912 | Authentication, sessions, MFA, organizations, RBAC, passkeys, encryption |
-| `kora` | 46 | Meta-package with `createApp`, full type inference from schema to hooks |
+| Package | Status | Description |
+|---------|--------|-------------|
+| `korajs` | Beta | Meta-package: `createApp`, full type inference from schema to hooks |
+| `@korajs/core` | Beta | Schema, operations, HLC, version vectors, type inference |
+| `@korajs/store` | Beta | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
+| `@korajs/merge` | Beta | Three-tier conflict resolution with Yjs CRDT richtext merge |
+| `@korajs/sync` | Beta | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
+| `@korajs/server` | Beta | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
+| `@korajs/react` | Beta | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
+| `@korajs/cli` | Beta | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
+| `@korajs/auth` | Experimental | Authentication, sessions, MFA, organizations, RBAC, passkeys, encryption |
+| `@korajs/devtools` | Experimental | Browser DevTools extension with sync timeline, conflict inspector |
+| `@korajs/vue` | Experimental | Vue composables mirroring the React bindings |
+| `@korajs/svelte` | Experimental | Svelte stores mirroring the React bindings |
+| `@korajs/tauri` | Experimental | Tauri desktop integration |
+
+Beta means the API is stable enough to build on and covered by the release gates. Experimental means it works and is tested, but has had less production exposure and its API may still move.
 
 ## What It Does
 
@@ -47,7 +52,7 @@ cd my-app
 pnpm dev
 ```
 
-Choose from 4 templates: **React + Tailwind (with sync)** (recommended), React + Tailwind (local-only), React + CSS (with sync), or React + CSS (local-only). Or skip the prompts:
+Choose from 13 templates across React, Vue, Svelte, and Tauri, each in sync and local-only variants (with or without Tailwind). The recommended default is **React + Tailwind (with sync)**. Or skip the prompts:
 
 ```bash
 npx create-kora-app my-app --yes    # Recommended defaults
@@ -160,18 +165,23 @@ Operation {
 
 ```
 packages/
-  core/       @korajs/core     — Schema, operations, HLC, version vectors
-  store/      @korajs/store    — Local storage, CRUD, reactive queries
-  merge/      @korajs/merge    — Three-tier conflict resolution
-  sync/       @korajs/sync     — Sync protocol and transports
-  server/     @korajs/server   — Self-hosted sync server
-  react/      @korajs/react    — React hooks and bindings
-  auth/       @korajs/auth     — Authentication, sessions, MFA, RBAC
-  devtools/   @korajs/devtools — Browser DevTools extension
-  cli/        @korajs/cli      — CLI tooling and scaffolding
-kora/         Meta-package re-exporting core, store, merge, sync
-e2e/          Playwright E2E test suite
-docs/         VitePress documentation site
+  core/             @korajs/core       Schema, operations, HLC, version vectors
+  store/            @korajs/store      Local storage, CRUD, reactive queries
+  merge/            @korajs/merge      Three-tier conflict resolution
+  sync/             @korajs/sync       Sync protocol and transports
+  server/           @korajs/server     Self-hosted sync server
+  react/            @korajs/react      React hooks and bindings
+  vue/              @korajs/vue        Vue composables
+  svelte/           @korajs/svelte     Svelte stores
+  tauri/            @korajs/tauri      Tauri desktop integration
+  auth/             @korajs/auth       Authentication, sessions, MFA, RBAC
+  devtools/         @korajs/devtools   Browser DevTools extension
+  cli/              @korajs/cli        CLI tooling, templates, scaffolding
+  create-kora-app/  create-kora-app    npx entry point (delegates to the CLI)
+  test/             @korajs/test       Cross-package convergence test utilities
+kora/               Meta-package re-exporting core, store, merge, sync
+e2e/                Playwright E2E test suite
+docs/               VitePress documentation site
 ```
 
 ## Development
@@ -195,7 +205,7 @@ pnpm test
 
 ```bash
 pnpm build              # Build all packages
-pnpm test               # Run all unit/integration tests (2100+ tests)
+pnpm test               # Run all unit/integration tests
 pnpm typecheck          # TypeScript strict mode check
 pnpm lint               # Biome lint and format check
 pnpm lint:fix           # Auto-fix lint/format issues

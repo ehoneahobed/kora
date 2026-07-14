@@ -1,6 +1,6 @@
-import { createRichTextController } from '@korajs/store'
-import * as Y from 'yjs'
 import { describe, expect, test, vi } from 'vitest'
+import * as Y from 'yjs'
+import { createRichTextController } from './create-richtext-controller'
 
 function encodeText(value: string): Uint8Array {
 	const doc = new Y.Doc()

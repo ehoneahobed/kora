@@ -23,8 +23,7 @@ export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQu
 
 	if (skippedFields.length > 0 && typeof console !== 'undefined') {
 		console.warn(
-			`[Kora] Sync query subset omitted non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. ` +
-				'Only plain equality WHERE clauses are registered for incremental sync.',
+			`[Kora] Sync query subset omitted non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. Only plain equality WHERE clauses are registered for incremental sync.`,
 		)
 	}
 

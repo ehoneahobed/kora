@@ -1,6 +1,6 @@
 import { getContext, setContext } from 'svelte'
+import { type OrgSession, createOrgSession } from '../bindings/create-org-session'
 import type { OrgClient } from '../client/org-client'
-import { createOrgSession, type OrgSession } from '../bindings/create-org-session'
 
 const orgContextKey = Symbol('korajs-org-context')
 

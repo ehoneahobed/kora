@@ -1,5 +1,6 @@
-import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
 import { describe, expect, it, vi } from 'vitest'
+import type { QueryBuilder } from '../query/query-builder'
+import type { CollectionRecord, SubscriptionCallback } from '../types'
 import { QueryStore } from './query-store'
 
 function createMockQueryBuilder(initialResults: CollectionRecord[] = []): {

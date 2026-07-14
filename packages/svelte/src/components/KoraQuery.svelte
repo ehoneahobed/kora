@@ -1,5 +1,5 @@
 <script lang="ts" module>
-	import type { CollectionRecord, QueryBuilder } from '@korajs/store'
+import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 </script>
 
 <script lang="ts" generics="T extends CollectionRecord = CollectionRecord">

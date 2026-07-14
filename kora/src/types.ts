@@ -9,8 +9,8 @@ import type {
 	SchemaInput,
 	SequenceConfig,
 } from '@korajs/core'
-import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type { FieldBuilder } from '@korajs/core'
+import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type {
 	AuditExportOptions,
 	BackupOptions,

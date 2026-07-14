@@ -1,69 +1,65 @@
 <script lang="ts">
-	import { createAuthStore } from '@korajs/auth/svelte'
-	import { createSyncStatusStore } from '@korajs/svelte'
-	import {
-		AlertCircle,
-		CheckCircle2,
-		Circle,
-		ClipboardList,
-		Loader2,
-		Plus,
-		Trash2,
-		Wifi,
-		WifiOff,
-	} from '@lucide/svelte'
-	import { createTodosStores } from './modules/todos/useTodos'
+import { createAuthStore } from '@korajs/auth/svelte'
+import { createSyncStatusStore } from '@korajs/svelte'
+import {
+	AlertCircle,
+	CheckCircle2,
+	Circle,
+	ClipboardList,
+	Loader2,
+	Plus,
+	Trash2,
+	Wifi,
+	WifiOff,
+} from '@lucide/svelte'
+import { createTodosStores } from './modules/todos/useTodos'
 
-	type Filter = 'all' | 'active' | 'completed'
+type Filter = 'all' | 'active' | 'completed'
 
-	const syncStatus = createSyncStatusStore()
-	const auth = createAuthStore()
-	const todos = createTodosStores()
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
+const syncStatus = createSyncStatusStore()
+const auth = createAuthStore()
+const todos = createTodosStores()
+const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 
-	let filter = $state<Filter>('all')
-	let input = $state('')
+const filter = $state<Filter>('all')
+let input = $state('')
 
-	const filteredTodos = $derived(
-		filter === 'active'
-			? $activeTodos
-			: filter === 'completed'
-				? $completedTodos
-				: $allTodos,
-	)
+const filteredTodos = $derived(
+	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
+)
 
-	const syncBadge = $derived.by(() => {
-		const s = $syncStatus.status
-		const pending = $syncStatus.pendingOperations ?? 0
-		const map: Record<string, { icon: typeof Wifi; color: string; label: string }> = {
-			connected: { icon: Wifi, color: 'text-emerald-400', label: 'Connected' },
-			syncing: { icon: Wifi, color: 'text-amber-400', label: 'Syncing' },
-			synced: { icon: Wifi, color: 'text-emerald-400', label: 'Synced' },
-			offline: { icon: WifiOff, color: 'text-gray-500', label: 'Offline' },
-			error: { icon: AlertCircle, color: 'text-red-400', label: 'Error' },
-		}
-		return { ...(map[s] ?? map.offline), pending }
-	})
-
-	function handleSubmit(event: SubmitEvent): void {
-		event.preventDefault()
-		const title = input.trim()
-		if (!title) return
-		addTodo.mutate({ title })
-		input = ''
+const syncBadge = $derived.by(() => {
+	const s = $syncStatus.status
+	const pending = $syncStatus.pendingOperations ?? 0
+	const map: Record<string, { icon: typeof Wifi; color: string; label: string }> = {
+		connected: { icon: Wifi, color: 'text-emerald-400', label: 'Connected' },
+		syncing: { icon: Wifi, color: 'text-amber-400', label: 'Syncing' },
+		synced: { icon: Wifi, color: 'text-emerald-400', label: 'Synced' },
+		offline: { icon: WifiOff, color: 'text-gray-500', label: 'Offline' },
+		error: { icon: AlertCircle, color: 'text-red-400', label: 'Error' },
 	}
+	return { ...(map[s] ?? map.offline), pending }
+})
 
-	function clearCompleted(): void {
-		for (const todo of $completedTodos) {
-			deleteTodo.mutate(todo.id)
-		}
-	}
+function handleSubmit(event: SubmitEvent): void {
+	event.preventDefault()
+	const title = input.trim()
+	if (!title) return
+	addTodo.mutate({ title })
+	input = ''
+}
 
-	function emptyMessage(f: Filter): string {
-		if (f === 'all') return 'No tasks yet. Add one above!'
-		if (f === 'active') return 'All caught up! No active tasks.'
-		return 'No completed tasks yet.'
+function clearCompleted(): void {
+	for (const todo of $completedTodos) {
+		deleteTodo.mutate(todo.id)
 	}
+}
+
+function emptyMessage(f: Filter): string {
+	if (f === 'all') return 'No tasks yet. Add one above!'
+	if (f === 'active') return 'All caught up! No active tasks.'
+	return 'No completed tasks yet.'
+}
 </script>
 
 <div class="min-h-screen bg-gray-950 text-gray-100">

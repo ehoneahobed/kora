@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in Kora does not behave as documented
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. A minimal reproduction is the single most useful thing you can provide; bugs with reproductions get fixed first.
+  - type: input
+    id: version
+    attributes:
+      label: Kora version
+      description: Output of `npm ls korajs @korajs/react @korajs/store` in your app
+      placeholder: korajs@0.6.1
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: Which package is affected?
+      options:
+        - korajs (meta)
+        - "@korajs/core"
+        - "@korajs/store"
+        - "@korajs/merge"
+        - "@korajs/sync"
+        - "@korajs/server"
+        - "@korajs/react"
+        - "@korajs/vue"
+        - "@korajs/svelte"
+        - "@korajs/auth"
+        - "@korajs/cli / create-kora-app"
+        - "@korajs/devtools"
+        - "@korajs/tauri"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Ideally starting from `npx create-kora-app`, the smallest schema and steps that show the problem
+      placeholder: |
+        1. npx create-kora-app repro --yes
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include console output, and note explicitly if the console was silent
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "macOS 15, Chrome 138, Node 20.12, pnpm 9.15"
+    validations:
+      required: true

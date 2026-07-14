@@ -1,6 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { defineComponent, h, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent, h, ref } from 'vue'
 import { koraContextKey } from '../context'
 import { useMutation } from './use-mutation'
 

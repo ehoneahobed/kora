@@ -149,7 +149,9 @@ export function createCompatibilityLayerPlan(templateName: TemplateName): Templa
 		case 'vue-tailwind-sync':
 			return {
 				compatibilityTarget: templateName,
-				layers: [{ category: 'base', name: 'vue-tailwind-sync', sourceTemplate: 'vue-tailwind-sync' }],
+				layers: [
+					{ category: 'base', name: 'vue-tailwind-sync', sourceTemplate: 'vue-tailwind-sync' },
+				],
 			}
 		case 'vue-tailwind':
 			return {
@@ -160,7 +162,11 @@ export function createCompatibilityLayerPlan(templateName: TemplateName): Templa
 			return {
 				compatibilityTarget: templateName,
 				layers: [
-					{ category: 'base', name: 'svelte-tailwind-sync', sourceTemplate: 'svelte-tailwind-sync' },
+					{
+						category: 'base',
+						name: 'svelte-tailwind-sync',
+						sourceTemplate: 'svelte-tailwind-sync',
+					},
 				],
 			}
 		case 'svelte-tailwind':

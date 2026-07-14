@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'vitest'
 import { HttpLongPollingTransport, WebSocketTransport } from '@korajs/sync'
+import { describe, expect, test } from 'vitest'
 import { createSyncTransport } from './create-sync-transport'
 
 describe('createSyncTransport', () => {

@@ -54,7 +54,9 @@ export async function initializeApp(
 		dbName,
 		nodeId: authNodeId,
 		isolation: authNodeId ? 'shared' : config.store?.isolation,
-		...(config.sync ? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) } : {}),
+		...(config.sync
+			? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }
+			: {}),
 	})
 	await store.open()
 

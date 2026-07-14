@@ -21,8 +21,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 
 	const offlineSyncStatus = (): SyncStatusInfo => OFFLINE_SYNC_STATUS
 
-	const bridgeStatus = (): SyncStatusInfo =>
-		state.syncStatusBridge?.status ?? offlineSyncStatus()
+	const bridgeStatus = (): SyncStatusInfo => state.syncStatusBridge?.status ?? offlineSyncStatus()
 
 	return {
 		get status(): SyncStatusInfo {

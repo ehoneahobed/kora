@@ -27,9 +27,17 @@ packages/
   sync/                     # @korajs/sync - Sync protocol and transports
   server/                   # @korajs/server - Self-hosted sync server
   react/                    # @korajs/react - React hooks and bindings
+  vue/                      # @korajs/vue - Vue composables
+  svelte/                   # @korajs/svelte - Svelte stores
+  tauri/                    # @korajs/tauri - Tauri desktop integration
+  auth/                     # @korajs/auth - Authentication, sessions, MFA, RBAC
   devtools/                 # @korajs/devtools - Browser DevTools extension
-  cli/                      # @korajs/cli - CLI tooling and scaffolding
+  cli/                      # @korajs/cli - CLI tooling, bundled templates, scaffolding
+  create-kora-app/          # create-kora-app - npx entry point (delegates to CLI)
+  test/                     # @korajs/test - Cross-package convergence test utilities
 ```
+
+**Spec vs. source:** where this document and the shipped source disagree, the source is authoritative for behavior and this document must be updated, not the other way around. Two divergences were reconciled in July 2026: scaffolding uses bundled templates rather than giget, and the IndexedDB fallback is a hand-written adapter rather than the `idb` library.
 
 ---
 
@@ -73,7 +81,7 @@ These decisions are locked. Do not deviate or substitute.
 |-----------|---------|-----|
 | SQLite WASM | `@sqlite.org/sqlite-wasm` (v3.51+) | Official build. Best OPFS support. Long-term maintenance guaranteed |
 | OPFS | Origin Private File System API | Primary persistence. Production-ready in all browsers 2026 |
-| IndexedDB | `idb` | Fallback only. Used when WASM/OPFS unavailable |
+| IndexedDB | hand-written adapter (`packages/store/src/adapters/indexeddb-adapter.ts`) | Fallback only. Used when WASM/OPFS unavailable |
 | CRDT | `yjs` | Fastest CRDT library. For rich text fields and complex merge types |
 | React bindings | `react` 18+ | useSyncExternalStore for concurrent-mode safety |
 
@@ -91,7 +99,7 @@ These decisions are locked. Do not deviate or substitute.
 | Component | Package | Why |
 |-----------|---------|-----|
 | CLI framework | `citty` | Lightweight. TypeScript-first. Used by Nuxt team |
-| Scaffolding | `giget` | Git-based template system |
+| Scaffolding | templates bundled in `@korajs/cli` | Templates ship inside the published CLI tarball and are composed by `template-engine.ts`. Works offline; every template fix requires a CLI release |
 | DevTools UI | `preact` + `htm` | Tiny footprint for browser extension |
 
 ---
@@ -641,7 +649,7 @@ interface Transaction {
 
 **Implementation priority:**
 1. SQLite WASM with OPFS (primary, implement first)
-2. IndexedDB via `idb` (fallback, implement second)
+2. IndexedDB via the hand-written adapter (fallback, implement second)
 3. Native SQLite via `better-sqlite3` (server-side and Electron, implement third)
 
 **SQLite WASM initialization:**

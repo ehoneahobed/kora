@@ -12,9 +12,9 @@ import {
 	shallowRef,
 	watch,
 } from 'vue'
-import { koraContextKey, koraAppInjectionKey } from '../context'
-import type { KoraAppLike, KoraContextValue } from '../types'
+import { koraAppInjectionKey, koraContextKey } from '../context'
 import { resolveQueryStoreCache } from '../resolve-query-store-cache'
+import type { KoraAppLike, KoraContextValue } from '../types'
 
 export const KoraProvider = defineComponent({
 	name: 'KoraProvider',
@@ -126,11 +126,10 @@ export const KoraProvider = defineComponent({
 
 		return () => {
 			if (initError.value) {
-				return h(
-					'div',
-					{ style: { color: 'red', padding: '1rem', fontFamily: 'monospace' } },
-					[h('strong', null, 'Kora initialization error: '), initError.value.message],
-				)
+				return h('div', { style: { color: 'red', padding: '1rem', fontFamily: 'monospace' } }, [
+					h('strong', null, 'Kora initialization error: '),
+					initError.value.message,
+				])
 			}
 
 			if (!ready.value) {

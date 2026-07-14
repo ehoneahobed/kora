@@ -1,8 +1,8 @@
 import type { InjectionKey } from 'vue'
 import type { PropType } from 'vue'
 import { defineComponent, inject, onScopeDispose, provide } from 'vue'
+import { type OrgSession, createOrgSession } from '../bindings/create-org-session'
 import type { OrgClient } from '../client/org-client'
-import { createOrgSession, type OrgSession } from '../bindings/create-org-session'
 
 export interface OrgContextValue {
 	client: OrgClient

@@ -4,7 +4,12 @@ import { koraAppInjectionKey } from './context'
 import type { KoraAppLike } from './types'
 
 export type { KoraAppHandle, KoraAppLike, KoraContextValue, KoraProviderProps } from './types'
-export type { UseMutationOptions, UseMutationResult, UseQueryOptions, UseRichTextResult } from './types'
+export type {
+	UseMutationOptions,
+	UseMutationResult,
+	UseQueryOptions,
+	UseRichTextResult,
+} from './types'
 
 export { koraAppInjectionKey, koraContextKey, useKoraContext } from './context'
 export { KoraProvider } from './components/kora-provider'

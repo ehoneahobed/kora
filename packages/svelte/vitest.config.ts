@@ -1,6 +1,6 @@
-import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { defineConfig, mergeConfig } from 'vitest/config'
 import shared from '../../vitest.shared'
 

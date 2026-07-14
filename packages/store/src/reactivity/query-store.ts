@@ -1,5 +1,5 @@
-import type { CollectionRecord } from '../types'
 import type { QueryBuilder } from '../query/query-builder'
+import type { CollectionRecord } from '../types'
 
 /**
  * Frozen empty array returned as the initial snapshot before any data loads.

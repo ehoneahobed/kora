@@ -165,8 +165,7 @@ export function createAuthSession(client: AuthClient): AuthSession {
 				throw error instanceof Error ? error : new Error(String(error))
 			}
 		},
-		linkOAuth: (provider, params) =>
-			runWithResult(async () => client.linkOAuth(provider, params)),
+		linkOAuth: (provider, params) => runWithResult(async () => client.linkOAuth(provider, params)),
 		listLinkedAccounts: () =>
 			runWithResult(async () => client.listLinkedAccounts()).then((value) => value ?? []),
 		unlinkOAuth: (provider) =>

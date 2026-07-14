@@ -3,8 +3,8 @@ import type { SchemaDefinition } from '@korajs/core'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import type { SyncEngine } from '@korajs/sync'
-import { mount, type VueWrapper } from '@vue/test-utils'
-import { defineComponent, h, type Component } from 'vue'
+import { type VueWrapper, mount } from '@vue/test-utils'
+import { type Component, defineComponent, h } from 'vue'
 import { KoraProvider } from '../../src/components/kora-provider'
 
 export const defaultSchema = defineSchema({
@@ -34,10 +34,8 @@ export function mountWithProvider(
 		defineComponent({
 			setup(_, { slots }) {
 				return () =>
-					h(
-						KoraProvider,
-						{ store: options.store, syncEngine: options.syncEngine ?? null },
-						() => h(component, null, slots),
+					h(KoraProvider, { store: options.store, syncEngine: options.syncEngine ?? null }, () =>
+						h(component, null, slots),
 					)
 			},
 		}),

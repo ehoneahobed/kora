@@ -1,7 +1,7 @@
 import type { KoraEventEmitter } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
 import type { SyncStatusInfo } from '../types'
-import { createSyncStatusController, OFFLINE_SYNC_STATUS } from './sync-status-controller'
+import { OFFLINE_SYNC_STATUS, createSyncStatusController } from './sync-status-controller'
 
 function createStatus(overrides: Partial<SyncStatusInfo> = {}): SyncStatusInfo {
 	return {
@@ -28,20 +28,22 @@ describe('createSyncStatusController', () => {
 	})
 
 	test('uses subscribeSyncStatus bridge when provided', () => {
-		let listener: ((status: SyncStatusInfo) => void) | null = null
+		const listeners: Array<(status: SyncStatusInfo) => void> = []
 		const controller = createSyncStatusController({
 			subscribeSyncStatus: (onStatus) => {
-				listener = onStatus
+				listeners.push(onStatus)
 				onStatus(createStatus({ status: 'syncing' }))
 				return () => {
-					listener = null
+					listeners.length = 0
 				}
 			},
 			events: null,
 		})
 
 		expect(controller.getSnapshot().status).toBe('syncing')
-		listener?.(createStatus({ status: 'synced' }))
+		for (const listener of listeners) {
+			listener(createStatus({ status: 'synced' }))
+		}
 		expect(controller.getSnapshot().status).toBe('synced')
 		controller.destroy()
 	})
@@ -66,14 +68,18 @@ describe('createSyncStatusController', () => {
 
 	test('refreshes on sync events when emitter is available', () => {
 		const handlers = new Map<string, Set<() => void>>()
-		const events = {
-			on: (type: string, handler: () => void) => {
+		const events: KoraEventEmitter = {
+			on: (type, handler) => {
 				const set = handlers.get(type) ?? new Set()
-				set.add(handler)
+				set.add(handler as () => void)
 				handlers.set(type, set)
-				return () => set.delete(handler)
+				return () => set.delete(handler as () => void)
 			},
-		} as KoraEventEmitter
+			off: (type, handler) => {
+				handlers.get(type)?.delete(handler as () => void)
+			},
+			emit: () => {},
+		}
 
 		const getStatus = vi
 			.fn()

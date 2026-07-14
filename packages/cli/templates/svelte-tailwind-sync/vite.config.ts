@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import tailwindcss from '@tailwindcss/vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
+import tailwindcss from '@tailwindcss/vite'
 import type { Plugin } from 'vite'
 import { defineConfig } from 'vite'
 

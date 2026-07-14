@@ -1,7 +1,7 @@
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { onDestroy } from 'svelte'
-import { get, readable, type Readable } from 'svelte/store'
+import { type Readable, get, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
 import type { UseRichTextResult } from '../types'
 
@@ -80,9 +80,7 @@ export function createRichTextBinding(
 /** @alias createRichTextBinding */
 export const useRichText = createRichTextBinding
 
-function buildResult(
-	controller: ReturnType<typeof createRichTextController>,
-): UseRichTextResult {
+function buildResult(controller: ReturnType<typeof createRichTextController>): UseRichTextResult {
 	const snapshot = controller.getSnapshot()
 	return {
 		doc: controller.doc,

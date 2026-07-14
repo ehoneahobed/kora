@@ -186,4 +186,3 @@ export {
 	getRemoteAwarenessStates,
 	subscribeRemoteAwarenessStates,
 } from './reactivity/collaborators-snapshot'
-

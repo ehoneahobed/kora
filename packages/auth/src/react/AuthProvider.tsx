@@ -1,7 +1,7 @@
 import { createElement, useEffect, useMemo, useSyncExternalStore } from 'react'
 import type { ReactElement, ReactNode } from 'react'
-import type { AuthClient } from '../client/auth-client'
 import { createAuthSession } from '../bindings/create-auth-session'
+import type { AuthClient } from '../client/auth-client'
 import { AuthContext } from './auth-context'
 
 interface AuthProviderProps {

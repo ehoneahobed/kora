@@ -1,6 +1,6 @@
 import { OFFLINE_SYNC_STATUS, createSyncStatusController } from '@korajs/sync'
 import type { SyncStatusInfo } from '@korajs/sync'
-import { readable, type Readable } from 'svelte/store'
+import { type Readable, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
 
 /**

@@ -1,13 +1,9 @@
 import type { KoraEventEmitter } from '@korajs/core'
+import { ConnectionMonitor, ReconnectionManager, type SyncEngine } from '@korajs/sync'
 import { AuthSyncCoordinator } from './auth-sync-coordinator'
 import type { InitializeAppResult } from './initialize-app'
-import { createSyncStatusBridge, type SyncStatusBridge } from './sync-status-bridge'
+import { type SyncStatusBridge, createSyncStatusBridge } from './sync-status-bridge'
 import type { KoraConfig } from './types'
-import {
-	ConnectionMonitor,
-	ReconnectionManager,
-	type SyncEngine,
-} from '@korajs/sync'
 
 /** Mutable sync runtime state owned by {@link createApp}. */
 export interface SyncRuntimeState {

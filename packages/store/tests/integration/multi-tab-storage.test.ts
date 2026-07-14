@@ -1,8 +1,8 @@
 import { defineSchema, t } from '@korajs/core'
-import { Store } from '@korajs/store'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { SqliteWasmAdapter } from '../../src/adapters/sqlite-wasm-adapter'
 import { MockWorkerBridge } from '../../src/adapters/sqlite-wasm-mock-bridge'
+import { Store } from '../../src/index'
 import { FollowerBroadcastBridge, startLeaderRpcRelay } from '../../src/multi-tab/tab-storage'
 
 const schema = defineSchema({

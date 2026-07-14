@@ -1,5 +1,5 @@
-import type { CollectionRecord } from '../types'
 import type { QueryBuilder } from '../query/query-builder'
+import type { CollectionRecord } from '../types'
 import { QueryStore } from './query-store'
 
 interface CacheEntry {

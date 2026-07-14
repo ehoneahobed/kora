@@ -1,6 +1,6 @@
 import type { AwarenessState } from '@korajs/sync'
 import { subscribeRemoteAwarenessStates } from '@korajs/sync'
-import { readable, type Readable } from 'svelte/store'
+import { type Readable, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
 
 /**

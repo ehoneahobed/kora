@@ -25,6 +25,7 @@ export function useQuery<T = CollectionRecord>(
 
 	const [queryStore, setQueryStore] = useState<import('@korajs/store').QueryStore<T> | null>(null)
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: descriptorKey intentionally re-runs the effect when the query descriptor changes, even though the effect reads the query via queryRef
 	useEffect(() => {
 		if (!enabled) {
 			setQueryStore(null)

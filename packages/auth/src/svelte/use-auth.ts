@@ -1,4 +1,5 @@
-import { readable, type Readable } from 'svelte/store'
+import { type Readable, readable } from 'svelte/store'
+import type { AuthSessionSnapshot } from '../bindings/create-auth-session'
 import type {
 	AuthUser,
 	LinkedOAuthAccount,
@@ -6,7 +7,6 @@ import type {
 	OAuthAuthorizationResult,
 	OAuthCallbackParams,
 } from '../client/auth-client'
-import type { AuthSessionSnapshot } from '../bindings/create-auth-session'
 import { getAuthContext } from './auth-context'
 
 export interface UseAuthResult extends AuthSessionSnapshot {

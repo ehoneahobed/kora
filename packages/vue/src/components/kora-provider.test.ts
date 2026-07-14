@@ -2,11 +2,11 @@ import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import { mount } from '@vue/test-utils'
-import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent, h } from 'vue'
 import { koraContextKey, useKoraContext } from '../context'
-import { KoraProvider } from './kora-provider'
 import type { KoraAppLike } from '../types'
+import { KoraProvider } from './kora-provider'
 
 afterEach(() => {
 	vi.restoreAllMocks()
@@ -95,8 +95,7 @@ describe('KoraProvider', () => {
 			const syncEngine = createMockSyncEngine()
 			const wrapper = mount(
 				defineComponent({
-					setup: () => () =>
-						h(KoraProvider, { store, syncEngine }, () => h(ContextReader)),
+					setup: () => () => h(KoraProvider, { store, syncEngine }, () => h(ContextReader)),
 				}),
 			)
 			expect(wrapper.get('[data-testid="has-sync"]').text()).toBe('yes')

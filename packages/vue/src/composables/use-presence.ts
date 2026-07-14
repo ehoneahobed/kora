@@ -1,6 +1,6 @@
 import type { AwarenessState } from '@korajs/sync'
 import { subscribeRemoteAwarenessStates } from '@korajs/sync'
-import { onScopeDispose, shallowRef, watch, watchEffect, type ShallowRef } from 'vue'
+import { type ShallowRef, onScopeDispose, shallowRef, watch, watchEffect } from 'vue'
 import { useKoraContext } from '../context'
 
 /**

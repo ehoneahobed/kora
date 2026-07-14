@@ -10,7 +10,7 @@ describe('assertQueryReady', () => {
 				where: {},
 				orderBy: [],
 			}),
-		} as QueryBuilder<unknown>
+		} as unknown as QueryBuilder<unknown>
 
 		expect(() => assertQueryReady(pending)).toThrow(/app\.ready/)
 	})
@@ -22,7 +22,7 @@ describe('assertQueryReady', () => {
 				where: {},
 				orderBy: [],
 			}),
-		} as QueryBuilder<unknown>
+		} as unknown as QueryBuilder<unknown>
 
 		expect(() => assertQueryReady(query)).not.toThrow()
 	})

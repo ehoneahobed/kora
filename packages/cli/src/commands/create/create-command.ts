@@ -22,13 +22,13 @@ import {
 	detectMonorepoContext,
 	resolveMonorepoTargetDirectory,
 } from './environment-detection'
+import { isSupportedWebFramework } from './options'
 import {
 	type CreateFlags,
 	resolveCreatePreferencesFlow,
 	saveResolvedPreferences,
 	shouldSavePreferences,
 } from './preferences-flow'
-import { isSupportedWebFramework } from './options'
 import { validateProjectName } from './project-name'
 import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'

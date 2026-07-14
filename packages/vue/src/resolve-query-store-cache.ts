@@ -1,5 +1,5 @@
-import { QueryStoreCache } from '@korajs/store'
-import type { KoraAppLike } from '../types'
+import type { QueryStoreCache } from '@korajs/store'
+import type { KoraAppLike } from './types'
 
 /**
  * Resolves the per-app query cache when available, otherwise a provider-local fallback.

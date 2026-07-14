@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from 'vitest'
-import { createAuthSession } from './create-auth-session'
 import type { AuthClient, AuthState } from '../client/auth-client'
+import { createAuthSession } from './create-auth-session'
 
 function createMockClient(initialState: AuthState = 'unauthenticated'): AuthClient {
 	let state = initialState

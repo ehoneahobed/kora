@@ -1,12 +1,12 @@
 <script lang="ts">
-	import type { KoraAppLike } from '../../src/types'
-	import KoraProvider from '../../src/components/KoraProvider.svelte'
+import KoraProvider from '../../src/components/KoraProvider.svelte'
+import type { KoraAppLike } from '../../src/types'
 
-	interface Props {
-		app: KoraAppLike
-	}
+interface Props {
+	app: KoraAppLike
+}
 
-	let { app }: Props = $props()
+const { app }: Props = $props()
 </script>
 
 <KoraProvider {app}>

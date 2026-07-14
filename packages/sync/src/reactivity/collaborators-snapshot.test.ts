@@ -1,10 +1,7 @@
+import { describe, expect, it, vi } from 'vitest'
 import type { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessState } from '../awareness/types'
-import { describe, expect, it, vi } from 'vitest'
-import {
-	getRemoteAwarenessStates,
-	subscribeRemoteAwarenessStates,
-} from './collaborators-snapshot'
+import { getRemoteAwarenessStates, subscribeRemoteAwarenessStates } from './collaborators-snapshot'
 
 function createMockAwareness(
 	states: Map<number, AwarenessState>,
@@ -44,9 +41,7 @@ describe('collaborators-snapshot', () => {
 
 		subscribeRemoteAwarenessStates(awareness, listener)
 		expect(listener).toHaveBeenCalledTimes(1)
-		expect(listener.mock.calls[0]?.[0]).toEqual([
-			{ user: { name: 'Remote', color: '#fff' } },
-		])
+		expect(listener.mock.calls[0]?.[0]).toEqual([{ user: { name: 'Remote', color: '#fff' } }])
 
 		listener.mockClear()
 		listenerRef?.()

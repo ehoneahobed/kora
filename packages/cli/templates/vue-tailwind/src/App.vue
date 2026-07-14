@@ -1,12 +1,5 @@
 <script setup lang="ts">
-import {
-	CheckCircle2,
-	Circle,
-	ClipboardList,
-	Loader2,
-	Plus,
-	Trash2,
-} from 'lucide-vue-next'
+import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { useTodos } from './modules/todos/useTodos'
 

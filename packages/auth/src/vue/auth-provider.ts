@@ -1,8 +1,8 @@
 import type { PropType, VNode } from 'vue'
 import { defineComponent, h, inject, onScopeDispose, provide, shallowRef } from 'vue'
+import { type AuthSessionSnapshot, createAuthSession } from '../bindings/create-auth-session'
 import type { AuthClient } from '../client/auth-client'
-import { createAuthSession, type AuthSessionSnapshot } from '../bindings/create-auth-session'
-import { authContextKey, type AuthContextValue } from './auth-context'
+import { type AuthContextValue, authContextKey } from './auth-context'
 
 export const AuthProvider = defineComponent({
 	name: 'AuthProvider',

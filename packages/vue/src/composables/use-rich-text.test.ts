@@ -1,7 +1,7 @@
 import type { CollectionAccessor, Store } from '@korajs/store'
 import { mount } from '@vue/test-utils'
-import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent, h } from 'vue'
 import * as Y from 'yjs'
 import { KoraProvider } from '../components/kora-provider'
 import { useRichText } from './use-rich-text'
@@ -71,11 +71,7 @@ describe('useRichText', () => {
 			setup() {
 				const binding = useRichText('notes', 'rec-1', 'body')
 				return () =>
-					h(
-						'span',
-						{ 'data-testid': 'value' },
-						binding.ready ? binding.text.toString() : 'loading',
-					)
+					h('span', { 'data-testid': 'value' }, binding.ready ? binding.text.toString() : 'loading')
 			},
 		})
 

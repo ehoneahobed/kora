@@ -1,48 +1,44 @@
 <script lang="ts">
-	import { createAuthStore } from '@korajs/auth/svelte'
-	import { createSyncStatusStore } from '@korajs/svelte'
-	import { createTodosStores } from './modules/todos/useTodos'
+import { createAuthStore } from '@korajs/auth/svelte'
+import { createSyncStatusStore } from '@korajs/svelte'
+import { createTodosStores } from './modules/todos/useTodos'
 
-	type Filter = 'all' | 'active' | 'completed'
+type Filter = 'all' | 'active' | 'completed'
 
-	const syncStatus = createSyncStatusStore()
-	const auth = createAuthStore()
-	const todos = createTodosStores()
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
+const syncStatus = createSyncStatusStore()
+const auth = createAuthStore()
+const todos = createTodosStores()
+const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 
-	let filter = $state<Filter>('all')
-	let input = $state('')
+const filter = $state<Filter>('all')
+let input = $state('')
 
-	const filteredTodos = $derived(
-		filter === 'active'
-			? $activeTodos
-			: filter === 'completed'
-				? $completedTodos
-				: $allTodos,
-	)
+const filteredTodos = $derived(
+	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
+)
 
-	function handleSubmit(event: SubmitEvent): void {
-		event.preventDefault()
-		const title = input.trim()
-		if (!title) return
-		addTodo.mutate({ title })
-		input = ''
+function handleSubmit(event: SubmitEvent): void {
+	event.preventDefault()
+	const title = input.trim()
+	if (!title) return
+	addTodo.mutate({ title })
+	input = ''
+}
+
+function clearCompleted(): void {
+	for (const todo of $completedTodos) {
+		deleteTodo.mutate(todo.id)
 	}
+}
 
-	function clearCompleted(): void {
-		for (const todo of $completedTodos) {
-			deleteTodo.mutate(todo.id)
-		}
+function formatTime(timestamp: number): string {
+	const date = new Date(timestamp)
+	const now = new Date()
+	if (date.toDateString() === now.toDateString()) {
+		return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 	}
-
-	function formatTime(timestamp: number): string {
-		const date = new Date(timestamp)
-		const now = new Date()
-		if (date.toDateString() === now.toDateString()) {
-			return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-		}
-		return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
-	}
+	return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
 </script>
 
 <div class="app">

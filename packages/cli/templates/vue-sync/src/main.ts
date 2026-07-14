@@ -37,7 +37,11 @@ createApp({
 			{ client: authClient, fallback: h('div', 'Restoring session...') },
 			{
 				default: () =>
-					h(KoraProvider, { app: kora, fallback: h('div', 'Loading...') }, { default: () => h(App) }),
+					h(
+						KoraProvider,
+						{ app: kora, fallback: h('div', 'Loading...') },
+						{ default: () => h(App) },
+					),
 			},
 		),
 }).mount('#app')

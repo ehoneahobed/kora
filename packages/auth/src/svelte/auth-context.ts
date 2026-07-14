@@ -1,6 +1,6 @@
 import { getContext, setContext } from 'svelte'
+import { type AuthSession, createAuthSession } from '../bindings/create-auth-session'
 import type { AuthClient, AuthState } from '../client/auth-client'
-import { createAuthSession, type AuthSession } from '../bindings/create-auth-session'
 
 const authContextKey = Symbol('korajs-auth-context')
 

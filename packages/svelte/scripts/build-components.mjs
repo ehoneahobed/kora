@@ -1,7 +1,7 @@
-import { compile } from 'svelte/compiler'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { compile } from 'svelte/compiler'
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 const packageRoot = path.resolve(rootDir, '..')

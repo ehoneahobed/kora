@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import { type InjectionKey, inject, type ShallowRef } from 'vue'
+import { type InjectionKey, type ShallowRef, inject } from 'vue'
 import type { KoraAppLike, KoraContextValue } from './types'
 
 export const koraContextKey: InjectionKey<ShallowRef<KoraContextValue | null>> =

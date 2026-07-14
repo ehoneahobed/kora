@@ -9,7 +9,11 @@ import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
 import { createSyncControl } from './sync-control'
-import { type SyncRuntimeState, teardownSyncLifecycle, wireSyncLifecycleAfterReady } from './sync-lifecycle'
+import {
+	type SyncRuntimeState,
+	teardownSyncLifecycle,
+	wireSyncLifecycleAfterReady,
+} from './sync-lifecycle'
 import { createTransactionExecutor } from './transaction-executor'
 import type { KoraApp, KoraConfig, TypedKoraApp, TypedKoraConfig } from './types'
 import { validateCreateAppConfig } from './validate-config'

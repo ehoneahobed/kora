@@ -16,5 +16,11 @@ export type { AuthContextValue } from './react/auth-context'
 // === Organization Hooks ===
 export { OrgProvider } from './react/OrgProvider'
 export type { OrgProviderProps } from './react/OrgProvider'
-export { OrgContext, useOrg, useOrgMembers, usePermission, checkOrgPermission } from './react/org-hooks'
+export {
+	OrgContext,
+	useOrg,
+	useOrgMembers,
+	usePermission,
+	checkOrgPermission,
+} from './react/org-hooks'
 export type { OrgContextValue, UseOrgResult, UseOrgMembersResult } from './react/org-hooks'

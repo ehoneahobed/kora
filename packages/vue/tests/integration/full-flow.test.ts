@@ -1,8 +1,8 @@
-import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
 import { QueryStoreCache } from '@korajs/store'
+import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
 import { mount } from '@vue/test-utils'
-import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent, h } from 'vue'
 import { KoraProvider } from '../../src/components/kora-provider'
 import { useCollection } from '../../src/composables/use-collection'
 import { useMutation } from '../../src/composables/use-mutation'
@@ -70,9 +70,11 @@ describe('Integration: full flow', () => {
 			},
 		})
 
-		const wrapper = mount(defineComponent({
-			setup: () => () => h(KoraProvider, { store }, () => h(TodoApp)),
-		}))
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { store }, () => h(TodoApp)),
+			}),
+		)
 
 		expect(wrapper.get('[data-testid="count"]').text()).toBe('0')
 		await wrapper.get('[data-testid="add"]').trigger('click')
@@ -93,9 +95,11 @@ describe('Integration: full flow', () => {
 			},
 		})
 
-		const wrapper = mount(defineComponent({
-			setup: () => () => h(KoraProvider, { store }, () => h(StatusDisplay)),
-		}))
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { store }, () => h(StatusDisplay)),
+			}),
+		)
 
 		expect(wrapper.get('[data-testid="status"]').text()).toBe('offline')
 		await store.close()
@@ -138,9 +142,11 @@ describe('Integration: full flow', () => {
 			},
 		})
 
-		const wrapper = mount(defineComponent({
-			setup: () => () => h(KoraProvider, { store, syncEngine }, () => h(FullApp)),
-		}))
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { store, syncEngine }, () => h(FullApp)),
+			}),
+		)
 
 		expect(wrapper.get('[data-testid="count"]').text()).toBe('0')
 		expect(wrapper.get('[data-testid="status"]').text()).toBe('synced')
@@ -177,9 +183,11 @@ describe('Integration: app prop', () => {
 			},
 		})
 
-		const wrapper = mount(defineComponent({
-			setup: () => () => h(KoraProvider, { app }, () => h(TodoList)),
-		}))
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { app }, () => h(TodoList)),
+			}),
+		)
 
 		expect(wrapper.find('[data-testid="count"]').exists()).toBe(false)
 
@@ -211,14 +219,16 @@ describe('Integration: app prop', () => {
 			getQueryStoreCache: () => new QueryStoreCache(),
 		}
 
-		const wrapper = mount(defineComponent({
-			setup: () => () =>
-				h(
-					KoraProvider,
-					{ app, fallback: h('div', { 'data-testid': 'fallback' }, 'Loading...') },
-					() => h('div', { 'data-testid': 'child' }, 'Loaded!'),
-				),
-		}))
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () =>
+					h(
+						KoraProvider,
+						{ app, fallback: h('div', { 'data-testid': 'fallback' }, 'Loading...') },
+						() => h('div', { 'data-testid': 'child' }, 'Loaded!'),
+					),
+			}),
+		)
 
 		expect(wrapper.get('[data-testid="fallback"]').text()).toBe('Loading...')
 		expect(wrapper.find('[data-testid="child"]').exists()).toBe(false)

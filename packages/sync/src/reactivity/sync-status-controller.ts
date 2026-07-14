@@ -44,8 +44,7 @@ export interface SyncStatusController {
 export function createSyncStatusController(
 	options: SyncStatusControllerOptions,
 ): SyncStatusController {
-	const useLiveSnapshot =
-		options.subscribeSyncStatus === null && options.events === null
+	const useLiveSnapshot = options.subscribeSyncStatus === null && options.events === null
 	let snapshot = OFFLINE_SYNC_STATUS
 	let serialized = JSON.stringify(OFFLINE_SYNC_STATUS)
 	const listeners = new Set<() => void>()

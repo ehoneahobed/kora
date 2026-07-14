@@ -1,5 +1,6 @@
-import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '../types'
 import { describe, expect, it, vi } from 'vitest'
+import type { QueryBuilder } from '../query/query-builder'
+import type { CollectionRecord, SubscriptionCallback } from '../types'
 import { QueryStoreCache } from './query-store-cache'
 
 function createMockQueryBuilder(

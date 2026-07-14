@@ -1,5 +1,5 @@
-import { describe, expect, test, vi } from 'vitest'
 import { get } from 'svelte/store'
+import { describe, expect, test, vi } from 'vitest'
 import { createSyncStatusStore } from './use-sync-status'
 
 vi.mock('../context', () => ({

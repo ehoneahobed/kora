@@ -1,14 +1,10 @@
 import { onScopeDispose, reactive, readonly, ref, watch } from 'vue'
-import type {
-	ClientInvitation,
-	ClientMembership,
-	ClientOrganization,
-} from '../client/org-client'
 import {
+	type OrgSnapshot,
 	createOrgMembersActions,
 	loadOrgMembers,
-	type OrgSnapshot,
 } from '../bindings/create-org-session'
+import type { ClientInvitation, ClientMembership, ClientOrganization } from '../client/org-client'
 import { useOrgContext } from './org-provider'
 
 export interface UseOrgResult {

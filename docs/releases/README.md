@@ -6,4 +6,4 @@
 | v0.6 public beta | [v0.6-public-beta.md](./v0.6-public-beta.md) | `pnpm test:release-gate` + `pnpm test:e2e` |
 | npm publish (maintainers) | [npm-publish-checklist.md](./npm-publish-checklist.md) | `pnpm changeset publish --dry-run` |
 
-Implementation tracking: [best-in-class-implementation-plan.md](../plans/best-in-class-implementation-plan.md) (complete).
+Implementation tracking: the internal best-in-class implementation plan (complete; archived privately).

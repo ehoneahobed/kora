@@ -1,5 +1,5 @@
 import type { KoraEventEmitter } from '@korajs/core'
-import { createSyncStatusController, type SyncStatusInfo } from '@korajs/sync'
+import { type SyncStatusInfo, createSyncStatusController } from '@korajs/sync'
 
 /**
  * Event-driven sync status snapshot for non-React consumers (`app.sync.status`).

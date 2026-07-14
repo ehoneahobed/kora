@@ -48,3 +48,11 @@ e2e/test-results/
 
 # Local content directory
 content/
+
+# Rust build artifacts (tauri plugin)
+target/
+
+# Private planning docs and session workspaces (kept locally, not published)
+_private/
+_audit_tmp/
+_to_delete/

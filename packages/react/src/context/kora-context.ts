@@ -1,7 +1,15 @@
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
-import { createContext, createElement, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import {
+	createContext,
+	createElement,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from 'react'
 import type { ReactNode } from 'react'
 import type { KoraContextValue, KoraProviderProps } from '../types'
 
@@ -61,6 +69,9 @@ function KoraProvider({
 		if (!resolvedStore) {
 			return null
 		}
+		if (fallbackQueryStoreCache.current === null) {
+			fallbackQueryStoreCache.current = new QueryStoreCache()
+		}
 		return {
 			store: resolvedStore,
 			syncEngine: resolvedSync,
@@ -70,7 +81,7 @@ function KoraProvider({
 			queryStoreCache:
 				app && typeof app.getQueryStoreCache === 'function'
 					? app.getQueryStoreCache()
-					: fallbackQueryStoreCache.current!,
+					: fallbackQueryStoreCache.current,
 		}
 	}, [resolvedStore, resolvedSync, app])
 

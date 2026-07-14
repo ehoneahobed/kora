@@ -1,30 +1,26 @@
 <script lang="ts">
-	import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
-	import { createTodosStores } from './modules/todos/useTodos'
+import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
+import { createTodosStores } from './modules/todos/useTodos'
 
-	type Filter = 'all' | 'active' | 'completed'
+type Filter = 'all' | 'active' | 'completed'
 
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
-		createTodosStores()
+const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+	createTodosStores()
 
-	let filter = $state<Filter>('all')
-	let input = $state('')
+const filter = $state<Filter>('all')
+let input = $state('')
 
-	const filteredTodos = $derived(
-		filter === 'active'
-			? $activeTodos
-			: filter === 'completed'
-				? $completedTodos
-				: $allTodos,
-	)
+const filteredTodos = $derived(
+	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
+)
 
-	function handleSubmit(event: SubmitEvent): void {
-		event.preventDefault()
-		const title = input.trim()
-		if (!title) return
-		addTodo.mutate({ title })
-		input = ''
-	}
+function handleSubmit(event: SubmitEvent): void {
+	event.preventDefault()
+	const title = input.trim()
+	if (!title) return
+	addTodo.mutate({ title })
+	input = ''
+}
 </script>
 
 <div class="min-h-screen bg-gray-950 text-gray-100">

@@ -1,4 +1,9 @@
-import type { CollectionRecord, QueryBuilder, QueryStoreCache, SubscriptionCallback } from '@korajs/store'
+import type {
+	CollectionRecord,
+	QueryBuilder,
+	QueryStoreCache,
+	SubscriptionCallback,
+} from '@korajs/store'
 import { QueryStoreCache as QueryStoreCacheClass } from '@korajs/store'
 import { get } from 'svelte/store'
 import { describe, expect, it, vi } from 'vitest'

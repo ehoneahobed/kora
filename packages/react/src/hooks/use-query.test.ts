@@ -1,7 +1,7 @@
 import type { CollectionRecord, QueryBuilder, SubscriptionCallback } from '@korajs/store'
 import type { Store } from '@korajs/store'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
-import { StrictMode, createElement, useState, type ReactElement } from 'react'
+import { type ReactElement, StrictMode, createElement, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
 import { useQuery } from './use-query'

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, type ReactNode } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef } from 'react'
+import { type OrgSession, createOrgSession } from '../bindings/create-org-session'
 import type { OrgClient } from '../client/org-client'
-import { createOrgSession, type OrgSession } from '../bindings/create-org-session'
 import { OrgContext, type OrgContextValue } from './org-hooks'
 
 export interface OrgProviderProps {
@@ -26,12 +26,13 @@ export function OrgProvider({ client, children }: OrgProviderProps) {
 		}
 	}, [])
 
+	const session = sessionRef.current
 	const value = useMemo<OrgContextValue>(
 		() => ({
 			client,
-			session: sessionRef.current!,
+			session,
 		}),
-		[client],
+		[client, session],
 	)
 
 	return <OrgContext.Provider value={value}>{children}</OrgContext.Provider>

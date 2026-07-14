@@ -47,9 +47,7 @@ export function getKoraApp(): KoraAppLike {
 export async function initKoraProvider(app: KoraAppLike): Promise<KoraContextValue> {
 	await app.ready
 	const queryStoreCache =
-		typeof app.getQueryStoreCache === 'function'
-			? app.getQueryStoreCache()
-			: new QueryStoreCache()
+		typeof app.getQueryStoreCache === 'function' ? app.getQueryStoreCache() : new QueryStoreCache()
 	const value: KoraContextValue = {
 		store: app.getStore(),
 		syncEngine: app.getSyncEngine(),

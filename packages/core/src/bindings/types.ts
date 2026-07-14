@@ -26,7 +26,7 @@ export interface KoraAppLike<TStore = unknown, TSyncEngine = unknown, TQueryCach
 	sync?: KoraBindingSyncBridge | null
 	getStore(): TStore
 	getSyncEngine(): TSyncEngine | null
-	getQueryStoreCache(): TQueryCache
+	getQueryStoreCache?(): TQueryCache
 }
 
 /** Value provided by framework `KoraProvider` implementations. */
