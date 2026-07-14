@@ -1,4 +1,99 @@
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join, relative } from 'node:path'
 import { defineConfig } from 'vitepress'
+
+const SITE_URL = 'https://korajs.dev'
+
+interface DocPage {
+	path: string
+	title: string
+	description: string
+	body: string
+}
+
+function collectMarkdown(dir: string, root: string, out: string[]): void {
+	for (const entry of readdirSync(dir)) {
+		if (entry === 'node_modules' || entry.startsWith('.') || entry === 'CHANGELOG.md') continue
+		const full = join(dir, entry)
+		if (statSync(full).isDirectory()) collectMarkdown(full, root, out)
+		else if (entry.endsWith('.md')) out.push(relative(root, full))
+	}
+}
+
+function parsePage(root: string, path: string): DocPage {
+	const raw = readFileSync(join(root, path), 'utf-8')
+	const fm = raw.match(/^---\n([\s\S]*?)\n---\n/)
+	const title = fm?.[1].match(/^title:\s*(.+)$/m)?.[1]?.trim() ?? path
+	const description = fm?.[1].match(/^description:\s*"?(.+?)"?$/m)?.[1]?.trim() ?? ''
+	const body = fm ? raw.slice(fm[0].length) : raw
+	return { path, title, description, body }
+}
+
+/**
+ * Emits machine-readable docs at build time so AI agents can consume the site:
+ * raw .md copies of every page, an llms.txt index (llmstxt.org), and
+ * llms-full.txt with the entire documentation in one file.
+ */
+function emitLlmsArtifacts(srcDir: string, outDir: string): void {
+	const paths: string[] = []
+	collectMarkdown(srcDir, srcDir, paths)
+	paths.sort()
+
+	const pages = paths.map((p) => parsePage(srcDir, p))
+	for (const p of paths) {
+		const dest = join(outDir, p)
+		mkdirSync(dirname(dest), { recursive: true })
+		copyFileSync(join(srcDir, p), dest)
+	}
+
+	const link = (p: DocPage): string => {
+		const url = `${SITE_URL}/${p.path}`
+		return p.description ? `- [${p.title}](${url}): ${p.description}` : `- [${p.title}](${url})`
+	}
+	const inSection = (prefix: string) => pages.filter((p) => p.path.startsWith(prefix))
+	const rootPages = pages.filter((p) => !p.path.includes('/') && p.path !== 'index.md')
+
+	const llms = [
+		'# Kora.js',
+		'',
+		'> Kora.js is an offline-first JavaScript application framework. Apps store data locally in SQLite (WASM + OPFS in the browser, native SQLite in Node), get reactive queries and automatic conflict resolution, and sync across devices through a self-hosted server. Offline is the default state: every code path works without a network. Scaffold with `npx create-kora-app my-app`.',
+		'',
+		'Key facts: TypeScript-first with full type inference from schema to queries. Packages are published on npm under the @korajs scope plus the `korajs` meta-package. Conflict resolution is a three-tier merge engine (LWW/CRDT auto-merge, declarative constraints, custom resolvers). Sync uses hybrid logical clocks, version vectors, and a protobuf wire format, and resumes after disconnects. MIT licensed.',
+		'',
+		'The links below point directly at raw markdown files. The same pages rendered as HTML live at the same paths without the .md extension.',
+		'',
+		'## Start Here',
+		'',
+		...rootPages.map(link),
+		'',
+		'## Guides',
+		'',
+		...inSection('guide/').map(link),
+		'',
+		'## API Reference',
+		'',
+		...inSection('api/').map(link),
+		'',
+		'## Examples',
+		'',
+		...inSection('examples/').map(link),
+		'',
+		'## Optional',
+		'',
+		...inSection('releases/').map(link),
+		'',
+		`Full documentation in a single file: ${SITE_URL}/llms-full.txt`,
+		'',
+	].join('\n')
+	writeFileSync(join(outDir, 'llms.txt'), llms)
+
+	const full = pages
+		.filter((p) => !p.path.startsWith('releases/'))
+		.map((p) => `# ${p.title}\nSource: ${SITE_URL}/${p.path.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')}\n\n${p.body.trim()}\n`)
+		.join('\n---\n\n')
+	writeFileSync(join(outDir, 'llms-full.txt'), full)
+}
+
 
 export default defineConfig({
 	lang: 'en-US',
@@ -45,6 +140,9 @@ export default defineConfig({
 	],
 	sitemap: {
 		hostname: 'https://korajs.dev',
+	},
+	buildEnd(siteConfig) {
+		emitLlmsArtifacts(siteConfig.srcDir, siteConfig.outDir)
 	},
 	transformPageData(pageData) {
 		const path = pageData.relativePath.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')
