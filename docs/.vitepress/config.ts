@@ -1,9 +1,13 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+	lang: 'en-US',
 	title: 'Kora.js',
-	description: 'Offline-first application framework',
+	titleTemplate: ':title | Kora.js',
+	description:
+		'Kora.js is an offline-first JavaScript framework. Local-first storage on SQLite, automatic conflict resolution, and multi-device sync with zero distributed-systems code.',
 	base: '/',
+	cleanUrls: true,
 	head: [
 		['link', { rel: 'icon', href: '/favicon.ico', sizes: '48x48' }],
 		['link', { rel: 'icon', href: '/favicon-32x32.png', type: 'image/png', sizes: '32x32' }],
@@ -20,18 +24,38 @@ export default defineConfig({
 					'Build apps that work anywhere. Local-first storage, automatic conflict resolution, and sync with zero distributed-systems code.',
 			},
 		],
-		['meta', { property: 'og:image', content: 'https://korajs.dev/kora-app-icon-512x512.png' }],
+		['meta', { property: 'og:image', content: 'https://korajs.dev/og-image.png' }],
 		['meta', { property: 'og:url', content: 'https://korajs.dev/' }],
-		['meta', { name: 'twitter:card', content: 'summary' }],
+		['meta', { name: 'twitter:card', content: 'summary_large_image' }],
+		['meta', { name: 'twitter:title', content: 'Kora.js: Offline-first application framework' }],
+		['meta', { name: 'twitter:image', content: 'https://korajs.dev/og-image.png' }],
+		[
+			'script',
+			{ type: 'application/ld+json' },
+			JSON.stringify({
+				'@context': 'https://schema.org',
+				'@type': 'SoftwareApplication',
+				name: 'Kora.js',
+				applicationCategory: 'DeveloperApplication',
+				operatingSystem: 'Any',
+				description:
+					'Offline-first JavaScript application framework with local SQLite storage, automatic conflict resolution, and multi-device sync.',
+				url: 'https://korajs.dev',
+				offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+				license: 'https://opensource.org/licenses/MIT',
+			}),
+		],
 	],
 	sitemap: {
 		hostname: 'https://korajs.dev',
 	},
 	themeConfig: {
 		logo: {
-			light: '/kora-emblem-color-transparent.png',
-			dark: '/kora-emblem-white-transparent.png',
+			light: '/kora-js-primary-transparent.png',
+			dark: '/kora-js-white-transparent.png',
+			alt: 'Kora.js',
 		},
+		siteTitle: false,
 		nav: [
 			{ text: 'Guide', link: '/getting-started' },
 			{ text: 'API', link: '/api/' },
