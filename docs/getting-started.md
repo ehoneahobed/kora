@@ -1,3 +1,8 @@
+---
+title: Getting Started
+description: "Scaffold an offline-first app with create-kora-app, define a schema, and get local persistence, reactive queries, and multi-device sync in about ten minutes."
+---
+
 # Getting Started
 
 Get from zero to a working offline-first app in under 5 minutes.

@@ -1,3 +1,8 @@
+---
+title: Storage Configuration
+description: "Configure Kora.js storage: SQLite WASM with OPFS, the IndexedDB fallback, native SQLite, database naming, and multi-tab behavior."
+---
+
 # Storage Configuration
 
 Kora uses two separate storage systems: **client-side storage** for the browser (or Node.js) and **server-side storage** for the sync server. This guide covers how to configure both, run multiple apps, and switch between database backends.

@@ -1,3 +1,8 @@
+---
+title: Conflict Resolution
+description: "How Kora.js resolves concurrent edits: the three-tier merge engine with last-write-wins, CRDTs, declarative constraints, and custom resolvers."
+---
+
 # Conflict Resolution
 
 When multiple devices modify the same data concurrently, Kora resolves conflicts through a three-tier merge engine. Each tier adds more control, and most apps never need to go beyond Tier 1.

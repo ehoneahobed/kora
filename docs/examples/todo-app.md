@@ -1,3 +1,8 @@
+---
+title: Todo App Example
+description: "Build an offline-first todo app with Kora.js and React: schema, reactive queries, mutations, and optional multi-device sync."
+---
+
 # Todo App
 
 Build a fully offline-capable todo app with real-time sync in under 100 lines of application code. This example covers schema definition, CRUD operations, filtering, and live sync status.

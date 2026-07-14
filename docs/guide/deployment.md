@@ -1,3 +1,8 @@
+---
+title: Deployment
+description: "Deploy a Kora.js offline-first app: build the client, host the sync server with Docker on Fly.io or Railway, and configure Postgres, TLS, and wss."
+---
+
 # Deployment
 
 This guide walks you through deploying a Kora.js app to the internet. By the end, your app will have a public URL where anyone can use it, with real-time sync across devices.

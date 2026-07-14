@@ -1,3 +1,8 @@
+---
+title: Schema Design
+description: "Design Kora.js schemas: field types, defaults, enums, arrays, rich text, indexes, relations, constraints, and custom merge resolvers."
+---
+
 # Schema Design
 
 The schema is the foundation of every Kora app. It defines your collections, field types, indexes, and relations. Kora uses your schema to generate TypeScript types, create storage tables, and drive the merge engine.

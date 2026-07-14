@@ -1,3 +1,8 @@
+---
+title: Server API
+description: "@korajs/server API reference: the self-hosted sync server, memory, SQLite, and Postgres stores, sync rules, rate limits, and backups."
+---
+
 # Server API Reference
 
 `@korajs/server` is the self-hosted sync server for Kora clients.

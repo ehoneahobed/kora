@@ -1,3 +1,8 @@
+---
+title: Common Patterns
+description: "Production patterns for Kora.js: pagination, derived state, optimistic UI, soft deletes, and recipes beyond basic offline-first CRUD."
+---
+
 # Common Patterns
 
 Real-world apps go beyond basic CRUD. This guide covers patterns you'll encounter when building production applications with Kora.

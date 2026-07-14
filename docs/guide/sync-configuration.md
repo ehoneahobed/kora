@@ -1,3 +1,8 @@
+---
+title: Sync Configuration
+description: "Configure Kora.js sync: server URL, WebSocket and HTTP transports, auth, sync scopes, batching, and reconnection behavior."
+---
+
 # Sync Configuration
 
 Kora sync is opt-in. Your app works fully offline without sync. When enabled, sync handles connection management, delta exchange, conflict resolution, and reconnection automatically.

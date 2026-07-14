@@ -1,3 +1,8 @@
+---
+title: Release Milestones
+description: "Kora.js release milestones and the exit criteria each version must meet before it ships."
+---
+
 # Release milestones
 
 | Version | Doc | Gate command |

@@ -1,3 +1,8 @@
+---
+title: Sync API
+description: "@korajs/sync API reference: the sync engine, transports, protocol messages, the durable queue, encryption, and sync status."
+---
+
 # Sync API Reference
 
 `@korajs/sync` implements the Kora sync protocol: delta exchange, real-time streaming, and transport abstraction. It connects a local `SyncStore` to a remote sync server over any pluggable transport.

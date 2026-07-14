@@ -15,7 +15,6 @@ export default defineConfig({
 		['meta', { name: 'theme-color', content: '#e63323' }],
 		['meta', { property: 'og:type', content: 'website' }],
 		['meta', { property: 'og:site_name', content: 'Kora.js' }],
-		['meta', { property: 'og:title', content: 'Kora.js: Offline-first application framework' }],
 		[
 			'meta',
 			{
@@ -25,9 +24,7 @@ export default defineConfig({
 			},
 		],
 		['meta', { property: 'og:image', content: 'https://korajs.dev/og-image.png' }],
-		['meta', { property: 'og:url', content: 'https://korajs.dev/' }],
 		['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-		['meta', { name: 'twitter:title', content: 'Kora.js: Offline-first application framework' }],
 		['meta', { name: 'twitter:image', content: 'https://korajs.dev/og-image.png' }],
 		[
 			'script',
@@ -49,7 +46,23 @@ export default defineConfig({
 	sitemap: {
 		hostname: 'https://korajs.dev',
 	},
+	transformPageData(pageData) {
+		const path = pageData.relativePath.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')
+		const canonical = `https://korajs.dev/${path}`
+		const title = pageData.title ? `${pageData.title} | Kora.js` : 'Kora.js'
+		pageData.frontmatter.head = pageData.frontmatter.head ?? []
+		pageData.frontmatter.head.push(
+			['link', { rel: 'canonical', href: canonical }],
+			['meta', { property: 'og:url', content: canonical }],
+			['meta', { property: 'og:title', content: title }],
+			['meta', { name: 'twitter:title', content: title }],
+		)
+		if (pageData.description) {
+			pageData.frontmatter.head.push(['meta', { property: 'og:description', content: pageData.description }])
+		}
+	},
 	themeConfig: {
+		lastUpdated: true,
 		logo: {
 			light: '/kora-js-primary-transparent.png',
 			dark: '/kora-js-white-transparent.png',

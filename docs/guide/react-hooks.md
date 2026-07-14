@@ -1,3 +1,8 @@
+---
+title: React Hooks
+description: "Kora.js React bindings: useQuery for reactive data, useMutation, useSyncStatus, useRichText, and KoraProvider, all concurrent-mode safe."
+---
+
 # React Hooks
 
 Kora provides first-class React bindings through the `@korajs/react` package. All hooks are designed for offline-first: data loads synchronously from the local store, mutations are optimistic, and reactive queries update in real time.

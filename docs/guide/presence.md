@@ -1,3 +1,8 @@
+---
+title: Presence and Awareness
+description: "Show who is online and where they are working: presence, awareness, and live cursors for collaborative offline-first apps built with Kora.js."
+---
+
 # Presence & Awareness
 
 Kora includes a presence system for sharing ephemeral collaborative state between connected clients. Unlike operations, presence data is never persisted -- it exists only while clients are connected and is used for features like showing who is online, displaying cursor positions, and indicating which records are being edited.

@@ -1,3 +1,8 @@
+---
+title: React API
+description: "@korajs/react API reference: KoraProvider, useQuery, useMutation, useSyncStatus, useRichText, usePresence, and useCollaborators."
+---
+
 # React API Reference
 
 `@korajs/react` provides React hooks and components for building reactive offline-first UIs. All hooks are concurrent-mode safe (using `useSyncExternalStore` internally) and compatible with React.StrictMode.

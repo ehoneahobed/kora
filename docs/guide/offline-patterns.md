@@ -1,3 +1,8 @@
+---
+title: Offline Patterns
+description: "Designing for offline as the default state: durable write queues, sync status UX, connectivity changes, and convergence in Kora.js apps."
+---
+
 # Offline Patterns
 
 Kora treats offline as the default state. Every code path works without a network connection. Connectivity is a bonus that enables sync, not a prerequisite for functionality.

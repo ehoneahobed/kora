@@ -1,3 +1,8 @@
+---
+title: State Machines
+description: "Model workflow states safely in offline-first apps: field transitions and state machine validation in Kora.js schemas."
+---
+
 # State Machines
 
 Kora supports state machines on enum fields. A state machine constrains which transitions are allowed, preventing invalid state changes during both local mutations and concurrent merges.

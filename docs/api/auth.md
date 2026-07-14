@@ -1,3 +1,8 @@
+---
+title: Auth API
+description: "@korajs/auth API reference: auth client, sessions, MFA, passkeys, organizations, RBAC, and React, Vue, and Svelte auth bindings."
+---
+
 # Auth API Reference
 
 `@korajs/auth` provides authentication, authorization, encryption, and identity management for Kora.js applications.

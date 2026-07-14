@@ -1,3 +1,8 @@
+---
+title: Core API
+description: "@korajs/core API reference: defineSchema, field type builders, operations, hybrid logical clocks, version vectors, and events."
+---
+
 # Core API Reference
 
 `@korajs/core` is the foundation of every Kora.js application. It defines the schema system, operation model, hybrid logical clock, and shared types. It has zero dependencies on other `@kora` packages.

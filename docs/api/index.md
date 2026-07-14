@@ -1,3 +1,8 @@
+---
+title: API Reference
+description: "API reference for every Kora.js package: core, store, merge, sync, server, react, vue, svelte, auth, devtools, test, and the CLI."
+---
+
 # API Reference
 
 Kora.js is organized as a monorepo of focused packages. Each package owns a specific layer of the offline-first stack.

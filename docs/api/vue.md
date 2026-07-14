@@ -1,3 +1,8 @@
+---
+title: Vue API
+description: "@korajs/vue API reference: the Kora provider and composables for reactive queries, mutations, and sync status in Vue apps."
+---
+
 # Vue API Reference
 
 `@korajs/vue` provides Vue 3 composables for building reactive offline-first UIs. Composables use Vue's reactivity system and are safe to use inside `<script setup>`.

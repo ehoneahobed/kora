@@ -1,3 +1,8 @@
+---
+title: Sync Encryption
+description: "Encrypt Kora.js sync traffic end to end: encryption hooks, key management, and what the sync server can and cannot see."
+---
+
 # Sync Encryption
 
 Kora supports end-to-end encryption for sync. When enabled, operation data is encrypted on the client before it leaves the device. The sync server stores and relays encrypted payloads without ever seeing plaintext user data.

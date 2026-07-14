@@ -1,3 +1,8 @@
+---
+title: Test API
+description: "@korajs/test API reference: utilities for multi-client convergence testing, chaos transports, and deterministic sync tests."
+---
+
 # Test API Reference
 
 `@korajs/test` provides a testing harness for multi-device sync scenarios. It creates virtual networks with real SQLite stores and in-memory transports.

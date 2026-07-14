@@ -1,3 +1,8 @@
+---
+title: DevTools API
+description: "@korajs/devtools API reference: instrumentation events, the DevTools bridge, and embedding the in-page overlay."
+---
+
 # DevTools API Reference
 
 `@korajs/devtools` instruments a Kora application and feeds events to a browser DevTools panel for real-time inspection of operations, merges, conflicts, sync activity, and network status.

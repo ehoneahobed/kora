@@ -1,3 +1,8 @@
+---
+title: Testing
+description: "Test offline-first Kora.js apps: unit testing collections and merges, simulating offline states, and @korajs/test convergence utilities."
+---
+
 # Testing
 
 `@korajs/test` provides a testing harness for verifying sync, conflict resolution, and multi-device behavior. It creates virtual device networks with real SQLite stores and in-memory transports — no actual network required.

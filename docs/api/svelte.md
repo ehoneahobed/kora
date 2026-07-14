@@ -1,3 +1,8 @@
+---
+title: Svelte API
+description: "@korajs/svelte API reference: Kora stores and helpers for reactive queries, mutations, and sync status in Svelte apps."
+---
+
 # Svelte API Reference
 
 `@korajs/svelte` provides Svelte stores, composables, and components for offline-first UIs. Works with Svelte 4 store subscriptions and Svelte 5 runes/snippets.

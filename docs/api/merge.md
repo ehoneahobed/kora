@@ -1,3 +1,8 @@
+---
+title: Merge API
+description: "@korajs/merge API reference: the three-tier merge engine, merge strategies, constraints, custom resolvers, and MergeTrace."
+---
+
 # Merge API Reference
 
 `@korajs/merge` implements the three-tier conflict resolution engine for Kora.js. It determines what happens when concurrent operations from different devices modify the same data.

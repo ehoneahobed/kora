@@ -1,3 +1,8 @@
+---
+title: Store API
+description: "@korajs/store API reference: storage adapters, collections, CRUD, the query builder, reactive subscriptions, and multi-tab coordination."
+---
+
 # Store API Reference
 
 `@korajs/store` provides the local storage layer and the collection API that developers interact with for all data operations. It manages persistence (SQLite WASM, IndexedDB), reactive queries, and operation creation.

@@ -1,3 +1,8 @@
+---
+title: Backup and Restore
+description: "Back up and restore Kora.js sync server data: backup commands, storage format, scheduling, and recovery workflows for offline-first apps."
+---
+
 # Backup and Restore
 
 Kora supports two backup paths:

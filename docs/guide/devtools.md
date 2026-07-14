@@ -1,3 +1,8 @@
+---
+title: DevTools
+description: "Inspect operations, trace merge conflicts, and monitor sync in real time with Kora DevTools: the browser extension and in-page overlay."
+---
+
 # DevTools
 
 Kora DevTools is a browser extension that gives you real-time visibility into your app's operations, sync state, and conflict resolution. It is built for debugging offline-first applications where understanding data flow across devices is essential.

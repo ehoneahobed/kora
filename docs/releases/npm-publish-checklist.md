@@ -1,3 +1,8 @@
+---
+title: npm Publish Checklist
+description: "The npm publish checklist used for Kora.js releases: build, test, version, and publish steps with verification."
+---
+
 # npm publish checklist — v0.6.0 public beta
 
 Use this when promoting **local 0.6.0** to npm (registry currently at **0.5.0** for linked packages).

@@ -1,3 +1,8 @@
+---
+title: Tauri Desktop Apps
+description: "Ship Kora.js apps as native desktop applications with Tauri: native SQLite storage, the @korajs/tauri plugin, and desktop setup."
+---
+
 # Tauri Desktop Apps
 
 Build native desktop applications with Kora.js using [Tauri](https://tauri.app). Your app gets native SQLite (no WASM, no Web Workers), a real filesystem, and a tiny binary — while keeping the same React code and sync capabilities as the web version.

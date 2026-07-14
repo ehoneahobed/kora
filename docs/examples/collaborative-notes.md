@@ -1,3 +1,8 @@
+---
+title: Collaborative Notes Example
+description: "Build collaborative notes with Kora.js: CRDT rich text with Yjs, presence, and conflict-free multi-user editing that works offline."
+---
+
 # Collaborative Notes
 
 Build a collaborative note-taking app where multiple users can edit the same document simultaneously. This example demonstrates Kora's `t.richtext()` field type backed by Yjs CRDTs and custom conflict resolvers for computed fields.

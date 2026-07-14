@@ -1,3 +1,8 @@
+---
+title: CLI Reference
+description: "Kora CLI reference: create, dev, migrate, generate, doctor, deploy, backup, status, logs, and compact commands."
+---
+
 # CLI Reference
 
 The Kora CLI provides commands for creating, developing, and managing Kora.js applications. It includes project scaffolding, a development server, schema migration tools, and type generation.

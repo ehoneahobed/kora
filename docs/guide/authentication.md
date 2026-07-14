@@ -1,3 +1,8 @@
+---
+title: Authentication
+description: "Add sign-up, sign-in, sessions, MFA, passkeys, organizations, and role-based access control to an offline-first Kora.js app with @korajs/auth."
+---
+
 # Authentication
 
 `@korajs/auth` provides a complete authentication system designed for offline-first applications. It covers the entire auth lifecycle: sign-up, sign-in, session management, device identity, multi-factor authentication, organizations with role-based access control, passkeys, and encrypted token storage.
