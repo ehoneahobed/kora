@@ -25,6 +25,13 @@ export type {
 	FieldDifference,
 } from './assertions'
 
+// === Protobuf wire transport (for testing convergence through the real wire format) ===
+export { wrapTransportPairWithProtobufWire } from './protobuf-wire-transport'
+export type { TransportPair } from './protobuf-wire-transport'
+
+// === Server-clock transport (for testing clock-skew / rebase integration) ===
+export { wrapTransportPairWithServerClock } from './server-clock-transport'
+
 // === Re-export ChaosTransport for convenience ===
 export { ChaosTransport } from '@korajs/sync'
 export type { ChaosConfig } from '@korajs/sync'

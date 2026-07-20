@@ -55,8 +55,13 @@ Base:     tags = ["work"]
 Device A: tags = ["work", "urgent"]      (added "urgent")
 Device B: tags = ["work", "important"]   (added "important")
 
-Merged:   tags = ["work", "urgent", "important"]
+Merged:   tags = ["work", "important", "urgent"]
 ```
+
+The merged array is ordered deterministically: base elements keep their
+original order, then additions from both sides follow, sorted by their
+serialized form. Every device produces a byte-identical merged array,
+no matter which side it received first.
 
 ### Yjs CRDT (Rich Text)
 
@@ -441,3 +446,35 @@ Use the [DevTools Conflict Inspector](/guide/devtools) to view these traces in r
 | Complex domain-specific business logic | Tier 3 -- write a custom resolver |
 
 Most applications work entirely with Tier 1 defaults. Add Tier 2 and 3 only where your domain requires it.
+
+
+## Field-level convergence (0.7.0)
+
+As of 0.7.0, scalar last-write-wins is resolved **per field, atomically,
+inside the write transaction**. Every materialized row carries a per-field
+last-writer register (`_field_versions`: field → serialized HLC timestamp of
+the last writer). When a remote update arrives, each field it touches is
+compared against that field's stored version; the strictly newer writer wins.
+The comparison is a total order, so every device resolves the same winner
+regardless of the order operations arrive.
+
+What this guarantees in practice:
+
+- Concurrent edits to **different fields** of the same record both survive —
+  neither device's change is lost.
+- Concurrent edits to the **same field** converge to one agreed winner on
+  every device, deterministically.
+- Updates delivered **before their insert** (reordering networks) are folded
+  in when the insert lands, matching in-order devices exactly.
+- A remote insert that lands on an **already existing record id** resolves
+  per field like an update instead of failing on the primary key, and
+  `createdAt` converges to the later insert wall time.
+- Atomic operations compose: `op.increment(n)` on two offline devices merges
+  to the **sum of both deltas**, never last-write-wins.
+- Merge results are computed under an optimistic-concurrency guard, so a
+  local edit can never slip between a merge's read and its write.
+
+You can see all of this with your own eyes: `kora studio` shows each field's
+last writer, and the [Studio Lab](/studio) lets you reproduce any conflict
+interactively. Every merge decision is also persisted to the durable audit
+trail (`_kora_audit_traces`) and shown in Studio's Merges view.

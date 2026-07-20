@@ -343,6 +343,7 @@ interface ProtoEnvelope {
 	accepted?: boolean
 	rejectReason?: string
 	selectedWireFormat?: string
+	serverTime?: number
 	operations?: ProtoOperation[]
 	isFinal?: boolean
 	batchIndex?: number
@@ -381,6 +382,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				accepted: message.accepted,
 				rejectReason: message.rejectReason,
 				selectedWireFormat: message.selectedWireFormat,
+				serverTime: message.serverTime,
 			}
 		case 'operation-batch':
 			return {
@@ -446,6 +448,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 					envelope.selectedWireFormat === 'json' || envelope.selectedWireFormat === 'protobuf'
 						? envelope.selectedWireFormat
 						: undefined,
+				// Preserve the server's wall-clock time so clock-skew detection and
+				// automatic timestamp rebase work over the protobuf wire, not just JSON.
+				...(envelope.serverTime !== undefined ? { serverTime: envelope.serverTime } : {}),
 			}
 		case 'operation-batch':
 			return {
@@ -631,6 +636,8 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 		writer.uint32(138).string(envelope.errorMessage)
 	}
 	if (envelope.retriable !== undefined) writer.uint32(144).bool(envelope.retriable)
+	// Field 19: server wall-clock time (ms epoch). Optional; only handshake-response sets it.
+	if (envelope.serverTime !== undefined) writer.uint32(152).int64(envelope.serverTime)
 	return writer.finish()
 }
 
@@ -700,6 +707,9 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 18:
 				envelope.retriable = reader.bool()
+				break
+			case 19:
+				envelope.serverTime = longToNumber(reader.int64())
 				break
 			default:
 				reader.skipType(tag & 7)

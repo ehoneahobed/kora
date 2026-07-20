@@ -14,11 +14,12 @@ import type {
 	ApplyRemoteOptions,
 	CollectionRecord,
 	LocalMutationHandler,
+	RowVersionState,
 	Store,
 	TransactionCommitBatch,
 	TransactionCommitResult,
 } from '@korajs/store'
-import { richtextStatesEqual } from '@korajs/store'
+import { OptimisticLockError, richtextStatesEqual } from '@korajs/store'
 import {
 	executeDelete,
 	executeInsert,
@@ -32,6 +33,16 @@ import { buildSideEffectEntry } from './build-side-effect-entry'
  * Whether the operation originated locally or arrived from sync.
  */
 export type ApplyMode = 'local' | 'remote'
+
+/**
+ * How many times a merge-engine apply retries when the row changed underneath
+ * it (OptimisticLockError). Each retry recomputes the merge from fresh state;
+ * since JavaScript is single-threaded, invalidation requires an actual new
+ * local write landing at an `await` point, so contention is self-limiting.
+ * Exhaustion rethrows: the operation stays unacknowledged and sync retries it
+ * later — data is never dropped.
+ */
+const MERGE_APPLY_RETRY_LIMIT = 8
 
 /**
  * Dependencies for the unified apply pipeline.
@@ -297,14 +308,67 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return this.deps.store.applyRemoteOperation(op)
 		}
 
+		// Merge-engine paths read state, compute a merge, then write. A concurrent
+		// local mutation landing between read and write invalidates the merge; the
+		// guarded apply detects this (OptimisticLockError) and we recompute from
+		// fresh state. Bounded so a pathological writer can't spin forever —
+		// exhaustion rethrows, leaving the op unacknowledged for a later sync
+		// retry (never silently dropped).
+		let lockError: OptimisticLockError | null = null
+		for (let attempt = 0; attempt < MERGE_APPLY_RETRY_LIMIT; attempt++) {
+			try {
+				return await this.applyRemoteUpdateAttempt(op, collectionDef)
+			} catch (error) {
+				if (!(error instanceof OptimisticLockError)) {
+					throw error
+				}
+				lockError = error
+			}
+		}
+		throw lockError ?? new OptimisticLockError(op.collection, op.recordId)
+	}
+
+	private async applyRemoteUpdateAttempt(
+		op: Operation,
+		collectionDef: CollectionDefinition,
+	): Promise<ApplyResult> {
+		// Snapshot the row's version state BEFORE reading the record: if a local
+		// write lands between these two reads, the guard is older than the record
+		// and the guarded apply fails safe (retry). The reverse order would let a
+		// merge computed from a stale record pass a fresh guard and clobber the
+		// local write.
+		const guard: RowVersionState = (await this.deps.store.getRowVersionState(
+			op.collection,
+			op.recordId,
+		)) ?? { version: null, fieldVersions: null }
+
 		const accessor = this.deps.store.collection(op.collection)
 		const currentRecord = await accessor.findById(op.recordId)
 
 		if (!currentRecord) {
-			const tombstoneResult = await this.applyRemoteUpdateOnDeletedRow(op, collectionDef)
+			const tombstoneResult = await this.applyRemoteUpdateOnDeletedRow(op, collectionDef, guard)
 			if (tombstoneResult !== null) {
 				return tombstoneResult
 			}
+			// No materialized row at all: the store's atomic path appends the op
+			// (nothing to guard — materialization is a no-op until the insert lands).
+			return this.deps.store.applyRemoteOperation(op)
+		}
+
+		// Pure scalar last-write-wins is resolved deterministically and atomically
+		// inside the store using per-field HLC versions. Routing it there (instead
+		// of pre-reading the row here to guess a conflict) both removes the
+		// read-decide-write race — a concurrent local edit can no longer slip
+		// between the check and the write — and guarantees every node converges to
+		// the max-timestamp writer regardless of the order operations arrive. Only
+		// CRDT fields (richtext, add-wins-set arrays), declared constraints, or
+		// custom resolvers still need the three-tier merge engine.
+		if (!updateNeedsMergeEngine(op, collectionDef)) {
+			// The store resolves the write deterministically, but a same-field
+			// concurrent edit is still a merge decision the developer/DevTools must
+			// see. Emit the trace from the immutable local op in the log (race-free),
+			// then let the store perform the authoritative atomic write.
+			await this.observeScalarMerge(op, collectionDef)
 			return this.deps.store.applyRemoteOperation(op)
 		}
 
@@ -328,18 +392,63 @@ export class ApplyPipeline implements LocalMutationHandler {
 		}
 
 		if (!hasConflict) {
-			return this.deps.store.applyRemoteOperation(op)
+			// No CRDT/constraint field the remote op touches has diverged locally
+			// from the base it wrote from: a clean fast-forward. Guarded, because
+			// the divergence check above read the row outside the write transaction.
+			return this.deps.store.applyRemoteOperation(op, {
+				forceMaterialize: true,
+				guardRowState: guard,
+			})
 		}
 
-		return this.applyMergedUpdate(op, collectionDef, currentRecord, op.previousData ?? {})
+		return this.applyMergedUpdate(op, collectionDef, currentRecord, op.previousData ?? {}, guard)
 	}
 
 	/**
 	 * Remote update vs local soft-delete: merge before materializing to avoid zombie rows.
 	 */
+	/**
+	 * Emit merge observability (trace + conflict counter) for a scalar update that
+	 * concurrently touches a field a local operation also changed.
+	 *
+	 * The store resolves the actual value by deterministic per-field LWW; this
+	 * method exists only so the decision is loggable (CLAUDE.md: every merge
+	 * decision must be traceable). It reads the local operation from the append-
+	 * only log — which is immutable — rather than the materialized row, so it is
+	 * not subject to the read-then-write race the store write path was hardened
+	 * against. The merge engine is invoked purely to build an accurate trace; its
+	 * timestamps match the store's LWW comparison, so the trace never lies.
+	 */
+	private async observeScalarMerge(
+		op: Operation,
+		collectionDef: CollectionDefinition,
+	): Promise<void> {
+		const localOp = await this.deps.store.getLatestLocalOperationForRecord(
+			op.collection,
+			op.recordId,
+		)
+		if (!localOp || !localOp.data) {
+			return
+		}
+		const remoteFields = Object.keys(op.data ?? {})
+		const sharesField = remoteFields.some((field) => localOp.data?.[field] !== undefined)
+		if (!sharesField) {
+			return
+		}
+
+		const mergeResult = await this.deps.mergeEngine.merge({
+			local: localOp,
+			remote: op,
+			baseState: op.previousData ?? {},
+			collectionDef,
+		})
+		this.emitMergeLifecycle(op, localOp, mergeResult)
+	}
+
 	private async applyRemoteUpdateOnDeletedRow(
 		op: Operation,
 		collectionDef: CollectionDefinition,
+		guard: RowVersionState,
 	): Promise<ApplyResult | null> {
 		const snapshot = await this.deps.store.findMaterializedRow(op.collection, op.recordId)
 		if (!snapshot?.deleted) {
@@ -361,21 +470,23 @@ export class ApplyPipeline implements LocalMutationHandler {
 			collectionDef,
 		})
 
-		this.emitMergeLifecycle(op, localOp, mergeResult)
-
 		if (mergeResult.appliedOperation === 'local') {
+			this.emitMergeLifecycle(op, localOp, mergeResult)
 			return 'skipped'
 		}
 
-		const mergedOp: Operation = {
-			...op,
-			data: { ...mergeResult.mergedData },
-			timestamp: maxTimestamp(op.timestamp, localOp.timestamp),
-		}
-
-		const applyResult = await this.deps.store.applyRemoteOperation(mergedOp, {
+		// The log keeps the canonical op; only the ROW materializes the merged
+		// data at max(local, remote). Guarded: a local write between our snapshot
+		// read and this apply invalidates the merge and triggers a retry.
+		const applyResult = await this.deps.store.applyRemoteOperation(op, {
 			reactivateIfDeleted: true,
+			forceMaterialize: true,
+			materializeData: { ...mergeResult.mergedData },
+			materializeTimestamp: maxTimestamp(op.timestamp, localOp.timestamp),
+			guardRowState: guard,
 		})
+
+		this.emitMergeLifecycle(op, localOp, mergeResult)
 
 		if (applyResult === 'applied' && mergeResult.sideEffects.length > 0) {
 			await applySideEffectOps(this.deps.store, mergeResult.sideEffects, op.id)
@@ -389,21 +500,30 @@ export class ApplyPipeline implements LocalMutationHandler {
 		collectionDef: CollectionDefinition,
 		currentRecord: CollectionRecord,
 		baseState: Record<string, unknown>,
+		guard: RowVersionState,
 		applyOptions?: ApplyRemoteOptions,
 	): Promise<ApplyResult> {
-		const localTimestamp = await resolveLocalTimestamp(
-			this.deps.store,
+		const latestLocal = await this.deps.store.getLatestLocalOperationForRecord(
 			op.collection,
 			op.recordId,
+		)
+		const localTimestamp = resolveLocalTimestamp(
+			latestLocal,
 			currentRecord,
 			this.deps.store.getNodeId(),
 		)
+		// The spread of `op` would copy the REMOTE op's atomicOps onto the local
+		// side, making atomic composition double the remote delta instead of
+		// summing both intents. The local side's intent metadata must come from
+		// the actual local operation — or be absent entirely.
+		const { atomicOps: _remoteAtomicOps, ...opWithoutAtomic } = op
 		const localOp: Operation = {
-			...op,
+			...opWithoutAtomic,
 			data: buildLocalDiff(baseState, currentRecord, Object.keys(op.data ?? {})),
 			previousData: op.previousData,
 			nodeId: this.deps.store.getNodeId(),
 			timestamp: localTimestamp,
+			...(latestLocal?.atomicOps !== undefined ? { atomicOps: latestLocal.atomicOps } : {}),
 		}
 
 		const constraintContext = createConstraintContext(this.deps.store)
@@ -417,15 +537,24 @@ export class ApplyPipeline implements LocalMutationHandler {
 			constraintContext,
 		)
 
+		// The merged data is authoritative (it already folds in the current local
+		// row), so it must materialize even when its timestamp ties the current
+		// row version — otherwise the device that authored the newer of two
+		// concurrent edits silently drops the merge result and never converges.
+		// The LOG stores the canonical op (ops are immutable, content-addressed);
+		// only the row write uses the merged data and max(local, remote) stamp.
+		// Guarded: a local write since our snapshot invalidates the merge.
+		const applyResult = await this.deps.store.applyRemoteOperation(op, {
+			...applyOptions,
+			forceMaterialize: true,
+			materializeData: mergeResult.mergedData,
+			materializeTimestamp: maxTimestamp(op.timestamp, localTimestamp),
+			guardRowState: guard,
+		})
+
+		// Emit AFTER the guarded apply so a retried attempt doesn't double-report
+		// a merge decision that never materialized.
 		this.emitMergeLifecycle(op, localOp, mergeResult)
-
-		const mergedOp: Operation = {
-			...op,
-			data: mergeResult.mergedData,
-			timestamp: maxTimestamp(op.timestamp, localTimestamp),
-		}
-
-		const applyResult = await this.deps.store.applyRemoteOperation(mergedOp, applyOptions)
 
 		if (applyResult === 'applied' && mergeResult.sideEffects.length > 0) {
 			await applySideEffectOps(this.deps.store, mergeResult.sideEffects, op.id)
@@ -440,9 +569,35 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return this.deps.store.applyRemoteOperation(op)
 		}
 
+		let lockError: OptimisticLockError | null = null
+		for (let attempt = 0; attempt < MERGE_APPLY_RETRY_LIMIT; attempt++) {
+			try {
+				return await this.applyRemoteInsertAttempt(op, collectionDef)
+			} catch (error) {
+				if (!(error instanceof OptimisticLockError)) {
+					throw error
+				}
+				lockError = error
+			}
+		}
+		throw lockError ?? new OptimisticLockError(op.collection, op.recordId)
+	}
+
+	private async applyRemoteInsertAttempt(
+		op: Operation,
+		collectionDef: CollectionDefinition,
+	): Promise<ApplyResult> {
+		// Guard snapshot BEFORE the record read (see applyRemoteUpdateAttempt).
+		const guard: RowVersionState = (await this.deps.store.getRowVersionState(
+			op.collection,
+			op.recordId,
+		)) ?? { version: null, fieldVersions: null }
+
 		const snapshot = await this.deps.store.findMaterializedRow(op.collection, op.recordId)
 		if (!snapshot || snapshot.deleted) {
-			return this.deps.store.applyRemoteOperation(op)
+			// Absent row and insert-vs-tombstone are resolved atomically inside the
+			// store; guard against a local write racing this decision.
+			return this.deps.store.applyRemoteOperation(op, { guardRowState: guard })
 		}
 
 		const localOp = await resolveLocalOpForRecord(
@@ -459,15 +614,19 @@ export class ApplyPipeline implements LocalMutationHandler {
 			collectionDef,
 		})
 
+		// Canonical op in the log; merged data + max(local, remote) stamp on the
+		// row. Force, because the merged result folds in the current local row and
+		// must win even on a version tie with it.
+		const applyResult = await this.deps.store.applyRemoteOperation(op, {
+			forceMaterialize: true,
+			materializeData: mergeResult.mergedData,
+			materializeTimestamp: maxTimestamp(op.timestamp, localOp.timestamp),
+			guardRowState: guard,
+		})
+
 		this.emitMergeLifecycle(op, localOp, mergeResult)
 
-		const mergedOp: Operation = {
-			...op,
-			data: mergeResult.mergedData,
-			timestamp: maxTimestamp(op.timestamp, localOp.timestamp),
-		}
-
-		return this.deps.store.applyRemoteOperation(mergedOp)
+		return applyResult
 	}
 
 	private emitMergeLifecycle(remote: Operation, local: Operation, mergeResult: MergeResult): void {
@@ -594,6 +753,36 @@ async function applySideEffectOps(
 	}
 }
 
+/**
+ * Whether applying this remote update requires the three-tier merge engine.
+ *
+ * Scalar fields converge under deterministic per-field LWW handled entirely in
+ * the store. The merge engine is only needed when a changed field is a CRDT
+ * (richtext or add-wins-set array), when the collection declares constraints, or
+ * when a changed field has a custom resolver.
+ */
+function updateNeedsMergeEngine(op: Operation, collectionDef: CollectionDefinition): boolean {
+	if (collectionDef.constraints.length > 0) {
+		return true
+	}
+	// Intent-preserving atomic ops (increment/max/min) COMPOSE with a concurrent
+	// local atomic op instead of last-write-wins — plain per-field LWW would
+	// silently drop one side's delta (a lost update).
+	if (op.atomicOps && Object.keys(op.atomicOps).length > 0) {
+		return true
+	}
+	for (const field of Object.keys(op.data ?? {})) {
+		const kind = collectionDef.fields[field]?.kind
+		if (kind === 'richtext' || kind === 'array') {
+			return true
+		}
+		if (collectionDef.resolvers[field]) {
+			return true
+		}
+	}
+	return false
+}
+
 function buildLocalDiff(
 	baseState: Record<string, unknown>,
 	currentRecord: Record<string, unknown>,
@@ -606,14 +795,11 @@ function buildLocalDiff(
 	return diff
 }
 
-async function resolveLocalTimestamp(
-	store: Store,
-	collection: string,
-	recordId: string,
+function resolveLocalTimestamp(
+	latestLocal: Operation | null,
 	currentRecord: CollectionRecord,
 	nodeId: string,
-): Promise<HLCTimestamp> {
-	const latestLocal = await store.getLatestLocalOperationForRecord(collection, recordId)
+): HLCTimestamp {
 	if (latestLocal) {
 		return latestLocal.timestamp
 	}

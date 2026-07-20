@@ -84,6 +84,7 @@ function setupServerResponder(
 		rejectReason?: string
 		serverVector?: Record<string, number>
 		serverDelta?: Operation[]
+		serverTime?: number
 	},
 ): void {
 	const accept = options?.accept ?? true
@@ -103,6 +104,7 @@ function setupServerResponder(
 				...(options?.rejectReason?.startsWith('SCHEMA_MISMATCH')
 					? { supportedSchemaMin: 1, supportedSchemaMax: 1 }
 					: {}),
+				...(options?.serverTime !== undefined ? { serverTime: options.serverTime } : {}),
 			}
 			server.send(response)
 
@@ -141,6 +143,238 @@ function setupServerResponder(
 		}
 	})
 }
+
+describe('SyncEngine clock integrity', () => {
+	test('measures skew from serverTime and syncs normally within tolerance', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server, { serverTime: Date.now() + 5_000 })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(engine.isClockBlocked()).toBe(false)
+		const skew = engine.getClockSkewMs()
+		expect(skew).not.toBeNull()
+		expect(Math.abs((skew ?? 0) - 5_000)).toBeLessThan(2_000)
+		expect(engine.getStatus().clockSkewMs).toBe(skew)
+		await engine.stop()
+	})
+
+	test('blocks sync with clock-error status when the device clock is fast', async () => {
+		const { client, server } = createMemoryTransportPair()
+		// Server reports time 5 minutes BEHIND local: local clock is fast.
+		setupServerResponder(server, { serverTime: Date.now() - 5 * 60_000 })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(engine.isClockBlocked()).toBe(true)
+		expect(engine.getStatus().status).toBe('clock-error')
+		const skewEvents = emitter.events.filter((e) => e.type === 'sync:clock-skew')
+		expect(skewEvents.length).toBeGreaterThan(0)
+		expect(skewEvents[0]).toMatchObject({ severity: 'fast-blocked', source: 'handshake' })
+
+		// Recovery: after the user fixes the clock, the block clears and sync can restart.
+		engine.clearClockBlock()
+		expect(engine.isClockBlocked()).toBe(false)
+		expect(engine.getState()).toBe('disconnected')
+		await engine.stop()
+	})
+
+	test('warns without blocking when the device clock is very slow', async () => {
+		const { client, server } = createMemoryTransportPair()
+		// Server reports time 30 minutes AHEAD of local: local clock is slow.
+		setupServerResponder(server, { serverTime: Date.now() + 30 * 60_000 })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		expect(engine.isClockBlocked()).toBe(false)
+		const skewEvents = emitter.events.filter((e) => e.type === 'sync:clock-skew')
+		expect(skewEvents[0]).toMatchObject({ severity: 'slow-warning' })
+		await engine.stop()
+	})
+})
+
+describe('SyncEngine timestamp rebase', () => {
+	function futureOp(id: string, seq: number, wallTime: number): Operation {
+		return { ...makeOp(id, seq), timestamp: { wallTime, logical: 0, nodeId: 'node-1' } }
+	}
+
+	test('rebases queued future ops before delta, replaces the queue, and pushes only new ids', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const now = Date.now()
+		const future = now + 10 * 60_000
+		const oldOp1 = futureOp('old-1', 1, future)
+		const oldOp2 = futureOp('old-2', 2, future + 1)
+		const newOp1: Operation = {
+			...oldOp1,
+			id: 'new-1',
+			timestamp: { wallTime: now, logical: 0, nodeId: 'node-1' },
+		}
+		const newOp2: Operation = {
+			...oldOp2,
+			id: 'new-2',
+			timestamp: { wallTime: now, logical: 1, nodeId: 'node-1' },
+		}
+		const rebaseSpy = vi.fn(async (_ids: string[], _correctedNowMs: number) => ({
+			operations: [newOp1, newOp2],
+			idMapping: { 'old-1': 'new-1', 'old-2': 'new-2' },
+			rebasedCount: 2,
+		}))
+		const store = createMockStore({ rebaseUnsyncedOperations: rebaseSpy })
+		setupServerResponder(server, { serverTime: now })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test' },
+			emitter,
+		})
+
+		await engine.pushOperation(oldOp1)
+		await engine.pushOperation(oldOp2)
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+
+		expect(engine.getState()).toBe('streaming')
+		expect(rebaseSpy).toHaveBeenCalledTimes(1)
+		expect(rebaseSpy.mock.calls[0]?.[0]).toEqual(['old-1', 'old-2'])
+		expect(rebaseSpy.mock.calls[0]?.[1]).toBe(now)
+
+		const rebaseEvents = emitter.events.filter((e) => e.type === 'sync:clock-rebase')
+		expect(rebaseEvents).toHaveLength(1)
+		expect(rebaseEvents[0]).toMatchObject({ rebasedCount: 2, maxSkewMs: future + 1 - now })
+
+		// Only the re-stamped operation ids ever reached the wire.
+		const sentOpIds = client
+			.getSentMessages()
+			.filter((m): m is OperationBatchMessage => m.type === 'operation-batch')
+			.flatMap((m) => m.operations.map((op) => op.id))
+		expect(sentOpIds).toContain('new-1')
+		expect(sentOpIds).toContain('new-2')
+		expect(sentOpIds).not.toContain('old-1')
+		expect(sentOpIds).not.toContain('old-2')
+
+		await engine.stop()
+	})
+
+	test('skips rebase when queued ops are within the server future tolerance', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const now = Date.now()
+		const rebaseSpy = vi.fn(async (_ids: string[], _correctedNowMs: number) => ({
+			operations: [] as Operation[],
+			idMapping: {},
+			rebasedCount: 0,
+		}))
+		const store = createMockStore({ rebaseUnsyncedOperations: rebaseSpy })
+		setupServerResponder(server, { serverTime: now })
+		const engine = new SyncEngine({ transport: client, store, config: { url: 'ws://test' } })
+
+		// 10s ahead: the server accepts anything within 60s, no rewrite needed.
+		await engine.pushOperation(futureOp('near-1', 1, now + 10_000))
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+
+		expect(rebaseSpy).not.toHaveBeenCalled()
+		expect(engine.getState()).toBe('streaming')
+		await engine.stop()
+	})
+
+	test('a failing rebase does not crash the handshake', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const now = Date.now()
+		const store = createMockStore({
+			rebaseUnsyncedOperations: vi.fn(async () => {
+				throw new Error('disk full')
+			}),
+		})
+		setupServerResponder(server, { serverTime: now })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test' },
+			emitter,
+		})
+
+		await engine.pushOperation(futureOp('doomed-1', 1, now + 10 * 60_000))
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+
+		// Handshake completed despite the failed rebase; the failure was surfaced.
+		expect(engine.getState()).toBe('streaming')
+		const failures = emitter.events.filter(
+			(e) => e.type === 'store:persistence-error' && e.code === 'CLOCK_REBASE_FAILED',
+		)
+		expect(failures).toHaveLength(1)
+		expect(emitter.events.filter((e) => e.type === 'sync:clock-rebase')).toHaveLength(0)
+		await engine.stop()
+	})
+
+	test('auto-heals a clock block when a later handshake measures acceptable skew', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		setupServerResponder(server, { serverTime: Date.now() })
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.getState()).toBe('streaming')
+
+		// Server rejects a push with INVALID_TIMESTAMP: the durable block engages.
+		server.send({
+			type: 'error',
+			messageId: 'err-1',
+			code: 'INVALID_TIMESTAMP',
+			message: 'operation timestamp too far in the future',
+			retriable: false,
+		})
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.isClockBlocked()).toBe(true)
+		expect(engine.getStatus().status).toBe('clock-error')
+
+		// The connection drops; the engine lands in disconnected, block still set.
+		await server.disconnect()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.getState()).toBe('disconnected')
+		expect(engine.isClockBlocked()).toBe(true)
+
+		// Reconnect after the user fixed the clock: acceptable measured skew
+		// clears the block automatically, no manual clearClockBlock() needed.
+		setupServerResponder(server, { serverTime: Date.now() })
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.isClockBlocked()).toBe(false)
+		expect(engine.getState()).toBe('streaming')
+		await engine.stop()
+	})
+})
 
 describe('SyncEngine state transitions', () => {
 	test('starts in disconnected state', () => {

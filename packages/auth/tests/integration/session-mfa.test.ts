@@ -4,7 +4,8 @@
  * Tests the flow: sign-in → session creation → MFA requirement →
  * TOTP verification → full access.
  */
-import { beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { vi } from 'vitest'
 import {
 	BuiltInAuthRoutes,
 	InMemorySessionStore,
@@ -40,6 +41,10 @@ describe('Session + MFA integration', () => {
 			issuer: 'TestApp',
 			store: new InMemoryTotpStore(),
 		})
+	})
+
+	afterEach(() => {
+		vi.useRealTimers()
 	})
 
 	// ========================================================================
@@ -180,7 +185,11 @@ describe('Session + MFA integration', () => {
 		})
 		const { user } = (signUp.body as { data: { user: { id: string } } }).data
 
-		// Enable and verify TOTP
+		// Enable and verify TOTP under fake timers so login uses a fresh
+		// time-step (setup consumes the current one; codes are single-use).
+		vi.useFakeTimers()
+		vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
+
 		const setup = await totpManager.enable(user.id, 'mfa-session@example.com')
 		const code = generateTotpCode(setup.secret)
 		await totpManager.verifySetup(user.id, code)
@@ -194,7 +203,8 @@ describe('Session + MFA integration', () => {
 		// requireMfa should throw
 		await expect(sessionManager.requireMfa(session.id)).rejects.toThrow(SessionMfaRequiredError)
 
-		// Verify TOTP code
+		// Advance to the next time window and verify a fresh TOTP code
+		vi.setSystemTime(Date.now() + 30_000)
 		const loginCode = generateTotpCode(setup.secret)
 		const verified = await totpManager.verify(user.id, loginCode)
 		expect(verified).toBe(true)

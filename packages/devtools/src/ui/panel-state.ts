@@ -198,6 +198,10 @@ function timelineLabel(event: KoraEvent): string {
 			return 'sync disconnected'
 		case 'sync:auth-failed':
 			return 'sync auth failed'
+		case 'sync:clock-skew':
+			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
+		case 'sync:clock-rebase':
+			return `clock rebase ${event.rebasedCount} ops (${Math.round(event.maxSkewMs / 1000)}s ahead)`
 		case 'sync:schema-mismatch':
 			return `schema mismatch client ${event.clientSchemaVersion} server ${event.serverSchemaVersion}`
 		case 'sync:apply-failed':

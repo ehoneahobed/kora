@@ -18,16 +18,21 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
-import { StoreNotOpenError } from '../errors'
+import { OptimisticLockError, StoreNotOpenError } from '../errors'
+import {
+	fieldVersionsForFields,
+	parseFieldVersions,
+	resolvePerFieldLww,
+	serializeFieldVersions,
+} from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import type { LocalMutationContext } from '../mutations/types'
 import { QueryBuilder } from '../query/query-builder'
 import {
+	buildFieldFastForwardUpdateQuery,
 	buildInsertQuery,
 	buildLwwSoftDeleteQuery,
-	buildLwwUpdateQuery,
 	buildSoftDeleteQuery,
-	buildUpdateQuery,
 } from '../query/sql-builder'
 import { RelationEnforcer } from '../relations/relation-enforcer'
 import { buildReplaySnapshot } from '../replay/replay-to'
@@ -40,6 +45,8 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
+import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
+import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import {
 	collectOperationsAheadOfServer,
 	loadDeltaCursor,
@@ -58,9 +65,11 @@ import type {
 	MetaRow,
 	OperationRow,
 	RawCollectionRow,
+	RowVersionState,
 	StorageAdapter,
 	StoreConfig,
 	StoreIsolation,
+	Transaction,
 	VersionVectorRow,
 } from '../types'
 import { allocateNextSequenceNumber } from './sequence-allocator'
@@ -232,6 +241,15 @@ export class Store implements OperationLog {
 	/**
 	 * Get the node ID for this store instance.
 	 */
+	/**
+	 * Records the offset between server time and this device's clock
+	 * (serverTime - localTime), learned at sync handshake. Lets the store's HLC
+	 * validate remote timestamps correctly even when the local clock is wrong.
+	 */
+	setClockReferenceOffset(offsetMs: number): void {
+		this.clock?.setReferenceOffset(offsetMs)
+	}
+
 	getNodeId(): string {
 		this.ensureOpen()
 		return this.nodeId
@@ -265,48 +283,204 @@ export class Store implements OperationLog {
 			this.clock.receive(op.timestamp)
 		}
 
-		const remoteVersion = serializeRowVersion(op.timestamp)
-		const wallTime = op.timestamp.wallTime
+		// Materialization may use overridden data/timestamp (authoritative merge
+		// results), but the LOG below always stores the canonical operation:
+		// operations are immutable and content-addressed, so merged values must
+		// never be persisted under the original operation's id.
+		const materializeTimestamp = options?.materializeTimestamp ?? op.timestamp
+		const remoteVersion = serializeRowVersion(materializeTimestamp)
+		const wallTime = materializeTimestamp.wallTime
+		const materializeSource = options?.materializeData ?? op.data
 
 		// Apply the operation to the data table (LWW-guarded; op log always appended below)
 		await this.adapter.transaction(async (tx) => {
-			if (op.type === 'insert' && op.data) {
+			// Optimistic-concurrency guard: if the caller computed its data from a
+			// snapshot, verify the row hasn't changed since. Throwing rolls the
+			// whole transaction back (nothing written, op NOT logged) so the caller
+			// can recompute against fresh state and retry.
+			const checkGuard = (row: RawCollectionRow | undefined): void => {
+				const guard = options?.guardRowState
+				if (!guard) {
+					return
+				}
+				const version = typeof row?._version === 'string' ? row._version : null
+				const fieldVersions = typeof row?._field_versions === 'string' ? row._field_versions : null
+				if (version !== guard.version || fieldVersions !== guard.fieldVersions) {
+					throw new OptimisticLockError(collection, op.recordId)
+				}
+			}
+
+			if (op.type === 'insert' && materializeSource) {
+				const serializedData = serializeRecord(materializeSource, definition.fields)
 				const existing = await tx.query<RawCollectionRow>(
-					`SELECT _updated_at, _version FROM ${collection} WHERE id = ?`,
+					`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
 					[op.recordId],
 				)
 				const row = existing[0]
-				if (row && !isIncomingNewerThanRow(op.timestamp, row)) {
-					// Stale remote insert — skip materialization, still record op below
-				} else {
-					const serializedData = serializeRecord(op.data, definition.fields)
+				checkGuard(row)
+
+				if (!row) {
 					const record: Record<string, unknown> = {
 						id: op.recordId,
 						...serializedData,
 						_created_at: wallTime,
 						_updated_at: wallTime,
 						_version: remoteVersion,
+						// Stamp every inserted field so per-field LWW has a real baseline.
+						_field_versions: serializeFieldVersions(
+							fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
+						),
 					}
 					const insertQuery = buildInsertQuery(collection, record)
 					await tx.execute(insertQuery.sql, insertQuery.params)
+
+					// Catch up on operations delivered BEFORE this insert (transports may
+					// reorder): any update/delete already logged for this record was
+					// applied while no row existed, so it never materialized. The row is
+					// a fold of the log — fold the orphans now, in timestamp order,
+					// inside this same transaction. Per-field LWW makes the result
+					// identical to what an in-order device computed.
+					await this.foldOrphanedOperations(tx, collection, definition, op.recordId)
+				} else if (row._deleted === 1) {
+					// Insert vs tombstone: a strictly newer insert resurrects the record
+					// with its full field set; an older one is stale (delete wins).
+					if (isIncomingNewerThanRow(materializeTimestamp, row)) {
+						const fieldChanges: Record<string, unknown> = {
+							...serializedData,
+							_deleted: 0,
+							_field_versions: serializeFieldVersions(
+								fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
+							),
+						}
+						const upsert = buildFieldFastForwardUpdateQuery(
+							collection,
+							op.recordId,
+							fieldChanges,
+							remoteVersion,
+							wallTime,
+							{ maxCreatedAt: wallTime },
+						)
+						await tx.execute(upsert.sql, upsert.params)
+					}
+				} else {
+					// Insert collision on a LIVE row (relayed insert racing a local one,
+					// or an insert-vs-insert merge). A plain INSERT would violate the
+					// primary key; resolve per-field instead, exactly like an update, so
+					// every node converges no matter which insert (or interleaved
+					// update) it saw first. `_created_at` converges to the max insert
+					// wall time seen, applied even when every field loses.
+					const currentVersions = parseFieldVersions(row._field_versions)
+					const rowVersion = typeof row._version === 'string' ? row._version : undefined
+					const fieldChanges: Record<string, unknown> = {}
+					let fieldVersionsJson: string
+					if (options?.forceMaterialize) {
+						// Authoritative merged insert: every field is written.
+						const merged = { ...currentVersions }
+						for (const field of Object.keys(serializedData)) {
+							fieldChanges[field] = serializedData[field]
+							merged[field] = remoteVersion
+						}
+						fieldVersionsJson = serializeFieldVersions(merged)
+					} else {
+						const { winners, merged } = resolvePerFieldLww(
+							currentVersions,
+							Object.keys(serializedData),
+							remoteVersion,
+							rowVersion,
+						)
+						for (const field of winners) {
+							fieldChanges[field] = serializedData[field]
+						}
+						fieldVersionsJson = serializeFieldVersions(merged)
+					}
+					const upsert = buildFieldFastForwardUpdateQuery(
+						collection,
+						op.recordId,
+						{ ...fieldChanges, _field_versions: fieldVersionsJson },
+						remoteVersion,
+						wallTime,
+						{ maxCreatedAt: wallTime },
+					)
+					await tx.execute(upsert.sql, upsert.params)
 				}
-			} else if (op.type === 'update' && op.data) {
-				const serializedChanges = serializeRecord(op.data, definition.fields)
-				const updatePayload: Record<string, unknown> = {
-					...serializedChanges,
-					_updated_at: wallTime,
-					_version: remoteVersion,
-				}
-				if (options?.reactivateIfDeleted) {
-					updatePayload._deleted = 0
-				}
-				const updateQuery = buildLwwUpdateQuery(
-					collection,
-					op.recordId,
-					updatePayload,
-					remoteVersion,
+			} else if (op.type === 'update' && materializeSource) {
+				const serializedChanges = serializeRecord(materializeSource, definition.fields)
+				const changedFields = Object.keys(serializedChanges)
+
+				// Read the current per-field versions INSIDE the transaction so the
+				// resolve-then-write is atomic with respect to any concurrent local
+				// mutation — this is what prevents a relayed remote op from clobbering
+				// a newer local edit that lands between the read and the write.
+				const currentRows = await tx.query<RawCollectionRow>(
+					`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+					[op.recordId],
 				)
-				await tx.execute(updateQuery.sql, updateQuery.params)
+				const currentRow = currentRows[0]
+				checkGuard(currentRow)
+
+				if (currentRow) {
+					const currentVersions = parseFieldVersions(currentRow._field_versions)
+					const rowVersion =
+						typeof currentRow._version === 'string' ? currentRow._version : undefined
+
+					if (options?.forceMaterialize) {
+						// Authoritative merged result (richtext / add-wins-set / constraint
+						// resolution computed by the merge engine): write every changed
+						// field and stamp its per-field version to this op's version, while
+						// advancing the row watermark monotonically.
+						const merged = { ...currentVersions }
+						for (const field of changedFields) {
+							merged[field] = remoteVersion
+						}
+						const fieldChanges: Record<string, unknown> = {
+							...serializedChanges,
+							_field_versions: serializeFieldVersions(merged),
+						}
+						if (options?.reactivateIfDeleted) {
+							fieldChanges._deleted = 0
+						}
+						const forceQuery = buildFieldFastForwardUpdateQuery(
+							collection,
+							op.recordId,
+							fieldChanges,
+							remoteVersion,
+							wallTime,
+						)
+						await tx.execute(forceQuery.sql, forceQuery.params)
+					} else {
+						// Deterministic field-level LWW: write only the fields this op
+						// wins (strictly newer than the field's stored version). Same
+						// result on every node regardless of arrival order.
+						const { winners, merged } = resolvePerFieldLww(
+							currentVersions,
+							changedFields,
+							remoteVersion,
+							rowVersion,
+						)
+						if (winners.length > 0 || options?.reactivateIfDeleted) {
+							const winningChanges: Record<string, unknown> = {
+								_field_versions: serializeFieldVersions(merged),
+							}
+							for (const field of winners) {
+								winningChanges[field] = serializedChanges[field]
+							}
+							if (options?.reactivateIfDeleted) {
+								winningChanges._deleted = 0
+							}
+							const forceQuery = buildFieldFastForwardUpdateQuery(
+								collection,
+								op.recordId,
+								winningChanges,
+								remoteVersion,
+								wallTime,
+							)
+							await tx.execute(forceQuery.sql, forceQuery.params)
+						}
+					}
+				}
+				// currentRow absent: nothing materialized to update (insert not yet
+				// applied, or hard-absent). The op is still appended to the log below;
+				// the pipeline handles tombstone reactivation separately.
 			} else if (op.type === 'delete') {
 				const deleteQuery = buildLwwSoftDeleteQuery(
 					collection,
@@ -340,6 +514,78 @@ export class Store implements OperationLog {
 		this.subscriptionManager.notify(collection, op)
 
 		return 'applied'
+	}
+
+	/**
+	 * Materialize update/delete operations that were logged for a record BEFORE
+	 * its insert arrived (reordered delivery). Runs inside the insert's write
+	 * transaction, folding each orphan in timestamp order through the exact
+	 * per-field LWW / LWW-delete rules the normal apply paths use, so the final
+	 * row state equals what a device that received the operations in causal
+	 * order computed. Called only when the insert created a previously-absent
+	 * row — in that case every logged update/delete for the record is
+	 * necessarily an orphan (rows are soft-deleted, never removed, so a row
+	 * that is absent now was never materialized).
+	 */
+	private async foldOrphanedOperations(
+		tx: Transaction,
+		collection: string,
+		definition: NonNullable<SchemaDefinition['collections'][string]>,
+		recordId: string,
+	): Promise<void> {
+		const orphanRows = await tx.query<OperationRow>(
+			`SELECT * FROM _kora_ops_${collection} WHERE record_id = ? AND type IN ('update', 'delete')`,
+			[recordId],
+		)
+		if (orphanRows.length === 0) {
+			return
+		}
+
+		const orphans = orphanRows
+			.map((r) => deserializeOperationWithCollection(r, collection))
+			.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
+
+		for (const orphan of orphans) {
+			const orphanVersion = serializeRowVersion(orphan.timestamp)
+			const orphanWall = orphan.timestamp.wallTime
+
+			if (orphan.type === 'update' && orphan.data) {
+				const orphanChanges = serializeRecord(orphan.data, definition.fields)
+				const rows = await tx.query<RawCollectionRow>(
+					`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+					[recordId],
+				)
+				const current = rows[0]
+				if (!current) {
+					continue
+				}
+				const { winners, merged } = resolvePerFieldLww(
+					parseFieldVersions(current._field_versions),
+					Object.keys(orphanChanges),
+					orphanVersion,
+					typeof current._version === 'string' ? current._version : undefined,
+				)
+				if (winners.length > 0) {
+					const winningChanges: Record<string, unknown> = {
+						_field_versions: serializeFieldVersions(merged),
+					}
+					for (const field of winners) {
+						winningChanges[field] = orphanChanges[field]
+					}
+					const query = buildFieldFastForwardUpdateQuery(
+						collection,
+						recordId,
+						winningChanges,
+						orphanVersion,
+						orphanWall,
+					)
+					await tx.execute(query.sql, query.params)
+				}
+			} else if (orphan.type === 'delete') {
+				const query = buildLwwSoftDeleteQuery(collection, recordId, orphanWall, orphanVersion)
+				await tx.execute(query.sql, query.params)
+			}
+		}
 	}
 
 	/**
@@ -526,6 +772,32 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Raw version state of a materialized row, for optimistic-concurrency guarded
+	 * applies: capture this snapshot before computing a merge, pass it as
+	 * `guardRowState`, and the apply refuses to write if the row changed since.
+	 * Returns null when no row exists (which is itself a valid guard state — the
+	 * apply then requires the row to still be absent).
+	 */
+	async getRowVersionState(collection: string, recordId: string): Promise<RowVersionState | null> {
+		this.ensureOpen()
+		if (!this.schema.collections[collection]) {
+			return null
+		}
+		const rows = await this.adapter.query<RawCollectionRow>(
+			`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+			[recordId],
+		)
+		const row = rows[0]
+		if (!row) {
+			return null
+		}
+		return {
+			version: typeof row._version === 'string' ? row._version : null,
+			fieldVersions: typeof row._field_versions === 'string' ? row._field_versions : null,
+		}
+	}
+
+	/**
 	 * Latest operation from this device for a record (used for delete-vs-update merge on sync).
 	 */
 	/**
@@ -570,6 +842,34 @@ export class Store implements OperationLog {
 			serverVector,
 			(nodeId, fromSeq, toSeq) => this.getOperationRange(nodeId, fromSeq, toSeq),
 		)
+	}
+
+	/**
+	 * Re-stamp never-acknowledged local operations after a fast device clock was
+	 * corrected, so sync can resume immediately. Safe because unacknowledged
+	 * operations are private to this device (like unpushed git commits);
+	 * acknowledged/shared operations are immutable and never touched.
+	 *
+	 * After the rewrite the store's HLC is advanced past the highest new
+	 * timestamp so subsequent local writes keep sorting after the rebased ops.
+	 * No data-change notifications are emitted: materialized values are
+	 * unchanged, only version stamps move.
+	 */
+	async rebaseUnsyncedOperations(
+		unsyncedOpIds: string[],
+		correctedNowMs: number,
+	): Promise<ClockRebaseResult> {
+		this.ensureOpen()
+		const result = await rebaseUnsyncedOperationsInLog(
+			this.adapter,
+			this.schema,
+			unsyncedOpIds,
+			correctedNowMs,
+		)
+		if (result.newMaxTimestamp && this.clock) {
+			this.clock.advanceTo(result.newMaxTimestamp)
+		}
+		return result
 	}
 
 	/**

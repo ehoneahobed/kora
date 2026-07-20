@@ -75,7 +75,7 @@ Anonymous users' operations are synced to the server and visible to authenticate
 A common mistake is storing aggregated values (counts, sums, averages) as fields on a record, then trying to keep them in sync. This breaks in offline-first apps because:
 
 1. **Sync scoping** — anonymous users may not have write access to the collection containing the counter
-2. **Concurrent updates** — two devices incrementing a counter simultaneously can result in a lost increment (LWW picks one)
+2. **Concurrent updates** — two devices incrementing a counter with a plain read-modify-write update can lose an increment (per-field LWW picks one writer). Atomic `op.increment()` and fields declared `.merge('counter')` compose to the sum of both deltas instead, but the plain update pattern shown below does not
 3. **Stale data** — the counter can drift from reality if any update is lost or filtered
 
 **Instead, derive aggregated values from the actual data at query time.**
@@ -143,6 +143,7 @@ Stored counters work when:
 - Only one user/role ever updates the counter (no concurrent writes)
 - The counter is in a collection the updater has write access to
 - Exact accuracy isn't critical (e.g., a "views" counter where off-by-one is acceptable)
+- The counter is updated with atomic `op.increment()` or declared `.merge('counter')`, so concurrent changes accumulate instead of overwriting
 
 For everything else, derive from the source data.
 

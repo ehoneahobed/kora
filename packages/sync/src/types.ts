@@ -26,6 +26,7 @@ export const SYNC_STATUSES = [
 	'syncing',
 	'synced',
 	'offline',
+	'clock-error',
 	'error',
 	'schema-mismatch',
 ] as const
@@ -47,6 +48,8 @@ export interface SyncStatusInfo {
 	lastSuccessfulPull: number | null
 	/** Number of merge conflicts encountered during this session */
 	conflicts: number
+	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
+	clockSkewMs: number | null
 }
 
 /**

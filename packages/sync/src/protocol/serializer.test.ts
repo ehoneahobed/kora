@@ -94,6 +94,51 @@ describe('ProtobufMessageSerializer', () => {
 
 		expect(serializer.decode(serializer.encode(message))).toEqual(message)
 	})
+
+	test('preserves handshake-response serverTime across the wire', () => {
+		// Regression: serverTime was dropped by the protobuf envelope, which
+		// silently disabled clock-skew detection and auto-rebase for any client
+		// negotiated onto the protobuf wire format.
+		const message: HandshakeResponseMessage = {
+			type: 'handshake-response',
+			messageId: 'resp-clock',
+			nodeId: 'server-1',
+			versionVector: { 'node-1': 2 },
+			schemaVersion: 1,
+			accepted: true,
+			selectedWireFormat: 'protobuf',
+			serverTime: 1_700_000_123_456,
+		}
+
+		const decoded = serializer.decode(serializer.encode(message))
+		expect(decoded).toEqual(message)
+		if (decoded.type !== 'handshake-response') throw new Error('wrong message type')
+		expect(decoded.serverTime).toBe(1_700_000_123_456)
+	})
+
+	test('preserves tagged binary richtext op.data across the wire', () => {
+		// Binary richtext values are canonicalized to a tagged { $koraBytes }
+		// object at operation-creation time. That plain object must survive the
+		// protobuf dataJson round-trip byte-for-byte so content-addressed ids
+		// stay stable and the merge layer can decode the Yjs update.
+		const tagged = { $koraBytes: 'AQIDBAU=' }
+		const operation = serializer.encodeOperation(
+			makeOperation({ id: 'op-bin', collection: 'articles', data: { body: tagged } }),
+		)
+		const message: OperationBatchMessage = {
+			type: 'operation-batch',
+			messageId: 'msg-bin',
+			operations: [operation],
+			isFinal: true,
+			batchIndex: 0,
+		}
+
+		const decoded = serializer.decode(serializer.encode(message))
+		if (decoded.type !== 'operation-batch') throw new Error('wrong message type')
+		const decodedOp = serializer.decodeOperation(decoded.operations[0] as SerializedOperation)
+		expect(decodedOp.id).toBe('op-bin')
+		expect(decodedOp.data).toEqual({ body: tagged })
+	})
 })
 
 describe('NegotiatedMessageSerializer', () => {

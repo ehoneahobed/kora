@@ -33,6 +33,7 @@ function createMockSyncEngine(initialStatus?: Partial<SyncStatusInfo>): {
 		lastSuccessfulPush: null,
 		lastSuccessfulPull: null,
 		conflicts: 0,
+		clockSkewMs: null,
 		...initialStatus,
 	}
 
@@ -129,6 +130,7 @@ describe('useSyncStatus', () => {
 			lastSuccessfulPush: null,
 			lastSuccessfulPull: null,
 			conflicts: 0,
+			clockSkewMs: null,
 		})
 
 		await act(async () => {
@@ -157,6 +159,7 @@ describe('useSyncStatus', () => {
 						lastSuccessfulPush: null,
 						lastSuccessfulPull: null,
 						conflicts: 0,
+						clockSkewMs: null,
 					})
 					return () => {
 						listeners.delete(listener)
@@ -180,6 +183,7 @@ describe('useSyncStatus', () => {
 					lastSuccessfulPush: null,
 					lastSuccessfulPull: null,
 					conflicts: 0,
+					clockSkewMs: null,
 				})
 			}
 		})

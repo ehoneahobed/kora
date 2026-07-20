@@ -100,6 +100,39 @@ export class AppNotReadyError extends KoraError {
  * Thrown when the HLC detects excessive clock drift.
  * Drift > 60s: warning. Drift > 5min: this error is thrown, refusing to generate timestamps.
  */
+export class RemoteClockDriftError extends KoraError {
+	constructor(
+		public readonly remoteWallTime: number,
+		public readonly localReferenceTime: number,
+	) {
+		const aheadSeconds = Math.round((remoteWallTime - localReferenceTime) / 1000)
+		super(
+			`Rejected remote timestamp ${aheadSeconds}s ahead of local reference time. The sending device's clock is set too far in the future.`,
+			'REMOTE_CLOCK_DRIFT',
+			{ remoteWallTime, localReferenceTime, aheadSeconds },
+		)
+		this.name = 'RemoteClockDriftError'
+	}
+}
+
+/**
+ * Thrown when an HLC timestamp has structurally invalid fields: non-integer or
+ * negative wallTime/logical, or a logical counter beyond the serializable cap.
+ * Rejected BEFORE any clock state changes, so a malformed remote timestamp can
+ * never corrupt a replica's clock or break the lexicographic ordering of the
+ * serialized form.
+ */
+export class InvalidTimestampError extends KoraError {
+	constructor(
+		message: string,
+		public readonly wallTime: number,
+		public readonly logical: number,
+	) {
+		super(message, 'INVALID_TIMESTAMP_FIELDS', { wallTime, logical })
+		this.name = 'InvalidTimestampError'
+	}
+}
+
 export class ClockDriftError extends KoraError {
 	constructor(
 		public readonly currentHlcTime: number,

@@ -316,3 +316,162 @@ describe('TauriSqliteAdapter', () => {
 		})
 	})
 })
+
+/**
+ * A spy invoke that records every IPC call so we can assert command names,
+ * the plugin prefix, and argument marshaling without a Tauri runtime.
+ */
+function createSpyInvoke(): {
+	invoke: InvokeFn
+	calls: Array<{ cmd: string; args?: Record<string, unknown> }>
+} {
+	const calls: Array<{ cmd: string; args?: Record<string, unknown> }> = []
+	const invoke: InvokeFn = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+		calls.push({ cmd, args })
+		// `query` must return an array; everything else returns void.
+		return (cmd.endsWith('query') ? [] : undefined) as T
+	}
+	return { invoke, calls }
+}
+
+describe('TauriSqliteAdapter IPC marshaling', () => {
+	test('prefixes every command with the kora-sqlite plugin namespace', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+
+		await adapter.open(minimalSchema)
+		await adapter.execute('DELETE FROM todos')
+		await adapter.query('SELECT 1')
+		await adapter.close()
+
+		expect(calls.every((c) => c.cmd.startsWith('plugin:kora-sqlite|'))).toBe(true)
+		expect(calls.map((c) => c.cmd)).toEqual([
+			'plugin:kora-sqlite|open',
+			'plugin:kora-sqlite|execute',
+			'plugin:kora-sqlite|query',
+			'plugin:kora-sqlite|close',
+		])
+	})
+
+	test('open sends the generated DDL statements and the db path', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+
+		await adapter.open(minimalSchema)
+
+		const openCall = calls.find((c) => c.cmd.endsWith('open'))
+		expect(openCall?.args?.path).toBe('app.db')
+		const statements = openCall?.args?.statements as string[]
+		expect(Array.isArray(statements)).toBe(true)
+		expect(statements.some((s) => s.includes('CREATE TABLE') && s.includes('todos'))).toBe(true)
+	})
+
+	test('defaults missing params to an empty array when marshaling execute/query', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+		await adapter.open(minimalSchema)
+
+		await adapter.execute('DELETE FROM todos')
+		await adapter.query('SELECT * FROM todos')
+
+		const executeCall = calls.find((c) => c.cmd.endsWith('execute'))
+		const queryCall = calls.find((c) => c.cmd.endsWith('query'))
+		expect(executeCall?.args).toMatchObject({
+			path: 'app.db',
+			sql: 'DELETE FROM todos',
+			params: [],
+		})
+		expect(queryCall?.args).toMatchObject({
+			path: 'app.db',
+			sql: 'SELECT * FROM todos',
+			params: [],
+		})
+	})
+
+	test('forwards provided params verbatim', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ invoke })
+		await adapter.open(minimalSchema)
+
+		await adapter.execute('INSERT INTO todos (id) VALUES (?)', ['rec-1'])
+
+		const executeCall = calls.find((c) => c.cmd.endsWith('execute'))
+		expect(executeCall?.args?.params).toEqual(['rec-1'])
+	})
+
+	test('close is a no-op (no IPC) when the adapter was never opened', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ invoke })
+
+		await adapter.close()
+		expect(calls).toHaveLength(0)
+	})
+
+	test('wraps failures in TauriAdapterError with sql/params context', async () => {
+		const failing: InvokeFn = async <T>(cmd: string): Promise<T> => {
+			if (cmd.endsWith('open')) return undefined as T
+			throw new Error('native boom')
+		}
+		const adapter = new TauriSqliteAdapter({ invoke: failing })
+		await adapter.open(minimalSchema)
+
+		let caught: unknown
+		try {
+			await adapter.execute('UPDATE todos SET title = ?', ['x'])
+		} catch (error) {
+			caught = error
+		}
+
+		expect(caught).toBeInstanceOf(TauriAdapterError)
+		const err = caught as TauriAdapterError
+		expect(err.message).toContain('native boom')
+		expect(err.code).toBe('TAURI_ADAPTER_ERROR')
+		expect(err.context).toMatchObject({ sql: 'UPDATE todos SET title = ?', params: ['x'] })
+	})
+
+	test('migrate marshals only the statement list (path + statements), not transforms', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+		await adapter.open(minimalSchema)
+
+		await adapter.migrate(1, 2, {
+			statements: ['ALTER TABLE todos ADD COLUMN notes TEXT'],
+			transforms: [(row) => row],
+		})
+
+		const migrateCall = calls.find((c) => c.cmd.endsWith('migrate'))
+		expect(migrateCall?.args).toEqual({
+			path: 'app.db',
+			statements: ['ALTER TABLE todos ADD COLUMN notes TEXT'],
+		})
+		expect(migrateCall?.args).not.toHaveProperty('transforms')
+	})
+
+	test('transaction wraps BEGIN/COMMIT around the callback IPC', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+		await adapter.open(minimalSchema)
+
+		await adapter.transaction(async (tx) => {
+			await tx.execute('INSERT INTO todos (id) VALUES (?)', ['rec-1'])
+		})
+
+		const sqls = calls.filter((c) => c.cmd.endsWith('execute')).map((c) => c.args?.sql)
+		expect(sqls).toEqual(['BEGIN', 'INSERT INTO todos (id) VALUES (?)', 'COMMIT'])
+	})
+
+	test('transaction issues ROLLBACK when the callback throws', async () => {
+		const { invoke, calls } = createSpyInvoke()
+		const adapter = new TauriSqliteAdapter({ path: 'app.db', invoke })
+		await adapter.open(minimalSchema)
+
+		await expect(
+			adapter.transaction(async () => {
+				throw new Error('callback failed')
+			}),
+		).rejects.toThrow('callback failed')
+
+		const sqls = calls.filter((c) => c.cmd.endsWith('execute')).map((c) => c.args?.sql)
+		expect(sqls).toEqual(['BEGIN', 'ROLLBACK'])
+	})
+})

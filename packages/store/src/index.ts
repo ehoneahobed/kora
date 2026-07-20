@@ -10,6 +10,7 @@ export type {
 	TransactionCommitBatch,
 	TransactionCommitResult,
 	MaterializedRowSnapshot,
+	RowVersionState,
 	CollectionRecord,
 	ReplaySnapshot,
 	MigrationPlan,
@@ -28,6 +29,7 @@ export type {
 // === Errors ===
 export {
 	AdapterError,
+	OptimisticLockError,
 	PersistenceError,
 	QueryError,
 	RecordNotFoundError,
@@ -43,6 +45,9 @@ export {
 	compactOperationLog,
 	computeAckCompactionWatermark,
 } from './compaction/compact-operation-log'
+
+// === Clock rebase (timestamp rebase of unsynced operations) ===
+export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 
 // === Sync state helpers ===
 export {

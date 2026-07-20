@@ -3,6 +3,7 @@ import type { SchemaDefinition } from '@korajs/core'
 import type Database from 'better-sqlite3'
 import { AdapterError, StoreNotOpenError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
+import { Mutex } from './mutex'
 
 /**
  * Storage adapter backed by better-sqlite3 for Node.js environments.
@@ -17,6 +18,15 @@ import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
  */
 export class BetterSqlite3Adapter implements StorageAdapter {
 	private db: Database.Database | null = null
+
+	/**
+	 * Serializes transactions. better-sqlite3 is synchronous, but our
+	 * `transaction()` is async and yields the event loop at each `await` inside
+	 * the callback. Without this mutex, a transaction started while another is
+	 * mid-flight (e.g. a relayed remote operation applied during a local write)
+	 * issues a nested `BEGIN`, which SQLite rejects, and the operation is lost.
+	 */
+	private readonly txMutex = new Mutex()
 
 	/**
 	 * @param path - Database file path, or ':memory:' for in-memory database
@@ -90,57 +100,69 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		const db = this.getDb()
 
-		// better-sqlite3's transaction() is synchronous, but our interface is async.
-		// We use BEGIN/COMMIT/ROLLBACK manually for the async callback.
-		db.exec('BEGIN')
+		// Serialize with any other in-flight transaction so BEGIN is never nested.
+		const release = await this.txMutex.acquire()
 		try {
-			const tx: Transaction = {
-				execute: async (sql: string, params?: unknown[]): Promise<void> => {
-					try {
-						db.prepare(sql).run(...(params ?? []))
-					} catch (error) {
-						throw new AdapterError(`Transaction execute failed: ${(error as Error).message}`, {
-							sql,
-							params,
-						})
-					}
-				},
-				query: async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
-					try {
-						return db.prepare(sql).all(...(params ?? [])) as T[]
-					} catch (error) {
-						throw new AdapterError(`Transaction query failed: ${(error as Error).message}`, {
-							sql,
-							params,
-						})
-					}
-				},
+			// better-sqlite3's transaction() is synchronous, but our interface is async.
+			// We use BEGIN/COMMIT/ROLLBACK manually for the async callback.
+			db.exec('BEGIN')
+			try {
+				const tx: Transaction = {
+					execute: async (sql: string, params?: unknown[]): Promise<void> => {
+						try {
+							db.prepare(sql).run(...(params ?? []))
+						} catch (error) {
+							throw new AdapterError(`Transaction execute failed: ${(error as Error).message}`, {
+								sql,
+								params,
+							})
+						}
+					},
+					query: async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
+						try {
+							return db.prepare(sql).all(...(params ?? [])) as T[]
+						} catch (error) {
+							throw new AdapterError(`Transaction query failed: ${(error as Error).message}`, {
+								sql,
+								params,
+							})
+						}
+					},
+				}
+				await fn(tx)
+				db.exec('COMMIT')
+			} catch (error) {
+				db.exec('ROLLBACK')
+				throw error
 			}
-			await fn(tx)
-			db.exec('COMMIT')
-		} catch (error) {
-			db.exec('ROLLBACK')
-			throw error
+		} finally {
+			release()
 		}
 	}
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		const db = this.getDb()
-		db.exec('BEGIN')
+		// Serialize against transactions so migration's BEGIN is never nested.
+		const release = await this.txMutex.acquire()
 		try {
-			for (const sql of migration.statements) {
-				db.exec(sql)
+			db.exec('BEGIN')
+			try {
+				for (const sql of migration.statements) {
+					db.exec(sql)
+				}
+				db.exec('COMMIT')
+			} catch (error) {
+				db.exec('ROLLBACK')
+				throw new AdapterError(
+					`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
+					{
+						from,
+						to,
+					},
+				)
 			}
-			db.exec('COMMIT')
-		} catch (error) {
-			db.exec('ROLLBACK')
-			throw new AdapterError(
-				`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
-				{
-					from,
-					to,
-				},
-			)
+		} finally {
+			release()
 		}
 	}
 

@@ -420,6 +420,19 @@ export class OrgRoutes {
 			}
 		}
 
+		// The owner's role cannot be changed through this endpoint. Without this
+		// guard an admin could demote the owner (e.g. to "viewer"), stripping the
+		// owner of owner-gated powers while org.ownerId still points at them —
+		// locking the account out of deleteOrg / transferOwnership. Ownership
+		// changes must go through transferOwnership.
+		const org = await this.store.getOrg(orgId)
+		if (org && org.ownerId === params.targetUserId) {
+			return {
+				status: 403,
+				body: { error: "The organization owner's role cannot be changed. Use ownership transfer." },
+			}
+		}
+
 		// Admins cannot promote to admin (only owner can)
 		const callerMembership = await this.store.getMembership(orgId, userId)
 		if (callerMembership && callerMembership.role !== 'owner' && params.role === 'admin') {

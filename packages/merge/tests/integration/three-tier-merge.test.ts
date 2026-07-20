@@ -400,8 +400,11 @@ describe('three-tier merge integration', () => {
 		expect(result.mergedData.title).toBe('local title')
 		// completed: only remote changed → remote
 		expect(result.mergedData.completed).toBe(true)
-		// description: neither changed → base
-		expect(result.mergedData.description).toBe('keep me')
+		// description: neither op touched it, so it is NOT in the merged delta.
+		// The apply path only writes fields present in the merged operation, so an
+		// untouched field is preserved by omission (its stored value is never
+		// overwritten). Emitting it here would null required siblings on apply.
+		expect('description' in result.mergedData).toBe(false)
 		// No conflict traces
 		expect(result.traces).toHaveLength(0)
 	})

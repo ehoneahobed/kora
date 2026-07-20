@@ -14,6 +14,7 @@ function createMockEngine(initial: Partial<SyncStatusInfo> = {}): {
 		lastSuccessfulPush: null,
 		lastSuccessfulPull: null,
 		conflicts: 0,
+		clockSkewMs: null,
 		...initial,
 	}
 	return {
@@ -47,6 +48,7 @@ describe('createSyncStatusBridge', () => {
 			lastSuccessfulPush: null,
 			lastSuccessfulPull: null,
 			conflicts: 0,
+			clockSkewMs: null,
 		})
 		emitter.emit({ type: 'sync:sent', operations: [], batchSize: 1 })
 
@@ -90,6 +92,7 @@ describe('createSyncStatusBridge', () => {
 			lastSuccessfulPush: null,
 			lastSuccessfulPull: null,
 			conflicts: 0,
+			clockSkewMs: null,
 		})
 		emitter.emit({ type: 'sync:connected', nodeId: 'n1' })
 		expect(listener).not.toHaveBeenCalled()

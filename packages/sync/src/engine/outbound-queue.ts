@@ -141,6 +141,45 @@ export class OutboundQueue {
 	}
 
 	/**
+	 * All queued operations (not counting in-flight), in causal order.
+	 */
+	getAll(): Operation[] {
+		return [...this.queue]
+	}
+
+	/**
+	 * Atomically replace the entire queue with a new set of operations.
+	 *
+	 * Used after a timestamp rebase rewrote the queued operations under new
+	 * content-addressed ids: the old entries must vanish from memory AND from
+	 * persistent storage in one step, or a page refresh could resurrect
+	 * stale-stamped ops the server would reject. Resets the seen set to exactly
+	 * the new ids so the rewritten ops are not treated as duplicates.
+	 */
+	async replaceAll(ops: Operation[]): Promise<void> {
+		const removeIds: string[] = this.queue.map((op) => op.id)
+		for (const batch of this.inFlight.values()) {
+			for (const op of batch) {
+				removeIds.push(op.id)
+			}
+		}
+		this.inFlight.clear()
+
+		this.queue = ops.length > 1 ? topologicalSort([...ops]) : [...ops]
+		this.seen.clear()
+		for (const op of this.queue) {
+			this.seen.add(op.id)
+		}
+
+		if (removeIds.length > 0) {
+			await this.storage.dequeue(removeIds)
+		}
+		for (const op of this.queue) {
+			await this.storage.enqueue(op)
+		}
+	}
+
+	/**
 	 * Whether initialize() has been called.
 	 */
 	get isInitialized(): boolean {

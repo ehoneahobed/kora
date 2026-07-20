@@ -82,11 +82,17 @@ export class SyncEncryptor {
 	 * @param config - Encryption configuration with passphrase
 	 * @param salt - Optional salt for deterministic key derivation (mainly for testing).
 	 *              If omitted, a random salt is generated.
+	 * @param iterations - Optional PBKDF2 iteration count. Defaults to the
+	 *              production-strength value. Lower it only in tests.
 	 * @returns A configured SyncEncryptor instance
 	 * @throws {EncryptionError} If configuration is invalid
 	 * @throws {KeyDerivationError} If key derivation fails
 	 */
-	static async create(config: SyncEncryptionConfig, salt?: Uint8Array): Promise<SyncEncryptor> {
+	static async create(
+		config: SyncEncryptionConfig,
+		salt?: Uint8Array,
+		iterations?: number,
+	): Promise<SyncEncryptor> {
 		if (!config.enabled) {
 			throw new EncryptionError(
 				'Cannot create SyncEncryptor with encryption disabled. ' +
@@ -103,7 +109,7 @@ export class SyncEncryptor {
 			)
 		}
 
-		const versionedKey = await deriveVersionedKey(passphrase, 1, salt)
+		const versionedKey = await deriveVersionedKey(passphrase, 1, salt, iterations)
 		const keys = new Map<number, VersionedKey>()
 		keys.set(1, versionedKey)
 

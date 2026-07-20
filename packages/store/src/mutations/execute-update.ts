@@ -7,8 +7,10 @@ import {
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
+import { parseFieldVersions, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildUpdateQuery } from '../query/sql-builder'
+import { encodeRichtextFieldsForOpData } from '../serialization/op-data-encoding'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
@@ -75,8 +77,11 @@ export async function executeUpdate(
 				type: 'update',
 				collection: ctx.collection,
 				recordId: id,
-				data: { ...resolvedData },
-				previousData,
+				// Binary richtext values (new and previous) are tagged as canonical
+				// JSON BEFORE the operation is content-hashed, so the hash input,
+				// persisted JSON, and wire payload are the identical value.
+				data: encodeRichtextFieldsForOpData(resolvedData, ctx.definition.fields),
+				previousData: encodeRichtextFieldsForOpData(previousData, ctx.definition.fields),
 				sequenceNumber,
 				causalDeps,
 				schemaVersion: ctx.schema.version,
@@ -88,10 +93,18 @@ export async function executeUpdate(
 
 		const serializedChanges = serializeRecord(resolvedData, ctx.definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
+		// A local edit is always the newest writer of the fields it touches (the
+		// HLC advances past every timestamp this device has seen), so stamp each
+		// changed field with this operation's version.
+		const mergedFieldVersions = parseFieldVersions(currentRow._field_versions)
+		for (const changedField of Object.keys(serializedChanges)) {
+			mergedFieldVersions[changedField] = version
+		}
 		const updateQuery = buildUpdateQuery(ctx.collection, id, {
 			...serializedChanges,
 			_updated_at: operation.timestamp.wallTime,
 			_version: version,
+			_field_versions: serializeFieldVersions(mergedFieldVersions),
 		})
 		const opInsert = buildInsertQuery(
 			`_kora_ops_${ctx.collection}`,

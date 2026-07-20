@@ -34,4 +34,18 @@ export interface SyncStore {
 	 * @param toSeq - End sequence number (inclusive)
 	 */
 	getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]>
+
+	/**
+	 * Optional: re-stamp never-acknowledged local operations after a fast device
+	 * clock was corrected (timestamp rebase). Optional so hand-rolled SyncStore
+	 * implementations keep working; when absent the engine simply skips the
+	 * rebase and falls back to the clock-block behavior.
+	 *
+	 * @param ids - Operation ids that are candidates for re-stamping
+	 * @param correctedNowMs - Trusted "now" (server time at handshake) in ms
+	 */
+	rebaseUnsyncedOperations?(
+		ids: string[],
+		correctedNowMs: number,
+	): Promise<{ operations: Operation[]; idMapping: Record<string, string>; rebasedCount: number }>
 }

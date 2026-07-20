@@ -17,8 +17,13 @@ const SALT_LENGTH = 32
 /**
  * PBKDF2 iteration count. 600,000 iterations is the OWASP-recommended minimum
  * for SHA-256 as of 2024, providing strong resistance against brute-force attacks.
+ *
+ * This is the production default. It can be overridden per-call via the
+ * `iterations` argument on {@link deriveKey}/{@link deriveVersionedKey} — used
+ * by tests to keep the real crypto path exercised without paying the full
+ * brute-force-resistant cost on every derivation. The default is never lowered.
  */
-const PBKDF2_ITERATIONS = 600_000
+export const DEFAULT_PBKDF2_ITERATIONS = 600_000
 
 /** Derived key length in bits (AES-256). */
 const DERIVED_KEY_LENGTH = 256
@@ -60,6 +65,9 @@ export function generateSalt(): Uint8Array {
  *
  * @param passphrase - The user's passphrase (must be non-empty)
  * @param salt - Optional salt bytes. If omitted, a random 32-byte salt is generated.
+ * @param iterations - Optional PBKDF2 iteration count. Defaults to
+ *   {@link DEFAULT_PBKDF2_ITERATIONS}. Lower it only in tests; production must
+ *   keep the default so derived keys stay brute-force resistant.
  * @returns The derived CryptoKey and the salt used
  * @throws {KeyDerivationError} If the passphrase is empty, crypto is unavailable, or derivation fails
  *
@@ -75,12 +83,20 @@ export function generateSalt(): Uint8Array {
 export async function deriveKey(
 	passphrase: string,
 	salt?: Uint8Array,
+	iterations: number = DEFAULT_PBKDF2_ITERATIONS,
 ): Promise<{ key: CryptoKey; salt: Uint8Array }> {
 	assertCryptoAvailable()
 
 	if (passphrase.length === 0) {
 		throw new KeyDerivationError(
 			'Passphrase must not be empty. Provide a non-empty string for encryption key derivation.',
+		)
+	}
+
+	if (!Number.isInteger(iterations) || iterations < 1) {
+		throw new KeyDerivationError(
+			`PBKDF2 iteration count must be a positive integer, received: ${iterations}`,
+			{ iterations },
 		)
 	}
 
@@ -102,7 +118,7 @@ export async function deriveKey(
 			{
 				name: 'PBKDF2',
 				salt: usedSalt as unknown as ArrayBuffer,
-				iterations: PBKDF2_ITERATIONS,
+				iterations,
 				hash: 'SHA-256',
 			},
 			baseKey,
@@ -136,6 +152,8 @@ export async function deriveKey(
  * @param passphrase - The user's passphrase
  * @param version - Key version number (must be a positive integer)
  * @param salt - Optional salt bytes. If omitted, a random salt is generated.
+ * @param iterations - Optional PBKDF2 iteration count. Defaults to
+ *   {@link DEFAULT_PBKDF2_ITERATIONS}. Lower it only in tests.
  * @returns A {@link VersionedKey} containing the key, version, and salt
  * @throws {KeyDerivationError} If parameters are invalid or derivation fails
  */
@@ -143,6 +161,7 @@ export async function deriveVersionedKey(
 	passphrase: string,
 	version: number,
 	salt?: Uint8Array,
+	iterations: number = DEFAULT_PBKDF2_ITERATIONS,
 ): Promise<VersionedKey> {
 	if (!Number.isInteger(version) || version < 1) {
 		throw new KeyDerivationError(`Key version must be a positive integer, received: ${version}`, {
@@ -150,7 +169,7 @@ export async function deriveVersionedKey(
 		})
 	}
 
-	const { key, salt: usedSalt } = await deriveKey(passphrase, salt)
+	const { key, salt: usedSalt } = await deriveKey(passphrase, salt, iterations)
 
 	return { version, key, salt: usedSalt }
 }

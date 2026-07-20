@@ -292,12 +292,18 @@ importers:
       '@korajs/merge':
         specifier: workspace:*
         version: link:../merge
+      '@korajs/server':
+        specifier: workspace:*
+        version: link:../server
       '@korajs/store':
         specifier: workspace:*
         version: link:../store
       '@korajs/sync':
         specifier: workspace:*
         version: link:../sync
+      '@korajs/test':
+        specifier: workspace:*
+        version: link:../test
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
@@ -495,6 +501,9 @@ importers:
         specifier: ^13.6.30
         version: 13.6.30
     devDependencies:
+      '@fast-check/vitest':
+        specifier: 0.2.0
+        version: 0.2.0(vitest@3.2.4(@types/node@25.5.2)(happy-dom@17.6.3)(jiti@2.7.0)(jsdom@25.0.1)(lightningcss@1.32.0)(tsx@4.21.0))
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
@@ -507,6 +516,9 @@ importers:
       fake-indexeddb:
         specifier: ^6.2.5
         version: 6.2.5
+      fast-check:
+        specifier: ^4.6.0
+        version: 4.6.0
       tsup:
         specifier: ^8.3.6
         version: 8.5.1(jiti@2.7.0)(postcss@8.5.8)(tsx@4.21.0)(typescript@5.9.3)

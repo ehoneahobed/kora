@@ -190,7 +190,9 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 		case 'array':
 			return JSON.stringify(value)
 		case 'richtext':
-			return encodeRichtext(value as string | Uint8Array | ArrayBuffer)
+			// May be a record-shaped value (string/bytes) or an op-data value
+			// (tagged { $koraBytes }) — encodeRichtext accepts every form.
+			return encodeRichtext(value as Parameters<typeof encodeRichtext>[0])
 		default:
 			return value
 	}

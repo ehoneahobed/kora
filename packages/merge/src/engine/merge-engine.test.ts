@@ -197,6 +197,65 @@ describe('MergeEngine', () => {
 			expect(result.mergedData.tags).toEqual(['a', 'b', 'c', 'd'])
 		})
 
+		test('does not emit untouched fields (no null-sibling corruption)', async () => {
+			// Regression: two concurrent updates each touch only `title`. The merge
+			// output must contain ONLY `title`, never the untouched required fields
+			// `completed`/`priority`. Emitting those as null crashes the apply path
+			// with a NOT NULL violation (or silently loses data). See
+			// collectAffectedFields.
+			const local = makeOp({
+				data: { title: 'local title' },
+				previousData: { title: 'base' },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { title: 'remote title' },
+				previousData: { title: 'base' },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = await engine.merge({
+				local,
+				remote,
+				baseState: { title: 'base', completed: false, tags: [], priority: 'medium', count: 0 },
+				collectionDef: makeCollectionDef(),
+			})
+
+			expect(Object.keys(result.mergedData)).toEqual(['title'])
+			expect(result.mergedData.title).toBe('local title')
+			expect('completed' in result.mergedData).toBe(false)
+			expect('priority' in result.mergedData).toBe(false)
+			expect('count' in result.mergedData).toBe(false)
+		})
+
+		test('disjoint concurrent updates keep both changes and touch nothing else', async () => {
+			const local = makeOp({
+				data: { title: 'local title' },
+				previousData: { title: 'base' },
+				timestamp: { wallTime: 2000, logical: 0, nodeId: 'node-a' },
+			})
+			const remote = makeOp({
+				id: 'op-2',
+				nodeId: 'node-b',
+				data: { completed: true },
+				previousData: { completed: false },
+				timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-b' },
+			})
+
+			const result = await engine.merge({
+				local,
+				remote,
+				baseState: { title: 'base', completed: false, tags: [], priority: 'medium', count: 0 },
+				collectionDef: makeCollectionDef(),
+			})
+
+			expect(new Set(Object.keys(result.mergedData))).toEqual(new Set(['title', 'completed']))
+			expect(result.mergedData.title).toBe('local title')
+			expect(result.mergedData.completed).toBe(true)
+		})
+
 		test('multiple fields: mix of conflict and non-conflict', async () => {
 			const local = makeOp({
 				data: { title: 'local title', completed: true, priority: 'high' },

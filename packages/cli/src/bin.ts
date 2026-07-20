@@ -9,6 +9,7 @@ import { generateCommand } from './commands/generate/generate-command'
 import { logsCommand } from './commands/logs/logs-command'
 import { migrateCommand } from './commands/migrate/migrate-command'
 import { statusCommand } from './commands/status/status-command'
+import { studioCommand } from './commands/studio/studio-command'
 
 const main = defineCommand({
 	meta: {
@@ -26,6 +27,7 @@ const main = defineCommand({
 		logs: logsCommand,
 		migrate: migrateCommand,
 		status: statusCommand,
+		studio: studioCommand,
 	},
 })
 

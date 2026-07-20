@@ -200,10 +200,16 @@ function validateFieldValue(
 		}
 
 		case 'richtext': {
-			// Richtext fields accept Uint8Array (Yjs state) or string (plain text initial value)
-			if (!(value instanceof Uint8Array) && typeof value !== 'string') {
+			// Richtext fields accept Uint8Array/ArrayBuffer (Yjs state) or string
+			// (plain text initial value) — matching what the richtext serializer
+			// encodes, so no accepted input can be silently lost downstream.
+			if (
+				!(value instanceof Uint8Array) &&
+				!(value instanceof ArrayBuffer) &&
+				typeof value !== 'string'
+			) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a Uint8Array or string for richtext, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a Uint8Array, ArrayBuffer, or string for richtext, got ${typeof value}`,
 					{
 						collection,
 						field: fieldName,

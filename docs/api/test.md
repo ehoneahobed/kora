@@ -83,7 +83,7 @@ try {
 
 ## TestDevice
 
-A virtual device with a real SQLite store, sync engine, and merge engine.
+A virtual device with a real SQLite store, sync engine, and merge engine. Audit persistence is wired the same way as in production apps, so merge decisions made during a test are recorded in the `_kora_audit_traces` table of the device's store.
 
 ### Properties
 

@@ -212,6 +212,7 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			accepted: message.accepted,
 			rejectReason: message.rejectReason ?? '',
 			selectedWireFormat: message.selectedWireFormat ?? '',
+			serverTime: message.serverTime ?? 0,
 		}
 	}
 
@@ -423,6 +424,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 				? { rejectReason: payload.rejectReason as string }
 				: {}),
 			...(validFormat ? { selectedWireFormat: validFormat } : {}),
+			...(typeof payload.serverTime === 'number' && payload.serverTime > 0
+				? { serverTime: payload.serverTime }
+				: {}),
 		}
 	}
 

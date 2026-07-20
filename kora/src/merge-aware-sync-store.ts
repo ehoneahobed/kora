@@ -47,4 +47,15 @@ export class MergeAwareSyncStore implements SyncStore {
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
 		return this.pipeline.applyRemote(op)
 	}
+
+	/**
+	 * Delegates timestamp rebase to the store so the sync engine can re-stamp
+	 * never-acknowledged operations after a fast device clock is corrected.
+	 */
+	async rebaseUnsyncedOperations(
+		ids: string[],
+		correctedNowMs: number,
+	): Promise<{ operations: Operation[]; idMapping: Record<string, string>; rebasedCount: number }> {
+		return this.store.rebaseUnsyncedOperations(ids, correctedNowMs)
+	}
 }

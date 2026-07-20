@@ -1,0 +1,31 @@
+{
+  "mode": "pre",
+  "tag": "beta",
+  "initialVersions": {
+    "kora-docs": "0.1.0",
+    "kora-e2e": "0.0.0",
+    "kora-e2e-fixture": "0.1.8",
+    "kora-full-stack": "0.0.4",
+    "korajs": "0.6.1",
+    "@korajs/auth": "0.6.0",
+    "@korajs/cli": "0.6.0",
+    "@korajs/core": "0.6.0",
+    "create-kora-app": "0.1.24",
+    "@korajs/devtools": "0.6.0",
+    "@korajs/merge": "0.6.0",
+    "@korajs/react": "0.6.1",
+    "@korajs/server": "0.6.1",
+    "@korajs/store": "0.6.0",
+    "@korajs/svelte": "0.6.1",
+    "@korajs/sync": "0.6.1",
+    "@korajs/tauri": "0.4.2",
+    "@korajs/test": "0.6.1",
+    "@korajs/vue": "0.6.1"
+  },
+  "changesets": [
+    "agents-md-templates",
+    "clock-integrity",
+    "kora-studio",
+    "per-field-lww-convergence"
+  ]
+}

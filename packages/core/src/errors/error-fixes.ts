@@ -14,6 +14,8 @@ export const KORA_ERROR_FIX_SUGGESTIONS: Record<string, string> = {
 		'Confirm the storage adapter is supported in this environment and the database path is writable.',
 	CLOCK_DRIFT:
 		'Sync device wall-clock time (NTP). Kora refuses new timestamps when drift exceeds five minutes.',
+	INVALID_TIMESTAMP_FIELDS:
+		'HLC timestamps need non-negative integer wallTime (< 10^15) and logical (<= 99999). Generate timestamps through HybridLogicalClock instead of building them by hand.',
 	PERSISTENCE_ERROR:
 		'IndexedDB persistence failed; check browser storage settings and available disk quota.',
 	MISSING_WORKER_URL:

@@ -169,6 +169,17 @@ export function createSampleEvent<T extends KoraEventType>(
 			reason: 'Client schema v1 is below server minimum v2',
 		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
+		'sync:clock-skew': {
+			type: 'sync:clock-skew',
+			skewMs: -120_000,
+			severity: 'fast-blocked',
+			source: 'handshake',
+		},
+		'sync:clock-rebase': {
+			type: 'sync:clock-rebase',
+			rebasedCount: 3,
+			maxSkewMs: 600_000,
+		},
 		'sync:apply-failed': {
 			type: 'sync:apply-failed',
 			operationId: 'op-failed',

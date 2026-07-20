@@ -65,6 +65,8 @@ export interface HandshakeResponseMessage {
 	selectedWireFormat?: WireFormat
 	/** The server-accepted per-collection sync scope. Confirms what data will be synced. */
 	acceptedScope?: Record<string, Record<string, unknown>>
+	/** Server wall-clock time (ms since epoch) at response creation. Lets clients measure their own clock skew. */
+	serverTime?: number
 }
 
 /**

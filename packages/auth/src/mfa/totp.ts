@@ -38,6 +38,13 @@ export interface TotpSecret {
 	createdAt: number
 	/** When MFA was verified (confirmed with first valid code) */
 	verifiedAt: number | null
+	/**
+	 * The most recent TOTP time-step counter that was successfully consumed
+	 * during authentication. Used to enforce single-use of codes (RFC 6238 §5.2):
+	 * a code at or before this time-step is rejected as a replay. `undefined`
+	 * until the first code is consumed.
+	 */
+	lastUsedTimeStep?: number
 }
 
 /**
@@ -237,11 +244,11 @@ export class TotpManager {
 		}
 
 		if (stored.verified) {
-			// Already verified, just validate the code
-			return this.validateCode(stored.secret, code)
+			// Already verified, just validate the code (single-use enforced)
+			return this.consumeCode(stored, code)
 		}
 
-		const valid = this.validateCode(stored.secret, code)
+		const valid = await this.consumeCode(stored, code)
 		if (!valid) {
 			throw new TotpInvalidCodeError()
 		}
@@ -257,6 +264,11 @@ export class TotpManager {
 	/**
 	 * Verify a TOTP code during login.
 	 * Returns true if the code is valid, false otherwise.
+	 *
+	 * Enforces single-use: a code is rejected if its time-step has already
+	 * been consumed (or predates a previously consumed time-step). This
+	 * prevents an attacker who observes one valid code from replaying it
+	 * within the acceptance window (RFC 6238 §5.2).
 	 */
 	async verify(userId: string, code: string): Promise<boolean> {
 		const stored = await this.store.getByUserId(userId)
@@ -268,7 +280,7 @@ export class TotpManager {
 			throw new TotpNotVerifiedError(userId)
 		}
 
-		return this.validateCode(stored.secret, code)
+		return this.consumeCode(stored, code)
 	}
 
 	/**
@@ -376,6 +388,15 @@ export class TotpManager {
 	// --- Private ---
 
 	private validateCode(base32Secret: string, code: string): boolean {
+		return this.matchTimeStep(base32Secret, code) !== null
+	}
+
+	/**
+	 * Find the TOTP time-step counter (within the acceptance window) whose
+	 * generated code matches `code`, or null if none matches. Comparison is
+	 * timing-safe.
+	 */
+	private matchTimeStep(base32Secret: string, code: string): number | null {
 		const secretBytes = base32Decode(base32Secret)
 		const now = Math.floor(Date.now() / 1000)
 
@@ -384,11 +405,33 @@ export class TotpManager {
 			const timeCounter = Math.floor((now + offset * this.period) / this.period)
 			const expected = generateTotpCode(secretBytes, timeCounter, this.digits, this.algorithm)
 			if (timingSafeEqual(code, expected)) {
-				return true
+				return timeCounter
 			}
 		}
 
-		return false
+		return null
+	}
+
+	/**
+	 * Validate a code AND consume its time-step so it (and any earlier code in
+	 * the window) cannot be reused. Returns false for an invalid code or a
+	 * replay of an already-consumed time-step. Persists the consumed time-step.
+	 */
+	private async consumeCode(stored: TotpSecret, code: string): Promise<boolean> {
+		const matched = this.matchTimeStep(stored.secret, code)
+		if (matched === null) {
+			return false
+		}
+
+		// Reject replays: a code whose time-step was already used (or predates
+		// the last consumed time-step) must not authenticate a second time.
+		if (stored.lastUsedTimeStep !== undefined && matched <= stored.lastUsedTimeStep) {
+			return false
+		}
+
+		stored.lastUsedTimeStep = matched
+		await this.store.save(stored)
+		return true
 	}
 }
 

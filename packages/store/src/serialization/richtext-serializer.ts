@@ -1,4 +1,10 @@
 import * as Y from 'yjs'
+import {
+	type KoraBytesValue,
+	decodeRichtextOpDataValue,
+	isKoraBytesValue,
+	isLegacyNumericByteObject,
+} from './op-data-encoding'
 
 const TEXT_KEY = 'content'
 
@@ -6,8 +12,14 @@ export type RichtextInput = string | Uint8Array | ArrayBuffer | null | undefined
 
 /**
  * Encodes richtext values into Yjs document updates.
+ *
+ * Also accepts the tagged `{ $koraBytes }` form that binary richtext values
+ * take inside `op.data` (and, for old dev databases, the pre-fix numeric-key
+ * object shape), so every consumer that writes op-data values to columns
+ * inherits the decoding. Plain strings keep their exact historical behavior:
+ * encoded as a fresh Yjs document containing the string.
  */
-export function encodeRichtext(value: RichtextInput): Uint8Array | null {
+export function encodeRichtext(value: RichtextInput | KoraBytesValue): Uint8Array | null {
 	if (value === null || value === undefined) {
 		return null
 	}
@@ -24,6 +36,12 @@ export function encodeRichtext(value: RichtextInput): Uint8Array | null {
 
 	if (value instanceof ArrayBuffer) {
 		return new Uint8Array(value)
+	}
+
+	if (isKoraBytesValue(value) || isLegacyNumericByteObject(value)) {
+		const decoded = decodeRichtextOpDataValue(value)
+		// Both accepted shapes decode to bytes; strings were handled above.
+		return decoded instanceof Uint8Array ? decoded : null
 	}
 
 	throw new Error('Richtext value must be a string, Uint8Array, ArrayBuffer, null, or undefined.')

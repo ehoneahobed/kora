@@ -117,6 +117,61 @@ export function buildUpdateQuery(
 }
 
 /**
+ * Build a field-level fast-forward UPDATE: writes the changed field values
+ * unconditionally (the caller has already proven per-field that the local value
+ * still equals the base the remote wrote from, so the remote is the newest known
+ * writer of those fields), while advancing the row's `_version` / `_updated_at`
+ * watermark MONOTONICALLY — never regressing it below its current value.
+ *
+ * This is what makes per-field LWW correct on a per-row `_version` column: a
+ * concurrent edit to a different field may have pushed `_version` past this
+ * operation's timestamp, but that must not cause this operation's own field
+ * change to be dropped, nor may materializing it move the watermark backward
+ * (which would let a genuinely stale later operation win).
+ *
+ * @param collection - The collection name
+ * @param id - The record ID
+ * @param fieldChanges - Serialized field values to write unconditionally (must NOT include _version / _updated_at)
+ * @param remoteVersion - The operation's serialized row version (lexicographically comparable)
+ * @param wallTime - The operation's wall-clock time in ms
+ * @param options - Optional extras. `maxCreatedAt` advances `_created_at` to the
+ *   greater of its current value and the given wall time — used for insert
+ *   collisions so every node converges on the max insert wall time regardless
+ *   of arrival order.
+ */
+export function buildFieldFastForwardUpdateQuery(
+	collection: string,
+	id: string,
+	fieldChanges: Record<string, unknown>,
+	remoteVersion: string,
+	wallTime: number,
+	options?: { maxCreatedAt?: number },
+): SqlQuery {
+	const fieldClauses = Object.keys(fieldChanges).map((col) => `${col} = ?`)
+	// _version is a lexicographically-sortable string; _updated_at is a number.
+	// Keep the greater of the current and incoming value for each (monotonic).
+	const setClauses = [
+		...fieldClauses,
+		'_version = CASE WHEN _version >= ? THEN _version ELSE ? END',
+		'_updated_at = CASE WHEN _updated_at >= ? THEN _updated_at ELSE ? END',
+	]
+	const params: unknown[] = [
+		...Object.values(fieldChanges),
+		remoteVersion,
+		remoteVersion,
+		wallTime,
+		wallTime,
+	]
+	if (options?.maxCreatedAt !== undefined) {
+		setClauses.push('_created_at = CASE WHEN _created_at >= ? THEN _created_at ELSE ? END')
+		params.push(options.maxCreatedAt, options.maxCreatedAt)
+	}
+	params.push(id)
+	const sql = `UPDATE ${collection} SET ${setClauses.join(', ')} WHERE id = ?`
+	return { sql, params }
+}
+
+/**
  * Build a soft-delete query (SET _deleted = 1).
  *
  * @param collection - The collection name

@@ -53,10 +53,13 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos)
 
 		const indexStmts = stmts.filter((s) => s.startsWith('CREATE INDEX'))
-		expect(indexStmts).toHaveLength(3)
+		// Three schema-declared indexes plus the ops-table record_id index
+		// (record-scoped lookups run on every remote apply).
+		expect(indexStmts).toHaveLength(4)
 		expect(indexStmts[0]).toContain('idx_todos_assignee')
 		expect(indexStmts[1]).toContain('idx_todos_completed')
 		expect(indexStmts[2]).toContain('idx_todos_due_date')
+		expect(indexStmts[3]).toContain('idx_kora_ops_todos_record_id')
 	})
 
 	test('generates per-collection operations log table', () => {

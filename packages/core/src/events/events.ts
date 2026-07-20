@@ -39,6 +39,20 @@ export type KoraEvent =
 			reason: string
 	  }
 	| { type: 'sync:auth-failed'; reason: string }
+	| {
+			type: 'sync:clock-skew'
+			/** serverTime - localTime in ms. Negative = this device's clock is fast. */
+			skewMs: number
+			severity: 'info' | 'slow-warning' | 'fast-blocked'
+			source: 'handshake' | 'server-reject'
+	  }
+	| {
+			type: 'sync:clock-rebase'
+			/** Number of unsynced operations that were re-stamped. */
+			rebasedCount: number
+			/** How far ahead of server time the most future queued operation was, in ms. */
+			maxSkewMs: number
+	  }
 	| { type: 'sync:sent'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:received'; operations: Operation[]; batchSize: number }
 	| { type: 'sync:acknowledged'; sequenceNumber: number }

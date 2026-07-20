@@ -1,4 +1,4 @@
-import type { KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
+import type { HLCTimestamp, KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
 
 /**
  * Transaction interface for executing multiple operations atomically.
@@ -184,6 +184,8 @@ export interface RawCollectionRow {
 	_created_at: number
 	_updated_at: number
 	_version?: string
+	/** JSON map of per-field last-writer HLC versions: { field -> serialized HLC }. */
+	_field_versions?: string
 	_deleted: number
 	[key: string]: unknown
 }
@@ -207,6 +209,46 @@ export type { ApplyResult } from '@korajs/core'
 export interface ApplyRemoteOptions {
 	/** When true, a winning remote update clears soft-delete on the row. */
 	reactivateIfDeleted?: boolean
+	/**
+	 * When true, materialize the update unconditionally, bypassing the LWW
+	 * version guard. Used only for authoritative three-way merge results: the
+	 * merged value already incorporates the current local row, so it must be
+	 * written even when its timestamp ties the current row version (which
+	 * happens on the device that authored the newer of two concurrent edits —
+	 * without this, that device's CRDT/merge result is silently dropped).
+	 */
+	forceMaterialize?: boolean
+	/**
+	 * Data to materialize into the row INSTEAD of `op.data`, without altering
+	 * what is stored in the append-only operation log. Merge results must never
+	 * be persisted under the original operation's content-addressed id (ops are
+	 * immutable); the pipeline passes the merged values here so the log keeps
+	 * the canonical operation while the row reflects the merge.
+	 */
+	materializeData?: Record<string, unknown>
+	/**
+	 * Version timestamp to stamp on the materialized row INSTEAD of
+	 * `op.timestamp` (e.g. max(local, remote) for a merge result). The logged
+	 * operation keeps its own timestamp.
+	 */
+	materializeTimestamp?: HLCTimestamp
+	/**
+	 * Optimistic-concurrency guard: the row version state the caller observed
+	 * when it computed the data it is now applying. Inside the write
+	 * transaction, if the row's current `_version` / `_field_versions` no longer
+	 * match this snapshot, the apply throws `OptimisticLockError` (rolling back,
+	 * writing nothing) so the caller can recompute against fresh state.
+	 */
+	guardRowState?: RowVersionState
+}
+
+/**
+ * Raw version state of a materialized row, used for optimistic-concurrency
+ * guarded applies. `null` means the row (or column value) was absent.
+ */
+export interface RowVersionState {
+	version: string | null
+	fieldVersions: string | null
 }
 
 /**

@@ -1,5 +1,7 @@
+import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
+import { IndexedDbAdapter } from '../../src/adapters/indexeddb-adapter'
 import { SqliteWasmAdapter } from '../../src/adapters/sqlite-wasm-adapter'
 import { MockWorkerBridge } from '../../src/adapters/sqlite-wasm-mock-bridge'
 import { AdapterError, StoreNotOpenError } from '../../src/errors'
@@ -10,6 +12,7 @@ import { minimalSchema } from '../fixtures/test-schema'
  * Parameterized adapter contract test.
  * Proves behavioral equivalence between all StorageAdapter implementations.
  */
+let idbCounter = 0
 const adapters: Array<{
 	name: string
 	factory: () => StorageAdapter
@@ -24,6 +27,19 @@ const adapters: Array<{
 		name: 'SqliteWasmAdapter (MockBridge)',
 		factory: () => new SqliteWasmAdapter({ bridge: new MockWorkerBridge() }),
 		freshFactory: () => new SqliteWasmAdapter({ bridge: new MockWorkerBridge() }),
+	},
+	{
+		name: 'IndexedDbAdapter (MockBridge + fake-indexeddb)',
+		factory: () =>
+			new IndexedDbAdapter({
+				bridge: new MockWorkerBridge(),
+				dbName: `contract-idb-${++idbCounter}`,
+			}),
+		freshFactory: () =>
+			new IndexedDbAdapter({
+				bridge: new MockWorkerBridge(),
+				dbName: `contract-idb-fresh-${++idbCounter}`,
+			}),
 	},
 ]
 
@@ -104,6 +120,72 @@ for (const { name, factory, freshFactory } of adapters) {
 				'rec-1',
 			])
 			expect(rows[0]?.notes).toBe('Some notes')
+		})
+
+		test('CONCURRENT transactions serialize: interleaved async work never nests BEGIN or loses a write', async () => {
+			// This is the exact shape of the shipped op-drop bug: two async
+			// transactions interleaving at their await points. The adapter MUST
+			// serialize them — a nested BEGIN either throws (stranding the op) or
+			// silently folds two logical transactions into one commit scope.
+			const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+			const t1 = adapter.transaction(async (tx) => {
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					['rec-t1-a', 'T1-A', 0, 1000, 1000],
+				)
+				await yieldTick() // force interleaving opportunity mid-transaction
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					['rec-t1-b', 'T1-B', 0, 1000, 1000],
+				)
+			})
+			const t2 = adapter.transaction(async (tx) => {
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					['rec-t2-a', 'T2-A', 0, 1000, 1000],
+				)
+				await yieldTick()
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					['rec-t2-b', 'T2-B', 0, 1000, 1000],
+				)
+			})
+
+			await Promise.all([t1, t2])
+
+			const rows = await adapter.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+			expect(rows.map((r) => r.id)).toEqual(['rec-t1-a', 'rec-t1-b', 'rec-t2-a', 'rec-t2-b'])
+		})
+
+		test('CONCURRENT rollback stays isolated: a failing transaction never takes a concurrent commit down', async () => {
+			const yieldTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+			const failing = adapter
+				.transaction(async (tx) => {
+					await tx.execute(
+						'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+						['rec-fail', 'doomed', 0, 1000, 1000],
+					)
+					await yieldTick()
+					throw new Error('Intentional failure')
+				})
+				.catch((error: unknown) => error)
+
+			const committing = adapter.transaction(async (tx) => {
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					['rec-ok', 'survives', 0, 1000, 1000],
+				)
+				await yieldTick()
+			})
+
+			const [failure] = await Promise.all([failing, committing])
+			expect(failure).toBeInstanceOf(Error)
+
+			const rows = await adapter.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+			// The failed transaction's row rolled back; the concurrent commit survived.
+			expect(rows.map((r) => r.id)).toEqual(['rec-ok'])
 		})
 
 		test('guards: operations before open throw StoreNotOpenError', async () => {

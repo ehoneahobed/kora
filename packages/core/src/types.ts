@@ -103,7 +103,14 @@ export type FieldKind =
 export interface SyncDiagnosticsSnapshot {
 	// Connection
 	/** Current developer-facing sync status */
-	status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error' | 'schema-mismatch'
+	status:
+		| 'connected'
+		| 'syncing'
+		| 'synced'
+		| 'offline'
+		| 'error'
+		| 'schema-mismatch'
+		| 'clock-error'
 	/** Timestamp when the current connection was established, or null if disconnected */
 	connectedAt: number | null
 	/** Timestamp when the last disconnection occurred, or null if never disconnected */

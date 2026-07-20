@@ -13,6 +13,7 @@ import {
 	MergeAwareSyncStore,
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
+	wireAuditPersistence,
 } from 'korajs/testing'
 import type { TestServer } from './test-server'
 
@@ -62,6 +63,7 @@ export class TestDevice {
 	private syncEngine: SyncEngine | null = null
 	private currentTransport: SyncTransport | null = null
 	private unsubscribeSync: (() => void) | null = null
+	private unsubscribeAudit: (() => void) | null = null
 	private closing = false
 
 	constructor(options: TestDeviceOptions) {
@@ -94,6 +96,11 @@ export class TestDevice {
 			emitter: this.emitter,
 		})
 		this.store.setLocalMutationHandler(this.applyPipeline)
+		// Match production wiring (createApp): merge/constraint traces persist to
+		// `_kora_audit_traces`. Without this, harness devices emit merge events
+		// but the durable audit trail every real app has stays empty — a fidelity
+		// gap that hid from tests until Studio's Merges view made it visible.
+		this.unsubscribeAudit = wireAuditPersistence(this.store, this.emitter)
 	}
 
 	/**
@@ -220,6 +227,10 @@ export class TestDevice {
 	 */
 	async close(): Promise<void> {
 		this.closing = true
+		if (this.unsubscribeAudit) {
+			this.unsubscribeAudit()
+			this.unsubscribeAudit = null
+		}
 		await this.disconnect()
 		await this.store.close()
 		this.emitter.clear()

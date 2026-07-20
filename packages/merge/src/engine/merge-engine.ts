@@ -120,7 +120,7 @@ export class MergeEngine {
 		const { local, remote, baseState, collectionDef } = input
 
 		// Collect all field names that either operation touches
-		const allFields = collectAffectedFields(local, remote, baseState, collectionDef)
+		const allFields = collectAffectedFields(local, remote)
 
 		const mergedData: Record<string, unknown> = {}
 		const traces: MergeTrace[] = []
@@ -216,38 +216,30 @@ export class MergeEngine {
 }
 
 /**
- * Collect all field names affected by either operation or present in the base state.
+ * Collect the field names touched by either concurrent operation. This is the
+ * union of the two operations' changed fields, and nothing else.
  */
-function collectAffectedFields(
-	local: Operation,
-	remote: Operation,
-	baseState: Record<string, unknown>,
-	collectionDef: { fields: Record<string, unknown> },
-): Set<string> {
+function collectAffectedFields(local: Operation, remote: Operation): Set<string> {
+	// An update operation's `data` carries ONLY the fields that changed (see the
+	// Operation spec). The merge of two concurrent updates must therefore cover
+	// exactly the union of fields the two updates actually touched, and nothing
+	// else. Including untouched schema or base-state fields would emit them into
+	// `mergedData` with a resolved-from-nothing value (null), which the apply
+	// path then writes over the record: a NOT NULL constraint crash for required
+	// siblings, or silent data loss for optional ones. baseState supplies the
+	// 3-way merge BASE VALUE for the touched fields; it never widens the field set.
 	const fields = new Set<string>()
 
-	// Fields from the schema definition
-	for (const fieldName of Object.keys(collectionDef.fields)) {
-		fields.add(fieldName)
-	}
-
-	// Fields from local operation
 	if (local.data !== null) {
 		for (const fieldName of Object.keys(local.data)) {
 			fields.add(fieldName)
 		}
 	}
 
-	// Fields from remote operation
 	if (remote.data !== null) {
 		for (const fieldName of Object.keys(remote.data)) {
 			fields.add(fieldName)
 		}
-	}
-
-	// Fields from base state
-	for (const fieldName of Object.keys(baseState)) {
-		fields.add(fieldName)
 	}
 
 	return fields

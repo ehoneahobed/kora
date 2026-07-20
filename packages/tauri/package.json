@@ -1,6 +1,6 @@
 {
   "name": "@korajs/tauri",
-  "version": "0.4.2",
+  "version": "0.4.3-beta.0",
   "description": "Tauri storage adapter for Kora.js — native SQLite with zero WASM overhead",
   "type": "module",
   "main": "./dist/index.cjs",

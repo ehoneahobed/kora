@@ -18,6 +18,10 @@ import { RecordNotFoundError } from '../errors'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
+import {
+	decodeRichtextFieldsFromOpData,
+	encodeRichtextFieldsForOpData,
+} from '../serialization/op-data-encoding'
 import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
 import type {
 	CollectionRecord,
@@ -255,7 +259,9 @@ export class TransactionContext {
 				type: 'insert',
 				collection: collectionName,
 				recordId,
-				data: { ...validated },
+				// Binary richtext values are tagged as canonical JSON before the
+				// operation is content-hashed (see encodeRichtextFieldsForOpData).
+				data: encodeRichtextFieldsForOpData(validated, definition.fields),
 				previousData: null,
 				sequenceNumber,
 				causalDeps,
@@ -344,8 +350,10 @@ export class TransactionContext {
 				type: 'update',
 				collection: collectionName,
 				recordId: id,
-				data: { ...resolvedData },
-				previousData,
+				// Binary richtext values (new and previous) are tagged as canonical
+				// JSON before the operation is content-hashed.
+				data: encodeRichtextFieldsForOpData(resolvedData, definition.fields),
+				previousData: encodeRichtextFieldsForOpData(previousData, definition.fields),
 				sequenceNumber,
 				causalDeps,
 				schemaVersion: this.config.schema.version,
@@ -485,14 +493,16 @@ export class TransactionContext {
 			if (entry.operation.type === 'insert' && entry.operation.data) {
 				record = {
 					id,
-					...entry.operation.data,
+					// op.data stores binary richtext as tagged JSON; the effective
+					// record must expose record-shaped values (Uint8Array/string).
+					...decodeRichtextFieldsFromOpData(entry.operation.data, definition.fields),
 					createdAt: entry.operation.timestamp.wallTime,
 					updatedAt: entry.operation.timestamp.wallTime,
 				}
 			} else if (entry.operation.type === 'update' && entry.operation.data && record) {
 				record = {
 					...record,
-					...entry.operation.data,
+					...decodeRichtextFieldsFromOpData(entry.operation.data, definition.fields),
 					updatedAt: entry.operation.timestamp.wallTime,
 				}
 			} else if (entry.operation.type === 'delete') {

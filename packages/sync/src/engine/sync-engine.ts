@@ -165,6 +165,8 @@ export class SyncEngine {
 	private currentBatch: OutboundBatch | null = null
 	private reconnecting = false
 	private schemaBlocked = false
+	private clockBlocked = false
+	private clockSkewMs: number | null = null
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -380,9 +382,18 @@ export class SyncEngine {
 			lastSuccessfulPush: this.lastSuccessfulPush,
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
+			clockSkewMs: this.clockSkewMs,
 		}
 		switch (this.state) {
 			case 'disconnected':
+				// A durable block outranks plain offline: the user must act
+				// (fix the clock / upgrade the schema) before sync can resume.
+				if (this.clockBlocked) {
+					return { ...base, status: 'clock-error' }
+				}
+				if (this.schemaBlocked) {
+					return { ...base, status: 'schema-mismatch' }
+				}
 				return { ...base, status: 'offline' }
 			case 'connecting':
 			case 'handshaking':
@@ -393,6 +404,9 @@ export class SyncEngine {
 			case 'streaming':
 				return { ...base, status: pendingOperations > 0 ? 'syncing' : 'synced' }
 			case 'error':
+				if (this.clockBlocked) {
+					return { ...base, status: 'clock-error' }
+				}
 				return { ...base, status: this.schemaBlocked ? 'schema-mismatch' : 'error' }
 		}
 	}
@@ -403,6 +417,30 @@ export class SyncEngine {
 	 */
 	isSchemaBlocked(): boolean {
 		return this.schemaBlocked
+	}
+
+	/**
+	 * True when sync is blocked because this device's clock is too far ahead.
+	 * Local writes continue to work and queue; only sync is paused.
+	 */
+	isClockBlocked(): boolean {
+		return this.clockBlocked
+	}
+
+	/** serverTime - localTime measured at the last handshake, or null before first connect. */
+	getClockSkewMs(): number | null {
+		return this.clockSkewMs
+	}
+
+	/**
+	 * Clears the clock block after the user corrects the device clock.
+	 * Moves the engine back to `disconnected` so `start()` can run again.
+	 */
+	clearClockBlock(): void {
+		this.clockBlocked = false
+		if (this.state === 'error') {
+			this.transitionTo('disconnected')
+		}
 	}
 
 	/**
@@ -572,7 +610,7 @@ export class SyncEngine {
 	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		switch (message.type) {
 			case 'handshake-response':
-				this.handleHandshakeResponse(message)
+				await this.handleHandshakeResponse(message)
 				break
 			case 'operation-batch':
 				await this.handleOperationBatch(message)
@@ -597,8 +635,47 @@ export class SyncEngine {
 		this.handleTransportClose(reason)
 	}
 
-	private handleHandshakeResponse(msg: HandshakeResponseMessage): void {
+	/**
+	 * Compares server wall-clock time from the handshake with local time.
+	 * Negative skew = this device's clock is fast (dangerous for LWW and rejected
+	 * by server ingest beyond 60s). Positive skew = slow (accepted but surfaced).
+	 * Zero developer work required: the result flows into sync status and events.
+	 */
+	private evaluateClockSkew(serverTime: number): void {
+		const skewMs = serverTime - Date.now()
+		this.clockSkewMs = skewMs
+		const FAST_BLOCK_MS = 60_000
+		const SLOW_WARN_MS = 10 * 60_000
+		let severity: 'info' | 'slow-warning' | 'fast-blocked' = 'info'
+		if (skewMs < -FAST_BLOCK_MS) {
+			severity = 'fast-blocked'
+		} else if (skewMs > SLOW_WARN_MS) {
+			severity = 'slow-warning'
+		}
+		this.emitter?.emit({ type: 'sync:clock-skew', skewMs, severity, source: 'handshake' })
+		if (severity === 'fast-blocked') {
+			this.clockBlocked = true
+		} else {
+			// Auto-heal: an acceptable measured skew is authoritative proof the
+			// device clock has been corrected, so a block engaged earlier (at a
+			// previous handshake or via a server INVALID_TIMESTAMP reject) no
+			// longer applies and must not require a manual clearClockBlock().
+			this.clockBlocked = false
+		}
+	}
+
+	private async handleHandshakeResponse(msg: HandshakeResponseMessage): Promise<void> {
 		if (this.state !== 'handshaking') return
+
+		if (typeof msg.serverTime === 'number') {
+			this.evaluateClockSkew(msg.serverTime)
+			if (this.clockBlocked) {
+				this.metricsCollector.updateStatus('error')
+				this.transitionTo('error')
+				void this.transport.disconnect()
+				return
+			}
+		}
 
 		if (!msg.accepted) {
 			const reason = msg.rejectReason ?? 'Handshake rejected'
@@ -655,8 +732,67 @@ export class SyncEngine {
 		this.pendingDeltaBatchAcks.clear()
 		this.initialSyncTotalBatches = 0
 
+		// Rebase must finish BEFORE the delta exchange starts so only the
+		// re-stamped operation ids ever reach the wire.
+		if (typeof msg.serverTime === 'number') {
+			await this.maybeRebaseQueuedOperations(msg.serverTime)
+		}
+
 		// Send our delta to the server
 		this.sendDelta()
+	}
+
+	/**
+	 * Re-stamps queued (never-acknowledged) operations whose timestamps are far
+	 * enough in the future that the server would reject them, using the server's
+	 * own handshake time as the trusted "now". This is the automatic recovery
+	 * path after a user corrects a fast device clock: the queue drains
+	 * immediately instead of waiting for real time to catch up.
+	 */
+	private async maybeRebaseQueuedOperations(serverTime: number): Promise<void> {
+		// Optional store capability — hand-rolled SyncStore implementations
+		// without it silently keep the old (blocked-until-time-catches-up) behavior.
+		const rebase = this.store.rebaseUnsyncedOperations?.bind(this.store)
+		if (!rebase) return
+
+		const queued = this.outboundQueue.getAll()
+		if (queued.length === 0) return
+
+		let maxQueuedWallTime = Number.NEGATIVE_INFINITY
+		for (const op of queued) {
+			if (op.timestamp.wallTime > maxQueuedWallTime) {
+				maxQueuedWallTime = op.timestamp.wallTime
+			}
+		}
+
+		// Mirror the server's ingest tolerance: ops within +60s of server time
+		// would be accepted as-is, so rewriting them would churn ids for nothing.
+		const SERVER_FUTURE_TOLERANCE_MS = 60_000
+		if (maxQueuedWallTime <= serverTime + SERVER_FUTURE_TOLERANCE_MS) return
+
+		try {
+			const result = await rebase(
+				queued.map((op) => op.id),
+				serverTime,
+			)
+			await this.outboundQueue.replaceAll(result.operations)
+			this.emitter?.emit({
+				type: 'sync:clock-rebase',
+				rebasedCount: result.rebasedCount,
+				maxSkewMs: maxQueuedWallTime - serverTime,
+			})
+		} catch (error) {
+			// Never let a failed rebase crash the handshake: the old ops stay
+			// queued, the server will reject them with INVALID_TIMESTAMP, and the
+			// existing clock-block path takes over. Surface the failure through an
+			// existing event type rather than swallowing it.
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Timestamp rebase failed',
+				code: 'CLOCK_REBASE_FAILED',
+			})
+		}
 	}
 
 	private async sendDelta(): Promise<void> {
@@ -888,6 +1024,20 @@ export class SyncEngine {
 		this.transitionTo('error')
 		if (msg.code === 'AUTH_FAILED') {
 			this.emitter?.emit({ type: 'sync:auth-failed', reason: msg.message })
+		}
+		if (msg.code === 'INVALID_TIMESTAMP') {
+			// The server refused an operation stamped too far in the future: this
+			// device's clock is (or was) fast. Block sync so the queue is preserved
+			// and the app can tell the user to fix the clock.
+			this.clockBlocked = true
+			this.emitter?.emit({
+				type: 'sync:clock-skew',
+				skewMs: this.clockSkewMs ?? Number.NaN,
+				severity: 'fast-blocked',
+				source: 'server-reject',
+			})
+			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			return
 		}
 		this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
 		this.transitionTo('disconnected')

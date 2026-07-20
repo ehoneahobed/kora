@@ -13,7 +13,7 @@ description: "Test offline-first Kora.js apps: unit testing collections and merg
 pnpm add -D @korajs/test
 ```
 
-The package depends on `better-sqlite3` for local stores. It is designed for use with Vitest.
+The package depends on `korajs` and `better-sqlite3` for local stores. It is designed for use with Vitest.
 
 ## Creating a Test Network
 
@@ -190,6 +190,15 @@ test('deletes sync between devices', async () => {
   const todos = await deviceB.getState('todos')
   expect(todos).toHaveLength(0)
 })
+```
+
+## Inspecting Merge Decisions
+
+`TestDevice` wires audit persistence the same way production apps do, so every merge decision made during a harness test is persisted to the `_kora_audit_traces` table in that device's store. You can query it directly to assert on how a conflict was resolved:
+
+```typescript
+const traces = await deviceA.store.getAuditTraces({ collections: ['todos'] })
+expect(traces.length).toBeGreaterThan(0)
 ```
 
 ## TestDevice API

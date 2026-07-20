@@ -827,6 +827,10 @@ type KoraEvent =
   | { type: 'connection:quality'; quality: ConnectionQuality }
 ```
 
+::: warning
+`operation:applied` is declared in the catalog but is not yet emitted by the store. Do not rely on it firing; subscribe to `operation:created` to observe writes.
+:::
+
 ---
 
 ## KoraError

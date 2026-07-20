@@ -24,6 +24,26 @@ export class RecordNotFoundError extends KoraError {
 }
 
 /**
+ * Thrown inside `applyRemoteOperation` when the row's version state changed
+ * between the caller's snapshot read and the guarded write (a concurrent local
+ * mutation landed in the window). The transaction is rolled back with nothing
+ * written; the caller re-reads fresh state, recomputes its merge, and retries.
+ * This is the optimistic-concurrency guard that keeps merge-engine results
+ * (richtext, add-wins arrays, constraint resolutions) from clobbering newer
+ * local edits they never saw.
+ */
+export class OptimisticLockError extends KoraError {
+	constructor(collection: string, recordId: string) {
+		super(
+			`Row version changed while merging record "${recordId}" in "${collection}"; retry with fresh state`,
+			'OPTIMISTIC_LOCK',
+			{ collection, recordId },
+		)
+		this.name = 'OptimisticLockError'
+	}
+}
+
+/**
  * Thrown when a storage adapter operation fails.
  */
 export class AdapterError extends KoraError {

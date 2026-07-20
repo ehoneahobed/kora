@@ -1,5 +1,16 @@
 # kora-full-stack
 
+## 0.0.5-beta.0
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @korajs/store@1.0.0-beta.0
+  - korajs@1.0.0-beta.0
+  - @korajs/auth@1.0.0-beta.0
+  - @korajs/react@1.0.0-beta.0
+
 ## 0.0.4
 
 ### Patch Changes

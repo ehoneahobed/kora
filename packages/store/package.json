@@ -1,6 +1,6 @@
 {
   "name": "@korajs/store",
-  "version": "0.6.0",
+  "version": "1.0.0-beta.0",
   "description": "Local storage engine for Kora.js with SQLite WASM, IndexedDB, and reactive queries",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -104,10 +104,12 @@
     }
   },
   "devDependencies": {
+    "@fast-check/vitest": "0.2.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
     "better-sqlite3": "^12.8.0",
     "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.6.0",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
     "vitest": "^3.0.4"

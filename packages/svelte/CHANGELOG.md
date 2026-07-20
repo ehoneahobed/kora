@@ -1,5 +1,15 @@
 # @korajs/svelte
 
+## 1.0.0-beta.0
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @korajs/core@1.0.0-beta.0
+  - @korajs/sync@1.0.0-beta.0
+  - @korajs/store@1.0.0-beta.0
+
 ## 0.6.1
 
 ### Patch Changes

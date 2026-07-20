@@ -80,6 +80,8 @@ export function App() {
 					</div>
 				)}
 
+				<ClockErrorBanner status={status} />
+
 				{/* Stats */}
 				<div className="grid grid-cols-3 gap-4 mb-8">
 					<StatCard label="Total" value={allTodos.length} color="text-gray-300" />
@@ -216,6 +218,7 @@ function SyncBadge({ status }: { status: { status: string; pendingOperations?: n
 		synced: { icon: Wifi, color: 'text-emerald-400', label: 'Synced' },
 		offline: { icon: WifiOff, color: 'text-gray-500', label: 'Offline' },
 		error: { icon: AlertCircle, color: 'text-red-400', label: 'Error' },
+		'clock-error': { icon: AlertCircle, color: 'text-red-400', label: 'Clock error' },
 	}
 
 	const { icon: Icon, color, label } = config[s] ?? config.offline!
@@ -229,6 +232,31 @@ function SyncBadge({ status }: { status: { status: string; pendingOperations?: n
 					{pending} pending
 				</span>
 			)}
+		</div>
+	)
+}
+
+/**
+ * Shown when sync is paused because this device's clock is set too far ahead.
+ * Local changes keep saving; they sync automatically once the clock is fixed.
+ */
+function ClockErrorBanner({
+	status,
+}: {
+	status: { status: string; clockSkewMs?: number | null }
+}) {
+	if (status.status !== 'clock-error') return null
+	const skew = status.clockSkewMs
+	const minutes =
+		typeof skew === 'number' && Number.isFinite(skew) ? Math.round(Math.abs(skew) / 60000) : null
+	return (
+		<div className="mb-4 rounded-lg border border-amber-400/40 bg-amber-400/10 px-4 py-3 text-sm text-amber-200">
+			<strong>
+				This device's clock looks wrong{minutes !== null ? ` (about ${minutes} min ahead)` : ''}.
+			</strong>{' '}
+			Your changes are safe on this device, but they can't be shared with your other devices until
+			the clock is corrected. Open your device's Settings, find Date & Time, and turn on "Set
+			automatically", then return here.
 		</div>
 	)
 }

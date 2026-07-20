@@ -125,4 +125,106 @@ describe('useRichText', () => {
 			expect(updateSpy).toHaveBeenCalled()
 		})
 	})
+
+	it('exposes undo/redo controls and canUndo state for local edits', async () => {
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: null })),
+			update: vi.fn(async () => ({ id: 'rec-1' })),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
+		} as unknown as CollectionAccessor
+
+		const store = createMockStore({ notes })
+
+		const Probe = defineComponent({
+			setup() {
+				const binding = useRichText('notes', 'rec-1', 'body')
+				return () =>
+					h('div', null, [
+						h(
+							'span',
+							{ 'data-testid': 'history' },
+							`${binding.canUndo ? 'u1' : 'u0'}-${binding.text.toString()}`,
+						),
+						h(
+							'button',
+							{
+								type: 'button',
+								'data-testid': 'edit',
+								onClick: () => binding.text.insert(0, 'Draft'),
+							},
+							'edit',
+						),
+						h(
+							'button',
+							{ type: 'button', 'data-testid': 'undo', onClick: () => binding.undo() },
+							'undo',
+						),
+						h(
+							'button',
+							{ type: 'button', 'data-testid': 'redo', onClick: () => binding.redo() },
+							'redo',
+						),
+					])
+			},
+		})
+
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { store }, () => h(Probe)),
+			}),
+		)
+
+		await vi.waitFor(() => {
+			expect(wrapper.get('[data-testid="history"]').text()).toContain('u0')
+		})
+
+		await wrapper.get('[data-testid="edit"]').trigger('click')
+		await vi.waitFor(() => {
+			expect(wrapper.get('[data-testid="history"]').text()).toContain('Draft')
+		})
+		expect(wrapper.get('[data-testid="history"]').text()).toContain('u1')
+
+		await wrapper.get('[data-testid="undo"]').trigger('click')
+		await vi.waitFor(() => {
+			expect(wrapper.get('[data-testid="history"]').text()).not.toContain('Draft')
+		})
+
+		await wrapper.get('[data-testid="redo"]').trigger('click')
+		await vi.waitFor(() => {
+			expect(wrapper.get('[data-testid="history"]').text()).toContain('Draft')
+		})
+	})
+
+	it('destroys the rich text controller on unmount without throwing', async () => {
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: null })),
+			update: vi.fn(async () => ({ id: 'rec-1' })),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
+		} as unknown as CollectionAccessor
+
+		const store = createMockStore({ notes })
+
+		const Probe = defineComponent({
+			setup() {
+				const binding = useRichText('notes', 'rec-1', 'body')
+				return () => h('span', { 'data-testid': 'ready' }, binding.ready ? 'yes' : 'no')
+			},
+		})
+
+		const wrapper = mount(
+			defineComponent({
+				setup: () => () => h(KoraProvider, { store }, () => h(Probe)),
+			}),
+		)
+
+		await vi.waitFor(() => {
+			expect(wrapper.get('[data-testid="ready"]').text()).toBe('yes')
+		})
+
+		expect(() => wrapper.unmount()).not.toThrow()
+	})
 })

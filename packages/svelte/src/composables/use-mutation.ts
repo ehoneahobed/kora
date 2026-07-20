@@ -1,4 +1,5 @@
 import { createMutationController } from '@korajs/core/bindings'
+import { onDestroy } from 'svelte'
 import type { UseMutationOptions, UseMutationResult } from '../types'
 
 /**
@@ -22,7 +23,7 @@ export function createMutation<TData, TArgs extends unknown[], TContext = void>(
 	const loadingListeners = new Set<(value: boolean) => void>()
 	const errorListeners = new Set<(value: Error | null) => void>()
 
-	controller.subscribe(() => {
+	const unsubscribe = controller.subscribe(() => {
 		const snapshot = controller.getSnapshot()
 		for (const listener of loadingListeners) {
 			listener(snapshot.isLoading)
@@ -31,6 +32,19 @@ export function createMutation<TData, TArgs extends unknown[], TContext = void>(
 			listener(snapshot.error)
 		}
 	})
+
+	// Dispose the controller when the owning component unmounts, matching the
+	// React (`useController`) and Vue (`onScopeDispose`) lifecycles. Guarded so
+	// `createMutation()` can still be called outside a component (manual usage),
+	// where `onDestroy` is unavailable and the caller owns disposal.
+	try {
+		onDestroy(() => {
+			unsubscribe()
+			controller.destroy()
+		})
+	} catch {
+		// Not inside a component initialization — no lifecycle to hook into.
+	}
 
 	return {
 		mutate: (...args: TArgs) => controller.mutate(...args),

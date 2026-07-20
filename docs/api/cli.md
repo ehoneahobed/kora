@@ -529,3 +529,25 @@ kora --version
 kora migrate --help
 kora dev --cwd ./my-project
 ```
+
+
+## kora studio
+
+The visual window into Kora's data plane. Three modes:
+
+```bash
+# FILE mode: read-only inspection of any Kora database
+kora studio --db path/to/kora.db
+
+# LAB mode: interactive multi-device sync laboratory
+kora studio --lab [--devices 3] [--schema ./kora/schema.ts]
+
+# SPECTATOR mode: live read-only replica of a production sync server
+kora studio --connect wss://your-server.com/kora --schema ./kora/schema.ts [--token …]
+```
+
+Shows records with per-field last writers, full operation history, a causal
+DAG, time travel, the merge audit trail, and sync state — live. See the
+[Kora Studio guide](/studio) for the full walkthrough. Requires
+`better-sqlite3` (file mode), plus `@korajs/test` and `@korajs/server` for
+lab mode, and the Kora runtime packages for spectator mode.

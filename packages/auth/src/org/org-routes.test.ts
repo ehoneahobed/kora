@@ -441,6 +441,38 @@ describe('OrgRoutes', () => {
 			})
 			expect(result.status).toBe(400)
 		})
+
+		test('admin cannot demote the owner (privilege downgrade)', async () => {
+			// user-1 is the owner; user-2 is an admin.
+			const createResult = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const orgId = 'data' in createResult.body ? createResult.body.data.id : ''
+			await store.addMember(orgId, 'user-2', 'admin', 'user-1')
+
+			// The admin tries to strip the owner of their powers.
+			const result = await routes.updateMemberRole('user-2', orgId, {
+				targetUserId: 'user-1',
+				role: 'viewer',
+			})
+			expect(result.status).toBe(403)
+
+			// The owner's role must be unchanged.
+			const ownerMembership = await store.getMembership(orgId, 'user-1')
+			expect(ownerMembership?.role).toBe('owner')
+		})
+
+		test('owner cannot self-demote via role update (must transfer first)', async () => {
+			const createResult = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const orgId = 'data' in createResult.body ? createResult.body.data.id : ''
+
+			const result = await routes.updateMemberRole('user-1', orgId, {
+				targetUserId: 'user-1',
+				role: 'member',
+			})
+			expect(result.status).toBe(403)
+
+			const ownerMembership = await store.getMembership(orgId, 'user-1')
+			expect(ownerMembership?.role).toBe('owner')
+		})
 	})
 
 	// =========================================================================

@@ -1,6 +1,6 @@
 {
   "name": "@korajs/devtools",
-  "version": "0.6.0",
+  "version": "1.0.0-beta.0",
   "description": "Browser DevTools extension for Kora.js with sync timeline, conflict inspector, and operation log",
   "type": "module",
   "main": "./dist/index.cjs",

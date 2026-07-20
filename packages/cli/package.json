@@ -1,6 +1,6 @@
 {
   "name": "@korajs/cli",
-  "version": "0.6.0",
+  "version": "1.0.0-beta.0",
   "description": "Kora.js CLI tooling and project scaffolding",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -49,8 +49,10 @@
   },
   "devDependencies": {
     "@korajs/merge": "workspace:*",
+    "@korajs/server": "workspace:*",
     "@korajs/store": "workspace:*",
     "@korajs/sync": "workspace:*",
+    "@korajs/test": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
     "@types/validate-npm-package-name": "^4.0.2",

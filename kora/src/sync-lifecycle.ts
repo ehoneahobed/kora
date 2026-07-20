@@ -55,6 +55,12 @@ export function wireSyncLifecycleAfterReady(
 		maxDelay: config.sync.maxReconnectInterval,
 	})
 
+	// Feed measured clock skew into the store's HLC so remote-timestamp
+	// validation uses server-corrected time even on devices with wrong clocks.
+	emitter.on('sync:clock-skew', (event) => {
+		init.store.setClockReferenceOffset(event.skewMs)
+	})
+
 	emitter.on('sync:sent', () => state.connectionMonitor?.recordActivity())
 	emitter.on('sync:received', () => state.connectionMonitor?.recordActivity())
 	emitter.on('sync:acknowledged', () => state.connectionMonitor?.recordActivity())

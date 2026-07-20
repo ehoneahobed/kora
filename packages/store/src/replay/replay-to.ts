@@ -1,6 +1,7 @@
 import { OperationError } from '@korajs/core'
 import type { CollectionDefinition, Operation, SchemaDefinition } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
+import { decodeRichtextFieldsFromOpData } from '../serialization/op-data-encoding'
 import type { CollectionRecord } from '../types'
 
 /**
@@ -139,7 +140,9 @@ function applyOperationToMemory(
 			}
 			colMap.set(op.recordId, {
 				id: op.recordId,
-				fields: { ...op.data },
+				// op.data stores binary richtext as tagged JSON; snapshots must
+				// expose record-shaped values (Uint8Array/string).
+				fields: decodeRichtextFieldsFromOpData(op.data, definition.fields),
 				deleted: false,
 				createdAt: wallTime,
 				updatedAt: wallTime,
@@ -150,9 +153,10 @@ function applyOperationToMemory(
 			if (!op.data) {
 				return
 			}
+			const decodedData = decodeRichtextFieldsFromOpData(op.data, definition.fields)
 			const existing = colMap.get(op.recordId)
 			if (existing && !existing.deleted) {
-				existing.fields = { ...existing.fields, ...op.data }
+				existing.fields = { ...existing.fields, ...decodedData }
 				existing.updatedAt = wallTime
 				break
 			}
@@ -161,7 +165,7 @@ function applyOperationToMemory(
 			}
 			colMap.set(op.recordId, {
 				id: op.recordId,
-				fields: { ...op.data },
+				fields: decodedData,
 				deleted: false,
 				createdAt: wallTime,
 				updatedAt: wallTime,

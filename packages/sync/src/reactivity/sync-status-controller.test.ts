@@ -11,6 +11,7 @@ function createStatus(overrides: Partial<SyncStatusInfo> = {}): SyncStatusInfo {
 		lastSuccessfulPush: null,
 		lastSuccessfulPull: null,
 		conflicts: 0,
+		clockSkewMs: null,
 		...overrides,
 	}
 }

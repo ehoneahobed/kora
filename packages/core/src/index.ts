@@ -39,6 +39,8 @@ export { CONNECTION_QUALITIES, MERGE_STRATEGIES } from './types'
 export {
 	AppNotReadyError,
 	ClockDriftError,
+	InvalidTimestampError,
+	RemoteClockDriftError,
 	KoraError,
 	MergeConflictError,
 	OperationError,
@@ -49,7 +51,7 @@ export {
 export { getKoraErrorFix, KORA_ERROR_FIX_SUGGESTIONS } from './errors/error-fixes'
 
 // === Clock ===
-export { HybridLogicalClock } from './clock/hlc'
+export { HybridLogicalClock, MAX_LOGICAL } from './clock/hlc'
 
 // === Causal tracking ===
 export { CausalTracker } from './causal/causal-tracker'
@@ -79,6 +81,17 @@ export {
 	toAtomicOp,
 } from './operations/atomic-ops'
 export type { AtomicOpSentinel } from './operations/atomic-ops'
+
+// === Binary op-data encoding ===
+export {
+	base64ToBytes,
+	bytesToBase64,
+	decodeBytesFromOpData,
+	encodeBytesForOpData,
+	isKoraBytesValue,
+	isLegacyNumericByteObject,
+} from './operations/op-data-binary'
+export type { KoraBytesValue } from './operations/op-data-binary'
 
 // === Schema ===
 export { defineSchema } from './schema/define'

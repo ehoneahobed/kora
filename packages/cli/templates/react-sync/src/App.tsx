@@ -52,6 +52,14 @@ export function App() {
 				</div>
 			</div>
 
+			{status.status === 'clock-error' && (
+				<div className="clock-error-banner">
+					<strong>This device's clock looks wrong.</strong> Your changes are safe on this device,
+					but they can't sync until the clock is corrected. Open Settings, find Date &amp; Time, and
+					turn on "Set automatically".
+				</div>
+			)}
+
 			{error && <div className="auth-error">{error}</div>}
 
 			<div className="stats">

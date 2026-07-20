@@ -71,7 +71,13 @@ export function addWinsSet(
 	}
 
 	// Result = (base ∪ added_local ∪ added_remote) - removed_by_both
-	// Maintain order: base elements first (preserving order), then local adds, then remote adds
+	//
+	// Ordering must be COMMUTATIVE: "local" and "remote" are opposite roles on
+	// the two devices performing this same merge, so any local-before-remote
+	// ordering makes the devices converge on membership but DIVERGE on element
+	// order. Deterministic rule instead: base elements first (in base order),
+	// then all additions from either side sorted by their serialized form —
+	// identical on every device regardless of which side it calls "local".
 	const resultSerialized = new Set<string>()
 	const result: unknown[] = []
 
@@ -87,20 +93,22 @@ export function addWinsSet(
 		addIfNew(serialize(item), item)
 	}
 
-	// Local additions (in order they appear in local array)
+	// Additions from both sides, in a role-independent deterministic order.
+	const additions = new Map<string, unknown>()
 	for (const item of localArray) {
 		const s = serialize(item)
-		if (addedLocal.has(s)) {
-			addIfNew(s, item)
+		if (addedLocal.has(s) && !additions.has(s)) {
+			additions.set(s, item)
 		}
 	}
-
-	// Remote additions (in order they appear in remote array)
 	for (const item of remoteArray) {
 		const s = serialize(item)
-		if (addedRemote.has(s)) {
-			addIfNew(s, item)
+		if (addedRemote.has(s) && !additions.has(s)) {
+			additions.set(s, item)
 		}
+	}
+	for (const s of [...additions.keys()].sort()) {
+		addIfNew(s, additions.get(s))
 	}
 
 	return result

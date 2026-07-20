@@ -9,10 +9,12 @@ export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	lastSuccessfulPush: null,
 	lastSuccessfulPull: null,
 	conflicts: 0,
+	clockSkewMs: null,
 })
 
 const SYNC_STATUS_EVENT_TYPES = [
 	'sync:connected',
+	'sync:clock-skew',
 	'sync:disconnected',
 	'sync:schema-mismatch',
 	'sync:auth-failed',

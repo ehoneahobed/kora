@@ -1,3 +1,4 @@
+import { StorageError } from '@korajs/core'
 import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@korajs/core'
 
 /**
@@ -143,6 +144,65 @@ export function replayOperationsForRecord(
 	return deleted ? null : record
 }
 
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const BASE64_REVERSE: ReadonlyMap<string, number> = new Map(
+	Array.from(BASE64_ALPHABET, (char, index) => [char, index]),
+)
+
+function base64ToBytes(base64: string): Uint8Array {
+	const cleaned = base64.replace(/=+$/, '')
+	const out = new Uint8Array(Math.floor((cleaned.length * 6) / 8))
+	let buffer = 0
+	let bits = 0
+	let index = 0
+	for (const char of cleaned) {
+		const value = BASE64_REVERSE.get(char)
+		if (value === undefined) {
+			throw new StorageError(`Invalid base64 character "${char}" in tagged richtext value`, {
+				char,
+			})
+		}
+		buffer = (buffer << 6) | value
+		bits += 6
+		if (bits >= 8) {
+			bits -= 8
+			out[index] = (buffer >> bits) & 0xff
+			index += 1
+		}
+	}
+	return out
+}
+
+/**
+ * Decode a richtext op-data value to something a BLOB/BYTEA column accepts.
+ * Client operations carry binary richtext as the canonical tagged
+ * `{ $koraBytes: base64 }` form (raw bytes cannot survive the JSON `dataJson`
+ * wire field). The server cannot import the store package (dependency rules),
+ * so the tiny base64 decode is duplicated here rather than shared.
+ * Strings and byte views pass through unchanged.
+ */
+function decodeRichtextColumnValue(value: unknown): unknown {
+	if (typeof value !== 'object' || value === null || ArrayBuffer.isView(value)) {
+		return value
+	}
+	const record = value as Record<string, unknown>
+	if (Object.keys(record).length === 1 && typeof record.$koraBytes === 'string') {
+		return base64ToBytes(record.$koraBytes)
+	}
+	// Pre-fix operations serialized raw Uint8Arrays as numeric-key objects;
+	// reconstruct the bytes so old dev databases keep materializing.
+	const keys = Object.keys(record)
+	if (keys.length > 0 && keys.every((k, i) => k === String(i) && typeof record[k] === 'number')) {
+		const bytes = new Uint8Array(keys.length)
+		for (let i = 0; i < keys.length; i++) {
+			const byte = record[String(i)]
+			bytes[i] = typeof byte === 'number' ? byte & 0xff : 0
+		}
+		return bytes
+	}
+	return value
+}
+
 /**
  * Serialize a field value for SQL storage.
  * Arrays become JSON strings, booleans become 0/1, etc.
@@ -154,6 +214,8 @@ export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor)
 			return typeof value === 'string' ? value : JSON.stringify(value)
 		case 'boolean':
 			return value ? 1 : 0
+		case 'richtext':
+			return decodeRichtextColumnValue(value)
 		default:
 			return value
 	}

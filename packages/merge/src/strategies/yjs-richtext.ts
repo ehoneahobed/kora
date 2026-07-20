@@ -1,6 +1,12 @@
+import {
+	type KoraBytesValue,
+	decodeBytesFromOpData,
+	isKoraBytesValue,
+	isLegacyNumericByteObject,
+} from '@korajs/core'
 import * as Y from 'yjs'
 
-export type RichtextValue = string | Uint8Array | ArrayBuffer | null | undefined
+export type RichtextValue = string | Uint8Array | ArrayBuffer | KoraBytesValue | null | undefined
 
 const TEXT_KEY = 'content'
 
@@ -56,5 +62,17 @@ function toYjsUpdate(value: RichtextValue): Uint8Array {
 		return new Uint8Array(value)
 	}
 
-	throw new Error('Richtext value must be a string, Uint8Array, ArrayBuffer, null, or undefined.')
+	// Richtext values arrive here straight from op.data / previousData, where
+	// binary payloads are stored in the canonical tagged { $koraBytes } form (or,
+	// for pre-fix dev databases, a numeric-key object). Decode either shape back
+	// to Yjs update bytes. Without this, a concurrent richtext edit whose values
+	// round-tripped through JSON would crash the merge engine.
+	if (isKoraBytesValue(value) || isLegacyNumericByteObject(value)) {
+		const decoded = decodeBytesFromOpData(value)
+		return decoded instanceof Uint8Array ? decoded : stringToRichtextUpdate(decoded)
+	}
+
+	throw new Error(
+		'Richtext value must be a string, Uint8Array, ArrayBuffer, tagged { $koraBytes } object, null, or undefined.',
+	)
 }

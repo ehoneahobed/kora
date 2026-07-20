@@ -1,5 +1,89 @@
 # @korajs/cli
 
+## 1.0.0-beta.0
+
+### Minor Changes
+
+- New command: `kora studio` — the visual window into Kora's data plane, in two
+  modes.
+
+  FILE mode (`kora studio --db path/to/db.sqlite`) inspects any Kora database,
+  strictly read-only: records with each field's LAST WRITER (which device
+  changed it, and when), the full operation history behind every record, a
+  causal DAG that makes concurrency visible as parallel device lanes, TIME
+  TRAVEL (scrub to any operation and see the exact state at that causal cut,
+  with animated replay), tombstones, the outbound sync queue, the version
+  vector, and the merge audit trail. Live-updates via server-sent events when
+  the database changes. No schema file needed; no extra dependencies; the UI is
+  fully self-contained and offline.
+
+  LAB mode (`kora studio --lab`) is an interactive multi-device sync
+  laboratory: real Kora clients (own store, sync engine, merge pipeline)
+  against a real in-process sync server. Create devices, edit records on each,
+  disconnect them, make conflicting edits, watch the convergence banner flip to
+  DIVERGED, reconnect, and watch every device converge — with a live event feed
+  showing each operation, sync message, and merge decision as it happens.
+  Chaos controls per device (drop, duplicate, reorder, latency) and atomic
+  increment buttons demonstrate composition: +1 on two offline devices merges
+  to +2, never lost. Everything in the Lab is throwaway; it can never touch
+  real data. Optionally bring your own schema with `--schema`.
+
+  SPECTATOR mode (`kora studio --connect wss://… --schema ./kora/schema.ts`)
+  attaches to a LIVE production sync server as a real, read-only Kora client
+  over the real WebSocket protocol: full history on connect (production time
+  travel), live operation streaming, per-field writers, causal DAG, and merge
+  audit — with no mutation surface, so it can never write to production.
+
+  Studio answers the hardest question in a synced app — "why does this record
+  look like this on this device?" — with evidence, not logs.
+
+### Patch Changes
+
+- e6f7c98: Every scaffolded app now includes an AGENTS.md file: framework rules, data API
+  cheat sheet, and project conventions written for AI coding agents (and humans),
+  so agents build Kora apps correctly instead of reaching for fetch calls and
+  hand-written types.
+- Clock integrity: protection against wrong device clocks at every layer.
+
+  - HLC now validates remote timestamps BEFORE adopting them (`RemoteClockDriftError`),
+    so a far-future timestamp can no longer poison a replica's clock.
+  - Local timestamp generation never throws and never blocks writes: drift is
+    reported through callbacks and `sync:clock-skew` events instead.
+  - The sync handshake now carries `serverTime`; clients measure their own skew,
+    pause sync with a new `clock-error` status when the device clock is more than
+    60s fast (local writes keep queuing), and warn via events when it is very slow.
+  - `SyncStatusInfo` gains `clockSkewMs`; the store's HLC receives the measured
+    offset so remote validation works even on devices with wrong clocks.
+  - Scaffolded templates render a plain-language banner telling end users how to
+    fix their device clock. See the new Clock Integrity guide.
+  - Automatic timestamp rebase: after the clock is corrected, the next handshake
+    clears the clock block on its own and re-stamps queued never-acknowledged
+    operations (new content-addressed ids, causal deps remapped, original order
+    preserved) so sync resumes immediately instead of waiting for real time to
+    catch up. A new `sync:clock-rebase` event reports `rebasedCount` and
+    `maxSkewMs`. Safe because unacknowledged operations are private to the
+    device — like rewriting unpushed git commits.
+  - Bounded logical counter with carry: the HLC logical counter is capped at
+    99,999 (`MAX_LOGICAL`, exported from `@korajs/core`) so serialized timestamps
+    always sort lexicographically identically to `HybridLogicalClock.compare`.
+    Overflow carries into wallTime (+1ms, counter resets) in `now()`, `receive()`,
+    and `advanceTo()`; malformed timestamps (non-integer/negative fields, logical
+    past the cap) are rejected with `InvalidTimestampError`
+    (`INVALID_TIMESTAMP_FIELDS`) before any clock state changes, both at the
+    replica and at server ingest.
+  - Canonical binary encoding in op payloads: richtext `Uint8Array`/`ArrayBuffer`
+    values are normalized to a tagged `{ $koraBytes: base64 }` form in
+    `op.data`/`op.previousData` at operation creation, BEFORE content hashing, so
+    the hash input, persisted JSON, and wire payload are the identical value and
+    operation ids survive persistence round-trips. Plain-string richtext values
+    are untouched (existing operation ids are unaffected); apply paths decode the
+    tagged form (and tolerate the pre-fix numeric-key shape from dev databases)
+    back to bytes.
+
+- Updated dependencies
+- Updated dependencies
+  - @korajs/core@1.0.0-beta.0
+
 ## 0.6.0
 
 ### Minor Changes

@@ -48,6 +48,11 @@ export function generateSQL(
 	columns.push('_created_at INTEGER NOT NULL')
 	columns.push('_updated_at INTEGER NOT NULL')
 	columns.push("_version TEXT NOT NULL DEFAULT ''")
+	// Per-field last-writer HLC versions (JSON: { field -> serialized HLC }).
+	// Enables deterministic, order-independent field-level LWW so concurrent
+	// edits to different fields of one record never clobber each other and
+	// same-field conflicts converge to the max-timestamp writer on every node.
+	columns.push("_field_versions TEXT NOT NULL DEFAULT '{}'")
 	columns.push('_deleted INTEGER NOT NULL DEFAULT 0')
 
 	statements.push(`CREATE TABLE IF NOT EXISTS ${collectionName} (\n  ${columns.join(',\n  ')}\n)`)
@@ -60,6 +65,9 @@ export function generateSQL(
 	}
 	statements.push(
 		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _version TEXT NOT NULL DEFAULT ''`,
+	)
+	statements.push(
+		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _field_versions TEXT NOT NULL DEFAULT '{}'`,
 	)
 
 	// Create indexes
@@ -92,6 +100,11 @@ export function generateSQL(
   causal_deps TEXT NOT NULL,
   schema_version INTEGER NOT NULL
 )`,
+	)
+	// Record-scoped lookups run on every remote apply (latest-op-for-record,
+	// orphaned-op fold on out-of-order inserts) — index them.
+	statements.push(
+		`CREATE INDEX IF NOT EXISTS idx_kora_ops_${collectionName}_record_id ON _kora_ops_${collectionName} (record_id)`,
 	)
 
 	return statements

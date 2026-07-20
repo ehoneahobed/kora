@@ -44,45 +44,9 @@ export interface WorkerBridge {
 
 // === Mutex ===
 
-/**
- * Async mutex for serializing transaction access across the async worker boundary.
- * Only one transaction may be active at a time.
- */
-export class Mutex {
-	private locked = false
-	private waiters: Array<() => void> = []
-
-	/**
-	 * Acquire the mutex. Returns a release function.
-	 * If the mutex is already held, the caller waits until it's released.
-	 */
-	async acquire(): Promise<() => void> {
-		if (!this.locked) {
-			this.locked = true
-			return this.createRelease()
-		}
-
-		return new Promise<() => void>((resolve) => {
-			this.waiters.push(() => {
-				resolve(this.createRelease())
-			})
-		})
-	}
-
-	private createRelease(): () => void {
-		let released = false
-		return () => {
-			if (released) return
-			released = true
-			const next = this.waiters.shift()
-			if (next) {
-				next()
-			} else {
-				this.locked = false
-			}
-		}
-	}
-}
+// The Mutex now lives in its own module so non-browser adapters (better-sqlite3)
+// can serialize transactions without importing browser-worker code.
+export { Mutex } from './mutex'
 
 // === WebWorkerBridge ===
 

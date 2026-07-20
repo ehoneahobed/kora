@@ -6,6 +6,7 @@ import { createServerTransportPair } from '@korajs/server/internal'
 import type { ChaosConfig } from '@korajs/sync'
 import { ChaosTransport } from '@korajs/sync'
 import type { SyncTransport } from '@korajs/sync'
+import type { TransportPair } from './protobuf-wire-transport'
 import { TestDevice } from './test-device'
 import { TestServer, type TestServerOptions } from './test-server'
 
@@ -19,6 +20,14 @@ export interface TestNetworkOptions {
 	deviceNames?: string[]
 	/** Optional chaos transport settings applied to each device link. */
 	chaos?: ChaosConfig
+	/**
+	 * Optional wrapper applied to each device's transport pair after the base
+	 * (in-memory, optionally chaos-wrapped) pair is created. Use it to route
+	 * messages through the protobuf wire codec
+	 * ({@link wrapTransportPairWithProtobufWire}) or to inject a controllable
+	 * server clock. Called once per device connection.
+	 */
+	wrapTransport?: (pair: TransportPair) => TransportPair
 }
 
 /**
@@ -85,10 +94,11 @@ export async function createTestNetwork(
 				const pair = createServerTransportPair()
 				const client = pair.client as unknown as SyncTransport
 				const chaos = options?.chaos
-				return {
+				const base: TransportPair = {
 					client: chaos ? new ChaosTransport(client, chaos) : client,
 					serverTransport: pair.server,
 				}
+				return options?.wrapTransport ? options.wrapTransport(base) : base
 			},
 			tmpDir,
 		})

@@ -1,6 +1,6 @@
 {
   "name": "@korajs/svelte",
-  "version": "0.6.1",
+  "version": "1.0.0-beta.0",
   "description": "Kora.js Svelte bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",

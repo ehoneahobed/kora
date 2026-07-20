@@ -140,6 +140,8 @@ Last-Write-Wins merge strategy using HLC timestamps. The value with the later ti
 
 Used by default for `string`, `number`, `boolean`, `enum`, and `timestamp` fields.
 
+As of 0.7.0 the store applies this comparison per field: each materialized row records the last writer of every field in its `_field_versions` column, so a remote update wins or loses each field it touches independently. Concurrent edits to different fields of the same record both survive.
+
 ```typescript
 function lastWriteWins(
   localValue: unknown,
@@ -179,7 +181,7 @@ Algorithm:
   result = (base U added_local U added_remote) - (removed_local intersection removed_remote)
 ```
 
-Element ordering: base elements first (preserving original order), then local additions, then remote additions. Uses `JSON.stringify` for element comparison.
+Element ordering: base elements first (preserving original order), then additions from both sides sorted by their serialized form. This makes the merged array byte-identical on every device, regardless of which side is local. Uses `JSON.stringify` for element comparison and serialization.
 
 ```typescript
 function addWinsSet(

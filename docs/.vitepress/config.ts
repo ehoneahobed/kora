@@ -1,4 +1,11 @@
-import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import {
+	copyFileSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	statSync,
+	writeFileSync,
+} from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { defineConfig } from 'vitepress'
 
@@ -89,11 +96,13 @@ function emitLlmsArtifacts(srcDir: string, outDir: string): void {
 
 	const full = pages
 		.filter((p) => !p.path.startsWith('releases/'))
-		.map((p) => `# ${p.title}\nSource: ${SITE_URL}/${p.path.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')}\n\n${p.body.trim()}\n`)
+		.map(
+			(p) =>
+				`# ${p.title}\nSource: ${SITE_URL}/${p.path.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')}\n\n${p.body.trim()}\n`,
+		)
 		.join('\n---\n\n')
 	writeFileSync(join(outDir, 'llms-full.txt'), full)
 }
-
 
 export default defineConfig({
 	lang: 'en-US',
@@ -156,7 +165,10 @@ export default defineConfig({
 			['meta', { name: 'twitter:title', content: title }],
 		)
 		if (pageData.description) {
-			pageData.frontmatter.head.push(['meta', { property: 'og:description', content: pageData.description }])
+			pageData.frontmatter.head.push([
+				'meta',
+				{ property: 'og:description', content: pageData.description },
+			])
 		}
 	},
 	themeConfig: {
@@ -186,6 +198,7 @@ export default defineConfig({
 					{ text: 'React Hooks', link: '/guide/react-hooks' },
 					{ text: 'Offline Patterns', link: '/guide/offline-patterns' },
 					{ text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
+					{ text: 'Clock Integrity', link: '/guide/clock-integrity' },
 					{ text: 'Sync Configuration', link: '/guide/sync-configuration' },
 					{ text: 'Storage Configuration', link: '/guide/storage-configuration' },
 					{ text: 'Backup and Restore', link: '/guide/backup-restore' },
@@ -197,6 +210,7 @@ export default defineConfig({
 					{ text: 'Testing', link: '/guide/testing' },
 					{ text: 'Tauri Desktop Apps', link: '/guide/tauri-desktop' },
 					{ text: 'DevTools', link: '/guide/devtools' },
+					{ text: 'Kora Studio', link: '/studio' },
 				],
 			},
 			{

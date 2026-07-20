@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import {
 	InMemoryTotpStore,
 	TotpAlreadyEnabledError,
@@ -243,15 +243,51 @@ describe('TotpManager', () => {
 	// --- verify ---
 
 	describe('verify', () => {
-		test('accepts valid code', async () => {
+		afterEach(() => {
+			vi.useRealTimers()
+		})
+
+		test('accepts a fresh valid code from a new time window', async () => {
+			vi.useFakeTimers()
+			vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
+
 			const setup = await manager.enable('user-1', 'alice@example.com')
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			// Generate another code for the same window (should still be valid)
+			// Advance to the next time step so a genuinely new code is issued.
+			vi.setSystemTime(Date.now() + 30_000)
 			const loginCode = generateValidCode(setup.secret)
 			const result = await manager.verify('user-1', loginCode)
 			expect(result).toBe(true)
+		})
+
+		test('rejects replay of the same code (single-use, RFC 6238 §5.2)', async () => {
+			vi.useFakeTimers()
+			vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
+
+			const setup = await manager.enable('user-1', 'alice@example.com')
+			const setupCode = generateValidCode(setup.secret)
+			await manager.verifySetup('user-1', setupCode)
+
+			vi.setSystemTime(Date.now() + 30_000)
+			const loginCode = generateValidCode(setup.secret)
+			// First use succeeds...
+			expect(await manager.verify('user-1', loginCode)).toBe(true)
+			// ...replaying the identical code within the same window must fail.
+			expect(await manager.verify('user-1', loginCode)).toBe(false)
+		})
+
+		test('rejects a setup code replayed as a login code', async () => {
+			vi.useFakeTimers()
+			vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
+
+			const setup = await manager.enable('user-1', 'alice@example.com')
+			const setupCode = generateValidCode(setup.secret)
+			await manager.verifySetup('user-1', setupCode)
+
+			// Same window: the code consumed by verifySetup cannot log in.
+			expect(await manager.verify('user-1', setupCode)).toBe(false)
 		})
 
 		test('rejects invalid code', async () => {

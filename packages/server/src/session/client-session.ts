@@ -352,6 +352,7 @@ export class ClientSession {
 				rejectReason: `${SCHEMA_MISMATCH_PREFIX}: client schema version ${msg.schemaVersion} not in supported range [${min}, ${max}]`,
 				supportedSchemaMin: min,
 				supportedSchemaMax: max,
+				serverTime: Date.now(),
 			}
 			this.sendToClient(response)
 			this.close('schema version mismatch')
@@ -367,6 +368,7 @@ export class ClientSession {
 			schemaVersion: this.schemaVersion,
 			accepted: true,
 			selectedWireFormat,
+			serverTime: Date.now(),
 			// Confirm the accepted scope so the client knows what data will be synced.
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.scopes ? { acceptedScope: this.authContext.scopes } : {}),

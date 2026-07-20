@@ -40,7 +40,7 @@ export class ChaosTransport implements SyncTransport {
 
 	private messageHandler: TransportMessageHandler | null = null
 	private reorderBuffer: SyncMessage[] = []
-	private timers: ReturnType<typeof setTimeout>[] = []
+	private pending: Array<{ timer: ReturnType<typeof setTimeout>; message: SyncMessage }> = []
 
 	constructor(inner: SyncTransport, config?: ChaosConfig) {
 		this.inner = inner
@@ -60,11 +60,23 @@ export class ChaosTransport implements SyncTransport {
 	async disconnect(): Promise<void> {
 		// Flush reorder buffer
 		this.flushReorderBuffer()
-		// Clear pending timers
-		for (const timer of this.timers) {
+		// Deliver any incoming messages still sitting in their simulated-latency
+		// window rather than discarding them. `maxLatency` models delay already
+		// incurred on the wire before we hung up: the peer already sent these,
+		// so a local disconnect() shouldn't retroactively erase them. Cancelling
+		// the timer without delivering silently inflates the effective drop
+		// rate past what `dropRate` configures, and makes convergence depend on
+		// the real wall-clock race between each message's random delay and
+		// whenever a test happens to call disconnect() next, exactly the kind
+		// of timing dependency that makes "seeded" chaos tests flaky anyway.
+		const flushed = this.pending
+		this.pending = []
+		for (const { timer } of flushed) {
 			clearTimeout(timer)
 		}
-		this.timers = []
+		for (const { message } of flushed) {
+			this.deliverIncoming(message)
+		}
 		return this.inner.disconnect()
 	}
 
@@ -117,10 +129,15 @@ export class ChaosTransport implements SyncTransport {
 
 		if (this.maxLatency > 0) {
 			const delay = Math.floor(this.random() * this.maxLatency)
-			const timer = setTimeout(() => {
+			// `timer` is assigned before the callback can possibly run (setTimeout
+			// callbacks never fire synchronously), so the closure below always
+			// sees the real handle, letting the entry remove itself from
+			// `pending` once its delivery actually happens.
+			const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+				this.pending = this.pending.filter((p) => p.timer !== timer)
 				this.deliverIncoming(message)
 			}, delay)
-			this.timers.push(timer)
+			this.pending.push({ timer, message })
 			return
 		}
 

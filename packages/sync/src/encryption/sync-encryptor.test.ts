@@ -2,16 +2,38 @@ import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { SerializedOperation } from '../protocol/messages'
 import { JsonMessageSerializer, ProtobufMessageSerializer } from '../protocol/serializer'
-import { deriveVersionedKey, generateSalt } from './key-derivation'
+import { deriveVersionedKey as deriveVersionedKeyWithCost, generateSalt } from './key-derivation'
 import {
 	DecryptionError,
 	EncryptionError,
 	SyncEncryptor,
 	isEncryptedPayload,
 } from './sync-encryptor'
-import type { SyncEncryptionConfig } from './types'
+import type { SyncEncryptionConfig, VersionedKey } from './types'
 
 // --- Test helpers ---
+
+/**
+ * Low PBKDF2 iteration count for tests. Production derives at 600,000
+ * iterations (see DEFAULT_PBKDF2_ITERATIONS); those real derivations are
+ * CPU-bound on the libuv crypto threadpool and, when many test files run in
+ * parallel under `turbo test --concurrency=N`, several per-test derivations
+ * queued behind each other pushed heavy tests past the 5s default timeout
+ * (flaky in CI, green in isolation). 1,000 iterations exercises the exact same
+ * real WebCrypto PBKDF2/AES-GCM code path in ~1ms, removing the contention
+ * without touching the production default. Every derivation in this file must
+ * use the SAME count so encrypt/decrypt key pairs match.
+ */
+const TEST_KDF_ITERATIONS = 1_000
+
+/** deriveVersionedKey pinned to the fast test iteration count. */
+function deriveVersionedKey(
+	passphrase: string,
+	version: number,
+	salt?: Uint8Array,
+): Promise<VersionedKey> {
+	return deriveVersionedKeyWithCost(passphrase, version, salt, TEST_KDF_ITERATIONS)
+}
 
 function makeOperation(overrides?: Partial<Operation>): Operation {
 	return {
@@ -49,14 +71,14 @@ function makeDeleteOperation(): Operation {
 }
 
 async function createEncryptor(passphrase = 'test-passphrase'): Promise<SyncEncryptor> {
-	return SyncEncryptor.create({ enabled: true, key: passphrase })
+	return SyncEncryptor.create({ enabled: true, key: passphrase }, undefined, TEST_KDF_ITERATIONS)
 }
 
 async function createEncryptorWithSalt(
 	passphrase: string,
 	salt: Uint8Array,
 ): Promise<SyncEncryptor> {
-	return SyncEncryptor.create({ enabled: true, key: passphrase }, salt)
+	return SyncEncryptor.create({ enabled: true, key: passphrase }, salt, TEST_KDF_ITERATIONS)
 }
 
 // --- Tests ---
@@ -73,7 +95,7 @@ describe('SyncEncryptor.create', () => {
 			enabled: true,
 			key: async () => 'async-passphrase',
 		}
-		const encryptor = await SyncEncryptor.create(config)
+		const encryptor = await SyncEncryptor.create(config, undefined, TEST_KDF_ITERATIONS)
 		expect(encryptor).toBeInstanceOf(SyncEncryptor)
 	})
 

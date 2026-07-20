@@ -11,4 +11,4 @@ description: "Kora.js release milestones and the exit criteria each version must
 | v0.6 public beta | [v0.6-public-beta.md](./v0.6-public-beta.md) | `pnpm test:release-gate` + `pnpm test:e2e` |
 | npm publish (maintainers) | [npm-publish-checklist.md](./npm-publish-checklist.md) | `pnpm changeset publish --dry-run` |
 
-Implementation tracking: the internal best-in-class implementation plan (complete; archived privately).
+Implementation tracking: the best-in-class implementation plan (retired; all 92 items complete) (complete).

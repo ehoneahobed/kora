@@ -1,3 +1,4 @@
+import { fc, test as propTest } from '@fast-check/vitest'
 import { describe, expect, test } from 'vitest'
 import { addWinsSet } from './add-wins-set'
 
@@ -142,5 +143,27 @@ describe('addWinsSet', () => {
 		// e: added by local → stays
 		// f: added by remote → stays
 		expect(result).toEqual(['a', 'b', 'c', 'e', 'f'])
+	})
+
+	// The two devices performing this merge call OPPOSITE sides "local", so the
+	// result must be identical — including ELEMENT ORDER — when the roles swap.
+	// Divergent order is divergent state: reactive queries and UIs render it.
+	propTest.prop([
+		fc.array(fc.string({ maxLength: 4 }), { maxLength: 6 }),
+		fc.array(fc.string({ maxLength: 4 }), { maxLength: 6 }),
+		fc.array(fc.string({ maxLength: 4 }), { maxLength: 6 }),
+	])('is commutative including element order', (base, local, remote) => {
+		const ab = addWinsSet(local, remote, base)
+		const ba = addWinsSet(remote, local, base)
+		expect(ab).toEqual(ba)
+	})
+
+	propTest.prop([
+		fc.array(fc.string({ maxLength: 4 }), { maxLength: 6 }),
+		fc.array(fc.string({ maxLength: 4 }), { maxLength: 6 }),
+	])('is idempotent: re-merging the merged result is stable', (base, side) => {
+		const result = addWinsSet(side, side, base)
+		const again = addWinsSet(result, result, base)
+		expect(again).toEqual(result)
 	})
 })

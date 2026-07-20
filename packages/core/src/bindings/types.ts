@@ -3,12 +3,21 @@ import type { ScopeMap } from '../scopes/build-scope-map'
 
 /** Sync status shape consumed by framework binding hooks (matches {@link SyncStatusInfo} in `@korajs/sync`). */
 export interface KoraBindingSyncStatus {
-	status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error' | 'schema-mismatch'
+	status:
+		| 'connected'
+		| 'syncing'
+		| 'synced'
+		| 'offline'
+		| 'error'
+		| 'schema-mismatch'
+		| 'clock-error'
 	pendingOperations: number
 	lastSyncedAt: number | null
 	lastSuccessfulPush: number | null
 	lastSuccessfulPull: number | null
 	conflicts: number
+	/** serverTime - localTime in ms at last handshake; negative = device clock is fast. */
+	clockSkewMs: number | null
 }
 
 /** Minimal sync bridge surface exposed on `createApp().sync`. */
