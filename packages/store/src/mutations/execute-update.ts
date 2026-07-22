@@ -4,6 +4,7 @@ import {
 	isAtomicOp,
 	resolveAtomicOp,
 	toAtomicOp,
+	transformSecretFieldsForWrite,
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
@@ -65,6 +66,15 @@ export async function executeUpdate(
 		}
 	}
 
+	// Transform secret fields in the changed set to their at-rest form before the
+	// operation is built. previousData already holds the stored (ciphertext) value
+	// from the current record, so it needs no transform.
+	const writeData = await transformSecretFieldsForWrite(
+		resolvedData,
+		ctx.definition,
+		ctx.secretKeyProvider,
+	)
+
 	const hasAtomicOps = Object.keys(atomicOps).length > 0
 	const causalDeps = resolveCausalDeps(ctx)
 	let operation!: Awaited<ReturnType<typeof createOperation>>
@@ -80,7 +90,7 @@ export async function executeUpdate(
 				// Binary richtext values (new and previous) are tagged as canonical
 				// JSON BEFORE the operation is content-hashed, so the hash input,
 				// persisted JSON, and wire payload are the identical value.
-				data: encodeRichtextFieldsForOpData(resolvedData, ctx.definition.fields),
+				data: encodeRichtextFieldsForOpData(writeData, ctx.definition.fields),
 				previousData: encodeRichtextFieldsForOpData(previousData, ctx.definition.fields),
 				sequenceNumber,
 				causalDeps,
@@ -91,7 +101,7 @@ export async function executeUpdate(
 		)
 		ctx.causalTracker?.afterOperation(ctx.collection, operation.id, ctx.inTransaction)
 
-		const serializedChanges = serializeRecord(resolvedData, ctx.definition.fields)
+		const serializedChanges = serializeRecord(writeData, ctx.definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
 		// A local edit is always the newest writer of the fields it touches (the
 		// HLC advances past every timestamp this device has seen), so stamp each

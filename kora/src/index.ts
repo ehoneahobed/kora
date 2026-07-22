@@ -8,6 +8,8 @@ export { createApp } from './create-app'
 export type {
 	AdapterType,
 	AuthSyncBinding,
+	BlobApi,
+	BlobOptions,
 	KoraApp,
 	KoraConfig,
 	StoreOptions,
@@ -93,6 +95,39 @@ export type {
 	TransactionCollectionAccessor,
 	TransactionContextConfig,
 } from '@korajs/store'
+
+// === Blob transfer (out-of-band, content-addressed) ===
+export {
+	MemoryBlobStore,
+	OpfsBlobStore,
+	createOpfsBlobDirectory,
+	createOpfsBlobStore,
+	BlobIntegrityError,
+	chunkBlob,
+	reassembleBlob,
+	prepareBlobForSend,
+	receiveBlob,
+	createRemoteChunkProvider,
+	serveBlobChunks,
+	collectBlobGarbage,
+	extractBlobRefs,
+	DEFAULT_CHUNK_SIZE,
+} from '@korajs/store'
+export type {
+	ContentAddressedBlobStore,
+	BlobGcOptions,
+	BlobGcResult,
+	BlobManifest,
+	ChunkProvider,
+	ChunkMessage,
+	ChunkMessagePort,
+	OpfsBlobDirectory,
+	ReceiveBlobResult,
+	ReceiveBlobStores,
+} from '@korajs/store'
+export { createBlobRef, hashBlob, isBlobRef } from '@korajs/core'
+export type { BlobRef, BlobRefMetadata } from '@korajs/core'
+export { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 
 // === @korajs/merge re-exports ===
 export { MergeEngine } from '@korajs/merge'

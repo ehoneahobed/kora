@@ -139,6 +139,66 @@ describe('ProtobufMessageSerializer', () => {
 		expect(decodedOp.id).toBe('op-bin')
 		expect(decodedOp.data).toEqual({ body: tagged })
 	})
+
+	test('roundtrips a blob-chunk-request', () => {
+		const message: SyncMessage = {
+			type: 'blob-chunk-request',
+			messageId: 'msg-req',
+			requestId: 'req-1',
+			hash: 'sha256-abc',
+		}
+		expect(serializer.decode(serializer.encode(message))).toEqual(message)
+	})
+
+	test('roundtrips a blob-chunk-response carrying bytes', () => {
+		// Blob chunks carry durable user data; the bytes must survive the protobuf
+		// wire, not be dropped like ephemeral presence messages.
+		const message: SyncMessage = {
+			type: 'blob-chunk-response',
+			messageId: 'msg-resp',
+			requestId: 'req-1',
+			bytes: 'AQIDBAU=',
+		}
+		expect(serializer.decode(serializer.encode(message))).toEqual(message)
+	})
+
+	test('roundtrips a blob-chunk-push (client upload) carrying bytes', () => {
+		const message: SyncMessage = {
+			type: 'blob-chunk-push',
+			messageId: 'msg-push',
+			hash: 'a'.repeat(64),
+			bytes: 'AQIDBAU=',
+		}
+		expect(serializer.decode(serializer.encode(message))).toEqual(message)
+	})
+
+	test('preserves handshake-response blobStorageEnabled across the wire', () => {
+		const message: SyncMessage = {
+			type: 'handshake-response',
+			messageId: 'resp-blob',
+			nodeId: 'server-1',
+			versionVector: {},
+			schemaVersion: 1,
+			accepted: true,
+			selectedWireFormat: 'protobuf',
+			blobStorageEnabled: true,
+		}
+		const decoded = serializer.decode(serializer.encode(message))
+		expect(decoded).toEqual(message)
+	})
+
+	test('roundtrips a blob-chunk-response with null bytes (not held) distinctly from empty', () => {
+		const notHeld: SyncMessage = {
+			type: 'blob-chunk-response',
+			messageId: 'msg-null',
+			requestId: 'req-2',
+			bytes: null,
+		}
+		const decoded = serializer.decode(serializer.encode(notHeld))
+		expect(decoded).toEqual(notHeld)
+		if (decoded.type !== 'blob-chunk-response') throw new Error('wrong message type')
+		expect(decoded.bytes).toBeNull()
+	})
 })
 
 describe('NegotiatedMessageSerializer', () => {

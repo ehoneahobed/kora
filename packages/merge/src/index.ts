@@ -13,6 +13,7 @@ export type {
 // === Strategies ===
 export { lastWriteWins, type LWWResult } from './strategies/lww'
 export { addWinsSet } from './strategies/add-wins-set'
+export { mergeObject } from './strategies/object-merge'
 export {
 	mergeAtomicOps,
 	type AtomicMergeResult,

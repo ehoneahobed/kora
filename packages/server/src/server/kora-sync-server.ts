@@ -1,12 +1,17 @@
-import type { KoraEventEmitter, Operation } from '@korajs/core'
-import { SyncError, generateUUIDv7 } from '@korajs/core'
+import type { BlobRef, KoraEventEmitter, Operation } from '@korajs/core'
+import { SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
+import {
+	type ApplyServerOperationResult,
+	applyServerOperation,
+} from '../apply/apply-server-operation'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
 import type { ServerStore } from '../store/server-store'
@@ -72,6 +77,10 @@ export class KoraSyncServer {
 
 	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly yjsDocRelay = new YjsDocRelay()
+	private readonly blobChunkRelay: BlobChunkRelay
+	private readonly persistBlobChunk:
+		| ((hash: string, bytes: Uint8Array) => Promise<void> | void)
+		| null
 	private readonly sessions = new Map<string, ClientSession>()
 	private readonly httpClients = new Map<
 		string,
@@ -100,6 +109,8 @@ export class KoraSyncServer {
 		this.logger = config.logger ?? createDefaultLogger()
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
 		this.metrics.setSchemaVersion(this.schemaVersion)
+		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk)
+		this.persistBlobChunk = config.persistBlobChunk ?? null
 
 		// If no external emitter was provided, create an internal one for
 		// subscribing to session events for metrics and logging.
@@ -241,6 +252,7 @@ export class KoraSyncServer {
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
 		this.yjsDocRelay.clear()
+		this.blobChunkRelay.clear()
 
 		// Close all active sessions (works in both standalone and attach mode)
 		for (const session of this.sessions.values()) {
@@ -407,6 +419,13 @@ export class KoraSyncServer {
 			onYjsDocUpdate: (sourceSessionId, message) => {
 				this.handleYjsDocRelay(sourceSessionId, message)
 			},
+			onBlobChunkRequest: (sourceSessionId, message) => {
+				this.blobChunkRelay.handleRequest(sourceSessionId, message)
+			},
+			onBlobChunkResponse: (sourceSessionId, message) => {
+				this.blobChunkRelay.handleResponse(sourceSessionId, message)
+			},
+			...(this.persistBlobChunk ? { persistBlobChunk: this.persistBlobChunk } : {}),
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
@@ -414,6 +433,7 @@ export class KoraSyncServer {
 
 		this.sessions.set(sessionId, session)
 		this.yjsDocRelay.addClient(sessionId, transport)
+		this.blobChunkRelay.addClient(sessionId, transport)
 		session.start()
 
 		this.logger.log({
@@ -448,6 +468,65 @@ export class KoraSyncServer {
 			operationsSent: snapshot.operationsSent,
 			errorCount: snapshot.errorCount,
 		}
+	}
+
+	/**
+	 * Apply a server-originated operation (for example one created by a custom
+	 * HTTP route) through the same validated pipeline that incoming client
+	 * operations use — Tier 2 constraints, referential integrity, and cascade
+	 * side effects — then relay every applied operation to connected clients.
+	 *
+	 * Because the operation did not come from a client session, it is relayed to
+	 * ALL sessions (there is no source session to exclude). Each session still
+	 * applies its own per-scope visibility filter in `relayOperations`, so a
+	 * client only receives the operation if it falls within that client's scope.
+	 *
+	 * @param op - A fully-formed, server-originated operation to apply
+	 * @returns The apply result, including any server-generated side-effect ops
+	 */
+	async applyLocalOperation(op: Operation): Promise<ApplyServerOperationResult> {
+		const result = await applyServerOperation(this.store, op)
+
+		if (result.result === 'applied' && result.appliedOperations.length > 0) {
+			for (const session of this.sessions.values()) {
+				session.relayOperations(result.appliedOperations)
+			}
+		}
+
+		return result
+	}
+
+	/**
+	 * Collect every blob reference still reachable from live records on the server.
+	 *
+	 * This is the live set for garbage-collecting the server's central blob store:
+	 * pass the result to `collectBlobGarbage(blobStore, liveRefs)` from
+	 * `@korajs/store` to reclaim bytes no record references any more. Only
+	 * collections that declare a `blob` field are scanned.
+	 *
+	 * @returns Every live blob reference across all collections
+	 */
+	async getLiveBlobRefs(): Promise<BlobRef[]> {
+		const schema = this.store.getSchema()
+		if (!schema) {
+			return []
+		}
+		const refs: BlobRef[] = []
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			const hasBlobField = Object.values(collection.fields).some((field) => field.kind === 'blob')
+			if (!hasBlobField) {
+				continue
+			}
+			const records = await this.store.materializeCollection(name)
+			for (const record of records) {
+				for (const value of Object.values(record)) {
+					if (isBlobRef(value)) {
+						refs.push(value)
+					}
+				}
+			}
+		}
+		return refs
 	}
 
 	/**
@@ -487,6 +566,7 @@ export class KoraSyncServer {
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
 		this.yjsDocRelay.removeClient(sessionId)
+		this.blobChunkRelay.removeClient(sessionId)
 
 		this.sessions.delete(sessionId)
 

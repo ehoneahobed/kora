@@ -201,7 +201,12 @@ const CHALLENGE_TTL_MS = 60_000
  * validation happens by sending a confirmation email, not by regex.
  */
 function isValidEmail(email: string): boolean {
-	if (email.length === 0 || email.length > 254) {
+	// Bodies come from JSON.parse'd network input, not a type-checked call
+	// site: a missing or malformed `email` field means this runs with
+	// `undefined` at runtime despite the `string` type, and `.length` would
+	// throw, crashing the request (and, since httpRoutes handlers aren't
+	// wrapped in a try/catch further up, potentially the whole process).
+	if (typeof email !== 'string' || email.length === 0 || email.length > 254) {
 		return false
 	}
 	const atIndex = email.indexOf('@')
@@ -227,6 +232,13 @@ function isValidEmail(email: string): boolean {
  * Trims whitespace, enforces max length, and strips control characters.
  */
 function sanitizeName(name: string): string {
+	// Same reasoning as isValidEmail: `name` can come straight from a request
+	// body field (handleDeviceRegister's `body.name`), which is untyped at
+	// runtime, so guard before calling .replace on something that isn't
+	// actually a string.
+	if (typeof name !== 'string') {
+		return ''
+	}
 	// Strip ASCII control characters (0x00-0x1F, 0x7F)
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally stripping ASCII control characters for sanitization
 	const cleaned = name.replace(/[\x00-\x1f\x7f]/g, '')
@@ -330,8 +342,10 @@ export class BuiltInAuthRoutes {
 			}
 		}
 
-		// Validate password length (min and max)
-		if (body.password.length < MIN_PASSWORD_LENGTH) {
+		// Validate password length (min and max). Same runtime-untyped-body
+		// reasoning as the email check above: a missing password must not crash
+		// this length check.
+		if (typeof body.password !== 'string' || body.password.length < MIN_PASSWORD_LENGTH) {
 			return {
 				status: 400,
 				body: {
@@ -418,6 +432,17 @@ export class BuiltInAuthRoutes {
 		},
 		clientIp?: string,
 	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+		// Request bodies are untyped at runtime (JSON.parse'd network input, not
+		// a checked call site), so a missing/malformed `email` or `password`
+		// field reaches here as `undefined` despite the `string` type. Reject it
+		// before it's used, rather than crashing on `.toLowerCase()` below.
+		if (typeof body.email !== 'string' || typeof body.password !== 'string') {
+			return {
+				status: 400,
+				body: { error: 'Email and password are required.' },
+			}
+		}
+
 		// Rate limiting (use email + IP composite key for per-account protection)
 		const rateLimitKey = clientIp
 			? `signin:${body.email.toLowerCase()}:${clientIp}`

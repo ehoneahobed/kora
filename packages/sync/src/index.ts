@@ -152,6 +152,30 @@ export type {
 
 export { decodeYjsUpdate, encodeYjsUpdate, richtextDocKey } from './richtext/doc-channel-wire'
 
+// === Blob chunk channel (out-of-band blob transfer) ===
+export type {
+	BlobChunkPushMessage,
+	BlobChunkRequestMessage,
+	BlobChunkResponseMessage,
+} from './protocol/messages'
+
+export {
+	isBlobChunkPushMessage,
+	isBlobChunkRequestMessage,
+	isBlobChunkResponseMessage,
+} from './protocol/messages'
+
+export {
+	BlobChunkChannel,
+	decodeBlobChunkBytes,
+	encodeBlobChunkBytes,
+} from './blob/blob-chunk-channel'
+
+export type {
+	BlobChunkChannelMessage,
+	BlobChunkChannelOptions,
+} from './blob/blob-chunk-channel'
+
 // === Encryption ===
 export type {
 	EncryptedPayload,

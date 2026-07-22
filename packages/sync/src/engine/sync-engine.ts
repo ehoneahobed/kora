@@ -17,6 +17,7 @@ import {
 import { topologicalSort } from '@korajs/core/internal'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
+import { BlobChunkChannel } from '../blob/blob-chunk-channel'
 import {
 	createDeltaCursorFromBatch,
 	decodeDeltaCursor,
@@ -30,6 +31,9 @@ import type {
 	AcknowledgmentMessage,
 	AwarenessStateWire,
 	AwarenessUpdateMessage,
+	BlobChunkPushMessage,
+	BlobChunkRequestMessage,
+	BlobChunkResponseMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	SyncMessage,
@@ -152,6 +156,7 @@ export class SyncEngine {
 	private readonly encryptor: SyncEncryptor | null
 	private readonly awarenessManager: AwarenessManager
 	private readonly richtextDocChannel: RichtextDocChannel
+	private readonly blobChunkChannel: BlobChunkChannel
 	private readonly metricsCollector: SyncMetricsCollector
 	private readonly syncState: SyncStatePersistence | null
 
@@ -167,6 +172,7 @@ export class SyncEngine {
 	private schemaBlocked = false
 	private clockBlocked = false
 	private clockSkewMs: number | null = null
+	private blobStorageEnabled = false
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -218,6 +224,20 @@ export class SyncEngine {
 		this.richtextDocChannel = new RichtextDocChannel({
 			largeDocThreshold: options.config.richtextDocChannelThreshold,
 			onSend: (message: YjsDocUpdateMessage) => {
+				if (this.state !== 'streaming') {
+					return
+				}
+				this.transport.send(message)
+			},
+		})
+
+		this.blobChunkChannel = new BlobChunkChannel({
+			onSend: (
+				message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
+			) => {
+				// Blob transfer is only meaningful once the connection reaches steady
+				// state. A request dropped here is safe: the puller times out and
+				// retries, and blob transfer is resumable.
 				if (this.state !== 'streaming') {
 					return
 				}
@@ -597,6 +617,34 @@ export class SyncEngine {
 		return this.richtextDocChannel
 	}
 
+	/**
+	 * Side channel for out-of-band blob chunk transfer over the sync connection.
+	 * The app layer bridges this to a `ChunkMessagePort` to pull/serve blob bytes.
+	 */
+	getBlobChunkChannel(): BlobChunkChannel {
+		return this.blobChunkChannel
+	}
+
+	/**
+	 * Whether the connected server persists blob bytes centrally (learned from the
+	 * handshake response). When true, the app uploads the bytes behind `blob`
+	 * fields so they stay available after the authoring device goes offline.
+	 */
+	isBlobStorageEnabled(): boolean {
+		return this.blobStorageEnabled
+	}
+
+	/**
+	 * Upload a blob chunk (or manifest) to the server for central persistence.
+	 * A no-op unless connected and the server advertised blob storage.
+	 */
+	uploadBlobChunk(hash: string, bytes: Uint8Array): void {
+		if (this.state !== 'streaming' || !this.blobStorageEnabled) {
+			return
+		}
+		this.blobChunkChannel.send({ type: 'blob-chunk-push', hash, bytes })
+	}
+
 	// --- Private methods ---
 
 	private messageChain: Promise<void> = Promise.resolve()
@@ -626,6 +674,11 @@ export class SyncEngine {
 				break
 			case 'yjs-doc-update':
 				this.richtextDocChannel.deliver(message)
+				break
+			case 'blob-chunk-request':
+			case 'blob-chunk-response':
+			case 'blob-chunk-push':
+				this.blobChunkChannel.deliver(message)
 				break
 		}
 	}
@@ -666,6 +719,8 @@ export class SyncEngine {
 
 	private async handleHandshakeResponse(msg: HandshakeResponseMessage): Promise<void> {
 		if (this.state !== 'handshaking') return
+
+		this.blobStorageEnabled = msg.blobStorageEnabled === true
 
 		if (typeof msg.serverTime === 'number') {
 			this.evaluateClockSkew(msg.serverTime)

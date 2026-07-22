@@ -8,7 +8,9 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Public beta (v0.6.x).** The full data plane is implemented and covered by 3,300+ automated tests (run `pnpm test` to verify the current count), plus a Playwright E2E suite, a documentation site, and CI pipelines.
+**Public beta (v1.0.0-beta.0).** The full data plane is implemented and covered by 3,300+ automated tests (run `pnpm test` to verify the current count), plus a Playwright E2E suite, a documentation site, and CI pipelines. This is the first `1.0.0-beta` — the API is what we intend to ship as 1.0; the beta period is for real-world usage feedback before the stable cut.
+
+Beta packages publish under the `beta` npm dist-tag; install a specific package with `npm install korajs@beta` (or `@korajs/<pkg>@beta`).
 
 | Package | Status | Description |
 |---------|--------|-------------|
@@ -36,6 +38,7 @@ Kora sits alongside your UI layer (React, Vue, Svelte) and owns the entire data 
 - **Reactive queries** — Subscribe to query results, get notified on changes within one frame (16ms)
 - **Conflict resolution** — Three-tier merge: auto-merge (LWW/CRDT), constraints, custom resolvers
 - **Synchronization** — Causal ordering via HLC, delta sync via version vectors, protobuf wire format
+- **Binary blobs** — Content-addressed `blob` fields: durable OPFS storage, deduplicated, integrity-verified, transferred out of band over the sync connection, `app.blobs.pull(ref)` from a bare reference, optional central server storage for availability after the author goes offline, and mark-and-sweep GC via `app.blobs.gc()`
 - **Offline by default** — Every code path works without network. Sync is a bonus, not a requirement.
 - **Authentication** — Built-in auth with sessions, TOTP MFA, organizations, RBAC, passkeys, and encrypted tokens
 - **Full type inference** — Schema types flow through `createApp` to collection accessors and React hooks

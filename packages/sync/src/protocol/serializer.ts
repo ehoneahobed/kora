@@ -352,6 +352,14 @@ interface ProtoEnvelope {
 	errorCode?: string
 	errorMessage?: string
 	retriable?: boolean
+	requestId?: string
+	hash?: string
+	/** Base64-encoded chunk bytes for a blob-chunk-response or blob-chunk-push. */
+	chunkBytes?: string
+	/** Distinguishes a held chunk (true) from "not held" (false) when bytes is empty/absent. */
+	hasBytes?: boolean
+	/** Whether the server persists blob bytes centrally (handshake-response). */
+	blobStorageEnabled?: boolean
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -383,6 +391,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				rejectReason: message.rejectReason,
 				selectedWireFormat: message.selectedWireFormat,
 				serverTime: message.serverTime,
+				blobStorageEnabled: message.blobStorageEnabled,
 			}
 		case 'operation-batch':
 			return {
@@ -409,10 +418,35 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 			}
 		case 'awareness-update':
 		case 'yjs-doc-update':
-			// Ephemeral messages use JSON serialization only. Return a minimal envelope.
+			// Ephemeral presence/doc messages use JSON serialization only. Return a minimal envelope.
 			return {
 				type: message.type,
 				messageId: message.messageId,
+			}
+		case 'blob-chunk-request':
+			return {
+				type: message.type,
+				messageId: message.messageId,
+				requestId: message.requestId,
+				hash: message.hash,
+			}
+		case 'blob-chunk-response':
+			// Blob chunks carry durable user data, so they are fully represented on the
+			// protobuf wire (not JSON-only). hasBytes distinguishes a held chunk from
+			// "not held" (bytes === null), which an empty string alone could not.
+			return {
+				type: message.type,
+				messageId: message.messageId,
+				requestId: message.requestId,
+				hasBytes: message.bytes !== null,
+				...(message.bytes !== null ? { chunkBytes: message.bytes } : {}),
+			}
+		case 'blob-chunk-push':
+			return {
+				type: message.type,
+				messageId: message.messageId,
+				hash: message.hash,
+				chunkBytes: message.bytes,
 			}
 	}
 }
@@ -451,6 +485,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				// Preserve the server's wall-clock time so clock-skew detection and
 				// automatic timestamp rebase work over the protobuf wire, not just JSON.
 				...(envelope.serverTime !== undefined ? { serverTime: envelope.serverTime } : {}),
+				...(envelope.blobStorageEnabled !== undefined
+					? { blobStorageEnabled: envelope.blobStorageEnabled }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -474,6 +511,27 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				code: envelope.errorCode ?? 'UNKNOWN',
 				message: envelope.errorMessage ?? 'Unknown error',
 				retriable: envelope.retriable ?? false,
+			}
+		case 'blob-chunk-request':
+			return {
+				type: 'blob-chunk-request',
+				messageId: envelope.messageId,
+				requestId: envelope.requestId ?? '',
+				hash: envelope.hash ?? '',
+			}
+		case 'blob-chunk-response':
+			return {
+				type: 'blob-chunk-response',
+				messageId: envelope.messageId,
+				requestId: envelope.requestId ?? '',
+				bytes: envelope.hasBytes ? (envelope.chunkBytes ?? '') : null,
+			}
+		case 'blob-chunk-push':
+			return {
+				type: 'blob-chunk-push',
+				messageId: envelope.messageId,
+				hash: envelope.hash ?? '',
+				bytes: envelope.chunkBytes ?? '',
 			}
 		default:
 			throw new SyncError('Failed to decode sync message: unknown protobuf type', {
@@ -638,6 +696,16 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.retriable !== undefined) writer.uint32(144).bool(envelope.retriable)
 	// Field 19: server wall-clock time (ms epoch). Optional; only handshake-response sets it.
 	if (envelope.serverTime !== undefined) writer.uint32(152).int64(envelope.serverTime)
+	// Fields 20-23: blob chunk side channel (out-of-band blob transfer).
+	if (envelope.requestId && envelope.requestId.length > 0)
+		writer.uint32(162).string(envelope.requestId)
+	if (envelope.hash && envelope.hash.length > 0) writer.uint32(170).string(envelope.hash)
+	if (envelope.chunkBytes && envelope.chunkBytes.length > 0)
+		writer.uint32(178).string(envelope.chunkBytes)
+	if (envelope.hasBytes !== undefined) writer.uint32(184).bool(envelope.hasBytes)
+	// Field 25: server advertises central blob storage (handshake-response).
+	if (envelope.blobStorageEnabled !== undefined)
+		writer.uint32(200).bool(envelope.blobStorageEnabled)
 	return writer.finish()
 }
 
@@ -710,6 +778,21 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 19:
 				envelope.serverTime = longToNumber(reader.int64())
+				break
+			case 20:
+				envelope.requestId = reader.string()
+				break
+			case 21:
+				envelope.hash = reader.string()
+				break
+			case 22:
+				envelope.chunkBytes = reader.string()
+				break
+			case 23:
+				envelope.hasBytes = reader.bool()
+				break
+			case 25:
+				envelope.blobStorageEnabled = reader.bool()
 				break
 			default:
 				reader.skipType(tag & 7)

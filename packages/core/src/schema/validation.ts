@@ -1,3 +1,4 @@
+import { isBlobRef } from '../blob/blob-ref'
 import { SchemaValidationError } from '../errors/errors'
 import { isAtomicOp } from '../operations/atomic-ops'
 import type { CollectionDefinition, FieldDescriptor, OperationType } from '../types'
@@ -220,7 +221,119 @@ function validateFieldValue(
 			}
 			break
 		}
+
+		case 'object': {
+			if (!isPlainObject(value)) {
+				throw new SchemaValidationError(
+					`Field "${fieldName}" in collection "${collection}" must be a plain object, got ${describeType(value)}`,
+					{
+						collection,
+						field: fieldName,
+						expectedType: 'object',
+						receivedType: describeType(value),
+					},
+				)
+			}
+			// Validate declared nested keys by their own kind. Undeclared keys are
+			// allowed (forward-compatible), but a present declared key must type-check.
+			if (descriptor.nestedFields) {
+				for (const [nestedName, nestedDescriptor] of Object.entries(descriptor.nestedFields)) {
+					const nestedValue = (value as Record<string, unknown>)[nestedName]
+					if (nestedValue !== undefined && nestedValue !== null) {
+						validateFieldValue(
+							collection,
+							`${fieldName}.${nestedName}`,
+							nestedDescriptor,
+							nestedValue,
+						)
+					}
+				}
+			}
+			break
+		}
+
+		case 'json': {
+			// Dynamic-key JSON: accept any JSON-serializable value (object, array,
+			// scalar, or null). Reject only values that cannot round-trip through
+			// JSON, since the store persists them via JSON.stringify.
+			if (!isJsonSerializable(value)) {
+				throw new SchemaValidationError(
+					`Field "${fieldName}" in collection "${collection}" must be JSON-serializable, got ${describeType(value)}`,
+					{ collection, field: fieldName, expectedType: 'json', receivedType: describeType(value) },
+				)
+			}
+			break
+		}
+
+		case 'blob': {
+			// A blob field carries a content-addressed reference, not raw bytes.
+			// Developers upload bytes to the blob store (which returns a BlobRef)
+			// and assign that reference here.
+			if (!isBlobRef(value)) {
+				throw new SchemaValidationError(
+					`Field "${fieldName}" in collection "${collection}" must be a BlobRef (from the blob store), got ${describeType(value)}`,
+					{ collection, field: fieldName, expectedType: 'blob', receivedType: describeType(value) },
+				)
+			}
+			break
+		}
+
+		case 'secret': {
+			// A secret field takes plaintext as a string on input; the framework
+			// applies the at-rest transform (hash or encrypt). Its value is never
+			// exposed in traces (redacted in the merge engine).
+			if (typeof value !== 'string') {
+				throw new SchemaValidationError(
+					`Field "${fieldName}" in collection "${collection}" must be a string, got ${describeType(value)}`,
+					{
+						collection,
+						field: fieldName,
+						expectedType: 'secret',
+						receivedType: describeType(value),
+					},
+				)
+			}
+			break
+		}
 	}
+}
+
+/** True for plain data objects only (not arrays, null, or class instances). */
+function isPlainObject(value: unknown): boolean {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false
+	}
+	const proto = Object.getPrototypeOf(value)
+	return proto === null || proto === Object.prototype
+}
+
+/** True when the value can round-trip through JSON (no functions/symbols/undefined). */
+function isJsonSerializable(value: unknown): boolean {
+	if (value === null) {
+		return true
+	}
+	const type = typeof value
+	if (type === 'string' || type === 'number' || type === 'boolean') {
+		return Number.isFinite(value as number) || type !== 'number'
+	}
+	if (Array.isArray(value)) {
+		return value.every(isJsonSerializable)
+	}
+	if (type === 'object') {
+		return Object.values(value as Record<string, unknown>).every(isJsonSerializable)
+	}
+	return false
+}
+
+/** A readable type label for error messages (distinguishes array/null from object). */
+function describeType(value: unknown): string {
+	if (value === null) {
+		return 'null'
+	}
+	if (Array.isArray(value)) {
+		return 'array'
+	}
+	return typeof value
 }
 
 function jsTypeForKind(kind: string): string {

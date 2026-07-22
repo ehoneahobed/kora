@@ -1,5 +1,11 @@
 import { SchemaValidationError } from '../errors/errors'
-import type { FieldDescriptor, FieldKind, FieldMergeStrategy, TransitionMap } from '../types'
+import type {
+	FieldDescriptor,
+	FieldKind,
+	FieldMergeStrategy,
+	SecretMode,
+	TransitionMap,
+} from '../types'
 
 /**
  * Base field builder implementing the builder pattern for schema field definitions.
@@ -303,6 +309,224 @@ export class ArrayFieldBuilder<
 }
 
 /**
+ * Field builder for structured object fields with a nested field schema.
+ *
+ * Each nested key merges by its own declared kind (scalars via LWW, nested
+ * arrays via add-wins, nested objects recursively), so two devices editing
+ * different keys of the same object offline both converge on reconnect instead
+ * of one clobbering the other.
+ */
+export class ObjectFieldBuilder<
+	Req extends boolean = true,
+	Auto extends boolean = false,
+> extends FieldBuilder<'object', Req, Auto> {
+	private readonly _fields: Record<string, FieldBuilder>
+
+	constructor(
+		fields: Record<string, FieldBuilder>,
+		required = true as unknown as Req,
+		defaultValue: unknown = undefined,
+		auto = false as unknown as Auto,
+		mergeStrategy: FieldMergeStrategy | null = null,
+	) {
+		super('object', required, defaultValue, auto, mergeStrategy)
+		this._fields = fields
+	}
+
+	override optional(): ObjectFieldBuilder<false, Auto> {
+		return new ObjectFieldBuilder(
+			this._fields,
+			false,
+			this._defaultValue,
+			this._auto,
+			this._mergeStrategy,
+		)
+	}
+
+	override default(value: Record<string, unknown>): ObjectFieldBuilder<false, Auto> {
+		return new ObjectFieldBuilder(this._fields, false, value, this._auto, this._mergeStrategy)
+	}
+
+	override auto(): ObjectFieldBuilder<false, true> {
+		return new ObjectFieldBuilder(this._fields, false, undefined, true, this._mergeStrategy)
+	}
+
+	override merge(strategy: FieldMergeStrategy): ObjectFieldBuilder<Req, Auto> {
+		return new ObjectFieldBuilder(
+			this._fields,
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
+	}
+
+	override _build(): FieldDescriptor {
+		const nestedFields: Record<string, FieldDescriptor> = {}
+		for (const [key, builder] of Object.entries(this._fields)) {
+			nestedFields[key] = builder._build()
+		}
+		return {
+			kind: 'object',
+			required: this._required as unknown as boolean,
+			defaultValue: this._defaultValue,
+			auto: this._auto as unknown as boolean,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: this._mergeStrategy,
+			transitions: null,
+			nestedFields,
+		}
+	}
+}
+
+/**
+ * Field builder for dynamic-key JSON values. Carries a compile-time shape `T`
+ * for inference while merging structurally as a convergent CRDT: a plain-object
+ * value recurses as a map, an array merges add-wins, any other value is a scalar
+ * leaf under last-write-wins.
+ */
+export class JsonFieldBuilder<
+	T = unknown,
+	Req extends boolean = true,
+	Auto extends boolean = false,
+> extends FieldBuilder<'json', Req, Auto> {
+	override optional(): JsonFieldBuilder<T, false, Auto> {
+		return new JsonFieldBuilder<T, false, Auto>(
+			'json',
+			false,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			this._mergeStrategy,
+		)
+	}
+
+	override default(value: T): JsonFieldBuilder<T, false, Auto> {
+		return new JsonFieldBuilder<T, false, Auto>(
+			'json',
+			false,
+			value,
+			this._auto as unknown as Auto,
+			this._mergeStrategy,
+		)
+	}
+
+	override auto(): JsonFieldBuilder<T, false, true> {
+		return new JsonFieldBuilder<T, false, true>('json', false, undefined, true, this._mergeStrategy)
+	}
+
+	override merge(strategy: FieldMergeStrategy): JsonFieldBuilder<T, Req, Auto> {
+		return new JsonFieldBuilder<T, Req, Auto>(
+			'json',
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
+	}
+
+	override _build(): FieldDescriptor {
+		return {
+			kind: 'json',
+			required: this._required as unknown as boolean,
+			defaultValue: this._defaultValue,
+			auto: this._auto as unknown as boolean,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: this._mergeStrategy,
+			transitions: null,
+			nestedFields: null,
+		}
+	}
+}
+
+/**
+ * Field builder for secret fields (passwords, tokens, API keys).
+ *
+ * A secret field's value is never exposed in merge traces, DevTools, or logs
+ * (it is redacted at the point traces are built). Its at-rest protection is
+ * chosen with `.hashed()` (one-way, for passwords) or `.encrypted()` (reversible,
+ * for tokens); the default is `encrypted`.
+ */
+export class SecretFieldBuilder<
+	Req extends boolean = true,
+	Auto extends boolean = false,
+> extends FieldBuilder<'secret', Req, Auto> {
+	private readonly _secretMode: SecretMode
+
+	constructor(
+		secretMode: SecretMode = 'encrypted',
+		required = true as unknown as Req,
+		defaultValue: unknown = undefined,
+		auto = false as unknown as Auto,
+		mergeStrategy: FieldMergeStrategy | null = null,
+	) {
+		super('secret', required, defaultValue, auto, mergeStrategy)
+		this._secretMode = secretMode
+	}
+
+	/** Store this secret as a one-way salted hash (passwords: verify, never read back). */
+	hashed(): SecretFieldBuilder<Req, Auto> {
+		return new SecretFieldBuilder(
+			'hashed',
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			this._mergeStrategy,
+		)
+	}
+
+	/** Store this secret as reversible ciphertext (tokens/keys: decrypt to use). */
+	encrypted(): SecretFieldBuilder<Req, Auto> {
+		return new SecretFieldBuilder(
+			'encrypted',
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			this._mergeStrategy,
+		)
+	}
+
+	override optional(): SecretFieldBuilder<false, Auto> {
+		return new SecretFieldBuilder(
+			this._secretMode,
+			false,
+			this._defaultValue,
+			this._auto,
+			this._mergeStrategy,
+		)
+	}
+
+	override auto(): SecretFieldBuilder<false, true> {
+		return new SecretFieldBuilder(this._secretMode, false, undefined, true, this._mergeStrategy)
+	}
+
+	override merge(strategy: FieldMergeStrategy): SecretFieldBuilder<Req, Auto> {
+		return new SecretFieldBuilder(
+			this._secretMode,
+			this._required as unknown as Req,
+			this._defaultValue,
+			this._auto as unknown as Auto,
+			strategy,
+		)
+	}
+
+	override _build(): FieldDescriptor {
+		return {
+			kind: 'secret',
+			required: this._required as unknown as boolean,
+			defaultValue: this._defaultValue,
+			auto: this._auto as unknown as boolean,
+			enumValues: null,
+			itemKind: null,
+			mergeStrategy: this._mergeStrategy,
+			transitions: null,
+			secretMode: this._secretMode,
+		}
+	}
+}
+
+/**
  * Type builder namespace. The developer's primary interface for defining field types.
  *
  * @example
@@ -316,6 +540,8 @@ export class ArrayFieldBuilder<
  *   notes: t.richtext(),
  *   tags: t.array(t.string()).default([]),
  *   priority: t.enum(['low', 'medium', 'high']).default('medium'),
+ *   settings: t.object({ theme: t.string(), fontSize: t.number() }),
+ *   metadata: t.json<{ source: string }>(),
  *   createdAt: t.timestamp().auto(),
  * }
  * ```
@@ -347,5 +573,21 @@ export const t = {
 
 	array<K extends FieldKind>(itemBuilder: FieldBuilder<K>): ArrayFieldBuilder<K, true, false> {
 		return new ArrayFieldBuilder(itemBuilder, true, undefined, false)
+	},
+
+	object(fields: Record<string, FieldBuilder>): ObjectFieldBuilder<true, false> {
+		return new ObjectFieldBuilder(fields, true, undefined, false)
+	},
+
+	json<T = unknown>(): JsonFieldBuilder<T, true, false> {
+		return new JsonFieldBuilder<T, true, false>('json', true, undefined, false)
+	},
+
+	blob(): FieldBuilder<'blob', true, false> {
+		return new FieldBuilder('blob', true, undefined, false)
+	},
+
+	secret(): SecretFieldBuilder<true, false> {
+		return new SecretFieldBuilder('encrypted', true, undefined, false)
 	},
 }

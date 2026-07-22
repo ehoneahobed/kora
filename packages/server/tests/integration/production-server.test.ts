@@ -100,4 +100,93 @@ describe('createProductionServer operational auth', () => {
 			await server.stop()
 		}
 	})
+
+	// Regression: KoraForms hit a bug where a malformed request body reached
+	// @korajs/auth's handleSignUp/handleSignIn as `undefined` fields, which
+	// threw a TypeError inside a custom httpRoute handler. Because
+	// http.createServer's request listener isn't awaited by Node, a handler
+	// that throws becomes an unhandled promise rejection, which crashes the
+	// entire process under Node's default `--unhandled-rejections=throw` —
+	// one bad request took down the whole server, not just that response.
+	// This proves the fix: any handler that throws returns a clean 500, and
+	// the server keeps serving requests afterward instead of going down.
+	test('a throwing httpRoutes handler returns 500 instead of crashing the server', async () => {
+		const port = 39220
+		const server = createProductionServer({
+			store: new MemoryServerStore('server-1'),
+			port,
+			httpRoutes: [
+				{
+					path: '/echo',
+					async handle(request) {
+						// Simulates handleSignUp/handleSignIn crashing on a body field
+						// that's missing at runtime despite its required `string` type.
+						const email = (request.body as { email?: string } | undefined)?.email
+						return { status: 200, body: { emailLength: (email as unknown as string).length } }
+					},
+				},
+			],
+		})
+
+		await server.start()
+		try {
+			const baseUrl = `http://localhost:${port}`
+
+			// No body at all — request.body is undefined, `.length` throws inside
+			// the handler with the pre-fix code.
+			const crashing = await fetch(`${baseUrl}/echo`, { method: 'POST' })
+			expect(crashing.status).toBe(500)
+
+			// The server must still be alive and serving normally afterward.
+			const health = await fetch(`${baseUrl}/health`)
+			expect(health.status).toBe(200)
+
+			const stillWorks = await fetch(`${baseUrl}/echo`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ email: 'alice@example.com' }),
+			})
+			expect(stillWorks.status).toBe(200)
+			const body = (await stillWorks.json()) as { emailLength: number }
+			expect(body.emailLength).toBe('alice@example.com'.length)
+		} finally {
+			await server.stop()
+		}
+	})
+
+	// Regression: the actual root cause of the KoraForms report. A raw
+	// http.IncomingMessage starts paused; without an explicit resume() after
+	// attaching 'data'/'end' listeners, the body reads back empty on some
+	// Node versions/environments, so httpRoutes handlers (and @korajs/auth's
+	// signup/signin built on top of them) silently never see the real body.
+	test('reads the full POST body for httpRoutes handlers', async () => {
+		const port = 39221
+		const server = createProductionServer({
+			store: new MemoryServerStore('server-1'),
+			port,
+			httpRoutes: [
+				{
+					path: '/echo',
+					async handle(request) {
+						return { status: 200, body: { received: request.body } }
+					},
+				},
+			],
+		})
+
+		await server.start()
+		try {
+			const response = await fetch(`http://localhost:${port}/echo`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ hello: 'world' }),
+			})
+
+			expect(response.status).toBe(200)
+			const body = (await response.json()) as { received: { hello: string } }
+			expect(body.received).toEqual({ hello: 'world' })
+		} finally {
+			await server.stop()
+		}
+	})
 })

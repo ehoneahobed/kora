@@ -24,8 +24,24 @@
   },
   "changesets": [
     "agents-md-templates",
+    "blob-chunk-transport",
+    "blob-content-addressed-fields",
+    "blob-filesystem-store",
+    "blob-garbage-collection",
+    "blob-out-of-band-transfer",
+    "blob-pull-by-ref",
+    "blob-websocket-transport",
+    "central-blob-storage",
     "clock-integrity",
+    "exports-and-secret-hardening",
+    "httproutes-body-crash-fix",
     "kora-studio",
-    "per-field-lww-convergence"
+    "object-json-crdt-fields",
+    "opfs-blob-store-and-app-blobs",
+    "per-field-lww-convergence",
+    "scope-guardrail-and-browser-adapter",
+    "scoped-rest-route-context",
+    "secret-field-crypto-redaction",
+    "secret-write-time-transform"
   ]
 }

@@ -9,6 +9,7 @@ export default defineConfig({
 		'src/adapters/sqlite-wasm-worker.ts',
 		'src/adapters/sqlite-wasm-shared-host.ts',
 		'src/adapters/indexeddb.ts',
+		'src/blob-fs.ts',
 	],
 	format: ['esm', 'cjs'],
 	dts: true,

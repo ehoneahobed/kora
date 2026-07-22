@@ -1,12 +1,13 @@
 {
   "name": "@korajs/sync",
-  "version": "1.0.0-beta.0",
+  "version": "1.0.0-beta.1",
   "description": "Sync protocol and transports for Kora.js with delta sync, causal ordering, and automatic reconnection",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "import": {
         "types": "./dist/index.d.ts",

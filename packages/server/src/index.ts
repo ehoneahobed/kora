@@ -63,6 +63,13 @@ export type {
 	ProductionServer,
 } from './server/production-server'
 
+export type {
+	ProductionHttpRouteContext,
+	RouteMutation,
+	RouteScopeOptions,
+	RouteApplyResult,
+} from './server/route-context'
+
 export type { TokenAuthProviderOptions } from './auth/token-auth'
 export type { KoraAuthProviderOptions } from './auth/kora-auth-provider'
 export type { MixedAuthProviderOptions } from './auth/mixed-auth-provider'

@@ -28,6 +28,8 @@ export interface TestNetworkOptions {
 	 * server clock. Called once per device connection.
 	 */
 	wrapTransport?: (pair: TransportPair) => TransportPair
+	/** Enable central blob storage on the server (persist + serve uploaded blob bytes). */
+	blobStorage?: boolean
 }
 
 /**
@@ -81,7 +83,7 @@ export async function createTestNetwork(
 	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
 
 	// Create server
-	const server = new TestServer(schema)
+	const server = new TestServer(schema, { blobStorage: options?.blobStorage })
 
 	// Create devices
 	const devices: TestDevice[] = []

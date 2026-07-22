@@ -1,7 +1,8 @@
-import type { Operation, SchemaDefinition } from '@korajs/core'
+import type { BlobRef, Operation, SchemaDefinition } from '@korajs/core'
 import { MemoryServerStore } from '@korajs/server'
 import { KoraSyncServer } from '@korajs/server'
 import type { ServerTransport } from '@korajs/server'
+import { type ContentAddressedBlobStore, createMemoryServerBlobStore } from '@korajs/store'
 
 /**
  * In-memory test server wrapping KoraSyncServer with MemoryServerStore.
@@ -12,15 +13,21 @@ export interface TestServerOptions {
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake. */
 	supportedSchemaVersions?: { min: number; max: number }
+	/** Enable central blob storage: the server persists and serves uploaded blob bytes. */
+	blobStorage?: boolean
 }
 
 export class TestServer {
 	readonly store: MemoryServerStore
+	/** The server's central blob store, present when `blobStorage` was enabled. */
+	readonly blobStore: ContentAddressedBlobStore | null
 	private readonly syncServer: KoraSyncServer
 
 	constructor(schema: SchemaDefinition, options?: TestServerOptions) {
 		this.store = new MemoryServerStore()
 		const schemaVersion = options?.schemaVersion ?? schema.version
+		const blob = options?.blobStorage ? createMemoryServerBlobStore() : null
+		this.blobStore = blob?.store ?? null
 		this.syncServer = new KoraSyncServer({
 			store: this.store,
 			schemaVersion,
@@ -28,6 +35,7 @@ export class TestServer {
 				min: schemaVersion,
 				max: schemaVersion,
 			},
+			...(blob ? blob.callbacks : {}),
 		})
 		void this.store.setSchema(schema)
 	}
@@ -52,6 +60,11 @@ export class TestServer {
 	 */
 	getConnectionCount(): number {
 		return this.syncServer.getConnectionCount()
+	}
+
+	/** Every blob reference still reachable from live records on the server. */
+	getLiveBlobRefs(): Promise<BlobRef[]> {
+		return this.syncServer.getLiveBlobRefs()
 	}
 
 	/**

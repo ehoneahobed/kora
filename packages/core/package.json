@@ -1,12 +1,13 @@
 {
   "name": "@korajs/core",
-  "version": "1.0.0-beta.0",
+  "version": "1.0.0-beta.1",
   "description": "Schema definitions, operations, Hybrid Logical Clock, version vectors, and type inference for Kora.js",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "import": {
         "types": "./dist/index.d.ts",

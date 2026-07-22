@@ -4,7 +4,8 @@
 
 ### Patch Changes
 
-- Updated dependencies [e6f7c98]
+- Updated dependencies
+- Updated dependencies
 - Updated dependencies
 - Updated dependencies
   - @korajs/cli@1.0.0-beta.0

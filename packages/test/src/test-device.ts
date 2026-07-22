@@ -1,10 +1,26 @@
 import type { OperationTransform, SchemaDefinition } from '@korajs/core'
 import type { VersionVector } from '@korajs/core'
 import type { KoraEventEmitter } from '@korajs/core'
+import type { BlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
-import { Store } from '@korajs/store'
-import type { CollectionAccessor, StorageAdapter } from '@korajs/store'
+import {
+	MemoryBlobStore,
+	Store,
+	createRemoteChunkProvider,
+	prepareBlobForSend,
+	putBlobForTransfer,
+	receiveBlob,
+	resolveBlobManifest,
+	serveBlobChunks,
+} from '@korajs/store'
+import type {
+	BlobManifest,
+	ChunkProvider,
+	CollectionAccessor,
+	ReceiveBlobResult,
+	StorageAdapter,
+} from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { SyncEngine } from '@korajs/sync'
 import type { SyncTransport } from '@korajs/sync'
@@ -13,7 +29,9 @@ import {
 	MergeAwareSyncStore,
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
+	createSyncEngineChunkPort,
 	wireAuditPersistence,
+	wireBlobUpload,
 } from 'korajs/testing'
 import type { TestServer } from './test-server'
 
@@ -49,6 +67,8 @@ export class TestDevice {
 	readonly name: string
 	readonly store: Store
 	readonly emitter: KoraEventEmitter & { clear(): void }
+	/** Content-addressed blob store for out-of-band blob bytes (chunks + full blobs). */
+	readonly blobStore = new MemoryBlobStore()
 
 	private readonly schema: SchemaDefinition
 	private readonly server: TestServer
@@ -61,6 +81,7 @@ export class TestDevice {
 
 	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
+	private blobChunkProvider: ChunkProvider | null = null
 	private currentTransport: SyncTransport | null = null
 	private unsubscribeSync: (() => void) | null = null
 	private unsubscribeAudit: (() => void) | null = null
@@ -139,6 +160,16 @@ export class TestDevice {
 		})
 		conflictHandler.fn = () => this.syncEngine?.recordConflict()
 
+		// Bind the blob chunk channel to this connection: serve chunks this device
+		// holds, and prepare a provider to pull chunks it needs. Both ride the same
+		// sync socket; the request/response handlers are disjoint by message type.
+		const chunkPort = createSyncEngineChunkPort(this.syncEngine)
+		serveBlobChunks(chunkPort, this.blobStore)
+		this.blobChunkProvider = createRemoteChunkProvider(chunkPort)
+		// Mirror createApp: auto-upload blob bytes to the server as ops sync, so
+		// blobs stay available after this device disconnects.
+		wireBlobUpload(this.emitter, this.syncEngine, this.blobStore)
+
 		// Wire local mutations to sync outbound queue
 		const engine = this.syncEngine
 		this.unsubscribeSync = this.emitter.on('operation:created', (event) => {
@@ -171,6 +202,7 @@ export class TestDevice {
 			await this.syncEngine.stop()
 			this.syncEngine = null
 		}
+		this.blobChunkProvider = null
 		this.currentTransport = null
 	}
 
@@ -206,6 +238,65 @@ export class TestDevice {
 	/** Exposes the sync engine for integration tests (e.g. doc channel, chaos). */
 	getSyncEngine(): SyncEngine | null {
 		return this.syncEngine
+	}
+
+	/**
+	 * Stage a blob's bytes into this device's blob store, splitting them into
+	 * content-addressed chunks this device can then serve to peers over the sync
+	 * connection. Returns the manifest (blob hash + ordered chunk hashes) needed
+	 * to pull the blob elsewhere.
+	 */
+	async stageBlob(bytes: Uint8Array, options?: { chunkSize?: number }): Promise<BlobManifest> {
+		const { manifest } = await prepareBlobForSend(bytes, this.blobStore, options)
+		return manifest
+	}
+
+	/**
+	 * Store a blob for transfer the way `app.blobs.put` does: stage chunks, store
+	 * the full blob, and store the manifest as its own content-addressed object.
+	 * The returned reference carries a `manifestHash`, so a peer can pull the bytes
+	 * knowing only the reference.
+	 */
+	async putBlob(
+		bytes: Uint8Array,
+		options?: { chunkSize?: number; mimeType?: string; filename?: string },
+	): Promise<{ ref: BlobRef; manifest: BlobManifest }> {
+		return putBlobForTransfer(this.blobStore, bytes, options)
+	}
+
+	/**
+	 * Pull a blob's bytes over the live connection knowing only its reference: the
+	 * manifest is resolved by `ref.manifestHash` first, then the chunks are fetched.
+	 */
+	async pullBlobByRef(ref: BlobRef): Promise<ReceiveBlobResult> {
+		if (!this.blobChunkProvider) {
+			throw new Error('Cannot pull a blob before the device has connected (call sync() first)')
+		}
+		const manifest = await resolveBlobManifest(this.blobChunkProvider, ref)
+		return receiveBlob(manifest, this.blobChunkProvider, {
+			chunkStore: this.blobStore,
+			blobStore: this.blobStore,
+		})
+	}
+
+	/**
+	 * Pull a blob's bytes from peers over the live sync connection. Requests only
+	 * the chunks this device is missing, reassembles them, and verifies integrity
+	 * against the manifest's blob hash before storing the full blob locally.
+	 */
+	async pullBlob(manifest: BlobManifest): Promise<ReceiveBlobResult> {
+		if (!this.blobChunkProvider) {
+			throw new Error('Cannot pull a blob before the device has connected (call sync() first)')
+		}
+		return receiveBlob(manifest, this.blobChunkProvider, {
+			chunkStore: this.blobStore,
+			blobStore: this.blobStore,
+		})
+	}
+
+	/** Read fully-assembled blob bytes from this device's store, or null if absent. */
+	async getBlobBytes(hash: string): Promise<Uint8Array | null> {
+		return this.blobStore.get(hash)
 	}
 
 	/**

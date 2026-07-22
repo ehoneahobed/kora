@@ -1,4 +1,6 @@
 import type {
+	BlobRef,
+	BlobRefMetadata,
 	InferInsertInput,
 	InferRecord,
 	InferUpdateInput,
@@ -15,9 +17,14 @@ import type {
 	AuditExportOptions,
 	BackupOptions,
 	BackupProgress,
+	BlobGcOptions,
+	BlobGcResult,
+	BlobManifest,
 	CollectionAccessor,
 	CollectionRecord,
+	ContentAddressedBlobStore,
 	QueryBuilder,
+	ReceiveBlobResult,
 	ReplaySnapshot,
 	RestoreOptions,
 	RestoreResult,
@@ -118,6 +125,61 @@ export interface SyncOptions {
 }
 
 /**
+ * Optional configuration for the blob subsystem (the bytes behind `blob` fields).
+ */
+export interface BlobOptions {
+	/**
+	 * Content-addressed store for blob bytes. Defaults to OPFS in the browser
+	 * (durable across reloads) and in-memory elsewhere. Provide your own to use a
+	 * different backend (for example a filesystem store on the server).
+	 */
+	store?: ContentAddressedBlobStore
+	/** Chunk size, in bytes, used when preparing a blob for transfer. */
+	chunkSize?: number
+}
+
+/**
+ * The blob subsystem exposed on the KoraApp. Blob fields store a small
+ * content-addressed reference in the record; the bytes are held here and move
+ * between devices out of band over the sync connection.
+ */
+export interface BlobApi {
+	/**
+	 * Store bytes locally and prepare them for transfer to other devices. Returns
+	 * the reference to place in a record's `blob` field, plus the manifest another
+	 * device needs to pull the bytes. Identical content is stored once (dedup).
+	 */
+	put(
+		bytes: Uint8Array,
+		metadata?: BlobRefMetadata,
+	): Promise<{ ref: BlobRef; manifest: BlobManifest }>
+	/** Read blob bytes held locally by content hash, or null if absent. */
+	get(hash: string): Promise<Uint8Array | null>
+	/** Whether the bytes for a hash are held locally. */
+	has(hash: string): Promise<boolean>
+	/** Remove locally held bytes for a hash. Returns whether anything was removed. */
+	delete(hash: string): Promise<boolean>
+	/**
+	 * Pull a blob's bytes from peers (or the server) over the live sync connection,
+	 * fetching only the chunks this device is missing and verifying integrity.
+	 *
+	 * Accepts a {@link BlobRef} — the reference stored in a record, which carries a
+	 * `manifestHash` so the manifest is resolved automatically — or an explicit
+	 * {@link BlobManifest}. Requires an active sync connection.
+	 */
+	pull(source: BlobRef | BlobManifest): Promise<ReceiveBlobResult>
+	/**
+	 * Reclaim local storage by deleting blob bytes no live record references any
+	 * more (mark-and-sweep). Safe under deduplication: a chunk shared by a record
+	 * that still exists is kept. Pass `{ dryRun: true }` to preview what would be
+	 * collected without deleting.
+	 */
+	gc(options?: BlobGcOptions): Promise<BlobGcResult>
+	/** The underlying content-addressed store, for advanced use. */
+	readonly store: ContentAddressedBlobStore
+}
+
+/**
  * Full configuration passed to createApp().
  */
 export interface KoraConfig {
@@ -127,6 +189,8 @@ export interface KoraConfig {
 	store?: StoreOptions
 	/** Optional sync configuration. Enables sync when provided. */
 	sync?: SyncOptions
+	/** Optional blob subsystem configuration. */
+	blob?: BlobOptions
 	/** Enable DevTools instrumentation. Defaults to false. */
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
@@ -146,6 +210,8 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	store?: StoreOptions
 	/** Optional sync configuration. Enables sync when provided. */
 	sync?: SyncOptions
+	/** Optional blob subsystem configuration. */
+	blob?: BlobOptions
 	/** Enable DevTools instrumentation. Defaults to false. */
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
@@ -248,6 +314,8 @@ export interface KoraApp {
 	sync: SyncControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
+	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
+	blobs: BlobApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
@@ -346,6 +414,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	sync: SyncControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
+	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
+	blobs: BlobApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */

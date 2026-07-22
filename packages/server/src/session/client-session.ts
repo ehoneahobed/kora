@@ -1,8 +1,11 @@
-import type { KoraEventEmitter, Operation } from '@korajs/core'
-import { SyncError, generateUUIDv7 } from '@korajs/core'
+import type { KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
+import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
 	AwarenessUpdateMessage,
+	BlobChunkPushMessage,
+	BlobChunkRequestMessage,
+	BlobChunkResponseMessage,
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
@@ -10,6 +13,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
+import { decodeBlobChunkBytes } from '@korajs/sync'
 import {
 	type DeltaCursor,
 	NegotiatedMessageSerializer,
@@ -26,6 +30,7 @@ import {
 	wireToVersionVector,
 } from '@korajs/sync'
 import { applyServerOperation } from '../apply/apply-server-operation'
+import { NoAuthProvider } from '../auth/no-auth'
 import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ServerStore } from '../store/server-store'
@@ -41,6 +46,56 @@ import {
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+
+/**
+ * Tracks auth providers we have already warned about, so the multi-tenant
+ * no-scopes guardrail fires once per server (keyed by provider instance)
+ * rather than once per client connection.
+ */
+const warnedUnscopedProviders = new WeakSet<AuthProvider>()
+
+/**
+ * Warn once when a real (multi-user) auth provider is configured but an
+ * authenticated session resolves to no sync scopes at all.
+ *
+ * With no scopes, `operationMatchesScopes` treats every operation as visible,
+ * which is the correct zero-config behavior for a single-user local-first app.
+ * But once a real auth provider is in play, "no scopes" means every user syncs
+ * every other user's data — a silent cross-tenant data exposure. We cannot flip
+ * the default to deny-all without breaking the zero-config promise, so instead
+ * we surface the dangerous configuration loudly and exactly once.
+ *
+ * `null` auth (local-first, no auth) and `NoAuthProvider` (dev/testing) are
+ * intentionally excluded: for those, unscoped sync is the intended behavior.
+ */
+function warnIfMultiTenantWithoutScopes(
+	auth: AuthProvider | null,
+	resolvedScopes: unknown,
+	schema: SchemaDefinition | null,
+): void {
+	if (!auth || auth instanceof NoAuthProvider) {
+		return
+	}
+	if (resolvedScopes) {
+		return
+	}
+	if (!schema || Object.keys(schema.collections).length === 0) {
+		return
+	}
+	if (warnedUnscopedProviders.has(auth)) {
+		return
+	}
+	warnedUnscopedProviders.add(auth)
+	console.warn(
+		'[kora] An authenticated session resolved to no sync scopes, so every ' +
+			"user will sync every other user's data. Return per-user sync scopes " +
+			"from your auth provider (for example KoraAuthProvider's resolveScopes) " +
+			'to isolate tenants. Note: declaring sync rules in your schema is not ' +
+			'enough on its own — the per-user values come from the auth provider. ' +
+			'(This warning is expected for single-tenant apps where all authenticated ' +
+			'users are meant to share the same data.)',
+	)
+}
 
 /**
  * Possible states for a client session.
@@ -64,6 +119,29 @@ export type AwarenessRelayCallback = (
  * Callback invoked when a session receives a Yjs doc channel update to relay.
  */
 export type YjsDocRelayCallback = (sourceSessionId: string, message: YjsDocUpdateMessage) => void
+
+/**
+ * Callback invoked when a session receives a blob chunk request to route.
+ */
+export type BlobChunkRequestCallback = (
+	sourceSessionId: string,
+	message: BlobChunkRequestMessage,
+) => void
+
+/**
+ * Callback invoked when a session receives a blob chunk response to route back.
+ */
+export type BlobChunkResponseCallback = (
+	sourceSessionId: string,
+	message: BlobChunkResponseMessage,
+) => void
+
+/**
+ * Persist a blob chunk (or manifest) uploaded by a client, keyed by its content
+ * hash. Provided by the server operator; enables central blob storage so bytes
+ * survive the authoring device going offline.
+ */
+export type PersistBlobChunk = (hash: string, bytes: Uint8Array) => Promise<void> | void
 
 /**
  * Options for creating a ClientSession.
@@ -93,6 +171,12 @@ export interface ClientSessionOptions {
 	onAwarenessUpdate?: AwarenessRelayCallback
 	/** Called when this session receives a Yjs doc channel update to broadcast */
 	onYjsDocUpdate?: YjsDocRelayCallback
+	/** Called when this session receives a blob chunk request to route */
+	onBlobChunkRequest?: BlobChunkRequestCallback
+	/** Called when this session receives a blob chunk response to route back */
+	onBlobChunkResponse?: BlobChunkResponseCallback
+	/** Persist a client-uploaded blob chunk centrally (keyed by content hash) */
+	persistBlobChunk?: PersistBlobChunk
 	/** Called when this session closes */
 	onClose?: (sessionId: string) => void
 	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
@@ -134,6 +218,9 @@ export class ClientSession {
 	private readonly onRelay: RelayCallback | null
 	private readonly onAwarenessUpdate: AwarenessRelayCallback | null
 	private readonly onYjsDocUpdate: YjsDocRelayCallback | null
+	private readonly onBlobChunkRequest: BlobChunkRequestCallback | null
+	private readonly onBlobChunkResponse: BlobChunkResponseCallback | null
+	private readonly persistBlobChunk: PersistBlobChunk | null
 	private readonly onClose: ((sessionId: string) => void) | null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
@@ -156,6 +243,9 @@ export class ClientSession {
 		this.onRelay = options.onRelay ?? null
 		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
+		this.onBlobChunkRequest = options.onBlobChunkRequest ?? null
+		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
+		this.persistBlobChunk = options.persistBlobChunk ?? null
 		this.onClose = options.onClose ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
@@ -283,7 +373,34 @@ export class ClientSession {
 			case 'yjs-doc-update':
 				this.handleYjsDocUpdate(message)
 				break
+			case 'blob-chunk-request':
+				this.onBlobChunkRequest?.(this.sessionId, message)
+				break
+			case 'blob-chunk-response':
+				this.onBlobChunkResponse?.(this.sessionId, message)
+				break
+			case 'blob-chunk-push':
+				await this.handleBlobChunkPush(message)
+				break
 		}
+	}
+
+	/**
+	 * Persist a client-uploaded blob chunk (or manifest) centrally. The bytes are
+	 * verified to hash to the declared hash before storing, so a corrupt or
+	 * mislabeled upload is rejected rather than served later as trusted content.
+	 */
+	private async handleBlobChunkPush(message: BlobChunkPushMessage): Promise<void> {
+		if (!this.persistBlobChunk) {
+			return
+		}
+		const bytes = decodeBlobChunkBytes(message.bytes)
+		const actual = await hashBlob(bytes)
+		if (actual !== message.hash) {
+			// Reject a mismatched upload rather than persisting untrusted bytes.
+			return
+		}
+		await this.persistBlobChunk(message.hash, bytes)
 	}
 
 	private handleMessageFailure(error: unknown): void {
@@ -328,6 +445,8 @@ export class ClientSession {
 			}
 		}
 
+		warnIfMultiTenantWithoutScopes(this.auth, resolvedScopes, this.store.getSchema())
+
 		if (msg.syncQueries && msg.syncQueries.length > 0) {
 			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)
 		} else {
@@ -369,6 +488,9 @@ export class ClientSession {
 			accepted: true,
 			selectedWireFormat,
 			serverTime: Date.now(),
+			// Advertise central blob storage so the client uploads the bytes behind
+			// its blob fields, keeping them available after the author goes offline.
+			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
 			// Confirm the accepted scope so the client knows what data will be synced.
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.scopes ? { acceptedScope: this.authContext.scopes } : {}),

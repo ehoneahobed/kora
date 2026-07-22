@@ -800,6 +800,13 @@ describe('OrgRoutes', () => {
 			expect(result.status).toBe(400)
 		})
 
+		// Regression: same production bug class as auth-routes' isValidEmail
+		// (KoraForms report). Non-string input must return 400, not throw.
+		test('returns 400 instead of throwing for undefined email', async () => {
+			const result = await routes.listMyInvitations(undefined as unknown as string)
+			expect(result.status).toBe(400)
+		})
+
 		test('returns empty for unknown email', async () => {
 			const result = await routes.listMyInvitations('nobody@example.com')
 			expect(result.status).toBe(200)

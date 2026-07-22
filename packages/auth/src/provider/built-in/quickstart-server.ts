@@ -134,6 +134,21 @@ function createDefaultTokenManager(options: CreateKoraAuthServerOptions): TokenM
 		)
 	}
 
+	if (!secret) {
+		// Outside production we fall back to an ephemeral random secret so local
+		// development works with zero setup. Warn loudly: this secret is
+		// regenerated on every process start, so every previously issued token is
+		// silently invalidated on restart. That is a confusing failure mode if it
+		// ever reaches a deployed environment where NODE_ENV was simply never set
+		// to "production" — the production guard above only fires when NODE_ENV
+		// explicitly equals "production".
+		console.warn(
+			'[kora] No JWT secret configured; using an ephemeral random secret. ' +
+				'Every token is invalidated when the process restarts. ' +
+				'Set KORA_AUTH_SECRET or pass jwtSecret to createKoraAuthServer for stable sessions.',
+		)
+	}
+
 	return new TokenManager({
 		secret: secret ?? TokenManager.generateSecret(),
 		revocationStore: new InMemoryTokenRevocationStore(),
@@ -518,7 +533,16 @@ function notFound(): AuthRouteResponse<never> {
 }
 
 function readEnvSecret(): string | undefined {
-	return typeof process !== 'undefined' ? process.env.KORA_AUTH_SECRET : undefined
+	if (typeof process === 'undefined') {
+		return undefined
+	}
+	// Treat an explicitly empty or whitespace-only KORA_AUTH_SECRET as "not set"
+	// rather than as a real (invalid) secret. Otherwise an empty string slips past
+	// the nullish-coalescing fallback below and reaches TokenManager, which throws
+	// on secrets shorter than 32 chars — turning a blank env var into a hard crash
+	// instead of the intended dev fallback / production guard.
+	const value = process.env.KORA_AUTH_SECRET
+	return value && value.trim().length > 0 ? value : undefined
 }
 
 function isProduction(): boolean {

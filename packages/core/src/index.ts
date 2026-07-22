@@ -9,8 +9,10 @@ export type {
 	ConnectionQuality,
 	Constraint,
 	CustomResolver,
+	BlobRef,
 	FieldDescriptor,
 	FieldKind,
+	SecretMode,
 	FieldMergeStrategy,
 	HLCTimestamp,
 	MergeStrategy,
@@ -58,6 +60,24 @@ export { CausalTracker } from './causal/causal-tracker'
 
 // === Identifiers ===
 export { extractTimestamp, generateUUIDv7, isValidUUIDv7 } from './identifiers/uuid-v7'
+
+// === Blobs (content-addressed binary) ===
+export { createBlobRef, hashBlob, isBlobRef, type BlobRefMetadata } from './blob/blob-ref'
+
+// === Secret fields (field-level cryptography) ===
+export {
+	decryptSecret,
+	encryptSecret,
+	hashSecret,
+	verifySecret,
+} from './secret/secret-crypto'
+export {
+	MissingSecretKeyError,
+	revealSecret,
+	transformSecretFieldsForWrite,
+	verifySecretValue,
+	type SecretKeyProvider,
+} from './secret/secret-transform'
 
 // === Operations ===
 export {

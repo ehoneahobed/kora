@@ -67,6 +67,12 @@ export interface HandshakeResponseMessage {
 	acceptedScope?: Record<string, Record<string, unknown>>
 	/** Server wall-clock time (ms since epoch) at response creation. Lets clients measure their own clock skew. */
 	serverTime?: number
+	/**
+	 * Whether the server persists blob bytes centrally. When true, a client
+	 * automatically uploads the bytes behind its `blob` fields so they remain
+	 * available to other devices even after the authoring device goes offline.
+	 */
+	blobStorageEnabled?: boolean
 }
 
 /**
@@ -155,6 +161,54 @@ export interface YjsDocUpdateMessage {
 }
 
 /**
+ * Request for a single blob chunk by content hash. Ephemeral side channel for
+ * out-of-band blob transfer over the sync connection; never persisted in the
+ * operation log (durable state is the BlobRef inside a record's fields).
+ *
+ * Possession of a chunk hash is itself the capability to request it: hashes are
+ * only learned from BlobRefs inside records the peer already received through
+ * its (scope-filtered) sync, and SHA-256 preimage resistance makes guessing a
+ * hash infeasible. The server therefore relays chunk requests among peers
+ * without a separate ACL.
+ */
+export interface BlobChunkRequestMessage {
+	type: 'blob-chunk-request'
+	messageId: string
+	/** Correlates the response to this request. */
+	requestId: string
+	/** SHA-256 hash of the requested chunk. */
+	hash: string
+}
+
+/**
+ * Response to a {@link BlobChunkRequestMessage}. Carries the chunk bytes, or
+ * null when the responder does not hold that hash.
+ */
+export interface BlobChunkResponseMessage {
+	type: 'blob-chunk-response'
+	messageId: string
+	/** Echoes the request's `requestId` for correlation. */
+	requestId: string
+	/** Base64-encoded chunk bytes, or null when the responder does not hold the hash. */
+	bytes: string | null
+}
+
+/**
+ * Unsolicited upload of a blob chunk (or a blob manifest) from a client to the
+ * server, so the server can persist it centrally and serve it to other devices
+ * even after the authoring device disconnects. Content-addressed: the receiver
+ * verifies the bytes hash to `hash`.
+ */
+export interface BlobChunkPushMessage {
+	type: 'blob-chunk-push'
+	messageId: string
+	/** SHA-256 hash of the pushed bytes (a chunk hash or a manifest hash). */
+	hash: string
+	/** Base64-encoded bytes. */
+	bytes: string
+}
+
+/**
  * Union of all sync protocol messages.
  */
 export type SyncMessage =
@@ -165,6 +219,9 @@ export type SyncMessage =
 	| ErrorMessage
 	| AwarenessUpdateMessage
 	| YjsDocUpdateMessage
+	| BlobChunkRequestMessage
+	| BlobChunkResponseMessage
+	| BlobChunkPushMessage
 
 // --- Type Guards ---
 
@@ -190,6 +247,12 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isAwarenessUpdateMessage(value)
 		case 'yjs-doc-update':
 			return isYjsDocUpdateMessage(value)
+		case 'blob-chunk-request':
+			return isBlobChunkRequestMessage(value)
+		case 'blob-chunk-response':
+			return isBlobChunkResponseMessage(value)
+		case 'blob-chunk-push':
+			return isBlobChunkPushMessage(value)
 		default:
 			return false
 	}
@@ -303,5 +366,47 @@ export function isYjsDocUpdateMessage(value: unknown): value is YjsDocUpdateMess
 		typeof msg.recordId === 'string' &&
 		typeof msg.field === 'string' &&
 		typeof msg.update === 'string'
+	)
+}
+
+/**
+ * Check if a value is a BlobChunkRequestMessage.
+ */
+export function isBlobChunkRequestMessage(value: unknown): value is BlobChunkRequestMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'blob-chunk-request' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.requestId === 'string' &&
+		typeof msg.hash === 'string'
+	)
+}
+
+/**
+ * Check if a value is a BlobChunkResponseMessage.
+ */
+export function isBlobChunkResponseMessage(value: unknown): value is BlobChunkResponseMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'blob-chunk-response' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.requestId === 'string' &&
+		(typeof msg.bytes === 'string' || msg.bytes === null)
+	)
+}
+
+/**
+ * Check if a value is a BlobChunkPushMessage.
+ */
+export function isBlobChunkPushMessage(value: unknown): value is BlobChunkPushMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'blob-chunk-push' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.hash === 'string' &&
+		typeof msg.bytes === 'string'
 	)
 }

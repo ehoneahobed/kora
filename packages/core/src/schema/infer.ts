@@ -8,8 +8,8 @@
  * Zero runtime cost — these are purely compile-time constructs.
  */
 
-import type { FieldKind } from '../types'
-import type { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder } from './types'
+import type { BlobRef, FieldKind } from '../types'
+import type { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, JsonFieldBuilder } from './types'
 
 // === Field Kind → TypeScript Type Mapping ===
 
@@ -24,6 +24,10 @@ export interface FieldKindToType {
 	richtext: string
 	enum: string
 	array: unknown[]
+	object: Record<string, unknown>
+	json: unknown
+	blob: BlobRef
+	secret: string
 }
 
 // === Individual Field Inference ===
@@ -36,26 +40,29 @@ export type InferFieldType<F> =
 	// EnumFieldBuilder (class instance — preserves literal union)
 	F extends EnumFieldBuilder<infer V, any, any>
 		? V[number]
-		: // ArrayFieldBuilder (class instance)
-			F extends ArrayFieldBuilder<infer K, any, any>
-			? FieldKindToType[K][]
-			: // Generic FieldBuilder (class instance — string, number, boolean, timestamp, richtext)
-				F extends FieldBuilder<infer K, any, any>
-				? K extends keyof FieldKindToType
-					? FieldKindToType[K]
-					: unknown
-				: // FieldDescriptor enum (structural — enumValues should be readonly string[])
-					F extends { kind: 'enum'; enumValues: infer V }
-					? V extends readonly (infer S)[]
-						? S
-						: string
-					: // FieldDescriptor array (structural)
-						F extends { kind: 'array'; itemKind: infer K extends FieldKind }
-						? FieldKindToType[K][]
-						: // FieldDescriptor generic (structural — string, number, boolean, timestamp, richtext)
-							F extends { kind: infer K extends FieldKind }
-							? FieldKindToType[K]
-							: unknown
+		: // JsonFieldBuilder (class instance — preserves the compile-time shape T)
+			F extends JsonFieldBuilder<infer T, any, any>
+			? T
+			: // ArrayFieldBuilder (class instance)
+				F extends ArrayFieldBuilder<infer K, any, any>
+				? FieldKindToType[K][]
+				: // Generic FieldBuilder (class instance — string, number, boolean, timestamp, richtext, object)
+					F extends FieldBuilder<infer K, any, any>
+					? K extends keyof FieldKindToType
+						? FieldKindToType[K]
+						: unknown
+					: // FieldDescriptor enum (structural — enumValues should be readonly string[])
+						F extends { kind: 'enum'; enumValues: infer V }
+						? V extends readonly (infer S)[]
+							? S
+							: string
+						: // FieldDescriptor array (structural)
+							F extends { kind: 'array'; itemKind: infer K extends FieldKind }
+							? FieldKindToType[K][]
+							: // FieldDescriptor generic (structural — string, number, boolean, timestamp, richtext)
+								F extends { kind: infer K extends FieldKind }
+								? FieldKindToType[K]
+								: unknown
 
 // === Record Inference (full record type with id, createdAt, updatedAt) ===
 

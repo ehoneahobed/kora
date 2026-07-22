@@ -152,3 +152,58 @@ export type {
 	AuditTraceQuery,
 	PersistedAuditTrace,
 } from './audit'
+
+// === Content-addressed blob store ===
+export {
+	BlobIntegrityError,
+	MemoryBlobStore,
+	type ContentAddressedBlobStore,
+} from './blob/content-addressed-blob-store'
+export {
+	OpfsBlobStore,
+	createOpfsBlobDirectory,
+	createOpfsBlobStore,
+	type OpfsBlobDirectory,
+} from './blob/opfs-blob-store'
+export {
+	DEFAULT_CHUNK_SIZE,
+	chunkBlob,
+	reassembleBlob,
+	type BlobManifest,
+	type BlobManifestMetadata,
+} from './blob/blob-chunking'
+export {
+	prepareBlobForSend,
+	receiveBlob,
+	type ChunkProvider,
+	type ReceiveBlobResult,
+	type ReceiveBlobStores,
+} from './blob/blob-transfer'
+export {
+	fetchBlobManifest,
+	parseBlobManifest,
+	putBlobForTransfer,
+	resolveBlobManifest,
+	serializeBlobManifest,
+} from './blob/blob-manifest-transfer'
+export {
+	createMemoryServerBlobStore,
+	toServerBlobCallbacks,
+	type ServerBlobCallbacks,
+} from './blob/server-blob-callbacks'
+export {
+	collectBlobGarbage,
+	extractBlobRefs,
+	type BlobGcOptions,
+	type BlobGcResult,
+} from './blob/blob-gc'
+export {
+	createChunkPortPair,
+	createRemoteChunkProvider,
+	serveBlobChunks,
+	type ChunkMessage,
+	type ChunkMessagePort,
+	type ChunkRequestMessage,
+	type ChunkResponseMessage,
+	type RemoteChunkProvider,
+} from './blob/blob-chunk-transport'

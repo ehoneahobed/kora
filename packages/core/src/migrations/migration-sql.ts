@@ -108,6 +108,14 @@ function mapFieldType(descriptor: FieldDescriptor): string {
 			return 'INTEGER'
 		case 'array':
 			return 'TEXT'
+		case 'object':
+			return 'TEXT'
+		case 'json':
+			return 'TEXT'
+		case 'blob':
+			return 'TEXT'
+		case 'secret':
+			return 'TEXT'
 		case 'richtext':
 			return 'BLOB'
 	}

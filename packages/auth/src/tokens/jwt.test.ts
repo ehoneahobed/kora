@@ -166,6 +166,16 @@ describe('verifyJwt', () => {
 		expect(verifyJwt('', TEST_SECRET)).toBeNull()
 	})
 
+	// Regression: handleRefresh/handleSignOut/handleDeviceRegister/
+	// handleDeviceVerify all pass a token straight from a request body/header
+	// through to verifyJwt(). That's untyped network input, so a missing
+	// field reaches here as `undefined` despite the `string` type; `.split`
+	// used to throw instead of this returning null like any other malformed
+	// token.
+	test('returns null instead of throwing for undefined token', () => {
+		expect(verifyJwt(undefined as unknown as string, TEST_SECRET)).toBeNull()
+	})
+
 	test('returns null for malformed token with too few parts', () => {
 		expect(verifyJwt('header.payload', TEST_SECRET)).toBeNull()
 	})

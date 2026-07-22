@@ -4,6 +4,8 @@ import { MergeEngine } from '@korajs/merge'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
+import { createBlobApi } from './blob/create-blob-api'
+import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
 import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
@@ -15,7 +17,7 @@ import {
 	wireSyncLifecycleAfterReady,
 } from './sync-lifecycle'
 import { createTransactionExecutor } from './transaction-executor'
-import type { KoraApp, KoraConfig, TypedKoraApp, TypedKoraConfig } from './types'
+import type { BlobApi, KoraApp, KoraConfig, TypedKoraApp, TypedKoraConfig } from './types'
 import { validateCreateAppConfig } from './validate-config'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
@@ -41,6 +43,7 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	let store: Store | null = null
+	let blobApi: BlobApi | null = null
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
 
@@ -62,10 +65,19 @@ export function createApp<const S extends SchemaInput>(
 		store = init.store
 		unsubscribeSync = init.unsubscribeSync
 		unsubscribeAudit = init.unsubscribeAudit
+		blobApi = createBlobApi(init.blobStore, init.blobChunkProvider, config.blob?.chunkSize, () =>
+			enumerateLiveBlobRefs(init.store, config.schema),
+		)
 		wireSyncLifecycleAfterReady(config, emitter, syncState, init)
 	})
 
 	const getStore = (): Store | null => store
+	const requireBlobApi = (): BlobApi => {
+		if (!blobApi) {
+			throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
+		}
+		return blobApi
+	}
 	const executeTransaction = createTransactionExecutor(config, ready, getStore)
 
 	const app: KoraApp = {
@@ -73,6 +85,35 @@ export function createApp<const S extends SchemaInput>(
 		events: emitter,
 		sync: createSyncControl({ config, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),
+		blobs: {
+			get store() {
+				return requireBlobApi().store
+			},
+			async put(bytes, metadata) {
+				await ready
+				return requireBlobApi().put(bytes, metadata)
+			},
+			async get(hash) {
+				await ready
+				return requireBlobApi().get(hash)
+			},
+			async has(hash) {
+				await ready
+				return requireBlobApi().has(hash)
+			},
+			async delete(hash) {
+				await ready
+				return requireBlobApi().delete(hash)
+			},
+			async pull(manifest) {
+				await ready
+				return requireBlobApi().pull(manifest)
+			},
+			async gc(options) {
+				await ready
+				return requireBlobApi().gc(options)
+			},
+		},
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')

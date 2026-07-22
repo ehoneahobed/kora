@@ -94,6 +94,44 @@ export type FieldKind =
 	| 'richtext'
 	| 'enum'
 	| 'array'
+	| 'object'
+	| 'json'
+	| 'blob'
+	| 'secret'
+
+/**
+ * How a `secret` field's value is protected at rest.
+ * - `hashed`: one-way (passwords). Stored as a salted hash; never read back.
+ * - `encrypted`: reversible (tokens, keys). Stored as ciphertext; decrypted to use.
+ */
+export type SecretMode = 'hashed' | 'encrypted'
+
+/**
+ * A content-addressed reference to binary data stored out of band.
+ *
+ * A `blob` field never carries the bytes in the operation log; it carries this
+ * small reference. The bytes live in a content-addressed blob store, keyed by
+ * `hash`, so identical content is stored once and never re-synced to a peer that
+ * already has that hash.
+ */
+export interface BlobRef {
+	/** Hex-encoded SHA-256 hash of the bytes. The content address. */
+	hash: string
+	/** Size of the bytes in bytes. */
+	size: number
+	/** Optional MIME type (for example "image/png"). */
+	mimeType?: string
+	/** Optional original filename. */
+	filename?: string
+	/**
+	 * Hex-encoded SHA-256 hash of this blob's manifest — the small chunk index a
+	 * peer fetches first to learn how to pull the bytes out of band. Present when
+	 * the blob was stored for transfer; absent for a bare reference created without
+	 * chunking. Because it is a content address like `hash`, the manifest is fetched
+	 * and integrity-verified over the same channel as the chunks.
+	 */
+	manifestHash?: string
+}
 
 /**
  * Comprehensive sync diagnostics snapshot.
@@ -226,6 +264,17 @@ export interface FieldDescriptor {
 	mergeStrategy: FieldMergeStrategy | null
 	/** State machine transition map for enum fields. Null if no transitions declared. */
 	transitions: TransitionMap | null
+	/**
+	 * Nested field descriptors for `object` fields (each key merges by its own
+	 * kind). Null for `json` fields (dynamic keys, resolved structurally) and for
+	 * all non-structured kinds.
+	 */
+	nestedFields?: Record<string, FieldDescriptor> | null
+	/**
+	 * At-rest protection mode for `secret` fields (`hashed` or `encrypted`).
+	 * Null/absent for every other kind.
+	 */
+	secretMode?: SecretMode | null
 }
 
 /**

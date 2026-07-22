@@ -3,6 +3,7 @@ import type {
 	CollectionDefinition,
 	HybridLogicalClock,
 	SchemaDefinition,
+	SecretKeyProvider,
 } from '@korajs/core'
 import type { MutationCallback } from '../collection/collection'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
@@ -25,4 +26,10 @@ export interface LocalMutationContext {
 	readonly inTransaction: boolean
 	/** Additional parent op ids (e.g. referential cascade from a delete). */
 	readonly extraCausalDeps?: string[]
+	/**
+	 * Supplies the key used to encrypt `encrypted` secret fields at write time, so
+	 * plaintext never enters the operation log. Null/absent for apps with no
+	 * secret fields (or with only `hashed` secrets, which need no key).
+	 */
+	readonly secretKeyProvider?: SecretKeyProvider
 }

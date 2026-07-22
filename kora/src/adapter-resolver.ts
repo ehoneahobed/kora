@@ -71,9 +71,18 @@ export async function createAdapter(
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {
-			const { BetterSqlite3Adapter } = await import(
-				/* @vite-ignore */ '@korajs/store/better-sqlite3'
-			)
+			// Node-only adapter. The specifier is assembled at runtime so bundlers
+			// cannot statically follow this import into a browser graph. A literal
+			// `await import('@korajs/store/better-sqlite3')` (even with @vite-ignore)
+			// is a static code-split point that Rollup/Vite resolve and include, which
+			// is what pulled better-sqlite3 and its native bindings into browser builds
+			// and forced apps to add a manual alias/shim to exclude it. Unlike the
+			// `new Function` trick used for optional peers, this stays a real import()
+			// so it still resolves under Node and test runners.
+			const specifier = ['@korajs/store', 'better-sqlite3'].join('/')
+			const { BetterSqlite3Adapter } = (await import(/* @vite-ignore */ specifier)) as {
+				BetterSqlite3Adapter: new (dbName: string) => StorageAdapter
+			}
 			return new BetterSqlite3Adapter(dbName)
 		}
 		case 'sqlite-wasm': {

@@ -1,12 +1,13 @@
 {
   "name": "@korajs/merge",
-  "version": "1.0.0-beta.0",
+  "version": "1.0.0-beta.1",
   "description": "Three-tier conflict resolution engine for Kora.js (LWW, constraints, custom resolvers)",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "import": {
         "types": "./dist/index.d.ts",

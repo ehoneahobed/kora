@@ -1,4 +1,10 @@
-import type { HLCTimestamp, KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
+import type {
+	HLCTimestamp,
+	KoraEventEmitter,
+	Operation,
+	SchemaDefinition,
+	SecretKeyProvider,
+} from '@korajs/core'
 
 /**
  * Transaction interface for executing multiple operations atomically.
@@ -94,6 +100,11 @@ export interface StoreConfig {
 	localMutationHandler?: LocalMutationHandler
 	/** Called when a reactive query subscription is registered (for sync query subsets). */
 	onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
+	/**
+	 * Supplies the key used to encrypt `encrypted` secret fields at write time.
+	 * Required only when the schema declares encrypted secret fields.
+	 */
+	secretKeyProvider?: SecretKeyProvider
 }
 
 /**

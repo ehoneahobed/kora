@@ -9,6 +9,7 @@ import type { MergeTrace } from '@korajs/core'
 import { addWinsSet } from '../strategies/add-wins-set'
 import { mergeAtomicOps } from '../strategies/atomic-merge'
 import { lastWriteWins } from '../strategies/lww'
+import { mergeObject } from '../strategies/object-merge'
 import { applySchemaStrategy } from '../strategies/schema-strategies'
 import { mergeRichtext } from '../strategies/yjs-richtext'
 import type { RichtextValue } from '../strategies/yjs-richtext'
@@ -38,6 +39,59 @@ import type { FieldMergeResult } from '../types'
  * @returns The merged field value and a trace for DevTools
  */
 export function mergeField(
+	fieldName: string,
+	localOp: Operation,
+	remoteOp: Operation,
+	baseState: Record<string, unknown>,
+	fieldDescriptor: FieldDescriptor,
+	resolver?: CustomResolver,
+): FieldMergeResult {
+	const result = mergeFieldInner(fieldName, localOp, remoteOp, baseState, fieldDescriptor, resolver)
+	// Security: a secret field's value must never appear in a trace (DevTools,
+	// logs, audit export). Redact at this single boundary so no internal merge
+	// path can leak it. This covers BOTH the explicit input/output slots AND the
+	// field's value inside the embedded operationA/operationB (whose data and
+	// previousData would otherwise carry it).
+	if (fieldDescriptor.kind === 'secret') {
+		return {
+			value: result.value,
+			trace: {
+				...result.trace,
+				operationA: redactOperationField(result.trace.operationA, fieldName),
+				operationB: redactOperationField(result.trace.operationB, fieldName),
+				inputA: SECRET_REDACTED,
+				inputB: SECRET_REDACTED,
+				base: result.trace.base == null ? result.trace.base : SECRET_REDACTED,
+				output: SECRET_REDACTED,
+			},
+		}
+	}
+	return result
+}
+
+/** Sentinel written into merge traces in place of a secret field's value. */
+const SECRET_REDACTED = '[secret]'
+
+/**
+ * Return a copy of an operation with the given field's value redacted in both
+ * `data` and `previousData`. The original operation is never mutated (operations
+ * are immutable); this copy exists only for the trace.
+ */
+function redactOperationField(operation: Operation, field: string): Operation {
+	const redactRecord = (record: Record<string, unknown> | null): Record<string, unknown> | null => {
+		if (record === null || !(field in record)) {
+			return record
+		}
+		return { ...record, [field]: SECRET_REDACTED }
+	}
+	return {
+		...operation,
+		data: redactRecord(operation.data),
+		previousData: redactRecord(operation.previousData),
+	}
+}
+
+function mergeFieldInner(
 	fieldName: string,
 	localOp: Operation,
 	remoteOp: Operation,
@@ -207,7 +261,14 @@ function autoMerge(
 		case 'number':
 		case 'boolean':
 		case 'enum':
-		case 'timestamp': {
+		case 'timestamp':
+		// A blob field's value is a small content-addressed reference; concurrent
+		// replacements of the whole reference resolve by last-write-wins (the bytes
+		// themselves are immutable and deduplicated by hash in the blob store).
+		case 'blob':
+		// A secret field's stored value (ciphertext or hash) resolves by
+		// last-write-wins; the merge never sees or emits plaintext (redacted below).
+		case 'secret': {
 			const lwwResult = lastWriteWins(
 				localValue,
 				remoteValue,
@@ -263,6 +324,29 @@ function autoMerge(
 				remoteValue,
 				baseValue,
 				'crdt-text',
+				1,
+				startTime,
+			)
+		}
+
+		case 'object':
+		case 'json': {
+			const merged = mergeObject(
+				localValue,
+				remoteValue,
+				baseValue,
+				localOp.timestamp,
+				remoteOp.timestamp,
+			)
+			return createResult(
+				merged,
+				fieldName,
+				localOp,
+				remoteOp,
+				localValue,
+				remoteValue,
+				baseValue,
+				'object-lww-map',
 				1,
 				startTime,
 			)

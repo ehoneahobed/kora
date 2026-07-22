@@ -218,6 +218,14 @@ function mapFieldType(descriptor: FieldDescriptor): string {
 			return 'INTEGER'
 		case 'array':
 			return 'TEXT' // JSON-serialized
+		case 'object':
+			return 'TEXT' // JSON-serialized structured object
+		case 'json':
+			return 'TEXT' // JSON-serialized dynamic-key value
+		case 'blob':
+			return 'TEXT' // JSON-serialized content-addressed BlobRef (bytes stored out of band)
+		case 'secret':
+			return 'TEXT'
 		case 'richtext':
 			return 'BLOB' // Yjs state
 	}

@@ -137,6 +137,16 @@ export function decodeJwt(token: string): Record<string, unknown> | null {
  * ```
  */
 export function verifyJwt(token: string, secret: string): Record<string, unknown> | null {
+	// Callers ultimately trace back to request bodies (handleRefresh,
+	// handleSignOut, handleDeviceRegister, handleDeviceVerify all pass a body
+	// field straight through to validateToken -> verifyJwt). A malformed or
+	// missing field means `token` is not actually a string at runtime despite
+	// the type, and `.split` would throw, turning one bad request into a
+	// process-crashing uncaught exception. Treat non-string input as "not a
+	// valid token" instead, same as any other malformed token shape.
+	if (typeof token !== 'string') {
+		return null
+	}
 	const parts = token.split('.')
 	if (parts.length !== 3) {
 		return null

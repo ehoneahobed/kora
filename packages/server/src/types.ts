@@ -64,6 +64,23 @@ export interface KoraSyncServerConfig {
 	metricsCollector?: ServerMetricsCollector
 	/** Enable built-in dashboard and metrics endpoints. Defaults to true. */
 	enableDashboard?: boolean
+	/**
+	 * Resolve a blob chunk by content hash from server-side storage. Optional.
+	 * When provided, the server answers blob chunk requests directly from its own
+	 * store; when absent, the server relays chunk requests among connected peers
+	 * without storing any blob bytes itself.
+	 */
+	resolveBlobChunk?: (hash: string) => Promise<Uint8Array | null>
+	/**
+	 * Persist a client-uploaded blob chunk (or manifest) centrally, keyed by its
+	 * content hash. Optional. When provided, the server advertises central blob
+	 * storage at handshake, clients upload the bytes behind their `blob` fields,
+	 * and those bytes remain available to other devices after the authoring device
+	 * goes offline. Pair with `resolveBlobChunk` (both backed by the same store)
+	 * so uploaded blobs can then be served. `toServerBlobCallbacks` in
+	 * `@korajs/store` derives both from a `ContentAddressedBlobStore`.
+	 */
+	persistBlobChunk?: (hash: string, bytes: Uint8Array) => Promise<void> | void
 }
 
 /**

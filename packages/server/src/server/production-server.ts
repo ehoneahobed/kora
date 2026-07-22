@@ -2,6 +2,7 @@ import type { ServerStore } from '../store/server-store'
 import { WsServerTransport } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import { KoraSyncServer } from './kora-sync-server'
+import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
 
 /**
  * Configuration for the production server that serves both
@@ -52,6 +53,13 @@ export interface ProductionHttpRouteRequest {
 	headers?: Record<string, string | string[] | undefined>
 	query?: Record<string, string | string[] | undefined>
 	ip?: string
+	/**
+	 * Scoped, validated data-plane access. Use `kora.apply()` to mutate through
+	 * the same pipeline as sync (constraints, referential integrity, fan-out) and
+	 * `kora.query()` / `kora.findById()` to read materialized state, instead of
+	 * writing to the store directly and bypassing those guarantees.
+	 */
+	kora: ProductionHttpRouteContext
 }
 
 export interface ProductionHttpRouteResponse {
@@ -117,6 +125,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		enableDashboard: true,
 		...config.syncOptions,
 	})
+
+	// Scoped, validated data-plane access handed to every custom HTTP route as
+	// `request.kora`. Created once and shared: it holds no per-request state.
+	const routeContext = createRouteContext(syncServer, config.store)
 
 	let httpServer: import('node:http').Server | null = null
 
@@ -219,6 +231,20 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			const chunks: Buffer[] = []
 			req.on('data', (chunk: Buffer) => chunks.push(chunk))
 			req.on('end', () => resolve(Buffer.concat(chunks)))
+			// A raw http.IncomingMessage starts paused: attaching 'data'/'end'
+			// listeners alone does not put it in flowing mode. Without an
+			// explicit resume(), 'data' never fires, 'end' fires immediately with
+			// zero chunks, and every POST body silently reads back as empty —
+			// which is exactly what broke httpRoutes handlers (including
+			// @korajs/auth's signup/signin) reading `req.body`. Guard with
+			// `readableFlowing` so this stays a no-op if the stream is already
+			// flowing (e.g. a future caller that reads it differently).
+			if (!req.readableFlowing) {
+				req.resume()
+			}
+			// If the client disconnects mid-upload, `end` never fires; resolve
+			// with whatever arrived instead of leaving the request hung forever.
+			req.on('error', () => resolve(Buffer.concat(chunks)))
 		})
 	}
 
@@ -287,6 +313,30 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			const distDir = resolve(staticDir)
 
 			httpServer = createServer(async (req, res) => {
+				try {
+					await handleRequest(req, res)
+				} catch (error) {
+					// http.createServer never awaits its request listener, so a
+					// callback that rejects becomes an unhandled promise rejection
+					// process-wide, and Node's default `--unhandled-rejections=throw`
+					// crashes the entire server. One bad request (malformed body,
+					// a buggy custom httpRoute handler, anything unexpected) must
+					// only fail that one response, never take the whole process
+					// down with it.
+					console.error('[kora] Unhandled error in HTTP request handler:', error)
+					if (!res.headersSent) {
+						res.writeHead(500, { 'Content-Type': 'application/json' })
+						res.end(JSON.stringify({ error: 'Internal server error' }))
+					} else if (!res.writableEnded) {
+						res.end()
+					}
+				}
+			})
+
+			async function handleRequest(
+				req: import('node:http').IncomingMessage,
+				res: import('node:http').ServerResponse,
+			): Promise<void> {
 				// COOP/COEP headers required for SharedArrayBuffer (OPFS persistence)
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
 				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
@@ -435,6 +485,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						headers: req.headers,
 						query: getQuery(url),
 						ip: getClientIp(req),
+						kora: routeContext,
 					})
 					writeJsonResponse(res, result)
 					return
@@ -476,7 +527,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				const contentType = MIME_TYPES[ext] || 'application/octet-stream'
 				res.writeHead(200, { 'Content-Type': contentType })
 				createReadStream(filePath).pipe(res)
-			})
+			}
 
 			const wss = new WebSocketServer({ noServer: true })
 

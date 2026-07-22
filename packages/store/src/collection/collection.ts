@@ -4,6 +4,7 @@ import type {
 	HybridLogicalClock,
 	Operation,
 	SchemaDefinition,
+	SecretKeyProvider,
 } from '@korajs/core'
 import { executeDelete } from '../mutations/execute-delete'
 import { executeInsert } from '../mutations/execute-insert'
@@ -41,6 +42,7 @@ export class Collection {
 		private readonly relationEnforcer: RelationEnforcer | null,
 		private mutationHandler: LocalMutationHandler | null,
 		private readonly causalTracker: CausalTracker | null,
+		private readonly secretKeyProvider?: SecretKeyProvider,
 	) {}
 
 	private mutationContext(): LocalMutationContext {
@@ -56,6 +58,7 @@ export class Collection {
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
 			inTransaction: false,
+			secretKeyProvider: this.secretKeyProvider,
 		}
 	}
 

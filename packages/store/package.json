@@ -1,118 +1,129 @@
 {
-  "name": "@korajs/store",
-  "version": "1.0.0-beta.0",
-  "description": "Local storage engine for Kora.js with SQLite WASM, IndexedDB, and reactive queries",
-  "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "require": {
-        "types": "./dist/index.d.cts",
-        "default": "./dist/index.cjs"
-      }
-    },
-    "./better-sqlite3": {
-      "import": {
-        "types": "./dist/adapters/better-sqlite3.d.ts",
-        "default": "./dist/adapters/better-sqlite3.js"
-      },
-      "require": {
-        "types": "./dist/adapters/better-sqlite3.d.cts",
-        "default": "./dist/adapters/better-sqlite3.cjs"
-      }
-    },
-    "./sqlite-wasm": {
-      "import": {
-        "types": "./dist/adapters/sqlite-wasm.d.ts",
-        "default": "./dist/adapters/sqlite-wasm.js"
-      },
-      "require": {
-        "types": "./dist/adapters/sqlite-wasm.d.cts",
-        "default": "./dist/adapters/sqlite-wasm.cjs"
-      }
-    },
-    "./sqlite-wasm/worker": {
-      "import": {
-        "types": "./dist/adapters/sqlite-wasm-worker.d.ts",
-        "default": "./dist/adapters/sqlite-wasm-worker.js"
-      },
-      "require": {
-        "types": "./dist/adapters/sqlite-wasm-worker.d.cts",
-        "default": "./dist/adapters/sqlite-wasm-worker.cjs"
-      }
-    },
-    "./sqlite-wasm/shared-host": {
-      "import": {
-        "types": "./dist/adapters/sqlite-wasm-shared-host.d.ts",
-        "default": "./dist/adapters/sqlite-wasm-shared-host.js"
-      },
-      "require": {
-        "types": "./dist/adapters/sqlite-wasm-shared-host.d.cts",
-        "default": "./dist/adapters/sqlite-wasm-shared-host.cjs"
-      }
-    },
-    "./indexeddb": {
-      "import": {
-        "types": "./dist/adapters/indexeddb.d.ts",
-        "default": "./dist/adapters/indexeddb.js"
-      },
-      "require": {
-        "types": "./dist/adapters/indexeddb.d.cts",
-        "default": "./dist/adapters/indexeddb.cjs"
-      }
-    },
-    "./internal": {
-      "import": {
-        "types": "./dist/internal.d.ts",
-        "default": "./dist/internal.js"
-      },
-      "require": {
-        "types": "./dist/internal.d.cts",
-        "default": "./dist/internal.cjs"
-      }
-    }
-  },
-  "files": [
-    "dist"
-  ],
-  "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "test": "vitest run",
-    "test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check .",
-    "clean": "rm -rf dist .turbo coverage"
-  },
-  "dependencies": {
-    "@korajs/core": "workspace:*",
-    "yjs": "^13.6.30"
-  },
-  "peerDependencies": {
-    "@sqlite.org/sqlite-wasm": ">=3.51.0-build1"
-  },
-  "peerDependenciesMeta": {
-    "@sqlite.org/sqlite-wasm": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@fast-check/vitest": "0.2.0",
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.5.2",
-    "better-sqlite3": "^12.8.0",
-    "fake-indexeddb": "^6.2.5",
-    "fast-check": "^4.6.0",
-    "tsup": "^8.3.6",
-    "typescript": "^5.7.3",
-    "vitest": "^3.0.4"
-  },
-  "license": "MIT"
+	"name": "@korajs/store",
+	"version": "1.0.0-beta.1",
+	"description": "Local storage engine for Kora.js with SQLite WASM, IndexedDB, and reactive queries",
+	"type": "module",
+	"main": "./dist/index.cjs",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		"./package.json": "./package.json",
+		".": {
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		},
+		"./better-sqlite3": {
+			"import": {
+				"types": "./dist/adapters/better-sqlite3.d.ts",
+				"default": "./dist/adapters/better-sqlite3.js"
+			},
+			"require": {
+				"types": "./dist/adapters/better-sqlite3.d.cts",
+				"default": "./dist/adapters/better-sqlite3.cjs"
+			}
+		},
+		"./sqlite-wasm": {
+			"import": {
+				"types": "./dist/adapters/sqlite-wasm.d.ts",
+				"default": "./dist/adapters/sqlite-wasm.js"
+			},
+			"require": {
+				"types": "./dist/adapters/sqlite-wasm.d.cts",
+				"default": "./dist/adapters/sqlite-wasm.cjs"
+			}
+		},
+		"./sqlite-wasm/worker": {
+			"import": {
+				"types": "./dist/adapters/sqlite-wasm-worker.d.ts",
+				"default": "./dist/adapters/sqlite-wasm-worker.js"
+			},
+			"require": {
+				"types": "./dist/adapters/sqlite-wasm-worker.d.cts",
+				"default": "./dist/adapters/sqlite-wasm-worker.cjs"
+			}
+		},
+		"./sqlite-wasm/shared-host": {
+			"import": {
+				"types": "./dist/adapters/sqlite-wasm-shared-host.d.ts",
+				"default": "./dist/adapters/sqlite-wasm-shared-host.js"
+			},
+			"require": {
+				"types": "./dist/adapters/sqlite-wasm-shared-host.d.cts",
+				"default": "./dist/adapters/sqlite-wasm-shared-host.cjs"
+			}
+		},
+		"./indexeddb": {
+			"import": {
+				"types": "./dist/adapters/indexeddb.d.ts",
+				"default": "./dist/adapters/indexeddb.js"
+			},
+			"require": {
+				"types": "./dist/adapters/indexeddb.d.cts",
+				"default": "./dist/adapters/indexeddb.cjs"
+			}
+		},
+		"./blob-fs": {
+			"import": {
+				"types": "./dist/blob-fs.d.ts",
+				"default": "./dist/blob-fs.js"
+			},
+			"require": {
+				"types": "./dist/blob-fs.d.cts",
+				"default": "./dist/blob-fs.cjs"
+			}
+		},
+		"./internal": {
+			"import": {
+				"types": "./dist/internal.d.ts",
+				"default": "./dist/internal.js"
+			},
+			"require": {
+				"types": "./dist/internal.d.cts",
+				"default": "./dist/internal.cjs"
+			}
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"test": "vitest run",
+		"test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
+		"test:watch": "vitest",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"clean": "rm -rf dist .turbo coverage"
+	},
+	"dependencies": {
+		"@korajs/core": "workspace:*",
+		"yjs": "^13.6.30"
+	},
+	"peerDependencies": {
+		"@sqlite.org/sqlite-wasm": ">=3.51.0-build1"
+	},
+	"peerDependenciesMeta": {
+		"@sqlite.org/sqlite-wasm": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@fast-check/vitest": "0.2.0",
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/node": "^25.5.2",
+		"better-sqlite3": "^12.8.0",
+		"fake-indexeddb": "^6.2.5",
+		"fast-check": "^4.6.0",
+		"tsup": "^8.3.6",
+		"typescript": "^5.7.3",
+		"vitest": "^3.0.4"
+	},
+	"license": "MIT"
 }

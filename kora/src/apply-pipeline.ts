@@ -773,7 +773,11 @@ function updateNeedsMergeEngine(op: Operation, collectionDef: CollectionDefiniti
 	}
 	for (const field of Object.keys(op.data ?? {})) {
 		const kind = collectionDef.fields[field]?.kind
-		if (kind === 'richtext' || kind === 'array') {
+		// CRDT kinds converge key/element-wise via the merge engine, not by
+		// whole-value LWW: richtext (Yjs), arrays (add-wins set), and structured
+		// object/json (recursive LWW-map). Plain per-field LWW would clobber a
+		// concurrent edit to a different key of the same object.
+		if (kind === 'richtext' || kind === 'array' || kind === 'object' || kind === 'json') {
 			return true
 		}
 		if (collectionDef.resolvers[field]) {

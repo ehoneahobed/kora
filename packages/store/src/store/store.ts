@@ -11,6 +11,7 @@ import type {
 	Operation,
 	OperationLog,
 	SchemaDefinition,
+	SecretKeyProvider,
 	VersionVector,
 } from '@korajs/core'
 import { readBackupManifest as readManifest } from '../backup/backup'
@@ -108,6 +109,7 @@ export class Store implements OperationLog {
 	private localMutationHandler: LocalMutationHandler | null
 	private relationEnforcer: RelationEnforcer | null = null
 	private causalTracker: CausalTracker | null = null
+	private readonly secretKeyProvider: SecretKeyProvider | undefined
 
 	constructor(config: StoreConfig) {
 		this.schema = config.schema
@@ -117,6 +119,7 @@ export class Store implements OperationLog {
 		this.isolation = config.isolation ?? 'shared'
 		this.emitter = config.emitter ?? null
 		this.localMutationHandler = config.localMutationHandler ?? null
+		this.secretKeyProvider = config.secretKeyProvider
 		this.subscriptionManager = new SubscriptionManager({
 			onQuerySubscribed: config.onQuerySubscribed,
 		})
@@ -177,6 +180,7 @@ export class Store implements OperationLog {
 				this.relationEnforcer,
 				this.localMutationHandler,
 				this.causalTracker,
+				this.secretKeyProvider,
 			)
 			this.collections.set(name, col)
 		}
@@ -740,6 +744,7 @@ export class Store implements OperationLog {
 			causalTracker: this.causalTracker,
 			inTransaction: options?.inTransaction ?? false,
 			extraCausalDeps: options?.extraCausalDeps,
+			secretKeyProvider: this.secretKeyProvider,
 		}
 	}
 

@@ -1,4 +1,9 @@
-import { createOperation, generateUUIDv7, validateRecord } from '@korajs/core'
+import {
+	createOperation,
+	generateUUIDv7,
+	transformSecretFieldsForWrite,
+	validateRecord,
+} from '@korajs/core'
 import { fieldVersionsForFields, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
@@ -25,6 +30,14 @@ export async function executeInsert(
 		}
 	}
 
+	// Transform secret fields to their at-rest form (hash/ciphertext) BEFORE the
+	// operation is built, so plaintext never enters the op log, store, or sync.
+	const writeData = await transformSecretFieldsForWrite(
+		validated,
+		ctx.definition,
+		ctx.secretKeyProvider,
+	)
+
 	const causalDeps = resolveCausalDeps(ctx)
 
 	let operation!: Awaited<ReturnType<typeof createOperation>>
@@ -41,7 +54,7 @@ export async function executeInsert(
 				// Binary richtext values are tagged as canonical JSON BEFORE the
 				// operation is content-hashed, so the hash input, persisted JSON,
 				// and wire payload are the identical value.
-				data: encodeRichtextFieldsForOpData(validated, ctx.definition.fields),
+				data: encodeRichtextFieldsForOpData(writeData, ctx.definition.fields),
 				previousData: null,
 				sequenceNumber,
 				causalDeps,
@@ -51,7 +64,7 @@ export async function executeInsert(
 		)
 		ctx.causalTracker?.afterOperation(ctx.collection, operation.id, ctx.inTransaction)
 
-		const serializedData = serializeRecord(validated, ctx.definition.fields)
+		const serializedData = serializeRecord(writeData, ctx.definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
 		record = {
 			id: recordId,
@@ -80,7 +93,7 @@ export async function executeInsert(
 
 	return {
 		id: recordId,
-		...validated,
+		...writeData,
 		createdAt: operation.timestamp.wallTime,
 		updatedAt: operation.timestamp.wallTime,
 	}

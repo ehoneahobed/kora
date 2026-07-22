@@ -168,6 +168,47 @@ describe('handleSignUp', () => {
 			expect(devices[0]?.id).toBe('device-001')
 		}
 	})
+
+	// Regression: KoraForms hit a production server bug where a POST body was
+	// silently read as empty, so handlers received `{}` instead of the real
+	// payload. Every body field, typed as required `string` at compile time,
+	// arrived as `undefined` at runtime — and this handler crashed the process
+	// with `TypeError: Cannot read properties of undefined (reading 'length')`
+	// instead of returning a 400. Request bodies are untyped network input;
+	// the type system can't protect against a missing field actually reaching
+	// here, so this must degrade to a clean error, never a crash.
+	test('returns 400 instead of throwing when email is missing from the body', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleSignUp({
+			password: 'strong-password-123',
+		} as unknown as Parameters<BuiltInAuthRoutes['handleSignUp']>[0])
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
+
+	test('returns 400 instead of throwing when password is missing from the body', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleSignUp({
+			email: 'alice@example.com',
+		} as unknown as Parameters<BuiltInAuthRoutes['handleSignUp']>[0])
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
+
+	test('returns 400 instead of throwing when the entire body is missing fields', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleSignUp(
+			{} as unknown as Parameters<BuiltInAuthRoutes['handleSignUp']>[0],
+		)
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
 })
 
 describe('handleSignIn', () => {
@@ -260,6 +301,37 @@ describe('handleSignIn', () => {
 			expect(devices.some((d) => d.id === 'device-new')).toBe(true)
 		}
 	})
+
+	// Regression: same production bug as handleSignUp above. handleSignIn is
+	// actually the more exposed case — it builds the rate-limit key with
+	// `body.email.toLowerCase()` before any validation runs at all, so a
+	// missing email crashed here even before reaching an isValidEmail check.
+	test('returns 400 instead of throwing when email is missing from the body', async () => {
+		const result = await routes.handleSignIn({
+			password: 'strong-password-123',
+		} as unknown as Parameters<BuiltInAuthRoutes['handleSignIn']>[0])
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
+
+	test('returns 400 instead of throwing when password is missing from the body', async () => {
+		const result = await routes.handleSignIn({
+			email: 'alice@example.com',
+		} as unknown as Parameters<BuiltInAuthRoutes['handleSignIn']>[0])
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
+
+	test('returns 400 instead of throwing when the entire body is missing fields', async () => {
+		const result = await routes.handleSignIn(
+			{} as unknown as Parameters<BuiltInAuthRoutes['handleSignIn']>[0],
+		)
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+	})
 })
 
 describe('handleRefresh', () => {
@@ -315,6 +387,25 @@ describe('handleRefresh', () => {
 		const result = await routes.handleRefresh({
 			refreshToken: signUpResult.body.data.tokens.accessToken,
 		})
+
+		expect(result.status).toBe(401)
+		expect('error' in result.body).toBe(true)
+	})
+
+	// Regression: same production bug class as handleSignUp/handleSignIn, one
+	// level down. `refreshToken` is untyped network input; verifyJwt() used to
+	// call `token.split('.')` with no guard, so a missing field crashed with a
+	// TypeError instead of the expected 401. This traces through
+	// handleRefresh, handleSignOut, handleDeviceRegister, and
+	// handleDeviceVerify — they all funnel a body/header token through
+	// validateToken() -> verifyJwt(), so fixing it at that one chokepoint
+	// covers all four call sites at once.
+	test('returns 401 instead of throwing when refreshToken is missing from the body', async () => {
+		const { routes } = createTestRoutes()
+
+		const result = await routes.handleRefresh(
+			{} as unknown as Parameters<BuiltInAuthRoutes['handleRefresh']>[0],
+		)
 
 		expect(result.status).toBe(401)
 		expect('error' in result.body).toBe(true)
@@ -699,6 +790,32 @@ describe('handleDeviceRegister', () => {
 		expect('error' in result.body).toBe(true)
 		if ('error' in result.body) {
 			expect(result.body.error).toContain('Invalid public key format')
+		}
+	})
+
+	// Regression: same production bug class again. `body.name` is untyped
+	// network input; sanitizeName() used to call `.replace` on it directly
+	// with no guard, so a missing name crashed instead of the expected
+	// "Device name must not be empty" 400.
+	test('returns 400 instead of throwing when name is missing from the body', async () => {
+		const { routes } = createTestRoutes()
+
+		const signUpResult = await routes.handleSignUp({
+			email: 'alice@example.com',
+			password: 'strong-password-123',
+		})
+		if (!('data' in signUpResult.body)) return
+		const accessToken = signUpResult.body.data.tokens.accessToken
+
+		const result = await routes.handleDeviceRegister(accessToken, {
+			deviceId: 'device-register-004',
+			publicKey: '{"kty":"EC","crv":"P-256","x":"a","y":"b"}',
+		} as unknown as Parameters<BuiltInAuthRoutes['handleDeviceRegister']>[1])
+
+		expect(result.status).toBe(400)
+		expect('error' in result.body).toBe(true)
+		if ('error' in result.body) {
+			expect(result.body.error).toContain('Device name must not be empty')
 		}
 	})
 })

@@ -25,6 +25,13 @@ const SCALAR_TYPE_MAP: Record<Exclude<FieldKind, 'array' | 'enum'>, string> = {
 	boolean: 'bool',
 	timestamp: 'int64',
 	richtext: 'bytes',
+	// object/json values travel as JSON-serialized strings on the proto wire.
+	object: 'string',
+	json: 'string',
+	// A blob field carries a JSON-serialized content-addressed reference, not bytes.
+	blob: 'string',
+	// A secret field's stored value is a JSON string (ciphertext or hash).
+	secret: 'string',
 }
 
 /**

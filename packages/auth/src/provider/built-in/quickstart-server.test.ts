@@ -94,6 +94,32 @@ describe('createKoraAuthServer', () => {
 		vi.unstubAllEnvs()
 	})
 
+	it('warns when falling back to an ephemeral secret outside production', () => {
+		vi.stubEnv('NODE_ENV', 'development')
+		vi.stubEnv('KORA_AUTH_SECRET', '')
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+		createKoraAuthServer()
+
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining('ephemeral random secret'))
+
+		warn.mockRestore()
+		vi.unstubAllEnvs()
+	})
+
+	it('does not warn about ephemeral secrets when a secret is provided', () => {
+		vi.stubEnv('NODE_ENV', 'development')
+		vi.stubEnv('KORA_AUTH_SECRET', '')
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+		createKoraAuthServer({ jwtSecret: TEST_SECRET })
+
+		expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('ephemeral random secret'))
+
+		warn.mockRestore()
+		vi.unstubAllEnvs()
+	})
+
 	it('creates users and linked identities through OAuth callbacks', async () => {
 		const fetch = createOAuthFetch({
 			id: 'provider-user-1',

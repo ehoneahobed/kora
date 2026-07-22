@@ -55,7 +55,9 @@ const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,98}[a-z0-9]$/
  * Simple email format validation (same logic as auth-routes).
  */
 function isValidEmail(email: string): boolean {
-	if (email.length === 0 || email.length > 254) return false
+	// See the matching guard in auth-routes.ts: request bodies are untyped at
+	// runtime, so a missing `email` field must not crash this check.
+	if (typeof email !== 'string' || email.length === 0 || email.length > 254) return false
 	const atIndex = email.indexOf('@')
 	if (atIndex < 1) return false
 	const domain = email.slice(atIndex + 1)

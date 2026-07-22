@@ -188,6 +188,9 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 		case 'boolean':
 			return value ? 1 : 0
 		case 'array':
+		case 'object':
+		case 'json':
+		case 'blob':
 			return JSON.stringify(value)
 		case 'richtext':
 			// May be a record-shaped value (string/bytes) or an op-data value
@@ -205,6 +208,13 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 		case 'array':
 			if (typeof value === 'string') {
 				return JSON.parse(value) as unknown[]
+			}
+			return value
+		case 'object':
+		case 'json':
+		case 'blob':
+			if (typeof value === 'string') {
+				return JSON.parse(value) as unknown
 			}
 			return value
 		case 'richtext':
