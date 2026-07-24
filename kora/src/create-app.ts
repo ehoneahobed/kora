@@ -46,6 +46,7 @@ export function createApp<const S extends SchemaInput>(
 	let blobApi: BlobApi | null = null
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
+	let unsubscribeLocalOperations: (() => void) | null = null
 
 	const syncState: SyncRuntimeState = {
 		syncEngine: null,
@@ -65,6 +66,7 @@ export function createApp<const S extends SchemaInput>(
 		store = init.store
 		unsubscribeSync = init.unsubscribeSync
 		unsubscribeAudit = init.unsubscribeAudit
+		unsubscribeLocalOperations = init.unsubscribeLocalOperations
 		blobApi = createBlobApi(init.blobStore, init.blobChunkProvider, config.blob?.chunkSize, () =>
 			enumerateLiveBlobRefs(init.store, config.schema),
 		)
@@ -145,6 +147,10 @@ export function createApp<const S extends SchemaInput>(
 			if (unsubscribeAudit) {
 				unsubscribeAudit()
 				unsubscribeAudit = null
+			}
+			if (unsubscribeLocalOperations) {
+				unsubscribeLocalOperations()
+				unsubscribeLocalOperations = null
 			}
 			if (syncState.syncEngine) {
 				await syncState.syncEngine.stop()

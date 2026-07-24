@@ -1,5 +1,12 @@
 # @korajs/vue
 
+## 1.0.0-beta.6
+
+### Patch Changes
+
+- Updated dependencies
+  - @korajs/store@1.0.0-beta.6
+
 ## 1.0.0-beta.5
 
 ### Patch Changes

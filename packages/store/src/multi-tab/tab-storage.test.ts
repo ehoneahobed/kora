@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { WorkerRequest, WorkerResponse } from '../adapters/sqlite-wasm-channel'
-import { FollowerBroadcastBridge, startLeaderRpcRelay } from './tab-storage'
+import {
+	FollowerBroadcastBridge,
+	TransactionSerializingWorkerBridge,
+	startLeaderRpcRelay,
+} from './tab-storage'
 
 type ChannelHandler = (event: { data: unknown }) => void
 
@@ -43,9 +47,11 @@ describe('multi-tab tab storage RPC', () => {
 	beforeEach(() => {
 		MockBroadcastChannel.channels.clear()
 		vi.stubGlobal('BroadcastChannel', MockBroadcastChannel)
-		vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(
-			'00000000-0000-4000-8000-000000000001',
-		)
+		let id = 0
+		vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(() => {
+			id += 1
+			return `00000000-0000-4000-8000-${id.toString().padStart(12, '0')}`
+		})
 	})
 
 	test('follower forwards worker requests to leader bridge', async () => {
@@ -119,5 +125,68 @@ describe('multi-tab tab storage RPC', () => {
 		})
 
 		follower.terminate()
+	})
+
+	test('serializes whole transaction spans across bridge clients', async () => {
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type)
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge)
+
+		await bridge.send({ id: 1, type: 'begin' }, 'leader')
+		const followerBegin = bridge.send({ id: 2, type: 'begin' }, 'follower')
+		const leaderExecute = bridge.send(
+			{ id: 3, type: 'execute', sql: 'INSERT INTO todos VALUES (?)' },
+			'leader',
+		)
+
+		await leaderExecute
+		expect(calls).toEqual(['begin', 'execute'])
+
+		await bridge.send({ id: 4, type: 'commit' }, 'leader')
+		await followerBegin
+
+		expect(calls).toEqual(['begin', 'execute', 'commit', 'begin'])
+		bridge.terminate()
+	})
+
+	test('rolls back and resumes when a transaction client disappears', async () => {
+		vi.useFakeTimers()
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type)
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge, 50)
+
+		await bridge.send({ id: 1, type: 'begin' }, 'follower')
+		const leaderQuery = bridge.send({ id: 2, type: 'query', sql: 'SELECT 1' }, 'leader')
+
+		await vi.advanceTimersByTimeAsync(60)
+
+		await expect(leaderQuery).resolves.toMatchObject({ type: 'success' })
+		expect(calls).toEqual(['begin', 'rollback', 'query'])
+
+		await expect(
+			bridge.send({ id: 3, type: 'execute', sql: 'INSERT INTO todos VALUES (?)' }, 'follower'),
+		).resolves.toMatchObject({
+			type: 'error',
+			code: 'TRANSACTION_ABORTED',
+		})
+
+		await expect(bridge.send({ id: 4, type: 'begin' }, 'follower')).resolves.toMatchObject({
+			type: 'success',
+		})
+		await bridge.send({ id: 5, type: 'rollback' }, 'follower')
+		bridge.terminate()
+		vi.useRealTimers()
 	})
 })

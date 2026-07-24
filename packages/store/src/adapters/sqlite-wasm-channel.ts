@@ -36,7 +36,7 @@ export type WorkerResponse =
  */
 export interface WorkerBridge {
 	/** Send a request to the worker and wait for a response. */
-	send(request: WorkerRequest): Promise<WorkerResponse>
+	send(request: WorkerRequest, clientId?: string): Promise<WorkerResponse>
 
 	/** Terminate the worker. Safe to call multiple times. */
 	terminate(): void

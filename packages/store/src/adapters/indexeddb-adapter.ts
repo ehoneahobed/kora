@@ -1,7 +1,7 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
 import { PersistenceError } from '../errors'
-import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
+import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
@@ -74,6 +74,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private readonly dbName: string
 	private readonly emitter: KoraEventEmitter | undefined
 	private readonly scheduler: IndexedDbPersistenceScheduler
+	private storageOpenState: StorageOpenState | null = null
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
 		this.dbName = options.dbName ?? 'kora-db'
@@ -93,6 +94,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	async open(schema: SchemaDefinition): Promise<void> {
 		await this.inner.open(schema)
+		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
 
 		const persisted = await loadFromIndexedDB(this.dbName)
 		if (!persisted) return
@@ -127,6 +129,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		await this.inner.migrate(from, to, migration)
 		this.scheduler.schedule()
+	}
+
+	getStorageOpenState(): StorageOpenState | null {
+		return this.storageOpenState
 	}
 
 	/**

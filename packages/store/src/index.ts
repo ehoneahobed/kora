@@ -19,6 +19,8 @@ export type {
 	QueryDescriptor,
 	StoreConfig,
 	StoreIsolation,
+	StorageFallbackReason,
+	StorageOpenState,
 	StorageAdapter,
 	SubscriptionCallback,
 	Transaction,

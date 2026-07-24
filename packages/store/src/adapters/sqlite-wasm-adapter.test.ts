@@ -1,6 +1,6 @@
 import type { KoraEvent } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { AdapterError, StoreNotOpenError } from '../errors'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
@@ -239,6 +239,62 @@ describe('SqliteWasmAdapter', () => {
 		test('throws AdapterError when no bridge or workerUrl provided', async () => {
 			const noBridge = new SqliteWasmAdapter()
 			await expect(noBridge.open(minimalSchema)).rejects.toThrow(AdapterError)
+		})
+
+		test('warns once and ignores deprecated sharedWorkerUrl', async () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			class TestWorker {
+				onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null
+				private readonly bridge = new OpenDataBridge(new MockWorkerBridge(), { persistent: true })
+
+				postMessage(request: WorkerRequest): void {
+					void this.bridge.send(request).then((response) => {
+						this.onmessage?.({ data: response } as MessageEvent<WorkerResponse>)
+					})
+				}
+
+				terminate(): void {
+					this.bridge.terminate()
+				}
+			}
+
+			const originalWorker = globalThis.Worker
+			const originalSharedWorker = globalThis.SharedWorker
+			const sharedWorker = vi.fn(() => {
+				throw new Error('SharedWorker must not be constructed')
+			})
+			Object.defineProperty(globalThis, 'Worker', {
+				value: TestWorker,
+				configurable: true,
+			})
+			Object.defineProperty(globalThis, 'SharedWorker', {
+				value: sharedWorker,
+				configurable: true,
+			})
+
+			try {
+				const deprecated = new SqliteWasmAdapter({
+					workerUrl: '/worker.js',
+					sharedWorkerUrl: '/shared-host.js',
+				})
+				await deprecated.open(minimalSchema)
+				await deprecated.close()
+
+				expect(sharedWorker).not.toHaveBeenCalled()
+				expect(warn).toHaveBeenCalledWith(
+					expect.stringContaining('sharedWorkerUrl is deprecated and ignored'),
+				)
+			} finally {
+				warn.mockRestore()
+				Object.defineProperty(globalThis, 'Worker', {
+					value: originalWorker,
+					configurable: true,
+				})
+				Object.defineProperty(globalThis, 'SharedWorker', {
+					value: originalSharedWorker,
+					configurable: true,
+				})
+			}
 		})
 	})
 

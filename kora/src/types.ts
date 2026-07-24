@@ -56,7 +56,11 @@ export interface StoreOptions {
 	isolation?: import('@korajs/store').StoreIsolation
 	/** URL to the SQLite WASM worker script. Required for browser adapters (sqlite-wasm, indexeddb). */
 	workerUrl?: string | URL
-	/** Optional SharedWorker host for multi-tab SQLite (see `@korajs/store/sqlite-wasm/shared-host`). */
+	/**
+	 * @deprecated SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and
+	 * is never durable. This option is ignored; Kora uses the dedicated-worker
+	 * leader/follower path for durable multi-tab storage.
+	 */
 	sharedWorkerUrl?: string | URL
 	/** Max wait for a worker RPC (e.g. `open`). Defaults to 30000ms. */
 	workerResponseTimeoutMs?: number

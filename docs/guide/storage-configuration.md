@@ -16,7 +16,7 @@ When you call `createApp()`, Kora automatically detects and sets up a local data
 1. **Tauri native SQLite** (Tauri desktop apps via `@korajs/tauri`) -- best performance, auto-detected
 2. **Native SQLite** (Node.js and Electron via `better-sqlite3`)
 3. **SQLite WASM + OPFS** (browsers that expose the OPFS API)
-4. **IndexedDB** (browsers with no OPFS API at all -- a hand-written adapter that runs SQLite WASM in memory and serializes the database to IndexedDB)
+4. **IndexedDB** (durable browser fallback -- a hand-written adapter that runs SQLite WASM in memory and serializes the database to IndexedDB)
 
 You don't need to configure anything for the default case:
 
@@ -25,9 +25,17 @@ const app = createApp({ schema })
 // Kora auto-detects the best storage adapter
 ```
 
-::: warning OPFS fallback is in-memory, not IndexedDB
-The choice above is made at detection time. `indexeddb` is only auto-selected when the OPFS API is entirely absent. It is not what a *failed* OPFS install degrades to: if the `sqlite-wasm` adapter is selected but OPFS cannot be acquired at runtime (most commonly a lock conflict with another runtime on the same origin), the store keeps working from a **non-persistent in-memory** database and data is lost on reload. That case is never silent -- Kora emits a `store:opfs-unavailable` event. See [Multi-runtime Storage](/guide/multi-runtime-storage) for the diagnostics and how to avoid the collision.
+::: tip Durable fallback
+Adapter detection prefers SQLite WASM + OPFS in modern browsers. If OPFS SyncAccessHandle cannot be acquired at runtime, `createApp()` closes that non-durable open and falls back to the durable IndexedDB adapter before app code observes the store. Kora emits `store:storage-fallback` for that recovered state. `store:opfs-unavailable` is reserved for the last-resort case where IndexedDB also cannot open and the store is running in memory.
 :::
+
+### Multi-tab Durability
+
+Multi-tab durability uses one dedicated worker owned by a leader tab. Other tabs relay SQLite requests to that leader over browser cross-tab messaging, and a follower is promoted if the leader tab closes.
+
+This is the only durable SQLite WASM multi-tab path. OPFS synchronous access handles are available only in dedicated Web Workers, not the main thread or SharedWorker. A SharedWorker-hosted database cannot be durable, so Kora does not offer it as a storage mode. The old `sharedWorkerUrl` option is deprecated and ignored; remove it from app config.
+
+Kora also keeps open tabs reactive on this path. Local operations committed in one tab are announced over a database-scoped same-origin channel, and sibling tabs invalidate only the affected queries. The operation is not re-applied by receivers; the shared local database remains the source of truth. Worker RPC is serialized across complete transaction spans at the leader boundary, and abandoned follower spans are rolled back so closing a tab mid-transaction cannot freeze the database for other tabs. The crash-case idle reclaim defaults to 10s.
 
 ### Database Name
 
@@ -82,6 +90,7 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 | `adapter` | `'sqlite-wasm' \| 'indexeddb' \| 'better-sqlite3' \| 'tauri-sqlite'` | Auto-detected | Storage backend to use. |
 | `name` | `string` | `'kora-db'` | Database name. Must be unique per app on the same origin. |
 | `workerUrl` | `string \| URL` | -- | URL to the SQLite WASM worker script. Required for `sqlite-wasm` adapter in browsers. |
+| `sharedWorkerUrl` | `string \| URL` | -- | Deprecated and ignored. SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and is never durable. |
 
 ---
 

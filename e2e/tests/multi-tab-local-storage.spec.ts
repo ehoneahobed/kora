@@ -4,17 +4,8 @@ import { openFixtureInTabs } from './helpers'
 /**
  * Same-origin multi-tab without sync: leader election + shared SQLite (OPFS).
  * Requires VITE_E2E_LOCAL=true (see playwright project local-multi-tab).
- *
- * Skipped in Playwright: headless Chromium throttles the leader tab's BroadcastChannel
- * relay before the follower finishes `store.open()`. Covered by
- * `packages/store/tests/integration/multi-tab-storage.test.ts`.
  */
 test.describe('Multi-tab local storage (no sync)', () => {
-	test.skip(
-		() => true,
-		'Follower tab store.open() does not complete reliably in headless Playwright; see @korajs/store multi-tab integration tests',
-	)
-
 	let pageA: Page
 	let pageB: Page
 
@@ -65,5 +56,45 @@ test.describe('Multi-tab local storage (no sync)', () => {
 		const titlesA = await pageA.locator('[data-testid="todo-list"] li span').allTextContents()
 		const titlesB = await pageB.locator('[data-testid="todo-list"] li span').allTextContents()
 		expect(titlesA.sort()).toEqual(titlesB.sort())
+	})
+
+	test('local data survives reload through the durable worker path', async () => {
+		await pageA.fill('[data-testid="title-input"]', 'Survives reload')
+		await pageA.click('[data-testid="add-button"]')
+		await expect(pageA.locator('[data-testid="todo-list"] li')).toHaveCount(1, {
+			timeout: 5000,
+		})
+
+		await pageA.reload({ waitUntil: 'domcontentloaded' })
+		await expect(pageA.getByTestId('sync-status')).toBeAttached({ timeout: 120_000 })
+		await expect(pageA.locator('[data-testid="todo-list"] li')).toHaveCount(1, {
+			timeout: 10_000,
+		})
+		await expect(pageA.locator('[data-testid="todo-list"] li').first()).toContainText(
+			'Survives reload',
+		)
+	})
+
+	test('follower is promoted after leader closes and keeps durable data', async () => {
+		await pageA.fill('[data-testid="title-input"]', 'Before leader close')
+		await pageA.click('[data-testid="add-button"]')
+		await expect(pageB.locator('[data-testid="todo-list"] li')).toHaveCount(1, {
+			timeout: 10_000,
+		})
+
+		await pageA.close()
+		await pageB.fill('[data-testid="title-input"]', 'After promotion')
+		await pageB.click('[data-testid="add-button"]')
+		await expect(pageB.locator('[data-testid="todo-list"] li')).toHaveCount(2, {
+			timeout: 20_000,
+		})
+
+		await pageB.reload({ waitUntil: 'domcontentloaded' })
+		await expect(pageB.getByTestId('sync-status')).toBeAttached({ timeout: 120_000 })
+		await expect(pageB.locator('[data-testid="todo-list"] li')).toHaveCount(2, {
+			timeout: 20_000,
+		})
+		const titles = await pageB.locator('[data-testid="todo-list"] li span').allTextContents()
+		expect(titles.sort()).toEqual(['After promotion', 'Before leader close'])
 	})
 })

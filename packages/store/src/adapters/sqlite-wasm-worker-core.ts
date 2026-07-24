@@ -3,20 +3,16 @@
  * Reusable SQLite WASM core, decoupled from any specific worker global.
  *
  * The dedicated worker ({@link file://./sqlite-wasm-worker.ts}) wires one core to
- * `self.onmessage`/`self.postMessage`. The SharedWorker host
- * ({@link file://./sqlite-wasm-shared-host.ts}) runs one core PER database inside
- * a single SharedWorker scope, because a SharedWorker cannot spawn a nested
- * `Worker` (the `Worker` constructor is not defined in `SharedWorkerGlobalScope`
- * in Chromium), so it must run SQLite directly.
+ * `self.onmessage`/`self.postMessage`.
  *
  * The WASM module and the OPFS SyncAccessHandle pool are cached at module scope
- * and shared across every core in the same worker/SharedWorker: the pool holds
+ * and shared across every core in the same worker: the pool holds
  * multiple database files keyed by filename, so installing it once and opening
  * each database within it avoids the single-writer conflict that installing the
  * pool twice in one scope would cause.
  *
  * This file cannot be unit-tested in Node (no WASM/OPFS); it is exercised through
- * the browser E2E suite and its dispatch is covered via the shared-host tests.
+ * the browser E2E suite.
  */
 
 import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -92,7 +88,7 @@ function classifyOpfsFailure(error: unknown): 'lock-conflict' | 'timeout' | 'uns
 	return 'unsupported'
 }
 
-// Scope-global caches shared by every core in this worker/SharedWorker.
+// Scope-global caches shared by every core in this worker.
 let sqlite3Promise: Promise<Sqlite3Api> | null = null
 let opfsPoolPromise: Promise<OpfsPool | null> | null = null
 let opfsFallbackReason: 'lock-conflict' | 'timeout' | 'unsupported' | undefined
@@ -155,8 +151,8 @@ export interface SqliteWasmCore {
 
 /**
  * Creates a core bound to one database. `handle` resolves with the response for
- * each request; the caller routes it back to whichever transport delivered the
- * request (the dedicated worker's `postMessage`, or a SharedWorker client port).
+ * each request; the caller routes it back through the dedicated worker's
+ * `postMessage`.
  */
 export function createSqliteWasmCore(): SqliteWasmCore {
 	let db: SqliteDb | null = null
@@ -169,9 +165,8 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 		dbName?: string,
 	): Promise<WorkerResponse> {
 		try {
-			// A shared core (one per database in a SharedWorker) may receive `open`
-			// from more than one tab. Re-run the idempotent DDL on the existing handle
-			// rather than opening the database a second time.
+			// Re-run idempotent DDL on the existing handle rather than opening the
+			// database a second time.
 			if (db) {
 				applyDdl(db, ddlStatements)
 				return { id, type: 'success', data: buildOpenData() }

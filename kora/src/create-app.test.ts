@@ -1,8 +1,11 @@
+import 'fake-indexeddb/auto'
 import { defineSchema, t } from '@korajs/core'
 import type { KoraEvent } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
+import type { WorkerRequest, WorkerResponse } from '@korajs/store/sqlite-wasm'
 import type { SyncStatusInfo } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { MockWorkerBridge } from '../../packages/store/src/adapters/sqlite-wasm-mock-bridge'
 import { createApp } from './create-app'
 import type { KoraApp, KoraSyncEvent } from './types'
 
@@ -322,6 +325,81 @@ describe('createApp', () => {
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 		const record = await todos.insert({ title: 'No DevTools' })
 		expect(record.title).toBe('No DevTools')
+	})
+
+	test('falls back from non-persistent sqlite-wasm to durable IndexedDB before app use', async () => {
+		const originalWorker = globalThis.Worker
+		class VolatileOpfsWorker {
+			onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null
+			onerror: ((event: ErrorEvent) => void) | null = null
+			private readonly bridge = new MockWorkerBridge()
+
+			postMessage(request: WorkerRequest): void {
+				void this.bridge
+					.send(request)
+					.then((response) => {
+						if (request.type === 'open' && response.type === 'success') {
+							this.onmessage?.({
+								data: {
+									...response,
+									data: { persistent: false, fallbackReason: 'unsupported' },
+								},
+							} as MessageEvent<WorkerResponse>)
+							return
+						}
+						this.onmessage?.({ data: response } as MessageEvent<WorkerResponse>)
+					})
+					.catch((error: unknown) => {
+						this.onerror?.({
+							message: error instanceof Error ? error.message : String(error),
+						} as ErrorEvent)
+					})
+			}
+
+			terminate(): void {
+				this.bridge.terminate()
+			}
+		}
+		Object.defineProperty(globalThis, 'Worker', {
+			value: VolatileOpfsWorker,
+			configurable: true,
+		})
+
+		const dbName = `fallback-${Date.now()}-${Math.random().toString(36).slice(2)}`
+		const events: KoraEvent[] = []
+
+		try {
+			app = createApp({
+				schema,
+				store: { adapter: 'sqlite-wasm', workerUrl: '/worker.js', name: dbName },
+			})
+			app.events.on('store:storage-fallback', (event) => events.push(event))
+			app.events.on('store:opfs-unavailable', (event) => events.push(event))
+			await app.ready
+
+			const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+			const created = await todos.insert({ title: 'IndexedDB survives OPFS fallback' })
+			await app.close()
+
+			app = createApp({
+				schema,
+				store: { adapter: 'sqlite-wasm', workerUrl: '/worker.js', name: dbName },
+			})
+			await app.ready
+
+			const reopenedTodos = (app as Record<string, unknown>).todos as CollectionAccessor
+			await expect(reopenedTodos.findById(created.id)).resolves.toMatchObject({
+				title: 'IndexedDB survives OPFS fallback',
+			})
+
+			expect(events.some((event) => event.type === 'store:storage-fallback')).toBe(true)
+			expect(events.some((event) => event.type === 'store:opfs-unavailable')).toBe(false)
+		} finally {
+			Object.defineProperty(globalThis, 'Worker', {
+				value: originalWorker,
+				configurable: true,
+			})
+		}
 	})
 
 	test('close cleans up reconnection and devtools resources', async () => {

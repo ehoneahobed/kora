@@ -3,9 +3,7 @@
  * Web Worker script for running SQLite WASM in a dedicated worker.
  *
  * This file is intended to run inside a Web Worker in browsers. It wires one
- * {@link createSqliteWasmCore} to the worker's message channel. The database
- * logic lives in `sqlite-wasm-worker-core.ts` so it can be reused by the
- * SharedWorker host, which cannot spawn a nested worker.
+ * {@link createSqliteWasmCore} to the worker's message channel.
  *
  * This script cannot be tested in Node.js; it is validated in E2E browser tests.
  */

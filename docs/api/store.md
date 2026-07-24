@@ -659,6 +659,9 @@ interface StorageAdapter {
 
   /** Apply a schema migration. */
   migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
+
+  /** Optional post-open storage state for adapters that can degrade at runtime. */
+  getStorageOpenState?(): StorageOpenState | null
 }
 
 interface Transaction {
@@ -674,7 +677,7 @@ Each adapter is a class that implements `StorageAdapter`. Adapters ship as separ
 | Adapter | Import | Class | Environment | Notes |
 |---------|--------|-------|-------------|-------|
 | SQLite WASM + OPFS | `@korajs/store/sqlite-wasm` | `SqliteWasmAdapter` | Browser | Primary adapter. Runs SQLite in a Web Worker with OPFS persistence. Best performance. |
-| IndexedDB | `@korajs/store/indexeddb` | `IndexedDbAdapter` | Browser | Fallback adapter. Selected only when the OPFS API is entirely absent from the runtime. It is NOT the recovery path for an OPFS install that fails at runtime (see Storage diagnostics). |
+| IndexedDB | `@korajs/store/indexeddb` | `IndexedDbAdapter` | Browser | Durable fallback adapter. Selected when OPFS is absent and used by `createApp()` when OPFS SyncAccessHandle cannot be acquired at runtime. |
 | Native SQLite | `@korajs/store/better-sqlite3` | `BetterSqlite3Adapter` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
 
 The Tauri desktop adapter (`tauri-sqlite`) is provided by the separate `@korajs/tauri` package, not by `@korajs/store`.
@@ -698,7 +701,7 @@ If no adapter is specified, Kora selects the best available adapter for the curr
 1. In browsers: `sqlite-wasm` when the OPFS API is present, otherwise the hand-written `indexeddb` adapter.
 2. In Node.js: `better-sqlite3`.
 
-Adapter selection happens up front, based on which APIs the runtime exposes. It is distinct from the runtime fallback that occurs when the OPFS API is present but the install fails: in that case the SQLite WASM adapter degrades to a non-persistent in-memory database and emits `store:opfs-unavailable` (see Storage diagnostics). IndexedDB is never used as an automatic recovery path for a failed OPFS install.
+Adapter selection starts up front, based on which APIs the runtime exposes. `createApp()` also checks the SQLite WASM adapter after open: if OPFS SyncAccessHandle cannot be acquired and the worker reports a non-persistent open, Kora closes it and opens the durable IndexedDB adapter instead. This emits `store:storage-fallback`. `store:opfs-unavailable` is reserved for the last-resort case where IndexedDB also cannot open and the store is running in memory.
 
 ---
 
@@ -859,9 +862,24 @@ Thrown by `get()` when the bytes stored under a hash do not actually hash to tha
 
 Storage adapters can emit diagnostic events through the `KoraEventEmitter` passed to them (via `StoreConfig.emitter`, or the `emitter` option of an adapter's options such as `SqliteWasmAdapterOptions`). These surface conditions that would otherwise fail silently. The event types are defined in `@korajs/core`.
 
+### store:storage-fallback
+
+Emitted by `createApp()` when OPFS persistence was requested but could not be acquired, and Kora recovered by opening the durable IndexedDB adapter instead. This event is informational: data still survives reloads.
+
+```typescript
+{
+  type: 'store:storage-fallback'
+  dbName: string
+  from: 'opfs' | 'sqlite-wasm'
+  to: 'indexeddb'
+  reason: 'lock-conflict' | 'timeout' | 'unsupported'
+  message: string
+}
+```
+
 ### store:opfs-unavailable
 
-Emitted by the SQLite WASM adapter when OPFS persistence was requested but could not be installed, so the store fell back to a NON-PERSISTENT in-memory database. Anything written in the session is lost on reload. The event is emitted instead of failing silently so the data-loss condition is observable.
+Emitted only when OPFS persistence was requested, IndexedDB fallback could not open, and the store fell back to a NON-PERSISTENT in-memory database. Anything written in the session is lost on reload. The event is emitted instead of failing silently so the data-loss condition is observable.
 
 ```typescript
 {
@@ -877,8 +895,6 @@ Emitted by the SQLite WASM adapter when OPFS persistence was requested but could
 | `'lock-conflict'` | Another runtime on this origin already holds the OPFS pool for this database. |
 | `'timeout'` | The VFS install did not complete in time (common in headless CI). |
 | `'unsupported'` | The runtime has no usable OPFS. |
-
-Important: this in-memory fallback is the runtime recovery path for a failed OPFS install. It is NOT IndexedDB. The `indexeddb` adapter is only selected up front, when the OPFS API is entirely absent from the runtime.
 
 ### Other storage events
 

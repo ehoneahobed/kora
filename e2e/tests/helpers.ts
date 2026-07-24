@@ -52,7 +52,7 @@ async function waitForFixtureReadyWithLeaderPulse(leader: Page, follower: Page):
 }
 
 export interface OpenFixtureInTabsOptions {
-	/** When true, both tabs share one database (local multi-tab / SharedWorker). Default false for sync tests. */
+	/** When true, both tabs share one local database. Default false for sync tests. */
 	sharedDatabase?: boolean
 }
 

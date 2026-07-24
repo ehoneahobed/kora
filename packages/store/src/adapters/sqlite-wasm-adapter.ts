@@ -1,16 +1,24 @@
 import { generateFullDDL } from '@korajs/core'
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import { AdapterError, StoreNotOpenError } from '../errors'
-import { SharedWorkerClientBridge } from '../multi-tab/shared-worker-bridge'
 import {
 	FollowerBroadcastBridge,
+	TransactionSerializingWorkerBridge,
 	acquireTabStorageSession,
-	isSharedWorkerStorageSupported,
 	startLeaderRpcRelay,
 } from '../multi-tab/tab-storage'
-import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
+import type {
+	MigrationPlan,
+	StorageAdapter,
+	StorageFallbackReason,
+	StorageOpenState,
+	Transaction,
+} from '../types'
 import { Mutex } from './sqlite-wasm-channel'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
+
+type WorkerSuccessResponse = Extract<WorkerResponse, { type: 'success' }>
+let warnedSharedWorkerDeprecated = false
 
 /**
  * Options for creating a SqliteWasmAdapter.
@@ -36,11 +44,18 @@ export interface SqliteWasmAdapterOptions {
 	workerResponseTimeoutMs?: number
 
 	/**
-	 * Optional SharedWorker host script (`sqlite-wasm-shared-host`). When set and
-	 * {@link isSharedWorkerStorageSupported}, one DedicatedWorker per `dbName` is pooled per origin.
-	 * Requires `workerUrl` for the inner SQLite worker. Falls back to leader election when omitted.
+	 * @deprecated SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and
+	 * is never durable. Kora ignores this option and uses the dedicated-worker
+	 * leader/follower path for durable multi-tab storage.
 	 */
 	sharedWorkerUrl?: string | URL
+
+	/**
+	 * When false, the adapter records a non-persistent open without emitting
+	 * `store:opfs-unavailable`. `createApp()` uses this while it promotes the store
+	 * to durable IndexedDB; direct adapter users keep the diagnostic by default.
+	 */
+	emitNonPersistentDiagnostic?: boolean
 
 	/**
 	 * When set, storage diagnostics are emitted here: `store:opfs-unavailable` when
@@ -78,7 +93,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly dbName: string
 	private readonly emitter: KoraEventEmitter | undefined
 	private tabSession: Awaited<ReturnType<typeof acquireTabStorageSession>> | null = null
-	private sharedWorker: SharedWorker | null = null
+	private readonly emitNonPersistentDiagnostic: boolean
+	private storageOpenState: StorageOpenState | null = null
 	/** Retained so a follower promoted to leader can re-open its own worker. */
 	private schema: SchemaDefinition | null = null
 	private promoting = false
@@ -90,67 +106,77 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.workerResponseTimeoutMs = options.workerResponseTimeoutMs ?? 30_000
 		this.dbName = options.dbName ?? 'kora-db'
 		this.emitter = options.emitter
+		this.emitNonPersistentDiagnostic = options.emitNonPersistentDiagnostic ?? true
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
 		if (this.opened) return
 
+		const ddlStatements = generateFullDDL(schema)
 		if (this.injectedBridge) {
 			this.bridge = this.injectedBridge
-		} else if (this.sharedWorkerUrl && this.workerUrl && isSharedWorkerStorageSupported()) {
-			const workerUrlString =
-				typeof this.workerUrl === 'string' ? this.workerUrl : this.workerUrl.href
-			const sharedUrl =
-				typeof this.sharedWorkerUrl === 'string' ? this.sharedWorkerUrl : this.sharedWorkerUrl.href
-			// `type: 'module'` is required: the shared host is authored and served as an
-			// ES module (it uses import). A classic SharedWorker cannot parse it and
-			// fails silently, so `open` would hang forever.
-			this.sharedWorker = new SharedWorker(sharedUrl, {
-				type: 'module',
-				name: `kora-sw-${this.dbName}`,
-			})
-			this.bridge = new SharedWorkerClientBridge(this.sharedWorker, this.dbName, workerUrlString)
-		} else if (this.workerUrl) {
-			this.schema = schema
-			this.tabSession = await acquireTabStorageSession(this.dbName, {
-				onPromote: () => {
-					void this.promoteToLeader()
-				},
-			})
-			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+			const response = await this.openCurrentBridge(ddlStatements)
+			this.reportStorageMode(response.data)
+			this.opened = true
+			return
+		}
+		if (this.workerUrl) {
+			this.warnSharedWorkerDeprecated()
+			await this.openDurableWorkerBridge(schema)
+			const response = await this.openCurrentBridge(ddlStatements)
+			this.reportStorageMode(response.data)
+			this.opened = true
+			return
+		}
+		throw new AdapterError(
+			'SqliteWasmAdapter requires either a bridge (for testing) or a workerUrl (for browsers). ' +
+				'Pass { bridge: new MockWorkerBridge() } for tests, or { workerUrl: "/worker.js" } for browsers.',
+		)
+	}
 
-			if (this.tabSession.role === 'leader') {
-				const workerBridge = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs)
-				this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
-				this.bridge = workerBridge
-			} else {
-				const followerBridge = new FollowerBroadcastBridge(
-					this.tabSession.channelName,
-					this.workerResponseTimeoutMs,
-				)
-				this.bridge = followerBridge
-				// Another runtime on this origin already owns this database name. That is
-				// expected for multiple tabs of the same app (they share one leader),
-				// but a bug if these are logically separate apps, so surface it so the
-				// developer can give them distinct store names.
-				this.emitter?.emit({
-					type: 'store:db-name-collision',
-					dbName: this.dbName,
-					message: `Another runtime on this origin is already using database "${this.dbName}"; this runtime is sharing it as a follower. If these are separate apps, give each a distinct store name.`,
-				})
-				// Readiness handshake: give the leader relay a moment to answer before the
-				// first RPC, so a follower opened during a leader's startup race retries the
-				// handshake instead of firing into the void and waiting out the full timeout.
-				await followerBridge.waitForLeader()
-			}
-		} else {
-			throw new AdapterError(
-				'SqliteWasmAdapter requires either a bridge (for testing) or a workerUrl (for browsers). ' +
-					'Pass { bridge: new MockWorkerBridge() } for tests, or { workerUrl: "/worker.js" } for browsers.',
-			)
+	private async openDurableWorkerBridge(schema: SchemaDefinition): Promise<void> {
+		if (!this.workerUrl) {
+			throw new AdapterError('Durable SQLite WASM storage requires workerUrl.')
 		}
 
-		const ddlStatements = generateFullDDL(schema)
+		this.schema = schema
+		this.tabSession = await acquireTabStorageSession(this.dbName, {
+			onPromote: () => {
+				void this.promoteToLeader()
+			},
+		})
+		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+
+		if (this.tabSession.role === 'leader') {
+			const workerBridge = new TransactionSerializingWorkerBridge(
+				new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs),
+			)
+			this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
+			this.bridge = workerBridge
+			return
+		}
+
+		const followerBridge = new FollowerBroadcastBridge(
+			this.tabSession.channelName,
+			this.workerResponseTimeoutMs,
+		)
+		this.bridge = followerBridge
+		// Another runtime on this origin already owns this database name. That is
+		// expected for multiple tabs of the same app (they share one leader),
+		// but a bug if these are logically separate apps, so surface it so the
+		// developer can give them distinct store names.
+		this.emitter?.emit({
+			type: 'store:db-name-collision',
+			dbName: this.dbName,
+			message: `Another runtime on this origin is already using database "${this.dbName}"; this runtime is sharing it as a follower. If these are separate apps, give each a distinct store name.`,
+		})
+		// Readiness handshake: give the leader relay a moment to answer before the
+		// first RPC, so a follower opened during a leader's startup race retries the
+		// handshake instead of firing into the void and waiting out the full timeout.
+		await followerBridge.waitForLeader()
+	}
+
+	private async openCurrentBridge(ddlStatements: string[]): Promise<WorkerSuccessResponse> {
 		const response = await this.sendRequest({
 			id: 0,
 			type: 'open',
@@ -163,8 +189,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				dbName: this.dbName,
 			})
 		}
-		this.reportStorageMode(response.data)
-		this.opened = true
+		return response
 	}
 
 	/**
@@ -174,15 +199,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 * bridge that does not report a mode, e.g. the Node mock) emits nothing.
 	 */
 	private reportStorageMode(data: unknown): void {
-		if (!this.emitter || typeof data !== 'object' || data === null) {
+		this.storageOpenState = parseStorageOpenState(data)
+		if (!this.emitNonPersistentDiagnostic || !this.emitter || !this.storageOpenState) {
 			return
 		}
-		const mode = data as {
-			persistent?: boolean
-			fallbackReason?: 'lock-conflict' | 'timeout' | 'unsupported'
-		}
-		if (mode.persistent === false) {
-			const reason = mode.fallbackReason ?? 'unsupported'
+		if (this.storageOpenState.persistent === false) {
+			const reason = this.storageOpenState.fallbackReason ?? 'unsupported'
 			this.emitter.emit({
 				type: 'store:opfs-unavailable',
 				dbName: this.dbName,
@@ -190,6 +212,22 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				message: `OPFS persistence is unavailable (${reason}) for database "${this.dbName}"; the store is running in memory and data will not survive a reload.`,
 			})
 		}
+	}
+
+	getStorageOpenState(): StorageOpenState | null {
+		return this.storageOpenState
+	}
+
+	private warnSharedWorkerDeprecated(): void {
+		if (!this.sharedWorkerUrl || warnedSharedWorkerDeprecated) {
+			return
+		}
+		warnedSharedWorkerDeprecated = true
+		console.warn(
+			'[kora] sharedWorkerUrl is deprecated and ignored: SharedWorker-hosted SQLite ' +
+				'cannot use OPFS and is never durable. Kora uses the durable dedicated-worker ' +
+				'leader/follower path for multi-tab storage.',
+		)
 	}
 
 	async close(): Promise<void> {
@@ -204,7 +242,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				await this.tabSession.releaseLock()
 			}
 			this.tabSession = null
-			this.sharedWorker = null
 			this.bridge.terminate()
 			this.bridge = null
 			this.opened = false
@@ -225,7 +262,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.promoting = true
 
 		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
-		const workerBridge = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs)
+		const workerBridge = new TransactionSerializingWorkerBridge(
+			new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs),
+		)
 
 		const previousBridge = this.bridge
 		this.bridge = workerBridge
@@ -377,5 +416,23 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		if (response.type === 'error') {
 			throw new AdapterError(`${description} failed: ${response.message}`)
 		}
+	}
+}
+
+function parseStorageOpenState(data: unknown): StorageOpenState | null {
+	if (typeof data !== 'object' || data === null) {
+		return null
+	}
+	const mode = data as {
+		persistent?: boolean
+		fallbackReason?: StorageFallbackReason
+	}
+	if (typeof mode.persistent !== 'boolean') {
+		return null
+	}
+	return {
+		persistent: mode.persistent,
+		mode: mode.persistent ? 'opfs' : 'memory',
+		...(mode.fallbackReason ? { fallbackReason: mode.fallbackReason } : {}),
 	}
 }

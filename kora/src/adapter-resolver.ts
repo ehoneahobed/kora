@@ -60,6 +60,7 @@ export async function createAdapter(
 	emitter?: KoraEventEmitter,
 	workerResponseTimeoutMs?: number,
 	sharedWorkerUrl?: string | URL,
+	suppressNonPersistentDiagnostic = false,
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
@@ -93,6 +94,7 @@ export async function createAdapter(
 				sharedWorkerUrl,
 				workerResponseTimeoutMs,
 				emitter,
+				emitNonPersistentDiagnostic: !suppressNonPersistentDiagnostic,
 			})
 		}
 		case 'indexeddb': {

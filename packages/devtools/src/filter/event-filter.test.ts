@@ -31,6 +31,7 @@ describe('getEventCategory', () => {
 			'state-machine:rejected': 'operation',
 			'store:persistence-error': 'connection',
 			'store:quota-exceeded': 'connection',
+			'store:storage-fallback': 'connection',
 			'store:opfs-unavailable': 'connection',
 			'store:db-name-collision': 'connection',
 			'replay:completed': 'operation',

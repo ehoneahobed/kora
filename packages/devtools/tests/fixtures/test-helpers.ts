@@ -260,6 +260,14 @@ export function createSampleEvent<T extends KoraEventType>(
 			dbName: 'kora-db',
 			message: 'Quota exceeded',
 		},
+		'store:storage-fallback': {
+			type: 'store:storage-fallback',
+			dbName: 'kora-db',
+			from: 'opfs',
+			to: 'indexeddb',
+			reason: 'unsupported',
+			message: 'OPFS unavailable, using IndexedDB',
+		},
 		'store:opfs-unavailable': {
 			type: 'store:opfs-unavailable',
 			dbName: 'kora-db',

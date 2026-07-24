@@ -2,7 +2,12 @@ import type { KoraEventEmitter } from '@korajs/core'
 import { buildScopeMap } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
-import type { ChunkProvider, ContentAddressedBlobStore, StorageAdapter } from '@korajs/store'
+import type {
+	ChunkProvider,
+	ContentAddressedBlobStore,
+	StorageAdapter,
+	StorageFallbackReason,
+} from '@korajs/store'
 import { createRemoteChunkProvider, serveBlobChunks } from '@korajs/store'
 import { SyncEncryptor, SyncEngine } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
@@ -12,6 +17,7 @@ import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
+import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
 import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
@@ -25,6 +31,7 @@ export interface InitializeAppResult {
 	syncEngine: SyncEngine | null
 	unsubscribeSync: (() => void) | null
 	unsubscribeAudit: (() => void) | null
+	unsubscribeLocalOperations: (() => void) | null
 	authBinding: AuthSyncBinding | null
 	/** Content-addressed store for blob bytes (OPFS in browser, memory otherwise). */
 	blobStore: ContentAddressedBlobStore
@@ -42,13 +49,14 @@ export async function initializeApp(
 ): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	const dbName = config.store?.name ?? 'kora-db'
-	const adapter: StorageAdapter = await createAdapter(
+	let adapter: StorageAdapter = await createAdapter(
 		adapterType,
 		dbName,
 		config.store?.workerUrl,
 		emitter,
 		config.store?.workerResponseTimeoutMs,
 		config.store?.sharedWorkerUrl,
+		adapterType === 'sqlite-wasm',
 	)
 
 	const authBinding = config.sync?.authClient ?? null
@@ -66,19 +74,60 @@ export async function initializeApp(
 			: () => encryptionKey()
 		: undefined
 
-	const store = new Store({
-		schema: config.schema,
-		adapter,
-		emitter,
-		dbName,
-		nodeId: authNodeId,
-		isolation: authNodeId ? 'shared' : config.store?.isolation,
-		...(secretKeyProvider ? { secretKeyProvider } : {}),
-		...(config.sync
-			? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }
-			: {}),
-	})
+	const buildStore = (storeAdapter: StorageAdapter): Store =>
+		new Store({
+			schema: config.schema,
+			adapter: storeAdapter,
+			emitter,
+			dbName,
+			nodeId: authNodeId,
+			isolation: authNodeId ? 'shared' : config.store?.isolation,
+			...(secretKeyProvider ? { secretKeyProvider } : {}),
+			...(config.sync
+				? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }
+				: {}),
+		})
+
+	let store = buildStore(adapter)
 	await store.open()
+
+	if (adapterType === 'sqlite-wasm' && adapter.getStorageOpenState?.()?.persistent === false) {
+		const fallbackReason = adapter.getStorageOpenState()?.fallbackReason ?? 'unsupported'
+		await store.close()
+
+		try {
+			adapter = await createAdapter(
+				'indexeddb',
+				dbName,
+				config.store?.workerUrl,
+				emitter,
+				config.store?.workerResponseTimeoutMs,
+			)
+			store = buildStore(adapter)
+			await store.open()
+			emitter.emit({
+				type: 'store:storage-fallback',
+				dbName,
+				from: 'opfs',
+				to: 'indexeddb',
+				reason: fallbackReason,
+				message: `OPFS persistence is unavailable (${fallbackReason}) for database "${dbName}"; Kora is using durable IndexedDB instead.`,
+			})
+		} catch {
+			adapter = await createAdapter(
+				'sqlite-wasm',
+				dbName,
+				config.store?.workerUrl,
+				emitter,
+				config.store?.workerResponseTimeoutMs,
+				config.store?.sharedWorkerUrl,
+				true,
+			)
+			store = buildStore(adapter)
+			await store.open()
+			emitOpfsUnavailable(emitter, dbName, fallbackReason)
+		}
+	}
 
 	let recordConflict: (() => void) | undefined
 	const applyPipeline = new ApplyPipeline({
@@ -89,6 +138,7 @@ export async function initializeApp(
 	})
 	store.setLocalMutationHandler(applyPipeline)
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
+	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter)
 
 	// Blob byte storage is useful offline (local reads/writes) independent of sync.
 	const blobStore = await resolveBlobStore(config.blob, dbName)
@@ -163,8 +213,22 @@ export async function initializeApp(
 		syncEngine,
 		unsubscribeSync,
 		unsubscribeAudit,
+		unsubscribeLocalOperations,
 		authBinding,
 		blobStore,
 		blobChunkProvider,
 	}
+}
+
+function emitOpfsUnavailable(
+	emitter: KoraEventEmitter,
+	dbName: string,
+	reason: StorageFallbackReason,
+): void {
+	emitter.emit({
+		type: 'store:opfs-unavailable',
+		dbName,
+		reason,
+		message: `OPFS persistence is unavailable (${reason}) for database "${dbName}", and IndexedDB fallback could not open; the store is running in memory and data will not survive a reload.`,
+	})
 }

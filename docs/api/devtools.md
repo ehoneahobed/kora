@@ -41,7 +41,7 @@ Core orchestrator. Attaches to a `KoraEventEmitter`, records all emitted events 
 new Instrumenter(emitter: KoraEventEmitter, config?: DevtoolsConfig)
 ```
 
-The instrumenter subscribes to all 15 `KoraEventType` values on the emitter and begins recording immediately.
+The instrumenter subscribes to the supported `KoraEventType` values on the emitter and begins recording immediately.
 
 ### Methods
 

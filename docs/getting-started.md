@@ -174,7 +174,7 @@ import schema from './schema'
 export const app = createApp({ schema })
 ```
 
-That is the entire setup for a local-only app. No database configuration, no storage boilerplate. Kora uses SQLite WASM with OPFS persistence under the hood, running in a Web Worker so your UI never blocks. If OPFS is unavailable at runtime the store keeps working from a non-persistent in-memory database and emits a `store:opfs-unavailable` event so the condition is never silent; see the [Multi-runtime Storage](/guide/multi-runtime-storage) guide.
+That is the entire setup for a local-only app. No database configuration, no storage boilerplate. Kora uses SQLite WASM with OPFS persistence under the hood, running in a Web Worker so your UI never blocks. If OPFS cannot be acquired at runtime, `createApp()` falls back to durable IndexedDB and emits `store:storage-fallback`; `store:opfs-unavailable` is reserved for the last-resort case where the app is running in non-persistent memory. See the [Multi-runtime Storage](/guide/multi-runtime-storage) guide.
 
 ## CRUD Operations
 

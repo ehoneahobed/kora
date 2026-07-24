@@ -765,6 +765,23 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Notify this store that another same-origin runtime committed an operation to
+	 * the shared local database. The operation has already been persisted and
+	 * materialized by the database owner; this method only advances in-memory causal
+	 * watermarks and invalidates local reactive queries so already-open tabs stay
+	 * live without reapplying or rewriting the operation.
+	 */
+	notifyExternalOperation(operation: Operation): void {
+		this.ensureOpen()
+		const definition = this.schema.collections[operation.collection]
+		if (!definition) {
+			return
+		}
+		this.recordOperationSequence(operation)
+		this.subscriptionManager.notify(operation.collection, operation)
+	}
+
+	/**
 	 * Build mutation context for a collection (used by ApplyPipeline side effects).
 	 */
 	createMutationContext(

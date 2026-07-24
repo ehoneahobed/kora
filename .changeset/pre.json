@@ -51,6 +51,7 @@
     "per-field-lww-convergence",
     "production-server-surface",
     "reliable-relay-delivery",
+    "retire-sharedworker-storage",
     "richtext-string-determinism",
     "scope-guardrail-and-browser-adapter",
     "scope-partial-update-backfill",
@@ -59,8 +60,6 @@
     "secret-write-time-transform",
     "server-atomic-op-materialization",
     "server-side-operation-validation",
-    "sharedworker-error-surfacing",
-    "sharedworker-run-sqlite-directly",
     "sql-identifier-quoting",
     "tombstone-resurrection-convergence"
   ]

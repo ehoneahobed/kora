@@ -10,15 +10,19 @@ import { NoLeaderError, WorkerTimeoutError } from '../errors'
 
 const RPC_REQUEST = 'kora-worker-request'
 const RPC_RESPONSE = 'kora-worker-response'
+const CLIENT_LEAVE = 'kora-client-leave'
 const LEADER_PING = 'kora-leader-ping'
 const LEADER_PONG = 'kora-leader-pong'
 
 /** Default delay before a stalled follower RPC probes the leader for liveness. */
 const DEFAULT_LIVENESS_PROBE_MS = 2000
+/** Default idle budget for a client that owns an open transaction span. */
+const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 10_000
 
 interface RpcRequestMessage {
 	type: typeof RPC_REQUEST
 	requestId: string
+	clientId: string
 	request: WorkerRequest
 }
 
@@ -26,6 +30,15 @@ interface RpcResponseMessage {
 	type: typeof RPC_RESPONSE
 	requestId: string
 	response: WorkerResponse
+}
+
+interface ClientLeaveMessage {
+	type: typeof CLIENT_LEAVE
+	clientId: string
+}
+
+interface ReclaimingWorkerBridge extends WorkerBridge {
+	reclaimClient(clientId: string, reason: string): void
 }
 
 export type TabStorageRole = 'leader' | 'follower'
@@ -53,14 +66,6 @@ export interface TabStorageSession {
 	 * the promotion watch on close.
 	 */
 	cancelPromotionWatch?: () => void
-}
-
-/**
- * Returns whether a SharedWorker could host a single SQLite WASM instance per origin.
- * Not implemented yet — use {@link isMultiTabStorageSupported} + leader election today.
- */
-export function isSharedWorkerStorageSupported(): boolean {
-	return typeof globalThis !== 'undefined' && typeof SharedWorker !== 'undefined'
 }
 
 /**
@@ -169,7 +174,7 @@ export function startLeaderRpcRelay(channelName: string, bridge: WorkerBridge): 
 	const channel = new BroadcastChannel(channelName)
 
 	const onMessage = (
-		event: MessageEvent<RpcRequestMessage | { type: typeof LEADER_PING }>,
+		event: MessageEvent<RpcRequestMessage | ClientLeaveMessage | { type: typeof LEADER_PING }>,
 	): void => {
 		const data = event.data
 		// Answer liveness probes immediately, without touching the worker, so a
@@ -178,12 +183,18 @@ export function startLeaderRpcRelay(channelName: string, bridge: WorkerBridge): 
 			channel.postMessage({ type: LEADER_PONG })
 			return
 		}
+		if (data?.type === CLIENT_LEAVE) {
+			if (hasReclaimClient(bridge)) {
+				bridge.reclaimClient(data.clientId, 'client-left')
+			}
+			return
+		}
 		if (data?.type !== RPC_REQUEST) {
 			return
 		}
 
 		void bridge
-			.send(data.request)
+			.send(data.request, data.clientId)
 			.then((response) => {
 				const msg: RpcResponseMessage = {
 					type: RPC_RESPONSE,
@@ -220,6 +231,10 @@ export function startLeaderRpcRelay(channelName: string, bridge: WorkerBridge): 
  */
 export class FollowerBroadcastBridge implements WorkerBridge {
 	private readonly channel: BroadcastChannel
+	private readonly clientId = createClientId()
+	private readonly onPageHide = (): void => {
+		this.leaveLeader()
+	}
 	private readonly pending = new Map<
 		string,
 		{ resolve: (r: WorkerResponse) => void; reject: (e: Error) => void }
@@ -232,6 +247,9 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 		this.timeoutMs = timeoutMs
 		this.livenessProbeMs = Math.min(livenessProbeMs, timeoutMs)
 		this.channel = new BroadcastChannel(channelName)
+		if (typeof addEventListener === 'function') {
+			addEventListener('pagehide', this.onPageHide)
+		}
 		this.channel.addEventListener('message', (event: MessageEvent<RpcResponseMessage>) => {
 			const data = event.data
 			if (data?.type !== RPC_RESPONSE) {
@@ -299,8 +317,13 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			}
 		}
 
-		const requestId = crypto.randomUUID()
-		const msg: RpcRequestMessage = { type: RPC_REQUEST, requestId, request }
+		const requestId = createClientId()
+		const msg: RpcRequestMessage = {
+			type: RPC_REQUEST,
+			requestId,
+			clientId: this.clientId,
+			request,
+		}
 
 		return new Promise<WorkerResponse>((resolve, reject) => {
 			const settle = (fn: () => void): void => {
@@ -339,10 +362,249 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			return
 		}
 		this.terminated = true
+		this.leaveLeader()
+		if (typeof removeEventListener === 'function') {
+			removeEventListener('pagehide', this.onPageHide)
+		}
 		this.channel.close()
 		for (const [, entry] of this.pending) {
 			entry.reject(new Error('Follower bridge terminated'))
 		}
 		this.pending.clear()
 	}
+
+	private leaveLeader(): void {
+		try {
+			const message: ClientLeaveMessage = {
+				type: CLIENT_LEAVE,
+				clientId: this.clientId,
+			}
+			this.channel.postMessage(message)
+		} catch {
+			// Best effort: the serializer's idle rollback is the guaranteed backstop.
+		}
+	}
+}
+
+interface QueuedWorkerRequest {
+	clientId: string
+	request: WorkerRequest
+	resolve: (response: WorkerResponse) => void
+	reject: (error: Error) => void
+}
+
+/**
+ * Serializes one SQLite worker across the leader tab and all follower tabs.
+ *
+ * SQLite transactions are represented as multiple worker messages
+ * (`begin`, one or more reads/writes, then `commit`/`rollback`). Per-tab mutexes
+ * cannot protect that span because follower messages converge at the leader.
+ * This bridge promotes the worker boundary into the serialization point, so no
+ * other client can interleave while a client owns an active transaction.
+ */
+export class TransactionSerializingWorkerBridge implements WorkerBridge {
+	private readonly inner: WorkerBridge
+	private readonly leaderClientId = createClientId()
+	private readonly transactionIdleTimeoutMs: number
+	private queue: QueuedWorkerRequest[] = []
+	private activeTransactionClient: string | null = null
+	private abortedClients = new Set<string>()
+	private transactionIdleTimer: ReturnType<typeof setTimeout> | null = null
+	private reclaiming = false
+	private processing = false
+	private terminated = false
+
+	constructor(inner: WorkerBridge, transactionIdleTimeoutMs = DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS) {
+		this.inner = inner
+		this.transactionIdleTimeoutMs = transactionIdleTimeoutMs
+	}
+
+	send(request: WorkerRequest, clientId = this.leaderClientId): Promise<WorkerResponse> {
+		if (this.terminated) {
+			return Promise.resolve({
+				id: request.id,
+				type: 'error',
+				message: 'Worker has been terminated',
+				code: 'WORKER_TERMINATED',
+			})
+		}
+		if (this.abortedClients.has(clientId)) {
+			if (request.type === 'begin') {
+				this.abortedClients.delete(clientId)
+			} else {
+				return Promise.resolve({
+					id: request.id,
+					type: 'error',
+					message: 'Previous transaction was aborted because the client stopped sending requests.',
+					code: 'TRANSACTION_ABORTED',
+				})
+			}
+		}
+
+		return new Promise<WorkerResponse>((resolve, reject) => {
+			this.queue.push({ clientId, request, resolve, reject })
+			void this.processQueue()
+		})
+	}
+
+	terminate(): void {
+		if (this.terminated) {
+			return
+		}
+		this.terminated = true
+		this.clearTransactionIdleTimer()
+		this.inner.terminate()
+		const pending = this.queue.splice(0)
+		for (const entry of pending) {
+			entry.reject(new Error('Worker terminated'))
+		}
+	}
+
+	reclaimClient(clientId: string, reason: string): void {
+		if (this.terminated) {
+			return
+		}
+		void this.reclaimClientNow(clientId, reason)
+	}
+
+	private async processQueue(): Promise<void> {
+		if (this.processing || this.reclaiming) {
+			return
+		}
+		this.processing = true
+		try {
+			while (!this.terminated) {
+				const index = this.nextRunnableIndex()
+				if (index === -1) {
+					return
+				}
+				const [entry] = this.queue.splice(index, 1)
+				if (!entry) {
+					return
+				}
+				try {
+					const response = await this.inner.send(entry.request)
+					this.recordTransactionState(entry, response)
+					entry.resolve(response)
+				} catch (error) {
+					this.resetFailedTransaction(entry)
+					entry.reject(error instanceof Error ? error : new Error(String(error)))
+				}
+			}
+		} finally {
+			this.processing = false
+			if (!this.terminated && !this.reclaiming && this.nextRunnableIndex() !== -1) {
+				void this.processQueue()
+			}
+		}
+	}
+
+	private nextRunnableIndex(): number {
+		if (this.queue.length === 0) {
+			return -1
+		}
+		if (this.activeTransactionClient === null) {
+			return 0
+		}
+		return this.queue.findIndex((entry) => entry.clientId === this.activeTransactionClient)
+	}
+
+	private recordTransactionState(entry: QueuedWorkerRequest, response: WorkerResponse): void {
+		if (response.type === 'error') {
+			this.resetFailedTransaction(entry)
+			return
+		}
+		if (entry.request.type === 'begin') {
+			this.activeTransactionClient = entry.clientId
+			this.armTransactionIdleTimer(entry.clientId)
+			return
+		}
+		if (this.activeTransactionClient === entry.clientId) {
+			this.armTransactionIdleTimer(entry.clientId)
+		}
+		if (
+			this.activeTransactionClient === entry.clientId &&
+			(entry.request.type === 'commit' || entry.request.type === 'rollback')
+		) {
+			this.activeTransactionClient = null
+			this.clearTransactionIdleTimer()
+		}
+	}
+
+	private resetFailedTransaction(entry: QueuedWorkerRequest): void {
+		if (this.activeTransactionClient === entry.clientId) {
+			this.activeTransactionClient = null
+			this.clearTransactionIdleTimer()
+		}
+	}
+
+	private armTransactionIdleTimer(clientId: string): void {
+		this.clearTransactionIdleTimer()
+		this.transactionIdleTimer = setTimeout(() => {
+			void this.reclaimClientNow(clientId, 'transaction-idle-timeout')
+		}, this.transactionIdleTimeoutMs)
+	}
+
+	private clearTransactionIdleTimer(): void {
+		if (this.transactionIdleTimer) {
+			clearTimeout(this.transactionIdleTimer)
+			this.transactionIdleTimer = null
+		}
+	}
+
+	private async reclaimClientNow(clientId: string, reason: string): Promise<void> {
+		if (this.reclaiming || this.activeTransactionClient !== clientId) {
+			return
+		}
+		this.reclaiming = true
+		this.clearTransactionIdleTimer()
+		this.activeTransactionClient = null
+		this.abortedClients.add(clientId)
+		this.rejectQueuedClientRequests(clientId, reason)
+
+		try {
+			const response = await this.inner.send({ id: 0, type: 'rollback' })
+			if (response.type === 'error') {
+				// If there was no active SQLite transaction left, the important state
+				// is already reclaimed in JS. The next request will establish a fresh
+				// transaction if needed.
+			}
+		} catch {
+			// Keep the queue moving. The inner worker will surface any unrecoverable
+			// state through subsequent requests.
+		} finally {
+			this.reclaiming = false
+			if (!this.terminated && this.nextRunnableIndex() !== -1) {
+				void this.processQueue()
+			}
+		}
+	}
+
+	private rejectQueuedClientRequests(clientId: string, reason: string): void {
+		const keep: QueuedWorkerRequest[] = []
+		for (const entry of this.queue) {
+			if (entry.clientId === clientId) {
+				entry.resolve({
+					id: entry.request.id,
+					type: 'error',
+					message: `Transaction client was reclaimed: ${reason}`,
+					code: 'TRANSACTION_ABORTED',
+				})
+			} else {
+				keep.push(entry)
+			}
+		}
+		this.queue = keep
+	}
+}
+
+function hasReclaimClient(bridge: WorkerBridge): bridge is ReclaimingWorkerBridge {
+	return typeof (bridge as Partial<ReclaimingWorkerBridge>).reclaimClient === 'function'
+}
+
+function createClientId(): string {
+	if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+		return crypto.randomUUID()
+	}
+	return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }

@@ -1023,6 +1023,14 @@ type KoraEvent =
       reason: 'lock-conflict' | 'timeout' | 'unsupported'
       message: string
     }
+  | {
+      type: 'store:storage-fallback'
+      dbName: string
+      from: 'opfs' | 'sqlite-wasm'
+      to: 'indexeddb'
+      reason: 'lock-conflict' | 'timeout' | 'unsupported'
+      message: string
+    }
   | { type: 'store:db-name-collision'; dbName: string; message: string }
   | {
       type: 'replay:completed'

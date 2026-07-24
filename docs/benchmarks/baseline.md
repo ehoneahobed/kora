@@ -48,4 +48,4 @@ pnpm benchmark:gates
 
 ## Multi-tab storage
 
-Leader election + `BroadcastChannel` RPC is covered by `packages/store/tests/integration/multi-tab-storage.test.ts`. **SharedWorker** (single worker per origin) remains a stretch goal; see `isSharedWorkerStorageSupported()` in `@korajs/store` multi-tab module.
+Leader election + `BroadcastChannel` RPC is covered by the multi-tab storage tests. SharedWorker-hosted SQLite is intentionally not a storage mode because OPFS SyncAccessHandle is dedicated-worker-only.

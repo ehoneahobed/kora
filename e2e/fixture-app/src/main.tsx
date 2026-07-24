@@ -3,7 +3,6 @@ import { createApp } from 'korajs'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
-import sharedHostUrl from './kora-shared-host.ts?sharedworker&url'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
 import schema from './schema'
 
@@ -12,14 +11,11 @@ const localOnly = import.meta.env.VITE_E2E_LOCAL === 'true'
 const params = new URLSearchParams(window.location.search)
 const dbFromUrl = params.get('db')
 const dbName = dbFromUrl ?? (localOnly ? 'kora-e2e-local' : 'kora-e2e-sync')
-// `?sw=1` exercises the SharedWorker storage path (the public-runtime shape).
-const useSharedWorker = params.get('sw') === '1'
 
 const app = createApp({
 	schema,
 	store: {
 		workerUrl: koraWorkerUrl,
-		...(useSharedWorker ? { sharedWorkerUrl: sharedHostUrl } : {}),
 		workerResponseTimeoutMs: 90_000,
 		name: dbName,
 	},

@@ -233,6 +233,7 @@ The full set of instrumentation events (the `KoraEvent` union) that Kora emits a
 | `state-machine:rejected` | An invalid state-machine transition was rejected. |
 | `store:persistence-error` | The store failed to persist data. |
 | `store:quota-exceeded` | The store hit a storage quota limit. |
-| `store:opfs-unavailable` | OPFS was unavailable, so the store fell back to a non-persistent in-memory database (writes are lost on reload). |
+| `store:storage-fallback` | OPFS was unavailable, so Kora recovered by using durable IndexedDB. |
+| `store:opfs-unavailable` | OPFS and IndexedDB were unavailable, so the store fell back to a non-persistent in-memory database (writes are lost on reload). |
 | `store:db-name-collision` | Another runtime on this origin already used this database name, so this runtime attached to it as a follower and shares that database. |
 | `replay:completed` | A time-travel replay to a target operation completed. |

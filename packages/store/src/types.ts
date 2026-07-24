@@ -22,6 +22,17 @@ export interface MigrationPlan {
 	transforms?: Array<(row: Record<string, unknown>) => Record<string, unknown>>
 }
 
+export type StorageFallbackReason = 'lock-conflict' | 'timeout' | 'unsupported'
+
+export interface StorageOpenState {
+	/** True when the selected adapter can survive reload/browser restart. */
+	persistent: boolean
+	/** The concrete storage mode the adapter is using after open. */
+	mode: 'opfs' | 'indexeddb' | 'memory' | 'native' | 'unknown'
+	/** Present when a primary storage mode degraded during open. */
+	fallbackReason?: StorageFallbackReason
+}
+
 /**
  * Storage adapter interface. All storage backends must implement this.
  * Operations are async to support both sync (better-sqlite3) and async (IndexedDB, WASM) backends.
@@ -44,6 +55,13 @@ export interface StorageAdapter {
 
 	/** Apply a schema migration */
 	migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
+
+	/**
+	 * Optional post-open storage state. Adapters that can silently degrade at
+	 * runtime should expose this so higher-level runtimes can promote to a durable
+	 * fallback before app code starts reading or writing user data.
+	 */
+	getStorageOpenState?(): StorageOpenState | null
 }
 
 /**

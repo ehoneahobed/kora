@@ -145,6 +145,19 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * A preferred storage backend could not provide durable storage, so Kora
+			 * promoted the app to another durable backend before user code observed the
+			 * store. This is informational: data still survives reloads.
+			 */
+			type: 'store:storage-fallback'
+			dbName: string
+			from: 'opfs' | 'sqlite-wasm'
+			to: 'indexeddb'
+			reason: 'lock-conflict' | 'timeout' | 'unsupported'
+			message: string
+	  }
+	| {
+			/**
 			 * Another runtime on this origin was already using this database name, so
 			 * this runtime attached to it as a follower and now SHARES that one
 			 * database. That is intended for multiple tabs of the SAME app; it is a bug
