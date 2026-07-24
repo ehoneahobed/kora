@@ -310,6 +310,33 @@ function autoMerge(
 		}
 
 		case 'richtext': {
+			// A plain-string richtext value is a full replacement, not a collaborative
+			// Yjs edit. Merging it as a CRDT would convert the string to a Yjs update
+			// with a RANDOM clientID at merge time, so two replicas merging the same
+			// (local, remote, base) would produce different bytes — a non-deterministic
+			// merge and permanent divergence. When either side is a plain string, resolve
+			// by last-write-wins (deterministic). Only merge as a CRDT when both sides are
+			// Yjs byte updates, which carry stable, baked-in clientIds.
+			if (typeof localValue === 'string' || typeof remoteValue === 'string') {
+				const lwwResult = lastWriteWins(
+					localValue,
+					remoteValue,
+					localOp.timestamp,
+					remoteOp.timestamp,
+				)
+				return createResult(
+					lwwResult.value,
+					fieldName,
+					localOp,
+					remoteOp,
+					localValue,
+					remoteValue,
+					baseValue,
+					'richtext-lww',
+					1,
+					startTime,
+				)
+			}
 			const merged = mergeRichtext(
 				localValue as RichtextValue,
 				remoteValue as RichtextValue,

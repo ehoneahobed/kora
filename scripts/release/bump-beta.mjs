@@ -80,8 +80,7 @@ try {
 const linkedBases = new Set(bumped.filter((p) => linkedGroup.has(p.name)).map((p) => p.base))
 if (linkedBases.size > 1) {
 	console.warn(
-		`\n⚠  The linked packages are not on a single base (${[...linkedBases].join(', ')}). ` +
-			'They are meant to version together; align them before publishing.',
+		`\n⚠  The linked packages are not on a single base (${[...linkedBases].join(', ')}). They are meant to version together; align them before publishing.`,
 	)
 }
 

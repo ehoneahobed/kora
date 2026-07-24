@@ -5,7 +5,7 @@ description: "Ship Kora.js apps as native desktop applications with Tauri: nativ
 
 # Tauri Desktop Apps
 
-Build native desktop applications with Kora.js using [Tauri](https://tauri.app). Your app gets native SQLite (no WASM, no Web Workers), a real filesystem, and a tiny binary — while keeping the same React code and sync capabilities as the web version.
+Build native desktop applications with Kora.js using [Tauri](https://tauri.app). Your app gets native SQLite (no WASM, no Web Workers), a real filesystem, and a tiny binary, while keeping the same React code and sync capabilities as the web version.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ Before you begin, install the Tauri prerequisites for your OS:
 
 - **macOS**: Xcode Command Line Tools (`xcode-select --install`)
 - **Windows**: Microsoft Visual Studio C++ Build Tools, WebView2
-- **Linux**: System dependencies vary by distro — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+- **Linux**: System dependencies vary by distro. See [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 You also need [Rust](https://rustup.rs/) installed:
 
@@ -34,7 +34,7 @@ Or select **Desktop (Tauri)** when prompted for platform:
 ```
 ? Platform:
   > Web (browser)
-    Desktop (Tauri — native SQLite)
+    Desktop (Tauri - native SQLite)
 ```
 
 Then:
@@ -45,7 +45,7 @@ pnpm install
 pnpm dev
 ```
 
-This starts both the **sync server** and the **Tauri desktop app**. The first build takes a few minutes while Rust compiles — subsequent builds are fast.
+This starts both the **sync server** and the **Tauri desktop app**. The first build takes a few minutes while Rust compiles; subsequent builds are fast.
 
 Once the native window opens, you have a working offline-first app with sync ready to go.
 
@@ -89,7 +89,7 @@ On the web, Kora runs SQLite compiled to WebAssembly inside a Web Worker. In a T
 - Direct filesystem access via app data directories
 - Faster queries, especially for large datasets
 
-The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically — no configuration needed:
+The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically, no configuration needed:
 
 ```typescript
 import { createApp } from 'korajs'
@@ -110,7 +110,7 @@ function TodoList() {
   const todos = useQuery(app.todos.where({ completed: false }))
   const addTodo = useMutation(app.todos.insert)
 
-  // Identical to web — works offline, syncs when connected
+  // Identical to web: works offline, syncs when connected
   return (
     <ul>
       {todos.map(todo => <li key={todo.id}>{todo.title}</li>)}
@@ -124,7 +124,7 @@ function TodoList() {
 The Tauri template comes with sync **enabled by default**. When you run `pnpm dev`, both the desktop app and a local sync server start together. The app connects to the server automatically.
 
 ```typescript
-// src/main.tsx — sync is configured out of the box
+// src/main.tsx - sync is configured out of the box
 const syncUrl = import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001/kora-sync'
 
 const app = createApp({
@@ -211,7 +211,7 @@ On first launch, the app shows a setup screen where users enter their sync serve
 
 1. **User enters the URL** provided by their organization admin (e.g., `wss://acme-corp.example.com/kora-sync`)
 2. **App tests the connection** and saves the URL locally
-3. **Subsequent launches** connect automatically — no repeated setup
+3. **Subsequent launches** connect automatically, no repeated setup
 
 Users can also skip setup to use the app in local-only mode. They can connect later from the settings gear icon in the header.
 
@@ -316,7 +316,7 @@ See the [Deployment Guide](/guide/deployment) for detailed step-by-step instruct
 pnpm build
 ```
 
-Users configure the sync server on first launch — no need to bake in a URL. If you want to pre-configure it for a specific organization:
+Users configure the sync server on first launch, no need to bake in a URL. If you want to pre-configure it for a specific organization:
 
 ```bash
 VITE_SYNC_URL=wss://my-app.fly.dev/kora-sync pnpm build
@@ -340,7 +340,7 @@ Share these with your users. On first launch, each user enters the sync server U
 
 ### Step 4: Verify sync works
 
-Install the app on two devices. Enter the same sync server URL on both. Create data on one device — it should appear on the other within a second or two. Data also works completely offline — changes sync when connectivity returns.
+Install the app on two devices. Enter the same sync server URL on both. Create data on one device. It should appear on the other within a second or two. Data also works completely offline. Changes sync when connectivity returns.
 
 ### Managing the deployed server
 
@@ -410,8 +410,8 @@ The template includes `tauri-plugin-updater` for automatic updates. When you rel
    ```
 
 3. **Add secrets** to your GitHub repo:
-   - `TAURI_SIGNING_PRIVATE_KEY` — contents of `~/.tauri/myapp.key`
-   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — password used during generation
+   - `TAURI_SIGNING_PRIVATE_KEY`: contents of `~/.tauri/myapp.key`
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: password used during generation
 
 ### Releasing
 
@@ -427,7 +427,7 @@ The included GitHub Actions workflow (`.github/workflows/release-desktop.yml`) b
 
 ### How it works
 
-On each app launch, the updater checks the endpoint for a newer version. If found, it downloads and installs the update. The app restarts with the new version. If the network is unavailable, the check is silently skipped — the app works fully offline.
+On each app launch, the updater checks the endpoint for a newer version. If found, it downloads and installs the update. The app restarts with the new version. If the network is unavailable, the check is silently skipped; the app works fully offline.
 
 ## CI/CD for Desktop Releases
 
@@ -444,16 +444,16 @@ The template includes a GitHub Actions workflow at `.github/workflows/release-de
 
 For professional distribution, you'll want to sign your binaries:
 
-**macOS** — Requires an Apple Developer ID certificate ($99/year):
+**macOS** requires an Apple Developer ID certificate ($99/year):
 - Prevents Gatekeeper from blocking your app
 - Required for notarization (recommended for all distributed macOS apps)
 - Add `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` to GitHub secrets
 
-**Windows** — An EV code signing certificate ($200-400/year from DigiCert, Sectigo, etc.):
+**Windows** needs an EV code signing certificate ($200-400/year from DigiCert, Sectigo, etc.):
 - Prevents SmartScreen warnings
 - Builds user trust
 
-Without code signing, users will see "unidentified developer" warnings. The app still works — users just have to click through the warning.
+Without code signing, users will see "unidentified developer" warnings. The app still works; users just have to click through the warning.
 
 ## Building for Distribution
 
@@ -501,7 +501,7 @@ The first `pnpm dev` compiles the Rust backend, which takes 2-5 minutes. Subsequ
 
 ### `tauri-plugin-kora` not found
 
-Make sure you've run `pnpm install` — the Tauri plugin is referenced from `node_modules/@korajs/tauri/plugin` in `Cargo.toml`.
+Make sure you've run `pnpm install`: the Tauri plugin is referenced from `node_modules/@korajs/tauri/plugin` in `Cargo.toml`.
 
 ### Window is blank
 
@@ -523,7 +523,7 @@ In development, the database is stored in Tauri's app data directory:
 
 ## What's Next
 
-- [Schema Design](/guide/schema-design) — Field types and relations
-- [Sync Configuration](/guide/sync-configuration) — Advanced sync options
-- [Deployment](/guide/deployment) — Full deployment guide with platform details
-- [Common Patterns](/guide/common-patterns) — Real-world patterns for offline-first apps
+- [Schema Design](/guide/schema-design): Field types and relations
+- [Sync Configuration](/guide/sync-configuration): Advanced sync options
+- [Deployment](/guide/deployment): Full deployment guide with platform details
+- [Common Patterns](/guide/common-patterns): Real-world patterns for offline-first apps

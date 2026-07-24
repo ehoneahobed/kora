@@ -44,6 +44,19 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.getOperationRange(nodeId, fromSeq, toSeq)
 	}
 
+	/**
+	 * Read a record's current field values (including a soft-deleted row) so the sync
+	 * engine can backfill scope / query-subset fields a partial update or delete does
+	 * not restate, and thus never wrongly drop an in-scope edit from sync.
+	 */
+	async readRecordFields(
+		collection: string,
+		recordId: string,
+	): Promise<Record<string, unknown> | null> {
+		const snapshot = await this.store.findMaterializedRow(collection, recordId)
+		return snapshot ? snapshot.record : null
+	}
+
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
 		return this.pipeline.applyRemote(op)
 	}

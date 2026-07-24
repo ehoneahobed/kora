@@ -448,9 +448,9 @@ Use the [DevTools Conflict Inspector](/guide/devtools) to view these traces in r
 Most applications work entirely with Tier 1 defaults. Add Tier 2 and 3 only where your domain requires it.
 
 
-## Field-level convergence (0.7.0)
+## Field-level convergence
 
-As of 0.7.0, scalar last-write-wins is resolved **per field, atomically,
+Scalar last-write-wins is resolved **per field, atomically,
 inside the write transaction**. Every materialized row carries a per-field
 last-writer register (`_field_versions`: field → serialized HLC timestamp of
 the last writer). When a remote update arrives, each field it touches is
@@ -460,7 +460,7 @@ regardless of the order operations arrive.
 
 What this guarantees in practice:
 
-- Concurrent edits to **different fields** of the same record both survive —
+- Concurrent edits to **different fields** of the same record both survive:
   neither device's change is lost.
 - Concurrent edits to the **same field** converge to one agreed winner on
   every device, deterministically.

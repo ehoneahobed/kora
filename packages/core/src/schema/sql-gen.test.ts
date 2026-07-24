@@ -12,9 +12,9 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos)
 
 		const createTable = stmts[0]
-		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS todos')
+		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS "todos"')
 		expect(createTable).toContain('id TEXT PRIMARY KEY NOT NULL')
-		expect(createTable).toContain('title TEXT NOT NULL')
+		expect(createTable).toContain('"title" TEXT NOT NULL')
 		expect(createTable).toContain('_created_at INTEGER NOT NULL')
 		expect(createTable).toContain('_updated_at INTEGER NOT NULL')
 		expect(createTable).toContain("_version TEXT NOT NULL DEFAULT ''")
@@ -28,12 +28,12 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos)
 		const createTable = stmts[0] ?? ''
 
-		expect(createTable).toContain('title TEXT NOT NULL') // string
-		expect(createTable).toContain('completed INTEGER DEFAULT 0') // boolean with default(false)
-		expect(createTable).toContain('assignee TEXT') // optional string
-		expect(createTable).toContain('tags TEXT DEFAULT') // array with default
-		expect(createTable).toContain('notes BLOB NOT NULL') // richtext (required)
-		expect(createTable).toContain('due_date INTEGER') // optional timestamp
+		expect(createTable).toContain('"title" TEXT NOT NULL') // string
+		expect(createTable).toContain('"completed" INTEGER DEFAULT 0') // boolean with default(false)
+		expect(createTable).toContain('"assignee" TEXT') // optional string
+		expect(createTable).toContain('"tags" TEXT DEFAULT') // array with default
+		expect(createTable).toContain('"notes" BLOB NOT NULL') // richtext (required)
+		expect(createTable).toContain('"due_date" INTEGER') // optional timestamp
 	})
 
 	test('generates CHECK constraint for enum fields', () => {
@@ -43,7 +43,7 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos)
 		const createTable = stmts[0] ?? ''
 
-		expect(createTable).toContain("CHECK (priority IN ('low', 'medium', 'high'))")
+		expect(createTable).toContain("CHECK (\"priority\" IN ('low', 'medium', 'high'))")
 	})
 
 	test('generates CREATE INDEX statements', () => {
@@ -85,7 +85,7 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos, schema.relations)
 		const createTable = stmts[0] ?? ''
 
-		expect(createTable).toContain('project_id TEXT REFERENCES projects(id)')
+		expect(createTable).toContain('"project_id" TEXT REFERENCES "projects"(id)')
 	})
 
 	test('auto-creates index on FK field not already indexed', () => {
@@ -97,7 +97,7 @@ describe('generateSQL', () => {
 		// project_id is not in the explicit indexes array, so an auto-index should be created
 		const fkIndex = stmts.find((s) => s.includes('idx_todos_project_id'))
 		expect(fkIndex).toBeDefined()
-		expect(fkIndex).toContain('ON todos (project_id)')
+		expect(fkIndex).toContain('ON "todos" ("project_id")')
 	})
 
 	test('does not duplicate index for FK field already indexed', () => {
@@ -152,8 +152,8 @@ describe('generateFullDDL', () => {
 		const schema = defineSchema(FULL_SCHEMA)
 		const stmts = generateFullDDL(schema)
 
-		expect(stmts.some((s) => s.includes('CREATE TABLE IF NOT EXISTS todos'))).toBe(true)
-		expect(stmts.some((s) => s.includes('CREATE TABLE IF NOT EXISTS projects'))).toBe(true)
+		expect(stmts.some((s) => s.includes('CREATE TABLE IF NOT EXISTS "todos"'))).toBe(true)
+		expect(stmts.some((s) => s.includes('CREATE TABLE IF NOT EXISTS "projects"'))).toBe(true)
 	})
 
 	test('metadata tables come before collection tables', () => {
@@ -161,7 +161,7 @@ describe('generateFullDDL', () => {
 		const stmts = generateFullDDL(schema)
 
 		const metaIndex = stmts.findIndex((s) => s.includes('_kora_meta'))
-		const todosIndex = stmts.findIndex((s) => s.includes('CREATE TABLE IF NOT EXISTS todos'))
+		const todosIndex = stmts.findIndex((s) => s.includes('CREATE TABLE IF NOT EXISTS "todos"'))
 
 		expect(metaIndex).toBeLessThan(todosIndex)
 	})

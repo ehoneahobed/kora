@@ -50,6 +50,50 @@ export function isAtomicOp(value: unknown): value is AtomicOpSentinel {
 }
 
 /**
+ * Apply a plain atomic op (`{ type, value }`) to a current value, producing the
+ * concrete result. This is the single source of truth for atomic-op semantics:
+ * {@link resolveAtomicOp} (sentinel form, used on the write path) delegates here,
+ * and the server's materialization replays stored atomic ops through it, so the
+ * server's materialized view composes concurrent atomic writes identically to the
+ * client. Folding this over a field's writes in HLC order yields, for a same-type
+ * atomic chain, exactly the composed intent (sum of increments, max of maxes, ...).
+ *
+ * @param currentValue - The current value of the field
+ * @param atomicOp - The atomic op to apply (type + operand)
+ * @returns The resulting concrete value
+ */
+export function applyAtomicOp(currentValue: unknown, atomicOp: AtomicOp): unknown {
+	switch (atomicOp.type) {
+		case 'increment': {
+			const current = typeof currentValue === 'number' ? currentValue : 0
+			const operand = atomicOp.value as number
+			return current + operand
+		}
+		case 'max': {
+			const current = typeof currentValue === 'number' ? currentValue : Number.NEGATIVE_INFINITY
+			return Math.max(current, atomicOp.value as number)
+		}
+		case 'min': {
+			const current = typeof currentValue === 'number' ? currentValue : Number.POSITIVE_INFINITY
+			return Math.min(current, atomicOp.value as number)
+		}
+		case 'append': {
+			const current = Array.isArray(currentValue) ? [...currentValue] : []
+			current.push(atomicOp.value)
+			return current
+		}
+		case 'remove': {
+			if (!Array.isArray(currentValue)) return []
+			// Compare by value (JSON), matching add-wins-set semantics, so removing an
+			// object or array element works instead of silently no-op'ing under the
+			// reference inequality that `!==` would give for non-primitives.
+			const target = JSON.stringify(atomicOp.value)
+			return currentValue.filter((item) => JSON.stringify(item) !== target)
+		}
+	}
+}
+
+/**
  * Resolve an atomic op sentinel against a current value to produce a concrete result.
  *
  * @param currentValue - The current value of the field in the database
@@ -57,30 +101,7 @@ export function isAtomicOp(value: unknown): value is AtomicOpSentinel {
  * @returns The resolved concrete value
  */
 export function resolveAtomicOp(currentValue: unknown, sentinel: AtomicOpSentinel): unknown {
-	switch (sentinel.type) {
-		case 'increment': {
-			const current = typeof currentValue === 'number' ? currentValue : 0
-			const operand = sentinel.value as number
-			return current + operand
-		}
-		case 'max': {
-			const current = typeof currentValue === 'number' ? currentValue : Number.NEGATIVE_INFINITY
-			return Math.max(current, sentinel.value as number)
-		}
-		case 'min': {
-			const current = typeof currentValue === 'number' ? currentValue : Number.POSITIVE_INFINITY
-			return Math.min(current, sentinel.value as number)
-		}
-		case 'append': {
-			const current = Array.isArray(currentValue) ? [...currentValue] : []
-			current.push(sentinel.value)
-			return current
-		}
-		case 'remove': {
-			if (!Array.isArray(currentValue)) return []
-			return currentValue.filter((item) => item !== sentinel.value)
-		}
-	}
+	return applyAtomicOp(currentValue, { type: sentinel.type, value: sentinel.value })
 }
 
 function createSentinel(type: AtomicOpType, value: unknown): AtomicOpSentinel {

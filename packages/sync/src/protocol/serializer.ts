@@ -360,6 +360,19 @@ interface ProtoEnvelope {
 	hasBytes?: boolean
 	/** Whether the server persists blob bytes centrally (handshake-response). */
 	blobStorageEnabled?: boolean
+	/** Fields 26-28: per-operation rejection (operation-rejected). code/message/retriable reuse the error fields. */
+	operationId?: string
+	collection?: string
+	recordId?: string
+	/** Field 29: client's delivery watermark on a handshake. */
+	lastDeliverySequence?: number
+	/** Fields 30-31: delivery-stream chaining on an operation-batch. */
+	baseDeliverySequence?: number
+	maxDeliverySequence?: number
+	/** Field 32: acked delivery sequence on an acknowledgment. */
+	deliverySequence?: number
+	/** Field 33: server's max delivery sequence on a handshake-response. */
+	serverMaxDeliverySequence?: number
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -376,6 +389,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				schemaVersion: message.schemaVersion,
 				authToken: message.authToken,
 				supportedWireFormats: message.supportedWireFormats,
+				...(message.lastDeliverySequence !== undefined
+					? { lastDeliverySequence: message.lastDeliverySequence }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -392,6 +408,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				selectedWireFormat: message.selectedWireFormat,
 				serverTime: message.serverTime,
 				blobStorageEnabled: message.blobStorageEnabled,
+				...(message.serverMaxDeliverySequence !== undefined
+					? { serverMaxDeliverySequence: message.serverMaxDeliverySequence }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -400,6 +419,12 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				operations: message.operations.map(serializeProtoOperation),
 				isFinal: message.isFinal,
 				batchIndex: message.batchIndex,
+				...(message.baseDeliverySequence !== undefined
+					? { baseDeliverySequence: message.baseDeliverySequence }
+					: {}),
+				...(message.maxDeliverySequence !== undefined
+					? { maxDeliverySequence: message.maxDeliverySequence }
+					: {}),
 			}
 		case 'acknowledgment':
 			return {
@@ -407,11 +432,27 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				messageId: message.messageId,
 				acknowledgedMessageId: message.acknowledgedMessageId,
 				lastSequenceNumber: message.lastSequenceNumber,
+				...(message.deliverySequence !== undefined
+					? { deliverySequence: message.deliverySequence }
+					: {}),
 			}
 		case 'error':
 			return {
 				type: message.type,
 				messageId: message.messageId,
+				errorCode: message.code,
+				errorMessage: message.message,
+				retriable: message.retriable,
+			}
+		case 'operation-rejected':
+			// Reuse errorCode/errorMessage/retriable (fields 16-18) for the shared
+			// code/message/retriable; fields 26-28 carry the operation identity.
+			return {
+				type: message.type,
+				messageId: message.messageId,
+				operationId: message.operationId,
+				collection: message.collection,
+				recordId: message.recordId,
 				errorCode: message.code,
 				errorMessage: message.message,
 				retriable: message.retriable,
@@ -466,6 +507,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				supportedWireFormats: envelope.supportedWireFormats?.filter(
 					(format): format is WireFormat => format === 'json' || format === 'protobuf',
 				),
+				...(envelope.lastDeliverySequence !== undefined
+					? { lastDeliverySequence: envelope.lastDeliverySequence }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -488,6 +532,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.blobStorageEnabled !== undefined
 					? { blobStorageEnabled: envelope.blobStorageEnabled }
 					: {}),
+				...(envelope.serverMaxDeliverySequence !== undefined
+					? { serverMaxDeliverySequence: envelope.serverMaxDeliverySequence }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -496,6 +543,12 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				operations: (envelope.operations ?? []).map(deserializeProtoOperation),
 				isFinal: envelope.isFinal ?? false,
 				batchIndex: envelope.batchIndex ?? 0,
+				...(envelope.baseDeliverySequence !== undefined
+					? { baseDeliverySequence: envelope.baseDeliverySequence }
+					: {}),
+				...(envelope.maxDeliverySequence !== undefined
+					? { maxDeliverySequence: envelope.maxDeliverySequence }
+					: {}),
 			}
 		case 'acknowledgment':
 			return {
@@ -503,6 +556,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				messageId: envelope.messageId,
 				acknowledgedMessageId: envelope.acknowledgedMessageId ?? '',
 				lastSequenceNumber: envelope.lastSequenceNumber ?? 0,
+				...(envelope.deliverySequence !== undefined
+					? { deliverySequence: envelope.deliverySequence }
+					: {}),
 			}
 		case 'error':
 			return {
@@ -510,6 +566,17 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				messageId: envelope.messageId,
 				code: envelope.errorCode ?? 'UNKNOWN',
 				message: envelope.errorMessage ?? 'Unknown error',
+				retriable: envelope.retriable ?? false,
+			}
+		case 'operation-rejected':
+			return {
+				type: 'operation-rejected',
+				messageId: envelope.messageId,
+				operationId: envelope.operationId ?? '',
+				collection: envelope.collection ?? '',
+				recordId: envelope.recordId ?? '',
+				code: envelope.errorCode ?? 'REJECTED',
+				message: envelope.errorMessage ?? '',
 				retriable: envelope.retriable ?? false,
 			}
 		case 'blob-chunk-request':
@@ -706,6 +773,23 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	// Field 25: server advertises central blob storage (handshake-response).
 	if (envelope.blobStorageEnabled !== undefined)
 		writer.uint32(200).bool(envelope.blobStorageEnabled)
+	// Fields 26-28: per-operation rejection identity (operation-rejected).
+	if (envelope.operationId && envelope.operationId.length > 0)
+		writer.uint32(210).string(envelope.operationId)
+	if (envelope.collection && envelope.collection.length > 0)
+		writer.uint32(218).string(envelope.collection)
+	if (envelope.recordId && envelope.recordId.length > 0)
+		writer.uint32(226).string(envelope.recordId)
+	// Fields 29-32: delivery-watermark protocol. int64 (field << 3 | wiretype 0).
+	if (envelope.lastDeliverySequence !== undefined)
+		writer.uint32(232).int64(envelope.lastDeliverySequence)
+	if (envelope.baseDeliverySequence !== undefined)
+		writer.uint32(240).int64(envelope.baseDeliverySequence)
+	if (envelope.maxDeliverySequence !== undefined)
+		writer.uint32(248).int64(envelope.maxDeliverySequence)
+	if (envelope.deliverySequence !== undefined) writer.uint32(256).int64(envelope.deliverySequence)
+	if (envelope.serverMaxDeliverySequence !== undefined)
+		writer.uint32(264).int64(envelope.serverMaxDeliverySequence)
 	return writer.finish()
 }
 
@@ -793,6 +877,30 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 25:
 				envelope.blobStorageEnabled = reader.bool()
+				break
+			case 26:
+				envelope.operationId = reader.string()
+				break
+			case 27:
+				envelope.collection = reader.string()
+				break
+			case 28:
+				envelope.recordId = reader.string()
+				break
+			case 29:
+				envelope.lastDeliverySequence = longToNumber(reader.int64())
+				break
+			case 30:
+				envelope.baseDeliverySequence = longToNumber(reader.int64())
+				break
+			case 31:
+				envelope.maxDeliverySequence = longToNumber(reader.int64())
+				break
+			case 32:
+				envelope.deliverySequence = longToNumber(reader.int64())
+				break
+			case 33:
+				envelope.serverMaxDeliverySequence = longToNumber(reader.int64())
 				break
 			default:
 				reader.skipType(tag & 7)

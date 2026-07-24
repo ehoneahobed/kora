@@ -5,7 +5,12 @@ import type {
 	Operation,
 	SchemaDefinition,
 } from '@korajs/core'
-import { HybridLogicalClock, KoraError, createOperation } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	KoraError,
+	createOperation,
+	replayOperationsForRecord,
+} from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { MergeEngine, MergeResult, ReferentialMergeContext, SideEffectOp } from '@korajs/merge'
 import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@korajs/merge'
@@ -452,47 +457,43 @@ export class ApplyPipeline implements LocalMutationHandler {
 	): Promise<ApplyResult | null> {
 		const snapshot = await this.deps.store.findMaterializedRow(op.collection, op.recordId)
 		if (!snapshot?.deleted) {
+			// Not a tombstone (never inserted): let the caller append the orphan.
 			return null
 		}
 
-		const localOp = await this.deps.store.getLatestLocalOperationForRecord(
-			op.collection,
-			op.recordId,
+		// A remote update landing on a tombstone must be resolved authoritatively by
+		// folding the record's whole operation log in HLC order — the same fold the
+		// server uses — so every device agrees on whether the update resurrects the
+		// record and on the resulting field values. The previous path only handled a
+		// LOCAL delete (via the pairwise merge engine) and left a remote-created
+		// tombstone hidden on any passive observer that received delete-then-update,
+		// and it materialized the resurrecting op's raw value rather than the composed
+		// atomic chain. Folding fixes both: delete-vs-newer-update convergence and
+		// atomic resurrection (increments before and after the delete compose correctly).
+		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
+		const ops = [...priorOps, op].sort((a, b) =>
+			HybridLogicalClock.compare(a.timestamp, b.timestamp),
 		)
-		if (!localOp || localOp.type !== 'delete') {
-			return null
+		const folded = replayOperationsForRecord(ops)
+
+		if (!folded) {
+			// The delete still wins: append the op to the log (so a later fold — e.g. an
+			// atomic resurrection composing this op's delta — is complete) but leave the
+			// row a clean tombstone: no zombie fields, no version regression.
+			return this.deps.store.applyRemoteOperation(op, { logOnly: true })
 		}
 
-		const mergeResult = await this.deps.mergeEngine.merge({
-			local: localOp,
-			remote: op,
-			baseState: op.previousData ?? {},
-			collectionDef,
-		})
-
-		if (mergeResult.appliedOperation === 'local') {
-			this.emitMergeLifecycle(op, localOp, mergeResult)
-			return 'skipped'
-		}
-
-		// The log keeps the canonical op; only the ROW materializes the merged
-		// data at max(local, remote). Guarded: a local write between our snapshot
-		// read and this apply invalidates the merge and triggers a retry.
-		const applyResult = await this.deps.store.applyRemoteOperation(op, {
+		// Resurrected: materialize the authoritative folded state and clear the
+		// tombstone. The log keeps the canonical op; the row takes the folded data at
+		// the newest operation's timestamp. Guarded so a concurrent local write retries.
+		const newestTimestamp = (ops[ops.length - 1] as Operation).timestamp
+		return this.deps.store.applyRemoteOperation(op, {
 			reactivateIfDeleted: true,
 			forceMaterialize: true,
-			materializeData: { ...mergeResult.mergedData },
-			materializeTimestamp: maxTimestamp(op.timestamp, localOp.timestamp),
+			materializeData: folded,
+			materializeTimestamp: maxTimestamp(op.timestamp, newestTimestamp),
 			guardRowState: guard,
 		})
-
-		this.emitMergeLifecycle(op, localOp, mergeResult)
-
-		if (applyResult === 'applied' && mergeResult.sideEffects.length > 0) {
-			await applySideEffectOps(this.deps.store, mergeResult.sideEffects, op.id)
-		}
-
-		return applyResult
 	}
 
 	private async applyMergedUpdate(
@@ -537,6 +538,17 @@ export class ApplyPipeline implements LocalMutationHandler {
 			constraintContext,
 		)
 
+		// Atomic-op fields are materialized by folding the record's operation log in
+		// HLC order (the same fold the server uses), not through the merge engine's
+		// pairwise `base + localDelta + remoteDelta`. The pairwise form is correct only
+		// for two concurrent writes from a shared base; with a third concurrent writer
+		// the current row already folds in an earlier remote delta, and re-deriving from
+		// base + the local device's own delta silently drops it (a lost update). The
+		// fold composes a same-type atomic chain and last-write-wins for anything else
+		// (including a plain set breaking the chain), so every device — author or passive
+		// observer — converges to the same value the server materializes.
+		const mergedData = await this.materializeAtomicFieldsFromLog(op, mergeResult.mergedData)
+
 		// The merged data is authoritative (it already folds in the current local
 		// row), so it must materialize even when its timestamp ties the current
 		// row version — otherwise the device that authored the newer of two
@@ -547,7 +559,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 		const applyResult = await this.deps.store.applyRemoteOperation(op, {
 			...applyOptions,
 			forceMaterialize: true,
-			materializeData: mergeResult.mergedData,
+			materializeData: mergedData,
 			materializeTimestamp: maxTimestamp(op.timestamp, localTimestamp),
 			guardRowState: guard,
 		})
@@ -561,6 +573,39 @@ export class ApplyPipeline implements LocalMutationHandler {
 		}
 
 		return applyResult
+	}
+
+	/**
+	 * Materialize the operation's atomic-op fields by folding the record's full
+	 * operation log (in HLC order, including this not-yet-appended op) through the
+	 * shared atomic-aware replay — the same fold the server uses. Non-atomic fields
+	 * keep their merge-engine result. This composes a same-type atomic chain and
+	 * last-write-wins for anything else, so all replicas converge regardless of how
+	 * many concurrent atomic writers there were or which device authored them.
+	 */
+	private async materializeAtomicFieldsFromLog(
+		op: Operation,
+		mergedData: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		if (!op.atomicOps || Object.keys(op.atomicOps).length === 0) {
+			return mergedData
+		}
+		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
+		// The op being applied is not in the log yet; fold it in at its HLC position.
+		const ops = [...priorOps, op].sort((a, b) =>
+			HybridLogicalClock.compare(a.timestamp, b.timestamp),
+		)
+		const folded = replayOperationsForRecord(ops)
+		if (!folded) {
+			return mergedData
+		}
+		const result = { ...mergedData }
+		for (const field of Object.keys(op.atomicOps)) {
+			if (field in folded) {
+				result[field] = folded[field]
+			}
+		}
+		return result
 	}
 
 	private async applyRemoteInsert(op: Operation): Promise<ApplyResult> {

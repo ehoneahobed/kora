@@ -1,5 +1,5 @@
 import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
-import { KoraError, createOperation } from '@korajs/core'
+import { KoraError, createOperation, quoteIdent } from '@korajs/core'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { serializeOperation, serializeRecord } from '../serialization/serializer'
 import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
@@ -172,7 +172,7 @@ export class RelationEnforcer {
 
 		// Find all non-deleted records that reference the deleted record
 		const referencingRows = await tx.query<{ id: string }>(
-			`SELECT id FROM ${sourceCollection} WHERE ${foreignKeyField} = ? AND _deleted = 0`,
+			`SELECT id FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
 			[deletedRecordId],
 		)
 
@@ -237,7 +237,7 @@ export class RelationEnforcer {
 
 		// Find all non-deleted records that reference the deleted record
 		const referencingRows = await tx.query<{ id: string }>(
-			`SELECT id FROM ${sourceCollection} WHERE ${foreignKeyField} = ? AND _deleted = 0`,
+			`SELECT id FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
 			[deletedRecordId],
 		)
 
@@ -302,7 +302,7 @@ export class RelationEnforcer {
 		const { sourceCollection, foreignKeyField, relationName } = incoming
 
 		const countRows = await tx.query<{ cnt: number }>(
-			`SELECT COUNT(*) as cnt FROM ${sourceCollection} WHERE ${foreignKeyField} = ? AND _deleted = 0`,
+			`SELECT COUNT(*) as cnt FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
 			[deletedRecordId],
 		)
 		const count = countRows[0]?.cnt ?? 0

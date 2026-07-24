@@ -47,7 +47,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT * FROM todos WHERE _deleted = 0')
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0')
 		expect(result.params).toEqual([])
 	})
 
@@ -58,7 +58,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT * FROM todos WHERE _deleted = 0 AND completed = ?')
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 AND "completed" = ?')
 		// Boolean false serialized to 0
 		expect(result.params).toEqual([0])
 	})
@@ -70,7 +70,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [{ field: 'title', direction: 'asc' }],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT * FROM todos WHERE _deleted = 0 ORDER BY title ASC')
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 ORDER BY "title" ASC')
 	})
 
 	test('adds multiple ORDER BY fields', () => {
@@ -83,7 +83,7 @@ describe('buildSelectQuery', () => {
 			],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('ORDER BY priority DESC, title ASC')
+		expect(result.sql).toContain('ORDER BY "priority" DESC, "title" ASC')
 	})
 
 	test('adds LIMIT and OFFSET', () => {
@@ -95,7 +95,7 @@ describe('buildSelectQuery', () => {
 			offset: 20,
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT * FROM todos WHERE _deleted = 0 LIMIT 10 OFFSET 20')
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 LIMIT 10 OFFSET 20')
 	})
 
 	test('handles multiple where conditions (AND)', () => {
@@ -105,9 +105,9 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('completed = ?')
+		expect(result.sql).toContain('"completed" = ?')
 		expect(result.sql).toContain('AND')
-		expect(result.sql).toContain('priority = ?')
+		expect(result.sql).toContain('"priority" = ?')
 		expect(result.params).toContain(0) // false -> 0
 		expect(result.params).toContain('high')
 	})
@@ -119,8 +119,8 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('count > ?')
-		expect(result.sql).toContain('count < ?')
+		expect(result.sql).toContain('"count" > ?')
+		expect(result.sql).toContain('"count" < ?')
 		expect(result.params).toEqual([5, 10])
 	})
 
@@ -131,7 +131,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('priority IN (?, ?)')
+		expect(result.sql).toContain('"priority" IN (?, ?)')
 		expect(result.params).toEqual(['low', 'high'])
 	})
 
@@ -142,7 +142,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('due_date IS NULL')
+		expect(result.sql).toContain('"due_date" IS NULL')
 		expect(result.params).toEqual([])
 	})
 
@@ -153,7 +153,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('due_date IS NOT NULL')
+		expect(result.sql).toContain('"due_date" IS NOT NULL')
 	})
 
 	test('allows querying by id field', () => {
@@ -163,7 +163,7 @@ describe('buildSelectQuery', () => {
 			orderBy: [],
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toContain('id = ?')
+		expect(result.sql).toContain('"id" = ?')
 		expect(result.params).toEqual(['abc-123'])
 	})
 
@@ -212,7 +212,7 @@ describe('buildCountQuery', () => {
 			orderBy: [],
 		}
 		const result = buildCountQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT COUNT(*) as count FROM todos WHERE _deleted = 0')
+		expect(result.sql).toBe('SELECT COUNT(*) as count FROM "todos" WHERE _deleted = 0')
 		expect(result.params).toEqual([])
 	})
 
@@ -224,7 +224,7 @@ describe('buildCountQuery', () => {
 		}
 		const result = buildCountQuery(descriptor, todoFields)
 		expect(result.sql).toBe(
-			'SELECT COUNT(*) as count FROM todos WHERE _deleted = 0 AND completed = ?',
+			'SELECT COUNT(*) as count FROM "todos" WHERE _deleted = 0 AND "completed" = ?',
 		)
 		expect(result.params).toEqual([1]) // true -> 1
 	})
@@ -241,7 +241,7 @@ describe('buildInsertQuery', () => {
 		}
 		const result = buildInsertQuery('todos', record)
 		expect(result.sql).toBe(
-			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			'INSERT INTO "todos" ("id", "title", "completed", "_created_at", "_updated_at") VALUES (?, ?, ?, ?, ?)',
 		)
 		expect(result.params).toEqual(['rec-1', 'Hello', 0, 1000, 1000])
 	})
@@ -253,7 +253,7 @@ describe('buildUpdateQuery', () => {
 			completed: 1,
 			_updated_at: 2000,
 		})
-		expect(result.sql).toBe('UPDATE todos SET completed = ?, _updated_at = ? WHERE id = ?')
+		expect(result.sql).toBe('UPDATE "todos" SET "completed" = ?, "_updated_at" = ? WHERE id = ?')
 		expect(result.params).toEqual([1, 2000, 'rec-1'])
 	})
 })
@@ -261,7 +261,7 @@ describe('buildUpdateQuery', () => {
 describe('buildSoftDeleteQuery', () => {
 	test('builds soft-delete UPDATE', () => {
 		const result = buildSoftDeleteQuery('todos', 'rec-1', 3000)
-		expect(result.sql).toBe('UPDATE todos SET _deleted = 1, _updated_at = ? WHERE id = ?')
+		expect(result.sql).toBe('UPDATE "todos" SET _deleted = 1, _updated_at = ? WHERE id = ?')
 		expect(result.params).toEqual([3000, 'rec-1'])
 	})
 })
@@ -299,14 +299,14 @@ describe('buildWhereClause', () => {
 	test('builds simple equality condition', () => {
 		const result = buildWhereClause({ title: 'Hello' }, todoFields)
 		expect(result).not.toBeNull()
-		expect(result?.sql).toBe('title = ?')
+		expect(result?.sql).toBe('"title" = ?')
 		expect(result?.params).toEqual(['Hello'])
 	})
 
 	test('handles $gte and $lte operators', () => {
 		const result = buildWhereClause({ count: { $gte: 1, $lte: 100 } }, todoFields)
-		expect(result?.sql).toContain('count >= ?')
-		expect(result?.sql).toContain('count <= ?')
+		expect(result?.sql).toContain('"count" >= ?')
+		expect(result?.sql).toContain('"count" <= ?')
 		expect(result?.params).toEqual([1, 100])
 	})
 })

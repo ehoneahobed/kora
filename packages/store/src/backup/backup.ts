@@ -1,4 +1,4 @@
-import { generateUUIDv7 } from '@korajs/core'
+import { generateUUIDv7, quoteIdent } from '@korajs/core'
 import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
 import { deserializeOperationWithCollection } from '../serialization/serializer'
 import type { OperationRow, StorageAdapter } from '../types'
@@ -388,7 +388,7 @@ export async function restoreBackup(
 				}
 
 				await tx.execute(
-					`INSERT OR IGNORE INTO _kora_ops_${collection} (id, node_id, type, record_id, data, previous_data, timestamp, sequence_number, causal_deps, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT OR IGNORE INTO ${quoteIdent(`_kora_ops_${collection}`)} (id, node_id, type, record_id, data, previous_data, timestamp, sequence_number, causal_deps, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					[
 						opRow.id,
 						opRow.node_id,
@@ -409,8 +409,8 @@ export async function restoreBackup(
 		await adapter.transaction(async (tx) => {
 			// Clear existing data
 			for (const collection of Object.keys(schema.collections)) {
-				await tx.execute(`DELETE FROM _kora_ops_${collection}`)
-				await tx.execute(`DELETE FROM ${collection}`)
+				await tx.execute(`DELETE FROM ${quoteIdent(`_kora_ops_${collection}`)}`)
+				await tx.execute(`DELETE FROM ${quoteIdent(collection)}`)
 			}
 			await tx.execute('DELETE FROM _kora_version_vector')
 			await tx.execute('DELETE FROM _kora_meta')
@@ -436,7 +436,7 @@ export async function restoreBackup(
 			for (const op of operations) {
 				const collection = op.collection
 				await tx.execute(
-					`INSERT INTO _kora_ops_${collection} (id, node_id, type, record_id, data, previous_data, timestamp, sequence_number, causal_deps, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO ${quoteIdent(`_kora_ops_${collection}`)} (id, node_id, type, record_id, data, previous_data, timestamp, sequence_number, causal_deps, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					[
 						op.id,
 						op.nodeId,
@@ -478,6 +478,7 @@ export async function restoreBackup(
 				for (const record of records) {
 					const keys = Object.keys(record)
 					const placeholders = keys.map(() => '?').join(', ')
+					const quotedKeys = keys.map((k) => quoteIdent(k)).join(', ')
 					const values = keys.map((k) => {
 						const v = record[k]
 						if (typeof v === 'boolean') return v ? 1 : 0
@@ -486,7 +487,7 @@ export async function restoreBackup(
 					})
 
 					await tx.execute(
-						`INSERT OR REPLACE INTO ${col} (${keys.join(', ')}) VALUES (${placeholders})`,
+						`INSERT OR REPLACE INTO ${quoteIdent(col)} (${quotedKeys}) VALUES (${placeholders})`,
 						values,
 					)
 				}
@@ -536,7 +537,7 @@ async function readAllOperations(
 
 	for (const collectionName of Object.keys(schema.collections)) {
 		const rows = await adapter.query<OperationRow>(
-			`SELECT * FROM _kora_ops_${collectionName} ORDER BY sequence_number ASC`,
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} ORDER BY sequence_number ASC`,
 		)
 
 		for (const row of rows) {
@@ -551,7 +552,9 @@ async function readCollectionRecords(
 	adapter: StorageAdapter,
 	collection: string,
 ): Promise<Record<string, unknown>[]> {
-	return adapter.query<Record<string, unknown>>(`SELECT * FROM ${collection} WHERE _deleted = 0`)
+	return adapter.query<Record<string, unknown>>(
+		`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
+	)
 }
 
 // ── Crypto helpers ───────────────────────────────────────────────────────────

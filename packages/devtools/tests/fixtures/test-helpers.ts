@@ -189,6 +189,15 @@ export function createSampleEvent<T extends KoraEventType>(
 			message: 'Clock drift detected',
 			retriable: false,
 		},
+		'sync:operation-rejected': {
+			type: 'sync:operation-rejected',
+			operationId: 'op-rejected',
+			collection: 'todos',
+			recordId: 'rec-002',
+			code: 'WINDOW_CLOSED',
+			message: 'Submissions are closed',
+			retriable: false,
+		},
 		'sync:diagnostics': {
 			type: 'sync:diagnostics',
 			diagnostics: {
@@ -250,6 +259,17 @@ export function createSampleEvent<T extends KoraEventType>(
 			type: 'store:quota-exceeded',
 			dbName: 'kora-db',
 			message: 'Quota exceeded',
+		},
+		'store:opfs-unavailable': {
+			type: 'store:opfs-unavailable',
+			dbName: 'kora-db',
+			reason: 'lock-conflict',
+			message: 'OPFS unavailable, running in memory',
+		},
+		'store:db-name-collision': {
+			type: 'store:db-name-collision',
+			dbName: 'kora-db',
+			message: 'Another runtime is already using this database name',
 		},
 		'replay:completed': {
 			type: 'replay:completed',

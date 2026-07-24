@@ -140,7 +140,7 @@ Last-Write-Wins merge strategy using HLC timestamps. The value with the later ti
 
 Used by default for `string`, `number`, `boolean`, `enum`, and `timestamp` fields.
 
-As of 0.7.0 the store applies this comparison per field: each materialized row records the last writer of every field in its `_field_versions` column, so a remote update wins or loses each field it touches independently. Concurrent edits to different fields of the same record both survive.
+The store applies this comparison per field: each materialized row records the last writer of every field in its `_field_versions` column, so a remote update wins or loses each field it touches independently. Concurrent edits to different fields of the same record both survive.
 
 ```typescript
 function lastWriteWins(

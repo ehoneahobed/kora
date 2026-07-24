@@ -30,10 +30,13 @@ import {
 	wireToVersionVector,
 } from '@korajs/sync'
 import { applyServerOperation } from '../apply/apply-server-operation'
+import type { OperationValidator } from '../apply/operation-validator'
+import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
-import { operationMatchesScopes } from '../scopes/server-scope-filter'
-import type { ServerStore } from '../store/server-store'
+import { missingScopeFields, operationMatchesScopes } from '../scopes/server-scope-filter'
+import type { ProductionHttpRouteContext } from '../server/route-context'
+import type { DeliveredOperation, ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
@@ -179,10 +182,31 @@ export interface ClientSessionOptions {
 	persistBlobChunk?: PersistBlobChunk
 	/** Called when this session closes */
 	onClose?: (sessionId: string) => void
+	/**
+	 * Called on close with relay operations this client never acknowledged, so the
+	 * server can buffer them per node id and redeliver on the client's next
+	 * connection. Closes the window where a relay dropped just before a reconnect
+	 * would otherwise be lost (the per-session retransmit tick never fires in time).
+	 */
+	onOrphanedRelays?: (nodeId: string, ops: Operation[]) => void
+	/**
+	 * Called once this session reaches streaming to pull any relay operations buffered
+	 * for its node id while it was disconnected. They are re-sent through the normal
+	 * relay path (re-filtered by this session's current scope).
+	 */
+	takeOrphanedRelays?: (nodeId: string) => Operation[]
 	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
 	maxOperationBytes?: number
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
 	maxOpsPerMinute?: number
+	/**
+	 * Adjudicate untrusted client operations before materialization. When present,
+	 * each incoming operation is passed to this validator; a `reject` decision
+	 * sends an operation-rejected message and skips materialization.
+	 */
+	validateOperation?: OperationValidator
+	/** Trusted data-plane context handed to the validator (read state, author derived ops). */
+	koraContext?: ProductionHttpRouteContext
 }
 
 /**
@@ -206,6 +230,40 @@ export class ClientSession {
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private resumeDeltaCursor: DeltaCursor | null = null
 
+	/**
+	 * The delivery watermark the client reported at handshake, or null when the client
+	 * does not use the delivery watermark (old client, or no watermark yet). When set,
+	 * the server drives the gap-free server->client stream from delivery sequences
+	 * instead of the version-vector delta.
+	 */
+	private clientDeliveryWatermark: number | null = null
+	/**
+	 * The highest delivery sequence this client has ACKNOWLEDGED (its confirmed
+	 * watermark, as reported in acks). Incremental streaming pushes resume from here, not
+	 * from the highest sequence sent, so a dropped or unapplied batch is always
+	 * re-included by the next push (which re-scans from the acknowledged position). This
+	 * is what makes streaming recovery independent of any bounded retransmit buffer: there
+	 * is no sent-but-unacked window that a buffer eviction could strand. Seeded from the
+	 * client's reported watermark at handshake.
+	 */
+	private lastAckedDeliverySeq = 0
+	/** Serializes incremental delivery pushes so their batches never interleave. */
+	private deliveryPushChain: Promise<void> = Promise.resolve()
+
+	/**
+	 * Relay batches sent to this client but not yet acknowledged, keyed by messageId.
+	 * The client acks every operation-batch it applies; on ack the entry is cleared.
+	 * {@link retransmitPendingRelays} re-sends anything still unacked, so a relay
+	 * dropped by a lossy transport is redelivered instead of leaving the client with a
+	 * permanent version-vector gap (a lost operation) that delta sync cannot recover.
+	 * Bounded so a silent client cannot grow it without limit.
+	 */
+	private readonly pendingRelays = new Map<
+		string,
+		{ message: SyncMessage; ops: Operation[]; sentAtMs: number }
+	>()
+	private static readonly MAX_PENDING_RELAYS = 1000
+
 	private readonly sessionId: string
 	private readonly transport: ServerTransport
 	private readonly store: ServerStore
@@ -222,9 +280,13 @@ export class ClientSession {
 	private readonly onBlobChunkResponse: BlobChunkResponseCallback | null
 	private readonly persistBlobChunk: PersistBlobChunk | null
 	private readonly onClose: ((sessionId: string) => void) | null
+	private readonly onOrphanedRelays: ((nodeId: string, ops: Operation[]) => void) | null
+	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly rateLimiter: SessionRateLimiter
+	private readonly validateOperation: OperationValidator | null
+	private readonly koraContext: ProductionHttpRouteContext | null
 
 	constructor(options: ClientSessionOptions) {
 		this.sessionId = options.sessionId
@@ -247,9 +309,13 @@ export class ClientSession {
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
 		this.persistBlobChunk = options.persistBlobChunk ?? null
 		this.onClose = options.onClose ?? null
+		this.onOrphanedRelays = options.onOrphanedRelays ?? null
+		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.validateOperation = options.validateOperation ?? null
+		this.koraContext = options.koraContext ?? null
 	}
 
 	/**
@@ -272,10 +338,56 @@ export class ClientSession {
 	 */
 	relayOperations(operations: Operation[]): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		// A delivery-watermark client is fed by the gap-free delivery stream, resumed from
+		// the last sequence sent to it, so its watermark keeps advancing live and a
+		// reconnect resends only what was genuinely missed. The specific operations from
+		// the fan-out are only a wake-up: the push pulls everything in scope after the send
+		// cursor from the delivery log, which is the authoritative, contiguous order.
+		if (this.clientDeliveryWatermark !== null) {
+			this.pushDeliveryStream()
+			return
+		}
 		if (operations.length === 0) return
+		// Visibility now requires an async record lookup (scope/subset backfill); relay
+		// is fire-and-forget, so run it without blocking the caller's fan-out loop.
+		void this.relayVisibleOperations(operations)
+	}
 
-		const visibleOperations = operations.filter((op) => this.operationVisibleToClient(op))
+	/**
+	 * Push newly-available in-scope operations to a delivery-watermark client, resuming
+	 * from the highest delivery sequence already sent. Pushes are serialized so their
+	 * batches never interleave (which would break the base/max chain).
+	 */
+	private pushDeliveryStream(): void {
+		this.deliveryPushChain = this.deliveryPushChain.then(async () => {
+			if (this.state !== 'streaming' || !this.transport.isConnected()) return
+			try {
+				// Resume from the client's last acknowledged sequence, not the last sent, so a
+				// dropped or unapplied batch is re-included here. Exclude the client's own
+				// operations during streaming; it already has them.
+				await this.sendDeliveryStream(
+					this.lastAckedDeliverySeq,
+					false,
+					this.clientNodeId ?? undefined,
+				)
+			} catch {
+				// A failed push (e.g. a transient store read error) must not reject the chain
+				// and stall all future pushes. The next push, or a reconnect resend from the
+				// client's watermark, recovers anything this push did not deliver.
+			}
+		})
+	}
+
+	private async relayVisibleOperations(operations: Operation[]): Promise<void> {
+		const visibleOperations: Operation[] = []
+		for (const op of operations) {
+			if (await this.operationVisibleToClient(op)) {
+				visibleOperations.push(op)
+			}
+		}
 		if (visibleOperations.length === 0) return
+		// Re-check liveness: an await may have elapsed since the caller's guard.
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 
 		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
 		const msg: SyncMessage = {
@@ -285,15 +397,71 @@ export class ClientSession {
 			isFinal: true,
 			batchIndex: 0,
 		}
+		// Track this relay until the client acks it, so a drop can be retransmitted.
+		this.trackPendingRelay(msg, visibleOperations)
 		this.sendToClient(msg)
+	}
+
+	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
+	private trackPendingRelay(msg: SyncMessage, ops: Operation[]): void {
+		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
+			const oldest = this.pendingRelays.keys().next().value
+			if (oldest !== undefined) {
+				this.pendingRelays.delete(oldest)
+			}
+		}
+		this.pendingRelays.set(msg.messageId, { message: msg, ops, sentAtMs: Date.now() })
+	}
+
+	/**
+	 * Retransmit relay batches this client has not acknowledged within `staleMs`.
+	 * Called on a periodic tick by the server (and directly by tests). Redelivering an
+	 * already-applied op is harmless: the client dedups by content-addressed id.
+	 */
+	retransmitPendingRelays(staleMs = 0): void {
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		// A delivery-watermark client recovers a dropped or stalled batch by re-pushing
+		// from its last acknowledged position (which re-includes anything unapplied), so a
+		// gap is recovered on the next tick even with no new operations and with no reliance
+		// on the bounded relay buffer. When the client is caught up the re-push is a no-op.
+		if (this.clientDeliveryWatermark !== null) {
+			this.pushDeliveryStream()
+			return
+		}
+		if (this.pendingRelays.size === 0) return
+		const cutoff = Date.now() - staleMs
+		for (const { message, sentAtMs } of this.pendingRelays.values()) {
+			if (sentAtMs <= cutoff) {
+				this.sendToClient(message)
+			}
+		}
 	}
 
 	/**
 	 * Close this session.
 	 */
+	/**
+	 * Hand any unacknowledged relays to the server so they survive this session and are
+	 * redelivered when this client reconnects (per-node buffer), then clear them. Called
+	 * from every session-teardown path (explicit close and transport close).
+	 */
+	private flushOrphanedRelays(): void {
+		if (this.onOrphanedRelays && this.clientNodeId && this.pendingRelays.size > 0) {
+			const ops: Operation[] = []
+			for (const entry of this.pendingRelays.values()) {
+				ops.push(...entry.ops)
+			}
+			if (ops.length > 0) {
+				this.onOrphanedRelays(this.clientNodeId, ops)
+			}
+		}
+		this.pendingRelays.clear()
+	}
+
 	close(reason?: string): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
+		this.flushOrphanedRelays()
 
 		if (this.transport.isConnected()) {
 			this.transport.close(1000, reason ?? 'session closed')
@@ -364,6 +532,11 @@ export class ClientSession {
 				await this.handleOperationBatch(message)
 				break
 			case 'acknowledgment':
+				this.pendingRelays.delete(message.acknowledgedMessageId)
+				if (message.deliverySequence !== undefined) {
+					// Advance the confirmed watermark; the next streaming push resumes here.
+					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
+				}
 				break
 			case 'error':
 				break
@@ -454,6 +627,24 @@ export class ClientSession {
 		}
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
+		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+
+		// Only read the server's delivery frontier when the client actually uses the
+		// watermark. If the client's reported watermark exceeds that frontier, the server's
+		// log was rolled back (for example a backup restore reset the sequence), so resync
+		// that client from the beginning rather than let it sit above a frontier that no
+		// longer exists; the server advertises its max so the client resets to match.
+		const clientUsesWatermark = this.clientDeliveryWatermark !== null
+		let serverMaxDelivery = 0
+		if (clientUsesWatermark) {
+			serverMaxDelivery = await this.store.getMaxDeliverySequence()
+			if (
+				this.clientDeliveryWatermark !== null &&
+				this.clientDeliveryWatermark > serverMaxDelivery
+			) {
+				this.clientDeliveryWatermark = 0
+			}
+		}
 
 		const serverVector = this.store.getVersionVector()
 		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
@@ -488,6 +679,10 @@ export class ClientSession {
 			accepted: true,
 			selectedWireFormat,
 			serverTime: Date.now(),
+			// The server's highest delivery sequence, so a client whose persisted watermark
+			// is ahead of it (server rolled back) can reset to a full resync. Sent only to
+			// watermark-using clients.
+			...(clientUsesWatermark ? { serverMaxDeliverySequence: serverMaxDelivery } : {}),
 			// Advertise central blob storage so the client uploads the bytes behind
 			// its blob fields, keeping them available after the author goes offline.
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
@@ -499,13 +694,42 @@ export class ClientSession {
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
 
-		// Transition to syncing and send delta
+		// Transition to syncing and send the server->client stream. A client that
+		// reports a delivery watermark gets the gap-free delivery stream (resumed from
+		// that watermark); an older client gets the version-vector delta. Both send only
+		// operations visible in this session's scope.
 		this.state = 'syncing'
-		const clientVector = wireToVersionVector(msg.versionVector)
-		await this.sendDelta(clientVector)
+		if (this.clientDeliveryWatermark !== null) {
+			this.lastAckedDeliverySeq = this.clientDeliveryWatermark
+			// Resuming from a non-zero watermark: the client already holds its own history,
+			// so exclude its own operations. A full resync (watermark 0, e.g. a fresh or
+			// recovered client) passes no exclusion so it recovers everything, its own
+			// operations included.
+			const excludeOwn =
+				this.clientDeliveryWatermark > 0 ? (this.clientNodeId ?? undefined) : undefined
+			await this.sendDeliveryStream(this.clientDeliveryWatermark, true, excludeOwn)
+		} else {
+			const clientVector = wireToVersionVector(msg.versionVector)
+			await this.sendDelta(clientVector)
+		}
 
 		// Transition to streaming after delta is sent
 		this.state = 'streaming'
+
+		// Redeliver any relays buffered while this client's node id was disconnected
+		// (dropped just before a prior reconnect). relayOperations re-filters them by
+		// this session's current scope and re-tracks them for acknowledgment.
+		if (this.takeOrphanedRelays && this.clientNodeId) {
+			const buffered = this.takeOrphanedRelays(this.clientNodeId)
+			if (buffered.length > 0) {
+				this.relayOperations(buffered)
+			}
+		}
+		// A delivery-watermark client needs no explicit drain here: an operation committed
+		// during the handshake-scan-to-streaming window is picked up by the next streaming
+		// push (or the retransmit tick), which resumes from the client's acknowledged
+		// position. Draining here would re-scan from the not-yet-advanced acknowledged
+		// position and re-send the whole handshake stream.
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -514,7 +738,7 @@ export class ClientSession {
 		const rejected: Operation[] = []
 
 		for (const op of operations) {
-			if (!this.operationVisibleToClient(op)) {
+			if (!(await this.operationVisibleToClient(op))) {
 				rejected.push(op)
 				continue
 			}
@@ -547,10 +771,48 @@ export class ClientSession {
 				continue
 			}
 
+			// Server-side adjudication of untrusted client operations. Runs after
+			// the built-in guards and before materialization, so a rejected op never
+			// enters the authoritative log and never relays to other clients.
+			if (this.validateOperation && this.koraContext) {
+				let decision: Awaited<ReturnType<OperationValidator>>
+				try {
+					decision = await this.validateOperation(op, {
+						auth: this.authContext,
+						kora: this.koraContext,
+					})
+				} catch (error) {
+					// A throwing validator must not crash ingestion or silently accept.
+					// Treat it as a retriable rejection so the submitter can try again.
+					const message = error instanceof Error ? error.message : 'validator error'
+					this.sendOperationRejected(op, 'VALIDATION_ERROR', `Validator threw: ${message}`, true)
+					continue
+				}
+				if (decision.action === 'reject') {
+					this.sendOperationRejected(
+						op,
+						decision.code,
+						decision.message,
+						decision.retriable ?? isRetriableRejection(decision.code),
+					)
+					continue
+				}
+				if (decision.action === 'ignore') {
+					// The server took responsibility out of band; do not materialize the
+					// raw op and do not reject. The batch ack lets the client drop it.
+					continue
+				}
+				// action === 'accept' falls through to normal materialization.
+			}
+
 			try {
 				const applyResult = await applyServerOperation(this.store, op)
 				if (applyResult.rejection) {
-					this.sendError(applyResult.rejection.code, applyResult.rejection.message, false)
+					this.sendError(
+						applyResult.rejection.code,
+						applyResult.rejection.message,
+						applyResult.rejection.retriable,
+					)
 					continue
 				}
 				if (applyResult.result === 'applied') {
@@ -605,8 +867,11 @@ export class ClientSession {
 			const clientSeq = clientVector.get(nodeId) ?? 0
 			if (serverSeq > clientSeq) {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
-				const visible = ops.filter((op) => this.operationVisibleToClient(op))
-				missing.push(...visible)
+				for (const op of ops) {
+					if (await this.operationVisibleToClient(op)) {
+						missing.push(op)
+					}
+				}
 			}
 		}
 
@@ -665,11 +930,157 @@ export class ClientSession {
 		}
 	}
 
-	private operationVisibleToClient(op: Operation): boolean {
-		if (!operationMatchesScopes(op, this.authContext?.scopes)) {
+	/**
+	 * Send the gap-free server->client delivery stream, resuming just after
+	 * `fromDeliverySeq`. Operations are scanned in server delivery-sequence order
+	 * (commit order), scope-filtered for this session, and sent in batches that chain:
+	 * each batch's `baseDeliverySequence` equals the previous batch's
+	 * `maxDeliverySequence` (the first batch bases on `fromDeliverySeq`). The client
+	 * applies a batch only when its watermark equals the base and advances the
+	 * watermark to the max, so a dropped batch stalls the watermark and is recovered by
+	 * the next handshake resend. Because delivery-sequence order respects causal order
+	 * (a dependency is always committed, and thus sequenced, before its dependent), no
+	 * topological sort is needed and the client never defers on a missing dependency
+	 * that is itself in this stream.
+	 *
+	 * The final batch advances the watermark to the highest delivery sequence scanned,
+	 * not merely the last in-scope one, so an out-of-scope tail is not re-scanned on the
+	 * next reconnect. Returns the number of operations actually sent.
+	 */
+	private async sendDeliveryStream(
+		fromDeliverySeq: number,
+		finalizeWhenEmpty: boolean,
+		excludeNodeId?: string,
+	): Promise<number> {
+		const scanChunk = Math.max(this.batchSize, 1) * 5
+		let scanCursor = fromDeliverySeq
+		let maxScanned = fromDeliverySeq
+		const visible: DeliveredOperation[] = []
+
+		while (true) {
+			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
+			const last = chunk[chunk.length - 1]
+			if (last === undefined) break
+			scanCursor = last.deliverySequence
+			// maxScanned counts every operation scanned, including any excluded (own or
+			// out-of-scope) ones, so the batch max advances the client's watermark past
+			// them even though they are not sent.
+			maxScanned = scanCursor
+			for (const delivered of chunk) {
+				// Skip the client's own operations during streaming: it already holds them,
+				// so echoing them back is pure waste. They are still counted in maxScanned,
+				// and a full resync (fromDeliverySeq 0) passes no excludeNodeId, so a client
+				// that lost its local store still recovers its own history.
+				if (excludeNodeId !== undefined && delivered.operation.nodeId === excludeNodeId) {
+					continue
+				}
+				if (await this.operationVisibleToClient(delivered.operation)) {
+					visible.push(delivered)
+				}
+			}
+			if (chunk.length < scanChunk) break
+		}
+
+		if (visible.length === 0) {
+			// Nothing in scope after the cursor. On a handshake resume, send a single empty
+			// final batch so the client advances past an out-of-scope tail and completes
+			// initial sync. During streaming, send nothing (an empty batch every relay tick
+			// would be pure noise); a reconnect re-scans the small tail if needed.
+			if (finalizeWhenEmpty) {
+				this.sendDeliveryBatch([], fromDeliverySeq, maxScanned, 0, true)
+			}
+			return 0
+		}
+
+		const totalBatches = Math.ceil(visible.length / this.batchSize)
+		let base = fromDeliverySeq
+		for (let i = 0; i < totalBatches; i++) {
+			const slice = visible.slice(i * this.batchSize, (i + 1) * this.batchSize)
+			const lastInSlice = slice[slice.length - 1]
+			if (lastInSlice === undefined) continue
+			const isFinal = i === totalBatches - 1
+			const lastSeq = lastInSlice.deliverySequence
+			// The final batch carries the max scanned sequence (>= lastSeq) so the client
+			// skips past any out-of-scope operations above the last in-scope one.
+			const max = isFinal ? Math.max(maxScanned, lastSeq) : lastSeq
+			this.sendDeliveryBatch(slice, base, max, i, isFinal)
+			base = max
+		}
+		return visible.length
+	}
+
+	/** Build, track, and send one chained delivery-stream batch. */
+	private sendDeliveryBatch(
+		slice: DeliveredOperation[],
+		base: number,
+		max: number,
+		batchIndex: number,
+		isFinal: boolean,
+	): void {
+		const batchMsg: SyncMessage = {
+			type: 'operation-batch',
+			messageId: generateUUIDv7(),
+			operations: slice.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			isFinal,
+			batchIndex,
+			baseDeliverySequence: base,
+			maxDeliverySequence: max,
+		}
+		// Delivery batches are NOT tracked in the bounded pending-relay buffer: recovery of
+		// a dropped or unapplied batch is by re-scan from the client's acknowledged
+		// position (the next push or the retransmit tick), which cannot be defeated by a
+		// buffer eviction. The client re-acks a duplicate and stalls on a gap, so re-sends
+		// are always safe.
+		this.sendToClient(batchMsg)
+		if (slice.length > 0) {
+			this.emitter?.emit({
+				type: 'sync:sent',
+				operations: slice.map((delivered) => delivered.operation),
+				batchSize: slice.length,
+			})
+		}
+	}
+
+	private async operationVisibleToClient(op: Operation): Promise<boolean> {
+		const scopes = this.authContext?.scopes
+		const subsets = this.syncQuerySubsets
+		// A partial update (or a delete) may not carry the scope / query-subset fields
+		// in its own data. Judging visibility from the bare op would wrongly hide such
+		// an operation, so backfill those fields from the materialized record (including
+		// a soft-deleted one) whenever they are missing. Only look up when needed so the
+		// common case (inserts, or ops that already carry the fields) stays lookup-free.
+		const needsBackfill =
+			missingScopeFields(op, scopes).length > 0 || (subsets !== undefined && subsets.length > 0)
+		const fullRecord = needsBackfill
+			? await this.lookupRecordFields(op.collection, op.recordId)
+			: undefined
+
+		if (!operationMatchesScopes(op, scopes, fullRecord)) {
 			return false
 		}
-		return operationMatchesQuerySubsets(op, this.syncQuerySubsets)
+		return operationMatchesQuerySubsets(op, subsets, fullRecord)
+	}
+
+	/**
+	 * Read a record's current field values from the materialized store for scope /
+	 * query-subset backfill. Includes soft-deleted rows so a relayed delete (whose op
+	 * carries no fields) is still judged against the record's actual scope. Returns
+	 * undefined when the record cannot be read (never materialized, or no schema).
+	 */
+	private async lookupRecordFields(
+		collection: string,
+		recordId: string,
+	): Promise<Record<string, unknown> | undefined> {
+		try {
+			const rows = await this.store.queryCollection(collection, {
+				where: { id: recordId },
+				includeDeleted: true,
+				limit: 1,
+			})
+			return rows[0]
+		} catch {
+			return undefined
+		}
 	}
 
 	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
@@ -693,6 +1104,31 @@ export class ClientSession {
 		this.sendToClient(errorMsg)
 	}
 
+	/**
+	 * Reject one specific client operation, tied to its id, so the submitter can
+	 * divert it out of its pending queue into a durable rejected store rather than
+	 * losing it or retrying forever. The op is NOT materialized, so no other
+	 * replica ever sees it.
+	 */
+	private sendOperationRejected(
+		op: Operation,
+		code: string,
+		message: string,
+		retriable: boolean,
+	): void {
+		const rejectedMsg: SyncMessage = {
+			type: 'operation-rejected',
+			messageId: generateUUIDv7(),
+			operationId: op.id,
+			collection: op.collection,
+			recordId: op.recordId,
+			code,
+			message,
+			retriable,
+		}
+		this.sendToClient(rejectedMsg)
+	}
+
 	private setSerializerWireFormat(format: WireFormat): void {
 		if (typeof this.serializer.setWireFormat === 'function') {
 			this.serializer.setWireFormat(format)
@@ -702,6 +1138,7 @@ export class ClientSession {
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
+		this.flushOrphanedRelays()
 		this.emitter?.emit({ type: 'sync:disconnected', reason: 'transport closed' })
 		this.onClose?.(this.sessionId)
 	}

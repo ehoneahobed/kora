@@ -16,7 +16,7 @@ Many apps need both authenticated and public access. For example:
 - A **survey tool** where respondents don't need accounts
 - A **feedback widget** embedded on any website
 
-Kora supports this with `MixedAuthProvider` on the server and anonymous sync on the client. Public users get full offline-first capabilities — their data saves locally and syncs when connected.
+Kora supports this with `MixedAuthProvider` on the server and anonymous sync on the client. Public users get full offline-first capabilities: their data saves locally and syncs when connected.
 
 ### Server Setup
 
@@ -74,9 +74,9 @@ Anonymous users' operations are synced to the server and visible to authenticate
 
 A common mistake is storing aggregated values (counts, sums, averages) as fields on a record, then trying to keep them in sync. This breaks in offline-first apps because:
 
-1. **Sync scoping** — anonymous users may not have write access to the collection containing the counter
-2. **Concurrent updates** — two devices incrementing a counter with a plain read-modify-write update can lose an increment (per-field LWW picks one writer). Atomic `op.increment()` and fields declared `.merge('counter')` compose to the sum of both deltas instead, but the plain update pattern shown below does not
-3. **Stale data** — the counter can drift from reality if any update is lost or filtered
+1. **Sync scoping**: anonymous users may not have write access to the collection containing the counter
+2. **Concurrent updates**: two devices incrementing a counter with a plain read-modify-write update can lose an increment (per-field LWW picks one writer). Atomic `op.increment()` and fields declared `.merge('counter')` compose to the sum of both deltas instead, but the plain update pattern shown below does not
+3. **Stale data**: the counter can drift from reality if any update is lost or filtered
 
 **Instead, derive aggregated values from the actual data at query time.**
 
@@ -101,7 +101,7 @@ const schema = defineSchema({
   },
 })
 
-// On submission — this can fail if the user can't write to 'forms'
+// On submission - this can fail if the user can't write to 'forms'
 await app.forms.update(formId, { responseCount: currentCount + 1 })
 ```
 
@@ -201,7 +201,7 @@ Transactions are local-only. They ensure atomicity on the device where they run.
 
 ## Sequences
 
-Sequences generate formatted, ordered identifiers like invoice numbers, order codes, or receipt IDs. They are offline-safe — each device maintains its own counter.
+Sequences generate formatted, ordered identifiers like invoice numbers, order codes, or receipt IDs. They are offline-safe: each device maintains its own counter.
 
 ### Basic Usage
 
@@ -223,13 +223,13 @@ Available format tokens: `{seq}`, `{seq:N}` (zero-padded), `{date}` (YYYYMMDD), 
 
 ### Scoped Sequences
 
-Independent counters per scope — useful for per-store, per-tenant, or per-category numbering:
+Independent counters per scope, useful for per-store, per-tenant, or per-category numbering:
 
 ```typescript
 // Each store gets its own sequence
 const storeAReceipt = await app.sequences.next('receipt', { scope: 'store-A' })
 const storeBReceipt = await app.sequences.next('receipt', { scope: 'store-B' })
-// Both return 'receipt-0001' — independent counters
+// Both return 'receipt-0001' - independent counters
 ```
 
 ### Using Sequences with Records
@@ -259,7 +259,7 @@ When a user's session expires or the server resets, sync connections will fail a
 
 ```typescript
 app.events.on('sync:auth-failed', () => {
-  console.warn('Sync auth failed — signing out stale session')
+  console.warn('Sync auth failed - signing out stale session')
   authClient.signOut()
 })
 ```
@@ -314,7 +314,7 @@ app.get('/api/forms/:id/stats', async (req, res) => {
 ```
 
 ::: tip
-Materialized collection queries are indexed SQL queries — O(1) lookups, not operation log replays. Always define `indexes` in your schema for fields you query frequently.
+Materialized collection queries are indexed SQL queries: O(1) lookups, not operation log replays. Always define `indexes` in your schema for fields you query frequently.
 :::
 
 ---
@@ -348,7 +348,7 @@ When scopes are set, the server filters operations in both directions:
 - **Outbound**: Only sends operations matching the user's scopes
 - **Inbound**: Only accepts operations targeting collections the user has access to
 
-Collections **not listed** in scopes are inaccessible — the user won't sync any data for those collections.
+Collections **not listed** in scopes are inaccessible; the user won't sync any data for those collections.
 
 ---
 
@@ -445,7 +445,7 @@ function FormWithResponses({ formId }: { formId: string }) {
 }
 ```
 
-Since all data is local, these queries are instant — no loading spinners needed. The `useQuery` hook re-renders automatically when new responses sync in.
+Since all data is local, these queries are instant: no loading spinners needed. The `useQuery` hook re-renders automatically when new responses sync in.
 
 ---
 
@@ -458,16 +458,16 @@ Listen for sync events to surface issues to users:
 ```typescript
 app.events.on('sync:disconnected', ({ reason }) => {
   // Show offline indicator
-  showToast('Working offline — changes will sync when connected')
+  showToast('Working offline - changes will sync when connected')
 })
 
 app.events.on('sync:connected', () => {
-  showToast('Back online — syncing changes')
+  showToast('Back online - syncing changes')
 })
 
-app.events.on('sync:error', ({ error }) => {
-  console.error('Sync error:', error)
-  // Don't panic — local data is safe, sync will retry
+app.events.on('sync:apply-failed', ({ message }) => {
+  console.error('Sync error:', message)
+  // Don't panic: local data is safe, sync will retry
 })
 ```
 
@@ -479,7 +479,7 @@ Show users how many changes haven't synced yet:
 function SyncBadge() {
   const status = useSyncStatus()
 
-  if (status.state === 'offline' && status.pendingOperations > 0) {
+  if (status.status === 'offline' && status.pendingOperations > 0) {
     return (
       <span>{status.pendingOperations} changes waiting to sync</span>
     )
@@ -489,4 +489,4 @@ function SyncBadge() {
 }
 ```
 
-Pending operations are persisted locally — they survive page refreshes and app restarts. They'll sync automatically on the next successful connection.
+Pending operations are persisted locally; they survive page refreshes and app restarts. They'll sync automatically on the next successful connection.

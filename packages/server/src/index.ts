@@ -68,7 +68,19 @@ export type {
 	RouteMutation,
 	RouteScopeOptions,
 	RouteApplyResult,
+	RouteConditionalApply,
+	RouteConditionalResult,
 } from './server/route-context'
+export type { RoutePredicate, RoutePredicateOperators } from './apply/route-predicate'
+
+export type { OperationRejection } from './apply/rejection-taxonomy'
+export { RETRIABLE_REJECTION_CODES, isRetriableRejection } from './apply/rejection-taxonomy'
+
+export type {
+	OperationDecision,
+	OperationValidationContext,
+	OperationValidator,
+} from './apply/operation-validator'
 
 export type { TokenAuthProviderOptions } from './auth/token-auth'
 export type { KoraAuthProviderOptions } from './auth/kora-auth-provider'

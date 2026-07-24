@@ -612,10 +612,10 @@ Client                                    Server
 ```
 
 **Sync rules:**
-- Operations are sent in CAUSAL ORDER. Dependencies before dependents.
+- Operations are sent in CAUSAL ORDER. Dependencies before dependents. (Server-to-client delivery order is the server-assigned delivery sequence, which is assigned in commit order and therefore respects causal order: a dependency is always committed, and thus sequenced, before its dependent.)
 - The protocol is IDEMPOTENT. Receiving the same operation twice is a no-op (content-addressing catches duplicates).
-- The protocol is RESUMABLE. If connection drops mid-sync, resume from the last acknowledged sequence number, not from the beginning.
-- Initial sync (new client) receives all operations matching its sync scope. For large datasets, this is paginated in batches with `is_final` flag on the last batch.
+- The protocol is RESUMABLE and GAP-FREE server-to-client. Every stored operation carries a monotonic delivery sequence; each client tracks a durable **delivery watermark** (the highest delivery sequence up to which it has applied every in-scope operation with no gap). Server-to-client batches chain `baseDeliverySequence -> maxDeliverySequence`; the client applies a batch only when its watermark equals the base and advances only on full apply, so a dropped or failed operation stalls the watermark and is re-sent, never skipped. This closes both the version-vector gap (a later op advancing the vector past a dropped one) and the resume-cursor skip (a retriable apply failure skipping an op). The version vector remains authoritative for the client-to-server direction and local dedup. See `docs/design/durable-delivery.md`.
+- Initial sync (new client) receives all operations matching its sync scope, resumed from the client's delivery watermark (0 on first sync). For large datasets, this is paginated in batches with `is_final` flag on the last batch.
 - Outbound queue persists to local storage. Operations survive page refresh and are sent when connection is re-established.
 
 ### Storage Adapter Interface

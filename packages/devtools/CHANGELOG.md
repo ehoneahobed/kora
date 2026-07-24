@@ -1,5 +1,16 @@
 # @korajs/devtools
 
+## 1.0.0-beta.5
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @korajs/core@1.0.0-beta.5
+
 ## 1.0.0-beta.0
 
 ### Patch Changes

@@ -4,6 +4,8 @@
 // === Types ===
 export type {
 	QueueStorage,
+	RejectedOperation,
+	RejectedOperationStorage,
 	SyncStatePersistence,
 	SyncConfig,
 	SyncEncryptionConfig,
@@ -15,7 +17,13 @@ export type {
 	DeltaCursor,
 } from './types'
 
-export { InvalidScopeError, ScopeViolationError, SYNC_STATES, SYNC_STATUSES } from './types'
+export {
+	InvalidScopeError,
+	MemoryRejectedOperationStorage,
+	ScopeViolationError,
+	SYNC_STATES,
+	SYNC_STATUSES,
+} from './types'
 
 // === Scope Filtering ===
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
@@ -43,6 +51,7 @@ export type {
 	HandshakeMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
+	OperationRejectedMessage,
 	SerializedOperation,
 	SyncMessage,
 	WireFormat,
@@ -60,6 +69,7 @@ export {
 	isHandshakeMessage,
 	isHandshakeResponseMessage,
 	isOperationBatchMessage,
+	isOperationRejectedMessage,
 	isSyncMessage,
 } from './protocol/messages'
 

@@ -311,7 +311,7 @@ transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
 |-----------|------|-------------|
 | `fn` | `(tx: TransactionProxy) => Promise<void>` | Function that performs mutations using the transaction proxy. |
 
-**Returns:** `Promise<Operation[]>` — The operations created by the transaction.
+**Returns:** `Promise<Operation[]>` -- The operations created by the transaction.
 
 ```typescript
 const ops = await app.transaction(async (tx) => {
@@ -326,7 +326,7 @@ The transaction proxy (`tx`) provides the same collection accessors as the app (
 
 ### app.mutation(name, fn)
 
-A named transaction — identical to `app.transaction()` but with a name that appears in DevTools for easier debugging.
+A named transaction, identical to `app.transaction()` but with a name that appears in DevTools for easier debugging.
 
 ```typescript
 mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
@@ -363,7 +363,7 @@ Queries (`.where()`, `.exec()`) are not available inside transactions. Use `find
 
 ## Sequences
 
-Sequences generate ordered, formatted identifiers (invoice numbers, order codes, receipt IDs). They are offline-safe — each device maintains its own counter that increments monotonically.
+Sequences generate ordered, formatted identifiers (invoice numbers, order codes, receipt IDs). They are offline-safe: each device maintains its own counter that increments monotonically.
 
 ### app.sequences.next(name, config?)
 
@@ -669,41 +669,229 @@ interface Transaction {
 
 ### Built-in adapters
 
-| Adapter | Identifier | Environment | Description |
-|---------|------------|-------------|-------------|
-| SQLite WASM + OPFS | `'sqlite-wasm'` | Browser | Primary adapter. Runs SQLite in a Web Worker with OPFS persistence. Best performance. |
-| IndexedDB | `'indexeddb'` | Browser | Fallback adapter. Used automatically when WASM/OPFS is unavailable. |
-| Native SQLite | `'better-sqlite3'` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
+Each adapter is a class that implements `StorageAdapter`. Adapters ship as separate subpath entry points so that a browser bundle never pulls in Node-only code (and vice versa).
+
+| Adapter | Import | Class | Environment | Notes |
+|---------|--------|-------|-------------|-------|
+| SQLite WASM + OPFS | `@korajs/store/sqlite-wasm` | `SqliteWasmAdapter` | Browser | Primary adapter. Runs SQLite in a Web Worker with OPFS persistence. Best performance. |
+| IndexedDB | `@korajs/store/indexeddb` | `IndexedDbAdapter` | Browser | Fallback adapter. Selected only when the OPFS API is entirely absent from the runtime. It is NOT the recovery path for an OPFS install that fails at runtime (see Storage diagnostics). |
+| Native SQLite | `@korajs/store/better-sqlite3` | `BetterSqlite3Adapter` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
+
+The Tauri desktop adapter (`tauri-sqlite`) is provided by the separate `@korajs/tauri` package, not by `@korajs/store`.
 
 ### Selecting an adapter
+
+At the application level, `createApp()` selects and configures an adapter for you. You can override the choice through the `store` option:
 
 ```typescript
 const app = createApp({
   schema,
   store: {
     adapter: 'sqlite-wasm',  // or 'indexeddb', 'better-sqlite3'
-    name: 'my-app-db',       // Database name (used for OPFS directory / IndexedDB name)
+    name: 'my-app-db',       // Database name (OPFS file name / IndexedDB name)
   },
 })
 ```
 
-If no adapter is specified, Kora automatically selects the best available adapter for the current environment:
+If no adapter is specified, Kora selects the best available adapter for the current environment:
 
-1. In browsers: `sqlite-wasm` if OPFS is available, otherwise `indexeddb`
-2. In Node.js: `better-sqlite3`
+1. In browsers: `sqlite-wasm` when the OPFS API is present, otherwise the hand-written `indexeddb` adapter.
+2. In Node.js: `better-sqlite3`.
+
+Adapter selection happens up front, based on which APIs the runtime exposes. It is distinct from the runtime fallback that occurs when the OPFS API is present but the install fails: in that case the SQLite WASM adapter degrades to a non-persistent in-memory database and emits `store:opfs-unavailable` (see Storage diagnostics). IndexedDB is never used as an automatic recovery path for a failed OPFS install.
 
 ---
 
 ## StoreConfig
 
-Configuration options for the store, passed to `createApp()`.
+`StoreConfig` is the low-level configuration consumed by the `Store` constructor (exported from `@korajs/store`). `createApp()` builds one of these from its higher-level `store` option, so most applications never construct it directly.
+
+Unlike the `createApp` `store` option (where `adapter` is an identifier string such as `'sqlite-wasm'`), `StoreConfig.adapter` is a concrete `StorageAdapter` instance and is required.
 
 ```typescript
 interface StoreConfig {
-  /** Storage adapter to use. Auto-detected if omitted. */
-  adapter?: 'sqlite-wasm' | 'indexeddb' | 'better-sqlite3'
+  /** Schema definition for the store. */
+  schema: SchemaDefinition
 
-  /** Database name. Defaults to 'kora-db'. */
-  name?: string
+  /** A concrete storage adapter instance (not an identifier string). */
+  adapter: StorageAdapter
+
+  /** Database name used for per-tab node id keys. Defaults to 'kora-db'. */
+  dbName?: string
+
+  /**
+   * 'shared' (default): one node id per database in _kora_meta.
+   * 'per-tab': a unique node id per browser tab, via sessionStorage.
+   */
+  isolation?: StoreIsolation  // 'shared' | 'per-tab'
+
+  /** Optional node ID. If omitted, one is generated or loaded from the database. */
+  nodeId?: string
+
+  /** Optional event emitter. When provided, local mutations and storage diagnostics are emitted here. */
+  emitter?: KoraEventEmitter
+
+  /** Routes local mutations through a unified apply pipeline when provided. */
+  localMutationHandler?: LocalMutationHandler
+
+  /** Called when a reactive query subscription is registered (for sync query subsets). */
+  onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
+
+  /**
+   * Supplies the key used to encrypt encrypted secret fields at write time.
+   * Required only when the schema declares encrypted secret fields.
+   */
+  secretKeyProvider?: SecretKeyProvider
 }
+```
+
+`StoreIsolation` is exported as `type StoreIsolation = 'shared' | 'per-tab'`.
+
+---
+
+## Blob storage
+
+`blob` fields do not carry their bytes in the operation log; they carry a small content-addressed `BlobRef` (hash, size, optional MIME type and filename). The bytes themselves live in a blob store keyed by the SHA-256 hash of the content, so identical content is stored once (dedup) and never re-synced to a peer that already holds that hash.
+
+### ContentAddressedBlobStore
+
+All blob backends implement this interface. Reads are integrity-checked: the returned bytes are verified to hash to the requested key, and a mismatch throws `BlobIntegrityError` rather than returning corrupt data.
+
+```typescript
+interface ContentAddressedBlobStore {
+  /** Store bytes and return their content-addressed reference. Storing content that already exists is a no-op that returns the same reference (dedup). */
+  put(bytes: Uint8Array, metadata?: BlobRefMetadata): Promise<BlobRef>
+
+  /** Retrieve the bytes for a hash, or null if absent. Throws BlobIntegrityError on a hash mismatch. */
+  get(hash: string): Promise<Uint8Array | null>
+
+  /** Whether the store holds content for the given hash. */
+  has(hash: string): Promise<boolean>
+
+  /** Remove the content for a hash. Returns whether anything was removed. */
+  delete(hash: string): Promise<boolean>
+
+  /** Number of distinct blobs held. */
+  size(): Promise<number>
+
+  /** List the hashes of every blob currently held (order unspecified). Used by garbage collection. */
+  list(): Promise<string[]>
+}
+```
+
+`BlobRef` and `BlobRefMetadata` come from `@korajs/core`:
+
+```typescript
+interface BlobRef {
+  hash: string          // hex-encoded SHA-256 of the bytes (the content address)
+  size: number          // size of the bytes
+  mimeType?: string
+  filename?: string
+  manifestHash?: string // present when the blob was stored for chunked transfer
+}
+
+interface BlobRefMetadata {
+  mimeType?: string
+  filename?: string
+}
+```
+
+### Implementations
+
+| Class | Import | Environment | Persistence |
+|-------|--------|-------------|-------------|
+| `MemoryBlobStore` | `@korajs/store` | Any | In-memory (non-persistent). Reference backend for tests. |
+| `OpfsBlobStore` | `@korajs/store` | Browser | Persistent, backed by the Origin Private File System. |
+| `FilesystemBlobStore` | `@korajs/store/blob-fs` | Node.js | Persistent, backed by the filesystem. |
+
+`MemoryBlobStore`, `OpfsBlobStore`, and `BlobIntegrityError` are exported from the package root (`@korajs/store`). `FilesystemBlobStore` is exported from the `@korajs/store/blob-fs` subpath only, which keeps its `node:fs` dependency out of browser bundles.
+
+### FilesystemBlobStore (Node.js)
+
+```typescript
+import { FilesystemBlobStore } from '@korajs/store/blob-fs'
+
+const blobs = new FilesystemBlobStore('/var/data/kora-blobs')
+
+const ref = await blobs.put(bytes, { mimeType: 'image/png', filename: 'avatar.png' })
+// ref: { hash, size, mimeType?, filename? }
+
+const back = await blobs.get(ref.hash)   // Uint8Array | null
+await blobs.has(ref.hash)                // boolean
+await blobs.delete(ref.hash)             // boolean
+await blobs.size()                       // number
+await blobs.list()                       // string[] of hashes
+```
+
+```typescript
+class FilesystemBlobStore implements ContentAddressedBlobStore {
+  constructor(dir: string)
+}
+```
+
+The constructor takes a single directory path. Blobs are stored at `<dir>/<hash[0:2]>/<hash>`, sharded by hash prefix so no single directory holds millions of entries. Writes are atomic (write to a temp file, then rename), so a crash mid-write cannot leave a half-written blob under a valid hash.
+
+### OpfsBlobStore (browser)
+
+```typescript
+import { OpfsBlobStore, createOpfsBlobStore, createOpfsBlobDirectory } from '@korajs/store'
+
+// Backed by real OPFS. rootDirName defaults to 'kora-blobs'.
+const blobs = await createOpfsBlobStore()
+```
+
+`OpfsBlobStore` is constructed from an `OpfsBlobDirectory`. In a browser, `createOpfsBlobStore(rootDirName = 'kora-blobs')` returns an `OpfsBlobStore` backed by real OPFS. `createOpfsBlobDirectory` and the `OpfsBlobDirectory` type are also exported for supplying a custom directory backend. Blobs are sharded by hash prefix, deduplicated, and integrity-verified on read, and they survive reloads.
+
+### BlobIntegrityError
+
+```typescript
+class BlobIntegrityError extends Error {
+  readonly expectedHash: string
+  readonly actualHash: string
+}
+```
+
+Thrown by `get()` when the bytes stored under a hash do not actually hash to that value (corruption or tampering).
+
+---
+
+## Storage diagnostics
+
+Storage adapters can emit diagnostic events through the `KoraEventEmitter` passed to them (via `StoreConfig.emitter`, or the `emitter` option of an adapter's options such as `SqliteWasmAdapterOptions`). These surface conditions that would otherwise fail silently. The event types are defined in `@korajs/core`.
+
+### store:opfs-unavailable
+
+Emitted by the SQLite WASM adapter when OPFS persistence was requested but could not be installed, so the store fell back to a NON-PERSISTENT in-memory database. Anything written in the session is lost on reload. The event is emitted instead of failing silently so the data-loss condition is observable.
+
+```typescript
+{
+  type: 'store:opfs-unavailable'
+  dbName: string
+  reason: 'lock-conflict' | 'timeout' | 'unsupported'
+  message: string
+}
+```
+
+| `reason` | Meaning |
+|----------|---------|
+| `'lock-conflict'` | Another runtime on this origin already holds the OPFS pool for this database. |
+| `'timeout'` | The VFS install did not complete in time (common in headless CI). |
+| `'unsupported'` | The runtime has no usable OPFS. |
+
+Important: this in-memory fallback is the runtime recovery path for a failed OPFS install. It is NOT IndexedDB. The `indexeddb` adapter is only selected up front, when the OPFS API is entirely absent from the runtime.
+
+### Other storage events
+
+- `store:db-name-collision`: emitted by the SQLite WASM adapter when another runtime on this origin was already using this database name, so this runtime attached to it as a follower and now shares that database.
+- `store:quota-exceeded`: emitted by the IndexedDB adapter when a write fails because the storage quota was exceeded.
+
+To receive any of these, pass an emitter when constructing the adapter:
+
+```typescript
+import { SqliteWasmAdapter } from '@korajs/store/sqlite-wasm'
+
+const adapter = new SqliteWasmAdapter({
+  workerUrl: '/sqlite-wasm-worker.js',
+  emitter,  // KoraEventEmitter; storage diagnostics are emitted here
+})
 ```

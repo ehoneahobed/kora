@@ -45,6 +45,14 @@ export interface HandshakeMessage {
 	deltaCursor?: string
 	/** Live query filters that further narrow synced data within auth/schema scope */
 	syncQueries?: SyncQuerySubset[]
+	/**
+	 * The client's persisted delivery watermark: the highest server delivery sequence
+	 * up to which it has contiguously applied every in-scope operation. Omitted (or 0)
+	 * on first sync. When present, the server resumes the gap-free server->client
+	 * stream from just after it, superseding the version-vector delta and the resume
+	 * cursor for the server->client direction. Optional, so old servers ignore it.
+	 */
+	lastDeliverySequence?: number
 }
 
 /**
@@ -73,6 +81,13 @@ export interface HandshakeResponseMessage {
 	 * available to other devices even after the authoring device goes offline.
 	 */
 	blobStorageEnabled?: boolean
+	/**
+	 * The server's highest delivery sequence at handshake time. A client whose
+	 * persisted delivery watermark exceeds this (the server's operation log was rolled
+	 * back, for example by a backup restore) resets its watermark to 0 so it resyncs
+	 * from the beginning instead of sitting above a frontier that no longer exists.
+	 */
+	serverMaxDeliverySequence?: number
 }
 
 /**
@@ -90,6 +105,20 @@ export interface OperationBatchMessage {
 	cursor?: string
 	/** Total batches in this delta exchange (for progress reporting) */
 	totalBatches?: number
+	/**
+	 * Delivery-watermark chaining (server->client). `baseDeliverySequence` is the
+	 * delivery sequence the client must already hold for this batch to apply in order
+	 * (it equals the previous batch's `maxDeliverySequence`, or the client's reported
+	 * watermark for the first batch after a handshake). `maxDeliverySequence` is the
+	 * highest delivery sequence carried by this batch. The client applies the batch
+	 * only when its watermark equals `baseDeliverySequence`, then advances the
+	 * watermark to `maxDeliverySequence`. A dropped batch breaks the chain and stalls
+	 * the watermark, so the reconnect resend recovers it. Present only on batches the
+	 * server sends as part of the delivery stream; absent on legacy version-vector
+	 * batches.
+	 */
+	baseDeliverySequence?: number
+	maxDeliverySequence?: number
 }
 
 /**
@@ -100,6 +129,12 @@ export interface AcknowledgmentMessage {
 	messageId: string
 	acknowledgedMessageId: string
 	lastSequenceNumber: number
+	/**
+	 * The acknowledged batch's `maxDeliverySequence`, echoed so the server can advance
+	 * this client's durable delivery watermark. Present only when acking a delivery-
+	 * stream batch. `lastSequenceNumber` stays for existing per-node behavior.
+	 */
+	deliverySequence?: number
 }
 
 /**
@@ -110,6 +145,34 @@ export interface ErrorMessage {
 	messageId: string
 	code: string
 	message: string
+	retriable: boolean
+}
+
+/**
+ * Server-to-client rejection of ONE specific operation the client submitted.
+ *
+ * Unlike {@link ErrorMessage}, which is connection-level, this is tied to an
+ * `operationId` so the client can divert exactly that operation out of its
+ * pending outbound queue and into a durable rejected-operations store — kept and
+ * explainable rather than silently retried forever or lost on the batch ack. The
+ * operation never entered the server's authoritative log, so no other replica
+ * ever sees it; the submitter is told so its optimistic local copy can be
+ * reconciled (rolled back or resubmitted) by the app.
+ */
+export interface OperationRejectedMessage {
+	type: 'operation-rejected'
+	messageId: string
+	/** Content-addressed id of the rejected operation. */
+	operationId: string
+	/** Collection the rejected operation targeted (for app routing / display). */
+	collection: string
+	/** Record the rejected operation targeted. */
+	recordId: string
+	/** Stable, machine-readable reason code. */
+	code: string
+	/** Human-readable explanation. */
+	message: string
+	/** Whether resubmitting the identical operation may later succeed. */
 	retriable: boolean
 }
 
@@ -217,6 +280,7 @@ export type SyncMessage =
 	| OperationBatchMessage
 	| AcknowledgmentMessage
 	| ErrorMessage
+	| OperationRejectedMessage
 	| AwarenessUpdateMessage
 	| YjsDocUpdateMessage
 	| BlobChunkRequestMessage
@@ -243,6 +307,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isAcknowledgmentMessage(value)
 		case 'error':
 			return isErrorMessage(value)
+		case 'operation-rejected':
+			return isOperationRejectedMessage(value)
 		case 'awareness-update':
 			return isAwarenessUpdateMessage(value)
 		case 'yjs-doc-update':
@@ -331,6 +397,24 @@ export function isErrorMessage(value: unknown): value is ErrorMessage {
 	return (
 		msg.type === 'error' &&
 		typeof msg.messageId === 'string' &&
+		typeof msg.code === 'string' &&
+		typeof msg.message === 'string' &&
+		typeof msg.retriable === 'boolean'
+	)
+}
+
+/**
+ * Check if a value is an OperationRejectedMessage.
+ */
+export function isOperationRejectedMessage(value: unknown): value is OperationRejectedMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	return (
+		msg.type === 'operation-rejected' &&
+		typeof msg.messageId === 'string' &&
+		typeof msg.operationId === 'string' &&
+		typeof msg.collection === 'string' &&
+		typeof msg.recordId === 'string' &&
 		typeof msg.code === 'string' &&
 		typeof msg.message === 'string' &&
 		typeof msg.retriable === 'boolean'

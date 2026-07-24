@@ -1,4 +1,4 @@
-import { HybridLogicalClock, MAX_LOGICAL } from '@korajs/core'
+import { HybridLogicalClock, MAX_LOGICAL, quoteIdent } from '@korajs/core'
 import type { HLCTimestamp, Operation, OperationInput, SchemaDefinition } from '@korajs/core'
 import { computeOperationId } from '@korajs/core/internal'
 import { parseFieldVersions, serializeFieldVersions } from '../lww/field-versions'
@@ -69,7 +69,9 @@ export async function rebaseUnsyncedOperationsInLog(
 	let maxOtherSerializedTs: string | null = null
 
 	for (const collectionName of Object.keys(schema.collections)) {
-		const rows = await adapter.query<OperationRow>(`SELECT * FROM _kora_ops_${collectionName}`)
+		const rows = await adapter.query<OperationRow>(
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)}`,
+		)
 		for (const row of rows) {
 			if (rebaseIds.has(row.id)) {
 				rebased.push(deserializeOperationWithCollection(row, collectionName))
@@ -163,7 +165,7 @@ export async function rebaseUnsyncedOperationsInLog(
 				continue
 			}
 			const opsTable = `_kora_ops_${oldOp.collection}`
-			await tx.execute(`DELETE FROM ${opsTable} WHERE id = ?`, [oldOp.id])
+			await tx.execute(`DELETE FROM ${quoteIdent(opsTable)} WHERE id = ?`, [oldOp.id])
 			const opInsert = buildInsertQuery(
 				opsTable,
 				serializeOperation(newOp) as unknown as Record<string, unknown>,
@@ -176,7 +178,7 @@ export async function rebaseUnsyncedOperationsInLog(
 			const oldVersion = serializeRowVersion(oldOp.timestamp)
 			const newVersion = serializeRowVersion(newOp.timestamp)
 			await tx.execute(
-				`UPDATE ${oldOp.collection} SET _version = ?, _updated_at = ? WHERE id = ? AND _version = ?`,
+				`UPDATE ${quoteIdent(oldOp.collection)} SET _version = ?, _updated_at = ? WHERE id = ? AND _version = ?`,
 				[newVersion, newOp.timestamp.wallTime, oldOp.recordId, oldVersion],
 			)
 
@@ -184,7 +186,7 @@ export async function rebaseUnsyncedOperationsInLog(
 			// rebase) version string, so re-stamp them too — otherwise field-level
 			// LWW would keep comparing against the uncorrected timestamp forever.
 			const rows = await tx.query<RawCollectionRow>(
-				`SELECT _field_versions FROM ${oldOp.collection} WHERE id = ?`,
+				`SELECT _field_versions FROM ${quoteIdent(oldOp.collection)} WHERE id = ?`,
 				[oldOp.recordId],
 			)
 			const fieldVersions = parseFieldVersions(rows[0]?._field_versions)
@@ -196,10 +198,10 @@ export async function rebaseUnsyncedOperationsInLog(
 				}
 			}
 			if (changed) {
-				await tx.execute(`UPDATE ${oldOp.collection} SET _field_versions = ? WHERE id = ?`, [
-					serializeFieldVersions(fieldVersions),
-					oldOp.recordId,
-				])
+				await tx.execute(
+					`UPDATE ${quoteIdent(oldOp.collection)} SET _field_versions = ? WHERE id = ?`,
+					[serializeFieldVersions(fieldVersions), oldOp.recordId],
+				)
 			}
 
 			// The insert op also stamped `_created_at` (the developer-visible
@@ -209,7 +211,7 @@ export async function rebaseUnsyncedOperationsInLog(
 			// (pre-rebase) created time so only rows this op created are touched.
 			if (oldOp.type === 'insert') {
 				await tx.execute(
-					`UPDATE ${oldOp.collection} SET _created_at = ? WHERE id = ? AND _created_at = ?`,
+					`UPDATE ${quoteIdent(oldOp.collection)} SET _created_at = ? WHERE id = ? AND _created_at = ?`,
 					[newOp.timestamp.wallTime, oldOp.recordId, oldOp.timestamp.wallTime],
 				)
 			}

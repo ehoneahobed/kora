@@ -1,4 +1,4 @@
-import type { SyncStatusInfo } from '@korajs/sync'
+import type { RejectedOperation, SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
 import type { SyncRuntimeState } from './sync-lifecycle'
 import type { KoraConfig, SyncControl } from './types'
@@ -67,6 +67,19 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		clearSchemaBlock(): void {
 			state.syncEngine?.clearSchemaBlock()
+		},
+		async getRejectedOperations(): Promise<RejectedOperation[]> {
+			await ready
+			if (state.syncEngine) {
+				return state.syncEngine.getRejectedOperations()
+			}
+			return []
+		},
+		async clearRejectedOperations(operationIds: string[]): Promise<void> {
+			await ready
+			if (state.syncEngine) {
+				await state.syncEngine.clearRejectedOperations(operationIds)
+			}
 		},
 		exportDiagnostics() {
 			if (state.syncEngine) {

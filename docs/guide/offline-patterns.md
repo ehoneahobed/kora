@@ -26,7 +26,7 @@ There is no "offline mode" to enable. The app is always offline-capable.
 All mutations in Kora are optimistic. When you call `app.todos.insert(...)`, the record appears in the local store and in any reactive queries immediately, before the operation syncs to the server.
 
 ```typescript
-// This returns instantly — no network round-trip
+// This returns instantly - no network round-trip
 const todo = await app.todos.insert({
   title: 'Buy groceries',
 })
@@ -63,13 +63,16 @@ The entire process is automatic. No developer intervention required.
 
 Kora manages reconnection automatically with exponential backoff:
 
-| Attempt | Delay |
-|---------|-------|
-| 1 | Immediate |
-| 2 | 1 second |
-| 3 | 2 seconds |
-| 4 | 4 seconds |
-| 5+ | 8 seconds (max) |
+| Attempt | Delay (before jitter) |
+|---------|-----------------------|
+| 1 | 1 second |
+| 2 | 2 seconds |
+| 3 | 4 seconds |
+| 4 | 8 seconds |
+| 5 | 16 seconds |
+| 6+ | 30 seconds (max) |
+
+The base delay is `min(initialDelay * 2^attempt, maxDelay)`, capped at a maximum of 30 seconds. A jitter of plus or minus 25% is applied to each delay so that many clients do not reconnect in lockstep.
 
 On each successful reconnection, the full sync handshake runs to bring both sides up to date. The protocol is resumable -- if the connection drops during sync, it picks up from the last acknowledged operation, not from the beginning.
 
@@ -85,7 +88,7 @@ function SyncIndicator() {
 
   return (
     <div>
-      <span>{status.state}</span>
+      <span>{status.status}</span>
       {status.pendingOperations > 0 && (
         <span>{status.pendingOperations} changes pending</span>
       )}
@@ -102,13 +105,15 @@ function SyncIndicator() {
 | `'syncing'` | Actively exchanging operations |
 | `'synced'` | All local operations acknowledged by server |
 | `'offline'` | No connection to sync server |
+| `'clock-error'` | Device clock skew is too large to sync safely |
 | `'error'` | Connection failed (will retry automatically) |
+| `'schema-mismatch'` | Client and server schema versions are incompatible |
 
 ### Status Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `state` | `string` | Current sync state |
+| `status` | `string` | Current sync status |
 | `pendingOperations` | `number` | Operations queued but not yet sent |
 | `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
 
@@ -150,7 +155,7 @@ Users care about whether their data is saved, not whether a WebSocket is connect
 function StatusBar() {
   const status = useSyncStatus()
 
-  if (status.state === 'synced') {
+  if (status.status === 'synced') {
     return <span>All changes saved</span>
   }
 
@@ -158,7 +163,7 @@ function StatusBar() {
     return <span>Saving {status.pendingOperations} changes...</span>
   }
 
-  if (status.state === 'offline') {
+  if (status.status === 'offline') {
     return <span>Working offline - changes will sync when connected</span>
   }
 
@@ -176,7 +181,7 @@ function AddTodo() {
   const addTodo = useMutation(app.todos.insert)
 
   return (
-    <button onClick={() => addTodo({ title: 'New task' })}>
+    <button onClick={() => addTodo.mutate({ title: 'New task' })}>
       Add Task
     </button>
   )

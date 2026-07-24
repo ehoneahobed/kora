@@ -6,6 +6,7 @@ import type {
 	SchemaDefinition,
 	SecretKeyProvider,
 } from '@korajs/core'
+import { quoteIdent } from '@korajs/core'
 import { executeDelete } from '../mutations/execute-delete'
 import { executeInsert } from '../mutations/execute-insert'
 import { executeUpdate } from '../mutations/execute-update'
@@ -71,7 +72,7 @@ export class Collection {
 
 	async findById(id: string): Promise<CollectionRecord | null> {
 		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${this.name} WHERE id = ? AND _deleted = 0`,
+			`SELECT * FROM ${quoteIdent(this.name)} WHERE id = ? AND _deleted = 0`,
 			[id],
 		)
 		const row = rows[0]

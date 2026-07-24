@@ -1,4 +1,5 @@
 import type { Operation, SchemaDefinition } from '@korajs/core'
+import { quoteIdent } from '@korajs/core'
 import { deserializeOperationWithCollection } from '../serialization/serializer'
 import type { StorageAdapter } from '../types'
 import type { OperationRow } from '../types'
@@ -98,7 +99,7 @@ async function readAllOperations(
 	const allOps: Operation[] = []
 	for (const collectionName of collections) {
 		const rows = await adapter.query<OperationRow>(
-			`SELECT * FROM _kora_ops_${collectionName} ORDER BY sequence_number ASC`,
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} ORDER BY sequence_number ASC`,
 		)
 
 		for (const row of rows) {

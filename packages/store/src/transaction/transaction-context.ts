@@ -10,6 +10,7 @@ import {
 	createOperation,
 	generateUUIDv7,
 	isAtomicOp,
+	quoteIdent,
 	resolveAtomicOp,
 	toAtomicOp,
 	validateRecord,
@@ -476,7 +477,7 @@ export class TransactionContext {
 
 		// Read from database first
 		const rows = await this.config.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${collectionName} WHERE id = ? AND _deleted = 0`,
+			`SELECT * FROM ${quoteIdent(collectionName)} WHERE id = ? AND _deleted = 0`,
 			[id],
 		)
 

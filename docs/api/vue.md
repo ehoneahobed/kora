@@ -70,7 +70,7 @@ function useQuery<T extends CollectionRecord>(
 ): Readonly<Ref<T[]>>
 ```
 
-In templates, refs auto-unwrap — use `todos` directly, not `todos.value`.
+In templates, refs auto-unwrap: use `todos` directly, not `todos.value`.
 
 ### Example
 
@@ -108,7 +108,7 @@ Returns `mutate`, `mutateAsync`, `isLoading` (ref), `error` (ref), and `reset`.
 
 ## useSyncStatus()
 
-Returns a readonly ref of `SyncStatusInfo` — connection state, pending operations, last sync time.
+Returns a readonly ref of `SyncStatusInfo`: connection state, pending operations, last sync time.
 
 ```vue
 <script setup lang="ts">
@@ -118,7 +118,7 @@ const status = useSyncStatus()
 </script>
 
 <template>
-  <span>{{ status.status }} — {{ status.pendingOperations }} pending</span>
+  <span>{{ status.status }} - {{ status.pendingOperations }} pending</span>
 </template>
 ```
 
@@ -126,8 +126,8 @@ const status = useSyncStatus()
 
 ## useApp() / useCollection()
 
-- `useApp()` — returns the `KoraAppLike` instance from context.
-- `useCollection(name)` — typed collection accessor from the store.
+- `useApp()`: returns the `KoraAppLike` instance from context.
+- `useCollection(name)`: typed collection accessor from the store.
 
 ---
 
@@ -159,8 +159,8 @@ const collaborators = useCollaborators()
 </script>
 ```
 
-- `usePresence(user)` — publishes local presence; clears on unmount.
-- `useCollaborators()` — readonly ref of remote peers' awareness states.
+- `usePresence(user)`: publishes local presence; clears on unmount.
+- `useCollaborators()`: readonly ref of remote peers' awareness states.
 
 ---
 

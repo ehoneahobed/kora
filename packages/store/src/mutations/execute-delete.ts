@@ -1,4 +1,4 @@
-import { createOperation } from '@korajs/core'
+import { createOperation, quoteIdent } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { serializeRowVersion } from '../lww/row-version'
@@ -26,7 +26,7 @@ export async function executeDelete(
 	options?: ExecuteDeleteOptions,
 ): Promise<Operation[]> {
 	const currentRows = await ctx.adapter.query<RawCollectionRow>(
-		`SELECT * FROM ${ctx.collection} WHERE id = ? AND _deleted = 0`,
+		`SELECT * FROM ${quoteIdent(ctx.collection)} WHERE id = ? AND _deleted = 0`,
 		[id],
 	)
 	if (!currentRows[0]) {

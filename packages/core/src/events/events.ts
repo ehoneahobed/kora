@@ -65,6 +65,22 @@ export type KoraEvent =
 			message: string
 			retriable: boolean
 	  }
+	| {
+			/**
+			 * The server rejected one of THIS client's outbound operations before it
+			 * became authoritative. The op has been diverted out of the pending sync
+			 * queue into the durable rejected store (kept, not retried); the app can
+			 * surface the reason and decide whether to roll back the optimistic local
+			 * write or let the user edit and resubmit.
+			 */
+			type: 'sync:operation-rejected'
+			operationId: string
+			collection: string
+			recordId: string
+			code: string
+			message: string
+			retriable: boolean
+	  }
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
@@ -106,6 +122,36 @@ export type KoraEvent =
 	  }
 	| {
 			type: 'store:quota-exceeded'
+			dbName: string
+			message: string
+	  }
+	| {
+			/**
+			 * OPFS persistence was unavailable, so the store fell back to a
+			 * NON-PERSISTENT in-memory database. Anything written this session is lost
+			 * on reload. This is emitted instead of failing silently so the condition
+			 * is observable rather than a data-loss trap.
+			 */
+			type: 'store:opfs-unavailable'
+			dbName: string
+			/**
+			 * Why OPFS could not be used. `lock-conflict` means another runtime on this
+			 * origin already holds the OPFS pool for this database; `timeout` means the
+			 * VFS install did not complete in time (common in headless CI); `unsupported`
+			 * means the runtime has no usable OPFS.
+			 */
+			reason: 'lock-conflict' | 'timeout' | 'unsupported'
+			message: string
+	  }
+	| {
+			/**
+			 * Another runtime on this origin was already using this database name, so
+			 * this runtime attached to it as a follower and now SHARES that one
+			 * database. That is intended for multiple tabs of the SAME app; it is a bug
+			 * if these are logically separate apps, which should each use a distinct
+			 * store name (`store: { name: '...' }`) to stay isolated.
+			 */
+			type: 'store:db-name-collision'
 			dbName: string
 			message: string
 	  }

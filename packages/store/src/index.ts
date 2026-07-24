@@ -29,6 +29,7 @@ export type {
 // === Errors ===
 export {
 	AdapterError,
+	NoLeaderError,
 	OptimisticLockError,
 	PersistenceError,
 	QueryError,

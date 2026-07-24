@@ -5,7 +5,7 @@ description: "Test offline-first Kora.js apps: unit testing collections and merg
 
 # Testing
 
-`@korajs/test` provides a testing harness for verifying sync, conflict resolution, and multi-device behavior. It creates virtual device networks with real SQLite stores and in-memory transports — no actual network required.
+`@korajs/test` provides a testing harness for verifying sync, conflict resolution, and multi-device behavior. It creates virtual device networks with real SQLite stores and in-memory transports. No actual network required.
 
 ## Installation
 
@@ -82,6 +82,33 @@ network = await createTestNetwork(schema, {
   deviceNames: ['alice', 'bob', 'charlie'],
 })
 ```
+
+## Server-Side Network Options
+
+`createTestNetwork` also accepts options that configure the virtual server:
+
+```typescript
+import type { OperationValidator } from '@korajs/server'
+
+const validateOperation: OperationValidator = (op) => {
+  // Reject operations the server should not accept. A rejected outbound
+  // operation is surfaced on the originating device via getRejectedOperations().
+  if (op.collection === 'todos' && op.type === 'insert') {
+    return { action: 'reject', code: 'FORBIDDEN', message: 'inserts are blocked' }
+  }
+  return { action: 'accept' }
+}
+
+network = await createTestNetwork(schema, {
+  validateOperation,   // adjudicate untrusted client operations before materialization
+  blobStorage: true,   // enable central blob storage on the server (persist and serve uploaded blob bytes)
+})
+```
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `validateOperation` | `OperationValidator` | Adjudicate untrusted client operations on the server before materialization. Operations the server rejects are surfaced on the originating device through `getRejectedOperations()`. |
+| `blobStorage` | `boolean` | Enable central blob storage on the server, which persists and serves uploaded blob bytes. |
 
 ## Testing Offline Behavior
 
@@ -215,4 +242,5 @@ Each device in the network exposes:
 | `.getNodeId()` | Get the device's unique node ID |
 | `.getVersionVector()` | Get the device's version vector |
 | `.isConnected()` | Check if currently connected |
+| `.getRejectedOperations()` | Async: get the operations the server rejected for this device that have not been reconciled (empty when the device has never connected) |
 | `.close()` | Release all resources |

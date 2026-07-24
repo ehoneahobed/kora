@@ -1,5 +1,197 @@
 # kora
 
+## 1.0.0-beta.5
+
+### Minor Changes
+
+- Server-side adjudication of untrusted client operations before they become
+  authoritative. This is what lets Kora serve public and multi-tenant offline apps
+  where the client cannot be trusted (anonymous form submissions, one tenant that
+  must not write another's data).
+
+  Pass `validateOperation` in the server's `syncOptions` (or to `KoraSyncServer`).
+  It runs at sync ingestion, after HLC ordering and the built-in guards, and before
+  materialization, returning `accept`, `reject`, or `ignore`. On `reject` the
+  operation never enters the authoritative log, so no other replica ever sees it,
+  and a structured rejection travels back to the submitter tied to the operation id.
+  The validator receives an `auth` context (null for anonymous connections) and the
+  trusted `kora` data-plane, so it can read current state and author a derived
+  server operation — for example promoting a validated anonymous submission into an
+  owner-visible collection.
+
+  On the client, a rejected operation is diverted out of the pending outbound queue
+  into a durable rejected store (`_kora_sync_rejected`, survives a page refresh)
+  rather than being retried forever or lost on the batch ack, and a
+  `sync:operation-rejected` event fires. `app.sync.getRejectedOperations()` and
+  `app.sync.clearRejectedOperations()` let the app surface failed submissions and
+  reconcile (roll back the optimistic write or resubmit). Convergence holds: the
+  authoritative state is defined purely by accepted operations, so every synced
+  device agrees without the rejected op, and the submitter is told rather than
+  diverging silently. See the new "Server-side operation validation" guide.
+
+### Patch Changes
+
+- Fix a lost-update bug where three or more concurrent atomic writes (`op.increment`,
+  `op.max`, ...) to the same field failed to converge on clients.
+
+  The client apply pipeline composed a remote atomic op through the merge engine's
+  pairwise rule (`base + localDelta + remoteDelta`), which is correct only for exactly
+  two concurrent writes from a shared base. With a third concurrent writer, the current
+  row already folded in an earlier remote delta, and re-deriving the value from the base
+  plus the local device's own delta silently dropped that earlier delta. Three devices
+  each incrementing a shared counter by 5, 3, and 2 could settle at 7/5/5 across devices
+  instead of 10.
+
+  The client now materializes atomic-op fields by folding the record's operation log in
+  HLC order through the same atomic-aware replay the server uses (moved into
+  `@korajs/core` as `replayOperationsForRecord` so both sides share one definition).
+  The fold composes a same-type atomic chain and resolves anything else — including a
+  plain set breaking the chain — by last-write-wins, so every replica converges to the
+  same value regardless of how many concurrent atomic writers there were or which device
+  authored them, including a passive device that only observes the writes. Non-atomic
+  fields are unaffected.
+
+- Add a gap-free server-to-client delivery watermark, so no operation the server holds is
+  ever lost on its way to a client, even across drops, reconnects, restarts, and scoped
+  sync.
+
+  Previously the server drove server-to-client sync from the version vector. Under a lossy
+  transport this could strand an operation permanently: if a relayed operation was dropped
+  while a later operation from the same node was delivered, the client's version vector
+  advanced past the gap, and version-vector delta on the next connection never re-sent the
+  missing one. The paginated initial-sync resume cursor had the mirror problem: a retriable
+  apply failure let the cursor advance past the failed operation, skipping it on resume.
+
+  The server now assigns every stored operation a monotonic delivery sequence in commit
+  order and drives each client's stream from a durable, per-client delivery watermark. On
+  Postgres the sequence is assigned from a counter row locked inside the append
+  transaction, so delivery order equals visibility order and a `> watermark` scan can never
+  skip an operation that later becomes visible below the cursor, even across concurrent
+  server instances. Each server-to-client batch chains `base -> max` delivery sequences;
+  the client applies a batch only when its watermark equals the base and advances the
+  watermark only when every operation applied, so a dropped or failed batch stalls the
+  watermark and is recovered contiguously rather than skipped. The watermark advances live
+  during streaming and is persisted on the client, so a reconnect resends only what was
+  genuinely missed. Because a causal dependency is always committed (and thus sequenced)
+  before its dependent, delivery order respects causal order and needs no reordering.
+
+  The watermark also advances live during streaming (a client's watermark tracks the
+  server frontier while connected, so a reconnect resends only the true delta), a client's
+  own operations are not echoed back to it during streaming (they are still included in a
+  full resync so a client that lost its local store recovers its own history), and a client
+  whose persisted watermark is ahead of the server's frontier (the server restored an older
+  backup) resets to a full resync instead of stalling above a frontier that no longer
+  exists.
+
+  All wire fields are optional and additive: an old client omits its watermark and gets the
+  version-vector delta unchanged, and a new client against an old server keeps its version
+  vector, so both still converge. The version vector remains authoritative for the
+  client-to-server direction and for local deduplication. On Postgres the schema setup and
+  delivery-sequence backfill run under an advisory-locked transaction, so simultaneous
+  cold start of multiple server replicas against a fresh database is safe.
+
+  Correctness characteristics worth knowing when adopting:
+
+  - The delivery watermark is tracked per view (a stable signature of the active scope plus
+    query subscriptions), so changing the scope or registering a new query subscription
+    back-fills that view at most once and returning to a previously-synced view resumes from
+    its own watermark instead of re-scanning it. A widened scope can expose operations below
+    the current watermark, so the first visit to a view scans from zero; any back-fill is
+    deduplicated, so operations already applied under another view are re-received but not
+    re-applied.
+  - Per-view watermarks are retained under a bounded, least-recently-used cap (default and
+    live views are never evicted), so a client that churns through many distinct views (for
+    example a search that registers a fresh subscription per keystroke) cannot accumulate an
+    unbounded number of persisted watermark rows. Eviction is a storage tradeoff only, never
+    a correctness one: an evicted cold view simply back-fills from zero (deduplicated) the
+    next time it is visited.
+  - An inbound operation that cannot be applied (for example a scope that includes a child
+    record but excludes its parent) surfaces as a visible, recoverable sync stall rather
+    than being silently skipped: the watermark holds and the operation is re-fetched until
+    it applies. This upholds the no-silent-loss guarantee.
+  - A dropped or unacknowledged streaming batch is recovered by re-sending from the client's
+    last acknowledged position, so recovery does not depend on a bounded retransmit buffer.
+  - Backup export preserves delivery (commit) order, so restoring a backup keeps causal
+    order and a resumed client never receives a dependent before its dependency.
+
+- Storage persistence failures are no longer silent. When OPFS is unavailable the
+  store falls back to a non-persistent in-memory database so the app keeps working,
+  but anything written that session is lost on reload — previously with no signal.
+  The SQLite WASM worker now classifies why OPFS could not be used (`lock-conflict`,
+  `timeout`, or `unsupported`) and the store emits a `store:opfs-unavailable` event,
+  so the condition is observable instead of a quiet data-loss trap. The most common
+  cause, `lock-conflict`, is two runtimes on one origin contending for the same
+  database.
+
+  A `store:db-name-collision` event now fires when a runtime attaches to a database
+  name another runtime on the same origin already owns. That is expected for
+  multiple tabs of the same app (they share one leader), and the exact clue a
+  developer needs when two logically separate apps accidentally share the default
+  store name and should each use a distinct one. Both events surface in DevTools and
+  via `app.events`. See the new "Multi-runtime storage and isolation" guide.
+
+- Fix multi-tenant scoped sync dropping any update that does not restate the scope
+  field, which silently diverged tenants across devices.
+
+  Scope visibility was judged from an operation's own `data`/`previousData` only. A
+  partial update that changed a non-scope field (toggling `completed`, an atomic
+  increment, a cascade side-effect) or a delete carried no scope field, so it was
+  treated as out of scope and never relayed, delta-synced, or (when the client
+  configured a scope) pushed. Two devices of the same tenant would then disagree.
+
+  Visibility now backfills the scope (and query-subset) fields from the record's
+  materialized state when the operation itself does not carry them, on both the server
+  relay/delta path and the client push path. The record read includes soft-deleted
+  rows so a relayed delete is judged against the record's actual scope, and an
+  operation that reassigns the scope field is judged by its new value (the record
+  leaving one tenant and entering another). Genuinely out-of-scope operations are still
+  hidden, preserving tenant isolation.
+
+- Fix two convergence bugs around deleted records that could leave replicas
+  permanently disagreeing on whether a record exists.
+
+  A remote update landing on a tombstone was only handled when the tombstone came
+  from a LOCAL delete (resolved via the pairwise merge engine). A device that merely
+  observed a delete and then a newer update relayed from other devices kept the record
+  hidden (`_deleted` stayed set) while the authoring devices and the server showed it
+  alive — a permanent, arrival-order-dependent divergence. The same path also
+  materialized a resurrecting op's raw value instead of the composed atomic chain, so
+  increments before and after a delete were mis-counted on resurrection.
+
+  The client now resolves any remote update on a tombstone by folding the record's
+  whole operation log in HLC order — the same fold the server uses — so every device
+  agrees on whether the update resurrects the record and on its field values, and
+  atomic deltas on both sides of a delete compose correctly.
+
+  A stale update that loses to a newer delete is now appended to the log via a new
+  log-only apply (so a later fold — e.g. an atomic resurrection composing its delta —
+  is complete) while leaving the tombstone untouched: no zombie fields, no version
+  regression. Previously such an op was dropped, which could lose an atomic delta
+  needed by a subsequent resurrection.
+
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @korajs/sync@1.0.0-beta.5
+  - @korajs/store@1.0.0-beta.5
+  - @korajs/core@1.0.0-beta.5
+  - @korajs/merge@1.0.0-beta.5
+  - @korajs/react@1.0.0-beta.5
+  - @korajs/svelte@1.0.0-beta.5
+  - @korajs/vue@1.0.0-beta.5
+  - @korajs/devtools@1.0.0-beta.5
+
 ## 1.0.0-beta.0
 
 ### Minor Changes

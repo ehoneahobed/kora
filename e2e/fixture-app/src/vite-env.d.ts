@@ -12,4 +12,5 @@ declare module '*?sharedworker&url' {
 
 interface Window {
 	__KORA_E2E_READY__?: boolean
+	__KORA_E2E_ERROR__?: string
 }

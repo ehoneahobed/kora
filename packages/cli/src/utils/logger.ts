@@ -56,7 +56,7 @@ export function createLogger(options?: LoggerOptions): Logger {
 		banner(): void {
 			console.log()
 			console.log(
-				color(BOLD + CYAN, '  Kora.js') + color(DIM, ' — Offline-first application framework'),
+				color(BOLD + CYAN, '  Kora.js') + color(DIM, ', the offline-first application framework'),
 			)
 			console.log()
 		},

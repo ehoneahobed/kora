@@ -1,8 +1,18 @@
 /// <reference lib="webworker" />
 /**
- * SharedWorker host: one DedicatedWorker (SQLite WASM) per `dbName` per browser origin.
+ * SharedWorker host: runs SQLite WASM directly inside the SharedWorker, one
+ * database core per `dbName`, shared by every tab on the origin.
  *
- * Bundle this file separately and pass its URL as `store.sharedWorkerUrl` alongside `workerUrl`.
+ * A SharedWorker CANNOT spawn a nested `Worker` (the `Worker` constructor is not
+ * defined in `SharedWorkerGlobalScope` in Chromium), so the host does not delegate
+ * to a dedicated worker. It runs {@link createSqliteWasmCore} in its own scope.
+ * Because each request is answered by a Promise from the core, responses are
+ * correlated to their caller directly, with no inner-id bookkeeping.
+ *
+ * Bundle this file separately and pass its URL as `store.sharedWorkerUrl` alongside
+ * `workerUrl`. The entry that bundles it must set `__KORA_SQLITE_WASM_URL` (via a
+ * `?url` import of the sqlite wasm binary) the same way the dedicated worker entry
+ * does, so the core can locate the hashed WASM asset in production builds.
  *
  * @example
  * ```typescript
@@ -16,6 +26,7 @@
  */
 
 import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
+import { type SqliteWasmCore, createSqliteWasmCore } from './sqlite-wasm-worker-core'
 
 const SW_REQUEST = 'kora-sw-request'
 const SW_RESPONSE = 'kora-sw-response'
@@ -34,84 +45,97 @@ interface SharedWorkerRpcResponse {
 	response: WorkerResponse
 }
 
-interface WorkerEntry {
-	worker: Worker
-	pending: Map<number, string>
+/** Minimal structural view of a connected client `MessagePort`. */
+export interface HostPort {
+	start(): void
+	postMessage(message: SharedWorkerRpcResponse): void
+	addEventListener(
+		type: 'message' | 'messageerror',
+		handler: (event: { data: unknown }) => void,
+	): void
 }
 
-declare const self: SharedWorkerGlobalScope
+export interface SharedWorkerHostOptions {
+	/** Creates a database core. Injectable so the host routing can be unit-tested. */
+	createCore: () => SqliteWasmCore
+}
 
-const pools = new Map<string, WorkerEntry>()
+export interface SharedWorkerHost {
+	/** Wire a newly connected client port into the host. */
+	connect(port: HostPort): void
+}
 
-function getPool(dbName: string, workerUrl: string): WorkerEntry {
-	const existing = pools.get(dbName)
-	if (existing) {
-		return existing
+/**
+ * Creates the SharedWorker host routing core: one SQLite core per `dbName`, shared
+ * by every connected tab, with each request answered directly by the core.
+ */
+export function createSharedWorkerHost(options: SharedWorkerHostOptions): SharedWorkerHost {
+	const cores = new Map<string, SqliteWasmCore>()
+
+	function coreFor(dbName: string): SqliteWasmCore {
+		let core = cores.get(dbName)
+		if (!core) {
+			core = options.createCore()
+			cores.set(dbName, core)
+		}
+		return core
 	}
 
-	const worker = new Worker(workerUrl, { type: 'module' })
-	const entry: WorkerEntry = { worker, pending: new Map() }
+	function connect(port: HostPort): void {
+		port.start()
 
-	worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-		const response = event.data
-		const requestId = entry.pending.get(response.id)
-		if (!requestId) {
-			return
-		}
-		entry.pending.delete(response.id)
-		const port = findPortForRequest(requestId)
-		if (port) {
-			const msg: SharedWorkerRpcResponse = {
-				type: SW_RESPONSE,
-				requestId,
-				response,
+		port.addEventListener('message', (event: { data: unknown }): void => {
+			const data = event.data as SharedWorkerRpcRequest | undefined
+			if (data?.type !== SW_REQUEST) {
+				return
 			}
-			port.postMessage(msg)
-		}
+
+			const core = coreFor(data.dbName)
+			void core.handle(data.request).then(
+				(response) => {
+					port.postMessage({ type: SW_RESPONSE, requestId: data.requestId, response })
+				},
+				(error: unknown) => {
+					// The core catches its own errors, so this only fires on an unexpected
+					// throw. Relay it so the client never hangs waiting for a response.
+					const message = error instanceof Error ? error.message : 'SharedWorker core failed'
+					port.postMessage({
+						type: SW_RESPONSE,
+						requestId: data.requestId,
+						response: {
+							id: data.request.id,
+							type: 'error',
+							message,
+							code: 'SHARED_WORKER_CORE_ERROR',
+						},
+					})
+				},
+			)
+		})
 	}
 
-	pools.set(dbName, entry)
-	return entry
+	return { connect }
 }
 
-const portRequestIds = new Map<MessagePort, Set<string>>()
-const requestPort = new Map<string, MessagePort>()
+// Wire the host to the SharedWorker global only when running as an actual
+// SharedWorker. The guard uses `instanceof SharedWorkerGlobalScope` so it is true
+// in a real SharedWorker and false everywhere else (Node test runtimes, the main
+// thread, a dedicated worker), which keeps `createSharedWorkerHost` unit-testable
+// in isolation. A connection is delivered as a `connect` event whose `ports[0]` is
+// the client MessagePort.
+declare const self: SharedWorkerGlobalScope
+if (
+	typeof SharedWorkerGlobalScope !== 'undefined' &&
+	typeof self !== 'undefined' &&
+	self instanceof SharedWorkerGlobalScope
+) {
+	const host = createSharedWorkerHost({ createCore: createSqliteWasmCore })
 
-function findPortForRequest(requestId: string): MessagePort | undefined {
-	return requestPort.get(requestId)
-}
-
-self.onconnect = (event: MessageEvent): void => {
-	const port = event.ports[0]
-	if (!port) {
-		return
-	}
-
-	port.start()
-	portRequestIds.set(port, new Set())
-
-	port.addEventListener('message', (messageEvent: MessageEvent<SharedWorkerRpcRequest>) => {
-		const data = messageEvent.data
-		if (data?.type !== SW_REQUEST) {
+	self.addEventListener('connect', (event: MessageEvent): void => {
+		const port = event.ports[0]
+		if (!port) {
 			return
 		}
-
-		const pool = getPool(data.dbName, data.workerUrl)
-		pool.pending.set(data.request.id, data.requestId)
-		requestPort.set(data.requestId, port)
-		portRequestIds.get(port)?.add(data.requestId)
-
-		pool.worker.postMessage(data.request)
-	})
-
-	port.addEventListener('messageerror', () => {
-		const ids = portRequestIds.get(port)
-		if (!ids) {
-			return
-		}
-		for (const requestId of ids) {
-			requestPort.delete(requestId)
-		}
-		portRequestIds.delete(port)
+		host.connect(port as unknown as HostPort)
 	})
 }

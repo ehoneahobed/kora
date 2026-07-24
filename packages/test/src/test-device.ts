@@ -241,6 +241,15 @@ export class TestDevice {
 	}
 
 	/**
+	 * Operations the server rejected for this device that have not been reconciled.
+	 * Empty when the device has never connected.
+	 */
+	async getRejectedOperations(): Promise<import('@korajs/sync').RejectedOperation[]> {
+		if (!this.syncEngine) return []
+		return this.syncEngine.getRejectedOperations()
+	}
+
+	/**
 	 * Stage a blob's bytes into this device's blob store, splitting them into
 	 * content-addressed chunks this device can then serve to peers over the sync
 	 * connection. Returns the manifest (blob hash + ordered chunk hashes) needed

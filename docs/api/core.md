@@ -249,7 +249,7 @@ const schema = defineSchema({
     products: {
       fields: {
         name: t.string(),
-        quantity: t.number().merge('counter'),   // additive — both decrements apply
+        quantity: t.number().merge('counter'),   // additive - both decrements apply
         highScore: t.number().merge('max'),      // keep the highest value
         tags: t.array(t.string()).merge('append-only'), // never lose tags
         status: t.string().merge('server-authoritative'), // server decides
@@ -384,14 +384,17 @@ Creates a new immutable, content-addressed operation. The operation's `id` is de
 ### Signature
 
 ```typescript
-function createOperation(input: OperationInput): Operation
+function createOperation(input: OperationInput, clock: HybridLogicalClock): Promise<Operation>
 ```
+
+`createOperation` is asynchronous (the content-addressed `id` is derived via a SHA-256 digest) and takes the HLC as a second argument. The operation's timestamp is generated internally from the clock, so it is not part of `OperationInput`.
 
 ### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `input` | `OperationInput` | Operation data. See fields below. |
+| `clock` | `HybridLogicalClock` | The HLC used to generate this operation's timestamp. |
 
 #### OperationInput
 
@@ -402,15 +405,17 @@ function createOperation(input: OperationInput): Operation
 | `collection` | `string` | Yes | Target collection name (from schema). |
 | `recordId` | `string` | Yes | ID of the affected record. |
 | `data` | `Record<string, unknown> \| null` | Yes | Field values. `null` for delete. For updates, only changed fields. |
-| `previousData` | `Record<string, unknown> \| null` | No | Previous values of changed fields (enables 3-way merge). `null` for insert/delete. |
-| `timestamp` | `HLCTimestamp` | Yes | Hybrid Logical Clock timestamp. |
+| `previousData` | `Record<string, unknown> \| null` | Yes | Previous values of changed fields (enables 3-way merge). `null` for insert/delete. |
 | `sequenceNumber` | `number` | Yes | Monotonically increasing per node. |
-| `causalDeps` | `string[]` | No | Operation IDs this operation depends on. Defaults to `[]`. |
+| `causalDeps` | `string[]` | Yes | Operation IDs this operation causally depends on. Pass `[]` if none. |
 | `schemaVersion` | `number` | Yes | Schema version at time of creation. |
+| `atomicOps` | `Record<string, AtomicOp>` | No | Atomic operation intents for fields in `data` (e.g., increment, max). |
+| `transactionId` | `string` | No | Groups this operation with others in an atomic transaction. Not part of the content hash. |
+| `mutationName` | `string` | No | Human-readable name for the mutation group. For DevTools display. |
 
 ### Returns
 
-`Operation` -- An immutable operation with a computed content-addressed `id`.
+`Promise<Operation>` -- Resolves to an immutable operation with a computed content-addressed `id`.
 
 ### Example
 
@@ -420,16 +425,17 @@ import { createOperation, HybridLogicalClock, generateUUIDv7 } from 'korajs'
 const nodeId = generateUUIDv7()
 const clock = new HybridLogicalClock(nodeId)
 
-const op = createOperation({
+const op = await createOperation({
   nodeId,
   type: 'insert',
   collection: 'todos',
   recordId: generateUUIDv7(),
   data: { title: 'Ship Kora v1', completed: false },
-  timestamp: clock.now(),
+  previousData: null,
   sequenceNumber: 1,
+  causalDeps: [],
   schemaVersion: 1,
-})
+}, clock)
 
 console.log(op.id) // SHA-256 content hash
 ```
@@ -500,7 +506,7 @@ await app.todos.update(id, { tags: op.remove('draft') })
 ```
 
 ::: warning
-Atomic operations are resolved locally before creating the operation. They do not provide distributed atomicity — concurrent `op.increment(1)` calls from two devices both apply their deltas correctly because the operation stores the resolved value and the previous value, enabling 3-way merge.
+Atomic operations are resolved locally before creating the operation. They do not provide distributed atomicity. Concurrent `op.increment(1)` calls from two devices both apply their deltas correctly because the operation stores the resolved value and the previous value, enabling 3-way merge.
 :::
 
 ---
@@ -527,7 +533,7 @@ function buildScopeMap(
 
 ### Returns
 
-`ScopeMap` — A `Record<string, Record<string, unknown>>` mapping collection names to their scope filter objects.
+`ScopeMap`: a `Record<string, Record<string, unknown>>` mapping collection names to their scope filter objects.
 
 ---
 
@@ -614,7 +620,7 @@ const scopeMap = buildScopeMap(schema, scopeValues)
 
 ## migrate() / MigrationBuilder {#migrations}
 
-Creates a fluent migration builder for defining schema migration steps programmatically. The builder is immutable — each method returns a new instance.
+Creates a fluent migration builder for defining schema migration steps programmatically. The builder is immutable: each method returns a new instance.
 
 ```typescript
 import { migrate, migrationStepsToSQL, t } from '@korajs/core'
@@ -667,6 +673,106 @@ const sql = migrationStepsToSQL(definition.steps)
 
 ---
 
+## quoteIdent()
+
+Quotes a SQL identifier (table or column name) for safe interpolation into generated SQL. It wraps the identifier in double quotes and doubles any embedded double quote, following the SQL standard. Both SQLite and PostgreSQL honor this form, so quoting lets a valid JavaScript identifier (camelCase, PascalCase, or a word that happens to be a SQL keyword like `order` or `select`) round-trip through generated DDL and queries without producing invalid or ambiguous SQL.
+
+### Signature
+
+```typescript
+function quoteIdent(name: string): string
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | `string` | The raw identifier (collection name, or field/column name). |
+
+### Returns
+
+`string` -- The identifier wrapped in double quotes, with any embedded double quotes doubled, ready to splice into SQL.
+
+### Example
+
+```typescript
+import { quoteIdent } from '@korajs/core'
+
+quoteIdent('formResponses') // '"formResponses"'
+quoteIdent('order')         // '"order"' (safe even though `order` is a SQL keyword)
+```
+
+---
+
+## Blobs (content-addressed binary)
+
+Blob helpers create and validate content-addressed references to binary data stored out of band. A `blob` field never carries the bytes in the operation log; it carries a small `BlobRef` keyed by the content hash, so identical content is stored once and never re-synced to a peer that already has that hash.
+
+```typescript
+import { createBlobRef, hashBlob, isBlobRef } from '@korajs/core'
+```
+
+### hashBlob()
+
+Computes the hex-encoded SHA-256 content hash of a byte buffer. This is the content address of a blob: identical bytes always hash to the same value.
+
+```typescript
+function hashBlob(bytes: Uint8Array): Promise<string>
+```
+
+### createBlobRef()
+
+Creates a content-addressed `BlobRef` for a byte buffer, carrying the content hash, size, and optional metadata.
+
+```typescript
+function createBlobRef(bytes: Uint8Array, metadata?: BlobRefMetadata): Promise<BlobRef>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bytes` | `Uint8Array` | The binary content. |
+| `metadata` | `BlobRefMetadata` | Optional MIME type and filename. Defaults to `{}`. |
+
+### isBlobRef()
+
+Type guard that checks whether a value is a structurally valid `BlobRef`. It validates the shape only (a non-empty hex hash and a non-negative integer size); it does not verify that the bytes behind the hash exist or match.
+
+```typescript
+function isBlobRef(value: unknown): value is BlobRef
+```
+
+### BlobRef
+
+A content-addressed reference to binary data stored out of band.
+
+```typescript
+interface BlobRef {
+  /** Hex-encoded SHA-256 hash of the bytes. The content address. */
+  hash: string
+  /** Size of the bytes in bytes. */
+  size: number
+  /** Optional MIME type (for example "image/png"). */
+  mimeType?: string
+  /** Optional original filename. */
+  filename?: string
+  /** Hex-encoded SHA-256 hash of this blob's manifest (the chunk index a peer fetches first). Present when the blob was stored for transfer; absent for a bare reference. */
+  manifestHash?: string
+}
+```
+
+### BlobRefMetadata
+
+Optional metadata carried alongside a blob reference.
+
+```typescript
+interface BlobRefMetadata {
+  mimeType?: string
+  filename?: string
+}
+```
+
+---
+
 ## Types
 
 ### Operation
@@ -707,6 +813,15 @@ interface Operation {
 
   /** Schema version at time of creation. */
   schemaVersion: number
+
+  /** Atomic operation intents for fields in data (e.g., increment, max). Present only when atomic ops were used. */
+  atomicOps?: Record<string, AtomicOp>
+
+  /** Groups this operation with others in an atomic transaction. Not part of the content hash. */
+  transactionId?: string
+
+  /** Human-readable name for the mutation group (e.g., 'complete-sale'). For DevTools display. */
+  mutationName?: string
 }
 ```
 
@@ -744,6 +859,10 @@ interface SchemaDefinition {
   version: number
   collections: Record<string, CollectionDefinition>
   relations: Record<string, RelationDefinition>
+  /** Schema migrations keyed by target version. */
+  migrations: Record<number, MigrationDefinition>
+  /** Declarative partial-sync rules per collection. Present only when sync rules are declared. */
+  sync?: Record<string, SyncRuleDefinition>
 }
 ```
 
@@ -753,15 +872,20 @@ Describes a single field's type, default value, and modifiers. Produced by the `
 
 ```typescript
 interface FieldDescriptor {
-  type: 'string' | 'number' | 'boolean' | 'enum' | 'timestamp' | 'array' | 'richtext'
+  kind: FieldKind
   required: boolean
-  defaultValue: unknown | undefined
+  defaultValue: unknown
   auto: boolean
-  enumValues?: readonly string[]
-  inner?: FieldDescriptor   // For array fields
-  mergeStrategy?: 'lww' | 'counter' | 'max' | 'min' | 'union' | 'append-only' | 'server-authoritative'
+  enumValues: readonly string[] | null
+  itemKind: FieldKind | null              // Element kind for array fields
+  mergeStrategy: FieldMergeStrategy | null
+  transitions: TransitionMap | null       // State machine transitions for enum fields
+  nestedFields?: Record<string, FieldDescriptor> | null   // For object fields
+  secretMode?: SecretMode | null          // For secret fields
 }
 ```
+
+`FieldKind` is one of `'string' | 'number' | 'boolean' | 'timestamp' | 'richtext' | 'enum' | 'array' | 'object' | 'json' | 'blob' | 'secret'`. `FieldMergeStrategy` is one of `'lww' | 'counter' | 'max' | 'min' | 'union' | 'append-only' | 'server-authoritative'`. `SecretMode` is `'hashed' | 'encrypted'`.
 
 ### MergeTrace
 
@@ -778,8 +902,8 @@ interface MergeTrace {
   /** The field where the conflict occurred. */
   field: string
 
-  /** Which strategy resolved the conflict. */
-  strategy: 'lww' | 'crdt-text' | 'add-wins-set' | 'unique-constraint' | 'custom'
+  /** Which strategy resolved the conflict (e.g. 'lww', 'crdt-text', 'add-wins-set', 'unique-constraint', 'custom'). */
+  strategy: string
 
   /** Value from operation A. */
   inputA: unknown
@@ -818,13 +942,94 @@ type KoraEvent =
   | { type: 'constraint:violated'; constraint: string; trace: MergeTrace }
   | { type: 'sync:connected'; nodeId: string }
   | { type: 'sync:disconnected'; reason: string }
+  | {
+      type: 'sync:schema-mismatch'
+      clientSchemaVersion: number
+      serverSchemaVersion: number
+      supportedMin: number
+      supportedMax: number
+      reason: string
+    }
+  | { type: 'sync:auth-failed'; reason: string }
+  | {
+      type: 'sync:clock-skew'
+      /** serverTime - localTime in ms. Negative = this device's clock is fast. */
+      skewMs: number
+      severity: 'info' | 'slow-warning' | 'fast-blocked'
+      source: 'handshake' | 'server-reject'
+    }
+  | {
+      type: 'sync:clock-rebase'
+      /** Number of unsynced operations that were re-stamped. */
+      rebasedCount: number
+      /** How far ahead of server time the most future queued operation was, in ms. */
+      maxSkewMs: number
+    }
   | { type: 'sync:sent'; operations: Operation[]; batchSize: number }
   | { type: 'sync:received'; operations: Operation[]; batchSize: number }
   | { type: 'sync:acknowledged'; sequenceNumber: number }
+  | {
+      type: 'sync:apply-failed'
+      operationId: string
+      collection: string
+      recordId: string
+      code: string
+      message: string
+      retriable: boolean
+    }
+  | {
+      type: 'sync:operation-rejected'
+      operationId: string
+      collection: string
+      recordId: string
+      code: string
+      message: string
+      retriable: boolean
+    }
   | { type: 'query:subscribed'; queryId: string; collection: string }
   | { type: 'query:invalidated'; queryId: string; trigger: Operation }
   | { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
   | { type: 'connection:quality'; quality: ConnectionQuality }
+  | { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
+  | { type: 'sync:bandwidth'; bytesPerSecond: number; direction: 'in' | 'out' }
+  | {
+      type: 'sync:initial-sync-progress'
+      progress: number
+      totalBatches: number
+      receivedBatches: number
+    }
+  | { type: 'awareness:updated'; states: Map<number, unknown> }
+  | {
+      type: 'state-machine:transition'
+      collection: string
+      recordId: string
+      from: string
+      to: string
+      valid: boolean
+    }
+  | {
+      type: 'state-machine:rejected'
+      collection: string
+      recordId: string
+      from: string
+      to: string
+      allowed: string[]
+    }
+  | { type: 'store:persistence-error'; dbName: string; message: string; code: string }
+  | { type: 'store:quota-exceeded'; dbName: string; message: string }
+  | {
+      type: 'store:opfs-unavailable'
+      dbName: string
+      reason: 'lock-conflict' | 'timeout' | 'unsupported'
+      message: string
+    }
+  | { type: 'store:db-name-collision'; dbName: string; message: string }
+  | {
+      type: 'replay:completed'
+      targetOperationId: string
+      operationsApplied: number
+      duration: number
+    }
 ```
 
 ::: warning
@@ -1065,36 +1270,6 @@ const transitions = getTransitionMap(schema, 'orders', 'status')
 const none = getTransitionMap(schema, 'orders', 'title')
 // null (title is a string field, not an enum with transitions)
 ```
-
-### validateStateMachineDefinition()
-
-Validates a state machine definition against a collection's fields during schema building. Called internally by `defineSchema()` to ensure the state machine is well-formed. You can also call it directly for custom validation logic.
-
-#### Signature
-
-```typescript
-function validateStateMachineDefinition(
-  collectionName: string,
-  sm: { field: string; transitions: Record<string, string[]>; onInvalidTransition: string },
-  fields: Record<string, FieldDescriptor>
-): void
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `collectionName` | `string` | Name of the collection (for error messages). |
-| `sm` | `object` | The state machine input definition with `field`, `transitions`, and `onInvalidTransition`. |
-| `fields` | `Record<string, FieldDescriptor>` | The built field descriptors for the collection. |
-
-#### Errors
-
-- Throws `SchemaValidationError` if the referenced field does not exist in the collection.
-- Throws `SchemaValidationError` if the referenced field is not an enum.
-- Throws `SchemaValidationError` if the enum field has no values defined.
-- Throws `SchemaValidationError` if a source or target state in the transition map is not a valid enum value.
-- Throws `SchemaValidationError` if `onInvalidTransition` is not `'reject'` or `'last-valid-state'`.
 
 ### State machine types
 

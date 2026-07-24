@@ -1,5 +1,35 @@
 # @korajs/test
 
+## 1.0.0-beta.5
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @korajs/sync@1.0.0-beta.5
+  - korajs@1.0.0-beta.5
+  - @korajs/store@1.0.0-beta.5
+  - @korajs/core@1.0.0-beta.5
+  - @korajs/server@1.0.0-beta.5
+  - @korajs/merge@1.0.0-beta.5
+
 ## 1.0.0-beta.0
 
 ### Minor Changes

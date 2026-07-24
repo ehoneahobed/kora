@@ -14,8 +14,15 @@ import type {
 } from '../types'
 import type { FieldBuilder } from './types'
 
-/** Valid collection name pattern: lowercase, alphanumeric + underscore, starting with letter */
-const COLLECTION_NAME_RE = /^[a-z][a-z0-9_]*$/
+/**
+ * Valid collection name pattern: starts with a letter, then letters, numbers,
+ * and underscores. Case is preserved, so camelCase (`formResponses`) and
+ * PascalCase (`UserProfiles`) are allowed — generated SQL quotes every
+ * identifier (see `quoteIdent`), so mixed case and even reserved words like
+ * `order` round-trip safely. The leading-letter rule keeps names clear of the
+ * framework's own `_`-prefixed tables.
+ */
+const COLLECTION_NAME_RE = /^[A-Za-z][A-Za-z0-9_]*$/
 
 /** Valid field name pattern: camelCase allowed (e.g. createdAt, dueDate) */
 const FIELD_NAME_RE = /^[a-z][a-zA-Z0-9_]*$/
@@ -205,7 +212,7 @@ function validateVersion(version: number): void {
 function validateCollectionName(name: string): void {
 	if (!COLLECTION_NAME_RE.test(name)) {
 		throw new SchemaValidationError(
-			`Collection name "${name}" is invalid. Must be lowercase, start with a letter, and contain only letters, numbers, and underscores.`,
+			`Collection name "${name}" is invalid. Must start with a letter and contain only letters, numbers, and underscores.`,
 			{ collection: name },
 		)
 	}

@@ -37,6 +37,13 @@ export async function createServerSideEffectOperation(
  * Allocate the next sequence number for server-originated operations.
  */
 export function nextServerSequenceNumber(store: ServerStore): number {
+	// Prefer the store's atomic reservation when it serves writes concurrently (the
+	// Postgres conditional path), so two in-flight server operations never collide on
+	// a sequence number. Serialized stores fall back to the version vector, which is
+	// safe because only one server operation is ever in flight at a time.
+	if (store.reserveSequenceNumber) {
+		return store.reserveSequenceNumber()
+	}
 	const nodeId = store.getNodeId()
 	const current = store.getVersionVector().get(nodeId) ?? 0
 	return current + 1

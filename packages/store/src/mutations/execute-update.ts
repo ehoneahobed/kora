@@ -2,6 +2,7 @@ import type { AtomicOp } from '@korajs/core'
 import {
 	createOperation,
 	isAtomicOp,
+	quoteIdent,
 	resolveAtomicOp,
 	toAtomicOp,
 	transformSecretFieldsForWrite,
@@ -28,7 +29,7 @@ export async function executeUpdate(
 	data: Record<string, unknown>,
 ): Promise<CollectionRecord> {
 	const currentRows = await ctx.adapter.query<RawCollectionRow>(
-		`SELECT * FROM ${ctx.collection} WHERE id = ? AND _deleted = 0`,
+		`SELECT * FROM ${quoteIdent(ctx.collection)} WHERE id = ? AND _deleted = 0`,
 		[id],
 	)
 	const currentRow = currentRows[0]
@@ -128,7 +129,7 @@ export async function executeUpdate(
 	ctx.onMutation(ctx.collection, operation)
 
 	const rows = await ctx.adapter.query<RawCollectionRow>(
-		`SELECT * FROM ${ctx.collection} WHERE id = ? AND _deleted = 0`,
+		`SELECT * FROM ${quoteIdent(ctx.collection)} WHERE id = ? AND _deleted = 0`,
 		[id],
 	)
 	const row = rows[0]

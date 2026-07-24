@@ -1,5 +1,16 @@
-import { StorageError } from '@korajs/core'
-import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@korajs/core'
+import { StorageError, quoteIdent, replayOperationsForRecord } from '@korajs/core'
+import type {
+	CollectionDefinition,
+	FieldDescriptor,
+	ReplayOperation,
+	SchemaDefinition,
+} from '@korajs/core'
+
+// Re-exported so existing server-internal imports keep working; the implementation
+// now lives in @korajs/core so the client apply pipeline and the server materialize
+// records through the exact same atomic-aware fold.
+export { replayOperationsForRecord }
+export type { ReplayOperation }
 
 /**
  * SQL dialect for DDL generation.
@@ -24,6 +35,16 @@ function fieldTypeToSql(descriptor: FieldDescriptor, dialect: SqlDialect): strin
 			return dialect === 'postgres' ? 'BIGINT' : 'INTEGER'
 		case 'array':
 			return dialect === 'postgres' ? 'JSONB' : 'TEXT'
+		case 'object':
+			return dialect === 'postgres' ? 'JSONB' : 'TEXT'
+		case 'json':
+			return dialect === 'postgres' ? 'JSONB' : 'TEXT'
+		case 'blob':
+			// Content-addressed BlobRef metadata is stored as JSON; the bytes live
+			// out of band, so the column is textual, not binary.
+			return 'TEXT'
+		case 'secret':
+			return 'TEXT'
 		case 'richtext':
 			return dialect === 'postgres' ? 'BYTEA' : 'BLOB'
 	}
@@ -56,13 +77,13 @@ export function generateCollectionDDL(
 
 	for (const [fieldName, descriptor] of Object.entries(collection.fields)) {
 		const sqlType = fieldTypeToSql(descriptor, dialect)
-		let colDef = `${fieldName} ${sqlType}`
+		let colDef = `${quoteIdent(fieldName)} ${sqlType}`
 		if (descriptor.defaultValue !== undefined) {
 			colDef += ` DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`
 		}
 		if (descriptor.kind === 'enum' && descriptor.enumValues) {
 			const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-			colDef += ` CHECK (${fieldName} IN (${values}))`
+			colDef += ` CHECK (${quoteIdent(fieldName)} IN (${values}))`
 		}
 		columns.push(colDef)
 	}
@@ -72,27 +93,30 @@ export function generateCollectionDDL(
 	columns.push(`_updated_at ${tsType} NOT NULL DEFAULT 0`)
 	columns.push('_deleted INTEGER NOT NULL DEFAULT 0')
 
-	statements.push(`CREATE TABLE IF NOT EXISTS ${name} (\n  ${columns.join(',\n  ')}\n)`)
+	statements.push(`CREATE TABLE IF NOT EXISTS ${quoteIdent(name)} (\n  ${columns.join(',\n  ')}\n)`)
 
 	// Safe ALTER TABLE for adding new columns to existing tables
 	for (const [fieldName, descriptor] of Object.entries(collection.fields)) {
 		const sqlType = fieldTypeToSql(descriptor, dialect)
-		let colDef = `${fieldName} ${sqlType}`
+		let colDef = `${quoteIdent(fieldName)} ${sqlType}`
 		if (descriptor.defaultValue !== undefined) {
 			colDef += ` DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`
 		}
-		statements.push(`--kora:safe-alter\nALTER TABLE ${name} ADD COLUMN ${colDef}`)
+		statements.push(`--kora:safe-alter\nALTER TABLE ${quoteIdent(name)} ADD COLUMN ${colDef}`)
 	}
 
-	// User-defined indexes from schema
+	// User-defined indexes from schema. The index NAME stays unquoted (only ever
+	// created/dropped by this construction); the table and column are quoted.
 	for (const indexField of collection.indexes) {
 		statements.push(
-			`CREATE INDEX IF NOT EXISTS idx_${name}_${indexField} ON ${name} (${indexField})`,
+			`CREATE INDEX IF NOT EXISTS idx_${name}_${indexField} ON ${quoteIdent(name)} (${quoteIdent(indexField)})`,
 		)
 	}
 
 	// Always index _deleted for efficient soft-delete filtering
-	statements.push(`CREATE INDEX IF NOT EXISTS idx_${name}__deleted ON ${name} (_deleted)`)
+	statements.push(
+		`CREATE INDEX IF NOT EXISTS idx_${name}__deleted ON ${quoteIdent(name)} (_deleted)`,
+	)
 
 	return statements
 }
@@ -106,42 +130,6 @@ export function generateAllCollectionDDL(schema: SchemaDefinition, dialect: SqlD
 		statements.push(...generateCollectionDDL(name, collection, dialect))
 	}
 	return statements
-}
-
-/**
- * Replay a list of operations (must be sorted by HLC order) to produce
- * the current state of a single record.
- *
- * Returns the record field data (without `id`) or null if the record was deleted
- * or never inserted.
- */
-export function replayOperationsForRecord(
-	ops: Array<{ type: string; data: Record<string, unknown> | null }>,
-): Record<string, unknown> | null {
-	let record: Record<string, unknown> | null = null
-	let deleted = false
-
-	for (const op of ops) {
-		switch (op.type) {
-			case 'insert':
-				if (op.data) {
-					record = { ...op.data }
-					deleted = false
-				}
-				break
-			case 'update':
-				if (op.data) {
-					record = { ...(record ?? {}), ...op.data }
-					deleted = false
-				}
-				break
-			case 'delete':
-				deleted = true
-				break
-		}
-	}
-
-	return deleted ? null : record
 }
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'

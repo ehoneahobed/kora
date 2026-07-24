@@ -32,24 +32,20 @@ await store.open()
 const proj = await store.collection('projects').insert({ name: 'Kora 0.7.0 release' })
 await store.collection('projects').insert({ name: 'Studio prototype' })
 
-const t1 = await store
-	.collection('tasks')
-	.insert({
-		title: 'Fix concurrent edit data loss',
-		assignee: 'obed',
-		priority: 'high',
-		tags: ['sync', 'correctness'],
-	})
+const t1 = await store.collection('tasks').insert({
+	title: 'Fix concurrent edit data loss',
+	assignee: 'obed',
+	priority: 'high',
+	tags: ['sync', 'correctness'],
+})
 await store.collection('tasks').update(t1.id, { done: true })
 
-const t2 = await store
-	.collection('tasks')
-	.insert({
-		title: 'Per-field LWW register',
-		assignee: 'claude',
-		priority: 'high',
-		tags: ['store'],
-	})
+const t2 = await store.collection('tasks').insert({
+	title: 'Per-field LWW register',
+	assignee: 'claude',
+	priority: 'high',
+	tags: ['store'],
+})
 await store.collection('tasks').update(t2.id, { done: true })
 await store.collection('tasks').update(t2.id, { tags: ['store', 'merge', 'shipped'] })
 

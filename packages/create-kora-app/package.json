@@ -1,6 +1,6 @@
 {
   "name": "create-kora-app",
-  "version": "0.1.25-beta.1",
+  "version": "0.1.25-beta.5",
   "description": "Create a new Kora.js offline-first application",
   "type": "module",
   "bin": {

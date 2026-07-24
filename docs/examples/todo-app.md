@@ -147,7 +147,7 @@ export function AddTodo() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!title.trim()) return
-    addTodo({ title: title.trim(), priority: 'medium' })
+    addTodo.mutate({ title: title.trim(), priority: 'medium' })
     setTitle('')
   }
 
@@ -164,7 +164,7 @@ export function AddTodo() {
 }
 ```
 
-`useMutation` is optimistic by default. The todo appears in the list instantly, before sync confirms it. If you need confirmation, you can `await` the result.
+`useMutation` returns an object with `mutate` (fire-and-forget) and `mutateAsync` (awaitable) methods, plus `reset`, `isLoading`, and `error`. It is optimistic by default: calling `addTodo.mutate(...)` makes the todo appear in the list instantly, before sync confirms it. If you need confirmation, call `await addTodo.mutateAsync(...)` instead.
 
 ### TodoItem
 
@@ -190,13 +190,13 @@ export function TodoItem({ todo }: { todo: Todo }) {
       <input
         type="checkbox"
         checked={todo.completed}
-        onChange={() => updateTodo(todo.id, { completed: !todo.completed })}
+        onChange={() => updateTodo.mutate(todo.id, { completed: !todo.completed })}
       />
       <span style={{ textDecoration: todo.completed ? 'line-through' : 'none' }}>
         {todo.title}
       </span>
       <span>{todo.priority}</span>
-      <button onClick={() => deleteTodo(todo.id)}>Delete</button>
+      <button onClick={() => deleteTodo.mutate(todo.id)}>Delete</button>
     </li>
   )
 }

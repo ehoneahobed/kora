@@ -340,6 +340,14 @@ function mapFieldType(descriptor: FieldDescriptor): string {
 			return 'INTEGER'
 		case 'array':
 			return 'TEXT'
+		case 'object':
+			return 'TEXT'
+		case 'json':
+			return 'TEXT'
+		case 'blob':
+			return 'TEXT'
+		case 'secret':
+			return 'TEXT'
 		case 'richtext':
 			return 'BLOB'
 	}
@@ -357,7 +365,10 @@ function quoteIdentifier(identifier: string): string {
 	if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(identifier)) {
 		throw new Error(`Invalid SQL identifier: ${identifier}`)
 	}
-	return identifier
+	// Double-quote to match @korajs/core's generateSQL, so a generated migration
+	// is internally consistent (CREATE from core, DROP/rebuild from here) even for
+	// camelCase or reserved-word collection and column names.
+	return `"${identifier}"`
 }
 
 function formatChange(change: SchemaDiff['changes'][number]): string {

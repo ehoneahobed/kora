@@ -4,6 +4,7 @@ import type {
 	RelationDefinition,
 	SchemaDefinition,
 } from '../types'
+import { quoteIdent } from './quote-ident'
 
 /**
  * Generate CREATE TABLE and CREATE INDEX SQL for a single collection.
@@ -34,7 +35,7 @@ export function generateSQL(
 		if (relations) {
 			for (const rel of Object.values(relations)) {
 				if (rel.from === collectionName && rel.field === fieldName) {
-					colDef += ` REFERENCES ${rel.to}(id)`
+					colDef += ` REFERENCES ${quoteIdent(rel.to)}(id)`
 					fkFields.push(fieldName)
 					break
 				}
@@ -55,25 +56,32 @@ export function generateSQL(
 	columns.push("_field_versions TEXT NOT NULL DEFAULT '{}'")
 	columns.push('_deleted INTEGER NOT NULL DEFAULT 0')
 
-	statements.push(`CREATE TABLE IF NOT EXISTS ${collectionName} (\n  ${columns.join(',\n  ')}\n)`)
+	statements.push(
+		`CREATE TABLE IF NOT EXISTS ${quoteIdent(collectionName)} (\n  ${columns.join(',\n  ')}\n)`,
+	)
 
 	// Add ALTER TABLE statements so new columns are added to existing tables.
 	// These are tagged with --kora:safe-alter so the runtime can ignore "duplicate column" errors.
 	for (const [fieldName, descriptor] of Object.entries(collection.fields)) {
 		const colDef = columnDefinition(fieldName, descriptor)
-		statements.push(`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN ${colDef}`)
+		statements.push(
+			`--kora:safe-alter\nALTER TABLE ${quoteIdent(collectionName)} ADD COLUMN ${colDef}`,
+		)
 	}
 	statements.push(
-		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _version TEXT NOT NULL DEFAULT ''`,
+		`--kora:safe-alter\nALTER TABLE ${quoteIdent(collectionName)} ADD COLUMN _version TEXT NOT NULL DEFAULT ''`,
 	)
 	statements.push(
-		`--kora:safe-alter\nALTER TABLE ${collectionName} ADD COLUMN _field_versions TEXT NOT NULL DEFAULT '{}'`,
+		`--kora:safe-alter\nALTER TABLE ${quoteIdent(collectionName)} ADD COLUMN _field_versions TEXT NOT NULL DEFAULT '{}'`,
 	)
 
-	// Create indexes
+	// Create indexes. The index NAME stays unquoted (it is only ever created and
+	// dropped by this same construction, never referenced by a query), but the
+	// table and column in the ON clause are quoted so mixed-case / keyword names
+	// resolve correctly.
 	for (const indexField of collection.indexes) {
 		statements.push(
-			`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${indexField} ON ${collectionName} (${indexField})`,
+			`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${indexField} ON ${quoteIdent(collectionName)} (${quoteIdent(indexField)})`,
 		)
 	}
 
@@ -81,14 +89,16 @@ export function generateSQL(
 	for (const fkField of fkFields) {
 		if (!indexedFields.has(fkField)) {
 			statements.push(
-				`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${fkField} ON ${collectionName} (${fkField})`,
+				`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${fkField} ON ${quoteIdent(collectionName)} (${quoteIdent(fkField)})`,
 			)
 		}
 	}
 
-	// Per-collection operations log table
+	// Per-collection operations log table. The table name carries the collection
+	// name, so it is quoted too (a collection named `order` would otherwise make
+	// `_kora_ops_order` collide with reserved-word handling on some engines).
 	statements.push(
-		`CREATE TABLE IF NOT EXISTS _kora_ops_${collectionName} (
+		`CREATE TABLE IF NOT EXISTS ${quoteIdent(`_kora_ops_${collectionName}`)} (
   id TEXT PRIMARY KEY NOT NULL,
   node_id TEXT NOT NULL,
   type TEXT NOT NULL,
@@ -104,7 +114,7 @@ export function generateSQL(
 	// Record-scoped lookups run on every remote apply (latest-op-for-record,
 	// orphaned-op fold on out-of-order inserts) — index them.
 	statements.push(
-		`CREATE INDEX IF NOT EXISTS idx_kora_ops_${collectionName}_record_id ON _kora_ops_${collectionName} (record_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_kora_ops_${collectionName}_record_id ON ${quoteIdent(`_kora_ops_${collectionName}`)} (record_id)`,
 	)
 
 	return statements
@@ -154,6 +164,21 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 			')',
 	)
 
+	// Durable record of operations the server rejected (survives page refresh).
+	// An op lands here after being diverted out of the outbound queue, so it is
+	// never retried yet stays explainable to the app until reconciled.
+	statements.push(
+		'CREATE TABLE IF NOT EXISTS _kora_sync_rejected (\n' +
+			'  operation_id TEXT PRIMARY KEY NOT NULL,\n' +
+			'  collection TEXT NOT NULL,\n' +
+			'  record_id TEXT NOT NULL,\n' +
+			'  code TEXT NOT NULL,\n' +
+			'  message TEXT NOT NULL,\n' +
+			'  retriable INTEGER NOT NULL,\n' +
+			'  rejected_at INTEGER NOT NULL\n' +
+			')',
+	)
+
 	// Durable merge / constraint audit trail (enterprise audit export)
 	statements.push(
 		'CREATE TABLE IF NOT EXISTS _kora_audit_traces (\n' +
@@ -185,7 +210,7 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 
 function columnDefinition(fieldName: string, descriptor: FieldDescriptor): string {
 	const sqlType = mapFieldType(descriptor)
-	const parts = [fieldName, sqlType]
+	const parts = [quoteIdent(fieldName), sqlType]
 
 	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
 		parts.push('NOT NULL')
@@ -198,7 +223,7 @@ function columnDefinition(fieldName: string, descriptor: FieldDescriptor): strin
 	// CHECK constraint for enum fields
 	if (descriptor.kind === 'enum' && descriptor.enumValues) {
 		const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-		parts.push(`CHECK (${fieldName} IN (${values}))`)
+		parts.push(`CHECK (${quoteIdent(fieldName)} IN (${values}))`)
 	}
 
 	return parts.join(' ')

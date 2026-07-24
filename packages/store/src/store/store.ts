@@ -4,6 +4,8 @@ import {
 	createVersionVector,
 	generateUUIDv7,
 	migrationStepsToSQL,
+	quoteIdent,
+	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
 	KoraEventEmitter,
@@ -50,9 +52,13 @@ import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import {
 	collectOperationsAheadOfServer,
+	deleteDeliveryWatermark,
+	loadAllDeliveryWatermarks,
+	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
 	mergeVersionVectors,
+	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
 } from '../sync/sync-state'
@@ -275,7 +281,7 @@ export class Store implements OperationLog {
 
 		// Check for duplicate (content-addressed dedup)
 		const existing = await this.adapter.query<{ id: string }>(
-			`SELECT id FROM _kora_ops_${collection} WHERE id = ?`,
+			`SELECT id FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE id = ?`,
 			[op.id],
 		)
 		if (existing.length > 0) {
@@ -314,7 +320,11 @@ export class Store implements OperationLog {
 				}
 			}
 
-			if (op.type === 'insert' && materializeSource) {
+			if (options?.logOnly) {
+				// Append-only: the caller (after folding the record's log) determined
+				// this op does not change the authoritative row. Persist it for future
+				// folds but leave the row untouched. Fall through to op-log insert + VV.
+			} else if (op.type === 'insert' && materializeSource) {
 				const serializedData = serializeRecord(materializeSource, definition.fields)
 				const existing = await tx.query<RawCollectionRow>(
 					`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
@@ -344,7 +354,7 @@ export class Store implements OperationLog {
 					// a fold of the log — fold the orphans now, in timestamp order,
 					// inside this same transaction. Per-field LWW makes the result
 					// identical to what an in-order device computed.
-					await this.foldOrphanedOperations(tx, collection, definition, op.recordId)
+					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
 				} else if (row._deleted === 1) {
 					// Insert vs tombstone: a strictly newer insert resurrects the record
 					// with its full field set; an older one is stale (delete wins).
@@ -416,7 +426,7 @@ export class Store implements OperationLog {
 				// mutation — this is what prevents a relayed remote op from clobbering
 				// a newer local edit that lands between the read and the write.
 				const currentRows = await tx.query<RawCollectionRow>(
-					`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+					`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
 					[op.recordId],
 				)
 				const currentRow = currentRows[0]
@@ -536,9 +546,10 @@ export class Store implements OperationLog {
 		collection: string,
 		definition: NonNullable<SchemaDefinition['collections'][string]>,
 		recordId: string,
+		insertOp: Operation,
 	): Promise<void> {
 		const orphanRows = await tx.query<OperationRow>(
-			`SELECT * FROM _kora_ops_${collection} WHERE record_id = ? AND type IN ('update', 'delete')`,
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND type IN ('update', 'delete')`,
 			[recordId],
 		)
 		if (orphanRows.length === 0) {
@@ -556,7 +567,7 @@ export class Store implements OperationLog {
 			if (orphan.type === 'update' && orphan.data) {
 				const orphanChanges = serializeRecord(orphan.data, definition.fields)
 				const rows = await tx.query<RawCollectionRow>(
-					`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+					`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
 					[recordId],
 				)
 				const current = rows[0]
@@ -590,6 +601,46 @@ export class Store implements OperationLog {
 				await tx.execute(query.sql, query.params)
 			}
 		}
+
+		// Atomic-op fields need composition, not last-write-wins: the per-field LWW
+		// loop above would keep only one concurrent increment's resolved value and drop
+		// the rest. Re-materialize just the atomic fields by folding [insert, ...orphans]
+		// in HLC order through the shared atomic-aware replay — the same fold the server
+		// and the live apply path use — so an atomic op that arrived before its insert
+		// (reordered delivery) composes correctly instead of losing deltas. Only the
+		// field VALUES are overwritten; their per-field versions were already stamped to
+		// the latest writer by the loop above, so future LWW stays correct.
+		const atomicFields = new Set<string>()
+		for (const orphan of orphans) {
+			if (orphan.type === 'update' && orphan.atomicOps) {
+				for (const field of Object.keys(orphan.atomicOps)) {
+					atomicFields.add(field)
+				}
+			}
+		}
+		if (atomicFields.size > 0) {
+			const ordered = [insertOp, ...orphans].sort((a, b) =>
+				HybridLogicalClock.compare(a.timestamp, b.timestamp),
+			)
+			const folded = replayOperationsForRecord(ordered)
+			if (folded) {
+				const composed: Record<string, unknown> = {}
+				for (const field of atomicFields) {
+					if (field in folded) {
+						composed[field] = folded[field]
+					}
+				}
+				const serialized = serializeRecord(composed, definition.fields)
+				const cols = Object.keys(serialized)
+				if (cols.length > 0) {
+					const setClause = cols.map((c) => `${quoteIdent(c)} = ?`).join(', ')
+					await tx.execute(`UPDATE ${quoteIdent(collection)} SET ${setClause} WHERE id = ?`, [
+						...cols.map((c) => serialized[c]),
+						recordId,
+					])
+				}
+			}
+		}
 	}
 
 	/**
@@ -609,7 +660,7 @@ export class Store implements OperationLog {
 
 		for (const collectionName of Object.keys(this.schema.collections)) {
 			const rows = await this.adapter.query<OperationRow>(
-				`SELECT * FROM _kora_ops_${collectionName} WHERE node_id = ? AND sequence_number >= ? AND sequence_number <= ? ORDER BY sequence_number ASC`,
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} WHERE node_id = ? AND sequence_number >= ? AND sequence_number <= ? ORDER BY sequence_number ASC`,
 				[nodeId, fromSeq, toSeq],
 			)
 			for (const row of rows) {
@@ -632,7 +683,7 @@ export class Store implements OperationLog {
 
 		for (const collectionName of Object.keys(this.schema.collections)) {
 			const rows = await this.adapter.query<OperationRow>(
-				`SELECT * FROM _kora_ops_${collectionName} ORDER BY sequence_number ASC`,
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} ORDER BY sequence_number ASC`,
 			)
 			for (const row of rows) {
 				allOps.push(deserializeOperationWithCollection(row, collectionName))
@@ -762,7 +813,7 @@ export class Store implements OperationLog {
 		}
 
 		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${collection} WHERE id = ?`,
+			`SELECT * FROM ${quoteIdent(collection)} WHERE id = ?`,
 			[recordId],
 		)
 		const row = rows[0]
@@ -789,7 +840,7 @@ export class Store implements OperationLog {
 			return null
 		}
 		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT _version, _field_versions FROM ${collection} WHERE id = ?`,
+			`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
 			[recordId],
 		)
 		const row = rows[0]
@@ -835,6 +886,39 @@ export class Store implements OperationLog {
 	async saveDeltaCursor(cursor: string | null): Promise<void> {
 		this.ensureOpen()
 		await saveDeltaCursor(this.adapter, cursor)
+	}
+
+	/**
+	 * Load the persisted delivery watermark for a view signature (0 when none recorded).
+	 * Defaults to the unfiltered view so existing single-watermark reads keep working.
+	 */
+	async loadDeliveryWatermark(signature = ''): Promise<number> {
+		this.ensureOpen()
+		return loadDeliveryWatermark(this.adapter, signature)
+	}
+
+	/**
+	 * Persist the delivery watermark for a view signature so it survives a client restart.
+	 */
+	async saveDeliveryWatermark(signature: string, watermark: number): Promise<void> {
+		this.ensureOpen()
+		await saveDeliveryWatermark(this.adapter, signature, watermark)
+	}
+
+	/**
+	 * Load every persisted view watermark, keyed by signature.
+	 */
+	async loadAllDeliveryWatermarks(): Promise<Record<string, number>> {
+		this.ensureOpen()
+		return loadAllDeliveryWatermarks(this.adapter)
+	}
+
+	/**
+	 * Delete a persisted view watermark (safe: the view back-fills from 0 when next visited).
+	 */
+	async deleteDeliveryWatermark(signature: string): Promise<void> {
+		this.ensureOpen()
+		await deleteDeliveryWatermark(this.adapter, signature)
 	}
 
 	/**
@@ -912,7 +996,7 @@ export class Store implements OperationLog {
 	): Promise<Operation | null> {
 		this.ensureOpen()
 		const rows = await this.adapter.query<OperationRow>(
-			`SELECT * FROM _kora_ops_${collection} WHERE node_id = ? AND record_id = ? ORDER BY sequence_number DESC LIMIT 1`,
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE node_id = ? AND record_id = ? ORDER BY sequence_number DESC LIMIT 1`,
 			[this.nodeId, recordId],
 		)
 		const row = rows[0]
@@ -931,7 +1015,7 @@ export class Store implements OperationLog {
 	): Promise<Operation | null> {
 		this.ensureOpen()
 		const rows = await this.adapter.query<OperationRow>(
-			`SELECT * FROM _kora_ops_${collection} WHERE record_id = ?`,
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
 			[recordId],
 		)
 
@@ -943,6 +1027,22 @@ export class Store implements OperationLog {
 			}
 		}
 		return latest
+	}
+
+	/**
+	 * All operations for a record, sorted in HLC total order (wallTime, logical,
+	 * nodeId). Used by the apply pipeline to materialize atomic-op fields by folding
+	 * the record's log, matching the server's materialization exactly.
+	 */
+	async getOperationsForRecord(collection: string, recordId: string): Promise<Operation[]> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<OperationRow>(
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
+			[recordId],
+		)
+		const ops = rows.map((row) => deserializeOperationWithCollection(row, collection))
+		ops.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
+		return ops
 	}
 
 	/** Expose the subscription manager for direct access (e.g., by QueryBuilder) */
@@ -1154,7 +1254,7 @@ export class Store implements OperationLog {
 		transform: (record: Record<string, unknown>) => Record<string, unknown>,
 	): Promise<void> {
 		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${collection} WHERE _deleted = 0`,
+			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
 		)
 
 		await this.adapter.transaction(async (tx) => {
@@ -1163,7 +1263,7 @@ export class Store implements OperationLog {
 				const fields = Object.keys(updates)
 				if (fields.length === 0) continue
 
-				const setClauses = fields.map((f) => `${f} = ?`).join(', ')
+				const setClauses = fields.map((f) => `${quoteIdent(f)} = ?`).join(', ')
 				const values = fields.map((f) => {
 					const val = updates[f]
 					// Serialize booleans to 0/1 for SQLite
@@ -1176,7 +1276,7 @@ export class Store implements OperationLog {
 				})
 				values.push(row.id)
 
-				await tx.execute(`UPDATE ${collection} SET ${setClauses} WHERE id = ?`, values)
+				await tx.execute(`UPDATE ${quoteIdent(collection)} SET ${setClauses} WHERE id = ?`, values)
 			}
 		})
 	}

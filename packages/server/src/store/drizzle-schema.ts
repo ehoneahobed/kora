@@ -18,6 +18,7 @@ export const operations = sqliteTable(
 		recordId: text('record_id').notNull(),
 		data: text('data'), // JSON-serialized, null for deletes
 		previousData: text('previous_data'), // JSON-serialized, null for insert/delete
+		atomicOps: text('atomic_ops'), // JSON-serialized Record<field, AtomicOp>, null when none
 		wallTime: integer('wall_time').notNull(),
 		logical: integer('logical').notNull(),
 		timestampNodeId: text('timestamp_node_id').notNull(),
@@ -25,11 +26,16 @@ export const operations = sqliteTable(
 		causalDeps: text('causal_deps').notNull().default('[]'), // JSON array of op IDs
 		schemaVersion: integer('schema_version').notNull(),
 		receivedAt: integer('received_at').notNull(),
+		// Server-assigned monotonic delivery sequence, ordered by commit. Drives the
+		// gap-free server->client delivery watermark. Nullable only for rows written
+		// before the column existed; those are backfilled on startup.
+		deliverySeq: integer('delivery_seq'),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_node_seq').on(table.nodeId, table.sequenceNumber),
 		collectionIdx: index('idx_collection').on(table.collection),
 		receivedIdx: index('idx_received').on(table.receivedAt),
+		deliveryIdx: index('idx_delivery_seq').on(table.deliverySeq),
 	}),
 )
 

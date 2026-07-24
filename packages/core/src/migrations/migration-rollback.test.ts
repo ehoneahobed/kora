@@ -357,7 +357,7 @@ describe('rollbackStepsToSQL', () => {
 		const builder = migrate().addField('todos', 'priority', t.string().default('medium'))
 
 		const sql = rollbackStepsToSQL(builder)
-		expect(sql).toEqual(['ALTER TABLE todos DROP COLUMN priority'])
+		expect(sql).toEqual(['ALTER TABLE "todos" DROP COLUMN "priority"'])
 	})
 
 	test('skips backfill steps (handled at application layer)', () => {
@@ -368,7 +368,7 @@ describe('rollbackStepsToSQL', () => {
 			})
 		const sql = rollbackStepsToSQL(builder)
 		// backfill produces no SQL
-		expect(sql).toEqual(['ALTER TABLE todos DROP COLUMN priority'])
+		expect(sql).toEqual(['ALTER TABLE "todos" DROP COLUMN "priority"'])
 	})
 })
 
@@ -388,9 +388,9 @@ describe('round-trip: up then down', () => {
 		const downSQL = migrationStepsToSQL(rollback)
 
 		expect(upSQL).toHaveLength(1)
-		expect(upSQL[0]).toContain('ADD COLUMN priority')
+		expect(upSQL[0]).toContain('ADD COLUMN "priority"')
 		expect(downSQL).toHaveLength(1)
-		expect(downSQL[0]).toContain('DROP COLUMN priority')
+		expect(downSQL[0]).toContain('DROP COLUMN "priority"')
 	})
 
 	test('addIndex followed by removeIndex rollback', () => {
@@ -413,8 +413,8 @@ describe('round-trip: up then down', () => {
 		const upSQL = migrationStepsToSQL(upSteps)
 		const downSQL = migrationStepsToSQL(rollback)
 
-		expect(upSQL[0]).toBe('ALTER TABLE products RENAME COLUMN cost TO costPrice')
-		expect(downSQL[0]).toBe('ALTER TABLE products RENAME COLUMN costPrice TO cost')
+		expect(upSQL[0]).toBe('ALTER TABLE "products" RENAME COLUMN "cost" TO "costPrice"')
+		expect(downSQL[0]).toBe('ALTER TABLE "products" RENAME COLUMN "costPrice" TO "cost"')
 	})
 
 	test('complex migration with multiple auto-rollbackable steps', () => {
@@ -467,9 +467,9 @@ describe('backward compatibility', () => {
 			.addIndex('products', 'costPrice').steps
 		const sql = migrationStepsToSQL(steps)
 		expect(sql).toEqual([
-			'ALTER TABLE products ADD COLUMN taxInclusive INTEGER DEFAULT 0',
-			'ALTER TABLE products RENAME COLUMN cost TO costPrice',
-			'CREATE INDEX IF NOT EXISTS idx_products_costPrice ON products (costPrice)',
+			'ALTER TABLE "products" ADD COLUMN "taxInclusive" INTEGER DEFAULT 0',
+			'ALTER TABLE "products" RENAME COLUMN "cost" TO "costPrice"',
+			'CREATE INDEX IF NOT EXISTS idx_products_costPrice ON "products" ("costPrice")',
 		])
 	})
 })
@@ -495,8 +495,8 @@ describe('edge cases', () => {
 		const upSQL = migrationStepsToSQL(migration.up)
 		const downSQL = migrationStepsToSQL(migration.down)
 
-		expect(upSQL).toEqual(['ALTER TABLE todos ADD COLUMN x REAL DEFAULT 0'])
-		expect(downSQL).toEqual(['ALTER TABLE todos DROP COLUMN x'])
+		expect(upSQL).toEqual(['ALTER TABLE "todos" ADD COLUMN "x" REAL DEFAULT 0'])
+		expect(downSQL).toEqual(['ALTER TABLE "todos" DROP COLUMN "x"'])
 	})
 
 	test('MigrationRollbackError context includes step details', () => {

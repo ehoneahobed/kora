@@ -376,11 +376,16 @@ describe('MergeAwareSyncStore', () => {
 				nodeId: 'remote-node',
 			},
 		})
+		// The stale update loses to the newer delete, but it is still appended to the
+		// log (so a later fold — e.g. an atomic resurrection — can compose it) via a
+		// log-only apply that leaves the tombstone untouched.
 		const result = await syncStore.applyRemoteOperation(updateOp)
-		expect(result).toBe('skipped')
+		expect(result).toBe('applied')
 
 		const row = await store.findMaterializedRow('todos', 'rec-1')
 		expect(row?.deleted).toBe(true)
+		// No zombie field: the tombstoned row keeps its original values.
+		expect((row?.record as Record<string, unknown> | undefined)?.title).toBe('Base')
 	})
 
 	test('remote update newer than local delete reactivates without zombie state', async () => {

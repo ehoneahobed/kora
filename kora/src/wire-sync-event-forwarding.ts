@@ -10,6 +10,7 @@ const SYNC_EVENT_TYPES = [
 	'sync:received',
 	'sync:acknowledged',
 	'sync:apply-failed',
+	'sync:operation-rejected',
 	'sync:diagnostics',
 	'sync:bandwidth',
 	'sync:initial-sync-progress',

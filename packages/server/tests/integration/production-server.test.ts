@@ -1,3 +1,4 @@
+import { type BlobRef, defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
@@ -188,5 +189,122 @@ describe('createProductionServer operational auth', () => {
 		} finally {
 			await server.stop()
 		}
+	})
+})
+
+describe('createProductionServer data-plane surface', () => {
+	const schema = defineSchema({
+		version: 1,
+		collections: {
+			tasks: {
+				fields: { title: t.string(), done: t.boolean().default(false) },
+			},
+			tags: {
+				fields: { name: t.string() },
+				constraints: [{ type: 'unique', fields: ['name'], onConflict: 'server-decides' }],
+			},
+			attachments: {
+				fields: { label: t.string(), file: t.blob() },
+			},
+		},
+	})
+
+	test('server.kora applies and reads through the validated pipeline with no HTTP request', async () => {
+		// A background job / scheduled task path: no request object, no client
+		// connection, yet the same validated data plane as sync.
+		const store = new MemoryServerStore('server-kora')
+		await store.setSchema(schema)
+		const server = createProductionServer({ store })
+
+		const applied = await server.kora.apply({
+			collection: 'tasks',
+			type: 'insert',
+			data: { title: 'seeded by a job', done: false },
+		})
+		expect(applied.ok).toBe(true)
+		if (!applied.ok) return
+
+		const readBack = await server.kora.findById('tasks', applied.operation.recordId)
+		expect(readBack?.title).toBe('seeded by a job')
+
+		const all = await server.kora.query('tasks')
+		expect(all).toHaveLength(1)
+	})
+
+	test('server.kora surfaces a non-retriable rejection when a constraint is violated', async () => {
+		const store = new MemoryServerStore('server-kora-reject')
+		await store.setSchema(schema)
+		const server = createProductionServer({ store })
+
+		const first = await server.kora.apply({
+			collection: 'tags',
+			type: 'insert',
+			recordId: 'tag-1',
+			data: { name: 'urgent' },
+		})
+		expect(first.ok).toBe(true)
+
+		// A second record with the same unique name must be refused, and the
+		// refusal must be classed permanent — resubmitting the same bytes can never
+		// succeed, so a client should not retry it.
+		const second = await server.kora.apply({
+			collection: 'tags',
+			type: 'insert',
+			recordId: 'tag-2',
+			data: { name: 'urgent' },
+		})
+		expect(second.ok).toBe(false)
+		if (second.ok) return
+		expect(second.retriable).toBe(false)
+	})
+
+	test('getLiveBlobRefs returns every blob still reachable from a live record', async () => {
+		const store = new MemoryServerStore('server-blobs')
+		await store.setSchema(schema)
+		const server = createProductionServer({ store })
+
+		const ref: BlobRef = {
+			hash: 'a'.repeat(64),
+			size: 3,
+			mimeType: 'text/plain',
+			filename: 'note.txt',
+		}
+		const inserted = await server.kora.apply({
+			collection: 'attachments',
+			type: 'insert',
+			data: { label: 'a note', file: ref },
+		})
+		expect(inserted.ok).toBe(true)
+		if (!inserted.ok) return
+
+		const live = await server.getLiveBlobRefs()
+		expect(live.map((r) => r.hash)).toContain(ref.hash)
+
+		// After the record is deleted, the blob is no longer live, so a scheduled
+		// GC using this set would reclaim it.
+		await server.kora.apply({
+			collection: 'attachments',
+			type: 'delete',
+			recordId: inserted.operation.recordId,
+		})
+		const afterDelete = await server.getLiveBlobRefs()
+		expect(afterDelete.map((r) => r.hash)).not.toContain(ref.hash)
+	})
+
+	test('accepts maxOperationBytes and maxOpsPerMinute at server config', async () => {
+		// The knobs are set once at the server level (item 3). Enforcement itself
+		// is covered against a live session in kora-sync-server.test.ts.
+		const store = new MemoryServerStore('server-limits')
+		await store.setSchema(schema)
+		const server = createProductionServer({
+			store,
+			syncOptions: { maxOperationBytes: 1024, maxOpsPerMinute: 5 },
+		})
+		const applied = await server.kora.apply({
+			collection: 'tasks',
+			type: 'insert',
+			data: { title: 'ok', done: false },
+		})
+		expect(applied.ok).toBe(true)
 	})
 })

@@ -135,7 +135,9 @@ describe('migrate command', () => {
 			join(tempDir.path, 'kora', 'migrations', '001-v1-to-v1.ts'),
 			'utf-8',
 		)
-		expect(migration).toContain('DROP TABLE todos')
+		// The migration file is JSON.stringify'd, so the quoted identifier's inner
+		// double quotes are backslash-escaped in the emitted source.
+		expect(migration).toContain('DROP TABLE \\"todos\\"')
 	})
 })
 

@@ -48,4 +48,16 @@ export interface SyncStore {
 		ids: string[],
 		correctedNowMs: number,
 	): Promise<{ operations: Operation[]; idMapping: Record<string, string>; rebasedCount: number }>
+
+	/**
+	 * Optional: read a record's current materialized field values, used to backfill
+	 * scope / query-subset fields that a partial update (or a delete) does not carry
+	 * in its own data. Without it, such an operation would be judged out of scope by
+	 * its changed fields alone and wrongly dropped from sync. Optional so hand-rolled
+	 * SyncStore implementations keep working; when absent, the engine falls back to
+	 * judging visibility from the operation's own data.
+	 *
+	 * @returns the record's fields, or null when it cannot be read.
+	 */
+	readRecordFields?(collection: string, recordId: string): Promise<Record<string, unknown> | null>
 }

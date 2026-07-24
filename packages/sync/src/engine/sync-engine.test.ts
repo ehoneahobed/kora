@@ -1934,3 +1934,96 @@ describe('apply failure observability', () => {
 		})
 	})
 })
+
+describe('SyncEngine operation rejection', () => {
+	test('diverts a server-rejected op out of the queue, records it, and emits without disconnecting', async () => {
+		const { client, server } = createMemoryTransportPair()
+
+		// A server that accepts the handshake, sends an empty delta so the engine
+		// reaches streaming, then rejects every operation the client pushes (still
+		// acking the batch, exactly as the real server does).
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				const handshake = msg as HandshakeMessage
+				server.send({
+					type: 'handshake-response',
+					messageId: `resp-${handshake.messageId}`,
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: handshake.schemaVersion,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-empty',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+			} else if (msg.type === 'operation-batch') {
+				const batch = msg as OperationBatchMessage
+				for (const op of batch.operations) {
+					server.send({
+						type: 'operation-rejected',
+						messageId: `rej-${op.id}`,
+						operationId: op.id,
+						collection: op.collection,
+						recordId: op.recordId,
+						code: 'WINDOW_CLOSED',
+						message: 'Submissions are closed',
+						retriable: false,
+					})
+				}
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${batch.messageId}`,
+					acknowledgedMessageId: batch.messageId,
+					lastSequenceNumber: 0,
+				})
+			}
+		})
+
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(engine.getState()).toBe('streaming')
+
+		const op = makeOp('rej-op-1', 1)
+		await engine.pushOperation(op)
+
+		await vi.waitFor(async () => {
+			expect((await engine.getRejectedOperations()).length).toBe(1)
+		})
+
+		// Recorded, explainable, and keyed by the op id.
+		const rejected = await engine.getRejectedOperations()
+		expect(rejected[0]?.operationId).toBe(op.id)
+		expect(rejected[0]?.collection).toBe(op.collection)
+		expect(rejected[0]?.code).toBe('WINDOW_CLOSED')
+		expect(rejected[0]?.retriable).toBe(false)
+
+		// App-observable event fired exactly once.
+		const events = emitter.events.filter((e) => e.type === 'sync:operation-rejected')
+		expect(events).toHaveLength(1)
+		expect(events[0]).toMatchObject({ operationId: op.id, code: 'WINDOW_CLOSED' })
+
+		// A per-op rejection is not a connection error: the engine stays streaming.
+		expect(engine.getState()).toBe('streaming')
+
+		// The op left the pending set, so it is never retried.
+		expect(engine.exportDiagnostics().pendingOperations).toBe(0)
+
+		// The app can forget it once reconciled.
+		await engine.clearRejectedOperations([op.id])
+		expect(await engine.getRejectedOperations()).toHaveLength(0)
+
+		await engine.stop()
+	})
+})

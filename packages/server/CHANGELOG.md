@@ -1,5 +1,294 @@
 # @korajs/server
 
+## 1.0.0-beta.5
+
+### Minor Changes
+
+- Add `applyConditional` to the production route context: a conditional,
+  multi-collection admission gate for custom HTTP routes.
+
+  `request.kora.applyConditional({ collection, id, if, update, also, reject,
+idempotencyKey })` reads the target record, evaluates the `if` predicate against
+  its current materialized state, and only then applies the `update` to the target
+  plus every mutation in `also` as one set. When the predicate fails it applies
+  nothing and returns the structured `reject`. `idempotencyKey` names a record whose
+  prior existence proves the set already committed, so a retry returns the earlier
+  outcome instead of re-running non-idempotent counter increments. The predicate
+  language (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`) is exported as
+  `RoutePredicate`.
+
+  This also fixes the route `apply` path to resolve atomic-op sentinels
+  (`op.increment`, `op.max`, ...): `data` now carries the concrete resolved value
+  and the operation carries the atomic intent, so server-authored atomic writes
+  compose in the merge engine exactly like client writes instead of being stored as
+  raw sentinel objects.
+
+  The whole mutation set is built and scope-validated before any of it is committed,
+  so a malformed mutation or scope violation in `also` cannot leave the target update
+  (for example a counter increment) committed while the rest is rejected.
+
+  Within one server instance the check and writes do not interleave with other route
+  mutations. Cross-instance race-free admission and all-or-nothing across a mid-set
+  crash require a store-level conditional transaction (a Postgres `WHERE ... < cap`
+  commit with row locking), which is a follow-up that needs a live-Postgres
+  integration environment to certify.
+
+- Make conditional route apply (`request.kora.applyConditional`) race-free across
+  server instances backed by the same Postgres database.
+
+  Previously the admission gate (read the target, check the predicate, apply the
+  update plus its `also` set) was atomic only within a single server instance. Two
+  instances admitting to the same capped record concurrently could both pass a
+  `responseCount < max` check and over-admit. The Postgres store now implements a
+  store-level conditional transaction: a transaction-scoped advisory lock keyed on
+  the target record serializes the read-decide-write cycle across every instance
+  sharing the database, the idempotency key is checked under that same lock (so a
+  retry is at-most-once even across instances), and the whole set commits or rolls
+  back together.
+
+  Two correctness details this depends on:
+
+  - The increment op is re-resolved against the value read under the lock, and its
+    HLC is advanced past the target record's latest committed operation, so
+    last-write-wins materialization reflects the serialized commit order even when
+    two instances commit in the same millisecond. Without the advance, a
+    same-millisecond tie could let materialization pick an earlier resolved value
+    and undercount the counter, admitting past the cap.
+  - Server-originated sequence numbers are now reserved atomically on the Postgres
+    store (`reserveSequenceNumber`), so two concurrent server operations can never be
+    handed the same number (which would let one shadow the other during
+    version-vector delta sync).
+
+  Stores that serve writes on a single process (in-memory, SQLite) are unchanged:
+  they keep the per-instance serialized path, which is correct because only one
+  server operation is ever in flight.
+
+- Add a gap-free server-to-client delivery watermark, so no operation the server holds is
+  ever lost on its way to a client, even across drops, reconnects, restarts, and scoped
+  sync.
+
+  Previously the server drove server-to-client sync from the version vector. Under a lossy
+  transport this could strand an operation permanently: if a relayed operation was dropped
+  while a later operation from the same node was delivered, the client's version vector
+  advanced past the gap, and version-vector delta on the next connection never re-sent the
+  missing one. The paginated initial-sync resume cursor had the mirror problem: a retriable
+  apply failure let the cursor advance past the failed operation, skipping it on resume.
+
+  The server now assigns every stored operation a monotonic delivery sequence in commit
+  order and drives each client's stream from a durable, per-client delivery watermark. On
+  Postgres the sequence is assigned from a counter row locked inside the append
+  transaction, so delivery order equals visibility order and a `> watermark` scan can never
+  skip an operation that later becomes visible below the cursor, even across concurrent
+  server instances. Each server-to-client batch chains `base -> max` delivery sequences;
+  the client applies a batch only when its watermark equals the base and advances the
+  watermark only when every operation applied, so a dropped or failed batch stalls the
+  watermark and is recovered contiguously rather than skipped. The watermark advances live
+  during streaming and is persisted on the client, so a reconnect resends only what was
+  genuinely missed. Because a causal dependency is always committed (and thus sequenced)
+  before its dependent, delivery order respects causal order and needs no reordering.
+
+  The watermark also advances live during streaming (a client's watermark tracks the
+  server frontier while connected, so a reconnect resends only the true delta), a client's
+  own operations are not echoed back to it during streaming (they are still included in a
+  full resync so a client that lost its local store recovers its own history), and a client
+  whose persisted watermark is ahead of the server's frontier (the server restored an older
+  backup) resets to a full resync instead of stalling above a frontier that no longer
+  exists.
+
+  All wire fields are optional and additive: an old client omits its watermark and gets the
+  version-vector delta unchanged, and a new client against an old server keeps its version
+  vector, so both still converge. The version vector remains authoritative for the
+  client-to-server direction and for local deduplication. On Postgres the schema setup and
+  delivery-sequence backfill run under an advisory-locked transaction, so simultaneous
+  cold start of multiple server replicas against a fresh database is safe.
+
+  Correctness characteristics worth knowing when adopting:
+
+  - The delivery watermark is tracked per view (a stable signature of the active scope plus
+    query subscriptions), so changing the scope or registering a new query subscription
+    back-fills that view at most once and returning to a previously-synced view resumes from
+    its own watermark instead of re-scanning it. A widened scope can expose operations below
+    the current watermark, so the first visit to a view scans from zero; any back-fill is
+    deduplicated, so operations already applied under another view are re-received but not
+    re-applied.
+  - Per-view watermarks are retained under a bounded, least-recently-used cap (default and
+    live views are never evicted), so a client that churns through many distinct views (for
+    example a search that registers a fresh subscription per keystroke) cannot accumulate an
+    unbounded number of persisted watermark rows. Eviction is a storage tradeoff only, never
+    a correctness one: an evicted cold view simply back-fills from zero (deduplicated) the
+    next time it is visited.
+  - An inbound operation that cannot be applied (for example a scope that includes a child
+    record but excludes its parent) surfaces as a visible, recoverable sync stall rather
+    than being silently skipped: the watermark holds and the operation is re-fetched until
+    it applies. This upholds the no-silent-loss guarantee.
+  - A dropped or unacknowledged streaming batch is recovered by re-sending from the client's
+    last acknowledged position, so recovery does not depend on a bounded retransmit buffer.
+  - Backup export preserves delivery (commit) order, so restoring a backup keeps causal
+    order and a resumed client never receives a dependent before its dependency.
+
+- The production server handle now exposes the data plane it already owns, so
+  background jobs and scheduled tasks no longer have to reach past it.
+
+  `server.kora` gives server-side callers `apply`, `query`, and `findById` through
+  the exact validated pipeline sync uses (Tier 2 constraints, referential
+  integrity, materialization, and fan-out to connected clients), with no HTTP
+  request needed. It is the same context custom HTTP routes receive as
+  `request.kora`, so a job and a request share one code path.
+
+  `server.getLiveBlobRefs()` returns every blob reference still reachable from a
+  live record, which is the live set for a scheduled mark-and-sweep: pair it with
+  `collectBlobGarbage` from `@korajs/store` to reclaim orphaned central blob bytes.
+
+  `maxOperationBytes` and `maxOpsPerMinute` are now settable on
+  `KoraSyncServerConfig` (and therefore via `createProductionServer({ syncOptions })`),
+  so one payload-size cap and one per-client rate cap apply to every connected
+  session instead of being configured session by session.
+
+  Every apply rejection now carries a `retriable` flag through a single shared
+  taxonomy (`OperationRejection`, `isRetriableRejection`): `true` for transient
+  conditions like a rate limit, `false` for permanent ones like a constraint or
+  referential conflict. This is the same `retriable` flag the sync protocol already
+  sends clients on the wire, so server-side callers and remote clients read one
+  classification. See the new "Production server" guide for the central-blob +
+  scheduled-GC example.
+
+- Compose atomic operations in the server's materialized view so it matches what
+  clients converge to.
+
+  Previously the server materialized records by last-write-wins over each operation's
+  resolved `data`, and did not persist the atomic-op intent (`op.increment`,
+  `op.max`, `op.min`, `op.append`, `op.remove`). Concurrent, independent atomic writes
+  to the same field — two offline clients each incrementing a shared counter, then
+  syncing — collapsed to a single winner in the server's view (materialized reads and
+  initial-sync hydration), even though clients converge to the composed result.
+
+  The server now persists atomic-op intent alongside each operation and composes it
+  during materialization. Per field, an atomic op composes onto the running value when
+  the previous writer on that field was an atomic op of the same type (a same-type
+  chain: increments sum, maxes take the max, appends accumulate); any other write,
+  including the first atomic write after a plain set, resolves by last-write-wins. This
+  mirrors the client merge engine, so the server's materialized value equals the
+  clients' converged value. Verified end to end against real client devices syncing
+  through the server (`@korajs/test`), plus SQLite and Postgres persistence.
+
+  Details:
+
+  - `@korajs/core` exports `applyAtomicOp(currentValue, atomicOp)`, the single source
+    of truth for atomic-op semantics that both the client write path (`resolveAtomicOp`)
+    and the server materialization use.
+  - The SQLite and Postgres operation logs gain a nullable `atomic_ops` column, added
+    by a backward-compatible migration. Existing rows read as "no atomic ops" and keep
+    materializing by last-write-wins exactly as before, so no data migration is required.
+  - Materialization now orders operations by full HLC total order (wallTime, logical,
+    nodeId), matching `HybridLogicalClock.compare`, so composition and last-write-wins
+    see operations in the order the merge engine converges them.
+
+  Operations that carry no atomic-op intent (the common case) materialize exactly as
+  before.
+
+- Server-side adjudication of untrusted client operations before they become
+  authoritative. This is what lets Kora serve public and multi-tenant offline apps
+  where the client cannot be trusted (anonymous form submissions, one tenant that
+  must not write another's data).
+
+  Pass `validateOperation` in the server's `syncOptions` (or to `KoraSyncServer`).
+  It runs at sync ingestion, after HLC ordering and the built-in guards, and before
+  materialization, returning `accept`, `reject`, or `ignore`. On `reject` the
+  operation never enters the authoritative log, so no other replica ever sees it,
+  and a structured rejection travels back to the submitter tied to the operation id.
+  The validator receives an `auth` context (null for anonymous connections) and the
+  trusted `kora` data-plane, so it can read current state and author a derived
+  server operation — for example promoting a validated anonymous submission into an
+  owner-visible collection.
+
+  On the client, a rejected operation is diverted out of the pending outbound queue
+  into a durable rejected store (`_kora_sync_rejected`, survives a page refresh)
+  rather than being retried forever or lost on the batch ack, and a
+  `sync:operation-rejected` event fires. `app.sync.getRejectedOperations()` and
+  `app.sync.clearRejectedOperations()` let the app surface failed submissions and
+  reconcile (roll back the optimistic write or resubmit). Convergence holds: the
+  authoritative state is defined purely by accepted operations, so every synced
+  device agrees without the rejected op, and the submitter is told rather than
+  diverging silently. See the new "Server-side operation validation" guide.
+
+### Patch Changes
+
+- Make relay delivery durable across reconnects, closing the remaining window in the
+  reliable-relay fix.
+
+  Reliable relay retransmits unacknowledged relay batches while the connection stays up,
+  but a relay dropped just before the client disconnected was lost with the session
+  (and delta sync on reconnect could not recover it, because a later operation had
+  advanced the client's version vector past the missing one). The server now buffers a
+  disconnecting client's unacknowledged relay operations by node id and, when that client
+  reconnects and reaches streaming, replays them through the normal relay path (re-filtered
+  by the reconnected session's current scope). The buffer is deduped by operation id,
+  bounded per node, and expired by age so a client that never returns cannot grow it.
+
+- Make server-to-client relay reliable, closing a lost-operation bug under a lossy
+  transport.
+
+  Real-time relay was fire-and-forget: if the transport dropped a relayed operation
+  batch, the client never received it. Because a later operation from the same node
+  still advanced the client's version vector past the missing one, delta sync on the
+  next handshake would never re-send it, so the operation was lost and that client
+  diverged permanently (a violation of the "no operation is ever lost" guarantee).
+
+  The server now tracks each relay batch until the client acknowledges it (clients
+  already ack every applied batch by messageId) and retransmits anything still unacked
+  on a periodic tick. Redelivering an already-applied operation is harmless because
+  clients dedup by content-addressed id. The pending set is bounded per session and
+  cleared on close.
+
+  Note: this closes the common case where the connection stays up while individual
+  messages drop. A drop immediately followed by a reconnect (before retransmit) is not
+  yet covered — that requires delivery tracking durable across reconnects, tracked
+  separately.
+
+- Fix multi-tenant scoped sync dropping any update that does not restate the scope
+  field, which silently diverged tenants across devices.
+
+  Scope visibility was judged from an operation's own `data`/`previousData` only. A
+  partial update that changed a non-scope field (toggling `completed`, an atomic
+  increment, a cascade side-effect) or a delete carried no scope field, so it was
+  treated as out of scope and never relayed, delta-synced, or (when the client
+  configured a scope) pushed. Two devices of the same tenant would then disagree.
+
+  Visibility now backfills the scope (and query-subset) fields from the record's
+  materialized state when the operation itself does not carry them, on both the server
+  relay/delta path and the client push path. The record read includes soft-deleted
+  rows so a relayed delete is judged against the record's actual scope, and an
+  operation that reassigns the scope field is judged by its new value (the record
+  leaving one tenant and entering another). Genuinely out-of-scope operations are still
+  hidden, preserving tenant isolation.
+
+- SQL identifiers are now quoted everywhere they are generated, so a collection or
+  field name that is valid JavaScript always produces valid SQL. camelCase
+  (`formResponses`), PascalCase (`UserProfiles`), and names that happen to be SQL
+  reserved words (`order`, `select`) now work end to end across the client store,
+  both server stores, migrations, and CLI-generated migration files. Previously a
+  camelCase collection was rejected at `defineSchema` and a reserved-word name
+  produced a runtime SQL syntax error.
+
+  A new `quoteIdent` helper is exported from `@korajs/core`. Schema validation
+  still fails fast for genuinely malformed names (empty, or containing characters
+  that are not letters, numbers, or underscores). Existing all-lowercase schemas
+  are unaffected: quoting a lowercase identifier is a no-op in both SQLite and
+  Postgres.
+
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @korajs/sync@1.0.0-beta.5
+  - @korajs/core@1.0.0-beta.5
+  - @korajs/merge@1.0.0-beta.5
+
 ## 1.0.0-beta.0
 
 ### Minor Changes

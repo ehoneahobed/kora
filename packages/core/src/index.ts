@@ -95,12 +95,17 @@ export {
 
 // === Atomic Operations ===
 export {
+	applyAtomicOp,
 	isAtomicOp,
 	op,
 	resolveAtomicOp,
 	toAtomicOp,
 } from './operations/atomic-ops'
 export type { AtomicOpSentinel } from './operations/atomic-ops'
+
+// === Record materialization (shared client/server atomic-aware replay) ===
+export { replayOperationsForRecord } from './operations/replay-record'
+export type { ReplayOperation } from './operations/replay-record'
 
 // === Binary op-data encoding ===
 export {
@@ -124,6 +129,7 @@ export type {
 	TypedSchemaDefinition,
 } from './schema/define'
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
+export { quoteIdent } from './schema/quote-ident'
 export { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './schema/types'
 export { validateRecord } from './schema/validation'
 

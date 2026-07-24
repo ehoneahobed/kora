@@ -1,4 +1,5 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
+import { quoteIdent } from '@korajs/core'
 import { PersistenceError } from '../errors'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
@@ -170,7 +171,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 		for (const table of dump.tables) {
 			const name = ensureSafeIdentifier(table.name)
-			await this.inner.execute(`DELETE FROM ${name}`)
+			await this.inner.execute(`DELETE FROM ${quoteIdent(name)}`)
 
 			if (table.rows.length === 0) continue
 
@@ -181,11 +182,13 @@ export class IndexedDbAdapter implements StorageAdapter {
 				if (columns.length === 0) continue
 
 				const placeholders = columns.map(() => '?').join(', ')
-				const quotedColumns = columns.map((column) => ensureSafeIdentifier(column)).join(', ')
+				const quotedColumns = columns
+					.map((column) => quoteIdent(ensureSafeIdentifier(column)))
+					.join(', ')
 				const values = columns.map((column) => row[column])
 
 				await this.inner.execute(
-					`INSERT INTO ${name} (${quotedColumns}) VALUES (${placeholders})`,
+					`INSERT INTO ${quoteIdent(name)} (${quotedColumns}) VALUES (${placeholders})`,
 					values,
 				)
 			}
@@ -200,9 +203,13 @@ export class IndexedDbAdapter implements StorageAdapter {
 		const tables: DatabaseDump['tables'] = []
 		for (const tableRow of tableRows) {
 			const tableName = ensureSafeIdentifier(tableRow.name)
-			const columns = await this.inner.query<{ name: string }>(`PRAGMA table_info(${tableName})`)
+			const columns = await this.inner.query<{ name: string }>(
+				`PRAGMA table_info(${quoteIdent(tableName)})`,
+			)
 			const columnNames = columns.map((column) => column.name)
-			const rows = await this.inner.query<Record<string, unknown>>(`SELECT * FROM ${tableName}`)
+			const rows = await this.inner.query<Record<string, unknown>>(
+				`SELECT * FROM ${quoteIdent(tableName)}`,
+			)
 
 			tables.push({
 				name: tableName,

@@ -1,9 +1,9 @@
 import { createRequire } from 'node:module'
-import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import { generateUUIDv7 } from '@korajs/core'
+import type { AtomicOp, Operation, SchemaDefinition, VersionVector } from '@korajs/core'
+import { generateUUIDv7, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
-import { and, asc, between, count, eq, sql } from 'drizzle-orm'
+import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { operations, syncState } from './drizzle-schema'
 import {
@@ -13,7 +13,12 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import type { CollectionQueryOptions, MaterializedRecord, ServerStore } from './server-store'
+import type {
+	CollectionQueryOptions,
+	DeliveredOperation,
+	MaterializedRecord,
+	ServerStore,
+} from './server-store'
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -33,6 +38,12 @@ export class SqliteServerStore implements ServerStore {
 	private readonly db: BetterSQLite3Database
 	private schema: SchemaDefinition | null = null
 	private closed = false
+	/**
+	 * Next delivery sequence to assign. Single-writer (better-sqlite3 is synchronous),
+	 * so a plain in-memory counter, seeded from MAX(delivery_seq) at startup, gives
+	 * commit-order delivery sequence. Assigned inside the append transaction.
+	 */
+	private deliverySeqCounter = 0
 
 	constructor(db: BetterSQLite3Database, nodeId?: string) {
 		this.db = db
@@ -91,20 +102,22 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 
 		const now = Date.now()
-		const row = this.serializeOperation(op, now)
 
 		// Use a transaction for atomicity: insert op + update version vector + materialize
 		const result = this.db.transaction((tx) => {
-			// Content-addressed dedup via onConflictDoNothing
-			const insertResult = tx
-				.insert(operations)
-				.values(row)
-				.onConflictDoNothing({ target: operations.id })
-				.run()
-
-			if (insertResult.changes === 0) {
+			// Content-addressed dedup: check before assigning a delivery sequence so a
+			// duplicate never burns one (keeps the sequence gap-free on this store).
+			const existing = tx.all<{ id: string }>(
+				sql`SELECT id FROM operations WHERE id = ${op.id} LIMIT 1`,
+			)
+			if (existing.length > 0) {
 				return 'duplicate' as const
 			}
+
+			// Assign the next delivery sequence in commit order (single-writer: no race).
+			this.deliverySeqCounter += 1
+			const row = this.serializeOperation(op, now, this.deliverySeqCounter)
+			tx.insert(operations).values(row).run()
 
 			// Advance version vector: upsert with MAX to ensure monotonic progress
 			tx.insert(syncState)
@@ -151,6 +164,32 @@ export class SqliteServerStore implements ServerStore {
 
 		const result = this.db.select({ value: count() }).from(operations).all()
 		return result[0]?.value ?? 0
+	}
+
+	async getMaxDeliverySequence(): Promise<number> {
+		this.assertOpen()
+		const rows = this.db.all<{ m: number | null }>(
+			sql`SELECT MAX(delivery_seq) AS m FROM operations`,
+		)
+		return rows[0]?.m ?? 0
+	}
+
+	async getOperationsAfterDelivery(
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveredOperation[]> {
+		this.assertOpen()
+		const rows = this.db
+			.select()
+			.from(operations)
+			.where(gt(operations.deliverySeq, afterDeliverySequence))
+			.orderBy(asc(operations.deliverySeq))
+			.limit(limit)
+			.all()
+		return rows.map((row) => ({
+			operation: this.deserializeOperation(row),
+			deliverySequence: row.deliverySeq ?? 0,
+		}))
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -203,7 +242,7 @@ export class SqliteServerStore implements ServerStore {
 		const collectionDef = schema.collections[collection] as NonNullable<
 			SchemaDefinition['collections'][string]
 		>
-		const query = sql`SELECT * FROM ${sql.raw(collection)} WHERE id = ${id} AND _deleted = 0`
+		const query = sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${id} AND _deleted = 0`
 		const rows = this.db.all<Record<string, unknown>>(query)
 
 		if (rows.length === 0) return null
@@ -223,7 +262,7 @@ export class SqliteServerStore implements ServerStore {
 		}
 
 		const whereClause = this.buildWhereClause(where ?? {}, false)
-		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(collection)} WHERE ${whereClause}`
+		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`
 		const rows = this.db.all<{ cnt: number }>(query)
 		return rows[0]?.cnt ?? 0
 	}
@@ -236,7 +275,9 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 
 		const { buildServerBackup } = await import('./server-backup')
-		const rows = this.db.select().from(operations).all()
+		// Export in delivery-sequence (commit) order so a restore reassigns delivery
+		// sequences causally; an implicit scan order must not be relied on.
+		const rows = this.db.select().from(operations).orderBy(asc(operations.deliverySeq)).all()
 		const deserialized = rows.map((row) => this.deserializeOperation(row))
 		const vv = this.getVersionVector()
 
@@ -272,10 +313,14 @@ export class SqliteServerStore implements ServerStore {
 					.run()
 			}
 
+			// Re-assign delivery sequence from scratch in backup order.
+			let deliverySeq = 0
 			for (const op of ops) {
-				const row = this.serializeOperation(op, Date.now())
+				deliverySeq += 1
+				const row = this.serializeOperation(op, Date.now(), deliverySeq)
 				tx.insert(operations).values(row).run()
 			}
+			this.deliverySeqCounter = deliverySeq
 		})
 
 		return { operationsRestored: ops.length, success: true }
@@ -298,22 +343,26 @@ export class SqliteServerStore implements ServerStore {
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
 
-		// Fetch all ops for this specific record, ordered by HLC
+		// Fetch all ops for this specific record, in HLC total order (wallTime,
+		// logical, nodeId) so atomic composition and LWW converge like the merge engine.
 		const ops = txOrDb
 			.select({
 				type: operations.type,
 				data: operations.data,
+				atomicOps: operations.atomicOps,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
 			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.sequenceNumber))
+			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
 			.all()
 
 		// Replay to get current state
 		const parsedOps = ops.map((op) => ({
 			type: op.type,
 			data: op.data !== null ? JSON.parse(op.data) : null,
+			atomicOps:
+				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -338,7 +387,7 @@ export class SqliteServerStore implements ServerStore {
 		} else {
 			// Record was deleted — soft-delete in materialized table
 			txOrDb.run(
-				sql`UPDATE ${sql.raw(collection)} SET _deleted = 1, _updated_at = ${Date.now()} WHERE id = ${recordId}`,
+				sql`UPDATE ${sql.raw(quoteIdent(collection))} SET _deleted = 1, _updated_at = ${Date.now()} WHERE id = ${recordId}`,
 			)
 		}
 	}
@@ -369,7 +418,7 @@ export class SqliteServerStore implements ServerStore {
 			0, // _deleted = false
 		]
 
-		const columnsSql = sql.raw(allColumns.join(', '))
+		const columnsSql = sql.raw(allColumns.map((c) => quoteIdent(c)).join(', '))
 		const valuesSql = sql.join(
 			values.map((v) => sql`${v}`),
 			sql.raw(', '),
@@ -377,12 +426,12 @@ export class SqliteServerStore implements ServerStore {
 		const updateSet = sql.raw(
 			allColumns
 				.slice(1)
-				.map((c) => `${c} = excluded.${c}`)
+				.map((c) => `${quoteIdent(c)} = excluded.${quoteIdent(c)}`)
 				.join(', '),
 		)
 
 		txOrDb.run(
-			sql`INSERT INTO ${sql.raw(tableName)} (${columnsSql}) VALUES (${valuesSql}) ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
+			sql`INSERT INTO ${sql.raw(quoteIdent(tableName))} (${columnsSql}) VALUES (${valuesSql}) ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
 		)
 	}
 
@@ -405,17 +454,18 @@ export class SqliteServerStore implements ServerStore {
 		const collectionDef = this.schema?.collections[collectionName]
 		if (!collectionDef) return
 
-		// Fetch all ops for this collection, ordered by HLC
+		// Fetch all ops for this collection, in HLC total order (wallTime, logical, nodeId).
 		const allOps = this.db
 			.select({
 				recordId: operations.recordId,
 				type: operations.type,
 				data: operations.data,
+				atomicOps: operations.atomicOps,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
 			.where(eq(operations.collection, collectionName))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.sequenceNumber))
+			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
 			.all()
 
 		if (allOps.length === 0) return
@@ -438,6 +488,8 @@ export class SqliteServerStore implements ServerStore {
 				const parsedOps = recordOps.map((op) => ({
 					type: op.type,
 					data: op.data !== null ? JSON.parse(op.data) : null,
+					atomicOps:
+						op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
 				}))
 				const recordData = replayOperationsForRecord(parsedOps)
 
@@ -456,7 +508,7 @@ export class SqliteServerStore implements ServerStore {
 					)
 				} else {
 					tx.run(
-						sql`INSERT INTO ${sql.raw(collectionName)} (id, _deleted, _created_at, _updated_at) VALUES (${recordId}, 1, ${Date.now()}, ${Date.now()}) ON CONFLICT (id) DO UPDATE SET _deleted = 1, _updated_at = ${Date.now()}`,
+						sql`INSERT INTO ${sql.raw(quoteIdent(collectionName))} (id, _deleted, _created_at, _updated_at) VALUES (${recordId}, 1, ${Date.now()}, ${Date.now()}) ON CONFLICT (id) DO UPDATE SET _deleted = 1, _updated_at = ${Date.now()}`,
 					)
 				}
 			}
@@ -473,11 +525,13 @@ export class SqliteServerStore implements ServerStore {
 			options?.includeDeleted ?? false,
 		)
 
-		const parts: SQL[] = [sql`SELECT * FROM ${sql.raw(collection)} WHERE ${whereClause}`]
+		const parts: SQL[] = [
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`,
+		]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
-			parts.push(sql.raw(` ORDER BY ${options.orderBy} ${dir}`))
+			parts.push(sql.raw(` ORDER BY ${quoteIdent(options.orderBy)} ${dir}`))
 		}
 
 		if (options?.limit !== undefined) {
@@ -499,7 +553,7 @@ export class SqliteServerStore implements ServerStore {
 		}
 
 		for (const [key, value] of Object.entries(where)) {
-			conditions.push(sql`${sql.raw(key)} = ${value}`)
+			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${value}`)
 		}
 
 		if (conditions.length === 0) {
@@ -595,6 +649,7 @@ export class SqliteServerStore implements ServerStore {
 				record_id TEXT NOT NULL,
 				data TEXT,
 				previous_data TEXT,
+				atomic_ops TEXT,
 				wall_time INTEGER NOT NULL,
 				logical INTEGER NOT NULL,
 				timestamp_node_id TEXT NOT NULL,
@@ -605,8 +660,39 @@ export class SqliteServerStore implements ServerStore {
 			)
 		`)
 
+		// Backward-compatible migration: add atomic_ops to operation logs created
+		// before atomic-op persistence. Nullable, so existing rows read as "no atomic
+		// ops" and keep materializing by last-write-wins exactly as before. SQLite has
+		// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate-column error on re-run.
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN atomic_ops TEXT`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
+		// Backward-compatible migration: add the delivery_seq column for the gap-free
+		// delivery watermark. SQLite has no ADD COLUMN IF NOT EXISTS, so tolerate the
+		// duplicate-column error on re-run.
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN delivery_seq INTEGER`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
+		`)
+
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_delivery_seq ON operations (delivery_seq)
 		`)
 
 		this.db.run(sql`
@@ -629,13 +715,42 @@ export class SqliteServerStore implements ServerStore {
 				last_seen_at INTEGER NOT NULL
 			)
 		`)
+
+		this.backfillDeliverySequence()
+	}
+
+	/**
+	 * Assign delivery sequences to any operations written before the column existed,
+	 * then seed the in-memory counter from the current max. Ordered by
+	 * (received_at, sequence_number, id) so the backfill is deterministic and stable
+	 * across restarts. A one-time migration: after it runs, all rows have a value.
+	 */
+	private backfillDeliverySequence(): void {
+		this.db.transaction((tx) => {
+			const maxRow = tx.all<{ m: number | null }>(
+				sql`SELECT MAX(delivery_seq) AS m FROM operations`,
+			)
+			let next = maxRow[0]?.m ?? 0
+			const nullRows = tx.all<{ id: string }>(
+				sql`SELECT id FROM operations WHERE delivery_seq IS NULL ORDER BY received_at ASC, sequence_number ASC, id ASC`,
+			)
+			for (const row of nullRows) {
+				next += 1
+				tx.run(sql`UPDATE operations SET delivery_seq = ${next} WHERE id = ${row.id}`)
+			}
+			this.deliverySeqCounter = next
+		})
 	}
 
 	// ---------------------------------------------------------------------------
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
-	private serializeOperation(op: Operation, receivedAt: number): typeof operations.$inferInsert {
+	private serializeOperation(
+		op: Operation,
+		receivedAt: number,
+		deliverySeq: number,
+	): typeof operations.$inferInsert {
 		return {
 			id: op.id,
 			nodeId: op.nodeId,
@@ -644,6 +759,8 @@ export class SqliteServerStore implements ServerStore {
 			recordId: op.recordId,
 			data: op.data !== null ? JSON.stringify(op.data) : null,
 			previousData: op.previousData !== null ? JSON.stringify(op.previousData) : null,
+			atomicOps:
+				op.atomicOps && Object.keys(op.atomicOps).length > 0 ? JSON.stringify(op.atomicOps) : null,
 			wallTime: op.timestamp.wallTime,
 			logical: op.timestamp.logical,
 			timestampNodeId: op.timestamp.nodeId,
@@ -651,10 +768,13 @@ export class SqliteServerStore implements ServerStore {
 			causalDeps: JSON.stringify(op.causalDeps),
 			schemaVersion: op.schemaVersion,
 			receivedAt,
+			deliverySeq,
 		}
 	}
 
 	private deserializeOperation(row: typeof operations.$inferSelect): Operation {
+		const atomicOps =
+			row.atomicOps != null ? (JSON.parse(row.atomicOps) as Record<string, AtomicOp>) : undefined
 		return {
 			id: row.id,
 			nodeId: row.nodeId,
@@ -671,6 +791,7 @@ export class SqliteServerStore implements ServerStore {
 			sequenceNumber: row.sequenceNumber,
 			causalDeps: JSON.parse(row.causalDeps),
 			schemaVersion: row.schemaVersion,
+			...(atomicOps ? { atomicOps } : {}),
 		}
 	}
 

@@ -14,6 +14,7 @@ import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
 import { StoreQueueStorage } from './store-queue-storage'
+import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
 import { createSyncQuerySubscriptionHook } from './sync-query-bridge'
 import type { AuthSyncBinding, KoraConfig } from './types'
@@ -129,6 +130,7 @@ export async function initializeApp(
 			},
 			emitter,
 			queueStorage: new StoreQueueStorage(adapter),
+			rejectedStorage: new StoreRejectedOperationStorage(adapter),
 			syncState: new StoreSyncStatePersistence(store, scopeMap),
 			encryptor,
 		})

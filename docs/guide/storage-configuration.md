@@ -11,12 +11,12 @@ Kora uses two separate storage systems: **client-side storage** for the browser 
 
 ### How It Works
 
-When you call `createApp()`, Kora automatically sets up a local database for your app. By default, it uses:
+When you call `createApp()`, Kora automatically detects and sets up a local database adapter for your app:
 
 1. **Tauri native SQLite** (Tauri desktop apps via `@korajs/tauri`) -- best performance, auto-detected
-2. **SQLite WASM + OPFS** (browsers with OPFS support)
-3. **IndexedDB** (fallback when OPFS is unavailable)
-4. **Native SQLite** (Node.js and Electron via `better-sqlite3`)
+2. **Native SQLite** (Node.js and Electron via `better-sqlite3`)
+3. **SQLite WASM + OPFS** (browsers that expose the OPFS API)
+4. **IndexedDB** (browsers with no OPFS API at all -- a hand-written adapter that runs SQLite WASM in memory and serializes the database to IndexedDB)
 
 You don't need to configure anything for the default case:
 
@@ -24,6 +24,10 @@ You don't need to configure anything for the default case:
 const app = createApp({ schema })
 // Kora auto-detects the best storage adapter
 ```
+
+::: warning OPFS fallback is in-memory, not IndexedDB
+The choice above is made at detection time. `indexeddb` is only auto-selected when the OPFS API is entirely absent. It is not what a *failed* OPFS install degrades to: if the `sqlite-wasm` adapter is selected but OPFS cannot be acquired at runtime (most commonly a lock conflict with another runtime on the same origin), the store keeps working from a **non-persistent in-memory** database and data is lost on reload. That case is never silent -- Kora emits a `store:opfs-unavailable` event. See [Multi-runtime Storage](/guide/multi-runtime-storage) for the diagnostics and how to avoid the collision.
+:::
 
 ### Database Name
 
@@ -248,3 +252,7 @@ The server stores are interchangeable -- they implement the same `ServerStore` i
 ::: warning
 Switching storage backends does not migrate data. If you have existing data in SQLite, it won't automatically appear in PostgreSQL. For new projects, choose your production backend early. For existing projects, you would need to export operations from the old store and import them into the new one.
 :::
+
+## Related guides
+
+- [Multi-runtime Storage](/guide/multi-runtime-storage) covers running more than one runtime on a single origin safely: store names, multi-tab coordination, the OPFS single-writer model, and the diagnostics that make a silent in-memory fallback observable.

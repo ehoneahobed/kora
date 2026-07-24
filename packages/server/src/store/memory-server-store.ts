@@ -7,7 +7,12 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import type { CollectionQueryOptions, MaterializedRecord, ServerStore } from './server-store'
+import type {
+	CollectionQueryOptions,
+	DeliveredOperation,
+	MaterializedRecord,
+	ServerStore,
+} from './server-store'
 
 /**
  * In-memory server store for testing and quick prototyping.
@@ -21,6 +26,14 @@ export class MemoryServerStore implements ServerStore {
 	private readonly operations: Operation[] = []
 	private readonly operationIndex = new Map<string, Operation>()
 	private readonly versionVector: Map<string, number> = new Map()
+	/**
+	 * Server-assigned delivery sequence per operation id. Single-process, so a plain
+	 * counter incremented at insert time gives commit-order delivery sequence with no
+	 * gaps. `operations` is kept in insertion (== delivery) order, so a delivery scan
+	 * is a forward walk.
+	 */
+	private readonly deliverySeqByOpId = new Map<string, number>()
+	private deliverySeqCounter = 0
 	private schema: SchemaDefinition | null = null
 
 	/** Materialized records: collection -> recordId -> record data */
@@ -70,6 +83,10 @@ export class MemoryServerStore implements ServerStore {
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
 
+		// Assign the next delivery sequence in commit order (single-process: no race).
+		this.deliverySeqCounter += 1
+		this.deliverySeqByOpId.set(op.id, this.deliverySeqCounter)
+
 		// Advance version vector
 		const currentSeq = this.versionVector.get(op.nodeId) ?? 0
 		if (op.sequenceNumber > currentSeq) {
@@ -97,6 +114,30 @@ export class MemoryServerStore implements ServerStore {
 	async getOperationCount(): Promise<number> {
 		this.assertOpen()
 		return this.operations.length
+	}
+
+	async getMaxDeliverySequence(): Promise<number> {
+		this.assertOpen()
+		return this.deliverySeqCounter
+	}
+
+	async getOperationsAfterDelivery(
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveredOperation[]> {
+		this.assertOpen()
+		const result: DeliveredOperation[] = []
+		if (limit <= 0) return result
+		// operations is in delivery order, so once entries exceed the cursor they all do;
+		// the guard on each entry keeps this correct even if that invariant ever weakens.
+		for (const op of this.operations) {
+			const deliverySequence = this.deliverySeqByOpId.get(op.id) ?? 0
+			if (deliverySequence > afterDeliverySequence) {
+				result.push({ operation: op, deliverySequence })
+				if (result.length >= limit) break
+			}
+		}
+		return result
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -289,6 +330,8 @@ export class MemoryServerStore implements ServerStore {
 		this.operations.length = 0
 		this.operationIndex.clear()
 		this.versionVector.clear()
+		this.deliverySeqByOpId.clear()
+		this.deliverySeqCounter = 0
 
 		for (const [nid, seq] of versionVector) {
 			this.versionVector.set(nid, seq)
@@ -297,6 +340,9 @@ export class MemoryServerStore implements ServerStore {
 		for (const op of operations) {
 			this.operations.push(op)
 			this.operationIndex.set(op.id, op)
+			// Re-assign delivery sequence in backup order (the order ops were shipped).
+			this.deliverySeqCounter += 1
+			this.deliverySeqByOpId.set(op.id, this.deliverySeqCounter)
 
 			// Update materialized records if schema is set
 			if (this.schema?.collections[op.collection]) {
@@ -331,7 +377,8 @@ export class MemoryServerStore implements ServerStore {
 			this.materializedRecords.set(collection, collectionMap)
 		}
 
-		// Get all ops for this record in HLC order
+		// Get all ops for this record in HLC total order (wallTime, logical, nodeId)
+		// so atomic composition and LWW converge like the merge engine.
 		const recordOps = this.operations
 			.filter((op) => op.collection === collection && op.recordId === recordId)
 			.sort((a, b) => {
@@ -339,12 +386,17 @@ export class MemoryServerStore implements ServerStore {
 					return a.timestamp.wallTime - b.timestamp.wallTime
 				if (a.timestamp.logical !== b.timestamp.logical)
 					return a.timestamp.logical - b.timestamp.logical
-				return a.sequenceNumber - b.sequenceNumber
+				return a.timestamp.nodeId < b.timestamp.nodeId
+					? -1
+					: a.timestamp.nodeId > b.timestamp.nodeId
+						? 1
+						: 0
 			})
 
 		const parsedOps = recordOps.map((op) => ({
 			type: op.type,
 			data: op.data,
+			atomicOps: op.atomicOps ?? null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 

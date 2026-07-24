@@ -48,6 +48,9 @@ import {
   // Awareness / Presence
   AwarenessManager,
 
+  // Rejected operations
+  MemoryRejectedOperationStorage,
+
   // Type guards
   isSyncMessage,
   isHandshakeMessage,
@@ -55,6 +58,7 @@ import {
   isOperationBatchMessage,
   isAcknowledgmentMessage,
   isErrorMessage,
+  isOperationRejectedMessage,
   isAwarenessUpdateMessage,
 
   // Constants
@@ -91,6 +95,7 @@ import type {
   OperationBatchMessage,
   AcknowledgmentMessage,
   ErrorMessage,
+  OperationRejectedMessage,
   SerializedOperation,
   WireFormat,
   MessageSerializer,
@@ -114,6 +119,7 @@ import type {
   // Store
   SyncStore,
   ApplyResult,
+  ApplyFailureReason,
 
   // Types
   SyncConfig,
@@ -123,6 +129,10 @@ import type {
   SyncScopeContext,
   SyncScopeMap,
   QueueStorage,
+
+  // Rejected operations
+  RejectedOperation,
+  RejectedOperationStorage,
 } from '@korajs/sync'
 ```
 
@@ -154,8 +164,10 @@ const engine = new SyncEngine(options: SyncEngineOptions)
 | `serializer` | `MessageSerializer` | No | `NegotiatedMessageSerializer('json')` |
 | `emitter` | `KoraEventEmitter` | No | `null` |
 | `queueStorage` | `QueueStorage` | No | In-memory |
+| `rejectedStorage` | `RejectedOperationStorage` | No | `MemoryRejectedOperationStorage` (in-memory) |
 | `encryptor` | `SyncEncryptor` | No | `null` |
 | `metricsConfig` | `MetricsCollectorConfig` | No | See Diagnostics section |
+| `syncState` | `SyncStatePersistence` | No | `null` |
 
 When an `encryptor` is provided, operation `data` and `previousData` fields are encrypted before sending and decrypted after receiving. The server never sees plaintext data. See the [E2E Sync Encryption](#e2e-sync-encryption) section.
 
@@ -167,6 +179,10 @@ When an `encryptor` is provided, operation `data` and `previousData` fields are 
 - **`getStatus(): SyncStatusInfo`** -- Returns the developer-facing sync status (see `SyncStatusInfo` below).
 - **`getState(): SyncState`** -- Returns the internal state machine state. Primarily for testing.
 - **`setReconnecting(value: boolean): void`** -- When `true`, `getStatus()` reports `'offline'` during intermediate states (connecting, handshaking, syncing) instead of `'syncing'`.
+- **`getRejectedOperations(): Promise<RejectedOperation[]>`** -- Returns every operation the server permanently rejected that has not yet been reconciled. Use alongside the `sync:operation-rejected` event to surface failed submissions and decide whether to roll back or resubmit. See `RejectedOperation` below.
+- **`clearRejectedOperations(operationIds: string[]): Promise<void>`** -- Forget rejected operations by id once the app has reconciled them (rolled the optimistic write back or resubmitted a corrected op).
+- **`isClockBlocked(): boolean`** -- Returns `true` when sync is blocked because this device's clock is too far ahead. Local writes continue to work and queue; only sync is paused. While blocked, `getStatus()` reports `'clock-error'`.
+- **`clearClockBlock(): void`** -- Clears the clock block after the user corrects the device clock. Moves the engine back to `disconnected` so `start()` can run again.
 - **`getOutboundQueue(): OutboundQueue`** -- Access the outbound queue. Primarily for testing.
 - **`exportDiagnostics(): SyncDiagnostics`** -- Export a diagnostics snapshot for debugging and support. Contains connection state, timing info, and queue metrics. See the [Sync Diagnostics](#sync-diagnostics--metrics) section.
 - **`getAwarenessManager(): AwarenessManager`** -- Access the awareness manager for presence and cursor sharing. See the [Awareness / Presence](#awareness--presence-protocol) section.
@@ -194,7 +210,15 @@ await engine.pushOperation(operation)
 
 // Check status
 const info = engine.getStatus()
-// { status: 'synced', pendingOperations: 0, lastSyncedAt: 1715097600000 }
+// {
+//   status: 'synced',
+//   pendingOperations: 0,
+//   lastSyncedAt: 1715097600000,
+//   lastSuccessfulPush: 1715097600000,
+//   lastSuccessfulPull: 1715097600000,
+//   conflicts: 0,
+//   clockSkewMs: 12,
+// }
 
 await engine.stop()
 ```
@@ -322,7 +346,15 @@ type SyncMessage =
   | OperationBatchMessage
   | AcknowledgmentMessage
   | ErrorMessage
+  | OperationRejectedMessage
+  | AwarenessUpdateMessage
+  | YjsDocUpdateMessage
+  | BlobChunkRequestMessage
+  | BlobChunkResponseMessage
+  | BlobChunkPushMessage
 ```
+
+The core operation-sync messages are documented below. `AwarenessUpdateMessage` is covered in the [Awareness / Presence](#awareness--presence-protocol) section; the richtext-doc (`YjsDocUpdateMessage`) and blob-chunk message variants are additional side-channel exports of `@korajs/sync`.
 
 ### `HandshakeMessage`
 
@@ -337,6 +369,7 @@ Sent by the client to initiate sync.
 | `schemaVersion` | `number` | Client schema version |
 | `authToken` | `string?` | Optional auth token |
 | `supportedWireFormats` | `WireFormat[]?` | `['json', 'protobuf']` |
+| `lastDeliverySequence` | `number?` | Client's persisted [delivery watermark](../guide/sync-configuration.md#delivery-guarantees-server-to-client). When present, the server resumes the gap-free server-to-client stream from just after it. Omitted (or 0) on first sync. |
 
 ### `HandshakeResponseMessage`
 
@@ -352,6 +385,7 @@ Server response to a handshake.
 | `accepted` | `boolean` | Whether the handshake was accepted |
 | `rejectReason` | `string?` | Reason if rejected |
 | `selectedWireFormat` | `WireFormat?` | Negotiated wire format |
+| `serverMaxDeliverySequence` | `number?` | Server's highest delivery sequence. A client whose watermark exceeds it (the server restored an older backup) resets to a full resync. Sent only to watermark-using clients. |
 
 ### `OperationBatchMessage`
 
@@ -364,6 +398,8 @@ Batch of operations sent during delta exchange or streaming.
 | `operations` | `SerializedOperation[]` | Operations in this batch |
 | `isFinal` | `boolean` | `true` if last batch in delta exchange |
 | `batchIndex` | `number` | 0-based batch index |
+| `baseDeliverySequence` | `number?` | Delivery-stream chaining: the sequence the client must already hold for this batch to apply in order (equals the previous batch's `maxDeliverySequence`). Present only on delivery-stream batches. |
+| `maxDeliverySequence` | `number?` | The highest delivery sequence this batch advances the client's watermark to once fully applied. Present only on delivery-stream batches. |
 
 ### `AcknowledgmentMessage`
 
@@ -375,6 +411,7 @@ Confirms receipt of a message.
 | `messageId` | `string` | Unique message identifier |
 | `acknowledgedMessageId` | `string` | ID of the message being acknowledged |
 | `lastSequenceNumber` | `number` | Last sequence number in the acknowledged batch |
+| `deliverySequence` | `number?` | The acknowledged delivery-stream batch's `maxDeliverySequence`, echoed so the server can release its retransmit copy. Present only when acknowledging a delivery-stream batch. |
 
 ### `ErrorMessage`
 
@@ -385,6 +422,23 @@ Confirms receipt of a message.
 | `code` | `string` | Error code |
 | `message` | `string` | Human-readable error description |
 | `retriable` | `boolean` | Whether the client should retry |
+
+### `OperationRejectedMessage`
+
+Server-to-client rejection of one specific operation the client submitted. Unlike `ErrorMessage` (which is connection-level), this is tied to an `operationId`, so the client can divert exactly that operation out of its pending outbound queue and into the durable rejected-operations store rather than retrying it forever or losing it on the batch ack. The operation never entered the server's authoritative log, so no other replica sees it; the submitter is told so its optimistic local copy can be reconciled (rolled back or resubmitted).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `'operation-rejected'` | |
+| `messageId` | `string` | Unique message identifier |
+| `operationId` | `string` | Content-addressed id of the rejected operation |
+| `collection` | `string` | Collection the rejected operation targeted |
+| `recordId` | `string` | Record the rejected operation targeted |
+| `code` | `string` | Stable, machine-readable reason code |
+| `message` | `string` | Human-readable explanation |
+| `retriable` | `boolean` | Whether resubmitting the identical operation may later succeed |
+
+When received, the engine records the rejection (see [Rejected Operations](#rejected-operations)) and emits a `sync:operation-rejected` event.
 
 ### `SerializedOperation`
 
@@ -420,6 +474,7 @@ All type guards accept `unknown` and return a type predicate:
 - `isOperationBatchMessage(value): value is OperationBatchMessage`
 - `isAcknowledgmentMessage(value): value is AcknowledgmentMessage`
 - `isErrorMessage(value): value is ErrorMessage`
+- `isOperationRejectedMessage(value): value is OperationRejectedMessage`
 
 ---
 
@@ -634,8 +689,28 @@ interface SyncStore {
 
 ### `ApplyResult`
 
+Outcome of applying a single operation. Re-exported from `@korajs/core`.
+
 ```typescript
-type ApplyResult = 'applied' | 'duplicate' | 'skipped'
+type ApplyResult = 'applied' | 'duplicate' | 'skipped' | 'rejected' | 'deferred'
+```
+
+- `'applied'`: the operation was new and applied.
+- `'duplicate'`: already seen (content-addressed dedup).
+- `'skipped'`: filtered out (e.g. out of scope).
+- `'rejected'`: refused (non-retriable).
+- `'deferred'`: could not be applied yet (retriable).
+
+### `ApplyFailureReason`
+
+Structured failure metadata attached when apply returns `'skipped'`, `'rejected'`, or `'deferred'`. Re-exported from `@korajs/core`.
+
+```typescript
+interface ApplyFailureReason {
+  code: string
+  message: string
+  retriable: boolean
+}
 ```
 
 ---
@@ -681,18 +756,39 @@ Available as a const array: `SYNC_STATES`.
 Developer-facing status (simplified view of internal state):
 
 ```typescript
-type SyncStatus = 'connected' | 'syncing' | 'synced' | 'offline' | 'error'
+type SyncStatus =
+  | 'connected'
+  | 'syncing'
+  | 'synced'
+  | 'offline'
+  | 'clock-error'
+  | 'error'
+  | 'schema-mismatch'
 ```
 
 Available as a const array: `SYNC_STATUSES`.
+
+- `'clock-error'`: sync is blocked because this device's clock is too far ahead (see `SyncEngine.isClockBlocked()` / `clearClockBlock()`).
+- `'schema-mismatch'`: the server rejected this client's schema version at handshake.
 
 ### `SyncStatusInfo`
 
 ```typescript
 interface SyncStatusInfo {
+  /** Current developer-facing status */
   status: SyncStatus
+  /** Number of operations waiting to be sent */
   pendingOperations: number
+  /** Timestamp of last successful sync (null if never synced) */
   lastSyncedAt: number | null
+  /** Timestamp of last successful push to the server (null if never pushed) */
+  lastSuccessfulPush: number | null
+  /** Timestamp of last successful pull from the server (null if never pulled) */
+  lastSuccessfulPull: number | null
+  /** Number of merge conflicts encountered during this session */
+  conflicts: number
+  /** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
+  clockSkewMs: number | null
 }
 ```
 
@@ -703,6 +799,62 @@ type SyncScopeMap = Record<string, Record<string, unknown>>
 ```
 
 A map of collection names to field-value filters. An empty filter `{}` means no restriction (all records visible). A missing collection means hidden (no records visible for that collection).
+
+---
+
+## Rejected Operations
+
+When the server permanently refuses one specific outbound operation, it sends an [`OperationRejectedMessage`](#operationrejectedmessage). The engine diverts that operation out of the pending outbound queue (so it is never retried or resurrected on reconnect), records it in a durable rejected-operations store, and emits a `sync:operation-rejected` event so the app can reconcile (roll the optimistic local write back, or resubmit a corrected op). Query and clear the store via `SyncEngine.getRejectedOperations()` and `SyncEngine.clearRejectedOperations()`.
+
+### `RejectedOperation`
+
+A record of one outbound operation the server permanently refused. Preserved so a rejected op is explainable and reconcilable rather than silently lost.
+
+```typescript
+interface RejectedOperation {
+  /** Content-addressed id of the rejected operation. */
+  operationId: string
+  /** Collection the operation targeted. */
+  collection: string
+  /** Record the operation targeted. */
+  recordId: string
+  /** Stable, machine-readable reason code from the server. */
+  code: string
+  /** Human-readable explanation. */
+  message: string
+  /** Whether resubmitting the identical operation may later succeed. */
+  retriable: boolean
+  /** Wall-clock time (ms since epoch) the rejection was recorded. Display only. */
+  rejectedAt: number
+}
+```
+
+### `RejectedOperationStorage` (interface)
+
+Durably persists operations the server rejected so the record survives a page refresh. Keyed by operation id (idempotent on re-rejection). Provide a store-backed implementation via `SyncEngineOptions.rejectedStorage`; a durable implementation is backed by the `_kora_sync_rejected` table generated by `@korajs/core`.
+
+```typescript
+interface RejectedOperationStorage {
+  /** Record (or overwrite) a rejected operation. */
+  record(rejected: RejectedOperation): Promise<void>
+  /** List all recorded rejected operations. */
+  list(): Promise<RejectedOperation[]>
+  /** Remove rejected operations by their operation ids (after the app reconciles them). */
+  remove(operationIds: string[]): Promise<void>
+}
+```
+
+### `MemoryRejectedOperationStorage`
+
+In-memory `RejectedOperationStorage`. The default when no durable store is provided; suitable for tests and ephemeral sessions.
+
+```typescript
+const storage = new MemoryRejectedOperationStorage()
+```
+
+### `sync:operation-rejected` event
+
+Emitted (when a `KoraEventEmitter` is attached) after a per-operation rejection is recorded. The payload carries `operationId`, `collection`, `recordId`, `code`, `message`, and `retriable`.
 
 ---
 

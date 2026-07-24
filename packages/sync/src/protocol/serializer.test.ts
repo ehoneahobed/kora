@@ -8,6 +8,7 @@ import type {
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	SerializedOperation,
+	SyncMessage,
 } from './messages'
 import {
 	JsonMessageSerializer,
@@ -172,6 +173,20 @@ describe('ProtobufMessageSerializer', () => {
 		expect(serializer.decode(serializer.encode(message))).toEqual(message)
 	})
 
+	test('roundtrips an operation-rejected message with full identity and taxonomy', () => {
+		const message: SyncMessage = {
+			type: 'operation-rejected',
+			messageId: 'msg-rej',
+			operationId: 'op-123',
+			collection: 'formResponses',
+			recordId: 'rec-9',
+			code: 'CONSTRAINT_VIOLATION',
+			message: 'Submission window is closed',
+			retriable: false,
+		}
+		expect(serializer.decode(serializer.encode(message))).toEqual(message)
+	})
+
 	test('preserves handshake-response blobStorageEnabled across the wire', () => {
 		const message: SyncMessage = {
 			type: 'handshake-response',
@@ -269,6 +284,21 @@ describe('JsonMessageSerializer', () => {
 				versionVector: {},
 				schemaVersion: 1,
 				authToken: 'secret-token',
+			}
+			const decoded = serializer.decode(serializer.encode(msg))
+			expect(decoded).toEqual(msg)
+		})
+
+		test('roundtrips an operation-rejected message', () => {
+			const msg: SyncMessage = {
+				type: 'operation-rejected',
+				messageId: 'msg-rej',
+				operationId: 'op-123',
+				collection: 'formResponses',
+				recordId: 'rec-9',
+				code: 'RATE_LIMIT',
+				message: 'Too many submissions',
+				retriable: true,
 			}
 			const decoded = serializer.decode(serializer.encode(msg))
 			expect(decoded).toEqual(msg)

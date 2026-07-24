@@ -251,6 +251,16 @@ export interface ApplyRemoteOptions {
 	 * writing nothing) so the caller can recompute against fresh state.
 	 */
 	guardRowState?: RowVersionState
+	/**
+	 * When true, append the operation to the log (advancing the version vector and
+	 * enabling dedup) WITHOUT materializing anything into the row. Used when a fold
+	 * of the record's log has determined the operation does not change the
+	 * authoritative row state (e.g. a stale update that loses to a newer delete):
+	 * the op must still be persisted so a later fold — for example an atomic
+	 * resurrection composing this op's delta — is complete, but the row (a clean
+	 * tombstone) must be left untouched, with no zombie fields and no version regression.
+	 */
+	logOnly?: boolean
 }
 
 /**

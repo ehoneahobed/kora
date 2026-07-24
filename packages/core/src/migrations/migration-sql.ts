@@ -1,3 +1,4 @@
+import { quoteIdent } from '../schema/quote-ident'
 import type { FieldDescriptor } from '../types'
 import type { MigrationDefinition, MigrationStep } from './migration-builder'
 import { generateRollbackSteps } from './migration-rollback'
@@ -24,15 +25,19 @@ export function migrationStepsToSQL(steps: readonly MigrationStep[]): string[] {
 				// SQLite 3.35+ supports DROP COLUMN. For broader compat, we mark
 				// the column as nullable so it can be ignored in queries.
 				// Drop is preferred when available.
-				statements.push(`ALTER TABLE ${step.collection} DROP COLUMN ${step.field}`)
+				statements.push(
+					`ALTER TABLE ${quoteIdent(step.collection)} DROP COLUMN ${quoteIdent(step.field)}`,
+				)
 				break
 			case 'renameField':
 				// SQLite 3.25+ supports RENAME COLUMN
-				statements.push(`ALTER TABLE ${step.collection} RENAME COLUMN ${step.from} TO ${step.to}`)
+				statements.push(
+					`ALTER TABLE ${quoteIdent(step.collection)} RENAME COLUMN ${quoteIdent(step.from)} TO ${quoteIdent(step.to)}`,
+				)
 				break
 			case 'addIndex':
 				statements.push(
-					`CREATE INDEX IF NOT EXISTS idx_${step.collection}_${step.field} ON ${step.collection} (${step.field})`,
+					`CREATE INDEX IF NOT EXISTS idx_${step.collection}_${step.field} ON ${quoteIdent(step.collection)} (${quoteIdent(step.field)})`,
 				)
 				break
 			case 'removeIndex':
@@ -66,7 +71,7 @@ export function migrationStepsToSQL(steps: readonly MigrationStep[]): string[] {
  *
  * const rollbackSQL = rollbackStepsToSQL(migration)
  * // ['DROP INDEX IF EXISTS idx_todos_priority',
- * //  'ALTER TABLE todos DROP COLUMN priority']
+ * //  'ALTER TABLE "todos" DROP COLUMN "priority"']
  * ```
  */
 export function rollbackStepsToSQL(migration: MigrationDefinition): string[] {
@@ -80,7 +85,7 @@ export function rollbackStepsToSQL(migration: MigrationDefinition): string[] {
  */
 function addFieldSQL(collection: string, field: string, descriptor: FieldDescriptor): string {
 	const sqlType = mapFieldType(descriptor)
-	const parts = [`ALTER TABLE ${collection} ADD COLUMN ${field}`, sqlType]
+	const parts = [`ALTER TABLE ${quoteIdent(collection)} ADD COLUMN ${quoteIdent(field)}`, sqlType]
 
 	if (descriptor.defaultValue !== undefined) {
 		parts.push(`DEFAULT ${sqlDefault(descriptor.defaultValue)}`)
@@ -88,7 +93,7 @@ function addFieldSQL(collection: string, field: string, descriptor: FieldDescrip
 
 	if (descriptor.kind === 'enum' && descriptor.enumValues) {
 		const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-		parts.push(`CHECK (${field} IN (${values}))`)
+		parts.push(`CHECK (${quoteIdent(field)} IN (${values}))`)
 	}
 
 	return parts.join(' ')

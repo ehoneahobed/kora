@@ -417,7 +417,7 @@ kora deploy rollback [deployment-id]
 | `--app` | string | *(directory name)* | Application name on the platform |
 | `--region` | string | `iad` | Deployment region (e.g., `iad`, `lhr`, `syd`, `nrt`) |
 | `--prod` | boolean | `false` | Deploy to production environment |
-| `--confirm` | boolean | `false` | Non-interactive mode — fails fast on missing data |
+| `--confirm` | boolean | `false` | Non-interactive mode: fails fast on missing data |
 | `--reset` | boolean | `false` | Delete all deploy state and generated artifacts |
 
 ### Subcommands
@@ -438,14 +438,14 @@ Reverts the deployment to a previous version. If no `id` is provided, rolls back
 
 When you run `kora deploy`, the following steps execute in order:
 
-1. **Artifact generation** — Creates `Dockerfile`, `.dockerignore` in `.kora/deploy/`
-2. **CLI detection** — Verifies the platform CLI is installed (e.g., `flyctl`)
-3. **Authentication** — Checks login state, prompts if needed
-4. **Provisioning** — Creates the app on the platform (idempotent — skips if exists)
-5. **Server bundle** — Bundles `server.ts` into a single `server-bundled.js` using esbuild
-6. **Client build** — Runs `vite build` to produce static assets in `.kora/deploy/dist/`
-7. **Platform config** — Generates `fly.toml` or `railway.json`
-8. **Deploy** — Pushes to the platform and returns live URLs
+1. **Artifact generation**: Creates `Dockerfile`, `.dockerignore` in `.kora/deploy/`
+2. **CLI detection**: Verifies the platform CLI is installed (e.g., `flyctl`)
+3. **Authentication**: Checks login state, prompts if needed
+4. **Provisioning**: Creates the app on the platform (idempotent, skips if exists)
+5. **Server bundle**: Bundles `server.ts` into a single `server-bundled.js` using esbuild
+6. **Client build**: Runs `vite build` to produce static assets in `.kora/deploy/dist/`
+7. **Platform config**: Generates `fly.toml` or `railway.json`
+8. **Deploy**: Pushes to the platform and returns live URLs
 
 ### Deploy State
 
@@ -547,7 +547,7 @@ kora studio --connect wss://your-server.com/kora --schema ./kora/schema.ts [--to
 ```
 
 Shows records with per-field last writers, full operation history, a causal
-DAG, time travel, the merge audit trail, and sync state — live. See the
+DAG, time travel, the merge audit trail, and sync state, live. See the
 [Kora Studio guide](/studio) for the full walkthrough. Requires
 `better-sqlite3` (file mode), plus `@korajs/test` and `@korajs/server` for
 lab mode, and the Kora runtime packages for spectator mode.

@@ -170,6 +170,17 @@ describe('resolveAtomicOp', () => {
 		test('handles non-array current', () => {
 			expect(resolveAtomicOp(undefined, op.remove('x'))).toEqual([])
 		})
+
+		test('removes an object element by value, not by reference', () => {
+			const list = [
+				{ id: 1, label: 'a' },
+				{ id: 2, label: 'b' },
+			]
+			// A fresh object with the same shape must still be removed.
+			expect(resolveAtomicOp(list, op.remove({ id: 1, label: 'a' }))).toEqual([
+				{ id: 2, label: 'b' },
+			])
+		})
 	})
 })
 

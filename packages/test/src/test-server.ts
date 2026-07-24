@@ -1,7 +1,7 @@
 import type { BlobRef, Operation, SchemaDefinition } from '@korajs/core'
 import { MemoryServerStore } from '@korajs/server'
 import { KoraSyncServer } from '@korajs/server'
-import type { ServerTransport } from '@korajs/server'
+import type { OperationValidator, ServerTransport } from '@korajs/server'
 import { type ContentAddressedBlobStore, createMemoryServerBlobStore } from '@korajs/store'
 
 /**
@@ -15,6 +15,8 @@ export interface TestServerOptions {
 	supportedSchemaVersions?: { min: number; max: number }
 	/** Enable central blob storage: the server persists and serves uploaded blob bytes. */
 	blobStorage?: boolean
+	/** Adjudicate untrusted client operations before materialization. */
+	validateOperation?: OperationValidator
 }
 
 export class TestServer {
@@ -36,6 +38,7 @@ export class TestServer {
 				max: schemaVersion,
 			},
 			...(blob ? blob.callbacks : {}),
+			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 		})
 		void this.store.setSchema(schema)
 	}
@@ -60,6 +63,15 @@ export class TestServer {
 	 */
 	getConnectionCount(): number {
 		return this.syncServer.getConnectionCount()
+	}
+
+	/**
+	 * Retransmit relay batches connected clients have not acknowledged. Lets a test
+	 * deterministically trigger the redelivery that the server also runs on a timer,
+	 * without depending on wall-clock time. `staleMs` of 0 resends every pending relay.
+	 */
+	retransmitPendingRelays(staleMs = 0): void {
+		this.syncServer.retransmitPendingRelays(staleMs)
 	}
 
 	/** Every blob reference still reachable from live records on the server. */

@@ -4,6 +4,7 @@ import type { ApplyResult } from '@korajs/sync'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
 import { createServerReferentialContext } from '../constraints/server-referential-context'
 import type { ServerStore } from '../store/server-store'
+import { type OperationRejection, isRetriableRejection } from './rejection-taxonomy'
 import {
 	createServerSideEffectOperation,
 	nextServerSequenceNumber,
@@ -15,10 +16,7 @@ export interface ApplyServerOperationResult {
 	/** Primary op when applied, plus any server-generated side-effect operations */
 	appliedOperations: Operation[]
 	/** Rejection reason when the operation was not applied */
-	rejection?: {
-		code: string
-		message: string
-	}
+	rejection?: OperationRejection
 }
 
 /**
@@ -35,12 +33,14 @@ export async function applyServerOperation(
 
 	const constraintCheck = await validateIncomingOperationConstraints(store, op, schema)
 	if (!constraintCheck.valid) {
+		const code = constraintCheck.code ?? 'CONSTRAINT_VIOLATION'
 		return {
 			result: 'skipped',
 			appliedOperations: [],
 			rejection: {
-				code: constraintCheck.code ?? 'CONSTRAINT_VIOLATION',
+				code,
 				message: constraintCheck.message ?? `Operation "${op.id}" violates a schema constraint`,
+				retriable: isRetriableRejection(code),
 			},
 		}
 	}
@@ -56,6 +56,7 @@ export async function applyServerOperation(
 				rejection: {
 					code: 'REFERENTIAL_INTEGRITY',
 					message: `Operation "${op.id}" violates referential integrity on "${op.collection}"`,
+					retriable: isRetriableRejection('REFERENTIAL_INTEGRITY'),
 				},
 			}
 		}
@@ -66,17 +67,19 @@ export async function applyServerOperation(
 		}
 
 		const appliedOperations: Operation[] = [op]
-		let serverSeq = nextServerSequenceNumber(store)
 
 		for (const effect of referential.sideEffectOps) {
+			// Allocate each side-effect's sequence number individually. On a store
+			// that reserves atomically (Postgres), this keeps a concurrent conditional
+			// apply from being handed the same server sequence number; on a serialized
+			// store, each allocation reads the version vector the prior apply advanced.
 			const sideOp = await createServerSideEffectOperation(
 				store,
 				op,
 				effect,
 				op.schemaVersion,
-				serverSeq,
+				nextServerSequenceNumber(store),
 			)
-			serverSeq += 1
 			const sideResult = await store.applyRemoteOperation(sideOp)
 			if (sideResult === 'applied') {
 				appliedOperations.push(sideOp)

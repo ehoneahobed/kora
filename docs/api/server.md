@@ -24,6 +24,24 @@ import {
   MixedAuthProvider,
   KoraAuthProvider,
   AwarenessRelay,
+  RETRIABLE_REJECTION_CODES,
+  isRetriableRejection,
+} from '@korajs/server'
+```
+
+Type-only exports for the validation and route-context surfaces are imported the same way:
+
+```typescript
+import type {
+  OperationValidator,
+  OperationValidationContext,
+  OperationDecision,
+  OperationRejection,
+  ProductionServer,
+  ProductionHttpRouteContext,
+  RouteMutation,
+  RouteScopeOptions,
+  RouteApplyResult,
 } from '@korajs/server'
 ```
 
@@ -40,13 +58,18 @@ function createKoraServer(config: KoraSyncServerConfig): KoraSyncServer
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `store` | `ServerStore` | Yes | -- |
-| `port` | `number` | No | `4567` |
+| `port` | `number` | No | none (required for standalone `start()`; omit for attach mode via `handleConnection()`) |
 | `host` | `string` | No | `'0.0.0.0'` |
 | `path` | `string` | No | `'/'` |
 | `auth` | `AuthProvider` | No | `NoAuthProvider` behavior |
 | `batchSize` | `number` | No | `100` |
 | `maxConnections` | `number` | No | `0` (unlimited) |
 | `schemaVersion` | `number` | No | `1` |
+| `maxOperationBytes` | `number` | No | `262144` (256 KiB) |
+| `maxOpsPerMinute` | `number` | No | `600` |
+| `validateOperation` | `OperationValidator` | No | -- (all operations accepted) |
+
+`maxOperationBytes` is the maximum serialized byte size of a single client operation accepted at sync ingest; operations larger than this are rejected before materialization. `maxOpsPerMinute` is the maximum operations accepted per connected client per minute (sliding window); operations beyond the limit are rejected with a retriable `RATE_LIMIT` rejection until the window resets. Both are enforced per connection across every connected client. `validateOperation` is covered under [Operation Validation](#operation-validation).
 
 ### Example
 
@@ -130,18 +153,61 @@ await server.start()
 | `metricsToken` | `/__kora/metrics`; falls back to `adminToken` when omitted |
 | `backupToken` | `/__kora/backup/export`, `/__kora/backup/import`; falls back to `adminToken` when omitted |
 
+### `ProductionServer`
+
+The handle returned by `createProductionServer()`.
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `start()` | `Promise<string>` | Start listening. Resolves to the URL the server is available at. |
+| `stop()` | `Promise<void>` | Stop the server gracefully. |
+| `kora` | `ProductionHttpRouteContext` | Trusted, scoped data-plane access for server-side callers with no HTTP request (background jobs, scheduled tasks, seeding scripts). Same context handed to custom HTTP routes as `request.kora`. |
+| `getLiveBlobRefs()` | `Promise<BlobRef[]>` | Every blob reference still reachable from a live record across all collections that declare a `blob` field. Pass it to `collectBlobGarbage(blobStore, refs)` from `@korajs/store` to reclaim bytes no record points at any more. |
+
+#### Route context (`server.kora` / `request.kora`)
+
+`ProductionHttpRouteContext` runs mutations through the same validated pipeline as sync (Tier 2 constraints, referential integrity, materialization, and fan-out to connected clients), so server-side callers and custom HTTP routes cannot bypass validation, constraints, or tenant isolation.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `apply` | `(mutation: RouteMutation, options?: RouteScopeOptions) => Promise<RouteApplyResult>` | Apply a mutation through the validated pipeline and relay the resulting operation to connected clients. |
+| `query` | `(collection: string, options?: CollectionQueryOptions & RouteScopeOptions) => Promise<MaterializedRecord[]>` | Read materialized records from a collection, optionally scoped. |
+| `findById` | `(collection: string, id: string, options?: RouteScopeOptions) => Promise<MaterializedRecord \| null>` | Read a single materialized record by id, optionally scoped. |
+
+`RouteMutation`:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `collection` | `string` | Yes | Target collection. |
+| `type` | `'insert' \| 'update' \| 'delete'` | Yes | Mutation type. |
+| `recordId` | `string` | No | Optional for inserts (a UUID v7 is generated when omitted); required for updates and deletes. |
+| `data` | `Record<string, unknown> \| null` | No | Field values. For updates, only the changed fields. |
+
+`RouteScopeOptions`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scope` | `Record<string, Record<string, unknown>>` | Per-actor scope enforced exactly like a sync session's scope: `apply()` rejects a mutation whose resulting record falls outside it, and `query()` / `findById()` only return records inside it. Omit for genuinely public routes where no per-actor isolation applies. |
+
+`RouteApplyResult` is a discriminated union on `ok`:
+
+- `{ ok: true; operation: Operation; record: MaterializedRecord | null }`
+- `{ ok: false; code: string; message: string; retriable: boolean }`
+
+Custom HTTP routes receive this context as `request.kora` on `ProductionHttpRouteRequest`, alongside `method`, `path`, `body`, `headers`, `query`, and `ip`.
+
 ## `KoraSyncServer`
 
 Main server class.
 
 ### Methods
 
-- `start(): Promise<void>` — starts WebSocket server mode.
-- `stop(): Promise<void>` — gracefully stops server and sessions.
-- `handleConnection(transport): string` — attach a server transport manually.
-- `handleHttpRequest(request): Promise<HttpSyncResponse>` — HTTP sync endpoint handler.
-- `getStatus(): Promise<ServerStatus>` — returns runtime status.
-- `getConnectionCount(): number` — returns active connection count.
+- `start(): Promise<void>`: starts WebSocket server mode.
+- `stop(): Promise<void>`: gracefully stops server and sessions.
+- `handleConnection(transport): string`: attach a server transport manually.
+- `handleHttpRequest(request): Promise<HttpSyncResponse>`: HTTP sync endpoint handler.
+- `getStatus(): Promise<ServerStatus>`: returns runtime status.
+- `getConnectionCount(): number`: returns active connection count.
 
 ## Stores
 
@@ -172,6 +238,21 @@ const store = await createPostgresServerStore({
   connectionString: process.env.DATABASE_URL!,
 })
 ```
+
+### Delivery sequence (gap-free server-to-client sync)
+
+Every store assigns each stored operation a monotonic **delivery sequence** in commit order. This is the substrate for the [server-to-client delivery watermark](../guide/sync-configuration.md#delivery-guarantees-server-to-client) that guarantees no operation is ever lost on its way to a client. Two `ServerStore` methods expose it (you rarely call them directly; the sync server uses them):
+
+| Method | Description |
+|--------|-------------|
+| `getMaxDeliverySequence(): Promise<number>` | The highest delivery sequence currently stored (0 when empty). |
+| `getOperationsAfterDelivery(afterDeliverySequence, limit): Promise<DeliveredOperation[]>` | Operations with a delivery sequence above the cursor, in delivery order, up to `limit`. |
+
+Operational notes:
+
+- **Automatic migration.** On first startup after upgrading, each store adds a `delivery_seq` column and backfills existing operations deterministically (ordered by receipt time, then sequence number, then id). This runs once and needs no manual step. On SQLite and Postgres it is idempotent and safe to re-run.
+- **Postgres and commit order.** On Postgres the delivery sequence is assigned from a counter row locked inside the append transaction, so delivery order equals commit (visibility) order even across multiple server instances sharing one database. This serializes appends through one counter row, a deliberate correctness-over-throughput choice; it is not a bottleneck for typical sync workloads, but is worth knowing if you drive a single Postgres at very high sustained write rates.
+- **Concurrent cold start.** Schema setup and the delivery-sequence backfill run under an advisory-locked transaction, so starting several server replicas at once against a fresh database is safe.
 
 ---
 
@@ -301,7 +382,7 @@ const auth = new TokenAuthProvider({
 
 Accepts both authenticated and anonymous connections. Authenticated users get full access; anonymous users get restricted access via scoped collections.
 
-**This is the recommended provider for apps with public-facing features** — for example, a form builder where authenticated users create forms but anyone can submit responses.
+**This is the recommended provider for apps with public-facing features**, for example a form builder where authenticated users create forms but anyone can submit responses.
 
 ```typescript
 import { MixedAuthProvider } from '@korajs/server'
@@ -372,6 +453,84 @@ The return type from `authenticate()`:
 | `metadata` | `Record<string, unknown>` | No | Arbitrary metadata (device info, email, etc.) |
 
 When `scopes` is provided, the server only sends/accepts operations matching the scope filters. For example, `{ todos: { userId: 'user-1' } }` means the user only syncs todos where `userId` equals `'user-1'`.
+
+## Operation Validation
+
+The `validateOperation` config hook adjudicates untrusted client operations before they become authoritative. It runs at sync ingestion for every incoming client operation, after HLC ordering and the built-in guards (timestamp, rate, size), and before materialization. This is what lets Kora serve public / multi-tenant apps where the client is not trusted. Omit it and every operation is accepted.
+
+```typescript
+import { createProductionServer } from '@korajs/server'
+import type { OperationValidator } from '@korajs/server'
+
+const validateOperation: OperationValidator = async (operation, context) => {
+  // Anonymous submitters can only insert into 'responses'
+  if (!context.auth && operation.collection !== 'responses') {
+    return { action: 'reject', code: 'SCOPE_VIOLATION', message: 'Not allowed' }
+  }
+  return { action: 'accept' }
+}
+
+const server = createProductionServer({
+  store,
+  syncOptions: { validateOperation },
+})
+```
+
+### `OperationValidator`
+
+```typescript
+type OperationValidator = (
+  operation: Operation,
+  context: OperationValidationContext,
+) => Promise<OperationDecision> | OperationDecision
+```
+
+### `OperationValidationContext`
+
+The context passed to the validator.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auth` | `AuthContext \| null` | The authenticated actor for the submitting session, or `null` for an anonymous / unauthenticated connection. |
+| `kora` | `ProductionHttpRouteContext` | Trusted, scoped data-plane access (the same context as `server.kora` / `request.kora`). Use `kora.query` / `kora.findById` to read current authoritative state while deciding, and `kora.apply` to author a derived server operation. Authoring a new operation is preferred over mutating the incoming one, which must stay immutable so content-addressing and convergence hold. |
+
+### `OperationDecision`
+
+The verdict a validator returns for one incoming operation. A discriminated union on `action`:
+
+| Variant | Shape | Meaning |
+|---------|-------|---------|
+| accept | `{ action: 'accept' }` | Let the operation materialize as-is and relay to connected clients. |
+| reject | `{ action: 'reject'; code: string; message: string; retriable?: boolean }` | Refuse it. The operation never enters the authoritative log; a structured rejection travels back to the submitter tied to the operation id, and the submitter keeps the op in a durable rejected store. `retriable` defaults from the shared taxonomy for the code. |
+| ignore | `{ action: 'ignore' }` | The server handled the operation out of band (for example the validator already authored a derived op via `context.kora`). No rejection is sent; the submitter treats it as handled and drops it from its pending queue. |
+
+## Rejection Taxonomy
+
+The shared vocabulary for why the server refused an operation. The `retriable` flag answers whether resubmitting the identical operation may later succeed: `true` for transient conditions (for example a rate limit), `false` for permanent ones (a constraint violation, referential conflict, malformed mutation, or scope violation).
+
+### `OperationRejection`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | `string` | Stable, machine-readable reason code (for example `CONSTRAINT_VIOLATION`). |
+| `message` | `string` | Human-readable explanation with enough context to debug without reproduction. |
+| `retriable` | `boolean` | Whether resubmitting the identical operation may later succeed. |
+
+### `RETRIABLE_REJECTION_CODES`
+
+```typescript
+const RETRIABLE_REJECTION_CODES: ReadonlySet<string>
+```
+
+The set of reason codes whose underlying condition is transient. Everything not listed is treated as permanent (the safe default). Currently contains `RATE_LIMIT`, the code the session emits when a client exceeds its per-minute operation budget.
+
+### `isRetriableRejection(code)`
+
+```typescript
+function isRetriableRejection(code: string): boolean
+```
+
+Returns `true` when resubmitting the identical operation may later succeed (that is, when `code` is in `RETRIABLE_REJECTION_CODES`).
 
 ## Awareness Relay
 

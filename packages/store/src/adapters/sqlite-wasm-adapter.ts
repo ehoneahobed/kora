@@ -1,5 +1,5 @@
 import { generateFullDDL } from '@korajs/core'
-import type { SchemaDefinition } from '@korajs/core'
+import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import { AdapterError, StoreNotOpenError } from '../errors'
 import { SharedWorkerClientBridge } from '../multi-tab/shared-worker-bridge'
 import {
@@ -41,6 +41,14 @@ export interface SqliteWasmAdapterOptions {
 	 * Requires `workerUrl` for the inner SQLite worker. Falls back to leader election when omitted.
 	 */
 	sharedWorkerUrl?: string | URL
+
+	/**
+	 * When set, storage diagnostics are emitted here: `store:opfs-unavailable` when
+	 * persistence silently degraded to a non-persistent in-memory database, and
+	 * `store:db-name-collision` when another runtime on this origin was already
+	 * using this database name.
+	 */
+	emitter?: KoraEventEmitter
 }
 
 /**
@@ -68,8 +76,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly sharedWorkerUrl: string | URL | undefined
 	private readonly workerResponseTimeoutMs: number
 	private readonly dbName: string
+	private readonly emitter: KoraEventEmitter | undefined
 	private tabSession: Awaited<ReturnType<typeof acquireTabStorageSession>> | null = null
 	private sharedWorker: SharedWorker | null = null
+	/** Retained so a follower promoted to leader can re-open its own worker. */
+	private schema: SchemaDefinition | null = null
+	private promoting = false
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
@@ -77,6 +89,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.sharedWorkerUrl = options.sharedWorkerUrl
 		this.workerResponseTimeoutMs = options.workerResponseTimeoutMs ?? 30_000
 		this.dbName = options.dbName ?? 'kora-db'
+		this.emitter = options.emitter
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
@@ -89,10 +102,21 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				typeof this.workerUrl === 'string' ? this.workerUrl : this.workerUrl.href
 			const sharedUrl =
 				typeof this.sharedWorkerUrl === 'string' ? this.sharedWorkerUrl : this.sharedWorkerUrl.href
-			this.sharedWorker = new SharedWorker(sharedUrl, { name: `kora-sw-${this.dbName}` })
+			// `type: 'module'` is required: the shared host is authored and served as an
+			// ES module (it uses import). A classic SharedWorker cannot parse it and
+			// fails silently, so `open` would hang forever.
+			this.sharedWorker = new SharedWorker(sharedUrl, {
+				type: 'module',
+				name: `kora-sw-${this.dbName}`,
+			})
 			this.bridge = new SharedWorkerClientBridge(this.sharedWorker, this.dbName, workerUrlString)
 		} else if (this.workerUrl) {
-			this.tabSession = await acquireTabStorageSession(this.dbName)
+			this.schema = schema
+			this.tabSession = await acquireTabStorageSession(this.dbName, {
+				onPromote: () => {
+					void this.promoteToLeader()
+				},
+			})
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 
 			if (this.tabSession.role === 'leader') {
@@ -100,10 +124,24 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
 				this.bridge = workerBridge
 			} else {
-				this.bridge = new FollowerBroadcastBridge(
+				const followerBridge = new FollowerBroadcastBridge(
 					this.tabSession.channelName,
 					this.workerResponseTimeoutMs,
 				)
+				this.bridge = followerBridge
+				// Another runtime on this origin already owns this database name. That is
+				// expected for multiple tabs of the same app (they share one leader),
+				// but a bug if these are logically separate apps, so surface it so the
+				// developer can give them distinct store names.
+				this.emitter?.emit({
+					type: 'store:db-name-collision',
+					dbName: this.dbName,
+					message: `Another runtime on this origin is already using database "${this.dbName}"; this runtime is sharing it as a follower. If these are separate apps, give each a distinct store name.`,
+				})
+				// Readiness handshake: give the leader relay a moment to answer before the
+				// first RPC, so a follower opened during a leader's startup race retries the
+				// handshake instead of firing into the void and waiting out the full timeout.
+				await followerBridge.waitForLeader()
 			}
 		} else {
 			throw new AdapterError(
@@ -125,7 +163,33 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				dbName: this.dbName,
 			})
 		}
+		this.reportStorageMode(response.data)
 		this.opened = true
+	}
+
+	/**
+	 * Surface a `store:opfs-unavailable` diagnostic when the worker reported that
+	 * persistence silently degraded to an in-memory database, so a data-loss
+	 * condition is observable instead of failing silently. A persistent open (or a
+	 * bridge that does not report a mode, e.g. the Node mock) emits nothing.
+	 */
+	private reportStorageMode(data: unknown): void {
+		if (!this.emitter || typeof data !== 'object' || data === null) {
+			return
+		}
+		const mode = data as {
+			persistent?: boolean
+			fallbackReason?: 'lock-conflict' | 'timeout' | 'unsupported'
+		}
+		if (mode.persistent === false) {
+			const reason = mode.fallbackReason ?? 'unsupported'
+			this.emitter.emit({
+				type: 'store:opfs-unavailable',
+				dbName: this.dbName,
+				reason,
+				message: `OPFS persistence is unavailable (${reason}) for database "${this.dbName}"; the store is running in memory and data will not survive a reload.`,
+			})
+		}
 	}
 
 	async close(): Promise<void> {
@@ -135,6 +199,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			await this.sendRequest({ id: 0, type: 'close' })
 		} finally {
 			this.tabSession?.stopRelay?.()
+			this.tabSession?.cancelPromotionWatch?.()
 			if (this.tabSession?.releaseLock) {
 				await this.tabSession.releaseLock()
 			}
@@ -144,6 +209,36 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			this.bridge = null
 			this.opened = false
 		}
+	}
+
+	/**
+	 * Promotes a follower to leader after the previous leader released the storage
+	 * lock (its tab closed or crashed). The lock is only granted once the old leader
+	 * is gone, so opening our own worker here is safe from the OPFS single-writer
+	 * rule. In-flight follower RPCs are rejected and left to the caller / reactive
+	 * layer to retry against the new leader.
+	 */
+	private async promoteToLeader(): Promise<void> {
+		if (this.promoting || !this.opened || this.workerUrl === undefined || this.schema === null) {
+			return
+		}
+		this.promoting = true
+
+		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+		const workerBridge = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs)
+
+		const previousBridge = this.bridge
+		this.bridge = workerBridge
+		if (this.tabSession) {
+			this.tabSession.role = 'leader'
+			this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
+		}
+		previousBridge?.terminate()
+
+		// Re-open against our own worker. DDL is idempotent, and the OPFS data the old
+		// leader persisted is now readable by this worker.
+		const ddlStatements = generateFullDDL(this.schema)
+		await this.sendRequest({ id: 0, type: 'open', ddlStatements, dbName: this.dbName })
 	}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {

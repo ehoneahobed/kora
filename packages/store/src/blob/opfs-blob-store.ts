@@ -118,7 +118,7 @@ interface StorageManagerLike {
 }
 
 function getStorageManager(): StorageManagerLike {
-	const nav = (globalThis as { navigator?: { storage?: StorageManagerLike } }).navigator
+	const nav = (globalThis as unknown as { navigator?: { storage?: StorageManagerLike } }).navigator
 	if (!nav?.storage || typeof nav.storage.getDirectory !== 'function') {
 		throw new Error(
 			'OPFS is unavailable in this environment. The OPFS blob store requires a browser with Origin Private File System support; use MemoryBlobStore or a server-side store elsewhere.',

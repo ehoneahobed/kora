@@ -1,5 +1,5 @@
 import type { SchemaDefinition, VersionVector } from '@korajs/core'
-import { HybridLogicalClock, createVersionVector } from '@korajs/core'
+import { HybridLogicalClock, createVersionVector, quoteIdent } from '@korajs/core'
 import type { StorageAdapter, Transaction } from '../types'
 import type { CompactionResult, CompactionStrategy } from './types'
 import { COMPACTION_BASELINE_META_KEY } from './types'
@@ -52,7 +52,9 @@ export async function compactOperationLog(
 
 	await adapter.transaction(async (tx: Transaction) => {
 		for (const collectionName of collectionNames) {
-			const table = `_kora_ops_${collectionName}`
+			// Already quoted here so the buildCountSql / buildDeleteSql helpers can
+			// interpolate it verbatim (they do not route through sql-builder).
+			const table = quoteIdent(`_kora_ops_${collectionName}`)
 			for (const [nodeId, maxSeq] of watermark) {
 				if (maxSeq <= 0) continue
 

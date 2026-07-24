@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'vitest'
-import type { BlobChunkRequestMessage, BlobChunkResponseMessage } from '../protocol/messages'
+import type {
+	BlobChunkPushMessage,
+	BlobChunkRequestMessage,
+	BlobChunkResponseMessage,
+} from '../protocol/messages'
 import {
 	BlobChunkChannel,
 	type BlobChunkChannelMessage,
@@ -14,7 +18,8 @@ describe('blob chunk channel', () => {
 	})
 
 	test('send emits a request message with a generated messageId', () => {
-		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage> = []
+		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
+			[]
 		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
 
 		channel.send({ type: 'blob-chunk-request', requestId: 'r1', hash: 'abc' })
@@ -29,7 +34,8 @@ describe('blob chunk channel', () => {
 	})
 
 	test('send base64-encodes response bytes onto the wire', () => {
-		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage> = []
+		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
+			[]
 		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
 		const bytes = new Uint8Array([10, 20, 30])
 
@@ -42,7 +48,8 @@ describe('blob chunk channel', () => {
 	})
 
 	test('send carries a null response (responder does not hold the hash) as null', () => {
-		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage> = []
+		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
+			[]
 		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
 
 		channel.send({ type: 'blob-chunk-response', requestId: 'r3', bytes: null })
@@ -94,13 +101,19 @@ describe('blob chunk channel', () => {
 	})
 
 	test('send base64-encodes a blob-chunk-push onto the wire', () => {
-		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage> = []
-		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m as never) })
+		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
+			[]
+		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
 		const bytes = new Uint8Array([3, 1, 4, 1, 5])
 
 		channel.send({ type: 'blob-chunk-push', hash: 'deadbeef', bytes })
 
-		const msg = sent[0] as { type: string; hash: string; bytes: string; messageId: string }
+		const msg = sent[0] as unknown as {
+			type: string
+			hash: string
+			bytes: string
+			messageId: string
+		}
 		expect(msg.type).toBe('blob-chunk-push')
 		expect(msg.hash).toBe('deadbeef')
 		expect(msg.bytes).toBe(encodeBlobChunkBytes(bytes))

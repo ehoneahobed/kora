@@ -1,5 +1,6 @@
 import type { KoraEventEmitter } from '@korajs/core'
 import type { MessageSerializer } from '@korajs/sync'
+import type { OperationValidator } from './apply/operation-validator'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
 import type { Logger } from './logging/structured-logger'
 import type { ServerStore } from './store/server-store'
@@ -81,6 +82,31 @@ export interface KoraSyncServerConfig {
 	 * `@korajs/store` derives both from a `ContentAddressedBlobStore`.
 	 */
 	persistBlobChunk?: (hash: string, bytes: Uint8Array) => Promise<void> | void
+	/**
+	 * Maximum serialized byte size of a single client operation accepted at sync
+	 * ingest. Operations larger than this are rejected before materialization.
+	 * Defaults to 256 KiB. Set once here to enforce one payload cap across every
+	 * connected client instead of configuring each session.
+	 */
+	maxOperationBytes?: number
+	/**
+	 * Maximum operations accepted per connected client per minute (sliding window).
+	 * Operations beyond the limit are rejected until the window resets. Defaults to
+	 * 600. Set once here to enforce one rate cap across every connected client.
+	 */
+	maxOpsPerMinute?: number
+	/**
+	 * Adjudicate untrusted client operations before they become authoritative.
+	 *
+	 * Runs at sync ingestion for every incoming client operation, after HLC
+	 * ordering and the built-in guards, and before materialization. Return
+	 * `accept` to let it through, `reject` to refuse it (a structured rejection
+	 * travels back to the submitter and the op never enters the authoritative
+	 * log), or `ignore` when the server has handled it out of band. This is what
+	 * lets Kora serve public / multi-tenant apps where the client is not trusted.
+	 * Omit it and every operation is accepted, as before.
+	 */
+	validateOperation?: OperationValidator
 }
 
 /**

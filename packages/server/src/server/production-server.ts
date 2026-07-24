@@ -1,8 +1,9 @@
+import type { BlobRef } from '@korajs/core'
 import type { ServerStore } from '../store/server-store'
 import { WsServerTransport } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import { KoraSyncServer } from './kora-sync-server'
-import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
+import type { ProductionHttpRouteContext } from './route-context'
 
 /**
  * Configuration for the production server that serves both
@@ -82,6 +83,29 @@ export interface ProductionServer {
 	start(): Promise<string>
 	/** Stop the server gracefully. */
 	stop(): Promise<void>
+	/**
+	 * Trusted, scoped data-plane access for server-side callers that have no HTTP
+	 * request — background jobs, scheduled tasks, seeding scripts.
+	 *
+	 * `kora.apply()` runs the mutation through the exact same validated pipeline as
+	 * sync (Tier 2 constraints, referential integrity, materialization, and fan-out
+	 * to connected clients), and `kora.query()` / `kora.findById()` read
+	 * materialized state. This is the same context handed to custom HTTP routes as
+	 * `request.kora`, so a job and a request share one code path and one set of
+	 * guarantees instead of the job writing to the store directly and silently
+	 * bypassing validation.
+	 */
+	kora: ProductionHttpRouteContext
+	/**
+	 * Every blob reference still reachable from a live record across all
+	 * collections that declare a `blob` field. This is the live set for
+	 * garbage-collecting the server's central blob store: pass it to
+	 * `collectBlobGarbage(blobStore, refs)` from `@korajs/store` on a schedule to
+	 * reclaim bytes no record points at any more.
+	 *
+	 * @returns Every live blob reference the server can currently see.
+	 */
+	getLiveBlobRefs(): Promise<BlobRef[]>
 }
 
 // MIME types for static file serving
@@ -127,8 +151,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	})
 
 	// Scoped, validated data-plane access handed to every custom HTTP route as
-	// `request.kora`. Created once and shared: it holds no per-request state.
-	const routeContext = createRouteContext(syncServer, config.store)
+	// `request.kora`, exposed on the handle as `server.kora`, and used by the
+	// operation validator. One shared context (it holds no per-request state).
+	const routeContext = syncServer.getKoraContext()
 
 	let httpServer: import('node:http').Server | null = null
 
@@ -304,6 +329,12 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	}
 
 	return {
+		kora: routeContext,
+
+		getLiveBlobRefs(): Promise<BlobRef[]> {
+			return syncServer.getLiveBlobRefs()
+		},
+
 		async start(): Promise<string> {
 			const { createServer } = await import('node:http')
 			const { createReadStream, existsSync, statSync } = await import('node:fs')

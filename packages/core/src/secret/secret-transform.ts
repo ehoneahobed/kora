@@ -13,8 +13,7 @@ export type SecretKeyProvider = () => string | undefined | Promise<string | unde
 export class MissingSecretKeyError extends Error {
 	constructor(readonly field: string) {
 		super(
-			`Secret field "${field}" is encrypted but no encryption key is configured. ` +
-				'Provide sync.encryption.key (or a key provider) to createApp.',
+			`Secret field "${field}" is encrypted but no encryption key is configured. Provide sync.encryption.key (or a key provider) to createApp.`,
 		)
 		this.name = 'MissingSecretKeyError'
 	}

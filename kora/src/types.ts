@@ -238,6 +238,15 @@ export interface SyncControl {
 	clearSchemaBlock(): void
 	/** Export a diagnostics snapshot for debugging and support tickets. */
 	exportDiagnostics(): import('@korajs/sync').SyncDiagnostics
+	/**
+	 * Operations the server rejected that have not been reconciled yet. Pair with
+	 * the `sync:operation-rejected` event to surface failed submissions and decide
+	 * whether to roll back the optimistic local write or resubmit a corrected op.
+	 * Empty when sync is not configured.
+	 */
+	getRejectedOperations(): Promise<import('@korajs/sync').RejectedOperation[]>
+	/** Forget rejected operations by id once the app has reconciled them. */
+	clearRejectedOperations(operationIds: string[]): Promise<void>
 }
 
 /**

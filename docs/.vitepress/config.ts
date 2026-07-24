@@ -11,6 +11,14 @@ import { defineConfig } from 'vitepress'
 
 const SITE_URL = 'https://korajs.dev'
 
+/**
+ * Internal working docs (planning, design notes, release trackers, benchmark
+ * baselines) that must never reach the public site, the sitemap, the raw .md
+ * copies, or the llms.txt / llms-full.txt agent artifacts. One list drives both
+ * the VitePress page build (srcExclude) and the machine-readable emitters below.
+ */
+const INTERNAL_DIRS = ['plans', 'design', 'releases', 'benchmarks']
+
 interface DocPage {
 	path: string
 	title: string
@@ -21,6 +29,7 @@ interface DocPage {
 function collectMarkdown(dir: string, root: string, out: string[]): void {
 	for (const entry of readdirSync(dir)) {
 		if (entry === 'node_modules' || entry.startsWith('.') || entry === 'CHANGELOG.md') continue
+		if (INTERNAL_DIRS.includes(entry)) continue
 		const full = join(dir, entry)
 		if (statSync(full).isDirectory()) collectMarkdown(full, root, out)
 		else if (entry.endsWith('.md')) out.push(relative(root, full))
@@ -85,17 +94,12 @@ function emitLlmsArtifacts(srcDir: string, outDir: string): void {
 		'',
 		...inSection('examples/').map(link),
 		'',
-		'## Optional',
-		'',
-		...inSection('releases/').map(link),
-		'',
 		`Full documentation in a single file: ${SITE_URL}/llms-full.txt`,
 		'',
 	].join('\n')
 	writeFileSync(join(outDir, 'llms.txt'), llms)
 
 	const full = pages
-		.filter((p) => !p.path.startsWith('releases/'))
 		.map(
 			(p) =>
 				`# ${p.title}\nSource: ${SITE_URL}/${p.path.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '')}\n\n${p.body.trim()}\n`,
@@ -112,6 +116,7 @@ export default defineConfig({
 		'Kora.js is an offline-first JavaScript framework. Local-first storage on SQLite, automatic conflict resolution, and multi-device sync with zero distributed-systems code.',
 	base: '/',
 	cleanUrls: true,
+	srcExclude: INTERNAL_DIRS.map((dir) => `${dir}/**`),
 	head: [
 		['link', { rel: 'icon', href: '/favicon.ico', sizes: '48x48' }],
 		['link', { rel: 'icon', href: '/favicon-32x32.png', type: 'image/png', sizes: '32x32' }],
@@ -160,6 +165,16 @@ export default defineConfig({
 		pageData.frontmatter.head = pageData.frontmatter.head ?? []
 		pageData.frontmatter.head.push(
 			['link', { rel: 'canonical', href: canonical }],
+			// Advertise the raw-markdown twin so an agent that lands on the HTML page
+			// (or curls it) can discover clean markdown instead of parsing the rendered DOM.
+			[
+				'link',
+				{
+					rel: 'alternate',
+					type: 'text/markdown',
+					href: `https://korajs.dev/${pageData.relativePath}`,
+				},
+			],
 			['meta', { property: 'og:url', content: canonical }],
 			['meta', { property: 'og:title', content: title }],
 			['meta', { name: 'twitter:title', content: title }],
@@ -188,19 +203,25 @@ export default defineConfig({
 		sidebar: [
 			{
 				text: 'Introduction',
-				items: [{ text: 'Getting Started', link: '/getting-started' }],
+				items: [
+					{ text: 'Getting Started', link: '/getting-started' },
+					{ text: 'Kora for AI Agents', link: '/guide/ai-agents' },
+				],
 			},
 			{
 				text: 'Guide',
 				items: [
 					{ text: 'Deployment', link: '/guide/deployment' },
+					{ text: 'Production Server', link: '/guide/production-server' },
 					{ text: 'Schema Design', link: '/guide/schema-design' },
 					{ text: 'React Hooks', link: '/guide/react-hooks' },
 					{ text: 'Offline Patterns', link: '/guide/offline-patterns' },
 					{ text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
 					{ text: 'Clock Integrity', link: '/guide/clock-integrity' },
 					{ text: 'Sync Configuration', link: '/guide/sync-configuration' },
+					{ text: 'Server-side Validation', link: '/guide/server-side-validation' },
 					{ text: 'Storage Configuration', link: '/guide/storage-configuration' },
+					{ text: 'Multi-runtime Storage', link: '/guide/multi-runtime-storage' },
 					{ text: 'Backup and Restore', link: '/guide/backup-restore' },
 					{ text: 'Authentication', link: '/guide/authentication' },
 					{ text: 'State Machines', link: '/guide/state-machines' },

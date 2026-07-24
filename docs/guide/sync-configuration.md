@@ -196,7 +196,7 @@ sync: {
 }
 ```
 
-Anonymous connections get full offline-first capabilities — data saves locally and syncs when connected — but are restricted to the collections listed in `anonymousScopes`.
+Anonymous connections get full offline-first capabilities (data saves locally and syncs when connected) but are restricted to the collections listed in `anonymousScopes`.
 
 See the [Common Patterns guide](/guide/common-patterns#anonymous-public-data-access) for a complete walkthrough.
 
@@ -227,7 +227,7 @@ app.todos.where({ completed: false }).subscribe((todos) => {
 })
 ```
 
-Subsets are sent in the handshake as `syncQueries`. The server filters delta exchange and relay to match. Operator-based filters (`$gt`, `$in`, etc.) are not registered as sync subsets — use schema sync rules or auth scopes for those.
+Subsets are sent in the handshake as `syncQueries`. The server filters delta exchange and relay to match. Operator-based filters (`$gt`, `$in`, etc.) are not registered as sync subsets. Use schema sync rules or auth scopes for those.
 
 Changing active subscriptions triggers a debounced reconnect so the server receives updated subsets.
 
@@ -244,6 +244,21 @@ Server needs: nothing (client has nothing server doesn't)
 ```
 
 Only the missing operations are transferred. This makes incremental sync very efficient -- typically under 200ms for a single new operation.
+
+### Delivery guarantees (server to client)
+
+You do not configure this and you do not need to think about it, but it is worth knowing what the framework promises. Once an operation reaches the server, it will reach every client whose sync scope includes it, and it will never be silently skipped. This holds across dropped messages, reconnects, client restarts, and scoped sync.
+
+The server drives each client from a durable delivery watermark: a single position in the server's operation stream up to which the client has applied every in-scope operation with no gap. The watermark advances only when a batch is fully applied, so a message that is dropped or that fails to apply leaves the watermark in place, and the next exchange re-sends everything above it. The watermark is persisted on the client, so a client that restarts resumes exactly where it left off rather than re-syncing from zero. The watermark is tracked per view (a stable signature of the active scope plus query subscriptions), so a client that switches views and later returns resumes each view from its own position instead of re-scanning it.
+
+Two consequences are useful in practice:
+
+- A transient apply failure (for example a temporary error while writing to local storage) is retried automatically on the next exchange rather than skipping that operation.
+- A client that reconnects after a long streaming session receives only what it actually missed, not the whole session, because its watermark tracked the server frontier while it was connected.
+
+This behavior is automatic and requires no client or server configuration. It is also backward compatible: an older client and a newer server (or the reverse) fall back to version-vector delta sync and still converge.
+
+Two things to expect in practice. First, changing the sync scope (for example when a user joins a project) or subscribing to a new reactive query back-fills that view once: the widened scope can include historical data the client did not have before, so the client scans it from that view's watermark, which starts at zero the first time the view is seen. Each view is back-filled at most once, and returning to a view you have already synced resumes from where you left off rather than re-scanning it. Any back-fill is deduplicated, so operations already applied under another view are re-received but not re-applied. The number of remembered views is bounded (the least-recently-used are dropped, never the default or current view), so an app that churns through many transient views does not accumulate state without limit; a dropped view simply back-fills once when you return to it. Second, if an operation genuinely cannot be applied on a client (most often a sign that the sync scope includes a child record but excludes its parent), sync will visibly stall on that operation and surface an apply-failure event rather than skipping it. That is intentional: it makes a scope misconfiguration a loud, diagnosable condition instead of silent data loss. The fix in that case is to make the scope consistent (include the parent).
 
 ### Offline Handling
 
@@ -321,15 +336,19 @@ import { useSyncStatus } from '@korajs/react'
 function SyncIndicator() {
   const status = useSyncStatus()
 
-  switch (status.state) {
+  switch (status.status) {
     case 'synced':
       return <span>All changes saved</span>
     case 'syncing':
       return <span>Syncing...</span>
     case 'offline':
       return <span>Working offline</span>
+    case 'clock-error':
+      return <span>Clock error - check your device time</span>
     case 'error':
       return <span>Sync error - retrying</span>
+    case 'schema-mismatch':
+      return <span>Update required</span>
     case 'connected':
       return <span>Connected</span>
   }
@@ -340,7 +359,7 @@ function SyncIndicator() {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `state` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'error'` | Current sync state |
+| `status` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'clock-error' \| 'error' \| 'schema-mismatch'` | Current sync status |
 | `pendingOperations` | `number` | Operations queued but not yet sent |
 | `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
 
@@ -473,7 +492,7 @@ app.events.on('sync:received', (event) => {
 app.events.on('sync:auth-failed', () => {
   // Token rejected by the server (expired, revoked, or database reset).
   // Sign out the user so they can re-authenticate.
-  console.warn('Auth token rejected — signing out')
+  console.warn('Auth token rejected - signing out')
   authClient.signOut()
 })
 ```
@@ -505,3 +524,8 @@ These events are also visible in the [DevTools](/guide/devtools) sync timeline.
 
 - This should not happen. Kora operations are content-addressed (same content = same ID), and duplicates are automatically deduplicated.
 - If you see duplicates, check that your schema's `id` field is not being generated client-side with non-deterministic IDs.
+
+## Related guides
+
+- [Server-side Validation](/guide/server-side-validation): adjudicate untrusted client operations before they become authoritative (public forms, multi-tenant boundaries), and surface rejections back to the submitter.
+- [Production Server](/guide/production-server): set `maxOperationBytes` and `maxOpsPerMinute` once at server config, plus background-job data access and blob GC.

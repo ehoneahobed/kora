@@ -424,12 +424,10 @@ describe('ClientSession', () => {
 		test('does not warn when the auth provider supplies scopes', async () => {
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 			const auth: AuthProvider = {
-				authenticate: vi
-					.fn()
-					.mockResolvedValue({
-						userId: 'user-1',
-						scopes: { todos: { userId: 'user-1' } },
-					} satisfies AuthContext),
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { userId: 'user-1' } },
+				} satisfies AuthContext),
 			}
 
 			await handshakeWith({ auth, schema: guardrailSchema })
@@ -636,12 +634,87 @@ describe('ClientSession', () => {
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
 			const op = createTestOp({ id: 'relay-op', sequenceNumber: 1 })
+			// Relay is fire-and-forget async (visibility may require a record backfill),
+			// so wait for the batch to be delivered rather than asserting synchronously.
 			session.relayOperations([op])
 
-			const relayed = messages.filter(
-				(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'relay-op'),
+			await vi.waitFor(() => {
+				const relayed = messages.filter(
+					(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'relay-op'),
+				)
+				expect(relayed).toHaveLength(1)
+			})
+		})
+
+		test('relays an in-scope partial update by backfilling the scope field from the record', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.setSchema(guardrailSchema)
+			// Seed two records owned by different users, so their materialized rows carry
+			// userId even though later partial updates will not restate it.
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'ins-u1',
+					recordId: 'rec-u1',
+					nodeId: 'node-a',
+					sequenceNumber: 1,
+					data: { title: 'orig', userId: 'user-1' },
+				}),
 			)
-			expect(relayed).toHaveLength(1)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'ins-u2',
+					recordId: 'rec-u2',
+					nodeId: 'node-a',
+					sequenceNumber: 2,
+					data: { title: 'orig', userId: 'user-2' },
+				}),
+			)
+
+			const auth: AuthProvider = {
+				authenticate: vi
+					.fn()
+					.mockResolvedValue({ userId: 'user-1', scopes: { todos: { userId: 'user-1' } } }),
+			}
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+			session.start()
+			sendHandshake(client, { authToken: 'valid-token' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			// Partial updates that change only `title` — neither restates `userId`.
+			const updU1 = createTestOp({
+				id: 'upd-u1',
+				type: 'update',
+				recordId: 'rec-u1',
+				nodeId: 'node-a',
+				sequenceNumber: 3,
+				data: { title: 'edited' },
+				previousData: { title: 'orig' },
+			})
+			const updU2 = createTestOp({
+				id: 'upd-u2',
+				type: 'update',
+				recordId: 'rec-u2',
+				nodeId: 'node-a',
+				sequenceNumber: 4,
+				data: { title: 'edited' },
+				previousData: { title: 'orig' },
+			})
+			session.relayOperations([updU1, updU2])
+
+			// The update to user-1's record is relayed (backfilled userId matches scope).
+			await vi.waitFor(() => {
+				const ids = messages
+					.filter((m) => m.type === 'operation-batch')
+					.flatMap((m) => m.operations.map((o) => o.id))
+				expect(ids).toContain('upd-u1')
+			})
+			// The update to user-2's record is never relayed to user-1 (out of scope).
+			const relayedIds = messages
+				.filter((m) => m.type === 'operation-batch')
+				.flatMap((m) => m.operations.map((o) => o.id))
+			expect(relayedIds).not.toContain('upd-u2')
 		})
 
 		test('skips non-streaming session', () => {

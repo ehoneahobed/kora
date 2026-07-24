@@ -26,6 +26,11 @@ export function encodeRichtext(value: RichtextInput | KoraBytesValue): Uint8Arra
 
 	if (typeof value === 'string') {
 		const doc = new Y.Doc()
+		// Deterministic clientId so the same string encodes to the same bytes on every
+		// device (a plain string is a replacement, not a collaborative actor). A random
+		// clientId would make a string-derived richtext column diverge byte-wise across
+		// replicas even when the text is identical.
+		doc.clientID = 0
 		doc.getText(TEXT_KEY).insert(0, value)
 		return Y.encodeStateAsUpdate(doc)
 	}

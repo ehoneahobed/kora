@@ -133,6 +133,23 @@ export interface SyncStatePersistence {
 	/** Resume position for paginated initial sync (optional). */
 	loadDeltaCursor?(): Promise<DeltaCursor | null>
 	saveDeltaCursor?(cursor: DeltaCursor | null): Promise<void>
+	/**
+	 * The delivery watermark for a sync view, keyed by an opaque view signature (the auth
+	 * scope plus active query subscriptions). Persisted per view so a restarted client
+	 * resumes each view's gap-free stream from the right point, and switching views does not
+	 * re-sync a view already synced. The empty-string signature is the default, unfiltered
+	 * view. Optional: a persistence layer that omits these falls back to re-sync on restart.
+	 */
+	loadDeliveryWatermark?(signature: string): Promise<number>
+	saveDeliveryWatermark?(signature: string, watermark: number): Promise<void>
+	/** Load every persisted view watermark, keyed by signature. */
+	loadAllDeliveryWatermarks?(): Promise<Record<string, number>>
+	/**
+	 * Delete a persisted view watermark. Used to bound the number of stored view watermarks
+	 * (a cold view is evicted from the client's cache and its persisted row removed). Safe:
+	 * an evicted view back-fills from 0 (deduplicated) when next visited.
+	 */
+	deleteDeliveryWatermark?(signature: string): Promise<void>
 }
 
 /**
@@ -148,6 +165,62 @@ export interface QueueStorage {
 	dequeue(ids: string[]): Promise<void>
 	/** Return number of operations in storage */
 	count(): Promise<number>
+}
+
+/**
+ * A record of one outbound operation the server permanently refused. Preserved so
+ * a rejected op is explainable and reconcilable rather than silently lost.
+ */
+export interface RejectedOperation {
+	/** Content-addressed id of the rejected operation. */
+	operationId: string
+	/** Collection the operation targeted. */
+	collection: string
+	/** Record the operation targeted. */
+	recordId: string
+	/** Stable, machine-readable reason code from the server. */
+	code: string
+	/** Human-readable explanation. */
+	message: string
+	/** Whether resubmitting the identical operation may later succeed. */
+	retriable: boolean
+	/** Wall-clock time (ms since epoch) the rejection was recorded. Display only. */
+	rejectedAt: number
+}
+
+/**
+ * Interface for durably persisting operations the server rejected, so the record
+ * survives a page refresh. Keyed by operation id (idempotent on re-rejection).
+ */
+export interface RejectedOperationStorage {
+	/** Record (or overwrite) a rejected operation. */
+	record(rejected: RejectedOperation): Promise<void>
+	/** List all recorded rejected operations. */
+	list(): Promise<RejectedOperation[]>
+	/** Remove rejected operations by their operation ids (after the app reconciles them). */
+	remove(operationIds: string[]): Promise<void>
+}
+
+/**
+ * In-memory {@link RejectedOperationStorage}. The default when no durable store is
+ * provided; suitable for tests and ephemeral sessions.
+ */
+export class MemoryRejectedOperationStorage implements RejectedOperationStorage {
+	private readonly rejected = new Map<string, RejectedOperation>()
+
+	async record(rejected: RejectedOperation): Promise<void> {
+		this.rejected.set(rejected.operationId, rejected)
+	}
+
+	async list(): Promise<RejectedOperation[]> {
+		return [...this.rejected.values()]
+	}
+
+	async remove(operationIds: string[]): Promise<void> {
+		for (const id of operationIds) {
+			this.rejected.delete(id)
+		}
+	}
 }
 
 /**

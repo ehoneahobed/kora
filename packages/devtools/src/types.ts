@@ -28,6 +28,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:clock-rebase': 'sync',
 	'sync:schema-mismatch': 'sync',
 	'sync:apply-failed': 'sync',
+	'sync:operation-rejected': 'sync',
 	'sync:sent': 'sync',
 	'sync:received': 'sync',
 	'sync:acknowledged': 'sync',
@@ -43,6 +44,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'state-machine:rejected': 'operation',
 	'store:persistence-error': 'connection',
 	'store:quota-exceeded': 'connection',
+	'store:opfs-unavailable': 'connection',
+	'store:db-name-collision': 'connection',
 	'replay:completed': 'operation',
 }
 

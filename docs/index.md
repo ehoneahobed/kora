@@ -33,7 +33,7 @@ features:
     details: Last-write-wins and CRDTs by default, declarative constraints when rules matter, custom resolvers when your domain demands it. Every merge decision is traceable.
   - icon: 🗄️
     title: A Real Database in the Browser
-    details: SQLite compiled to WebAssembly, persisted with OPFS, running in a worker so your UI never blocks. IndexedDB fallback and native SQLite included.
+    details: SQLite compiled to WebAssembly, persisted with OPFS, running in a worker so your UI never blocks. IndexedDB and native SQLite adapters included.
   - icon: ⚡
     title: Type-Safe by Design
     details: Full TypeScript inference flows from your schema to your queries, mutations, and hooks. Your IDE knows your data shape everywhere.

@@ -131,13 +131,13 @@ describe('generateCollectionDDL', () => {
 	test('generates CREATE TABLE with correct columns', () => {
 		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const createTable = ddl[0] as string
-		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS forms')
+		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS "forms"')
 		expect(createTable).toContain('id TEXT PRIMARY KEY NOT NULL')
-		expect(createTable).toContain('title TEXT')
-		expect(createTable).toContain('slug TEXT')
-		expect(createTable).toContain('status TEXT')
-		expect(createTable).toContain('viewCount REAL')
-		expect(createTable).toContain('isPublic INTEGER')
+		expect(createTable).toContain('"title" TEXT')
+		expect(createTable).toContain('"slug" TEXT')
+		expect(createTable).toContain('"status" TEXT')
+		expect(createTable).toContain('"viewCount" REAL')
+		expect(createTable).toContain('"isPublic" INTEGER')
 		expect(createTable).toContain('_created_at INTEGER NOT NULL DEFAULT 0')
 		expect(createTable).toContain('_updated_at INTEGER NOT NULL DEFAULT 0')
 		expect(createTable).toContain('_deleted INTEGER NOT NULL DEFAULT 0')
@@ -155,20 +155,20 @@ describe('generateCollectionDDL', () => {
 		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const alterStatements = ddl.filter((s) => s.startsWith('--kora:safe-alter'))
 		expect(alterStatements.length).toBeGreaterThan(0)
-		expect(alterStatements.some((s) => s.includes('ADD COLUMN title'))).toBe(true)
+		expect(alterStatements.some((s) => s.includes('ADD COLUMN "title"'))).toBe(true)
 	})
 
 	test('postgres dialect uses correct types', () => {
 		const ddl = generateCollectionDDL('forms', formsCollection, 'postgres')
 		const createTable = ddl[0] as string
-		expect(createTable).toContain('viewCount DOUBLE PRECISION')
+		expect(createTable).toContain('"viewCount" DOUBLE PRECISION')
 		expect(createTable).toContain('_created_at BIGINT NOT NULL DEFAULT 0')
 	})
 
 	test('generates enum CHECK constraints', () => {
 		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
 		const createTable = ddl[0] as string
-		expect(createTable).toContain("CHECK (status IN ('draft', 'published', 'archived'))")
+		expect(createTable).toContain("CHECK (\"status\" IN ('draft', 'published', 'archived'))")
 	})
 })
 

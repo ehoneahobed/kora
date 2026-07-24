@@ -72,4 +72,52 @@ describe('multi-tab tab storage RPC', () => {
 		follower.terminate()
 		stop()
 	})
+
+	test('waitForLeader resolves true when a leader relay is answering', async () => {
+		const channelName = 'kora-storage-ready-db'
+		const innerBridge = {
+			send: vi.fn(
+				async (r: WorkerRequest): Promise<WorkerResponse> => ({ id: r.id, type: 'success' }),
+			),
+			terminate: vi.fn(),
+		}
+		const stop = startLeaderRpcRelay(channelName, innerBridge)
+		const follower = new FollowerBroadcastBridge(channelName, 5000)
+
+		await expect(follower.waitForLeader(300, 3)).resolves.toBe(true)
+
+		follower.terminate()
+		stop()
+	})
+
+	test('waitForLeader resolves false when no leader is present', async () => {
+		const follower = new FollowerBroadcastBridge('kora-storage-empty-db', 5000)
+
+		await expect(follower.waitForLeader(120, 2)).resolves.toBe(false)
+
+		follower.terminate()
+	})
+
+	test('send fails fast with NoLeaderError when the leader is gone', async () => {
+		const channelName = 'kora-storage-dead-db'
+		const innerBridge = {
+			send: vi.fn(
+				async (r: WorkerRequest): Promise<WorkerResponse> => ({ id: r.id, type: 'success' }),
+			),
+			terminate: vi.fn(),
+		}
+		const stop = startLeaderRpcRelay(channelName, innerBridge)
+		// Leader disappears before the follower sends (tab closed / crashed).
+		stop()
+
+		// Long hard timeout, short liveness probe: the probe must trip first and reject
+		// fast rather than waiting out the 30s ceiling.
+		const follower = new FollowerBroadcastBridge(channelName, 30000, 60)
+
+		await expect(follower.send({ id: 1, type: 'query', sql: 'SELECT 1' })).rejects.toMatchObject({
+			code: 'NO_LEADER',
+		})
+
+		follower.terminate()
+	})
 })

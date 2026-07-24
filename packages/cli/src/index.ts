@@ -14,6 +14,16 @@ export {
 	SchemaNotFoundError,
 } from './errors'
 
+// === Agent guidance (programmatic use) ===
+export { agentsCommand } from './commands/agents/agents-command'
+export {
+	AGENTS_FRAMEWORKS,
+	detectFrameworkFromManifest,
+	generateAgentsMd,
+	isAgentsFramework,
+	type AgentsFramework,
+} from './commands/agents/agents-md-content'
+
 // === Type Generation (programmatic use) ===
 export { generateTypes } from './commands/generate/type-generator'
 export { deployCommand } from './commands/deploy/deploy-command'

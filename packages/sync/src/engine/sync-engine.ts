@@ -36,6 +36,7 @@ import type {
 	BlobChunkResponseMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
+	OperationRejectedMessage,
 	SyncMessage,
 	WireFormat,
 	YjsDocUpdateMessage,
@@ -56,13 +57,16 @@ import {
 import { operationMatchesScope } from '../scopes/scope-filter'
 import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
-import type {
-	QueueStorage,
-	SyncConfig,
-	SyncScopeMap,
-	SyncState,
-	SyncStatePersistence,
-	SyncStatusInfo,
+import {
+	MemoryRejectedOperationStorage,
+	type QueueStorage,
+	type RejectedOperation,
+	type RejectedOperationStorage,
+	type SyncConfig,
+	type SyncScopeMap,
+	type SyncState,
+	type SyncStatePersistence,
+	type SyncStatusInfo,
 } from '../types'
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
@@ -101,6 +105,11 @@ export interface SyncEngineOptions {
 	/** Queue storage for persistent outbound queue. Defaults to in-memory. */
 	queueStorage?: QueueStorage
 	/**
+	 * Durable storage for operations the server rejected. Defaults to in-memory.
+	 * Provide a store-backed implementation so rejections survive a page refresh.
+	 */
+	rejectedStorage?: RejectedOperationStorage
+	/**
 	 * Optional encryptor for end-to-end encryption.
 	 * When provided, `data` and `previousData` fields of operations are encrypted
 	 * before sending and decrypted after receiving. The server never sees plaintext data.
@@ -138,6 +147,36 @@ function generateMessageId(): string {
 }
 
 /**
+ * Upper bound on the number of per-view delivery watermarks retained (in memory and in
+ * persistence). A client that churns through many distinct views (for example a search that
+ * registers a fresh query subscription per keystroke) would otherwise accumulate an
+ * unbounded number of `_kora_meta` rows. Cold views are evicted least-recently-used; the
+ * default view and the live view are never evicted. Eviction is a storage/performance
+ * tradeoff only, never a correctness one: an evicted view back-fills from 0 (deduplicated)
+ * when next visited.
+ */
+const MAX_DELIVERY_VIEW_WATERMARKS = 64
+
+/**
+ * Deterministic JSON stringify with sorted object keys, so two equal values always
+ * produce the identical string. Used to build a stable sync-view signature for keying the
+ * per-view delivery watermark.
+ */
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== 'object') {
+		return JSON.stringify(value) ?? 'null'
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map(stableStringify).join(',')}]`
+	}
+	const entries = Object.entries(value as Record<string, unknown>)
+		.filter(([, v]) => v !== undefined)
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+		.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
+	return `{${entries.join(',')}}`
+}
+
+/**
  * Core sync orchestrator. Manages the sync lifecycle:
  * disconnected → connecting → handshaking → syncing → streaming
  *
@@ -152,6 +191,7 @@ export class SyncEngine {
 	private readonly serializer: MessageSerializer
 	private readonly emitter: KoraEventEmitter | null
 	private readonly outboundQueue: OutboundQueue
+	private readonly rejectedStorage: RejectedOperationStorage
 	private readonly batchSize: number
 	private readonly encryptor: SyncEncryptor | null
 	private readonly awarenessManager: AwarenessManager
@@ -198,6 +238,26 @@ export class SyncEngine {
 	private resumeDeltaCursor: DeltaCursor | null = null
 	private initialSyncTotalBatches = 0
 
+	/**
+	 * The delivery watermark for the CURRENT sync view: the highest server delivery
+	 * sequence up to which every operation in the current view (scope + active query
+	 * subscriptions) has been contiguously applied. Advanced only through the server's
+	 * gap-free delivery stream (never through live relay), so it is a durable lower bound
+	 * on what this client holds for this view. Reported at handshake to resume the stream.
+	 *
+	 * The watermark is keyed by view: switching views (a scope or subscription change)
+	 * saves the current view's watermark and loads the target view's, so returning to a
+	 * previously-synced view resumes exactly where it left off instead of re-syncing. This
+	 * is correct because a view's watermark is a lower bound specific to that view's
+	 * filter; a widened view is simply a different (initially unsynced) view.
+	 */
+	private deliveryWatermark = 0
+	/**
+	 * In-memory cache of watermark per view signature, preloaded from persistence at start
+	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
+	 */
+	private readonly deliverySignatureWatermarks = new Map<string, number>()
+
 	constructor(options: SyncEngineOptions) {
 		this.transport = options.transport
 		this.store = options.store
@@ -211,6 +271,7 @@ export class SyncEngine {
 
 		const queueStorage = options.queueStorage ?? new MemoryQueueStorage()
 		this.outboundQueue = new OutboundQueue(queueStorage)
+		this.rejectedStorage = options.rejectedStorage ?? new MemoryRejectedOperationStorage()
 
 		this.metricsCollector = new SyncMetricsCollector(options.metricsConfig)
 		if (this.emitter) {
@@ -275,6 +336,20 @@ export class SyncEngine {
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
 			}
+			// Preload every view's watermark so a view switch resolves synchronously.
+			if (this.syncState.loadAllDeliveryWatermarks) {
+				const all = await this.syncState.loadAllDeliveryWatermarks()
+				for (const [signature, watermark] of Object.entries(all)) {
+					this.deliverySignatureWatermarks.set(signature, watermark)
+				}
+			} else if (this.syncState.loadDeliveryWatermark) {
+				// Fallback: load just the current (default) view's watermark.
+				this.deliverySignatureWatermarks.set('', await this.syncState.loadDeliveryWatermark(''))
+			}
+			this.deliveryWatermark = this.deliverySignatureWatermarks.get(this.deliverySignature()) ?? 0
+			// Bound a set that predates the retention cap (older clients persisted views
+			// without a limit); this one-time trim removes cold rows down to the cap.
+			this.evictColdViewWatermarks()
 		}
 		await this.reconcileOutboundFromOpLog()
 		await this.refreshPendingCount()
@@ -314,6 +389,10 @@ export class SyncEngine {
 				...(this.resumeDeltaCursor
 					? { deltaCursor: encodeDeltaCursor(this.resumeDeltaCursor) }
 					: {}),
+				// Resume the server's gap-free delivery stream from our watermark. A server
+				// that understands it drives server->client sync from delivery sequences; an
+				// older server ignores it and falls back to the version-vector delta.
+				lastDeliverySequence: this.deliveryWatermark,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -362,7 +441,7 @@ export class SyncEngine {
 	 * because they should remain local-only and not be sent to the server.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
-		if (!this.operationAllowedForSync(op)) {
+		if (!(await this.operationAllowedForSync(op))) {
 			return
 		}
 
@@ -568,9 +647,92 @@ export class SyncEngine {
 	 * @param scopeMap - New per-collection scope filters, or undefined to remove scope
 	 */
 	updateScope(scopeMap: SyncScopeMap | undefined): void {
+		const previousSignature = this.deliverySignature()
 		this.activeScope = scopeMap
 		// Also update the config so that the next handshake sends the new scope
 		this.config.scopeMap = scopeMap
+		this.switchDeliveryView(previousSignature)
+	}
+
+	/**
+	 * A stable identifier for the current sync view: the auth/tenant scope plus the set of
+	 * active query subscriptions, canonicalized so the same view always produces the same
+	 * string. The delivery watermark is keyed by this, so each distinct view resumes from
+	 * its own last position.
+	 */
+	private deliverySignature(): string {
+		const subsets = this.getActiveQuerySubsets()
+		if (!this.activeScope && subsets.length === 0) {
+			return '' // the default, unfiltered view (maps to the legacy watermark key)
+		}
+		const normalizedSubsets = subsets
+			.map((s) => `${s.collection}:${stableStringify(s.where)}`)
+			.sort()
+		return stableStringify({ scope: this.activeScope ?? null, subsets: normalizedSubsets })
+	}
+
+	/**
+	 * Switch the active delivery watermark to the current view after a scope or subscription
+	 * change. The prior view's watermark is saved so returning to it resumes; the new view's
+	 * watermark is restored from the in-memory cache (0 for a never-synced view, which then
+	 * does a one-time resync under that view). No data is lost: a view's watermark is a lower
+	 * bound for that specific view's filter.
+	 */
+	private switchDeliveryView(previousSignature: string): void {
+		const nextSignature = this.deliverySignature()
+		if (nextSignature === previousSignature) {
+			return
+		}
+		this.setViewWatermark(previousSignature, this.deliveryWatermark)
+		void this.persistDeliveryWatermark(this.deliveryWatermark, previousSignature)
+		this.deliveryWatermark = this.deliverySignatureWatermarks.get(nextSignature) ?? 0
+	}
+
+	/**
+	 * Record a view's watermark in the in-memory cache as the most-recently-used entry (the
+	 * Map preserves insertion order, so re-inserting moves it to the tail), then evict cold
+	 * views past the retention cap. This is the single place the cache is written, so LRU
+	 * order and the size bound are always maintained together.
+	 */
+	private setViewWatermark(signature: string, watermark: number): void {
+		this.deliverySignatureWatermarks.delete(signature)
+		this.deliverySignatureWatermarks.set(signature, watermark)
+		this.evictColdViewWatermarks()
+	}
+
+	/**
+	 * Trim the per-view watermark cache to `MAX_DELIVERY_VIEW_WATERMARKS`, evicting the
+	 * least-recently-used views. The default view ('') and the live view are never evicted
+	 * (evicting the live view would force an immediate re-scan of what we are actively
+	 * syncing). Each eviction also removes the persisted row, bounding storage. Safe by
+	 * construction: an evicted view simply back-fills from 0 (deduplicated) when next seen.
+	 */
+	private evictColdViewWatermarks(): void {
+		if (this.deliverySignatureWatermarks.size <= MAX_DELIVERY_VIEW_WATERMARKS) {
+			return
+		}
+		const liveSignature = this.deliverySignature()
+		for (const signature of this.deliverySignatureWatermarks.keys()) {
+			if (this.deliverySignatureWatermarks.size <= MAX_DELIVERY_VIEW_WATERMARKS) {
+				break
+			}
+			if (signature === '' || signature === liveSignature) {
+				continue
+			}
+			this.deliverySignatureWatermarks.delete(signature)
+			void this.deleteDeliveryWatermark(signature)
+		}
+	}
+
+	/**
+	 * Remove a view's persisted watermark row (best-effort; a persistence layer that omits
+	 * the delete simply keeps the row, which is harmless).
+	 */
+	private async deleteDeliveryWatermark(signature: string): Promise<void> {
+		if (!this.syncState?.deleteDeliveryWatermark) {
+			return
+		}
+		await this.syncState.deleteDeliveryWatermark(signature)
 	}
 
 	/**
@@ -586,10 +748,18 @@ export class SyncEngine {
 	 */
 	registerQuerySubset(subset: SyncQuerySubset): () => void {
 		const id = `query-${nextQuerySubsetId++}`
+		const previousSignature = this.deliverySignature()
 		this.querySubsets.set(id, subset)
+		// Registering or unregistering a subset changes the sync view. Switch the watermark
+		// to the new view (resuming it if seen before, or resyncing it once if new); returning
+		// to a previously-synced view resumes instead of re-syncing. The debounce coalesces a
+		// burst of subscription changes into a single reconnect.
+		this.switchDeliveryView(previousSignature)
 		this.scheduleQuerySubsetReconnect()
 		return () => {
+			const sigBeforeRemove = this.deliverySignature()
 			this.querySubsets.delete(id)
+			this.switchDeliveryView(sigBeforeRemove)
 			this.scheduleQuerySubsetReconnect()
 		}
 	}
@@ -668,6 +838,9 @@ export class SyncEngine {
 				break
 			case 'error':
 				this.handleError(message)
+				break
+			case 'operation-rejected':
+				await this.handleOperationRejected(message)
 				break
 			case 'awareness-update':
 				this.handleAwarenessUpdate(message)
@@ -763,6 +936,20 @@ export class SyncEngine {
 		this.remoteVector = wireToVersionVector(msg.versionVector)
 		void this.persistLastAckedServerVector(this.remoteVector)
 
+		// If our watermark is ahead of the server's frontier, the server's log was rolled
+		// back (for example a backup restore reset the delivery sequence). Reset to a full
+		// resync so we do not sit above operations the server will re-send from the start.
+		// The server independently resyncs such a client from 0, so the stream that follows
+		// this response chains from 0 and this reset lets us apply it.
+		if (
+			typeof msg.serverMaxDeliverySequence === 'number' &&
+			this.deliveryWatermark > msg.serverMaxDeliverySequence
+		) {
+			this.deliveryWatermark = 0
+			this.setViewWatermark(this.deliverySignature(), 0)
+			await this.persistDeliveryWatermark(0)
+		}
+
 		if (msg.selectedWireFormat) {
 			this.setSerializerWireFormat(msg.selectedWireFormat)
 		}
@@ -854,7 +1041,7 @@ export class SyncEngine {
 		const localVector = this.store.getVersionVector()
 		const allMissingOps = await this.collectDelta(localVector, this.remoteVector)
 
-		const missingOps = allMissingOps.filter((op) => this.operationAllowedForSync(op))
+		const missingOps = await this.filterAllowedForSync(allMissingOps)
 
 		this.deltaSentOpIds = missingOps.map((op) => op.id)
 
@@ -946,6 +1133,29 @@ export class SyncEngine {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
+		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
+
+		// Delivery-stream chain control. The server sends in-scope operations in delivery
+		// order, each batch chaining base -> max. Three cases keep the watermark a sound,
+		// gap-free lower bound and let a dropped batch recover without a lost operation:
+		if (isDeliveryBatch) {
+			const base = msg.baseDeliverySequence ?? 0
+			if (base > this.deliveryWatermark) {
+				// A gap: an earlier batch has not arrived. Do not apply out of order and do
+				// not acknowledge, so the server's reliable retransmit (or the next handshake
+				// resend from the watermark) redelivers the missing batch first.
+				return
+			}
+			if (base < this.deliveryWatermark) {
+				// A duplicate of an already-applied batch (a retransmit that crossed an ack).
+				// Re-acknowledge so the server can release it, but do not re-apply or move the
+				// watermark backward.
+				this.sendDeliveryAck(msg.messageId, this.deliveryWatermark)
+				return
+			}
+			// base === watermark: this batch continues the chain; apply it in order below.
+		}
+
 		const deserialized = msg.operations.map((s) => this.serializer.decodeOperation(s))
 
 		// Decrypt data fields after deserialization if E2E encryption is enabled
@@ -953,10 +1163,16 @@ export class SyncEngine {
 			? await this.encryptor.decryptBatch(deserialized)
 			: deserialized
 
-		const inScopeOps = operations.filter((op) => this.operationAllowedForSync(op))
+		const inScopeOps = await this.filterAllowedForSync(operations)
 
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		const transforms = this.config.operationTransforms ?? []
+
+		// Whether every operation in this batch was durably applied (or was a harmless
+		// duplicate). A retriable failure clears this so the delivery watermark does not
+		// advance past the failed operation, which is what makes a transient apply failure
+		// recoverable instead of silently skipped.
+		let fullyApplied = true
 
 		// Apply each in-scope operation; per-op failures must not block batch ACK
 		for (const op of inScopeOps) {
@@ -972,6 +1188,16 @@ export class SyncEngine {
 					this.emitApplyFailure(transformed, result)
 				}
 			} catch (error) {
+				// Any throw means the store did NOT take custody of the operation, so the
+				// delivery watermark must not advance past it (whether the error is retriable
+				// or terminal). Inbound operations are authoritative and are not diverted to a
+				// rejected store the way the client's own rejected outbound operations are, so
+				// advancing here would silently lose the operation with no way to recover it.
+				// Stalling instead surfaces the failure (an emitted event) and re-fetches the
+				// operation on the next exchange; a genuinely un-appliable inbound operation
+				// (for example a scope that includes a child but excludes its parent) becomes a
+				// visible, diagnosable stall rather than silent data loss.
+				fullyApplied = false
 				if (error instanceof ClockDriftError) {
 					this.emitApplyFailure(transformed, 'rejected', {
 						code: APPLY_FAILURE_CODES.CLOCK_DRIFT,
@@ -989,11 +1215,8 @@ export class SyncEngine {
 							: error instanceof Error && 'code' in error && typeof error.code === 'string'
 								? error.code
 								: APPLY_FAILURE_CODES.APPLY_FAILED
-				this.emitApplyFailure(transformed, 'rejected', {
-					code,
-					message,
-					retriable: code !== APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY,
-				})
+				const retriable = code !== APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY
+				this.emitApplyFailure(transformed, 'rejected', { code, message, retriable })
 			}
 		}
 
@@ -1006,20 +1229,39 @@ export class SyncEngine {
 			})
 		}
 
-		// Send acknowledgment for the original batch (server tracks by batch, not per-op)
-		const lastOp = operations[operations.length - 1]
-		const ack: SyncMessage = {
-			type: 'acknowledgment',
-			messageId: generateMessageId(),
-			acknowledgedMessageId: msg.messageId,
-			lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-		}
-		this.transport.send(ack)
+		// Acknowledge the batch. A legacy (version-vector) batch is always acknowledged.
+		// A delivery-stream batch is acknowledged only when it fully applied: a failed
+		// delivery batch must NOT be acknowledged, so the server keeps re-sending it from
+		// the client's last acknowledged position rather than releasing it (which would
+		// strand the client until an unrelated reconnect).
+		const deliveryFullyApplied = isDeliveryBatch && fullyApplied
+		if (!isDeliveryBatch || deliveryFullyApplied) {
+			const lastOp = operations[operations.length - 1]
+			const ack: SyncMessage = {
+				type: 'acknowledgment',
+				messageId: generateMessageId(),
+				acknowledgedMessageId: msg.messageId,
+				lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+				...(deliveryFullyApplied && msg.maxDeliverySequence !== undefined
+					? { deliverySequence: msg.maxDeliverySequence }
+					: {}),
+			}
+			this.transport.send(ack)
 
-		this.emitter?.emit({
-			type: 'sync:acknowledged',
-			sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-		})
+			this.emitter?.emit({
+				type: 'sync:acknowledged',
+				sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+			})
+		}
+
+		// Advance the delivery watermark only for a chained delivery batch that fully
+		// applied. This is the single place the watermark moves, so it always reflects a
+		// gap-free prefix of the server's in-scope stream.
+		if (isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined) {
+			this.deliveryWatermark = msg.maxDeliverySequence
+			this.setViewWatermark(this.deliverySignature(), this.deliveryWatermark)
+			await this.persistDeliveryWatermark(this.deliveryWatermark)
+		}
 
 		if (this.state === 'syncing') {
 			this.deltaBatchesReceived++
@@ -1029,19 +1271,27 @@ export class SyncEngine {
 			}
 			this.metricsCollector.updateInitialSyncProgress(this.deltaBatchesReceived, totalBatches)
 
-			const cursorFromBatch =
-				msg.cursor !== undefined
-					? decodeDeltaCursor(msg.cursor)
-					: createDeltaCursorFromBatch(
-							inScopeOps.length > 0 ? inScopeOps : operations,
-							msg.batchIndex,
-						)
-			if (cursorFromBatch) {
-				this.resumeDeltaCursor = cursorFromBatch
-				await this.persistDeltaCursor(cursorFromBatch)
+			// The version-vector resume cursor is only used for the legacy (non-delivery)
+			// delta path. A delivery stream resumes from the watermark instead, so leave the
+			// cursor untouched for those batches.
+			if (!isDeliveryBatch) {
+				const cursorFromBatch =
+					msg.cursor !== undefined
+						? decodeDeltaCursor(msg.cursor)
+						: createDeltaCursorFromBatch(
+								inScopeOps.length > 0 ? inScopeOps : operations,
+								msg.batchIndex,
+							)
+				if (cursorFromBatch) {
+					this.resumeDeltaCursor = cursorFromBatch
+					await this.persistDeltaCursor(cursorFromBatch)
+				}
 			}
 
-			if (msg.isFinal) {
+			// A delivery stream advances the watermark only when the batch fully applied; a
+			// batch with a retriable failure must not complete initial sync (its operations
+			// still need to arrive), so gate completion on fullyApplied for delivery batches.
+			if (msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
 				this.deltaReceiveComplete = true
 				this.resumeDeltaCursor = null
 				await this.persistDeltaCursor(null)
@@ -1049,6 +1299,18 @@ export class SyncEngine {
 				void this.checkDeltaComplete()
 			}
 		}
+	}
+
+	/** Acknowledge a delivery batch (used for duplicates) without re-applying it. */
+	private sendDeliveryAck(acknowledgedMessageId: string, deliverySequence: number): void {
+		const ack: SyncMessage = {
+			type: 'acknowledgment',
+			messageId: generateMessageId(),
+			acknowledgedMessageId,
+			lastSequenceNumber: 0,
+			deliverySequence,
+		}
+		this.transport.send(ack)
 	}
 
 	private handleAcknowledgment(msg: AcknowledgmentMessage): void {
@@ -1076,6 +1338,14 @@ export class SyncEngine {
 	}
 
 	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
+		// An in-flight outbound batch will never be acknowledged now. Return it to the
+		// queue so it is retried, instead of leaving `currentBatch` set — which would
+		// wedge every future flush behind a batch that can never clear (real-time
+		// outbound sync would stall until the transport happened to reconnect).
+		if (this.currentBatch) {
+			this.outboundQueue.returnBatch(this.currentBatch.batchId)
+			this.currentBatch = null
+		}
 		this.transitionTo('error')
 		if (msg.code === 'AUTH_FAILED') {
 			this.emitter?.emit({ type: 'sync:auth-failed', reason: msg.message })
@@ -1096,6 +1366,58 @@ export class SyncEngine {
 		}
 		this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
 		this.transitionTo('disconnected')
+	}
+
+	/**
+	 * Handle a per-operation rejection: divert the op out of the pending outbound
+	 * queue (so it is never retried or resurrected on reconnect), record it in the
+	 * durable rejected store (so it is kept and explainable), and emit an event so
+	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
+	 * signal, so the connection stays up.
+	 */
+	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
+		await this.outboundQueue.reject(msg.operationId)
+
+		await this.rejectedStorage.record({
+			operationId: msg.operationId,
+			collection: msg.collection,
+			recordId: msg.recordId,
+			code: msg.code,
+			message: msg.message,
+			retriable: msg.retriable,
+			rejectedAt: Date.now(),
+		})
+
+		// The rejected op left the pending set, so the app-visible pending count
+		// must be refreshed or it would over-count forever.
+		await this.refreshPendingCount()
+
+		this.emitter?.emit({
+			type: 'sync:operation-rejected',
+			operationId: msg.operationId,
+			collection: msg.collection,
+			recordId: msg.recordId,
+			code: msg.code,
+			message: msg.message,
+			retriable: msg.retriable,
+		})
+	}
+
+	/**
+	 * Every operation the server rejected that has not yet been reconciled. The app
+	 * uses this (alongside the `sync:operation-rejected` event) to surface failed
+	 * submissions and decide whether to roll back or resubmit.
+	 */
+	getRejectedOperations(): Promise<RejectedOperation[]> {
+		return this.rejectedStorage.list()
+	}
+
+	/**
+	 * Forget rejected operations by id once the app has reconciled them (rolled the
+	 * optimistic write back or resubmitted a corrected op).
+	 */
+	clearRejectedOperations(operationIds: string[]): Promise<void> {
+		return this.rejectedStorage.remove(operationIds)
 	}
 
 	private async checkDeltaComplete(): Promise<void> {
@@ -1217,7 +1539,7 @@ export class SyncEngine {
 		}
 
 		const ops = await this.store.getOperationRange(localNodeId, 1, localSeq)
-		const inScope = ops.filter((op) => this.operationAllowedForSync(op))
+		const inScope = await this.filterAllowedForSync(ops)
 		for (const op of inScope) {
 			await this.outboundQueue.enqueue(op)
 		}
@@ -1333,11 +1655,52 @@ export class SyncEngine {
 		}
 	}
 
-	private operationAllowedForSync(op: Operation): boolean {
-		if (!operationMatchesScope(op, this.activeScope)) {
+	private async operationAllowedForSync(op: Operation): Promise<boolean> {
+		// Fast path: the bare operation already carries the scope / subset fields
+		// (inserts, or an op that restates them). No record read needed.
+		if (this.matchesScopeAndSubsets(op)) {
+			return true
+		}
+		// It failed on the bare op. That may be a genuine out-of-scope op, OR a partial
+		// update / delete that simply does not restate the scope / subset field. Backfill
+		// the record's current fields and re-check before dropping it, so we never fail
+		// to sync an in-scope edit just because it changed an unrelated field.
+		const fullRecord = await this.readRecordForBackfill(op)
+		if (!fullRecord) {
 			return false
 		}
-		return operationMatchesQuerySubsets(op, this.getActiveQuerySubsets())
+		return this.matchesScopeAndSubsets(op, fullRecord)
+	}
+
+	private matchesScopeAndSubsets(
+		op: Operation,
+		fullRecord?: Record<string, unknown> | null,
+	): boolean {
+		if (!operationMatchesScope(op, this.activeScope, fullRecord)) {
+			return false
+		}
+		return operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord)
+	}
+
+	private async readRecordForBackfill(op: Operation): Promise<Record<string, unknown> | null> {
+		if (!this.store.readRecordFields) {
+			return null
+		}
+		try {
+			return await this.store.readRecordFields(op.collection, op.recordId)
+		} catch {
+			return null
+		}
+	}
+
+	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {
+		const allowed: Operation[] = []
+		for (const op of ops) {
+			if (await this.operationAllowedForSync(op)) {
+				allowed.push(op)
+			}
+		}
+		return allowed
 	}
 
 	private async persistDeltaCursor(cursor: DeltaCursor | null): Promise<void> {
@@ -1345,6 +1708,16 @@ export class SyncEngine {
 			return
 		}
 		await this.syncState.saveDeltaCursor(cursor)
+	}
+
+	private async persistDeliveryWatermark(
+		watermark: number,
+		signature = this.deliverySignature(),
+	): Promise<void> {
+		if (!this.syncState?.saveDeliveryWatermark) {
+			return
+		}
+		await this.syncState.saveDeliveryWatermark(signature, watermark)
 	}
 
 	private scheduleQuerySubsetReconnect(): void {

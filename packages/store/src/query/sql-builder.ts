@@ -1,4 +1,5 @@
 import type { CollectionDefinition, FieldDescriptor } from '@korajs/core'
+import { quoteIdent } from '@korajs/core'
 import { QueryError } from '../errors'
 import { lwwVersionWhereClause } from '../lww/row-version'
 import type { QueryDescriptor, WhereOperators } from '../types'
@@ -24,7 +25,7 @@ export function buildSelectQuery(
 	fields: Record<string, FieldDescriptor>,
 ): SqlQuery {
 	const params: unknown[] = []
-	const parts = [`SELECT * FROM ${descriptor.collection}`]
+	const parts = [`SELECT * FROM ${quoteIdent(descriptor.collection)}`]
 
 	const whereClause = buildWhereClauseParts(descriptor.where, fields, params)
 	// Always filter out soft-deleted records
@@ -38,7 +39,7 @@ export function buildSelectQuery(
 	if (descriptor.orderBy.length > 0) {
 		const orderParts = descriptor.orderBy.map((o) => {
 			validateFieldName(o.field, fields)
-			return `${o.field} ${o.direction.toUpperCase()}`
+			return `${quoteIdent(o.field)} ${o.direction.toUpperCase()}`
 		})
 		parts.push(`ORDER BY ${orderParts.join(', ')}`)
 	}
@@ -67,7 +68,7 @@ export function buildCountQuery(
 	fields: Record<string, FieldDescriptor>,
 ): SqlQuery {
 	const params: unknown[] = []
-	const parts = [`SELECT COUNT(*) as count FROM ${descriptor.collection}`]
+	const parts = [`SELECT COUNT(*) as count FROM ${quoteIdent(descriptor.collection)}`]
 
 	const whereClause = buildWhereClauseParts(descriptor.where, fields, params)
 	const deletedFilter = '_deleted = 0'
@@ -92,7 +93,8 @@ export function buildInsertQuery(collection: string, record: Record<string, unkn
 	const placeholders = columns.map(() => '?')
 	const params = Object.values(record)
 
-	const sql = `INSERT INTO ${collection} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`
+	const quotedColumns = columns.map((col) => quoteIdent(col))
+	const sql = `INSERT INTO ${quoteIdent(collection)} (${quotedColumns.join(', ')}) VALUES (${placeholders.join(', ')})`
 	return { sql, params }
 }
 
@@ -109,10 +111,10 @@ export function buildUpdateQuery(
 	id: string,
 	changes: Record<string, unknown>,
 ): SqlQuery {
-	const setClauses = Object.keys(changes).map((col) => `${col} = ?`)
+	const setClauses = Object.keys(changes).map((col) => `${quoteIdent(col)} = ?`)
 	const params = [...Object.values(changes), id]
 
-	const sql = `UPDATE ${collection} SET ${setClauses.join(', ')} WHERE id = ?`
+	const sql = `UPDATE ${quoteIdent(collection)} SET ${setClauses.join(', ')} WHERE id = ?`
 	return { sql, params }
 }
 
@@ -147,7 +149,7 @@ export function buildFieldFastForwardUpdateQuery(
 	wallTime: number,
 	options?: { maxCreatedAt?: number },
 ): SqlQuery {
-	const fieldClauses = Object.keys(fieldChanges).map((col) => `${col} = ?`)
+	const fieldClauses = Object.keys(fieldChanges).map((col) => `${quoteIdent(col)} = ?`)
 	// _version is a lexicographically-sortable string; _updated_at is a number.
 	// Keep the greater of the current and incoming value for each (monotonic).
 	const setClauses = [
@@ -167,7 +169,7 @@ export function buildFieldFastForwardUpdateQuery(
 		params.push(options.maxCreatedAt, options.maxCreatedAt)
 	}
 	params.push(id)
-	const sql = `UPDATE ${collection} SET ${setClauses.join(', ')} WHERE id = ?`
+	const sql = `UPDATE ${quoteIdent(collection)} SET ${setClauses.join(', ')} WHERE id = ?`
 	return { sql, params }
 }
 
@@ -187,12 +189,12 @@ export function buildSoftDeleteQuery(
 ): SqlQuery {
 	if (version !== undefined) {
 		return {
-			sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ?`,
+			sql: `UPDATE ${quoteIdent(collection)} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ?`,
 			params: [updatedAt, version, id],
 		}
 	}
 	return {
-		sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ? WHERE id = ?`,
+		sql: `UPDATE ${quoteIdent(collection)} SET _deleted = 1, _updated_at = ? WHERE id = ?`,
 		params: [updatedAt, id],
 	}
 }
@@ -207,9 +209,9 @@ export function buildLwwUpdateQuery(
 	changes: Record<string, unknown>,
 	remoteVersion: string,
 ): SqlQuery {
-	const setClauses = Object.keys(changes).map((col) => `${col} = ?`)
+	const setClauses = Object.keys(changes).map((col) => `${quoteIdent(col)} = ?`)
 	const lww = lwwVersionWhereClause(remoteVersion)
-	const sql = `UPDATE ${collection} SET ${setClauses.join(', ')} WHERE id = ? AND ${lww.sql}`
+	const sql = `UPDATE ${quoteIdent(collection)} SET ${setClauses.join(', ')} WHERE id = ? AND ${lww.sql}`
 	const params = [...Object.values(changes), id, ...lww.params]
 	return { sql, params }
 }
@@ -225,7 +227,7 @@ export function buildLwwSoftDeleteQuery(
 ): SqlQuery {
 	const lww = lwwVersionWhereClause(version)
 	return {
-		sql: `UPDATE ${collection} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ? AND ${lww.sql}`,
+		sql: `UPDATE ${quoteIdent(collection)} SET _deleted = 1, _updated_at = ?, _version = ? WHERE id = ? AND ${lww.sql}`,
 		params: [updatedAt, version, id, ...lww.params],
 	}
 }
@@ -296,31 +298,33 @@ function buildOperatorCondition(
 	const sqlValue =
 		descriptor?.kind === 'boolean' && typeof value === 'boolean' ? (value ? 1 : 0) : value
 
+	const column = quoteIdent(fieldName)
+
 	switch (operator) {
 		case '$eq':
 			if (sqlValue === null) {
-				return `${fieldName} IS NULL`
+				return `${column} IS NULL`
 			}
 			params.push(sqlValue)
-			return `${fieldName} = ?`
+			return `${column} = ?`
 		case '$ne':
 			if (sqlValue === null) {
-				return `${fieldName} IS NOT NULL`
+				return `${column} IS NOT NULL`
 			}
 			params.push(sqlValue)
-			return `${fieldName} != ?`
+			return `${column} != ?`
 		case '$gt':
 			params.push(sqlValue)
-			return `${fieldName} > ?`
+			return `${column} > ?`
 		case '$gte':
 			params.push(sqlValue)
-			return `${fieldName} >= ?`
+			return `${column} >= ?`
 		case '$lt':
 			params.push(sqlValue)
-			return `${fieldName} < ?`
+			return `${column} < ?`
 		case '$lte':
 			params.push(sqlValue)
-			return `${fieldName} <= ?`
+			return `${column} <= ?`
 		case '$in': {
 			if (!Array.isArray(sqlValue)) {
 				throw new QueryError(`$in operator requires an array value for field "${fieldName}"`, {
@@ -334,7 +338,7 @@ function buildOperatorCondition(
 					descriptor?.kind === 'boolean' && typeof item === 'boolean' ? (item ? 1 : 0) : item,
 				)
 			}
-			return `${fieldName} IN (${placeholders.join(', ')})`
+			return `${column} IN (${placeholders.join(', ')})`
 		}
 		default:
 			throw new QueryError(`Unknown operator "${operator}"`, { operator })

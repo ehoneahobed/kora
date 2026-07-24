@@ -187,6 +187,43 @@ export class OutboundQueue {
 	}
 
 	/**
+	 * Remove a single operation the server permanently rejected — from the queue,
+	 * from any in-flight batch, and from durable storage — so a later batch ack or
+	 * a reconnect `returnBatch` can never resend or resurrect it. Returns the
+	 * removed operation so the caller can record it in a durable rejected store,
+	 * or null if it was not present (already acknowledged and removed).
+	 */
+	async reject(opId: string): Promise<Operation | null> {
+		let removed: Operation | null = null
+
+		// Common case: the op was just sent and sits in an in-flight batch.
+		for (const [batchId, ops] of this.inFlight) {
+			const idx = ops.findIndex((op) => op.id === opId)
+			if (idx !== -1) {
+				removed = ops[idx] ?? null
+				ops.splice(idx, 1)
+				if (ops.length === 0) {
+					this.inFlight.delete(batchId)
+				}
+				break
+			}
+		}
+
+		// Otherwise it may still be queued (not yet sent).
+		if (!removed) {
+			const idx = this.queue.findIndex((op) => op.id === opId)
+			if (idx !== -1) {
+				removed = this.queue[idx] ?? null
+				this.queue.splice(idx, 1)
+			}
+		}
+
+		this.seen.delete(opId)
+		await this.storage.dequeue([opId])
+		return removed
+	}
+
+	/**
 	 * Remove operations by id from queue and persistent storage.
 	 * Used when ops were already sent during handshake delta exchange.
 	 */

@@ -7,6 +7,7 @@ import {
 	type ApplyServerOperationResult,
 	applyServerOperation,
 } from '../apply/apply-server-operation'
+import type { OperationValidator } from '../apply/operation-validator'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
@@ -25,12 +26,15 @@ import type {
 	KoraSyncServerConfig,
 	ServerStatus,
 } from '../types'
+import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
 
 const DEFAULT_MAX_CONNECTIONS = 0 // unlimited
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
+/** How often to retransmit relay batches connected clients have not acknowledged. */
+const RELAY_RETRANSMIT_INTERVAL_MS = 2000
 
 /**
  * Minimal interface for a ws.WebSocketServer instance.
@@ -81,15 +85,38 @@ export class KoraSyncServer {
 	private readonly persistBlobChunk:
 		| ((hash: string, bytes: Uint8Array) => Promise<void> | void)
 		| null
+	private readonly maxOperationBytes: number | undefined
+	private readonly maxOpsPerMinute: number | undefined
+	private readonly validateOperation: OperationValidator | undefined
+	private readonly koraContext: ProductionHttpRouteContext
 	private readonly sessions = new Map<string, ClientSession>()
 	private readonly httpClients = new Map<
 		string,
 		{ sessionId: string; transport: HttpServerTransport }
 	>()
 	private readonly httpSessionToClient = new Map<string, string>()
-	private readonly serverVersion = '0.4.0'
+	// Informational value reported by getStatus(). Keep in sync with the
+	// @korajs/server package version on release; it is not used for protocol negotiation.
+	private readonly serverVersion = '1.0.0-beta.0'
 	private wsServer: WsServerLike | null = null
 	private running = false
+	/**
+	 * Periodic tick that retransmits relay batches connected clients have not
+	 * acknowledged, so a relay dropped by a lossy transport is redelivered instead of
+	 * leaving that client with a permanent version-vector gap (a lost operation).
+	 */
+	private relayRetransmitTimer: ReturnType<typeof setInterval> | null = null
+	/**
+	 * Relay operations a client never acknowledged before it disconnected, buffered by
+	 * client node id so they can be redelivered on its next connection. Bounded per
+	 * node and expired by age so a client that never returns cannot grow this forever.
+	 */
+	private readonly orphanedRelaysByNode = new Map<
+		string,
+		{ ops: Operation[]; bufferedAtMs: number }
+	>()
+	private static readonly MAX_ORPHANED_RELAY_OPS_PER_NODE = 5000
+	private static readonly ORPHANED_RELAY_TTL_MS = 5 * 60_000
 
 	constructor(config: KoraSyncServerConfig) {
 		this.store = config.store
@@ -111,12 +138,91 @@ export class KoraSyncServer {
 		this.metrics.setSchemaVersion(this.schemaVersion)
 		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk)
 		this.persistBlobChunk = config.persistBlobChunk ?? null
+		this.maxOperationBytes = config.maxOperationBytes
+		this.maxOpsPerMinute = config.maxOpsPerMinute
+		this.validateOperation = config.validateOperation
+		// One trusted data-plane context, shared by custom HTTP routes (via
+		// production-server) and by the operation validator. It holds no per-request
+		// state; the closures only reach back into `this` when actually invoked.
+		this.koraContext = createRouteContext(this, this.store)
 
 		// If no external emitter was provided, create an internal one for
 		// subscribing to session events for metrics and logging.
 		if (!this.emitter) {
 			this.emitter = new SimpleEventEmitter()
 		}
+
+		// Retransmit relays a client hasn't acked within one interval. Started here (not
+		// in start()) so it also runs for embedded/in-memory servers that never call
+		// start(). unref() so it never keeps the process alive; cleared in stop().
+		this.relayRetransmitTimer = setInterval(() => {
+			this.retransmitPendingRelays(RELAY_RETRANSMIT_INTERVAL_MS)
+		}, RELAY_RETRANSMIT_INTERVAL_MS)
+		this.relayRetransmitTimer.unref?.()
+	}
+
+	/**
+	 * Retransmit relay batches that connected clients have not acknowledged within
+	 * `staleMs`. Called on a periodic tick and directly by tests. Redelivering an
+	 * already-applied operation is harmless (clients dedup by content-addressed id).
+	 */
+	retransmitPendingRelays(staleMs = 0): void {
+		for (const session of this.sessions.values()) {
+			session.retransmitPendingRelays(staleMs)
+		}
+		this.expireOrphanedRelays()
+	}
+
+	/**
+	 * Buffer relay operations a disconnected client never acknowledged, keyed by its
+	 * node id, deduped by operation id and bounded by count. Redelivered when the
+	 * client reconnects (see {@link takeOrphanedRelays}).
+	 */
+	private bufferOrphanedRelays(nodeId: string, ops: Operation[]): void {
+		if (ops.length === 0) return
+		const existing = this.orphanedRelaysByNode.get(nodeId)
+		const merged = existing ? existing.ops : []
+		const seen = new Set(merged.map((op) => op.id))
+		for (const op of ops) {
+			if (!seen.has(op.id)) {
+				merged.push(op)
+				seen.add(op.id)
+			}
+		}
+		// Keep only the most recent ops if the buffer is oversized.
+		const bounded =
+			merged.length > KoraSyncServer.MAX_ORPHANED_RELAY_OPS_PER_NODE
+				? merged.slice(merged.length - KoraSyncServer.MAX_ORPHANED_RELAY_OPS_PER_NODE)
+				: merged
+		this.orphanedRelaysByNode.set(nodeId, { ops: bounded, bufferedAtMs: Date.now() })
+	}
+
+	/** Remove and return a node's buffered orphaned relay operations, if any. */
+	private takeOrphanedRelays(nodeId: string): Operation[] {
+		const entry = this.orphanedRelaysByNode.get(nodeId)
+		if (!entry) return []
+		this.orphanedRelaysByNode.delete(nodeId)
+		return entry.ops
+	}
+
+	/** Drop buffered orphaned relays older than the TTL (client never returned). */
+	private expireOrphanedRelays(): void {
+		if (this.orphanedRelaysByNode.size === 0) return
+		const cutoff = Date.now() - KoraSyncServer.ORPHANED_RELAY_TTL_MS
+		for (const [nodeId, entry] of this.orphanedRelaysByNode) {
+			if (entry.bufferedAtMs <= cutoff) {
+				this.orphanedRelaysByNode.delete(nodeId)
+			}
+		}
+	}
+
+	/**
+	 * The trusted, scoped data-plane context (`apply` / `query` / `findById`).
+	 * Shared with the production server so HTTP routes, the operation validator,
+	 * and `server.kora` are all the same object over the same pipeline.
+	 */
+	getKoraContext(): ProductionHttpRouteContext {
+		return this.koraContext
 	}
 
 	/**
@@ -248,6 +354,13 @@ export class KoraSyncServer {
 			event: 'server.stopping',
 			details: { connectedClients: this.sessions.size },
 		})
+
+		// Stop the relay retransmit tick and drop buffered orphaned relays.
+		if (this.relayRetransmitTimer) {
+			clearInterval(this.relayRetransmitTimer)
+			this.relayRetransmitTimer = null
+		}
+		this.orphanedRelaysByNode.clear()
 
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
@@ -426,9 +539,22 @@ export class KoraSyncServer {
 				this.blobChunkRelay.handleResponse(sourceSessionId, message)
 			},
 			...(this.persistBlobChunk ? { persistBlobChunk: this.persistBlobChunk } : {}),
+			// Only forward when configured, so an unset server value leaves the
+			// session on its own documented default rather than `undefined`.
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
+			...(this.maxOpsPerMinute !== undefined ? { maxOpsPerMinute: this.maxOpsPerMinute } : {}),
+			...(this.validateOperation
+				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
+				: {}),
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
+			onOrphanedRelays: (nodeId, ops) => {
+				this.bufferOrphanedRelays(nodeId, ops)
+			},
+			takeOrphanedRelays: (nodeId) => this.takeOrphanedRelays(nodeId),
 		})
 
 		this.sessions.set(sessionId, session)
@@ -494,6 +620,23 @@ export class KoraSyncServer {
 		}
 
 		return result
+	}
+
+	/**
+	 * Relay already-applied, server-originated operations to every connected client.
+	 * Used by the conditional route apply, which commits its operations atomically
+	 * through the store (bypassing {@link applyLocalOperation}) and then fans them
+	 * out. Each session still enforces its own per-scope visibility filter.
+	 *
+	 * @param operations - Operations that have already been committed to the store
+	 */
+	relayServerOperations(operations: Operation[]): void {
+		if (operations.length === 0) {
+			return
+		}
+		for (const session of this.sessions.values()) {
+			session.relayOperations(operations)
+		}
 	}
 
 	/**

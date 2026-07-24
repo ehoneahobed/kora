@@ -29,10 +29,10 @@ describe('generateMigration', () => {
 		const generated = generateMigration(previous, current, diff)
 
 		expect(
-			generated.up.some((statement) => statement.includes('CREATE TABLE IF NOT EXISTS todos')),
+			generated.up.some((statement) => statement.includes('CREATE TABLE IF NOT EXISTS "todos"')),
 		).toBe(true)
 		expect(
-			generated.down.some((statement) => statement.includes('DROP TABLE IF EXISTS todos')),
+			generated.down.some((statement) => statement.includes('DROP TABLE IF EXISTS "todos"')),
 		).toBe(true)
 	})
 
@@ -62,11 +62,11 @@ describe('generateMigration', () => {
 		const generated = generateMigration(previous, current, diff)
 
 		expect(
-			generated.up.some((statement) => statement.includes('CREATE TABLE _kora_mig_todos_new')),
+			generated.up.some((statement) => statement.includes('CREATE TABLE "_kora_mig_todos_new"')),
 		).toBe(true)
 		expect(
 			generated.up.some((statement) =>
-				statement.includes('ALTER TABLE _kora_mig_todos_new RENAME TO todos'),
+				statement.includes('ALTER TABLE "_kora_mig_todos_new" RENAME TO "todos"'),
 			),
 		).toBe(true)
 	})
@@ -92,10 +92,10 @@ describe('generateMigration', () => {
 
 		const generated = generateMigration(previous, current, diffSchemas(previous, current))
 		const insertStatement = generated.up.find((statement) =>
-			statement.startsWith('INSERT INTO _kora_mig_todos_new'),
+			statement.startsWith('INSERT INTO "_kora_mig_todos_new"'),
 		)
 
-		expect(insertStatement).toContain('LOWER(TRIM(CAST(done AS TEXT)))')
+		expect(insertStatement).toContain('LOWER(TRIM(CAST("done" AS TEXT)))')
 		expect(insertStatement).toContain("IN ('1','true','t','yes','y','on')")
 	})
 

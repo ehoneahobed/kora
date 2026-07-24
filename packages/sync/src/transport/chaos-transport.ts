@@ -21,6 +21,14 @@ export interface ChaosConfig {
 	maxLatency?: number
 	/** Injectable random source for deterministic testing. Returns value in [0, 1). */
 	randomSource?: () => number
+	/**
+	 * Deterministic targeted drop. When it returns true for a message and direction,
+	 * that message is dropped unconditionally (independent of `dropRate`). Enables
+	 * reproducing an exact gap (e.g. drop one specific operation) instead of relying
+	 * on probabilistic drops. `direction` is 'outgoing' for `send` and 'incoming' for
+	 * messages arriving from the inner transport.
+	 */
+	dropPredicate?: (message: SyncMessage, direction: 'outgoing' | 'incoming') => boolean
 }
 
 /**
@@ -37,6 +45,9 @@ export class ChaosTransport implements SyncTransport {
 	private readonly reorderRate: number
 	private readonly maxLatency: number
 	private readonly random: () => number
+	private readonly dropPredicate:
+		| ((message: SyncMessage, direction: 'outgoing' | 'incoming') => boolean)
+		| null
 
 	private messageHandler: TransportMessageHandler | null = null
 	private reorderBuffer: SyncMessage[] = []
@@ -49,6 +60,7 @@ export class ChaosTransport implements SyncTransport {
 		this.reorderRate = config?.reorderRate ?? 0
 		this.maxLatency = config?.maxLatency ?? 0
 		this.random = config?.randomSource ?? Math.random
+		this.dropPredicate = config?.dropPredicate ?? null
 	}
 
 	async connect(url: string, options?: TransportOptions): Promise<void> {
@@ -81,6 +93,10 @@ export class ChaosTransport implements SyncTransport {
 	}
 
 	send(message: SyncMessage): void {
+		// Deterministic targeted drop takes precedence over probabilistic drop.
+		if (this.dropPredicate?.(message, 'outgoing')) {
+			return // Dropped
+		}
 		// Apply chaos to outgoing messages
 		if (this.random() < this.dropRate) {
 			return // Dropped
@@ -122,6 +138,10 @@ export class ChaosTransport implements SyncTransport {
 	private handleIncoming(message: SyncMessage): void {
 		if (!this.messageHandler) return
 
+		// Deterministic targeted drop takes precedence over probabilistic drop.
+		if (this.dropPredicate?.(message, 'incoming')) {
+			return // Dropped
+		}
 		// Apply chaos to incoming messages
 		if (this.random() < this.dropRate) {
 			return // Dropped

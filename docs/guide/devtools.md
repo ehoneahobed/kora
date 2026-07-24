@@ -197,3 +197,42 @@ app.events.on('sync:sent', (event) => {
 ```
 
 This is useful for custom logging, analytics, or building your own debugging tools.
+
+### Event Reference
+
+The full set of instrumentation events (the `KoraEvent` union) that Kora emits and that DevTools consumes:
+
+| Event | Description |
+|-------|-------------|
+| `operation:created` | A new operation was created from a local mutation. |
+| `operation:applied` | An operation was applied to the local store (includes apply duration). |
+| `merge:started` | A merge between two conflicting operations began. |
+| `merge:completed` | A merge finished; carries the `MergeTrace`. |
+| `merge:conflict` | A merge resolved a genuine conflict; carries the `MergeTrace`. |
+| `constraint:violated` | A Tier 2 constraint was violated during merge. |
+| `sync:connected` | The sync connection to the server was established. |
+| `sync:disconnected` | The sync connection closed (includes a reason). |
+| `sync:schema-mismatch` | The client and server schema versions are incompatible. |
+| `sync:auth-failed` | Sync authentication was rejected. |
+| `sync:clock-skew` | Device clock skew was measured (`info`, `slow-warning`, or `fast-blocked`). |
+| `sync:clock-rebase` | Queued future-dated operations were re-stamped after the clock was corrected. |
+| `sync:sent` | A batch of operations was sent to the server. |
+| `sync:received` | A batch of operations was received from the server. |
+| `sync:acknowledged` | The server acknowledged operations up to a sequence number. |
+| `sync:apply-failed` | An incoming operation could not be applied to the local store. |
+| `sync:operation-rejected` | The server rejected one of this client's outbound operations; it was diverted to the durable rejected store rather than retried. |
+| `query:subscribed` | A reactive query subscription was registered. |
+| `query:invalidated` | A query's results were invalidated by an operation. |
+| `query:executed` | A query ran (includes duration and result count). |
+| `connection:quality` | The measured connection quality changed. |
+| `sync:diagnostics` | A sync diagnostics snapshot was emitted. |
+| `sync:bandwidth` | A sync bandwidth sample (bytes per second and direction). |
+| `sync:initial-sync-progress` | Progress of the initial sync (received and total batch counts). |
+| `awareness:updated` | Presence/awareness states changed. |
+| `state-machine:transition` | An enum state-machine field transitioned (includes a `valid` flag). |
+| `state-machine:rejected` | An invalid state-machine transition was rejected. |
+| `store:persistence-error` | The store failed to persist data. |
+| `store:quota-exceeded` | The store hit a storage quota limit. |
+| `store:opfs-unavailable` | OPFS was unavailable, so the store fell back to a non-persistent in-memory database (writes are lost on reload). |
+| `store:db-name-collision` | Another runtime on this origin already used this database name, so this runtime attached to it as a follower and shares that database. |
+| `replay:completed` | A time-travel replay to a target operation completed. |

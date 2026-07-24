@@ -42,4 +42,20 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	async saveDeltaCursor(cursor: DeltaCursor | null): Promise<void> {
 		await this.store.saveDeltaCursor(cursor ? encodeDeltaCursor(cursor) : null)
 	}
+
+	loadDeliveryWatermark(signature: string): Promise<number> {
+		return this.store.loadDeliveryWatermark(signature)
+	}
+
+	async saveDeliveryWatermark(signature: string, watermark: number): Promise<void> {
+		await this.store.saveDeliveryWatermark(signature, watermark)
+	}
+
+	loadAllDeliveryWatermarks(): Promise<Record<string, number>> {
+		return this.store.loadAllDeliveryWatermarks()
+	}
+
+	async deleteDeliveryWatermark(signature: string): Promise<void> {
+		await this.store.deleteDeliveryWatermark(signature)
+	}
 }

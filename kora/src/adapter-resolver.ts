@@ -87,7 +87,13 @@ export async function createAdapter(
 		}
 		case 'sqlite-wasm': {
 			const { SqliteWasmAdapter } = await import('@korajs/store/sqlite-wasm')
-			return new SqliteWasmAdapter({ dbName, workerUrl, sharedWorkerUrl, workerResponseTimeoutMs })
+			return new SqliteWasmAdapter({
+				dbName,
+				workerUrl,
+				sharedWorkerUrl,
+				workerResponseTimeoutMs,
+				emitter,
+			})
 		}
 		case 'indexeddb': {
 			const { IndexedDbAdapter } = await import('@korajs/store/indexeddb')

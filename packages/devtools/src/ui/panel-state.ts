@@ -206,6 +206,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `schema mismatch client ${event.clientSchemaVersion} server ${event.serverSchemaVersion}`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
+		case 'sync:operation-rejected':
+			return `sync op rejected ${event.collection}/${event.recordId} (${event.code})`
 		case 'sync:sent':
 			return `sync sent ${event.batchSize}`
 		case 'sync:received':
@@ -236,6 +238,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `store persistence error ${event.message}`
 		case 'store:quota-exceeded':
 			return 'store quota exceeded'
+		case 'store:opfs-unavailable':
+			return `store OPFS unavailable (${event.reason}), running in memory`
+		case 'store:db-name-collision':
+			return `store db-name collision ${event.dbName}`
 		case 'replay:completed':
 			return `replay ${event.operationsApplied} ops`
 	}

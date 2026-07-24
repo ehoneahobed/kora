@@ -1,4 +1,4 @@
-import { type Operation, generateUUIDv7 } from '@korajs/core'
+import { type Operation, defineSchema, generateUUIDv7, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
@@ -279,5 +279,218 @@ describe('KoraSyncServer', () => {
 
 		await server.stop()
 		expect(server.getConnectionCount()).toBe(0)
+	})
+
+	describe('server-config operation limits reach the session', () => {
+		test('maxOpsPerMinute set at server config rate-limits a connected client', async () => {
+			const store = new MemoryServerStore('server-rate')
+			const server = new KoraSyncServer({ store, maxOpsPerMinute: 1 })
+
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
+
+			sendHandshake(client, 'client-rate')
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'handshake-response')).toBeDefined()
+			})
+
+			// Two ops in one batch: the first is allowed, the second trips the
+			// per-minute limit of 1 and comes back as a retriable RATE_LIMIT error.
+			const op1 = createTestOp({ id: 'rate-1', nodeId: 'client-rate', recordId: 'r1' })
+			const op2 = createTestOp({ id: 'rate-2', nodeId: 'client-rate', recordId: 'r2' })
+			client.send({
+				type: 'operation-batch',
+				messageId: 'rate-batch',
+				operations: [op1, op2].map((op) => ({
+					...op,
+					timestamp: { ...op.timestamp },
+					causalDeps: [...op.causalDeps],
+				})),
+				isFinal: true,
+				batchIndex: 0,
+			})
+
+			await vi.waitFor(() => {
+				const err = messages.find((m) => m.type === 'error' && m.code === 'RATE_LIMIT')
+				expect(err).toBeDefined()
+			})
+			const err = messages.find((m) => m.type === 'error' && m.code === 'RATE_LIMIT')
+			if (err?.type === 'error') {
+				expect(err.retriable).toBe(true)
+			}
+
+			await server.stop()
+		})
+
+		test('maxOperationBytes set at server config rejects an oversized op', async () => {
+			const store = new MemoryServerStore('server-size')
+			const server = new KoraSyncServer({ store, maxOperationBytes: 64 })
+
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
+
+			sendHandshake(client, 'client-size')
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'handshake-response')).toBeDefined()
+			})
+
+			// A payload well past the 64-byte cap: rejected as a permanent
+			// OPERATION_TOO_LARGE (resending the same bytes can never fit).
+			const big = createTestOp({
+				id: 'big-1',
+				nodeId: 'client-size',
+				recordId: 'big',
+				data: { title: 'x'.repeat(500) },
+			})
+			client.send({
+				type: 'operation-batch',
+				messageId: 'size-batch',
+				operations: [{ ...big, timestamp: { ...big.timestamp }, causalDeps: [...big.causalDeps] }],
+				isFinal: true,
+				batchIndex: 0,
+			})
+
+			await vi.waitFor(() => {
+				const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
+				expect(err).toBeDefined()
+			})
+			const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
+			if (err?.type === 'error') {
+				expect(err.retriable).toBe(false)
+			}
+
+			await server.stop()
+		})
+	})
+
+	describe('server-side operation validation', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: { submissions: { fields: { text: t.string() } } },
+		})
+
+		function submissionOp(id: string, text: string): Operation {
+			return createTestOp({
+				id,
+				nodeId: 'client-sub',
+				collection: 'submissions',
+				recordId: id,
+				data: { text },
+			})
+		}
+
+		async function connectStreaming(server: KoraSyncServer) {
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
+			sendHandshake(client, 'client-sub')
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'handshake-response')).toBeDefined()
+			})
+			return { client, messages }
+		}
+
+		function sendOp(client: ReturnType<typeof createServerTransportPair>['client'], op: Operation) {
+			client.send({
+				type: 'operation-batch',
+				messageId: `batch-${op.id}`,
+				operations: [{ ...op, timestamp: { ...op.timestamp }, causalDeps: [...op.causalDeps] }],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		}
+
+		test('accept lets the operation materialize', async () => {
+			const store = new MemoryServerStore('server-accept')
+			await store.setSchema(schema)
+			const server = new KoraSyncServer({ store, validateOperation: () => ({ action: 'accept' }) })
+
+			const { client } = await connectStreaming(server)
+			sendOp(client, submissionOp('accept-1', 'hello'))
+
+			await vi.waitFor(async () => {
+				const rows = await store.materializeCollection('submissions')
+				expect(rows).toHaveLength(1)
+			})
+			await server.stop()
+		})
+
+		test('reject sends operation-rejected tied to the op id and never materializes', async () => {
+			const store = new MemoryServerStore('server-reject')
+			await store.setSchema(schema)
+			const server = new KoraSyncServer({
+				store,
+				validateOperation: (op) => {
+					// Policy: the submitter passed the incoming op; anonymous auth is null.
+					expect(op.collection).toBe('submissions')
+					return { action: 'reject', code: 'WINDOW_CLOSED', message: 'Submissions are closed' }
+				},
+			})
+
+			const { client, messages } = await connectStreaming(server)
+			const op = submissionOp('reject-1', 'too late')
+			sendOp(client, op)
+
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'operation-rejected')).toBeDefined()
+			})
+			const rejected = messages.find((m) => m.type === 'operation-rejected')
+			if (rejected?.type === 'operation-rejected') {
+				expect(rejected.operationId).toBe(op.id)
+				expect(rejected.collection).toBe('submissions')
+				expect(rejected.recordId).toBe(op.recordId)
+				expect(rejected.code).toBe('WINDOW_CLOSED')
+				// Unknown code defaults to permanent via the shared taxonomy.
+				expect(rejected.retriable).toBe(false)
+			}
+
+			// The rejected op never entered the authoritative log.
+			const rows = await store.materializeCollection('submissions')
+			expect(rows).toHaveLength(0)
+			await server.stop()
+		})
+
+		test('a validator can author a derived op and ignore the raw submission', async () => {
+			const store = new MemoryServerStore('server-derive')
+			await store.setSchema(
+				defineSchema({
+					version: 1,
+					collections: {
+						submissions: { fields: { text: t.string() } },
+						formResponses: { fields: { answer: t.string() } },
+					},
+				}),
+			)
+			const server = new KoraSyncServer({
+				store,
+				validateOperation: async (op, ctx) => {
+					// Promote the anonymous submission into the owner-visible collection
+					// as a NEW server-authored op, then ignore the raw one.
+					await ctx.kora.apply({
+						collection: 'formResponses',
+						type: 'insert',
+						data: { answer: (op.data as { text: string }).text },
+					})
+					return { action: 'ignore' }
+				},
+			})
+
+			const { client, messages } = await connectStreaming(server)
+			sendOp(client, submissionOp('derive-1', 'my answer'))
+
+			await vi.waitFor(async () => {
+				const owner = await store.materializeCollection('formResponses')
+				expect(owner).toHaveLength(1)
+			})
+			const owner = await store.materializeCollection('formResponses')
+			expect(owner[0]?.answer).toBe('my answer')
+			// The raw submission was ignored: not materialized, and no rejection sent.
+			const raw = await store.materializeCollection('submissions')
+			expect(raw).toHaveLength(0)
+			expect(messages.find((m) => m.type === 'operation-rejected')).toBeUndefined()
+			await server.stop()
+		})
 	})
 })

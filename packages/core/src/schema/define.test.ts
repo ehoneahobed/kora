@@ -52,13 +52,20 @@ describe('defineSchema', () => {
 	})
 
 	describe('collection name validation', () => {
-		test('rejects uppercase collection names', () => {
-			expect(() =>
-				defineSchema({
-					version: 1,
-					collections: { MyCollection: { fields: { name: t.string() } } },
-				}),
-			).toThrow(SchemaValidationError)
+		test('accepts PascalCase collection names (generated SQL is quoted)', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: { MyCollection: { fields: { name: t.string() } } },
+			})
+			expect(schema.collections.MyCollection).toBeDefined()
+		})
+
+		test('accepts camelCase collection names', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: { formResponses: { fields: { name: t.string() } } },
+			})
+			expect(schema.collections.formResponses).toBeDefined()
 		})
 
 		test('rejects names starting with numbers', () => {

@@ -1,5 +1,120 @@
 # @korajs/core
 
+## 1.0.0-beta.5
+
+### Minor Changes
+
+- Fix a lost-update bug where three or more concurrent atomic writes (`op.increment`,
+  `op.max`, ...) to the same field failed to converge on clients.
+
+  The client apply pipeline composed a remote atomic op through the merge engine's
+  pairwise rule (`base + localDelta + remoteDelta`), which is correct only for exactly
+  two concurrent writes from a shared base. With a third concurrent writer, the current
+  row already folded in an earlier remote delta, and re-deriving the value from the base
+  plus the local device's own delta silently dropped that earlier delta. Three devices
+  each incrementing a shared counter by 5, 3, and 2 could settle at 7/5/5 across devices
+  instead of 10.
+
+  The client now materializes atomic-op fields by folding the record's operation log in
+  HLC order through the same atomic-aware replay the server uses (moved into
+  `@korajs/core` as `replayOperationsForRecord` so both sides share one definition).
+  The fold composes a same-type atomic chain and resolves anything else — including a
+  plain set breaking the chain — by last-write-wins, so every replica converges to the
+  same value regardless of how many concurrent atomic writers there were or which device
+  authored them, including a passive device that only observes the writes. Non-atomic
+  fields are unaffected.
+
+- Compose atomic operations in the server's materialized view so it matches what
+  clients converge to.
+
+  Previously the server materialized records by last-write-wins over each operation's
+  resolved `data`, and did not persist the atomic-op intent (`op.increment`,
+  `op.max`, `op.min`, `op.append`, `op.remove`). Concurrent, independent atomic writes
+  to the same field — two offline clients each incrementing a shared counter, then
+  syncing — collapsed to a single winner in the server's view (materialized reads and
+  initial-sync hydration), even though clients converge to the composed result.
+
+  The server now persists atomic-op intent alongside each operation and composes it
+  during materialization. Per field, an atomic op composes onto the running value when
+  the previous writer on that field was an atomic op of the same type (a same-type
+  chain: increments sum, maxes take the max, appends accumulate); any other write,
+  including the first atomic write after a plain set, resolves by last-write-wins. This
+  mirrors the client merge engine, so the server's materialized value equals the
+  clients' converged value. Verified end to end against real client devices syncing
+  through the server (`@korajs/test`), plus SQLite and Postgres persistence.
+
+  Details:
+
+  - `@korajs/core` exports `applyAtomicOp(currentValue, atomicOp)`, the single source
+    of truth for atomic-op semantics that both the client write path (`resolveAtomicOp`)
+    and the server materialization use.
+  - The SQLite and Postgres operation logs gain a nullable `atomic_ops` column, added
+    by a backward-compatible migration. Existing rows read as "no atomic ops" and keep
+    materializing by last-write-wins exactly as before, so no data migration is required.
+  - Materialization now orders operations by full HLC total order (wallTime, logical,
+    nodeId), matching `HybridLogicalClock.compare`, so composition and last-write-wins
+    see operations in the order the merge engine converges them.
+
+  Operations that carry no atomic-op intent (the common case) materialize exactly as
+  before.
+
+- Server-side adjudication of untrusted client operations before they become
+  authoritative. This is what lets Kora serve public and multi-tenant offline apps
+  where the client cannot be trusted (anonymous form submissions, one tenant that
+  must not write another's data).
+
+  Pass `validateOperation` in the server's `syncOptions` (or to `KoraSyncServer`).
+  It runs at sync ingestion, after HLC ordering and the built-in guards, and before
+  materialization, returning `accept`, `reject`, or `ignore`. On `reject` the
+  operation never enters the authoritative log, so no other replica ever sees it,
+  and a structured rejection travels back to the submitter tied to the operation id.
+  The validator receives an `auth` context (null for anonymous connections) and the
+  trusted `kora` data-plane, so it can read current state and author a derived
+  server operation — for example promoting a validated anonymous submission into an
+  owner-visible collection.
+
+  On the client, a rejected operation is diverted out of the pending outbound queue
+  into a durable rejected store (`_kora_sync_rejected`, survives a page refresh)
+  rather than being retried forever or lost on the batch ack, and a
+  `sync:operation-rejected` event fires. `app.sync.getRejectedOperations()` and
+  `app.sync.clearRejectedOperations()` let the app surface failed submissions and
+  reconcile (roll back the optimistic write or resubmit). Convergence holds: the
+  authoritative state is defined purely by accepted operations, so every synced
+  device agrees without the rejected op, and the submitter is told rather than
+  diverging silently. See the new "Server-side operation validation" guide.
+
+### Patch Changes
+
+- Storage persistence failures are no longer silent. When OPFS is unavailable the
+  store falls back to a non-persistent in-memory database so the app keeps working,
+  but anything written that session is lost on reload — previously with no signal.
+  The SQLite WASM worker now classifies why OPFS could not be used (`lock-conflict`,
+  `timeout`, or `unsupported`) and the store emits a `store:opfs-unavailable` event,
+  so the condition is observable instead of a quiet data-loss trap. The most common
+  cause, `lock-conflict`, is two runtimes on one origin contending for the same
+  database.
+
+  A `store:db-name-collision` event now fires when a runtime attaches to a database
+  name another runtime on the same origin already owns. That is expected for
+  multiple tabs of the same app (they share one leader), and the exact clue a
+  developer needs when two logically separate apps accidentally share the default
+  store name and should each use a distinct one. Both events surface in DevTools and
+  via `app.events`. See the new "Multi-runtime storage and isolation" guide.
+
+- SQL identifiers are now quoted everywhere they are generated, so a collection or
+  field name that is valid JavaScript always produces valid SQL. camelCase
+  (`formResponses`), PascalCase (`UserProfiles`), and names that happen to be SQL
+  reserved words (`order`, `select`) now work end to end across the client store,
+  both server stores, migrations, and CLI-generated migration files. Previously a
+  camelCase collection was rejected at `defineSchema` and a reserved-word name
+  produced a runtime SQL syntax error.
+
+  A new `quoteIdent` helper is exported from `@korajs/core`. Schema validation
+  still fails fast for genuinely malformed names (empty, or containing characters
+  that are not letters, numbers, or underscores). Existing all-lowercase schemas
+  are unaffected: quoting a lowercase identifier is a no-op in both SQLite and
+  Postgres.
+
 ## 1.0.0-beta.0
 
 ### Minor Changes

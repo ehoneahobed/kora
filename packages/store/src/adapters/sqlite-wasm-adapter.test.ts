@@ -1,9 +1,36 @@
+import type { KoraEvent } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { AdapterError, StoreNotOpenError } from '../errors'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import { Mutex } from './sqlite-wasm-channel'
+import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 import { MockWorkerBridge } from './sqlite-wasm-mock-bridge'
+
+/**
+ * Wraps a real MockWorkerBridge (so tables are actually created) but injects a
+ * `data` payload onto the open success response, letting a test simulate the
+ * worker reporting a non-persistent in-memory fallback.
+ */
+class OpenDataBridge implements WorkerBridge {
+	constructor(
+		private readonly inner: MockWorkerBridge,
+		private readonly openData: unknown,
+	) {}
+
+	async send(request: WorkerRequest): Promise<WorkerResponse> {
+		const response = await this.inner.send(request)
+		if (request.type === 'open' && response.type === 'success') {
+			return { ...response, data: this.openData }
+		}
+		return response
+	}
+
+	terminate(): void {
+		this.inner.terminate()
+	}
+}
 
 describe('SqliteWasmAdapter', () => {
 	let adapter: SqliteWasmAdapter
@@ -212,6 +239,54 @@ describe('SqliteWasmAdapter', () => {
 		test('throws AdapterError when no bridge or workerUrl provided', async () => {
 			const noBridge = new SqliteWasmAdapter()
 			await expect(noBridge.open(minimalSchema)).rejects.toThrow(AdapterError)
+		})
+	})
+
+	describe('storage diagnostics', () => {
+		test('emits store:opfs-unavailable when the worker reports a non-persistent fallback', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:opfs-unavailable', (e) => events.push(e))
+
+			const bridge = new OpenDataBridge(new MockWorkerBridge(), {
+				persistent: false,
+				fallbackReason: 'lock-conflict',
+			})
+			const diag = new SqliteWasmAdapter({ bridge, dbName: 'shared-db', emitter })
+			await diag.open(minimalSchema)
+
+			expect(events).toHaveLength(1)
+			const event = events[0]
+			if (event?.type === 'store:opfs-unavailable') {
+				expect(event.dbName).toBe('shared-db')
+				expect(event.reason).toBe('lock-conflict')
+			}
+			await diag.close()
+		})
+
+		test('emits nothing when the worker reports persistent storage', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:opfs-unavailable', (e) => events.push(e))
+
+			const bridge = new OpenDataBridge(new MockWorkerBridge(), { persistent: true })
+			const diag = new SqliteWasmAdapter({ bridge, dbName: 'own-db', emitter })
+			await diag.open(minimalSchema)
+
+			expect(events).toHaveLength(0)
+			await diag.close()
+		})
+
+		test('emits nothing when the bridge does not report a storage mode (e.g. Node)', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:opfs-unavailable', (e) => events.push(e))
+
+			const diag = new SqliteWasmAdapter({ bridge: new MockWorkerBridge(), emitter })
+			await diag.open(minimalSchema)
+
+			expect(events).toHaveLength(0)
+			await diag.close()
 		})
 	})
 })

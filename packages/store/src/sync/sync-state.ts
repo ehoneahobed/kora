@@ -4,6 +4,7 @@ import type { MetaRow, StorageAdapter } from '../types'
 
 export const LAST_ACKED_SERVER_VECTOR_META_KEY = 'last_acked_server_vector'
 export const DELTA_CURSOR_META_KEY = 'delta_cursor'
+export const DELIVERY_WATERMARK_META_KEY = 'delivery_watermark'
 
 /**
  * Serialize a version vector for `_kora_meta` storage.
@@ -118,4 +119,80 @@ export async function saveDeltaCursor(
 		DELTA_CURSOR_META_KEY,
 		cursor,
 	])
+}
+
+/**
+ * The `_kora_meta` key for a view's delivery watermark. The default (empty) signature
+ * uses the bare key for backward compatibility; other views suffix the signature.
+ */
+function deliveryWatermarkKey(signature: string): string {
+	return signature === ''
+		? DELIVERY_WATERMARK_META_KEY
+		: `${DELIVERY_WATERMARK_META_KEY}:${signature}`
+}
+
+/**
+ * Load the persisted delivery watermark for a view signature (0 when none recorded).
+ */
+export async function loadDeliveryWatermark(
+	adapter: StorageAdapter,
+	signature: string,
+): Promise<number> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		deliveryWatermarkKey(signature),
+	])
+	const value = rows[0]?.value
+	if (value === undefined || value === null) {
+		return 0
+	}
+	const parsed = Number(value)
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+}
+
+/**
+ * Persist the delivery watermark for a view signature in `_kora_meta`.
+ */
+export async function saveDeliveryWatermark(
+	adapter: StorageAdapter,
+	signature: string,
+	watermark: number,
+): Promise<void> {
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		deliveryWatermarkKey(signature),
+		String(watermark),
+	])
+}
+
+/**
+ * Delete a persisted view watermark. Dropping a watermark is always safe: the view simply
+ * back-fills from 0 (deduplicated) the next time it is visited. This bounds the number of
+ * `_kora_meta` rows an app that churns through many distinct views can accumulate.
+ */
+export async function deleteDeliveryWatermark(
+	adapter: StorageAdapter,
+	signature: string,
+): Promise<void> {
+	await adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [deliveryWatermarkKey(signature)])
+}
+
+/**
+ * Load every persisted view watermark, keyed by signature (the default view is '').
+ */
+export async function loadAllDeliveryWatermarks(
+	adapter: StorageAdapter,
+): Promise<Record<string, number>> {
+	const rows = await adapter.query<MetaRow & { key: string }>(
+		'SELECT key, value FROM _kora_meta WHERE key = ? OR key LIKE ?',
+		[DELIVERY_WATERMARK_META_KEY, `${DELIVERY_WATERMARK_META_KEY}:%`],
+	)
+	const result: Record<string, number> = {}
+	const prefix = `${DELIVERY_WATERMARK_META_KEY}:`
+	for (const row of rows) {
+		const signature = row.key === DELIVERY_WATERMARK_META_KEY ? '' : row.key.slice(prefix.length)
+		const parsed = Number(row.value)
+		if (Number.isFinite(parsed) && parsed >= 0) {
+			result[signature] = parsed
+		}
+	}
+	return result
 }

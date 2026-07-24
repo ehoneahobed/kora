@@ -30,6 +30,8 @@ export interface TestNetworkOptions {
 	wrapTransport?: (pair: TransportPair) => TransportPair
 	/** Enable central blob storage on the server (persist + serve uploaded blob bytes). */
 	blobStorage?: boolean
+	/** Adjudicate untrusted client operations on the server before materialization. */
+	validateOperation?: import('@korajs/server').OperationValidator
 }
 
 /**
@@ -83,7 +85,10 @@ export async function createTestNetwork(
 	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
 
 	// Create server
-	const server = new TestServer(schema, { blobStorage: options?.blobStorage })
+	const server = new TestServer(schema, {
+		blobStorage: options?.blobStorage,
+		validateOperation: options?.validateOperation,
+	})
 
 	// Create devices
 	const devices: TestDevice[] = []

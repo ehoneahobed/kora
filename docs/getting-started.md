@@ -22,7 +22,7 @@ Kora.js - Offline-first application framework
 
 ? Platform:
   > Web (browser)
-    Desktop (Tauri — native SQLite)
+    Desktop (Tauri - native SQLite)
 
 ? UI framework:
   > React
@@ -38,7 +38,7 @@ Kora.js - Offline-first application framework
     bun
 ```
 
-Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite and sync enabled — see the [Tauri Desktop guide](/guide/tauri-desktop) for details.
+Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite and sync enabled. See the [Tauri Desktop guide](/guide/tauri-desktop) for details.
 
 You can also skip the prompts entirely:
 
@@ -61,7 +61,7 @@ Your app is running. Everything works offline out of the box.
 If you prefer to add Kora to an existing project:
 
 ```bash
-pnpm add kora @korajs/react
+pnpm add korajs @korajs/react
 ```
 
 ## Project Structure
@@ -174,7 +174,7 @@ import schema from './schema'
 export const app = createApp({ schema })
 ```
 
-That is the entire setup for a local-only app. No database configuration, no storage boilerplate. Kora uses SQLite WASM with OPFS under the hood and falls back to IndexedDB automatically.
+That is the entire setup for a local-only app. No database configuration, no storage boilerplate. Kora uses SQLite WASM with OPFS persistence under the hood, running in a Web Worker so your UI never blocks. If OPFS is unavailable at runtime the store keeps working from a non-persistent in-memory database and emits a `store:opfs-unavailable` event so the condition is never silent; see the [Multi-runtime Storage](/guide/multi-runtime-storage) guide.
 
 ## CRUD Operations
 
@@ -194,7 +194,7 @@ const todo = await app.todos.insert({
 // Find by ID
 const found = await app.todos.findById(todo.id)
 
-// Update (partial — only the fields you pass)
+// Update (partial: only the fields you pass)
 await app.todos.update(todo.id, { completed: true })
 
 // Query with filters
@@ -230,7 +230,7 @@ function App() {
 }
 
 function TodoList() {
-  // Reactive query — re-renders when data changes
+  // Reactive query: re-renders when data changes
   const todos = useQuery(
     app.todos.where({ completed: false }).orderBy('createdAt')
   )
@@ -289,19 +289,23 @@ See the [Deployment guide](/guide/deployment) for a full step-by-step walkthroug
 
 ## What's Next
 
-- [Deployment](/guide/deployment) — Deploy your app to Fly.io or Railway in 10 minutes
-- [Schema Design](/guide/schema-design) — Field types, relations, state machines, and versioning
-- [State Machines](/guide/state-machines) — Constrained enum transitions for workflows
-- [Offline Patterns](/guide/offline-patterns) — Building UIs that embrace offline-first
-- [Conflict Resolution](/guide/conflict-resolution) — How Kora handles concurrent edits
-- [React Hooks](/guide/react-hooks) — Full reference for all React bindings
-- [Presence & Awareness](/guide/presence) — Real-time collaborative presence
-- [Sync Configuration](/guide/sync-configuration) — Transports, encryption, diagnostics, and reconnection
-- [Sync Encryption](/guide/sync-encryption) — End-to-end encryption for sync
-- [Authentication](/guide/authentication) — Sessions, MFA, organizations, RBAC, and passkeys
-- [Storage Configuration](/guide/storage-configuration) — Client and server storage backends
-- [Backup and Restore](/guide/backup-restore) — Local app backups and sync server backups
-- [Testing](/guide/testing) — Test harness for offline-first apps
-- [Tauri Desktop Apps](/guide/tauri-desktop) — Build native desktop apps with native SQLite
-- [DevTools](/guide/devtools) — Debugging with the Kora browser extension
-- [API Reference](/api/) — Complete reference for all packages
+- [Deployment](/guide/deployment): Deploy your app to Fly.io or Railway in 10 minutes
+- [Schema Design](/guide/schema-design): Field types, relations, state machines, and versioning
+- [State Machines](/guide/state-machines): Constrained enum transitions for workflows
+- [Offline Patterns](/guide/offline-patterns): Building UIs that embrace offline-first
+- [Conflict Resolution](/guide/conflict-resolution): How Kora handles concurrent edits
+- [React Hooks](/guide/react-hooks): Full reference for all React bindings
+- [Kora for AI Agents](/guide/ai-agents): Rules and the `kora agents-md` command so coding agents build Kora apps correctly
+- [Presence & Awareness](/guide/presence): Real-time collaborative presence
+- [Sync Configuration](/guide/sync-configuration): Transports, encryption, diagnostics, and reconnection
+- [Server-side Validation](/guide/server-side-validation): Adjudicate untrusted client operations before they become authoritative
+- [Production Server](/guide/production-server): Background-job data access, size and rate limits, and central blob storage
+- [Sync Encryption](/guide/sync-encryption): End-to-end encryption for sync
+- [Authentication](/guide/authentication): Sessions, MFA, organizations, RBAC, and passkeys
+- [Storage Configuration](/guide/storage-configuration): Client and server storage backends
+- [Multi-runtime Storage](/guide/multi-runtime-storage): Running more than one runtime on one origin, and storage diagnostics
+- [Backup and Restore](/guide/backup-restore): Local app backups and sync server backups
+- [Testing](/guide/testing): Test harness for offline-first apps
+- [Tauri Desktop Apps](/guide/tauri-desktop): Build native desktop apps with native SQLite
+- [DevTools](/guide/devtools): Debugging with the Kora browser extension
+- [API Reference](/api/): Complete reference for all packages

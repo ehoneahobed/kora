@@ -98,7 +98,7 @@ export function NotesApp() {
   const status = useSyncStatus()
 
   const handleNewNote = async () => {
-    const note = await createNote({ title: 'Untitled', content: '' })
+    const note = await createNote.mutateAsync({ title: 'Untitled', content: '' })
     setSelectedId(note.id)
   }
 
@@ -125,7 +125,7 @@ export function NotesApp() {
               <br />
               <small>{note.wordCount} words</small>
               <button
-                onClick={(e) => { e.stopPropagation(); deleteNote(note.id) }}
+                onClick={(e) => { e.stopPropagation(); deleteNote.mutate(note.id) }}
                 style={{ float: 'right' }}
               >
                 Delete
@@ -144,29 +144,46 @@ export function NotesApp() {
 
 ### Rich Text Editor
 
-The `useRichText` hook connects a Kora `t.richtext()` field to a text editor. It returns a Yjs `Y.Text` binding that any Yjs-compatible editor (Tiptap, ProseMirror, Quill, etc.) can consume.
+The `useRichText` hook connects a Kora `t.richtext()` field to a text editor. It returns the shared Yjs document (`doc`) and its bound `Y.Text` (`text`), which any Yjs-compatible editor (Tiptap, ProseMirror, Quill, etc.) can consume through its collaboration plugin.
 
 ```tsx
 // NoteEditor.tsx
+import { useEffect } from 'react'
+import { useEditor, EditorContent } from '@tiptap/react'
+import StarterKit from '@tiptap/starter-kit'
+import Collaboration from '@tiptap/extension-collaboration'
 import { useQuery, useMutation, useRichText } from '@korajs/react'
 import { app } from './app'
 
 export function NoteEditor({ noteId }: { noteId: string }) {
   const [note] = useQuery(app.notes.where({ id: noteId }))
   const updateNote = useMutation(app.notes.update)
-  const { binding, getText } = useRichText(app.notes, noteId, 'content')
+  const { doc, text, ready } = useRichText('notes', noteId, 'content')
+
+  const editor = useEditor(
+    {
+      extensions: [StarterKit, Collaboration.configure({ document: doc })],
+    },
+    [doc],
+  )
+
+  // Recompute the word count whenever the shared text changes.
+  useEffect(() => {
+    if (!text) return
+    const recount = () => {
+      const value = text.toString()
+      const count = value.trim() ? value.trim().split(/\s+/).length : 0
+      updateNote.mutate(noteId, { wordCount: count, lastEditedBy: 'current-user' })
+    }
+    text.observe(recount)
+    return () => text.unobserve(recount)
+  }, [text, noteId, updateNote])
 
   if (!note) return <p>Note not found.</p>
+  if (!ready) return <p>Loading...</p>
 
   const handleTitleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    updateNote(noteId, { title: e.target.value })
-  }
-
-  const handleContentChange = () => {
-    // Update the word count whenever content changes.
-    const text = getText()
-    const count = text.trim() ? text.trim().split(/\s+/).length : 0
-    updateNote(noteId, { wordCount: count, lastEditedBy: 'current-user' })
+    updateNote.mutate(noteId, { title: e.target.value })
   }
 
   return (
@@ -177,27 +194,19 @@ export function NoteEditor({ noteId }: { noteId: string }) {
         style={{ fontSize: 24, border: 'none', width: '100%' }}
       />
       <p style={{ color: '#888' }}>{note.wordCount} words</p>
-      {/*
-        Pass `binding` to any Yjs-compatible editor.
-        This example uses a minimal textarea for clarity.
-        In production, use Tiptap or ProseMirror with y-prosemirror.
-      */}
-      <textarea
-        ref={(el) => { if (el) binding.attach(el) }}
-        onChange={handleContentChange}
-        style={{ width: '100%', minHeight: 400, fontFamily: 'inherit' }}
-      />
+      <EditorContent editor={editor} />
     </div>
   )
 }
 ```
 
-`useRichText` returns:
+`useRichText` returns, among other fields:
 
-- **`binding`** -- a Yjs binding object. Call `binding.attach(element)` to connect it to a DOM node, or pass it to a Yjs editor plugin like `y-prosemirror`.
-- **`getText()`** -- returns the current plain-text content of the rich text field.
+- **`doc`** is the shared Yjs `Y.Doc`. Hand it to your editor's collaboration plugin (here, Tiptap's `Collaboration` extension, or `y-prosemirror` for a bare ProseMirror view).
+- **`text`** is the bound `Y.Text` for the field. Read `text.toString()` for the current plain text, or call `text.observe(...)` to react to edits.
+- **`ready`** turns `true` once the document has loaded from the local store.
 
-Edits made through the binding are automatically captured as Kora operations and synced to other clients.
+Edits made through the editor are automatically captured as Kora operations and synced to other clients.
 
 ## How Rich Text Sync Works
 
@@ -242,10 +251,10 @@ The `tags` field is declared as `t.array(t.string())`. Kora merges arrays using 
 
 ```typescript
 // User A
-updateNote(noteId, { tags: [...note.tags, 'work'] })
+updateNote.mutate(noteId, { tags: [...note.tags, 'work'] })
 
 // User B (concurrently)
-updateNote(noteId, { tags: [...note.tags, 'urgent'] })
+updateNote.mutate(noteId, { tags: [...note.tags, 'urgent'] })
 
 // After sync, both users see: ['work', 'urgent']
 ```

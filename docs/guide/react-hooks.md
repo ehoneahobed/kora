@@ -113,7 +113,7 @@ function TodoList({ userId }: { userId: string }) {
 
 ## useMutation
 
-`useMutation` returns a function that performs an optimistic mutation.
+`useMutation` returns a mutation object with `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, and the `isLoading` and `error` state fields.
 
 ```tsx
 import { useMutation } from '@korajs/react'
@@ -123,7 +123,7 @@ function AddTodo() {
   const addTodo = useMutation(app.todos.insert)
 
   return (
-    <button onClick={() => addTodo({ title: 'New task' })}>
+    <button onClick={() => addTodo.mutate({ title: 'New task' })}>
       Add Task
     </button>
   )
@@ -132,35 +132,45 @@ function AddTodo() {
 
 ### Key Behaviors
 
-- **Fire-and-forget.** The mutation function does not return a promise by default. The local store updates instantly and any reactive queries re-render.
+- **Fire-and-forget.** `mutate(...)` returns nothing. The local store updates instantly and any reactive queries re-render.
 - **Optimistic.** The data appears in the UI before it syncs to the server.
 - **Offline safe.** Mutations work regardless of network state. Operations queue for sync.
+
+### Result Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `mutate` | `(...args) => void` | Fire-and-forget trigger. Does not return a promise. |
+| `mutateAsync` | `(...args) => Promise<TData>` | Awaitable trigger. Resolves with the write result. |
+| `reset` | `() => void` | Clears `error` and `isLoading` back to their initial state. |
+| `isLoading` | `boolean` | `true` while an async mutation is in flight. |
+| `error` | `Error \| null` | The last error thrown by `mutateAsync`, or `null`. |
 
 ### Mutation Types
 
 ```tsx
 // Insert
 const addTodo = useMutation(app.todos.insert)
-addTodo({ title: 'New task', completed: false })
+addTodo.mutate({ title: 'New task', completed: false })
 
 // Update
 const updateTodo = useMutation(app.todos.update)
-updateTodo('record-id', { completed: true })
+updateTodo.mutate('record-id', { completed: true })
 
 // Delete
 const deleteTodo = useMutation(app.todos.delete)
-deleteTodo('record-id')
+deleteTodo.mutate('record-id')
 ```
 
 ### Awaiting Mutations
 
-If you need to wait for the local write to complete (e.g., to get the generated ID):
+If you need to wait for the local write to complete (e.g., to get the generated ID), use `mutateAsync`:
 
 ```tsx
 const addTodo = useMutation(app.todos.insert)
 
 async function handleAdd() {
-  const todo = await addTodo({ title: 'New task' })
+  const todo = await addTodo.mutateAsync({ title: 'New task' })
   console.log(todo.id) // the generated UUID
 }
 ```
@@ -175,7 +185,7 @@ import { useSyncStatus } from '@korajs/react'
 function SyncIndicator() {
   const status = useSyncStatus()
 
-  switch (status.state) {
+  switch (status.status) {
     case 'synced':
       return <span>All changes saved</span>
     case 'syncing':
@@ -184,6 +194,10 @@ function SyncIndicator() {
       return <span>Working offline</span>
     case 'error':
       return <span>Sync error - retrying</span>
+    case 'clock-error':
+      return <span>Clock integrity blocked</span>
+    case 'schema-mismatch':
+      return <span>Server schema mismatch</span>
     case 'connected':
       return <span>Connected</span>
   }
@@ -194,9 +208,13 @@ function SyncIndicator() {
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `state` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'error'` | Current sync state |
+| `status` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'error' \| 'clock-error' \| 'schema-mismatch'` | Current sync state |
 | `pendingOperations` | `number` | Number of operations not yet sent to server |
-| `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
+| `lastSyncedAt` | `number \| null` | Timestamp of last successful sync (`null` if never synced) |
+| `lastSuccessfulPush` | `number \| null` | Timestamp of last successful push to the server |
+| `lastSuccessfulPull` | `number \| null` | Timestamp of last successful pull from the server |
+| `conflicts` | `number` | Merge conflicts encountered this session |
+| `clockSkewMs` | `number \| null` | `serverTime - localTime` in ms at the last handshake. Negative means this device's clock is fast. |
 
 `useSyncStatus` only re-renders when the status object changes, not on every sync event. This keeps the component efficient.
 
@@ -226,7 +244,7 @@ function PendingBadge() {
 import { useCollection } from '@korajs/react'
 
 function TodoManager() {
-  const todos = useCollection(app.todos)
+  const todos = useCollection('todos')
 
   async function handleAdd() {
     await todos.insert({ title: 'New task' })
@@ -246,20 +264,34 @@ function TodoManager() {
 
 ## useRichText
 
-`useRichText` binds a `t.richtext()` field to a rich text editor. It returns the Yjs document and a binding helper.
+`useRichText` binds a `t.richtext()` field to a rich text editor. Its first argument is the collection **name** (a string), followed by the record ID and field name. It returns the shared Yjs document plus undo/redo controls, readiness state, and collaborative cursor helpers.
 
 ```tsx
 import { useRichText } from '@korajs/react'
 
 function NoteEditor({ todoId }: { todoId: string }) {
-  const { doc, provider } = useRichText(app.todos, todoId, 'notes')
+  const { doc, text, ready } = useRichText('todos', todoId, 'notes')
 
-  // Pass `doc` to your editor (e.g., TipTap, Slate, ProseMirror)
-  // The `provider` handles syncing the Yjs document
+  // Pass `doc` to your editor (e.g., TipTap, Slate, ProseMirror).
+  // Kora keeps the document synced; there is no separate provider to wire up.
+  if (!ready) return <span>Loading...</span>
 
   return <YourEditor doc={doc} />
 }
 ```
+
+### Result Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `doc` | `Y.Doc` | The shared Yjs document to hand to your editor binding. |
+| `text` | `Y.Text` | The bound `Y.Text` for the field. |
+| `undo` / `redo` | `() => void` | Undo/redo scoped to this field's edits. |
+| `canUndo` / `canRedo` | `boolean` | Whether an undo/redo step is available. |
+| `ready` | `boolean` | `true` once the document has loaded from the store. |
+| `error` | `Error \| null` | Load or binding error, if any. |
+| `cursors` | `CursorInfo[]` | Remote collaborators' cursor positions. |
+| `setCursor` / `clearCursor` | `(anchor, head) => void` / `() => void` | Publish or clear this client's cursor. |
 
 ### With TipTap
 
@@ -270,7 +302,7 @@ import Collaboration from '@tiptap/extension-collaboration'
 import { useRichText } from '@korajs/react'
 
 function NoteEditor({ todoId }: { todoId: string }) {
-  const { doc } = useRichText(app.todos, todoId, 'notes')
+  const { doc } = useRichText('todos', todoId, 'notes')
 
   const editor = useEditor({
     extensions: [
@@ -312,7 +344,7 @@ function App() {
 function SyncIndicator() {
   const status = useSyncStatus()
 
-  if (status.state === 'offline') {
+  if (status.status === 'offline') {
     return <span>Offline - changes will sync later</span>
   }
   if (status.pendingOperations > 0) {
@@ -329,7 +361,7 @@ function AddTodo() {
     const form = e.currentTarget
     const title = new FormData(form).get('title') as string
     if (title.trim()) {
-      addTodo({ title: title.trim() })
+      addTodo.mutate({ title: title.trim() })
       form.reset()
     }
   }
@@ -357,11 +389,11 @@ function TodoList() {
             type="checkbox"
             checked={todo.completed}
             onChange={() =>
-              updateTodo(todo.id, { completed: !todo.completed })
+              updateTodo.mutate(todo.id, { completed: !todo.completed })
             }
           />
           <span>{todo.title}</span>
-          <button onClick={() => deleteTodo(todo.id)}>Delete</button>
+          <button onClick={() => deleteTodo.mutate(todo.id)}>Delete</button>
         </li>
       ))}
     </ul>
@@ -409,7 +441,7 @@ function ActiveUsers() {
     <div className="avatars">
       {collaborators.map((c) => (
         <span
-          key={c.clientId}
+          key={c.user.name}
           style={{ borderColor: c.user.color }}
           title={c.user.name}
         >
@@ -421,13 +453,11 @@ function ActiveUsers() {
 }
 ```
 
-Each collaborator includes:
+Each collaborator is an `AwarenessState` with two fields:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `clientId` | `number` | Unique identifier for the connection |
-| `user` | `AwarenessUser` | Name, color, avatar |
-| `cursor` | `CursorInfo \| undefined` | Cursor position (if set) |
-| `lastSeen` | `number` | Timestamp of last update |
+| `user` | `AwarenessUser` | Name, color, and optional avatar |
+| `cursor` | `AwarenessCursor \| undefined` | Cursor position, present only while the collaborator is editing a field |
 
 See the [Presence guide](/guide/presence) for a full walkthrough.

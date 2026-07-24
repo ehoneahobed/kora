@@ -88,6 +88,23 @@ export class WorkerTimeoutError extends KoraError {
 }
 
 /**
+ * Thrown when a follower tab cannot reach a live leader tab over the multi-tab
+ * broadcast channel (the leader tab was closed, crashed, or is unresponsive).
+ * Distinct from {@link WorkerTimeoutError}: this fails fast on a confirmed-absent
+ * leader instead of waiting out the full RPC timeout.
+ */
+export class NoLeaderError extends KoraError {
+	constructor(operation: string) {
+		super(
+			`No live leader tab is answering multi-tab storage RPC for operation "${operation}"`,
+			'NO_LEADER',
+			{ operation },
+		)
+		this.name = 'NoLeaderError'
+	}
+}
+
+/**
  * Thrown when IndexedDB persistence operations fail (serialize/deserialize).
  */
 export class PersistenceError extends KoraError {

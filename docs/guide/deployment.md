@@ -125,7 +125,7 @@ Open that URL in your browser. Your app is live.
 
 ### Step 5: Verify sync works
 
-Open the URL in two browser tabs (or on your phone). Add a todo in one tab — it should appear in the other tab within a second. That's real-time sync working.
+Open the URL in two browser tabs (or on your phone). Add a todo in one tab. It should appear in the other tab within a second. That's real-time sync working.
 
 ---
 
@@ -231,7 +231,7 @@ railway login
 kora deploy --platform=railway
 ```
 
-The flow is the same as Fly.io — Kora handles Dockerfile generation, bundling, and deployment.
+The flow is the same as Fly.io. Kora handles Dockerfile generation, bundling, and deployment.
 
 ---
 
@@ -410,9 +410,9 @@ After the service is created, subsequent deploys with `kora deploy` work automat
 ::: tip Using PostgreSQL with AWS
 For production AWS deployments, use a managed PostgreSQL service (Amazon RDS, Neon, Supabase) instead of SQLite. Set the `DATABASE_URL` environment variable before deploying:
 
-**Lightsail** — Kora automatically forwards `DATABASE_URL` from your shell to the container. See [Environment variables](#environment-variables) above. You can also update it later via the Lightsail console.
+**Lightsail**: Kora automatically forwards `DATABASE_URL` from your shell to the container. See [Environment variables](#environment-variables) above. You can also update it later via the Lightsail console.
 
-**ECS** — add `DATABASE_URL` to the task definition's environment variables or use AWS Secrets Manager.
+**ECS**: add `DATABASE_URL` to the task definition's environment variables or use AWS Secrets Manager.
 
 See [Storage backends](#storage-backends) below for server code examples.
 :::
@@ -435,7 +435,7 @@ Make sure your CI environment has AWS credentials configured (e.g., via `AWS_ACC
 
 ## Deploy a Tauri Desktop App's Sync Server
 
-Tauri desktop apps store data locally in native SQLite. To sync across multiple devices, you deploy the **sync server** — the desktop binary is distributed separately.
+Tauri desktop apps store data locally in native SQLite. To sync across multiple devices, you deploy the **sync server**; the desktop binary is distributed separately.
 
 ### How it differs from web deployment
 
@@ -457,7 +457,7 @@ pnpm deploy:server
 This is the same `kora deploy` command used for web apps. It works with all supported platforms (Fly.io, Railway, AWS).
 
 ::: tip
-The sync server for a Tauri app is identical to a web app's server — it's just a Node.js process with WebSocket support. Any deployment method in this guide works.
+The sync server for a Tauri app is identical to a web app's server: it's just a Node.js process with WebSocket support. Any deployment method in this guide works.
 :::
 
 ### Step 2: Build the desktop binary with the server URL
@@ -480,9 +480,9 @@ For the full Tauri workflow, see the [Tauri Desktop Guide](/guide/tauri-desktop)
 
 The following platforms appear in the `kora deploy` interactive prompt but are not yet implemented:
 
-- **Render** — Web service deployment with automatic HTTPS
-- **Docker (self-hosted)** — Generate a production Docker image for any hosting environment
-- **Kora Cloud** — Managed hosting optimized for Kora apps
+- **Render**: Web service deployment with automatic HTTPS
+- **Docker (self-hosted)**: Generate a production Docker image for any hosting environment
+- **Kora Cloud**: Managed hosting optimized for Kora apps
 
 Selecting these will show a "not implemented yet" message. For now, use Fly.io, Railway, or one of the AWS options. If you need to deploy to an unsupported platform, see [Manual Server Setup](#advanced-manual-server-setup) below.
 
@@ -492,12 +492,12 @@ Selecting these will show a "not implemented yet" message. For now, use Fly.io, 
 
 You don't need to know this to use it, but if you're curious:
 
-1. **Generates a Dockerfile** in `.kora/deploy/` — a recipe for building your app's container image
-2. **Bundles your server** — combines `server.ts` and its dependencies into a single `server-bundled.js` file using esbuild
-3. **Builds your client** — runs `vite build` to create optimized HTML, CSS, and JavaScript for the browser
-4. **Generates platform config** — creates `fly.toml` (Fly.io), `railway.json` (Railway), or configures AWS resources (ECS/Lightsail) with the right settings
-5. **Provisions the app** — creates the app on the platform if it doesn't exist yet
-6. **Deploys** — pushes the container image and starts your app
+1. **Generates a Dockerfile** in `.kora/deploy/`, a recipe for building your app's container image
+2. **Bundles your server**: combines `server.ts` and its dependencies into a single `server-bundled.js` file using esbuild
+3. **Builds your client**: runs `vite build` to create optimized HTML, CSS, and JavaScript for the browser
+4. **Generates platform config**: creates `fly.toml` (Fly.io), `railway.json` (Railway), or configures AWS resources (ECS/Lightsail) with the right settings
+5. **Provisions the app**: creates the app on the platform if it doesn't exist yet
+6. **Deploys**: pushes the container image and starts your app
 
 All generated files go into `.kora/deploy/`. Add this to your `.gitignore`:
 
@@ -569,7 +569,7 @@ const app = createApp({
 
 ### Storage backends
 
-**SQLite** (default — good for single-server deployments):
+**SQLite** (default, good for single-server deployments):
 
 ```typescript
 import { createSqliteServerStore } from '@korajs/server'
@@ -591,7 +591,7 @@ const store = await createPostgresServerStore({
 })
 ```
 
-**Memory** (development/testing only — data lost on restart):
+**Memory** (development/testing only, data lost on restart):
 
 ```typescript
 import { MemoryServerStore } from '@korajs/server'
@@ -626,10 +626,10 @@ CMD ["node", "--import", "tsx", "server.ts"]
 
 Before sharing your app publicly:
 
-- [ ] **Use HTTPS/WSS** — Fly.io, Railway, and AWS Lightsail/ECS provide this automatically. If self-hosting, put a reverse proxy (nginx, Caddy) in front of your server.
-- [ ] **Add authentication** — The default server accepts all connections. See [Sync Configuration](/guide/sync-configuration) for setting up token-based auth.
-- [ ] **Use PostgreSQL for production** — SQLite works great for development and small deployments, but PostgreSQL is better for production workloads.
-- [ ] **Add `.kora/deploy/` to `.gitignore`** — Generated deployment files shouldn't be committed.
+- [ ] **Use HTTPS/WSS**: Fly.io, Railway, and AWS Lightsail/ECS provide this automatically. If self-hosting, put a reverse proxy (nginx, Caddy) in front of your server.
+- [ ] **Add authentication**: The default server accepts all connections. See [Sync Configuration](/guide/sync-configuration) for setting up token-based auth.
+- [ ] **Use PostgreSQL for production**: SQLite works great for development and small deployments, but PostgreSQL is better for production workloads.
+- [ ] **Add `.kora/deploy/` to `.gitignore`**: Generated deployment files shouldn't be committed.
 
 ---
 
@@ -641,7 +641,7 @@ Install the Fly CLI and make sure it's in your PATH. See [Step 2](#step-2-instal
 
 ### "Could not find a server entry file"
 
-Kora looks for `server.ts`, `server.js`, `src/server.ts`, or `src/server.js` in your project root. If you used a sync template, this file already exists. If not, create one — see [Manual Server Setup](#advanced-manual-server-setup).
+Kora looks for `server.ts`, `server.js`, `src/server.ts`, or `src/server.js` in your project root. If you used a sync template, this file already exists. If not, create one. See [Manual Server Setup](#advanced-manual-server-setup).
 
 ### "Name has already been taken" on Fly.io
 
@@ -729,3 +729,7 @@ ECS Fargate requires proper networking. Make sure your security group allows inb
 ### Sync not working after deploy
 
 Make sure your client-side `sync.url` matches the deployed WebSocket URL. If you deployed to `my-app.fly.dev`, the sync URL is `wss://my-app.fly.dev/kora-sync`.
+
+## Related guides
+
+- [Production Server](/guide/production-server) covers the `createProductionServer` handle in depth: background-job data access via `server.kora`, size and rate limits, central blob storage, and scheduled blob garbage collection.

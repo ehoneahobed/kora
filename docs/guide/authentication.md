@@ -286,7 +286,7 @@ const app = createApp({
 })
 ```
 
-Do not pass both `auth` and `authClient` — `authClient` takes precedence when both are set.
+Do not pass both `auth` and `authClient`; `authClient` takes precedence when both are set.
 
 The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
 
@@ -394,7 +394,7 @@ await authClient.signIn({
 })
 ```
 
-The device identity provider stores a stable device ID and a non-extractable ECDSA P-256 key pair. The server receives `deviceId` and `devicePublicKey`, so token claims and device revocation apply to the actual offline device. Browsers and Tauri WebViews use IndexedDB for the key pair by default; React Native and other runtimes without IndexedDB should pass a platform-backed `keyStore`.
+The device identity provider stores a stable device ID and a non-extractable ECDSA P-256 key pair. The server receives `deviceId` and `devicePublicKey`, so token claims and device revocation apply to the actual offline device. Browsers and Tauri WebViews use IndexedDB for the key pair by default; React Native and other runtimes without IndexedDB should pass a platform-backed `deviceKeyStore`.
 
 ### Mixed Auth (Authenticated + Anonymous)
 
@@ -1059,19 +1059,19 @@ todos:*          -> all actions on todos
 ### React Organization Hooks
 
 ```tsx
-import { OrgContext, useOrg, useOrgMembers, usePermission } from '@korajs/auth/react'
+import { OrgProvider, useOrg, useOrgMembers, usePermission } from '@korajs/auth/react'
 import { OrgClient } from '@korajs/auth'
 
 const orgClient = new OrgClient({
   serverUrl: 'http://localhost:3001',
-  authClient,
+  getAccessToken: () => authClient.getAccessToken(),
 })
 
 function App() {
   return (
-    <OrgContext.Provider value={{ client: orgClient }}>
+    <OrgProvider client={orgClient}>
       <OrgSwitcher />
-    </OrgContext.Provider>
+    </OrgProvider>
   )
 }
 

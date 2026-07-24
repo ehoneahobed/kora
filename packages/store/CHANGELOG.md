@@ -1,5 +1,235 @@
 # @korajs/store
 
+## 1.0.0-beta.5
+
+### Minor Changes
+
+- Harden multi-tab SQLite WASM storage coordination.
+
+  - Fix a response mis-correlation bug in the SharedWorker host: it correlated the
+    inner worker's replies by `request.id`, which is `0` for every request from
+    every tab, so overlapping requests could resolve each other's responses. The
+    host now mints a unique inner id per request and correlates on it. The routing
+    core is extracted as `createSharedWorkerHost` and unit-tested for concurrency.
+  - Add leader liveness and a readiness handshake to the leader/follower fallback:
+    the leader relay answers `ping` with `pong`, followers expose `waitForLeader()`
+    so a follower opened during a leader's startup race retries the handshake instead
+    of firing into the void, and a stalled follower RPC now fails fast with
+    `NoLeaderError` when the leader is confirmed absent instead of waiting out the
+    full timeout.
+  - Add automatic failover: a follower queues a blocking lock request and, when the
+    previous leader releases the storage lock (its tab closed or crashed), is promoted
+    to leader and rebuilds its own worker (safe under the OPFS single-writer rule
+    because the lock is only granted once the old leader is gone).
+
+- Fix the SharedWorker storage path, which previously hung forever on `open` (so
+  `app.ready` never resolved).
+
+  Two real bugs plus a browser limitation, all found by reproducing in headless
+  Chromium:
+
+  - The host tried to spawn a nested dedicated `Worker` inside the SharedWorker, but
+    `Worker` is not defined in `SharedWorkerGlobalScope` in Chromium. The SQLite
+    logic is now extracted into a reusable core (`createSqliteWasmCore`) that the
+    SharedWorker host runs directly in its own scope, one core per `dbName`. The
+    dedicated worker uses the same core. This also removes the inner-id correlation
+    bookkeeping, since each request is answered by a Promise from the core.
+  - The client created `new SharedWorker(url, { name })` without `{ type: 'module' }`.
+    The host is an ES module, so a classic SharedWorker could not parse it and failed
+    silently. It is now created as a module worker.
+
+  Browser limitation surfaced by this work: OPFS `createSyncAccessHandle` is not
+  available in a SharedWorker in Chromium, so the SharedWorker path cannot persist to
+  OPFS there. It runs in memory and emits `store:opfs-unavailable`, and the
+  dedicated-worker leader/follower path remains the persistent multi-tab default.
+  Applications that need offline persistence should use the leader/follower path, not
+  the SharedWorker path, on Chromium.
+
+  The SharedWorker host entry must set `__KORA_SQLITE_WASM_URL` (via a `?url` import
+  of the sqlite wasm binary) the same way the dedicated worker entry does, so the
+  core can locate the hashed WASM asset in production builds.
+
+### Patch Changes
+
+- Fix a lost-update bug where three or more concurrent atomic writes (`op.increment`,
+  `op.max`, ...) to the same field failed to converge on clients.
+
+  The client apply pipeline composed a remote atomic op through the merge engine's
+  pairwise rule (`base + localDelta + remoteDelta`), which is correct only for exactly
+  two concurrent writes from a shared base. With a third concurrent writer, the current
+  row already folded in an earlier remote delta, and re-deriving the value from the base
+  plus the local device's own delta silently dropped that earlier delta. Three devices
+  each incrementing a shared counter by 5, 3, and 2 could settle at 7/5/5 across devices
+  instead of 10.
+
+  The client now materializes atomic-op fields by folding the record's operation log in
+  HLC order through the same atomic-aware replay the server uses (moved into
+  `@korajs/core` as `replayOperationsForRecord` so both sides share one definition).
+  The fold composes a same-type atomic chain and resolves anything else — including a
+  plain set breaking the chain — by last-write-wins, so every replica converges to the
+  same value regardless of how many concurrent atomic writers there were or which device
+  authored them, including a passive device that only observes the writes. Non-atomic
+  fields are unaffected.
+
+- Add a gap-free server-to-client delivery watermark, so no operation the server holds is
+  ever lost on its way to a client, even across drops, reconnects, restarts, and scoped
+  sync.
+
+  Previously the server drove server-to-client sync from the version vector. Under a lossy
+  transport this could strand an operation permanently: if a relayed operation was dropped
+  while a later operation from the same node was delivered, the client's version vector
+  advanced past the gap, and version-vector delta on the next connection never re-sent the
+  missing one. The paginated initial-sync resume cursor had the mirror problem: a retriable
+  apply failure let the cursor advance past the failed operation, skipping it on resume.
+
+  The server now assigns every stored operation a monotonic delivery sequence in commit
+  order and drives each client's stream from a durable, per-client delivery watermark. On
+  Postgres the sequence is assigned from a counter row locked inside the append
+  transaction, so delivery order equals visibility order and a `> watermark` scan can never
+  skip an operation that later becomes visible below the cursor, even across concurrent
+  server instances. Each server-to-client batch chains `base -> max` delivery sequences;
+  the client applies a batch only when its watermark equals the base and advances the
+  watermark only when every operation applied, so a dropped or failed batch stalls the
+  watermark and is recovered contiguously rather than skipped. The watermark advances live
+  during streaming and is persisted on the client, so a reconnect resends only what was
+  genuinely missed. Because a causal dependency is always committed (and thus sequenced)
+  before its dependent, delivery order respects causal order and needs no reordering.
+
+  The watermark also advances live during streaming (a client's watermark tracks the
+  server frontier while connected, so a reconnect resends only the true delta), a client's
+  own operations are not echoed back to it during streaming (they are still included in a
+  full resync so a client that lost its local store recovers its own history), and a client
+  whose persisted watermark is ahead of the server's frontier (the server restored an older
+  backup) resets to a full resync instead of stalling above a frontier that no longer
+  exists.
+
+  All wire fields are optional and additive: an old client omits its watermark and gets the
+  version-vector delta unchanged, and a new client against an old server keeps its version
+  vector, so both still converge. The version vector remains authoritative for the
+  client-to-server direction and for local deduplication. On Postgres the schema setup and
+  delivery-sequence backfill run under an advisory-locked transaction, so simultaneous
+  cold start of multiple server replicas against a fresh database is safe.
+
+  Correctness characteristics worth knowing when adopting:
+
+  - The delivery watermark is tracked per view (a stable signature of the active scope plus
+    query subscriptions), so changing the scope or registering a new query subscription
+    back-fills that view at most once and returning to a previously-synced view resumes from
+    its own watermark instead of re-scanning it. A widened scope can expose operations below
+    the current watermark, so the first visit to a view scans from zero; any back-fill is
+    deduplicated, so operations already applied under another view are re-received but not
+    re-applied.
+  - Per-view watermarks are retained under a bounded, least-recently-used cap (default and
+    live views are never evicted), so a client that churns through many distinct views (for
+    example a search that registers a fresh subscription per keystroke) cannot accumulate an
+    unbounded number of persisted watermark rows. Eviction is a storage tradeoff only, never
+    a correctness one: an evicted cold view simply back-fills from zero (deduplicated) the
+    next time it is visited.
+  - An inbound operation that cannot be applied (for example a scope that includes a child
+    record but excludes its parent) surfaces as a visible, recoverable sync stall rather
+    than being silently skipped: the watermark holds and the operation is re-fetched until
+    it applies. This upholds the no-silent-loss guarantee.
+  - A dropped or unacknowledged streaming batch is recovered by re-sending from the client's
+    last acknowledged position, so recovery does not depend on a bounded retransmit buffer.
+  - Backup export preserves delivery (commit) order, so restoring a backup keeps causal
+    order and a resumed client never receives a dependent before its dependency.
+
+- Storage persistence failures are no longer silent. When OPFS is unavailable the
+  store falls back to a non-persistent in-memory database so the app keeps working,
+  but anything written that session is lost on reload — previously with no signal.
+  The SQLite WASM worker now classifies why OPFS could not be used (`lock-conflict`,
+  `timeout`, or `unsupported`) and the store emits a `store:opfs-unavailable` event,
+  so the condition is observable instead of a quiet data-loss trap. The most common
+  cause, `lock-conflict`, is two runtimes on one origin contending for the same
+  database.
+
+  A `store:db-name-collision` event now fires when a runtime attaches to a database
+  name another runtime on the same origin already owns. That is expected for
+  multiple tabs of the same app (they share one leader), and the exact clue a
+  developer needs when two logically separate apps accidentally share the default
+  store name and should each use a distinct one. Both events surface in DevTools and
+  via `app.events`. See the new "Multi-runtime storage and isolation" guide.
+
+- Fix atomic operations that arrive before their insert (reordered delivery) being
+  folded by last-write-wins, which dropped concurrent deltas.
+
+  When an update lands before the record's insert, it is logged but not materialized;
+  the insert later folds those orphaned operations into the row. That fold used plain
+  per-field last-write-wins, so two concurrent `op.increment`s that both arrived before
+  the insert would keep only one writer's resolved value instead of composing (for
+  example settling at 3 or 5 instead of 8).
+
+  The fold now re-materializes atomic-op fields by replaying `[insert, ...orphans]` in
+  HLC order through the shared atomic-aware replay (the same fold the server and the
+  live apply path use), so reordered atomic deltas compose correctly. Non-atomic fields
+  keep their last-write-wins result, and per-field versions are unchanged, so future
+  merges stay correct.
+
+- Fix non-deterministic merges of plain-string richtext values, which could diverge
+  replicas.
+
+  When a richtext field is set to a plain string (a full replacement rather than a
+  collaborative Yjs edit), the merge engine converted it to a Yjs update with a random
+  clientId at merge time. Two replicas merging the same values could therefore produce
+  different bytes, a non-deterministic merge that never converges.
+
+  A plain-string richtext value is now resolved by last-write-wins (deterministic),
+  since a string replacement is not a collaborative edit. The CRDT merge is used only
+  when both sides are Yjs byte updates, which carry stable, baked-in clientIds. The
+  store also encodes a plain string to richtext bytes with a fixed clientId, so the same
+  string materializes to identical bytes on every device.
+
+- Surface SharedWorker inner-worker failures instead of hanging. When the inner
+  SQLite worker spawned by the SharedWorker host fails to load or throws at the top
+  level (for example the module script or the SQLite WASM binary cannot be fetched
+  in the nested worker context), the host now relays a `SHARED_WORKER_ERROR` (or
+  `SHARED_WORKER_SPAWN_FAILED` for a synchronous spawn failure) to every waiting
+  client and drops the pool so the next request respawns. Previously such a failure
+  left `open` (and therefore `app.ready`) hanging until the RPC timeout, with no
+  observable error.
+- SQL identifiers are now quoted everywhere they are generated, so a collection or
+  field name that is valid JavaScript always produces valid SQL. camelCase
+  (`formResponses`), PascalCase (`UserProfiles`), and names that happen to be SQL
+  reserved words (`order`, `select`) now work end to end across the client store,
+  both server stores, migrations, and CLI-generated migration files. Previously a
+  camelCase collection was rejected at `defineSchema` and a reserved-word name
+  produced a runtime SQL syntax error.
+
+  A new `quoteIdent` helper is exported from `@korajs/core`. Schema validation
+  still fails fast for genuinely malformed names (empty, or containing characters
+  that are not letters, numbers, or underscores). Existing all-lowercase schemas
+  are unaffected: quoting a lowercase identifier is a no-op in both SQLite and
+  Postgres.
+
+- Fix two convergence bugs around deleted records that could leave replicas
+  permanently disagreeing on whether a record exists.
+
+  A remote update landing on a tombstone was only handled when the tombstone came
+  from a LOCAL delete (resolved via the pairwise merge engine). A device that merely
+  observed a delete and then a newer update relayed from other devices kept the record
+  hidden (`_deleted` stayed set) while the authoring devices and the server showed it
+  alive — a permanent, arrival-order-dependent divergence. The same path also
+  materialized a resurrecting op's raw value instead of the composed atomic chain, so
+  increments before and after a delete were mis-counted on resurrection.
+
+  The client now resolves any remote update on a tombstone by folding the record's
+  whole operation log in HLC order — the same fold the server uses — so every device
+  agrees on whether the update resurrects the record and on its field values, and
+  atomic deltas on both sides of a delete compose correctly.
+
+  A stale update that loses to a newer delete is now appended to the log via a new
+  log-only apply (so a later fold — e.g. an atomic resurrection composing its delta —
+  is complete) while leaving the tombstone untouched: no zombie fields, no version
+  regression. Previously such an op was dropped, which could lose an atomic delta
+  needed by a subsequent resurrection.
+
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies
+  - @korajs/core@1.0.0-beta.5
+
 ## 1.0.0-beta.0
 
 ### Minor Changes
