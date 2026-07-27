@@ -178,6 +178,32 @@ export async function loadDumpFromIndexedDB<T>(dbName: string): Promise<T | null
 }
 
 /**
+ * Delete only the binary SQLite database snapshot from IndexedDB.
+ *
+ * The logical dump is stored under a separate key and may be the authoritative
+ * durable fallback when a browser worker cannot export a binary SQLite image.
+ */
+export async function deleteSnapshotFromIndexedDB(dbName: string): Promise<void> {
+	const idb = await openIdb()
+	try {
+		await new Promise<void>((resolve, reject) => {
+			const tx = idb.transaction(IDB_STORE_NAME, 'readwrite')
+			const store = tx.objectStore(IDB_STORE_NAME)
+			store.delete(dbName)
+			tx.oncomplete = () => resolve()
+			tx.onerror = () =>
+				reject(
+					new PersistenceError(`Failed to delete database snapshot "${dbName}" from IndexedDB`, {
+						dbName,
+					}),
+				)
+		})
+	} finally {
+		idb.close()
+	}
+}
+
+/**
  * Delete a serialized SQLite database from IndexedDB.
  *
  * @param dbName - Key to delete

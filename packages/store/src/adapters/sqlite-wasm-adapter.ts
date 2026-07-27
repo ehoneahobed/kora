@@ -380,7 +380,10 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.guardOpen()
 		const response = await this.sendRequest({ id: 0, type: 'export' })
 		if (response.type === 'error') {
-			throw new AdapterError(`Export failed: ${response.message}`)
+			throw new AdapterError(`Export failed: ${response.message}`, {
+				code: response.code,
+				context: response.context,
+			})
 		}
 		return response.data as Uint8Array
 	}

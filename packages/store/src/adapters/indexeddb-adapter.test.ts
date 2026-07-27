@@ -6,7 +6,11 @@ import { PersistenceError, StoreNotOpenError } from '../errors'
 import { IndexedDbAdapter } from './indexeddb-adapter'
 import { MockWorkerBridge } from './sqlite-wasm-mock-bridge'
 import * as persistence from './sqlite-wasm-persistence'
-import { deleteFromIndexedDB, loadFromIndexedDB } from './sqlite-wasm-persistence'
+import {
+	deleteFromIndexedDB,
+	loadDumpFromIndexedDB,
+	loadFromIndexedDB,
+} from './sqlite-wasm-persistence'
 
 describe('IndexedDbAdapter', () => {
 	const DB_NAME = 'test-idb-adapter'
@@ -99,6 +103,48 @@ describe('IndexedDbAdapter', () => {
 		await reopened.close()
 	})
 
+	test('persists and restores from logical dump when browser worker export is unavailable', async () => {
+		const exportlessDb = 'test-idb-exportless'
+		await deleteFromIndexedDB(exportlessDb).catch(() => {})
+
+		const emitter = new SimpleEventEmitter()
+		const persistenceErrors: unknown[] = []
+		emitter.on('store:persistence-error', (event) => persistenceErrors.push(event))
+
+		const first = new IndexedDbAdapter({
+			bridge: new NoExportWorkerBridge(),
+			dbName: exportlessDb,
+			emitter,
+		})
+		await first.open(minimalSchema)
+		await first.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-exportless', 'Exportless Restore', 0, 1000, 1000],
+		)
+		await first.close()
+
+		expect(persistenceErrors).toHaveLength(0)
+		await expect(loadFromIndexedDB(exportlessDb)).resolves.toBeNull()
+		await expect(loadDumpFromIndexedDB(exportlessDb)).resolves.toMatchObject({
+			tables: expect.any(Array),
+		})
+
+		const reopened = new IndexedDbAdapter({
+			bridge: new MockWorkerBridge(),
+			dbName: exportlessDb,
+		})
+		await reopened.open(minimalSchema)
+
+		const rows = await reopened.query<{ id: string; title: string }>(
+			'SELECT id, title FROM todos WHERE id = ?',
+			['rec-exportless'],
+		)
+		expect(rows[0]?.title).toBe('Exportless Restore')
+
+		await reopened.close()
+		await deleteFromIndexedDB(exportlessDb).catch(() => {})
+	})
+
 	test('coalesces rapid executes into one debounced persist', async () => {
 		const saveSpy = vi.spyOn(persistence, 'saveToIndexedDB')
 
@@ -178,6 +224,23 @@ class NoImportWorkerBridge extends MockWorkerBridge {
 				type: 'error',
 				message: 'Import intentionally unsupported in this bridge',
 				code: 'IMPORT_NOT_SUPPORTED',
+			}
+		}
+
+		return await super.send(request)
+	}
+}
+
+class NoExportWorkerBridge extends MockWorkerBridge {
+	override async send(
+		request: import('./sqlite-wasm-channel').WorkerRequest,
+	): Promise<import('./sqlite-wasm-channel').WorkerResponse> {
+		if (request.type === 'export') {
+			return {
+				id: request.id,
+				type: 'error',
+				message: 'Export not yet supported in browser worker',
+				code: 'EXPORT_NOT_SUPPORTED',
 			}
 		}
 

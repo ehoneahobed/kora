@@ -1,11 +1,12 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
-import { PersistenceError } from '../errors'
+import { AdapterError, PersistenceError } from '../errors'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
 import {
+	deleteSnapshotFromIndexedDB,
 	isIndexedDbQuotaError,
 	loadDumpFromIndexedDB,
 	loadFromIndexedDB,
@@ -97,7 +98,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
 
 		const persisted = await loadFromIndexedDB(this.dbName)
-		if (!persisted) return
+		if (!persisted) {
+			await this.restoreFromDumpFallback()
+			return
+		}
 
 		try {
 			await this.inner.importDatabase(persisted)
@@ -144,10 +148,18 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	private async writeSnapshot(): Promise<void> {
-		const data = await this.inner.exportDatabase()
-		await saveToIndexedDB(this.dbName, data)
 		const dump = await this.exportDump()
 		await saveDumpToIndexedDB(this.dbName, dump)
+
+		try {
+			const data = await this.inner.exportDatabase()
+			await saveToIndexedDB(this.dbName, data)
+		} catch (error) {
+			if (!isUnsupportedWorkerExport(error)) {
+				throw error
+			}
+			await deleteSnapshotFromIndexedDB(this.dbName)
+		}
 	}
 
 	private handlePersistenceError(error: unknown): void {
@@ -236,4 +248,8 @@ function ensureSafeIdentifier(identifier: string): string {
 		})
 	}
 	return identifier
+}
+
+function isUnsupportedWorkerExport(error: unknown): boolean {
+	return error instanceof AdapterError && error.context?.code === 'EXPORT_NOT_SUPPORTED'
 }
