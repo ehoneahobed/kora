@@ -16,4 +16,5 @@ Harden the framework paths surfaced by production-style E2E usage.
 - Serialize `json`, `object`, and `blob` fields during server materialization, and fail loudly instead of acknowledging an operation whose persistence failed.
 - Serialize sync start/stop transitions and retry pending outbound operations when an auth/session transition leaves the connection idle.
 - Improve JSON schema validation errors by reporting the exact invalid nested path, including `undefined`, non-finite numbers, and circular objects.
+- Fix IndexedDB fallback persistence so logical dumps are durable when binary SQLite export is unavailable, stale binary snapshots cannot shadow newer dumps, and dump-only databases restore correctly.
 - Allow production server COEP policy configuration and document route access to the owned Kora data plane.
