@@ -1,6 +1,6 @@
 {
 	"name": "@korajs/store",
-	"version": "1.0.0-beta.6",
+	"version": "1.0.0-beta.7",
 	"description": "Local storage engine for Kora.js with SQLite WASM, IndexedDB, and reactive queries",
 	"type": "module",
 	"main": "./dist/index.cjs",
