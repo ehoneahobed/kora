@@ -1,5 +1,19 @@
 # kora
 
+## 1.0.0-beta.9
+
+### Patch Changes
+
+- Updated dependencies [b657130]
+  - @korajs/core@1.0.0-beta.9
+  - @korajs/react@1.0.0-beta.9
+  - @korajs/store@1.0.0-beta.9
+  - @korajs/sync@1.0.0-beta.9
+  - @korajs/devtools@1.0.0-beta.9
+  - @korajs/merge@1.0.0-beta.9
+  - @korajs/svelte@1.0.0-beta.9
+  - @korajs/vue@1.0.0-beta.9
+
 ## 1.0.0-beta.6
 
 ### Patch Changes
