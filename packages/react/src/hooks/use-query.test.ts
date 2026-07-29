@@ -27,14 +27,18 @@ interface MockQueryBuilderResult {
 function createMockQueryBuilder(
 	initialResults: CollectionRecord[] = [],
 	descriptor: Record<string, unknown> = { collection: 'todos', where: {}, orderBy: [] },
+	options: { emitInitial?: boolean } = {},
 ): MockQueryBuilderResult {
 	let capturedCallback: SubscriptionCallback<CollectionRecord> | null = null
 	const unsubscribeSpy = vi.fn()
+	const emitInitial = options.emitInitial ?? true
 
 	const queryBuilder = {
 		subscribe: vi.fn((callback: SubscriptionCallback<CollectionRecord>) => {
 			capturedCallback = callback
-			callback(initialResults)
+			if (emitInitial) {
+				callback(initialResults)
+			}
 			return unsubscribeSpy
 		}),
 		getDescriptor: vi.fn().mockReturnValue(descriptor),
@@ -160,6 +164,67 @@ describe('useQuery', () => {
 
 		await waitFor(() => {
 			expect(screen.getByTestId('results').textContent).toBe('["2","3"]')
+		})
+	})
+
+	it('keeps the previous snapshot while a replacement query subscribes', async () => {
+		const mock1 = createMockQueryBuilder([createRecord('1')], {
+			collection: 'todos',
+			where: { projectId: 'one' },
+			orderBy: [],
+		})
+		const mock2 = createMockQueryBuilder(
+			[],
+			{
+				collection: 'todos',
+				where: { projectId: 'two' },
+				orderBy: [],
+			},
+			{ emitInitial: false },
+		)
+
+		function DynamicQuery(): ReturnType<typeof createElement> {
+			const [project, setProject] = useState<'one' | 'two'>('one')
+			const query = project === 'one' ? mock1.queryBuilder : mock2.queryBuilder
+			const results = useQuery(query)
+			return createElement(
+				'div',
+				null,
+				createElement(
+					'div',
+					{ 'data-testid': 'results' },
+					JSON.stringify(results.map((r) => r.id)),
+				),
+				createElement(
+					'button',
+					{
+						type: 'button',
+						'data-testid': 'toggle',
+						onClick: () => setProject('two'),
+					},
+					'Toggle',
+				),
+			)
+		}
+
+		renderWithProvider(createElement(DynamicQuery))
+		expect(screen.getByTestId('results').textContent).toBe('["1"]')
+
+		act(() => {
+			screen.getByTestId('toggle').click()
+		})
+
+		await waitFor(() => {
+			expect(mock2.queryBuilder.subscribe).toHaveBeenCalled()
+		})
+		expect(screen.getByTestId('results').textContent).toBe('["1"]')
+
+		act(() => {
+			mock2.triggerCallback([])
+		})
+
+		await waitFor(() => {
+			expect(screen.getByTestId('results').textContent).toBe('[]')
 		})
 	})
 

@@ -1,6 +1,6 @@
 import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 import { assertQueryReady } from '@korajs/store'
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 import type { UseQueryOptions } from '../types'
 
@@ -22,6 +22,7 @@ export function useQuery<T = CollectionRecord>(
 	const descriptorKey = JSON.stringify(query.getDescriptor())
 	const queryRef = useRef(query)
 	queryRef.current = query
+	const lastSnapshotRef = useRef<readonly T[]>(EMPTY_ARRAY as readonly T[])
 
 	const [queryStore, setQueryStore] = useState<import('@korajs/store').QueryStore<T> | null>(null)
 
@@ -39,14 +40,24 @@ export function useQuery<T = CollectionRecord>(
 
 		return () => {
 			queryStoreCache.release(currentQuery as QueryBuilder<unknown>)
-			setQueryStore(null)
 		}
 	}, [descriptorKey, enabled, queryStoreCache])
 
-	const disabledGetSnapshot = (): readonly T[] => EMPTY_ARRAY as readonly T[]
+	const getSnapshot = useCallback((): readonly T[] => {
+		if (!enabled) {
+			lastSnapshotRef.current = EMPTY_ARRAY as readonly T[]
+			return lastSnapshotRef.current
+		}
+		if (!queryStore) {
+			return lastSnapshotRef.current
+		}
+		if (!queryStore.hasSnapshot()) {
+			return lastSnapshotRef.current
+		}
+		const snapshot = queryStore.getSnapshot()
+		lastSnapshotRef.current = snapshot
+		return snapshot
+	}, [enabled, queryStore])
 
-	return useSyncExternalStore(
-		queryStore ? queryStore.subscribe : noopSubscribe,
-		queryStore ? queryStore.getSnapshot : disabledGetSnapshot,
-	)
+	return useSyncExternalStore(queryStore ? queryStore.subscribe : noopSubscribe, getSnapshot)
 }

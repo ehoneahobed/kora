@@ -21,6 +21,13 @@ export interface ProductionServerConfig {
 	/** Additional KoraSyncServer options */
 	syncOptions?: Omit<KoraSyncServerConfig, 'store' | 'port' | 'host' | 'path'>
 	/**
+	 * Cross-Origin-Embedder-Policy for static and route responses. Defaults to
+	 * `credentialless`, which keeps third-party embeds usable while allowing
+	 * capable browsers to enable cross-origin isolation. Use `require-corp` only
+	 * when every embedded resource explicitly opts in with CORP/CORS headers.
+	 */
+	crossOriginEmbedderPolicy?: 'credentialless' | 'require-corp' | 'unsafe-none'
+	/**
 	 * Optional HTTP route handlers mounted before static file serving.
 	 *
 	 * This is intentionally framework-agnostic so packages such as
@@ -143,6 +150,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const port = config.port ?? (Number(process.env.PORT) || 3001)
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
+	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
 		store: config.store,
@@ -370,7 +378,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			): Promise<void> {
 				// COOP/COEP headers required for SharedArrayBuffer (OPFS persistence)
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				res.setHeader('Cross-Origin-Embedder-Policy', crossOriginEmbedderPolicy)
 
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
 

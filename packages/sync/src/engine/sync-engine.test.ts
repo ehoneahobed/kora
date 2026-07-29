@@ -11,6 +11,12 @@ import type {
 } from '../protocol/messages'
 import { JsonMessageSerializer } from '../protocol/serializer'
 import { type MemoryTransport, createMemoryTransportPair } from '../transport/memory-transport'
+import type {
+	SyncTransport,
+	TransportCloseHandler,
+	TransportErrorHandler,
+	TransportMessageHandler,
+} from '../transport/transport'
 import { SyncEngine } from './sync-engine'
 import type { SyncStore } from './sync-store'
 
@@ -41,6 +47,41 @@ function createMockStore(overrides?: Partial<SyncStore>): SyncStore {
 		getOperationRange: vi.fn(async () => []),
 		...overrides,
 	}
+}
+
+function createDeferredTransport() {
+	let resolveConnect: (() => void) | null = null
+	let connected = false
+	const sent: unknown[] = []
+	const transport: SyncTransport & {
+		connectCount: number
+		sent: unknown[]
+		resolveConnect(): void
+	} = {
+		connectCount: 0,
+		sent,
+		connect: vi.fn(async () => {
+			transport.connectCount++
+			await new Promise<void>((resolve) => {
+				resolveConnect = resolve
+			})
+			connected = true
+		}),
+		disconnect: vi.fn(async () => {
+			connected = false
+		}),
+		send: vi.fn((message) => {
+			sent.push(message)
+		}),
+		onMessage: vi.fn((_handler: TransportMessageHandler) => {}),
+		onClose: vi.fn((_handler: TransportCloseHandler) => {}),
+		onError: vi.fn((_handler: TransportErrorHandler) => {}),
+		isConnected: vi.fn(() => connected),
+		resolveConnect: () => {
+			resolveConnect?.()
+		},
+	}
+	return transport
 }
 
 function createMockEmitter(): KoraEventEmitter & { events: KoraEvent[] } {
@@ -85,6 +126,7 @@ function setupServerResponder(
 		serverVector?: Record<string, number>
 		serverDelta?: Operation[]
 		serverTime?: number
+		acknowledgeOperations?: boolean
 	},
 ): void {
 	const accept = options?.accept ?? true
@@ -131,6 +173,7 @@ function setupServerResponder(
 				server.send(batch)
 			}
 		} else if (msg.type === 'operation-batch') {
+			if (options?.acknowledgeOperations === false) return
 			// Acknowledge operation batches
 			const batch = msg as OperationBatchMessage
 			const ack: AcknowledgmentMessage = {
@@ -143,6 +186,47 @@ function setupServerResponder(
 		}
 	})
 }
+
+describe('SyncEngine lifecycle serialization', () => {
+	test('coalesces overlapping start calls during connection setup', async () => {
+		const transport = createDeferredTransport()
+		const engine = new SyncEngine({
+			transport,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		const firstStart = engine.start()
+		await vi.waitFor(() => expect(transport.connectCount).toBe(1))
+
+		const secondStart = engine.start()
+		transport.resolveConnect()
+
+		await expect(Promise.all([firstStart, secondStart])).resolves.toEqual([undefined, undefined])
+		expect(transport.connectCount).toBe(1)
+		expect(transport.sent).toHaveLength(1)
+	})
+
+	test('cancels a start cleanly when stop runs before connect resolves', async () => {
+		const transport = createDeferredTransport()
+		const engine = new SyncEngine({
+			transport,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		const start = engine.start()
+		await vi.waitFor(() => expect(transport.connectCount).toBe(1))
+
+		const stop = engine.stop()
+		transport.resolveConnect()
+
+		await expect(Promise.all([start, stop])).resolves.toEqual([undefined, undefined])
+		expect(transport.disconnect).toHaveBeenCalled()
+		expect(transport.sent).toHaveLength(0)
+		expect(engine.getStatus().status).toBe('offline')
+	})
+})
 
 describe('SyncEngine clock integrity', () => {
 	test('measures skew from serverTime and syncs normally within tolerance', async () => {
@@ -592,7 +676,7 @@ describe('SyncEngine state transitions', () => {
 		expect(engine.getOutboundQueue().totalPending).toBe(0)
 	})
 
-	test('throws when starting from non-disconnected state', async () => {
+	test('start is idempotent once already connected', async () => {
 		const { client, server } = createMemoryTransportPair()
 		setupServerResponder(server)
 
@@ -605,7 +689,8 @@ describe('SyncEngine state transitions', () => {
 		await engine.start()
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
-		await expect(engine.start()).rejects.toThrow(SyncError)
+		await expect(engine.start()).resolves.toBeUndefined()
+		expect(engine.getState()).toBe('streaming')
 	})
 
 	test('stop brings engine to disconnected', async () => {
@@ -1101,6 +1186,31 @@ describe('SyncEngine events', () => {
 
 		const disconnected = emitter.events.find((e) => e.type === 'sync:disconnected')
 		expect(disconnected).toBeDefined()
+	})
+
+	test('returns a stalled outbound batch to the queue and disconnects for reconnect', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server, { acknowledgeOperations: false })
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', outboundAckTimeoutMs: 20 },
+			emitter,
+		})
+
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+		await engine.pushOperation(makeOp('stalled', 1, 'test-node'))
+		expect(engine.exportDiagnostics().hasInFlightBatch).toBe(true)
+
+		await vi.waitFor(() => {
+			const diagnostics = engine.exportDiagnostics()
+			expect(diagnostics.state).toBe('disconnected')
+			expect(diagnostics.hasInFlightBatch).toBe(false)
+			expect(diagnostics.pendingOperations).toBe(1)
+		})
+		expect(emitter.events.some((event) => event.type === 'sync:disconnected')).toBe(true)
 	})
 
 	test('emits sync:sent when operations are sent', async () => {

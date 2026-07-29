@@ -256,10 +256,17 @@ function validateFieldValue(
 			// Dynamic-key JSON: accept any JSON-serializable value (object, array,
 			// scalar, or null). Reject only values that cannot round-trip through
 			// JSON, since the store persists them via JSON.stringify.
-			if (!isJsonSerializable(value)) {
+			const nonJson = findNonJsonSerializable(value, fieldName)
+			if (nonJson) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be JSON-serializable, got ${describeType(value)}`,
-					{ collection, field: fieldName, expectedType: 'json', receivedType: describeType(value) },
+					`Field "${fieldName}" in collection "${collection}" must be JSON-serializable; found ${nonJson.receivedType} at "${nonJson.path}"`,
+					{
+						collection,
+						field: fieldName,
+						expectedType: 'json',
+						receivedType: nonJson.receivedType,
+						path: nonJson.path,
+					},
 				)
 			}
 			break
@@ -307,22 +314,51 @@ function isPlainObject(value: unknown): boolean {
 	return proto === null || proto === Object.prototype
 }
 
-/** True when the value can round-trip through JSON (no functions/symbols/undefined). */
-function isJsonSerializable(value: unknown): boolean {
+interface NonJsonSerializableValue {
+	path: string
+	receivedType: string
+}
+
+/** Find the first value that cannot safely round-trip through JSON. */
+function findNonJsonSerializable(
+	value: unknown,
+	path: string,
+	seen = new WeakSet<object>(),
+): NonJsonSerializableValue | null {
 	if (value === null) {
-		return true
+		return null
 	}
 	const type = typeof value
 	if (type === 'string' || type === 'number' || type === 'boolean') {
-		return Number.isFinite(value as number) || type !== 'number'
+		if (type === 'number' && !Number.isFinite(value as number)) {
+			return { path, receivedType: describeType(value) }
+		}
+		return null
+	}
+	if (type === 'undefined' || type === 'function' || type === 'symbol' || type === 'bigint') {
+		return { path, receivedType: describeType(value) }
 	}
 	if (Array.isArray(value)) {
-		return value.every(isJsonSerializable)
+		for (let index = 0; index < value.length; index++) {
+			const invalid = findNonJsonSerializable(value[index], `${path}[${index}]`, seen)
+			if (invalid) return invalid
+		}
+		return null
 	}
 	if (type === 'object') {
-		return Object.values(value as Record<string, unknown>).every(isJsonSerializable)
+		const objectValue = value as Record<string, unknown>
+		if (seen.has(objectValue)) {
+			return { path, receivedType: 'circular object' }
+		}
+		seen.add(objectValue)
+		for (const [key, nestedValue] of Object.entries(objectValue)) {
+			const invalid = findNonJsonSerializable(nestedValue, `${path}.${key}`, seen)
+			if (invalid) return invalid
+		}
+		seen.delete(objectValue)
+		return null
 	}
-	return false
+	return { path, receivedType: describeType(value) }
 }
 
 /** A readable type label for error messages (distinguishes array/null from object). */

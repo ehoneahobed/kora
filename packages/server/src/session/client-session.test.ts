@@ -525,6 +525,41 @@ describe('ClientSession', () => {
 			expect(store.getAllOperations()[0]?.id).toBe('op-new')
 		})
 
+		test('logs and closes loudly when operation persistence fails', async () => {
+			const store = new MemoryServerStore('server-1')
+			vi.spyOn(store, 'applyRemoteOperation').mockRejectedValue(new Error('bind failed'))
+			const logger = { log: vi.fn() }
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+
+			const session = new ClientSession({
+				sessionId: 'sess-1',
+				transport: server,
+				store,
+				logger,
+			})
+			session.start()
+
+			sendHandshake(client)
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			sendOpBatch(client, [createTestOp({ id: 'op-fails' })])
+
+			await vi.waitFor(() => {
+				expect(logger.log).toHaveBeenCalledWith(
+					expect.objectContaining({
+						level: 'error',
+						event: 'session.message_failed',
+						sessionId: 'sess-1',
+						nodeId: 'client-1',
+						error: 'bind failed',
+					}),
+				)
+			})
+			expect(messages.some((message) => message.type === 'error')).toBe(true)
+			expect(session.getState()).toBe('closed')
+		})
+
 		test('sends acknowledgment with correct sequence number', async () => {
 			const store = new MemoryServerStore('server-1')
 			const { client, server } = createServerTransportPair()

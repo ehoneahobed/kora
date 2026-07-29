@@ -520,6 +520,7 @@ export class KoraSyncServer {
 			auth: this.auth ?? undefined,
 			serializer: this.serializer,
 			emitter: sessionEmitter,
+			logger: this.logger,
 			batchSize: this.batchSize,
 			schemaVersion: this.schemaVersion,
 			supportedSchemaVersions: this.supportedSchemaVersions,

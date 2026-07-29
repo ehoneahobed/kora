@@ -109,7 +109,7 @@ Creates one HTTP server for static frontend assets, WebSocket sync, health check
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 import schema from './src/schema'
 
-const store = createSqliteServerStore({ filename: './kora-server.db' })
+const store = createSqliteServerStore({ filename: './.kora/kora-server.db' })
 await store.setSchema(schema)
 
 const server = createProductionServer({
@@ -117,6 +117,7 @@ const server = createProductionServer({
   port: Number(process.env.PORT) || 3001,
   staticDir: './dist',
   syncPath: '/kora-sync',
+  crossOriginEmbedderPolicy: 'credentialless',
   httpRoutes: [
     // Example: mount @korajs/auth with createKoraAuthServer()
     // { path: '/auth', handle: auth.handleRequest },
@@ -140,12 +141,15 @@ await server.start()
 | `staticDir` | `string` | No | `'./dist'` |
 | `syncPath` | `string` | No | `'/kora-sync'` |
 | `syncOptions` | `Omit<KoraSyncServerConfig, 'store' \| 'port' \| 'host' \| 'path'>` | No | -- |
+| `crossOriginEmbedderPolicy` | `'credentialless' \| 'require-corp' \| 'unsafe-none'` | No | `'credentialless'` |
 | `httpRoutes` | `ProductionHttpRoute[]` | No | -- |
 | `operationalAuth` | `ProductionOperationalAuth` | No | Public endpoints |
 
 `/health` is always public for hosting platform health checks. Operational endpoints under `/__kora/*` are protected when the matching token is configured. Send tokens with `Authorization: Bearer <token>`.
 
 `httpRoutes` are mounted before static file serving and are useful for auth routes, webhooks, and small app APIs without adding a separate HTTP framework.
+
+`crossOriginEmbedderPolicy` controls the COEP response header for route and static responses. The default `credentialless` keeps common third-party embeds working while still allowing capable browsers to use cross-origin isolation; choose `require-corp` only when every embedded resource opts in with CORP/CORS headers.
 
 | Token | Protects |
 |-------|----------|

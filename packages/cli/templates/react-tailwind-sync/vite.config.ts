@@ -7,23 +7,26 @@ import { defineConfig } from 'vite'
 
 /**
  * Adds Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers
- * required for SharedArrayBuffer. Without these headers, OPFS SAH Pool VFS
- * cannot be used and SQLite WASM falls back to in-memory storage (no persistence).
+ * enabling SharedArrayBuffer where browsers support it while keeping common
+ * third-party embeds such as YouTube and Vimeo usable. Kora falls back to
+ * durable IndexedDB storage when SharedArrayBuffer is unavailable.
  */
 function crossOriginIsolation(): Plugin {
+	const embedderPolicy = process.env.KORA_COEP_POLICY || 'credentialless'
+
 	return {
 		name: 'cross-origin-isolation',
 		configureServer(server) {
 			server.middlewares.use((_req, res, next) => {
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				res.setHeader('Cross-Origin-Embedder-Policy', embedderPolicy)
 				next()
 			})
 		},
 		configurePreviewServer(server) {
 			server.middlewares.use((_req, res, next) => {
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				res.setHeader('Cross-Origin-Embedder-Policy', embedderPolicy)
 				next()
 			})
 		},
@@ -82,11 +85,18 @@ export default defineConfig({
 	},
 	server: {
 		allowedHosts: true,
+		watch: {
+			ignored: ['**/.kora/**', '**/*.db', '**/*.db-shm', '**/*.db-wal'],
+		},
 		proxy: {
 			'/kora-sync': {
 				target: 'ws://localhost:3001',
 				ws: true,
 				rewriteWsOrigin: true,
+			},
+			'/auth': {
+				target: 'http://localhost:3001',
+				changeOrigin: true,
 			},
 		},
 	},

@@ -33,6 +33,7 @@ import { applyServerOperation } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
+import type { Logger } from '../logging/structured-logger'
 import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { missingScopeFields, operationMatchesScopes } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
@@ -162,6 +163,8 @@ export interface ClientSessionOptions {
 	serializer?: MessageSerializer
 	/** Event emitter for DevTools integration */
 	emitter?: KoraEventEmitter
+	/** Structured logger used for protocol and persistence failures */
+	logger?: Logger
 	/** Max operations per sync batch */
 	batchSize?: number
 	/** Schema version the server expects */
@@ -270,6 +273,7 @@ export class ClientSession {
 	private readonly auth: AuthProvider | null
 	private readonly serializer: MessageSerializer
 	private readonly emitter: KoraEventEmitter | null
+	private readonly logger: Logger | null
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
@@ -295,6 +299,7 @@ export class ClientSession {
 		this.auth = options.auth ?? null
 		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
+		this.logger = options.logger ?? null
 		this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
 		this.schemaVersion = options.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		const supported = options.supportedSchemaVersions
@@ -578,6 +583,18 @@ export class ClientSession {
 
 	private handleMessageFailure(error: unknown): void {
 		const reason = error instanceof Error ? error.message : 'Message handling failed'
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'error',
+			event: 'session.message_failed',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			error: reason,
+			details: {
+				state: this.state,
+				errorName: error instanceof Error ? error.name : typeof error,
+			},
+		})
 		this.sendError('SYNC_ERROR', reason, true)
 		this.close(reason)
 	}
@@ -805,21 +822,17 @@ export class ClientSession {
 				// action === 'accept' falls through to normal materialization.
 			}
 
-			try {
-				const applyResult = await applyServerOperation(this.store, op)
-				if (applyResult.rejection) {
-					this.sendError(
-						applyResult.rejection.code,
-						applyResult.rejection.message,
-						applyResult.rejection.retriable,
-					)
-					continue
-				}
-				if (applyResult.result === 'applied') {
-					applied.push(...applyResult.appliedOperations)
-				}
-			} catch {
-				// Per-op failure must not block batch acknowledgment
+			const applyResult = await applyServerOperation(this.store, op)
+			if (applyResult.rejection) {
+				this.sendError(
+					applyResult.rejection.code,
+					applyResult.rejection.message,
+					applyResult.rejection.retriable,
+				)
+				continue
+			}
+			if (applyResult.result === 'applied') {
+				applied.push(...applyResult.appliedOperations)
 			}
 		}
 

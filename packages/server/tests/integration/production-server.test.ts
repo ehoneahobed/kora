@@ -51,6 +51,33 @@ describe('createProductionServer operational auth', () => {
 		}
 	})
 
+	test('uses credentialless COEP by default and allows explicit override', async () => {
+		const defaultServer = createProductionServer({
+			store: new MemoryServerStore('server-coep-default'),
+			port: 39223,
+		})
+		await defaultServer.start()
+		try {
+			const response = await fetch('http://localhost:39223/health')
+			expect(response.headers.get('Cross-Origin-Embedder-Policy')).toBe('credentialless')
+		} finally {
+			await defaultServer.stop()
+		}
+
+		const strictServer = createProductionServer({
+			store: new MemoryServerStore('server-coep-strict'),
+			port: 39224,
+			crossOriginEmbedderPolicy: 'require-corp',
+		})
+		await strictServer.start()
+		try {
+			const response = await fetch('http://localhost:39224/health')
+			expect(response.headers.get('Cross-Origin-Embedder-Policy')).toBe('require-corp')
+		} finally {
+			await strictServer.stop()
+		}
+	})
+
 	test('mounts custom HTTP routes before static file serving', async () => {
 		const port = 39218
 		const server = createProductionServer({

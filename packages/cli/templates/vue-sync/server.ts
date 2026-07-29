@@ -20,7 +20,7 @@ async function createStore() {
 	}
 
 	return createSqliteServerStore({
-		filename: process.env.KORA_SERVER_DB || './kora-server.db',
+		filename: process.env.KORA_SERVER_DB || './.kora/kora-server.db',
 	})
 }
 
@@ -72,7 +72,7 @@ async function createOAuthConfig(): Promise<CreateKoraAuthServerOptions['oauth']
 	const oauthStores = process.env.DATABASE_URL
 		? await createPostgresOAuthStores({ connectionString: process.env.DATABASE_URL })
 		: await createSqliteOAuthStores({
-				filename: process.env.KORA_AUTH_DB || './kora-auth.db',
+				filename: process.env.KORA_AUTH_DB || './.kora/kora-auth.db',
 			})
 
 	return {

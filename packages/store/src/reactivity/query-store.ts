@@ -19,6 +19,7 @@ export class QueryStore<T = CollectionRecord> {
 	private listeners = new Set<() => void>()
 	private unsubscribeQuery: (() => void) | null = null
 	private active = false
+	private hasEmittedSnapshot = false
 	private readonly queryBuilder: QueryBuilder<T>
 
 	constructor(queryBuilder: QueryBuilder<T>) {
@@ -50,17 +51,27 @@ export class QueryStore<T = CollectionRecord> {
 		return this.snapshot
 	}
 
+	/**
+	 * Whether the underlying query subscription has delivered at least one
+	 * authoritative result for the current subscription lifecycle.
+	 */
+	hasSnapshot = (): boolean => {
+		return this.hasEmittedSnapshot
+	}
+
 	/** Tear down listeners and the underlying query subscription. */
 	destroy(): void {
 		this.stopSubscription()
 		this.listeners.clear()
 		this.snapshot = EMPTY_ARRAY as readonly T[]
+		this.hasEmittedSnapshot = false
 	}
 
 	private startSubscription(): void {
 		this.active = true
 		this.unsubscribeQuery = this.queryBuilder.subscribe((results: readonly T[]) => {
 			if (!this.active) return
+			this.hasEmittedSnapshot = true
 			this.snapshot = Object.freeze([...results])
 			this.notifyListeners()
 		})

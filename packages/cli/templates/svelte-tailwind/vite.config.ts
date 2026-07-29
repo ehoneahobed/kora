@@ -6,19 +6,21 @@ import type { Plugin } from 'vite'
 import { defineConfig } from 'vite'
 
 function crossOriginIsolation(): Plugin {
+	const embedderPolicy = process.env.KORA_COEP_POLICY || 'credentialless'
+
 	return {
 		name: 'cross-origin-isolation',
 		configureServer(server) {
 			server.middlewares.use((_req, res, next) => {
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				res.setHeader('Cross-Origin-Embedder-Policy', embedderPolicy)
 				next()
 			})
 		},
 		configurePreviewServer(server) {
 			server.middlewares.use((_req, res, next) => {
 				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+				res.setHeader('Cross-Origin-Embedder-Policy', embedderPolicy)
 				next()
 			})
 		},

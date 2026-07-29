@@ -78,6 +78,13 @@ export interface SyncConfig {
 	scopeMap?: SyncScopeMap
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
+	/**
+	 * Maximum time to wait for the server to acknowledge an outbound batch before
+	 * treating the connection as stalled. The batch is returned to the durable
+	 * outbound queue before disconnecting so it can be retried on reconnect.
+	 * Defaults to 30000ms. Set to 0 to disable the watchdog.
+	 */
+	outboundAckTimeoutMs?: number
 	/** Initial reconnection delay in ms. Defaults to 1000. */
 	reconnectInterval?: number
 	/** Maximum reconnection delay in ms. Defaults to 30000. */

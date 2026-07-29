@@ -272,6 +272,84 @@ describe('validateRecord', () => {
 			).toThrow(/richtext/)
 		})
 
+		test('pinpoints undefined inside json objects', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					events: {
+						fields: {
+							name: t.string(),
+							metadata: t.json(),
+						},
+					},
+				},
+			})
+			const events = schema.collections.events
+			if (!events) return
+
+			expect(() =>
+				validateRecord(
+					'events',
+					events,
+					{
+						name: 'Launch',
+						metadata: { profile: { nickname: undefined } },
+					},
+					'insert',
+				),
+			).toThrow(/found undefined at "metadata\.profile\.nickname"/)
+		})
+
+		test('pinpoints undefined inside json arrays', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					events: {
+						fields: {
+							name: t.string(),
+							metadata: t.json(),
+						},
+					},
+				},
+			})
+			const events = schema.collections.events
+			if (!events) return
+
+			expect(() =>
+				validateRecord(
+					'events',
+					events,
+					{
+						name: 'Launch',
+						metadata: { tags: ['a', undefined] },
+					},
+					'insert',
+				),
+			).toThrow(/found undefined at "metadata\.tags\[1\]"/)
+		})
+
+		test('rejects circular json with a precise path', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					events: {
+						fields: {
+							name: t.string(),
+							metadata: t.json(),
+						},
+					},
+				},
+			})
+			const events = schema.collections.events
+			if (!events) return
+			const metadata: Record<string, unknown> = { ok: true }
+			metadata.self = metadata
+
+			expect(() =>
+				validateRecord('events', events, { name: 'Launch', metadata }, 'insert'),
+			).toThrow(/found circular object at "metadata\.self"/)
+		})
+
 		test('rejects Infinity for timestamp field', () => {
 			const col = simpleTodosCollection()
 			if (!col) return

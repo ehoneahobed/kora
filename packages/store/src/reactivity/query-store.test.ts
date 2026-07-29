@@ -60,14 +60,27 @@ describe('QueryStore', () => {
 
 		// Before subscribe, snapshot is empty
 		expect(store.getSnapshot()).toEqual([])
+		expect(store.hasSnapshot()).toBe(false)
 
 		store.subscribe(vi.fn())
 
 		// After subscribe, snapshot is populated (mock calls callback synchronously)
 		const snapshot = store.getSnapshot()
 		expect(snapshot).toHaveLength(1)
+		expect(store.hasSnapshot()).toBe(true)
 		expect(snapshot[0]?.id).toBe('1')
 		expect(Object.isFrozen(snapshot)).toBe(true)
+	})
+
+	it('marks an emitted empty result as an authoritative snapshot', () => {
+		const { queryBuilder } = createMockQueryBuilder([])
+		const store = new QueryStore(queryBuilder)
+
+		expect(store.hasSnapshot()).toBe(false)
+		store.subscribe(vi.fn())
+
+		expect(store.getSnapshot()).toEqual([])
+		expect(store.hasSnapshot()).toBe(true)
 	})
 
 	it('returns frozen empty array before subscribe', () => {
@@ -201,6 +214,7 @@ describe('QueryStore', () => {
 
 		// Snapshot should be empty after destroy
 		expect(store.getSnapshot()).toEqual([])
+		expect(store.hasSnapshot()).toBe(false)
 	})
 
 	it('returns new frozen snapshot on each update', () => {

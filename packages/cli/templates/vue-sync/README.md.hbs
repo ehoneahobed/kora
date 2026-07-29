@@ -43,8 +43,9 @@ writes, and `useTodos.ts` is the React binding that exposes todo data and action
 | `VITE_SYNC_URL` | `ws://localhost:3001` | WebSocket URL for the sync server |
 | `VITE_AUTH_URL` | current origin | HTTP URL for `/auth/*` routes |
 | `PORT` | `3001` | Sync server port |
-| `KORA_SERVER_DB` | `./kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
-| `KORA_AUTH_DB` | `./kora-auth.db` | SQLite file used by OAuth state and linked identities when `DATABASE_URL` is empty |
+| `KORA_SERVER_DB` | `./.kora/kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
+| `KORA_AUTH_DB` | `./.kora/kora-auth.db` | SQLite file used by OAuth state and linked identities when `DATABASE_URL` is empty |
+| `KORA_COEP_POLICY` | `credentialless` | Dev/preview Cross-Origin-Embedder-Policy. Use `require-corp` only when every embedded resource opts in. |
 | `DATABASE_URL` | (none) | PostgreSQL connection string for production sync server deployments |
 | `KORA_SYNC_PATH` | `/kora-sync` | WebSocket path exposed by the sync server |
 | `KORA_AUTH_SECRET` | (none) | Enables built-in `/auth/*` routes and authenticated sync when set |

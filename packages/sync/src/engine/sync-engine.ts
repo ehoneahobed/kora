@@ -75,6 +75,7 @@ import type { SyncStore } from './sync-store'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 
 /**
  * Valid state transitions for the sync engine state machine.
@@ -193,6 +194,7 @@ export class SyncEngine {
 	private readonly outboundQueue: OutboundQueue
 	private readonly rejectedStorage: RejectedOperationStorage
 	private readonly batchSize: number
+	private readonly outboundAckTimeoutMs: number
 	private readonly encryptor: SyncEncryptor | null
 	private readonly awarenessManager: AwarenessManager
 	private readonly richtextDocChannel: RichtextDocChannel
@@ -213,6 +215,9 @@ export class SyncEngine {
 	private clockBlocked = false
 	private clockSkewMs: number | null = null
 	private blobStorageEnabled = false
+	private outboundAckTimer: ReturnType<typeof setTimeout> | null = null
+	private startPromise: Promise<void> | null = null
+	private stopPromise: Promise<void> | null = null
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -265,6 +270,8 @@ export class SyncEngine {
 		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
+		this.outboundAckTimeoutMs =
+			options.config.outboundAckTimeoutMs ?? DEFAULT_OUTBOUND_ACK_TIMEOUT_MS
 		this.encryptor = options.encryptor ?? null
 		this.syncState = options.syncState ?? null
 		this.activeScope = options.config.scopeMap
@@ -324,10 +331,22 @@ export class SyncEngine {
 	 * Start the sync engine: connect → handshake → delta exchange → streaming.
 	 */
 	async start(): Promise<void> {
+		if (this.state === 'streaming') return
+		if (this.startPromise) return this.startPromise
+
+		this.startPromise = this.startInternal().finally(() => {
+			this.startPromise = null
+		})
+		return this.startPromise
+	}
+
+	private async startInternal(): Promise<void> {
+		if (this.stopPromise) {
+			await this.stopPromise
+		}
+		if (this.state === 'streaming') return
 		if (this.state !== 'disconnected') {
-			throw new SyncError('Cannot start sync engine: not in disconnected state', {
-				currentState: this.state,
-			})
+			await this.stop()
 		}
 
 		await this.outboundQueue.initialize()
@@ -369,8 +388,13 @@ export class SyncEngine {
 
 		try {
 			const authToken = this.config.auth ? (await this.config.auth()).token : undefined
+			if (this.state !== 'connecting') return
 
 			await this.transport.connect(this.config.url, { authToken })
+			if (this.state !== 'connecting') {
+				await this.transport.disconnect()
+				return
+			}
 			this.transitionTo('handshaking')
 
 			// Send handshake
@@ -407,7 +431,18 @@ export class SyncEngine {
 	 * Stop the sync engine. Disconnects the transport.
 	 */
 	async stop(): Promise<void> {
+		if (this.stopPromise) return this.stopPromise
+
+		this.stopPromise = this.stopInternal().finally(() => {
+			this.stopPromise = null
+		})
+		return this.stopPromise
+	}
+
+	private async stopInternal(): Promise<void> {
 		if (this.state === 'disconnected') return
+
+		this.clearOutboundAckTimer()
 
 		// Stop awareness tracking
 		this.awarenessManager.stopCleanupTimer()
@@ -1314,6 +1349,7 @@ export class SyncEngine {
 	}
 
 	private handleAcknowledgment(msg: AcknowledgmentMessage): void {
+		this.clearOutboundAckTimer()
 		if (this.state === 'syncing' && this.config.strictHandshake) {
 			this.pendingDeltaBatchAcks.delete(msg.acknowledgedMessageId)
 			this.markDeltaSendCompleteIfReady()
@@ -1338,6 +1374,7 @@ export class SyncEngine {
 	}
 
 	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
+		this.clearOutboundAckTimer()
 		// An in-flight outbound batch will never be acknowledged now. Return it to the
 		// queue so it is retried, instead of leaving `currentBatch` set — which would
 		// wedge every future flush behind a batch that can never clear (real-time
@@ -1567,6 +1604,7 @@ export class SyncEngine {
 						batchIndex: 0,
 					}
 					this.transport.send(batchMsg)
+					this.startOutboundAckTimer(batch.batchId)
 
 					this.emitter?.emit({
 						type: 'sync:sent',
@@ -1594,12 +1632,47 @@ export class SyncEngine {
 				batchIndex: 0,
 			}
 			this.transport.send(batchMsg)
+			this.startOutboundAckTimer(batch.batchId)
 
 			this.emitter?.emit({
 				type: 'sync:sent',
 				operations: batch.operations,
 				batchSize: batch.operations.length,
 			})
+		}
+	}
+
+	private startOutboundAckTimer(batchId: string): void {
+		this.clearOutboundAckTimer()
+		if (this.outboundAckTimeoutMs <= 0) return
+
+		this.outboundAckTimer = setTimeout(() => {
+			void this.handleOutboundAckTimeout(batchId)
+		}, this.outboundAckTimeoutMs)
+	}
+
+	private clearOutboundAckTimer(): void {
+		if (!this.outboundAckTimer) return
+		clearTimeout(this.outboundAckTimer)
+		this.outboundAckTimer = null
+	}
+
+	private async handleOutboundAckTimeout(batchId: string): Promise<void> {
+		if (!this.currentBatch || this.currentBatch.batchId !== batchId) return
+
+		this.outboundQueue.returnBatch(batchId)
+		this.currentBatch = null
+		this.clearOutboundAckTimer()
+		await this.refreshPendingCount()
+
+		if (this.state === 'disconnected') return
+
+		const reason = `Timed out waiting for acknowledgment of outbound batch ${batchId}`
+		try {
+			await this.transport.disconnect()
+		} finally {
+			this.ensureDisconnected()
+			this.emitter?.emit({ type: 'sync:disconnected', reason })
 		}
 	}
 
@@ -1613,6 +1686,7 @@ export class SyncEngine {
 	}
 
 	private handleTransportClose(reason: string): void {
+		this.clearOutboundAckTimer()
 		// Return in-flight batch to queue
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)

@@ -199,6 +199,9 @@ export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor)
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
 		case 'array':
+		case 'object':
+		case 'json':
+		case 'blob':
 			return typeof value === 'string' ? value : JSON.stringify(value)
 		case 'boolean':
 			return value ? 1 : 0
@@ -216,6 +219,9 @@ export function deserializeFieldValue(value: unknown, descriptor: FieldDescripto
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
 		case 'array':
+		case 'object':
+		case 'json':
+		case 'blob':
 			return typeof value === 'string' ? JSON.parse(value) : value
 		case 'boolean':
 			return value === 1 || value === true

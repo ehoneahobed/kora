@@ -53,16 +53,26 @@ describe('chaos real-path convergence (Store + MergeAware + TestServer)', () => 
 			await device.sync()
 		}
 
-		for (const device of network.devices) {
-			await device.disconnect()
-			await device.sync()
+		// Heal chaos-dropped relays: retry exchange rounds until the fleet actually
+		// converges, then assert. A fixed pass would depend on real event-loop timing
+		// (chaos latency is real setTimeout delay), which CLAUDE.md rules out; mirror
+		// the contended test's healing loop below.
+		for (let round = 0; round < 30; round++) {
+			for (const device of network.devices) {
+				await device.disconnect()
+				await device.sync()
+			}
+			const result = await checkConvergence(network.devices, schema)
+			if (result.converged) {
+				break
+			}
 		}
 
 		await expectConverged(network.devices, schema)
 
 		const serverCount = network.server.getAllOperations().length
 		expect(serverCount).toBe(CLIENT_COUNT * OPS_PER_CLIENT)
-	})
+	}, 60000)
 
 	test('contended workload (updates, deletes, same records) converges under chaos', async () => {
 		const network = await createTestNetwork(schema, {

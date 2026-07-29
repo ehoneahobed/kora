@@ -25,6 +25,19 @@ const schema = defineSchema({
 				},
 			],
 		},
+		assets: {
+			fields: {
+				settings: t.object({
+					theme: t.string(),
+					density: t.number(),
+				}),
+				metadata: t.json<{
+					flags: string[]
+					nested: { enabled: boolean }
+				}>(),
+				file: t.blob(),
+			},
+		},
 	},
 })
 
@@ -36,6 +49,33 @@ function createTestOp(overrides: Partial<Operation> = {}): Operation {
 		collection: 'todos',
 		recordId: 'rec-1',
 		data: { title: 'alpha' },
+		previousData: null,
+		timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
+		sequenceNumber: 1,
+		causalDeps: [],
+		schemaVersion: 1,
+		...overrides,
+	}
+}
+
+function createStructuredOp(overrides: Partial<Operation> = {}): Operation {
+	return {
+		id: `op-${Math.random().toString(36).slice(2)}`,
+		nodeId: 'node-a',
+		type: 'insert',
+		collection: 'assets',
+		recordId: 'asset-1',
+		data: {
+			settings: { theme: 'dark', density: 2 },
+			metadata: { flags: ['offline', 'public'], nested: { enabled: true } },
+			file: {
+				hash: 'a'.repeat(64),
+				size: 4096,
+				mimeType: 'image/png',
+				filename: 'hero.png',
+				manifestHash: 'b'.repeat(64),
+			},
+		},
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
 		sequenceNumber: 1,
@@ -88,6 +128,31 @@ async function runSharedStoreParityTests(
 		expect((await applyServerOperation(store, op)).result).toBe('applied')
 		expect((await applyServerOperation(store, op)).result).toBe('duplicate')
 		expect(await store.getOperationCount()).toBe(1)
+
+		await store.close()
+	})
+
+	test(`${label}: materializes structured json object and blob fields`, async () => {
+		const store = await createStore()
+		await store.setSchema(schema)
+
+		const op = createStructuredOp()
+		const result = await applyServerOperation(store, op)
+		expect(result.result).toBe('applied')
+
+		const row = await store.findRecord('assets', 'asset-1')
+		expect(row?.settings).toEqual({ theme: 'dark', density: 2 })
+		expect(row?.metadata).toEqual({
+			flags: ['offline', 'public'],
+			nested: { enabled: true },
+		})
+		expect(row?.file).toEqual({
+			hash: 'a'.repeat(64),
+			size: 4096,
+			mimeType: 'image/png',
+			filename: 'hero.png',
+			manifestHash: 'b'.repeat(64),
+		})
 
 		await store.close()
 	})
