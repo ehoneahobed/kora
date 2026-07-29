@@ -15,23 +15,42 @@ describe('queryDescriptorToSyncSubset', () => {
 		})
 	})
 
-	test('returns null for operator-based filters', () => {
+	test('widens operator-only filters to a collection-wide subset', () => {
 		expect(
 			queryDescriptorToSyncSubset({
 				collection: 'todos',
 				where: { createdAt: { $gt: 1000 } },
 				orderBy: [],
 			}),
-		).toBeNull()
+		).toEqual({
+			collection: 'todos',
+			where: {},
+		})
 	})
 
-	test('returns null when where is empty', () => {
+	test('registers empty where as a collection-wide subset', () => {
 		expect(
 			queryDescriptorToSyncSubset({
 				collection: 'todos',
 				where: {},
 				orderBy: [],
 			}),
-		).toBeNull()
+		).toEqual({
+			collection: 'todos',
+			where: {},
+		})
+	})
+
+	test('keeps equality filters when unsupported filters are also present', () => {
+		expect(
+			queryDescriptorToSyncSubset({
+				collection: 'todos',
+				where: { ownerId: 'u-1', createdAt: { $gt: 1000 } },
+				orderBy: [],
+			}),
+		).toEqual({
+			collection: 'todos',
+			where: { ownerId: 'u-1' },
+		})
 	})
 })

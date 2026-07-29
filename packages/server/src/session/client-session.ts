@@ -101,6 +101,24 @@ function warnIfMultiTenantWithoutScopes(
 	)
 }
 
+function stableStringify(value: unknown): string {
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => stableStringify(item)).join(',')}]`
+	}
+	if (value && typeof value === 'object') {
+		const record = value as Record<string, unknown>
+		const entries = Object.keys(record)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+		return `{${entries.join(',')}}`
+	}
+	return JSON.stringify(value)
+}
+
+function sameScopeMap(a: unknown, b: unknown): boolean {
+	return stableStringify(a ?? null) === stableStringify(b ?? null)
+}
+
 /**
  * Possible states for a client session.
  */
@@ -645,6 +663,18 @@ export class ClientSession {
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
 		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+		// A delivery watermark is valid only for the exact server-visible view that
+		// earned it. When the server resolves a different scope than the client sent
+		// (common with server-auth scopes, promotions, or invite acceptance), the client
+		// cannot have keyed its local watermark by that authoritative view before this
+		// handshake. Reset to a full scoped backfill instead of trusting a cursor that may
+		// have advanced over previously hidden operations.
+		if (
+			this.clientDeliveryWatermark !== null &&
+			!sameScopeMap(msg.syncScope, this.authContext?.scopes)
+		) {
+			this.clientDeliveryWatermark = 0
+		}
 
 		// Only read the server's delivery frontier when the client actually uses the
 		// watermark. If the client's reported watermark exceeds that frontier, the server's

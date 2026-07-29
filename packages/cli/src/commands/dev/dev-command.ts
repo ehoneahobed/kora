@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'node:fs'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { resolve } from 'node:path'
@@ -56,6 +57,8 @@ export const devCommand = defineCommand({
 		if (!projectRoot) {
 			throw new InvalidProjectError(process.cwd())
 		}
+
+		loadProjectEnv(projectRoot)
 
 		const config = await loadKoraConfig(projectRoot)
 		const vitePort = typeof args.port === 'string' ? args.port : String(config?.dev?.port ?? 5173)
@@ -280,6 +283,52 @@ async function fileExists(path: string): Promise<boolean> {
 	} catch {
 		return false
 	}
+}
+
+function loadProjectEnv(projectRoot: string, mode = 'development'): void {
+	const files = ['.env', '.env.local', `.env.${mode}`, `.env.${mode}.local`]
+	const existingKeys = new Set(Object.keys(process.env))
+	for (const file of files) {
+		const path = join(projectRoot, file)
+		if (!existsSync(path)) continue
+		const parsed = parseEnvFile(readFileSync(path, 'utf8'))
+		for (const [key, value] of Object.entries(parsed)) {
+			if (!existingKeys.has(key)) {
+				process.env[key] = value
+			}
+		}
+	}
+}
+
+function parseEnvFile(contents: string): Record<string, string> {
+	const env: Record<string, string> = {}
+
+	for (const rawLine of contents.split(/\r?\n/)) {
+		const line = rawLine.trim()
+		if (!line || line.startsWith('#')) continue
+
+		const normalized = line.startsWith('export ') ? line.slice('export '.length).trim() : line
+		const equalsIndex = normalized.indexOf('=')
+		if (equalsIndex <= 0) continue
+
+		const key = normalized.slice(0, equalsIndex).trim()
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+
+		env[key] = parseEnvValue(normalized.slice(equalsIndex + 1).trim())
+	}
+
+	return env
+}
+
+function parseEnvValue(value: string): string {
+	const quote = value[0]
+	if ((quote === '"' || quote === "'") && value[value.length - 1] === quote) {
+		const inner = value.slice(1, -1)
+		return quote === '"' ? inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r') : inner
+	}
+
+	const commentIndex = value.search(/\s#/)
+	return (commentIndex >= 0 ? value.slice(0, commentIndex) : value).trim()
 }
 
 function normalizeManagedSyncStore(

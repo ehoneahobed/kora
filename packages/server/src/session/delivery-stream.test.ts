@@ -3,6 +3,7 @@ import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
+import type { AuthProvider } from '../types'
 import { ClientSession } from './client-session'
 
 /**
@@ -38,11 +39,11 @@ async function seed(store: MemoryServerStore, ids: string[]): Promise<void> {
 	}
 }
 
-function startSession(store: MemoryServerStore, batchSize?: number) {
+function startSession(store: MemoryServerStore, batchSize?: number, auth?: AuthProvider) {
 	const { client, server } = createServerTransportPair()
 	const messages: SyncMessage[] = []
 	client.onMessage((m) => messages.push(m))
-	const session = new ClientSession({ sessionId: 's1', transport: server, store, batchSize })
+	const session = new ClientSession({ sessionId: 's1', transport: server, store, batchSize, auth })
 	session.start()
 	return { client, messages, session }
 }
@@ -271,5 +272,31 @@ describe('server delivery stream', () => {
 		const opBatches = batches(messages)
 		expect(opBatches[0]?.baseDeliverySequence).toBe(0)
 		expect(opBatches.flatMap((b) => b.operations.map((o) => o.id))).toEqual(['a', 'b'])
+	})
+
+	test('server-authoritative scope mismatch invalidates the client delivery watermark', async () => {
+		const store = new MemoryServerStore('server-1')
+		await seed(store, ['a', 'b', 'c']) // delivery seq 1..3
+		const auth: AuthProvider = {
+			authenticate: async () => ({ userId: 'staff-1', scopes: { todos: {} } }),
+		}
+		const { client, messages } = startSession(store, 10, auth)
+
+		client.send({
+			type: 'handshake',
+			messageId: 'hs',
+			nodeId: 'client-1',
+			versionVector: {},
+			schemaVersion: 1,
+			authToken: 'valid',
+			lastDeliverySequence: 2,
+		})
+
+		await vi.waitFor(() => {
+			expect(batches(messages).some((b) => b.isFinal)).toBe(true)
+		})
+		const opBatches = batches(messages)
+		expect(opBatches[0]?.baseDeliverySequence).toBe(0)
+		expect(opBatches.flatMap((b) => b.operations.map((o) => o.id))).toEqual(['a', 'b', 'c'])
 	})
 })

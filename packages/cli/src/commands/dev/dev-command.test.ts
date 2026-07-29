@@ -211,6 +211,38 @@ describe('dev command', () => {
 		)
 	})
 
+	test('loads project .env before spawning dev processes', async () => {
+		const previousSecret = process.env.KORA_AUTH_SECRET
+		Reflect.deleteProperty(process.env, 'KORA_AUTH_SECRET')
+		try {
+			const { devCommand } = await import('./dev-command')
+			findProjectRootMock.mockResolvedValue(tempDir.path)
+			findSchemaFileMock.mockResolvedValue(null)
+			await writeFile(join(tempDir.path, '.env'), 'KORA_AUTH_SECRET=base-secret\n')
+			await writeFile(join(tempDir.path, '.env.local'), 'KORA_AUTH_SECRET=dev-secret\n')
+			await writeFile(join(tempDir.path, 'server.ts'), 'console.log("sync")')
+
+			await devCommand.run({ args: defaultArgs() })
+
+			expect(process.env.KORA_AUTH_SECRET).toBe('dev-secret')
+			expect(processManagerSpawnMock).toHaveBeenCalledWith(
+				expect.objectContaining({
+					label: 'sync',
+					env: expect.objectContaining({
+						PORT: '3001',
+						KORA_SYNC_PORT: '3001',
+					}),
+				}),
+			)
+		} finally {
+			if (previousSecret === undefined) {
+				Reflect.deleteProperty(process.env, 'KORA_AUTH_SECRET')
+			} else {
+				process.env.KORA_AUTH_SECRET = previousSecret
+			}
+		}
+	})
+
 	test('uses ports from kora.config when args are omitted', async () => {
 		const { devCommand } = await import('./dev-command')
 		findProjectRootMock.mockResolvedValue(tempDir.path)

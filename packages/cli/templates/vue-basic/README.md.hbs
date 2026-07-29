@@ -47,7 +47,7 @@ To enable real-time sync across devices, update `src/main.tsx`:
 const app = createApp({
   schema,
   sync: {
-    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001',
+    url: import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001/kora-sync',
   },
   // ...
 })

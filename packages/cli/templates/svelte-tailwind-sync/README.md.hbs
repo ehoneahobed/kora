@@ -11,7 +11,7 @@ npm run dev
 This starts both the Vite dev server and the Kora sync server.
 
 - **App**: http://localhost:5173
-- **Sync server**: ws://localhost:3001
+- **Sync server**: ws://localhost:3001/kora-sync
 
 ## Project Structure
 
@@ -40,7 +40,7 @@ writes, and `useTodos.ts` is the React binding that exposes todo data and action
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_SYNC_URL` | `ws://localhost:3001` | WebSocket URL for the sync server |
+| `VITE_SYNC_URL` | `ws://localhost:3001/kora-sync` | WebSocket URL for the sync endpoint |
 | `VITE_AUTH_URL` | current origin | HTTP URL for `/auth/*` routes |
 | `PORT` | `3001` | Sync server port |
 | `KORA_SERVER_DB` | `./.kora/kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
@@ -95,7 +95,7 @@ The client and sync server must be deployed separately:
 Set `VITE_SYNC_URL` to your deployed sync server URL when building:
 
 ```bash
-VITE_SYNC_URL=wss://your-server.example.com npm run build
+VITE_SYNC_URL=wss://your-server.example.com/kora-sync npm run build
 ```
 
 ## Learn More

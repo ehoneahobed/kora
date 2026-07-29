@@ -3,9 +3,12 @@ import type { SyncEngine, SyncQuerySubset } from '@korajs/sync'
 
 /**
  * Extract equality-only WHERE conditions for sync query subset registration.
- * Operator-based filters (e.g. `$gt`) are not representable as sync subsets yet.
+ * Empty queries and operator-only filters are registered as collection-wide
+ * subsets. That may over-deliver within the server-authorized scope, but it is
+ * the only correctness-preserving representation until sync subsets support the
+ * full query predicate language.
  */
-export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQuerySubset | null {
+export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQuerySubset {
 	const where: Record<string, unknown> = {}
 	const skippedFields: string[] = []
 
@@ -23,12 +26,8 @@ export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQu
 
 	if (skippedFields.length > 0 && typeof console !== 'undefined') {
 		console.warn(
-			`[Kora] Sync query subset omitted non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. Only plain equality WHERE clauses are registered for incremental sync.`,
+			`[Kora] Sync query subset widened non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. Only plain equality WHERE clauses are represented for incremental sync; unsupported predicates sync the containing collection subset and are filtered locally.`,
 		)
-	}
-
-	if (Object.keys(where).length === 0) {
-		return null
 	}
 
 	return {
@@ -45,10 +44,6 @@ export function createSyncQuerySubscriptionHook(
 ): (descriptor: QueryDescriptor) => () => void {
 	return (descriptor) => {
 		const subset = queryDescriptorToSyncSubset(descriptor)
-		if (!subset) {
-			return () => {}
-		}
-
 		const engine = getSyncEngine()
 		if (!engine) {
 			return () => {}

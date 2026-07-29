@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'node:fs'
 import {
 	type CreateKoraAuthServerOptions,
 	createKoraAuthServer,
@@ -19,6 +20,45 @@ import schema from './src/schema'
 // All desktop clients connect to this server to sync data across devices.
 // For production, deploy this server and set VITE_SYNC_URL when building
 // the desktop app: VITE_SYNC_URL=wss://your-server.com/kora-sync pnpm build
+
+loadLocalEnv()
+
+function loadLocalEnv(mode = process.env.NODE_ENV || 'development') {
+	const existingKeys = new Set(Object.keys(process.env))
+	for (const file of ['.env', '.env.local', `.env.${mode}`, `.env.${mode}.local`]) {
+		if (!existsSync(file)) continue
+		for (const [key, value] of Object.entries(parseEnvFile(readFileSync(file, 'utf8')))) {
+			if (!existingKeys.has(key)) {
+				process.env[key] = value
+			}
+		}
+	}
+}
+
+function parseEnvFile(contents: string): Record<string, string> {
+	const env: Record<string, string> = {}
+	for (const rawLine of contents.split(/\r?\n/)) {
+		const line = rawLine.trim()
+		if (!line || line.startsWith('#')) continue
+		const normalized = line.startsWith('export ') ? line.slice('export '.length).trim() : line
+		const equalsIndex = normalized.indexOf('=')
+		if (equalsIndex <= 0) continue
+		const key = normalized.slice(0, equalsIndex).trim()
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+		env[key] = parseEnvValue(normalized.slice(equalsIndex + 1).trim())
+	}
+	return env
+}
+
+function parseEnvValue(value: string): string {
+	const quote = value[0]
+	if ((quote === '"' || quote === "'") && value[value.length - 1] === quote) {
+		const inner = value.slice(1, -1)
+		return quote === '"' ? inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r') : inner
+	}
+	const commentIndex = value.search(/\s#/)
+	return (commentIndex >= 0 ? value.slice(0, commentIndex) : value).trim()
+}
 
 async function createStore() {
 	if (process.env.DATABASE_URL) {
