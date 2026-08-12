@@ -1,4 +1,4 @@
-import type { BlobRef, Operation, SchemaDefinition } from '@korajs/core'
+import type { BlobRef, Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
 import { MemoryServerStore } from '@korajs/server'
 import { KoraSyncServer } from '@korajs/server'
 import type { OperationValidator, ServerTransport } from '@korajs/server'
@@ -13,6 +13,8 @@ export interface TestServerOptions {
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake. */
 	supportedSchemaVersions?: { min: number; max: number }
+	/** Transform accepted legacy operations into the server schema before validation. */
+	operationTransforms?: OperationTransform[]
 	/** Enable central blob storage: the server persists and serves uploaded blob bytes. */
 	blobStorage?: boolean
 	/** Adjudicate untrusted client operations before materialization. */
@@ -37,6 +39,7 @@ export class TestServer {
 				min: schemaVersion,
 				max: schemaVersion,
 			},
+			...(options?.operationTransforms ? { operationTransforms: options.operationTransforms } : {}),
 			...(blob ? blob.callbacks : {}),
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 		})

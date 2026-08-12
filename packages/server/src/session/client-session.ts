@@ -1,4 +1,10 @@
-import type { KoraEventEmitter, Operation, SchemaDefinition } from '@korajs/core'
+import type {
+	KoraEventEmitter,
+	Operation,
+	OperationTransform,
+	SchemaDefinition,
+} from '@korajs/core'
+import { applyOperationTransforms } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
@@ -189,6 +195,8 @@ export interface ClientSessionOptions {
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake */
 	supportedSchemaVersions?: { min: number; max: number }
+	/** Transform accepted legacy operations into the server schema before validation. */
+	operationTransforms?: OperationTransform[]
 	/** Called when this session has operations to relay to other sessions */
 	onRelay?: RelayCallback
 	/** Called when this session receives an awareness update to broadcast */
@@ -268,6 +276,13 @@ export class ClientSession {
 	 * client's reported watermark at handshake.
 	 */
 	private lastAckedDeliverySeq = 0
+	/**
+	 * Timestamp of the last delivery-stream send attempt. Periodic retransmission uses
+	 * this as its stale window so a slow client does not receive duplicate full-stream
+	 * batches every server tick while the first batch is still being applied.
+	 */
+	private lastDeliveryPushAttemptAtMs = 0
+	private deliveryStallRepeatCount = 0
 	/** Serializes incremental delivery pushes so their batches never interleave. */
 	private deliveryPushChain: Promise<void> = Promise.resolve()
 
@@ -295,6 +310,7 @@ export class ClientSession {
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
+	private readonly operationTransforms: OperationTransform[]
 	private readonly onRelay: RelayCallback | null
 	private readonly onAwarenessUpdate: AwarenessRelayCallback | null
 	private readonly onYjsDocUpdate: YjsDocRelayCallback | null
@@ -325,6 +341,7 @@ export class ClientSession {
 			min: this.schemaVersion,
 			max: this.schemaVersion,
 		}
+		this.operationTransforms = options.operationTransforms ?? []
 		this.onRelay = options.onRelay ?? null
 		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
@@ -385,6 +402,7 @@ export class ClientSession {
 		this.deliveryPushChain = this.deliveryPushChain.then(async () => {
 			if (this.state !== 'streaming' || !this.transport.isConnected()) return
 			try {
+				this.lastDeliveryPushAttemptAtMs = Date.now()
 				// Resume from the client's last acknowledged sequence, not the last sent, so a
 				// dropped or unapplied batch is re-included here. Exclude the client's own
 				// operations during streaming; it already has them.
@@ -448,6 +466,18 @@ export class ClientSession {
 		// gap is recovered on the next tick even with no new operations and with no reliance
 		// on the bounded relay buffer. When the client is caught up the re-push is a no-op.
 		if (this.clientDeliveryWatermark !== null) {
+			if (staleMs > 0 && Date.now() - this.lastDeliveryPushAttemptAtMs < staleMs) {
+				return
+			}
+			this.deliveryStallRepeatCount += 1
+			if (this.deliveryStallRepeatCount >= 3) {
+				this.emitter?.emit({
+					type: 'sync:delivery-stalled',
+					sessionId: this.sessionId,
+					watermark: this.lastAckedDeliverySeq,
+					repeatCount: this.deliveryStallRepeatCount,
+				})
+			}
 			this.pushDeliveryStream()
 			return
 		}
@@ -559,6 +589,7 @@ export class ClientSession {
 				if (message.deliverySequence !== undefined) {
 					// Advance the confirmed watermark; the next streaming push resumes here.
 					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
+					this.deliveryStallRepeatCount = 0
 				}
 				break
 			case 'error':
@@ -699,6 +730,14 @@ export class ClientSession {
 
 		if (!isClientSchemaVersionSupported(msg.schemaVersion, this.supportedSchemaVersions)) {
 			const { min, max } = this.supportedSchemaVersions
+			this.emitter?.emit({
+				type: 'sync:schema-mismatch',
+				clientSchemaVersion: msg.schemaVersion,
+				serverSchemaVersion: this.schemaVersion,
+				supportedMin: min,
+				supportedMax: max,
+				reason: `${SCHEMA_MISMATCH_PREFIX}: client schema version ${msg.schemaVersion} not in supported range [${min}, ${max}]`,
+			})
 			const response: SyncMessage = {
 				type: 'handshake-response',
 				messageId: generateUUIDv7(),
@@ -754,6 +793,7 @@ export class ClientSession {
 			// operations included.
 			const excludeOwn =
 				this.clientDeliveryWatermark > 0 ? (this.clientNodeId ?? undefined) : undefined
+			this.lastDeliveryPushAttemptAtMs = Date.now()
 			await this.sendDeliveryStream(this.clientDeliveryWatermark, true, excludeOwn)
 		} else {
 			const clientVector = wireToVersionVector(msg.versionVector)
@@ -782,11 +822,22 @@ export class ClientSession {
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
 		const applied: Operation[] = []
-		const rejected: Operation[] = []
+		let acknowledgedThrough = 0
+		let canAdvanceAck = true
 
 		for (const op of operations) {
+			if (!canAdvanceAck) {
+				continue
+			}
+
 			if (!(await this.operationVisibleToClient(op))) {
-				rejected.push(op)
+				this.sendOperationRejected(
+					op,
+					'SCOPE_VIOLATION',
+					`Operation "${op.id}" in collection "${op.collection}" is outside the client's sync scope. Refresh sync scopes and retry.`,
+					true,
+				)
+				canAdvanceAck = false
 				continue
 			}
 
@@ -796,6 +847,7 @@ export class ClientSession {
 					`Operation "${op.id}" timestamp is too far in the future`,
 					false,
 				)
+				canAdvanceAck = false
 				continue
 			}
 
@@ -805,6 +857,7 @@ export class ClientSession {
 					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
 					true,
 				)
+				canAdvanceAck = false
 				continue
 			}
 
@@ -815,6 +868,19 @@ export class ClientSession {
 					sizeCheck.message ?? `Operation "${op.id}" is too large`,
 					false,
 				)
+				canAdvanceAck = false
+				continue
+			}
+
+			const serverOp = this.transformForServerSchema(op)
+			if (serverOp === null) {
+				this.sendOperationRejected(
+					op,
+					'SCHEMA_TRANSFORM_UNAVAILABLE',
+					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
+					false,
+				)
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -824,7 +890,7 @@ export class ClientSession {
 			if (this.validateOperation && this.koraContext) {
 				let decision: Awaited<ReturnType<OperationValidator>>
 				try {
-					decision = await this.validateOperation(op, {
+					decision = await this.validateOperation(serverOp, {
 						auth: this.authContext,
 						kora: this.koraContext,
 					})
@@ -832,49 +898,54 @@ export class ClientSession {
 					// A throwing validator must not crash ingestion or silently accept.
 					// Treat it as a retriable rejection so the submitter can try again.
 					const message = error instanceof Error ? error.message : 'validator error'
-					this.sendOperationRejected(op, 'VALIDATION_ERROR', `Validator threw: ${message}`, true)
+					this.sendOperationRejected(
+						serverOp,
+						'VALIDATION_ERROR',
+						`Validator threw: ${message}`,
+						true,
+					)
+					canAdvanceAck = false
 					continue
 				}
 				if (decision.action === 'reject') {
-					this.sendOperationRejected(
-						op,
-						decision.code,
-						decision.message,
-						decision.retriable ?? isRetriableRejection(decision.code),
-					)
+					const retriable = decision.retriable ?? isRetriableRejection(decision.code)
+					this.sendOperationRejected(serverOp, decision.code, decision.message, retriable)
+					if (retriable) {
+						canAdvanceAck = false
+					} else {
+						acknowledgedThrough = op.sequenceNumber
+					}
 					continue
 				}
 				if (decision.action === 'ignore') {
 					// The server took responsibility out of band; do not materialize the
 					// raw op and do not reject. The batch ack lets the client drop it.
+					acknowledgedThrough = op.sequenceNumber
 					continue
 				}
 				// action === 'accept' falls through to normal materialization.
 			}
 
-			const applyResult = await applyServerOperation(this.store, op)
+			const applyResult = await applyServerOperation(this.store, serverOp)
 			if (applyResult.rejection) {
-				this.sendError(
+				this.sendOperationRejected(
+					serverOp,
 					applyResult.rejection.code,
 					applyResult.rejection.message,
 					applyResult.rejection.retriable,
 				)
+				if (applyResult.rejection.retriable) {
+					canAdvanceAck = false
+				} else {
+					acknowledgedThrough = op.sequenceNumber
+				}
 				continue
 			}
 			if (applyResult.result === 'applied') {
 				applied.push(...applyResult.appliedOperations)
-			}
-		}
-
-		// Send scope violation errors for rejected operations so the client
-		// knows its writes were rejected rather than silently dropped.
-		if (rejected.length > 0) {
-			for (const op of rejected) {
-				this.sendError(
-					'SCOPE_VIOLATION',
-					`Operation "${op.id}" in collection "${op.collection}" is outside the client's sync scope`,
-					false,
-				)
+				acknowledgedThrough = op.sequenceNumber
+			} else {
+				acknowledgedThrough = op.sequenceNumber
 			}
 		}
 
@@ -892,7 +963,7 @@ export class ClientSession {
 			type: 'acknowledgment',
 			messageId: generateUUIDv7(),
 			acknowledgedMessageId: msg.messageId,
-			lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+			lastSequenceNumber: lastOp ? Math.min(acknowledgedThrough, lastOp.sequenceNumber) : 0,
 		}
 		this.sendToClient(ack)
 
@@ -900,6 +971,13 @@ export class ClientSession {
 		if (applied.length > 0) {
 			this.onRelay?.(this.sessionId, applied)
 		}
+	}
+
+	private transformForServerSchema(op: Operation): Operation | null {
+		if (op.schemaVersion === this.schemaVersion) {
+			return op
+		}
+		return applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
 	}
 
 	private async sendDelta(clientVector: Map<string, number>): Promise<void> {

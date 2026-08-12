@@ -3,11 +3,12 @@ import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { SchemaWatcher } from './schema-watcher'
 
-const { watchMock, spawnMock, hasTsxInstalledMock } = vi.hoisted(() => {
+const { watchMock, spawnMock, hasTsxInstalledMock, loadSchemaDefinitionMock } = vi.hoisted(() => {
 	return {
 		watchMock: vi.fn(),
 		spawnMock: vi.fn(),
 		hasTsxInstalledMock: vi.fn(),
+		loadSchemaDefinitionMock: vi.fn(),
 	}
 })
 
@@ -29,6 +30,12 @@ vi.mock('../../utils/fs-helpers', () => {
 	}
 })
 
+vi.mock('../migrate/schema-loader', () => {
+	return {
+		loadSchemaDefinition: loadSchemaDefinitionMock,
+	}
+})
+
 describe('SchemaWatcher', () => {
 	let watchCallback: (() => void) | null
 	let fakeFsWatcher: EventEmitter & { close: ReturnType<typeof vi.fn> }
@@ -41,6 +48,8 @@ describe('SchemaWatcher', () => {
 		watchMock.mockReset()
 		spawnMock.mockReset()
 		hasTsxInstalledMock.mockReset()
+		loadSchemaDefinitionMock.mockReset()
+		loadSchemaDefinitionMock.mockResolvedValue({ version: 1, collections: {} })
 
 		watchMock.mockImplementation((_path: string, callback: () => void) => {
 			watchCallback = callback
@@ -180,6 +189,35 @@ describe('SchemaWatcher', () => {
 			],
 			expect.objectContaining({ cwd: '/project' }),
 		)
+	})
+
+	test('regenerate() reports schema version changes', async () => {
+		hasTsxInstalledMock.mockResolvedValue(true)
+		loadSchemaDefinitionMock
+			.mockResolvedValueOnce({ version: 1, collections: {} })
+			.mockResolvedValueOnce({ version: 2, collections: {} })
+		spawnMock.mockImplementation(() => {
+			const child = createFakeChild()
+			queueMicrotask(() => {
+				child.emit('exit', 0, null)
+			})
+			return child
+		})
+
+		const onSchemaVersionChange = vi.fn()
+		const watcher = new SchemaWatcher({
+			schemaPath: '/project/src/schema.ts',
+			projectRoot: '/project',
+			onSchemaVersionChange,
+		})
+
+		watcher.start()
+		await vi.waitFor(() => {
+			expect(loadSchemaDefinitionMock).toHaveBeenCalledTimes(1)
+		})
+		await watcher.regenerate()
+
+		expect(onSchemaVersionChange).toHaveBeenCalledWith({ previous: 1, next: 2 })
 	})
 })
 

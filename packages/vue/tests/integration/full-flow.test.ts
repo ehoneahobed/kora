@@ -110,6 +110,7 @@ describe('Integration: full flow', () => {
 		const syncEngine = {
 			getStatus: vi.fn().mockReturnValue({
 				status: 'synced',
+				reconnecting: false,
 				pendingOperations: 0,
 				lastSyncedAt: 99999,
 			} as SyncStatusInfo),

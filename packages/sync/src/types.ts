@@ -23,6 +23,7 @@ export type SyncState = (typeof SYNC_STATES)[number]
  */
 export const SYNC_STATUSES = [
 	'connected',
+	'reconnecting',
 	'syncing',
 	'synced',
 	'offline',
@@ -38,6 +39,8 @@ export type SyncStatus = (typeof SYNC_STATUSES)[number]
 export interface SyncStatusInfo {
 	/** Current developer-facing status */
 	status: SyncStatus
+	/** True when the engine is actively trying to re-establish a transport session. */
+	reconnecting: boolean
 	/** Number of operations waiting to be sent */
 	pendingOperations: number
 	/** Timestamp of last successful sync (null if never synced) */

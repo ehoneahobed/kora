@@ -22,6 +22,7 @@ export function operationMatchesScopes(
 
 	const collectionScope = scopes[op.collection]
 	if (!collectionScope) return false
+	if (Object.keys(collectionScope).length === 0) return true
 
 	const snapshot = buildSnapshot(op, fullRecord)
 	if (!snapshot) return false
@@ -46,6 +47,7 @@ export function missingScopeFields(op: Operation, scopes: ScopeMap | undefined):
 	if (!scopes) return []
 	const collectionScope = scopes[op.collection]
 	if (!collectionScope) return []
+	if (Object.keys(collectionScope).length === 0) return []
 	const snapshot = buildSnapshot(op)
 	return Object.keys(collectionScope).filter((field) => !snapshot || !(field in snapshot))
 }

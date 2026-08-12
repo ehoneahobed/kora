@@ -1,4 +1,4 @@
-import type { KoraEventEmitter } from '@korajs/core'
+import type { KoraEventEmitter, OperationTransform } from '@korajs/core'
 import type { MessageSerializer } from '@korajs/sync'
 import type { OperationValidator } from './apply/operation-validator'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
@@ -50,13 +50,23 @@ export interface KoraSyncServerConfig {
 	maxConnections?: number
 	/** Maximum operations per sync batch. Defaults to 100. */
 	batchSize?: number
-	/** Schema version the server expects. Defaults to 1. */
+	/**
+	 * Schema version the server expects. Defaults to `store.getSchema()?.version`
+	 * when the store has been configured with a schema, otherwise `1`.
+	 */
 	schemaVersion?: number
 	/**
 	 * Inclusive range of client schema versions accepted at handshake.
 	 * Defaults to `{ min: schemaVersion, max: schemaVersion }`.
 	 */
 	supportedSchemaVersions?: { min: number; max: number }
+	/**
+	 * Transform accepted legacy client operations into the server schema version
+	 * before validation and materialization. Required when
+	 * `supportedSchemaVersions.min` is lower than `schemaVersion` and operation
+	 * shapes changed across versions.
+	 */
+	operationTransforms?: OperationTransform[]
 	/** WebSocket path (standalone mode). Defaults to '/'. */
 	path?: string
 	/** Structured logger. Defaults to pretty-print in dev, JSON lines in production. */

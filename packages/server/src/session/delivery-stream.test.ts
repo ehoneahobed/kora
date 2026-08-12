@@ -238,8 +238,15 @@ describe('server delivery stream', () => {
 		expect(sentIds).toEqual(['c'])
 		expect(batches(messages)[0]?.baseDeliverySequence).toBe(2)
 
-		// Now WITHOUT a further ack, a re-push (as the retransmit tick does) resumes from
-		// the still-acked position 2 and re-sends c, recovering it had the first send dropped.
+		// A normal retransmit tick should not immediately duplicate the same delivery
+		// stream while the client's ack may still be in flight.
+		messages.length = 0
+		session.retransmitPendingRelays(2000)
+		await new Promise((r) => setTimeout(r, 5))
+		expect(batches(messages)).toHaveLength(0)
+
+		// Now WITHOUT a further ack, a forced re-push resumes from the still-acked
+		// position 2 and re-sends c, recovering it had the first send dropped.
 		messages.length = 0
 		session.retransmitPendingRelays(0)
 		await vi.waitFor(() => expect(batches(messages).length).toBeGreaterThan(0))

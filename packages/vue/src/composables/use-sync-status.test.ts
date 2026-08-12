@@ -14,6 +14,7 @@ afterEach(() => {
 function makeStatus(overrides: Partial<SyncStatusInfo> = {}): SyncStatusInfo {
 	return {
 		status: 'offline',
+		reconnecting: false,
 		pendingOperations: 0,
 		lastSyncedAt: null,
 		lastSuccessfulPush: null,

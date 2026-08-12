@@ -35,6 +35,25 @@ describe('operationMatchesScopes', () => {
 		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-1' } })).toBe(true)
 	})
 
+	test('empty collection scope allows all operations in that collection', () => {
+		const insert = createOp()
+		const update = createOp({
+			type: 'update',
+			data: { title: 'Renamed' },
+			previousData: { title: 'Old' },
+		})
+		const deletion = createOp({
+			type: 'delete',
+			data: null,
+			previousData: null,
+		})
+
+		expect(operationMatchesScopes(insert, { todos: {} })).toBe(true)
+		expect(operationMatchesScopes(update, { todos: {} })).toBe(true)
+		expect(operationMatchesScopes(deletion, { todos: {} })).toBe(true)
+		expect(missingScopeFields(deletion, { todos: {} })).toEqual([])
+	})
+
 	test('rejects mismatched scoped fields', () => {
 		const op = createOp()
 		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-2' } })).toBe(false)

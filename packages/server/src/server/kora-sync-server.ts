@@ -1,4 +1,4 @@
-import type { BlobRef, KoraEventEmitter, Operation } from '@korajs/core'
+import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@korajs/core'
 import { SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
@@ -73,6 +73,7 @@ export class KoraSyncServer {
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
+	private readonly operationTransforms: OperationTransform[]
 	private readonly port: number | undefined
 	private readonly host: string
 	private readonly path: string
@@ -120,16 +121,28 @@ export class KoraSyncServer {
 
 	constructor(config: KoraSyncServerConfig) {
 		this.store = config.store
+		const storeSchemaVersion = this.store.getSchema()?.version
+		if (
+			config.schemaVersion !== undefined &&
+			storeSchemaVersion !== undefined &&
+			config.schemaVersion !== storeSchemaVersion
+		) {
+			throw new SyncError('Sync schema version does not match the configured store schema.', {
+				syncSchemaVersion: config.schemaVersion,
+				storeSchemaVersion,
+			})
+		}
 		this.auth = config.auth ?? null
 		this.serializer = config.serializer ?? new JsonMessageSerializer()
 		this.emitter = config.emitter ?? null
 		this.maxConnections = config.maxConnections ?? DEFAULT_MAX_CONNECTIONS
 		this.batchSize = config.batchSize ?? DEFAULT_BATCH_SIZE
-		this.schemaVersion = config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		this.schemaVersion = config.schemaVersion ?? storeSchemaVersion ?? DEFAULT_SCHEMA_VERSION
 		this.supportedSchemaVersions = config.supportedSchemaVersions ?? {
 			min: this.schemaVersion,
 			max: this.schemaVersion,
 		}
+		this.operationTransforms = config.operationTransforms ?? []
 		this.port = config.port
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
@@ -274,6 +287,22 @@ export class KoraSyncServer {
 				event: 'session.disconnected',
 				sessionId,
 				details: { reason: event.reason },
+			})
+		})
+
+		sessionEmitter.on('sync:schema-mismatch', (event) => {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.schema_mismatch',
+				sessionId,
+				details: {
+					clientSchemaVersion: event.clientSchemaVersion,
+					serverSchemaVersion: event.serverSchemaVersion,
+					supportedMin: event.supportedMin,
+					supportedMax: event.supportedMax,
+					reason: event.reason,
+				},
 			})
 		})
 	}
@@ -513,6 +542,35 @@ export class KoraSyncServer {
 			})
 		})
 
+		sessionEmitter.on('sync:schema-mismatch', (event) => {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.schema_mismatch',
+				sessionId,
+				details: {
+					clientSchemaVersion: event.clientSchemaVersion,
+					serverSchemaVersion: event.serverSchemaVersion,
+					supportedMin: event.supportedMin,
+					supportedMax: event.supportedMax,
+					reason: event.reason,
+				},
+			})
+		})
+
+		sessionEmitter.on('sync:delivery-stalled', (event) => {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.delivery_stalled',
+				sessionId,
+				details: {
+					watermark: event.watermark,
+					repeatCount: event.repeatCount,
+				},
+			})
+		})
+
 		const session = new ClientSession({
 			sessionId,
 			transport,
@@ -524,6 +582,7 @@ export class KoraSyncServer {
 			batchSize: this.batchSize,
 			schemaVersion: this.schemaVersion,
 			supportedSchemaVersions: this.supportedSchemaVersions,
+			operationTransforms: this.operationTransforms,
 			onRelay: (sourceSessionId, operations) => {
 				this.handleRelay(sourceSessionId, operations)
 			},

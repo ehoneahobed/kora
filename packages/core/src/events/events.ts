@@ -81,6 +81,20 @@ export type KoraEvent =
 			message: string
 			retriable: boolean
 	  }
+	| {
+			type: 'sync:delivery-gap'
+			expectedBase: number
+			receivedBase: number
+			currentWatermark: number
+			messageId: string
+			repeatCount: number
+	  }
+	| {
+			type: 'sync:delivery-stalled'
+			sessionId: string
+			watermark: number
+			repeatCount: number
+	  }
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }

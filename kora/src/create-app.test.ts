@@ -1,4 +1,6 @@
 import 'fake-indexeddb/auto'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import type { KoraEvent } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
@@ -113,6 +115,49 @@ describe('createApp', () => {
 		const found = await todos.findById(record.id)
 		expect(found).not.toBeNull()
 		expect(found?.title).toBe('Test Todo')
+	})
+
+	test('can namespace local stores by authenticated user id', async () => {
+		const baseName = join(
+			tmpdir(),
+			`kora-user-namespace-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		)
+		const createUserApp = (userId: string) =>
+			createApp({
+				schema,
+				store: {
+					adapter: 'better-sqlite3',
+					name: baseName,
+					namespaceByAuthUser: true,
+				},
+				sync: {
+					url: 'ws://localhost:65535/kora-sync',
+					authClient: {
+						auth: async () => ({ token: 'token' }),
+						resolveUserId: async () => userId,
+						resolveNodeId: async () => `device-${userId}`,
+					},
+				},
+			})
+
+		app = createUserApp('learner-a')
+		await app.ready
+		const todosA = (app as Record<string, unknown>).todos as CollectionAccessor
+		const created = await todosA.insert({ title: 'Learner A private row' })
+		await app.close()
+
+		app = createUserApp('learner-b')
+		await app.ready
+		const todosB = (app as Record<string, unknown>).todos as CollectionAccessor
+		await expect(todosB.findById(created.id)).resolves.toBeNull()
+		await app.close()
+
+		app = createUserApp('learner-a')
+		await app.ready
+		const reopenedTodosA = (app as Record<string, unknown>).todos as CollectionAccessor
+		await expect(reopenedTodosA.findById(created.id)).resolves.toMatchObject({
+			title: 'Learner A private row',
+		})
 	})
 
 	test('emits operation:created events on mutations', async () => {

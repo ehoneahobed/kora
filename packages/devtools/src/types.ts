@@ -39,6 +39,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:diagnostics': 'sync',
 	'sync:bandwidth': 'sync',
 	'sync:initial-sync-progress': 'sync',
+	'sync:delivery-gap': 'sync',
+	'sync:delivery-stalled': 'sync',
 	'awareness:updated': 'sync',
 	'state-machine:transition': 'operation',
 	'state-machine:rejected': 'operation',

@@ -124,8 +124,8 @@ describe('scaffoldTemplate', () => {
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync')
 
-		// Check devtools enabled
-		expect(main).toContain('devtools: true')
+		// Check devtools are enabled only in Vite dev mode
+		expect(main).toContain('devtools: import.meta.env.DEV')
 
 		// Check server uses SQLite
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')
@@ -161,9 +161,9 @@ describe('scaffoldTemplate', () => {
 		const css = await readFile(join(targetDir, 'src', 'index.css'), 'utf-8')
 		expect(css).toContain('@import "tailwindcss"')
 
-		// Check devtools enabled
+		// Check devtools are enabled only in Vite dev mode
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 		expect(main).not.toContain('sync')
 	})
 
@@ -188,11 +188,11 @@ describe('scaffoldTemplate', () => {
 		expect(pkg).toContain('lucide-react')
 		expect(pkg).toContain('@korajs/server')
 
-		// Check sync + devtools in main.tsx
+		// Check sync + dev-only devtools in main.tsx
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync')
 		expect(main).toContain('ws://localhost:3001')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 
 		// Check server uses SQLite
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')

@@ -28,8 +28,42 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 	const shadow = host.attachShadow({ mode: 'open' })
 
 	const style = document.createElement('style')
-	style.textContent = KORA_DEVTOOLS_STYLES
+	style.textContent = `${KORA_DEVTOOLS_STYLES}
+		:host {
+			color-scheme: dark;
+			background: #1e1e2e;
+			color: #cdd6f4;
+			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+			overflow: hidden;
+			border: 1px solid #45475a;
+			box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+		}
+		.kora-overlay-close {
+			position: absolute;
+			top: 6px;
+			right: 8px;
+			z-index: 1;
+			background: #313244;
+			color: #cdd6f4;
+			border: 1px solid #45475a;
+			border-radius: 4px;
+			cursor: pointer;
+			font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+			line-height: 1;
+			padding: 4px 8px;
+		}
+		.kora-overlay-close:hover {
+			background: #45475a;
+		}
+	`
 	shadow.appendChild(style)
+
+	const closeButton = document.createElement('button')
+	closeButton.type = 'button'
+	closeButton.className = 'kora-overlay-close'
+	closeButton.textContent = 'Close'
+	closeButton.setAttribute('aria-label', 'Close Kora DevTools')
+	shadow.appendChild(closeButton)
 
 	const panelRoot = document.createElement('div')
 	panelRoot.id = 'kora-devtools-root'
@@ -48,7 +82,8 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 	const setVisible = (next: boolean): void => {
 		visible = next
 		host.style.display = visible ? 'block' : 'none'
-		hint.style.display = visible ? 'none' : 'block'
+		hint.textContent = visible ? 'Hide Kora DevTools (Esc)' : 'Kora DevTools (Ctrl+Shift+K)'
+		hint.style.display = 'block'
 	}
 
 	const refresh = (): void => {
@@ -60,19 +95,40 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 
 	const onKeyDown = (event: KeyboardEvent): void => {
 		const isToggle = event.key === 'K' && event.shiftKey && (event.ctrlKey || event.metaKey)
-		if (!isToggle) return
-		event.preventDefault()
+		if (isToggle) {
+			event.preventDefault()
+			setVisible(!visible)
+			if (visible) {
+				refresh()
+			}
+			return
+		}
+		if (event.key === 'Escape' && visible) {
+			event.preventDefault()
+			setVisible(false)
+		}
+	}
+
+	const onHintClick = (): void => {
 		setVisible(!visible)
 		if (visible) {
 			refresh()
 		}
 	}
 
+	const onCloseClick = (): void => {
+		setVisible(false)
+	}
+
 	window.addEventListener('keydown', onKeyDown)
+	hint.addEventListener('click', onHintClick)
+	closeButton.addEventListener('click', onCloseClick)
 
 	return () => {
 		window.clearInterval(intervalId)
 		window.removeEventListener('keydown', onKeyDown)
+		hint.removeEventListener('click', onHintClick)
+		closeButton.removeEventListener('click', onCloseClick)
 		host.remove()
 		hint.remove()
 	}

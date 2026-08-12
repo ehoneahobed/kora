@@ -26,7 +26,7 @@ const app = createApp({
 	store: {
 		workerUrl: koraWorkerUrl,
 	},
-	devtools: true,
+	devtools: import.meta.env.DEV,
 })
 
 // Connect to sync server once the app is ready

@@ -156,6 +156,46 @@ async function runSharedStoreParityTests(
 
 		await store.close()
 	})
+
+	test(`${label}: rejects undeclared operation fields before accepting the log`, async () => {
+		const store = await createStore()
+		await store.setSchema(schema)
+
+		const result = await applyServerOperation(
+			store,
+			createTestOp({
+				id: 'unknown-field-op',
+				data: { title: 'bad', slug: 'not-in-schema' },
+			}),
+		)
+
+		expect(result.result).toBe('skipped')
+		expect(result.rejection?.code).toBe('SCHEMA_VALIDATION_ERROR')
+		expect(await store.getOperationCount()).toBe(0)
+		expect(await store.findRecord('todos', 'rec-1')).toBeNull()
+
+		await store.close()
+	})
+
+	test(`${label}: rejects unknown collections before accepting the log`, async () => {
+		const store = await createStore()
+		await store.setSchema(schema)
+
+		const result = await applyServerOperation(
+			store,
+			createTestOp({
+				id: 'unknown-collection-op',
+				collection: 'missing',
+				data: { title: 'bad' },
+			}),
+		)
+
+		expect(result.result).toBe('skipped')
+		expect(result.rejection?.code).toBe('UNKNOWN_COLLECTION')
+		expect(await store.getOperationCount()).toBe(0)
+
+		await store.close()
+	})
 }
 
 describe('server store parity', () => {

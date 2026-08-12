@@ -31,16 +31,25 @@ const v1ToV2Transforms: OperationTransform[] = [
 		fromVersion: 1,
 		toVersion: 2,
 		transform(op) {
-			const data = op.data ?? {}
-			const { done, ...rest } = data as { done?: boolean; title?: string }
 			return {
 				...op,
 				schemaVersion: 2,
-				data: { ...rest, completed: done ?? false },
+				data: transformTodoRecord(op.data),
+				previousData: transformTodoRecord(op.previousData),
 			}
 		},
 	},
 ]
+
+function transformTodoRecord(
+	record: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+	if (!record) {
+		return null
+	}
+	const { done, ...rest } = record
+	return 'done' in record ? { ...rest, completed: done } : rest
+}
 
 /**
  * PRODUCTION_PATH: v1 client + v2 server + transforms on modern client.
@@ -58,7 +67,11 @@ describe('PRODUCTION_PATH schema version sync', () => {
 	test('v1 legacy insert converges on v2 peer with operation transforms', async () => {
 		network = await createMixedTestNetwork(
 			schemaV2,
-			{ schemaVersion: 2, supportedSchemaVersions: { min: 1, max: 2 } },
+			{
+				schemaVersion: 2,
+				supportedSchemaVersions: { min: 1, max: 2 },
+				operationTransforms: v1ToV2Transforms,
+			},
 			[
 				{ name: 'legacy', schema: schemaV1, syncSchemaVersion: 1 },
 				{

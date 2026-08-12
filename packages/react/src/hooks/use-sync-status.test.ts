@@ -28,6 +28,7 @@ function createMockSyncEngine(initialStatus?: Partial<SyncStatusInfo>): {
 } {
 	let currentStatus: SyncStatusInfo = {
 		status: 'offline',
+		reconnecting: false,
 		pendingOperations: 0,
 		lastSyncedAt: null,
 		lastSuccessfulPush: null,
@@ -94,6 +95,7 @@ describe('useSyncStatus', () => {
 		const store = createMockStore()
 		const { syncEngine } = createMockSyncEngine({
 			status: 'synced',
+			reconnecting: false,
 			pendingOperations: 3,
 			lastSyncedAt: 12345,
 		})
@@ -125,6 +127,7 @@ describe('useSyncStatus', () => {
 
 		setStatus({
 			status: 'syncing',
+			reconnecting: false,
 			pendingOperations: 5,
 			lastSyncedAt: null,
 			lastSuccessfulPush: null,
@@ -154,6 +157,7 @@ describe('useSyncStatus', () => {
 					listeners.add(listener)
 					listener({
 						status: 'offline',
+						reconnecting: false,
 						pendingOperations: 0,
 						lastSyncedAt: null,
 						lastSuccessfulPush: null,
@@ -178,6 +182,7 @@ describe('useSyncStatus', () => {
 			for (const listener of listeners) {
 				listener({
 					status: 'synced',
+					reconnecting: false,
 					pendingOperations: 1,
 					lastSyncedAt: 99,
 					lastSuccessfulPush: null,

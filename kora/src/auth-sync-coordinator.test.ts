@@ -6,8 +6,9 @@ function createMockEngine() {
 	return {
 		stop: vi.fn(async () => {}),
 		start: vi.fn(async () => {}),
+		reconnect: vi.fn(async () => {}),
 		updateScope: vi.fn(),
-		getStatus: vi.fn(() => ({ status: 'connected' as const })),
+		getStatus: vi.fn(() => ({ status: 'connected' as const, reconnecting: false })),
 	}
 }
 
@@ -41,7 +42,7 @@ describe('AuthSyncCoordinator', () => {
 		coordinator.scheduleReconnect()
 
 		await vi.waitFor(() => {
-			expect(engine.start).toHaveBeenCalledTimes(2)
+			expect(engine.reconnect).toHaveBeenCalledTimes(2)
 		})
 
 		expect(maxConcurrentAuth).toBe(1)
@@ -60,5 +61,6 @@ describe('AuthSyncCoordinator', () => {
 			expect(engine.stop).toHaveBeenCalled()
 		})
 		expect(engine.start).not.toHaveBeenCalled()
+		expect(engine.reconnect).not.toHaveBeenCalled()
 	})
 })

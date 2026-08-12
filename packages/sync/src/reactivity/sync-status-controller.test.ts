@@ -6,6 +6,7 @@ import { OFFLINE_SYNC_STATUS, createSyncStatusController } from './sync-status-c
 function createStatus(overrides: Partial<SyncStatusInfo> = {}): SyncStatusInfo {
 	return {
 		status: 'connected',
+		reconnecting: false,
 		pendingOperations: 0,
 		lastSyncedAt: null,
 		lastSuccessfulPush: null,

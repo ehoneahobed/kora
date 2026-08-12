@@ -50,6 +50,13 @@ export interface StoreOptions {
 	/** Database name. Defaults to 'kora-db'. */
 	name?: string
 	/**
+	 * Namespace the physical local database by authenticated user id when
+	 * `sync.authClient` exposes one. Use this for shared browser profiles and lab
+	 * machines so one user's rows, queues, watermarks, and blob refs never appear in
+	 * another user's local store.
+	 */
+	namespaceByAuthUser?: boolean
+	/**
 	 * `shared` (default): one sync node id per database.
 	 * `per-tab`: unique node id per browser tab (sessionStorage).
 	 */
@@ -230,6 +237,8 @@ export interface SyncControl {
 	connect(): Promise<void>
 	/** Disconnect from the sync server. */
 	disconnect(): Promise<void>
+	/** Disconnect and reconnect as one serialized sync lifecycle operation. */
+	reconnect(): Promise<void>
 	/** Current sync status snapshot (updates on sync events). */
 	readonly status: SyncStatusInfo
 	/** Get the current developer-facing sync status. */

@@ -392,9 +392,10 @@ function relativeToTarget(targetDir: string, filePath: string | null): string {
  * Reads the version from @korajs/cli's own package.json and derives a
  * compatible version range for all @korajs packages.
  *
- * The CLI may be a patch ahead of other packages (e.g. CLI-only fixes),
- * so we use the major.minor range (^major.minor.0) which matches all
- * packages in the same release series.
+ * Stable CLI releases may be a patch ahead of other packages (e.g. CLI-only
+ * fixes), so we use the major.minor range (^major.minor.0) for stable versions.
+ * Prereleases are pinned exactly: semver ranges like ^1.0.0 do not include beta
+ * packages, and split beta tags are a rough first-run scaffold experience.
  */
 function resolveKoraVersion(): string {
 	try {
@@ -404,10 +405,7 @@ function resolveKoraVersion(): string {
 			if (existsSync(pkgPath)) {
 				const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: string; version: string }
 				if (pkg.name === '@korajs/cli') {
-					if (pkg.version === '0.0.0') return 'latest'
-					// Use ^major.minor.0 so all packages in the series match
-					const parts = pkg.version.split('.')
-					return `^${parts[0]}.${parts[1]}.0`
+					return deriveKoraTemplateVersion(pkg.version)
 				}
 			}
 			dir = dirname(dir)
@@ -416,4 +414,12 @@ function resolveKoraVersion(): string {
 	} catch {
 		return 'latest'
 	}
+}
+
+export function deriveKoraTemplateVersion(version: string): string {
+	if (version === '0.0.0') return 'latest'
+	if (version.includes('-')) return version
+
+	const parts = version.split('.')
+	return `^${parts[0]}.${parts[1]}.0`
 }

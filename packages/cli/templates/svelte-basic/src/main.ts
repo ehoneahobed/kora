@@ -10,7 +10,7 @@ const kora = createKoraApp({
 	store: {
 		workerUrl: koraWorkerUrl,
 	},
-	devtools: true,
+	devtools: import.meta.env.DEV,
 })
 
 mount(Root, { target: document.getElementById('app')!, props: { kora } })

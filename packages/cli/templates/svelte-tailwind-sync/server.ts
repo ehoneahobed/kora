@@ -76,7 +76,10 @@ async function start() {
 		staticDir: './dist',
 		syncPath,
 		httpRoutes: auth ? [{ path: '/auth', handle: auth.handleRequest }] : undefined,
-		syncOptions: auth ? { auth: auth.auth } : undefined,
+		syncOptions: {
+			schemaVersion: schema.version,
+			...(auth ? { auth: auth.auth } : {}),
+		},
 		operationalAuth: {
 			adminToken: process.env.KORA_ADMIN_TOKEN,
 			metricsToken: process.env.KORA_METRICS_TOKEN,

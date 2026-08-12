@@ -72,7 +72,7 @@ export default defineConfig({
 	server: {
 		allowedHosts: true,
 		watch: {
-			ignored: ['**/.kora/**', '**/*.db', '**/*.db-shm', '**/*.db-wal'],
+			ignored: ['**/.kora/**', '**/kora/generated/**', '**/*.db', '**/*.db-shm', '**/*.db-wal'],
 		},
 		proxy: {
 			'/kora-sync': {

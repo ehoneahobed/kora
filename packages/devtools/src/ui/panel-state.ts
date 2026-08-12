@@ -228,6 +228,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `bandwidth ${event.direction} ${event.bytesPerSecond}B/s`
 		case 'sync:initial-sync-progress':
 			return `initial sync ${Math.round(event.progress * 100)}%`
+		case 'sync:delivery-gap':
+			return `delivery gap expected ${event.expectedBase} received ${event.receivedBase}`
+		case 'sync:delivery-stalled':
+			return `delivery stalled at ${event.watermark} (${event.repeatCount} repeats)`
 		case 'awareness:updated':
 			return `awareness ${event.states.size} peers`
 		case 'state-machine:transition':

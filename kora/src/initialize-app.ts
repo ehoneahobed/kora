@@ -48,7 +48,13 @@ export async function initializeApp(
 	mergeEngine: MergeEngine,
 ): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
-	const dbName = config.store?.name ?? 'kora-db'
+	const baseDbName = config.store?.name ?? 'kora-db'
+	const authBinding = config.sync?.authClient ?? null
+	const authUserId =
+		config.store?.namespaceByAuthUser && authBinding?.resolveUserId
+			? await authBinding.resolveUserId()
+			: undefined
+	const dbName = resolveLocalDbName(baseDbName, authUserId, config.store?.namespaceByAuthUser)
 	let adapter: StorageAdapter = await createAdapter(
 		adapterType,
 		dbName,
@@ -59,7 +65,6 @@ export async function initializeApp(
 		adapterType === 'sqlite-wasm',
 	)
 
-	const authBinding = config.sync?.authClient ?? null
 	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
 
 	let syncEngine: SyncEngine | null = null
@@ -231,4 +236,27 @@ function emitOpfsUnavailable(
 		reason,
 		message: `OPFS persistence is unavailable (${reason}) for database "${dbName}", and IndexedDB fallback could not open; the store is running in memory and data will not survive a reload.`,
 	})
+}
+
+function resolveLocalDbName(
+	baseName: string,
+	authUserId: string | undefined,
+	namespaceByAuthUser: boolean | undefined,
+): string {
+	if (!namespaceByAuthUser) {
+		return baseName
+	}
+	return `${baseName}__user_${encodeDbNameComponent(authUserId ?? 'signed-out')}`
+}
+
+function encodeDbNameComponent(value: string): string {
+	let encoded = ''
+	for (const char of value) {
+		if (/^[A-Za-z0-9._-]$/.test(char)) {
+			encoded += char
+			continue
+		}
+		encoded += `_${char.codePointAt(0)?.toString(16) ?? '0'}`
+	}
+	return encoded || 'empty'
 }

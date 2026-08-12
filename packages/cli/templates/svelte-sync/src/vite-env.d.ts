@@ -2,6 +2,7 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
+	readonly DEV: boolean
 	readonly VITE_SYNC_URL?: string
 	readonly VITE_AUTH_URL?: string
 }

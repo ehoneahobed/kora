@@ -232,6 +232,20 @@ export function createSampleEvent<T extends KoraEventType>(
 			totalBatches: 10,
 			receivedBatches: 5,
 		},
+		'sync:delivery-gap': {
+			type: 'sync:delivery-gap',
+			expectedBase: 4,
+			receivedBase: 8,
+			currentWatermark: 4,
+			messageId: 'msg-gap',
+			repeatCount: 1,
+		},
+		'sync:delivery-stalled': {
+			type: 'sync:delivery-stalled',
+			sessionId: 'session-001',
+			watermark: 4,
+			repeatCount: 3,
+		},
 		'awareness:updated': { type: 'awareness:updated', states: new Map() },
 		'state-machine:transition': {
 			type: 'state-machine:transition',

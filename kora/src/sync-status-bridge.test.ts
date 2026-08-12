@@ -9,6 +9,7 @@ function createMockEngine(initial: Partial<SyncStatusInfo> = {}): {
 } {
 	let status: SyncStatusInfo = {
 		status: 'offline',
+		reconnecting: false,
 		pendingOperations: 0,
 		lastSyncedAt: null,
 		lastSuccessfulPush: null,
@@ -43,6 +44,7 @@ describe('createSyncStatusBridge', () => {
 
 		engine.setStatus({
 			status: 'syncing',
+			reconnecting: false,
 			pendingOperations: 2,
 			lastSyncedAt: null,
 			lastSuccessfulPush: null,
@@ -87,6 +89,7 @@ describe('createSyncStatusBridge', () => {
 		bridge.destroy()
 		engine.setStatus({
 			status: 'connected',
+			reconnecting: false,
 			pendingOperations: 0,
 			lastSyncedAt: null,
 			lastSuccessfulPush: null,

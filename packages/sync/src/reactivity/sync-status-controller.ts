@@ -4,6 +4,7 @@ import type { SyncStatusInfo } from '../types'
 /** Default status when sync is not configured or the engine is unavailable. */
 export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	status: 'offline',
+	reconnecting: false,
 	pendingOperations: 0,
 	lastSyncedAt: null,
 	lastSuccessfulPush: null,
@@ -22,6 +23,7 @@ const SYNC_STATUS_EVENT_TYPES = [
 	'sync:received',
 	'sync:acknowledged',
 	'sync:apply-failed',
+	'sync:delivery-gap',
 	'sync:diagnostics',
 	'sync:initial-sync-progress',
 ] as const satisfies readonly KoraEventType[]

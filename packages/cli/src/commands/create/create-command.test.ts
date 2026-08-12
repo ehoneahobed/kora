@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { ProjectExistsError } from '../../errors'
 import { directoryExists } from '../../utils/fs-helpers'
-import { createCommand } from './create-command'
+import { createCommand, deriveKoraTemplateVersion } from './create-command'
 import { applySyncProviderPreset } from './sync-provider-preset'
 import { scaffoldTemplate } from './template-engine'
 
@@ -111,6 +111,12 @@ describe('create command flow', () => {
 		expect(pkg).not.toContain('{{koraVersion}}')
 	})
 
+	test('pins prerelease Kora template dependencies exactly', () => {
+		expect(deriveKoraTemplateVersion('1.0.0-beta.9')).toBe('1.0.0-beta.9')
+		expect(deriveKoraTemplateVersion('1.2.3')).toBe('^1.2.0')
+		expect(deriveKoraTemplateVersion('0.0.0')).toBe('latest')
+	})
+
 	test('scaffolds react-tailwind-sync project with Tailwind and sync', async () => {
 		const targetDir = join(tempDir.path, 'tw-sync-app')
 		await scaffoldTemplate('react-tailwind-sync', targetDir, {
@@ -181,7 +187,7 @@ describe('create command flow', () => {
 		expect(pkg).toContain('@tauri-apps/cli')
 	})
 
-	test('all templates include devtools: true', async () => {
+	test('all templates enable devtools only in Vite dev mode', async () => {
 		const templates = [
 			'react-basic',
 			'react-sync',
@@ -196,7 +202,7 @@ describe('create command flow', () => {
 				koraVersion: '0.1.0',
 			})
 			const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
-			expect(main).toContain('devtools: true')
+			expect(main).toContain('devtools: import.meta.env.DEV')
 		}
 	})
 

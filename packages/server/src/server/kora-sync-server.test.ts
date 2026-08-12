@@ -4,6 +4,7 @@ import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
+import type { AuthProvider } from '../types'
 import { KoraSyncServer } from './kora-sync-server'
 
 function createTestOp(overrides: Partial<Operation> = {}): Operation {
@@ -81,6 +82,40 @@ describe('KoraSyncServer', () => {
 		expect(status.connectedClients).toBe(1)
 		expect(status.port).toBe(3000)
 		expect(status.totalOperations).toBe(1)
+	})
+
+	test('defaults schemaVersion from configured store schema', async () => {
+		const store = new MemoryServerStore('server-schema-default')
+		await store.setSchema(
+			defineSchema({
+				version: 7,
+				collections: {
+					todos: { fields: { title: t.string() } },
+				},
+			}),
+		)
+
+		const server = new KoraSyncServer({ store })
+		const status = await server.getStatus()
+
+		expect(status.schemaVersion).toBe(7)
+		await server.stop()
+	})
+
+	test('rejects explicit schemaVersion that disagrees with store schema', async () => {
+		const store = new MemoryServerStore('server-schema-mismatch')
+		await store.setSchema(
+			defineSchema({
+				version: 2,
+				collections: {
+					todos: { fields: { title: t.string() } },
+				},
+			}),
+		)
+
+		expect(() => new KoraSyncServer({ store, schemaVersion: 1 })).toThrow(
+			'Sync schema version does not match',
+		)
 	})
 
 	test('getConnectionCount reflects active sessions', () => {
@@ -490,6 +525,80 @@ describe('KoraSyncServer', () => {
 			const raw = await store.materializeCollection('submissions')
 			expect(raw).toHaveLength(0)
 			expect(messages.find((m) => m.type === 'operation-rejected')).toBeUndefined()
+			await server.stop()
+		})
+	})
+
+	describe('stale-scope inbound pushes', () => {
+		test('scope violations are retryable per-op rejections and do not advance the ack range', async () => {
+			const store = new MemoryServerStore('server-stale-scope')
+			await store.setSchema(
+				defineSchema({
+					version: 1,
+					collections: {
+						submissions: { fields: { ownerId: t.string(), text: t.string() } },
+					},
+				}),
+			)
+			const auth: AuthProvider = {
+				authenticate: async () => ({
+					userId: 'user-1',
+					scopes: { submissions: { ownerId: 'user-1' } },
+				}),
+			}
+			const server = new KoraSyncServer({ store, auth })
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
+
+			client.send({
+				type: 'handshake',
+				messageId: 'hs-stale-scope',
+				nodeId: 'client-sub',
+				versionVector: {},
+				schemaVersion: 1,
+				authToken: 'valid',
+			})
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'handshake-response')).toBeDefined()
+			})
+
+			const scopedOut = createTestOp({
+				id: 'stale-scope-1',
+				collection: 'submissions',
+				recordId: 'submission-stale-scope-1',
+				sequenceNumber: 1,
+				data: { ownerId: 'user-2', text: 'out of scope' },
+			})
+			client.send({
+				type: 'operation-batch',
+				messageId: `batch-${scopedOut.id}`,
+				operations: [
+					{
+						...scopedOut,
+						timestamp: { ...scopedOut.timestamp },
+						causalDeps: [...scopedOut.causalDeps],
+					},
+				],
+				isFinal: true,
+				batchIndex: 0,
+			})
+
+			await vi.waitFor(() => {
+				expect(messages.find((m) => m.type === 'operation-rejected')).toBeDefined()
+				expect(messages.find((m) => m.type === 'acknowledgment')).toBeDefined()
+			})
+			const rejected = messages.find((m) => m.type === 'operation-rejected')
+			if (rejected?.type === 'operation-rejected') {
+				expect(rejected.operationId).toBe(scopedOut.id)
+				expect(rejected.code).toBe('SCOPE_VIOLATION')
+				expect(rejected.retriable).toBe(true)
+			}
+			const ack = messages.find((m) => m.type === 'acknowledgment')
+			if (ack?.type === 'acknowledgment') {
+				expect(ack.lastSequenceNumber).toBe(0)
+			}
+			expect(await store.materializeCollection('submissions')).toHaveLength(0)
 			await server.stop()
 		})
 	})

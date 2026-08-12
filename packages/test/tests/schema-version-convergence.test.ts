@@ -31,16 +31,25 @@ const v1ToV2Transforms: OperationTransform[] = [
 		fromVersion: 1,
 		toVersion: 2,
 		transform(op) {
-			const data = op.data ?? {}
-			const { done, ...rest } = data as { done?: boolean; title?: string }
 			return {
 				...op,
 				schemaVersion: 2,
-				data: { ...rest, completed: done ?? false },
+				data: transformTodoRecord(op.data),
+				previousData: transformTodoRecord(op.previousData),
 			}
 		},
 	},
 ]
+
+function transformTodoRecord(
+	record: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+	if (!record) {
+		return null
+	}
+	const { done, ...rest } = record
+	return 'done' in record ? { ...rest, completed: done } : rest
+}
 
 /**
  * Plan 2.3.5: v1 client ops sync through a v2 server; v2 client transforms and converges.
@@ -58,7 +67,11 @@ describe('schema version cross-version sync', () => {
 	test('v1 insert on A materializes as v2 completed on B after sync', async () => {
 		network = await createMixedTestNetwork(
 			schemaV2,
-			{ schemaVersion: 2, supportedSchemaVersions: { min: 1, max: 2 } },
+			{
+				schemaVersion: 2,
+				supportedSchemaVersions: { min: 1, max: 2 },
+				operationTransforms: v1ToV2Transforms,
+			},
 			[
 				{ name: 'legacy-client', schema: schemaV1, syncSchemaVersion: 1 },
 				{
@@ -89,7 +102,11 @@ describe('schema version cross-version sync', () => {
 	test('CONCURRENT conflicting edits across schema versions converge without data loss', async () => {
 		network = await createMixedTestNetwork(
 			schemaV2,
-			{ schemaVersion: 2, supportedSchemaVersions: { min: 1, max: 2 } },
+			{
+				schemaVersion: 2,
+				supportedSchemaVersions: { min: 1, max: 2 },
+				operationTransforms: v1ToV2Transforms,
+			},
 			[
 				{ name: 'legacy-client', schema: schemaV1, syncSchemaVersion: 1 },
 				{

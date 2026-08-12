@@ -22,7 +22,7 @@ const kora = createKoraApp({
 	store: {
 		workerUrl: koraWorkerUrl,
 	},
-	devtools: true,
+	devtools: import.meta.env.DEV,
 })
 
 kora.ready.then(() => kora.sync?.connect())

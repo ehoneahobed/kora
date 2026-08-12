@@ -138,6 +138,8 @@ export interface SyncDiagnostics {
 	pendingOperations: number
 	hasInFlightBatch: boolean
 	reconnecting: boolean
+	deliveryWatermark: number
+	deliveryGapRepeatCount: number
 	timestamp: number
 }
 
@@ -210,6 +212,7 @@ export class SyncEngine {
 	private lastSuccessfulPull: number | null = null
 	private conflictCount = 0
 	private currentBatch: OutboundBatch | null = null
+	private currentBatchRequiresPartialAck = false
 	private reconnecting = false
 	private schemaBlocked = false
 	private clockBlocked = false
@@ -218,6 +221,7 @@ export class SyncEngine {
 	private outboundAckTimer: ReturnType<typeof setTimeout> | null = null
 	private startPromise: Promise<void> | null = null
 	private stopPromise: Promise<void> | null = null
+	private reconnectPromise: Promise<void> | null = null
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -262,6 +266,8 @@ export class SyncEngine {
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
 	 */
 	private readonly deliverySignatureWatermarks = new Map<string, number>()
+	private deliveryGapRepeatCount = 0
+	private lastDeliveryGapKey: string | null = null
 
 	constructor(options: SyncEngineOptions) {
 		this.transport = options.transport
@@ -451,6 +457,7 @@ export class SyncEngine {
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
+			this.currentBatchRequiresPartialAck = false
 		}
 
 		try {
@@ -511,6 +518,7 @@ export class SyncEngine {
 			? this.cachedUnsyncedCount
 			: this.outboundQueue.totalPending
 		const base = {
+			reconnecting: this.reconnecting,
 			pendingOperations,
 			lastSyncedAt: this.lastSyncedAt,
 			lastSuccessfulPush: this.lastSuccessfulPush,
@@ -532,9 +540,7 @@ export class SyncEngine {
 			case 'connecting':
 			case 'handshaking':
 			case 'syncing':
-				// During reconnection attempts, show 'offline' instead of 'syncing'
-				// since the user is disconnected and reconnection is in progress.
-				return { ...base, status: this.reconnecting ? 'offline' : 'syncing' }
+				return { ...base, status: this.reconnecting ? 'reconnecting' : 'syncing' }
 			case 'streaming':
 				return { ...base, status: pendingOperations > 0 ? 'syncing' : 'synced' }
 			case 'error':
@@ -634,6 +640,27 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Atomically refresh the transport session. Overlapping callers share one
+	 * reconnect, in-flight outbound batches are returned to the queue by stop(), and the
+	 * next start handshakes with the latest auth token, sync scope, and query subsets.
+	 */
+	async reconnect(): Promise<void> {
+		if (this.schemaBlocked) return
+		if (this.reconnectPromise) return this.reconnectPromise
+
+		this.reconnecting = false
+		this.reconnectPromise = this.reconnectInternal().finally(() => {
+			this.reconnectPromise = null
+		})
+		return this.reconnectPromise
+	}
+
+	private async reconnectInternal(): Promise<void> {
+		await this.stop()
+		await this.start()
+	}
+
+	/**
 	 * Export a diagnostics snapshot for debugging and support tickets.
 	 * Contains connection state, timing info, and queue metrics.
 	 */
@@ -651,6 +678,8 @@ export class SyncEngine {
 			pendingOperations: this.outboundQueue.totalPending,
 			hasInFlightBatch: this.currentBatch !== null,
 			reconnecting: this.reconnecting,
+			deliveryWatermark: this.deliveryWatermark,
+			deliveryGapRepeatCount: this.deliveryGapRepeatCount,
 			timestamp: Date.now(),
 		}
 	}
@@ -869,7 +898,7 @@ export class SyncEngine {
 				await this.handleOperationBatch(message)
 				break
 			case 'acknowledgment':
-				this.handleAcknowledgment(message)
+				await this.handleAcknowledgment(message)
 				break
 			case 'error':
 				this.handleError(message)
@@ -1179,6 +1208,18 @@ export class SyncEngine {
 				// A gap: an earlier batch has not arrived. Do not apply out of order and do
 				// not acknowledge, so the server's reliable retransmit (or the next handshake
 				// resend from the watermark) redelivers the missing batch first.
+				const gapKey = `${this.deliveryWatermark}:${base}`
+				this.deliveryGapRepeatCount =
+					this.lastDeliveryGapKey === gapKey ? this.deliveryGapRepeatCount + 1 : 1
+				this.lastDeliveryGapKey = gapKey
+				this.emitter?.emit({
+					type: 'sync:delivery-gap',
+					expectedBase: this.deliveryWatermark,
+					receivedBase: base,
+					currentWatermark: this.deliveryWatermark,
+					messageId: msg.messageId,
+					repeatCount: this.deliveryGapRepeatCount,
+				})
 				return
 			}
 			if (base < this.deliveryWatermark) {
@@ -1293,6 +1334,8 @@ export class SyncEngine {
 		// applied. This is the single place the watermark moves, so it always reflects a
 		// gap-free prefix of the server's in-scope stream.
 		if (isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined) {
+			this.deliveryGapRepeatCount = 0
+			this.lastDeliveryGapKey = null
 			this.deliveryWatermark = msg.maxDeliverySequence
 			this.setViewWatermark(this.deliverySignature(), this.deliveryWatermark)
 			await this.persistDeliveryWatermark(this.deliveryWatermark)
@@ -1348,7 +1391,7 @@ export class SyncEngine {
 		this.transport.send(ack)
 	}
 
-	private handleAcknowledgment(msg: AcknowledgmentMessage): void {
+	private async handleAcknowledgment(msg: AcknowledgmentMessage): Promise<void> {
 		this.clearOutboundAckTimer()
 		if (this.state === 'syncing' && this.config.strictHandshake) {
 			this.pendingDeltaBatchAcks.delete(msg.acknowledgedMessageId)
@@ -1356,16 +1399,23 @@ export class SyncEngine {
 		}
 
 		if (this.currentBatch) {
-			this.outboundQueue.acknowledge(this.currentBatch.batchId)
+			if (this.currentBatchRequiresPartialAck) {
+				await this.outboundQueue.acknowledgeThrough(
+					this.currentBatch.batchId,
+					msg.lastSequenceNumber,
+				)
+			} else {
+				await this.outboundQueue.acknowledge(this.currentBatch.batchId)
+			}
 			this.currentBatch = null
+			this.currentBatchRequiresPartialAck = false
 			const now = Date.now()
 			this.lastSyncedAt = now
 			this.lastSuccessfulPush = now
 		}
 
-		void this.advanceLastAckedForLocalNode(msg.lastSequenceNumber).then(() =>
-			this.refreshPendingCount(),
-		)
+		await this.advanceLastAckedForLocalNode(msg.lastSequenceNumber)
+		await this.refreshPendingCount()
 
 		// Continue flushing if more ops in queue
 		if (this.state === 'streaming' && this.outboundQueue.hasOperations) {
@@ -1382,6 +1432,7 @@ export class SyncEngine {
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
+			this.currentBatchRequiresPartialAck = false
 		}
 		this.transitionTo('error')
 		if (msg.code === 'AUTH_FAILED') {
@@ -1413,6 +1464,21 @@ export class SyncEngine {
 	 * signal, so the connection stays up.
 	 */
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
+		if (msg.retriable) {
+			this.currentBatchRequiresPartialAck = true
+			await this.refreshPendingCount()
+			this.emitter?.emit({
+				type: 'sync:operation-rejected',
+				operationId: msg.operationId,
+				collection: msg.collection,
+				recordId: msg.recordId,
+				code: msg.code,
+				message: msg.message,
+				retriable: true,
+			})
+			return
+		}
+
 		await this.outboundQueue.reject(msg.operationId)
 
 		await this.rejectedStorage.record({
@@ -1590,6 +1656,7 @@ export class SyncEngine {
 		if (!batch) return
 
 		this.currentBatch = batch
+		this.currentBatchRequiresPartialAck = false
 
 		if (this.encryptor) {
 			// Encryption is async — encrypt then send. Errors return the batch to the queue.
@@ -1616,6 +1683,7 @@ export class SyncEngine {
 					// If encryption fails, return the batch to the queue so no data is lost
 					this.outboundQueue.returnBatch(batch.batchId)
 					this.currentBatch = null
+					this.currentBatchRequiresPartialAck = false
 					this.emitter?.emit({
 						type: 'sync:disconnected',
 						reason: err instanceof Error ? err.message : 'Encryption failed',
@@ -1662,6 +1730,7 @@ export class SyncEngine {
 
 		this.outboundQueue.returnBatch(batchId)
 		this.currentBatch = null
+		this.currentBatchRequiresPartialAck = false
 		this.clearOutboundAckTimer()
 		await this.refreshPendingCount()
 
@@ -1691,6 +1760,7 @@ export class SyncEngine {
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
+			this.currentBatchRequiresPartialAck = false
 		}
 
 		if (this.schemaBlocked) {
@@ -1808,8 +1878,7 @@ export class SyncEngine {
 	}
 
 	private async reconnectForQuerySubsets(): Promise<void> {
-		await this.stop()
-		await this.start()
+		await this.reconnect()
 	}
 }
 

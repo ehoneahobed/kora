@@ -12,7 +12,7 @@ const app = createApp({
 	store: {
 		workerUrl: koraWorkerUrl,
 	},
-	devtools: true,
+	devtools: import.meta.env.DEV,
 })
 
 createRoot(document.getElementById('root')!).render(

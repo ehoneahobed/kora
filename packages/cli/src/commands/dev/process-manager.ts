@@ -24,6 +24,7 @@ export class ProcessManager {
 	private readonly processes = new Map<string, RunningProcess>()
 
 	spawn(config: ManagedProcessConfig): void {
+		this.processes.get(config.label)?.child.kill('SIGTERM')
 		const options: SpawnOptions = {
 			cwd: config.cwd,
 			env: { ...process.env, ...config.env },
@@ -73,6 +74,22 @@ export class ProcessManager {
 
 	hasRunning(): boolean {
 		return this.processes.size > 0
+	}
+
+	async restart(config: ManagedProcessConfig): Promise<void> {
+		await this.stop(config.label)
+		this.spawn(config)
+	}
+
+	async stop(label: string): Promise<void> {
+		const running = this.processes.get(label)
+		if (!running) return
+		running.child.kill('SIGTERM')
+		await Promise.race([running.exitPromise, delay(5000)])
+		const remaining = this.processes.get(label)
+		if (!remaining) return
+		remaining.child.kill('SIGKILL')
+		await remaining.exitPromise
 	}
 
 	async shutdownAll(): Promise<void> {

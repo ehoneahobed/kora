@@ -31,6 +31,19 @@ export async function applyServerOperation(
 	const schema = store.getSchema()
 	const lookup = relationLookup ?? (schema ? buildMergeRelationLookup(schema) : new Map())
 
+	const shapeCheck = validateOperationShape(op, schema)
+	if (!shapeCheck.valid) {
+		return {
+			result: 'skipped',
+			appliedOperations: [],
+			rejection: {
+				code: shapeCheck.code ?? 'SCHEMA_VALIDATION_ERROR',
+				message: shapeCheck.message ?? `Operation "${op.id}" does not match the server schema`,
+				retriable: false,
+			},
+		}
+	}
+
 	const constraintCheck = await validateIncomingOperationConstraints(store, op, schema)
 	if (!constraintCheck.valid) {
 		const code = constraintCheck.code ?? 'CONSTRAINT_VIOLATION'
@@ -94,4 +107,79 @@ export async function applyServerOperation(
 		result,
 		appliedOperations: result === 'applied' ? [op] : [],
 	}
+}
+
+function validateOperationShape(
+	op: Operation,
+	schema: ReturnType<ServerStore['getSchema']>,
+): { valid: true } | { valid: false; code: string; message: string } {
+	if (!schema) {
+		return { valid: true }
+	}
+
+	const collection = schema.collections[op.collection]
+	if (!collection) {
+		return {
+			valid: false,
+			code: 'UNKNOWN_COLLECTION',
+			message: `Operation "${op.id}" targets unknown collection "${op.collection}".`,
+		}
+	}
+
+	const declaredFields = new Set(Object.keys(collection.fields))
+	const systemPreviousFields = new Set(['id', '_created_at', '_updated_at', '_deleted'])
+	const invalidDataField = firstInvalidField(op.data, declaredFields)
+	if (invalidDataField) {
+		return {
+			valid: false,
+			code: 'SCHEMA_VALIDATION_ERROR',
+			message: `Operation "${op.id}" contains undeclared field "${invalidDataField}" in data for collection "${op.collection}".`,
+		}
+	}
+
+	const invalidPreviousField = firstInvalidField(
+		op.previousData,
+		declaredFields,
+		systemPreviousFields,
+	)
+	if (invalidPreviousField) {
+		return {
+			valid: false,
+			code: 'SCHEMA_VALIDATION_ERROR',
+			message: `Operation "${op.id}" contains undeclared field "${invalidPreviousField}" in previousData for collection "${op.collection}".`,
+		}
+	}
+
+	if (op.atomicOps) {
+		for (const field of Object.keys(op.atomicOps)) {
+			if (!declaredFields.has(field)) {
+				return {
+					valid: false,
+					code: 'SCHEMA_VALIDATION_ERROR',
+					message: `Operation "${op.id}" contains undeclared atomic field "${field}" for collection "${op.collection}".`,
+				}
+			}
+		}
+	}
+
+	return { valid: true }
+}
+
+function firstInvalidField(
+	value: unknown,
+	declaredFields: Set<string>,
+	extraAllowedFields?: Set<string>,
+): string | null {
+	if (value === null || value === undefined) {
+		return null
+	}
+	if (typeof value !== 'object' || Array.isArray(value)) {
+		return null
+	}
+	for (const field of Object.keys(value)) {
+		if (!declaredFields.has(field) && !extraAllowedFields?.has(field)) {
+			return field
+		}
+	}
+	return null
 }

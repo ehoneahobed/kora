@@ -1273,6 +1273,26 @@ describe('SyncEngine status', () => {
 		expect(status.lastSyncedAt).toBeNull()
 	})
 
+	test('reports reconnecting while a reconnect attempt is in progress', async () => {
+		const transport = createDeferredTransport()
+		const engine = new SyncEngine({
+			transport,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		engine.setReconnecting(true)
+		const start = engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('connecting'))
+
+		const status = engine.getStatus()
+		expect(status.status).toBe('reconnecting')
+		expect(status.reconnecting).toBe(true)
+
+		transport.resolveConnect()
+		await start
+	})
+
 	test('reports synced when streaming with empty queue', async () => {
 		const { client, server } = createMemoryTransportPair()
 		setupServerResponder(server)
@@ -1892,6 +1912,23 @@ describe('SyncEngine enhanced status', () => {
 		await engine.retryNow()
 		expect(engine.getState()).toBe('streaming')
 	})
+
+	test('reconnect refreshes an active transport session', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+
+		await engine.reconnect()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+	})
 })
 
 describe('SyncEngine query subsets', () => {
@@ -2133,6 +2170,103 @@ describe('SyncEngine operation rejection', () => {
 		// The app can forget it once reconciled.
 		await engine.clearRejectedOperations([op.id])
 		expect(await engine.getRejectedOperations()).toHaveLength(0)
+
+		await engine.stop()
+	})
+
+	test('retryable per-op rejection plus partial ack keeps the unacked suffix pending', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const pushedBatches: OperationBatchMessage[] = []
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				const handshake = msg as HandshakeMessage
+				server.send({
+					type: 'handshake-response',
+					messageId: `resp-${handshake.messageId}`,
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: handshake.schemaVersion,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-empty',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+				return
+			}
+
+			if (msg.type !== 'operation-batch' || msg.operations.length === 0) {
+				return
+			}
+
+			const batch = msg as OperationBatchMessage
+			pushedBatches.push(batch)
+
+			if (pushedBatches.length === 1) {
+				const rejected = batch.operations[1]
+				if (!rejected) throw new Error('expected second operation in first pushed batch')
+				server.send({
+					type: 'operation-rejected',
+					messageId: `rej-${rejected.id}`,
+					operationId: rejected.id,
+					collection: rejected.collection,
+					recordId: rejected.recordId,
+					code: 'SCOPE_VIOLATION',
+					message: 'Refresh sync scopes and retry',
+					retriable: true,
+				})
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${batch.messageId}`,
+					acknowledgedMessageId: batch.messageId,
+					lastSequenceNumber: 1,
+				})
+			} else if (pushedBatches.length === 2) {
+				server.send({
+					type: 'acknowledgment',
+					messageId: `ack-${batch.messageId}`,
+					acknowledgedMessageId: batch.messageId,
+					lastSequenceNumber: 2,
+				})
+			}
+		})
+
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+			emitter,
+		})
+
+		const op1 = makeOp('accepted-prefix', 1, 'test-node')
+		const op2 = makeOp('retryable-suffix', 2, 'test-node')
+		await engine.pushOperation(op1)
+		await engine.pushOperation(op2)
+		await engine.start()
+
+		await vi.waitFor(() => {
+			expect(pushedBatches.length).toBeGreaterThanOrEqual(2)
+		})
+
+		expect(pushedBatches[0]?.operations.map((op) => op.id)).toEqual([op1.id, op2.id])
+		expect(pushedBatches[1]?.operations.map((op) => op.id)).toEqual([op2.id])
+		await vi.waitFor(() => {
+			expect(engine.exportDiagnostics().pendingOperations).toBe(0)
+		})
+		expect(await engine.getRejectedOperations()).toHaveLength(0)
+
+		const events = emitter.events.filter((e) => e.type === 'sync:operation-rejected')
+		expect(events).toHaveLength(1)
+		expect(events[0]).toMatchObject({
+			operationId: op2.id,
+			code: 'SCOPE_VIOLATION',
+			retriable: true,
+		})
 
 		await engine.stop()
 	})

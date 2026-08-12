@@ -142,6 +142,20 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 		return readDeviceIdFromClaims(claims)
 	}
 
+	binding.resolveUserId = async () => {
+		const token = await authClient.getAccessToken()
+		if (!token) {
+			return undefined
+		}
+
+		const claims = decodeJwtPayload(token)
+		if (!claims || typeof claims.sub !== 'string' || claims.sub.length === 0) {
+			return undefined
+		}
+
+		return claims.sub
+	}
+
 	if (authClient.onAuthChange) {
 		binding.subscribe = (listener) => authClient.onAuthChange?.(() => listener()) ?? (() => {})
 	}

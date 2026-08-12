@@ -11,7 +11,7 @@ const kora = createKoraApp({
 	store: {
 		workerUrl: koraWorkerUrl,
 	},
-	devtools: true,
+	devtools: import.meta.env.DEV,
 })
 
 createApp({

@@ -78,6 +78,21 @@ describe('createKoraAuthSync', () => {
 		await expect(binding.resolveNodeId?.()).resolves.toBe('device-xyz')
 	})
 
+	test('resolveUserId returns sub claim for local store namespacing', async () => {
+		const token = makeToken({
+			sub: 'user-abc',
+			dev: 'device-xyz',
+			exp: Math.floor(Date.now() / 1000) + 3600,
+		})
+
+		const authClient = {
+			getAccessToken: vi.fn().mockResolvedValue(token),
+		}
+
+		const binding = createKoraAuthSync({ authClient })
+		await expect(binding.resolveUserId?.()).resolves.toBe('user-abc')
+	})
+
 	test('scopeFromClaims override is applied', async () => {
 		const token = makeToken({
 			sub: 'user-abc',

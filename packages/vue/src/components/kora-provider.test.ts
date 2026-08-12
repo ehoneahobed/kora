@@ -25,6 +25,7 @@ function createMockSyncEngine(): SyncEngine {
 	return {
 		getStatus: vi.fn().mockReturnValue({
 			status: 'offline',
+			reconnecting: false,
 			pendingOperations: 0,
 			lastSyncedAt: null,
 		}),

@@ -53,6 +53,16 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 				state.syncStatusBridge?.refresh()
 			}
 		},
+		async reconnect(): Promise<void> {
+			await ready
+			if (state.syncEngine) {
+				state.intentionalDisconnect = false
+				state.reconnectionManager?.stop()
+				state.reconnectionManager?.reset()
+				await state.syncEngine.reconnect()
+				state.syncStatusBridge?.refresh()
+			}
+		},
 		getStatus(): SyncStatusInfo {
 			if (state.syncEngine) {
 				return state.syncEngine.getStatus()
@@ -89,6 +99,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 				state: 'disconnected' as const,
 				status: {
 					status: 'offline' as const,
+					reconnecting: false,
 					pendingOperations: 0,
 					lastSyncedAt: null,
 					lastSuccessfulPush: null,
@@ -107,6 +118,8 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 				pendingOperations: 0,
 				hasInFlightBatch: false,
 				reconnecting: false,
+				deliveryWatermark: 0,
+				deliveryGapRepeatCount: 0,
 				timestamp: Date.now(),
 			}
 		},

@@ -5,12 +5,14 @@ import type { ScopeMap } from '../scopes/build-scope-map'
 export interface KoraBindingSyncStatus {
 	status:
 		| 'connected'
+		| 'reconnecting'
 		| 'syncing'
 		| 'synced'
 		| 'offline'
 		| 'error'
 		| 'schema-mismatch'
 		| 'clock-error'
+	reconnecting: boolean
 	pendingOperations: number
 	lastSyncedAt: number | null
 	lastSuccessfulPush: number | null
@@ -84,6 +86,8 @@ export interface AuthSyncBinding {
 	 * Separate from the user id (`sub`).
 	 */
 	resolveNodeId?: () => Promise<string | undefined>
+	/** Returns the authenticated user id used for local store namespacing. */
+	resolveUserId?: () => Promise<string | undefined>
 	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
 	subscribe?: (listener: () => void) => () => void
 }

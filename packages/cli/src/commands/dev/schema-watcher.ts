@@ -3,12 +3,14 @@ import { watch } from 'node:fs'
 import type { FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { hasTsxInstalled } from '../../utils/fs-helpers'
+import { loadSchemaDefinition } from '../migrate/schema-loader'
 
 export interface SchemaWatcherConfig {
 	schemaPath: string
 	projectRoot: string
 	debounceMs?: number
 	onRegenerate?: () => void
+	onSchemaVersionChange?: (change: { previous: number; next: number }) => void
 	onError?: (error: Error) => void
 }
 
@@ -19,6 +21,7 @@ export class SchemaWatcher {
 	private readonly debounceMs: number
 	private watcher: FSWatcher | null = null
 	private debounceTimer: NodeJS.Timeout | null = null
+	private schemaVersion: number | null = null
 
 	constructor(private readonly config: SchemaWatcherConfig) {
 		this.debounceMs = config.debounceMs ?? 300
@@ -32,6 +35,10 @@ export class SchemaWatcher {
 		})
 
 		this.watcher.on('error', (error) => {
+			this.config.onError?.(toError(error))
+		})
+
+		void this.refreshSchemaVersion().catch((error) => {
 			this.config.onError?.(toError(error))
 		})
 	}
@@ -66,6 +73,16 @@ export class SchemaWatcher {
 
 		await spawnCommand(command, args, this.config.projectRoot)
 		this.config.onRegenerate?.()
+		await this.refreshSchemaVersion()
+	}
+
+	private async refreshSchemaVersion(): Promise<void> {
+		const schema = await loadSchemaDefinition(this.config.schemaPath, this.config.projectRoot)
+		const previous = this.schemaVersion
+		this.schemaVersion = schema.version
+		if (previous !== null && previous !== schema.version) {
+			this.config.onSchemaVersionChange?.({ previous, next: schema.version })
+		}
 	}
 
 	private scheduleRegeneration(): void {

@@ -93,6 +93,36 @@ export class OutboundQueue {
 	}
 
 	/**
+	 * Acknowledge only operations in an in-flight batch whose local sequence number is
+	 * covered by the server's ack. Any later operations return to the front of the
+	 * queue for retry. This is required when the server accepts a prefix but rejects a
+	 * later operation retriably (for example a stale-scope push after auth changed).
+	 */
+	async acknowledgeThrough(batchId: string, lastSequenceNumber: number): Promise<void> {
+		const ops = this.inFlight.get(batchId)
+		if (!ops) return
+
+		this.inFlight.delete(batchId)
+		const acknowledged = ops.filter((op) => op.sequenceNumber <= lastSequenceNumber)
+		const retry = ops.filter((op) => op.sequenceNumber > lastSequenceNumber)
+
+		if (retry.length > 0) {
+			this.queue.unshift(...retry)
+			if (this.queue.length > 1) {
+				this.queue = topologicalSort(this.queue)
+			}
+		}
+
+		if (acknowledged.length > 0) {
+			const ids = acknowledged.map((op) => op.id)
+			for (const id of ids) {
+				this.seen.delete(id)
+			}
+			await this.storage.dequeue(ids)
+		}
+	}
+
+	/**
 	 * Return a failed batch to the front of the queue for retry.
 	 * Prepends the operations to maintain priority.
 	 */

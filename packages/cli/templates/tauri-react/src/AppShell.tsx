@@ -101,7 +101,7 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 						},
 					}
 				: {}),
-			devtools: true,
+			devtools: import.meta.env.DEV,
 		}),
 	)
 

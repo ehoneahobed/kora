@@ -49,7 +49,7 @@ describe('create-kora-app flow', () => {
 
 		// Verify devtools enabled
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 	})
 
 	test('react-sync: includes sync-specific files', async () => {
@@ -67,7 +67,7 @@ describe('create-kora-app flow', () => {
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync:')
 		expect(main).toContain('ws://localhost:3001')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 
 		// Verify @korajs/server in devDependencies
 		const pkgContent = await readFile(join(targetDir, 'package.json'), 'utf-8')
@@ -109,7 +109,7 @@ describe('create-kora-app flow', () => {
 		// No sync config
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).not.toContain('sync:')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 	})
 
 	test('react-tailwind-sync: full featured template', async () => {
@@ -137,7 +137,7 @@ describe('create-kora-app flow', () => {
 		// Sync + devtools in main
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
 		expect(main).toContain('sync:')
-		expect(main).toContain('devtools: true')
+		expect(main).toContain('devtools: import.meta.env.DEV')
 
 		// SQLite server store
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')

@@ -143,6 +143,7 @@ export interface SyncDiagnosticsSnapshot {
 	/** Current developer-facing sync status */
 	status:
 		| 'connected'
+		| 'reconnecting'
 		| 'syncing'
 		| 'synced'
 		| 'offline'

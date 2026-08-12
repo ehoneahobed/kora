@@ -58,7 +58,8 @@ export class AuthSyncCoordinator {
 
 		const status = engine.getStatus().status
 		if (status !== 'offline') {
-			await engine.stop()
+			await engine.reconnect()
+			return
 		}
 		await engine.start()
 	}

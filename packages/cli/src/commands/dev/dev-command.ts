@@ -14,6 +14,7 @@ import { createLogger } from '../../utils/logger'
 import { loadKoraConfig } from './kora-config'
 import type { KoraConfigFile } from './kora-config'
 import { ProcessManager } from './process-manager'
+import type { ManagedProcessConfig } from './process-manager'
 import { SchemaWatcher } from './schema-watcher'
 
 interface ManagedSyncStoreConfig {
@@ -197,7 +198,9 @@ export const devCommand = defineCommand({
 		}
 		logger.blank()
 
-		logger.step('  Kora DevTools overlay: Ctrl+Shift+K (Cmd+Shift+K on macOS) when devtools: true')
+		logger.step(
+			'  Kora DevTools overlay: Ctrl+Shift+K (Cmd+Shift+K on macOS) when devtools is enabled',
+		)
 
 		processManager.spawn({
 			label: 'vite',
@@ -210,34 +213,37 @@ export const devCommand = defineCommand({
 			onExit: onManagedProcessExit,
 		})
 
-		if (shouldStartSync && hasTsx && syncServerFile) {
-			processManager.spawn({
-				label: 'sync',
-				command: process.execPath,
-				args: ['--import', 'tsx', syncServerFile],
-				cwd: projectRoot,
-				env: {
-					PORT: String(syncPort),
-					KORA_SYNC_PORT: String(syncPort),
-				},
-				onExit: onManagedProcessExit,
-			})
-		}
+		const syncProcessConfig: ManagedProcessConfig | null =
+			shouldStartSync && hasTsx && syncServerFile
+				? {
+						label: 'sync',
+						command: process.execPath,
+						args: ['--import', 'tsx', syncServerFile],
+						cwd: projectRoot,
+						env: {
+							PORT: String(syncPort),
+							KORA_SYNC_PORT: String(syncPort),
+						},
+						onExit: onManagedProcessExit,
+					}
+				: shouldStartSync && syncServerFile === null && managedSyncStore !== null
+					? {
+							label: 'sync',
+							command: process.execPath,
+							args: ['--input-type=module', '--eval', MANAGED_SYNC_BOOTSTRAP_SCRIPT],
+							cwd: projectRoot,
+							env: {
+								KORA_DEV_SYNC_CONFIG: JSON.stringify({
+									port: Number(syncPort),
+									store: managedSyncStore,
+								}),
+							},
+							onExit: onManagedProcessExit,
+						}
+					: null
 
-		if (shouldStartSync && syncServerFile === null && managedSyncStore !== null) {
-			processManager.spawn({
-				label: 'sync',
-				command: process.execPath,
-				args: ['--input-type=module', '--eval', MANAGED_SYNC_BOOTSTRAP_SCRIPT],
-				cwd: projectRoot,
-				env: {
-					KORA_DEV_SYNC_CONFIG: JSON.stringify({
-						port: Number(syncPort),
-						store: managedSyncStore,
-					}),
-				},
-				onExit: onManagedProcessExit,
-			})
+		if (syncProcessConfig) {
+			processManager.spawn(syncProcessConfig)
 		}
 
 		if (watchEnabled && schemaPath) {
@@ -247,6 +253,16 @@ export const devCommand = defineCommand({
 				debounceMs: watchDebounceMs,
 				onRegenerate: () => {
 					logger.success('Regenerated types from schema changes')
+				},
+				onSchemaVersionChange: ({ previous, next }) => {
+					if (!syncProcessConfig) {
+						logger.warn(
+							`Schema version changed from ${previous} to ${next}; restart your sync server before clients can sync.`,
+						)
+						return
+					}
+					logger.warn(`Schema version changed from ${previous} to ${next}; restarting sync server.`)
+					void processManager.restart(syncProcessConfig)
 				},
 				onError: (error) => {
 					logger.error(`Schema watcher error: ${error.message}`)
