@@ -51,6 +51,17 @@ export interface KoraSyncServerConfig {
 	/** Maximum operations per sync batch. Defaults to 100. */
 	batchSize?: number
 	/**
+	 * How often to retransmit unacknowledged non-watermark relay batches, in
+	 * milliseconds. Defaults to 2000. Set to 0 to disable periodic retransmit.
+	 */
+	relayRetransmitIntervalMs?: number
+	/**
+	 * How often the server checks the authoritative delivery log for writes that did
+	 * not pass through this KoraSyncServer instance, in milliseconds. Defaults to
+	 * 2000. Set to 0 to disable polling.
+	 */
+	deliveryPollIntervalMs?: number
+	/**
 	 * Schema version the server expects. Defaults to `store.getSchema()?.version`
 	 * when the store has been configured with a schema, otherwise `1`.
 	 */

@@ -248,7 +248,7 @@ describe('server delivery stream', () => {
 		// Now WITHOUT a further ack, a forced re-push resumes from the still-acked
 		// position 2 and re-sends c, recovering it had the first send dropped.
 		messages.length = 0
-		session.retransmitPendingRelays(0)
+		session.pushDeliveryStreamIfSupported(0)
 		await vi.waitFor(() => expect(batches(messages).length).toBeGreaterThan(0))
 		expect(batches(messages).flatMap((b) => b.operations.map((o) => o.id))).toEqual(['c'])
 	})

@@ -1,8 +1,12 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { type Operation, defineSchema, generateUUIDv7, t } from '@korajs/core'
-import type { SyncMessage } from '@korajs/sync'
+import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
+import { createSqliteServerStore } from '../store/sqlite-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
 import type { AuthProvider } from '../types'
 import { KoraSyncServer } from './kora-sync-server'
@@ -43,6 +47,27 @@ function sendHandshake(
 		nodeId,
 		versionVector,
 		schemaVersion: 1,
+	})
+}
+
+function sendDeliveryHandshake(
+	client: ReturnType<typeof createServerTransportPair>['client'],
+	nodeId = 'client-1',
+	lastDeliverySequence = 0,
+): void {
+	client.send({
+		type: 'handshake',
+		messageId: `hs-${nodeId}`,
+		nodeId,
+		versionVector: {},
+		schemaVersion: 1,
+		lastDeliverySequence,
+	})
+}
+
+function operationBatches(messages: SyncMessage[]): OperationBatchMessage[] {
+	return messages.filter((message): message is OperationBatchMessage => {
+		return message.type === 'operation-batch'
 	})
 }
 
@@ -116,6 +141,57 @@ describe('KoraSyncServer', () => {
 		expect(() => new KoraSyncServer({ store, schemaVersion: 1 })).toThrow(
 			'Sync schema version does not match',
 		)
+	})
+
+	test('rejects invalid background interval options', () => {
+		const store = new MemoryServerStore('server-1')
+		expect(() => new KoraSyncServer({ store, relayRetransmitIntervalMs: -1 })).toThrow(
+			'relayRetransmitIntervalMs must be a non-negative integer',
+		)
+		expect(() => new KoraSyncServer({ store, deliveryPollIntervalMs: 1.5 })).toThrow(
+			'deliveryPollIntervalMs must be a non-negative integer',
+		)
+	})
+
+	test('pollDeliveryLog pushes operations appended through another SQLite store instance', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-server-external-'))
+		const filename = join(dir, 'server.db')
+		const liveStore = createSqliteServerStore({ filename, nodeId: 'live-server' })
+		const externalStore = createSqliteServerStore({ filename, nodeId: 'external-writer' })
+		const server = new KoraSyncServer({
+			store: liveStore,
+			relayRetransmitIntervalMs: 0,
+			deliveryPollIntervalMs: 0,
+		})
+		const { client, server: transport } = createServerTransportPair()
+		const messages = collectClientMessages(client)
+		server.handleConnection(transport)
+
+		sendDeliveryHandshake(client, 'client-1', 0)
+		await vi.waitFor(() => {
+			expect(messages.some((message) => message.type === 'handshake-response')).toBe(true)
+		})
+		messages.length = 0
+
+		await externalStore.applyRemoteOperation(createTestOp({ id: 'external-op', nodeId: 'job' }))
+		await server.pollDeliveryLog()
+
+		await vi.waitFor(() => {
+			expect(operationBatches(messages).length).toBeGreaterThan(0)
+		})
+		expect(
+			operationBatches(messages).flatMap((batch) => batch.operations.map((op) => op.id)),
+		).toEqual(['external-op'])
+
+		await liveStore.applyRemoteOperation(
+			createTestOp({ id: 'live-op', nodeId: 'live', sequenceNumber: 2 }),
+		)
+		const delivered = await externalStore.getOperationsAfterDelivery(0, 100)
+		expect(delivered.map((d) => d.operation.id)).toEqual(['external-op', 'live-op'])
+		expect(delivered.map((d) => d.deliverySequence)).toEqual([1, 2])
+
+		await server.stop()
+		await externalStore.close()
 	})
 
 	test('getConnectionCount reflects active sessions', () => {

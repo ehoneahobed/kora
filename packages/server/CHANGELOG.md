@@ -1,5 +1,23 @@
 # @korajs/server
 
+## 1.0.0-beta.10
+
+### Patch Changes
+
+- Make SQLite delivery sequencing cross-instance safe by moving delivery sequence
+  allocation from an in-memory counter to a durable `delivery_counter` table.
+  Multiple `SqliteServerStore` instances sharing one database now allocate unique,
+  monotonic delivery sequences, and backup restore reseeds the same counter.
+- Add configurable `relayRetransmitIntervalMs` and `deliveryPollIntervalMs`
+  options to `KoraSyncServerConfig`. The default remains 2000ms for backward
+  compatibility, and `0` disables the corresponding periodic task.
+- Split delivery-watermark polling from legacy relay retransmit. Live sync
+  servers now poll the authoritative delivery log and wake connected
+  delivery-watermark clients, so valid operations appended through another store
+  instance can be delivered without restarting the server.
+- Reject production-server listen errors instead of leaving `start()` pending
+  forever when the port cannot be bound.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

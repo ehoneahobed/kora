@@ -44,3 +44,8 @@ export const syncState = sqliteTable('sync_state', {
 	maxSequenceNumber: integer('max_sequence_number').notNull(),
 	lastSeenAt: integer('last_seen_at').notNull(),
 })
+
+export const deliveryCounter = sqliteTable('delivery_counter', {
+	id: integer('id').primaryKey(),
+	value: integer('value').notNull(),
+})

@@ -5,7 +5,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
-import { operations, syncState } from './drizzle-schema'
+import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
 	deserializeFieldValue,
 	generateAllCollectionDDL,
@@ -38,12 +38,6 @@ export class SqliteServerStore implements ServerStore {
 	private readonly db: BetterSQLite3Database
 	private schema: SchemaDefinition | null = null
 	private closed = false
-	/**
-	 * Next delivery sequence to assign. Single-writer (better-sqlite3 is synchronous),
-	 * so a plain in-memory counter, seeded from MAX(delivery_seq) at startup, gives
-	 * commit-order delivery sequence. Assigned inside the append transaction.
-	 */
-	private deliverySeqCounter = 0
 
 	constructor(db: BetterSQLite3Database, nodeId?: string) {
 		this.db = db
@@ -114,9 +108,7 @@ export class SqliteServerStore implements ServerStore {
 				return 'duplicate' as const
 			}
 
-			// Assign the next delivery sequence in commit order (single-writer: no race).
-			this.deliverySeqCounter += 1
-			const row = this.serializeOperation(op, now, this.deliverySeqCounter)
+			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
 			tx.insert(operations).values(row).run()
 
 			// Advance version vector: upsert with MAX to ensure monotonic progress
@@ -306,6 +298,7 @@ export class SqliteServerStore implements ServerStore {
 		this.db.transaction((tx) => {
 			tx.run(sql.raw('DELETE FROM operations'))
 			tx.run(sql.raw('DELETE FROM sync_state'))
+			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
 
 			for (const [nid, seq] of versionVector) {
 				tx.insert(syncState)
@@ -320,7 +313,7 @@ export class SqliteServerStore implements ServerStore {
 				const row = this.serializeOperation(op, Date.now(), deliverySeq)
 				tx.insert(operations).values(row).run()
 			}
-			this.deliverySeqCounter = deliverySeq
+			tx.update(deliveryCounter).set({ value: deliverySeq }).where(eq(deliveryCounter.id, 1)).run()
 		})
 
 		return { operationsRestored: ops.length, success: true }
@@ -696,6 +689,12 @@ export class SqliteServerStore implements ServerStore {
 		`)
 
 		this.db.run(sql`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_seq_unique
+			ON operations (delivery_seq)
+			WHERE delivery_seq IS NOT NULL
+		`)
+
+		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)
 		`)
 
@@ -716,12 +715,19 @@ export class SqliteServerStore implements ServerStore {
 			)
 		`)
 
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS delivery_counter (
+				id INTEGER PRIMARY KEY,
+				value INTEGER NOT NULL
+			)
+		`)
+
 		this.backfillDeliverySequence()
 	}
 
 	/**
 	 * Assign delivery sequences to any operations written before the column existed,
-	 * then seed the in-memory counter from the current max. Ordered by
+	 * then seed the durable counter from the current max. Ordered by
 	 * (received_at, sequence_number, id) so the backfill is deterministic and stable
 	 * across restarts. A one-time migration: after it runs, all rows have a value.
 	 */
@@ -738,8 +744,37 @@ export class SqliteServerStore implements ServerStore {
 				next += 1
 				tx.run(sql`UPDATE operations SET delivery_seq = ${next} WHERE id = ${row.id}`)
 			}
-			this.deliverySeqCounter = next
+			tx.insert(deliveryCounter)
+				.values({ id: 1, value: next })
+				.onConflictDoUpdate({
+					target: deliveryCounter.id,
+					set: {
+						value: sql`MAX(${deliveryCounter.value}, ${next})`,
+					},
+				})
+				.run()
 		})
+	}
+
+	/**
+	 * Reserve the next delivery sequence inside the append transaction. SQLite locks
+	 * the database for the write transaction, and this counter row keeps sequence
+	 * allocation shared by every SqliteServerStore instance using the same file.
+	 */
+	private nextDeliverySeq(tx: BetterSQLite3Database): number {
+		const rows = tx
+			.update(deliveryCounter)
+			.set({ value: sql`${deliveryCounter.value} + 1` })
+			.where(eq(deliveryCounter.id, 1))
+			.returning({ value: deliveryCounter.value })
+			.all()
+		const value = rows[0]?.value
+		if (value === undefined || value === null) {
+			throw new Error(
+				'delivery_counter row (id=1) is missing; the operations log cannot assign delivery sequences',
+			)
+		}
+		return value
 	}
 
 	// ---------------------------------------------------------------------------

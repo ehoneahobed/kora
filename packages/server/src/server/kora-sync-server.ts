@@ -33,8 +33,8 @@ const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
-/** How often to retransmit relay batches connected clients have not acknowledged. */
-const RELAY_RETRANSMIT_INTERVAL_MS = 2000
+const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
+const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
 
 /**
  * Minimal interface for a ws.WebSocketServer instance.
@@ -55,6 +55,15 @@ export type WsServerConstructor = new (options: {
 	path?: string
 }) => WsServerLike
 
+function validateIntervalOption(name: string, value: number): number {
+	if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+		throw new SyncError(`${name} must be a non-negative integer number of milliseconds`, {
+			[name]: value,
+		})
+	}
+	return value
+}
+
 /**
  * Self-hosted sync server. Accepts WebSocket connections from clients,
  * handles the sync protocol, stores operations, and relays changes
@@ -71,6 +80,8 @@ export class KoraSyncServer {
 	private readonly emitter: KoraEventEmitter | null
 	private readonly maxConnections: number
 	private readonly batchSize: number
+	private readonly relayRetransmitIntervalMs: number
+	private readonly deliveryPollIntervalMs: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
 	private readonly operationTransforms: OperationTransform[]
@@ -107,6 +118,9 @@ export class KoraSyncServer {
 	 * leaving that client with a permanent version-vector gap (a lost operation).
 	 */
 	private relayRetransmitTimer: ReturnType<typeof setInterval> | null = null
+	private deliveryPollTimer: ReturnType<typeof setInterval> | null = null
+	private lastObservedDeliverySequence = 0
+	private deliveryPollInFlight = false
 	/**
 	 * Relay operations a client never acknowledged before it disconnected, buffered by
 	 * client node id so they can be redelivered on its next connection. Bounded per
@@ -137,6 +151,14 @@ export class KoraSyncServer {
 		this.emitter = config.emitter ?? null
 		this.maxConnections = config.maxConnections ?? DEFAULT_MAX_CONNECTIONS
 		this.batchSize = config.batchSize ?? DEFAULT_BATCH_SIZE
+		this.relayRetransmitIntervalMs = validateIntervalOption(
+			'relayRetransmitIntervalMs',
+			config.relayRetransmitIntervalMs ?? DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS,
+		)
+		this.deliveryPollIntervalMs = validateIntervalOption(
+			'deliveryPollIntervalMs',
+			config.deliveryPollIntervalMs ?? DEFAULT_DELIVERY_POLL_INTERVAL_MS,
+		)
 		this.schemaVersion = config.schemaVersion ?? storeSchemaVersion ?? DEFAULT_SCHEMA_VERSION
 		this.supportedSchemaVersions = config.supportedSchemaVersions ?? {
 			min: this.schemaVersion,
@@ -164,14 +186,22 @@ export class KoraSyncServer {
 		if (!this.emitter) {
 			this.emitter = new SimpleEventEmitter()
 		}
+	}
 
-		// Retransmit relays a client hasn't acked within one interval. Started here (not
-		// in start()) so it also runs for embedded/in-memory servers that never call
-		// start(). unref() so it never keeps the process alive; cleared in stop().
-		this.relayRetransmitTimer = setInterval(() => {
-			this.retransmitPendingRelays(RELAY_RETRANSMIT_INTERVAL_MS)
-		}, RELAY_RETRANSMIT_INTERVAL_MS)
-		this.relayRetransmitTimer.unref?.()
+	private ensureBackgroundTimersStarted(): void {
+		if (this.relayRetransmitIntervalMs > 0 && !this.relayRetransmitTimer) {
+			this.relayRetransmitTimer = setInterval(() => {
+				this.retransmitPendingRelays(this.relayRetransmitIntervalMs)
+			}, this.relayRetransmitIntervalMs)
+			this.relayRetransmitTimer.unref?.()
+		}
+
+		if (this.deliveryPollIntervalMs > 0 && !this.deliveryPollTimer) {
+			this.deliveryPollTimer = setInterval(() => {
+				void this.pollDeliveryLog()
+			}, this.deliveryPollIntervalMs)
+			this.deliveryPollTimer.unref?.()
+		}
 	}
 
 	/**
@@ -184,6 +214,40 @@ export class KoraSyncServer {
 			session.retransmitPendingRelays(staleMs)
 		}
 		this.expireOrphanedRelays()
+	}
+
+	/**
+	 * Check whether the authoritative delivery log advanced without passing through
+	 * this server instance, then wake delivery-watermark sessions to scan from their
+	 * own acknowledged cursors. Session-level filtering remains the only fan-out path.
+	 */
+	async pollDeliveryLog(): Promise<void> {
+		if (this.deliveryPollInFlight) return
+		this.deliveryPollInFlight = true
+		try {
+			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
+			if (maxDeliverySequence <= this.lastObservedDeliverySequence) {
+				for (const session of this.sessions.values()) {
+					session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
+						trackStall: true,
+					})
+				}
+				return
+			}
+			this.lastObservedDeliverySequence = maxDeliverySequence
+			for (const session of this.sessions.values()) {
+				session.pushDeliveryStreamIfSupported(0)
+			}
+		} catch (error) {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'delivery_poll.failed',
+				details: { error: error instanceof Error ? error.message : String(error) },
+			})
+		} finally {
+			this.deliveryPollInFlight = false
+		}
 	}
 
 	/**
@@ -389,6 +453,10 @@ export class KoraSyncServer {
 			clearInterval(this.relayRetransmitTimer)
 			this.relayRetransmitTimer = null
 		}
+		if (this.deliveryPollTimer) {
+			clearInterval(this.deliveryPollTimer)
+			this.deliveryPollTimer = null
+		}
 		this.orphanedRelaysByNode.clear()
 
 		// Clean up awareness relay
@@ -487,6 +555,8 @@ export class KoraSyncServer {
 				max: this.maxConnections,
 			})
 		}
+
+		this.ensureBackgroundTimersStarted()
 
 		const sessionId = generateUUIDv7()
 		this.metrics.recordConnection(sessionId)

@@ -582,8 +582,13 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				}
 			})
 
-			return new Promise<string>((resolve) => {
+			return new Promise<string>((resolve, reject) => {
+				const onError = (error: Error) => {
+					reject(error)
+				}
+				httpServer?.once('error', onError)
 				httpServer?.listen(port, '0.0.0.0', () => {
+					httpServer?.off('error', onError)
 					resolve(`http://localhost:${port}`)
 				})
 			})

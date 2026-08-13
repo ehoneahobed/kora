@@ -461,24 +461,7 @@ export class ClientSession {
 	 */
 	retransmitPendingRelays(staleMs = 0): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
-		// A delivery-watermark client recovers a dropped or stalled batch by re-pushing
-		// from its last acknowledged position (which re-includes anything unapplied), so a
-		// gap is recovered on the next tick even with no new operations and with no reliance
-		// on the bounded relay buffer. When the client is caught up the re-push is a no-op.
 		if (this.clientDeliveryWatermark !== null) {
-			if (staleMs > 0 && Date.now() - this.lastDeliveryPushAttemptAtMs < staleMs) {
-				return
-			}
-			this.deliveryStallRepeatCount += 1
-			if (this.deliveryStallRepeatCount >= 3) {
-				this.emitter?.emit({
-					type: 'sync:delivery-stalled',
-					sessionId: this.sessionId,
-					watermark: this.lastAckedDeliverySeq,
-					repeatCount: this.deliveryStallRepeatCount,
-				})
-			}
-			this.pushDeliveryStream()
 			return
 		}
 		if (this.pendingRelays.size === 0) return
@@ -488,6 +471,32 @@ export class ClientSession {
 				this.sendToClient(message)
 			}
 		}
+	}
+
+	/**
+	 * Wake the durable delivery stream for clients that negotiated delivery
+	 * watermarks. This is used both for dropped watermark batches and for operations
+	 * appended by another server/store instance: the session always scans from its
+	 * own acknowledged cursor and applies its visibility filter before sending.
+	 */
+	pushDeliveryStreamIfSupported(staleMs = 0, options: { trackStall?: boolean } = {}): void {
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.clientDeliveryWatermark === null) return
+		if (staleMs > 0 && Date.now() - this.lastDeliveryPushAttemptAtMs < staleMs) {
+			return
+		}
+		if (options.trackStall) {
+			this.deliveryStallRepeatCount += 1
+			if (this.deliveryStallRepeatCount >= 3) {
+				this.emitter?.emit({
+					type: 'sync:delivery-stalled',
+					sessionId: this.sessionId,
+					watermark: this.lastAckedDeliverySeq,
+					repeatCount: this.deliveryStallRepeatCount,
+				})
+			}
+		}
+		this.pushDeliveryStream()
 	}
 
 	/**

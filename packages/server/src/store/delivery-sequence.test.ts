@@ -1,4 +1,7 @@
+import { mkdtempSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Operation } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
@@ -190,6 +193,40 @@ describe('sqlite delivery-seq backfill', () => {
 			expect(fresh.delivery_seq).toBe(4)
 			await store.close()
 		})
+	})
+})
+
+describe('sqlite delivery sequence across store instances', () => {
+	test('allocates unique delivery sequences from a shared database counter', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-sqlite-delivery-'))
+		const filename = join(dir, 'server.db')
+		const a = createSqliteServerStore({ filename, nodeId: 'server-a' })
+		const b = createSqliteServerStore({ filename, nodeId: 'server-b' })
+
+		await a.applyRemoteOperation(op({ id: 'from-a-1', nodeId: 'a' }))
+		await b.applyRemoteOperation(op({ id: 'from-b-1', nodeId: 'b' }))
+		await a.applyRemoteOperation(op({ id: 'from-a-2', nodeId: 'a', sequenceNumber: 2 }))
+
+		const delivered = await b.getOperationsAfterDelivery(0, 100)
+		expect(delivered.map((d) => d.operation.id)).toEqual(['from-a-1', 'from-b-1', 'from-a-2'])
+		expect(delivered.map((d) => d.deliverySequence)).toEqual([1, 2, 3])
+
+		await a.close()
+		await b.close()
+	})
+
+	test('continues above an externally advanced counter after reopening', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-sqlite-delivery-'))
+		const filename = join(dir, 'server.db')
+		const a = createSqliteServerStore({ filename, nodeId: 'server-a' })
+		await a.applyRemoteOperation(op({ id: 'first' }))
+		await a.close()
+
+		const b = createSqliteServerStore({ filename, nodeId: 'server-b' })
+		await b.applyRemoteOperation(op({ id: 'second', nodeId: 'b' }))
+		const delivered = await b.getOperationsAfterDelivery(0, 100)
+		expect(delivered.map((d) => d.deliverySequence)).toEqual([1, 2])
+		await b.close()
 	})
 })
 
