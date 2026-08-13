@@ -1,5 +1,13 @@
 # kora
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Add authenticated-only sync suspension, stable query-subset policies, awaitable
+  active-view settlement, active apply-failure state, store identity introspection,
+  and an auth-bound React app lifecycle for shared-browser isolation.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

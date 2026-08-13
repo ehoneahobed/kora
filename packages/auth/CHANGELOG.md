@@ -1,5 +1,13 @@
 # @korajs/auth
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Make `createKoraAuthSync()` expose explicit loading, signed-out, anonymous, and
+  authenticated states. Signed-out synchronization now suspends by default;
+  anonymous synchronization requires `anonymous: 'allow'`.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

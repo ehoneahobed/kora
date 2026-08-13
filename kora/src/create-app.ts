@@ -17,7 +17,14 @@ import {
 	wireSyncLifecycleAfterReady,
 } from './sync-lifecycle'
 import { createTransactionExecutor } from './transaction-executor'
-import type { BlobApi, KoraApp, KoraConfig, TypedKoraApp, TypedKoraConfig } from './types'
+import type {
+	BlobApi,
+	KoraApp,
+	KoraConfig,
+	StoreInfo,
+	TypedKoraApp,
+	TypedKoraConfig,
+} from './types'
 import { validateCreateAppConfig } from './validate-config'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
@@ -47,6 +54,14 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
 	let unsubscribeLocalOperations: (() => void) | null = null
+	let currentStoreInfo: StoreInfo = {
+		baseName: config.store?.name ?? 'kora-db',
+		databaseName: '',
+		authUserId: null,
+		persistence: config.store?.adapter ?? 'sqlite-wasm',
+		durable: false,
+		isolationState: 'closed',
+	}
 
 	const syncState: SyncRuntimeState = {
 		syncEngine: null,
@@ -70,6 +85,7 @@ export function createApp<const S extends SchemaInput>(
 		blobApi = createBlobApi(init.blobStore, init.blobChunkProvider, config.blob?.chunkSize, () =>
 			enumerateLiveBlobRefs(init.store, config.schema),
 		)
+		currentStoreInfo = init.storeInfo
 		wireSyncLifecycleAfterReady(config, emitter, syncState, init)
 	})
 
@@ -128,6 +144,9 @@ export function createApp<const S extends SchemaInput>(
 		getQueryStoreCache(): QueryStoreCache {
 			return queryStoreCache
 		},
+		storeInfo(): StoreInfo {
+			return { ...currentStoreInfo }
+		},
 		transaction(fn) {
 			return executeTransaction(fn)
 		},
@@ -161,6 +180,7 @@ export function createApp<const S extends SchemaInput>(
 				await store.close()
 				store = null
 			}
+			currentStoreInfo = { ...currentStoreInfo, isolationState: 'closed' }
 			emitter.clear()
 		},
 		async exportBackup(options) {

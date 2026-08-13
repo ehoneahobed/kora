@@ -1,5 +1,6 @@
 export type {
 	AuthSyncBinding,
+	AuthSyncState,
 	KoraAppLike,
 	KoraBindingSyncBridge,
 	KoraBindingSyncStatus,

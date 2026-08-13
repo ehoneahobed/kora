@@ -170,6 +170,11 @@ The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Andro
 
 ### `createKoraAuthSync(options)`
 
+Signed-out synchronization is suspended by default. Pass `anonymous: 'allow'` only when the
+server intentionally uses `MixedAuthProvider`. The binding exposes `resolveSyncState()` with
+distinct `loading`, `signed-out`, `anonymous`, and `authenticated` states, so an empty token is
+never used as an auth-readiness signal.
+
 Creates an `AuthSyncBinding` for `createApp({ sync: { authClient } })`. Wires `@korajs/auth` to Kora sync with minimal boilerplate.
 
 ```typescript
@@ -192,14 +197,17 @@ const app = createApp({
 | `authClient` | `AuthSyncClient` | Yes | Auth client with `getAccessToken()` (and optional `onAuthChange`) |
 | `schema` | `SchemaDefinition` | No | When set, builds scope map from JWT claims via `extractScopeValuesFromClaims()` |
 | `scopeFromClaims` | `(claims) => Record<string, unknown>` | No | Custom claim → flat scope value mapping |
+| `anonymous` | `'suspend' \| 'allow'` | No | Signed-out behavior. Defaults to `'suspend'`. |
 
 Returns `AuthSyncBinding` (alias: `KoraAuthSyncBinding`, deprecated):
 
 | Method | Description |
 |--------|-------------|
-| `auth()` | Returns `{ token }` for sync handshake; empty string when signed out |
+| `auth()` | Returns `{ token }` for a permitted handshake; readiness is resolved separately |
 | `resolveScopeMap?()` | Builds per-collection scope map from current token + schema |
 | `resolveNodeId?()` | Returns JWT `dev` claim as device-bound sync node id |
+| `resolveUserId?()` | Returns JWT `sub` for local store namespacing |
+| `resolveSyncState?()` | Returns explicit loading, signed-out, anonymous, or authenticated state |
 | `subscribe?(listener)` | Notifies on auth state change so `createApp` can reconnect |
 
 When `schema` is provided, scope values are extracted from:

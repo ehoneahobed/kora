@@ -1480,3 +1480,12 @@ awareness.setLocalState({
 ```
 
 When a `KoraEventEmitter` is attached to the engine, awareness changes emit `awareness:updated` events containing the full states map.
+## Settlement and query-subset policy
+
+Configure `sync.querySubsets.mode` as `reactive` (default), `static`, or `disabled`. Static
+manifests are replaced atomically with `app.sync.setQuerySubsets(subsets)`.
+
+`app.sync.waitForSettled({ upload, download: 'active-view', timeoutMs, signal })` returns a
+structured `settled`, `offline`, `suspended`, `blocked`, `timeout`, or `aborted` result. Detailed
+status snapshots include phase, pending/in-flight upload work, active-view completeness,
+watermark/frontier, initial-sync progress, and the current blocking apply failure.

@@ -242,6 +242,20 @@ function AddTodoForm() {
 
 ---
 
+## `AuthBoundKoraProvider`
+
+Owns authenticated app creation and teardown on shared browsers. It removes the previous provider
+tree and awaits `app.close()` before creating a different user's app. Same-user token refreshes do
+not replace the app.
+
+```tsx
+<AuthBoundKoraProvider authClient={binding} createApp={createAppForSession} signedOut={<SignIn />}>
+  <AuthenticatedApp />
+</AuthBoundKoraProvider>
+```
+
+---
+
 ## useSyncStatus()
 
 Returns the current sync connection status and metadata. Re-renders only when the status changes, not on every sync event.
@@ -258,8 +272,12 @@ function useSyncStatus(): SyncStatus
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `status` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'error'` | Current connection state. |
+| `status` | `SyncStatus` | Compatible high-level connection state, including `auth-required`. |
+| `phase` | `SyncPhase` | Detailed suspended/offline/connecting/handshaking/uploading/receiving/applying/streaming/blocked phase. |
 | `pendingOperations` | `number` | Number of local operations waiting to be sent to the server. |
+| `inFlightUploadOperations` | `number` | Operations sent but not yet acknowledged. |
+| `activeViewComplete` | `boolean` | Whether the active downlink view is applied through the accepted frontier. |
+| `blockedFailure` | `ActiveApplyFailure \| null` | Current delivery-blocking apply failure. |
 | `lastSyncedAt` | `number \| null` | Timestamp (milliseconds) of the last successful sync. `null` if never synced. |
 
 #### Status values

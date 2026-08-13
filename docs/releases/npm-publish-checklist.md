@@ -1,160 +1,122 @@
 ---
 title: npm Publish Checklist
-description: "The npm publish checklist used for Kora.js releases: build, test, version, and publish steps with verification."
+description: "The maintainer checklist for validating, publishing, and verifying a Kora.js release on npm."
 ---
 
-# npm publish checklist — v0.6.0 public beta
+# npm publish checklist — 1.0.0-beta.11
 
-Use this when promoting **local 0.6.0** to npm (registry currently at **0.5.0** for linked packages).
-
-## Current registry state (verify before publish)
-
-```bash
-npm view korajs version          # 0.5.0 → publishing 0.6.0
-npm view @korajs/vue version     # 0.5.0 → publishing 0.6.0
-npm view @korajs/svelte version  # 0.5.0 → publishing 0.6.0
-npm view create-kora-app version # 0.1.23 → publishing 0.1.24
-npm view @korajs/tauri version   # 0.4.1 → publishing 0.4.2
-```
-
-The `@korajs` npm org already exists. Vue and Svelte bindings were first published at **0.5.0**; this release is a **minor bump**, not a greenfield scope setup.
-
----
+Use this checklist with the [beta.11 release notes and sign-off](./v1.0.0-beta.11.md).
+The manifests are already versioned for beta.11; do **not** run `pnpm beta:bump`,
+`pnpm beta:release`, or `pnpm changeset version` for this release.
 
 ## Pre-publish gates
 
-Run from repo root:
+Run from the repository root on the exact commit that will be released:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm build
-pnpm test
-pnpm test:release-gate
-pnpm typecheck
-```
-
-Optional full gate (includes lint + E2E):
-
-```bash
 pnpm test:pre-release
+pnpm release:dry-run
 ```
 
-**CI note:** `ci.yml` runs `pnpm lint`. Resolve any Biome failures on `main` before merging release-related PRs.
+`release:dry-run` builds and locally packs every publishable workspace package. It verifies the
+packed manifests, resolves `workspace:` dependencies, and checks declared entry points without
+contacting or writing to the npm registry.
 
-Manual smoke (see [v0.6-public-beta.md](./v0.6-public-beta.md)):
+Expected publish set: 15 packages. The 13 linked packages are `1.0.0-beta.11`,
+`create-kora-app` is `0.1.25-beta.10`, and `@korajs/tauri` is `0.4.3-beta.10`.
 
-- Chrome / Firefox / Safari: offline CRUD, multi-tab, sync, DevTools
-- `npx create-kora-app my-app --template react-tailwind-sync` after publish
+## Publish
 
----
+Choose exactly one publishing path. A push to `main` triggers
+[the release workflow](../../.github/workflows/release.yml), so do not run a local publish at the
+same time.
 
-## Dry-run (no registry writes)
+### Option A — GitHub Actions (recommended)
 
-Requires `npm login` or `NPM_TOKEN` in `~/.npmrc`.
+1. Commit the release changes on a branch, open a pull request, and ensure CI is green.
+2. Confirm the repository `NPM_TOKEN` can publish `@korajs/*`.
+3. Merge the exact reviewed commit to `main`.
+4. Monitor the `release` workflow; with versions already prepared and changesets consumed in
+   prerelease metadata, it runs `pnpm release` and publishes the package set.
+
+### Option B — Local maintainer publish
+
+Use this only when the automated release workflow will not publish the same commit.
+
+1. Check out the exact reviewed, CI-green release commit.
+2. Authenticate with an npm account that can publish `@korajs/*` and confirm it with:
+
+   ```bash
+   npm whoami
+   ```
+
+3. Re-run the safe package validation:
+
+   ```bash
+   pnpm release:dry-run
+   ```
+
+4. Publish through Changesets:
+
+   ```bash
+   pnpm release
+   ```
+
+The repository is in Changesets prerelease mode with tag `beta`, so prerelease packages are
+published under npm's `beta` dist-tag. Complete any npm two-factor authentication prompt; do not
+retry blindly if the command reports a partial publish.
+
+## Verify
+
+Check the primary package, dist-tags, and each version in the publish set:
 
 ```bash
-pnpm build
-pnpm changeset publish --dry-run
+npm view korajs@1.0.0-beta.11 version
+npm view korajs dist-tags
+npm view @korajs/auth@1.0.0-beta.11 version
+npm view @korajs/cli@1.0.0-beta.11 version
+npm view @korajs/core@1.0.0-beta.11 version
+npm view @korajs/devtools@1.0.0-beta.11 version
+npm view @korajs/merge@1.0.0-beta.11 version
+npm view @korajs/react@1.0.0-beta.11 version
+npm view @korajs/server@1.0.0-beta.11 version
+npm view @korajs/store@1.0.0-beta.11 version
+npm view @korajs/svelte@1.0.0-beta.11 version
+npm view @korajs/sync@1.0.0-beta.11 version
+npm view @korajs/test@1.0.0-beta.11 version
+npm view @korajs/vue@1.0.0-beta.11 version
+npm view create-kora-app@0.1.25-beta.10 version
+npm view @korajs/tauri@0.4.3-beta.10 version
 ```
 
-Expected: **16 packages** with local versions not yet on npm:
-
-| Package | Local | npm (today) |
-|---------|-------|-------------|
-| `korajs` | 0.6.0 | 0.5.0 |
-| `@korajs/core` … `@korajs/test` (linked) | 0.6.0 | 0.5.0 |
-| `@korajs/vue`, `@korajs/svelte` | 0.6.0 | 0.5.0 |
-| `create-kora-app` | 0.1.24 | 0.1.23 |
-| `@korajs/tauri` | 0.4.2 | 0.4.1 |
-
-`changeset publish` replaces `workspace:*` dependencies with concrete semver in published tarballs.
-
----
-
-## Version bump model
-
-Linked packages (single version line) are defined in [`.changeset/config.json`](../../.changeset/config.json):
-
-`@korajs/core`, `@korajs/store`, `@korajs/merge`, `@korajs/sync`, `@korajs/server`, `@korajs/react`, `@korajs/auth`, `@korajs/devtools`, `@korajs/cli`, `@korajs/test`, `@korajs/vue`, `@korajs/svelte`, `korajs`
-
-**Not linked** (independent semver):
-
-- `create-kora-app` — bump when CLI/templates change
-- `@korajs/tauri` — desktop adapter; on its own cadence
-
-**Important:** Package versions are **already set to 0.6.0** in `package.json`. Do **not** run `pnpm changeset version` again unless you add a new changeset (that would bump to 0.7.0). Publish directly:
+Then smoke-test installation from outside the monorepo, tag the released commit, push the tag,
+and create the GitHub release from the beta.11 release notes:
 
 ```bash
-pnpm build
-pnpm changeset publish
+git tag v1.0.0-beta.11
+git push origin v1.0.0-beta.11
 ```
-
-For **future** releases after 0.6.0, use the standard Changesets flow:
-
-```bash
-pnpm changeset          # describe change, select packages
-pnpm changeset version  # bumps versions + CHANGELOG
-pnpm build
-pnpm changeset publish
-```
-
-Or merge the **Version Packages** PR created by [`.github/workflows/release.yml`](../../.github/workflows/release.yml).
-
----
-
-## Publish (maintainers)
-
-### Option A — Local publish
-
-```bash
-npm login   # or export NPM_TOKEN
-pnpm build
-pnpm changeset publish
-```
-
-Verify:
-
-```bash
-npm view korajs version
-npm view @korajs/vue version
-npx create-kora-app@latest my-smoke-test --yes --sync
-```
-
-### Option B — GitHub Actions (recommended after 0.6.0)
-
-1. Ensure `NPM_TOKEN` secret is set on the repo (Automation token, publish access to `@korajs/*`).
-2. Push to `main` with versions already bumped (current state).
-3. Trigger publish manually or via a one-off workflow dispatch, **or** use local Option A once, then revert to changeset PR flow for 0.6.1+.
-
-The default `release.yml` uses `changesets/action`, which expects pending `.changeset/*.md` files for version PRs. Because 0.6.0 is pre-bumped, the **first** 0.6.0 publish is easiest via Option A.
-
----
-
-## Post-publish
-
-- [ ] Tag git: `git tag v0.6.0 && git push origin v0.6.0`
-- [ ] GitHub Release notes from [v0.6-public-beta.md](./v0.6-public-beta.md) highlights
-- [ ] Update [docs/releases/README.md](./README.md) — mark v0.6 shipped
-- [ ] Smoke `npx create-kora-app` on a clean machine (no monorepo)
-- [ ] Announce: Vue/Svelte bindings, modular `createApp`, auth sync coordinator, per-app query cache
-
----
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| `E403` / `402` on `@korajs/*` | Confirm npm user is member of `@korajs` org with publish rights |
-| `E404` on `create-kora-app` | Usually missing auth token; run `npm whoami` |
-| Publish skips packages | Local version must be **greater** than registry (`npm view pkg version`) |
-| `workspace:*` in published package | Run `changeset publish`, not raw `npm publish` per package |
-| Canary tags on every main push | [canary.yml](../../.github/workflows/canary.yml) runs when **no** `.changeset/*.md` exists; add a changeset or disable canary until 0.6.0 ships |
+| Symptom | Action |
+|---------|--------|
+| `E403` / `E402` for `@korajs/*` | Confirm npm organization membership, publish rights, and 2FA configuration. |
+| `E404` during publish | Run `npm whoami`; an unpublished scoped version can also appear as `E404` without valid auth. |
+| A package is skipped | Compare its local version with `npm view <package> versions --json`. |
+| A publish partially succeeds | Verify every package individually, then rerun only through Changesets; already-published versions will be skipped. |
+| A packed manifest contains `workspace:` | Stop the release and fix packaging; `pnpm release:dry-run` is expected to catch this. |
 
----
+## Future releases
 
-## Document history
+After beta.11, use the normal Changesets flow or merge the Version Packages PR created by
+[the release workflow](../../.github/workflows/release.yml):
 
-| Date | Note |
-|------|------|
-| 2026-06-20 | Checklist for v0.6.0 public beta (pre-bumped versions, dry-run verified) |
-| 2026-06-20 | **Published** — all 16 packages on npm at 0.6.0 / 0.1.24 / 0.4.2 |
+```bash
+pnpm changeset
+pnpm changeset version
+pnpm test:pre-release
+pnpm release:dry-run
+pnpm release
+```

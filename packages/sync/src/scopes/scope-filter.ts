@@ -40,12 +40,20 @@ export function operationMatchesScope(
 	if (!snapshot) return false
 
 	for (const [field, expected] of Object.entries(collectionScope)) {
-		if (snapshot[field] !== expected) {
+		if (!matchesPredicate(snapshot[field], expected)) {
 			return false
 		}
 	}
 
 	return true
+}
+
+function matchesPredicate(actual: unknown, expected: unknown): boolean {
+	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+		const values = (expected as { $in?: unknown }).$in
+		return Array.isArray(values) && values.some((value) => Object.is(actual, value))
+	}
+	return Object.is(actual, expected)
 }
 
 /**

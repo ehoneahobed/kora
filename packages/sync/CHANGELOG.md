@@ -1,5 +1,13 @@
 # @korajs/sync
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Add auth readiness gating, canonical and configurable query subsets with safe
+  contained-view watermark reuse, detailed sync phases/completeness, and active
+  blocking apply-failure lifecycle state.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

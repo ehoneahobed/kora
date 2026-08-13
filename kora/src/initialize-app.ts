@@ -37,6 +37,7 @@ export interface InitializeAppResult {
 	blobStore: ContentAddressedBlobStore
 	/** Chunk provider bound to the sync connection, or null when sync is disabled. */
 	blobChunkProvider: ChunkProvider | null
+	storeInfo: import('./types').StoreInfo
 }
 
 /**
@@ -48,6 +49,7 @@ export async function initializeApp(
 	mergeEngine: MergeEngine,
 ): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
+	let effectiveAdapterType = adapterType
 	const baseDbName = config.store?.name ?? 'kora-db'
 	const authBinding = config.sync?.authClient ?? null
 	const authUserId =
@@ -108,6 +110,7 @@ export async function initializeApp(
 				emitter,
 				config.store?.workerResponseTimeoutMs,
 			)
+			effectiveAdapterType = 'indexeddb'
 			store = buildStore(adapter)
 			await store.open()
 			emitter.emit({
@@ -119,6 +122,7 @@ export async function initializeApp(
 				message: `OPFS persistence is unavailable (${fallbackReason}) for database "${dbName}"; Kora is using durable IndexedDB instead.`,
 			})
 		} catch {
+			effectiveAdapterType = 'sqlite-wasm'
 			adapter = await createAdapter(
 				'sqlite-wasm',
 				dbName,
@@ -176,6 +180,8 @@ export async function initializeApp(
 				url: config.sync.url,
 				transport: config.sync.transport,
 				auth: syncAuth,
+				authState: authBinding?.resolveSyncState,
+				querySubsets: config.sync.querySubsets,
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
 				scopeMap,
@@ -222,6 +228,14 @@ export async function initializeApp(
 		authBinding,
 		blobStore,
 		blobChunkProvider,
+		storeInfo: {
+			baseName: baseDbName,
+			databaseName: dbName,
+			authUserId: authUserId ?? null,
+			persistence: effectiveAdapterType,
+			durable: adapter.getStorageOpenState?.()?.persistent ?? adapterType !== 'sqlite-wasm',
+			isolationState: 'ready',
+		},
 	}
 }
 

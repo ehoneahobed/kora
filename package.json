@@ -20,7 +20,7 @@
     "beta:bump:dry": "node scripts/release/bump-beta.mjs --dry-run",
     "beta:release": "pnpm build && node scripts/release/bump-beta.mjs && changeset publish",
     "release": "pnpm build && changeset publish",
-    "release:dry-run": "pnpm build && changeset publish --dry-run",
+    "release:dry-run": "pnpm build && node scripts/release/validate-packages.mjs",
     "test:e2e": "pnpm --filter kora-e2e test:e2e",
     "test:production-path": "pnpm --filter korajs test:production-path",
     "test:release-gate": "pnpm test:production-path && pnpm test:sync-reconnect && pnpm test:chaos:real-path && pnpm benchmark:gates",

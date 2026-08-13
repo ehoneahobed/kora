@@ -342,21 +342,21 @@ describe('client delivery watermark', () => {
 		await engine.stop()
 	})
 
-	test('a never-seen view starts at 0 (one-time resync); a query subscription is its own view', async () => {
+	test('a narrower query view safely inherits a completed broad-view watermark', async () => {
 		const syncState = createSyncState(0)
 		const { server } = await startEngine(createStore(), syncState)
 		server.send(deliveryBatch('b1', [makeOp('o1', 1)], 0, 4))
 		await flush()
 		expect(syncState.map.get('')).toBe(4)
 
-		// Registering a subset switches to a new (unsynced) view: a batch that chains from 0
-		// applies, proving the view starts fresh rather than at the default view's 4.
+		// Registering a narrower subset inherits the broad view's safe watermark. A stale
+		// zero-based batch is therefore only re-acknowledged and does not replay history.
 		engine.registerQuerySubset({ collection: 'todos', where: { completed: true } })
 		await flush()
 		server.send(deliveryBatch('b2', [makeOp('o2', 2)], 0, 3))
 		await flush()
 		const subsetSig = [...syncState.map.keys()].find((k) => k !== '')
-		expect(syncState.map.get(subsetSig ?? 'x')).toBe(3)
+		expect(syncState.map.get(subsetSig ?? 'x')).toBe(4)
 		// The default view's watermark is untouched.
 		expect(syncState.map.get('')).toBe(4)
 		await engine.stop()

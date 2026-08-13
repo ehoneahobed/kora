@@ -14,6 +14,10 @@ export type {
 	SyncState,
 	SyncStatus,
 	SyncStatusInfo,
+	SyncPhase,
+	SyncSettlementOptions,
+	SyncSettlementResult,
+	ActiveApplyFailure,
 	DeltaCursor,
 } from './types'
 
@@ -29,6 +33,7 @@ export {
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
 export {
 	dedupeQuerySubsets,
+	querySubsetContains,
 	operationMatchesQuerySubsets,
 	type SyncQuerySubset,
 } from './scopes/query-subset'

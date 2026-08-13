@@ -1,5 +1,13 @@
 # @korajs/react
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Add `AuthBoundKoraProvider`, which serializes authenticated app replacement,
+  closes the prior user's app before mounting the next, and prevents stale provider
+  trees from crossing an auth-user boundary.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

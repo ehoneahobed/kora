@@ -1,5 +1,16 @@
 import type { ConnectionQuality, Operation, SyncDiagnosticsSnapshot } from '../types'
 
+export interface SyncApplyFailureEvent {
+	operationId: string
+	collection: string
+	recordId: string
+	code: string
+	message: string
+	retriable: boolean
+	firstSeenAt: number
+	retryCount: number
+}
+
 /**
  * Trace of a merge decision. Records all inputs and outputs for debugging and DevTools.
  */
@@ -39,6 +50,14 @@ export type KoraEvent =
 			reason: string
 	  }
 	| { type: 'sync:auth-failed'; reason: string }
+	| {
+			type: 'sync:suspended'
+			reason: 'auth-loading' | 'auth-required' | 'auth-rejected' | 'device-revoked' | string
+	  }
+	| { type: 'sync:apply-blocked'; failure: SyncApplyFailureEvent }
+	| { type: 'sync:apply-retrying'; failure: SyncApplyFailureEvent }
+	| { type: 'sync:apply-recovered'; failure: SyncApplyFailureEvent }
+	| { type: 'sync:apply-abandoned'; failure: SyncApplyFailureEvent }
 	| {
 			type: 'sync:clock-skew'
 			/** serverTime - localTime in ms. Negative = this device's clock is fast. */

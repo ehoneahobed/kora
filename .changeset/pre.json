@@ -25,6 +25,7 @@
   "changesets": [
     "agents-md-command",
     "agents-md-templates",
+    "authenticated-offline-lifecycle",
     "blob-chunk-transport",
     "blob-content-addressed-fields",
     "blob-filesystem-store",
@@ -62,6 +63,7 @@
     "server-atomic-op-materialization",
     "server-side-operation-validation",
     "sql-identifier-quoting",
+    "sqlite-live-delivery-polling",
     "tombstone-resurrection-convergence"
   ]
 }

@@ -50,6 +50,14 @@ describe('operationMatchesScope', () => {
 		expect(operationMatchesScope(op, scope)).toBe(false)
 	})
 
+	test('matches bounded $in predicates and treats empty $in as deny', () => {
+		const op = createOp({ data: { userId: 'user-2' } })
+		expect(operationMatchesScope(op, { todos: { userId: { $in: ['user-1', 'user-2'] } } })).toBe(
+			true,
+		)
+		expect(operationMatchesScope(op, { todos: { userId: { $in: [] } } })).toBe(false)
+	})
+
 	test('matches multiple scope fields (all must match)', () => {
 		const op = createOp({ data: { userId: 'user-1', orgId: 'org-1', title: 'Test' } })
 		const scope: SyncScopeMap = { todos: { userId: 'user-1', orgId: 'org-1' } }

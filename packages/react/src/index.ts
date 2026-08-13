@@ -14,6 +14,8 @@ export type {
 
 // === Context ===
 export { KoraProvider } from './context/kora-context'
+export { AuthBoundKoraProvider } from './context/auth-bound-kora-provider'
+export type { AuthBoundKoraProviderProps } from './context/auth-bound-kora-provider'
 
 // === Hooks ===
 export { useApp } from './hooks/use-app'

@@ -44,9 +44,16 @@ export class AuthSyncCoordinator {
 		if (!engine) {
 			return
 		}
+		engine.notifyAuthChanged?.()
 
+		const authState = await this.authBinding.resolveSyncState?.()
+		if (authState?.state === 'loading' || authState?.state === 'signed-out') {
+			await engine.stop()
+			await engine.start() // records the suspended state without opening a transport
+			return
+		}
 		const headers = await this.authBinding.auth()
-		if (!headers.token) {
+		if (!headers.token && authState?.state !== 'anonymous') {
 			await engine.stop()
 			return
 		}

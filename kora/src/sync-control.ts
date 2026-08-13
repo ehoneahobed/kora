@@ -63,6 +63,69 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 				state.syncStatusBridge?.refresh()
 			}
 		},
+		async setQuerySubsets(subsets): Promise<void> {
+			await ready
+			state.syncEngine?.setQuerySubsets(subsets)
+		},
+		async waitForSettled(options = {}) {
+			await ready
+			const upload = options.upload ?? true
+			const download = options.download ?? 'active-view'
+			const classify = (): import('@korajs/sync').SyncSettlementResult | null => {
+				const status = state.syncEngine?.getStatus() ?? offlineSyncStatus()
+				if (status.phase === 'suspended')
+					return { outcome: 'suspended', reason: status.reason ?? 'suspended', status }
+				if (status.blockedFailure)
+					return { outcome: 'blocked', failure: status.blockedFailure, status }
+				if (status.phase === 'offline') return { outcome: 'offline', status }
+				const uploadDone =
+					!upload ||
+					(status.pendingOperations === 0 && (status.inFlightUploadOperations ?? 0) === 0)
+				const downloadDone = download === false || status.activeViewComplete
+				return uploadDone && downloadDone ? { outcome: 'settled', status } : null
+			}
+			return await new Promise((resolve) => {
+				let done = false
+				let unsubscribeReady = false
+				let cleanupPending = false
+				let timer: ReturnType<typeof setTimeout> | null = null
+				let unsubscribe = (): void => {}
+				const finish = (result: import('@korajs/sync').SyncSettlementResult): void => {
+					if (done) return
+					done = true
+					if (unsubscribeReady) unsubscribe()
+					else cleanupPending = true
+					if (timer) clearTimeout(timer)
+					options.signal?.removeEventListener('abort', onAbort)
+					resolve(result)
+				}
+				const check = (): void => {
+					const result = classify()
+					if (result) finish(result)
+				}
+				const onAbort = (): void =>
+					finish({
+						outcome: 'aborted',
+						status: state.syncEngine?.getStatus() ?? offlineSyncStatus(),
+					})
+				// Subscribe before checking to avoid missing the settlement edge.
+				unsubscribe = state.syncStatusBridge?.subscribe(check) ?? (() => {})
+				unsubscribeReady = true
+				if (cleanupPending) unsubscribe()
+				options.signal?.addEventListener('abort', onAbort, { once: true })
+				if (options.timeoutMs !== undefined)
+					timer = setTimeout(
+						() =>
+							finish({
+								outcome: 'timeout',
+								status: state.syncEngine?.getStatus() ?? offlineSyncStatus(),
+							}),
+						options.timeoutMs,
+					)
+				if (options.signal?.aborted) onAbort()
+				else check()
+			})
+		},
 		getStatus(): SyncStatusInfo {
 			if (state.syncEngine) {
 				return state.syncEngine.getStatus()
@@ -99,6 +162,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 				state: 'disconnected' as const,
 				status: {
 					status: 'offline' as const,
+					phase: 'offline' as const,
 					reconnecting: false,
 					pendingOperations: 0,
 					lastSyncedAt: null,
@@ -106,6 +170,14 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 					lastSuccessfulPull: null,
 					conflicts: 0,
 					clockSkewMs: null,
+					inFlightUploadOperations: 0,
+					hasInFlightDeliveryBatch: false,
+					activeViewId: '',
+					activeViewComplete: false,
+					initialSync: { complete: false, receivedBatches: 0, totalBatches: null, progress: null },
+					deliveryWatermark: 0,
+					serverFrontier: null,
+					blockedFailure: null,
 				},
 				nodeId: '',
 				url: config.sync?.url ?? '',

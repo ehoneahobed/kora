@@ -40,6 +40,31 @@ describe('createKoraAuthSync', () => {
 		await expect(binding.auth()).resolves.toEqual({ token: '' })
 	})
 
+	test('suspends signed-out sync by default and allows explicit anonymous sync', async () => {
+		const authClient = {
+			state: 'unauthenticated' as const,
+			getAccessToken: vi.fn().mockResolvedValue(null),
+		}
+		await expect(createKoraAuthSync({ authClient }).resolveSyncState?.()).resolves.toEqual({
+			state: 'signed-out',
+			mayConnectAnonymously: false,
+		})
+		await expect(
+			createKoraAuthSync({ authClient, anonymous: 'allow' }).resolveSyncState?.(),
+		).resolves.toEqual({ state: 'anonymous', mayConnectAnonymously: true })
+	})
+
+	test('keeps auth restoration distinct from signed-out state', async () => {
+		const authClient = {
+			state: 'loading' as const,
+			getAccessToken: vi.fn().mockResolvedValue(null),
+		}
+		await expect(createKoraAuthSync({ authClient }).resolveSyncState?.()).resolves.toEqual({
+			state: 'loading',
+		})
+		expect(authClient.getAccessToken).not.toHaveBeenCalled()
+	})
+
 	test('resolveScopeMap builds map from JWT claims and schema', async () => {
 		const token = makeToken({
 			sub: 'user-abc',
