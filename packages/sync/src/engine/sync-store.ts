@@ -60,4 +60,14 @@ export interface SyncStore {
 	 * @returns the record's fields, or null when it cannot be read.
 	 */
 	readRecordFields?(collection: string, recordId: string): Promise<Record<string, unknown> | null>
+
+	/**
+	 * Remove a record from this client's materialized authorization view without
+	 * writing a domain delete to the replicated operation log.
+	 */
+	applyScopeRetraction?(collection: string, recordId: string): Promise<void>
+	/** Retract every currently materialized row outside a newly accepted scope. */
+	applyScopeNarrowing?(
+		scopes: Record<string, Record<string, unknown>>,
+	): Promise<Array<{ collection: string; recordId: string }>>
 }

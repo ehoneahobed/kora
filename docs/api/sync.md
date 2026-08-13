@@ -727,10 +727,28 @@ Developer-facing sync configuration.
 | `transport` | `'websocket' \| 'http'` | No | `'websocket'` |
 | `auth` | `() => Promise<{ token: string }>` | No | -- |
 | `scopes` | `Record<string, (ctx: SyncScopeContext) => Record<string, unknown>>` | No | -- |
+| `scopeExit` | `'retain' \| 'retract'` | No | `'retain'` |
 | `batchSize` | `number` | No | `100` |
+| `outboundAckTimeoutMs` | `number` (ms) | No | `30000` |
+| `outboundRetryBaseDelayMs` | `number` (ms) | No | `250` |
+| `outboundRetryMaxDelayMs` | `number` (ms) | No | `30000` |
 | `reconnectInterval` | `number` (ms) | No | `1000` |
 | `maxReconnectInterval` | `number` (ms) | No | `30000` |
 | `schemaVersion` | `number` | No | `1` |
+
+With `scopeExit: 'retract'`, a record leaving the accepted downlink scope is removed only from that
+client's materialized view—not added to shared history as a delete. Queries are invalidated and
+pending writes for the record are quarantined as `SCOPE_RETRACTED`. Scope narrowing purges rows
+outside the new map before view completion; widening backfills the current authoritative row. This
+is reconnect-dependent: a device that never reconnects cannot be remotely erased. Blob bytes become
+reclaimable after normal garbage collection once no live row references them.
+
+Permanent per-operation rejections—including `SCOPE_VIOLATION`—leave the outbound queue, enter the
+durable rejected-operation store, and are never uploaded again automatically. The server advances
+the acknowledgement through them so valid later offline writes are not blocked. If authorization
+later widens, refresh scopes and create or explicitly resubmit a newly authorized operation.
+Transient rejections such as `RATE_LIMIT` remain pending and retry with bounded exponential backoff
+from `outboundRetryBaseDelayMs` up to `outboundRetryMaxDelayMs`.
 
 ### `SyncScopeContext`
 

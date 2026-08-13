@@ -892,6 +892,50 @@ describe('ClientSession', () => {
 			expect(ids).not.toContain('hidden')
 		})
 
+		test('retract mode sends a client-local retraction when a record exits scope', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.setSchema(
+				defineSchema({
+					version: 1,
+					collections: {
+						todos: { fields: { status: t.string(), title: t.string() } },
+					},
+				}),
+			)
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { status: 'published' } },
+				}),
+			}
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+			session.start()
+			sendHandshake(client, { authToken: 'ok', scopeExitPolicy: 'retract' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			const archived = createTestOp({
+				id: 'archive-1',
+				type: 'update',
+				recordId: 'announcement-1',
+				data: { status: 'archived' },
+				previousData: { status: 'published', title: 'News' },
+			})
+			await store.applyRemoteOperation(archived)
+			session.relayOperations([archived])
+
+			await vi.waitFor(() =>
+				expect(
+					messages.some(
+						(message) =>
+							message.type === 'operation-batch' &&
+							message.retractions?.some((retraction) => retraction.recordId === 'announcement-1'),
+					),
+				).toBe(true),
+			)
+		})
+
 		test('drops incoming out-of-scope operations', async () => {
 			const store = new MemoryServerStore('server-1')
 			const auth: AuthProvider = {
@@ -936,6 +980,141 @@ describe('ClientSession', () => {
 
 			expect(await store.getOperationCount()).toBe(0)
 			expect(onRelay).not.toHaveBeenCalled()
+		})
+
+		test('permanently rejects an out-of-scope prefix once and continues through the batch', async () => {
+			const store = new MemoryServerStore('server-1')
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					uplinkScopes: { todos: { ownerId: 'user-1' } },
+					downlinkScopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+			session.start()
+
+			sendHandshake(client, { authToken: 'ok' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			sendOpBatch(
+				client,
+				[
+					createTestOp({
+						id: 'legacy-other-user',
+						recordId: 'legacy-other-user',
+						sequenceNumber: 1,
+						data: { ownerId: 'other-user', title: 'Must not upload' },
+					}),
+					createTestOp({
+						id: 'current-user',
+						recordId: 'current-user',
+						sequenceNumber: 2,
+						data: { ownerId: 'user-1', title: 'Must still upload' },
+					}),
+				],
+				'mixed-scope-batch',
+			)
+
+			await vi.waitFor(() =>
+				expect(
+					messages.find(
+						(message) =>
+							message.type === 'acknowledgment' &&
+							message.acknowledgedMessageId === 'mixed-scope-batch',
+					),
+				).toMatchObject({ lastSequenceNumber: 2 }),
+			)
+
+			const rejection = messages.filter(
+				(message) =>
+					message.type === 'operation-rejected' && message.operationId === 'legacy-other-user',
+			)
+			expect(rejection).toHaveLength(1)
+			expect(rejection[0]).toMatchObject({ code: 'SCOPE_VIOLATION', retriable: false })
+			expect(await store.getOperationRange('client-1', 1, 2)).toEqual([
+				expect.objectContaining({ id: 'current-user' }),
+			])
+		})
+
+		test('enforces distinct server-authoritative downlink and uplink scopes', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'foreign-row',
+					nodeId: 'server-writer',
+					data: { ownerId: 'other-user', viewerId: 'other-user', title: 'Private' },
+				}),
+			)
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					downlinkScopes: { todos: { viewerId: 'user-1' } },
+					uplinkScopes: { todos: { ownerId: 'user-1' } },
+				}),
+			}
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+			session.start()
+
+			sendHandshake(client, { authToken: 'ok' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+			const response = messages.find((message) => message.type === 'handshake-response')
+			expect(response).toMatchObject({
+				acceptedDownlinkScopes: { todos: { viewerId: 'user-1' } },
+				acceptedUplinkScopes: { todos: { ownerId: 'user-1' } },
+			})
+			const deliveredIds = messages
+				.filter((message) => message.type === 'operation-batch')
+				.flatMap((message) =>
+					message.type === 'operation-batch' ? message.operations.map((op) => op.id) : [],
+				)
+			expect(deliveredIds).not.toContain('foreign-row')
+
+			sendOpBatch(
+				client,
+				[
+					createTestOp({
+						id: 'self-owned',
+						recordId: 'self-owned',
+						sequenceNumber: 2,
+						data: { ownerId: 'user-1', viewerId: 'other-user', title: 'Allowed upload' },
+					}),
+				],
+				'allowed-batch',
+			)
+			await vi.waitFor(async () => {
+				expect((await store.getOperationRange('client-1', 2, 2)).map((op) => op.id)).toContain(
+					'self-owned',
+				)
+			})
+
+			sendOpBatch(
+				client,
+				[
+					createTestOp({
+						id: 'forged-owner',
+						recordId: 'forged-owner',
+						sequenceNumber: 3,
+						data: { ownerId: 'other-user', viewerId: 'user-1', title: 'Denied upload' },
+					}),
+				],
+				'denied-batch',
+			)
+			await vi.waitFor(() =>
+				expect(
+					messages.some(
+						(message) =>
+							message.type === 'operation-rejected' && message.operationId === 'forged-owner',
+					),
+				).toBe(true),
+			)
+			expect((await store.getOperationRange('client-1', 3, 3)).map((op) => op.id)).not.toContain(
+				'forged-owner',
+			)
 		})
 	})
 

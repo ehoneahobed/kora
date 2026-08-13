@@ -199,6 +199,7 @@ const KORA_OPERATION_MESSAGE = `message KoraOperation {
 const OPERATION_BATCH_MESSAGE = `message OperationBatch {
 \trepeated KoraOperation operations = 1;
 \tbool is_final = 2;
+\tbytes retractions_json = 3;
 }`
 
 /**
@@ -208,6 +209,7 @@ const HANDSHAKE_MESSAGE = `message HandshakeMessage {
 \tmap<string, int64> version_vector = 1;
 \tint32 schema_version = 2;
 \tstring node_id = 3;
+\tstring scope_exit_policy = 4;
 }`
 
 /**
@@ -216,6 +218,9 @@ const HANDSHAKE_MESSAGE = `message HandshakeMessage {
 const HANDSHAKE_RESPONSE_MESSAGE = `message HandshakeResponse {
 \tmap<string, int64> version_vector = 1;
 \tint32 schema_version = 2;
+\tbytes accepted_scope_json = 3;
+\tbytes accepted_downlink_scopes_json = 4;
+\tbytes accepted_uplink_scopes_json = 5;
 }`
 
 /**
@@ -305,6 +310,7 @@ function buildJsonDescriptor(schema: SchemaDefinition): Record<string, unknown> 
 		fields: {
 			operations: { type: 'KoraOperation', id: 1, rule: 'repeated' },
 			is_final: { type: 'bool', id: 2 },
+			retractions_json: { type: 'bytes', id: 3 },
 		},
 	}
 
@@ -314,6 +320,7 @@ function buildJsonDescriptor(schema: SchemaDefinition): Record<string, unknown> 
 			version_vector: { keyType: 'string', type: 'int64', id: 1 },
 			schema_version: { type: 'int32', id: 2 },
 			node_id: { type: 'string', id: 3 },
+			scope_exit_policy: { type: 'string', id: 4 },
 		},
 	}
 
@@ -322,6 +329,9 @@ function buildJsonDescriptor(schema: SchemaDefinition): Record<string, unknown> 
 		fields: {
 			version_vector: { keyType: 'string', type: 'int64', id: 1 },
 			schema_version: { type: 'int32', id: 2 },
+			accepted_scope_json: { type: 'bytes', id: 3 },
+			accepted_downlink_scopes_json: { type: 'bytes', id: 4 },
+			accepted_uplink_scopes_json: { type: 'bytes', id: 5 },
 		},
 	}
 

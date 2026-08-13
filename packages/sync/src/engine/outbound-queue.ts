@@ -253,6 +253,19 @@ export class OutboundQueue {
 		return removed
 	}
 
+	/** Remove every pending/in-flight operation for a record so authorization loss cannot upload it. */
+	async rejectRecord(collection: string, recordId: string): Promise<Operation[]> {
+		const matching = [...this.queue, ...[...this.inFlight.values()].flat()].filter(
+			(op) => op.collection === collection && op.recordId === recordId,
+		)
+		const removed: Operation[] = []
+		for (const operation of matching) {
+			const rejected = await this.reject(operation.id)
+			if (rejected) removed.push(rejected)
+		}
+		return removed
+	}
+
 	/**
 	 * Remove operations by id from queue and persistent storage.
 	 * Used when ops were already sent during handshake delta exchange.

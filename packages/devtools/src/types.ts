@@ -37,6 +37,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:sent': 'sync',
 	'sync:received': 'sync',
 	'sync:acknowledged': 'sync',
+	'sync:scope-retracted': 'sync',
 	'query:subscribed': 'query',
 	'query:invalidated': 'query',
 	'query:executed': 'query',

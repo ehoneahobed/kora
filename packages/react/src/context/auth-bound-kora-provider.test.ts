@@ -1,10 +1,10 @@
 import type { AuthSyncBinding, AuthSyncState } from '@korajs/core/bindings'
 import type { Store } from '@korajs/store'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { StrictMode, createElement } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import type { KoraAppLike } from '../types'
-import { AuthBoundKoraProvider } from './auth-bound-kora-provider'
+import { AuthBoundKoraProvider, classifyKoraInitializationError } from './auth-bound-kora-provider'
 
 afterEach(cleanup)
 
@@ -43,6 +43,74 @@ function mockApp(userId: string, lifecycle: string[]): KoraAppLike & { close(): 
 }
 
 describe('AuthBoundKoraProvider', () => {
+	test.each([
+		'OPFS_UNAVAILABLE',
+		'INDEXEDDB_OPEN_FAILED',
+		'DATABASE_OPEN_FAILED',
+		'SCHEMA_MISMATCH',
+		'WORKER_INIT_ERROR',
+	])('preserves structured initialization code %s', (code) => {
+		const failure = Object.assign(new Error('Could not open workspace'), { code })
+		expect(classifyKoraInitializationError(failure).code).toBe(code)
+	})
+
+	test('classifies the browser quota exception without parsing its message', () => {
+		const failure = new DOMException('Localized browser message', 'QuotaExceededError')
+		expect(classifyKoraInitializationError(failure).code).toBe('STORAGE_QUOTA_EXCEEDED')
+	})
+
+	test('renders a classified token-free error and serializes retry after cleanup', async () => {
+		const auth = authController({ state: 'authenticated', userId: 'a', token: 'top-secret' })
+		const closeFailed = vi.fn(async () => {})
+		const failure = Object.assign(new Error('Database could not open'), {
+			code: 'WORKER_INIT_ERROR',
+			context: { adapter: 'sqlite-wasm', token: 'must-not-leak' },
+		})
+		const goodApp = mockApp('a', [])
+		const createApp = vi
+			.fn()
+			.mockReturnValueOnce({
+				...mockApp('a', []),
+				ready: Promise.reject(failure),
+				close: closeFailed,
+			})
+			.mockReturnValueOnce(goodApp)
+		const seen: unknown[] = []
+
+		render(
+			createElement(
+				AuthBoundKoraProvider,
+				{
+					authClient: auth.binding,
+					createApp,
+					error: (context) => {
+						seen.push(context)
+						return createElement(
+							'button',
+							{ type: 'button', onClick: context.retry },
+							context.error.code,
+						)
+					},
+				},
+				createElement('span', null, 'private app'),
+			),
+		)
+
+		await screen.findByRole('button', { name: 'WORKER_INIT_ERROR' })
+		expect(closeFailed).toHaveBeenCalledTimes(1)
+		expect(seen[0]).toMatchObject({
+			error: { code: 'WORKER_INIT_ERROR', metadata: { adapter: 'sqlite-wasm' } },
+			session: { userId: 'a' },
+		})
+		expect(JSON.stringify(seen[0])).not.toContain('top-secret')
+		expect(JSON.stringify(seen[0])).not.toContain('must-not-leak')
+
+		fireEvent.click(screen.getByRole('button', { name: 'WORKER_INIT_ERROR' }))
+		await screen.findByText('private app')
+		expect(createApp).toHaveBeenCalledTimes(2)
+		expect(closeFailed).toHaveBeenCalledTimes(1)
+	})
+
 	test('closes user A before creating user B and hides the stale provider tree', async () => {
 		const auth = authController({ state: 'authenticated', userId: 'a', token: 'token-a' })
 		const lifecycle: string[] = []

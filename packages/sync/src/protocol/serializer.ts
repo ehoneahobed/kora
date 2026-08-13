@@ -373,6 +373,12 @@ interface ProtoEnvelope {
 	deliverySequence?: number
 	/** Field 33: server's max delivery sequence on a handshake-response. */
 	serverMaxDeliverySequence?: number
+	/** Fields 34-37: directional scope/retraction protocol JSON and policy. */
+	acceptedScopeJson?: string
+	acceptedDownlinkScopesJson?: string
+	acceptedUplinkScopesJson?: string
+	retractionsJson?: string
+	scopeExitPolicy?: string
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -392,6 +398,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: message.lastDeliverySequence }
 					: {}),
+				scopeExitPolicy: message.scopeExitPolicy,
 			}
 		case 'handshake-response':
 			return {
@@ -411,6 +418,15 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.serverMaxDeliverySequence !== undefined
 					? { serverMaxDeliverySequence: message.serverMaxDeliverySequence }
 					: {}),
+				acceptedScopeJson: message.acceptedScope
+					? JSON.stringify(message.acceptedScope)
+					: undefined,
+				acceptedDownlinkScopesJson: message.acceptedDownlinkScopes
+					? JSON.stringify(message.acceptedDownlinkScopes)
+					: undefined,
+				acceptedUplinkScopesJson: message.acceptedUplinkScopes
+					? JSON.stringify(message.acceptedUplinkScopes)
+					: undefined,
 			}
 		case 'operation-batch':
 			return {
@@ -425,6 +441,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.maxDeliverySequence !== undefined
 					? { maxDeliverySequence: message.maxDeliverySequence }
 					: {}),
+				retractionsJson: message.retractions ? JSON.stringify(message.retractions) : undefined,
 			}
 		case 'acknowledgment':
 			return {
@@ -510,6 +527,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: envelope.lastDeliverySequence }
 					: {}),
+				...(envelope.scopeExitPolicy === 'retain' || envelope.scopeExitPolicy === 'retract'
+					? { scopeExitPolicy: envelope.scopeExitPolicy }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -535,6 +555,15 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.serverMaxDeliverySequence !== undefined
 					? { serverMaxDeliverySequence: envelope.serverMaxDeliverySequence }
 					: {}),
+				...(envelope.acceptedScopeJson
+					? { acceptedScope: JSON.parse(envelope.acceptedScopeJson) }
+					: {}),
+				...(envelope.acceptedDownlinkScopesJson
+					? { acceptedDownlinkScopes: JSON.parse(envelope.acceptedDownlinkScopesJson) }
+					: {}),
+				...(envelope.acceptedUplinkScopesJson
+					? { acceptedUplinkScopes: JSON.parse(envelope.acceptedUplinkScopesJson) }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -549,6 +578,7 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.maxDeliverySequence !== undefined
 					? { maxDeliverySequence: envelope.maxDeliverySequence }
 					: {}),
+				...(envelope.retractionsJson ? { retractions: JSON.parse(envelope.retractionsJson) } : {}),
 			}
 		case 'acknowledgment':
 			return {
@@ -790,6 +820,13 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.deliverySequence !== undefined) writer.uint32(256).int64(envelope.deliverySequence)
 	if (envelope.serverMaxDeliverySequence !== undefined)
 		writer.uint32(264).int64(envelope.serverMaxDeliverySequence)
+	if (envelope.acceptedScopeJson) writer.uint32(274).string(envelope.acceptedScopeJson)
+	if (envelope.acceptedDownlinkScopesJson)
+		writer.uint32(282).string(envelope.acceptedDownlinkScopesJson)
+	if (envelope.acceptedUplinkScopesJson)
+		writer.uint32(290).string(envelope.acceptedUplinkScopesJson)
+	if (envelope.retractionsJson) writer.uint32(298).string(envelope.retractionsJson)
+	if (envelope.scopeExitPolicy) writer.uint32(306).string(envelope.scopeExitPolicy)
 	return writer.finish()
 }
 
@@ -901,6 +938,21 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 33:
 				envelope.serverMaxDeliverySequence = longToNumber(reader.int64())
+				break
+			case 34:
+				envelope.acceptedScopeJson = reader.string()
+				break
+			case 35:
+				envelope.acceptedDownlinkScopesJson = reader.string()
+				break
+			case 36:
+				envelope.acceptedUplinkScopesJson = reader.string()
+				break
+			case 37:
+				envelope.retractionsJson = reader.string()
+				break
+			case 38:
+				envelope.scopeExitPolicy = reader.string()
 				break
 			default:
 				reader.skipType(tag & 7)

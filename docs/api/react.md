@@ -249,10 +249,22 @@ tree and awaits `app.close()` before creating a different user's app. Same-user 
 not replace the app.
 
 ```tsx
-<AuthBoundKoraProvider authClient={binding} createApp={createAppForSession} signedOut={<SignIn />}>
+<AuthBoundKoraProvider
+  authClient={binding}
+  createApp={createAppForSession}
+  signedOut={<SignIn />}
+  fallback={<OpeningWorkspace />}
+  error={({ error, retry, session }) => (
+    <WorkspaceOpenError code={error.code} userId={session.userId} onRetry={retry} />
+  )}
+>
   <AuthenticatedApp />
 </AuthBoundKoraProvider>
 ```
+
+The renderer receives a stable code, sanitized primitive metadata, and a token-free session with
+only `userId`. `retry()` uses the provider's serialized transition queue and closes partial resources
+before opening exactly one replacement. Omitting `error` retains the default framework view.
 
 ---
 

@@ -224,6 +224,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `sync received ${event.batchSize}`
 		case 'sync:acknowledged':
 			return `sync ack ${event.sequenceNumber}`
+		case 'sync:scope-retracted':
+			return `scope retracted ${event.collection}/${event.recordId}`
 		case 'query:subscribed':
 			return `query subscribed ${event.collection}`
 		case 'query:invalidated':
@@ -241,7 +243,7 @@ function timelineLabel(event: KoraEvent): string {
 		case 'sync:delivery-gap':
 			return `delivery gap expected ${event.expectedBase} received ${event.receivedBase}`
 		case 'sync:delivery-stalled':
-			return `delivery stalled at ${event.watermark} (${event.repeatCount} repeats)`
+			return `delivery unacknowledged ${event.watermark} → ${event.outstandingMaxDeliverySequence} (${event.repeatCount} repeats)`
 		case 'awareness:updated':
 			return `awareness ${event.states.size} peers`
 		case 'state-machine:transition':

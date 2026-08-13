@@ -13,6 +13,10 @@ export interface AuthContext {
 	userId: string
 	/** Per-collection sync scopes (optional) */
 	scopes?: Record<string, Record<string, unknown>>
+	/** Server-authoritative records this session may receive. Overrides `scopes`. */
+	downlinkScopes?: Record<string, Record<string, unknown>>
+	/** Server-authoritative records this session may upload. Overrides `scopes`. */
+	uplinkScopes?: Record<string, Record<string, unknown>>
 	/** Arbitrary metadata about the authenticated user */
 	metadata?: Record<string, unknown>
 }

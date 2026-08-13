@@ -77,6 +77,8 @@ import type { SyncStore } from './sync-store'
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
+const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
+const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
 
 /**
  * Valid state transitions for the sync engine state machine.
@@ -198,6 +200,8 @@ export class SyncEngine {
 	private readonly rejectedStorage: RejectedOperationStorage
 	private readonly batchSize: number
 	private readonly outboundAckTimeoutMs: number
+	private readonly outboundRetryBaseDelayMs: number
+	private readonly outboundRetryMaxDelayMs: number
 	private readonly encryptor: SyncEncryptor | null
 	private readonly awarenessManager: AwarenessManager
 	private readonly richtextDocChannel: RichtextDocChannel
@@ -214,6 +218,9 @@ export class SyncEngine {
 	private conflictCount = 0
 	private currentBatch: OutboundBatch | null = null
 	private currentBatchRequiresPartialAck = false
+	private currentBatchRequiresRetryBackoff = false
+	private outboundRetryAttempt = 0
+	private outboundRetryTimer: ReturnType<typeof setTimeout> | null = null
 	private reconnecting = false
 	private schemaBlocked = false
 	private clockBlocked = false
@@ -244,6 +251,9 @@ export class SyncEngine {
 	 * with the server-accepted scope (server is authoritative).
 	 */
 	private activeScope: SyncScopeMap | undefined
+	/** Server-authoritative upload authorization, separate from the downloaded view. */
+	private activeUplinkScope: SyncScopeMap | undefined
+	private hasDirectionalScopes = false
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -285,9 +295,18 @@ export class SyncEngine {
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
 		this.outboundAckTimeoutMs =
 			options.config.outboundAckTimeoutMs ?? DEFAULT_OUTBOUND_ACK_TIMEOUT_MS
+		this.outboundRetryBaseDelayMs = Math.max(
+			0,
+			options.config.outboundRetryBaseDelayMs ?? DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS,
+		)
+		this.outboundRetryMaxDelayMs = Math.max(
+			this.outboundRetryBaseDelayMs,
+			options.config.outboundRetryMaxDelayMs ?? DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS,
+		)
 		this.encryptor = options.encryptor ?? null
 		this.syncState = options.syncState ?? null
 		this.activeScope = options.config.scopeMap
+		this.activeUplinkScope = options.config.scopeMap
 
 		const queueStorage = options.queueStorage ?? new MemoryQueueStorage()
 		this.outboundQueue = new OutboundQueue(queueStorage)
@@ -438,6 +457,7 @@ export class SyncEngine {
 				authToken,
 				supportedWireFormats: ['json', 'protobuf'],
 				...(this.config.scopeMap ? { syncScope: this.config.scopeMap } : {}),
+				...(this.config.scopeExit ? { scopeExitPolicy: this.config.scopeExit } : {}),
 				...(activeQuerySubsets.length > 0 ? { syncQueries: activeQuerySubsets } : {}),
 				...(this.resumeDeltaCursor
 					? { deltaCursor: encodeDeltaCursor(this.resumeDeltaCursor) }
@@ -469,9 +489,9 @@ export class SyncEngine {
 	}
 
 	private async stopInternal(): Promise<void> {
-		if (this.state === 'disconnected') return
-
 		this.clearOutboundAckTimer()
+		this.clearOutboundRetryTimer()
+		if (this.state === 'disconnected') return
 
 		// Stop awareness tracking
 		this.awarenessManager.stopCleanupTimer()
@@ -481,6 +501,7 @@ export class SyncEngine {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
 			this.currentBatchRequiresPartialAck = false
+			this.currentBatchRequiresRetryBackoff = false
 		}
 
 		try {
@@ -806,6 +827,10 @@ export class SyncEngine {
 	updateScope(scopeMap: SyncScopeMap | undefined): void {
 		const previousSignature = this.deliverySignature()
 		this.activeScope = scopeMap
+		// Until the server accepts distinct directional maps, preserve the legacy
+		// shorthand semantics locally as well.
+		this.activeUplinkScope = scopeMap
+		this.hasDirectionalScopes = false
 		// Also update the config so that the next handshake sends the new scope
 		this.config.scopeMap = scopeMap
 		this.switchDeliveryView(previousSignature)
@@ -897,6 +922,11 @@ export class SyncEngine {
 	 */
 	getActiveScope(): SyncScopeMap | undefined {
 		return this.activeScope
+	}
+
+	/** Get the server-accepted upload authorization scope. */
+	getActiveUplinkScope(): SyncScopeMap | undefined {
+		return this.activeUplinkScope
 	}
 
 	/**
@@ -1148,8 +1178,17 @@ export class SyncEngine {
 		// If the server sent back an accepted scope, use it as the authoritative scope.
 		// The server may have narrowed or augmented the client's requested scope
 		// based on the auth context.
-		if (msg.acceptedScope) {
-			this.activeScope = msg.acceptedScope
+		if (msg.acceptedDownlinkScopes ?? msg.acceptedScope) {
+			this.activeScope = msg.acceptedDownlinkScopes ?? msg.acceptedScope
+		}
+		this.hasDirectionalScopes = msg.acceptedUplinkScopes !== undefined
+		this.activeUplinkScope = msg.acceptedUplinkScopes ?? msg.acceptedScope ?? this.activeScope
+		if (this.config.scopeExit === 'retract' && this.activeScope && this.store.applyScopeNarrowing) {
+			const narrowed = await this.store.applyScopeNarrowing(this.activeScope)
+			for (const retraction of narrowed) {
+				await this.applyScopeRetraction(retraction, false)
+			}
+			await this.refreshPendingCount()
 		}
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: this.store.getNodeId() })
@@ -1378,6 +1417,15 @@ export class SyncEngine {
 		// recoverable instead of silently skipped.
 		let fullyApplied = true
 
+		for (const retraction of msg.retractions ?? []) {
+			try {
+				await this.applyScopeRetraction(retraction, true)
+			} catch {
+				fullyApplied = false
+			}
+		}
+		await this.refreshPendingCount()
+
 		// Apply each in-scope operation; per-op failures must not block batch ACK
 		for (const op of inScopeOps) {
 			const transformed =
@@ -1535,6 +1583,7 @@ export class SyncEngine {
 
 	private async handleAcknowledgment(msg: AcknowledgmentMessage): Promise<void> {
 		this.clearOutboundAckTimer()
+		const requiresRetryBackoff = this.currentBatchRequiresRetryBackoff
 		if (this.state === 'syncing' && this.config.strictHandshake) {
 			this.pendingDeltaBatchAcks.delete(msg.acknowledgedMessageId)
 			this.markDeltaSendCompleteIfReady()
@@ -1551,6 +1600,7 @@ export class SyncEngine {
 			}
 			this.currentBatch = null
 			this.currentBatchRequiresPartialAck = false
+			this.currentBatchRequiresRetryBackoff = false
 			const now = Date.now()
 			this.lastSyncedAt = now
 			this.lastSuccessfulPush = now
@@ -1561,7 +1611,14 @@ export class SyncEngine {
 
 		// Continue flushing if more ops in queue
 		if (this.state === 'streaming' && this.outboundQueue.hasOperations) {
-			this.flushQueue()
+			if (requiresRetryBackoff) {
+				this.scheduleOutboundRetry()
+			} else {
+				this.outboundRetryAttempt = 0
+				this.flushQueue()
+			}
+		} else if (!requiresRetryBackoff) {
+			this.outboundRetryAttempt = 0
 		}
 	}
 
@@ -1575,6 +1632,7 @@ export class SyncEngine {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
 			this.currentBatchRequiresPartialAck = false
+			this.currentBatchRequiresRetryBackoff = false
 		}
 		this.transitionTo('error')
 		if (msg.code === 'AUTH_FAILED' || msg.code === 'DEVICE_REVOKED') {
@@ -1608,9 +1666,43 @@ export class SyncEngine {
 	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
 	 * signal, so the connection stays up.
 	 */
+	private async applyScopeRetraction(
+		retraction: { collection: string; recordId: string },
+		applyToStore: boolean,
+	): Promise<void> {
+		if (applyToStore) {
+			if (!this.store.applyScopeRetraction) {
+				throw new Error('The configured sync store does not support scope retractions')
+			}
+			await this.store.applyScopeRetraction(retraction.collection, retraction.recordId)
+		}
+		const quarantined = await this.outboundQueue.rejectRecord(
+			retraction.collection,
+			retraction.recordId,
+		)
+		for (const operation of quarantined) {
+			await this.rejectedStorage.record({
+				operationId: operation.id,
+				collection: operation.collection,
+				recordId: operation.recordId,
+				code: 'SCOPE_RETRACTED',
+				message: 'Authorization changed before this operation could be uploaded.',
+				retriable: false,
+				rejectedAt: Date.now(),
+			})
+		}
+		this.emitter?.emit({
+			type: 'sync:scope-retracted',
+			collection: retraction.collection,
+			recordId: retraction.recordId,
+			quarantinedOperationIds: quarantined.map((operation) => operation.id),
+		})
+	}
+
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
 		if (msg.retriable) {
 			this.currentBatchRequiresPartialAck = true
+			this.currentBatchRequiresRetryBackoff = true
 			await this.refreshPendingCount()
 			this.emitter?.emit({
 				type: 'sync:operation-rejected',
@@ -1795,6 +1887,7 @@ export class SyncEngine {
 
 	private flushQueue(): void {
 		if (this.currentBatch) return // Already have an in-flight batch
+		if (this.outboundRetryTimer) return // Transient rejection backoff is active
 		if (!this.outboundQueue.hasOperations) return
 
 		const batch = this.outboundQueue.takeBatch(this.batchSize)
@@ -1802,6 +1895,7 @@ export class SyncEngine {
 
 		this.currentBatch = batch
 		this.currentBatchRequiresPartialAck = false
+		this.currentBatchRequiresRetryBackoff = false
 
 		if (this.encryptor) {
 			// Encryption is async — encrypt then send. Errors return the batch to the queue.
@@ -1829,6 +1923,7 @@ export class SyncEngine {
 					this.outboundQueue.returnBatch(batch.batchId)
 					this.currentBatch = null
 					this.currentBatchRequiresPartialAck = false
+					this.currentBatchRequiresRetryBackoff = false
 					this.emitter?.emit({
 						type: 'sync:disconnected',
 						reason: err instanceof Error ? err.message : 'Encryption failed',
@@ -1870,12 +1965,32 @@ export class SyncEngine {
 		this.outboundAckTimer = null
 	}
 
+	private scheduleOutboundRetry(): void {
+		if (this.outboundRetryTimer || !this.outboundQueue.hasOperations) return
+		const delay = Math.min(
+			this.outboundRetryMaxDelayMs,
+			this.outboundRetryBaseDelayMs * 2 ** this.outboundRetryAttempt,
+		)
+		this.outboundRetryAttempt += 1
+		this.outboundRetryTimer = setTimeout(() => {
+			this.outboundRetryTimer = null
+			if (this.state === 'streaming') this.flushQueue()
+		}, delay)
+	}
+
+	private clearOutboundRetryTimer(): void {
+		if (!this.outboundRetryTimer) return
+		clearTimeout(this.outboundRetryTimer)
+		this.outboundRetryTimer = null
+	}
+
 	private async handleOutboundAckTimeout(batchId: string): Promise<void> {
 		if (!this.currentBatch || this.currentBatch.batchId !== batchId) return
 
 		this.outboundQueue.returnBatch(batchId)
 		this.currentBatch = null
 		this.currentBatchRequiresPartialAck = false
+		this.currentBatchRequiresRetryBackoff = false
 		this.clearOutboundAckTimer()
 		await this.refreshPendingCount()
 
@@ -1901,11 +2016,13 @@ export class SyncEngine {
 
 	private handleTransportClose(reason: string): void {
 		this.clearOutboundAckTimer()
+		this.clearOutboundRetryTimer()
 		// Return in-flight batch to queue
 		if (this.currentBatch) {
 			this.outboundQueue.returnBatch(this.currentBatch.batchId)
 			this.currentBatch = null
 			this.currentBatchRequiresPartialAck = false
+			this.currentBatchRequiresRetryBackoff = false
 		}
 
 		if (this.schemaBlocked) {
@@ -1965,10 +2082,13 @@ export class SyncEngine {
 		op: Operation,
 		fullRecord?: Record<string, unknown> | null,
 	): boolean {
-		if (!operationMatchesScope(op, this.activeScope, fullRecord)) {
+		if (!operationMatchesScope(op, this.activeUplinkScope, fullRecord)) {
 			return false
 		}
-		return operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord)
+		return (
+			this.hasDirectionalScopes ||
+			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord)
+		)
 	}
 
 	private async readRecordForBackfill(op: Operation): Promise<Record<string, unknown> | null> {

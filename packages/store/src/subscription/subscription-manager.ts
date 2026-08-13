@@ -202,6 +202,11 @@ export class SubscriptionManager {
 	 * Schedules a microtask flush to batch multiple mutations in the same tick.
 	 */
 	notify(collection: string, _operation: Operation): void {
+		this.invalidate(collection)
+	}
+
+	/** Invalidate a collection after a local-view change that has no domain operation. */
+	invalidate(collection: string): void {
 		this.pendingCollections.add(collection)
 		this.scheduleFlush()
 	}

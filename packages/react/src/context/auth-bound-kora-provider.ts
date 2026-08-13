@@ -11,7 +11,67 @@ export interface AuthBoundKoraProviderProps {
 	) => KoraAppLike & { close(): Promise<void> }
 	signedOut?: ReactNode
 	fallback?: ReactNode
+	error?: (context: AuthBoundKoraErrorContext) => ReactNode
 	children?: ReactNode
+}
+
+export interface AuthBoundKoraSession {
+	/** The authenticated identity only. Access tokens are deliberately omitted. */
+	userId: string
+}
+
+export interface AuthBoundKoraInitializationError {
+	/** Stable Kora/DOM error code suitable for application-owned copy and recovery UI. */
+	code: string
+	name: string
+	message: string
+	/** Sanitized primitive metadata. Credential-shaped keys are always removed. */
+	metadata: Readonly<Record<string, string | number | boolean | null>>
+	/** Sanitized Error for logging; custom credential-bearing properties are omitted. */
+	cause: Error
+}
+
+export interface AuthBoundKoraErrorContext {
+	error: AuthBoundKoraInitializationError
+	retry(): void
+	session: AuthBoundKoraSession
+}
+
+const SENSITIVE_METADATA_KEY = /token|secret|password|authorization|cookie/i
+
+/** Classify initialization failures without requiring applications to parse copy. */
+export function classifyKoraInitializationError(error: unknown): AuthBoundKoraInitializationError {
+	const candidate = error as {
+		code?: unknown
+		context?: unknown
+		message?: unknown
+		name?: unknown
+		stack?: unknown
+	}
+	const message = typeof candidate?.message === 'string' ? candidate.message : String(error)
+	const name = typeof candidate?.name === 'string' ? candidate.name : 'Error'
+	const cause = new Error(message)
+	cause.name = name
+	if (typeof candidate?.stack === 'string') cause.stack = candidate.stack
+	let code = typeof candidate?.code === 'string' ? candidate.code : 'INITIALIZATION_FAILED'
+	if (code === 'INITIALIZATION_FAILED' && cause.name === 'QuotaExceededError') {
+		code = 'STORAGE_QUOTA_EXCEEDED'
+	}
+	const metadata: Record<string, string | number | boolean | null> = {}
+	if (candidate?.context && typeof candidate.context === 'object') {
+		for (const [key, value] of Object.entries(candidate.context)) {
+			if (SENSITIVE_METADATA_KEY.test(key)) continue
+			if (
+				typeof value === 'string' ||
+				typeof value === 'number' ||
+				typeof value === 'boolean' ||
+				value === null
+			) {
+				metadata[key] = value
+			}
+		}
+	}
+	return { code, name: cause.name, message: cause.message, metadata, cause }
 }
 
 /**
@@ -24,17 +84,22 @@ export function AuthBoundKoraProvider({
 	createApp,
 	signedOut = null,
 	fallback = null,
+	error: renderError,
 	children,
 }: AuthBoundKoraProviderProps): ReactNode {
 	const [app, setApp] = useState<(KoraAppLike & { close(): Promise<void> }) | null>(null)
 	const [state, setState] = useState<AuthSyncState>({ state: 'loading' })
-	const [initError, setInitError] = useState<Error | null>(null)
+	const [initError, setInitError] = useState<{
+		error: AuthBoundKoraInitializationError
+		session: AuthBoundKoraSession
+	} | null>(null)
 	const active = useRef<(KoraAppLike & { close(): Promise<void> }) | null>(null)
 	const createAppRef = useRef(createApp)
 	createAppRef.current = createApp
 	const activeUserId = useRef<string | null>(null)
 	const generation = useRef(0)
 	const transition = useRef(Promise.resolve())
+	const reconcileRef = useRef<() => void>(() => {})
 
 	useEffect(() => {
 		let disposed = false
@@ -78,10 +143,22 @@ export function AuthBoundKoraProvider({
 				})
 				.catch((error: unknown) => {
 					if (!disposed && currentGeneration === generation.current) {
-						setInitError(error instanceof Error ? error : new Error(String(error)))
+						void authClient.resolveSyncState?.().then((failedSession) => {
+							if (
+								!disposed &&
+								currentGeneration === generation.current &&
+								failedSession?.state === 'authenticated'
+							) {
+								setInitError({
+									error: classifyKoraInitializationError(error),
+									session: { userId: failedSession.userId },
+								})
+							}
+						})
 					}
 				})
 		}
+		reconcileRef.current = reconcile
 		reconcile()
 		const unsubscribe = authClient.subscribe?.(reconcile) ?? (() => {})
 		return () => {
@@ -96,11 +173,18 @@ export function AuthBoundKoraProvider({
 	}, [authClient])
 
 	if (initError) {
+		if (renderError) {
+			return renderError({
+				error: initError.error,
+				session: initError.session,
+				retry: () => reconcileRef.current(),
+			})
+		}
 		return createElement(
 			'div',
 			{ style: { color: 'red', padding: '1rem', fontFamily: 'monospace' } },
 			createElement('strong', null, 'Kora initialization error: '),
-			initError.message,
+			initError.error.message,
 		)
 	}
 	if (state.state === 'signed-out' || state.state === 'anonymous') return signedOut

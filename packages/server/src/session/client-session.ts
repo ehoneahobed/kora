@@ -44,6 +44,7 @@ import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import {
 	missingScopeFields,
 	normalizeScopeMap,
+	operationExitsScopes,
 	operationMatchesScopes,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
@@ -265,6 +266,7 @@ export class ClientSession {
 	private clientNodeId: string | null = null
 	private authContext: AuthContext | null = null
 	private syncQuerySubsets: SyncQuerySubset[] = []
+	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	private resumeDeltaCursor: DeltaCursor | null = null
 
 	/**
@@ -290,7 +292,12 @@ export class ClientSession {
 	 * batches every server tick while the first batch is still being applied.
 	 */
 	private lastDeliveryPushAttemptAtMs = 0
-	private deliveryStallRepeatCount = 0
+	private outstandingDelivery: {
+		base: number
+		max: number
+		sentAtMs: number
+		repeatCount: number
+	} | null = null
 	/** Serializes incremental delivery pushes so their batches never interleave. */
 	private deliveryPushChain: Promise<void> = Promise.resolve()
 
@@ -406,19 +413,51 @@ export class ClientSession {
 	 * from the highest delivery sequence already sent. Pushes are serialized so their
 	 * batches never interleave (which would break the base/max chain).
 	 */
-	private pushDeliveryStream(): void {
+	private pushDeliveryStream(options: { trackStall?: boolean } = {}): void {
 		this.deliveryPushChain = this.deliveryPushChain.then(async () => {
 			if (this.state !== 'streaming' || !this.transport.isConnected()) return
 			try {
+				const previous = this.outstandingDelivery
+				if (options.trackStall && previous && previous.max > this.lastAckedDeliverySeq) {
+					previous.repeatCount += 1
+					if (previous.repeatCount >= 3) {
+						this.emitter?.emit({
+							type: 'sync:delivery-stalled',
+							sessionId: this.sessionId,
+							watermark: this.lastAckedDeliverySeq,
+							outstandingMaxDeliverySequence: previous.max,
+							repeatCount: previous.repeatCount,
+							reason: 'unacknowledged-delivery',
+						})
+					}
+				}
 				this.lastDeliveryPushAttemptAtMs = Date.now()
 				// Resume from the client's last acknowledged sequence, not the last sent, so a
 				// dropped or unapplied batch is re-included here. Exclude the client's own
 				// operations during streaming; it already has them.
-				await this.sendDeliveryStream(
+				const result = await this.sendDeliveryStream(
 					this.lastAckedDeliverySeq,
 					false,
 					this.clientNodeId ?? undefined,
 				)
+				if (result.sent && result.maxScanned > this.lastAckedDeliverySeq) {
+					if (
+						!this.outstandingDelivery ||
+						this.outstandingDelivery.base !== this.lastAckedDeliverySeq ||
+						this.outstandingDelivery.max !== result.maxScanned
+					) {
+						this.outstandingDelivery = {
+							base: this.lastAckedDeliverySeq,
+							max: result.maxScanned,
+							sentAtMs: Date.now(),
+							repeatCount: 0,
+						}
+					} else {
+						this.outstandingDelivery.sentAtMs = Date.now()
+					}
+				} else if (result.maxScanned <= this.lastAckedDeliverySeq) {
+					this.outstandingDelivery = null
+				}
 			} catch {
 				// A failed push (e.g. a transient store read error) must not reject the chain
 				// and stall all future pushes. The next push, or a reconnect resend from the
@@ -429,12 +468,15 @@ export class ClientSession {
 
 	private async relayVisibleOperations(operations: Operation[]): Promise<void> {
 		const visibleOperations: Operation[] = []
+		const retractions: Array<{ collection: string; recordId: string }> = []
 		for (const op of operations) {
 			if (await this.operationVisibleToClient(op)) {
 				visibleOperations.push(op)
+			} else if (await this.scopeRetractionFor(op)) {
+				retractions.push({ collection: op.collection, recordId: op.recordId })
 			}
 		}
-		if (visibleOperations.length === 0) return
+		if (visibleOperations.length === 0 && retractions.length === 0) return
 		// Re-check liveness: an await may have elapsed since the caller's guard.
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 
@@ -443,6 +485,7 @@ export class ClientSession {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
 			operations: serializedOps,
+			...(retractions.length > 0 ? { retractions } : {}),
 			isFinal: true,
 			batchIndex: 0,
 		}
@@ -487,24 +530,23 @@ export class ClientSession {
 	 * appended by another server/store instance: the session always scans from its
 	 * own acknowledged cursor and applies its visibility filter before sending.
 	 */
-	pushDeliveryStreamIfSupported(staleMs = 0, options: { trackStall?: boolean } = {}): void {
+	pushDeliveryStreamIfSupported(
+		staleMs = 0,
+		options: { trackStall?: boolean; serverFrontier?: number } = {},
+	): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark === null) return
+		if (
+			options.serverFrontier !== undefined &&
+			options.serverFrontier <= this.lastAckedDeliverySeq
+		) {
+			this.outstandingDelivery = null
+			return
+		}
 		if (staleMs > 0 && Date.now() - this.lastDeliveryPushAttemptAtMs < staleMs) {
 			return
 		}
-		if (options.trackStall) {
-			this.deliveryStallRepeatCount += 1
-			if (this.deliveryStallRepeatCount >= 3) {
-				this.emitter?.emit({
-					type: 'sync:delivery-stalled',
-					sessionId: this.sessionId,
-					watermark: this.lastAckedDeliverySeq,
-					repeatCount: this.deliveryStallRepeatCount,
-				})
-			}
-		}
-		this.pushDeliveryStream()
+		this.pushDeliveryStream({ trackStall: options.trackStall })
 	}
 
 	/**
@@ -606,7 +648,14 @@ export class ClientSession {
 				if (message.deliverySequence !== undefined) {
 					// Advance the confirmed watermark; the next streaming push resumes here.
 					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
-					this.deliveryStallRepeatCount = 0
+					if (
+						this.outstandingDelivery &&
+						this.lastAckedDeliverySeq >= this.outstandingDelivery.max
+					) {
+						this.outstandingDelivery = null
+					} else if (this.outstandingDelivery) {
+						this.outstandingDelivery.repeatCount = 0
+					}
 				}
 				break
 			case 'error':
@@ -673,6 +722,7 @@ export class ClientSession {
 		}
 
 		this.clientNodeId = msg.nodeId
+		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 
 		// Authenticate if provider is configured
 		if (this.auth) {
@@ -687,14 +737,36 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
-		// Merge handshake sync scopes with auth scopes using schema sync rules.
-		const rawResolvedScopes = resolveSessionScopes(this.store.getSchema(), {
+		// Resolve download and upload authorization independently. The legacy `scopes`
+		// contract remains shorthand for both directions.
+		const directionalScopesConfigured =
+			this.authContext?.downlinkScopes !== undefined || this.authContext?.uplinkScopes !== undefined
+		const downlinkAuthScopes = directionalScopesConfigured
+			? (this.authContext?.downlinkScopes ?? this.authContext?.scopes ?? {})
+			: this.authContext?.scopes
+		const uplinkAuthScopes = directionalScopesConfigured
+			? (this.authContext?.uplinkScopes ?? this.authContext?.scopes ?? {})
+			: this.authContext?.scopes
+		const rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
 			handshakeScope: msg.syncScope,
-			authScopes: this.authContext?.scopes,
+			authScopes: downlinkAuthScopes,
 		})
-		let resolvedScopes: typeof rawResolvedScopes
+		const rawResolvedUplinkScopes = directionalScopesConfigured
+			? uplinkAuthScopes
+			: rawResolvedDownlinkScopes
+		let resolvedDownlinkScopes: typeof rawResolvedDownlinkScopes
+		let resolvedUplinkScopes: typeof rawResolvedUplinkScopes
 		try {
-			resolvedScopes = rawResolvedScopes ? normalizeScopeMap(rawResolvedScopes) : undefined
+			resolvedDownlinkScopes = rawResolvedDownlinkScopes
+				? normalizeScopeMap(rawResolvedDownlinkScopes)
+				: directionalScopesConfigured
+					? {}
+					: undefined
+			resolvedUplinkScopes = rawResolvedUplinkScopes
+				? normalizeScopeMap(rawResolvedUplinkScopes)
+				: directionalScopesConfigured
+					? {}
+					: undefined
 		} catch (error) {
 			this.sendToClient({
 				type: 'error',
@@ -707,15 +779,25 @@ export class ClientSession {
 			return
 		}
 
-		if (resolvedScopes) {
+		if (resolvedDownlinkScopes || resolvedUplinkScopes) {
 			if (this.authContext) {
-				this.authContext = { ...this.authContext, scopes: resolvedScopes }
+				this.authContext = {
+					...this.authContext,
+					scopes: resolvedDownlinkScopes,
+					downlinkScopes: resolvedDownlinkScopes,
+					uplinkScopes: resolvedUplinkScopes,
+				}
 			} else {
-				this.authContext = { userId: msg.nodeId, scopes: resolvedScopes }
+				this.authContext = {
+					userId: msg.nodeId,
+					scopes: resolvedDownlinkScopes,
+					downlinkScopes: resolvedDownlinkScopes,
+					uplinkScopes: resolvedUplinkScopes,
+				}
 			}
 		}
 
-		warnIfMultiTenantWithoutScopes(this.auth, resolvedScopes, this.store.getSchema())
+		warnIfMultiTenantWithoutScopes(this.auth, resolvedDownlinkScopes, this.store.getSchema())
 
 		if (msg.syncQueries && msg.syncQueries.length > 0) {
 			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)
@@ -733,7 +815,7 @@ export class ClientSession {
 		// have advanced over previously hidden operations.
 		if (
 			this.clientDeliveryWatermark !== null &&
-			!sameScopeMap(msg.syncScope, this.authContext?.scopes)
+			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes)
 		) {
 			this.clientDeliveryWatermark = 0
 		}
@@ -805,7 +887,15 @@ export class ClientSession {
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
 			// Confirm the accepted scope so the client knows what data will be synced.
 			// This may differ from what the client requested if auth scopes are narrower.
-			...(this.authContext?.scopes ? { acceptedScope: this.authContext.scopes } : {}),
+			...(this.authContext?.downlinkScopes
+				? {
+						acceptedScope: this.authContext.downlinkScopes,
+						acceptedDownlinkScopes: this.authContext.downlinkScopes,
+					}
+				: {}),
+			...(this.authContext?.uplinkScopes
+				? { acceptedUplinkScopes: this.authContext.uplinkScopes }
+				: {}),
 		}
 		this.sendToClient(response)
 
@@ -855,20 +945,24 @@ export class ClientSession {
 		const applied: Operation[] = []
 		let acknowledgedThrough = 0
 		let canAdvanceAck = true
+		let uniqueOperations = 0
+		let duplicateOperations = 0
+		let rejectedOperations = 0
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
 				continue
 			}
 
-			if (!(await this.operationVisibleToClient(op))) {
+			if (!(await this.operationAllowedFromClient(op))) {
 				this.sendOperationRejected(
 					op,
 					'SCOPE_VIOLATION',
-					`Operation "${op.id}" in collection "${op.collection}" is outside the client's sync scope. Refresh sync scopes and retry.`,
-					true,
+					`Operation "${op.id}" in collection "${op.collection}" is outside the accepted uplink scope. Refresh scopes before creating or explicitly resubmitting an authorized operation.`,
+					false,
 				)
-				canAdvanceAck = false
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -911,6 +1005,7 @@ export class ClientSession {
 					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
 					false,
 				)
+				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
@@ -941,6 +1036,7 @@ export class ClientSession {
 				if (decision.action === 'reject') {
 					const retriable = decision.retriable ?? isRetriableRejection(decision.code)
 					this.sendOperationRejected(serverOp, decision.code, decision.message, retriable)
+					rejectedOperations += 1
 					if (retriable) {
 						canAdvanceAck = false
 					} else {
@@ -965,6 +1061,7 @@ export class ClientSession {
 					applyResult.rejection.message,
 					applyResult.rejection.retriable,
 				)
+				rejectedOperations += 1
 				if (applyResult.rejection.retriable) {
 					canAdvanceAck = false
 				} else {
@@ -974,8 +1071,10 @@ export class ClientSession {
 			}
 			if (applyResult.result === 'applied') {
 				applied.push(...applyResult.appliedOperations)
+				uniqueOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			} else {
+				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			}
 		}
@@ -985,6 +1084,9 @@ export class ClientSession {
 				type: 'sync:received',
 				operations,
 				batchSize: operations.length,
+				uniqueOperations,
+				duplicateOperations,
+				rejectedOperations,
 			})
 		}
 
@@ -1103,11 +1205,11 @@ export class ClientSession {
 		fromDeliverySeq: number,
 		finalizeWhenEmpty: boolean,
 		excludeNodeId?: string,
-	): Promise<number> {
+	): Promise<{ sentOperations: number; maxScanned: number; sent: boolean }> {
 		const scanChunk = Math.max(this.batchSize, 1) * 5
 		let scanCursor = fromDeliverySeq
 		let maxScanned = fromDeliverySeq
-		const visible: DeliveredOperation[] = []
+		const deliverable: Array<DeliveredOperation & { retraction?: boolean }> = []
 
 		while (true) {
 			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
@@ -1127,27 +1229,30 @@ export class ClientSession {
 					continue
 				}
 				if (await this.operationVisibleToClient(delivered.operation)) {
-					visible.push(delivered)
+					deliverable.push(delivered)
+				} else if (await this.scopeRetractionFor(delivered.operation)) {
+					deliverable.push({ ...delivered, retraction: true })
 				}
 			}
 			if (chunk.length < scanChunk) break
 		}
 
-		if (visible.length === 0) {
+		if (deliverable.length === 0) {
 			// Nothing in scope after the cursor. On a handshake resume, send a single empty
 			// final batch so the client advances past an out-of-scope tail and completes
 			// initial sync. During streaming, send nothing (an empty batch every relay tick
 			// would be pure noise); a reconnect re-scans the small tail if needed.
-			if (finalizeWhenEmpty) {
-				this.sendDeliveryBatch([], fromDeliverySeq, maxScanned, 0, true)
+			let sent = false
+			if (finalizeWhenEmpty || maxScanned > fromDeliverySeq) {
+				sent = this.sendDeliveryBatch([], fromDeliverySeq, maxScanned, 0, true)
 			}
-			return 0
+			return { sentOperations: 0, maxScanned, sent }
 		}
 
-		const totalBatches = Math.ceil(visible.length / this.batchSize)
+		const totalBatches = Math.ceil(deliverable.length / this.batchSize)
 		let base = fromDeliverySeq
 		for (let i = 0; i < totalBatches; i++) {
-			const slice = visible.slice(i * this.batchSize, (i + 1) * this.batchSize)
+			const slice = deliverable.slice(i * this.batchSize, (i + 1) * this.batchSize)
 			const lastInSlice = slice[slice.length - 1]
 			if (lastInSlice === undefined) continue
 			const isFinal = i === totalBatches - 1
@@ -1158,21 +1263,37 @@ export class ClientSession {
 			this.sendDeliveryBatch(slice, base, max, i, isFinal)
 			base = max
 		}
-		return visible.length
+		return {
+			sentOperations: deliverable.filter((item) => !item.retraction).length,
+			maxScanned,
+			sent: true,
+		}
 	}
 
 	/** Build, track, and send one chained delivery-stream batch. */
 	private sendDeliveryBatch(
-		slice: DeliveredOperation[],
+		slice: Array<DeliveredOperation & { retraction?: boolean }>,
 		base: number,
 		max: number,
 		batchIndex: number,
 		isFinal: boolean,
-	): void {
+	): boolean {
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
-			operations: slice.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			operations: slice
+				.filter((delivered) => !delivered.retraction)
+				.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			...(slice.some((delivered) => delivered.retraction)
+				? {
+						retractions: slice
+							.filter((delivered) => delivered.retraction)
+							.map((delivered) => ({
+								collection: delivered.operation.collection,
+								recordId: delivered.operation.recordId,
+							})),
+					}
+				: {}),
 			isFinal,
 			batchIndex,
 			baseDeliverySequence: base,
@@ -1183,18 +1304,20 @@ export class ClientSession {
 		// position (the next push or the retransmit tick), which cannot be defeated by a
 		// buffer eviction. The client re-acks a duplicate and stalls on a gap, so re-sends
 		// are always safe.
-		this.sendToClient(batchMsg)
-		if (slice.length > 0) {
+		const sent = this.sendToClient(batchMsg)
+		const sentOperations = slice.filter((delivered) => !delivered.retraction)
+		if (sentOperations.length > 0) {
 			this.emitter?.emit({
 				type: 'sync:sent',
-				operations: slice.map((delivered) => delivered.operation),
-				batchSize: slice.length,
+				operations: sentOperations.map((delivered) => delivered.operation),
+				batchSize: sentOperations.length,
 			})
 		}
+		return sent
 	}
 
 	private async operationVisibleToClient(op: Operation): Promise<boolean> {
-		const scopes = this.authContext?.scopes
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
 		// A partial update (or a delete) may not carry the scope / query-subset fields
 		// in its own data. Judging visibility from the bare op would wrongly hide such
@@ -1211,6 +1334,24 @@ export class ClientSession {
 			return false
 		}
 		return operationMatchesQuerySubsets(op, subsets, fullRecord)
+	}
+
+	/** Upload authorization is independent from the client's downloaded/query view. */
+	private async operationAllowedFromClient(op: Operation): Promise<boolean> {
+		const scopes = this.authContext?.uplinkScopes ?? this.authContext?.scopes
+		const needsBackfill = missingScopeFields(op, scopes).length > 0
+		const fullRecord = needsBackfill
+			? await this.lookupRecordFields(op.collection, op.recordId)
+			: undefined
+		return operationMatchesScopes(op, scopes, fullRecord)
+	}
+
+	private async scopeRetractionFor(op: Operation): Promise<boolean> {
+		if (this.scopeExitPolicy !== 'retract') return false
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		if (!scopes) return false
+		const resultingRecord = await this.lookupRecordFields(op.collection, op.recordId)
+		return operationExitsScopes(op, scopes, resultingRecord)
 	}
 
 	/**

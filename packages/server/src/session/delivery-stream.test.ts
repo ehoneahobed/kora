@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
@@ -39,11 +40,23 @@ async function seed(store: MemoryServerStore, ids: string[]): Promise<void> {
 	}
 }
 
-function startSession(store: MemoryServerStore, batchSize?: number, auth?: AuthProvider) {
+function startSession(
+	store: MemoryServerStore,
+	batchSize?: number,
+	auth?: AuthProvider,
+	emitter?: SimpleEventEmitter,
+) {
 	const { client, server } = createServerTransportPair()
 	const messages: SyncMessage[] = []
 	client.onMessage((m) => messages.push(m))
-	const session = new ClientSession({ sessionId: 's1', transport: server, store, batchSize, auth })
+	const session = new ClientSession({
+		sessionId: 's1',
+		transport: server,
+		store,
+		batchSize,
+		auth,
+		emitter,
+	})
 	session.start()
 	return { client, messages, session }
 }
@@ -251,6 +264,87 @@ describe('server delivery stream', () => {
 		session.pushDeliveryStreamIfSupported(0)
 		await vi.waitFor(() => expect(batches(messages).length).toBeGreaterThan(0))
 		expect(batches(messages).flatMap((b) => b.operations.map((o) => o.id))).toEqual(['c'])
+	})
+
+	test('does not report a fully acknowledged idle client as stalled', async () => {
+		const store = new MemoryServerStore('server-1')
+		await seed(store, ['a', 'b'])
+		const emitter = new SimpleEventEmitter()
+		const stalled = vi.fn()
+		emitter.on('sync:delivery-stalled', stalled)
+		const { client, messages, session } = startSession(store, 10, undefined, emitter)
+
+		client.send({
+			type: 'handshake',
+			messageId: 'hs',
+			nodeId: 'client-1',
+			versionVector: {},
+			schemaVersion: 1,
+			lastDeliverySequence: 2,
+		})
+		await vi.waitFor(() => expect(batches(messages).some((batch) => batch.isFinal)).toBe(true))
+		const final = batches(messages).at(-1)
+		client.send({
+			type: 'acknowledgment',
+			messageId: 'ack-idle',
+			acknowledgedMessageId: final?.messageId ?? 'missing',
+			lastSequenceNumber: 0,
+			deliverySequence: 2,
+		})
+		await new Promise((resolve) => setTimeout(resolve, 5))
+
+		for (let poll = 0; poll < 10; poll++) {
+			session.pushDeliveryStreamIfSupported(0, { trackStall: true, serverFrontier: 2 })
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5))
+		expect(stalled).not.toHaveBeenCalled()
+	})
+
+	test('reports only a repeatedly unacknowledged delivery range as stalled', async () => {
+		const store = new MemoryServerStore('server-1')
+		await seed(store, ['a'])
+		const emitter = new SimpleEventEmitter()
+		const stalled = vi.fn()
+		emitter.on('sync:delivery-stalled', stalled)
+		const { client, messages, session } = startSession(store, 10, undefined, emitter)
+
+		client.send({
+			type: 'handshake',
+			messageId: 'hs',
+			nodeId: 'client-1',
+			versionVector: {},
+			schemaVersion: 1,
+			lastDeliverySequence: 1,
+		})
+		await vi.waitFor(() => expect(batches(messages).some((batch) => batch.isFinal)).toBe(true))
+		const handshakeFinal = batches(messages).at(-1)
+		client.send({
+			type: 'acknowledgment',
+			messageId: 'ack-initial',
+			acknowledgedMessageId: handshakeFinal?.messageId ?? 'missing',
+			lastSequenceNumber: 0,
+			deliverySequence: 1,
+		})
+		await new Promise((resolve) => setTimeout(resolve, 5))
+
+		await store.applyRemoteOperation(op('b'))
+		session.pushDeliveryStreamIfSupported(0, { serverFrontier: 2 })
+		await vi.waitFor(() =>
+			expect(batches(messages).some((batch) => batch.maxDeliverySequence === 2)).toBe(true),
+		)
+		for (let retry = 0; retry < 3; retry++) {
+			session.pushDeliveryStreamIfSupported(0, { trackStall: true, serverFrontier: 2 })
+			await new Promise((resolve) => setTimeout(resolve, 5))
+		}
+		expect(stalled).toHaveBeenCalledTimes(1)
+		expect(stalled).toHaveBeenCalledWith(
+			expect.objectContaining({
+				watermark: 1,
+				outstandingMaxDeliverySequence: 2,
+				repeatCount: 3,
+				reason: 'unacknowledged-delivery',
+			}),
+		)
 	})
 
 	test('a watermark ahead of the server frontier resyncs from zero and advertises the max', async () => {
