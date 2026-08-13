@@ -316,6 +316,9 @@ importers:
       '@types/validate-npm-package-name':
         specifier: ^4.0.2
         version: 4.0.2
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.1
       better-sqlite3:
         specifier: ^12.8.0
         version: 12.8.0
@@ -331,6 +334,9 @@ importers:
       vitest:
         specifier: ^3.0.4
         version: 3.2.4(@types/node@25.5.2)(happy-dom@17.6.3)(jiti@2.7.0)(jsdom@25.0.1)(lightningcss@1.32.0)(tsx@4.21.0)
+      ws:
+        specifier: ^8.18.0
+        version: 8.20.0
 
   packages/core:
     devDependencies:
