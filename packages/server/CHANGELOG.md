@@ -1,5 +1,13 @@
 # @korajs/server
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Support canonical, bounded server-authoritative `$in` scope predicates across
+  handshake, downlink, relay, backfill, and uplink validation. Empty `$in` is an
+  explicit deny and excessive predicates fail closed.
+
 ## 1.0.0-beta.10
 
 ### Patch Changes

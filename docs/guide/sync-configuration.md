@@ -529,3 +529,42 @@ These events are also visible in the [DevTools](/guide/devtools) sync timeline.
 
 - [Server-side Validation](/guide/server-side-validation): adjudicate untrusted client operations before they become authoritative (public forms, multi-tenant boundaries), and surface rejections back to the submitter.
 - [Production Server](/guide/production-server): set `maxOperationBytes` and `maxOpsPerMinute` once at server config, plus background-job data access and blob GC.
+# Query views and settlement
+
+Reactive query subsets remain the compatibility default. Applications with route-heavy UIs
+can choose a stable manifest or keep all queries local:
+
+```ts
+sync: { querySubsets: { mode: 'static' } }
+await app.sync?.setQuerySubsets([
+  { collection: 'courses', where: { orgId } },
+])
+```
+
+Use `mode: 'disabled'` to send no client query subsets. Subsets are canonicalized: object key
+order and duplicates do not matter, and a broader equality predicate removes contained narrower
+predicates. Static replacement is atomic.
+
+`useSyncStatus()` and `app.sync.getStatus()` expose `phase`, active-view completeness, upload
+in-flight state, the delivery watermark/frontier, initial-sync progress, and any active blocking
+apply failure. For workflows, prefer the race-safe settlement primitive:
+
+```ts
+const result = await app.sync?.waitForSettled({
+  upload: true,
+  download: 'active-view',
+  timeoutMs: 30_000,
+  signal,
+})
+```
+
+The structured result distinguishes settled, offline, suspended, blocked, timed out, and aborted
+states; waiting never discards local operations or changes sync state.
+
+# Multi-partition authorization
+
+Server-authoritative scopes accept bounded `$in` predicates such as
+`{ courses: { offeringId: { $in: ['a', 'b'] } } }`. Values are deduplicated and sorted before
+the scope signature is computed. An empty `$in` is an explicit deny. The default maximum is 100
+values per predicate; excessive or malformed predicates fail the handshake rather than widening
+access. The same matcher is used for downlink filtering, relay, backfill, and uplink validation.

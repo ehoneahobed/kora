@@ -1,6 +1,10 @@
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { missingScopeFields, operationMatchesScopes } from './server-scope-filter'
+import {
+	missingScopeFields,
+	normalizeScopeMap,
+	operationMatchesScopes,
+} from './server-scope-filter'
 
 function createOp(overrides: Partial<Operation> = {}): Operation {
 	return {
@@ -33,6 +37,20 @@ describe('operationMatchesScopes', () => {
 	test('matches scoped fields in operation data', () => {
 		const op = createOp()
 		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-1' } })).toBe(true)
+	})
+
+	test('supports canonical, explicit-deny $in predicates', () => {
+		expect(
+			operationMatchesScopes(createOp(), { todos: { ownerId: { $in: ['user-2', 'user-1'] } } }),
+		).toBe(true)
+		expect(operationMatchesScopes(createOp(), { todos: { ownerId: { $in: [] } } })).toBe(false)
+		expect(
+			normalizeScopeMap({ todos: { ownerId: { $in: ['user-2', 'user-1', 'user-2'] } } }),
+		).toEqual({ todos: { ownerId: { $in: ['user-1', 'user-2'] } } })
+	})
+
+	test('rejects excessive predicate values', () => {
+		expect(() => normalizeScopeMap({ todos: { ownerId: { $in: ['a', 'b'] } } }, 1)).toThrow(/limit/)
 	})
 
 	test('empty collection scope allows all operations in that collection', () => {

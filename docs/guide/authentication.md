@@ -1374,3 +1374,30 @@ Device proof-of-possession challenges are:
 - [ ] Set appropriate CORS headers on auth endpoints
 - [ ] Consider using `EncryptedTokenStore` for sensitive environments
 - [ ] Periodically call `cleanExpired()` on session and token stores to prevent unbounded memory growth
+# Authenticated app lifecycle
+
+Authenticated sync is suspended while auth is loading or signed out. `createKoraAuthSync()`
+uses `anonymous: 'suspend'` by default, so a sign-in screen opens no WebSocket and schedules
+no reconnect. Opt into anonymous replication only with `anonymous: 'allow'` and a server
+configured with `MixedAuthProvider`.
+
+On shared browsers, bind the whole app lifetime to the authenticated user:
+
+```tsx
+<AuthBoundKoraProvider
+  authClient={createKoraAuthSync({ authClient, schema })}
+  createApp={({ userId }) => createApp({
+    schema,
+    store: { name: 'acme', namespaceByAuthUser: true },
+    sync: { url, authClient: createKoraAuthSync({ authClient, schema }), autoConnect: true },
+  })}
+  signedOut={<SignIn />}
+>
+  <AuthenticatedApp />
+</AuthBoundKoraProvider>
+```
+
+The host waits for initial auth restoration, removes the old provider tree, closes the old
+app, and only then creates the next user's app. A refresh or scope change for the same user
+keeps the app and store. `app.storeInfo()` exposes the active database identity and durability
+without providing access to any other user's data. `app.close()` remains the teardown boundary.

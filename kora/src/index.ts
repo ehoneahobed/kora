@@ -13,6 +13,7 @@ export type {
 	KoraApp,
 	KoraConfig,
 	StoreOptions,
+	StoreInfo,
 	SyncControl,
 	SyncOptions,
 	SequenceAccessor,

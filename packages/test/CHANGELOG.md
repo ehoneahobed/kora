@@ -1,5 +1,12 @@
 # @korajs/test
 
+## 1.0.0-beta.11
+
+### Minor Changes
+
+- Add `createTestAuthBinding()` for deterministic loading/sign-in/refresh/sign-out and multi-user
+  transitions, plus `createTransportMetrics()` for connection, message, and byte-cost assertions.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { SchemaDefinition } from '@korajs/core'
+import type { WebSocketConstructor } from '@korajs/sync'
 
 /**
  * Kora Studio SPECTATOR: live, read-only inspection of a production sync
@@ -93,6 +94,7 @@ export class SpectatorManager {
 			MergeEngine: typeof import('@korajs/merge').MergeEngine
 			SyncEngine: typeof import('@korajs/sync').SyncEngine
 			WebSocketTransport: typeof import('@korajs/sync').WebSocketTransport
+			WebSocket: typeof import('ws').default
 			testing: typeof import('korajs/testing')
 			SimpleEventEmitter: typeof import('@korajs/core/internal').SimpleEventEmitter
 		}
@@ -103,6 +105,7 @@ export class SpectatorManager {
 				MergeEngine: (await import('@korajs/merge')).MergeEngine,
 				SyncEngine: (await import('@korajs/sync')).SyncEngine,
 				WebSocketTransport: (await import('@korajs/sync')).WebSocketTransport,
+				WebSocket: (await import('ws')).default,
 				testing: await import('korajs/testing'),
 				SimpleEventEmitter: (await import('@korajs/core/internal')).SimpleEventEmitter,
 			}
@@ -128,7 +131,9 @@ export class SpectatorManager {
 
 		const syncStore = new mods.testing.MergeAwareSyncStore(store, mergeEngine, emitter)
 		const engine = new mods.SyncEngine({
-			transport: new mods.WebSocketTransport(),
+			transport: new mods.WebSocketTransport({
+				WebSocketImpl: mods.WebSocket as unknown as WebSocketConstructor,
+			}),
 			store: syncStore,
 			queueStorage: new mods.testing.StoreQueueStorage(adapter),
 			syncState: new mods.testing.StoreSyncStatePersistence(store),

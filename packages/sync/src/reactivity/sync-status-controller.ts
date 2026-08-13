@@ -4,6 +4,7 @@ import type { SyncStatusInfo } from '../types'
 /** Default status when sync is not configured or the engine is unavailable. */
 export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	status: 'offline',
+	phase: 'offline',
 	reconnecting: false,
 	pendingOperations: 0,
 	lastSyncedAt: null,
@@ -11,6 +12,14 @@ export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	lastSuccessfulPull: null,
 	conflicts: 0,
 	clockSkewMs: null,
+	inFlightUploadOperations: 0,
+	hasInFlightDeliveryBatch: false,
+	activeViewId: '',
+	activeViewComplete: false,
+	initialSync: { complete: false, receivedBatches: 0, totalBatches: null, progress: null },
+	deliveryWatermark: 0,
+	serverFrontier: null,
+	blockedFailure: null,
 })
 
 const SYNC_STATUS_EVENT_TYPES = [
@@ -23,6 +32,10 @@ const SYNC_STATUS_EVENT_TYPES = [
 	'sync:received',
 	'sync:acknowledged',
 	'sync:apply-failed',
+	'sync:suspended',
+	'sync:apply-blocked',
+	'sync:apply-retrying',
+	'sync:apply-recovered',
 	'sync:delivery-gap',
 	'sync:diagnostics',
 	'sync:initial-sync-progress',

@@ -12,6 +12,7 @@ export interface KoraBindingSyncStatus {
 		| 'error'
 		| 'schema-mismatch'
 		| 'clock-error'
+		| 'auth-required'
 	reconnecting: boolean
 	pendingOperations: number
 	lastSyncedAt: number | null
@@ -79,6 +80,8 @@ export interface UseMutationResultBase<TData, TArgs extends unknown[]> {
 export interface AuthSyncBinding {
 	/** Returns the access token for sync handshake (empty string when signed out). */
 	auth: () => Promise<{ token: string }>
+	/** Resolve whether sync may currently open a transport. Tokens are never used as readiness signals. */
+	resolveSyncState?: () => Promise<AuthSyncState>
 	/** Builds a scope map from the current token and schema. */
 	resolveScopeMap?: () => Promise<ScopeMap | undefined>
 	/**
@@ -91,3 +94,10 @@ export interface AuthSyncBinding {
 	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
 	subscribe?: (listener: () => void) => () => void
 }
+
+/** Authentication state consumed by the sync and auth-isolated store lifecycles. */
+export type AuthSyncState =
+	| { state: 'loading' }
+	| { state: 'signed-out'; mayConnectAnonymously: false }
+	| { state: 'anonymous'; mayConnectAnonymously: true }
+	| { state: 'authenticated'; userId: string; token: string }

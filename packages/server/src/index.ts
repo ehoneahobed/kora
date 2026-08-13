@@ -98,6 +98,11 @@ export { NoAuthProvider } from './auth/no-auth'
 export { TokenAuthProvider } from './auth/token-auth'
 export { KoraAuthProvider } from './auth/kora-auth-provider'
 export { MixedAuthProvider } from './auth/mixed-auth-provider'
+export {
+	DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
+	normalizeScopeMap,
+	operationMatchesScopes,
+} from './scopes/server-scope-filter'
 
 // === Awareness ===
 export { AwarenessRelay } from './awareness/awareness-relay'

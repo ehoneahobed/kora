@@ -35,3 +35,9 @@ export { wrapTransportPairWithServerClock } from './server-clock-transport'
 // === Re-export ChaosTransport for convenience ===
 export { ChaosTransport } from '@korajs/sync'
 export type { ChaosConfig } from '@korajs/sync'
+
+// === Auth lifecycle and transfer-cost instrumentation ===
+export { createTestAuthBinding } from './test-auth'
+export type { TestAuthBinding } from './test-auth'
+export { createTransportMetrics } from './transport-metrics'
+export type { TestTransferMetrics } from './transport-metrics'

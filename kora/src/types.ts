@@ -73,6 +73,15 @@ export interface StoreOptions {
 	workerResponseTimeoutMs?: number
 }
 
+export interface StoreInfo {
+	baseName: string
+	databaseName: string
+	authUserId: string | null
+	persistence: AdapterType
+	durable: boolean
+	isolationState: 'ready' | 'switching' | 'closed' | 'failed'
+}
+
 /**
  * Pre-built auth binding from `createKoraAuthSync()` in `@korajs/auth`.
  * Canonical definition lives in `@korajs/core/bindings`.
@@ -94,6 +103,8 @@ export interface SyncOptions {
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
 	 */
 	authClient?: AuthSyncBinding
+	/** Controls whether reactive queries affect the replicated view. Defaults to `reactive`. */
+	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
 	/** Sync scopes per collection. */
 	scopes?: Record<string, (ctx: Record<string, unknown>) => Record<string, unknown>>
 	/**
@@ -239,6 +250,12 @@ export interface SyncControl {
 	disconnect(): Promise<void>
 	/** Disconnect and reconnect as one serialized sync lifecycle operation. */
 	reconnect(): Promise<void>
+	/** Atomically replace the static query-subset manifest. */
+	setQuerySubsets(subsets: import('@korajs/sync').SyncQuerySubset[]): Promise<void>
+	/** Wait for upload acknowledgement and/or active-view download completion. */
+	waitForSettled(
+		options?: import('@korajs/sync').SyncSettlementOptions,
+	): Promise<import('@korajs/sync').SyncSettlementResult>
 	/** Current sync status snapshot (updates on sync events). */
 	readonly status: SyncStatusInfo
 	/** Get the current developer-facing sync status. */
@@ -344,6 +361,8 @@ export interface KoraApp {
 	getSyncEngine(): SyncEngine | null
 	/** Per-app reference-counted cache for framework query subscriptions. */
 	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
+	/** Safe local-store identity and durability metadata (never exposes records). */
+	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
 	/**
@@ -444,6 +463,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	getSyncEngine(): SyncEngine | null
 	/** Per-app reference-counted cache for framework query subscriptions. */
 	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
+	/** Safe local-store identity and durability metadata. */
+	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
 	/** Execute multiple mutations atomically within a transaction. */

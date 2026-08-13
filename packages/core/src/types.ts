@@ -150,6 +150,7 @@ export interface SyncDiagnosticsSnapshot {
 		| 'error'
 		| 'schema-mismatch'
 		| 'clock-error'
+		| 'auth-required'
 	/** Timestamp when the current connection was established, or null if disconnected */
 	connectedAt: number | null
 	/** Timestamp when the last disconnection occurred, or null if never disconnected */

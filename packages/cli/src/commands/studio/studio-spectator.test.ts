@@ -7,7 +7,7 @@ import { MergeEngine } from '@korajs/merge'
 import { MemoryServerStore, createKoraServer } from '@korajs/server'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { SyncEngine, WebSocketTransport } from '@korajs/sync'
+import { SyncEngine, type WebSocketConstructor, WebSocketTransport } from '@korajs/sync'
 import {
 	ApplyPipeline,
 	MergeAwareSyncStore,
@@ -15,6 +15,7 @@ import {
 	StoreSyncStatePersistence,
 } from 'korajs/testing'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
+import WebSocket from 'ws'
 import { StudioDbReader } from './db-reader'
 import { SpectatorManager } from './spectator-manager'
 
@@ -48,7 +49,9 @@ async function createWsClient(dir: string, name: string) {
 	const pipeline = new ApplyPipeline({ store, mergeEngine, emitter })
 	store.setLocalMutationHandler(pipeline)
 	const engine = new SyncEngine({
-		transport: new WebSocketTransport(),
+		transport: new WebSocketTransport({
+			WebSocketImpl: WebSocket as unknown as WebSocketConstructor,
+		}),
 		store: new MergeAwareSyncStore(store, mergeEngine, emitter),
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),

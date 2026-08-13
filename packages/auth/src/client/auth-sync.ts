@@ -13,6 +13,7 @@ import type { AuthState } from './auth-client'
  */
 export interface AuthSyncClient {
 	getAccessToken(): Promise<string | null>
+	readonly state?: AuthState
 	onAuthChange?(callback: (state: AuthState) => void): () => void
 }
 
@@ -40,6 +41,8 @@ export interface CreateKoraAuthSyncOptions {
 	 * Defaults to {@link extractScopeValuesFromClaims}.
 	 */
 	scopeFromClaims?: (claims: Record<string, unknown>) => Record<string, unknown>
+	/** Signed-out behavior. Authenticated-only sync is suspended by default. */
+	anonymous?: 'suspend' | 'allow'
 }
 
 /**
@@ -99,13 +102,31 @@ function readDeviceIdFromClaims(claims: Record<string, unknown>): string | undef
  * ```
  */
 export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSyncBinding {
-	const { authClient, schema, scopeFromClaims } = options
+	const { authClient, schema, scopeFromClaims, anonymous = 'suspend' } = options
 
 	const binding: AuthSyncBinding = {
 		auth: async () => {
 			const token = await authClient.getAccessToken()
 			return { token: token ?? '' }
 		},
+	}
+
+	binding.resolveSyncState = async () => {
+		if (authClient.state === 'loading') return { state: 'loading' }
+		const token = await authClient.getAccessToken()
+		if (!token) {
+			return anonymous === 'allow'
+				? { state: 'anonymous', mayConnectAnonymously: true }
+				: { state: 'signed-out', mayConnectAnonymously: false }
+		}
+		const claims = decodeJwtPayload(token)
+		const userId = typeof claims?.sub === 'string' ? claims.sub : ''
+		if (!userId) {
+			return anonymous === 'allow'
+				? { state: 'anonymous', mayConnectAnonymously: true }
+				: { state: 'signed-out', mayConnectAnonymously: false }
+		}
+		return { state: 'authenticated', userId, token }
 	}
 
 	if (schema) {

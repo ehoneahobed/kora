@@ -1688,3 +1688,7 @@ import protobuf from 'protobufjs'
 const root = protobuf.Root.fromJSON(jsonDescriptor)
 const TodosRecord = root.lookupType('kora.TodosRecord')
 ```
+## Store identity
+
+`app.storeInfo()` returns the base name, resolved database name, auth user id, persistence adapter,
+durability, and isolation lifecycle state without exposing another namespace's data.

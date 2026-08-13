@@ -198,6 +198,8 @@ function timelineLabel(event: KoraEvent): string {
 			return 'sync disconnected'
 		case 'sync:auth-failed':
 			return 'sync auth failed'
+		case 'sync:suspended':
+			return `sync suspended (${event.reason})`
 		case 'sync:clock-skew':
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
 		case 'sync:clock-rebase':
@@ -206,6 +208,14 @@ function timelineLabel(event: KoraEvent): string {
 			return `schema mismatch client ${event.clientSchemaVersion} server ${event.serverSchemaVersion}`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
+		case 'sync:apply-blocked':
+			return `sync apply blocked ${event.failure.collection}/${event.failure.recordId}`
+		case 'sync:apply-retrying':
+			return `sync apply retry ${event.failure.collection}/${event.failure.recordId}`
+		case 'sync:apply-recovered':
+			return `sync apply recovered ${event.failure.collection}/${event.failure.recordId}`
+		case 'sync:apply-abandoned':
+			return `sync apply abandoned ${event.failure.collection}/${event.failure.recordId}`
 		case 'sync:operation-rejected':
 			return `sync op rejected ${event.collection}/${event.recordId} (${event.code})`
 		case 'sync:sent':

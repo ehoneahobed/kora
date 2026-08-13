@@ -5,6 +5,55 @@ import type { Operation } from '@korajs/core'
  */
 export type ScopeMap = Record<string, Record<string, unknown>>
 
+export const DEFAULT_MAX_SCOPE_PREDICATE_VALUES = 100
+
+/** Canonicalize bounded `$in` predicates so equivalent authorization has one signature. */
+export function normalizeScopeMap(
+	scopes: ScopeMap,
+	maxValues = DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
+): ScopeMap {
+	const normalized: ScopeMap = {}
+	for (const collection of Object.keys(scopes).sort()) {
+		const predicate: Record<string, unknown> = {}
+		for (const field of Object.keys(scopes[collection] ?? {}).sort()) {
+			const expected = scopes[collection]?.[field]
+			if (
+				expected &&
+				typeof expected === 'object' &&
+				!Array.isArray(expected) &&
+				'$in' in expected
+			) {
+				const values = (expected as { $in?: unknown }).$in
+				if (!Array.isArray(values))
+					throw new Error(`Invalid $in predicate for ${collection}.${field}`)
+				const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).values()]
+				if (unique.length > maxValues)
+					throw new Error(
+						`Scope predicate for ${collection}.${field} exceeds the ${maxValues}-value limit`,
+					)
+				predicate[field] = {
+					$in: unique.sort((a, b) => stableValueKey(a).localeCompare(stableValueKey(b))),
+				}
+			} else predicate[field] = expected
+		}
+		normalized[collection] = predicate
+	}
+	return normalized
+}
+
+function stableValueKey(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableValueKey).join(',')}]`
+	if (value && typeof value === 'object')
+		return `{${Object.keys(value as Record<string, unknown>)
+			.sort()
+			.map(
+				(key) =>
+					`${JSON.stringify(key)}:${stableValueKey((value as Record<string, unknown>)[key])}`,
+			)
+			.join(',')}}`
+	return JSON.stringify(value)
+}
+
 /**
  * Returns true if an operation is visible to a session based on its scopes.
  *
@@ -28,12 +77,20 @@ export function operationMatchesScopes(
 	if (!snapshot) return false
 
 	for (const [field, expected] of Object.entries(collectionScope)) {
-		if (snapshot[field] !== expected) {
+		if (!matchesPredicate(snapshot[field], expected)) {
 			return false
 		}
 	}
 
 	return true
+}
+
+function matchesPredicate(actual: unknown, expected: unknown): boolean {
+	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+		const values = (expected as { $in?: unknown }).$in
+		return Array.isArray(values) && values.some((value) => Object.is(actual, value))
+	}
+	return Object.is(actual, expected)
 }
 
 /**

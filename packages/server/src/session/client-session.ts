@@ -41,7 +41,11 @@ import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
 import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
-import { missingScopeFields, operationMatchesScopes } from '../scopes/server-scope-filter'
+import {
+	missingScopeFields,
+	normalizeScopeMap,
+	operationMatchesScopes,
+} from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type { DeliveredOperation, ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
@@ -122,7 +126,11 @@ function stableStringify(value: unknown): string {
 }
 
 function sameScopeMap(a: unknown, b: unknown): boolean {
-	return stableStringify(a ?? null) === stableStringify(b ?? null)
+	const normalize = (value: unknown): unknown =>
+		value && typeof value === 'object'
+			? normalizeScopeMap(value as Record<string, Record<string, unknown>>)
+			: value
+	return stableStringify(normalize(a) ?? null) === stableStringify(normalize(b) ?? null)
 }
 
 /**
@@ -680,10 +688,24 @@ export class ClientSession {
 		}
 
 		// Merge handshake sync scopes with auth scopes using schema sync rules.
-		const resolvedScopes = resolveSessionScopes(this.store.getSchema(), {
+		const rawResolvedScopes = resolveSessionScopes(this.store.getSchema(), {
 			handshakeScope: msg.syncScope,
 			authScopes: this.authContext?.scopes,
 		})
+		let resolvedScopes: typeof rawResolvedScopes
+		try {
+			resolvedScopes = rawResolvedScopes ? normalizeScopeMap(rawResolvedScopes) : undefined
+		} catch (error) {
+			this.sendToClient({
+				type: 'error',
+				messageId: generateUUIDv7(),
+				code: 'SCOPE_PREDICATE_LIMIT',
+				message: error instanceof Error ? error.message : 'Invalid scope predicate',
+				retriable: false,
+			})
+			this.close('invalid scope predicate')
+			return
+		}
 
 		if (resolvedScopes) {
 			if (this.authContext) {

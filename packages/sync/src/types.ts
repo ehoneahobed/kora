@@ -30,8 +30,32 @@ export const SYNC_STATUSES = [
 	'clock-error',
 	'error',
 	'schema-mismatch',
+	'auth-required',
 ] as const
 export type SyncStatus = (typeof SYNC_STATUSES)[number]
+
+export type SyncPhase =
+	| 'suspended'
+	| 'offline'
+	| 'connecting'
+	| 'authenticating'
+	| 'handshaking'
+	| 'uploading'
+	| 'receiving'
+	| 'applying'
+	| 'streaming'
+	| 'blocked'
+
+export interface ActiveApplyFailure {
+	operationId: string
+	collection: string
+	recordId: string
+	code: string
+	message: string
+	retriable: boolean
+	firstSeenAt: number
+	retryCount: number
+}
 
 /**
  * Sync status information exposed to developers.
@@ -39,6 +63,8 @@ export type SyncStatus = (typeof SYNC_STATUSES)[number]
 export interface SyncStatusInfo {
 	/** Current developer-facing status */
 	status: SyncStatus
+	phase?: SyncPhase
+	reason?: string
 	/** True when the engine is actively trying to re-establish a transport session. */
 	reconnecting: boolean
 	/** Number of operations waiting to be sent */
@@ -53,7 +79,35 @@ export interface SyncStatusInfo {
 	conflicts: number
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
+	inFlightUploadOperations?: number
+	hasInFlightDeliveryBatch?: boolean
+	activeViewId?: string
+	activeViewComplete?: boolean
+	initialSync?: {
+		complete: boolean
+		receivedBatches: number
+		totalBatches: number | null
+		progress: number | null
+	}
+	deliveryWatermark?: number
+	serverFrontier?: number | null
+	blockedFailure?: ActiveApplyFailure | null
 }
+
+export interface SyncSettlementOptions {
+	upload?: boolean
+	download?: 'active-view' | false
+	timeoutMs?: number
+	signal?: AbortSignal
+}
+
+export type SyncSettlementResult =
+	| { outcome: 'settled'; status: SyncStatusInfo }
+	| { outcome: 'offline'; status: SyncStatusInfo }
+	| { outcome: 'suspended'; reason: string; status: SyncStatusInfo }
+	| { outcome: 'blocked'; failure: ActiveApplyFailure; status: SyncStatusInfo }
+	| { outcome: 'timeout'; status: SyncStatusInfo }
+	| { outcome: 'aborted'; status: SyncStatusInfo }
 
 /**
  * Per-collection sync scope map. Maps collection names to field-value filters.
@@ -72,6 +126,12 @@ export interface SyncConfig {
 	transport?: 'websocket' | 'http'
 	/** Auth provider function. Called before each connection attempt. */
 	auth?: () => Promise<{ token: string }>
+	/** Auth readiness gate. A suspended result prevents transport creation and retries. */
+	authState?: () => Promise<{
+		state: 'loading' | 'signed-out' | 'anonymous' | 'authenticated'
+		mayConnectAnonymously?: boolean
+	}>
+	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
 	/** Sync scopes per collection. Limits which records sync to this client. */
 	scopes?: Record<string, (ctx: SyncScopeContext) => Record<string, unknown>>
 	/**

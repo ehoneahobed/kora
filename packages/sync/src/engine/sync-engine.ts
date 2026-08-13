@@ -53,6 +53,7 @@ import {
 	type SyncQuerySubset,
 	dedupeQuerySubsets,
 	operationMatchesQuerySubsets,
+	querySubsetContains,
 } from '../scopes/query-subset'
 import { operationMatchesScope } from '../scopes/scope-filter'
 import type { SyncTransport } from '../transport/transport'
@@ -218,6 +219,11 @@ export class SyncEngine {
 	private clockBlocked = false
 	private clockSkewMs: number | null = null
 	private blobStorageEnabled = false
+	private suspensionReason: string | null = null
+	private authRejected = false
+	private serverFrontier: number | null = null
+	private hasInFlightDeliveryBatch = false
+	private blockedFailure: import('../types').ActiveApplyFailure | null = null
 	private outboundAckTimer: ReturnType<typeof setTimeout> | null = null
 	private startPromise: Promise<void> | null = null
 	private stopPromise: Promise<void> | null = null
@@ -241,6 +247,7 @@ export class SyncEngine {
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
+	private staticQuerySubsets: SyncQuerySubset[] = []
 	private querySubsetReconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 	/** Resume cursor for paginated initial sync (persisted across reconnects) */
@@ -354,7 +361,23 @@ export class SyncEngine {
 		if (this.state !== 'disconnected') {
 			await this.stop()
 		}
+		if (this.authRejected) {
+			this.emitter?.emit({
+				type: 'sync:suspended',
+				reason: this.suspensionReason ?? 'auth-rejected',
+			})
+			return
+		}
 
+		if (this.config.authState) {
+			const authState = await this.config.authState()
+			if (authState.state === 'loading' || authState.state === 'signed-out') {
+				this.suspensionReason = authState.state === 'loading' ? 'auth-loading' : 'auth-required'
+				this.emitter?.emit({ type: 'sync:suspended', reason: this.suspensionReason })
+				return
+			}
+		}
+		this.suspensionReason = null
 		await this.outboundQueue.initialize()
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
@@ -518,6 +541,8 @@ export class SyncEngine {
 			? this.cachedUnsyncedCount
 			: this.outboundQueue.totalPending
 		const base = {
+			phase: this.resolvePhase(),
+			...(this.suspensionReason ? { reason: this.suspensionReason } : {}),
 			reconnecting: this.reconnecting,
 			pendingOperations,
 			lastSyncedAt: this.lastSyncedAt,
@@ -525,7 +550,28 @@ export class SyncEngine {
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
 			clockSkewMs: this.clockSkewMs,
+			inFlightUploadOperations: this.currentBatch?.operations.length ?? 0,
+			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
+			activeViewId: this.deliverySignature(),
+			activeViewComplete:
+				this.state === 'streaming' &&
+				!this.hasInFlightDeliveryBatch &&
+				this.blockedFailure === null &&
+				(this.serverFrontier === null || this.deliveryWatermark >= this.serverFrontier),
+			initialSync: {
+				complete: this.deltaReceiveComplete && this.deltaSendComplete,
+				receivedBatches: this.deltaBatchesReceived,
+				totalBatches: this.initialSyncTotalBatches || null,
+				progress:
+					this.initialSyncTotalBatches > 0
+						? Math.min(1, this.deltaBatchesReceived / this.initialSyncTotalBatches)
+						: null,
+			},
+			deliveryWatermark: this.deliveryWatermark,
+			serverFrontier: this.serverFrontier,
+			blockedFailure: this.blockedFailure,
 		}
+		if (this.suspensionReason) return { ...base, status: 'auth-required' }
 		switch (this.state) {
 			case 'disconnected':
 				// A durable block outranks plain offline: the user must act
@@ -548,6 +594,27 @@ export class SyncEngine {
 					return { ...base, status: 'clock-error' }
 				}
 				return { ...base, status: this.schemaBlocked ? 'schema-mismatch' : 'error' }
+		}
+	}
+
+	private resolvePhase(): import('../types').SyncPhase {
+		if (this.suspensionReason) return 'suspended'
+		if (this.blockedFailure || this.schemaBlocked || this.clockBlocked) return 'blocked'
+		if (this.hasInFlightDeliveryBatch) return 'applying'
+		if (this.currentBatch) return 'uploading'
+		switch (this.state) {
+			case 'disconnected':
+				return 'offline'
+			case 'connecting':
+				return 'connecting'
+			case 'handshaking':
+				return 'handshaking'
+			case 'syncing':
+				return 'receiving'
+			case 'streaming':
+				return 'streaming'
+			case 'error':
+				return 'blocked'
 		}
 	}
 
@@ -614,8 +681,26 @@ export class SyncEngine {
 		op: Operation,
 		result: Exclude<ApplyResult, 'applied' | 'duplicate'>,
 		overrides?: Partial<ApplyFailureReason>,
+		blocking = false,
 	): void {
 		const reason = defaultApplyFailureReason(result, overrides)
+		if (blocking || reason.retriable) {
+			const prior = this.blockedFailure
+			this.blockedFailure = {
+				operationId: op.id,
+				collection: op.collection,
+				recordId: op.recordId,
+				code: reason.code,
+				message: reason.message,
+				retriable: reason.retriable,
+				firstSeenAt: prior?.operationId === op.id ? prior.firstSeenAt : Date.now(),
+				retryCount: prior?.operationId === op.id ? prior.retryCount + 1 : 0,
+			}
+			this.emitter?.emit({
+				type: prior?.operationId === op.id ? 'sync:apply-retrying' : 'sync:apply-blocked',
+				failure: this.blockedFailure,
+			})
+		}
 		this.emitter?.emit({
 			type: 'sync:apply-failed',
 			operationId: op.id,
@@ -633,10 +718,18 @@ export class SyncEngine {
 	 */
 	async retryNow(): Promise<void> {
 		if (this.schemaBlocked) return
+		this.authRejected = false
+		this.suspensionReason = null
 		if (this.state === 'disconnected' || this.state === 'error') {
 			this.reconnecting = false
 			await this.start()
 		}
+	}
+
+	/** Wake a permanent auth suspension after the binding reports a new auth state. */
+	notifyAuthChanged(): void {
+		this.authRejected = false
+		this.suspensionReason = null
 	}
 
 	/**
@@ -811,28 +904,60 @@ export class SyncEngine {
 	 * Takes effect on the next connection; reconnects when already connected.
 	 */
 	registerQuerySubset(subset: SyncQuerySubset): () => void {
+		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'reactive') return () => {}
 		const id = `query-${nextQuerySubsetId++}`
 		const previousSignature = this.deliverySignature()
+		const previousEffective = this.getActiveQuerySubsets()
 		this.querySubsets.set(id, subset)
 		// Registering or unregistering a subset changes the sync view. Switch the watermark
 		// to the new view (resuming it if seen before, or resyncing it once if new); returning
 		// to a previously-synced view resumes instead of re-syncing. The debounce coalesces a
 		// burst of subscription changes into a single reconnect.
-		this.switchDeliveryView(previousSignature)
-		this.scheduleQuerySubsetReconnect()
+		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
+		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
 		return () => {
 			const sigBeforeRemove = this.deliverySignature()
+			const effectiveBeforeRemove = this.getActiveQuerySubsets()
 			this.querySubsets.delete(id)
-			this.switchDeliveryView(sigBeforeRemove)
-			this.scheduleQuerySubsetReconnect()
+			this.switchDeliveryViewWithInheritance(sigBeforeRemove, effectiveBeforeRemove)
+			if (this.deliverySignature() !== sigBeforeRemove) this.scheduleQuerySubsetReconnect()
 		}
+	}
+
+	private switchDeliveryViewWithInheritance(
+		previousSignature: string,
+		previousSubsets: SyncQuerySubset[],
+	): void {
+		const nextSubsets = this.getActiveQuerySubsets()
+		const previousWatermark = this.deliveryWatermark
+		this.switchDeliveryView(previousSignature)
+		if (this.deliveryWatermark === 0 && querySubsetContains(previousSubsets, nextSubsets)) {
+			this.deliveryWatermark = previousWatermark
+			this.setViewWatermark(this.deliverySignature(), previousWatermark)
+			void this.persistDeliveryWatermark(previousWatermark)
+		}
+	}
+
+	/** Atomically replace the manifest used by static query-subset mode. */
+	setQuerySubsets(subsets: SyncQuerySubset[]): void {
+		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'static')
+			throw new Error('setQuerySubsets() requires sync.querySubsets.mode = "static"')
+		const previousSignature = this.deliverySignature()
+		const previousEffective = this.getActiveQuerySubsets()
+		this.staticQuerySubsets = dedupeQuerySubsets(subsets)
+		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
+		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
 	}
 
 	/**
 	 * Returns deduplicated active query subsets from registered subscriptions.
 	 */
 	getActiveQuerySubsets(): SyncQuerySubset[] {
-		return dedupeQuerySubsets([...this.querySubsets.values()])
+		const mode = this.config.querySubsets?.mode ?? 'reactive'
+		if (mode === 'disabled') return []
+		return mode === 'static'
+			? this.staticQuerySubsets
+			: dedupeQuerySubsets([...this.querySubsets.values()])
 	}
 
 	/**
@@ -921,6 +1046,7 @@ export class SyncEngine {
 	}
 
 	private handleMessageFailure(error: unknown): void {
+		this.hasInFlightDeliveryBatch = false
 		const reason = error instanceof Error ? error.message : 'Message handling failed'
 		this.handleTransportClose(reason)
 	}
@@ -1013,6 +1139,7 @@ export class SyncEngine {
 			this.setViewWatermark(this.deliverySignature(), 0)
 			await this.persistDeliveryWatermark(0)
 		}
+		this.serverFrontier = msg.serverMaxDeliverySequence ?? null
 
 		if (msg.selectedWireFormat) {
 			this.setSerializerWireFormat(msg.selectedWireFormat)
@@ -1230,6 +1357,7 @@ export class SyncEngine {
 				return
 			}
 			// base === watermark: this batch continues the chain; apply it in order below.
+			this.hasInFlightDeliveryBatch = true
 		}
 
 		const deserialized = msg.operations.map((s) => this.serializer.decodeOperation(s))
@@ -1275,11 +1403,16 @@ export class SyncEngine {
 				// visible, diagnosable stall rather than silent data loss.
 				fullyApplied = false
 				if (error instanceof ClockDriftError) {
-					this.emitApplyFailure(transformed, 'rejected', {
-						code: APPLY_FAILURE_CODES.CLOCK_DRIFT,
-						message: error.message,
-						retriable: false,
-					})
+					this.emitApplyFailure(
+						transformed,
+						'rejected',
+						{
+							code: APPLY_FAILURE_CODES.CLOCK_DRIFT,
+							message: error.message,
+							retriable: false,
+						},
+						true,
+					)
 					continue
 				}
 				const message = error instanceof Error ? error.message : 'Apply failed'
@@ -1292,7 +1425,7 @@ export class SyncEngine {
 								? error.code
 								: APPLY_FAILURE_CODES.APPLY_FAILED
 				const retriable = code !== APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY
-				this.emitApplyFailure(transformed, 'rejected', { code, message, retriable })
+				this.emitApplyFailure(transformed, 'rejected', { code, message, retriable }, true)
 			}
 		}
 
@@ -1339,7 +1472,16 @@ export class SyncEngine {
 			this.deliveryWatermark = msg.maxDeliverySequence
 			this.setViewWatermark(this.deliverySignature(), this.deliveryWatermark)
 			await this.persistDeliveryWatermark(this.deliveryWatermark)
+			if (
+				this.blockedFailure &&
+				inScopeOps.some((op) => op.id === this.blockedFailure?.operationId)
+			) {
+				const recovered = this.blockedFailure
+				this.blockedFailure = null
+				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
+			}
 		}
+		this.hasInFlightDeliveryBatch = false
 
 		if (this.state === 'syncing') {
 			this.deltaBatchesReceived++
@@ -1435,8 +1577,11 @@ export class SyncEngine {
 			this.currentBatchRequiresPartialAck = false
 		}
 		this.transitionTo('error')
-		if (msg.code === 'AUTH_FAILED') {
+		if (msg.code === 'AUTH_FAILED' || msg.code === 'DEVICE_REVOKED') {
+			this.authRejected = true
+			this.suspensionReason = msg.code === 'DEVICE_REVOKED' ? 'device-revoked' : 'auth-rejected'
 			this.emitter?.emit({ type: 'sync:auth-failed', reason: msg.message })
+			this.emitter?.emit({ type: 'sync:suspended', reason: this.suspensionReason })
 		}
 		if (msg.code === 'INVALID_TIMESTAMP') {
 			// The server refused an operation stamped too far in the future: this
