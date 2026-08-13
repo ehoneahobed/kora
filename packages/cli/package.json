@@ -46,7 +46,8 @@
     "citty": "^0.1.6",
     "conf": "^15.1.0",
     "esbuild": "^0.28.0",
-    "validate-npm-package-name": "^7.0.2"
+    "validate-npm-package-name": "^7.0.2",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@korajs/merge": "workspace:*",
@@ -62,8 +63,7 @@
     "korajs": "workspace:*",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.4",
-    "ws": "^8.18.0"
+    "vitest": "^3.0.4"
   },
   "license": "MIT"
 }

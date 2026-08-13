@@ -291,6 +291,9 @@ importers:
       validate-npm-package-name:
         specifier: ^7.0.2
         version: 7.0.2
+      ws:
+        specifier: ^8.18.0
+        version: 8.20.0
     devDependencies:
       '@korajs/merge':
         specifier: workspace:*
@@ -334,10 +337,6 @@ importers:
       vitest:
         specifier: ^3.0.4
         version: 3.2.4(@types/node@25.5.2)(happy-dom@17.6.3)(jiti@2.7.0)(jsdom@25.0.1)(lightningcss@1.32.0)(tsx@4.21.0)
-      ws:
-        specifier: ^8.18.0
-        version: 8.20.0
-
   packages/core:
     devDependencies:
       '@fast-check/vitest':
