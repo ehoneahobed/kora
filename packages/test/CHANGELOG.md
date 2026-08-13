@@ -1,5 +1,17 @@
 # @korajs/test
 
+## 1.0.0-beta.13
+
+### Patch Changes
+
+- Updated dependencies [3da0afb]
+  - korajs@1.0.0-beta.13
+  - @korajs/core@1.0.0-beta.13
+  - @korajs/server@1.0.0-beta.13
+  - @korajs/store@1.0.0-beta.13
+  - @korajs/sync@1.0.0-beta.13
+  - @korajs/merge@1.0.0-beta.13
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

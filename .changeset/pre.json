@@ -47,6 +47,7 @@
     "kora-studio",
     "multi-runtime-storage-diagnostics",
     "multi-tab-hardening",
+    "next-beta-scope-hardening",
     "object-json-crdt-fields",
     "opfs-blob-store-and-app-blobs",
     "orphan-atomic-fold",

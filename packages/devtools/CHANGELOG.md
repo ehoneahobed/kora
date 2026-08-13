@@ -1,5 +1,12 @@
 # @korajs/devtools
 
+## 1.0.0-beta.13
+
+### Patch Changes
+
+- Updated dependencies [3da0afb]
+  - @korajs/core@1.0.0-beta.13
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

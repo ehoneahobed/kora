@@ -1,5 +1,22 @@
 # @korajs/server
 
+## 1.0.0-beta.13
+
+### Minor Changes
+
+- 3da0afb: Harden delivery-stall diagnostics, collision-free collections and events, auth-bound initialization
+  errors, scope-exit retractions, and independent server-authoritative downlink/uplink scopes.
+  Permanently reject and acknowledge uplink scope violations so stale shared-device writes cannot
+  pin the queue, add bounded backoff for transient operation rejections, and expose ingest outcome
+  metrics.
+
+### Patch Changes
+
+- Updated dependencies [3da0afb]
+  - @korajs/core@1.0.0-beta.13
+  - @korajs/sync@1.0.0-beta.13
+  - @korajs/merge@1.0.0-beta.13
+
 ## 1.0.0-beta.12
 
 ### Minor Changes
