@@ -1,5 +1,12 @@
 # @korajs/merge
 
+## 1.0.0-beta.9
+
+### Patch Changes
+
+- Updated dependencies [b657130]
+  - @korajs/core@1.0.0-beta.9
+
 ## 1.0.0-beta.5
 
 ### Patch Changes

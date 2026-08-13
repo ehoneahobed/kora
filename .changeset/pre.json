@@ -41,6 +41,7 @@
     "delivery-watermark-gapfree-sync",
     "durable-relay-reconnect",
     "exports-and-secret-hardening",
+    "framework-beta-hardening",
     "httproutes-body-crash-fix",
     "kora-studio",
     "multi-runtime-storage-diagnostics",
