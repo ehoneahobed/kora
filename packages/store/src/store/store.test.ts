@@ -101,6 +101,17 @@ describe('Store', () => {
 			expect(found).toBeNull()
 		})
 
+		test('scope retraction hides a row without authoring a delete operation', async () => {
+			const col = store.collection('todos')
+			const record = await col.insert({ title: 'Authorized copy' })
+			const before = await store.getOperationRange('test-node', 1, 100)
+
+			await store.applyScopeRetraction('todos', record.id)
+
+			expect(await col.findById(record.id)).toBeNull()
+			expect(await store.getOperationRange('test-node', 1, 100)).toEqual(before)
+		})
+
 		test('where query', async () => {
 			const col = store.collection('todos')
 			await col.insert({ title: 'A', completed: true })

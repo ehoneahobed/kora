@@ -99,6 +99,37 @@ describe('createApp', () => {
 		expect((app as Record<string, unknown>).projects).toBeDefined()
 	})
 
+	test('keeps framework APIs intact when collection names collide', async () => {
+		const collisionSchema = defineSchema({
+			version: 1,
+			collections: {
+				events: { fields: { value: t.string() } },
+				sync: { fields: { value: t.string() } },
+				close: { fields: { value: t.string() } },
+				todos: { fields: { value: t.string() } },
+			},
+		})
+		app = createApp({
+			schema: collisionSchema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		await app.ready
+
+		expect(typeof app.events.emit).toBe('function')
+		expect(app.sync).toBeNull()
+		expect(typeof app.close).toBe('function')
+		expect(typeof app.collections.events?.insert).toBe('function')
+		expect(typeof app.collections.sync?.insert).toBe('function')
+		expect(typeof app.collections.close?.insert).toBe('function')
+		expect((app as Record<string, unknown>).todos).toBeDefined()
+
+		const listener = vi.fn()
+		const unsubscribe = app.on('sync:disconnected', listener)
+		app.events.emit({ type: 'sync:disconnected', reason: 'test' })
+		expect(listener).toHaveBeenCalledWith({ type: 'sync:disconnected', reason: 'test' })
+		unsubscribe()
+	})
+
 	test('insert and findById work through collection accessor', async () => {
 		app = createApp({
 			schema,

@@ -73,8 +73,22 @@ export type KoraEvent =
 			maxSkewMs: number
 	  }
 	| { type: 'sync:sent'; operations: Operation[]; batchSize: number }
-	| { type: 'sync:received'; operations: Operation[]; batchSize: number }
+	| {
+			type: 'sync:received'
+			operations: Operation[]
+			batchSize: number
+			/** Server-ingest outcomes. Omitted for ordinary client-side receive events. */
+			uniqueOperations?: number
+			duplicateOperations?: number
+			rejectedOperations?: number
+	  }
 	| { type: 'sync:acknowledged'; sequenceNumber: number }
+	| {
+			type: 'sync:scope-retracted'
+			collection: string
+			recordId: string
+			quarantinedOperationIds: string[]
+	  }
 	| {
 			type: 'sync:apply-failed'
 			operationId: string
@@ -112,7 +126,9 @@ export type KoraEvent =
 			type: 'sync:delivery-stalled'
 			sessionId: string
 			watermark: number
+			outstandingMaxDeliverySequence: number
 			repeatCount: number
+			reason: 'unacknowledged-delivery'
 	  }
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }

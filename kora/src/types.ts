@@ -105,6 +105,8 @@ export interface SyncOptions {
 	authClient?: AuthSyncBinding
 	/** Controls whether reactive queries affect the replicated view. Defaults to `reactive`. */
 	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
+	/** Remove records from the local active view when server authorization retracts them. */
+	scopeExit?: 'retain' | 'retract'
 	/** Sync scopes per collection. */
 	scopes?: Record<string, (ctx: Record<string, unknown>) => Record<string, unknown>>
 	/**
@@ -349,6 +351,13 @@ export interface KoraApp {
 	ready: Promise<void>
 	/** Event emitter for DevTools integration and custom listeners. */
 	events: KoraEventEmitter
+	/** Collision-free event subscription shorthand. */
+	on: KoraEventEmitter['on']
+	/**
+	 * Collision-free collection namespace. Every schema collection is exposed here,
+	 * including collections whose names overlap framework APIs such as `events`.
+	 */
+	collections: Readonly<Record<string, CollectionAccessor>>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** Offline-safe sequence generation. */
@@ -446,11 +455,44 @@ export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate> {
  * A typed Kora application object with collection accessors inferred from the schema.
  * Each collection becomes a property with fully typed insert/update/query methods.
  */
+type KoraFrameworkProperty =
+	| 'ready'
+	| 'events'
+	| 'on'
+	| 'collections'
+	| 'sync'
+	| 'sequences'
+	| 'blobs'
+	| 'getStore'
+	| 'getSyncEngine'
+	| 'getQueryStoreCache'
+	| 'storeInfo'
+	| 'close'
+	| 'transaction'
+	| 'mutation'
+	| 'exportBackup'
+	| 'importBackup'
+	| 'replayTo'
+	| 'exportAudit'
+
+export type TypedCollections<S extends SchemaInput> = {
+	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
+		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
+		fields: infer F extends Record<string, FieldBuilder<any, any, any>>
+	}
+		? TypedCollectionAccessor<InferRecord<F>, InferInsertInput<F>, InferUpdateInput<F>>
+		: CollectionAccessor
+}
+
 export type TypedKoraApp<S extends SchemaInput> = {
 	/** Resolves when the store is open and collections are ready. */
 	ready: Promise<void>
 	/** Event emitter for DevTools integration and custom listeners. */
 	events: KoraEventEmitter
+	/** Collision-free event subscription shorthand. */
+	on: KoraEventEmitter['on']
+	/** All schema collections, including names reserved by the framework. */
+	collections: TypedCollections<S>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** Offline-safe sequence generation. */
@@ -479,11 +521,4 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	replayTo(operationId: string): Promise<ReplaySnapshot>
 	/** Export the operation log and persisted merge traces as a portable audit bundle. */
 	exportAudit(options?: AuditExportOptions): Promise<Uint8Array>
-} & {
-	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
-		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
-		fields: infer F extends Record<string, FieldBuilder<any, any, any>>
-	}
-		? TypedCollectionAccessor<InferRecord<F>, InferInsertInput<F>, InferUpdateInput<F>>
-		: CollectionAccessor
-}
+} & Pick<TypedCollections<S>, Exclude<keyof TypedCollections<S>, KoraFrameworkProperty>>

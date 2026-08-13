@@ -182,6 +182,7 @@ export async function initializeApp(
 				auth: syncAuth,
 				authState: authBinding?.resolveSyncState,
 				querySubsets: config.sync.querySubsets,
+				scopeExit: config.sync.scopeExit,
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
 				scopeMap,

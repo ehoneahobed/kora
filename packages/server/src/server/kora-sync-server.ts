@@ -230,13 +230,16 @@ export class KoraSyncServer {
 				for (const session of this.sessions.values()) {
 					session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
 						trackStall: true,
+						serverFrontier: maxDeliverySequence,
 					})
 				}
 				return
 			}
 			this.lastObservedDeliverySequence = maxDeliverySequence
 			for (const session of this.sessions.values()) {
-				session.pushDeliveryStreamIfSupported(0)
+				session.pushDeliveryStreamIfSupported(0, {
+					serverFrontier: maxDeliverySequence,
+				})
 			}
 		} catch (error) {
 			this.logger.log({
@@ -320,7 +323,11 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:received', (event) => {
 			const byteSize = estimateByteSize(event.operations)
-			this.metrics.recordReceived(sessionId, event.batchSize, byteSize)
+			this.metrics.recordReceived(sessionId, event.batchSize, byteSize, {
+				unique: event.uniqueOperations ?? event.batchSize,
+				duplicates: event.duplicateOperations ?? 0,
+				rejected: event.rejectedOperations ?? 0,
+			})
 			this.logger.log({
 				timestamp: Date.now(),
 				level: 'info',
@@ -579,7 +586,11 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:received', (event) => {
 			const byteSize = estimateOperationByteSize(event.operations)
-			this.metrics.recordReceived(sessionId, event.batchSize, byteSize)
+			this.metrics.recordReceived(sessionId, event.batchSize, byteSize, {
+				unique: event.uniqueOperations ?? event.batchSize,
+				duplicates: event.duplicateOperations ?? 0,
+				rejected: event.rejectedOperations ?? 0,
+			})
 			this.logger.log({
 				timestamp: Date.now(),
 				level: 'info',
@@ -636,7 +647,9 @@ export class KoraSyncServer {
 				sessionId,
 				details: {
 					watermark: event.watermark,
+					outstandingMaxDeliverySequence: event.outstandingMaxDeliverySequence,
 					repeatCount: event.repeatCount,
+					reason: event.reason,
 				},
 			})
 		})

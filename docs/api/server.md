@@ -71,6 +71,20 @@ function createKoraServer(config: KoraSyncServerConfig): KoraSyncServer
 
 `maxOperationBytes` is the maximum serialized byte size of a single client operation accepted at sync ingest; operations larger than this are rejected before materialization. `maxOpsPerMinute` is the maximum operations accepted per connected client per minute (sliding window); operations beyond the limit are rejected with a retriable `RATE_LIMIT` rejection until the window resets. Both are enforced per connection across every connected client. `validateOperation` is covered under [Operation Validation](#operation-validation).
 
+An operation outside the accepted uplink scope is rejected as non-retriable
+`SCOPE_VIOLATION`. Its sequence is acknowledged, the client moves it into durable rejected storage,
+and ingestion continues with later operations in the same batch. A temporary authorization workflow
+must refresh scopes before creating or explicitly resubmitting an authorized operation; the
+transport never loops the identical unauthorized bytes.
+
+The built-in status snapshot and `/__kora/metrics` endpoint expose separate counters for received
+batches, total received operations, newly materialized operations, duplicates, and rejected
+operations (`batchesReceived`, `operationsReceived`, `uniqueOperationsReceived`,
+`duplicateOperationsReceived`, and `rejectedOperations`). The Prometheus names are
+`kora_operation_batches_received_total`, `kora_operations_received_total`,
+`kora_unique_operations_received_total`, `kora_duplicate_operations_received_total`, and
+`kora_rejected_operations_total`.
+
 ### Example
 
 ```typescript
@@ -454,9 +468,21 @@ The return type from `authenticate()`:
 |-------|------|----------|-------------|
 | `userId` | `string` | Yes | Unique user identifier |
 | `scopes` | `Record<string, Record<string, unknown>>` | No | Per-collection sync scope filters |
+| `downlinkScopes` | `Record<string, Record<string, unknown>>` | No | Records this session may receive |
+| `uplinkScopes` | `Record<string, Record<string, unknown>>` | No | Operations this session may upload |
 | `metadata` | `Record<string, unknown>` | No | Arbitrary metadata (device info, email, etc.) |
 
-When `scopes` is provided, the server only sends/accepts operations matching the scope filters. For example, `{ todos: { userId: 'user-1' } }` means the user only syncs todos where `userId` equals `'user-1'`.
+`scopes` remains shorthand for both directions. Directional maps are server-authoritative and omitted
+collections deny access. The uplink check runs before `validateOperation`; accepted maps are returned
+in handshake diagnostics without auth claims or tokens.
+
+```typescript
+return {
+  userId,
+  downlinkScopes: { submissions: { learnerId: userId } },
+  uplinkScopes: { submissions: { authorId: userId } },
+}
+```
 
 ## Operation Validation
 

@@ -9,6 +9,10 @@ export interface ServerMetricsSnapshot {
 	peakConnections: number
 	connectionsTotal: number
 	operationsReceived: number
+	batchesReceived: number
+	uniqueOperationsReceived: number
+	duplicateOperationsReceived: number
+	rejectedOperations: number
 	operationsSent: number
 	bytesReceived: number
 	bytesSent: number
@@ -28,6 +32,10 @@ export interface ClientMetrics {
 	state: SessionState
 	connectedAt: number
 	operationsReceived: number
+	batchesReceived: number
+	uniqueOperationsReceived: number
+	duplicateOperationsReceived: number
+	rejectedOperations: number
 	operationsSent: number
 	authContext: AuthContext | null
 }
@@ -57,6 +65,10 @@ export class ServerMetricsCollector {
 	private peakConnections = 0
 	private connectionsTotal = 0
 	private operationsReceived = 0
+	private batchesReceived = 0
+	private uniqueOperationsReceived = 0
+	private duplicateOperationsReceived = 0
+	private rejectedOperations = 0
 	private operationsSent = 0
 	private bytesReceived = 0
 	private bytesSent = 0
@@ -74,6 +86,10 @@ export class ServerMetricsCollector {
 			state: 'connected',
 			connectedAt: Date.now(),
 			operationsReceived: 0,
+			batchesReceived: 0,
+			uniqueOperationsReceived: 0,
+			duplicateOperationsReceived: 0,
+			rejectedOperations: 0,
 			operationsSent: 0,
 			authContext: null,
 		})
@@ -110,12 +126,29 @@ export class ServerMetricsCollector {
 	}
 
 	/** Record operations received from a client. */
-	recordReceived(sessionId: string, count: number, byteSize: number): void {
+	recordReceived(
+		sessionId: string,
+		count: number,
+		byteSize: number,
+		outcomes: { unique: number; duplicates: number; rejected: number } = {
+			unique: count,
+			duplicates: 0,
+			rejected: 0,
+		},
+	): void {
 		this.operationsReceived += count
+		this.batchesReceived += 1
+		this.uniqueOperationsReceived += outcomes.unique
+		this.duplicateOperationsReceived += outcomes.duplicates
+		this.rejectedOperations += outcomes.rejected
 		this.bytesReceived += byteSize
 		const client = this.clientMetrics.get(sessionId)
 		if (client) {
 			client.operationsReceived += count
+			client.batchesReceived += 1
+			client.uniqueOperationsReceived += outcomes.unique
+			client.duplicateOperationsReceived += outcomes.duplicates
+			client.rejectedOperations += outcomes.rejected
 		}
 	}
 
@@ -149,6 +182,10 @@ export class ServerMetricsCollector {
 			peakConnections: this.peakConnections,
 			connectionsTotal: this.connectionsTotal,
 			operationsReceived: this.operationsReceived,
+			batchesReceived: this.batchesReceived,
+			uniqueOperationsReceived: this.uniqueOperationsReceived,
+			duplicateOperationsReceived: this.duplicateOperationsReceived,
+			rejectedOperations: this.rejectedOperations,
 			operationsSent: this.operationsSent,
 			bytesReceived: this.bytesReceived,
 			bytesSent: this.bytesSent,
@@ -166,6 +203,10 @@ export class ServerMetricsCollector {
 		this.peakConnections = 0
 		this.connectionsTotal = 0
 		this.operationsReceived = 0
+		this.batchesReceived = 0
+		this.uniqueOperationsReceived = 0
+		this.duplicateOperationsReceived = 0
+		this.rejectedOperations = 0
 		this.operationsSent = 0
 		this.bytesReceived = 0
 		this.bytesSent = 0

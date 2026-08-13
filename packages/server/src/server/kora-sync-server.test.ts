@@ -606,7 +606,7 @@ describe('KoraSyncServer', () => {
 	})
 
 	describe('stale-scope inbound pushes', () => {
-		test('scope violations are retryable per-op rejections and do not advance the ack range', async () => {
+		test('scope violations are permanent per-op rejections and advance the ack range', async () => {
 			const store = new MemoryServerStore('server-stale-scope')
 			await store.setSchema(
 				defineSchema({
@@ -668,11 +668,11 @@ describe('KoraSyncServer', () => {
 			if (rejected?.type === 'operation-rejected') {
 				expect(rejected.operationId).toBe(scopedOut.id)
 				expect(rejected.code).toBe('SCOPE_VIOLATION')
-				expect(rejected.retriable).toBe(true)
+				expect(rejected.retriable).toBe(false)
 			}
 			const ack = messages.find((m) => m.type === 'acknowledgment')
 			if (ack?.type === 'acknowledgment') {
-				expect(ack.lastSequenceNumber).toBe(0)
+				expect(ack.lastSequenceNumber).toBe(1)
 			}
 			expect(await store.materializeCollection('submissions')).toHaveLength(0)
 			await server.stop()

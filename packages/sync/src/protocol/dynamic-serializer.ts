@@ -11,6 +11,16 @@ import type {
 	SyncMessage,
 	WireFormat,
 } from './messages'
+
+function decodeJsonBytes(value: unknown): string | undefined {
+	if (value instanceof Uint8Array) {
+		return value.length > 0 ? new TextDecoder().decode(value) : undefined
+	}
+	if (typeof value === 'string' && value.length > 0) {
+		return atob(value)
+	}
+	return undefined
+}
 import { isSyncMessage } from './messages'
 import type { EncodedMessage, MessageSerializer } from './serializer'
 import { JsonMessageSerializer } from './serializer'
@@ -197,6 +207,7 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			syncQueriesJson: message.syncQueries
 				? new TextEncoder().encode(JSON.stringify(message.syncQueries))
 				: new Uint8Array(0),
+			scopeExitPolicy: message.scopeExitPolicy ?? '',
 		}
 	}
 
@@ -213,6 +224,15 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			rejectReason: message.rejectReason ?? '',
 			selectedWireFormat: message.selectedWireFormat ?? '',
 			serverTime: message.serverTime ?? 0,
+			acceptedScopeJson: message.acceptedScope
+				? new TextEncoder().encode(JSON.stringify(message.acceptedScope))
+				: new Uint8Array(0),
+			acceptedDownlinkScopesJson: message.acceptedDownlinkScopes
+				? new TextEncoder().encode(JSON.stringify(message.acceptedDownlinkScopes))
+				: new Uint8Array(0),
+			acceptedUplinkScopesJson: message.acceptedUplinkScopes
+				? new TextEncoder().encode(JSON.stringify(message.acceptedUplinkScopes))
+				: new Uint8Array(0),
 		}
 	}
 
@@ -224,6 +244,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			batchIndex: message.batchIndex,
 			cursor: message.cursor ?? '',
 			totalBatches: message.totalBatches ?? 0,
+			retractionsJson: message.retractions
+				? new TextEncoder().encode(JSON.stringify(message.retractions))
+				: new Uint8Array(0),
 		}
 	}
 
@@ -392,6 +415,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			...(supportedWireFormats && supportedWireFormats.length > 0 ? { supportedWireFormats } : {}),
 			...(syncScope ? { syncScope } : {}),
 			...(syncQueries && syncQueries.length > 0 ? { syncQueries } : {}),
+			...(payload.scopeExitPolicy === 'retain' || payload.scopeExitPolicy === 'retract'
+				? { scopeExitPolicy: payload.scopeExitPolicy }
+				: {}),
 			...(deltaCursor ? { deltaCursor } : {}),
 		}
 	}
@@ -412,6 +438,14 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			selectedWireFormat === 'json' || selectedWireFormat === 'protobuf'
 				? selectedWireFormat
 				: undefined
+		const decodeScope = (value: unknown): Record<string, Record<string, unknown>> | undefined => {
+			const decoded = decodeJsonBytes(value)
+			if (!decoded) return undefined
+			return JSON.parse(decoded) as Record<string, Record<string, unknown>>
+		}
+		const acceptedScope = decodeScope(payload.acceptedScopeJson)
+		const acceptedDownlinkScopes = decodeScope(payload.acceptedDownlinkScopesJson)
+		const acceptedUplinkScopes = decodeScope(payload.acceptedUplinkScopesJson)
 
 		return {
 			type: 'handshake-response',
@@ -424,6 +458,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 				? { rejectReason: payload.rejectReason as string }
 				: {}),
 			...(validFormat ? { selectedWireFormat: validFormat } : {}),
+			...(acceptedScope ? { acceptedScope } : {}),
+			...(acceptedDownlinkScopes ? { acceptedDownlinkScopes } : {}),
+			...(acceptedUplinkScopes ? { acceptedUplinkScopes } : {}),
 			...(typeof payload.serverTime === 'number' && payload.serverTime > 0
 				? { serverTime: payload.serverTime }
 				: {}),
@@ -438,11 +475,16 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			typeof payload.totalBatches === 'number' && payload.totalBatches > 0
 				? payload.totalBatches
 				: undefined
+		const retractionsJson = decodeJsonBytes(payload.retractionsJson)
+		const retractions = retractionsJson
+			? (JSON.parse(retractionsJson) as Array<{ collection: string; recordId: string }>)
+			: undefined
 
 		return {
 			type: 'operation-batch',
 			messageId: payload.messageId as string,
 			operations: operations.map((op) => this.deserializeOperation(op)),
+			...(retractions ? { retractions } : {}),
 			isFinal: (payload.isFinal as boolean) ?? false,
 			batchIndex: (payload.batchIndex as number) ?? 0,
 			...(cursor ? { cursor } : {}),

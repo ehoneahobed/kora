@@ -61,6 +61,16 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.pipeline.applyRemote(op)
 	}
 
+	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
+		return this.store.applyScopeRetraction(collection, recordId)
+	}
+
+	async applyScopeNarrowing(
+		scopes: Record<string, Record<string, unknown>>,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		return this.store.applyScopeNarrowing(scopes)
+	}
+
 	/**
 	 * Delegates timestamp rebase to the store so the sync engine can re-stamp
 	 * never-acknowledged operations after a fast device clock is corrected.

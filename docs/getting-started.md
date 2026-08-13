@@ -184,7 +184,7 @@ With your app instance, you can immediately perform operations on your collectio
 import { app } from './app'
 
 // Insert a record
-const todo = await app.todos.insert({
+const todo = await app.collections.todos.insert({
   title: 'Ship Kora v1',
   // completed defaults to false
   // createdAt is set automatically
@@ -192,24 +192,29 @@ const todo = await app.todos.insert({
 // => { id: '01905e5a-...', title: 'Ship Kora v1', completed: false, createdAt: 1712188800000 }
 
 // Find by ID
-const found = await app.todos.findById(todo.id)
+const found = await app.collections.todos.findById(todo.id)
 
 // Update (partial: only the fields you pass)
-await app.todos.update(todo.id, { completed: true })
+await app.collections.todos.update(todo.id, { completed: true })
 
 // Query with filters
-const active = await app.todos
+const active = await app.collections.todos
   .where({ completed: false })
   .orderBy('createdAt', 'desc')
   .limit(10)
   .exec()
 
 // Count
-const count = await app.todos.where({ completed: false }).count()
+const count = await app.collections.todos.where({ completed: false }).count()
 
 // Delete
-await app.todos.delete(todo.id)
+await app.collections.todos.delete(todo.id)
 ```
+
+`app.collections` is collision-free and works for every wire collection name. Direct access such as
+`app.todos` remains available when the name does not overlap a framework member. A schema with an
+`events` collection keeps its wire name and uses `app.collections.events`; framework events remain
+available through `app.events` or `app.on(type, listener)`.
 
 Every operation works offline. Data is persisted to the local store immediately.
 

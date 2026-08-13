@@ -1,5 +1,11 @@
 # @korajs/store
 
+## 1.0.0-beta.12
+
+### Minor Changes
+
+- Add local-view retraction and scope-narrowing materialization support.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

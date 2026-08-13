@@ -143,6 +143,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			batchSize: 1,
 		},
 		'sync:acknowledged': { type: 'sync:acknowledged', sequenceNumber: 5 },
+		'sync:scope-retracted': {
+			type: 'sync:scope-retracted',
+			collection: 'todos',
+			recordId: 'record-1',
+			quarantinedOperationIds: [],
+		},
 		'query:subscribed': {
 			type: 'query:subscribed',
 			queryId: 'q-001',
@@ -297,7 +303,9 @@ export function createSampleEvent<T extends KoraEventType>(
 			type: 'sync:delivery-stalled',
 			sessionId: 'session-001',
 			watermark: 4,
+			outstandingMaxDeliverySequence: 8,
 			repeatCount: 3,
+			reason: 'unacknowledged-delivery',
 		},
 		'awareness:updated': { type: 'awareness:updated', states: new Map() },
 		'state-machine:transition': {

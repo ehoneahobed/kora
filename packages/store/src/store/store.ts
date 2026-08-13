@@ -137,6 +137,9 @@ export class Store implements OperationLog {
 	 */
 	async open(): Promise<void> {
 		await this.adapter.open(this.schema)
+		await this.adapter.execute(
+			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
+		)
 
 		// Run schema migrations if needed
 		await this.runMigrationsIfNeeded()
@@ -285,6 +288,22 @@ export class Store implements OperationLog {
 			[op.id],
 		)
 		if (existing.length > 0) {
+			const retracted = await this.adapter.query<{ record_id: string }>(
+				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+				[collection, op.recordId],
+			)
+			if (retracted.length > 0) {
+				await this.adapter.transaction(async (tx) => {
+					await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
+						op.recordId,
+					])
+					await tx.execute(
+						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
+				})
+				this.subscriptionManager.invalidate(collection)
+			}
 			return 'duplicate'
 		}
 
@@ -528,6 +547,62 @@ export class Store implements OperationLog {
 		this.subscriptionManager.notify(collection, op)
 
 		return 'applied'
+	}
+
+	/**
+	 * Hide a record from this client's authorized materialized view. This writes no
+	 * replicated operation and therefore cannot be mistaken for a domain deletion.
+	 * The marker lets a later authoritative backfill reactivate the retained row.
+	 */
+	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
+		this.ensureOpen()
+		if (!this.schema.collections[collection]) return
+		await this.adapter.transaction(async (tx) => {
+			await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 1 WHERE id = ?`, [recordId])
+			await tx.execute(
+				'INSERT OR REPLACE INTO _kora_scope_retractions (collection, record_id) VALUES (?, ?)',
+				[collection, recordId],
+			)
+		})
+		this.subscriptionManager.invalidate(collection)
+	}
+
+	/** Hide all live rows that no longer match a newly accepted server scope. */
+	async applyScopeNarrowing(
+		scopes: Record<string, Record<string, unknown>>,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		this.ensureOpen()
+		const retractions: Array<{ collection: string; recordId: string }> = []
+		for (const [collection, definition] of Object.entries(this.schema.collections)) {
+			const rows = await this.adapter.query<RawCollectionRow>(
+				`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
+			)
+			const predicate = scopes[collection]
+			for (const row of rows) {
+				const record = deserializeRecord(row, definition.fields)
+				const matches =
+					predicate !== undefined &&
+					Object.entries(predicate).every(([field, expected]) => {
+						if (
+							expected &&
+							typeof expected === 'object' &&
+							!Array.isArray(expected) &&
+							'$in' in expected
+						) {
+							const values = (expected as { $in?: unknown }).$in
+							return (
+								Array.isArray(values) && values.some((value) => Object.is(record[field], value))
+							)
+						}
+						return Object.is(record[field], expected)
+					})
+				if (!matches) {
+					await this.applyScopeRetraction(collection, String(record.id))
+					retractions.push({ collection, recordId: String(record.id) })
+				}
+			}
+		}
+		return retractions
 	}
 
 	/**

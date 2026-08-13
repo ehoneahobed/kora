@@ -85,6 +85,26 @@ export function operationMatchesScopes(
 	return true
 }
 
+/** True when an update moved a previously visible record outside the scope. */
+export function operationExitsScopes(
+	op: Operation,
+	scopes: ScopeMap | undefined,
+	resultingRecord?: Record<string, unknown> | null,
+): boolean {
+	if (!scopes || op.type !== 'update' || !op.previousData) return false
+	if (operationMatchesScopes(op, scopes, resultingRecord)) return false
+	const previousSnapshot = {
+		...(resultingRecord ?? {}),
+		...(op.data ?? {}),
+		...op.previousData,
+	}
+	return operationMatchesScopes(
+		{ ...op, type: 'insert', data: previousSnapshot, previousData: null },
+		scopes,
+		previousSnapshot,
+	)
+}
+
 function matchesPredicate(actual: unknown, expected: unknown): boolean {
 	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
 		const values = (expected as { $in?: unknown }).$in

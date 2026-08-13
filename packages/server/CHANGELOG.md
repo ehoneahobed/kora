@@ -1,5 +1,14 @@
 # @korajs/server
 
+## 1.0.0-beta.12
+
+### Minor Changes
+
+- Fix false idle delivery stalls and add directional authorization and retractions.
+- Treat uplink `SCOPE_VIOLATION` as a permanent per-operation rejection, acknowledge through it,
+  continue evaluating the batch, and expose received-batch, newly materialized, duplicate, and
+  rejected-operation counters.
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

@@ -296,6 +296,74 @@ describe('SyncEngine clock integrity', () => {
 		expect(skewEvents[0]).toMatchObject({ severity: 'slow-warning' })
 		await engine.stop()
 	})
+
+	test('uses bounded exponential backoff for transient operation rejections', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const pushedAt: number[] = []
+
+		server.onMessage((msg) => {
+			if (msg.type === 'handshake') {
+				server.send({
+					type: 'handshake-response',
+					messageId: `resp-${msg.messageId}`,
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: msg.schemaVersion,
+					accepted: true,
+				})
+				server.send({
+					type: 'operation-batch',
+					messageId: 'delta-empty',
+					operations: [],
+					isFinal: true,
+					batchIndex: 0,
+				})
+				return
+			}
+			if (msg.type !== 'operation-batch' || msg.operations.length === 0) return
+
+			pushedAt.push(Date.now())
+			const operation = msg.operations[0]
+			if (!operation) throw new Error('expected an outbound operation')
+			if (pushedAt.length <= 3) {
+				server.send({
+					type: 'operation-rejected',
+					messageId: `retry-${String(pushedAt.length)}`,
+					operationId: operation.id,
+					collection: operation.collection,
+					recordId: operation.recordId,
+					code: 'RATE_LIMIT',
+					message: 'Try later',
+					retriable: true,
+				})
+			}
+			server.send({
+				type: 'acknowledgment',
+				messageId: `ack-${msg.messageId}`,
+				acknowledgedMessageId: msg.messageId,
+				lastSequenceNumber: pushedAt.length <= 3 ? 0 : operation.sequenceNumber,
+			})
+		})
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: {
+				url: 'ws://test',
+				outboundRetryBaseDelayMs: 20,
+				outboundRetryMaxDelayMs: 40,
+			},
+		})
+		await engine.pushOperation(makeOp('transient-op', 1, 'test-node'))
+		await engine.start()
+
+		await vi.waitFor(() => expect(pushedAt).toHaveLength(4), { timeout: 1000 })
+		expect((pushedAt[1] ?? 0) - (pushedAt[0] ?? 0)).toBeGreaterThanOrEqual(15)
+		expect((pushedAt[2] ?? 0) - (pushedAt[1] ?? 0)).toBeGreaterThanOrEqual(35)
+		expect((pushedAt[3] ?? 0) - (pushedAt[2] ?? 0)).toBeGreaterThanOrEqual(35)
+		await vi.waitFor(() => expect(engine.exportDiagnostics().pendingOperations).toBe(0))
+		await engine.stop()
+	})
 })
 
 describe('SyncEngine timestamp rebase', () => {
@@ -1563,6 +1631,42 @@ describe('SyncEngine scope', () => {
 		expect(appliedOps).not.toContain('out')
 	})
 
+	test('applies authorization retractions and acknowledges only after local removal', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const applyScopeRetraction = vi.fn(async () => {})
+		const store = createMockStore({ applyScopeRetraction })
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeExit: 'retract' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		client.clearSentMessages()
+		server.send({
+			type: 'operation-batch',
+			messageId: 'retract-1',
+			operations: [],
+			retractions: [{ collection: 'todos', recordId: 'record-1' }],
+			isFinal: true,
+			batchIndex: 0,
+			baseDeliverySequence: 0,
+			maxDeliverySequence: 1,
+		})
+
+		await vi.waitFor(() => expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1'))
+		expect(
+			client
+				.getSentMessages()
+				.some(
+					(message) =>
+						message.type === 'acknowledgment' && message.acknowledgedMessageId === 'retract-1',
+				),
+		).toBe(true)
+	})
+
 	test('accepted scope from handshake response overrides client scope', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const store = createMockStore()
@@ -2085,6 +2189,7 @@ describe('apply failure observability', () => {
 describe('SyncEngine operation rejection', () => {
 	test('diverts a server-rejected op out of the queue, records it, and emits without disconnecting', async () => {
 		const { client, server } = createMemoryTransportPair()
+		const pushedBatches: OperationBatchMessage[] = []
 
 		// A server that accepts the handshake, sends an empty delta so the engine
 		// reaches streaming, then rejects every operation the client pushes (still
@@ -2109,6 +2214,7 @@ describe('SyncEngine operation rejection', () => {
 				})
 			} else if (msg.type === 'operation-batch') {
 				const batch = msg as OperationBatchMessage
+				if (batch.operations.length > 0) pushedBatches.push(batch)
 				for (const op of batch.operations) {
 					server.send({
 						type: 'operation-rejected',
@@ -2116,8 +2222,8 @@ describe('SyncEngine operation rejection', () => {
 						operationId: op.id,
 						collection: op.collection,
 						recordId: op.recordId,
-						code: 'WINDOW_CLOSED',
-						message: 'Submissions are closed',
+						code: 'SCOPE_VIOLATION',
+						message: 'Outside the accepted uplink scope',
 						retriable: false,
 					})
 				}
@@ -2153,19 +2259,22 @@ describe('SyncEngine operation rejection', () => {
 		const rejected = await engine.getRejectedOperations()
 		expect(rejected[0]?.operationId).toBe(op.id)
 		expect(rejected[0]?.collection).toBe(op.collection)
-		expect(rejected[0]?.code).toBe('WINDOW_CLOSED')
+		expect(rejected[0]?.code).toBe('SCOPE_VIOLATION')
 		expect(rejected[0]?.retriable).toBe(false)
 
 		// App-observable event fired exactly once.
 		const events = emitter.events.filter((e) => e.type === 'sync:operation-rejected')
 		expect(events).toHaveLength(1)
-		expect(events[0]).toMatchObject({ operationId: op.id, code: 'WINDOW_CLOSED' })
+		expect(events[0]).toMatchObject({ operationId: op.id, code: 'SCOPE_VIOLATION' })
 
 		// A per-op rejection is not a connection error: the engine stays streaming.
 		expect(engine.getState()).toBe('streaming')
 
 		// The op left the pending set, so it is never retried.
 		expect(engine.exportDiagnostics().pendingOperations).toBe(0)
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(pushedBatches).toHaveLength(1)
+		expect(pushedBatches[0]?.operations.map((item) => item.id)).toEqual([op.id])
 
 		// The app can forget it once reconciled.
 		await engine.clearRejectedOperations([op.id])

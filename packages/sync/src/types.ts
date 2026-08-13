@@ -132,6 +132,8 @@ export interface SyncConfig {
 		mayConnectAnonymously?: boolean
 	}>
 	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
+	/** Client-local behavior for records leaving the accepted downlink scope. Defaults to `retain`. */
+	scopeExit?: 'retain' | 'retract'
 	/** Sync scopes per collection. Limits which records sync to this client. */
 	scopes?: Record<string, (ctx: SyncScopeContext) => Record<string, unknown>>
 	/**
@@ -148,6 +150,10 @@ export interface SyncConfig {
 	 * Defaults to 30000ms. Set to 0 to disable the watchdog.
 	 */
 	outboundAckTimeoutMs?: number
+	/** Initial delay before resending a transiently rejected outbound operation. Defaults to 250ms. */
+	outboundRetryBaseDelayMs?: number
+	/** Maximum transient-operation retry delay. Defaults to 30000ms. */
+	outboundRetryMaxDelayMs?: number
 	/** Initial reconnection delay in ms. Defaults to 1000. */
 	reconnectInterval?: number
 	/** Maximum reconnection delay in ms. Defaults to 30000. */

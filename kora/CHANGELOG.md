@@ -1,5 +1,11 @@
 # kora
 
+## 1.0.0-beta.12
+
+### Minor Changes
+
+- Add collision-free `app.collections` access, `app.on()`, and opt-in scope retractions.
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

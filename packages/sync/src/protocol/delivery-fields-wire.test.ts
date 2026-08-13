@@ -98,5 +98,30 @@ describe('delivery watermark wire round-trip', () => {
 				expect(decoded.maxDeliverySequence).toBeUndefined()
 			}
 		})
+
+		test(`directional scopes and retractions survive ${format}`, () => {
+			const serializer = new NegotiatedMessageSerializer(format)
+			const response: SyncMessage = {
+				type: 'handshake-response',
+				messageId: 'scope-response',
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				acceptedDownlinkScopes: { todos: { viewerId: 'u1' } },
+				acceptedUplinkScopes: { todos: { ownerId: 'u1' } },
+			}
+			expect(serializer.decode(serializer.encode(response))).toEqual(response)
+
+			const batch: SyncMessage = {
+				type: 'operation-batch',
+				messageId: 'retraction',
+				operations: [],
+				retractions: [{ collection: 'todos', recordId: 'r1' }],
+				isFinal: true,
+				batchIndex: 0,
+			}
+			expect(serializer.decode(serializer.encode(batch))).toEqual(batch)
+		})
 	}
 })

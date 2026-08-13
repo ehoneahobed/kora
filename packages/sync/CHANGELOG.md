@@ -1,5 +1,13 @@
 # @korajs/sync
 
+## 1.0.0-beta.12
+
+### Minor Changes
+
+- Add directional scope negotiation, scope retractions, and pending-write quarantine.
+- Persist permanent uplink scope violations in rejected-operation storage without retrying them,
+  and use configurable bounded exponential backoff for genuinely transient operation rejections.
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

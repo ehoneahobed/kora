@@ -1,5 +1,11 @@
 # @korajs/core
 
+## 1.0.0-beta.12
+
+### Minor Changes
+
+- Add structured delivery-stall and scope-retraction events and protocol fields.
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

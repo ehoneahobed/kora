@@ -33,7 +33,8 @@ import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
  *
  * Wires together store, merge engine, event emitter, and optionally sync
  * into a single developer-facing `KoraApp` object. Collection accessors
- * (e.g. `app.todos`) are defined as properties for immediate use after `await app.ready`.
+ * are always available through `app.collections`. Non-reserved names also retain
+ * the convenient direct form (for example, `app.todos`).
  */
 export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
 export function createApp(config: KoraConfig): KoraApp
@@ -97,10 +98,25 @@ export function createApp<const S extends SchemaInput>(
 		return blobApi
 	}
 	const executeTransaction = createTransactionExecutor(config, ready, getStore)
+	const collections: Record<string, ReturnType<typeof createCollectionAccessor>> = Object.create(
+		null,
+	)
+	for (const collectionName of Object.keys(config.schema.collections)) {
+		Object.defineProperty(collections, collectionName, {
+			get() {
+				return createCollectionAccessor(collectionName, getStore)
+			},
+			enumerable: true,
+			configurable: false,
+		})
+	}
+	Object.freeze(collections)
 
 	const app: KoraApp = {
 		ready,
 		events: emitter,
+		on: emitter.on.bind(emitter),
+		collections,
 		sync: createSyncControl({ config, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),
 		blobs: {
@@ -213,7 +229,9 @@ export function createApp<const S extends SchemaInput>(
 		},
 	}
 
+	const reservedProperties = new Set(Reflect.ownKeys(app))
 	for (const collectionName of Object.keys(config.schema.collections)) {
+		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {
 			get() {
 				return createCollectionAccessor(collectionName, getStore)

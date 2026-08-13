@@ -53,6 +53,8 @@ export interface HandshakeMessage {
 	 * cursor for the server->client direction. Optional, so old servers ignore it.
 	 */
 	lastDeliverySequence?: number
+	/** Opt in to client-local removal when records leave the accepted downlink view. */
+	scopeExitPolicy?: 'retain' | 'retract'
 }
 
 /**
@@ -73,6 +75,10 @@ export interface HandshakeResponseMessage {
 	selectedWireFormat?: WireFormat
 	/** The server-accepted per-collection sync scope. Confirms what data will be synced. */
 	acceptedScope?: Record<string, Record<string, unknown>>
+	/** Server-authoritative scope for records delivered to this client. */
+	acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+	/** Server-authoritative scope for operations uploaded by this client. */
+	acceptedUplinkScopes?: Record<string, Record<string, unknown>>
 	/** Server wall-clock time (ms since epoch) at response creation. Lets clients measure their own clock skew. */
 	serverTime?: number
 	/**
@@ -97,6 +103,8 @@ export interface OperationBatchMessage {
 	type: 'operation-batch'
 	messageId: string
 	operations: SerializedOperation[]
+	/** Client-local authorization removals; these are never domain delete operations. */
+	retractions?: ScopeRetraction[]
 	/** True if this is the last batch in the delta exchange phase */
 	isFinal: boolean
 	/** Index of this batch (0-based) for ordering */
@@ -119,6 +127,11 @@ export interface OperationBatchMessage {
 	 */
 	baseDeliverySequence?: number
 	maxDeliverySequence?: number
+}
+
+export interface ScopeRetraction {
+	collection: string
+	recordId: string
 }
 
 /**
