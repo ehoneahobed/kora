@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto'
+import { KoraError } from '@korajs/core'
 import {
 	InMemoryTokenRevocationStore,
 	TokenManager,
 	type TokenManagerConfig,
+	type TokenRevocationStore,
 } from '../../tokens/token-manager'
 import type { AuthTokens } from '../../types'
 import {
@@ -18,6 +20,7 @@ import {
 	type OAuthUserInfo,
 } from '../oauth/oauth-types'
 import {
+	type AuthRevocationEvent,
 	type AuthRouteResponse,
 	type AuthRoutesConfig,
 	BuiltInAuthRoutes,
@@ -25,7 +28,14 @@ import {
 	type RateLimiter,
 } from './auth-routes'
 import { hashPassword } from './password-hash'
-import { type AuthUser, InMemoryUserStore, type StoredUser, type UserStore } from './user-store'
+import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
+import {
+	type AuthUser,
+	DeviceOwnershipError,
+	InMemoryUserStore,
+	type StoredUser,
+	type UserStore,
+} from './user-store'
 
 type SignUpBody = Parameters<BuiltInAuthRoutes['handleSignUp']>[0]
 type SignInBody = Parameters<BuiltInAuthRoutes['handleSignIn']>[0]
@@ -60,9 +70,21 @@ export interface OAuthServerConfig extends Omit<OAuthManagerConfig, 'providers'>
 	allowUnlinkLastIdentity?: boolean
 }
 
-export interface CreateKoraAuthServerOptions {
+export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	/** Existing user store. Defaults to InMemoryUserStore for development. */
 	userStore?: UserStore
+	/**
+	 * Token revocation store. Defaults to the user store's own revocation store
+	 * (`userStore.getTokenRevocationStore()`), so revocations persist and are shared
+	 * exactly as far as the users are.
+	 */
+	revocationStore?: TokenRevocationStore
+	/**
+	 * Allow in-memory user or revocation stores when `NODE_ENV=production`.
+	 * In-memory stores lose every account and every revocation on restart and are
+	 * not shared between instances, so production refuses them by default.
+	 */
+	allowInMemory?: boolean
 	/** Existing token manager. Overrides `jwtSecret` and `tokenManager` options. */
 	tokenManager?: TokenManager
 	/** JWT secret. Required in production when `tokenManager` is not provided. */
@@ -77,14 +99,56 @@ export interface CreateKoraAuthServerOptions {
 	rateLimiter?: RateLimiter
 }
 
+/**
+ * The part of `KoraSyncServer` the auth server needs to end live sessions.
+ * Structural, so `@korajs/auth` does not depend on `@korajs/server`.
+ */
+export interface SyncSessionTerminator {
+	terminateSessions(filter: { userId?: string; deviceId?: string }): unknown
+}
+
 export interface KoraAuthServer {
 	routes: BuiltInAuthRoutes
 	userStore: UserStore
 	tokenManager: TokenManager
 	oauth?: OAuthManager
 	linkedIdentityStore?: LinkedIdentityStore
-	auth: ReturnType<BuiltInAuthRoutes['toSyncAuthProvider']>
+	/** Sync auth provider with server-derived scopes (pass to `KoraSyncServer`). */
+	auth: SyncAuthProvider
 	handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
+	/**
+	 * Revoke every credential a user holds (call after a password change made
+	 * outside these routes, an admin action or an account deletion).
+	 */
+	revokeAllForUser(userId: string): Promise<void>
+	/** Subscribe to credential revocations. Returns an unsubscribe function. */
+	onRevoke(listener: (event: AuthRevocationEvent) => void | Promise<void>): () => void
+	/**
+	 * End live sync sessions when their credentials are revoked (AUTH-11).
+	 * Requires a sync server exposing `terminateSessions({ userId, deviceId })`.
+	 * Returns an unsubscribe function.
+	 */
+	bindSyncServer(server: SyncSessionTerminator): () => void
+}
+
+/**
+ * Thrown by `createKoraAuthServer` in production when a store would silently
+ * lose accounts or revocations on restart.
+ */
+export class InMemoryAuthStoreError extends KoraError {
+	constructor(which: 'userStore' | 'revocationStore') {
+		super(
+			`createKoraAuthServer refuses an in-memory ${which} in production: it loses every ${
+				which === 'userStore' ? 'account' : 'sign-out and revocation'
+			} on restart and is not shared between instances.`,
+			'IN_MEMORY_AUTH_STORE',
+			{
+				which,
+				fix: 'Pass a persistent store (createSqliteUserStore / createPostgresUserStore, whose getTokenRevocationStore() is used automatically), or set allowInMemory: true for a throwaway deployment.',
+			},
+		)
+		this.name = 'InMemoryAuthStoreError'
+	}
 }
 
 interface OAuthServerRuntime {
@@ -103,7 +167,19 @@ interface OAuthServerRuntime {
  */
 export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}): KoraAuthServer {
 	const userStore = options.userStore ?? new InMemoryUserStore()
-	const tokenManager = options.tokenManager ?? createDefaultTokenManager(options)
+	const revocationStore =
+		options.revocationStore ??
+		options.tokenManagerOptions?.revocationStore ??
+		userStore.getTokenRevocationStore?.() ??
+		new InMemoryTokenRevocationStore()
+	const tokenManager = options.tokenManager ?? createDefaultTokenManager(options, revocationStore)
+	if (isProduction() && !options.allowInMemory) {
+		if (userStore instanceof InMemoryUserStore) throw new InMemoryAuthStoreError('userStore')
+		const effectiveRevocation = tokenManager.getRevocationStore()
+		if (!effectiveRevocation || effectiveRevocation instanceof InMemoryTokenRevocationStore) {
+			throw new InMemoryAuthStoreError('revocationStore')
+		}
+	}
 	const routes = new BuiltInAuthRoutes({
 		userStore,
 		tokenManager,
@@ -119,14 +195,35 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		tokenManager,
 		oauth: oauth?.manager,
 		linkedIdentityStore: oauth?.linkedIdentityStore,
-		auth: routes.toSyncAuthProvider(),
+		auth: routes.toSyncAuthProvider({
+			scopeValues: options.scopeValues,
+			resolveScopes: options.resolveScopes,
+		}),
 		handleRequest(request) {
 			return handleAuthRequest(routes, path, request, oauth, userStore, tokenManager)
+		},
+		revokeAllForUser(userId) {
+			return routes.revokeAllForUser(userId)
+		},
+		onRevoke(listener) {
+			return routes.onRevoke(listener)
+		},
+		bindSyncServer(server) {
+			return routes.onRevoke((event) => {
+				if (event.kind === 'user') {
+					server.terminateSessions({ userId: event.userId })
+				} else {
+					server.terminateSessions({ userId: event.userId, deviceId: event.deviceId })
+				}
+			})
 		},
 	}
 }
 
-function createDefaultTokenManager(options: CreateKoraAuthServerOptions): TokenManager {
+function createDefaultTokenManager(
+	options: CreateKoraAuthServerOptions,
+	revocationStore: TokenRevocationStore,
+): TokenManager {
 	const secret = options.jwtSecret ?? readEnvSecret()
 	if (!secret && isProduction()) {
 		throw new Error(
@@ -151,8 +248,8 @@ function createDefaultTokenManager(options: CreateKoraAuthServerOptions): TokenM
 
 	return new TokenManager({
 		secret: secret ?? TokenManager.generateSecret(),
-		revocationStore: new InMemoryTokenRevocationStore(),
 		...options.tokenManagerOptions,
+		revocationStore,
 	})
 }
 
@@ -187,6 +284,7 @@ async function handleAuthRequest(
 	if (relativePath.startsWith('/oauth/')) {
 		return handleOAuthRequest({
 			oauth,
+			routes,
 			userStore,
 			tokenManager,
 			relativePath,
@@ -234,6 +332,7 @@ async function handleAuthRequest(
 
 async function handleOAuthRequest(params: {
 	oauth: OAuthServerRuntime | undefined
+	routes: BuiltInAuthRoutes
 	userStore: UserStore
 	tokenManager: TokenManager
 	relativePath: string
@@ -242,14 +341,15 @@ async function handleOAuthRequest(params: {
 	query: KoraAuthHttpRequest['query']
 	token: string
 }): Promise<AuthRouteResponse<unknown>> {
-	const { oauth, userStore, tokenManager, relativePath, method, body, query, token } = params
+	const { oauth, routes, userStore, tokenManager, relativePath, method, body, query, token } =
+		params
 	if (!oauth) {
 		return notFound()
 	}
 
 	try {
 		if (method === 'GET' && relativePath === '/oauth/links') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const identities = await oauth.linkedIdentityStore.findByUser(authUser.id)
 			return { status: 200, body: { data: identities } }
@@ -290,7 +390,7 @@ async function handleOAuthRequest(params: {
 		}
 
 		if (method === 'POST' && action === 'link') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const code = readString(body.code)
 			const state = readString(body.state)
@@ -301,7 +401,7 @@ async function handleOAuthRequest(params: {
 		}
 
 		if (method === 'DELETE' && action === 'link') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const identities = await oauth.linkedIdentityStore.findByUser(authUser.id)
 			if (!oauth.allowUnlinkLastIdentity && identities.length <= 1) {
@@ -362,13 +462,30 @@ async function completeOAuthSignIn(params: {
 		})
 	}
 
-	const resolvedDeviceId = deviceId ?? readString(stateMetadata?.deviceId) ?? `device-${user.id}`
-	await userStore.registerDevice({
-		id: resolvedDeviceId,
-		userId: user.id,
-		publicKey: devicePublicKey ?? readString(stateMetadata?.devicePublicKey) ?? '',
-		name: deviceId ? 'Device' : 'Browser',
-	})
+	// Never trust a device id carried in OAuth state metadata (it comes from the
+	// query string of whoever started the flow), and never default to a per-user
+	// id that every browser of the user would share (AUTH-3, AUTH-5).
+	void stateMetadata
+	const resolvedDeviceId = deviceId ?? `dev-${randomUUID()}`
+	try {
+		await userStore.registerDevice({
+			id: resolvedDeviceId,
+			userId: user.id,
+			publicKey: devicePublicKey ?? '',
+			name: deviceId ? 'Device' : 'Browser',
+		})
+	} catch (error) {
+		if (error instanceof DeviceOwnershipError) {
+			return {
+				status: 409,
+				body: {
+					error: 'This device id is registered to another account.',
+					code: 'DEVICE_OWNERSHIP_CONFLICT',
+				},
+			}
+		}
+		throw error
+	}
 
 	const tokens = tokenManager.issueTokens(user.id, resolvedDeviceId)
 	return { status: 200, body: { data: { user, tokens, identity } } }
@@ -441,22 +558,24 @@ async function linkOAuthIdentity(
 }
 
 async function requireAuthUser(
-	tokenManager: TokenManager,
-	userStore: UserStore,
+	routes: BuiltInAuthRoutes,
 	token: string,
 ): Promise<AuthUser | AuthRouteResponse<never>> {
 	if (!token) {
-		return { status: 401, body: { error: 'Authorization token required.' } }
+		return {
+			status: 401,
+			body: { error: 'Authorization token required.', code: 'ACCESS_TOKEN_REQUIRED' },
+		}
 	}
-	const payload = await tokenManager.validateToken(token)
-	if (!payload || payload.type !== 'access') {
-		return { status: 401, body: { error: 'Invalid or expired token.' } }
+	// The same revocation-aware check every route uses (AUTH-2, AUTH-8).
+	const access = await routes.authenticateAccess(token)
+	if (!access) {
+		return {
+			status: 401,
+			body: { error: 'Invalid or expired token.', code: 'ACCESS_TOKEN_INVALID' },
+		}
 	}
-	const user = await userStore.findById(payload.sub)
-	if (!user) {
-		return { status: 401, body: { error: 'User not found.' } }
-	}
-	return toAuthUser(user)
+	return toAuthUser(access.user)
 }
 
 function extractBearerToken(headers: KoraAuthHttpRequest['headers']): string {

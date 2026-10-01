@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import type { AuthTokens, DeviceCredentialPayload, TokenPayload } from '../types'
 import {
 	DEFAULT_ACCESS_TOKEN_LIFETIME,
@@ -15,60 +15,90 @@ import { encodeJwt, isExpired, verifyJwt } from './jwt'
 const MIN_SECRET_LENGTH = 32
 
 /**
+ * Default window during which a just-rotated refresh token may be presented
+ * once more and receive the SAME successor pair (NEW-AUTH-3). Covers a rotation
+ * response lost on a flaky network without opening a long replay window.
+ */
+export const DEFAULT_REFRESH_REUSE_GRACE_MS = 30_000
+
+/** Result of an atomic {@link TokenRevocationStore.consume}. */
+export interface ConsumeResult {
+	/** True only for the single call that consumed the id first. */
+	firstUse: boolean
+	/** When the id was first consumed (milliseconds since epoch). */
+	consumedAt: number
+}
+
+/**
  * Interface for server-side token revocation storage.
  *
  * Implementing this interface allows the TokenManager to:
- * - Revoke individual tokens by their `jti`
- * - Detect refresh token reuse (potential theft indicator)
- * - Invalidate all tokens for a specific device on revocation
+ * - Revoke individual tokens (and token families) by id
+ * - Rotate refresh tokens atomically (each refresh token mints at most one successor)
+ * - Invalidate every credential a device or a user obtained before a point in time
  *
- * The in-memory implementation ({@link InMemoryTokenRevocationStore}) is suitable
- * for development. Production deployments should use a persistent store (Redis, database).
+ * Shipped implementations: {@link InMemoryTokenRevocationStore} (development),
+ * `SqliteTokenRevocationStore` and `PostgresTokenRevocationStore`. The SQLite and
+ * Postgres user stores expose one sharing their database through
+ * `getTokenRevocationStore()`, which `createKoraAuthServer` uses by default.
  */
 export interface TokenRevocationStore {
 	/**
-	 * Check whether a token has been revoked.
-	 * @param jti - The JWT ID to check
-	 * @returns true if the token has been revoked
+	 * Check whether a token (or token family, keyed `family:<id>`) has been revoked.
+	 * @param jti - The JWT ID (or family key) to check
 	 */
 	isRevoked(jti: string): Promise<boolean>
 
 	/**
-	 * Revoke a specific token by its JWT ID.
-	 * @param jti - The JWT ID to revoke
-	 * @param expiresAt - The token's original expiration time (seconds since epoch).
-	 *   The store may use this to auto-purge expired revocations.
+	 * Revoke a specific token (or token family) by id.
+	 * @param jti - The JWT ID (or family key) to revoke
+	 * @param expiresAt - Expiry in seconds since epoch; the store may purge after it
 	 */
 	revoke(jti: string, expiresAt: number): Promise<void>
 
 	/**
-	 * Revoke all tokens associated with a specific device.
-	 * Called when a device is revoked to invalidate all its tokens.
-	 * @param deviceId - The device ID whose tokens should be revoked
+	 * Atomically mark an id as consumed (test-and-set). Exactly one concurrent
+	 * caller observes `firstUse: true`, on every instance sharing the store.
+	 * @param jti - The id to consume
+	 * @param expiresAt - Expiry in seconds since epoch; the store may purge after it
 	 */
-	revokeAllForDevice(deviceId: string): Promise<void>
+	consume(jti: string, expiresAt: number): Promise<ConsumeResult>
+
+	/** Whether an id has been consumed (read-only; never consumes). */
+	isConsumed(jti: string): Promise<boolean>
 
 	/**
-	 * Check whether all tokens for a device have been revoked.
-	 * @param deviceId - The device ID to check
-	 * @returns true if the device's token family has been revoked
+	 * Reject every token for a device issued at or before `before` (ms). Later
+	 * tokens (a fresh sign-in on the same device) stay valid. Monotonic: a
+	 * smaller `before` never lowers an existing cut-off.
 	 */
-	isDeviceRevoked(deviceId: string): Promise<boolean>
+	revokeAllForDevice(deviceId: string, before?: number): Promise<void>
+
+	/** Cut-off (ms) recorded by {@link revokeAllForDevice}, or null. */
+	getDeviceRevokedBefore(deviceId: string): Promise<number | null>
+
+	/**
+	 * Reject every token for a user issued at or before `before` (ms). Used by
+	 * password reset and change, admin session revocation and user deletion.
+	 */
+	revokeAllForUser(userId: string, before?: number): Promise<void>
+
+	/** Cut-off (ms) recorded by {@link revokeAllForUser}, or null. */
+	getUserRevokedBefore(userId: string): Promise<number | null>
 }
 
 /**
  * In-memory token revocation store.
  *
- * Suitable for development and testing. Revoked tokens are stored in a Set
- * and automatically cleaned up when they would have expired naturally.
- *
- * **Not suitable for production**: revocations are lost on server restart
- * and not shared across server instances. Use a Redis or database-backed
- * store in production.
+ * Suitable for development and testing. Revocations are lost on restart and not
+ * shared across instances, so `createKoraAuthServer` refuses it in production
+ * unless `allowInMemory: true` is set.
  */
 export class InMemoryTokenRevocationStore implements TokenRevocationStore {
 	private readonly revokedTokens = new Map<string, number>()
-	private readonly revokedDevices = new Set<string>()
+	private readonly consumed = new Map<string, { consumedAt: number; expiresAt: number }>()
+	private readonly deviceCutoffs = new Map<string, number>()
+	private readonly userCutoffs = new Map<string, number>()
 
 	async isRevoked(jti: string): Promise<boolean> {
 		return this.revokedTokens.has(jti)
@@ -78,15 +108,33 @@ export class InMemoryTokenRevocationStore implements TokenRevocationStore {
 		this.revokedTokens.set(jti, expiresAt)
 	}
 
-	async revokeAllForDevice(deviceId: string): Promise<void> {
-		this.revokedDevices.add(deviceId)
+	async consume(jti: string, expiresAt: number): Promise<ConsumeResult> {
+		// Single-threaded: the check and the set happen in one synchronous step.
+		const existing = this.consumed.get(jti)
+		if (existing) return { firstUse: false, consumedAt: existing.consumedAt }
+		const consumedAt = Date.now()
+		this.consumed.set(jti, { consumedAt, expiresAt })
+		return { firstUse: true, consumedAt }
 	}
 
-	/**
-	 * Check if a device has been revoked.
-	 */
-	async isDeviceRevoked(deviceId: string): Promise<boolean> {
-		return this.revokedDevices.has(deviceId)
+	async isConsumed(jti: string): Promise<boolean> {
+		return this.consumed.has(jti)
+	}
+
+	async revokeAllForDevice(deviceId: string, before: number = Date.now()): Promise<void> {
+		this.deviceCutoffs.set(deviceId, Math.max(this.deviceCutoffs.get(deviceId) ?? 0, before))
+	}
+
+	async getDeviceRevokedBefore(deviceId: string): Promise<number | null> {
+		return this.deviceCutoffs.get(deviceId) ?? null
+	}
+
+	async revokeAllForUser(userId: string, before: number = Date.now()): Promise<void> {
+		this.userCutoffs.set(userId, Math.max(this.userCutoffs.get(userId) ?? 0, before))
+	}
+
+	async getUserRevokedBefore(userId: string): Promise<number | null> {
+		return this.userCutoffs.get(userId) ?? null
 	}
 
 	/**
@@ -96,9 +144,10 @@ export class InMemoryTokenRevocationStore implements TokenRevocationStore {
 	cleanup(): void {
 		const nowSeconds = Math.floor(Date.now() / 1000)
 		for (const [jti, expiresAt] of this.revokedTokens) {
-			if (nowSeconds > expiresAt) {
-				this.revokedTokens.delete(jti)
-			}
+			if (nowSeconds > expiresAt) this.revokedTokens.delete(jti)
+		}
+		for (const [jti, entry] of this.consumed) {
+			if (nowSeconds > entry.expiresAt) this.consumed.delete(jti)
 		}
 	}
 }
@@ -115,8 +164,6 @@ export interface TokenManagerConfig {
 	 *
 	 * For key rotation, provide an array of secrets. The first secret is used for
 	 * signing new tokens; all secrets are tried during verification (newest first).
-	 * This allows graceful rotation: add the new secret at index 0, then remove
-	 * the old secret after all tokens signed with it have expired.
 	 */
 	secret: string | string[]
 
@@ -130,23 +177,55 @@ export interface TokenManagerConfig {
 	deviceCredentialLifetime?: number
 
 	/**
-	 * Optional token revocation store. When provided, enables:
-	 * - Individual token revocation via `revokeToken()`
-	 * - Refresh token reuse detection (consumed tokens are tracked)
-	 * - Device-level token invalidation via `revokeDeviceTokens()`
-	 *
+	 * Optional token revocation store. When provided, enables revocation,
+	 * atomic refresh rotation with reuse detection, and device/user cut-offs.
 	 * Without a revocation store, tokens are valid until they expire.
 	 */
 	revocationStore?: TokenRevocationStore
+
+	/**
+	 * Window (ms) during which a just-rotated refresh token is accepted ONCE more
+	 * and returns the same successor pair. Set 0 to disable. Default 30 seconds.
+	 */
+	refreshReuseGraceMs?: number
 }
+
+/** Options for minting a token set. */
+export interface IssueTokenOptions {
+	/** Refresh-token family to continue. A new family is started when omitted. */
+	family?: string
+	/** Authentication methods (RFC 8176) to record, for example `['pwd', 'otp']`. */
+	amr?: string[]
+}
+
+/** Why a refresh was refused. */
+export type RefreshFailureReason =
+	| 'invalid'
+	| 'revoked'
+	| 'reused'
+	| 'in_progress'
+	| 'device_revoked'
+	| 'user_revoked'
+
+/** Outcome of {@link TokenManager.rotateRefreshToken}. */
+export type RefreshResult =
+	| {
+			ok: true
+			tokens: { accessToken: string; refreshToken: string }
+			/** The verified payload of the refresh token that was presented. */
+			payload: TokenPayload
+			/** True when this was the one grace replay of a just-rotated token. */
+			replayed: boolean
+	  }
+	| { ok: false; reason: RefreshFailureReason }
 
 /**
  * Server-side token manager responsible for issuing, refreshing, and validating
  * Kora authentication tokens.
  *
  * Uses HMAC-SHA256 signed JWTs with unique `jti` identifiers for every token.
- * Supports key rotation (multiple secrets), token revocation, and refresh token
- * reuse detection.
+ * Supports key rotation (multiple secrets), token revocation, token families and
+ * atomic, rotation-safe refresh.
  *
  * @example
  * ```typescript
@@ -155,14 +234,9 @@ export interface TokenManagerConfig {
  *   revocationStore: new InMemoryTokenRevocationStore(),
  * })
  *
- * // Issue all tokens at once
  * const tokens = tokenManager.issueTokens('user-123', 'device-456')
- *
- * // Validate an access token
- * const payload = tokenManager.validateToken(tokens.accessToken)
- *
- * // Refresh when the access token expires
- * const newTokens = await tokenManager.refreshAccessToken(tokens.refreshToken)
+ * const payload = await tokenManager.validateTokenWithRevocation(tokens.accessToken)
+ * const next = await tokenManager.rotateRefreshToken(tokens.refreshToken)
  * ```
  */
 export class TokenManager {
@@ -172,6 +246,9 @@ export class TokenManager {
 	private readonly refreshTokenLifetime: number
 	private readonly deviceCredentialLifetime: number
 	private readonly revocationStore: TokenRevocationStore | undefined
+	private readonly refreshReuseGraceMs: number
+	/** Refresh jtis whose rotation is executing on this instance right now. */
+	private readonly rotating = new Set<string>()
 
 	constructor(config: TokenManagerConfig) {
 		const secrets = Array.isArray(config.secret) ? config.secret : [config.secret]
@@ -195,13 +272,11 @@ export class TokenManager {
 		this.deviceCredentialLifetime =
 			config.deviceCredentialLifetime ?? DEFAULT_DEVICE_CREDENTIAL_LIFETIME
 		this.revocationStore = config.revocationStore
+		this.refreshReuseGraceMs = config.refreshReuseGraceMs ?? DEFAULT_REFRESH_REUSE_GRACE_MS
 	}
 
 	/**
 	 * Generate a cryptographically random secret suitable for HMAC-SHA256 signing.
-	 *
-	 * Returns a 64-character hex string (32 bytes / 256 bits of entropy).
-	 * Store this securely (environment variable, secrets manager) — never in source code.
 	 *
 	 * @returns A random 256-bit hex-encoded secret
 	 */
@@ -209,60 +284,61 @@ export class TokenManager {
 		return randomBytes(32).toString('hex')
 	}
 
+	/** The revocation store this manager enforces, if any. */
+	getRevocationStore(): TokenRevocationStore | undefined {
+		return this.revocationStore
+	}
+
 	/**
 	 * Issue a signed JWT access token.
 	 *
-	 * Access tokens are short-lived (default 15 minutes) and used to authorize
-	 * API requests. When expired, use {@link refreshAccessToken} with a valid
-	 * refresh token to obtain a new one.
-	 *
 	 * @param userId - The subject (user ID) to encode in the token
 	 * @param deviceId - The device ID of the requesting device
+	 * @param options - Family and authentication methods to record
 	 * @returns A signed JWT string with type 'access'
 	 */
-	issueAccessToken(userId: string, deviceId: string): string {
-		const nowSeconds = Math.floor(Date.now() / 1000)
-		const payload: TokenPayload = {
-			jti: randomUUID(),
-			sub: userId,
-			dev: deviceId,
-			type: 'access',
-			iat: nowSeconds,
-			exp: nowSeconds + Math.floor(this.accessTokenLifetime / 1000),
-		}
-		return encodeJwt(payload as unknown as Record<string, unknown>, this.secrets[0] as string)
+	issueAccessToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
+		const nowMs = Date.now()
+		return this.sign(
+			this.basePayload({
+				jti: randomUUID(),
+				sub: userId,
+				dev: deviceId,
+				type: 'access',
+				iatMs: nowMs,
+				lifetimeMs: this.accessTokenLifetime,
+				family: options.family,
+				amr: options.amr,
+			}),
+		)
 	}
 
 	/**
 	 * Issue a signed JWT refresh token.
 	 *
-	 * Refresh tokens are longer-lived (default 90 days) and used exclusively
-	 * to obtain new access tokens via {@link refreshAccessToken}. They should
-	 * be stored securely and never sent to resource APIs.
-	 *
 	 * @param userId - The subject (user ID) to encode in the token
 	 * @param deviceId - The device ID of the requesting device
+	 * @param options - Family and authentication methods to record
 	 * @returns A signed JWT string with type 'refresh'
 	 */
-	issueRefreshToken(userId: string, deviceId: string): string {
-		const nowSeconds = Math.floor(Date.now() / 1000)
-		const payload: TokenPayload = {
-			jti: randomUUID(),
-			sub: userId,
-			dev: deviceId,
-			type: 'refresh',
-			iat: nowSeconds,
-			exp: nowSeconds + Math.floor(this.refreshTokenLifetime / 1000),
-		}
-		return encodeJwt(payload as unknown as Record<string, unknown>, this.secrets[0] as string)
+	issueRefreshToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
+		const nowMs = Date.now()
+		return this.sign(
+			this.basePayload({
+				jti: randomUUID(),
+				sub: userId,
+				dev: deviceId,
+				type: 'refresh',
+				iatMs: nowMs,
+				lifetimeMs: this.refreshTokenLifetime,
+				family: options.family ?? randomUUID(),
+				amr: options.amr,
+			}),
+		)
 	}
 
 	/**
-	 * Issue a signed device credential token.
-	 *
-	 * Device credentials are long-lived tokens bound to a device's public key.
-	 * They include a `mustCheckinBy` deadline; if the device does not check in
-	 * before this deadline, the credential should be treated as revoked.
+	 * Issue a signed device credential token bound to a device's public key.
 	 *
 	 * @param userId - The subject (user ID) to encode in the token
 	 * @param deviceId - The device ID of the requesting device
@@ -270,7 +346,8 @@ export class TokenManager {
 	 * @returns A signed JWT string with type 'device_credential'
 	 */
 	issueDeviceCredential(userId: string, deviceId: string, publicKeyThumbprint: string): string {
-		const nowSeconds = Math.floor(Date.now() / 1000)
+		const nowMs = Date.now()
+		const nowSeconds = Math.floor(nowMs / 1000)
 		const lifetimeSeconds = Math.floor(this.deviceCredentialLifetime / 1000)
 		const payload: DeviceCredentialPayload = {
 			jti: randomUUID(),
@@ -279,6 +356,7 @@ export class TokenManager {
 			type: 'device_credential',
 			iat: nowSeconds,
 			exp: nowSeconds + lifetimeSeconds,
+			iatMs: nowMs,
 			dpk: publicKeyThumbprint,
 			mustCheckinBy: nowSeconds + lifetimeSeconds,
 		}
@@ -286,21 +364,25 @@ export class TokenManager {
 	}
 
 	/**
-	 * Issue a complete set of authentication tokens.
-	 *
-	 * Always issues an access token and refresh token. If a `publicKeyThumbprint`
-	 * is provided, also issues a device credential.
+	 * Issue a complete set of authentication tokens for a new session. The access
+	 * and refresh token share a fresh family id.
 	 *
 	 * @param userId - The subject (user ID) to encode in the tokens
 	 * @param deviceId - The device ID of the requesting device
-	 * @param publicKeyThumbprint - Optional SHA-256 thumbprint of the device's public key.
-	 *   When provided, a device credential is included in the returned tokens.
+	 * @param publicKeyThumbprint - Optional device key thumbprint; adds a device credential
+	 * @param options - Authentication methods to record
 	 * @returns An {@link AuthTokens} object containing the issued tokens
 	 */
-	issueTokens(userId: string, deviceId: string, publicKeyThumbprint?: string): AuthTokens {
+	issueTokens(
+		userId: string,
+		deviceId: string,
+		publicKeyThumbprint?: string,
+		options: Omit<IssueTokenOptions, 'family'> = {},
+	): AuthTokens {
+		const family = randomUUID()
 		const tokens: AuthTokens = {
-			accessToken: this.issueAccessToken(userId, deviceId),
-			refreshToken: this.issueRefreshToken(userId, deviceId),
+			accessToken: this.issueAccessToken(userId, deviceId, { family, amr: options.amr }),
+			refreshToken: this.issueRefreshToken(userId, deviceId, { family, amr: options.amr }),
 		}
 
 		if (publicKeyThumbprint !== undefined) {
@@ -311,38 +393,26 @@ export class TokenManager {
 	}
 
 	/**
-	 * Validate and decode a token.
+	 * Validate and decode a token's signature, expiry and claims.
 	 *
-	 * Verifies the HMAC-SHA256 signature (trying all configured secrets for key rotation),
-	 * checks that the token has not expired, and validates all required claims.
-	 * Returns null (rather than throwing) for invalid or expired tokens, so callers
-	 * can handle authentication failure without try/catch.
+	 * This does NOT consult revocation. Every request-authorization path must use
+	 * {@link validateTokenWithRevocation} (or `BuiltInAuthRoutes.authenticateAccess`).
 	 *
 	 * @param token - The JWT string to validate
-	 * @returns The decoded {@link TokenPayload} if valid, or null if the token is
-	 *   invalid, expired, or missing required claims
+	 * @returns The decoded {@link TokenPayload}, or null if invalid or expired
 	 */
 	validateToken(token: string): TokenPayload | null {
-		// Try verification with each secret (supports key rotation)
-		let decoded: Record<string, unknown> | null = null
-		for (const secret of this.secrets) {
-			decoded = verifyJwt(token, secret)
-			if (decoded !== null) {
-				break
-			}
-		}
-
+		const decoded = this.verifySignature(token)
 		if (decoded === null) {
 			return null
 		}
 
-		// verifyJwt validates the signature but not expiration;
-		// check the exp claim separately
+		// verifyJwt validates the signature but not expiration; a token without a
+		// numeric exp is rejected by the claim check below.
 		if (isExpired(decoded as { exp?: number })) {
 			return null
 		}
 
-		// Validate that all required base claims are present and correctly typed
 		if (
 			typeof decoded.jti !== 'string' ||
 			typeof decoded.sub !== 'string' ||
@@ -359,21 +429,25 @@ export class TokenManager {
 			return null
 		}
 
-		return {
-			jti: decoded.jti as string,
-			sub: decoded.sub as string,
-			dev: decoded.dev as string,
+		const payload: TokenPayload = {
+			jti: decoded.jti,
+			sub: decoded.sub,
+			dev: decoded.dev,
 			type,
-			iat: decoded.iat as number,
-			exp: decoded.exp as number,
+			iat: decoded.iat,
+			exp: decoded.exp,
 		}
+		if (typeof decoded.fam === 'string') payload.fam = decoded.fam
+		if (typeof decoded.iatMs === 'number') payload.iatMs = decoded.iatMs
+		if (Array.isArray(decoded.amr) && decoded.amr.every((m) => typeof m === 'string')) {
+			payload.amr = decoded.amr as string[]
+		}
+		return payload
 	}
 
 	/**
-	 * Validate a token and check it against the revocation store.
-	 *
-	 * Like {@link validateToken}, but also checks whether the token's `jti` has been
-	 * revoked or belongs to a revoked device. Requires a revocation store to be configured.
+	 * Validate a token and check every revocation primitive: the token's own
+	 * `jti`, its family, the device cut-off and the per-user cut-off.
 	 *
 	 * @param token - The JWT string to validate
 	 * @returns The decoded {@link TokenPayload} if valid and not revoked, or null otherwise
@@ -383,27 +457,29 @@ export class TokenManager {
 		if (payload === null) {
 			return null
 		}
+		return (await this.revocationReason(payload)) === null ? payload : null
+	}
 
-		if (this.revocationStore) {
-			const revoked = await this.revocationStore.isRevoked(payload.jti)
-			if (revoked) {
-				return null
-			}
-
-			const deviceRevoked = await this.revocationStore.isDeviceRevoked(payload.dev)
-			if (deviceRevoked) {
-				return null
-			}
-		}
-
-		return payload
+	/**
+	 * Why an otherwise valid token is no longer accepted, or null when it is.
+	 */
+	async revocationReason(
+		payload: TokenPayload,
+	): Promise<'revoked' | 'device_revoked' | 'user_revoked' | null> {
+		const store = this.revocationStore
+		if (!store) return null
+		if (await store.isRevoked(payload.jti)) return 'revoked'
+		if (payload.fam && (await store.isRevoked(familyKey(payload.fam)))) return 'revoked'
+		const issuedAt = issuedAtMs(payload)
+		const deviceCutoff = await store.getDeviceRevokedBefore(payload.dev)
+		if (deviceCutoff !== null && issuedAt <= deviceCutoff) return 'device_revoked'
+		const userCutoff = await store.getUserRevokedBefore(payload.sub)
+		if (userCutoff !== null && issuedAt <= userCutoff) return 'user_revoked'
+		return null
 	}
 
 	/**
 	 * Revoke a specific token by its JWT ID.
-	 *
-	 * Requires a revocation store to be configured. After revocation, the token
-	 * will be rejected by {@link validateTokenWithRevocation}.
 	 *
 	 * @param jti - The JWT ID of the token to revoke
 	 * @param expiresAt - The token's expiration time (seconds since epoch)
@@ -415,64 +491,229 @@ export class TokenManager {
 	}
 
 	/**
-	 * Revoke all tokens for a specific device.
+	 * Revoke a whole refresh-token family (one sign-in and all its rotations,
+	 * including the access tokens minted along the way).
 	 *
-	 * Called when a device is revoked to ensure all its existing tokens
-	 * (access, refresh, and device credentials) are invalidated.
+	 * @param family - The family id (`fam` claim)
+	 * @param expiresAt - Latest expiry of any token in the family (seconds since epoch)
+	 */
+	async revokeFamily(family: string, expiresAt: number): Promise<void> {
+		if (this.revocationStore) {
+			await this.revocationStore.revoke(familyKey(family), expiresAt)
+		}
+	}
+
+	/**
+	 * Revoke every token issued to a device up to now. A later sign-in on the
+	 * same device issues tokens that are accepted again.
 	 *
 	 * @param deviceId - The device ID whose tokens should be revoked
 	 */
 	async revokeDeviceTokens(deviceId: string): Promise<void> {
 		if (this.revocationStore) {
-			await this.revocationStore.revokeAllForDevice(deviceId)
+			await this.revocationStore.revokeAllForDevice(deviceId, Date.now())
+		}
+	}
+
+	/**
+	 * Revoke every token issued to a user up to now (password reset or change,
+	 * admin session revocation, account deletion).
+	 *
+	 * @param userId - The user whose credentials should be revoked
+	 */
+	async revokeAllForUser(userId: string): Promise<void> {
+		if (this.revocationStore) {
+			await this.revocationStore.revokeAllForUser(userId, Date.now())
+		}
+	}
+
+	/**
+	 * Rotate a refresh token: atomically consume it and mint its successor pair.
+	 *
+	 * - Each refresh `jti` mints at most one successor family member (AUTH-6).
+	 * - A concurrent duplicate on this instance gets `in_progress` (retry later).
+	 * - Within the grace window, presenting a just-rotated token ONCE more returns
+	 *   the SAME successor pair, so a response lost on the wire does not sign the
+	 *   user out (NEW-AUTH-3).
+	 * - Any other reuse revokes the token FAMILY, never the device (NEW-AUTH-1).
+	 *
+	 * @param refreshToken - The refresh token JWT string
+	 * @returns The successor pair, or the reason the refresh was refused
+	 */
+	async rotateRefreshToken(refreshToken: string): Promise<RefreshResult> {
+		const payload = this.validateToken(refreshToken)
+		if (payload === null || payload.type !== 'refresh') {
+			return { ok: false, reason: 'invalid' }
+		}
+		// Checked and set before the first await, so a same-instance duplicate
+		// that arrives while this rotation is still running is told to retry
+		// instead of being mistaken for a replay.
+		if (this.rotating.has(payload.jti)) {
+			return { ok: false, reason: 'in_progress' }
+		}
+		this.rotating.add(payload.jti)
+		try {
+			return await this.rotate(payload)
+		} finally {
+			this.rotating.delete(payload.jti)
 		}
 	}
 
 	/**
 	 * Refresh an access token using a valid refresh token.
 	 *
-	 * Implements **refresh token rotation with reuse detection**: a new refresh token
-	 * is issued alongside the new access token. The old refresh token's `jti` is
-	 * recorded in the revocation store (if configured). If a previously consumed
-	 * refresh token is presented again, it indicates potential token theft.
-	 *
-	 * Returns null if the provided token is invalid, expired, or not a refresh token.
+	 * Convenience wrapper over {@link rotateRefreshToken} that collapses every
+	 * failure to null. HTTP handlers should use `rotateRefreshToken` so they can
+	 * tell a client to retry (`in_progress`) instead of signing it out.
 	 *
 	 * @param refreshToken - The refresh token JWT string
-	 * @returns A new access/refresh token pair, or null if the refresh token is invalid
+	 * @returns A new access/refresh token pair, or null if the refresh was refused
 	 */
 	async refreshAccessToken(
 		refreshToken: string,
 	): Promise<{ accessToken: string; refreshToken: string } | null> {
-		const payload = this.validateToken(refreshToken)
+		const result = await this.rotateRefreshToken(refreshToken)
+		return result.ok ? result.tokens : null
+	}
 
-		if (payload === null) {
-			return null
+	private async rotate(payload: TokenPayload): Promise<RefreshResult> {
+		const store = this.revocationStore
+		const successor = (consumedAt: number): { accessToken: string; refreshToken: string } =>
+			this.successorTokens(payload, consumedAt)
+		if (!store) {
+			return { ok: true, tokens: successor(Date.now()), payload, replayed: false }
 		}
 
-		// Only refresh tokens can be used for token refresh.
-		// Accepting access tokens or device credentials here would be a security hole.
-		if (payload.type !== 'refresh') {
-			return null
+		const reason = await this.revocationReason(payload)
+		if (reason !== null) {
+			return { ok: false, reason }
 		}
 
-		// Check revocation store for replay detection
-		if (this.revocationStore) {
-			const wasRevoked = await this.revocationStore.isRevoked(payload.jti)
-			if (wasRevoked) {
-				// This refresh token was already consumed. This is a potential token theft.
-				// Revoke all tokens for this device as a safety measure.
-				await this.revocationStore.revokeAllForDevice(payload.dev)
-				return null
+		const consumed = await store.consume(payload.jti, payload.exp)
+		if (consumed.firstUse) {
+			return { ok: true, tokens: successor(consumed.consumedAt), payload, replayed: false }
+		}
+
+		const family = payload.fam ?? payload.jti
+		const withinGrace =
+			this.refreshReuseGraceMs > 0 && Date.now() - consumed.consumedAt <= this.refreshReuseGraceMs
+		if (withinGrace) {
+			const successorRefreshJti = this.deriveJti('refresh', payload.jti)
+			// Once the client has used the successor it clearly received it, so a
+			// replay of the parent can no longer be a lost response.
+			const successorSpent =
+				(await store.isRevoked(successorRefreshJti)) ||
+				(await store.isConsumed(successorRefreshJti))
+			const grace = await store.consume(graceKey(payload.jti), payload.exp)
+			if (grace.firstUse && !successorSpent) {
+				return { ok: true, tokens: successor(consumed.consumedAt), payload, replayed: true }
 			}
-
-			// Mark this refresh token as consumed (revoked)
-			await this.revocationStore.revoke(payload.jti, payload.exp)
 		}
 
+		// A consumed token presented again outside the one grace replay: treat the
+		// family as compromised. Other sign-ins on the same device are unaffected.
+		await this.revokeFamily(family, payload.exp)
+		return { ok: false, reason: 'reused' }
+	}
+
+	/**
+	 * Deterministically mint the successor pair of a refresh token. The jtis and
+	 * issue time derive from the consumed token and its consumption time, so a
+	 * grace replay re-signs byte-identical tokens without storing them.
+	 */
+	private successorTokens(
+		payload: TokenPayload,
+		consumedAtMs: number,
+	): { accessToken: string; refreshToken: string } {
+		const family = payload.fam ?? payload.jti
 		return {
-			accessToken: this.issueAccessToken(payload.sub, payload.dev),
-			refreshToken: this.issueRefreshToken(payload.sub, payload.dev),
+			accessToken: this.sign(
+				this.basePayload({
+					jti: this.deriveJti('access', payload.jti),
+					sub: payload.sub,
+					dev: payload.dev,
+					type: 'access',
+					iatMs: consumedAtMs,
+					lifetimeMs: this.accessTokenLifetime,
+					family,
+					amr: payload.amr,
+				}),
+			),
+			refreshToken: this.sign(
+				this.basePayload({
+					jti: this.deriveJti('refresh', payload.jti),
+					sub: payload.sub,
+					dev: payload.dev,
+					type: 'refresh',
+					iatMs: consumedAtMs,
+					lifetimeMs: this.refreshTokenLifetime,
+					family,
+					amr: payload.amr,
+				}),
+			),
 		}
 	}
+
+	private deriveJti(kind: 'access' | 'refresh', parentJti: string): string {
+		const digest = createHmac('sha256', this.secrets[0] as string)
+			.update(`kora-rotation:${kind}:${parentJti}`)
+			.digest('hex')
+		// Format as a UUID-shaped string so stores sized for UUIDs keep working.
+		return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`
+	}
+
+	private basePayload(input: {
+		jti: string
+		sub: string
+		dev: string
+		type: 'access' | 'refresh'
+		iatMs: number
+		lifetimeMs: number
+		family?: string
+		amr?: string[]
+	}): TokenPayload {
+		const iat = Math.floor(input.iatMs / 1000)
+		// Field order is fixed so a deterministic re-issue is byte-identical.
+		const payload: TokenPayload = {
+			jti: input.jti,
+			sub: input.sub,
+			dev: input.dev,
+			type: input.type,
+			iat,
+			exp: iat + Math.floor(input.lifetimeMs / 1000),
+			iatMs: input.iatMs,
+		}
+		if (input.family) payload.fam = input.family
+		if (input.amr && input.amr.length > 0) payload.amr = [...input.amr]
+		return payload
+	}
+
+	private sign(payload: TokenPayload): string {
+		return encodeJwt(payload as unknown as Record<string, unknown>, this.secrets[0] as string)
+	}
+
+	private verifySignature(token: string): Record<string, unknown> | null {
+		for (const secret of this.secrets) {
+			const decoded = verifyJwt(token, secret)
+			if (decoded !== null) return decoded
+		}
+		return null
+	}
+}
+
+function familyKey(family: string): string {
+	return `family:${family}`
+}
+
+function graceKey(jti: string): string {
+	return `grace:${jti}`
+}
+
+/**
+ * Issue time in ms. Tokens minted before beta.13 only carry second-resolution
+ * `iat`; treat them as issued at the START of that second so a revocation made
+ * later within the same second still covers them (fail closed).
+ */
+function issuedAtMs(payload: TokenPayload): number {
+	return payload.iatMs ?? payload.iat * 1000
 }

@@ -17,7 +17,10 @@ afterEach(() => {
 })
 
 async function victim() {
-	const auth = createKoraAuthServer({ jwtSecret: 'w'.repeat(64) })
+	// allowInMemory: since beta.13 createKoraAuthServer refuses in-memory stores under
+	// NODE_ENV=production (AUTH-12). This repro is about reset-token disclosure, not
+	// storage, so it opts in explicitly to keep exercising the same code path.
+	const auth = createKoraAuthServer({ jwtSecret: 'w'.repeat(64), allowInMemory: true })
 	const s = (
 		await auth.handleRequest({
 			method: 'POST',

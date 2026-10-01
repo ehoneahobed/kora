@@ -8,22 +8,49 @@ export {
 	InMemoryRateLimiter,
 } from './provider/built-in/auth-routes'
 export type {
+	AuthenticatedAccess,
+	AuthRevocationEvent,
 	AuthRoutesConfig,
 	AuthRouteResponse,
 	ChallengeStore,
 	RateLimiter,
 } from './provider/built-in/auth-routes'
-export { createKoraAuthServer } from './provider/built-in/quickstart-server'
+export {
+	createKoraAuthServer,
+	InMemoryAuthStoreError,
+} from './provider/built-in/quickstart-server'
 export type {
 	CreateKoraAuthServerOptions,
 	KoraAuthHttpRequest,
 	KoraAuthServer,
 	OAuthServerConfig,
+	SyncSessionTerminator,
 } from './provider/built-in/quickstart-server'
+export type {
+	SyncAuthContext,
+	SyncAuthProvider,
+	SyncScopeOptions,
+	VerifiedSyncClaims,
+} from './provider/built-in/sync-scopes'
 
 // === Token Manager ===
-export { TokenManager, InMemoryTokenRevocationStore } from './tokens/token-manager'
-export type { TokenManagerConfig, TokenRevocationStore } from './tokens/token-manager'
+export {
+	DEFAULT_REFRESH_REUSE_GRACE_MS,
+	InMemoryTokenRevocationStore,
+	TokenManager,
+} from './tokens/token-manager'
+export type {
+	ConsumeResult,
+	IssueTokenOptions,
+	RefreshFailureReason,
+	RefreshResult,
+	TokenManagerConfig,
+	TokenRevocationStore,
+} from './tokens/token-manager'
+export { SqliteTokenRevocationStore } from './tokens/sqlite-token-revocation-store'
+export type { SqliteRevocationDatabase } from './tokens/sqlite-token-revocation-store'
+export { PostgresTokenRevocationStore } from './tokens/postgres-token-revocation-store'
+export type { PostgresRevocationClient } from './tokens/postgres-token-revocation-store'
 
 // === JWT Utilities ===
 export { encodeJwt, decodeJwt, verifyJwt, isExpired } from './tokens/jwt'
@@ -61,7 +88,11 @@ export type {
 } from './provider/built-in/email-verification'
 
 // === User Store ===
-export { InMemoryUserStore, DuplicateEmailError } from './provider/built-in/user-store'
+export {
+	InMemoryUserStore,
+	DeviceOwnershipError,
+	DuplicateEmailError,
+} from './provider/built-in/user-store'
 export type { UserStore, AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
 
 // === SQLite User Store ===

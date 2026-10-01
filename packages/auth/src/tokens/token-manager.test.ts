@@ -292,7 +292,7 @@ describe('TokenManager', () => {
 			expect(await revokeManager.validateTokenWithRevocation(token)).toBeNull()
 		})
 
-		it('detects refresh token reuse and revokes all device tokens', async () => {
+		it('detects refresh token reuse and revokes the token family, not the device', async () => {
 			const store = new InMemoryTokenRevocationStore()
 			const revokeManager = new TokenManager({
 				secret: TEST_SECRET,
@@ -306,15 +306,18 @@ describe('TokenManager', () => {
 			const result1 = await revokeManager.refreshAccessToken(refresh)
 			expect(result1).not.toBeNull()
 
-			// Second use (replay): detected as potential theft, returns null
-			vi.advanceTimersByTime(1000)
+			// Replay after the grace window: detected as potential theft, returns null
+			vi.advanceTimersByTime(31_000)
 			const result2 = await revokeManager.refreshAccessToken(refresh)
 			expect(result2).toBeNull()
 
-			// Any token for that device is rejected after token-family revocation.
+			// Every token of that family is rejected...
 			const accessToken = result1?.accessToken as string
 			expect(await revokeManager.validateTokenWithRevocation(accessToken)).toBeNull()
-			expect(await store.isDeviceRevoked(DEVICE_ID)).toBe(true)
+			// ...but a fresh sign-in on the same device is not (NEW-AUTH-1).
+			const fresh = revokeManager.issueTokens(USER_ID, DEVICE_ID)
+			expect(await revokeManager.validateTokenWithRevocation(fresh.accessToken)).not.toBeNull()
+			expect(await store.getDeviceRevokedBefore(DEVICE_ID)).toBeNull()
 		})
 
 		it('rejects tokens for a revoked device', async () => {

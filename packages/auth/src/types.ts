@@ -69,6 +69,22 @@ export interface TokenPayload {
 	iat: number
 	/** Expiration time (seconds since epoch, per JWT spec) */
 	exp: number
+	/**
+	 * Refresh-token family id. Every token minted by one sign-in and its refresh
+	 * rotations shares it, so reuse detection can revoke exactly that family
+	 * instead of the whole device. Absent on tokens minted before beta.13.
+	 */
+	fam?: string
+	/**
+	 * Issue time in milliseconds. `iat` has one-second resolution, which is too
+	 * coarse to order a token against a revocation made in the same second.
+	 */
+	iatMs?: number
+	/**
+	 * Authentication methods used to obtain this session (RFC 8176), for example
+	 * `['pwd']` or `['pwd', 'otp']`.
+	 */
+	amr?: string[]
 }
 
 /**

@@ -22,15 +22,57 @@ describe('PasswordResetManager', () => {
 		})
 		userId = user.id
 
+		// Development mode must be explicit since beta.13 (AUTH-7a).
 		manager = new PasswordResetManager({
 			userStore,
 			resetStore,
+			exposeTokenForDevelopment: true,
 		})
 	})
 
 	// --- requestReset ---
 
 	describe('requestReset', () => {
+		// Inverted (AUTH-7a): previously a manager without onResetRequested returned
+		// the reset token to whoever asked, which is an account takeover by email.
+		test('never discloses the token without an explicit development opt-in', async () => {
+			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+			const mgr = new PasswordResetManager({ userStore, resetStore })
+			const result = await mgr.requestReset('alice@example.com')
+			expect(result.status).toBe(200)
+			expect('data' in result.body && result.body.data.token).toBeFalsy()
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('onResetRequested'))
+			error.mockRestore()
+		})
+
+		test('never discloses the token in production, even with the development opt-in', async () => {
+			vi.stubEnv('NODE_ENV', 'production')
+			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+			try {
+				const mgr = new PasswordResetManager({
+					userStore,
+					resetStore,
+					exposeTokenForDevelopment: true,
+				})
+				const result = await mgr.requestReset('alice@example.com')
+				expect('data' in result.body && result.body.data.token).toBeFalsy()
+			} finally {
+				error.mockRestore()
+				vi.unstubAllEnvs()
+			}
+		})
+
+		test('existing and unknown emails get the same message', async () => {
+			const mailer = new PasswordResetManager({
+				userStore,
+				resetStore,
+				onResetRequested: () => {},
+			})
+			const known = await mailer.requestReset('alice@example.com')
+			const unknown = await mailer.requestReset('nobody@example.com')
+			expect(known.body).toEqual(unknown.body)
+		})
+
 		test('returns 200 and generates token for existing user', async () => {
 			const result = await manager.requestReset('alice@example.com')
 			expect(result.status).toBe(200)
@@ -137,6 +179,7 @@ describe('PasswordResetManager', () => {
 				userStore,
 				resetStore,
 				tokenTtlMs: 1, // 1ms TTL for testing
+				exposeTokenForDevelopment: true,
 			})
 
 			const reqResult = await mgr.requestReset('alice@example.com')
@@ -205,6 +248,66 @@ describe('PasswordResetManager', () => {
 			const result = await manager.changePassword(userId, 'oldPassword123', 'a'.repeat(129))
 			expect(result.status).toBe(400)
 		})
+	})
+})
+
+// --- Credential revocation (AUTH-7b) ---
+
+describe('PasswordResetManager revokes earlier credentials', () => {
+	test('resetPassword and changePassword cut off every earlier token of the user', async () => {
+		const userStore = new InMemoryUserStore()
+		const hashed = await hashPassword('oldPassword123')
+		const user = await userStore.createUser({
+			email: 'bob@example.com',
+			passwordHash: hashed.hash,
+			salt: hashed.salt,
+			name: 'Bob',
+		})
+		const changed = vi.fn()
+		let mailed = ''
+		const mgr = new PasswordResetManager({
+			userStore,
+			onResetRequested: (_email, token) => {
+				mailed = token
+			},
+			onPasswordChanged: changed,
+		})
+		const revocations = userStore.getTokenRevocationStore()
+
+		await mgr.requestReset('bob@example.com')
+		const before = Date.now()
+		expect((await mgr.resetPassword(mailed, 'brandNewPass1')).status).toBe(200)
+		const cutoff = await revocations.getUserRevokedBefore(user.id)
+		expect(cutoff).not.toBeNull()
+		expect(cutoff as number).toBeGreaterThanOrEqual(before)
+		expect(changed).toHaveBeenCalledWith(user.id)
+
+		expect((await mgr.changePassword(user.id, 'brandNewPass1', 'anotherPass12')).status).toBe(200)
+		expect(changed).toHaveBeenCalledTimes(2)
+	})
+
+	test('a reset token can be redeemed by only one of two concurrent resets', async () => {
+		const userStore = new InMemoryUserStore()
+		const hashed = await hashPassword('oldPassword123')
+		await userStore.createUser({
+			email: 'carol@example.com',
+			passwordHash: hashed.hash,
+			salt: hashed.salt,
+			name: 'Carol',
+		})
+		let mailed = ''
+		const mgr = new PasswordResetManager({
+			userStore,
+			onResetRequested: (_email, token) => {
+				mailed = token
+			},
+		})
+		await mgr.requestReset('carol@example.com')
+		const results = await Promise.all([
+			mgr.resetPassword(mailed, 'firstNewPass1'),
+			mgr.resetPassword(mailed, 'secondNewPass1'),
+		])
+		expect(results.filter((r) => r.status === 200)).toHaveLength(1)
 	})
 })
 

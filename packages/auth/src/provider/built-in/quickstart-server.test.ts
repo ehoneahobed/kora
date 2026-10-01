@@ -167,7 +167,11 @@ describe('createKoraAuthServer', () => {
 		expect(token?.dev).toBe('desktop-1')
 	})
 
-	it('uses authorization-start device metadata for browser OAuth callbacks', async () => {
+	// Inverted (AUTH-3/AUTH-5): the device id used to be taken from OAuth state
+	// metadata, which comes from the query string of whoever started the flow.
+	// A GET callback now gets a fresh server-assigned device id; clients that own a
+	// device identity POST it to the callback instead.
+	it('never takes the device id from authorization-start metadata', async () => {
 		const fetch = createOAuthFetch({
 			id: 'provider-user-1',
 			email: 'alice@example.com',
@@ -199,10 +203,9 @@ describe('createKoraAuthServer', () => {
 		if (!('data' in callback.body)) return
 		const data = callback.body.data as AuthData
 		const token = await auth.tokenManager.validateToken(data.tokens.accessToken)
-		expect(token?.dev).toBe('browser-device')
-		await expect(auth.userStore.findDevice('browser-device')).resolves.toMatchObject({
-			publicKey: 'browser-public-key',
-		})
+		expect(token?.dev).not.toBe('browser-device')
+		expect(token?.dev).toMatch(/^dev-/)
+		await expect(auth.userStore.findDevice('browser-device')).resolves.toBeNull()
 	})
 
 	it('returns a structured error for unconfigured OAuth providers', async () => {
