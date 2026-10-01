@@ -1085,7 +1085,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-4.test.ts"
@@ -1094,10 +1094,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 stopgap: TransactionContext insert/update route secret fields through the shared toAtRestWriteData helper (same as executeInsert/executeUpdate). W6 keeps the helper."
   },
   {
    "id": "STORE-5",
