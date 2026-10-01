@@ -6,9 +6,20 @@ describe('OrgRoutes', () => {
 	let store: InMemoryOrgStore
 	let routes: OrgRoutes
 
+	// Verified identities resolved server-side (AUTH-4): invitations are matched
+	// against the caller's own verified email, never a request parameter.
+	const identities: Record<string, { email: string; emailVerified: boolean }> = {
+		'user-2': { email: 'Bob@Example.com', emailVerified: true },
+		'user-3': { email: 'carol@example.com', emailVerified: true },
+		'user-4': { email: 'bob@example.com', emailVerified: false },
+	}
+
 	beforeEach(() => {
 		store = new InMemoryOrgStore()
-		routes = new OrgRoutes({ orgStore: store })
+		routes = new OrgRoutes({
+			orgStore: store,
+			userLookup: { findById: async (id) => identities[id] ?? null },
+		})
 	})
 
 	// =========================================================================
@@ -707,6 +718,40 @@ describe('OrgRoutes', () => {
 			const result = await routes.acceptInvitation('user-2', {})
 			expect(result.status).toBe(400)
 		})
+
+		test('refuses (and does not burn) an invitation addressed to another email', async () => {
+			const createResult = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const orgId = 'data' in createResult.body ? createResult.body.data.id : ''
+			const invResult = await routes.createInvitation('user-1', orgId, {
+				email: 'bob@example.com',
+				role: 'admin',
+			})
+			const token = 'data' in invResult.body ? invResult.body.data.token : ''
+
+			expect((await routes.acceptInvitation('user-3', { token })).status).toBe(403)
+			expect((await routes.acceptInvitation('user-4', { token })).status).toBe(403)
+			expect((await routes.acceptInvitation('stranger', { token })).status).toBe(403)
+			// The real invitee can still accept.
+			expect((await routes.acceptInvitation('user-2', { token })).status).toBe(200)
+		})
+
+		test('accepts an explicitly passed verified identity without a lookup', async () => {
+			const bare = new OrgRoutes({ orgStore: store })
+			const createResult = await bare.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const orgId = 'data' in createResult.body ? createResult.body.data.id : ''
+			const invResult = await bare.createInvitation('user-1', orgId, {
+				email: 'dan@example.com',
+				role: 'member',
+			})
+			const token = 'data' in invResult.body ? invResult.body.data.token : ''
+			expect((await bare.acceptInvitation('user-9', { token })).status).toBe(403)
+			const ok = await bare.acceptInvitation(
+				'user-9',
+				{ token },
+				{ email: 'dan@example.com', emailVerified: true },
+			)
+			expect(ok.status).toBe(200)
+		})
 	})
 
 	// =========================================================================
@@ -783,32 +828,30 @@ describe('OrgRoutes', () => {
 	// listMyInvitations
 	// =========================================================================
 
+	// Updated (AUTH-4): listMyInvitations takes the authenticated user id; the
+	// email is resolved server-side and tokens are stripped.
 	describe('listMyInvitations', () => {
-		test('returns pending invitations for email', async () => {
+		test('returns pending invitations for the caller’s verified email, without tokens', async () => {
 			const createResult = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
 			const orgId = 'data' in createResult.body ? createResult.body.data.id : ''
 
 			await routes.createInvitation('user-1', orgId, { email: 'bob@example.com', role: 'member' })
 
-			const result = await routes.listMyInvitations('bob@example.com')
+			const result = await routes.listMyInvitations('user-2')
 			expect(result.status).toBe(200)
-			expect('data' in result.body && result.body.data).toHaveLength(1)
+			const data = 'data' in result.body ? result.body.data : []
+			expect(data).toHaveLength(1)
+			expect(data[0]).not.toHaveProperty('token')
 		})
 
-		test('rejects invalid email', async () => {
-			const result = await routes.listMyInvitations('not-valid')
-			expect(result.status).toBe(400)
+		test('refuses unverified or unknown users', async () => {
+			expect((await routes.listMyInvitations('user-4')).status).toBe(403)
+			expect((await routes.listMyInvitations('bob@example.com')).status).toBe(403)
+			expect((await routes.listMyInvitations(undefined as unknown as string)).status).toBe(403)
 		})
 
-		// Regression: same production bug class as auth-routes' isValidEmail
-		// (KoraForms report). Non-string input must return 400, not throw.
-		test('returns 400 instead of throwing for undefined email', async () => {
-			const result = await routes.listMyInvitations(undefined as unknown as string)
-			expect(result.status).toBe(400)
-		})
-
-		test('returns empty for unknown email', async () => {
-			const result = await routes.listMyInvitations('nobody@example.com')
+		test('returns empty for a user without invitations', async () => {
+			const result = await routes.listMyInvitations('user-3')
 			expect(result.status).toBe(200)
 			expect('data' in result.body && result.body.data).toEqual([])
 		})

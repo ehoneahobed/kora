@@ -294,10 +294,11 @@ export class OrgClient {
 	}
 
 	/**
-	 * List pending invitations for the current user's email.
+	 * List pending invitations addressed to the signed-in user's verified email.
+	 * The server resolves the email from the session; tokens are never returned.
 	 */
-	async listMyInvitations(email: string): Promise<ClientInvitation[]> {
-		return this.request<ClientInvitation[]>(`/invitations?email=${encodeURIComponent(email)}`, {
+	async listMyInvitations(): Promise<Array<Omit<ClientInvitation, 'token'>>> {
+		return this.request<Array<Omit<ClientInvitation, 'token'>>>('/invitations', {
 			method: 'GET',
 		})
 	}

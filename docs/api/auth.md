@@ -1300,7 +1300,7 @@ All methods return `Promise<OrgRouteResponse<T>>`.
 - `acceptInvitation(userId, params: { token })` -- Accept an invitation by token.
 - `revokeInvitation(userId, orgId, invitationId)` -- Revoke a pending invitation. Requires admin+.
 - `listPendingInvitations(userId, orgId)` -- List pending invitations. Requires admin+.
-- `listMyInvitations(email)` -- List invitations for a user's email.
+- `listMyInvitations(userId, identity?)` -- List invitations addressed to the user's own verified email (resolved server-side via `userLookup`; tokens are never returned).
 
 #### Org Roles
 

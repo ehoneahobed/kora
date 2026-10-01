@@ -449,12 +449,25 @@ describe('InMemoryOrgStore', () => {
 				role: 'member',
 			})
 
-			await store.revokeInvitation(inv.id)
+			await store.revokeInvitation(org.id, inv.id)
 			expect(await store.getInvitationByToken(inv.token)).toBeNull()
 		})
 
+		test('refuses to revoke an invitation of another org (AUTH-4)', async () => {
+			const org = await store.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const other = await store.createOrg('user-2', { name: 'Evil', slug: 'evil' })
+			const inv = await store.createInvitation(org.id, 'user-1', {
+				email: 'bob@example.com',
+				role: 'member',
+			})
+			await expect(store.revokeInvitation(other.id, inv.id)).rejects.toThrow(
+				InvitationNotFoundError,
+			)
+			expect(await store.getInvitationByToken(inv.token)).not.toBeNull()
+		})
+
 		test('throws for non-existent invitation', async () => {
-			await expect(store.revokeInvitation('bogus')).rejects.toThrow(InvitationNotFoundError)
+			await expect(store.revokeInvitation('org', 'bogus')).rejects.toThrow(InvitationNotFoundError)
 		})
 
 		test('throws for already accepted invitation', async () => {
