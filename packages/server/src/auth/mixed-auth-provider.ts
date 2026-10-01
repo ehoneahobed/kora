@@ -112,6 +112,9 @@ export class MixedAuthProvider implements AuthProvider {
 		this.anonymousCounter++
 		return {
 			userId: `${this.anonymousPrefix}-${Date.now()}-${this.anonymousCounter}`,
+			// The userId above is per connection, so node-id claims must not be keyed by
+			// it (a reconnecting anonymous device would be locked out of its own node).
+			anonymous: true,
 			// A fresh copy per session: the grant must not be shared mutable state.
 			scopes: Object.fromEntries(
 				Object.entries(this.anonymousScopes).map(([collection, predicate]) => [

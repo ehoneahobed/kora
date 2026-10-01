@@ -32,6 +32,8 @@ describe('MixedAuthProvider', () => {
 		const result = await auth.authenticate('')
 		expect(result?.userId).toMatch(/^anon-/)
 		expect(result?.scopes).toEqual({ responses: {} })
+		// Marked anonymous so node claims use the stable anonymous owner (RT-5).
+		expect(result?.anonymous).toBe(true)
 		// Primary should NOT be called for empty tokens
 		expect(primary.authenticate).not.toHaveBeenCalled()
 	})

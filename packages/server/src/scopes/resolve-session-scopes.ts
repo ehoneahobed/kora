@@ -8,6 +8,7 @@ import {
 	hasSchemaSyncRules,
 	isCollectionSyncScoped,
 } from '@korajs/core'
+import { assertScopeValuesDefined } from './scope-predicate-errors'
 
 export interface ResolveSessionScopesOptions {
 	/** Scope map sent by the client during handshake. It can only NARROW the grant. */
@@ -126,6 +127,9 @@ export function resolveSessionScopeGrant(
 	if (authScopes !== undefined || scopeValues !== undefined) {
 		const claims = mergeClaims(getScopeClaims(authScopes), scopeValues)
 		const explicit = withoutReservedKeys(authScopes ?? {})
+		// A grant value of undefined/null (a failed lookup) would match every record
+		// lacking the field: refuse it rather than widen the grant (RT-8).
+		assertScopeValuesDefined(explicit)
 		grant = { ...explicit }
 		if (claims && schema) {
 			const derived = bindClaimsToSchema(schema, claims, denied)
@@ -150,13 +154,14 @@ export function resolveSessionScopeGrant(
 	}
 
 	if (grant === undefined) {
-		return {
-			scopes: handshakeScope ? withoutReservedKeys(handshakeScope) : undefined,
-			denied: effectiveDenied,
-		}
+		const scopes = handshakeScope ? withoutReservedKeys(handshakeScope) : undefined
+		assertScopeValuesDefined(scopes)
+		return { scopes, denied: effectiveDenied }
 	}
 
-	return { scopes: intersectScopes(grant, handshakeScope), denied: effectiveDenied }
+	const scopes = intersectScopes(grant, handshakeScope)
+	assertScopeValuesDefined(scopes)
+	return { scopes, denied: effectiveDenied }
 }
 
 /**

@@ -2220,7 +2220,11 @@ export class SyncEngine {
 		fullRecord?: Record<string, unknown> | null,
 		direction: 'inbound' | 'upload' = 'inbound',
 	): boolean {
-		if (!operationMatchesScope(op, this.activeUplinkScope, fullRecord)) {
+		// A client judging its own local view may trust previousData: this is not a
+		// cross-tenant visibility decision (the server judges those on its own rows).
+		if (
+			!operationMatchesScope(op, this.activeUplinkScope, fullRecord, { includePreviousData: true })
+		) {
 			return false
 		}
 		if (direction === 'upload') {
@@ -2228,7 +2232,9 @@ export class SyncEngine {
 		}
 		return (
 			this.hasDirectionalScopes ||
-			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord)
+			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord, {
+				includePreviousData: true,
+			})
 		)
 	}
 

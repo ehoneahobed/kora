@@ -126,8 +126,20 @@ describe('SRV-6 server resource limits', () => {
 		const store = new MemoryServerStore('s3')
 		await store.setSchema(schema)
 		const server = new KoraSyncServer({ store })
+		// RT-2 replaced the caller-chosen clientId with a server-issued session id: a
+		// session is opened by a handshake POST (a GET without a session id is refused).
 		for (let i = 0; i < 100; i++) {
-			await server.handleHttpRequest({ method: 'GET', clientId: `client-${i}` })
+			await server.handleHttpRequest({
+				method: 'POST',
+				contentType: 'application/json',
+				body: JSON.stringify({
+					type: 'handshake',
+					messageId: `hs-${i}`,
+					nodeId: `client-${i}`,
+					versionVector: {},
+					schemaVersion: 1,
+				}),
+			})
 		}
 		expect(server.getConnectionCount()).toBe(100)
 		await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000)

@@ -26,10 +26,22 @@ function createOp(overrides: Partial<Operation> = {}): Operation {
 }
 
 describe('buildScopeSnapshot', () => {
-	test('layers fullRecord < previousData < data', () => {
+	test('by default layers fullRecord < data and ignores the writer previousData (RT-3)', () => {
 		const snapshot = buildScopeSnapshot(
 			createOp({ data: { a: 3 }, previousData: { a: 2, b: 2 } }),
 			{ a: 1, b: 1, c: 1 },
+		)
+		expect(snapshot).toEqual({ a: 3, b: 1, c: 1, id: 'victim' })
+		expect(buildScopeSnapshot(createOp({ data: {}, previousData: { b: 2 } }))).toEqual({
+			id: 'victim',
+		})
+	})
+
+	test('with includePreviousData layers fullRecord < previousData < data', () => {
+		const snapshot = buildScopeSnapshot(
+			createOp({ data: { a: 3 }, previousData: { a: 2, b: 2 } }),
+			{ a: 1, b: 1, c: 1 },
+			{ includePreviousData: true },
 		)
 		expect(snapshot).toEqual({ a: 3, b: 2, c: 1, id: 'victim' })
 	})
@@ -62,6 +74,14 @@ describe('matchesScopePredicate / recordMatchesScopePredicates', () => {
 		expect(matchesScopePredicate('b', { $in: ['a', 'b'] })).toBe(true)
 		expect(matchesScopePredicate('c', { $in: ['a', 'b'] })).toBe(false)
 		expect(matchesScopePredicate('a', { $in: 'a' })).toBe(false)
+	})
+
+	test('undefined and null predicate values never match (RT-8)', () => {
+		expect(matchesScopePredicate(undefined, undefined)).toBe(false)
+		expect(matchesScopePredicate(null, null)).toBe(false)
+		expect(matchesScopePredicate(undefined, { $in: [undefined, 'a'] })).toBe(false)
+		expect(matchesScopePredicate(null, { $in: [null] })).toBe(false)
+		expect(recordMatchesScopePredicates({}, { orgId: undefined })).toBe(false)
 	})
 
 	test('every predicate must match', () => {

@@ -116,6 +116,10 @@ export {
 	type UplinkAuthorizationResult,
 } from './scopes/server-scope-filter'
 export {
+	InvalidScopePredicateError,
+	ScopePredicateLimitError,
+} from './scopes/scope-predicate-errors'
+export {
 	ScopeRequiredError,
 	resolveSessionScopeGrant,
 	resolveSessionScopes,

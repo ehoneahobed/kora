@@ -241,11 +241,12 @@ export interface YjsDocUpdateMessage {
  * out-of-band blob transfer over the sync connection; never persisted in the
  * operation log (durable state is the BlobRef inside a record's fields).
  *
- * Possession of a chunk hash is itself the capability to request it: hashes are
- * only learned from BlobRefs inside records the peer already received through
- * its (scope-filtered) sync, and SHA-256 preimage resistance makes guessing a
- * hash infeasible. The server therefore relays chunk requests among peers
- * without a separate ACL.
+ * Knowing a hash is not a capability: the server serves (from its central store)
+ * or forwards a request only when a live record inside the requester's download
+ * scope references the hash (as a blob, a manifest, or a chunk of one), forwards it
+ * only to peers whose own scope references it, accepts the answer only from a peer
+ * it asked and only when the bytes hash to the requested hash. Any other request
+ * is answered `bytes: null`, exactly like an unknown hash.
  */
 export interface BlobChunkRequestMessage {
 	type: 'blob-chunk-request'

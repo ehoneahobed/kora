@@ -1,11 +1,26 @@
 import type { Operation } from '@korajs/core'
 
+/** Options for {@link buildScopeSnapshot}. */
+export interface ScopeSnapshotOptions {
+	/**
+	 * Layer the writer's `previousData` between the stored record and `op.data`.
+	 * Off by default: `previousData` is supplied by the writer and is never checked
+	 * against the stored row, so a server visibility decision built on it lets one
+	 * tenant steer its operations into another tenant's log (RT-3). Opt in only
+	 * where the writer is trusted for the decision, such as a client filtering its
+	 * own local view.
+	 * @default false
+	 */
+	includePreviousData?: boolean
+}
+
 /**
  * Build the record snapshot a scope or query-subset predicate is evaluated against
  * for an operation.
  *
- * Layering is `fullRecord < previousData < data`, so the snapshot approximates the
- * record after the operation. The record identity is NOT taken from any of those
+ * Layering is `fullRecord < data` (or `fullRecord < previousData < data` with
+ * `includePreviousData`), so the snapshot approximates the record after the
+ * operation. The record identity is NOT taken from any of those
  * layers: `id` is always `op.recordId`, assigned last. An operation (or a stale
  * stored row) can therefore never claim to be a different record than the one it
  * actually targets, which is what made `previousData: { id: '<allowed>' }` a write
@@ -18,15 +33,17 @@ import type { Operation } from '@korajs/core'
  *
  * @param op - The operation being judged
  * @param fullRecord - Optional stored record state used to fill fields the op omits
+ * @param options - Whether to trust the writer's `previousData` (default: no)
  * @returns The snapshot, always carrying `id === op.recordId`
  */
 export function buildScopeSnapshot(
 	op: Operation,
 	fullRecord?: Record<string, unknown> | null,
+	options: ScopeSnapshotOptions = {},
 ): Record<string, unknown> {
 	return {
 		...(fullRecord ?? {}),
-		...(asPlainRecord(op.previousData) ?? {}),
+		...(options.includePreviousData ? (asPlainRecord(op.previousData) ?? {}) : {}),
 		...(asPlainRecord(op.data) ?? {}),
 		id: op.recordId,
 	}
@@ -34,16 +51,24 @@ export function buildScopeSnapshot(
 
 /**
  * True when `actual` satisfies a scope predicate value: either an exact value
- * (compared with `Object.is`) or a bounded `{ $in: [...] }` set.
+ * (compared with `Object.is`) or a bounded `{ $in: [...] }` set. An `undefined` or
+ * `null` predicate value (or `$in` member) never matches.
  *
  * @param actual - The record's field value
  * @param expected - The scope predicate for that field
  * @returns Whether the value is inside the predicate
  */
 export function matchesScopePredicate(actual: unknown, expected: unknown): boolean {
-	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+	// Fail closed (RT-8): an undefined/null predicate value would otherwise match
+	// every record that lacks the field. The server refuses such grants outright;
+	// this keeps any other caller from widening by accident.
+	if (expected === undefined || expected === null) return false
+	if (typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
 		const values = (expected as { $in?: unknown }).$in
-		return Array.isArray(values) && values.some((value) => Object.is(actual, value))
+		return (
+			Array.isArray(values) &&
+			values.some((value) => value !== undefined && value !== null && Object.is(actual, value))
+		)
 	}
 	return Object.is(actual, expected)
 }

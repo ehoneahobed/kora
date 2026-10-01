@@ -1,3 +1,4 @@
+import { hashBlob } from '@korajs/core'
 import type {
 	AwarenessUpdateMessage,
 	BlobChunkRequestMessage,
@@ -6,7 +7,7 @@ import type {
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
 import { encodeBlobChunkBytes } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import { beforeAll, describe, expect, test } from 'vitest'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import type {
 	ServerCloseHandler,
@@ -34,8 +35,14 @@ class FakeTransport implements ServerTransport {
 	}
 }
 
+const chunk = new Uint8Array([1])
+let chunkHash = ''
+beforeAll(async () => {
+	chunkHash = await hashBlob(chunk)
+})
+
 function request(requestId: string): BlobChunkRequestMessage {
-	return { type: 'blob-chunk-request', messageId: `m-${requestId}`, requestId, hash: 'h' }
+	return { type: 'blob-chunk-request', messageId: `m-${requestId}`, requestId, hash: chunkHash }
 }
 
 function response(requestId: string): BlobChunkResponseMessage {
@@ -43,9 +50,11 @@ function response(requestId: string): BlobChunkResponseMessage {
 		type: 'blob-chunk-response',
 		messageId: `r-${requestId}`,
 		requestId,
-		bytes: encodeBlobChunkBytes(new Uint8Array([1])),
+		bytes: encodeBlobChunkBytes(chunk),
 	}
 }
+
+const allowAll = { canReadFromStore: async () => true, canForward: async () => true }
 
 function awareness(
 	clientId: number,
@@ -57,46 +66,49 @@ function awareness(
 const presence = (name: string) => ({ user: { name, color: '#000' } }) as never
 
 describe('BlobChunkRelay limits (SEC-5)', () => {
-	test('caps outstanding forwarded requests per session', () => {
-		const relay = new BlobChunkRelay(undefined, { maxPendingPerSession: 3 })
+	test('caps outstanding forwarded requests per session', async () => {
+		const relay = new BlobChunkRelay(undefined, allowAll, { maxPendingPerSession: 3 })
 		const b = new FakeTransport()
 		relay.addClient('a', new FakeTransport())
 		relay.addClient('b', b)
-		for (let i = 0; i < 10; i++) relay.handleRequest('a', request(`r${i}`))
+		for (let i = 0; i < 10; i++) await relay.handleRequest('a', request(`r${i}`))
 		expect(relay.getPendingCount()).toBe(3)
 		expect(b.sent).toHaveLength(3)
-		relay.handleRequest('b', request('rb'))
+		await relay.handleRequest('b', request('rb'))
 		expect(relay.getPendingCount()).toBe(4)
 	})
 
-	test('forgets unanswered requests after the TTL', () => {
-		const relay = new BlobChunkRelay(undefined, { maxPendingPerSession: 1, pendingTtlMs: 0 })
+	test('forgets unanswered requests after the TTL', async () => {
+		const relay = new BlobChunkRelay(undefined, allowAll, {
+			maxPendingPerSession: 1,
+			pendingTtlMs: 0,
+		})
 		relay.addClient('a', new FakeTransport())
 		relay.addClient('b', new FakeTransport())
-		relay.handleRequest('a', request('r1'))
-		relay.handleRequest('a', request('r2'))
+		await relay.handleRequest('a', request('r1'))
+		await relay.handleRequest('a', request('r2'))
 		expect(relay.getPendingCount()).toBe(1)
 	})
 
-	test("a session cannot hijack another session's pending request id", () => {
-		const relay = new BlobChunkRelay()
+	test("a session cannot hijack another session's pending request id", async () => {
+		const relay = new BlobChunkRelay(undefined, allowAll)
 		const a = new FakeTransport()
 		const mallory = new FakeTransport()
 		relay.addClient('a', a)
 		relay.addClient('b', new FakeTransport())
 		relay.addClient('m', mallory)
-		relay.handleRequest('a', request('shared'))
-		relay.handleRequest('m', request('shared'))
-		relay.handleResponse('b', response('shared'))
+		await relay.handleRequest('a', request('shared'))
+		await relay.handleRequest('m', request('shared'))
+		await relay.handleResponse('b', response('shared'))
 		expect(a.sent.some((m) => m.type === 'blob-chunk-response')).toBe(true)
 		expect(mallory.sent.some((m) => m.type === 'blob-chunk-response')).toBe(false)
 	})
 
-	test('an unregistered session can neither request nor be forwarded to', () => {
-		const relay = new BlobChunkRelay()
+	test('an unregistered session can neither request nor be forwarded to', async () => {
+		const relay = new BlobChunkRelay(undefined, allowAll)
 		const b = new FakeTransport()
 		relay.addClient('b', b)
-		relay.handleRequest('stranger', request('r'))
+		await relay.handleRequest('stranger', request('r'))
 		expect(relay.getPendingCount()).toBe(0)
 		expect(b.sent).toHaveLength(0)
 	})

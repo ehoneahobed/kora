@@ -285,6 +285,8 @@ await transport.connect('wss://my-server.com/kora', {
 
 HTTP long-polling fallback with automatic WebSocket upgrade. If `preferWebSocket` is `true` (the default), the transport attempts a WebSocket connection first and falls back to long-polling on failure.
 
+Over long-polling, the handshake POST opens a server-side session and the server returns a session id in the `x-kora-session` response header (`HTTP_SYNC_SESSION_HEADER`). Polling starts once the id is known; every later request carries it plus the `Authorization: Bearer` credential, and POSTs are sent one at a time in order. A 401, 403, 404 or 410 closes the transport so the sync engine reconnects from scratch.
+
 ```typescript
 const transport = new HttpLongPollingTransport(options?: HttpLongPollingTransportOptions)
 ```

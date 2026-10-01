@@ -6,6 +6,7 @@ import {
 	resolveSessionScopeGrant,
 	resolveSessionScopes,
 } from './resolve-session-scopes'
+import { InvalidScopePredicateError } from './scope-predicate-errors'
 import { operationMatchesScopes } from './server-scope-filter'
 
 const schema = defineSchema({
@@ -30,6 +31,37 @@ const multiTenant = defineSchema({
 		projects: { fields: { name: t.string(), orgId: t.string() }, scope: ['orgId'] },
 		settings: { fields: { theme: t.string() } },
 	},
+})
+
+describe('resolveSessionScopes refuses undefined/null predicate values (RT-8)', () => {
+	test.each([undefined, null])('an explicit grant value of %s throws', (bad) => {
+		expect(() =>
+			resolveSessionScopes(multiTenant, {
+				authScopes: { projects: { orgId: bad } },
+				authenticated: true,
+			}),
+		).toThrow(InvalidScopePredicateError)
+	})
+
+	test('a handshake null value on an ungranted field throws instead of narrowing to null', () => {
+		expect(() =>
+			resolveSessionScopes(multiTenant, {
+				authScopes: { settings: {} },
+				handshakeScope: { settings: { theme: null } },
+				authenticated: true,
+			}),
+		).toThrow(InvalidScopePredicateError)
+	})
+
+	test('a missing claim value still denies (SCOPE_REQUIRED), it does not throw a predicate error', () => {
+		expect(() =>
+			resolveSessionScopes(multiTenant, {
+				authScopes: claimScopes({ orgId: undefined }),
+				authenticated: true,
+				onUnresolved: 'throw',
+			}),
+		).toThrow(ScopeRequiredError)
+	})
 })
 
 describe('resolveSessionScopes', () => {

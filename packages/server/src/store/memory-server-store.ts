@@ -15,6 +15,7 @@ import type {
 	MaterializedRecord,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 /**
  * In-memory server store for testing and quick prototyping.
@@ -311,12 +312,28 @@ export class MemoryServerStore implements ServerStore {
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
 		const owner = this.nodeOwners.get(nodeId)
 		if (owner === undefined) {
+			// History without a claim predates node claims: its writer is unknown, so
+			// nobody adopts it until an admin releases it (RT-5).
+			if ((this.versionVector.get(nodeId) ?? 0) > 0) return false
+			this.nodeOwners.set(nodeId, userId)
+			return true
+		}
+		if (owner === RELEASED_NODE_OWNER) {
 			this.nodeOwners.set(nodeId, userId)
 			return true
 		}
 		return owner === userId
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		const known = this.nodeOwners.has(nodeId) || (this.versionVector.get(nodeId) ?? 0) > 0
+		if (!known) return false
+		this.nodeOwners.set(nodeId, RELEASED_NODE_OWNER)
+		return true
 	}
 
 	/**

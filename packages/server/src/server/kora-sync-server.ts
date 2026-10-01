@@ -2,17 +2,19 @@ import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@
 import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
-import { JsonMessageSerializer } from '@korajs/sync'
+import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
 	applyServerOperation,
 } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
+import { NoAuthProvider } from '../auth/no-auth'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
@@ -21,6 +23,7 @@ import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
 import { WsServerTransport } from '../transport/ws-server-transport'
 import type {
+	AuthContext,
 	AuthProvider,
 	HttpSyncRequest,
 	HttpSyncResponse,
@@ -37,6 +40,9 @@ const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
 const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
+const DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS = 2 * 60_000
+/** Bytes of randomness in a server-issued HTTP session id (256 bits). */
+const HTTP_SESSION_ID_BYTES = 32
 /** Default largest WebSocket message accepted (the ws library default is 100 MiB). */
 export const DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
@@ -99,21 +105,27 @@ export class KoraSyncServer {
 	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
+	/** Which blob hashes each download scope may obtain (RT-1). */
+	private readonly blobAccess: BlobAccessIndex
 	private readonly persistBlobChunk:
 		| ((hash: string, bytes: Uint8Array) => Promise<void> | void)
 		| null
 	private readonly maxOperationBytes: number | undefined
 	private readonly maxOpsPerMinute: number | undefined
+	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
 	private readonly sessions = new Map<string, ClientSession>()
-	private readonly httpClients = new Map<
-		string,
-		{ sessionId: string; transport: HttpServerTransport }
-	>()
-	private readonly httpSessionToClient = new Map<string, string>()
+	/**
+	 * HTTP long-poll sessions by their server-issued, high-entropy id (RT-2). Each is
+	 * bound to the principal that opened it; every request must re-authenticate as it.
+	 */
+	private readonly httpSessions = new Map<string, HttpSessionEntry>()
+	/** Internal ClientSession id -> HTTP session id, for cleanup on close. */
+	private readonly httpSessionIdBySession = new Map<string, string>()
+	private readonly httpSessionIdleTimeoutMs: number
 	// Informational value reported by getStatus(). Keep in sync with the
 	// @korajs/server package version on release; it is not used for protocol negotiation.
 	private readonly serverVersion = '1.0.0-beta.0'
@@ -181,18 +193,41 @@ export class KoraSyncServer {
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
 		this.metrics.setSchemaVersion(this.schemaVersion)
 		this.blobLimits = config.blobLimits ?? {}
-		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk, {
-			...(this.blobLimits.maxPendingRequestsPerSession !== undefined
-				? { maxPendingPerSession: this.blobLimits.maxPendingRequestsPerSession }
-				: {}),
-			...(this.blobLimits.pendingRequestTtlMs !== undefined
-				? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
-				: {}),
-		})
+		this.blobAccess = new BlobAccessIndex(this.store, config.resolveBlobChunk ?? null)
+		this.blobChunkRelay = new BlobChunkRelay(
+			config.resolveBlobChunk,
+			{
+				canReadFromStore: (requesterId, hash) => this.sessionReferencesBlob(requesterId, hash),
+				canForward: (requesterId, targetId, hash) =>
+					this.mayForwardBlobRequest(requesterId, targetId, hash),
+				observeVerifiedBytes: (hash, bytes) => this.blobAccess.observeVerifiedBytes(hash, bytes),
+			},
+			{
+				...(this.blobLimits.maxPendingRequestsPerSession !== undefined
+					? { maxPendingPerSession: this.blobLimits.maxPendingRequestsPerSession }
+					: {}),
+				...(this.blobLimits.pendingRequestTtlMs !== undefined
+					? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
+					: {}),
+			},
+		)
+		this.httpSessionIdleTimeoutMs = validateIntervalOption(
+			'httpSessionIdleTimeoutMs',
+			config.httpSessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS,
+		)
 		this.maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
+		if (
+			config.maxOpsPerBatch !== undefined &&
+			(!Number.isInteger(config.maxOpsPerBatch) || config.maxOpsPerBatch < 1)
+		) {
+			throw new SyncError('maxOpsPerBatch must be a positive integer', {
+				maxOpsPerBatch: config.maxOpsPerBatch,
+			})
+		}
+		this.maxOpsPerBatch = config.maxOpsPerBatch
 		this.validateOperation = config.validateOperation
 		// One trusted data-plane context, shared by custom HTTP routes (via
 		// production-server) and by the operation validator. It holds no per-request
@@ -273,6 +308,43 @@ export class KoraSyncServer {
 		return terminated
 	}
 
+	/**
+	 * Admin release of a device node id (RT-5). The next principal to handshake with
+	 * this node id claims it, even when the node already has operation history.
+	 *
+	 * Use it to hand over operation history written before node claims existed (an
+	 * upgrade from beta.12, where nobody may adopt such a node until it is released),
+	 * or to reassign a lost device's node id. Live sessions on that node id are ended
+	 * with a retriable `NODE_RELEASED` error so the handover starts clean.
+	 *
+	 * @param nodeId - The device node id to release
+	 * @returns True when the node had a claim or history to release; false when it
+	 *   was unknown or the store does not support node claims
+	 *
+	 * @example
+	 * ```typescript
+	 * await server.releaseNodeClaim('0190a1b2-...')
+	 * ```
+	 */
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		if (!this.store.releaseNodeClaim) return false
+		const released = await this.store.releaseNodeClaim(nodeId)
+		if (released) {
+			for (const session of [...this.sessions.values()]) {
+				if (session.getClientNodeId() === nodeId && session.getState() !== 'connected') {
+					session.endForNodeRelease()
+				}
+			}
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'node_claim.released',
+				nodeId,
+			})
+		}
+		return released
+	}
+
 	private ensureBackgroundTimersStarted(): void {
 		if (this.relayRetransmitIntervalMs > 0 && !this.relayRetransmitTimer) {
 			this.relayRetransmitTimer = setInterval(() => {
@@ -299,6 +371,18 @@ export class KoraSyncServer {
 			session.retransmitPendingRelays(staleMs)
 		}
 		this.expireOrphanedRelays()
+		this.expireIdleHttpSessions()
+	}
+
+	/** Close HTTP long-poll sessions that sent no request within the idle timeout. */
+	private expireIdleHttpSessions(now = Date.now()): void {
+		if (this.httpSessionIdleTimeoutMs <= 0 || this.httpSessions.size === 0) return
+		const cutoff = now - this.httpSessionIdleTimeoutMs
+		for (const entry of [...this.httpSessions.values()]) {
+			if (entry.lastSeenAtMs <= cutoff) {
+				entry.transport.close(4008, 'http session idle')
+			}
+		}
 	}
 
 	/**
@@ -321,6 +405,8 @@ export class KoraSyncServer {
 				return
 			}
 			this.lastObservedDeliverySequence = maxDeliverySequence
+			// Records may have changed through another instance: rebuild blob access sets.
+			this.blobAccess.invalidate()
 			for (const session of this.sessions.values()) {
 				session.pushDeliveryStreamIfSupported(0, {
 					serverFrontier: maxDeliverySequence,
@@ -565,8 +651,8 @@ export class KoraSyncServer {
 			session.close('server shutting down')
 		}
 		this.sessions.clear()
-		this.httpClients.clear()
-		this.httpSessionToClient.clear()
+		this.httpSessions.clear()
+		this.httpSessionIdBySession.clear()
 
 		// Close WebSocket server (standalone mode only)
 		if (this.wsServer) {
@@ -587,38 +673,106 @@ export class KoraSyncServer {
 	/**
 	 * Handle one HTTP sync request for a long-polling client.
 	 *
-	 * A stable `clientId` identifies the logical connection across requests.
+	 * The POST that opens a session (the handshake, sent without `sessionId`) creates
+	 * it and answers with a server-issued, high-entropy session id in the
+	 * `x-kora-session` response header. Every later request must name that id.
+	 *
+	 * With an auth provider, EVERY request is authenticated from its `authorization`
+	 * header and must resolve to the same principal (user, device and anonymity) as
+	 * the request that opened the session and as the session's handshake, so knowing
+	 * a session id alone grants nothing (RT-2). Sessions with no request for
+	 * `httpSessionIdleTimeoutMs` are closed.
+	 *
+	 * Responses: 202 (POST accepted), 200/204/304 (GET), 400 (malformed), 401
+	 * (credential missing or invalid), 403 (credential of another principal), 404
+	 * (unknown or expired session), 405 (method), 410 (session closed).
 	 */
 	async handleHttpRequest(request: HttpSyncRequest): Promise<HttpSyncResponse> {
-		if (!request.clientId || request.clientId.trim().length === 0) {
-			return { status: 400 }
+		if (request.method !== 'GET' && request.method !== 'POST') {
+			return { status: 405, headers: { allow: 'GET, POST' } }
+		}
+		this.expireIdleHttpSessions()
+
+		const authenticated = await this.authenticateHttpRequest(request.authorization)
+		if (authenticated === 'unauthorized') {
+			return { status: 401, headers: { 'www-authenticate': 'Bearer' } }
 		}
 
-		const client = this.getOrCreateHttpClient(request.clientId)
+		if (request.sessionId === undefined || request.sessionId.length === 0) {
+			// Only the POST carrying the handshake may open a session.
+			if (request.method !== 'POST' || request.body === undefined) {
+				return { status: 400 }
+			}
+			const entry = this.openHttpSession(authenticated)
+			entry.transport.receive(normalizeHttpBody(request.body, request.contentType))
+			return {
+				status: 202,
+				headers: { [HTTP_SYNC_SESSION_HEADER]: entry.id },
+			}
+		}
+
+		const entry = this.httpSessions.get(request.sessionId)
+		if (!entry) {
+			return { status: 404 }
+		}
+		if (!this.httpPrincipalMatches(entry, authenticated)) {
+			return { status: 403 }
+		}
+		entry.lastSeenAtMs = Date.now()
 
 		if (request.method === 'POST') {
 			if (request.body === undefined) {
 				return { status: 400 }
 			}
-
-			const payload = normalizeHttpBody(request.body, request.contentType)
-			client.transport.receive(payload)
+			if (!entry.transport.isConnected()) {
+				return { status: 410 }
+			}
+			entry.transport.receive(normalizeHttpBody(request.body, request.contentType))
 			return { status: 202 }
 		}
 
-		if (request.method === 'GET') {
-			const polled = client.transport.poll(request.ifNoneMatch)
-			return {
-				status: polled.status,
-				body: polled.body,
-				headers: polled.headers,
-			}
-		}
-
+		const polled = entry.transport.poll(request.ifNoneMatch)
 		return {
-			status: 405,
-			headers: { allow: 'GET, POST' },
+			status: polled.status,
+			body: polled.body,
+			headers: polled.headers,
 		}
+	}
+
+	/**
+	 * Authenticate one HTTP request. Returns the principal identity, null when the
+	 * server has no real auth provider, or 'unauthorized'.
+	 */
+	private async authenticateHttpRequest(
+		authorization: string | undefined,
+	): Promise<HttpPrincipal | null | 'unauthorized'> {
+		if (!this.auth || this.auth instanceof NoAuthProvider) return null
+		const token = parseBearer(authorization)
+		if (token === null) return 'unauthorized'
+		let context: AuthContext | null
+		try {
+			context = await this.auth.authenticate(token)
+		} catch {
+			return 'unauthorized'
+		}
+		return context ? principalOf(context) : 'unauthorized'
+	}
+
+	/**
+	 * True when a request's principal is the one that opened the session and, once
+	 * the handshake authenticated, the session's own principal.
+	 */
+	private httpPrincipalMatches(entry: HttpSessionEntry, principal: HttpPrincipal | null): boolean {
+		if (!samePrincipal(entry.principal, principal)) return false
+		const session = this.sessions.get(entry.sessionId)
+		const handshakePrincipal = session?.getPrincipal()
+		if (handshakePrincipal && !samePrincipal(principalOf(handshakePrincipal), principal)) {
+			// The handshake authenticated someone other than the HTTP credential: the
+			// session cannot be trusted by either; end it.
+			entry.transport.close(4003, 'http principal mismatch')
+			return false
+		}
+		return true
 	}
 
 	/**
@@ -766,10 +920,10 @@ export class KoraSyncServer {
 				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
 			},
 			onBlobChunkRequest: (sourceSessionId, message) => {
-				this.blobChunkRelay.handleRequest(sourceSessionId, message)
+				void this.blobChunkRelay.handleRequest(sourceSessionId, message)
 			},
 			onBlobChunkResponse: (sourceSessionId, message) => {
-				this.blobChunkRelay.handleResponse(sourceSessionId, message)
+				void this.blobChunkRelay.handleResponse(sourceSessionId, message)
 			},
 			...(this.persistBlobChunk ? { persistBlobChunk: this.persistBlobChunk } : {}),
 			...(this.blobLimits.maxChunkBytes !== undefined
@@ -789,6 +943,7 @@ export class KoraSyncServer {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			...(this.maxOpsPerMinute !== undefined ? { maxOpsPerMinute: this.maxOpsPerMinute } : {}),
+			...(this.maxOpsPerBatch !== undefined ? { maxOpsPerBatch: this.maxOpsPerBatch } : {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),
@@ -860,6 +1015,7 @@ export class KoraSyncServer {
 		const result = await applyServerOperation(this.store, op, undefined, options)
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
+			this.blobAccess.invalidate()
 			for (const session of this.sessions.values()) {
 				session.relayOperations(result.appliedOperations)
 			}
@@ -880,6 +1036,7 @@ export class KoraSyncServer {
 		if (operations.length === 0) {
 			return
 		}
+		this.blobAccess.invalidate()
 		for (const session of this.sessions.values()) {
 			session.relayOperations(operations)
 		}
@@ -927,7 +1084,39 @@ export class KoraSyncServer {
 
 	// --- Private ---
 
+	/**
+	 * Blob access policy (RT-1): true when the session is streaming and a live record
+	 * inside its download scope references the hash. Gates the central store.
+	 */
+	private async sessionReferencesBlob(sessionId: string, hash: string): Promise<boolean> {
+		const session = this.sessions.get(sessionId)
+		if (!session || !session.isStreaming()) return false
+		return this.blobAccess.isReferenced(session.getDownlinkScopes(), hash)
+	}
+
+	/**
+	 * Blob access policy (RT-1): a request may be forwarded to a peer that shares the
+	 * requester's exact download scope (the same tenant view, as for presence), which
+	 * keeps manifests handed over out of band working; across scopes, only when both
+	 * scopes reference the hash, so neither the hash nor the bytes cross a tenant.
+	 */
+	private async mayForwardBlobRequest(
+		requesterId: string,
+		targetId: string,
+		hash: string,
+	): Promise<boolean> {
+		const requester = this.sessions.get(requesterId)
+		const target = this.sessions.get(targetId)
+		if (!requester?.isStreaming() || !target?.isStreaming()) return false
+		if (requester.getScopePartitionKey() === target.getScopePartitionKey()) return true
+		return (
+			(await this.sessionReferencesBlob(requesterId, hash)) &&
+			(await this.sessionReferencesBlob(targetId, hash))
+		)
+	}
+
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
+		this.blobAccess.invalidate()
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
 		this.metrics.recordSent(
@@ -959,10 +1148,10 @@ export class KoraSyncServer {
 
 		this.sessions.delete(sessionId)
 
-		const clientId = this.httpSessionToClient.get(sessionId)
-		if (clientId) {
-			this.httpSessionToClient.delete(sessionId)
-			this.httpClients.delete(clientId)
+		const httpSessionId = this.httpSessionIdBySession.get(sessionId)
+		if (httpSessionId) {
+			this.httpSessionIdBySession.delete(sessionId)
+			this.httpSessions.delete(httpSessionId)
 		}
 	}
 
@@ -1002,24 +1191,75 @@ export class KoraSyncServer {
 		})
 	}
 
-	private getOrCreateHttpClient(clientId: string): {
-		sessionId: string
-		transport: HttpServerTransport
-	} {
-		const existing = this.httpClients.get(clientId)
-		if (existing) {
-			return existing
-		}
-
+	/** Open a new HTTP long-poll session bound to `principal`, under a fresh random id. */
+	private openHttpSession(principal: HttpPrincipal | null): HttpSessionEntry {
 		const transport = new HttpServerTransport(this.serializer)
 		const sessionId = this.handleConnection(transport)
-		const client = { sessionId, transport }
-
-		this.httpClients.set(clientId, client)
-		this.httpSessionToClient.set(sessionId, clientId)
-
-		return client
+		const entry: HttpSessionEntry = {
+			id: generateHttpSessionId(),
+			sessionId,
+			transport,
+			principal,
+			lastSeenAtMs: Date.now(),
+		}
+		this.httpSessions.set(entry.id, entry)
+		this.httpSessionIdBySession.set(sessionId, entry.id)
+		return entry
 	}
+}
+
+/** The identity an HTTP session is bound to (RT-2). */
+interface HttpPrincipal {
+	userId: string
+	deviceId: string | null
+	anonymous: boolean
+}
+
+interface HttpSessionEntry {
+	/** Server-issued, high-entropy id the client presents on every request. */
+	id: string
+	/** The ClientSession behind it. */
+	sessionId: string
+	transport: HttpServerTransport
+	/** Principal of the request that opened it; null without a real auth provider. */
+	principal: HttpPrincipal | null
+	lastSeenAtMs: number
+}
+
+function principalOf(context: AuthContext): HttpPrincipal {
+	const deviceId = context.metadata?.deviceId
+	return {
+		userId: context.userId,
+		deviceId: typeof deviceId === 'string' ? deviceId : null,
+		anonymous: context.anonymous === true,
+	}
+}
+
+/**
+ * Same principal. Anonymous principals get a fresh userId per authentication, so two
+ * anonymous principals match on anonymity alone; their session id is their only
+ * credential.
+ */
+function samePrincipal(a: HttpPrincipal | null, b: HttpPrincipal | null): boolean {
+	if (a === null || b === null) return a === b
+	if (a.anonymous || b.anonymous) return a.anonymous && b.anonymous
+	return a.userId === b.userId && a.deviceId === b.deviceId
+}
+
+/** The token of a `Bearer <token>` header; '' when absent (anonymous); null when malformed. */
+function parseBearer(authorization: string | undefined): string | null {
+	if (authorization === undefined || authorization.trim() === '') return ''
+	const match = /^Bearer\s+(\S+)\s*$/i.exec(authorization.trim())
+	return match?.[1] ?? null
+}
+
+/** 256 random bits, base64url: an unguessable HTTP session id. */
+function generateHttpSessionId(): string {
+	const bytes = new Uint8Array(HTTP_SESSION_ID_BYTES)
+	globalThis.crypto.getRandomValues(bytes)
+	let binary = ''
+	for (const byte of bytes) binary += String.fromCharCode(byte)
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 /**

@@ -197,6 +197,54 @@ describe('ClientSession node binding (SEC-3, server half)', () => {
 		const again = await login('bob-2', 'bob-device')
 		expect(again.messages.some((m) => m.type === 'handshake-response')).toBe(true)
 	})
+
+	test('releaseNodeClaim ends live sessions on the node and hands it to the next claimant (RT-5)', async () => {
+		const { login, server } = await setup()
+		const bob = await login('bob', 'lost-device')
+		expect(await server.releaseNodeClaim('lost-device')).toBe(true)
+		await tick()
+		const error = bob.messages.find((m) => m.type === 'error')
+		expect(error?.type === 'error' ? [error.code, error.retriable] : null).toEqual([
+			'NODE_RELEASED',
+			true,
+		])
+		const alice = await login('alice', 'lost-device')
+		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+		expect(await server.releaseNodeClaim('never-seen')).toBe(false)
+	})
+})
+
+describe('Blob relay stays inside the tenant (RT-1)', () => {
+	test('a request for an unreferenced hash reaches same-scope devices only', async () => {
+		const { login } = await setup()
+		const alice1 = await login('alice-1', 'alice-1')
+		const alice2 = await login('alice-2', 'alice-2')
+		const bob = await login('bob', 'bob-node')
+		alice1.client.send({
+			type: 'blob-chunk-request',
+			messageId: 'r',
+			requestId: 'oob',
+			hash: 'e'.repeat(64),
+		})
+		await tick()
+		expect(alice2.messages.some((m) => m.type === 'blob-chunk-request')).toBe(true)
+		expect(bob.messages.some((m) => m.type === 'blob-chunk-request')).toBe(false)
+	})
+
+	test('a requester with nobody to ask is told "not held" at once', async () => {
+		const { login } = await setup()
+		const bob = await login('bob', 'bob-node')
+		await login('alice', 'alice-node')
+		bob.client.send({
+			type: 'blob-chunk-request',
+			messageId: 'r',
+			requestId: 'lonely',
+			hash: 'f'.repeat(64),
+		})
+		await tick()
+		const answer = bob.messages.find((m) => m.type === 'blob-chunk-response')
+		expect(answer?.type === 'blob-chunk-response' ? answer.bytes : 'missing').toBeNull()
+	})
 })
 
 describe('Side channels after the handshake (SEC-5)', () => {
@@ -298,5 +346,113 @@ describe('Side channels after the handshake (SEC-5)', () => {
 		expect(persisted).toHaveLength(1)
 		const codes = bob.messages.flatMap((m) => (m.type === 'error' ? [m.code] : []))
 		expect(codes).toEqual(['BLOB_CHUNK_TOO_LARGE', 'BLOB_QUOTA_EXCEEDED'])
+	})
+})
+
+describe('ingest limits are charged before store work (RT-6)', () => {
+	const errorCodes = (messages: SyncMessage[]) =>
+		messages.flatMap((m) => (m.type === 'error' ? [m.code] : []))
+
+	test('out-of-scope ops count against the rate limit and stop store reads', async () => {
+		const { login, store } = await setup({ maxOpsPerMinute: 3 })
+		const alice = await login('alice', 'alice-node')
+		const reads = vi.spyOn(store, 'queryCollection')
+		const ops = Array.from({ length: 10 }, () =>
+			op('alice-node', { data: { title: 't', userId: 'bob' } }),
+		)
+		alice.client.send(batch(ops))
+		await tick()
+		expect(alice.messages.filter((m) => m.type === 'operation-rejected')).toHaveLength(3)
+		expect(errorCodes(alice.messages)).toEqual(['RATE_LIMIT'])
+		expect(reads.mock.calls.length).toBeLessThanOrEqual(3)
+	})
+
+	test('foreign-node ops are charged before the duplicate lookup', async () => {
+		const { login, store } = await setup({ maxOpsPerMinute: 2 })
+		const alice = await login('alice', 'alice-node')
+		const lookups = vi.spyOn(store, 'getOperationRange')
+		alice.client.send(batch(Array.from({ length: 6 }, () => op('someone-else'))))
+		await tick()
+		expect(lookups.mock.calls.length).toBeLessThanOrEqual(2)
+		expect(errorCodes(alice.messages)).toEqual(['RATE_LIMIT'])
+	})
+
+	test('a batch over maxOpsPerBatch is refused whole, unacknowledged, without store reads', async () => {
+		const { login, store, server } = await setup({ maxOpsPerBatch: 5 })
+		const alice = await login('alice', 'alice-node')
+		const reads = vi.spyOn(store, 'queryCollection')
+		alice.client.send(
+			batch(
+				Array.from({ length: 6 }, () =>
+					op('alice-node', { data: { title: 't', userId: 'alice' } }),
+				),
+			),
+		)
+		await tick()
+		expect(errorCodes(alice.messages)).toEqual(['BATCH_TOO_LARGE'])
+		expect(alice.messages.some((m) => m.type === 'acknowledgment')).toBe(false)
+		expect(reads).not.toHaveBeenCalled()
+		const session = (
+			server as unknown as { sessions: Map<string, { getIngestLimitCounts(): unknown }> }
+		).sessions
+		expect([...session.values()][0]?.getIngestLimitCounts()).toEqual({
+			rateLimitedOperations: 0,
+			rejectedBatches: 1,
+		})
+	})
+
+	test('a batch at the cap is processed', async () => {
+		const { login, store } = await setup({ maxOpsPerBatch: 2 })
+		const alice = await login('alice', 'alice-node')
+		const a = op('alice-node', { data: { title: 'a', userId: 'alice' } })
+		const b = op('alice-node', { data: { title: 'b', userId: 'alice' } })
+		alice.client.send(batch([a, b]))
+		await tick()
+		expect(await store.findRecord('notes', b.recordId)).not.toBeNull()
+	})
+
+	test('maxOpsPerBatch must be a positive integer', () => {
+		expect(
+			() => new KoraSyncServer({ store: new MemoryServerStore('s'), maxOpsPerBatch: 0 }),
+		).toThrow(/maxOpsPerBatch/)
+	})
+})
+
+describe('handshake vector reveals only own and delivered nodes (RT-7)', () => {
+	test('a node id the client names is not echoed unless its ops are delivered', async () => {
+		const { login, connect } = await setup()
+		const bob = await login('bob', 'bob-node')
+		bob.client.send(
+			batch([op('bob-node', { sequenceNumber: 1, data: { title: 'b', userId: 'bob' } })]),
+		)
+		await tick()
+		const probe = connect()
+		probe.client.send({
+			type: 'handshake',
+			messageId: 'hs-probe',
+			nodeId: 'alice-node',
+			versionVector: { 'bob-node': 0, 'alice-node': 0 },
+			schemaVersion: 1,
+			authToken: 'alice',
+		})
+		await vi.waitFor(() =>
+			expect(probe.messages.some((m) => m.type === 'handshake-response')).toBe(true),
+		)
+		const response = probe.messages.find((m) => m.type === 'handshake-response')
+		const vector = response?.type === 'handshake-response' ? response.versionVector : {}
+		expect(vector).not.toHaveProperty('bob-node')
+	})
+
+	test("the client's own entry and delivered nodes are present", async () => {
+		const { login } = await setup()
+		const a1 = await login('alice', 'alice-a')
+		a1.client.send(
+			batch([op('alice-a', { sequenceNumber: 1, data: { title: 'x', userId: 'alice' } })]),
+		)
+		await tick()
+		const a2 = await login('alice-b', 'alice-b')
+		const response = a2.messages.find((m) => m.type === 'handshake-response')
+		const vector = response?.type === 'handshake-response' ? response.versionVector : {}
+		expect(vector).toHaveProperty('alice-a', 1)
 	})
 })

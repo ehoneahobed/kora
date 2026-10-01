@@ -75,14 +75,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops. REOPENED by red team (RT-1): blob relay still forwards requests/answers across tenants and the central store answers any hash."
+   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops. REOPENED by red team (RT-1): blob relay still forwards requests/answers across tenants and the central store answers any hash. RT-1 fixed: blob requests are served/forwarded only within the requester tenant (central store only for hashes referenced by a live record in its download scope), responses only from asked peers and hash-verified. Remaining hardening (not a repro): blob push is still not restricted to hashes referenced by the session ops."
   },
   {
    "id": "SEC-6",
@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -899,7 +899,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat."
   },
   {
    "id": "SRV-7",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1716,14 +1716,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: BlobAccessIndex (server/src/richtext/blob-access-index.ts) answers whether a live record in a download scope references a hash (BlobRef.hash, manifestHash, or a chunk of a manifest read from the central store or learned from relay-verified bytes); scoped query over blob collections, cached per scope, invalidated on every local write / delivery-log advance / 5 s TTL (cost O(records in scope with blobs) per rebuild; a store hash index is the follow-up). BlobChunkRelay takes a BlobAccessPolicy: central store serves only requesters whose scope references the hash; requests are forwarded only to peers with the same download scope (partition key) or, across scopes, when both reference the hash; responses accepted only from asked peers and only when bytes hash to the requested hash; otherwise bytes:null. Policy errors fail closed."
   },
   {
    "id": "RT-2",
@@ -1731,14 +1731,14 @@
    "severity": "P0",
    "workstream": "W5",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: HttpSyncRequest drops clientId, gains sessionId (x-kora-session) and authorization. The handshake POST opens a session and the 202 returns a server-issued 256-bit id; unknown ids are 404. With auth, every request is authenticated and must match user+device+anonymity of the opener and of the handshake principal (401/403; mismatch ends the session). HTTP sessions idle for httpSessionIdleTimeoutMs (default 2 min) close. HttpLongPollingTransport polls only after the id is issued, sends id + bearer on every request, serializes POSTs, closes on 401/403/404/410. Integration test: tests/integration/http-long-poll.test.ts."
   },
   {
    "id": "RT-3",
@@ -1746,14 +1746,29 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: buildScopeSnapshot layers previousData only with { includePreviousData: true }. Server visibility (live relay, version-vector delta, delivery stream, query subsets) uses the materialized row + op.data only; the client SyncEngine opts in for its own local view. Residual: scope-exit retraction still reads the writer previousData for the prior snapshot (can reveal a record id, never data)."
+  },
+  {
+   "id": "RT-4",
+   "title": "Live sessions survive revocation and expiry; bindSyncServer called a non-existent terminateSessions",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed by the AUTH-11 merge. Confirmed by packages/auth/tests/repro/RT-4.test.ts: bindSyncServer behind a wrapped provider (no onRevoke) ends a revoked device session, and a session ends with AUTH_EXPIRED when its access token expires."
   },
   {
    "id": "RT-5",
@@ -1761,14 +1776,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: AuthContext.anonymous (set by MixedAuthProvider) -> claims keyed by the stable anonymous owner (kora:anonymous); anonymous cannot take a user node. NoAuthProvider no longer claims. claimNode refuses an unclaimed node with op history (pre-claims history has no writer); going forward every write follows a claim. KoraSyncServer.releaseNodeClaim(nodeId) (store releaseNodeClaim, memory/SQLite/Postgres, atomic single winner) hands the node to the next claimant and ends live sessions with retriable NODE_RELEASED. Postgres test: src/store/postgres-node-claims.test.ts."
   },
   {
    "id": "RT-6",
@@ -1776,14 +1791,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: the rate limiter is charged first for every uploaded op (before the foreign-node duplicate lookup, uplink authorization read, timestamp check). maxOpsPerBatch (default 1000) refuses an oversized batch whole with BATCH_TOO_LARGE before decoding; nothing is acknowledged. ClientSession.getIngestLimitCounts()."
   },
   {
    "id": "RT-7",
@@ -1791,14 +1806,14 @@
    "severity": "P3",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: the handshake vector carries only the client own node and nodes whose in-scope ops it is about to receive; names in the client vector are never echoed."
   },
   {
    "id": "RT-8",
@@ -1806,14 +1821,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: normalizeScopeMap and resolveSessionScopes (explicit grant, intersected result, handshake-only scope) throw InvalidScopePredicateError for undefined/null values (also inside $in); handshake refused with INVALID_SCOPE_PREDICATE. matchesScopePredicate never matches undefined/null. $in limit errors are ScopePredicateLimitError."
   },
   {
    "id": "RT-9",
@@ -1821,14 +1836,14 @@
    "severity": "P3",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: TokenManager.rotate() re-checks revocation after consume; any later revocation has a cut-off >= consumedAt (the successors iat). Deterministic race tests in token-rotation.test.ts."
   },
   {
    "id": "RT-10",
@@ -1836,14 +1851,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: applyServerOperation authorizeSideEffect: every cascade/set-null of an untrusted delete is checked against the writer uplink scope (child stored row) before the delete applies; any refusal rejects the whole delete. Decision: integrity judges ALL children in every tenant, but untrusted writers get one generic RESTRICTED rejection (no ids, no counts) for both restrict violations and unauthorized side effects; trusted server deletes keep REFERENTIAL_INTEGRITY. Wired in ClientSession and scoped route-context apply (conditional apply path has no referential side effects)."
   }
  ],
  "rejectedProposalPins": {

@@ -1,10 +1,33 @@
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
+import { InvalidScopePredicateError, ScopePredicateLimitError } from './scope-predicate-errors'
 import {
 	missingScopeFields,
 	normalizeScopeMap,
 	operationMatchesScopes,
 } from './server-scope-filter'
+
+describe('normalizeScopeMap fails closed on missing predicate values (RT-8)', () => {
+	test.each([undefined, null])('rejects a %s value with InvalidScopePredicateError', (bad) => {
+		expect(() => normalizeScopeMap({ todos: { ownerId: bad } })).toThrow(InvalidScopePredicateError)
+		expect(() => normalizeScopeMap({ todos: { ownerId: { $in: ['a', bad] } } })).toThrow(
+			InvalidScopePredicateError,
+		)
+	})
+
+	test('an oversized $in is a typed ScopePredicateLimitError', () => {
+		const values = ['v0', 'v1', 'v2']
+		expect(() => normalizeScopeMap({ todos: { ownerId: { $in: values } } }, 2)).toThrow(
+			ScopePredicateLimitError,
+		)
+	})
+
+	test('a null or undefined predicate never matches a record lacking the field', () => {
+		const op = createOp({ data: { title: 'no owner' } })
+		expect(operationMatchesScopes(op, { todos: { ownerId: null } })).toBe(false)
+		expect(operationMatchesScopes(op, { todos: { ownerId: undefined } })).toBe(false)
+	})
+})
 
 function createOp(overrides: Partial<Operation> = {}): Operation {
 	return {
@@ -77,22 +100,38 @@ describe('operationMatchesScopes', () => {
 		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-2' } })).toBe(false)
 	})
 
-	test('matches update scope using merged previousData and data', () => {
+	// RT-3: previousData is writer-supplied and never steers download visibility.
+	// Visibility is judged on the server's stored row plus op.data only.
+	test('an update is judged on the stored row plus data, never previousData', () => {
 		const op = createOp({
 			type: 'update',
 			data: { title: 'Renamed' },
 			previousData: { ownerId: 'user-1', title: 'Old' },
 		})
-		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-1' } })).toBe(true)
+		const scope = { todos: { ownerId: 'user-1' } }
+		expect(operationMatchesScopes(op, scope)).toBe(false)
+		expect(operationMatchesScopes(op, scope, { ownerId: 'user-1' })).toBe(true)
+		// A forged previousData cannot pull another tenant's update into this scope...
+		expect(operationMatchesScopes(op, scope, { ownerId: 'user-2' })).toBe(false)
+		// ...nor hide an in-scope update from its own tenant.
+		const hiding = createOp({
+			type: 'update',
+			data: { title: 'x' },
+			previousData: { ownerId: 'z' },
+		})
+		expect(operationMatchesScopes(hiding, scope, { ownerId: 'user-1' })).toBe(true)
+		expect(missingScopeFields(op, scope)).toEqual(['ownerId'])
 	})
 
-	test('matches delete scope using previousData', () => {
+	test('a delete is judged on the stored row, never previousData', () => {
 		const op = createOp({
 			type: 'delete',
 			data: null,
 			previousData: { ownerId: 'user-1', title: 'Old' },
 		})
-		expect(operationMatchesScopes(op, { todos: { ownerId: 'user-1' } })).toBe(true)
+		const scope = { todos: { ownerId: 'user-1' } }
+		expect(operationMatchesScopes(op, scope)).toBe(false)
+		expect(operationMatchesScopes(op, scope, { ownerId: 'user-1', _deleted: 1 })).toBe(true)
 	})
 
 	// A real partial update carries ONLY the changed field in data/previousData, not

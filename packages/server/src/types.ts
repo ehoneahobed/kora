@@ -20,6 +20,13 @@ export interface AuthContext {
 	/** Arbitrary metadata about the authenticated user */
 	metadata?: Record<string, unknown>
 	/**
+	 * True for an unauthenticated (anonymous) principal, such as the fallback of
+	 * `MixedAuthProvider`. Its `userId` is not stable across connections, so node-id
+	 * claims are keyed by the shared anonymous owner instead: an anonymous device can
+	 * reconnect with its node id, but can never take a signed-in user's node id.
+	 */
+	anonymous?: boolean
+	/**
 	 * When the credential that authenticated this session expires (ms since
 	 * epoch). A session must not outlive its credential: the sync server can
 	 * close it with a retriable AUTH_EXPIRED so the client refreshes (AUTH-11).
@@ -175,6 +182,18 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerMinute?: number
 	/**
+	 * Largest operation batch accepted from a client in one message. A larger batch is
+	 * refused whole with `BATCH_TOO_LARGE` before the server decodes it or reads the
+	 * store, so one message cannot buy unbounded work. Defaults to 1000 (the client
+	 * sends batches of 100 by default).
+	 */
+	maxOpsPerBatch?: number
+	/**
+	 * How long an HTTP long-poll session may go without any request before the server
+	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
+	 */
+	httpSessionIdleTimeoutMs?: number
+	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *
 	 * Runs at sync ingestion for every incoming client operation, after HLC
@@ -190,12 +209,25 @@ export interface KoraSyncServerConfig {
 
 /**
  * Request envelope for the server-side HTTP sync endpoint.
+ *
+ * Map it from your HTTP framework: `sessionId` from the `x-kora-session` header and
+ * `authorization` from the `Authorization` header, on every request.
  */
 export interface HttpSyncRequest {
-	/** Stable client identifier for binding HTTP requests to a server session */
-	clientId: string
 	/** HTTP method */
 	method: 'GET' | 'POST'
+	/**
+	 * The server-issued session id (`x-kora-session` request header). Absent only on
+	 * the POST that opens a session (the handshake); the response to that POST
+	 * carries the new id in its `x-kora-session` header. Never chosen by the client.
+	 */
+	sessionId?: string
+	/**
+	 * The raw `Authorization` header (`Bearer <token>`). With an auth provider
+	 * configured, EVERY request is authenticated and must resolve to the same
+	 * principal and device as the session it names (RT-2).
+	 */
+	authorization?: string
 	/** Optional raw request payload for POST */
 	body?: string | Uint8Array
 	/** Value of the Content-Type header for POST payloads */
@@ -209,7 +241,7 @@ export interface HttpSyncRequest {
  */
 export interface HttpSyncResponse {
 	/** HTTP status code */
-	status: 200 | 202 | 204 | 304 | 400 | 405 | 410
+	status: 200 | 202 | 204 | 304 | 400 | 401 | 403 | 404 | 405 | 410
 	/** Optional raw response payload */
 	body?: string | Uint8Array
 	/** Optional response headers */

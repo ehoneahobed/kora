@@ -41,6 +41,7 @@ import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
 import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
+import { InvalidScopePredicateError } from '../scopes/scope-predicate-errors'
 import {
 	type ScopeMap,
 	type UplinkAuthorizationResult,
@@ -59,6 +60,7 @@ import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import {
 	DEFAULT_MAX_OPERATION_BYTES,
+	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
 	SessionRateLimiter,
 	validateOperationSize,
@@ -70,6 +72,12 @@ const DEFAULT_SCHEMA_VERSION = 1
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 /** Revocations remembered for a session whose handshake has not resolved its principal. */
 const MAX_PENDING_REVOCATIONS = 32
+
+/**
+ * Node-claim owner for anonymous principals (`AuthContext.anonymous`). Contains
+ * characters no Kora-issued user id uses, so it cannot collide with a real user.
+ */
+export const ANONYMOUS_NODE_OWNER = 'kora:anonymous'
 
 /** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
 export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
@@ -278,6 +286,11 @@ export interface ClientSessionOptions {
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
 	maxOpsPerMinute?: number
 	/**
+	 * Largest operation batch accepted in one message. A larger batch is refused whole
+	 * (`BATCH_TOO_LARGE`) before it is decoded or the store is read. Defaults to 1000.
+	 */
+	maxOpsPerBatch?: number
+	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
 	 * sends an operation-rejected message and skips materialization.
@@ -391,7 +404,12 @@ export class ClientSession {
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
+	private readonly maxOpsPerBatch: number
 	private readonly rateLimiter: SessionRateLimiter
+	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
+	private rateLimitedOperations = 0
+	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
+	private rejectedBatches = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 
@@ -427,6 +445,7 @@ export class ClientSession {
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 	}
@@ -662,6 +681,20 @@ export class ClientSession {
 		return true
 	}
 
+	/**
+	 * End this session because an admin released its node id (RT-5). Retriable: a
+	 * client that still owns the node simply reconnects and claims it again.
+	 */
+	endForNodeRelease(): void {
+		if (this.state === 'closed') return
+		this.sendError(
+			'NODE_RELEASED',
+			'An administrator released this device node id. Reconnect to claim it again.',
+			true,
+		)
+		this.close('node id released')
+	}
+
 	private terminate(code: SessionTerminationCode): void {
 		const message =
 			code === 'AUTH_EXPIRED'
@@ -723,8 +756,28 @@ export class ClientSession {
 		return this.authContext
 	}
 
+	/**
+	 * The principal the auth provider verified at handshake, or null before (or
+	 * without) authentication. Unlike {@link getAuthContext}, never a context
+	 * synthesized for an unauthenticated session.
+	 */
+	getPrincipal(): AuthContext | null {
+		return this.principal
+	}
+
 	isStreaming(): boolean {
 		return this.state === 'streaming'
+	}
+
+	/**
+	 * Ingest refusals that happen before any store work (RT-6): operations refused by
+	 * the per-minute rate limiter and batches refused for exceeding the per-batch cap.
+	 */
+	getIngestLimitCounts(): { rateLimitedOperations: number; rejectedBatches: number } {
+		return {
+			rateLimitedOperations: this.rateLimitedOperations,
+			rejectedBatches: this.rejectedBatches,
+		}
 	}
 
 	/**
@@ -747,6 +800,11 @@ export class ClientSession {
 	 * relayed between sessions that share exactly the same key, so it never crosses a
 	 * tenant boundary. Unscoped sessions share the key `"*"`.
 	 */
+	/** This session's download scope, or undefined when it is unscoped. */
+	getDownlinkScopes(): ScopeMap | undefined {
+		return this.authContext?.downlinkScopes ?? this.authContext?.scopes
+	}
+
 	getScopePartitionKey(): string {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		return scopes ? stableStringify(normalizeScopeMap(scopes)) : '*'
@@ -916,14 +974,19 @@ export class ClientSession {
 			}
 			// Bind the device node id to this principal. A node id another user already
 			// claimed is refused, so nobody can upload operations as someone else's device.
-			if (this.store.claimNode && !(await this.store.claimNode(msg.nodeId, context.userId))) {
-				this.sendError(
-					'NODE_ID_CLAIMED',
-					`Node id "${msg.nodeId}" belongs to another user. Use a fresh node id per signed-in user.`,
-					false,
-				)
-				this.close('node id claimed by another user')
-				return
+			// Anonymous principals get a fresh userId per connection, so they claim under
+			// one shared anonymous owner (RT-5). NoAuthProvider has no identity at all.
+			if (this.store.claimNode && !(this.auth instanceof NoAuthProvider)) {
+				const owner = context.anonymous === true ? ANONYMOUS_NODE_OWNER : context.userId
+				if (!(await this.store.claimNode(msg.nodeId, owner))) {
+					this.sendError(
+						'NODE_ID_CLAIMED',
+						`Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
+						false,
+					)
+					this.close('node id claimed by another user')
+					return
+				}
 			}
 			// A revocation that landed while this handshake was authenticating applies now.
 			if (this.pendingRevocations.some((filter) => revocationMatches(context, filter))) {
@@ -979,6 +1042,11 @@ export class ClientSession {
 				onUnresolved: 'throw',
 			})
 		} catch (error) {
+			if (error instanceof InvalidScopePredicateError) {
+				this.sendError('INVALID_SCOPE_PREDICATE', error.message, false)
+				this.close('invalid scope predicate')
+				return
+			}
 			if (!(error instanceof ScopeRequiredError)) throw error
 			this.sendError('SCOPE_REQUIRED', error.message, false)
 			this.close('sync scope required')
@@ -1004,7 +1072,10 @@ export class ClientSession {
 			this.sendToClient({
 				type: 'error',
 				messageId: generateUUIDv7(),
-				code: 'SCOPE_PREDICATE_LIMIT',
+				code:
+					error instanceof InvalidScopePredicateError
+						? 'INVALID_SCOPE_PREDICATE'
+						: 'SCOPE_PREDICATE_LIMIT',
 				message: error instanceof Error ? error.message : 'Invalid scope predicate',
 				retriable: false,
 			})
@@ -1123,11 +1194,12 @@ export class ClientSession {
 				: null
 		const deltaPlan = deliveryPlan === null ? await this.collectDeltaOperations(clientVector) : []
 
-		// Only reveal vector entries for nodes the client already knows about (it reported
-		// them), its own, and the nodes whose in-scope operations it is about to receive.
-		// The full vector would leak every device id and write count across tenants.
-		const visibleNodes = new Set(clientVector.keys())
-		visibleNodes.add(msg.nodeId)
+		// Only reveal vector entries for the client's own node and the nodes whose in-scope
+		// operations it is about to receive. The full vector would leak every device id and
+		// write count across tenants, and echoing the nodes the client names in its own
+		// vector would make the handshake a write-count oracle for any device id (RT-7).
+		// The client only reads its own entry (pending count and upload delta).
+		const visibleNodes = new Set<string>([msg.nodeId])
 		const plannedOps = deliveryPlan
 			? deliveryPlan.deliverable.filter((item) => !item.retraction).map((item) => item.operation)
 			: deltaPlan
@@ -1205,6 +1277,18 @@ export class ClientSession {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
+		// Refuse an oversized batch before decoding it or reading the store (RT-6). The
+		// whole batch is refused and nothing is acknowledged, so a client that sent it
+		// legitimately can split it and resubmit; no operation is lost.
+		if (msg.operations.length > this.maxOpsPerBatch) {
+			this.rejectedBatches += 1
+			this.sendError(
+				'BATCH_TOO_LARGE',
+				`Operation batch "${msg.messageId}" holds ${String(msg.operations.length)} operations; the limit is ${String(this.maxOpsPerBatch)} per batch. Send smaller batches.`,
+				false,
+			)
+			return
+		}
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
 		const applied: Operation[] = []
 		let acknowledgedThrough = 0
@@ -1215,6 +1299,20 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+
+			// Charge the rate limiter before anything that touches the store (RT-6): a
+			// refused operation (foreign node, out of scope) still costs a store read, so
+			// it must count against the budget like an accepted one.
+			if (!this.rateLimiter.allow(1)) {
+				this.rateLimitedOperations += 1
+				this.sendError(
+					'RATE_LIMIT',
+					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
+					true,
+				)
+				canAdvanceAck = false
 				continue
 			}
 
@@ -1262,16 +1360,6 @@ export class ClientSession {
 					'INVALID_TIMESTAMP',
 					`Operation "${op.id}" timestamp is too far in the future`,
 					false,
-				)
-				canAdvanceAck = false
-				continue
-			}
-
-			if (!this.rateLimiter.allow(1)) {
-				this.sendError(
-					'RATE_LIMIT',
-					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
-					true,
 				)
 				canAdvanceAck = false
 				continue
@@ -1350,6 +1438,8 @@ export class ClientSession {
 			const uplinkScopes = this.uplinkScopes()
 			const applyResult = await applyServerOperation(this.store, serverOp, undefined, {
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
+				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
+				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
 			})
 			if (applyResult.rejection) {
 				this.sendOperationRejected(
@@ -1639,11 +1729,13 @@ export class ClientSession {
 	private async operationVisibleToClient(op: Operation): Promise<boolean> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
-		// A partial update (or a delete) may not carry the scope / query-subset fields
-		// in its own data. Judging visibility from the bare op would wrongly hide such
-		// an operation, so backfill those fields from the materialized record (including
-		// a soft-deleted one) whenever they are missing. Only look up when needed so the
-		// common case (inserts, or ops that already carry the fields) stays lookup-free.
+		// Visibility is judged on the server-materialized row plus op.data, never on the
+		// writer's previousData (RT-3: it is unverified, so it could push an op into
+		// another tenant's log or hide it from the writer's own devices). A partial
+		// update (or a delete) may not carry the scope / query-subset fields in its own
+		// data, so backfill them from the materialized record (including a soft-deleted
+		// one) whenever they are missing. Only look up when needed so the common case
+		// (inserts, or ops that already carry the fields) stays lookup-free.
 		const needsBackfill =
 			missingScopeFields(op, scopes).length > 0 || (subsets !== undefined && subsets.length > 0)
 		const fullRecord = needsBackfill

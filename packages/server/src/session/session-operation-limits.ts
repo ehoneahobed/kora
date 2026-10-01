@@ -6,6 +6,9 @@ export const DEFAULT_MAX_OPERATION_BYTES = 256 * 1024
 /** Default maximum operations accepted per client session per minute. */
 export const DEFAULT_MAX_OPS_PER_MINUTE = 600
 
+/** Default largest operation batch a session accepts in one message. */
+export const DEFAULT_MAX_OPS_PER_BATCH = 1000
+
 /**
  * Approximate UTF-8 byte length of an operation payload for rate/size guards.
  */

@@ -21,6 +21,7 @@ import type {
 	MaterializedRecord,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -281,13 +282,40 @@ export class SqliteServerStore implements ServerStore {
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		const now = Date.now()
+		// better-sqlite3 runs these synchronously, so no other claim interleaves.
+		// A fresh claim is only created for a node without history: history with no
+		// claim predates node claims, so its writer is unknown (RT-5).
 		this.db.run(
-			sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at) VALUES (${nodeId}, ${userId}, ${Date.now()})`,
+			sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at)
+				SELECT ${nodeId}, ${userId}, ${now}
+				WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)
+		// An admin-released node is taken over by its next claimant.
+		this.db.run(
+			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
+				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
 		)
 		const rows = this.db.all<{ user_id: string }>(
 			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
 		)
 		return rows[0]?.user_id === userId
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		const known = this.db.all<{ one: number }>(
+			sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
+				OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)
+		if (known.length === 0) return false
+		this.db.run(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
+		)
+		return true
 	}
 
 	/**

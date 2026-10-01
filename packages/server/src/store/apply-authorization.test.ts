@@ -110,6 +110,32 @@ describe.each(stores)('%s in-store uplink authorization', (_name, create) => {
 		expect(await store.claimNode?.('device-1', 'mallory')).toBe(false)
 		expect(await store.claimNode?.('device-2', 'mallory')).toBe(true)
 	})
+
+	test('an unclaimed node with operation history cannot be claimed (RT-5)', async () => {
+		const store = await create(false)
+		await store.applyRemoteOperation(op({ nodeId: 'node-1' }))
+		expect(await store.claimNode?.('node-1', 'mallory')).toBe(false)
+		expect(await store.claimNode?.('node-1', 'alice')).toBe(false)
+	})
+
+	test('an admin release lets the next claimant take the node over, once (RT-5)', async () => {
+		const store = await create(false)
+		await store.applyRemoteOperation(op({ nodeId: 'node-1' }))
+		expect(await store.releaseNodeClaim?.('node-1')).toBe(true)
+		expect(await store.claimNode?.('node-1', 'alice')).toBe(true)
+		expect(await store.claimNode?.('node-1', 'mallory')).toBe(false)
+		expect(await store.claimNode?.('node-1', 'alice')).toBe(true)
+		// A claimed node can be released and reassigned too.
+		expect(await store.releaseNodeClaim?.('node-1')).toBe(true)
+		expect(await store.claimNode?.('node-1', 'bob')).toBe(true)
+		expect(await store.claimNode?.('node-1', 'alice')).toBe(false)
+	})
+
+	test('releasing an unknown node reports false and never yields an empty owner', async () => {
+		const store = await create(false)
+		expect(await store.releaseNodeClaim?.('nobody')).toBe(false)
+		expect(await store.claimNode?.('fresh', '')).toBe(false)
+	})
 })
 
 describe('applyServerOperation with authorize', () => {

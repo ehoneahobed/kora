@@ -70,14 +70,34 @@ describe('operationMatchesScope', () => {
 		expect(operationMatchesScope(op, scope)).toBe(false)
 	})
 
-	test('matches update operation using merged previousData and data', () => {
+	// previousData is writer-supplied; it is only layered in when the caller opts in
+	// (a client judging its own local view). By default it is ignored (RT-3).
+	const trusted = { includePreviousData: true }
+
+	test('ignores previousData by default', () => {
 		const op = createOp({
 			type: 'update',
 			data: { title: 'Updated' },
 			previousData: { userId: 'user-1', title: 'Old' },
 		})
 		const scope: SyncScopeMap = { todos: { userId: 'user-1' } }
-		expect(operationMatchesScope(op, scope)).toBe(true)
+		expect(operationMatchesScope(op, scope)).toBe(false)
+		expect(operationMatchesScope(op, scope, { userId: 'user-1' })).toBe(true)
+		expect(
+			operationMatchesScope({ ...op, previousData: { userId: 'user-2' } }, scope, {
+				userId: 'user-1',
+			}),
+		).toBe(true)
+	})
+
+	test('matches update operation using merged previousData and data when opted in', () => {
+		const op = createOp({
+			type: 'update',
+			data: { title: 'Updated' },
+			previousData: { userId: 'user-1', title: 'Old' },
+		})
+		const scope: SyncScopeMap = { todos: { userId: 'user-1' } }
+		expect(operationMatchesScope(op, scope, undefined, trusted)).toBe(true)
 	})
 
 	test('data fields override previousData in snapshot', () => {
@@ -88,17 +108,17 @@ describe('operationMatchesScope', () => {
 		})
 		const scope: SyncScopeMap = { todos: { userId: 'user-1' } }
 		// After merge, userId is 'user-2' (from data), so it should NOT match
-		expect(operationMatchesScope(op, scope)).toBe(false)
+		expect(operationMatchesScope(op, scope, undefined, trusted)).toBe(false)
 	})
 
-	test('matches delete operation using previousData', () => {
+	test('matches delete operation using previousData when opted in', () => {
 		const op = createOp({
 			type: 'delete',
 			data: null,
 			previousData: { userId: 'user-1', title: 'Deleted' },
 		})
 		const scope: SyncScopeMap = { todos: { userId: 'user-1' } }
-		expect(operationMatchesScope(op, scope)).toBe(true)
+		expect(operationMatchesScope(op, scope, undefined, trusted)).toBe(true)
 	})
 
 	test('returns false when operation has null data and null previousData', () => {
