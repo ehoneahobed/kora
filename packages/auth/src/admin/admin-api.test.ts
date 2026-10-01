@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'vitest'
 import { InMemoryUserStore } from '../provider/built-in/user-store'
 import { InMemorySessionStore } from '../session/session'
 import type { Session } from '../session/session'
-import { AdminApi, AdminUserNotFoundError } from './admin-api'
+import { AdminApi, AdminUnauthorizedError, AdminUserNotFoundError } from './admin-api'
 import { AuditLogger, InMemoryAuditLogStore } from './audit-log'
 
 async function createTestUser(
@@ -333,5 +333,23 @@ describe('AdminApi without optional dependencies', () => {
 		const userId = await createTestUser(userStore, 'alice@example.com')
 		// Should not throw even without audit logger
 		await admin.deleteUser('admin', userId)
+	})
+})
+
+describe('AdminApi authorization and credential revocation (AUTH-14)', () => {
+	test('enforces isAdmin and revokes every credential on session revoke and delete', async () => {
+		const userStore = new InMemoryUserStore()
+		const userId = await createTestUser(userStore, 'target@example.com')
+		const admin = new AdminApi({ userStore, isAdmin: (id) => id === 'root' })
+
+		await expect(admin.revokeUserSessions('mallory', userId)).rejects.toBeInstanceOf(
+			AdminUnauthorizedError,
+		)
+		expect(await userStore.getTokenRevocationStore().getUserRevokedBefore(userId)).toBeNull()
+
+		await admin.revokeUserSessions('root', userId)
+		expect(await userStore.getTokenRevocationStore().getUserRevokedBefore(userId)).not.toBeNull()
+		await admin.deleteUser('root', userId)
+		expect(await userStore.findById(userId)).toBeNull()
 	})
 })

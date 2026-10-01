@@ -320,6 +320,7 @@ export {
 	verifyWebhookSignature,
 	WebhookError,
 	WebhookEndpointNotFoundError,
+	WebhookTargetError,
 } from './admin/webhooks'
 export type {
 	WebhookEvent,

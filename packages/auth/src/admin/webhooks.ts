@@ -200,10 +200,30 @@ const RETRY_DELAYS_MS = [1000, 5000, 30000] // 1s, 5s, 30s
 export class WebhookManager {
 	private readonly store: WebhookStore
 	private readonly fetchFn: typeof globalThis.fetch
+	private readonly allowPrivateTargets: boolean
+	private readonly resolveHost: ((host: string) => Promise<string[]>) | null
 
-	constructor(config: { store: WebhookStore; fetch?: typeof globalThis.fetch }) {
+	/**
+	 * @param config.store - Endpoint and delivery storage
+	 * @param config.fetch - Custom fetch. A custom fetch (for example through an
+	 *   egress proxy) owns its own network policy, so Kora skips its delivery-time
+	 *   DNS check unless `resolveHost` is also given.
+	 * @param config.allowPrivateTargets - Development only: allow http:// and
+	 *   loopback/private/link-local targets. Default false.
+	 * @param config.resolveHost - Resolve a hostname to addresses at delivery time
+	 *   (defaults to node:dns when no custom fetch is given), so a public name that
+	 *   points at a private address is refused (SSRF, DNS rebinding).
+	 */
+	constructor(config: {
+		store: WebhookStore
+		fetch?: typeof globalThis.fetch
+		allowPrivateTargets?: boolean
+		resolveHost?: (host: string) => Promise<string[]>
+	}) {
 		this.store = config.store
 		this.fetchFn = config.fetch ?? globalThis.fetch.bind(globalThis)
+		this.allowPrivateTargets = config.allowPrivateTargets === true
+		this.resolveHost = config.resolveHost ?? (config.fetch ? null : resolveWithNodeDns)
 	}
 
 	/**
@@ -214,6 +234,7 @@ export class WebhookManager {
 		events: WebhookEvent[]
 		metadata?: Record<string, unknown>
 	}): Promise<WebhookEndpoint> {
+		assertSafeWebhookUrl(params.url, this.allowPrivateTargets)
 		const endpoint: WebhookEndpoint = {
 			id: generateId(),
 			url: params.url,
@@ -240,7 +261,10 @@ export class WebhookManager {
 			throw new WebhookEndpointNotFoundError(id)
 		}
 
-		if (updates.url !== undefined) endpoint.url = updates.url
+		if (updates.url !== undefined) {
+			assertSafeWebhookUrl(updates.url, this.allowPrivateTargets)
+			endpoint.url = updates.url
+		}
 		if (updates.events !== undefined) endpoint.events = [...updates.events]
 		if (updates.active !== undefined) endpoint.active = updates.active
 
@@ -307,8 +331,6 @@ export class WebhookManager {
 		payloadJson: string,
 		event: WebhookEvent,
 	): Promise<void> {
-		const signature = await signPayload(payloadJson, endpoint.secret)
-
 		const delivery: WebhookDelivery = {
 			id: generateId(),
 			endpointId: endpoint.id,
@@ -327,15 +349,22 @@ export class WebhookManager {
 			delivery.lastAttemptAt = Date.now()
 
 			try {
+				await this.assertDeliverable(endpoint.url)
+				// Sign the timestamp together with the body, so a captured delivery
+				// cannot be replayed later (AUTH-14).
+				const timestamp = Math.floor(Date.now() / 1000)
+				const signature = await signPayload(`${timestamp}.${payloadJson}`, endpoint.secret)
 				const response = await this.fetchFn(endpoint.url, {
 					method: 'POST',
 					headers: {
 						'Content-Type': 'application/json',
-						'X-Webhook-Signature': signature,
+						'X-Webhook-Signature': `t=${timestamp},v1=${signature}`,
+						'X-Webhook-Timestamp': String(timestamp),
 						'X-Webhook-Event': event,
 						'X-Webhook-Delivery': delivery.id,
 					},
 					body: payloadJson,
+					redirect: 'manual',
 				})
 
 				delivery.responseStatus = response.status
@@ -360,6 +389,100 @@ export class WebhookManager {
 		// All retries exhausted
 		await this.store.saveDelivery(delivery)
 	}
+
+	private async assertDeliverable(url: string): Promise<void> {
+		assertSafeWebhookUrl(url, this.allowPrivateTargets)
+		if (this.allowPrivateTargets || !this.resolveHost) return
+		const host = new URL(url).hostname
+		const addresses = await this.resolveHost(host)
+		if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
+			throw new WebhookTargetError(url)
+		}
+	}
+}
+
+/** Thrown when a webhook URL points at a non-public target. */
+export class WebhookTargetError extends WebhookError {
+	constructor(url: string) {
+		super('Webhook URLs must be https and resolve to public addresses.', 'WEBHOOK_TARGET_REFUSED', {
+			url,
+		})
+		this.name = 'WebhookTargetError'
+	}
+}
+
+function assertSafeWebhookUrl(url: string, allowPrivate: boolean): void {
+	let parsed: URL
+	try {
+		parsed = new URL(url)
+	} catch {
+		throw new WebhookTargetError(url)
+	}
+	if (allowPrivate) {
+		if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
+			throw new WebhookTargetError(url)
+		return
+	}
+	if (parsed.protocol !== 'https:') throw new WebhookTargetError(url)
+	const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+	if (host === 'localhost' || host.endsWith('.localhost') || isPrivateAddress(host)) {
+		throw new WebhookTargetError(url)
+	}
+}
+
+/**
+ * True for loopback, private (RFC 1918 / ULA), link-local (incl. cloud metadata
+ * 169.254.169.254), CGNAT, unspecified and IPv4-mapped private addresses.
+ * Non-IP strings return false (hostnames are checked after resolution).
+ */
+function isPrivateAddress(address: string): boolean {
+	let host = address.replace(/^\[|\]$/g, '').toLowerCase()
+	// URL() normalizes IPv4-mapped IPv6 to hex groups (::ffff:c0a8:1).
+	const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host)
+	if (mapped) {
+		const hi = Number.parseInt(mapped[1] as string, 16)
+		const lo = Number.parseInt(mapped[2] as string, 16)
+		host = `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`
+	}
+	const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(
+		host.startsWith('::ffff:') ? host.slice(7) : host,
+	)
+	if (v4) {
+		const [a, b] = [Number(v4[1]), Number(v4[2])]
+		return (
+			a === 0 ||
+			a === 10 ||
+			a === 127 ||
+			(a === 169 && b === 254) ||
+			(a === 172 && b >= 16 && b <= 31) ||
+			(a === 192 && b === 168) ||
+			(a === 100 && b >= 64 && b <= 127) ||
+			a >= 224
+		)
+	}
+	if (host.includes(':')) {
+		return (
+			host === '::' ||
+			host === '::1' ||
+			host.startsWith('fe8') ||
+			host.startsWith('fe9') ||
+			host.startsWith('fea') ||
+			host.startsWith('feb') ||
+			host.startsWith('fc') ||
+			host.startsWith('fd') ||
+			host.startsWith('ff')
+		)
+	}
+	return false
+}
+
+async function resolveWithNodeDns(host: string): Promise<string[]> {
+	if (isPrivateAddress(host) || /^[\d.]+$/.test(host) || host.includes(':')) return [host]
+	const dns = (await import('node:dns/promises')) as {
+		lookup(h: string, o: { all: true }): Promise<Array<{ address: string }>>
+	}
+	const results = await dns.lookup(host, { all: true })
+	return results.map((r) => r.address)
 }
 
 // ============================================================================
@@ -404,24 +527,46 @@ async function signPayload(payload: string, secret: string): Promise<string> {
 	for (let i = 0; i < bytes.length; i++) {
 		hex += bytes[i]?.toString(16).padStart(2, '0')
 	}
-	return `sha256=${hex}`
+	return hex
 }
 
+/** Default accepted age of a webhook delivery: 5 minutes. */
+const DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
+
 /**
- * Verify a webhook payload signature.
- * Useful for consumers of webhooks to verify authenticity.
+ * Verify a webhook payload signature (`X-Webhook-Signature: t=<unix>,v1=<hex>`).
+ *
+ * The HMAC covers `${t}.${payload}`, and a delivery older (or newer) than
+ * `toleranceSeconds` is rejected, so a captured delivery cannot be replayed.
+ *
+ * @param payload - The raw request body
+ * @param signature - The `X-Webhook-Signature` header
+ * @param secret - The endpoint secret
+ * @param options - `toleranceSeconds` (default 300)
+ * @returns True when the signature is valid and fresh
  */
 export async function verifyWebhookSignature(
 	payload: string,
 	signature: string,
 	secret: string,
+	options: { toleranceSeconds?: number } = {},
 ): Promise<boolean> {
-	const expected = await signPayload(payload, secret)
+	const parts = new Map<string, string>()
+	for (const piece of signature.split(',')) {
+		const index = piece.indexOf('=')
+		if (index > 0) parts.set(piece.slice(0, index).trim(), piece.slice(index + 1).trim())
+	}
+	const timestamp = Number(parts.get('t'))
+	const provided = parts.get('v1')
+	if (!Number.isInteger(timestamp) || !provided) return false
+	const tolerance = options.toleranceSeconds ?? DEFAULT_SIGNATURE_TOLERANCE_SECONDS
+	if (Math.abs(Math.floor(Date.now() / 1000) - timestamp) > tolerance) return false
+	const expected = await signPayload(`${timestamp}.${payload}`, secret)
 	// Timing-safe comparison
-	if (expected.length !== signature.length) return false
+	if (expected.length !== provided.length) return false
 	let result = 0
 	for (let i = 0; i < expected.length; i++) {
-		result |= expected.charCodeAt(i) ^ signature.charCodeAt(i)
+		result |= expected.charCodeAt(i) ^ provided.charCodeAt(i)
 	}
 	return result === 0
 }

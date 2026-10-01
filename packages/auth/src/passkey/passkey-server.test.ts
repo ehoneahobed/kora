@@ -419,8 +419,8 @@ describe('verifyRegistrationResponse', () => {
 			await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRpId)),
 		)
 
-		// Flags: UP (0x01) | AT (0x40) = 0x41
-		const flags = 0x41
+		// Flags: UP (0x01) | UV (0x04) | AT (0x40) = 0x45 (UV is required since AUTH-14)
+		const flags = 0x45
 
 		// Sign count: 1 (big-endian uint32)
 		const signCount = new Uint8Array([0x00, 0x00, 0x00, 0x01])
@@ -865,7 +865,7 @@ describe('verifyAuthenticationResponse', () => {
 		// Construct authData with sign count = 5
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
-		authData[32] = 0x01 // UP flag
+		authData[32] = 0x05 // UP | UV flags
 		// signCount = 5 (big-endian at bytes 33-36)
 		authData[33] = 0x00
 		authData[34] = 0x00
@@ -906,7 +906,7 @@ describe('verifyAuthenticationResponse', () => {
 		// authData with signCount = 0, UP flag
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
-		authData[32] = 0x01
+		authData[32] = 0x05 // UP | UV
 
 		// Use a real key pair so the COSE key contains valid EC point coordinates
 		const keyPair = await globalThis.crypto.subtle.generateKey(
@@ -1029,7 +1029,7 @@ describe('verifyAuthenticationResponse', () => {
 		)
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
-		authData[32] = 0x01 // UP flag
+		authData[32] = 0x05 // UP | UV flags
 		// signCount = 1
 		authData[36] = 0x01
 
@@ -1121,7 +1121,7 @@ describe('verifyAuthenticationResponse', () => {
 		)
 		const authData = new Uint8Array(37)
 		authData.set(rpIdHash, 0)
-		authData[32] = 0x01
+		authData[32] = 0x05 // UP | UV
 		authData[36] = 0x01
 
 		// Sign with the correct key but then tamper with the data
