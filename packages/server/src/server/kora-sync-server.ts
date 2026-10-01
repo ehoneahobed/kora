@@ -104,6 +104,7 @@ export class KoraSyncServer {
 		| null
 	private readonly maxOperationBytes: number | undefined
 	private readonly maxOpsPerMinute: number | undefined
+	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
@@ -193,6 +194,15 @@ export class KoraSyncServer {
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
+		if (
+			config.maxOpsPerBatch !== undefined &&
+			(!Number.isInteger(config.maxOpsPerBatch) || config.maxOpsPerBatch < 1)
+		) {
+			throw new SyncError('maxOpsPerBatch must be a positive integer', {
+				maxOpsPerBatch: config.maxOpsPerBatch,
+			})
+		}
+		this.maxOpsPerBatch = config.maxOpsPerBatch
 		this.validateOperation = config.validateOperation
 		// One trusted data-plane context, shared by custom HTTP routes (via
 		// production-server) and by the operation validator. It holds no per-request
@@ -789,6 +799,7 @@ export class KoraSyncServer {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			...(this.maxOpsPerMinute !== undefined ? { maxOpsPerMinute: this.maxOpsPerMinute } : {}),
+			...(this.maxOpsPerBatch !== undefined ? { maxOpsPerBatch: this.maxOpsPerBatch } : {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),

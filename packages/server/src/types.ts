@@ -175,6 +175,13 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerMinute?: number
 	/**
+	 * Largest operation batch accepted from a client in one message. A larger batch is
+	 * refused whole with `BATCH_TOO_LARGE` before the server decodes it or reads the
+	 * store, so one message cannot buy unbounded work. Defaults to 1000 (the client
+	 * sends batches of 100 by default).
+	 */
+	maxOpsPerBatch?: number
+	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *
 	 * Runs at sync ingestion for every incoming client operation, after HLC

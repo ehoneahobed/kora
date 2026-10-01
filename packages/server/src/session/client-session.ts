@@ -60,6 +60,7 @@ import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import {
 	DEFAULT_MAX_OPERATION_BYTES,
+	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
 	SessionRateLimiter,
 	validateOperationSize,
@@ -279,6 +280,11 @@ export interface ClientSessionOptions {
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
 	maxOpsPerMinute?: number
 	/**
+	 * Largest operation batch accepted in one message. A larger batch is refused whole
+	 * (`BATCH_TOO_LARGE`) before it is decoded or the store is read. Defaults to 1000.
+	 */
+	maxOpsPerBatch?: number
+	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
 	 * sends an operation-rejected message and skips materialization.
@@ -392,7 +398,12 @@ export class ClientSession {
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
+	private readonly maxOpsPerBatch: number
 	private readonly rateLimiter: SessionRateLimiter
+	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
+	private rateLimitedOperations = 0
+	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
+	private rejectedBatches = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 
@@ -428,6 +439,7 @@ export class ClientSession {
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 	}
@@ -726,6 +738,17 @@ export class ClientSession {
 
 	isStreaming(): boolean {
 		return this.state === 'streaming'
+	}
+
+	/**
+	 * Ingest refusals that happen before any store work (RT-6): operations refused by
+	 * the per-minute rate limiter and batches refused for exceeding the per-batch cap.
+	 */
+	getIngestLimitCounts(): { rateLimitedOperations: number; rejectedBatches: number } {
+		return {
+			rateLimitedOperations: this.rateLimitedOperations,
+			rejectedBatches: this.rejectedBatches,
+		}
 	}
 
 	/**
@@ -1132,11 +1155,12 @@ export class ClientSession {
 				: null
 		const deltaPlan = deliveryPlan === null ? await this.collectDeltaOperations(clientVector) : []
 
-		// Only reveal vector entries for nodes the client already knows about (it reported
-		// them), its own, and the nodes whose in-scope operations it is about to receive.
-		// The full vector would leak every device id and write count across tenants.
-		const visibleNodes = new Set(clientVector.keys())
-		visibleNodes.add(msg.nodeId)
+		// Only reveal vector entries for the client's own node and the nodes whose in-scope
+		// operations it is about to receive. The full vector would leak every device id and
+		// write count across tenants, and echoing the nodes the client names in its own
+		// vector would make the handshake a write-count oracle for any device id (RT-7).
+		// The client only reads its own entry (pending count and upload delta).
+		const visibleNodes = new Set<string>([msg.nodeId])
 		const plannedOps = deliveryPlan
 			? deliveryPlan.deliverable.filter((item) => !item.retraction).map((item) => item.operation)
 			: deltaPlan
@@ -1214,6 +1238,18 @@ export class ClientSession {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
+		// Refuse an oversized batch before decoding it or reading the store (RT-6). The
+		// whole batch is refused and nothing is acknowledged, so a client that sent it
+		// legitimately can split it and resubmit; no operation is lost.
+		if (msg.operations.length > this.maxOpsPerBatch) {
+			this.rejectedBatches += 1
+			this.sendError(
+				'BATCH_TOO_LARGE',
+				`Operation batch "${msg.messageId}" holds ${String(msg.operations.length)} operations; the limit is ${String(this.maxOpsPerBatch)} per batch. Send smaller batches.`,
+				false,
+			)
+			return
+		}
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
 		const applied: Operation[] = []
 		let acknowledgedThrough = 0
@@ -1224,6 +1260,20 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+
+			// Charge the rate limiter before anything that touches the store (RT-6): a
+			// refused operation (foreign node, out of scope) still costs a store read, so
+			// it must count against the budget like an accepted one.
+			if (!this.rateLimiter.allow(1)) {
+				this.rateLimitedOperations += 1
+				this.sendError(
+					'RATE_LIMIT',
+					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
+					true,
+				)
+				canAdvanceAck = false
 				continue
 			}
 
@@ -1271,16 +1321,6 @@ export class ClientSession {
 					'INVALID_TIMESTAMP',
 					`Operation "${op.id}" timestamp is too far in the future`,
 					false,
-				)
-				canAdvanceAck = false
-				continue
-			}
-
-			if (!this.rateLimiter.allow(1)) {
-				this.sendError(
-					'RATE_LIMIT',
-					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
-					true,
 				)
 				canAdvanceAck = false
 				continue
