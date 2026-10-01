@@ -32,6 +32,7 @@ export {
 
 // === Scope Filtering ===
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
+export type { ScopeSnapshotOptions } from './scopes/scope-snapshot'
 export {
 	dedupeQuerySubsets,
 	querySubsetContains,

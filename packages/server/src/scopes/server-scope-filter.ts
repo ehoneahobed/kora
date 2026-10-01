@@ -5,6 +5,7 @@ import {
 	matchesScopePredicate,
 	recordMatchesScopePredicates,
 } from '@korajs/sync/internal'
+import { ScopePredicateLimitError, assertScopeValuesDefined } from './scope-predicate-errors'
 
 /**
  * Per-collection scope map from auth context.
@@ -13,11 +14,20 @@ export type ScopeMap = Record<string, Record<string, unknown>>
 
 export const DEFAULT_MAX_SCOPE_PREDICATE_VALUES = 100
 
-/** Canonicalize bounded `$in` predicates so equivalent authorization has one signature. */
+/**
+ * Canonicalize bounded `$in` predicates so equivalent authorization has one signature.
+ *
+ * Fails closed: an `undefined`/`null` predicate value (also inside `$in`) would match
+ * every record lacking the field, so it is refused (RT-8).
+ *
+ * @throws {InvalidScopePredicateError} On an undefined/null predicate value
+ * @throws {ScopePredicateLimitError} On a malformed or oversized `$in`
+ */
 export function normalizeScopeMap(
 	scopes: ScopeMap,
 	maxValues = DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
 ): ScopeMap {
+	assertScopeValuesDefined(scopes)
 	const normalized: ScopeMap = {}
 	for (const collection of Object.keys(scopes).sort()) {
 		const predicate: Record<string, unknown> = {}
@@ -31,11 +41,15 @@ export function normalizeScopeMap(
 			) {
 				const values = (expected as { $in?: unknown }).$in
 				if (!Array.isArray(values))
-					throw new Error(`Invalid $in predicate for ${collection}.${field}`)
+					throw new ScopePredicateLimitError(`Invalid $in predicate for ${collection}.${field}`, {
+						collection,
+						field,
+					})
 				const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).values()]
 				if (unique.length > maxValues)
-					throw new Error(
+					throw new ScopePredicateLimitError(
 						`Scope predicate for ${collection}.${field} exceeds the ${maxValues}-value limit`,
+						{ collection, field, maxValues },
 					)
 				predicate[field] = {
 					$in: unique.sort((a, b) => stableValueKey(a).localeCompare(stableValueKey(b))),

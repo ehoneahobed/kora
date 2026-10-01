@@ -41,6 +41,7 @@ import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
 import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
+import { InvalidScopePredicateError } from '../scopes/scope-predicate-errors'
 import {
 	type ScopeMap,
 	type UplinkAuthorizationResult,
@@ -979,6 +980,11 @@ export class ClientSession {
 				onUnresolved: 'throw',
 			})
 		} catch (error) {
+			if (error instanceof InvalidScopePredicateError) {
+				this.sendError('INVALID_SCOPE_PREDICATE', error.message, false)
+				this.close('invalid scope predicate')
+				return
+			}
 			if (!(error instanceof ScopeRequiredError)) throw error
 			this.sendError('SCOPE_REQUIRED', error.message, false)
 			this.close('sync scope required')
@@ -1004,7 +1010,10 @@ export class ClientSession {
 			this.sendToClient({
 				type: 'error',
 				messageId: generateUUIDv7(),
-				code: 'SCOPE_PREDICATE_LIMIT',
+				code:
+					error instanceof InvalidScopePredicateError
+						? 'INVALID_SCOPE_PREDICATE'
+						: 'SCOPE_PREDICATE_LIMIT',
 				message: error instanceof Error ? error.message : 'Invalid scope predicate',
 				retriable: false,
 			})
@@ -1639,11 +1648,13 @@ export class ClientSession {
 	private async operationVisibleToClient(op: Operation): Promise<boolean> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
-		// A partial update (or a delete) may not carry the scope / query-subset fields
-		// in its own data. Judging visibility from the bare op would wrongly hide such
-		// an operation, so backfill those fields from the materialized record (including
-		// a soft-deleted one) whenever they are missing. Only look up when needed so the
-		// common case (inserts, or ops that already carry the fields) stays lookup-free.
+		// Visibility is judged on the server-materialized row plus op.data, never on the
+		// writer's previousData (RT-3: it is unverified, so it could push an op into
+		// another tenant's log or hide it from the writer's own devices). A partial
+		// update (or a delete) may not carry the scope / query-subset fields in its own
+		// data, so backfill them from the materialized record (including a soft-deleted
+		// one) whenever they are missing. Only look up when needed so the common case
+		// (inserts, or ops that already carry the fields) stays lookup-free.
 		const needsBackfill =
 			missingScopeFields(op, scopes).length > 0 || (subsets !== undefined && subsets.length > 0)
 		const fullRecord = needsBackfill
