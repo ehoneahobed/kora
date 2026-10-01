@@ -9,6 +9,8 @@ export type {
 	HttpSyncResponse,
 	KoraSyncServerConfig,
 	ServerStatus,
+	SessionRevocation,
+	TerminateSessionsFilter,
 } from './types'
 
 export type {
@@ -98,7 +100,7 @@ export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
 export { HttpServerTransport } from './transport/http-server-transport'
 export { WsServerTransport } from './transport/ws-server-transport'
-export { ClientSession } from './session/client-session'
+export { ClientSession, type SessionTerminationCode } from './session/client-session'
 export { KoraSyncServer } from './server/kora-sync-server'
 export { NoAuthProvider } from './auth/no-auth'
 export { TokenAuthProvider } from './auth/token-auth'

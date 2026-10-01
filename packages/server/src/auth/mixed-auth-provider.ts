@@ -88,7 +88,16 @@ export class MixedAuthProvider implements AuthProvider {
 		this.primary = options.primary
 		this.anonymousScopes = options.anonymousScopes
 		this.anonymousPrefix = options.anonymousPrefix ?? 'anon'
+		// Forward the primary provider's revocation feed, so wrapping it does not
+		// silently stop revoked sessions from being terminated (AUTH-11).
+		const primary = this.primary
+		if (primary.onRevoke) {
+			this.onRevoke = (listener) => primary.onRevoke?.(listener) ?? (() => {})
+		}
 	}
+
+	/** The primary provider's revocation feed, when it has one. */
+	onRevoke?: AuthProvider['onRevoke']
 
 	async authenticate(token: string): Promise<AuthContext | null> {
 		// A presented credential is either valid or rejected. It is never silently

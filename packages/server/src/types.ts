@@ -38,6 +38,35 @@ export interface AuthProvider {
 	 * @returns AuthContext if valid, null if rejected
 	 */
 	authenticate(token: string): Promise<AuthContext | null>
+	/**
+	 * Optional revocation feed. When present, `KoraSyncServer` subscribes on
+	 * construction and calls {@link KoraSyncServer.terminateSessions} for every
+	 * event, so a revoked device or user loses its live sync sessions immediately
+	 * (AUTH-11). The built-in `createKoraAuthServer().auth` provides it.
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRevoke?(listener: (event: SessionRevocation) => void | Promise<void>): () => void
+}
+
+/**
+ * Which live sync sessions a credential revocation ends. `userId` alone ends
+ * every session of that user; with `deviceId` only that device's sessions
+ * (matched against `AuthContext.metadata.deviceId`).
+ */
+export interface SessionRevocation {
+	userId?: string
+	deviceId?: string
+}
+
+/** Options for {@link KoraSyncServer.terminateSessions}. */
+export interface TerminateSessionsFilter extends SessionRevocation {
+	/**
+	 * Error code sent to the client before the session closes. Both are retriable:
+	 * the client refreshes its credentials and re-handshakes, and the server then
+	 * decides again. Defaults to `'AUTH_REVOKED'`.
+	 */
+	code?: 'AUTH_REVOKED' | 'AUTH_EXPIRED'
 }
 
 /**

@@ -915,6 +915,26 @@ export class AuthClient {
 	}
 
 	/**
+	 * Refresh the session now, even when the cached access token has not expired
+	 * locally. Used after the sync server ended a session with `AUTH_EXPIRED` or
+	 * `AUTH_REVOKED`: the server's clock or a revocation says the cached token is
+	 * no longer good. Concurrent calls (and other tabs) share one refresh.
+	 *
+	 * A transient failure keeps the session (authenticated-offline) and returns
+	 * null; only a definitive server rejection signs the user out.
+	 *
+	 * @returns The refreshed access token, or null if none could be obtained now
+	 */
+	async refreshAccessToken(): Promise<string | null> {
+		const refreshToken = await this.storage.getRefreshToken()
+		if (!refreshToken) {
+			return null
+		}
+		const outcome = await this.refresh()
+		return outcome.kind === 'ok' ? outcome.accessToken : null
+	}
+
+	/**
 	 * Get a valid token for the sync engine handshake.
 	 * Alias for {@link getAccessToken}.
 	 *

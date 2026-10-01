@@ -100,14 +100,20 @@ describe('AUTH-11: live sync sessions survive revocation', () => {
 			isFinal: true,
 			batchIndex: 0,
 		} as SyncMessage)
-		// ...and to write.
-		stolen.client.send({
-			type: 'operation-batch',
-			messageId: 'b-stolen',
-			operations: [op('laptop', uid, 1, 'written by revoked device')],
-			isFinal: true,
-			batchIndex: 0,
-		} as SyncMessage)
+		// ...and to write. (Once the fix closes the session, the in-memory client
+		// transport refuses to send at all; that is the correct outcome, so a throw
+		// here counts as "the write did not reach the server".)
+		try {
+			stolen.client.send({
+				type: 'operation-batch',
+				messageId: 'b-stolen',
+				operations: [op('laptop', uid, 1, 'written by revoked device')],
+				isFinal: true,
+				batchIndex: 0,
+			} as SyncMessage)
+		} catch {
+			// transport closed by the server
+		}
 		await new Promise((res) => setTimeout(res, 150))
 
 		const got = stolen.messages.flatMap((m) => (m.type === 'operation-batch' ? m.operations : []))

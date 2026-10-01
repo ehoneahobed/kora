@@ -7,6 +7,7 @@ export type {
 	RejectedOperation,
 	RejectedOperationStorage,
 	SyncStatePersistence,
+	SyncAuthRequest,
 	SyncConfig,
 	SyncEncryptionConfig,
 	SyncScopeContext,

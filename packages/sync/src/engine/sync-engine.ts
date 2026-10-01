@@ -83,6 +83,11 @@ const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
 /**
  * Valid state transitions for the sync engine state machine.
  */
+/** Server error codes that end a session because its credential expired or was revoked. */
+function isCredentialEndingCode(code: string): boolean {
+	return code === 'AUTH_EXPIRED' || code === 'AUTH_REVOKED'
+}
+
 const VALID_TRANSITIONS: Record<SyncState, SyncState[]> = {
 	disconnected: ['connecting'],
 	connecting: ['handshaking', 'error', 'disconnected'],
@@ -231,6 +236,12 @@ export class SyncEngine {
 	private blobStorageEnabled = false
 	private suspensionReason: string | null = null
 	private authRejected = false
+	/**
+	 * Set when the server ended the session with AUTH_EXPIRED or AUTH_REVOKED. The
+	 * next connect asks the auth callback for a refreshed token (never the cached
+	 * one the server just refused) and is cleared by an accepted handshake.
+	 */
+	private credentialRefreshRequired = false
 	private serverFrontier: number | null = null
 	private hasInFlightDeliveryBatch = false
 	private blockedFailure: import('../types').ActiveApplyFailure | null = null
@@ -438,8 +449,24 @@ export class SyncEngine {
 		this.transitionTo('connecting')
 
 		try {
-			const authToken = this.config.auth ? (await this.config.auth()).token : undefined
+			const forceRefresh = this.credentialRefreshRequired
+			const authToken = this.config.auth
+				? (await (forceRefresh ? this.config.auth({ forceRefresh: true }) : this.config.auth()))
+						.token
+				: undefined
 			if (this.state !== 'connecting') return
+			if (forceRefresh && !authToken) {
+				// The refresh did not produce a token yet (offline, auth server down).
+				// Handshaking with an empty or stale token would be refused as AUTH_FAILED
+				// and suspend sync for good; fail this attempt so reconnection retries.
+				throw new SyncError(
+					'Waiting for refreshed credentials before reconnecting: the server ended the previous session because its credential expired or was revoked.',
+					{
+						code: 'AUTH_REFRESH_PENDING',
+						fix: 'Sync reconnects automatically once the auth client can refresh its token. If the user was signed out, sign in again.',
+					},
+				)
+			}
 
 			await this.transport.connect(this.config.url, { authToken })
 			if (this.state !== 'connecting') {
@@ -1050,6 +1077,12 @@ export class SyncEngine {
 	private messageChain: Promise<void> = Promise.resolve()
 
 	private enqueueMessage(message: SyncMessage): void {
+		// The server sends a credential-ending error and closes the socket right away.
+		// The close is handled synchronously (and may start a reconnect) before this
+		// queued message is processed, so record the need to refresh now (AUTH-11).
+		if (message.type === 'error' && isCredentialEndingCode(message.code)) {
+			this.credentialRefreshRequired = true
+		}
 		this.messageChain = this.messageChain
 			.then(() => this.handleMessageAsync(message))
 			.catch((error) => this.handleMessageFailure(error))
@@ -1134,6 +1167,10 @@ export class SyncEngine {
 				void this.transport.disconnect()
 				return
 			}
+		}
+
+		if (msg.accepted) {
+			this.credentialRefreshRequired = false
 		}
 
 		if (!msg.accepted) {
@@ -1651,7 +1688,20 @@ export class SyncEngine {
 			this.currentBatchRequiresPartialAck = false
 			this.currentBatchRequiresRetryBackoff = false
 		}
-		this.transitionTo('error')
+		// The server usually closes the socket right after an error, so the close may
+		// already have moved the engine to disconnected. The error still carries
+		// meaning (auth rejection, clock block, credential refresh): record it either way.
+		const live = this.state !== 'disconnected'
+		if (live) {
+			this.transitionTo('error')
+		}
+		if (isCredentialEndingCode(msg.code)) {
+			// The server ended this session because its credential expired or was
+			// revoked (AUTH-11). Not fatal and not a sign-out: refresh, then reconnect.
+			// A truly revoked device is refused at the next handshake (AUTH_FAILED), or
+			// its refresh is rejected and the auth client signs it out.
+			this.credentialRefreshRequired = true
+		}
 		if (msg.code === 'AUTH_FAILED' || msg.code === 'DEVICE_REVOKED') {
 			this.authRejected = true
 			this.suspensionReason = msg.code === 'DEVICE_REVOKED' ? 'device-revoked' : 'auth-rejected'
@@ -1669,11 +1719,15 @@ export class SyncEngine {
 				severity: 'fast-blocked',
 				source: 'server-reject',
 			})
-			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			if (live) {
+				this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			}
 			return
 		}
-		this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
-		this.transitionTo('disconnected')
+		if (live) {
+			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			this.transitionTo('disconnected')
+		}
 	}
 
 	/**

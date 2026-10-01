@@ -1300,6 +1300,14 @@ export class BuiltInAuthRoutes {
 					},
 				}
 			},
+			onRevoke: (listener) =>
+				this.onRevoke((event) =>
+					listener(
+						event.kind === 'user'
+							? { userId: event.userId }
+							: { userId: event.userId, deviceId: event.deviceId },
+					),
+				),
 		}
 	}
 }

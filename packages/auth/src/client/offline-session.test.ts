@@ -253,3 +253,41 @@ describe('sync binding uses the stored identity (LMS-2)', () => {
 		expect(await binding.resolveUserId?.()).toBeUndefined()
 	})
 })
+
+describe('refreshAccessToken (AUTH-11)', () => {
+	async function freshClient(refresh: () => Promise<Response>) {
+		const storage = createMemoryAuthTokenStorage()
+		await storage.setTokens(token('access', 600), token('refresh', 90 * 86400))
+		const calls = { refresh: 0 }
+		const fetchFn = (async (input: RequestInfo | URL) => {
+			if (String(input).endsWith('/auth/refresh')) {
+				calls.refresh++
+				return refresh()
+			}
+			throw new TypeError('offline')
+		}) as typeof fetch
+		const client = new AuthClient({ serverUrl: SERVER, storage, fetch: fetchFn })
+		return { client, storage, calls }
+	}
+
+	it('refreshes even though the cached access token is still valid locally', async () => {
+		const next = token('access', 900, 1)
+		const { client, calls } = await freshClient(async () =>
+			json(200, { data: { accessToken: next, refreshToken: token('refresh', 90 * 86400, 1) } }),
+		)
+		expect(await client.getAccessToken()).not.toBe(next)
+		expect(calls.refresh).toBe(0)
+		expect(await client.refreshAccessToken()).toBe(next)
+		expect(calls.refresh).toBe(1)
+		client.destroy()
+	})
+
+	it('a transient failure keeps the session and returns null', async () => {
+		const { client, storage } = await freshClient(async () => {
+			throw new TypeError('offline')
+		})
+		expect(await client.refreshAccessToken()).toBeNull()
+		expect(await storage.getRefreshToken()).not.toBeNull()
+		client.destroy()
+	})
+})

@@ -31,6 +31,24 @@ describe('createKoraAuthSync', () => {
 		await expect(binding.auth()).resolves.toEqual({ token: 'access-token' })
 	})
 
+	test('forceRefresh refreshes instead of returning the cached token (AUTH-11)', async () => {
+		const authClient = {
+			getAccessToken: vi.fn().mockResolvedValue('cached-token'),
+			refreshAccessToken: vi.fn().mockResolvedValue('fresh-token'),
+		}
+
+		const binding = createKoraAuthSync({ authClient })
+		await expect(binding.auth({ forceRefresh: true })).resolves.toEqual({ token: 'fresh-token' })
+		expect(authClient.getAccessToken).not.toHaveBeenCalled()
+		await expect(binding.auth()).resolves.toEqual({ token: 'cached-token' })
+	})
+
+	test('forceRefresh falls back to getAccessToken for clients without refreshAccessToken', async () => {
+		const authClient = { getAccessToken: vi.fn().mockResolvedValue('cached-token') }
+		const binding = createKoraAuthSync({ authClient })
+		await expect(binding.auth({ forceRefresh: true })).resolves.toEqual({ token: 'cached-token' })
+	})
+
 	test('returns empty token when unauthenticated', async () => {
 		const authClient = {
 			getAccessToken: vi.fn().mockResolvedValue(null),
