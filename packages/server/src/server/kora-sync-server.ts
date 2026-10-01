@@ -14,6 +14,7 @@ import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
@@ -104,6 +105,8 @@ export class KoraSyncServer {
 	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
+	/** Which blob hashes each download scope may obtain (RT-1). */
+	private readonly blobAccess: BlobAccessIndex
 	private readonly persistBlobChunk:
 		| ((hash: string, bytes: Uint8Array) => Promise<void> | void)
 		| null
@@ -190,14 +193,22 @@ export class KoraSyncServer {
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
 		this.metrics.setSchemaVersion(this.schemaVersion)
 		this.blobLimits = config.blobLimits ?? {}
-		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk, {
-			...(this.blobLimits.maxPendingRequestsPerSession !== undefined
-				? { maxPendingPerSession: this.blobLimits.maxPendingRequestsPerSession }
-				: {}),
-			...(this.blobLimits.pendingRequestTtlMs !== undefined
-				? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
-				: {}),
-		})
+		this.blobAccess = new BlobAccessIndex(this.store, config.resolveBlobChunk ?? null)
+		this.blobChunkRelay = new BlobChunkRelay(
+			config.resolveBlobChunk,
+			{
+				canAccess: (sessionId, hash) => this.sessionMayAccessBlob(sessionId, hash),
+				observeVerifiedBytes: (hash, bytes) => this.blobAccess.observeVerifiedBytes(hash, bytes),
+			},
+			{
+				...(this.blobLimits.maxPendingRequestsPerSession !== undefined
+					? { maxPendingPerSession: this.blobLimits.maxPendingRequestsPerSession }
+					: {}),
+				...(this.blobLimits.pendingRequestTtlMs !== undefined
+					? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
+					: {}),
+			},
+		)
 		this.httpSessionIdleTimeoutMs = validateIntervalOption(
 			'httpSessionIdleTimeoutMs',
 			config.httpSessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS,
@@ -392,6 +403,8 @@ export class KoraSyncServer {
 				return
 			}
 			this.lastObservedDeliverySequence = maxDeliverySequence
+			// Records may have changed through another instance: rebuild blob access sets.
+			this.blobAccess.invalidate()
 			for (const session of this.sessions.values()) {
 				session.pushDeliveryStreamIfSupported(0, {
 					serverFrontier: maxDeliverySequence,
@@ -905,10 +918,10 @@ export class KoraSyncServer {
 				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
 			},
 			onBlobChunkRequest: (sourceSessionId, message) => {
-				this.blobChunkRelay.handleRequest(sourceSessionId, message)
+				void this.blobChunkRelay.handleRequest(sourceSessionId, message)
 			},
 			onBlobChunkResponse: (sourceSessionId, message) => {
-				this.blobChunkRelay.handleResponse(sourceSessionId, message)
+				void this.blobChunkRelay.handleResponse(sourceSessionId, message)
 			},
 			...(this.persistBlobChunk ? { persistBlobChunk: this.persistBlobChunk } : {}),
 			...(this.blobLimits.maxChunkBytes !== undefined
@@ -1000,6 +1013,7 @@ export class KoraSyncServer {
 		const result = await applyServerOperation(this.store, op, undefined, options)
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
+			this.blobAccess.invalidate()
 			for (const session of this.sessions.values()) {
 				session.relayOperations(result.appliedOperations)
 			}
@@ -1020,6 +1034,7 @@ export class KoraSyncServer {
 		if (operations.length === 0) {
 			return
 		}
+		this.blobAccess.invalidate()
 		for (const session of this.sessions.values()) {
 			session.relayOperations(operations)
 		}
@@ -1067,7 +1082,19 @@ export class KoraSyncServer {
 
 	// --- Private ---
 
+	/**
+	 * Blob access policy (RT-1): a session may obtain (and be asked for) the bytes
+	 * behind a hash only when it is streaming and a live record inside its download
+	 * scope references that hash.
+	 */
+	private async sessionMayAccessBlob(sessionId: string, hash: string): Promise<boolean> {
+		const session = this.sessions.get(sessionId)
+		if (!session || !session.isStreaming()) return false
+		return this.blobAccess.isReferenced(session.getDownlinkScopes(), hash)
+	}
+
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
+		this.blobAccess.invalidate()
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
 		this.metrics.recordSent(

@@ -1,6 +1,8 @@
+import { hashBlob } from '@korajs/core'
 import {
 	type BlobChunkRequestMessage,
 	type BlobChunkResponseMessage,
+	decodeBlobChunkBytes,
 	encodeBlobChunkBytes,
 } from '@korajs/sync'
 import type { ServerTransport } from '../transport/server-transport'
@@ -12,6 +14,21 @@ import type { ServerTransport } from '../transport/server-transport'
  * forwarding chunk requests to peer sessions and their responses back.
  */
 export type ResolveBlobChunk = (hash: string) => Promise<Uint8Array | null>
+
+/**
+ * Decides which sessions may obtain the bytes behind a content hash (RT-1). The
+ * server's policy admits a session only when a live record inside its download
+ * scope references the hash (directly, as a manifest, or as a chunk of one).
+ */
+export interface BlobAccessPolicy {
+	/** Whether `sessionId` may request (and be asked for) the bytes behind `hash`. */
+	canAccess(sessionId: string, hash: string): Promise<boolean>
+	/**
+	 * Called with bytes the relay has verified to hash to `hash`, so the policy can
+	 * learn a manifest's chunk list. Optional.
+	 */
+	observeVerifiedBytes?(hash: string, bytes: Uint8Array): void
+}
 
 interface RelayClient {
 	sessionId: string
@@ -33,31 +50,46 @@ export const DEFAULT_BLOB_REQUEST_TTL_MS = 60_000
 
 interface PendingRequest {
 	originSessionId: string
+	/** The content hash requested; a response must hash to it. */
+	hash: string
+	/** Sessions the request was forwarded to: the only ones allowed to answer it. */
+	forwardedTo: Set<string>
 	createdAtMs: number
 }
 
 /**
  * Routes out-of-band blob chunk transfer between connected clients (and,
- * optionally, a server-side blob store).
+ * optionally, a server-side blob store), within tenant boundaries (RT-1).
  *
- * The server never stores or inspects blob bytes on the relay path: a
- * `blob-chunk-request` is forwarded to peer sessions, and the first peer to
- * answer with the bytes has its `blob-chunk-response` routed back to the
- * original requester by `requestId`. Blob bytes never enter the operation log;
- * only the `BlobRef` reference inside a record does.
+ * - A request is served only when the {@link BlobAccessPolicy} admits the requester
+ *   for that hash; otherwise it is answered "not held" (`bytes: null`), the same
+ *   answer as for an unknown hash, so nothing leaks.
+ * - The central store (when configured) answers only admitted requesters.
+ * - Otherwise the request is forwarded only to peer sessions the policy also admits
+ *   for that hash, so a hash never reaches another tenant.
+ * - A response is accepted only from a session the request was forwarded to, and
+ *   only when its bytes hash to the requested hash (no poisoning, by another tenant
+ *   or by a same-tenant peer).
  *
- * Not persisted — this is an ephemeral side channel, like the Yjs doc relay.
+ * Blob bytes never enter the operation log; only the `BlobRef` inside a record does.
+ * Not persisted: this is an ephemeral side channel, like the Yjs doc relay.
  */
 export class BlobChunkRelay {
 	private readonly clients = new Map<string, RelayClient>()
 	/** requestId -> the session that originated the request (to route the answer back). */
 	private readonly pending = new Map<string, PendingRequest>()
 	private readonly resolveBlobChunk: ResolveBlobChunk | null
+	private readonly policy: BlobAccessPolicy
 	private readonly maxPendingPerSession: number
 	private readonly pendingTtlMs: number
 
-	constructor(resolveBlobChunk?: ResolveBlobChunk, limits: BlobChunkRelayLimits = {}) {
+	constructor(
+		resolveBlobChunk: ResolveBlobChunk | undefined,
+		policy: BlobAccessPolicy,
+		limits: BlobChunkRelayLimits = {},
+	) {
 		this.resolveBlobChunk = resolveBlobChunk ?? null
+		this.policy = policy
 		this.maxPendingPerSession =
 			limits.maxPendingPerSession ?? DEFAULT_MAX_PENDING_BLOB_REQUESTS_PER_SESSION
 		this.pendingTtlMs = limits.pendingTtlMs ?? DEFAULT_BLOB_REQUEST_TTL_MS
@@ -74,6 +106,8 @@ export class BlobChunkRelay {
 		for (const [requestId, entry] of this.pending) {
 			if (entry.originSessionId === sessionId) {
 				this.pending.delete(requestId)
+			} else {
+				entry.forwardedTo.delete(sessionId)
 			}
 		}
 	}
@@ -92,43 +126,46 @@ export class BlobChunkRelay {
 	}
 
 	/**
-	 * Handle an inbound chunk request from a session. Tries the server's own
-	 * store first (if configured), otherwise forwards the request to peer
-	 * sessions and remembers who to route the answer back to.
+	 * Handle an inbound chunk request from a session. Refuses a requester the policy
+	 * does not admit for the hash; otherwise tries the server's own store first (if
+	 * configured), then forwards the request to admitted peers and remembers who to
+	 * route the answer back to.
 	 */
-	handleRequest(sourceSessionId: string, message: BlobChunkRequestMessage): void {
+	async handleRequest(sourceSessionId: string, message: BlobChunkRequestMessage): Promise<void> {
 		if (!this.clients.has(sourceSessionId)) {
+			return
+		}
+		if (!(await this.admits(sourceSessionId, message.hash))) {
+			this.sendResponseTo(sourceSessionId, message.requestId, null)
 			return
 		}
 
 		if (this.resolveBlobChunk) {
-			void this.resolveBlobChunk(message.hash).then(
-				(bytes) => {
-					if (bytes !== null) {
-						this.sendResponseTo(sourceSessionId, message.requestId, encodeBlobChunkBytes(bytes))
-						return
-					}
-					this.forwardRequestToPeers(sourceSessionId, message)
-				},
-				() => {
-					// A store read error is treated as "not held here": fall back to peers
-					// rather than crashing the connection.
-					this.forwardRequestToPeers(sourceSessionId, message)
-				},
-			)
-			return
+			let bytes: Uint8Array | null = null
+			try {
+				bytes = await this.resolveBlobChunk(message.hash)
+			} catch {
+				// A store read error is treated as "not held here": fall back to peers
+				// rather than crashing the connection.
+				bytes = null
+			}
+			if (bytes !== null) {
+				this.sendResponseTo(sourceSessionId, message.requestId, encodeBlobChunkBytes(bytes))
+				return
+			}
 		}
 
-		this.forwardRequestToPeers(sourceSessionId, message)
+		await this.forwardRequestToPeers(sourceSessionId, message)
 	}
 
 	/**
 	 * Handle an inbound chunk response from a peer. Routes it back to the session
-	 * that originally requested it. A "not held" answer (bytes === null) is
+	 * that originally requested it, but only when the responder was asked and the
+	 * bytes hash to the requested hash. A "not held" answer (bytes === null) is
 	 * ignored so a peer without the chunk does not preempt one that has it; the
 	 * requester's own per-request timeout bounds the wait.
 	 */
-	handleResponse(sourceSessionId: string, message: BlobChunkResponseMessage): void {
+	async handleResponse(sourceSessionId: string, message: BlobChunkResponseMessage): Promise<void> {
 		if (!this.clients.has(sourceSessionId)) {
 			return
 		}
@@ -136,14 +173,41 @@ export class BlobChunkRelay {
 			return
 		}
 		const entry = this.pending.get(message.requestId)
-		if (!entry) {
+		if (!entry || !entry.forwardedTo.has(sourceSessionId)) {
+			return
+		}
+		let decoded: Uint8Array
+		try {
+			decoded = decodeBlobChunkBytes(message.bytes)
+		} catch {
+			return
+		}
+		if ((await hashBlob(decoded)) !== entry.hash) {
+			// Wrong bytes for the hash: ignore them and keep waiting for an honest peer.
+			return
+		}
+		// Re-check after the await: another response may have completed the request.
+		if (this.pending.get(message.requestId) !== entry) {
 			return
 		}
 		this.pending.delete(message.requestId)
+		this.policy.observeVerifiedBytes?.(entry.hash, decoded)
 		this.sendResponseTo(entry.originSessionId, message.requestId, message.bytes)
 	}
 
-	private forwardRequestToPeers(sourceSessionId: string, message: BlobChunkRequestMessage): void {
+	private async admits(sessionId: string, hash: string): Promise<boolean> {
+		try {
+			return await this.policy.canAccess(sessionId, hash)
+		} catch {
+			// Fail closed: an authorization error never grants access.
+			return false
+		}
+	}
+
+	private async forwardRequestToPeers(
+		sourceSessionId: string,
+		message: BlobChunkRequestMessage,
+	): Promise<void> {
 		const now = Date.now()
 		this.expirePending(now)
 		const existing = this.pending.get(message.requestId)
@@ -157,15 +221,32 @@ export class BlobChunkRelay {
 			// bounds its wait; the relay's memory stays bounded per session.
 			return
 		}
-		this.pending.set(message.requestId, { originSessionId: sourceSessionId, createdAtMs: now })
-		for (const [, client] of this.clients) {
-			if (client.sessionId === sourceSessionId) {
-				continue
+		const targets: RelayClient[] = []
+		for (const client of this.clients.values()) {
+			if (client.sessionId === sourceSessionId) continue
+			if (!client.transport.isConnected()) continue
+			// Only peers that may hold the bytes themselves are asked: the hash never
+			// reaches a session outside the requester's tenant.
+			if (await this.admits(client.sessionId, message.hash)) {
+				targets.push(client)
 			}
-			if (!client.transport.isConnected()) {
-				continue
-			}
-			client.transport.send(message)
+		}
+		// The requester may have left, or a duplicate request id may have registered,
+		// while the policy was consulted.
+		if (!this.clients.has(sourceSessionId)) return
+		const current = this.pending.get(message.requestId)
+		if (current && current.originSessionId !== sourceSessionId) return
+		if (targets.length === 0) return
+		const forwardedTo = current?.forwardedTo ?? new Set<string>()
+		for (const target of targets) forwardedTo.add(target.sessionId)
+		this.pending.set(message.requestId, {
+			originSessionId: sourceSessionId,
+			hash: message.hash,
+			forwardedTo,
+			createdAtMs: now,
+		})
+		for (const target of targets) {
+			target.transport.send(message)
 		}
 	}
 
@@ -186,7 +267,7 @@ export class BlobChunkRelay {
 		}
 	}
 
-	private sendResponseTo(sessionId: string, requestId: string, bytes: string): void {
+	private sendResponseTo(sessionId: string, requestId: string, bytes: string | null): void {
 		const client = this.clients.get(sessionId)
 		if (!client || !client.transport.isConnected()) {
 			return

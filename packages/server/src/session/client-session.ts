@@ -800,6 +800,11 @@ export class ClientSession {
 	 * relayed between sessions that share exactly the same key, so it never crosses a
 	 * tenant boundary. Unscoped sessions share the key `"*"`.
 	 */
+	/** This session's download scope, or undefined when it is unscoped. */
+	getDownlinkScopes(): ScopeMap | undefined {
+		return this.authContext?.downlinkScopes ?? this.authContext?.scopes
+	}
+
 	getScopePartitionKey(): string {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		return scopes ? stableStringify(normalizeScopeMap(scopes)) : '*'
