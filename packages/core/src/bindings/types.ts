@@ -100,4 +100,22 @@ export type AuthSyncState =
 	| { state: 'loading' }
 	| { state: 'signed-out'; mayConnectAnonymously: false }
 	| { state: 'anonymous'; mayConnectAnonymously: true }
-	| { state: 'authenticated'; userId: string; token: string }
+	| {
+			state: 'authenticated'
+			userId: string
+			/**
+			 * Fresh access token, or null while authenticated-offline: the identity
+			 * is known from stored credentials but no fresh token can be minted now.
+			 * The local store opens either way; a sync transport waits for a token.
+			 */
+			token: string | null
+			/** Device id of the stored credentials, when known. */
+			deviceId?: string
+			/** True while the session is authenticated-offline (or locked). */
+			offline?: boolean
+			/**
+			 * True when the offline grace period ran out or the device clock moved
+			 * backwards. The UI should lock; local data is never wiped.
+			 */
+			locked?: boolean
+	  }

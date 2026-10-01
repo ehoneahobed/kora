@@ -5,6 +5,8 @@
 export { AuthClient, AuthError } from './client/auth-client'
 export type {
 	AuthClientConfig,
+	AuthClientSession,
+	AuthSessionStatus,
 	AuthTokenStorage,
 	AuthUser,
 	AuthState,
