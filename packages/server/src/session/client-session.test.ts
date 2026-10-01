@@ -135,6 +135,9 @@ describe('ClientSession', () => {
 
 		test('hides vector entries for out-of-scope nodes, but includes its own and in-scope senders', async () => {
 			const store = new MemoryServerStore('server-1')
+			// History written through a session is always preceded by its node claim; an
+			// unclaimed node with history is refused (RT-5), so seed the claim as well.
+			await store.claimNode('client-1', 'me')
 			await store.applyRemoteOperation(
 				createTestOp({
 					id: 'op-other',

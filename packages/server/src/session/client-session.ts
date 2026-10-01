@@ -73,6 +73,12 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
 /** Revocations remembered for a session whose handshake has not resolved its principal. */
 const MAX_PENDING_REVOCATIONS = 32
 
+/**
+ * Node-claim owner for anonymous principals (`AuthContext.anonymous`). Contains
+ * characters no Kora-issued user id uses, so it cannot collide with a real user.
+ */
+export const ANONYMOUS_NODE_OWNER = 'kora:anonymous'
+
 /** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
 export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
 
@@ -675,6 +681,20 @@ export class ClientSession {
 		return true
 	}
 
+	/**
+	 * End this session because an admin released its node id (RT-5). Retriable: a
+	 * client that still owns the node simply reconnects and claims it again.
+	 */
+	endForNodeRelease(): void {
+		if (this.state === 'closed') return
+		this.sendError(
+			'NODE_RELEASED',
+			'An administrator released this device node id. Reconnect to claim it again.',
+			true,
+		)
+		this.close('node id released')
+	}
+
 	private terminate(code: SessionTerminationCode): void {
 		const message =
 			code === 'AUTH_EXPIRED'
@@ -940,14 +960,19 @@ export class ClientSession {
 			}
 			// Bind the device node id to this principal. A node id another user already
 			// claimed is refused, so nobody can upload operations as someone else's device.
-			if (this.store.claimNode && !(await this.store.claimNode(msg.nodeId, context.userId))) {
-				this.sendError(
-					'NODE_ID_CLAIMED',
-					`Node id "${msg.nodeId}" belongs to another user. Use a fresh node id per signed-in user.`,
-					false,
-				)
-				this.close('node id claimed by another user')
-				return
+			// Anonymous principals get a fresh userId per connection, so they claim under
+			// one shared anonymous owner (RT-5). NoAuthProvider has no identity at all.
+			if (this.store.claimNode && !(this.auth instanceof NoAuthProvider)) {
+				const owner = context.anonymous === true ? ANONYMOUS_NODE_OWNER : context.userId
+				if (!(await this.store.claimNode(msg.nodeId, owner))) {
+					this.sendError(
+						'NODE_ID_CLAIMED',
+						`Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
+						false,
+					)
+					this.close('node id claimed by another user')
+					return
+				}
 			}
 			// A revocation that landed while this handshake was authenticating applies now.
 			if (this.pendingRevocations.some((filter) => revocationMatches(context, filter))) {

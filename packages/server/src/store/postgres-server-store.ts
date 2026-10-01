@@ -29,6 +29,7 @@ import type {
 	MaterializedRecord,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
@@ -559,13 +560,42 @@ export class PostgresServerStore implements ServerStore {
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		await this.ready
+		if (userId === RELEASED_NODE_OWNER) return false
+		const now = Date.now()
+		// Each statement is atomic on the node_claims primary key. A fresh claim is
+		// only created for a node without history: history with no claim predates
+		// node claims, so its writer is unknown (RT-5).
 		await this.db.execute(
-			sql`INSERT INTO node_claims (node_id, user_id, claimed_at) VALUES (${nodeId}, ${userId}, ${Date.now()}) ON CONFLICT (node_id) DO NOTHING`,
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				SELECT ${nodeId}, ${userId}, ${now}
+				WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})
+				ON CONFLICT (node_id) DO NOTHING`,
+		)
+		// An admin-released node is taken over by its next claimant (one winner).
+		await this.db.execute(
+			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
+				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
 		)
 		const rows = (await this.db.execute(
 			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
 		)) as unknown as { user_id: string }[]
 		return rows[0]?.user_id === userId
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		const known = (await this.db.execute(
+			sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
+				OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)) as unknown as { one: number }[]
+		if (known.length === 0) return false
+		await this.db.execute(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = EXCLUDED.user_id, claimed_at = EXCLUDED.claimed_at`,
+		)
+		return true
 	}
 
 	/**

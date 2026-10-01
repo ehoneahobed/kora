@@ -20,6 +20,13 @@ export interface AuthContext {
 	/** Arbitrary metadata about the authenticated user */
 	metadata?: Record<string, unknown>
 	/**
+	 * True for an unauthenticated (anonymous) principal, such as the fallback of
+	 * `MixedAuthProvider`. Its `userId` is not stable across connections, so node-id
+	 * claims are keyed by the shared anonymous owner instead: an anonymous device can
+	 * reconnect with its node id, but can never take a signed-in user's node id.
+	 */
+	anonymous?: boolean
+	/**
 	 * When the credential that authenticated this session expires (ms since
 	 * epoch). A session must not outlive its credential: the sync server can
 	 * close it with a retriable AUTH_EXPIRED so the client refreshes (AUTH-11).

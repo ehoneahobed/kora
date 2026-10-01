@@ -283,6 +283,43 @@ export class KoraSyncServer {
 		return terminated
 	}
 
+	/**
+	 * Admin release of a device node id (RT-5). The next principal to handshake with
+	 * this node id claims it, even when the node already has operation history.
+	 *
+	 * Use it to hand over operation history written before node claims existed (an
+	 * upgrade from beta.12, where nobody may adopt such a node until it is released),
+	 * or to reassign a lost device's node id. Live sessions on that node id are ended
+	 * with a retriable `NODE_RELEASED` error so the handover starts clean.
+	 *
+	 * @param nodeId - The device node id to release
+	 * @returns True when the node had a claim or history to release; false when it
+	 *   was unknown or the store does not support node claims
+	 *
+	 * @example
+	 * ```typescript
+	 * await server.releaseNodeClaim('0190a1b2-...')
+	 * ```
+	 */
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		if (!this.store.releaseNodeClaim) return false
+		const released = await this.store.releaseNodeClaim(nodeId)
+		if (released) {
+			for (const session of [...this.sessions.values()]) {
+				if (session.getClientNodeId() === nodeId && session.getState() !== 'connected') {
+					session.endForNodeRelease()
+				}
+			}
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'node_claim.released',
+				nodeId,
+			})
+		}
+		return released
+	}
+
 	private ensureBackgroundTimersStarted(): void {
 		if (this.relayRetransmitIntervalMs > 0 && !this.relayRetransmitTimer) {
 			this.relayRetransmitTimer = setInterval(() => {

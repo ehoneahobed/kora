@@ -3,6 +3,12 @@ import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
 /**
+ * Owner recorded for a node id an admin released (see `ServerStore.releaseNodeClaim`):
+ * the next principal to claim the node takes it over. Never a valid principal id.
+ */
+export const RELEASED_NODE_OWNER = ''
+
+/**
  * A materialized record reconstructed from the operation log
  * or read from a materialized collection table.
  */
@@ -136,12 +142,24 @@ export interface ServerStore extends SyncStore {
 
 	/**
 	 * Bind a client node id to the authenticated principal that first used it.
-	 * Returns true when the node id is unclaimed or already owned by `userId`, and
-	 * false when another principal owns it. Called at handshake when auth is
-	 * configured, so one user cannot upload operations under another user's device
-	 * id. Optional for custom stores; the built-in stores persist the claim.
+	 * Returns true when the node id is already owned by `userId`, was released by an
+	 * admin (see {@link releaseNodeClaim}; the caller takes it over), or is unclaimed
+	 * AND has no operation history. Returns false when another principal owns it, or
+	 * when it is unclaimed but already has operations in the log: history written
+	 * before node claims existed has no recorded writer, so nobody may adopt it
+	 * until an admin releases it (RT-5). Called at handshake when auth is configured,
+	 * so one user cannot upload operations under another user's device id. Every
+	 * write after this check is preceded by a claim, so going forward the claim row
+	 * records the writer of a node's history. Must be atomic per node id. Optional
+	 * for custom stores; the built-in stores persist the claim.
 	 */
 	claimNode?(nodeId: string, userId: string): Promise<boolean>
+	/**
+	 * Admin release of a node id (RT-5): the next principal to claim it takes it
+	 * over, even when the node has operation history. Returns true when the node had
+	 * a claim or history to release, false when it was unknown.
+	 */
+	releaseNodeClaim?(nodeId: string): Promise<boolean>
 	/** Close the store and release resources */
 	close(): Promise<void>
 

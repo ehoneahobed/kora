@@ -197,6 +197,21 @@ describe('ClientSession node binding (SEC-3, server half)', () => {
 		const again = await login('bob-2', 'bob-device')
 		expect(again.messages.some((m) => m.type === 'handshake-response')).toBe(true)
 	})
+
+	test('releaseNodeClaim ends live sessions on the node and hands it to the next claimant (RT-5)', async () => {
+		const { login, server } = await setup()
+		const bob = await login('bob', 'lost-device')
+		expect(await server.releaseNodeClaim('lost-device')).toBe(true)
+		await tick()
+		const error = bob.messages.find((m) => m.type === 'error')
+		expect(error?.type === 'error' ? [error.code, error.retriable] : null).toEqual([
+			'NODE_RELEASED',
+			true,
+		])
+		const alice = await login('alice', 'lost-device')
+		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+		expect(await server.releaseNodeClaim('never-seen')).toBe(false)
+	})
 })
 
 describe('Side channels after the handshake (SEC-5)', () => {

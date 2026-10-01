@@ -1,5 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import type { Operation, SchemaDefinition } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { authorizeUplinkWrite } from '../scopes/server-scope-filter'
 import { MemoryServerStore } from '../store/memory-server-store'
@@ -153,7 +153,7 @@ describe('applyServerOperation', () => {
 })
 
 describe('untrusted deletes: side effects authorized, restrict generic (RT-10)', () => {
-	async function seeded(target: typeof schema, owner: string) {
+	async function seeded(target: SchemaDefinition, owner: string) {
 		const store = new MemoryServerStore('server-test')
 		await store.setSchema(target)
 		await store.applyRemoteOperation(
