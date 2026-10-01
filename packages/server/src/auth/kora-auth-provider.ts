@@ -1,3 +1,4 @@
+import { claimScopes } from '@korajs/core'
 import type { AuthContext, AuthProvider } from '../types'
 
 /**
@@ -63,8 +64,15 @@ export interface KoraAuthProviderOptions {
 	deviceTracker?: DeviceToucher
 
 	/**
-	 * Optional scope resolver. Called with the user ID to determine
-	 * which collections/records the user can sync.
+	 * Optional scope resolver. Called with the verified user ID to determine
+	 * which collections/records the user can sync. Its result is the complete
+	 * server grant: a collection it omits is not visible, and the client
+	 * handshake can only narrow it. Use `claimScopes({ userId, orgId })` from
+	 * `@korajs/core` to bind every schema-scoped collection from verified values.
+	 *
+	 * When omitted, the grant binds every schema-scoped collection from
+	 * `{ userId: <verified sub> }`; collections scoped by any other key are denied
+	 * until you supply it.
 	 */
 	resolveScopes?: (userId: string) => Promise<Record<string, Record<string, unknown>>>
 }
@@ -139,8 +147,12 @@ export class KoraAuthProvider implements AuthProvider {
 			await this.deviceTracker.touchDevice(payload.dev)
 		}
 
-		// Compute sync scopes if a resolver is configured
-		const scopes = this.resolveScopes ? await this.resolveScopes(payload.sub) : undefined
+		// The grant is always server-derived. Without a resolver it binds scoped
+		// collections from the verified subject only, so the client handshake can
+		// never choose whose data it receives (AUTH-1).
+		const scopes = this.resolveScopes
+			? await this.resolveScopes(payload.sub)
+			: claimScopes({ userId: payload.sub })
 
 		return {
 			userId: payload.sub,

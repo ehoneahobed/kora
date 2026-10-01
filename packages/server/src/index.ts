@@ -103,6 +103,17 @@ export {
 	normalizeScopeMap,
 	operationMatchesScopes,
 } from './scopes/server-scope-filter'
+export {
+	ScopeRequiredError,
+	resolveSessionScopeGrant,
+	resolveSessionScopes,
+} from './scopes/resolve-session-scopes'
+export type {
+	DeniedScopeCollection,
+	ResolveSessionScopesOptions,
+	ResolvedSessionScopeGrant,
+} from './scopes/resolve-session-scopes'
+export { SCOPE_CLAIMS_KEY, claimScopes } from '@korajs/core'
 
 // === Awareness ===
 export { AwarenessRelay } from './awareness/awareness-relay'

@@ -158,6 +158,7 @@ export type { OperationLog } from './version-vector/version-vector'
 // === Scopes ===
 export { buildScopeMap } from './scopes/build-scope-map'
 export type { ScopeMap } from './scopes/build-scope-map'
+export { SCOPE_CLAIMS_KEY, claimScopes, getScopeClaims } from './scopes/scope-grant'
 export {
 	collectSchemaScopeFields,
 	extractScopeValuesFromClaims,

@@ -1,3 +1,4 @@
+import { SCOPE_CLAIMS_KEY } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
 import { NoAuthProvider } from './no-auth'
 import { TokenAuthProvider } from './token-auth'
@@ -22,7 +23,19 @@ describe('TokenAuthProvider', () => {
 		const result = await provider.authenticate('valid-token')
 
 		expect(validate).toHaveBeenCalledWith('valid-token')
-		expect(result).toEqual({ userId: 'user-1', metadata: { role: 'admin' } })
+		// AUTH-1: a context without a grant is bound to the verified user id
+		// instead of letting the client handshake pick the scope.
+		expect(result).toEqual({
+			userId: 'user-1',
+			metadata: { role: 'admin' },
+			scopes: { [SCOPE_CLAIMS_KEY]: { userId: 'user-1' } },
+		})
+	})
+
+	test('keeps an explicit grant untouched', async () => {
+		const ctx = { userId: 'user-1', scopes: { todos: { userId: 'user-1' } } }
+		const provider = new TokenAuthProvider({ validate: vi.fn().mockResolvedValue(ctx) })
+		expect(await provider.authenticate('t')).toEqual(ctx)
 	})
 
 	test('returns null when validate returns null', async () => {
