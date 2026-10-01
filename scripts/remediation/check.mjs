@@ -306,7 +306,7 @@ const phaseNames = [
 	'Phase 3: one fold + durability (beta.14)',
 	'Phase 4: encryption, scale, types, DX (RC)',
 ]
-for (let ph = 1; ph <= 4; ph++) {
+for (let ph = 0; ph <= 4; ph++) {
 	const ps = tracker.problems.filter((p) => p.phase === ph || (p.stopgap && p.stopgap.phase === ph))
 	lines.push(
 		`## ${phaseNames[ph]}`,
