@@ -397,6 +397,7 @@ export class MemoryServerStore implements ServerStore {
 			type: op.type,
 			data: op.data,
 			atomicOps: op.atomicOps ?? null,
+			previousData: op.previousData ?? null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 

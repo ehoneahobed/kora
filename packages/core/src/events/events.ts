@@ -207,6 +207,21 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * BLOCKING. The store could not obtain durable storage when it opened or when
+			 * this tab was promoted to storage leader, so it is running on a
+			 * non-persistent in-memory database. Writes are refused with
+			 * `StorageDurabilityError` (unless the app opted into non-durable storage)
+			 * instead of being accepted and lost on reload. Apps should show a blocking
+			 * state, for example asking the user to close other tabs and reload.
+			 */
+			type: 'store:durability-lost'
+			dbName: string
+			phase: 'open' | 'promotion'
+			reason: 'lock-conflict' | 'timeout' | 'unsupported' | 'open-failed'
+			message: string
+	  }
+	| {
+			/**
 			 * Another runtime on this origin was already using this database name, so
 			 * this runtime attached to it as a follower and now SHARES that one
 			 * database. That is intended for multiple tabs of the SAME app; it is a bug

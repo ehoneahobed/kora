@@ -34,6 +34,7 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:quota-exceeded',
 	'store:storage-fallback',
 	'store:opfs-unavailable',
+	'store:durability-lost',
 	'store:db-name-collision',
 	'replay:completed',
 	'query:subscribed',

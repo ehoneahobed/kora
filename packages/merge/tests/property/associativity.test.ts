@@ -40,19 +40,39 @@ function tagOp(nodeId: string, tags: string[], wallTime: number): Operation {
 	})
 }
 
-function noopTagsOp(tags: string[]): Operation {
+function tagSet(value: unknown): Set<string> {
+	return new Set((value as string[]).map((v) => JSON.stringify(v)))
+}
+
+// All three ops are concurrent edits of the same ancestor, so every merge,
+// including the second-level one, is three-way against that common ancestor.
+// (This test used to pass the first merge's RESULT as the base of the second,
+// which encodes the third op as removing everything the others added. The old
+// rule hid that because it never applied one-sided removals; MERGE-1.)
+function mergedTagsOp(tags: string[], previous: string[]): Operation {
 	return createTestOperation({
-		id: 'noop',
-		nodeId: 'noop',
+		id: 'merged',
+		nodeId: 'merged',
 		data: { tags },
-		previousData: { tags },
-		timestamp: { wallTime: 0, logical: 0, nodeId: 'noop' },
+		previousData: { tags: previous },
+		timestamp: { wallTime: 0, logical: 0, nodeId: 'merged' },
 		sequenceNumber: 0,
 	})
 }
 
-function tagSet(value: unknown): Set<string> {
-	return new Set((value as string[]).map((v) => JSON.stringify(v)))
+function tagOpFrom(
+	nodeId: string,
+	tags: string[],
+	previous: string[],
+	wallTime: number,
+): Operation {
+	return createTestOperation({
+		id: `op-${nodeId}-${wallTime}`,
+		nodeId,
+		data: { tags },
+		previousData: { tags: previous },
+		timestamp: { wallTime, logical: 0, nodeId },
+	})
 }
 
 describe('merge associativity (add-wins set)', () => {
@@ -70,16 +90,16 @@ describe('merge associativity (add-wins set)', () => {
 			const afterAB = tensor(baseState, opA, opB)
 			const left = engine.mergeFields({
 				local: opC,
-				remote: noopTagsOp(afterAB.tags as string[]),
-				baseState: afterAB,
+				remote: mergedTagsOp(afterAB.tags as string[], baseState.tags),
+				baseState,
 				collectionDef: simpleCollectionDef,
 			})
 
 			const afterBC = tensor(baseState, opB, opC)
 			const right = engine.mergeFields({
 				local: opA,
-				remote: noopTagsOp(afterBC.tags as string[]),
-				baseState: afterBC,
+				remote: mergedTagsOp(afterBC.tags as string[], baseState.tags),
+				baseState,
 				collectionDef: simpleCollectionDef,
 			})
 
@@ -89,6 +109,43 @@ describe('merge associativity (add-wins set)', () => {
 
 			expect(setLeft).toEqual(setRight)
 			expect(setLeft).toEqual(expected)
+		},
+	)
+
+	const subset = fc.subarray(['a', 'b', 'c', 'd', 'e', 'f'])
+
+	test.prop([subset, subset, subset, subset])(
+		'is associative with removals against a non-empty common ancestor',
+		(base, tagsA, tagsB, tagsC) => {
+			const state = { ...baseState, tags: base }
+			const opA = tagOpFrom('node-a', tagsA, base, 1)
+			const opB = tagOpFrom('node-b', tagsB, base, 2)
+			const opC = tagOpFrom('node-c', tagsC, base, 3)
+
+			const afterAB = tensor(state, opA, opB)
+			const left = engine.mergeFields({
+				local: opC,
+				remote: mergedTagsOp(afterAB.tags as string[], base),
+				baseState: state,
+				collectionDef: simpleCollectionDef,
+			})
+			const afterBC = tensor(state, opB, opC)
+			const right = engine.mergeFields({
+				local: opA,
+				remote: mergedTagsOp(afterBC.tags as string[], base),
+				baseState: state,
+				collectionDef: simpleCollectionDef,
+			})
+
+			expect(left.mergedData.tags).toEqual(right.mergedData.tags)
+			// A base element survives only if every side kept it; an added one if any side added it.
+			const all = [tagsA, tagsB, tagsC]
+			const expected = new Set(
+				[...new Set(all.flat())].filter(
+					(x) => !base.includes(x) || all.every((tags) => tags.includes(x)),
+				),
+			)
+			expect(new Set(left.mergedData.tags as string[])).toEqual(expected)
 		},
 	)
 })

@@ -1,4 +1,4 @@
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, decryptSecret, defineSchema, t, verifySecretValue } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
@@ -355,6 +355,98 @@ describe('TransactionContext', () => {
 			const txOps = ops.filter((op) => op.transactionId !== undefined)
 			expect(txOps.length).toBeGreaterThan(0)
 			expect(typeof txOps[0]?.transactionId).toBe('string')
+		})
+	})
+
+	describe('secret fields (STORE-4)', () => {
+		const secretSchema = defineSchema({
+			version: 1,
+			collections: {
+				accounts: {
+					fields: {
+						email: t.string(),
+						password: t.secret().hashed(),
+						apiKey: t.secret().optional(),
+					},
+				},
+			},
+		})
+
+		async function rawEverything(target: BetterSqlite3Adapter): Promise<string> {
+			const rows = await target.query('SELECT * FROM accounts')
+			const ops = await target.query('SELECT data, previous_data FROM _kora_ops_accounts')
+			return JSON.stringify([rows, ops])
+		}
+
+		async function openSecretStore(): Promise<{ s: Store; a: BetterSqlite3Adapter }> {
+			const a = new BetterSqlite3Adapter(':memory:')
+			const s = new Store({
+				schema: secretSchema,
+				adapter: a,
+				nodeId: 'secret-node',
+				secretKeyProvider: () => 'test-encryption-key',
+			})
+			await s.open()
+			return { s, a }
+		}
+
+		test('transaction insert stores and logs hashed and encrypted secrets, never plaintext', async () => {
+			const { s, a } = await openSecretStore()
+			try {
+				await s.transaction(async (tx) => {
+					await tx
+						.collection('accounts')
+						.insert({ email: 'a@b.c', password: 'hunter2', apiKey: 'sk-live-123' })
+				})
+				const raw = await rawEverything(a)
+				expect(raw).not.toContain('hunter2')
+				expect(raw).not.toContain('sk-live-123')
+				expect(raw).toContain('a@b.c')
+			} finally {
+				await s.close()
+			}
+		})
+
+		test('transaction update transforms the changed secret fields', async () => {
+			const { s, a } = await openSecretStore()
+			try {
+				const rec = await s.collection('accounts').insert({ email: 'a@b.c', password: 'old' })
+				await s.transaction(async (tx) => {
+					await tx.collection('accounts').update(rec.id, {
+						password: 'correct-horse',
+						apiKey: 'sk-live-456',
+					})
+				})
+				const raw = await rawEverything(a)
+				expect(raw).not.toContain('correct-horse')
+				expect(raw).not.toContain('sk-live-456')
+			} finally {
+				await s.close()
+			}
+		})
+
+		test('secrets written in a transaction verify and decrypt like the single-record path', async () => {
+			const { s, a } = await openSecretStore()
+			try {
+				let viaTx: Record<string, unknown> | undefined
+				await s.transaction(async (tx) => {
+					viaTx = await tx
+						.collection('accounts')
+						.insert({ email: 'y', password: 'same', apiKey: 'sk-1' })
+				})
+				const rows = await a.query<{ password: string; apiKey: string }>(
+					'SELECT password, apiKey FROM accounts WHERE id = ?',
+					[String(viaTx?.id)],
+				)
+				const row = rows[0]
+				expect(row).toBeDefined()
+				expect(await verifySecretValue('same', String(row?.password))).toBe(true)
+				expect(await decryptSecret(String(row?.apiKey), 'test-encryption-key')).toBe('sk-1')
+				// The returned record carries the at-rest form, like executeInsert.
+				expect(viaTx?.password).toBe(row?.password)
+			} finally {
+				await s.close()
+			}
 		})
 	})
 })

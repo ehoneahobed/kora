@@ -2,7 +2,7 @@ import type { KoraEvent } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
-import { AdapterError, StoreNotOpenError } from '../errors'
+import { AdapterError, StorageDurabilityError, StoreNotOpenError } from '../errors'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import { Mutex } from './sqlite-wasm-channel'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -343,6 +343,96 @@ describe('SqliteWasmAdapter', () => {
 
 			expect(events).toHaveLength(0)
 			await diag.close()
+		})
+	})
+
+	describe('durability enforcement (NEW-STORE-6)', () => {
+		function nonDurableBridge(): OpenDataBridge {
+			return new OpenDataBridge(new MockWorkerBridge(), {
+				persistent: false,
+				fallbackReason: 'lock-conflict',
+			})
+		}
+
+		test('a non-durable open emits store:durability-lost and refuses every write', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:durability-lost', (e) => events.push(e))
+
+			const lost = new SqliteWasmAdapter({ bridge: nonDurableBridge(), dbName: 'mem', emitter })
+			await lost.open(minimalSchema)
+
+			expect(events).toEqual([
+				expect.objectContaining({
+					type: 'store:durability-lost',
+					dbName: 'mem',
+					phase: 'open',
+					reason: 'lock-conflict',
+				}),
+			])
+			const insert =
+				"INSERT INTO todos (id, title, _created_at, _updated_at) VALUES ('a', 'x', 1, 1)"
+			await expect(lost.execute(insert)).rejects.toBeInstanceOf(StorageDurabilityError)
+			await expect(
+				lost.transaction(async (tx) => {
+					await tx.execute(insert)
+				}),
+			).rejects.toBeInstanceOf(StorageDurabilityError)
+			await expect(
+				lost.migrate(1, 2, { statements: ['SELECT 1'] } as never),
+			).rejects.toBeInstanceOf(StorageDurabilityError)
+			await expect(lost.execute(insert)).rejects.toMatchObject({ code: 'STORAGE_DURABILITY_LOST' })
+			// Reads still work so the app can render a blocking state.
+			await expect(lost.query('SELECT * FROM todos')).resolves.toEqual([])
+			await lost.close()
+		})
+
+		test('allowNonDurable opts into in-memory storage: writes succeed, no durability-lost event', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:durability-lost', (e) => events.push(e))
+
+			const opted = new SqliteWasmAdapter({
+				bridge: nonDurableBridge(),
+				emitter,
+				allowNonDurable: true,
+			})
+			await opted.open(minimalSchema)
+			await opted.execute(
+				"INSERT INTO todos (id, title, _created_at, _updated_at) VALUES ('a', 'x', 1, 1)",
+			)
+			expect(events).toHaveLength(0)
+			await opted.close()
+		})
+
+		test('deferOpenDurabilityCheck leaves the open to the caller (createApp falls back itself)', async () => {
+			const emitter = new SimpleEventEmitter()
+			const events: KoraEvent[] = []
+			emitter.on('store:durability-lost', (e) => events.push(e))
+
+			const probe = new SqliteWasmAdapter({
+				bridge: nonDurableBridge(),
+				emitter,
+				deferOpenDurabilityCheck: true,
+			})
+			await probe.open(minimalSchema)
+			await probe.execute(
+				"INSERT INTO todos (id, title, _created_at, _updated_at) VALUES ('a', 'x', 1, 1)",
+			)
+			expect(events).toHaveLength(0)
+			expect(probe.getStorageOpenState()?.persistent).toBe(false)
+			await probe.close()
+		})
+
+		test('a durable open, and a bridge that reports no mode, accept writes', async () => {
+			const durable = new SqliteWasmAdapter({
+				bridge: new OpenDataBridge(new MockWorkerBridge(), { persistent: true }),
+			})
+			await durable.open(minimalSchema)
+			await durable.execute(
+				"INSERT INTO todos (id, title, _created_at, _updated_at) VALUES ('a', 'x', 1, 1)",
+			)
+			await durable.close()
 		})
 	})
 })

@@ -5,6 +5,7 @@ import type {
 	HybridLogicalClock,
 	Operation,
 	SchemaDefinition,
+	SecretKeyProvider,
 } from '@korajs/core'
 import {
 	createOperation,
@@ -17,6 +18,7 @@ import {
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import { serializeRowVersion } from '../lww/row-version'
+import { toAtRestWriteData } from '../mutations/secret-write'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
 import {
@@ -62,6 +64,11 @@ export interface TransactionContextConfig {
 	relationEnforcer: RelationEnforcer | null
 	causalTracker: CausalTracker | null
 	localMutationHandler: LocalMutationHandler | null
+	/**
+	 * Key provider for `t.secret()` encrypted fields. Transaction writes transform
+	 * secret fields through the same helper as single-record writes (STORE-4).
+	 */
+	secretKeyProvider?: SecretKeyProvider
 }
 
 /**
@@ -252,6 +259,11 @@ export class TransactionContext {
 			}
 		}
 
+		// Secret fields reach their at-rest form (hash/ciphertext) BEFORE the
+		// operation is built, exactly like executeInsert, so plaintext never
+		// enters the op log, the row, or the wire (STORE-4).
+		const writeData = await toAtRestWriteData(validated, definition, this.config.secretKeyProvider)
+
 		const sequenceNumber = await this.config.sequenceAllocator.allocate()
 		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
 		const operation = await createOperation(
@@ -262,7 +274,7 @@ export class TransactionContext {
 				recordId,
 				// Binary richtext values are tagged as canonical JSON before the
 				// operation is content-hashed (see encodeRichtextFieldsForOpData).
-				data: encodeRichtextFieldsForOpData(validated, definition.fields),
+				data: encodeRichtextFieldsForOpData(writeData, definition.fields),
 				previousData: null,
 				sequenceNumber,
 				causalDeps,
@@ -274,7 +286,7 @@ export class TransactionContext {
 		)
 		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
 
-		const serializedData = serializeRecord(validated, definition.fields)
+		const serializedData = serializeRecord(writeData, definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
 		const record: Record<string, unknown> = {
 			id: recordId,
@@ -302,7 +314,7 @@ export class TransactionContext {
 
 		return {
 			id: recordId,
-			...validated,
+			...writeData,
 			createdAt: now,
 			updatedAt: now,
 		}
@@ -343,6 +355,14 @@ export class TransactionContext {
 
 		const hasAtomicOps = Object.keys(atomicOps).length > 0
 
+		// Same transform as executeUpdate. previousData already holds the stored
+		// (at-rest) value read from the row or the buffer, so it needs none.
+		const writeData = await toAtRestWriteData(
+			resolvedData,
+			definition,
+			this.config.secretKeyProvider,
+		)
+
 		const sequenceNumber = await this.config.sequenceAllocator.allocate()
 		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
 		const operation = await createOperation(
@@ -353,7 +373,7 @@ export class TransactionContext {
 				recordId: id,
 				// Binary richtext values (new and previous) are tagged as canonical
 				// JSON before the operation is content-hashed.
-				data: encodeRichtextFieldsForOpData(resolvedData, definition.fields),
+				data: encodeRichtextFieldsForOpData(writeData, definition.fields),
 				previousData: encodeRichtextFieldsForOpData(previousData, definition.fields),
 				sequenceNumber,
 				causalDeps,
@@ -366,7 +386,7 @@ export class TransactionContext {
 		)
 		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
 
-		const serializedChanges = serializeRecord(resolvedData, definition.fields)
+		const serializedChanges = serializeRecord(writeData, definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
 		const updateQuery = buildUpdateQuery(collectionName, id, {
 			...serializedChanges,
@@ -391,7 +411,7 @@ export class TransactionContext {
 		// Merge current record with resolved changes for return value
 		return {
 			...currentRecord,
-			...resolvedData,
+			...writeData,
 			updatedAt: now,
 		} as CollectionRecord
 	}

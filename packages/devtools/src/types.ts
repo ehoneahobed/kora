@@ -54,6 +54,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:quota-exceeded': 'connection',
 	'store:storage-fallback': 'connection',
 	'store:opfs-unavailable': 'connection',
+	'store:durability-lost': 'connection',
 	'store:db-name-collision': 'connection',
 	'replay:completed': 'operation',
 }

@@ -5,7 +5,6 @@ import {
 	quoteIdent,
 	resolveAtomicOp,
 	toAtomicOp,
-	transformSecretFieldsForWrite,
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
@@ -18,6 +17,7 @@ import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
 import type { CollectionRecord, RawCollectionRow } from '../types'
 import { resolveCausalDeps } from './resolve-causal-deps'
+import { toAtRestWriteData } from './secret-write'
 import type { LocalMutationContext } from './types'
 
 /**
@@ -70,11 +70,7 @@ export async function executeUpdate(
 	// Transform secret fields in the changed set to their at-rest form before the
 	// operation is built. previousData already holds the stored (ciphertext) value
 	// from the current record, so it needs no transform.
-	const writeData = await transformSecretFieldsForWrite(
-		resolvedData,
-		ctx.definition,
-		ctx.secretKeyProvider,
-	)
+	const writeData = await toAtRestWriteData(resolvedData, ctx.definition, ctx.secretKeyProvider)
 
 	const hasAtomicOps = Object.keys(atomicOps).length > 0
 	const causalDeps = resolveCausalDeps(ctx)

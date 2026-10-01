@@ -36,6 +36,7 @@ export {
 	PersistenceError,
 	QueryError,
 	RecordNotFoundError,
+	StorageDurabilityError,
 	StoreNotOpenError,
 	WorkerInitError,
 	WorkerTimeoutError,

@@ -104,7 +104,7 @@ export {
 export type { AtomicOpSentinel } from './operations/atomic-ops'
 
 // === Record materialization (shared client/server atomic-aware replay) ===
-export { replayOperationsForRecord } from './operations/replay-record'
+export { mergeArraySet, replayOperationsForRecord } from './operations/replay-record'
 export type { ReplayOperation } from './operations/replay-record'
 
 // === Binary op-data encoding ===

@@ -41,6 +41,7 @@ describe('getEventCategory', () => {
 			'store:quota-exceeded': 'connection',
 			'store:storage-fallback': 'connection',
 			'store:opfs-unavailable': 'connection',
+			'store:durability-lost': 'connection',
 			'store:db-name-collision': 'connection',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',

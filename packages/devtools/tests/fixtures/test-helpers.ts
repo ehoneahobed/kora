@@ -349,6 +349,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			reason: 'lock-conflict',
 			message: 'OPFS unavailable, running in memory',
 		},
+		'store:durability-lost': {
+			type: 'store:durability-lost',
+			dbName: 'kora-db',
+			phase: 'promotion',
+			reason: 'lock-conflict',
+			message: 'No durable storage; writes are refused',
+		},
 		'store:db-name-collision': {
 			type: 'store:db-name-collision',
 			dbName: 'kora-db',

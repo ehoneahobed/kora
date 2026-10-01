@@ -1,9 +1,4 @@
-import {
-	createOperation,
-	generateUUIDv7,
-	transformSecretFieldsForWrite,
-	validateRecord,
-} from '@korajs/core'
+import { createOperation, generateUUIDv7, validateRecord } from '@korajs/core'
 import { fieldVersionsForFields, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
@@ -12,6 +7,7 @@ import { serializeOperation, serializeRecord } from '../serialization/serializer
 import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
 import type { CollectionRecord } from '../types'
 import { resolveCausalDeps } from './resolve-causal-deps'
+import { toAtRestWriteData } from './secret-write'
 import type { LocalMutationContext } from './types'
 
 /**
@@ -32,11 +28,7 @@ export async function executeInsert(
 
 	// Transform secret fields to their at-rest form (hash/ciphertext) BEFORE the
 	// operation is built, so plaintext never enters the op log, store, or sync.
-	const writeData = await transformSecretFieldsForWrite(
-		validated,
-		ctx.definition,
-		ctx.secretKeyProvider,
-	)
+	const writeData = await toAtRestWriteData(validated, ctx.definition, ctx.secretKeyProvider)
 
 	const causalDeps = resolveCausalDeps(ctx)
 

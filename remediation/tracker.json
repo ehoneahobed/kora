@@ -494,7 +494,7 @@
    "severity": "P0",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-1.test.ts"
@@ -507,10 +507,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1/W3 step 1(a)(b): uploads (pushOperation, sendDelta, reconcile) check the uplink scope only, never query subsets; collectDelta and reconcile upload only own-node ops. An own op on a synced collection outside the uplink scope is recorded in the rejected store (OUT_OF_UPLINK_SCOPE) and emitted as sync:operation-rejected instead of being kept silently. Interim: durable 'not upload-eligible' bookkeeping and the contiguous acked prefix remain W3 step 2. Inbound filtering unchanged (SYNC-2, W4)."
   },
   {
    "id": "SYNC-2",
@@ -813,7 +813,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Array case now agrees (S1 interim: replayOperationsForRecord uses mergeArraySet against previousData). Object and custom-resolver cases remain for W7."
   },
   {
    "id": "SRV-2",
@@ -1035,7 +1035,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "STORE-1.test.ts"
@@ -1044,10 +1044,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
   },
   {
    "id": "STORE-2",
@@ -1085,7 +1085,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-4.test.ts"
@@ -1094,10 +1094,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 stopgap: TransactionContext insert/update route secret fields through the shared toAtRestWriteData helper (same as executeInsert/executeUpdate). W6 keeps the helper."
   },
   {
    "id": "STORE-5",
@@ -1360,7 +1360,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "browser": "LMS-5f"
@@ -1369,10 +1369,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: SqliteWasmAdapter open() and promoteToLeader() that end non-durable (or a failed promotion re-open) emit the blocking store:durability-lost event and refuse writes with StorageDurabilityError unless allowNonDurable is set (createApp: store.allowNonDurable; its OPFS probe defers only the open check because it falls back to IndexedDB itself). Real Chromium LMS-5f: blocking check passes; 'write accepted by promoted follower is durable' still fails by design (the write is refused, not made durable) until W8a per-database pools."
   },
   {
    "id": "NEW-STORE-7",
@@ -1380,7 +1380,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "browser": "LMS-6a"
@@ -1389,10 +1389,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: the SQLite WASM worker calls pool.reserveMinimumCapacity(fileCount + 2 + headroom 2) before every OPFS SAH pool open. Real Chromium LMS-6a both checks pass (8 per-user DBs durable; user #1 still writes). No eviction. Manifest, listDatabases/deleteDatabase and per-database pools remain W8a."
   },
   {
    "id": "NEW-STORE-8",
@@ -1457,7 +1457,7 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "MERGE-1.test.ts"
@@ -1466,10 +1466,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1492,7 +1492,7 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "NEW-MERGE-1.test.ts"
@@ -1501,10 +1501,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7."
   },
   {
    "id": "CORE-1",

@@ -85,6 +85,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 			workerUrl: options.workerUrl,
 			dbName: this.dbName,
 			workerResponseTimeoutMs: options.workerResponseTimeoutMs,
+			// The inner SQLite database is in memory by design: this adapter makes it
+			// durable by persisting snapshots to IndexedDB, so the inner adapter must
+			// not refuse writes as non-durable.
+			allowNonDurable: true,
 		})
 		this.scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: options.persistenceDebounceMs,

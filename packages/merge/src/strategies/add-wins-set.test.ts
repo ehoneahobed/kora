@@ -23,27 +23,26 @@ describe('addWinsSet', () => {
 		expect(result).toEqual(['a', 'b'])
 	})
 
-	test('add wins over remove (one adds, one removes different element)', () => {
+	// MERGE-1: the old rule kept an element unless BOTH sides removed it, so a
+	// one-sided removal was silently undone by the other side's unchanged copy.
+	test('one side adds, the other removes a different element: both changes apply', () => {
 		const base = ['a', 'b']
 		const local = ['a', 'b', 'c'] // added c
 		const remote = ['a'] // removed b
 
 		const result = addWinsSet(local, remote, base)
 
-		// b was only removed by remote, not local → b stays (add-wins)
-		// c was added by local → c stays
-		expect(result).toEqual(['a', 'b', 'c'])
+		expect(result).toEqual(['a', 'c'])
 	})
 
-	test('element removed by only one side stays (add-wins semantics)', () => {
+	test('an element removed by only one side is removed (unchanged does not resurrect it)', () => {
 		const base = ['a', 'b', 'c']
 		const local = ['a', 'c'] // removed b
 		const remote = ['a', 'b', 'c'] // no changes
 
 		const result = addWinsSet(local, remote, base)
 
-		// b removed only by local → stays
-		expect(result).toEqual(['a', 'b', 'c'])
+		expect(result).toEqual(['a', 'c'])
 	})
 
 	test('element removed by BOTH sides is actually removed', () => {
@@ -117,16 +116,16 @@ describe('addWinsSet', () => {
 		expect(result).toEqual(['c', 'a', 'b', 'x', 'y'])
 	})
 
-	test('one side empties the array, other adds — additions survive', () => {
+	test('one side empties the array, other adds — removals apply, additions survive', () => {
 		const base = ['a', 'b']
 		const local: string[] = [] // removed everything
 		const remote = ['a', 'b', 'c'] // added c
 
 		const result = addWinsSet(local, remote, base)
 
-		// a and b: removed only by local (not both) → stays
+		// a and b: removed by local → removed
 		// c: added by remote → stays
-		expect(result).toEqual(['a', 'b', 'c'])
+		expect(result).toEqual(['c'])
 	})
 
 	test('complex scenario: mixed adds and removes', () => {
@@ -137,12 +136,12 @@ describe('addWinsSet', () => {
 		const result = addWinsSet(local, remote, base)
 
 		// a: in all → stays
-		// b: removed by local only → stays (add-wins)
-		// c: removed by remote only → stays (add-wins)
-		// d: removed by both → actually removed
+		// b: removed by local → removed
+		// c: removed by remote → removed
+		// d: removed by both → removed
 		// e: added by local → stays
 		// f: added by remote → stays
-		expect(result).toEqual(['a', 'b', 'c', 'e', 'f'])
+		expect(result).toEqual(['a', 'e', 'f'])
 	})
 
 	// The two devices performing this merge call OPPOSITE sides "local", so the
@@ -166,4 +165,44 @@ describe('addWinsSet', () => {
 		const again = addWinsSet(result, result, base)
 		expect(again).toEqual(result)
 	})
+
+	test('an element added on one side and also present on the other is kept once', () => {
+		expect(addWinsSet(['a', 'x'], ['x'], ['a'])).toEqual(['x'])
+	})
+
+	const elements = fc.array(fc.constantFrom('a', 'b', 'c', 'd', 'e'), { maxLength: 6 })
+
+	propTest.prop([elements, elements, elements])(
+		'matches (local ∩ remote) ∪ (local − base) ∪ (remote − base) as a set',
+		(base, local, remote) => {
+			const result = new Set(addWinsSet(local, remote, base))
+			const B = new Set(base)
+			const L = new Set(local)
+			const R = new Set(remote)
+			const expected = new Set([...L, ...R].filter((x) => (L.has(x) && R.has(x)) || !B.has(x)))
+			expect(result).toEqual(expected)
+		},
+	)
+
+	propTest.prop([elements, elements])(
+		'removal beats unchanged: a base element one side removed never survives against an unchanged side',
+		(base, local) => {
+			// remote left the array untouched
+			const result = addWinsSet(local, base, base)
+			for (const x of base) {
+				if (!local.includes(x)) {
+					expect(result).not.toContain(x)
+				}
+			}
+			// and nothing the editing side kept or added is lost
+			expect(new Set(result)).toEqual(new Set(local))
+		},
+	)
+
+	propTest.prop([elements, elements, elements])(
+		'is commutative on the corrected rule, including element order',
+		(base, local, remote) => {
+			expect(addWinsSet(local, remote, base)).toEqual(addWinsSet(remote, local, base))
+		},
+	)
 })

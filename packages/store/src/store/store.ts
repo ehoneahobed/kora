@@ -1175,6 +1175,7 @@ export class Store implements OperationLog {
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
 			localMutationHandler: this.localMutationHandler,
+			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
 		})
 	}
 

@@ -1,20 +1,28 @@
+import { mergeArraySet } from '@korajs/core'
+
 /**
- * Add-wins set merge strategy for array fields.
+ * Add-wins set merge strategy for array fields (three-way, base-relative).
  *
- * When two sides concurrently modify an array, this strategy preserves all
- * additions from both sides. An element is only removed from the result if
- * BOTH sides independently removed it. This prevents data loss: if one side
- * adds an element while another removes a different element, both changes
- * are preserved.
+ * When two sides concurrently modify an array, every element either side ADDED
+ * survives, and every base element either side REMOVED is removed. An element
+ * one side left unchanged never resurrects an element the other side removed
+ * (MERGE-1, NEW-MERGE-1): "unchanged" is not a vote to keep it.
  *
  * Algorithm:
- *   added_local  = local - base
- *   added_remote = remote - base
- *   removed_local  = base - local
- *   removed_remote = base - remote
- *   result = (base ∪ added_local ∪ added_remote) - (removed_local ∩ removed_remote)
+ *   result = (local ∩ remote) ∪ (local − base) ∪ (remote − base)
+ *
+ * Equivalently: a base element is kept only if BOTH sides kept it; a non-base
+ * element is kept if EITHER side added it.
+ *
+ * Ordering is role-independent (the two devices performing this merge call
+ * opposite sides "local"): kept base elements first, in base order, then every
+ * other element sorted by its serialized form.
  *
  * Uses JSON.stringify for element comparison to handle primitives and objects.
+ * Delegates to `mergeArraySet` in `@korajs/core`.
+ *
+ * Interim (S1): this is still a pairwise merge. W7 replaces it with a per-element
+ * LWW set whose result is independent of merge order.
  *
  * @param localArray - The local array after local modifications
  * @param remoteArray - The remote array after remote modifications
@@ -26,90 +34,7 @@ export function addWinsSet(
 	remoteArray: unknown[],
 	baseArray: unknown[],
 ): unknown[] {
-	const serialize = (v: unknown): string => JSON.stringify(v)
-
-	const baseSet = new Set(baseArray.map(serialize))
-	const localSet = new Set(localArray.map(serialize))
-	const remoteSet = new Set(remoteArray.map(serialize))
-
-	// Elements added by each side (present in their set but not in base)
-	const addedLocal = new Set<string>()
-	for (const s of localSet) {
-		if (!baseSet.has(s)) {
-			addedLocal.add(s)
-		}
-	}
-
-	const addedRemote = new Set<string>()
-	for (const s of remoteSet) {
-		if (!baseSet.has(s)) {
-			addedRemote.add(s)
-		}
-	}
-
-	// Elements removed by each side (present in base but not in their set)
-	const removedLocal = new Set<string>()
-	for (const s of baseSet) {
-		if (!localSet.has(s)) {
-			removedLocal.add(s)
-		}
-	}
-
-	const removedRemote = new Set<string>()
-	for (const s of baseSet) {
-		if (!remoteSet.has(s)) {
-			removedRemote.add(s)
-		}
-	}
-
-	// An element is truly removed only if BOTH sides removed it
-	const removedByBoth = new Set<string>()
-	for (const s of removedLocal) {
-		if (removedRemote.has(s)) {
-			removedByBoth.add(s)
-		}
-	}
-
-	// Result = (base ∪ added_local ∪ added_remote) - removed_by_both
-	//
-	// Ordering must be COMMUTATIVE: "local" and "remote" are opposite roles on
-	// the two devices performing this same merge, so any local-before-remote
-	// ordering makes the devices converge on membership but DIVERGE on element
-	// order. Deterministic rule instead: base elements first (in base order),
-	// then all additions from either side sorted by their serialized form —
-	// identical on every device regardless of which side it calls "local".
-	const resultSerialized = new Set<string>()
-	const result: unknown[] = []
-
-	const addIfNew = (serialized: string, value: unknown): void => {
-		if (!resultSerialized.has(serialized) && !removedByBoth.has(serialized)) {
-			resultSerialized.add(serialized)
-			result.push(value)
-		}
-	}
-
-	// Base elements (in original order, minus those removed by both)
-	for (const item of baseArray) {
-		addIfNew(serialize(item), item)
-	}
-
-	// Additions from both sides, in a role-independent deterministic order.
-	const additions = new Map<string, unknown>()
-	for (const item of localArray) {
-		const s = serialize(item)
-		if (addedLocal.has(s) && !additions.has(s)) {
-			additions.set(s, item)
-		}
-	}
-	for (const item of remoteArray) {
-		const s = serialize(item)
-		if (addedRemote.has(s) && !additions.has(s)) {
-			additions.set(s, item)
-		}
-	}
-	for (const s of [...additions.keys()].sort()) {
-		addIfNew(s, additions.get(s))
-	}
-
-	return result
+	// One implementation shared with the record fold (`replayOperationsForRecord`),
+	// so the client merge and the server materialization agree.
+	return mergeArraySet(localArray, remoteArray, baseArray)
 }
