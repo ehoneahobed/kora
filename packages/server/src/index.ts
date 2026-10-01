@@ -17,6 +17,7 @@ export type {
 	MaterializedRecord,
 	CollectionQueryOptions,
 } from './store/server-store'
+export type { TrustProxySetting } from './server/trust-proxy'
 
 export type {
 	ServerCloseHandler,
