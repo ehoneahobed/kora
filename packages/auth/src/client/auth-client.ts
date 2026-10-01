@@ -16,6 +16,17 @@ export class AuthError extends KoraError {
 	}
 }
 
+/**
+ * Thrown by sign-in when the account requires a second factor (AUTH-10).
+ * Complete it with {@link AuthClient.verifyMfa} using {@link mfaToken}.
+ */
+export class MfaRequiredError extends AuthError {
+	constructor(public readonly mfaToken: string) {
+		super('A second factor is required to finish signing in.', 'AUTH_MFA_REQUIRED')
+		this.name = 'MfaRequiredError'
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -192,6 +203,11 @@ interface AuthSignInResponse {
 
 interface OAuthSignInResponse extends AuthSignInResponse {
 	identity: LinkedOAuthAccount
+}
+
+interface MfaChallengeResponse {
+	mfaRequired: true
+	mfaToken: string
 }
 
 /**
@@ -704,9 +720,30 @@ export class AuthClient {
 		devicePublicKey?: string
 	}): Promise<AuthUser> {
 		const body = await this.withDeviceIdentity(params)
-		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signin', {
+		const response = await this.request<
+			AuthSignInResponse | AuthTokensResponse | MfaChallengeResponse
+		>('/auth/signin', {
 			method: 'POST',
 			body,
+		})
+		return this.completeSignIn(response)
+	}
+
+	/**
+	 * Finish a sign-in that required a second factor.
+	 *
+	 * @param mfaToken - From the {@link MfaRequiredError} thrown by sign-in
+	 * @param proof - A current TOTP code, or a recovery code
+	 * @returns The authenticated AuthUser
+	 * @throws {AuthError} If the code or the MFA session is invalid
+	 */
+	async verifyMfa(
+		mfaToken: string,
+		proof: { code: string } | { recoveryCode: string },
+	): Promise<AuthUser> {
+		const response = await this.request<AuthSignInResponse>('/auth/mfa/verify', {
+			method: 'POST',
+			body: { mfaToken, ...proof },
 		})
 		return this.completeSignIn(response)
 	}
@@ -735,13 +772,16 @@ export class AuthClient {
 	async completeOAuthSignIn(provider: string, params: OAuthCallbackParams): Promise<AuthUser> {
 		const body = await this.withDeviceIdentity(params)
 		const binding = params.binding ?? this.takeOAuthBinding(params.state)
-		const response = await this.request<OAuthSignInResponse>(
+		const response = await this.request<OAuthSignInResponse | MfaChallengeResponse>(
 			`/auth/oauth/${encodeURIComponent(provider)}/callback`,
 			{
 				method: 'POST',
 				body: { ...body, ...(binding ? { binding } : {}) },
 			},
 		)
+		if ('mfaRequired' in response) {
+			throw new MfaRequiredError(response.mfaToken)
+		}
 
 		await this.storage.setTokens(response.tokens.accessToken, response.tokens.refreshToken)
 		this.markFresh(response.tokens.refreshToken)
@@ -989,8 +1029,11 @@ export class AuthClient {
 	}
 
 	private async completeSignIn(
-		response: AuthSignInResponse | AuthTokensResponse,
+		response: AuthSignInResponse | AuthTokensResponse | MfaChallengeResponse,
 	): Promise<AuthUser> {
+		if ('mfaRequired' in response) {
+			throw new MfaRequiredError(response.mfaToken)
+		}
 		const tokens = 'tokens' in response ? response.tokens : response
 		await this.storage.setTokens(tokens.accessToken, tokens.refreshToken)
 		this.markFresh(tokens.refreshToken)

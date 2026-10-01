@@ -186,6 +186,11 @@ export class BuiltInProvider implements AuthProviderAdapter {
 		if ('error' in result.body) {
 			throw new AuthProviderError(result.body.error, result.status)
 		}
+		if ('mfaRequired' in result.body.data) {
+			// This adapter has no second-factor step; MFA users must sign in through
+			// the HTTP routes (POST /auth/mfa/verify).
+			throw new AuthProviderError('A second factor is required for this account.', 401)
+		}
 		return result.body.data
 	}
 

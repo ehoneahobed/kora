@@ -2,7 +2,7 @@
 // Every export here is a public API commitment. Be explicit.
 
 // === Client ===
-export { AuthClient, AuthError } from './client/auth-client'
+export { AuthClient, AuthError, MfaRequiredError } from './client/auth-client'
 export type {
 	AuthClientConfig,
 	AuthClientSession,

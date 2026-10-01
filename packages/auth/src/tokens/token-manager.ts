@@ -21,6 +21,25 @@ const MIN_SECRET_LENGTH = 32
  */
 export const DEFAULT_REFRESH_REUSE_GRACE_MS = 30_000
 
+/** Lifetime of the short-lived token that bridges password and second factor. */
+export const MFA_PENDING_TOKEN_LIFETIME_MS = 5 * 60_000
+
+/**
+ * Payload of an `mfa_pending` token: proof that the first factor succeeded,
+ * accepted ONLY by the MFA verification step and rejected everywhere else
+ * (`validateToken` does not recognise its type).
+ */
+export interface MfaPendingPayload {
+	jti: string
+	sub: string
+	dev: string
+	type: 'mfa_pending'
+	iat: number
+	exp: number
+	/** Methods already satisfied (for example `['pwd']`). */
+	amr: string[]
+}
+
 /** Result of an atomic {@link TokenRevocationStore.consume}. */
 export interface ConsumeResult {
 	/** True only for the single call that consumed the id first. */
@@ -393,6 +412,76 @@ export class TokenManager {
 	}
 
 	/**
+	 * Issue a short-lived `mfa_pending` token after a successful first factor
+	 * for a user enrolled in MFA (AUTH-10). It grants nothing by itself.
+	 *
+	 * @param userId - The user who passed the first factor
+	 * @param deviceId - The device the session will be bound to
+	 * @param amr - Methods already satisfied (for example `['pwd']`)
+	 * @returns A signed JWT of type `mfa_pending`
+	 */
+	issueMfaPendingToken(userId: string, deviceId: string, amr: string[]): string {
+		const nowSeconds = Math.floor(Date.now() / 1000)
+		const payload: MfaPendingPayload = {
+			jti: randomUUID(),
+			sub: userId,
+			dev: deviceId,
+			type: 'mfa_pending',
+			iat: nowSeconds,
+			exp: nowSeconds + Math.floor(MFA_PENDING_TOKEN_LIFETIME_MS / 1000),
+			amr: [...amr],
+		}
+		return encodeJwt(payload as unknown as Record<string, unknown>, this.secrets[0] as string)
+	}
+
+	/**
+	 * Verify an `mfa_pending` token without consuming it, so a mistyped code can
+	 * be retried with the same token (TOTP checks have their own backoff).
+	 *
+	 * @param token - The `mfa_pending` JWT
+	 * @returns Its payload, or null when invalid, expired or already redeemed
+	 */
+	async verifyMfaPendingToken(token: string): Promise<MfaPendingPayload | null> {
+		const decoded = this.verifySignature(token)
+		if (decoded === null || isExpired(decoded as { exp?: number })) return null
+		if (
+			decoded.type !== 'mfa_pending' ||
+			typeof decoded.jti !== 'string' ||
+			typeof decoded.sub !== 'string' ||
+			typeof decoded.dev !== 'string' ||
+			typeof decoded.iat !== 'number' ||
+			typeof decoded.exp !== 'number' ||
+			!Array.isArray(decoded.amr)
+		) {
+			return null
+		}
+		if (this.revocationStore && (await this.revocationStore.isConsumed(mfaKey(decoded.jti)))) {
+			return null
+		}
+		return {
+			jti: decoded.jti,
+			sub: decoded.sub,
+			dev: decoded.dev,
+			type: 'mfa_pending',
+			iat: decoded.iat,
+			exp: decoded.exp,
+			amr: decoded.amr.filter((m): m is string => typeof m === 'string'),
+		}
+	}
+
+	/**
+	 * Redeem an `mfa_pending` token exactly once (atomic across instances).
+	 *
+	 * @param payload - A payload returned by {@link verifyMfaPendingToken}
+	 * @returns True only for the single successful redemption
+	 */
+	async redeemMfaPendingToken(payload: MfaPendingPayload): Promise<boolean> {
+		if (!this.revocationStore) return true
+		const result = await this.revocationStore.consume(mfaKey(payload.jti), payload.exp)
+		return result.firstUse
+	}
+
+	/**
 	 * Validate and decode a token's signature, expiry and claims.
 	 *
 	 * This does NOT consult revocation. Every request-authorization path must use
@@ -703,6 +792,10 @@ export class TokenManager {
 
 function familyKey(family: string): string {
 	return `family:${family}`
+}
+
+function mfaKey(jti: string): string {
+	return `mfa:${jti}`
 }
 
 function graceKey(jti: string): string {

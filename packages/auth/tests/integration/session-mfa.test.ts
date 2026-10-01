@@ -172,8 +172,9 @@ describe('Session + MFA integration', () => {
 		// 4. MFA is now active
 		expect(await totpManager.isEnabled(user.id)).toBe(true)
 
-		// 5. Disable MFA (requires a valid code)
-		const disableCode = generateTotpCode(setup.secret)
+		// 5. Disable MFA (requires a valid, unused code: the setup consumed the
+		// current time-step, so reusing it would be a replay since AUTH-10)
+		const disableCode = generateTotpCode(setup.secret, 1)
 		await totpManager.disable(user.id, disableCode)
 		expect(await totpManager.isEnabled(user.id)).toBe(false)
 	})
@@ -270,9 +271,9 @@ describe('Session + MFA integration', () => {
  * Generate a valid TOTP code from a base32-encoded secret.
  * Uses the same SHA-1 HMAC algorithm as authenticator apps.
  */
-function generateTotpCode(base32Secret: string): string {
+function generateTotpCode(base32Secret: string, stepOffset = 0): string {
 	const secret = base32Decode(base32Secret)
-	const counter = Math.floor(Date.now() / 1000 / 30)
+	const counter = Math.floor(Date.now() / 1000 / 30) + stepOffset
 
 	// Counter as 8-byte big-endian
 	const counterBytes = new Uint8Array(8)

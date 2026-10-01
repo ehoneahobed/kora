@@ -10,6 +10,9 @@ export {
 export type {
 	AuthenticatedAccess,
 	AuthRevocationEvent,
+	MfaChallenge,
+	MfaVerifier,
+	SignInResult,
 	AuthRoutesConfig,
 	AuthRouteResponse,
 	ChallengeStore,
@@ -41,6 +44,7 @@ export {
 } from './tokens/token-manager'
 export type {
 	ConsumeResult,
+	MfaPendingPayload,
 	IssueTokenOptions,
 	RefreshFailureReason,
 	RefreshResult,
@@ -269,6 +273,7 @@ export {
 	base32Decode,
 	TotpError,
 	TotpInvalidCodeError,
+	TotpLockedError,
 	TotpNotEnabledError,
 	TotpAlreadyEnabledError,
 	TotpNotVerifiedError,

@@ -32,7 +32,17 @@ describe('Organization + RBAC integration', () => {
 		})
 		routes = new BuiltInAuthRoutes({ userStore, tokenManager })
 		orgStore = new InMemoryOrgStore()
-		orgRoutes = new OrgRoutes({ orgStore })
+		// AUTH-4: invitations match the caller's server-resolved, verified email.
+		// These test users are treated as having verified their addresses.
+		orgRoutes = new OrgRoutes({
+			orgStore,
+			userLookup: {
+				findById: async (id) => {
+					const user = await userStore.findById(id)
+					return user ? { email: user.email, emailVerified: true } : null
+				},
+			},
+		})
 	})
 
 	// ========================================================================

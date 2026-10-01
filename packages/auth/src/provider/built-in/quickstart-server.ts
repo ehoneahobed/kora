@@ -25,7 +25,9 @@ import {
 	type AuthRoutesConfig,
 	BuiltInAuthRoutes,
 	type ChallengeStore,
+	type MfaVerifier,
 	type RateLimiter,
+	type SignInResult,
 } from './auth-routes'
 import { hashPassword } from './password-hash'
 import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
@@ -97,6 +99,12 @@ export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	oauth?: OAuthServerConfig
 	challengeStore?: ChallengeStore
 	rateLimiter?: RateLimiter
+	/**
+	 * Second-factor verifier (for example a `TotpManager`). Users with MFA enabled
+	 * then sign in in two steps: `{ mfaRequired, mfaToken }`, then
+	 * `POST /auth/mfa/verify` with `{ mfaToken, code }`.
+	 */
+	mfa?: MfaVerifier
 }
 
 /**
@@ -185,6 +193,7 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		tokenManager,
 		challengeStore: options.challengeStore,
 		rateLimiter: options.rateLimiter,
+		mfa: options.mfa,
 	})
 	const oauth = options.oauth ? createOAuthRuntime(options.oauth) : undefined
 	const path = normalizePath(options.path ?? '/auth')
@@ -303,6 +312,9 @@ async function handleAuthRequest(
 	if (method === 'POST' && relativePath === '/signin') {
 		return routes.handleSignIn(body as SignInBody, request.ip)
 	}
+	if (method === 'POST' && relativePath === '/mfa/verify') {
+		return routes.handleMfaVerify(body)
+	}
 	if (method === 'POST' && relativePath === '/refresh') {
 		return routes.handleRefresh(body as RefreshBody)
 	}
@@ -411,8 +423,8 @@ async function handleOAuthRequest(params: {
 			}
 			return await completeOAuthSignIn({
 				oauth,
+				routes,
 				userStore,
-				tokenManager,
 				provider,
 				code,
 				state,
@@ -465,17 +477,16 @@ async function handleOAuthRequest(params: {
 
 async function completeOAuthSignIn(params: {
 	oauth: OAuthServerRuntime
+	routes: BuiltInAuthRoutes
 	userStore: UserStore
-	tokenManager: TokenManager
 	provider: string
 	code: string
 	state: string
 	binding: string | undefined
 	deviceId?: string
 	devicePublicKey?: string
-}): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens; identity: LinkedIdentity }>> {
-	const { oauth, userStore, tokenManager, provider, code, state, deviceId, devicePublicKey } =
-		params
+}): Promise<AuthRouteResponse<SignInResult & { identity: LinkedIdentity }>> {
+	const { oauth, routes, userStore, provider, code, state, deviceId, devicePublicKey } = params
 	const { userInfo } = await oauth.manager.handleCallback(provider, code, state, {
 		purpose: 'signin',
 		binding: params.binding,
@@ -530,8 +541,10 @@ async function completeOAuthSignIn(params: {
 		throw error
 	}
 
-	const tokens = tokenManager.issueTokens(user.id, resolvedDeviceId)
-	return { status: 200, body: { data: { user, tokens, identity } } }
+	// Same rule as password sign-in: an MFA user gets a challenge, not tokens.
+	const result = await routes.completePrimaryAuthentication(user, resolvedDeviceId, ['oauth'])
+	if (!('data' in result.body)) return result as AuthRouteResponse<never>
+	return { status: result.status, body: { data: { ...result.body.data, identity } } }
 }
 
 async function resolveOAuthUser(

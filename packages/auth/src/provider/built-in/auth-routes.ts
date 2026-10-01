@@ -185,7 +185,30 @@ export interface AuthRoutesConfig {
 	 * sync sessions (AUTH-11).
 	 */
 	onRevoke?: (event: AuthRevocationEvent) => void | Promise<void>
+	/**
+	 * Second-factor verifier (a `TotpManager` fits). When configured, users with
+	 * MFA enabled get `{ mfaRequired, mfaToken }` from sign-in instead of tokens,
+	 * and only `POST /auth/mfa/verify` issues their session (AUTH-10).
+	 */
+	mfa?: MfaVerifier
 }
+
+/** Second-factor checks used at sign-in. `TotpManager` implements this. */
+export interface MfaVerifier {
+	isEnabled(userId: string): Promise<boolean>
+	verify(userId: string, code: string): Promise<boolean>
+	verifyRecoveryCode?(userId: string, recoveryCode: string): Promise<boolean>
+}
+
+/** Sign-in result for a user who still has to pass the second factor. */
+export interface MfaChallenge {
+	mfaRequired: true
+	/** Short-lived token accepted only by `POST /auth/mfa/verify`. */
+	mfaToken: string
+}
+
+/** Successful primary authentication: a session, or an MFA challenge. */
+export type SignInResult = { user: AuthUser; tokens: AuthTokens } | MfaChallenge
 
 /**
  * Describes credentials that were just revoked, so live sessions holding them
@@ -358,6 +381,7 @@ export class BuiltInAuthRoutes {
 	private readonly revokeListeners = new Set<(event: AuthRevocationEvent) => void | Promise<void>>()
 	/** Lazily computed hash used to equalize sign-in timing for unknown emails. */
 	private dummyCredential: Promise<{ hash: string; salt: string }> | null = null
+	private readonly mfa: MfaVerifier | undefined
 
 	constructor(config: AuthRoutesConfig) {
 		this.userStore = config.userStore
@@ -365,6 +389,91 @@ export class BuiltInAuthRoutes {
 		this.challengeStore = config.challengeStore ?? new InMemoryChallengeStore()
 		this.rateLimiter = config.rateLimiter ?? new InMemoryRateLimiter()
 		if (config.onRevoke) this.revokeListeners.add(config.onRevoke)
+		this.mfa = config.mfa
+	}
+
+	/**
+	 * Finish a successful primary authentication (password, OAuth): issue a
+	 * session, or an MFA challenge when the user is enrolled in MFA. No
+	 * full-privilege token is ever issued to an MFA user without a fresh second
+	 * factor.
+	 *
+	 * @param user - The authenticated user
+	 * @param deviceId - The (already registered) device
+	 * @param amr - Methods satisfied so far (for example `['pwd']`)
+	 */
+	async completePrimaryAuthentication(
+		user: AuthUser,
+		deviceId: string,
+		amr: string[],
+	): Promise<AuthRouteResponse<SignInResult>> {
+		if (this.mfa && (await this.mfa.isEnabled(user.id))) {
+			return {
+				status: 200,
+				body: {
+					data: {
+						mfaRequired: true,
+						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr),
+					},
+				},
+			}
+		}
+		const tokens = this.tokenManager.issueTokens(user.id, deviceId, undefined, { amr })
+		return { status: 200, body: { data: { user, tokens } } }
+	}
+
+	/**
+	 * Handle the second factor (POST /auth/mfa/verify).
+	 *
+	 * Exchanges an `mfa_pending` token plus a TOTP code (or recovery code) for a
+	 * session whose tokens carry `amr` including `otp` (or `rcv`). The pending
+	 * token is redeemed once; a wrong code can be retried until it expires.
+	 */
+	async handleMfaVerify(body: {
+		mfaToken?: unknown
+		code?: unknown
+		recoveryCode?: unknown
+	}): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+		const invalidToken: AuthRouteResponse<never> = {
+			status: 401,
+			body: { error: 'Invalid or expired MFA session. Sign in again.', code: 'MFA_TOKEN_INVALID' },
+		}
+		if (!this.mfa || typeof body?.mfaToken !== 'string') return invalidToken
+		const pending = await this.tokenManager.verifyMfaPendingToken(body.mfaToken)
+		if (!pending) return invalidToken
+
+		const storedUser = await this.userStore.findById(pending.sub)
+		const device = await this.userStore.findDevice(pending.dev)
+		if (!storedUser || (device && (device.revoked || device.userId !== pending.sub))) {
+			return invalidToken
+		}
+
+		let method: 'otp' | 'rcv' | null = null
+		if (typeof body.code === 'string' && (await this.mfa.verify(pending.sub, body.code))) {
+			method = 'otp'
+		} else if (
+			typeof body.recoveryCode === 'string' &&
+			this.mfa.verifyRecoveryCode &&
+			(await this.mfa.verifyRecoveryCode(pending.sub, body.recoveryCode))
+		) {
+			method = 'rcv'
+		}
+		if (method === null) {
+			return { status: 401, body: { error: 'Invalid MFA code.', code: 'MFA_CODE_INVALID' } }
+		}
+		if (!(await this.tokenManager.redeemMfaPendingToken(pending))) return invalidToken
+
+		const tokens = this.tokenManager.issueTokens(pending.sub, pending.dev, undefined, {
+			amr: [...new Set([...pending.amr, method])],
+		})
+		const user: AuthUser = {
+			id: storedUser.id,
+			email: storedUser.email,
+			name: storedUser.name,
+			emailVerified: storedUser.emailVerified,
+			createdAt: storedUser.createdAt,
+		}
+		return { status: 200, body: { data: { user, tokens } } }
 	}
 
 	/**
@@ -589,7 +698,7 @@ export class BuiltInAuthRoutes {
 			devicePublicKey?: string
 		},
 		clientIp?: string,
-	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+	): Promise<AuthRouteResponse<SignInResult>> {
 		// Request bodies are untyped at runtime (JSON.parse'd network input, not
 		// a checked call site), so a missing/malformed `email` or `password`
 		// field reaches here as `undefined` despite the `string` type. Reject it
@@ -648,10 +757,6 @@ export class BuiltInAuthRoutes {
 		})
 		if (typeof deviceId !== 'string') return deviceId
 
-		const tokens = this.tokenManager.issueTokens(storedUser.id, deviceId, undefined, {
-			amr: ['pwd'],
-		})
-
 		const user: AuthUser = {
 			id: storedUser.id,
 			email: storedUser.email,
@@ -660,10 +765,7 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return {
-			status: 200,
-			body: { data: { user, tokens } },
-		}
+		return this.completePrimaryAuthentication(user, deviceId, ['pwd'])
 	}
 
 	/**
