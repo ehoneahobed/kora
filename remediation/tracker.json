@@ -1885,6 +1885,9 @@
    "tests": [
     {
      "file": "RT-12.test.ts"
+    },
+    {
+     "file": "RT-12-client.test.ts"
     }
    ],
    "pr": null,
