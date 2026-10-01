@@ -494,7 +494,7 @@
    "severity": "P0",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-1.test.ts"
@@ -507,10 +507,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1/W3 step 1(a)(b): uploads (pushOperation, sendDelta, reconcile) check the uplink scope only, never query subsets; collectDelta and reconcile upload only own-node ops. An own op on a synced collection outside the uplink scope is recorded in the rejected store (OUT_OF_UPLINK_SCOPE) and emitted as sync:operation-rejected instead of being kept silently. Interim: durable 'not upload-eligible' bookkeeping and the contiguous acked prefix remain W3 step 2. Inbound filtering unchanged (SYNC-2, W4)."
   },
   {
    "id": "SYNC-2",

@@ -148,6 +148,9 @@ export interface SyncDiagnostics {
 
 let nextMessageId = 0
 let nextQuerySubsetId = 0
+
+/** Rejection code for a local operation the uplink scope refuses (recorded client-side). */
+const OUT_OF_UPLINK_SCOPE = 'OUT_OF_UPLINK_SCOPE'
 function generateMessageId(): string {
 	return `msg-${Date.now()}-${nextMessageId++}`
 }
@@ -523,11 +526,19 @@ export class SyncEngine {
 	 * Push a local operation to the outbound queue.
 	 * If streaming, flushes immediately.
 	 *
-	 * Operations outside the configured sync scope are silently skipped
-	 * because they should remain local-only and not be sent to the server.
+	 * Uploads are judged against the UPLINK scope only. Query subsets narrow what
+	 * this client downloads, never what it uploads: an edit that moves a record out
+	 * of a reactive query's view must still reach the server (SYNC-1).
+	 *
+	 * Operations on collections that do not sync at all stay local-only by design.
+	 * An operation on a synced collection that falls outside the uplink scope would
+	 * be refused by the server, so it is recorded in the rejected store and
+	 * surfaced as `sync:operation-rejected` (code `OUT_OF_UPLINK_SCOPE`) rather than
+	 * kept as a silent local fork.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
-		if (!(await this.operationAllowedForSync(op))) {
+		if (!(await this.operationAllowedForUpload(op))) {
+			await this.recordOutOfUplinkScope(op)
 			return
 		}
 
@@ -1271,7 +1282,7 @@ export class SyncEngine {
 		const localVector = this.store.getVersionVector()
 		const allMissingOps = await this.collectDelta(localVector, this.remoteVector)
 
-		const missingOps = await this.filterAllowedForSync(allMissingOps)
+		const missingOps = await this.filterAllowedForUpload(allMissingOps)
 
 		this.deltaSentOpIds = missingOps.map((op) => op.id)
 
@@ -1347,19 +1358,24 @@ export class SyncEngine {
 		void this.checkDeltaComplete()
 	}
 
+	/**
+	 * Local operations the server has not seen. Only this node's own operations are
+	 * uploaded: operations relayed from other nodes reached this client through the
+	 * server, so re-uploading them is redundant and would be refused once the server
+	 * binds nodeId to the session (W3 step 1b).
+	 */
 	private async collectDelta(
 		localVector: VersionVector,
 		remoteVector: VersionVector,
 	): Promise<Operation[]> {
-		const missing: Operation[] = []
-		for (const [nodeId, localSeq] of localVector) {
-			const remoteSeq = remoteVector.get(nodeId) ?? 0
-			if (localSeq > remoteSeq) {
-				const ops = await this.store.getOperationRange(nodeId, remoteSeq + 1, localSeq)
-				missing.push(...ops)
-			}
+		const localNodeId = this.store.getNodeId()
+		const localSeq = localVector.get(localNodeId) ?? 0
+		const remoteSeq = remoteVector.get(localNodeId) ?? 0
+		if (localSeq <= remoteSeq) {
+			return []
 		}
-		return missing
+		const ops = await this.store.getOperationRange(localNodeId, remoteSeq + 1, localSeq)
+		return ops.filter((op) => op.nodeId === localNodeId)
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -1406,6 +1422,7 @@ export class SyncEngine {
 			? await this.encryptor.decryptBatch(deserialized)
 			: deserialized
 
+		// Inbound filtering still uses the combined predicate; removing it is SYNC-2 (W4).
 		const inScopeOps = await this.filterAllowedForSync(operations)
 
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
@@ -1863,15 +1880,16 @@ export class SyncEngine {
 	 * Hydrate the outbound queue from unsynced ops in the op log (deduped by operation id).
 	 */
 	private async reconcileOutboundFromOpLog(): Promise<void> {
+		const localNodeId = this.store.getNodeId()
 		if (this.syncState) {
 			const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
-			for (const op of unsynced) {
+			const own = unsynced.filter((op) => op.nodeId === localNodeId)
+			for (const op of await this.filterAllowedForUpload(own)) {
 				await this.outboundQueue.enqueue(op)
 			}
 			return
 		}
 
-		const localNodeId = this.store.getNodeId()
 		const localVector = this.store.getVersionVector()
 		const localSeq = localVector.get(localNodeId) ?? 0
 		if (localSeq === 0) {
@@ -1879,7 +1897,7 @@ export class SyncEngine {
 		}
 
 		const ops = await this.store.getOperationRange(localNodeId, 1, localSeq)
-		const inScope = await this.filterAllowedForSync(ops)
+		const inScope = await this.filterAllowedForUpload(ops)
 		for (const op of inScope) {
 			await this.outboundQueue.enqueue(op)
 		}
@@ -2061,6 +2079,67 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Upload predicate: the UPLINK scope only, never query subsets (SYNC-1). Query
+	 * subsets describe what this client wants to download; the server authorizes
+	 * uploads independently of the client's downloaded view.
+	 */
+	private async operationAllowedForUpload(op: Operation): Promise<boolean> {
+		// Fast path: the bare operation already carries the scope fields.
+		if (this.matchesScopeAndSubsets(op, undefined, 'upload')) {
+			return true
+		}
+		// A partial update or delete may not restate the scope fields. Backfill the
+		// record's current fields before deciding, so an in-scope edit to an
+		// unrelated field is never dropped.
+		const fullRecord = await this.readRecordForBackfill(op)
+		if (!fullRecord) {
+			return false
+		}
+		return this.matchesScopeAndSubsets(op, fullRecord, 'upload')
+	}
+
+	/**
+	 * Record a local operation that the uplink scope refuses, so it is visible to
+	 * the app instead of silently diverging from the server. Operations on
+	 * collections that are not synced in either direction are local-only by design
+	 * and are not recorded.
+	 *
+	 * Interim (S1): the durable "out of uplink scope at creation" bookkeeping and the
+	 * contiguous acknowledged prefix come with W3 step 2.
+	 */
+	private async recordOutOfUplinkScope(op: Operation): Promise<void> {
+		const uplink = this.activeUplinkScope
+		if (!uplink) return
+		const syncsCollection =
+			uplink[op.collection] !== undefined || this.activeScope?.[op.collection] !== undefined
+		if (!syncsCollection) return
+
+		const message = `Operation on "${op.collection}" record "${op.recordId}" is outside this client's upload scope and was not sent to the server. The local change is not synced; roll it back or move the record back into scope.`
+		await this.rejectedStorage.record({
+			operationId: op.id,
+			collection: op.collection,
+			recordId: op.recordId,
+			code: OUT_OF_UPLINK_SCOPE,
+			message,
+			retriable: false,
+			rejectedAt: Date.now(),
+		})
+		this.emitter?.emit({
+			type: 'sync:operation-rejected',
+			operationId: op.id,
+			collection: op.collection,
+			recordId: op.recordId,
+			code: OUT_OF_UPLINK_SCOPE,
+			message,
+			retriable: false,
+		})
+	}
+
+	/**
+	 * Inbound predicate (unchanged): uplink scope plus query subsets. Judging
+	 * delivered operations against the uplink scope is SYNC-2, fixed in W4.
+	 */
 	private async operationAllowedForSync(op: Operation): Promise<boolean> {
 		// Fast path: the bare operation already carries the scope / subset fields
 		// (inserts, or an op that restates them). No record read needed.
@@ -2069,8 +2148,7 @@ export class SyncEngine {
 		}
 		// It failed on the bare op. That may be a genuine out-of-scope op, OR a partial
 		// update / delete that simply does not restate the scope / subset field. Backfill
-		// the record's current fields and re-check before dropping it, so we never fail
-		// to sync an in-scope edit just because it changed an unrelated field.
+		// the record's current fields and re-check before dropping it.
 		const fullRecord = await this.readRecordForBackfill(op)
 		if (!fullRecord) {
 			return false
@@ -2078,12 +2156,21 @@ export class SyncEngine {
 		return this.matchesScopeAndSubsets(op, fullRecord)
 	}
 
+	/**
+	 * The uplink scope always applies. Query subsets apply only to the inbound
+	 * direction: they describe what this client downloads, never what it may
+	 * upload (SYNC-1).
+	 */
 	private matchesScopeAndSubsets(
 		op: Operation,
 		fullRecord?: Record<string, unknown> | null,
+		direction: 'inbound' | 'upload' = 'inbound',
 	): boolean {
 		if (!operationMatchesScope(op, this.activeUplinkScope, fullRecord)) {
 			return false
+		}
+		if (direction === 'upload') {
+			return true
 		}
 		return (
 			this.hasDirectionalScopes ||
@@ -2100,6 +2187,16 @@ export class SyncEngine {
 		} catch {
 			return null
 		}
+	}
+
+	private async filterAllowedForUpload(ops: Operation[]): Promise<Operation[]> {
+		const allowed: Operation[] = []
+		for (const op of ops) {
+			if (await this.operationAllowedForUpload(op)) {
+				allowed.push(op)
+			}
+		}
+		return allowed
 	}
 
 	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {

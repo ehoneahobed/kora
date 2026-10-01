@@ -969,6 +969,8 @@ describe('SyncEngine delta exchange', () => {
 		const { client, server } = createMemoryTransportPair()
 		const ops = [makeOp('op-1', 1), makeOp('op-2', 2)]
 		const store = createMockStore({
+			// These ops are this node's own writes; only own ops are uploaded.
+			getNodeId: () => 'node-1',
 			getVersionVector: () => new Map([['node-1', 2]]),
 			getOperationRange: vi.fn(async () => ops),
 		})
@@ -1097,6 +1099,8 @@ describe('SyncEngine delta exchange', () => {
 		const { client, server } = createMemoryTransportPair()
 		const manyOps = Array.from({ length: 250 }, (_, i) => makeOp(`op-${i}`, i + 1))
 		const store = createMockStore({
+			// These ops are this node's own writes; only own ops are uploaded.
+			getNodeId: () => 'node-1',
 			getVersionVector: () => new Map([['node-1', 250]]),
 			getOperationRange: vi.fn(async () => manyOps),
 		})
@@ -1285,6 +1289,8 @@ describe('SyncEngine events', () => {
 		const { client, server } = createMemoryTransportPair()
 		const ops = [makeOp('op-1', 1)]
 		const store = createMockStore({
+			// These ops are this node's own writes; only own ops are uploaded.
+			getNodeId: () => 'node-1',
 			getVersionVector: () => new Map([['node-1', 1]]),
 			getOperationRange: vi.fn(async () => ops),
 		})
@@ -1732,6 +1738,8 @@ describe('SyncEngine scope', () => {
 		}
 
 		const store = createMockStore({
+			// These ops are this node's own writes; only own ops are uploaded.
+			getNodeId: () => 'node-1',
 			getVersionVector: () => new Map([['node-1', 2]]),
 			getOperationRange: vi.fn(async () => [inScopeOp, outOfScopeOp]),
 		})
@@ -2035,8 +2043,50 @@ describe('SyncEngine enhanced status', () => {
 	})
 })
 
+/**
+ * Accept the handshake with an empty server delta, ack every client batch, and
+ * collect the ids of every operation the client uploads.
+ */
+function respondAndCollectUploads(server: MemoryTransport): string[] {
+	const uploaded: string[] = []
+	const serializer = new JsonMessageSerializer()
+	server.onMessage((msg) => {
+		if (msg.type === 'handshake') {
+			server.send({
+				type: 'handshake-response',
+				messageId: 'resp',
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: 'delta',
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		} else if (msg.type === 'operation-batch') {
+			for (const encoded of (msg as OperationBatchMessage).operations) {
+				uploaded.push(serializer.decodeOperation(encoded).id)
+			}
+			server.send({
+				type: 'acknowledgment',
+				messageId: `ack-${msg.messageId}`,
+				acknowledgedMessageId: msg.messageId,
+				lastSequenceNumber: 0,
+			})
+		}
+	})
+	return uploaded
+}
+
 describe('SyncEngine query subsets', () => {
-	test('pushOperation skips ops outside registered query subsets', async () => {
+	// SYNC-1: query subsets narrow the DOWNLINK only. An own edit that moves a record
+	// out of a reactive query's view must still be uploaded. (This test previously
+	// asserted the opposite, which was the bug.)
+	test('pushOperation uploads own ops even when they leave registered query subsets', async () => {
 		const { client } = createMemoryTransportPair()
 		const engine = new SyncEngine({
 			transport: client,
@@ -2053,7 +2103,7 @@ describe('SyncEngine query subsets', () => {
 			previousData: { completed: false, title: 'Op done' },
 		})
 
-		expect(engine.getOutboundQueue().totalPending).toBe(0)
+		expect(engine.getOutboundQueue().totalPending).toBe(1)
 
 		await engine.pushOperation({
 			...makeOp('active', 2),
@@ -2062,7 +2112,41 @@ describe('SyncEngine query subsets', () => {
 			previousData: { completed: true, title: 'Op active' },
 		})
 
-		expect(engine.getOutboundQueue().totalPending).toBe(1)
+		expect(engine.getOutboundQueue().totalPending).toBe(2)
+	})
+
+	test('delta upload ignores query subsets and still honours the uplink scope', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const leaving: Operation = {
+			...makeOp('leaving', 1, 'test-node'),
+			type: 'update',
+			data: { completed: true },
+			previousData: { completed: false },
+		}
+		const foreignUser: Operation = {
+			...makeOp('foreign', 2, 'test-node'),
+			data: { userId: 'user-2', title: 'x' },
+		}
+		const store = createMockStore({
+			getVersionVector: () => new Map([['test-node', 2]]),
+			getOperationRange: vi.fn(async () => [leaving, foreignUser]),
+			readRecordFields: vi.fn(async (_c: string, recordId: string) =>
+				recordId === leaving.recordId ? { userId: 'user-1', completed: true } : null,
+			),
+		})
+		const uploaded = respondAndCollectUploads(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
+		})
+		engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+
+		expect(uploaded).toContain('leaving')
+		expect(uploaded).not.toContain('foreign')
 	})
 
 	test('handshake includes active syncQueries', async () => {
@@ -2089,6 +2173,80 @@ describe('SyncEngine query subsets', () => {
 		expect(capturedHandshake).not.toBeNull()
 		const handshake = capturedHandshake as unknown as HandshakeMessage
 		expect(handshake.syncQueries).toEqual([{ collection: 'todos', where: { completed: false } }])
+	})
+})
+
+describe('SyncEngine upload selection (S1 stopgap)', () => {
+	test('an own op on a synced collection outside the uplink scope is recorded and surfaced, not silently kept', async () => {
+		const { client } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
+			emitter,
+		})
+
+		const op: Operation = { ...makeOp('foreign', 1), data: { userId: 'user-2', title: 'x' } }
+		await engine.pushOperation(op)
+
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
+		const rejected = await engine.getRejectedOperations()
+		expect(rejected).toHaveLength(1)
+		expect(rejected[0]).toMatchObject({
+			operationId: 'foreign',
+			code: 'OUT_OF_UPLINK_SCOPE',
+			retriable: false,
+		})
+		expect(emitter.events).toContainEqual(
+			expect.objectContaining({
+				type: 'sync:operation-rejected',
+				operationId: 'foreign',
+				code: 'OUT_OF_UPLINK_SCOPE',
+			}),
+		)
+	})
+
+	test('an op on a local-only collection (absent from every scope) stays local without a rejection', async () => {
+		const { client } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
+			emitter,
+		})
+
+		await engine.pushOperation({ ...makeOp('draft', 1), collection: 'drafts' })
+
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
+		expect(await engine.getRejectedOperations()).toHaveLength(0)
+		expect(emitter.events.some((e) => e.type === 'sync:operation-rejected')).toBe(false)
+	})
+
+	test("delta upload sends only this node's own operations, never relayed ones", async () => {
+		const { client, server } = createMemoryTransportPair()
+		const own = makeOp('own-1', 1, 'test-node')
+		const relayed = makeOp('relayed-1', 1, 'other-node')
+		const getOperationRange = vi.fn(async (nodeId: string) =>
+			nodeId === 'test-node' ? [own] : [relayed],
+		)
+		const store = createMockStore({
+			getVersionVector: () =>
+				new Map([
+					['test-node', 1],
+					['other-node', 1],
+				]),
+			getOperationRange,
+		})
+		const uploaded = respondAndCollectUploads(server)
+
+		const engine = new SyncEngine({ transport: client, store, config: { url: 'ws://test' } })
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+
+		expect(uploaded).toEqual(['own-1'])
+		expect(getOperationRange.mock.calls.every(([nodeId]) => nodeId === 'test-node')).toBe(true)
 	})
 })
 
