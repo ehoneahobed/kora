@@ -109,7 +109,10 @@ export type {
 export type { HttpLongPollingTransportOptions } from './transport/http-long-polling-transport'
 
 export { WebSocketTransport } from './transport/websocket-transport'
-export { HttpLongPollingTransport } from './transport/http-long-polling-transport'
+export {
+	HTTP_SYNC_SESSION_HEADER,
+	HttpLongPollingTransport,
+} from './transport/http-long-polling-transport'
 
 export type { ChaosConfig } from './transport/chaos-transport'
 

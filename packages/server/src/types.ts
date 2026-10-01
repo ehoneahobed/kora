@@ -189,6 +189,11 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerBatch?: number
 	/**
+	 * How long an HTTP long-poll session may go without any request before the server
+	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
+	 */
+	httpSessionIdleTimeoutMs?: number
+	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *
 	 * Runs at sync ingestion for every incoming client operation, after HLC
@@ -204,12 +209,25 @@ export interface KoraSyncServerConfig {
 
 /**
  * Request envelope for the server-side HTTP sync endpoint.
+ *
+ * Map it from your HTTP framework: `sessionId` from the `x-kora-session` header and
+ * `authorization` from the `Authorization` header, on every request.
  */
 export interface HttpSyncRequest {
-	/** Stable client identifier for binding HTTP requests to a server session */
-	clientId: string
 	/** HTTP method */
 	method: 'GET' | 'POST'
+	/**
+	 * The server-issued session id (`x-kora-session` request header). Absent only on
+	 * the POST that opens a session (the handshake); the response to that POST
+	 * carries the new id in its `x-kora-session` header. Never chosen by the client.
+	 */
+	sessionId?: string
+	/**
+	 * The raw `Authorization` header (`Bearer <token>`). With an auth provider
+	 * configured, EVERY request is authenticated and must resolve to the same
+	 * principal and device as the session it names (RT-2).
+	 */
+	authorization?: string
 	/** Optional raw request payload for POST */
 	body?: string | Uint8Array
 	/** Value of the Content-Type header for POST payloads */
@@ -223,7 +241,7 @@ export interface HttpSyncRequest {
  */
 export interface HttpSyncResponse {
 	/** HTTP status code */
-	status: 200 | 202 | 204 | 304 | 400 | 405 | 410
+	status: 200 | 202 | 204 | 304 | 400 | 401 | 403 | 404 | 405 | 410
 	/** Optional raw response payload */
 	body?: string | Uint8Array
 	/** Optional response headers */

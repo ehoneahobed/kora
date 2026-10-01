@@ -2,13 +2,14 @@ import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@
 import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
-import { JsonMessageSerializer } from '@korajs/sync'
+import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
 	applyServerOperation,
 } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
+import { NoAuthProvider } from '../auth/no-auth'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import type { Logger } from '../logging/structured-logger'
@@ -21,6 +22,7 @@ import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
 import { WsServerTransport } from '../transport/ws-server-transport'
 import type {
+	AuthContext,
 	AuthProvider,
 	HttpSyncRequest,
 	HttpSyncResponse,
@@ -37,6 +39,9 @@ const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
 const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
+const DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS = 2 * 60_000
+/** Bytes of randomness in a server-issued HTTP session id (256 bits). */
+const HTTP_SESSION_ID_BYTES = 32
 /** Default largest WebSocket message accepted (the ws library default is 100 MiB). */
 export const DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
@@ -110,11 +115,14 @@ export class KoraSyncServer {
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
 	private readonly sessions = new Map<string, ClientSession>()
-	private readonly httpClients = new Map<
-		string,
-		{ sessionId: string; transport: HttpServerTransport }
-	>()
-	private readonly httpSessionToClient = new Map<string, string>()
+	/**
+	 * HTTP long-poll sessions by their server-issued, high-entropy id (RT-2). Each is
+	 * bound to the principal that opened it; every request must re-authenticate as it.
+	 */
+	private readonly httpSessions = new Map<string, HttpSessionEntry>()
+	/** Internal ClientSession id -> HTTP session id, for cleanup on close. */
+	private readonly httpSessionIdBySession = new Map<string, string>()
+	private readonly httpSessionIdleTimeoutMs: number
 	// Informational value reported by getStatus(). Keep in sync with the
 	// @korajs/server package version on release; it is not used for protocol negotiation.
 	private readonly serverVersion = '1.0.0-beta.0'
@@ -190,6 +198,10 @@ export class KoraSyncServer {
 				? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
 				: {}),
 		})
+		this.httpSessionIdleTimeoutMs = validateIntervalOption(
+			'httpSessionIdleTimeoutMs',
+			config.httpSessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS,
+		)
 		this.maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
@@ -346,6 +358,18 @@ export class KoraSyncServer {
 			session.retransmitPendingRelays(staleMs)
 		}
 		this.expireOrphanedRelays()
+		this.expireIdleHttpSessions()
+	}
+
+	/** Close HTTP long-poll sessions that sent no request within the idle timeout. */
+	private expireIdleHttpSessions(now = Date.now()): void {
+		if (this.httpSessionIdleTimeoutMs <= 0 || this.httpSessions.size === 0) return
+		const cutoff = now - this.httpSessionIdleTimeoutMs
+		for (const entry of [...this.httpSessions.values()]) {
+			if (entry.lastSeenAtMs <= cutoff) {
+				entry.transport.close(4008, 'http session idle')
+			}
+		}
 	}
 
 	/**
@@ -612,8 +636,8 @@ export class KoraSyncServer {
 			session.close('server shutting down')
 		}
 		this.sessions.clear()
-		this.httpClients.clear()
-		this.httpSessionToClient.clear()
+		this.httpSessions.clear()
+		this.httpSessionIdBySession.clear()
 
 		// Close WebSocket server (standalone mode only)
 		if (this.wsServer) {
@@ -634,38 +658,106 @@ export class KoraSyncServer {
 	/**
 	 * Handle one HTTP sync request for a long-polling client.
 	 *
-	 * A stable `clientId` identifies the logical connection across requests.
+	 * The POST that opens a session (the handshake, sent without `sessionId`) creates
+	 * it and answers with a server-issued, high-entropy session id in the
+	 * `x-kora-session` response header. Every later request must name that id.
+	 *
+	 * With an auth provider, EVERY request is authenticated from its `authorization`
+	 * header and must resolve to the same principal (user, device and anonymity) as
+	 * the request that opened the session and as the session's handshake, so knowing
+	 * a session id alone grants nothing (RT-2). Sessions with no request for
+	 * `httpSessionIdleTimeoutMs` are closed.
+	 *
+	 * Responses: 202 (POST accepted), 200/204/304 (GET), 400 (malformed), 401
+	 * (credential missing or invalid), 403 (credential of another principal), 404
+	 * (unknown or expired session), 405 (method), 410 (session closed).
 	 */
 	async handleHttpRequest(request: HttpSyncRequest): Promise<HttpSyncResponse> {
-		if (!request.clientId || request.clientId.trim().length === 0) {
-			return { status: 400 }
+		if (request.method !== 'GET' && request.method !== 'POST') {
+			return { status: 405, headers: { allow: 'GET, POST' } }
+		}
+		this.expireIdleHttpSessions()
+
+		const authenticated = await this.authenticateHttpRequest(request.authorization)
+		if (authenticated === 'unauthorized') {
+			return { status: 401, headers: { 'www-authenticate': 'Bearer' } }
 		}
 
-		const client = this.getOrCreateHttpClient(request.clientId)
+		if (request.sessionId === undefined || request.sessionId.length === 0) {
+			// Only the POST carrying the handshake may open a session.
+			if (request.method !== 'POST' || request.body === undefined) {
+				return { status: 400 }
+			}
+			const entry = this.openHttpSession(authenticated)
+			entry.transport.receive(normalizeHttpBody(request.body, request.contentType))
+			return {
+				status: 202,
+				headers: { [HTTP_SYNC_SESSION_HEADER]: entry.id },
+			}
+		}
+
+		const entry = this.httpSessions.get(request.sessionId)
+		if (!entry) {
+			return { status: 404 }
+		}
+		if (!this.httpPrincipalMatches(entry, authenticated)) {
+			return { status: 403 }
+		}
+		entry.lastSeenAtMs = Date.now()
 
 		if (request.method === 'POST') {
 			if (request.body === undefined) {
 				return { status: 400 }
 			}
-
-			const payload = normalizeHttpBody(request.body, request.contentType)
-			client.transport.receive(payload)
+			if (!entry.transport.isConnected()) {
+				return { status: 410 }
+			}
+			entry.transport.receive(normalizeHttpBody(request.body, request.contentType))
 			return { status: 202 }
 		}
 
-		if (request.method === 'GET') {
-			const polled = client.transport.poll(request.ifNoneMatch)
-			return {
-				status: polled.status,
-				body: polled.body,
-				headers: polled.headers,
-			}
-		}
-
+		const polled = entry.transport.poll(request.ifNoneMatch)
 		return {
-			status: 405,
-			headers: { allow: 'GET, POST' },
+			status: polled.status,
+			body: polled.body,
+			headers: polled.headers,
 		}
+	}
+
+	/**
+	 * Authenticate one HTTP request. Returns the principal identity, null when the
+	 * server has no real auth provider, or 'unauthorized'.
+	 */
+	private async authenticateHttpRequest(
+		authorization: string | undefined,
+	): Promise<HttpPrincipal | null | 'unauthorized'> {
+		if (!this.auth || this.auth instanceof NoAuthProvider) return null
+		const token = parseBearer(authorization)
+		if (token === null) return 'unauthorized'
+		let context: AuthContext | null
+		try {
+			context = await this.auth.authenticate(token)
+		} catch {
+			return 'unauthorized'
+		}
+		return context ? principalOf(context) : 'unauthorized'
+	}
+
+	/**
+	 * True when a request's principal is the one that opened the session and, once
+	 * the handshake authenticated, the session's own principal.
+	 */
+	private httpPrincipalMatches(entry: HttpSessionEntry, principal: HttpPrincipal | null): boolean {
+		if (!samePrincipal(entry.principal, principal)) return false
+		const session = this.sessions.get(entry.sessionId)
+		const handshakePrincipal = session?.getPrincipal()
+		if (handshakePrincipal && !samePrincipal(principalOf(handshakePrincipal), principal)) {
+			// The handshake authenticated someone other than the HTTP credential: the
+			// session cannot be trusted by either; end it.
+			entry.transport.close(4003, 'http principal mismatch')
+			return false
+		}
+		return true
 	}
 
 	/**
@@ -1007,10 +1099,10 @@ export class KoraSyncServer {
 
 		this.sessions.delete(sessionId)
 
-		const clientId = this.httpSessionToClient.get(sessionId)
-		if (clientId) {
-			this.httpSessionToClient.delete(sessionId)
-			this.httpClients.delete(clientId)
+		const httpSessionId = this.httpSessionIdBySession.get(sessionId)
+		if (httpSessionId) {
+			this.httpSessionIdBySession.delete(sessionId)
+			this.httpSessions.delete(httpSessionId)
 		}
 	}
 
@@ -1050,24 +1142,75 @@ export class KoraSyncServer {
 		})
 	}
 
-	private getOrCreateHttpClient(clientId: string): {
-		sessionId: string
-		transport: HttpServerTransport
-	} {
-		const existing = this.httpClients.get(clientId)
-		if (existing) {
-			return existing
-		}
-
+	/** Open a new HTTP long-poll session bound to `principal`, under a fresh random id. */
+	private openHttpSession(principal: HttpPrincipal | null): HttpSessionEntry {
 		const transport = new HttpServerTransport(this.serializer)
 		const sessionId = this.handleConnection(transport)
-		const client = { sessionId, transport }
-
-		this.httpClients.set(clientId, client)
-		this.httpSessionToClient.set(sessionId, clientId)
-
-		return client
+		const entry: HttpSessionEntry = {
+			id: generateHttpSessionId(),
+			sessionId,
+			transport,
+			principal,
+			lastSeenAtMs: Date.now(),
+		}
+		this.httpSessions.set(entry.id, entry)
+		this.httpSessionIdBySession.set(sessionId, entry.id)
+		return entry
 	}
+}
+
+/** The identity an HTTP session is bound to (RT-2). */
+interface HttpPrincipal {
+	userId: string
+	deviceId: string | null
+	anonymous: boolean
+}
+
+interface HttpSessionEntry {
+	/** Server-issued, high-entropy id the client presents on every request. */
+	id: string
+	/** The ClientSession behind it. */
+	sessionId: string
+	transport: HttpServerTransport
+	/** Principal of the request that opened it; null without a real auth provider. */
+	principal: HttpPrincipal | null
+	lastSeenAtMs: number
+}
+
+function principalOf(context: AuthContext): HttpPrincipal {
+	const deviceId = context.metadata?.deviceId
+	return {
+		userId: context.userId,
+		deviceId: typeof deviceId === 'string' ? deviceId : null,
+		anonymous: context.anonymous === true,
+	}
+}
+
+/**
+ * Same principal. Anonymous principals get a fresh userId per authentication, so two
+ * anonymous principals match on anonymity alone; their session id is their only
+ * credential.
+ */
+function samePrincipal(a: HttpPrincipal | null, b: HttpPrincipal | null): boolean {
+	if (a === null || b === null) return a === b
+	if (a.anonymous || b.anonymous) return a.anonymous && b.anonymous
+	return a.userId === b.userId && a.deviceId === b.deviceId
+}
+
+/** The token of a `Bearer <token>` header; '' when absent (anonymous); null when malformed. */
+function parseBearer(authorization: string | undefined): string | null {
+	if (authorization === undefined || authorization.trim() === '') return ''
+	const match = /^Bearer\s+(\S+)\s*$/i.exec(authorization.trim())
+	return match?.[1] ?? null
+}
+
+/** 256 random bits, base64url: an unguessable HTTP session id. */
+function generateHttpSessionId(): string {
+	const bytes = new Uint8Array(HTTP_SESSION_ID_BYTES)
+	globalThis.crypto.getRandomValues(bytes)
+	let binary = ''
+	for (const byte of bytes) binary += String.fromCharCode(byte)
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 /**

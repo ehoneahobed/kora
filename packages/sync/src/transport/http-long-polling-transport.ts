@@ -12,6 +12,16 @@ import { WebSocketTransport } from './websocket-transport'
 
 const DEFAULT_RETRY_DELAY_MS = 250
 
+/**
+ * Header carrying the server-issued HTTP sync session id. The server returns it on
+ * the response to the first POST (the handshake); the client sends it on every
+ * later request, together with its bearer credential.
+ */
+export const HTTP_SYNC_SESSION_HEADER = 'x-kora-session'
+
+/** Statuses after which the server-side HTTP session is gone: reconnect from scratch. */
+const SESSION_ENDED_STATUSES = new Set([401, 403, 404, 410])
+
 export interface HttpLongPollingTransportOptions {
 	serializer?: MessageSerializer
 	fetchImpl?: typeof fetch
@@ -22,6 +32,13 @@ export interface HttpLongPollingTransportOptions {
 
 /**
  * HTTP long-polling transport with optional WebSocket upgrade.
+ *
+ * The first POST (the handshake) opens a server-side session; the server answers
+ * with a high-entropy session id in the `x-kora-session` header. Every later
+ * request carries that id and the bearer credential, and the long-poll loop starts
+ * only once the id is known. POSTs are sent one at a time, in order. A 401, 403,
+ * 404 or 410 means the server-side session is gone: the transport closes so the
+ * sync engine reconnects (and re-authenticates) from scratch.
  */
 export class HttpLongPollingTransport implements SyncTransport {
 	private readonly serializer: MessageSerializer
@@ -40,6 +57,10 @@ export class HttpLongPollingTransport implements SyncTransport {
 	private authToken: string | undefined
 	private pollAbort: AbortController | null = null
 	private upgradedTransport: SyncTransport | null = null
+	/** Server-issued session id; null until the handshake POST is answered. */
+	private sessionId: string | null = null
+	/** Serializes POSTs so the server receives messages in send order. */
+	private postChain: Promise<void> = Promise.resolve()
 
 	constructor(options?: HttpLongPollingTransportOptions) {
 		this.serializer = options?.serializer ?? new NegotiatedMessageSerializer('json')
@@ -68,9 +89,10 @@ export class HttpLongPollingTransport implements SyncTransport {
 		}
 
 		this.connected = true
-		this.polling = true
+		this.sessionId = null
+		this.postChain = Promise.resolve()
 		this.pollAbort = new AbortController()
-		void this.runPollLoop()
+		// Polling starts once the server has issued a session id (first POST).
 	}
 
 	async disconnect(): Promise<void> {
@@ -84,6 +106,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 		this.pollAbort?.abort()
 		this.pollAbort = null
 		this.url = null
+		this.sessionId = null
 	}
 
 	send(message: import('../protocol/messages').SyncMessage): void {
@@ -98,7 +121,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 			return
 		}
 
-		void this.postMessage(message)
+		this.postChain = this.postChain.then(() => this.postMessage(message))
 	}
 
 	onMessage(handler: TransportMessageHandler): void {
@@ -148,14 +171,10 @@ export class HttpLongPollingTransport implements SyncTransport {
 	}
 
 	private async postMessage(message: import('../protocol/messages').SyncMessage): Promise<void> {
-		if (!this.url) return
+		if (!this.url || !this.connected) return
 
 		const encoded = this.serializer.encode(message)
-		const headers = new Headers()
-		headers.set('accept', 'application/json, application/x-protobuf')
-		if (this.authToken) {
-			headers.set('authorization', `Bearer ${this.authToken}`)
-		}
+		const headers = this.makeHeaders()
 
 		const isBinary = encoded instanceof Uint8Array
 		headers.set('content-type', isBinary ? 'application/x-protobuf' : 'application/json')
@@ -169,15 +188,41 @@ export class HttpLongPollingTransport implements SyncTransport {
 				body: requestBody,
 			})
 
+			if (SESSION_ENDED_STATUSES.has(response.status)) {
+				this.endSession(response.status)
+				return
+			}
 			if (!response.ok) {
 				throw new SyncError('HTTP transport send failed', {
 					status: response.status,
 					messageType: message.type,
 				})
 			}
+			const issued = response.headers.get(HTTP_SYNC_SESSION_HEADER)
+			if (this.sessionId === null && issued) {
+				this.sessionId = issued
+				this.startPolling()
+			}
 		} catch (error) {
 			this.errorHandler?.(error instanceof Error ? error : new Error(String(error)))
 		}
+	}
+
+	private startPolling(): void {
+		if (this.polling || !this.connected) return
+		this.polling = true
+		void this.runPollLoop()
+	}
+
+	/** The server-side session is gone: stop and report a close so the engine reconnects. */
+	private endSession(status: number): void {
+		if (!this.connected) return
+		this.connected = false
+		this.polling = false
+		this.pollAbort?.abort()
+		this.pollAbort = null
+		this.sessionId = null
+		this.closeHandler?.(`http sync session ended (${String(status)})`)
 	}
 
 	private async runPollLoop(): Promise<void> {
@@ -185,9 +230,14 @@ export class HttpLongPollingTransport implements SyncTransport {
 			try {
 				const response = await this.fetchImpl(this.url, {
 					method: 'GET',
-					headers: this.makePollHeaders(),
+					headers: this.makeHeaders(),
 					signal: this.pollAbort?.signal,
 				})
+
+				if (SESSION_ENDED_STATUSES.has(response.status)) {
+					this.endSession(response.status)
+					return
+				}
 
 				if (response.status === 204) {
 					await sleep(this.retryDelayMs)
@@ -226,11 +276,15 @@ export class HttpLongPollingTransport implements SyncTransport {
 		}
 	}
 
-	private makePollHeaders(): Headers {
+	/** Accept, bearer credential and (once issued) the session id: sent on every request. */
+	private makeHeaders(): Headers {
 		const headers = new Headers()
 		headers.set('accept', 'application/json, application/x-protobuf')
 		if (this.authToken) {
 			headers.set('authorization', `Bearer ${this.authToken}`)
+		}
+		if (this.sessionId) {
+			headers.set(HTTP_SYNC_SESSION_HEADER, this.sessionId)
 		}
 		return headers
 	}

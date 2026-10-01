@@ -756,6 +756,15 @@ export class ClientSession {
 		return this.authContext
 	}
 
+	/**
+	 * The principal the auth provider verified at handshake, or null before (or
+	 * without) authentication. Unlike {@link getAuthContext}, never a context
+	 * synthesized for an unauthenticated session.
+	 */
+	getPrincipal(): AuthContext | null {
+		return this.principal
+	}
+
 	isStreaming(): boolean {
 		return this.state === 'streaming'
 	}
