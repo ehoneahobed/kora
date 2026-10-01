@@ -197,7 +197,9 @@ export class KoraSyncServer {
 		this.blobChunkRelay = new BlobChunkRelay(
 			config.resolveBlobChunk,
 			{
-				canAccess: (sessionId, hash) => this.sessionMayAccessBlob(sessionId, hash),
+				canReadFromStore: (requesterId, hash) => this.sessionReferencesBlob(requesterId, hash),
+				canForward: (requesterId, targetId, hash) =>
+					this.mayForwardBlobRequest(requesterId, targetId, hash),
 				observeVerifiedBytes: (hash, bytes) => this.blobAccess.observeVerifiedBytes(hash, bytes),
 			},
 			{
@@ -1083,14 +1085,34 @@ export class KoraSyncServer {
 	// --- Private ---
 
 	/**
-	 * Blob access policy (RT-1): a session may obtain (and be asked for) the bytes
-	 * behind a hash only when it is streaming and a live record inside its download
-	 * scope references that hash.
+	 * Blob access policy (RT-1): true when the session is streaming and a live record
+	 * inside its download scope references the hash. Gates the central store.
 	 */
-	private async sessionMayAccessBlob(sessionId: string, hash: string): Promise<boolean> {
+	private async sessionReferencesBlob(sessionId: string, hash: string): Promise<boolean> {
 		const session = this.sessions.get(sessionId)
 		if (!session || !session.isStreaming()) return false
 		return this.blobAccess.isReferenced(session.getDownlinkScopes(), hash)
+	}
+
+	/**
+	 * Blob access policy (RT-1): a request may be forwarded to a peer that shares the
+	 * requester's exact download scope (the same tenant view, as for presence), which
+	 * keeps manifests handed over out of band working; across scopes, only when both
+	 * scopes reference the hash, so neither the hash nor the bytes cross a tenant.
+	 */
+	private async mayForwardBlobRequest(
+		requesterId: string,
+		targetId: string,
+		hash: string,
+	): Promise<boolean> {
+		const requester = this.sessions.get(requesterId)
+		const target = this.sessions.get(targetId)
+		if (!requester?.isStreaming() || !target?.isStreaming()) return false
+		if (requester.getScopePartitionKey() === target.getScopePartitionKey()) return true
+		return (
+			(await this.sessionReferencesBlob(requesterId, hash)) &&
+			(await this.sessionReferencesBlob(targetId, hash))
+		)
 	}
 
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {

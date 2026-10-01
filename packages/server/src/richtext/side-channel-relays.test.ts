@@ -54,7 +54,7 @@ function response(requestId: string): BlobChunkResponseMessage {
 	}
 }
 
-const allowAll = { canAccess: async () => true }
+const allowAll = { canReadFromStore: async () => true, canForward: async () => true }
 
 function awareness(
 	clientId: number,

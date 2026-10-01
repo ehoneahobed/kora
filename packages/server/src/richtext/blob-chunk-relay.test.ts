@@ -41,11 +41,18 @@ function response(requestId: string, bytes: string | null): BlobChunkResponseMes
 }
 
 /** Every session may access every hash (tenancy is tested separately). */
-const allowAll: BlobAccessPolicy = { canAccess: async () => true }
+const allowAll: BlobAccessPolicy = {
+	canReadFromStore: async () => true,
+	canForward: async () => true,
+}
 
-/** Only the listed sessions may access the hash. */
+/** Only the listed sessions take part (as requester or peer). */
 function allowOnly(sessions: string[]): BlobAccessPolicy {
-	return { canAccess: async (sessionId) => sessions.includes(sessionId) }
+	return {
+		canReadFromStore: async (requester) => sessions.includes(requester),
+		canForward: async (requester, target) =>
+			sessions.includes(requester) && sessions.includes(target),
+	}
 }
 
 const chunk = new Uint8Array([1, 2, 3])
@@ -118,7 +125,7 @@ describe('BlobChunkRelay (peer relay path)', () => {
 })
 
 describe('BlobChunkRelay tenancy (RT-1)', () => {
-	test('a requester the policy refuses gets "not held" and nobody is asked', async () => {
+	test('a requester nobody may be asked for gets "not held"', async () => {
 		const { relay, a, b, c } = setup(allowOnly(['b', 'c']))
 		await relay.handleRequest('a', request('r1', hash))
 		expect(a.sent).toEqual([
@@ -155,7 +162,10 @@ describe('BlobChunkRelay tenancy (RT-1)', () => {
 
 	test('a throwing policy fails closed', async () => {
 		const { relay, a, b } = setup({
-			canAccess: async () => {
+			canReadFromStore: async () => {
+				throw new Error('store down')
+			},
+			canForward: async () => {
 				throw new Error('store down')
 			},
 		})
@@ -166,7 +176,7 @@ describe('BlobChunkRelay tenancy (RT-1)', () => {
 
 	test('verified bytes are handed to the policy (manifest learning)', async () => {
 		const observe = vi.fn()
-		const { relay } = setup({ canAccess: async () => true, observeVerifiedBytes: observe })
+		const { relay } = setup({ ...allowAll, observeVerifiedBytes: observe })
 		await relay.handleRequest('a', request('r1', hash))
 		await relay.handleResponse('b', response('r1', encoded))
 		expect(observe).toHaveBeenCalledWith(hash, chunk)

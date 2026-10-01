@@ -214,6 +214,39 @@ describe('ClientSession node binding (SEC-3, server half)', () => {
 	})
 })
 
+describe('Blob relay stays inside the tenant (RT-1)', () => {
+	test('a request for an unreferenced hash reaches same-scope devices only', async () => {
+		const { login } = await setup()
+		const alice1 = await login('alice-1', 'alice-1')
+		const alice2 = await login('alice-2', 'alice-2')
+		const bob = await login('bob', 'bob-node')
+		alice1.client.send({
+			type: 'blob-chunk-request',
+			messageId: 'r',
+			requestId: 'oob',
+			hash: 'e'.repeat(64),
+		})
+		await tick()
+		expect(alice2.messages.some((m) => m.type === 'blob-chunk-request')).toBe(true)
+		expect(bob.messages.some((m) => m.type === 'blob-chunk-request')).toBe(false)
+	})
+
+	test('a requester with nobody to ask is told "not held" at once', async () => {
+		const { login } = await setup()
+		const bob = await login('bob', 'bob-node')
+		await login('alice', 'alice-node')
+		bob.client.send({
+			type: 'blob-chunk-request',
+			messageId: 'r',
+			requestId: 'lonely',
+			hash: 'f'.repeat(64),
+		})
+		await tick()
+		const answer = bob.messages.find((m) => m.type === 'blob-chunk-response')
+		expect(answer?.type === 'blob-chunk-response' ? answer.bytes : 'missing').toBeNull()
+	})
+})
+
 describe('Side channels after the handshake (SEC-5)', () => {
 	async function seedNote(store: MemoryServerStore, recordId: string, userId: string) {
 		await store.applyRemoteOperation(
