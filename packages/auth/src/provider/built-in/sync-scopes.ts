@@ -45,6 +45,8 @@ export interface SyncAuthContext {
 	userId: string
 	scopes?: Record<string, Record<string, unknown>>
 	metadata?: Record<string, unknown>
+	/** Access-token expiry (ms since epoch); a session must not outlive it (AUTH-11). */
+	expiresAt?: number
 }
 
 /** Structural `AuthProvider` returned by `toSyncAuthProvider()`. */

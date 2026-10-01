@@ -11,11 +11,13 @@ interface TokenValidator {
 		sub: string
 		dev: string
 		type: string
+		exp?: number
 	} | null
 	validateTokenWithRevocation?(token: string): Promise<{
 		sub: string
 		dev: string
 		type: string
+		exp?: number
 	} | null>
 }
 
@@ -157,6 +159,7 @@ export class KoraAuthProvider implements AuthProvider {
 		return {
 			userId: payload.sub,
 			scopes,
+			...(typeof payload.exp === 'number' ? { expiresAt: payload.exp * 1000 } : {}),
 			metadata: {
 				deviceId: payload.dev,
 				email: user.email,

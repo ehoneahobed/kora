@@ -1292,6 +1292,7 @@ export class BuiltInAuthRoutes {
 				return {
 					userId: payload.sub,
 					scopes,
+					expiresAt: payload.exp * 1000,
 					metadata: {
 						deviceId: payload.dev,
 						email: user.email,
