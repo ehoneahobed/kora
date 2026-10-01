@@ -56,3 +56,6 @@ target/
 _private/
 _audit_tmp/
 _to_delete/
+
+# Test artifacts written by store tests
+packages/store/:memory:*
