@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { buildScopeSnapshot } from './scope-snapshot'
 
 /**
  * A live query filter that narrows which operations sync for a collection.
@@ -6,31 +7,6 @@ import type { Operation } from '@korajs/core'
 export interface SyncQuerySubset {
 	collection: string
 	where: Record<string, unknown>
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-		return null
-	}
-	return value as Record<string, unknown>
-}
-
-function buildSnapshot(
-	op: Operation,
-	fullRecord?: Record<string, unknown> | null,
-): Record<string, unknown> | null {
-	const previous = asRecord(op.previousData)
-	const next = asRecord(op.data)
-
-	if (!previous && !next && !fullRecord) {
-		return null
-	}
-
-	return {
-		...(fullRecord ?? {}),
-		...(previous ?? {}),
-		...(next ?? {}),
-	}
 }
 
 function recordMatchesWhere(
@@ -68,11 +44,8 @@ export function operationMatchesQuerySubsets(
 		return true
 	}
 
-	const snapshot = buildSnapshot(op, fullRecord)
-	if (!snapshot) {
-		return false
-	}
-
+	// Shared snapshot: identity always comes from op.recordId, never from op fields.
+	const snapshot = buildScopeSnapshot(op, fullRecord)
 	return collectionSubsets.some((subset) => recordMatchesWhere(snapshot, subset.where))
 }
 

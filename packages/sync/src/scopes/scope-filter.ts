@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import type { SyncScopeMap } from '../types'
+import { buildScopeSnapshot, recordMatchesScopePredicates } from './scope-snapshot'
 
 /**
  * Check whether an operation matches the given scope map.
@@ -11,6 +12,7 @@ import type { SyncScopeMap } from '../types'
  * - Scope has field/value pairs: all must match in the operation's data snapshot.
  *
  * For updates, the snapshot is built by merging `previousData` and `data` (data wins),
+ * with `id` always taken from `op.recordId`,
  * which represents the record's state after the operation is applied. When an optional
  * `fullRecord` is provided (e.g., from the local store), its values fill in scope fields
  * that weren't included in the operation's data (critical for update operations where
@@ -36,24 +38,9 @@ export function operationMatchesScope(
 	// Empty scope means no field restrictions
 	if (Object.keys(collectionScope).length === 0) return true
 
-	const snapshot = buildSnapshot(op, fullRecord ?? undefined)
-	if (!snapshot) return false
-
-	for (const [field, expected] of Object.entries(collectionScope)) {
-		if (!matchesPredicate(snapshot[field], expected)) {
-			return false
-		}
-	}
-
-	return true
-}
-
-function matchesPredicate(actual: unknown, expected: unknown): boolean {
-	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
-		const values = (expected as { $in?: unknown }).$in
-		return Array.isArray(values) && values.some((value) => Object.is(actual, value))
-	}
-	return Object.is(actual, expected)
+	// The record identity is always op.recordId (assigned last by the shared
+	// snapshot), so an op cannot claim an in-scope `id` through data/previousData.
+	return recordMatchesScopePredicates(buildScopeSnapshot(op, fullRecord), collectionScope)
 }
 
 /**
@@ -69,27 +56,4 @@ export function filterOperationsByScope(
 ): Operation[] {
 	if (!scopeMap) return operations
 	return operations.filter((op) => operationMatchesScope(op, scopeMap))
-}
-
-function buildSnapshot(
-	op: Operation,
-	fullRecord?: Record<string, unknown> | null,
-): Record<string, unknown> | null {
-	const previous = asRecord(op.previousData)
-	const next = asRecord(op.data)
-
-	if (!previous && !next && !fullRecord) return null
-
-	return {
-		...(fullRecord ?? {}),
-		...(previous ?? {}),
-		...(next ?? {}),
-	}
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-		return null
-	}
-	return value as Record<string, unknown>
 }
