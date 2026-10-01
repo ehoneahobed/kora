@@ -31,6 +31,10 @@ interface SqliteDb {
 
 interface OpfsPool {
 	OpfsSAHPoolDb: new (filename: string) => SqliteDb
+	/** Number of files currently stored in the pool (each occupies one slot). */
+	getFileCount?: () => number
+	/** Grow the pool to at least `min` slots; existing files are untouched. */
+	reserveMinimumCapacity?: (min: number) => Promise<number>
 }
 
 interface Sqlite3Api {
@@ -43,6 +47,30 @@ interface Sqlite3Api {
  * multiple db files keyed by filename), so it must NOT be namespaced per database
  * or existing persisted data would be orphaned. */
 const OPFS_POOL_NAME = 'kora-opfs'
+
+/**
+ * Free slots kept beyond the database being opened. Every open needs one slot for
+ * the database file and one transient slot for its rollback journal during each
+ * write transaction; the headroom covers other databases' journals in the pool.
+ */
+const OPFS_POOL_HEADROOM = 2
+
+/**
+ * Make sure the shared pool has room for the database about to be opened (and its
+ * journal) before opening it. Without this, the 6th per-user database on an
+ * origin exhausts the default 6-slot pool and every database in it, including
+ * already-open ones, fails to commit (NEW-STORE-7). Slots are empty pre-allocated
+ * files, so reserving them is cheap; files are never evicted.
+ */
+async function ensurePoolCapacity(pool: OpfsPool): Promise<void> {
+	if (
+		typeof pool.getFileCount !== 'function' ||
+		typeof pool.reserveMinimumCapacity !== 'function'
+	) {
+		return
+	}
+	await pool.reserveMinimumCapacity(pool.getFileCount() + 2 + OPFS_POOL_HEADROOM)
+}
 
 /** Headless browsers and some profiles hang on OPFS VFS install; fall back to memory. */
 const OPFS_INIT_TIMEOUT_MS = 10_000
@@ -177,6 +205,7 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 			const pool = await getOpfsPool(sqlite3)
 
 			if (pool) {
+				await ensurePoolCapacity(pool)
 				db = new pool.OpfsSAHPoolDb(opfsDatabaseFilename(dbName ?? 'kora-db'))
 				persistent = true
 			} else {

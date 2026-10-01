@@ -1,6 +1,6 @@
 import { generateFullDDL } from '@korajs/core'
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
-import { AdapterError, StoreNotOpenError } from '../errors'
+import { AdapterError, StorageDurabilityError, StoreNotOpenError } from '../errors'
 import {
 	FollowerBroadcastBridge,
 	TransactionSerializingWorkerBridge,
@@ -58,6 +58,23 @@ export interface SqliteWasmAdapterOptions {
 	emitNonPersistentDiagnostic?: boolean
 
 	/**
+	 * Accept writes when durable OPFS storage could not be obtained and the
+	 * database runs in memory. Defaults to false: a non-durable open or promotion
+	 * emits the blocking `store:durability-lost` event and every write is refused
+	 * with {@link StorageDurabilityError}, so data is never accepted and then lost
+	 * on reload. Set true only for apps that can tolerate losing local writes.
+	 */
+	allowNonDurable?: boolean
+
+	/**
+	 * For `createApp()`: skip the durability check at open only, because the caller
+	 * inspects {@link SqliteWasmAdapter.getStorageOpenState} right after open and
+	 * switches to a durable backend itself. A later leader promotion that loses
+	 * durable storage is still enforced.
+	 */
+	deferOpenDurabilityCheck?: boolean
+
+	/**
 	 * When set, storage diagnostics are emitted here: `store:opfs-unavailable` when
 	 * persistence silently degraded to a non-persistent in-memory database, and
 	 * `store:db-name-collision` when another runtime on this origin was already
@@ -98,6 +115,10 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	/** Retained so a follower promoted to leader can re-open its own worker. */
 	private schema: SchemaDefinition | null = null
 	private promoting = false
+	private readonly allowNonDurable: boolean
+	private readonly deferOpenDurabilityCheck: boolean
+	/** Set when this adapter lost (or never had) durable storage; writes are refused. */
+	private durabilityLoss: { phase: 'open' | 'promotion'; reason: string } | null = null
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
@@ -107,6 +128,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.dbName = options.dbName ?? 'kora-db'
 		this.emitter = options.emitter
 		this.emitNonPersistentDiagnostic = options.emitNonPersistentDiagnostic ?? true
+		this.allowNonDurable = options.allowNonDurable ?? false
+		this.deferOpenDurabilityCheck = options.deferOpenDurabilityCheck ?? false
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
@@ -117,6 +140,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			this.bridge = this.injectedBridge
 			const response = await this.openCurrentBridge(ddlStatements)
 			this.reportStorageMode(response.data)
+			this.enforceDurability('open')
 			this.opened = true
 			return
 		}
@@ -125,6 +149,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			await this.openDurableWorkerBridge(schema)
 			const response = await this.openCurrentBridge(ddlStatements)
 			this.reportStorageMode(response.data)
+			this.enforceDurability('open')
 			this.opened = true
 			return
 		}
@@ -218,6 +243,48 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		return this.storageOpenState
 	}
 
+	/**
+	 * Durable or loud, never silent (NEW-STORE-6, interim). When the open or a
+	 * promotion ended on non-persistent storage and the app did not opt into that,
+	 * emit the blocking `store:durability-lost` event and refuse every later write.
+	 * A bridge that reports no mode (the Node mock) is not judged.
+	 */
+	private enforceDurability(
+		phase: 'open' | 'promotion',
+		failure?: { reason: 'open-failed'; message: string },
+	): void {
+		if (this.allowNonDurable) return
+		if (phase === 'open' && this.deferOpenDurabilityCheck) return
+		let reason: 'lock-conflict' | 'timeout' | 'unsupported' | 'open-failed'
+		if (failure) {
+			reason = failure.reason
+		} else if (this.storageOpenState?.persistent === false) {
+			reason = this.storageOpenState.fallbackReason ?? 'unsupported'
+		} else {
+			return
+		}
+		this.durabilityLoss = { phase, reason }
+		this.emitter?.emit({
+			type: 'store:durability-lost',
+			dbName: this.dbName,
+			phase,
+			reason,
+			message:
+				`Database "${this.dbName}" has no durable storage (${reason} during ${phase}); ` +
+				`writes are refused until the app reloads with durable storage.${failure ? ` ${failure.message}` : ''}`,
+		})
+	}
+
+	private guardDurableWrite(): void {
+		if (this.durabilityLoss) {
+			throw new StorageDurabilityError(
+				this.dbName,
+				this.durabilityLoss.phase,
+				this.durabilityLoss.reason,
+			)
+		}
+	}
+
 	private warnSharedWorkerDeprecated(): void {
 		if (!this.sharedWorkerUrl || warnedSharedWorkerDeprecated) {
 			return
@@ -277,11 +344,31 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		// Re-open against our own worker. DDL is idempotent, and the OPFS data the old
 		// leader persisted is now readable by this worker.
 		const ddlStatements = generateFullDDL(this.schema)
-		await this.sendRequest({ id: 0, type: 'open', ddlStatements, dbName: this.dbName })
+		let response: WorkerResponse
+		try {
+			response = await this.sendRequest({ id: 0, type: 'open', ddlStatements, dbName: this.dbName })
+		} catch (error) {
+			response = {
+				id: 0,
+				type: 'error',
+				message: error instanceof Error ? error.message : String(error),
+				code: 'PROMOTION_OPEN_FAILED',
+			}
+		}
+		// The promoted worker may not have obtained the OPFS pool (another database
+		// or app on the origin holds it). Never let it run silently in memory.
+		if (response.type === 'error') {
+			this.storageOpenState = { persistent: false, mode: 'memory' }
+			this.enforceDurability('promotion', { reason: 'open-failed', message: response.message })
+			return
+		}
+		this.storageOpenState = parseStorageOpenState(response.data) ?? this.storageOpenState
+		this.enforceDurability('promotion')
 	}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
 		this.guardOpen()
+		this.guardDurableWrite()
 		const response = await this.sendRequest({ id: 0, type: 'execute', sql, params })
 		if (response.type === 'error') {
 			throw new AdapterError(`Execute failed: ${response.message}`, { sql, params })
@@ -299,6 +386,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		this.guardOpen()
+		this.guardDurableWrite()
 
 		const release = await this.mutex.acquire()
 		try {
@@ -340,6 +428,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		this.guardOpen()
+		this.guardDurableWrite()
 
 		const release = await this.mutex.acquire()
 		try {
@@ -393,6 +482,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 */
 	async importDatabase(data: Uint8Array): Promise<void> {
 		this.guardOpen()
+		this.guardDurableWrite()
 		const response = await this.sendRequest({ id: 0, type: 'import', data })
 		if (response.type === 'error') {
 			throw new AdapterError(`Import failed: ${response.message}`)

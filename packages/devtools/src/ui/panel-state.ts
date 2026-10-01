@@ -258,6 +258,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `store fallback ${event.from} → ${event.to}`
 		case 'store:opfs-unavailable':
 			return `store OPFS unavailable (${event.reason}), running in memory`
+		case 'store:durability-lost':
+			return `store durability lost (${event.reason} during ${event.phase}), writes refused`
 		case 'store:db-name-collision':
 			return `store db-name collision ${event.dbName}`
 		case 'replay:completed':

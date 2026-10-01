@@ -1360,7 +1360,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "browser": "LMS-5f"
@@ -1369,10 +1369,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: SqliteWasmAdapter open() and promoteToLeader() that end non-durable (or a failed promotion re-open) emit the blocking store:durability-lost event and refuse writes with StorageDurabilityError unless allowNonDurable is set (createApp: store.allowNonDurable; its OPFS probe defers only the open check because it falls back to IndexedDB itself). Real Chromium LMS-5f: blocking check passes; 'write accepted by promoted follower is durable' still fails by design (the write is refused, not made durable) until W8a per-database pools."
   },
   {
    "id": "NEW-STORE-7",
@@ -1380,7 +1380,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "browser": "LMS-6a"
@@ -1389,10 +1389,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: the SQLite WASM worker calls pool.reserveMinimumCapacity(fileCount + 2 + headroom 2) before every OPFS SAH pool open. Real Chromium LMS-6a both checks pass (8 per-user DBs durable; user #1 still writes). No eviction. Manifest, listDatabases/deleteDatabase and per-database pools remain W8a."
   },
   {
    "id": "NEW-STORE-8",

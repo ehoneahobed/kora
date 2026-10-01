@@ -71,6 +71,13 @@ export interface StoreOptions {
 	sharedWorkerUrl?: string | URL
 	/** Max wait for a worker RPC (e.g. `open`). Defaults to 30000ms. */
 	workerResponseTimeoutMs?: number
+	/**
+	 * Accept writes when no durable browser storage can be obtained (the store runs
+	 * in memory and loses local writes on reload). Defaults to false: Kora emits the
+	 * blocking `store:durability-lost` event and refuses writes with
+	 * `StorageDurabilityError` instead.
+	 */
+	allowNonDurable?: boolean
 }
 
 export interface StoreInfo {
