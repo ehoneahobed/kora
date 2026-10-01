@@ -206,7 +206,7 @@
    "severity": "P0",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-1.test.ts"
@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. Remaining hardening for CUSTOM providers that return no scopes: ClientSession.handleHandshake must pass resolveSessionScopes(..., { authenticated: this.auth && !(this.auth instanceof NoAuthProvider) }) and may use onUnresolved:'throw' to answer SCOPE_REQUIRED (session/* owned by W1)."
   },
   {
    "id": "AUTH-2",
@@ -229,14 +229,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 2. BuiltInAuthRoutes.authenticateAccess() used by every route, requireAuthUser and the sync provider; refresh checks device record and user."
   },
   {
    "id": "AUTH-3",
@@ -244,14 +244,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 7. OAuth state bound to purpose/user/client binding (HttpOnly cookie or body); POST /oauth/:p/link/start; device id never from state metadata."
   },
   {
    "id": "AUTH-4",
@@ -259,14 +259,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 8. listMyInvitations(userId) resolves verified email server-side and strips tokens; accept requires verified email match (checked before consume); OrgStore.revokeInvitation(orgId, id)."
   },
   {
    "id": "AUTH-5",
@@ -274,14 +274,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 3. registerDevice throws DeviceOwnershipError (409) in memory/SQLite/Postgres stores; random default device id; OAuth ignores state device ids."
   },
   {
    "id": "AUTH-6",
@@ -289,14 +289,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 4. TokenRevocationStore.consume() atomic (SQLite/Postgres INSERT ON CONFLICT); same-instance duplicates get 409 REFRESH_IN_PROGRESS. Postgres contract test passes against PG16 (KORA_PG_TEST_URL)."
   },
   {
    "id": "AUTH-7",
@@ -304,14 +304,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 steps 2+9. Reset token never disclosed (exposeTokenForDevelopment opt-in, never in production; loud error when no callback, no constructor throw because the repro constructs one); reset/change revoke all earlier credentials; atomic reset-token consume. Repro AUTH-7 opts into allowInMemory for its production case."
   },
   {
    "id": "AUTH-8",
@@ -319,14 +319,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 2 (authenticateAccess on HTTP routes)."
   },
   {
    "id": "AUTH-9",
@@ -334,14 +334,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 9. Dummy-hash KDF for unknown emails; per-account and per-IP limiter keys. Client IP trust is W1 step 7 (SEC-9a)."
   },
   {
    "id": "AUTH-10",
@@ -349,14 +349,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 10. MFA challenge at issuance (mfa_pending token, POST /auth/mfa/verify, amr); TOTP failure backoff persisted; consumeCode in disable/regenerate."
   },
   {
    "id": "AUTH-11",
@@ -364,14 +364,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "AUTH-11.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Auth side done: AuthContext.expiresAt populated; createKoraAuthServer().onRevoke() and bindSyncServer({ terminateSessions({userId?, deviceId?}) }) emit on device revoke, sign-out, revokeAllForUser. Needs KoraSyncServer.terminateSessions + ClientSession expiry timer (AUTH_EXPIRED, retriable) in packages/server/src/session|server (W1 owner)."
   },
   {
    "id": "AUTH-12",
@@ -379,14 +379,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-12.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 4. SqliteTokenRevocationStore / PostgresTokenRevocationStore; user stores expose getTokenRevocationStore() used by default; production refuses in-memory stores unless allowInMemory; templates use persistent user stores."
   },
   {
    "id": "AUTH-13",
@@ -394,7 +394,7 @@
    "severity": "P0",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-13.test.ts"
@@ -412,7 +412,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 6. Only a Kora JSON 401 / 400 invalid_grant clears tokens; request timeout; backoff + Retry-After; Web Locks single refresher; authenticated-offline session (identity from stored credentials) used by createKoraAuthSync, namespaceByAuthUser and AuthBoundKoraProvider; maxOfflineGraceMs lock; clock-rollback guard."
   },
   {
    "id": "AUTH-14",
@@ -420,14 +420,14 @@
    "severity": "P3",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-14.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 11. Passkey UV enforced; ExternalJwt exp required + aud/iss (supabase default aud); webhook timestamped signatures + https/public targets + DNS check; AdminApi isAdmin + credential revocation."
   },
   {
    "id": "NEW-AUTH-1",
@@ -435,14 +435,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-AUTH-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 3. Device revocation is a cut-off (revokedBefore); reuse revokes the token family."
   },
   {
    "id": "NEW-AUTH-2",
@@ -450,7 +450,7 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-1.test.ts",
@@ -458,7 +458,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 6. Web Locks single refresher with storage re-read (in-realm fallback), and the server grace replay covers cross-realm races."
   },
   {
    "id": "NEW-AUTH-3",
@@ -466,7 +466,7 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-1.test.ts",
@@ -474,7 +474,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 3. One grace replay within 30s returns the byte-identical successor pair (deterministic jtis, nothing stored); closed once the successor is used."
   },
   {
    "id": "NEW-AUTH-4",
@@ -482,11 +482,14 @@
    "severity": "P2",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-AUTH-4.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "W2 step 6. restoreSession treats a Kora JSON 401 from /auth/me as definitive. Repro written: packages/auth/tests/repro/NEW-AUTH-4.test.ts (fails at beta.12)."
   },
   {
    "id": "SYNC-1",
