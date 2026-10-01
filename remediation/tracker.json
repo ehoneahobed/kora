@@ -813,7 +813,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Array case now agrees (S1 interim: replayOperationsForRecord uses mergeArraySet against previousData). Object and custom-resolver cases remain for W7."
   },
   {
    "id": "SRV-2",
@@ -1457,7 +1457,7 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "MERGE-1.test.ts"
@@ -1466,10 +1466,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1492,7 +1492,7 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "NEW-MERGE-1.test.ts"
@@ -1501,10 +1501,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7."
   },
   {
    "id": "CORE-1",

@@ -542,7 +542,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 		const { atomicOps: _remoteAtomicOps, ...opWithoutAtomic } = op
 		const localOp: Operation = {
 			...opWithoutAtomic,
-			data: buildLocalDiff(baseState, currentRecord, Object.keys(op.data ?? {})),
+			data: buildLocalDiff(baseState, currentRecord, Object.keys(op.data ?? {}), collectionDef),
 			previousData: op.previousData,
 			nodeId: this.deps.store.getNodeId(),
 			timestamp: localTimestamp,
@@ -854,14 +854,33 @@ function updateNeedsMergeEngine(op: Operation, collectionDef: CollectionDefiniti
 	return false
 }
 
+/**
+ * The local side of a pairwise merge: only the fields the remote op touches
+ * whose LOCAL value actually differs from the base the remote op wrote from.
+ *
+ * A field the local device left unchanged is not a concurrent edit. Treating it
+ * as one let the local copy of the base value compete with the remote change:
+ * for arrays it resurrected elements the remote side removed, and for scalars a
+ * newer local timestamp could restore the old value (NEW-MERGE-1). Interim (S1);
+ * W7 replaces the pairwise merge with a per-field fold.
+ */
 function buildLocalDiff(
 	baseState: Record<string, unknown>,
 	currentRecord: Record<string, unknown>,
 	fields: string[],
+	collectionDef: CollectionDefinition,
 ): Record<string, unknown> {
 	const diff: Record<string, unknown> = {}
 	for (const field of fields) {
-		diff[field] = currentRecord[field]
+		const local = currentRecord[field]
+		const base = baseState[field]
+		const unchanged =
+			collectionDef.fields[field]?.kind === 'richtext'
+				? richtextStatesEqual(local, base)
+				: deepEqual(local, base)
+		if (!unchanged) {
+			diff[field] = local
+		}
 	}
 	return diff
 }

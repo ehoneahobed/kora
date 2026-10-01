@@ -343,6 +343,7 @@ export class SqliteServerStore implements ServerStore {
 				type: operations.type,
 				data: operations.data,
 				atomicOps: operations.atomicOps,
+				previousData: operations.previousData,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
@@ -356,6 +357,7 @@ export class SqliteServerStore implements ServerStore {
 			data: op.data !== null ? JSON.parse(op.data) : null,
 			atomicOps:
 				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+			previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -454,6 +456,7 @@ export class SqliteServerStore implements ServerStore {
 				type: operations.type,
 				data: operations.data,
 				atomicOps: operations.atomicOps,
+				previousData: operations.previousData,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
@@ -483,6 +486,7 @@ export class SqliteServerStore implements ServerStore {
 					data: op.data !== null ? JSON.parse(op.data) : null,
 					atomicOps:
 						op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+					previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 				}))
 				const recordData = replayOperationsForRecord(parsedOps)
 

@@ -545,6 +545,7 @@ export class PostgresServerStore implements ServerStore {
 				type: pgOperations.type,
 				data: pgOperations.data,
 				atomicOps: pgOperations.atomicOps,
+				previousData: pgOperations.previousData,
 				wallTime: pgOperations.wallTime,
 			})
 			.from(pgOperations)
@@ -563,6 +564,7 @@ export class PostgresServerStore implements ServerStore {
 			data: op.data !== null ? JSON.parse(op.data) : null,
 			atomicOps:
 				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+			previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -656,6 +658,7 @@ export class PostgresServerStore implements ServerStore {
 				type: pgOperations.type,
 				data: pgOperations.data,
 				atomicOps: pgOperations.atomicOps,
+				previousData: pgOperations.previousData,
 				wallTime: pgOperations.wallTime,
 			})
 			.from(pgOperations)
@@ -689,6 +692,7 @@ export class PostgresServerStore implements ServerStore {
 				data: op.data !== null ? JSON.parse(op.data) : null,
 				atomicOps:
 					op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+				previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 			}))
 			const recordData = replayOperationsForRecord(parsedOps)
 
