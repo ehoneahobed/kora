@@ -75,14 +75,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "fixed",
+   "status": "in_progress",
    "tests": [
     {
      "file": "SEC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops."
+   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops. REOPENED by red team (RT-1): blob relay still forwards requests/answers across tenants and the central store answers any hash."
   },
   {
    "id": "SEC-6",
@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1709,6 +1709,141 @@
    "acceptance": "Make both tests deterministic (fake timers / no wall-clock budget); CLAUDE.md anti-pattern #9.",
    "pr": null,
    "notes": "Found 2026-10-01: both failed in a full pnpm test run while other heavy jobs ran; pass in isolation."
+  },
+  {
+   "id": "RT-1",
+   "title": "Blob chunk requests/responses relayed across tenants; central store serves any hash to any session",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-2",
+   "title": "HTTP long-poll: clientId alone binds a request to an authenticated session (session hijack)",
+   "severity": "P0",
+   "workstream": "W5",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-3",
+   "title": "Download visibility trusts writer previousData: cross-tenant op injection into other tenants' logs",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-5",
+   "title": "claimNode: anonymous MixedAuthProvider clients locked out on reconnect; node ids squattable at upgrade; no admin release",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-6",
+   "title": "Refused ops each cost a store read before the rate limiter; no per-batch op cap",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-7",
+   "title": "Handshake echoes write counts for any node id the client names",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-8",
+   "title": "Scope grant with undefined/null value matches records lacking the field",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-9",
+   "title": "Refresh racing a device revocation can mint tokens that survive it",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
+  },
+  {
+   "id": "RT-10",
+   "title": "Cascade side-effect ops not re-authorized; restrict check counts other tenants' children",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md)."
   }
  ],
  "rejectedProposalPins": {
