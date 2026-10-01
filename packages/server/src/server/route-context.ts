@@ -391,7 +391,13 @@ export function createRouteContext(
 		// against the row as it is at commit time.
 		const result = await server.applyLocalOperation(
 			op,
-			scope ? { authorize: (stored) => authorizeUplinkWrite(op, stored, scope) } : {},
+			scope
+				? {
+						authorize: (stored) => authorizeUplinkWrite(op, stored, scope),
+						// A scoped route's delete may only cascade inside its scope (RT-10).
+						authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, scope),
+					}
+				: {},
 		)
 		if (result.result !== 'applied') {
 			const code = result.rejection?.code ?? 'NOT_APPLIED'

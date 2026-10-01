@@ -1399,6 +1399,8 @@ export class ClientSession {
 			const uplinkScopes = this.uplinkScopes()
 			const applyResult = await applyServerOperation(this.store, serverOp, undefined, {
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
+				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
+				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
 			})
 			if (applyResult.rejection) {
 				this.sendOperationRejected(
