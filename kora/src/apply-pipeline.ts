@@ -198,6 +198,14 @@ export class ApplyPipeline implements LocalMutationHandler {
 			{ inTransaction: true },
 		)
 
+		// Highest own sequence number in this batch (buffered entries + side effects).
+		let highestOwnSeq = 0
+		for (const op of sortedOps) {
+			if (op.nodeId === ctx.nodeId && op.sequenceNumber > highestOwnSeq) {
+				highestOwnSeq = op.sequenceNumber
+			}
+		}
+
 		await ctx.adapter.transaction(async (tx) => {
 			for (const op of sortedOps) {
 				const commands = commandsByOpId.get(op.id)
@@ -207,6 +215,20 @@ export class ApplyPipeline implements LocalMutationHandler {
 				for (const cmd of commands) {
 					await tx.execute(cmd.sql, cmd.params)
 				}
+			}
+			// STORE-1 stopgap: persist the sequence counter inside the commit, and never
+			// lower it. Without this the next single-record write re-allocates a
+			// sequence number this transaction already used, so the server's ack of the
+			// transaction makes that later write look synced and it is never uploaded.
+			// MAX(existing, batch) also undoes any side-effect command that wrote an
+			// older value. Concurrent transactions can still collide on the same numbers
+			// until W6 reserves a block inside the transaction.
+			if (highestOwnSeq > 0) {
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[ctx.nodeId, highestOwnSeq],
+				)
 			}
 		})
 

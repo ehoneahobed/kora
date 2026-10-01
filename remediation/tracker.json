@@ -1035,7 +1035,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "mitigated",
    "tests": [
     {
      "file": "STORE-1.test.ts"
@@ -1044,10 +1044,10 @@
    "stopgap": {
     "workstream": "S1",
     "phase": 1,
-    "status": "open"
+    "status": "fixed"
    },
    "pr": null,
-   "notes": ""
+   "notes": "S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
   },
   {
    "id": "STORE-2",
