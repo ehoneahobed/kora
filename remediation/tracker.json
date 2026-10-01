@@ -45,14 +45,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Server half done: NODE_ID_MISMATCH for op.nodeId/timestamp.nodeId != session node (stored echoes ack as duplicates), ServerStore.claimNode at authenticated handshake (NODE_ID_CLAIMED). Client half (never trust server vector for own node, upload only own ops; W3 step 1b) still open."
+   "notes": "Server half done: NODE_ID_MISMATCH for op.nodeId/timestamp.nodeId != session node (stored echoes ack as duplicates), ServerStore.claimNode at authenticated handshake (NODE_ID_CLAIMED). Client half (never trust server vector for own node, upload only own ops; W3 step 1b) still open. Server half (NODE_ID_MISMATCH, claimNode) + client uploads only own ops (S1). Client-side defence in depth (never trust server vector for own node) lands with W3 step 2."
   },
   {
    "id": "SEC-4",
@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. Remaining hardening for CUSTOM providers that return no scopes: ClientSession.handleHandshake must pass resolveSessionScopes(..., { authenticated: this.auth && !(this.auth instanceof NoAuthProvider) }) and may use onUnresolved:'throw' to answer SCOPE_REQUIRED (session/* owned by W1)."
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. Remaining hardening for CUSTOM providers that return no scopes: ClientSession.handleHandshake must pass resolveSessionScopes(..., { authenticated: this.auth && !(this.auth instanceof NoAuthProvider) }) and may use onUnresolved:'throw' to answer SCOPE_REQUIRED (session/* owned by W1)."
   },
   {
    "id": "AUTH-2",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1697,15 +1697,23 @@
    ],
    "pr": null,
    "notes": ""
+  },
+  {
+   "id": "NEW-TEST-1",
+   "title": "Timing-dependent tests flake under load (indexeddb debounce, apply-order-determinism 5s timeout)",
+   "severity": "P3",
+   "workstream": "W0",
+   "phase": 0,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Make both tests deterministic (fake timers / no wall-clock budget); CLAUDE.md anti-pattern #9.",
+   "pr": null,
+   "notes": "Found 2026-10-01: both failed in a full pnpm test run while other heavy jobs ran; pass in isolation."
   }
  ],
  "rejectedProposalPins": {
   "description": "Tests that apply a REJECTED external proposal (LMS report) to a scratch copy and prove it is wrong. They are expected to keep failing; they never block and never count as repro tests.",
   "tests": [
-   {
-    "file": "LMS-8.test.ts",
-    "title": "LMS #8 patch does not close"
-   },
    {
     "browser": "LMS-5h",
     "title": "LMS retry"

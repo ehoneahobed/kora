@@ -410,7 +410,7 @@
    "status": "failed",
    "observation": false
   },
-  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill benchmark: 27 collections, 20000 ops — HEAD vs proposed vs no-op (marker)": {
+  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill benchmark: 27 collections, 20000 ops \u2014 HEAD vs proposed vs no-op (marker)": {
    "status": "passed",
    "observation": true
   },
@@ -498,15 +498,15 @@
    "status": "failed",
    "observation": false
   },
-  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects marks Kora-template unhashed sqlite3.wasm immutable for a year (defect)": {
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) \u2014 defects marks Kora-template unhashed sqlite3.wasm immutable for a year (defect)": {
    "status": "passed",
    "observation": false
   },
-  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects marks index.html immutable when the deploy path contains /assets/ (defect)": {
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) \u2014 defects marks index.html immutable when the deploy path contains /assets/ (defect)": {
    "status": "passed",
    "observation": false
   },
-  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects never matches on Windows paths (defect)": {
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) \u2014 defects never matches on Windows paths (defect)": {
    "status": "passed",
    "observation": false
   },
@@ -730,7 +730,7 @@
    "status": "passed",
    "observation": false
   },
-  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes] forged data.id is rejected today — but only by schema shape validation (SCHEMA_VALIDATION_ERROR), not by scope": {
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes] forged data.id is rejected today \u2014 but only by schema shape validation (SCHEMA_VALIDATION_ERROR), not by scope": {
    "status": "passed",
    "observation": true
   },
@@ -743,8 +743,9 @@
    "observation": false
   },
   "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [fails with LMS patch] LMS #8 patch does not close the previousData.id bypass": {
-   "status": "failed",
-   "observation": false
+   "status": "passed",
+   "observation": false,
+   "note": "Reclassified as guard after W1: the in-store authorize hook blocks the forgery even with the rejected LMS patch applied (defence in depth)."
   },
   "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes with correct fix] id forced from recordId + stored row authoritative rejects all forgeries": {
    "status": "passed",
@@ -766,7 +767,7 @@
    "status": "passed",
    "observation": false
   },
-  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [fails today] read-only learner: downlink {c1}, no uplink for lessons → receives nothing": {
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [fails today] read-only learner: downlink {c1}, no uplink for lessons \u2192 receives nothing": {
    "status": "failed",
    "observation": false
   },
