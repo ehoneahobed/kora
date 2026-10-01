@@ -18,6 +18,24 @@ interface RelayClient {
 	transport: ServerTransport
 }
 
+/** Limits that bound the relay's per-session bookkeeping. */
+export interface BlobChunkRelayLimits {
+	/** Most unanswered requests one session may have outstanding. Defaults to 256. */
+	maxPendingPerSession?: number
+	/** How long an unanswered request is remembered, in ms. Defaults to 60 seconds. */
+	pendingTtlMs?: number
+}
+
+/** Default cap on outstanding forwarded requests per session. */
+export const DEFAULT_MAX_PENDING_BLOB_REQUESTS_PER_SESSION = 256
+/** Default lifetime of an unanswered forwarded request. */
+export const DEFAULT_BLOB_REQUEST_TTL_MS = 60_000
+
+interface PendingRequest {
+	originSessionId: string
+	createdAtMs: number
+}
+
 /**
  * Routes out-of-band blob chunk transfer between connected clients (and,
  * optionally, a server-side blob store).
@@ -33,11 +51,16 @@ interface RelayClient {
 export class BlobChunkRelay {
 	private readonly clients = new Map<string, RelayClient>()
 	/** requestId -> the session that originated the request (to route the answer back). */
-	private readonly pending = new Map<string, string>()
+	private readonly pending = new Map<string, PendingRequest>()
 	private readonly resolveBlobChunk: ResolveBlobChunk | null
+	private readonly maxPendingPerSession: number
+	private readonly pendingTtlMs: number
 
-	constructor(resolveBlobChunk?: ResolveBlobChunk) {
+	constructor(resolveBlobChunk?: ResolveBlobChunk, limits: BlobChunkRelayLimits = {}) {
 		this.resolveBlobChunk = resolveBlobChunk ?? null
+		this.maxPendingPerSession =
+			limits.maxPendingPerSession ?? DEFAULT_MAX_PENDING_BLOB_REQUESTS_PER_SESSION
+		this.pendingTtlMs = limits.pendingTtlMs ?? DEFAULT_BLOB_REQUEST_TTL_MS
 	}
 
 	addClient(sessionId: string, transport: ServerTransport): void {
@@ -48,8 +71,8 @@ export class BlobChunkRelay {
 		this.clients.delete(sessionId)
 		// Drop any requests this session was waiting on; their answers can no
 		// longer be delivered.
-		for (const [requestId, originSessionId] of this.pending) {
-			if (originSessionId === sessionId) {
+		for (const [requestId, entry] of this.pending) {
+			if (entry.originSessionId === sessionId) {
 				this.pending.delete(requestId)
 			}
 		}
@@ -112,16 +135,29 @@ export class BlobChunkRelay {
 		if (message.bytes === null) {
 			return
 		}
-		const originSessionId = this.pending.get(message.requestId)
-		if (!originSessionId) {
+		const entry = this.pending.get(message.requestId)
+		if (!entry) {
 			return
 		}
 		this.pending.delete(message.requestId)
-		this.sendResponseTo(originSessionId, message.requestId, message.bytes)
+		this.sendResponseTo(entry.originSessionId, message.requestId, message.bytes)
 	}
 
 	private forwardRequestToPeers(sourceSessionId: string, message: BlobChunkRequestMessage): void {
-		this.pending.set(message.requestId, sourceSessionId)
+		const now = Date.now()
+		this.expirePending(now)
+		const existing = this.pending.get(message.requestId)
+		// A request id already pending for another session is refused, so one session
+		// cannot hijack the answer routed to another by reusing its request id.
+		if (existing && existing.originSessionId !== sourceSessionId) {
+			return
+		}
+		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
+			// Over the per-session cap: drop the request. The requester's own timeout
+			// bounds its wait; the relay's memory stays bounded per session.
+			return
+		}
+		this.pending.set(message.requestId, { originSessionId: sourceSessionId, createdAtMs: now })
 		for (const [, client] of this.clients) {
 			if (client.sessionId === sourceSessionId) {
 				continue
@@ -130,6 +166,23 @@ export class BlobChunkRelay {
 				continue
 			}
 			client.transport.send(message)
+		}
+	}
+
+	private pendingCountFor(sessionId: string): number {
+		let count = 0
+		for (const entry of this.pending.values()) {
+			if (entry.originSessionId === sessionId) count += 1
+		}
+		return count
+	}
+
+	private expirePending(now: number): void {
+		const cutoff = now - this.pendingTtlMs
+		for (const [requestId, entry] of this.pending) {
+			if (entry.createdAtMs <= cutoff) {
+				this.pending.delete(requestId)
+			}
 		}
 	}
 

@@ -108,6 +108,25 @@ export interface KoraSyncServerConfig {
 	 */
 	persistBlobChunk?: (hash: string, bytes: Uint8Array) => Promise<void> | void
 	/**
+	 * Limits on the blob side channel. `maxChunkBytes` (default 1 MiB) caps one
+	 * pushed chunk or manifest, `maxBytesPerSession` (default 256 MiB) caps the total
+	 * a session may push for central persistence, `maxPendingRequestsPerSession`
+	 * (default 256) and `pendingRequestTtlMs` (default 60s) bound the chunk requests
+	 * the relay remembers per session.
+	 */
+	blobLimits?: {
+		maxChunkBytes?: number
+		maxBytesPerSession?: number
+		maxPendingRequestsPerSession?: number
+		pendingRequestTtlMs?: number
+	}
+	/**
+	 * Largest WebSocket message the standalone server (and `createProductionServer`)
+	 * accepts, in bytes. Larger frames are refused by the socket layer before they are
+	 * buffered. Defaults to 32 MiB (the `ws` library default is 100 MiB).
+	 */
+	maxMessageBytes?: number
+	/**
 	 * Maximum serialized byte size of a single client operation accepted at sync
 	 * ingest. Operations larger than this are rejected before materialization.
 	 * Defaults to 256 KiB. Set once here to enforce one payload cap across every

@@ -20,7 +20,7 @@ function createTestOp(overrides: Partial<Operation> = {}): Operation {
 		recordId: 'rec-1',
 		data: { title: 'test' },
 		previousData: null,
-		timestamp: { wallTime: 1000, logical: 0, nodeId: 'client-1' },
+		timestamp: { wallTime: 1000, logical: 0, nodeId: overrides.nodeId ?? 'client-1' },
 		sequenceNumber: 1,
 		causalDeps: [],
 		schemaVersion: 1,
@@ -641,6 +641,7 @@ describe('KoraSyncServer', () => {
 
 			const scopedOut = createTestOp({
 				id: 'stale-scope-1',
+				nodeId: 'client-sub',
 				collection: 'submissions',
 				recordId: 'submission-stale-scope-1',
 				sequenceNumber: 1,

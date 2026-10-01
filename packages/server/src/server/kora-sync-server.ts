@@ -4,6 +4,7 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
 import {
+	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
 	applyServerOperation,
 } from '../apply/apply-server-operation'
@@ -15,7 +16,7 @@ import { createDefaultLogger } from '../logging/structured-logger'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
-import type { ServerStore } from '../store/server-store'
+import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
 import { WsServerTransport } from '../transport/ws-server-transport'
@@ -35,6 +36,8 @@ const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
 const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
+/** Default largest WebSocket message accepted (the ws library default is 100 MiB). */
+export const DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 /**
  * Minimal interface for a ws.WebSocketServer instance.
@@ -53,6 +56,7 @@ export type WsServerConstructor = new (options: {
 	port?: number
 	host?: string
 	path?: string
+	maxPayload?: number
 }) => WsServerLike
 
 function validateIntervalOption(name: string, value: number): number {
@@ -99,6 +103,8 @@ export class KoraSyncServer {
 		| null
 	private readonly maxOperationBytes: number | undefined
 	private readonly maxOpsPerMinute: number | undefined
+	private readonly maxMessageBytes: number
+	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
 	private readonly sessions = new Map<string, ClientSession>()
@@ -171,7 +177,16 @@ export class KoraSyncServer {
 		this.logger = config.logger ?? createDefaultLogger()
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
 		this.metrics.setSchemaVersion(this.schemaVersion)
-		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk)
+		this.blobLimits = config.blobLimits ?? {}
+		this.blobChunkRelay = new BlobChunkRelay(config.resolveBlobChunk, {
+			...(this.blobLimits.maxPendingRequestsPerSession !== undefined
+				? { maxPendingPerSession: this.blobLimits.maxPendingRequestsPerSession }
+				: {}),
+			...(this.blobLimits.pendingRequestTtlMs !== undefined
+				? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
+				: {}),
+		})
+		this.maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
@@ -414,6 +429,7 @@ export class KoraSyncServer {
 				port: this.port,
 				host: this.host,
 				path: this.path,
+				maxPayload: this.maxMessageBytes,
 			})
 		} else {
 			// Dynamic import of ws — only needed in standalone mode
@@ -422,6 +438,7 @@ export class KoraSyncServer {
 				port: this.port,
 				host: this.host,
 				path: this.path,
+				maxPayload: this.maxMessageBytes,
 			})
 		}
 
@@ -672,8 +689,8 @@ export class KoraSyncServer {
 			onAwarenessUpdate: (sourceSessionId, message) => {
 				this.handleAwarenessRelay(sourceSessionId, message)
 			},
-			onYjsDocUpdate: (sourceSessionId, message) => {
-				this.handleYjsDocRelay(sourceSessionId, message)
+			onYjsDocUpdate: (sourceSessionId, message, storedRecord) => {
+				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
 			},
 			onBlobChunkRequest: (sourceSessionId, message) => {
 				this.blobChunkRelay.handleRequest(sourceSessionId, message)
@@ -682,6 +699,17 @@ export class KoraSyncServer {
 				this.blobChunkRelay.handleResponse(sourceSessionId, message)
 			},
 			...(this.persistBlobChunk ? { persistBlobChunk: this.persistBlobChunk } : {}),
+			...(this.blobLimits.maxChunkBytes !== undefined
+				? { maxBlobChunkBytes: this.blobLimits.maxChunkBytes }
+				: {}),
+			...(this.blobLimits.maxBytesPerSession !== undefined
+				? { maxBlobBytesPerSession: this.blobLimits.maxBytesPerSession }
+				: {}),
+			// Side channels are joined only after an accepted handshake, never at connect.
+			onReady: (sid) => {
+				this.yjsDocRelay.addClient(sid, transport)
+				this.blobChunkRelay.addClient(sid, transport)
+			},
 			// Only forward when configured, so an unset server value leaves the
 			// session on its own documented default rather than `undefined`.
 			...(this.maxOperationBytes !== undefined
@@ -701,8 +729,6 @@ export class KoraSyncServer {
 		})
 
 		this.sessions.set(sessionId, session)
-		this.yjsDocRelay.addClient(sessionId, transport)
-		this.blobChunkRelay.addClient(sessionId, transport)
 		session.start()
 
 		this.logger.log({
@@ -751,10 +777,14 @@ export class KoraSyncServer {
 	 * client only receives the operation if it falls within that client's scope.
 	 *
 	 * @param op - A fully-formed, server-originated operation to apply
+	 * @param options - Optional in-store authorization (used by scoped routes)
 	 * @returns The apply result, including any server-generated side-effect ops
 	 */
-	async applyLocalOperation(op: Operation): Promise<ApplyServerOperationResult> {
-		const result = await applyServerOperation(this.store, op)
+	async applyLocalOperation(
+		op: Operation,
+		options: ApplyServerOperationOptions = {},
+	): Promise<ApplyServerOperationResult> {
+		const result = await applyServerOperation(this.store, op, undefined, options)
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
 			for (const session of this.sessions.values()) {
@@ -864,23 +894,39 @@ export class KoraSyncServer {
 	}
 
 	private handleAwarenessRelay(sourceSessionId: string, message: AwarenessUpdateMessage): void {
-		// Register client with awareness relay if not already done
+		// Only sessions that completed an accepted handshake take part in presence. The
+		// first update binds the session's awareness clientId (later updates must use
+		// it) and its presence partition (its canonical download scope).
 		const session = this.sessions.get(sourceSessionId)
-		if (!session) return
+		if (!session || !session.isStreaming()) return
 
-		const transport = session.getTransport()
-		if (!this.awarenessRelay.getClientCount() || !transport) {
-			// First awareness update from this client -- register
+		if (!this.awarenessRelay.hasClient(sourceSessionId)) {
+			this.awarenessRelay.addClient(
+				sourceSessionId,
+				message.clientId,
+				session.getTransport(),
+				session.getScopePartitionKey(),
+			)
 		}
-		this.awarenessRelay.addClient(sourceSessionId, message.clientId, transport)
 		this.awarenessRelay.handleUpdate(sourceSessionId, message)
 	}
 
-	private handleYjsDocRelay(sourceSessionId: string, message: YjsDocUpdateMessage): void {
+	private handleYjsDocRelay(
+		sourceSessionId: string,
+		message: YjsDocUpdateMessage,
+		storedRecord: MaterializedRecord | null,
+	): void {
 		if (!this.sessions.has(sourceSessionId)) {
 			return
 		}
-		this.yjsDocRelay.handleUpdate(sourceSessionId, message)
+		// The session already authorized the sender's write. Deliver only to sessions
+		// whose download scope contains the stored record.
+		this.yjsDocRelay.handleUpdate(sourceSessionId, message, (targetSessionId) => {
+			const target = this.sessions.get(targetSessionId)
+			return target
+				? target.canReceiveRecord(message.collection, message.recordId, storedRecord)
+				: false
+		})
 	}
 
 	private getOrCreateHttpClient(clientId: string): {

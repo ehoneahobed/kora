@@ -42,13 +42,18 @@ import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
 import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import {
+	type ScopeMap,
+	type UplinkAuthorizationResult,
+	authorizeRecordWrite,
+	authorizeUplinkWrite,
 	missingScopeFields,
 	normalizeScopeMap,
 	operationExitsScopes,
 	operationMatchesScopes,
+	recordMatchesScopes,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
-import type { DeliveredOperation, ServerStore } from '../store/server-store'
+import type { DeliveredOperation, MaterializedRecord, ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
@@ -155,7 +160,11 @@ export type AwarenessRelayCallback = (
 /**
  * Callback invoked when a session receives a Yjs doc channel update to relay.
  */
-export type YjsDocRelayCallback = (sourceSessionId: string, message: YjsDocUpdateMessage) => void
+export type YjsDocRelayCallback = (
+	sourceSessionId: string,
+	message: YjsDocUpdateMessage,
+	storedRecord: MaterializedRecord | null,
+) => void
 
 /**
  * Callback invoked when a session receives a blob chunk request to route.
@@ -179,6 +188,11 @@ export type BlobChunkResponseCallback = (
  * survive the authoring device going offline.
  */
 export type PersistBlobChunk = (hash: string, bytes: Uint8Array) => Promise<void> | void
+
+/** Default largest single blob chunk (or manifest) a session may push: 1 MiB. */
+export const DEFAULT_MAX_BLOB_CHUNK_BYTES = 1024 * 1024
+/** Default total blob bytes one session may push for central persistence: 256 MiB. */
+export const DEFAULT_MAX_BLOB_BYTES_PER_SESSION = 256 * 1024 * 1024
 
 /**
  * Options for creating a ClientSession.
@@ -218,6 +232,16 @@ export interface ClientSessionOptions {
 	onBlobChunkResponse?: BlobChunkResponseCallback
 	/** Persist a client-uploaded blob chunk centrally (keyed by content hash) */
 	persistBlobChunk?: PersistBlobChunk
+	/**
+	 * Called once the session completes an accepted handshake and reaches streaming.
+	 * Side channels (Yjs doc, blob and awareness relays) register the session here,
+	 * never at connect time, so an unauthenticated connection is never on a relay.
+	 */
+	onReady?: (sessionId: string) => void
+	/** Largest single blob chunk this session may push. Defaults to 1 MiB. */
+	maxBlobChunkBytes?: number
+	/** Total blob bytes this session may push. Defaults to 256 MiB. */
+	maxBlobBytesPerSession?: number
 	/** Called when this session closes */
 	onClose?: (sessionId: string) => void
 	/**
@@ -333,6 +357,10 @@ export class ClientSession {
 	private readonly onBlobChunkResponse: BlobChunkResponseCallback | null
 	private readonly persistBlobChunk: PersistBlobChunk | null
 	private readonly onClose: ((sessionId: string) => void) | null
+	private readonly onReady: ((sessionId: string) => void) | null
+	private readonly maxBlobChunkBytes: number
+	private readonly maxBlobBytesPerSession: number
+	private blobBytesPushed = 0
 	private readonly onOrphanedRelays: ((nodeId: string, ops: Operation[]) => void) | null
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
 	private readonly maxOperationBytes: number
@@ -364,6 +392,10 @@ export class ClientSession {
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
 		this.persistBlobChunk = options.persistBlobChunk ?? null
 		this.onClose = options.onClose ?? null
+		this.onReady = options.onReady ?? null
+		this.maxBlobChunkBytes = options.maxBlobChunkBytes ?? DEFAULT_MAX_BLOB_CHUNK_BYTES
+		this.maxBlobBytesPerSession =
+			options.maxBlobBytesPerSession ?? DEFAULT_MAX_BLOB_BYTES_PER_SESSION
 		this.onOrphanedRelays = options.onOrphanedRelays ?? null
 		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
@@ -605,6 +637,31 @@ export class ClientSession {
 	}
 
 	/**
+	 * True when a stored record is inside this session's download scope, so a side
+	 * channel (for example a Yjs doc update) about it may be delivered here. A record
+	 * not stored yet is judged by its id alone.
+	 */
+	canReceiveRecord(
+		collection: string,
+		recordId: string,
+		storedRecord: Record<string, unknown> | null,
+	): boolean {
+		if (this.state !== 'streaming') return false
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		return recordMatchesScopes(collection, { ...(storedRecord ?? {}), id: recordId }, scopes)
+	}
+
+	/**
+	 * A stable key for this session's download scope. Presence (awareness) is only
+	 * relayed between sessions that share exactly the same key, so it never crosses a
+	 * tenant boundary. Unscoped sessions share the key `"*"`.
+	 */
+	getScopePartitionKey(): string {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		return scopes ? stableStringify(normalizeScopeMap(scopes)) : '*'
+	}
+
+	/**
 	 * Get the transport for this session.
 	 * Used by the awareness relay to send messages to this client.
 	 */
@@ -636,6 +693,20 @@ export class ClientSession {
 	}
 
 	private async handleMessageAsync(message: SyncMessage): Promise<void> {
+		if (this.state === 'closed') return
+		// Nothing but a handshake is accepted until a handshake has been accepted (and,
+		// with auth configured, authenticated). Operations, acknowledgments and every
+		// side channel from a session that skipped it are refused and the connection is
+		// closed, so an unauthenticated peer can neither write nor reach other sessions.
+		if (message.type !== 'handshake' && this.state !== 'syncing' && this.state !== 'streaming') {
+			this.sendError(
+				'HANDSHAKE_REQUIRED',
+				`Received "${message.type}" before a successful handshake. Send a handshake first.`,
+				false,
+			)
+			this.close('handshake required')
+			return
+		}
 		switch (message.type) {
 			case 'handshake':
 				await this.handleHandshake(message)
@@ -664,7 +735,7 @@ export class ClientSession {
 				this.handleAwarenessUpdate(message)
 				break
 			case 'yjs-doc-update':
-				this.handleYjsDocUpdate(message)
+				await this.handleYjsDocUpdate(message)
 				break
 			case 'blob-chunk-request':
 				this.onBlobChunkRequest?.(this.sessionId, message)
@@ -688,11 +759,30 @@ export class ClientSession {
 			return
 		}
 		const bytes = decodeBlobChunkBytes(message.bytes)
+		// Bound what one session can make the server persist: a per-chunk size cap and a
+		// per-session byte quota, so a client cannot fill the operator's disk.
+		if (bytes.byteLength > this.maxBlobChunkBytes) {
+			this.sendError(
+				'BLOB_CHUNK_TOO_LARGE',
+				`Blob chunk ${message.hash} is ${String(bytes.byteLength)} bytes; the limit is ${String(this.maxBlobChunkBytes)}.`,
+				false,
+			)
+			return
+		}
+		if (this.blobBytesPushed + bytes.byteLength > this.maxBlobBytesPerSession) {
+			this.sendError(
+				'BLOB_QUOTA_EXCEEDED',
+				`This session exceeded its blob upload quota of ${String(this.maxBlobBytesPerSession)} bytes.`,
+				false,
+			)
+			return
+		}
 		const actual = await hashBlob(bytes)
 		if (actual !== message.hash) {
 			// Reject a mismatched upload rather than persisting untrusted bytes.
 			return
 		}
+		this.blobBytesPushed += bytes.byteLength
 		await this.persistBlobChunk(message.hash, bytes)
 	}
 
@@ -731,6 +821,17 @@ export class ClientSession {
 			if (!context) {
 				this.sendError('AUTH_FAILED', 'Authentication failed', false)
 				this.close('authentication failed')
+				return
+			}
+			// Bind the device node id to this principal. A node id another user already
+			// claimed is refused, so nobody can upload operations as someone else's device.
+			if (this.store.claimNode && !(await this.store.claimNode(msg.nodeId, context.userId))) {
+				this.sendError(
+					'NODE_ID_CLAIMED',
+					`Node id "${msg.nodeId}" belongs to another user. Use a fresh node id per signed-in user.`,
+					false,
+				)
+				this.close('node id claimed by another user')
 				return
 			}
 			this.authContext = context
@@ -855,7 +956,7 @@ export class ClientSession {
 				type: 'handshake-response',
 				messageId: generateUUIDv7(),
 				nodeId: this.store.getNodeId(),
-				versionVector: versionVectorToWire(serverVector),
+				versionVector: {},
 				schemaVersion: this.schemaVersion,
 				accepted: false,
 				rejectReason: `${SCHEMA_MISMATCH_PREFIX}: client schema version ${msg.schemaVersion} not in supported range [${min}, ${max}]`,
@@ -868,12 +969,42 @@ export class ClientSession {
 			return
 		}
 
-		// Send handshake response with server's version vector and accepted scope
+		// Collect the server->client stream before answering, so the response can describe
+		// exactly the nodes this client will hear from. A client that reports a delivery
+		// watermark gets the gap-free delivery stream (resumed from that watermark); an
+		// older client gets the version-vector delta. Both hold only in-scope operations.
+		const clientVector = wireToVersionVector(msg.versionVector)
+		const excludeOwn =
+			this.clientDeliveryWatermark !== null && this.clientDeliveryWatermark > 0
+				? (this.clientNodeId ?? undefined)
+				: undefined
+		const deliveryPlan =
+			this.clientDeliveryWatermark !== null
+				? await this.collectDeliveryStream(this.clientDeliveryWatermark, excludeOwn)
+				: null
+		const deltaPlan = deliveryPlan === null ? await this.collectDeltaOperations(clientVector) : []
+
+		// Only reveal vector entries for nodes the client already knows about (it reported
+		// them), its own, and the nodes whose in-scope operations it is about to receive.
+		// The full vector would leak every device id and write count across tenants.
+		const visibleNodes = new Set(clientVector.keys())
+		visibleNodes.add(msg.nodeId)
+		const plannedOps = deliveryPlan
+			? deliveryPlan.deliverable.filter((item) => !item.retraction).map((item) => item.operation)
+			: deltaPlan
+		for (const op of plannedOps) {
+			visibleNodes.add(op.nodeId)
+		}
+		const visibleServerVector = new Map(
+			[...serverVector].filter(([nodeId]) => visibleNodes.has(nodeId)),
+		)
+
+		// Send handshake response with the visible version vector and accepted scope
 		const response: SyncMessage = {
 			type: 'handshake-response',
 			messageId: generateUUIDv7(),
 			nodeId: this.store.getNodeId(),
-			versionVector: versionVectorToWire(serverVector),
+			versionVector: versionVectorToWire(visibleServerVector),
 			schemaVersion: this.schemaVersion,
 			accepted: true,
 			selectedWireFormat,
@@ -901,28 +1032,22 @@ export class ClientSession {
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
 
-		// Transition to syncing and send the server->client stream. A client that
-		// reports a delivery watermark gets the gap-free delivery stream (resumed from
-		// that watermark); an older client gets the version-vector delta. Both send only
-		// operations visible in this session's scope.
+		// Transition to syncing and send the collected server->client stream. Resuming
+		// from a non-zero watermark excludes the client's own operations (it already holds
+		// its history); a full resync (watermark 0) includes them so it recovers everything.
 		this.state = 'syncing'
-		if (this.clientDeliveryWatermark !== null) {
+		if (this.clientDeliveryWatermark !== null && deliveryPlan !== null) {
 			this.lastAckedDeliverySeq = this.clientDeliveryWatermark
-			// Resuming from a non-zero watermark: the client already holds its own history,
-			// so exclude its own operations. A full resync (watermark 0, e.g. a fresh or
-			// recovered client) passes no exclusion so it recovers everything, its own
-			// operations included.
-			const excludeOwn =
-				this.clientDeliveryWatermark > 0 ? (this.clientNodeId ?? undefined) : undefined
 			this.lastDeliveryPushAttemptAtMs = Date.now()
-			await this.sendDeliveryStream(this.clientDeliveryWatermark, true, excludeOwn)
+			this.sendCollectedDeliveryStream(deliveryPlan, this.clientDeliveryWatermark, true)
 		} else {
-			const clientVector = wireToVersionVector(msg.versionVector)
-			await this.sendDelta(clientVector)
+			this.sendCollectedDelta(deltaPlan)
 		}
 
 		// Transition to streaming after delta is sent
+		if (this.state !== 'syncing') return
 		this.state = 'streaming'
+		this.onReady?.(this.sessionId)
 
 		// Redeliver any relays buffered while this client's node id was disconnected
 		// (dropped just before a prior reconnect). relayOperations re-filters them by
@@ -954,11 +1079,38 @@ export class ClientSession {
 				continue
 			}
 
-			if (!(await this.operationAllowedFromClient(op))) {
+			// A session may only upload its own device's operations. A foreign nodeId
+			// would let one peer advance another device's version-vector entry and make
+			// that device skip uploading its real writes. The ack does not advance over a
+			// foreign op: its sequence number is not in this client's sequence space.
+			if (op.nodeId !== this.clientNodeId || op.timestamp.nodeId !== op.nodeId) {
+				// A client may echo back another device's operation that the server itself
+				// delivered (its delta is computed against the handshake-time vector). That
+				// op is already stored under its id, so accepting it as a duplicate writes
+				// nothing and cannot advance any vector: treat it exactly like a duplicate.
+				if (await this.isStoredOperation(op)) {
+					duplicateOperations += 1
+					acknowledgedThrough = op.sequenceNumber
+					continue
+				}
 				this.sendOperationRejected(
 					op,
-					'SCOPE_VIOLATION',
-					`Operation "${op.id}" in collection "${op.collection}" is outside the accepted uplink scope. Refresh scopes before creating or explicitly resubmitting an authorized operation.`,
+					'NODE_ID_MISMATCH',
+					`Operation "${op.id}" claims node "${op.nodeId}" (timestamp node "${op.timestamp.nodeId}") but this session is node "${String(this.clientNodeId)}". A client may only upload operations it authored.`,
+					false,
+				)
+				rejectedOperations += 1
+				continue
+			}
+
+			const authorization = await this.authorizeClientOperation(op)
+			if (!authorization.allowed) {
+				this.sendOperationRejected(
+					op,
+					authorization.code,
+					authorization.code === 'SCOPE_VIOLATION'
+						? `${authorization.message} Refresh scopes before creating or explicitly resubmitting an authorized operation.`
+						: authorization.message,
 					false,
 				)
 				rejectedOperations += 1
@@ -1053,7 +1205,13 @@ export class ClientSession {
 				// action === 'accept' falls through to normal materialization.
 			}
 
-			const applyResult = await applyServerOperation(this.store, serverOp)
+			// Re-check authorization inside the store's apply critical section against the
+			// row as it is at commit time, so a concurrent ownership change or same-id
+			// insert cannot slip in between the pre-check above and this write.
+			const uplinkScopes = this.uplinkScopes()
+			const applyResult = await applyServerOperation(this.store, serverOp, undefined, {
+				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
+			})
 			if (applyResult.rejection) {
 				this.sendOperationRejected(
 					serverOp,
@@ -1113,7 +1271,8 @@ export class ClientSession {
 		return applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
 	}
 
-	private async sendDelta(clientVector: Map<string, number>): Promise<void> {
+	/** The in-scope operations a version-vector client is missing (not yet sent). */
+	private async collectDeltaOperations(clientVector: Map<string, number>): Promise<Operation[]> {
 		const serverVector = this.store.getVersionVector()
 		const missing: Operation[] = []
 
@@ -1128,7 +1287,11 @@ export class ClientSession {
 				}
 			}
 		}
+		return missing
+	}
 
+	/** Send a collected version-vector delta in paginated, cursor-carrying batches. */
+	private sendCollectedDelta(missing: Operation[]): void {
 		if (missing.length === 0) {
 			const emptyBatch: SyncMessage = {
 				type: 'operation-batch',
@@ -1206,6 +1369,15 @@ export class ClientSession {
 		finalizeWhenEmpty: boolean,
 		excludeNodeId?: string,
 	): Promise<{ sentOperations: number; maxScanned: number; sent: boolean }> {
+		const collected = await this.collectDeliveryStream(fromDeliverySeq, excludeNodeId)
+		return this.sendCollectedDeliveryStream(collected, fromDeliverySeq, finalizeWhenEmpty)
+	}
+
+	/** Scan the delivery log after `fromDeliverySeq` and keep what this session may see. */
+	private async collectDeliveryStream(
+		fromDeliverySeq: number,
+		excludeNodeId?: string,
+	): Promise<CollectedDeliveryStream> {
 		const scanChunk = Math.max(this.batchSize, 1) * 5
 		let scanCursor = fromDeliverySeq
 		let maxScanned = fromDeliverySeq
@@ -1236,7 +1408,16 @@ export class ClientSession {
 			}
 			if (chunk.length < scanChunk) break
 		}
+		return { deliverable, maxScanned }
+	}
 
+	/** Send a collected delivery stream as chained base -> max batches. */
+	private sendCollectedDeliveryStream(
+		collected: CollectedDeliveryStream,
+		fromDeliverySeq: number,
+		finalizeWhenEmpty: boolean,
+	): { sentOperations: number; maxScanned: number; sent: boolean } {
+		const { deliverable, maxScanned } = collected
 		if (deliverable.length === 0) {
 			// Nothing in scope after the cursor. On a handshake resume, send a single empty
 			// final batch so the client advances past an out-of-scope tail and completes
@@ -1336,14 +1517,39 @@ export class ClientSession {
 		return operationMatchesQuerySubsets(op, subsets, fullRecord)
 	}
 
-	/** Upload authorization is independent from the client's downloaded/query view. */
-	private async operationAllowedFromClient(op: Operation): Promise<boolean> {
-		const scopes = this.authContext?.uplinkScopes ?? this.authContext?.scopes
-		const needsBackfill = missingScopeFields(op, scopes).length > 0
-		const fullRecord = needsBackfill
-			? await this.lookupRecordFields(op.collection, op.recordId)
-			: undefined
-		return operationMatchesScopes(op, scopes, fullRecord)
+	/** True when the store already holds exactly this operation (same node, sequence and id). */
+	private async isStoredOperation(op: Operation): Promise<boolean> {
+		try {
+			const stored = await this.store.getOperationRange(
+				op.nodeId,
+				op.sequenceNumber,
+				op.sequenceNumber,
+			)
+			return stored.some((candidate) => candidate.id === op.id)
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * The scopes this session may write under. Fails closed: with auth configured but
+	 * no accepted authentication, the session may write nothing (an empty scope map),
+	 * never everything.
+	 */
+	private uplinkScopes(): ScopeMap | undefined {
+		if (this.auth && !this.authContext) return {}
+		return this.authContext?.uplinkScopes ?? this.authContext?.scopes
+	}
+
+	/**
+	 * Upload authorization, independent from the client's downloaded/query view. The
+	 * stored row (including a soft-deleted one) is always loaded when scopes apply and
+	 * is authoritative; client-supplied previousData is never consulted.
+	 */
+	private async authorizeClientOperation(op: Operation): Promise<UplinkAuthorizationResult> {
+		const scopes = this.uplinkScopes()
+		const stored = scopes ? await this.lookupRecordFields(op.collection, op.recordId) : undefined
+		return authorizeUplinkWrite(op, stored ?? null, scopes)
 	}
 
 	private async scopeRetractionFor(op: Operation): Promise<boolean> {
@@ -1363,7 +1569,7 @@ export class ClientSession {
 	private async lookupRecordFields(
 		collection: string,
 		recordId: string,
-	): Promise<Record<string, unknown> | undefined> {
+	): Promise<MaterializedRecord | undefined> {
 		try {
 			const rows = await this.store.queryCollection(collection, {
 				where: { id: recordId },
@@ -1382,8 +1588,28 @@ export class ClientSession {
 		this.onAwarenessUpdate?.(this.sessionId, msg)
 	}
 
-	private handleYjsDocUpdate(msg: YjsDocUpdateMessage): void {
-		this.onYjsDocUpdate?.(this.sessionId, msg)
+	/**
+	 * A Yjs doc-channel update is a write to a richtext field: the sender must be
+	 * allowed to write the stored record (same rule as operation uploads). The stored
+	 * row is handed to the relay so delivery can be limited to sessions whose download
+	 * scope contains the record.
+	 */
+	private async handleYjsDocUpdate(msg: YjsDocUpdateMessage): Promise<void> {
+		if (!this.onYjsDocUpdate) return
+		const stored = (await this.lookupRecordFields(msg.collection, msg.recordId)) ?? null
+		const decision = authorizeRecordWrite(msg.collection, msg.recordId, stored, this.uplinkScopes())
+		if (!decision.allowed) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.yjs_update_rejected',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+				details: { collection: msg.collection, recordId: msg.recordId, code: decision.code },
+			})
+			return
+		}
+		this.onYjsDocUpdate(this.sessionId, msg, stored)
 	}
 
 	private sendError(code: string, message: string, retriable: boolean): void {
@@ -1435,6 +1661,12 @@ export class ClientSession {
 		this.emitter?.emit({ type: 'sync:disconnected', reason: 'transport closed' })
 		this.onClose?.(this.sessionId)
 	}
+}
+
+/** Delivery-log operations collected for one session, before they are batched. */
+interface CollectedDeliveryStream {
+	deliverable: Array<DeliveredOperation & { retraction?: boolean }>
+	maxScanned: number
 }
 
 function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {

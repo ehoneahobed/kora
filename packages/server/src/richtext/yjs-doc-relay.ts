@@ -21,11 +21,25 @@ export class YjsDocRelay {
 		this.clients.delete(sessionId)
 	}
 
-	handleUpdate(sourceSessionId: string, message: YjsDocUpdateMessage): void {
+	/**
+	 * Relay an update from a registered session to every other registered session
+	 * that `canDeliver` admits. The caller (the sync server) has already authorized
+	 * the sender's write; `canDeliver` limits delivery to sessions whose download
+	 * scope contains the record, so a doc update never crosses a tenant boundary.
+	 *
+	 * @param sourceSessionId - The sending session (never echoed back)
+	 * @param message - The doc-channel update
+	 * @param canDeliver - Per-target delivery check; defaults to deliver-to-all
+	 */
+	handleUpdate(
+		sourceSessionId: string,
+		message: YjsDocUpdateMessage,
+		canDeliver: (targetSessionId: string) => boolean = () => true,
+	): void {
 		if (!this.clients.has(sourceSessionId)) {
 			return
 		}
-		this.broadcastExcept(sourceSessionId, message)
+		this.broadcastExcept(sourceSessionId, message, canDeliver)
 	}
 
 	getClientCount(): number {
@@ -36,9 +50,16 @@ export class YjsDocRelay {
 		this.clients.clear()
 	}
 
-	private broadcastExcept(excludeSessionId: string, message: SyncMessage): void {
+	private broadcastExcept(
+		excludeSessionId: string,
+		message: SyncMessage,
+		canDeliver: (targetSessionId: string) => boolean,
+	): void {
 		for (const [, client] of this.clients) {
 			if (client.sessionId === excludeSessionId) {
+				continue
+			}
+			if (!canDeliver(client.sessionId)) {
 				continue
 			}
 			if (!client.transport.isConnected()) {

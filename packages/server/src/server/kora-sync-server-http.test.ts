@@ -1,7 +1,7 @@
 import type { Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { KoraSyncServer } from './kora-sync-server'
 
@@ -49,11 +49,16 @@ describe('KoraSyncServer HTTP sync endpoint', () => {
 
 		expect(postResponse.status).toBe(202)
 
-		const firstPoll = await server.handleHttpRequest({
-			clientId: 'client-a',
-			method: 'GET',
+		// The handshake is processed asynchronously (the server collects the client's
+		// in-scope stream before answering), so poll until the response is queued rather
+		// than assuming it is ready a fixed number of microtasks after the POST.
+		let firstPoll = await server.handleHttpRequest({ clientId: 'client-a', method: 'GET' })
+		await vi.waitFor(async () => {
+			if (firstPoll.status !== 200) {
+				firstPoll = await server.handleHttpRequest({ clientId: 'client-a', method: 'GET' })
+			}
+			expect(firstPoll.status).toBe(200)
 		})
-		expect(firstPoll.status).toBe(200)
 
 		const responseMessage = serializer.decode(firstPoll.body as string)
 		expect(responseMessage.type).toBe('handshake-response')

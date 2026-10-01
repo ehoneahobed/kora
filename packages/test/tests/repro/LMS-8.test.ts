@@ -287,10 +287,13 @@ describe('LMS-8 server upload with id-scoped uplink', () => {
 		expect(r.row?.status).toBe('published')
 	})
 
-	test('[passes] forged data.id is rejected today — but only by schema shape validation (SCHEMA_VALIDATION_ERROR), not by scope', async () => {
+	// Inverted by the NEW-SEC-2 fix: this observation used to assert the forgery was
+	// caught only by schema shape validation (SCHEMA_VALIDATION_ERROR). The shared
+	// authorization now refuses any op whose data/previousData names another id.
+	test('[inverted] forged data.id is rejected by the identity check (INVALID_OPERATION), independent of schema validation', async () => {
 		const { send } = await session()
 		const r = await send(forgedViaData())
-		expect(r.rejected.map((m) => m.code)).toEqual(['SCHEMA_VALIDATION_ERROR'])
+		expect(r.rejected.map((m) => m.code)).toEqual(['INVALID_OPERATION'])
 		expect(r.row?.title).toBe('orig-victim')
 	})
 
@@ -372,10 +375,13 @@ describe('LMS-8 server upload with id-scoped uplink', () => {
 })
 
 describe('LMS-8 pure matcher facts', () => {
-	test('shipped matchers let op fields override the stored id (SEC-2 class)', () => {
+	// Inverted by the NEW-SEC-2 fix: the shipped server and client matchers used to let
+	// op fields override the stored id. They now share one snapshot helper that assigns
+	// id = op.recordId last.
+	test('[inverted] shipped matchers force id from recordId, so op fields cannot override the stored id', () => {
 		const stored = { id: 'victim', title: 'orig' }
-		expect(operationMatchesScopes(forgedViaPrevious(), ID_SCOPE, stored)).toBe(true)
-		expect(operationMatchesScope(forgedViaPrevious(), ID_SCOPE, stored)).toBe(true)
+		expect(operationMatchesScopes(forgedViaPrevious(), ID_SCOPE, stored)).toBe(false)
+		expect(operationMatchesScope(forgedViaPrevious(), ID_SCOPE, stored)).toBe(false)
 		expect(matchWith(lmsBuildSnapshot, forgedViaPrevious(), ID_SCOPE, stored)).toBe(true)
 		expect(matchWith(fixedSnapshot, forgedViaPrevious(), ID_SCOPE, stored)).toBe(false)
 	})

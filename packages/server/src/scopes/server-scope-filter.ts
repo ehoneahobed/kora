@@ -1,4 +1,10 @@
 import type { Operation } from '@korajs/core'
+import { KoraError } from '@korajs/core'
+import {
+	buildScopeSnapshot,
+	matchesScopePredicate,
+	recordMatchesScopePredicates,
+} from '@korajs/sync/internal'
 
 /**
  * Per-collection scope map from auth context.
@@ -73,16 +79,7 @@ export function operationMatchesScopes(
 	if (!collectionScope) return false
 	if (Object.keys(collectionScope).length === 0) return true
 
-	const snapshot = buildSnapshot(op, fullRecord)
-	if (!snapshot) return false
-
-	for (const [field, expected] of Object.entries(collectionScope)) {
-		if (!matchesPredicate(snapshot[field], expected)) {
-			return false
-		}
-	}
-
-	return true
+	return recordMatchesScopePredicates(buildScopeSnapshot(op, fullRecord), collectionScope)
 }
 
 /** True when an update moved a previously visible record outside the scope. */
@@ -105,12 +102,38 @@ export function operationExitsScopes(
 	)
 }
 
-function matchesPredicate(actual: unknown, expected: unknown): boolean {
-	if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
-		const values = (expected as { $in?: unknown }).$in
-		return Array.isArray(values) && values.some((value) => Object.is(actual, value))
-	}
-	return Object.is(actual, expected)
+/**
+ * True when a field value satisfies one scope predicate (exact value or `$in`).
+ * Shared by the sync path and the route context so both honour the same operators.
+ *
+ * @param actual - The record's field value
+ * @param expected - The scope predicate for that field
+ * @returns Whether the value is inside the predicate
+ */
+export function matchesPredicate(actual: unknown, expected: unknown): boolean {
+	return matchesScopePredicate(actual, expected)
+}
+
+/**
+ * True when a stored record is inside the scope declared for its collection. A
+ * collection absent from the scope map is out of scope; an empty predicate admits
+ * every record. The record's `id` is used as stored, so callers must pass a row
+ * read by id (never one assembled from client-supplied fields).
+ *
+ * @param collection - The record's collection
+ * @param record - The stored record
+ * @param scopes - Scope map, or undefined for no restriction
+ * @returns Whether the record is visible under the scope
+ */
+export function recordMatchesScopes(
+	collection: string,
+	record: Record<string, unknown>,
+	scopes: ScopeMap | undefined,
+): boolean {
+	if (!scopes) return true
+	const collectionScope = scopes[collection]
+	if (!collectionScope) return false
+	return recordMatchesScopePredicates(record, collectionScope)
 }
 
 /**
@@ -125,24 +148,141 @@ export function missingScopeFields(op: Operation, scopes: ScopeMap | undefined):
 	const collectionScope = scopes[op.collection]
 	if (!collectionScope) return []
 	if (Object.keys(collectionScope).length === 0) return []
-	const snapshot = buildSnapshot(op)
-	return Object.keys(collectionScope).filter((field) => !snapshot || !(field in snapshot))
+	const snapshot = buildScopeSnapshot(op)
+	return Object.keys(collectionScope).filter((field) => !(field in snapshot))
 }
 
-function buildSnapshot(
-	op: Operation,
-	fullRecord?: Record<string, unknown> | null,
-): Record<string, unknown> | null {
-	const previous = asRecord(op.previousData)
-	const next = asRecord(op.data)
+/** Why {@link authorizeUplinkWrite} refused a write. */
+export type UplinkAuthorizationCode = 'SCOPE_VIOLATION' | 'INVALID_OPERATION'
 
-	if (!previous && !next && !fullRecord) return null
+/** Result of {@link authorizeUplinkWrite}. */
+export type UplinkAuthorizationResult =
+	| { allowed: true }
+	| { allowed: false; code: UplinkAuthorizationCode; message: string }
 
-	return {
-		...(fullRecord ?? {}),
-		...(previous ?? {}),
-		...(next ?? {}),
+/**
+ * Thrown by a server store when the uplink authorization re-check, evaluated inside
+ * the store's apply critical section against the row as it is at commit time,
+ * refuses an operation. Nothing was written.
+ */
+export class UplinkAuthorizationError extends KoraError {
+	constructor(
+		readonly rejectionCode: UplinkAuthorizationCode,
+		message: string,
+		context?: Record<string, unknown>,
+	) {
+		super(message, rejectionCode, context)
+		this.name = 'UplinkAuthorizationError'
 	}
+}
+
+/**
+ * Decides whether an untrusted writer (a sync session or a scoped route) may apply
+ * `op`, given the record as it is currently stored and the writer's scope.
+ *
+ * This is the single authorization rule for every untrusted write path (sync
+ * uploads, `request.kora` routes, the conditional store path and the Yjs doc
+ * channel). It never reads `op.previousData` for scope decisions, because it is
+ * attacker-controlled, and it never lets op fields name a different record:
+ *
+ * 1. `op.data` / `op.previousData` must not carry an `id` other than `op.recordId`
+ *    (`INVALID_OPERATION`), whether or not scopes are configured.
+ * 2. Without scopes every (well-formed) write is allowed.
+ * 3. If a stored row exists (including a soft-deleted one) it must be in scope,
+ *    judged on the stored values only, for inserts, updates and deletes alike. This
+ *    stops editing, deleting or overwriting (same-id insert) another tenant's record.
+ * 4. The post-image must be in scope: `{...stored, ...op.data}` for updates,
+ *    `op.data` for inserts and the stored row for deletes. This stops moving a
+ *    record out of scope (ownership transfer is a trusted server-route operation).
+ *
+ * In both images `id` is `op.recordId`, assigned last.
+ *
+ * @param op - The operation the writer wants to apply
+ * @param storedRow - The record as stored now (including soft-deleted), or null
+ * @param scopes - The writer's uplink scope map, or undefined for no restriction
+ * @returns Whether the write is allowed, and why not when it is refused
+ */
+export function authorizeUplinkWrite(
+	op: Operation,
+	storedRow: Record<string, unknown> | null | undefined,
+	scopes: ScopeMap | undefined,
+): UplinkAuthorizationResult {
+	const forgedIn = conflictingIdentity(op)
+	if (forgedIn !== null) {
+		return {
+			allowed: false,
+			code: 'INVALID_OPERATION',
+			message: `Operation "${op.id}" on "${op.collection}" carries ${forgedIn}.id that differs from its recordId "${op.recordId}".`,
+		}
+	}
+	if (!scopes) return { allowed: true }
+
+	const collectionScope = scopes[op.collection]
+	if (!collectionScope) {
+		return scopeViolation(op, `collection "${op.collection}" is not in the writer's scope`)
+	}
+	if (Object.keys(collectionScope).length === 0) return { allowed: true }
+
+	const stored = storedRow ?? null
+	if (stored !== null) {
+		const preImage = { ...stored, id: op.recordId }
+		if (!recordMatchesScopePredicates(preImage, collectionScope)) {
+			return scopeViolation(op, "the stored record is outside the writer's scope")
+		}
+	}
+
+	const data = asRecord(op.data) ?? {}
+	const postImage =
+		op.type === 'insert'
+			? { ...data, id: op.recordId }
+			: op.type === 'update'
+				? { ...(stored ?? {}), ...data, id: op.recordId }
+				: { ...(stored ?? {}), id: op.recordId }
+	if (!recordMatchesScopePredicates(postImage, collectionScope)) {
+		return scopeViolation(op, "the resulting record would be outside the writer's scope")
+	}
+	return { allowed: true }
+}
+
+function scopeViolation(op: Operation, reason: string): UplinkAuthorizationResult {
+	return {
+		allowed: false,
+		code: 'SCOPE_VIOLATION',
+		message: `Operation "${op.id}" on "${op.collection}" record "${op.recordId}" is outside the accepted uplink scope: ${reason}.`,
+	}
+}
+
+/** Returns which op field carries a conflicting `id`, or null when none does. */
+function conflictingIdentity(op: Operation): 'data' | 'previousData' | null {
+	const data = asRecord(op.data)
+	if (data && 'id' in data && data.id !== op.recordId) return 'data'
+	const previous = asRecord(op.previousData)
+	if (previous && 'id' in previous && previous.id !== op.recordId) return 'previousData'
+	return null
+}
+
+/**
+ * Split a collection scope into the equality predicates a store `where` clause can
+ * evaluate, and report whether any non-equality predicate (`$in`) remains, which the
+ * caller must filter in memory before applying limit/offset.
+ *
+ * @param collectionScope - Field predicates for one collection
+ * @returns The equality subset and whether other operators are present
+ */
+export function splitScopeForQuery(collectionScope: Record<string, unknown>): {
+	equality: Record<string, unknown>
+	hasNonEquality: boolean
+} {
+	const equality: Record<string, unknown> = {}
+	let hasNonEquality = false
+	for (const [field, expected] of Object.entries(collectionScope)) {
+		if (expected !== null && typeof expected === 'object') {
+			hasNonEquality = true
+		} else {
+			equality[field] = expected
+		}
+	}
+	return { equality, hasNonEquality }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -151,4 +291,32 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 	}
 
 	return value as Record<string, unknown>
+}
+
+/**
+ * Authorization for a write that names a record but carries no field values, such
+ * as a Yjs doc-channel update to a richtext field. The record must be inside the
+ * writer's scope as stored (with `id` forced to `recordId`); a record that is not
+ * stored yet is judged by its id alone, so it only passes id-based or empty scopes.
+ *
+ * @param collection - The record's collection
+ * @param recordId - The record the write targets
+ * @param storedRow - The record as stored now (including soft-deleted), or null
+ * @param scopes - The writer's uplink scope map, or undefined for no restriction
+ * @returns Whether the write is allowed, and why not when it is refused
+ */
+export function authorizeRecordWrite(
+	collection: string,
+	recordId: string,
+	storedRow: Record<string, unknown> | null | undefined,
+	scopes: ScopeMap | undefined,
+): UplinkAuthorizationResult {
+	if (!scopes) return { allowed: true }
+	const image = { ...(storedRow ?? {}), id: recordId }
+	if (recordMatchesScopes(collection, image, scopes)) return { allowed: true }
+	return {
+		allowed: false,
+		code: 'SCOPE_VIOLATION',
+		message: `Write to "${collection}" record "${recordId}" is outside the accepted uplink scope.`,
+	}
 }

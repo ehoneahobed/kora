@@ -1,5 +1,6 @@
 import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
-import type { SyncStore } from '@korajs/sync'
+import type { ApplyResult, SyncStore } from '@korajs/sync'
+import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
 /**
  * A materialized record reconstructed from the operation log
@@ -52,6 +53,12 @@ export interface ConditionalApplyContext {
 	 * it into operation creation) so they sort strictly after every prior write.
 	 */
 	clock: HybridLogicalClock
+	/**
+	 * Read a record as stored (including a soft-deleted one) inside the store's
+	 * conditional-apply transaction, for authorizing the built operations against the
+	 * same state they commit over. Optional; callers fall back to a plain read.
+	 */
+	readStoredRow?: (collection: string, id: string) => Promise<MaterializedRecord | null>
 }
 
 /** Result of {@link ServerStore.applyConditional}. */
@@ -94,10 +101,47 @@ export interface CollectionQueryOptions {
 }
 
 /**
+ * Options for {@link ServerStore.applyRemoteOperation}.
+ */
+export interface ApplyRemoteOptions {
+	/**
+	 * Authorization re-check for an operation submitted by an untrusted writer.
+	 *
+	 * The store calls it inside its apply critical section (the SQLite write
+	 * transaction, the in-memory store's synchronous apply, or a Postgres
+	 * transaction holding the per-record advisory lock shared with conditional
+	 * applies) with the record as stored at that moment, including a soft-deleted
+	 * one, or null when none exists. Returning a refusal aborts the apply and the
+	 * store throws {@link UplinkAuthorizationError}; nothing is written.
+	 *
+	 * This closes the window between a caller's own pre-check and the write, where an
+	 * ownership change or a same-id insert committed by another writer (or another
+	 * server instance) could otherwise slip in.
+	 */
+	authorize?: (storedRow: MaterializedRecord | null) => UplinkAuthorizationResult
+}
+
+/**
  * Server-side store interface. Extends SyncStore with lifecycle,
  * introspection, and materialization methods needed by the sync server.
  */
 export interface ServerStore extends SyncStore {
+	/**
+	 * Apply an operation to the log and materialized state. With
+	 * `options.authorize`, the authorization is re-checked atomically with the write
+	 * (see {@link ApplyRemoteOptions}). Stores written before this option existed
+	 * may ignore it; callers always pre-check as well.
+	 */
+	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
+
+	/**
+	 * Bind a client node id to the authenticated principal that first used it.
+	 * Returns true when the node id is unclaimed or already owned by `userId`, and
+	 * false when another principal owns it. Called at handshake when auth is
+	 * configured, so one user cannot upload operations under another user's device
+	 * id. Optional for custom stores; the built-in stores persist the claim.
+	 */
+	claimNode?(nodeId: string, userId: string): Promise<boolean>
 	/** Close the store and release resources */
 	close(): Promise<void>
 
