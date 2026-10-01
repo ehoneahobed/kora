@@ -15,14 +15,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "ClientSession.handleMessageAsync refuses every non-handshake message before syncing/streaming (HANDSHAKE_REQUIRED, close); uplink scopes fail closed when auth is set but unauthenticated."
   },
   {
    "id": "SEC-2",
@@ -30,14 +30,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Shared authorizeUplinkWrite (stored row incl. deleted + post-image in scope, never previousData) used by sync uploads and re-checked inside each store apply (memory sync apply, SQLite write tx, Postgres tx under the delivery-counter lock)."
   },
   {
    "id": "SEC-3",
@@ -45,14 +45,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "SEC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Server half done: NODE_ID_MISMATCH for op.nodeId/timestamp.nodeId != session node (stored echoes ack as duplicates), ServerStore.claimNode at authenticated handshake (NODE_ID_CLAIMED). Client half (never trust server vector for own node, upload only own ops; W3 step 1b) still open."
   },
   {
    "id": "SEC-4",
@@ -60,14 +60,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Handshake response vector limited to nodes the client reported, its own, and nodes whose in-scope ops it is about to receive (stream collected before answering); reject path sends {}."
   },
   {
    "id": "SEC-5",
@@ -75,14 +75,14 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops."
   },
   {
    "id": "SEC-6",
@@ -90,14 +90,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Route prepareMutation and the conditional store path use authorizeUplinkWrite against the stored row (in-store re-check on commit; Postgres conditional reads in its tx); query pushes equality scope into where and paginates after $in filtering."
   },
   {
    "id": "SEC-7",
@@ -120,14 +120,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "WebSocketTransport no longer puts the token in the URL; opt-in tokenInUrl; tests inverted, docs updated; repro fixed to use a constructible fake."
   },
   {
    "id": "SEC-9a",
@@ -135,7 +135,7 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-9.test.ts",
@@ -143,7 +143,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "createProductionServer trustProxy (hop count or IP/CIDR list, IPv4/IPv6); default request.ip is the socket address."
   },
   {
    "id": "SEC-9b",
@@ -167,14 +167,14 @@
    "severity": "P3",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-SEC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Route recordMatchesScope uses the shared matcher (adds $in) for query and findById."
   },
   {
    "id": "NEW-SEC-2",
@@ -182,7 +182,7 @@
    "severity": "P0",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-8.test.ts",
@@ -198,7 +198,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "One shared buildScopeSnapshot (@korajs/sync/internal) sets id = recordId last for client scope, query-subset and server filters; authorizeUplinkWrite rejects data/previousData id != recordId (INVALID_OPERATION); stored row always loaded for scoped uploads."
   },
   {
    "id": "AUTH-1",

@@ -5,6 +5,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
 	deserializeFieldValue,
@@ -14,6 +15,7 @@ import {
 	validateFieldName,
 } from './materialization'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
@@ -92,7 +94,7 @@ export class SqliteServerStore implements ServerStore {
 		await this.backfillAllCollections()
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 
 		const now = Date.now()
@@ -106,6 +108,20 @@ export class SqliteServerStore implements ServerStore {
 			)
 			if (existing.length > 0) {
 				return 'duplicate' as const
+			}
+
+			// Authorization re-check inside the write transaction: better-sqlite3 runs
+			// it synchronously under SQLite's single writer lock, so the row it sees is
+			// the row this write commits against. Throwing rolls the transaction back.
+			if (options?.authorize) {
+				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId))
+				if (!decision.allowed) {
+					throw new UplinkAuthorizationError(decision.code, decision.message, {
+						operationId: op.id,
+						collection: op.collection,
+						recordId: op.recordId,
+					})
+				}
 			}
 
 			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
@@ -261,6 +277,55 @@ export class SqliteServerStore implements ServerStore {
 
 	async close(): Promise<void> {
 		this.closed = true
+	}
+
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at) VALUES (${nodeId}, ${userId}, ${Date.now()})`,
+		)
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id === userId
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private readStoredRow(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): MaterializedRecord | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const rows = txOrDb.all<Record<string, unknown>>(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+			)
+			const row = rows[0]
+			return row ? this.deserializeRow(row, collectionDef) : null
+		}
+		const ops = txOrDb
+			.select({ type: operations.type, data: operations.data, atomicOps: operations.atomicOps })
+			.from(operations)
+			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
+			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
+			.all()
+		if (ops.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			ops
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({
+					type: o.type,
+					data: o.data !== null ? JSON.parse(o.data) : null,
+					atomicOps:
+						o.atomicOps != null ? (JSON.parse(o.atomicOps) as Record<string, AtomicOp>) : null,
+				})),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -686,6 +751,15 @@ export class SqliteServerStore implements ServerStore {
 
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
+		`)
+
+		// Node id -> principal binding (see claimNode). One row per device node id.
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS node_claims (
+				node_id TEXT PRIMARY KEY,
+				user_id TEXT NOT NULL,
+				claimed_at INTEGER NOT NULL
+			)
 		`)
 
 		this.db.run(sql`

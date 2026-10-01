@@ -11,6 +11,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
 	deserializeFieldValue,
@@ -20,6 +21,7 @@ import {
 	validateFieldName,
 } from './materialization'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	ConditionalApplyInput,
 	ConditionalApplyResult,
@@ -126,7 +128,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.backfillAllCollections()
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 		await this.ready
 
@@ -147,6 +149,24 @@ export class PostgresServerStore implements ServerStore {
 			// Assign the delivery sequence in commit order (see nextDeliverySeq). A rare
 			// concurrent duplicate insert below no-ops and simply leaves a harmless gap.
 			const deliverySeq = await this.nextDeliverySeq(tx)
+
+			// Authorization re-check against the committed row. nextDeliverySeq above
+			// holds the delivery_counter row lock until this transaction ends, and every
+			// append on every instance (including conditional applies) takes that lock,
+			// so every earlier write is committed and visible to this READ COMMITTED
+			// read, and no later write can commit before this one. Throwing rolls back.
+			if (options?.authorize) {
+				const stored = await this.readStoredRow(tx, op.collection, op.recordId)
+				const decision = options.authorize(stored)
+				if (!decision.allowed) {
+					throw new UplinkAuthorizationError(decision.code, decision.message, {
+						operationId: op.id,
+						collection: op.collection,
+						recordId: op.recordId,
+					})
+				}
+			}
+
 			const row = this.serializeOperation(op, now, deliverySeq)
 
 			// Insert operation with dedup
@@ -206,6 +226,12 @@ export class PostgresServerStore implements ServerStore {
 			// hashtextextended maps the key to the bigint pg_advisory_xact_lock expects;
 			// the lock releases automatically when the transaction ends.
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`)
+			// Also take the delivery-counter row lock now (every append takes it until
+			// commit), so the reads below, including the authorization reads of the
+			// built operations, see every earlier commit and no append can commit
+			// between them and this transaction's writes. Lock order (advisory, then
+			// counter) matches every other path, so this cannot deadlock.
+			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 
 			// Idempotency: if the key record already exists (from an earlier attempt),
 			// this set is already committed. Checked under the lock so a retry racing a
@@ -246,7 +272,10 @@ export class PostgresServerStore implements ServerStore {
 				clock.advanceTo(latest)
 			}
 
-			const ops = await input.buildOperations(current, { clock })
+			const ops = await input.buildOperations(current, {
+				clock,
+				readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
+			})
 			const now = Date.now()
 			for (const op of ops) {
 				const deliverySeq = await this.nextDeliverySeq(tx)
@@ -525,6 +554,63 @@ export class PostgresServerStore implements ServerStore {
 			return null
 		}
 		return { wallTime: row.wallTime, logical: row.logical, nodeId: row.timestampNodeId }
+	}
+
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at) VALUES (${nodeId}, ${userId}, ${Date.now()}) ON CONFLICT (node_id) DO NOTHING`,
+		)
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id === userId
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private async readStoredRow(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRecord | null> {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const rows = (await txOrDb.execute(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+			)) as unknown as Record<string, unknown>[]
+			const row = rows[0]
+			return row ? this.deserializeRow(row, collectionDef) : null
+		}
+		const ops = await txOrDb
+			.select({
+				type: pgOperations.type,
+				data: pgOperations.data,
+				atomicOps: pgOperations.atomicOps,
+			})
+			.from(pgOperations)
+			.where(and(eq(pgOperations.collection, collection), eq(pgOperations.recordId, recordId)))
+			.orderBy(
+				asc(pgOperations.wallTime),
+				asc(pgOperations.logical),
+				asc(pgOperations.timestampNodeId),
+			)
+		if (ops.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			ops
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({
+					type: o.type,
+					data: o.data !== null ? JSON.parse(o.data) : null,
+					atomicOps:
+						o.atomicOps != null ? (JSON.parse(o.atomicOps) as Record<string, AtomicOp>) : null,
+				})),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
 	}
 
 	/**
@@ -906,6 +992,15 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
 			)
+
+			// Node id -> principal binding (see claimNode). One row per device node id.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS node_claims (
+					node_id TEXT PRIMARY KEY,
+					user_id TEXT NOT NULL,
+					claimed_at BIGINT NOT NULL
+				)
+			`)
 
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS sync_state (

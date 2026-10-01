@@ -11,7 +11,13 @@ export type {
 	ServerStatus,
 } from './types'
 
-export type { ServerStore, MaterializedRecord, CollectionQueryOptions } from './store/server-store'
+export type {
+	ApplyRemoteOptions,
+	ServerStore,
+	MaterializedRecord,
+	CollectionQueryOptions,
+} from './store/server-store'
+export type { TrustProxySetting } from './server/trust-proxy'
 
 export type {
 	ServerCloseHandler,
@@ -100,8 +106,12 @@ export { KoraAuthProvider } from './auth/kora-auth-provider'
 export { MixedAuthProvider } from './auth/mixed-auth-provider'
 export {
 	DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
+	UplinkAuthorizationError,
+	authorizeUplinkWrite,
 	normalizeScopeMap,
 	operationMatchesScopes,
+	type UplinkAuthorizationCode,
+	type UplinkAuthorizationResult,
 } from './scopes/server-scope-filter'
 
 // === Awareness ===

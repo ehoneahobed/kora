@@ -3,3 +3,8 @@
 
 export { MemoryTransport, createMemoryTransportPair } from './transport/memory-transport'
 export { MemoryQueueStorage } from './engine/memory-queue-storage'
+export {
+	buildScopeSnapshot,
+	matchesScopePredicate,
+	recordMatchesScopePredicates,
+} from './scopes/scope-snapshot'

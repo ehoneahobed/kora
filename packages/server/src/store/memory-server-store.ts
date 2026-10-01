@@ -1,6 +1,7 @@
 import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
 import { generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
 	deserializeFieldValue,
 	replayOperationsForRecord,
@@ -8,6 +9,7 @@ import {
 	validateFieldName,
 } from './materialization'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
@@ -35,6 +37,9 @@ export class MemoryServerStore implements ServerStore {
 	private readonly deliverySeqByOpId = new Map<string, number>()
 	private deliverySeqCounter = 0
 	private schema: SchemaDefinition | null = null
+
+	/** Node id -> the authenticated principal that claimed it (see claimNode). */
+	private readonly nodeOwners = new Map<string, string>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -72,12 +77,25 @@ export class MemoryServerStore implements ServerStore {
 		this.backfillAllCollections()
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 
 		// Content-addressed dedup: same id = same content
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'
+		}
+
+		// Authorization re-check against the row as stored right now. Everything from
+		// here to the write is synchronous, so no other writer can interleave.
+		if (options?.authorize) {
+			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId))
+			if (!decision.allowed) {
+				throw new UplinkAuthorizationError(decision.code, decision.message, {
+					operationId: op.id,
+					collection: op.collection,
+					recordId: op.recordId,
+				})
+			}
 		}
 
 		this.operations.push(op)
@@ -291,6 +309,41 @@ export class MemoryServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		const owner = this.nodeOwners.get(nodeId)
+		if (owner === undefined) {
+			this.nodeOwners.set(nodeId, userId)
+			return true
+		}
+		return owner === userId
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private readStoredRow(collection: string, recordId: string): MaterializedRecord | null {
+		if (this.schema?.collections[collection]) {
+			const record = this.materializedRecords.get(collection)?.get(recordId)
+			if (!record) return null
+			const stored: MaterializedRecord = { ...record, id: recordId }
+			stored._deleted = undefined
+			return stored
+		}
+		const recordOps = this.operations
+			.filter((o) => o.collection === collection && o.recordId === recordId)
+			.sort((a, b) => compareTimestamps(a, b))
+		if (recordOps.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			recordOps
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({ type: o.type, data: o.data, atomicOps: o.atomicOps ?? null })),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
+	}
+
 	/**
 	 * Wipes all in-memory state. For tests and E2E isolation only.
 	 */
@@ -300,6 +353,7 @@ export class MemoryServerStore implements ServerStore {
 		this.operationIndex.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
+		this.nodeOwners.clear()
 		this.schema = null
 	}
 
@@ -523,4 +577,15 @@ export class MemoryServerStore implements ServerStore {
 			)
 		}
 	}
+}
+
+function compareTimestamps(a: Operation, b: Operation): number {
+	if (a.timestamp.wallTime !== b.timestamp.wallTime)
+		return a.timestamp.wallTime - b.timestamp.wallTime
+	if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
+	return a.timestamp.nodeId < b.timestamp.nodeId
+		? -1
+		: a.timestamp.nodeId > b.timestamp.nodeId
+			? 1
+			: 0
 }

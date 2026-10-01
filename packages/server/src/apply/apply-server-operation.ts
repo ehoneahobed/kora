@@ -3,7 +3,8 @@ import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@ko
 import type { ApplyResult } from '@korajs/sync'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
 import { createServerReferentialContext } from '../constraints/server-referential-context'
-import type { ServerStore } from '../store/server-store'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import type { ApplyRemoteOptions, ServerStore } from '../store/server-store'
 import { type OperationRejection, isRetriableRejection } from './rejection-taxonomy'
 import {
 	createServerSideEffectOperation,
@@ -19,14 +20,32 @@ export interface ApplyServerOperationResult {
 	rejection?: OperationRejection
 }
 
+/** Options for {@link applyServerOperation}. */
+export interface ApplyServerOperationOptions {
+	/**
+	 * Uplink authorization for an untrusted writer, re-evaluated by the store inside
+	 * its apply critical section against the row as stored at commit time (see
+	 * `ApplyRemoteOptions.authorize`). A refusal becomes a non-retriable rejection and
+	 * nothing is written. Server-generated side effects are not re-checked.
+	 */
+	authorize?: ApplyRemoteOptions['authorize']
+}
+
 /**
  * Applies an incoming client operation with Tier 2 constraints and referential integrity.
  * Cascade/set-null side effects are persisted as server-originated operations in the op log.
+ *
+ * @param store - The server store
+ * @param op - The operation to apply
+ * @param relationLookup - Optional precomputed relation lookup
+ * @param options - Optional in-store authorization for untrusted writers
+ * @returns The apply result, applied operations, and rejection (if any)
  */
 export async function applyServerOperation(
 	store: ServerStore,
 	op: Operation,
 	relationLookup?: ReturnType<typeof buildMergeRelationLookup>,
+	options: ApplyServerOperationOptions = {},
 ): Promise<ApplyServerOperationResult> {
 	const schema = store.getSchema()
 	const lookup = relationLookup ?? (schema ? buildMergeRelationLookup(schema) : new Map())
@@ -74,7 +93,14 @@ export async function applyServerOperation(
 			}
 		}
 
-		const primaryResult = await store.applyRemoteOperation(op)
+		let primaryResult: Awaited<ReturnType<ServerStore['applyRemoteOperation']>>
+		try {
+			primaryResult = await applyPrimary(store, op, options)
+		} catch (error) {
+			const rejection = authorizationRejection(error)
+			if (rejection) return { result: 'skipped', appliedOperations: [], rejection }
+			throw error
+		}
 		if (primaryResult !== 'applied') {
 			return { result: primaryResult, appliedOperations: [] }
 		}
@@ -102,11 +128,34 @@ export async function applyServerOperation(
 		return { result: 'applied', appliedOperations }
 	}
 
-	const result = await store.applyRemoteOperation(op)
+	let result: Awaited<ReturnType<ServerStore['applyRemoteOperation']>>
+	try {
+		result = await applyPrimary(store, op, options)
+	} catch (error) {
+		const rejection = authorizationRejection(error)
+		if (rejection) return { result: 'skipped', appliedOperations: [], rejection }
+		throw error
+	}
 	return {
 		result,
 		appliedOperations: result === 'applied' ? [op] : [],
 	}
+}
+
+function applyPrimary(
+	store: ServerStore,
+	op: Operation,
+	options: ApplyServerOperationOptions,
+): ReturnType<ServerStore['applyRemoteOperation']> {
+	return options.authorize
+		? store.applyRemoteOperation(op, { authorize: options.authorize })
+		: store.applyRemoteOperation(op)
+}
+
+/** Map an in-store authorization refusal to a structured, non-retriable rejection. */
+function authorizationRejection(error: unknown): OperationRejection | null {
+	if (!(error instanceof UplinkAuthorizationError)) return null
+	return { code: error.rejectionCode, message: error.message, retriable: false }
 }
 
 function validateOperationShape(

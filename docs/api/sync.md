@@ -265,8 +265,9 @@ const transport = new WebSocketTransport(options?: WebSocketTransportOptions)
 | `serializer` | `MessageSerializer` | No | `JsonMessageSerializer` |
 | `WebSocketImpl` | `WebSocketConstructor` | No | `globalThis.WebSocket` |
 | `connectTimeout` | `number` (ms) | No | `10000` |
+| `tokenInUrl` | `boolean` | No | `false` |
 
-Auth tokens are appended as a `?token=` query parameter on the connection URL.
+The auth token is sent in the sync handshake message, never in the connection URL, because URLs are recorded by reverse proxies, load balancers and access logs. Set `tokenInUrl: true` only if an intermediary must authenticate the WebSocket upgrade by a `?token=` query parameter.
 
 ```typescript
 import { WebSocketTransport } from '@korajs/sync'

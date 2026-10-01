@@ -96,7 +96,10 @@ function collectClientMessages(
 
 describe('ClientSession', () => {
 	describe('handshake', () => {
-		test('responds with correct version vector', async () => {
+		// SEC-4: the response carries only vector entries for nodes the client reported
+		// (plus its own). This test used to send an empty client vector and expect every
+		// server entry back, which leaked other devices' ids and write counts.
+		test('responds with the version vector entries for nodes the client reported', async () => {
 			const store = new MemoryServerStore('server-1')
 			// Pre-populate server store
 			await store.applyRemoteOperation(
@@ -113,7 +116,7 @@ describe('ClientSession', () => {
 			})
 			session.start()
 
-			sendHandshake(client)
+			sendHandshake(client, { versionVector: { 'node-a': 1 } })
 
 			// Wait for async handshake processing
 			await vi.waitFor(() => {
@@ -128,6 +131,57 @@ describe('ClientSession', () => {
 				expect(response.nodeId).toBe('server-1')
 				expect(response.selectedWireFormat).toBe('protobuf')
 			}
+		})
+
+		test('hides vector entries for out-of-scope nodes, but includes its own and in-scope senders', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-other',
+					nodeId: 'other-tenant-device',
+					recordId: 'other-rec',
+					data: { title: 'theirs', userId: 'other' },
+					sequenceNumber: 42,
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-peer',
+					nodeId: 'my-other-device',
+					recordId: 'peer-rec',
+					data: { title: 'mine', userId: 'me' },
+					sequenceNumber: 7,
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-own',
+					nodeId: 'client-1',
+					recordId: 'own-rec',
+					data: { title: 'own', userId: 'me' },
+					sequenceNumber: 3,
+				}),
+			)
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			new ClientSession({
+				sessionId: 'sess-vv',
+				transport: server,
+				store,
+				auth: {
+					authenticate: async () => ({ userId: 'me', scopes: { todos: { userId: 'me' } } }),
+				},
+			}).start()
+			sendHandshake(client, { versionVector: {}, authToken: 't' })
+			await vi.waitFor(() => {
+				expect(messages.some((m) => m.type === 'handshake-response')).toBe(true)
+			})
+			const response = messages.find((m) => m.type === 'handshake-response')
+			if (response?.type !== 'handshake-response') throw new Error('no handshake-response')
+			// Its own entry, plus the node whose in-scope op it is about to receive (so the
+			// client does not mistake that op for one it still has to upload); never the
+			// other tenant's device.
+			expect(response.versionVector).toEqual({ 'client-1': 3, 'my-other-device': 7 })
 		})
 
 		test('sends delta operations to client', async () => {
