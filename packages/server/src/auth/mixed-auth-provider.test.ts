@@ -30,13 +30,17 @@ describe('MixedAuthProvider', () => {
 		})
 
 		const result = await auth.authenticate('')
-		expect(result.userId).toMatch(/^anon-/)
-		expect(result.scopes).toEqual({ responses: {} })
+		expect(result?.userId).toMatch(/^anon-/)
+		expect(result?.scopes).toEqual({ responses: {} })
 		// Primary should NOT be called for empty tokens
 		expect(primary.authenticate).not.toHaveBeenCalled()
 	})
 
-	test('falls back to anonymous when primary rejects token', async () => {
+	// Inverted (beta.13): a presented but invalid/expired token used to be silently
+	// downgraded to anonymous, so a signed-in user whose access token had expired
+	// synced their private writes against the anonymous grant. It is now rejected
+	// and the client refreshes before reconnecting.
+	test('rejects (does not downgrade) a token the primary rejects', async () => {
 		const primary = createMockPrimary(null)
 		const auth = new MixedAuthProvider({
 			primary,
@@ -44,9 +48,18 @@ describe('MixedAuthProvider', () => {
 		})
 
 		const result = await auth.authenticate('invalid-token')
-		expect(result.userId).toMatch(/^anon-/)
-		expect(result.scopes).toEqual({ responses: {} })
+		expect(result).toBeNull()
 		expect(primary.authenticate).toHaveBeenCalledWith('invalid-token')
+	})
+
+	test('anonymous grants are fresh copies per session', async () => {
+		const anonymousScopes = { forms: { status: 'published' } }
+		const auth = new MixedAuthProvider({ primary: createMockPrimary(null), anonymousScopes })
+		const a = await auth.authenticate('')
+		if (a?.scopes?.forms) a.scopes.forms.status = 'draft'
+		const b = await auth.authenticate('')
+		expect(b?.scopes).toEqual({ forms: { status: 'published' } })
+		expect(anonymousScopes.forms.status).toBe('published')
 	})
 
 	test('each anonymous connection gets a unique userId', async () => {
@@ -58,7 +71,7 @@ describe('MixedAuthProvider', () => {
 
 		const result1 = await auth.authenticate('')
 		const result2 = await auth.authenticate('')
-		expect(result1.userId).not.toEqual(result2.userId)
+		expect(result1?.userId).not.toEqual(result2?.userId)
 	})
 
 	test('uses custom anonymous prefix', async () => {
@@ -70,7 +83,7 @@ describe('MixedAuthProvider', () => {
 		})
 
 		const result = await auth.authenticate('')
-		expect(result.userId).toMatch(/^guest-/)
+		expect(result?.userId).toMatch(/^guest-/)
 	})
 
 	test('anonymous scopes restrict to specified collections', async () => {
@@ -84,7 +97,7 @@ describe('MixedAuthProvider', () => {
 		})
 
 		const result = await auth.authenticate('')
-		expect(result.scopes).toEqual({
+		expect(result?.scopes).toEqual({
 			responses: {},
 			forms: { status: 'published' },
 		})
@@ -102,13 +115,13 @@ describe('MixedAuthProvider', () => {
 		})
 
 		const result = await auth.authenticate('valid-token')
-		expect(result.scopes).toEqual({
+		expect(result?.scopes).toEqual({
 			forms: { userId: 'user-1' },
 			responses: { formOwnerId: 'user-1' },
 		})
 	})
 
-	test('never returns null — always allows connection', async () => {
+	test('always allows a token-less (anonymous) connection', async () => {
 		const primary = createMockPrimary(null)
 		const auth = new MixedAuthProvider({
 			primary,
@@ -117,6 +130,6 @@ describe('MixedAuthProvider', () => {
 
 		const result = await auth.authenticate('')
 		expect(result).not.toBeNull()
-		expect(result.userId).toBeTruthy()
+		expect(result?.userId).toBeTruthy()
 	})
 })

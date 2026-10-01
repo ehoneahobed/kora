@@ -1300,7 +1300,7 @@ All methods return `Promise<OrgRouteResponse<T>>`.
 - `acceptInvitation(userId, params: { token })` -- Accept an invitation by token.
 - `revokeInvitation(userId, orgId, invitationId)` -- Revoke a pending invitation. Requires admin+.
 - `listPendingInvitations(userId, orgId)` -- List pending invitations. Requires admin+.
-- `listMyInvitations(email)` -- List invitations for a user's email.
+- `listMyInvitations(userId, identity?)` -- List invitations addressed to the user's own verified email (resolved server-side via `userLookup`; tokens are never returned).
 
 #### Org Roles
 
@@ -1490,7 +1490,9 @@ import {
 } from '@korajs/auth/server'
 ```
 
-Register webhook endpoints and receive notifications for auth events. Signatures are HMAC-SHA256 for verification.
+Register webhook endpoints and receive notifications for auth events. Endpoints must be `https` URLs that resolve to public addresses (loopback, private and link-local targets are refused; `allowPrivateTargets: true` relaxes this for local development).
+
+Each delivery carries `X-Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">` and `X-Webhook-Timestamp`. Verify with `verifyWebhookSignature(rawBody, signatureHeader, secret, { toleranceSeconds })` (default tolerance 300 s), which rejects replays of old deliveries. The pre-beta.13 `sha256=<hex>` format is no longer produced or accepted.
 
 ### JWT Utilities
 

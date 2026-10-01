@@ -73,7 +73,36 @@ describe('OAuthManager', () => {
 		test('includes metadata in state', async () => {
 			const { state } = await manager.getAuthorizationUrl('test', { returnTo: '/dashboard' })
 			const stored = await stateStore.consume(state)
-			expect(stored?.metadata).toEqual({ returnTo: '/dashboard' })
+			expect(stored?.metadata?.returnTo).toBe('/dashboard')
+		})
+
+		test('binds the state to purpose, user and client binding (AUTH-3)', async () => {
+			const signin = await manager.getAuthorizationUrl('test', undefined, { binding: 'b-1' })
+			await expect(
+				manager.handleCallback('test', 'code', signin.state, { purpose: 'link', userId: 'u1' }),
+			).rejects.toThrow(/does not match/)
+
+			const noBinding = await manager.getAuthorizationUrl('test', undefined, { binding: 'b-2' })
+			await expect(manager.handleCallback('test', 'code', noBinding.state)).rejects.toThrow(
+				/does not match/,
+			)
+
+			const link = await manager.getAuthorizationUrl('test', undefined, {
+				purpose: 'link',
+				userId: 'u1',
+				binding: 'b-3',
+			})
+			await expect(
+				manager.handleCallback('test', 'code', link.state, {
+					purpose: 'link',
+					userId: 'u2',
+					binding: 'b-3',
+				}),
+			).rejects.toThrow(/does not match/)
+
+			await expect(
+				manager.getAuthorizationUrl('test', undefined, { purpose: 'link' }),
+			).rejects.toThrow()
 		})
 
 		test('adds PKCE challenge for public native clients', async () => {

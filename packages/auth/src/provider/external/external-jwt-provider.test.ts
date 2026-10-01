@@ -690,6 +690,7 @@ describe('createSupabaseAdapter', () => {
 		const nowSeconds = Math.floor(Date.now() / 1000)
 		const token = createTestToken({
 			sub: 'sb-user-name',
+			aud: 'authenticated',
 			iat: nowSeconds,
 			exp: nowSeconds + 3600,
 			user_metadata: {
@@ -708,7 +709,9 @@ describe('createSupabaseAdapter', () => {
 			jwtSecret: TEST_SECRET,
 		})
 
-		const token = createValidToken({ sub: 'sb-user-no-meta' })
+		// Real Supabase access tokens carry aud 'authenticated', which the adapter
+		// now requires by default (AUTH-14).
+		const token = createValidToken({ sub: 'sb-user-no-meta', aud: 'authenticated' })
 
 		const syncAuth = adapter.toSyncAuthProvider()
 		const result = await syncAuth.authenticate(token)
@@ -724,6 +727,7 @@ describe('createSupabaseAdapter', () => {
 
 		const token = createValidToken({
 			sub: 'sb-user-bad-meta',
+			aud: 'authenticated',
 			user_metadata: 'not-an-object',
 		})
 
@@ -745,6 +749,7 @@ describe('createSupabaseAdapter', () => {
 
 		const token = createValidToken({
 			sub: 'custom-mapped',
+			aud: 'authenticated',
 			email: 'custom@sb.com',
 		})
 		const result = await adapter.validateAccessToken(token)
@@ -804,5 +809,37 @@ describe('Error classes', () => {
 		expect(error.context).toEqual({ detail: 'expired' })
 		expect(error.message).toContain('bad token')
 		expect(error).toBeInstanceOf(Error)
+	})
+})
+
+describe('ExternalJwtProvider audience, issuer and grant (AUTH-14, AUTH-1)', () => {
+	const secret = 'a'.repeat(48)
+	const exp = () => Math.floor(Date.now() / 1000) + 600
+
+	test('enforces configured audience and issuer', async () => {
+		const p = new ExternalJwtProvider({
+			providerName: 'auth0',
+			jwtSecret: secret,
+			audience: ['api-a', 'api-b'],
+			issuer: 'https://issuer.example/',
+		})
+		const ok = encodeJwt(
+			{ sub: 'u', aud: ['x', 'api-b'], iss: 'https://issuer.example/', exp: exp() },
+			secret,
+		)
+		const wrongIss = encodeJwt({ sub: 'u', aud: 'api-a', iss: 'https://evil/', exp: exp() }, secret)
+		expect(await p.toSyncAuthProvider().authenticate(ok)).not.toBeNull()
+		expect(await p.toSyncAuthProvider().authenticate(wrongIss)).toBeNull()
+	})
+
+	test('returns a server-derived grant bound to the verified subject', async () => {
+		const p = new ExternalJwtProvider({
+			providerName: 'auth0',
+			jwtSecret: secret,
+			scopeValues: (claims) => ({ orgId: claims.org_id }),
+		})
+		const token = encodeJwt({ sub: 'u1', org_id: 'o1', exp: exp() }, secret)
+		const ctx = await p.toSyncAuthProvider().authenticate(token)
+		expect(ctx?.scopes).toEqual({ $claims: { orgId: 'o1', userId: 'u1' } })
 	})
 })

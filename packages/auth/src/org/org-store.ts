@@ -94,7 +94,11 @@ export interface OrgStore {
 	consumeInvitation(token: string): Promise<OrgInvitation>
 
 	/** Revoke a pending invitation. */
-	revokeInvitation(invitationId: string): Promise<void>
+	/**
+	 * Revoke a pending invitation of `orgId`. Must throw InvitationNotFoundError
+	 * when the invitation belongs to another org (AUTH-4).
+	 */
+	revokeInvitation(orgId: string, invitationId: string): Promise<void>
 
 	/** List pending invitations for an organization. */
 	listPendingInvitations(orgId: string): Promise<OrgInvitation[]>
@@ -399,9 +403,9 @@ export class InMemoryOrgStore implements OrgStore {
 		throw new InvitationNotFoundError()
 	}
 
-	async revokeInvitation(invitationId: string): Promise<void> {
+	async revokeInvitation(orgId: string, invitationId: string): Promise<void> {
 		const invitation = this.invitations.get(invitationId)
-		if (!invitation || invitation.status !== 'pending') {
+		if (!invitation || invitation.orgId !== orgId || invitation.status !== 'pending') {
 			throw new InvitationNotFoundError()
 		}
 		this.invitations.set(invitationId, { ...invitation, status: 'revoked' })

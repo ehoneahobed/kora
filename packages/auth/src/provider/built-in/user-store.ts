@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { KoraError } from '@korajs/core'
+import { InMemoryTokenRevocationStore, type TokenRevocationStore } from '../../tokens/token-manager'
 
 /**
  * A user as visible to the application layer.
@@ -60,6 +61,21 @@ export class DuplicateEmailError extends KoraError {
 }
 
 /**
+ * Thrown when a device id is already registered to a different user. A token's
+ * `dev` claim must always name a device owned by its `sub` (AUTH-5).
+ */
+export class DeviceOwnershipError extends KoraError {
+	constructor(deviceId: string) {
+		super(
+			'This device id is registered to another account. Use a device id generated for this install.',
+			'DEVICE_OWNERSHIP_CONFLICT',
+			{ deviceId },
+		)
+		this.name = 'DeviceOwnershipError'
+	}
+}
+
+/**
  * Generic interface for user and device persistence.
  *
  * Implement this interface to provide database-backed user storage for
@@ -94,7 +110,11 @@ export interface UserStore {
 	/** Find a user by ID. */
 	findById(id: string): Promise<StoredUser | null>
 
-	/** Register a device for a user. Idempotent if device already exists and is not revoked. */
+	/**
+	 * Register a device for a user. Idempotent for the same owner (a revoked
+	 * device is re-activated). Must throw {@link DeviceOwnershipError} when the id
+	 * already belongs to a different user.
+	 */
 	registerDevice(params: {
 		id: string
 		userId: string
@@ -128,6 +148,13 @@ export interface UserStore {
 
 	/** Update the last-seen timestamp for a device. No-op if device does not exist. */
 	touchDevice(deviceId: string): Promise<void>
+
+	/**
+	 * Optional token revocation store that lives with the user data (same
+	 * database). `createKoraAuthServer` uses it by default, so revocations
+	 * persist and are shared exactly as far as users are.
+	 */
+	getTokenRevocationStore?(): TokenRevocationStore
 }
 
 /**
@@ -160,6 +187,14 @@ export class InMemoryUserStore implements UserStore {
 
 	/** Device IDs indexed by user ID for fast listing */
 	private readonly devicesByUserId = new Map<string, Set<string>>()
+
+	/** Revocations live with the users, so every server sharing this store shares them. */
+	private readonly revocationStore = new InMemoryTokenRevocationStore()
+
+	/** The token revocation store that shares this store's lifetime. */
+	getTokenRevocationStore(): TokenRevocationStore {
+		return this.revocationStore
+	}
 
 	/**
 	 * Create a new user account.
@@ -226,9 +261,10 @@ export class InMemoryUserStore implements UserStore {
 	/**
 	 * Register a device for a user.
 	 *
-	 * If a device with the same ID already exists and is not revoked, it is
-	 * returned as-is (idempotent registration). If it was previously revoked,
-	 * it is re-activated with updated details.
+	 * If a device with the same ID already exists for the same user and is not
+	 * revoked, it is returned as-is (idempotent registration). If it was
+	 * previously revoked, it is re-activated with updated details. A device id
+	 * owned by another user is refused.
 	 *
 	 * @param params - Device registration parameters
 	 * @param params.id - Unique device identifier
@@ -236,6 +272,7 @@ export class InMemoryUserStore implements UserStore {
 	 * @param params.publicKey - Base64url-encoded device public key or thumbprint
 	 * @param params.name - Human-readable device name
 	 * @returns The registered device record
+	 * @throws {DeviceOwnershipError} If the id is registered to another user
 	 */
 	async registerDevice(params: {
 		id: string
@@ -244,6 +281,9 @@ export class InMemoryUserStore implements UserStore {
 		name: string
 	}): Promise<AuthDevice> {
 		const existing = this.devicesById.get(params.id)
+		if (existing !== undefined && existing.userId !== params.userId) {
+			throw new DeviceOwnershipError(params.id)
+		}
 		if (existing !== undefined && !existing.revoked) {
 			return existing
 		}

@@ -45,6 +45,10 @@ export interface TotpSecret {
 	 * until the first code is consumed.
 	 */
 	lastUsedTimeStep?: number
+	/** Consecutive failed code checks (TOTP or recovery). Reset on success. */
+	failedAttempts?: number
+	/** While set and in the future, every code check fails without being evaluated. */
+	lockedUntil?: number
 }
 
 /**
@@ -79,6 +83,17 @@ export class TotpError extends KoraError {
 	constructor(message: string, code: string, context?: Record<string, unknown>) {
 		super(message, code, context)
 		this.name = 'TotpError'
+	}
+}
+
+/**
+ * Thrown by `disable` / `regenerateRecoveryCodes` while code checks are locked
+ * after repeated failures (AUTH-10). `verify` returns false instead.
+ */
+export class TotpLockedError extends TotpError {
+	constructor(public readonly lockedUntil: number) {
+		super('Too many invalid codes. Try again later.', 'TOTP_LOCKED', { lockedUntil })
+		this.name = 'TotpLockedError'
 	}
 }
 
@@ -175,6 +190,11 @@ const RECOVERY_CODE_LENGTH = 10
  * const valid = await totp.verify('user-123', '654321')
  * ```
  */
+/** Consecutive failures allowed before code checks start locking. */
+const FREE_FAILURES = 5
+const LOCK_BASE_MS = 30_000
+const LOCK_MAX_MS = 15 * 60_000
+
 export class TotpManager {
 	private readonly store: TotpStore
 	private readonly issuer: string
@@ -280,7 +300,10 @@ export class TotpManager {
 			throw new TotpNotVerifiedError(userId)
 		}
 
-		return this.consumeCode(stored, code)
+		if (this.isLocked(stored)) {
+			return false
+		}
+		return this.checkTotp(stored, code)
 	}
 
 	/**
@@ -297,15 +320,22 @@ export class TotpManager {
 			throw new TotpNotVerifiedError(userId)
 		}
 
+		if (this.isLocked(stored)) {
+			return false
+		}
+
 		const hashed = await hashRecoveryCode(recoveryCode.trim())
 
 		const index = stored.recoveryCodes.indexOf(hashed)
 		if (index === -1) {
+			await this.recordFailure(stored)
 			return false
 		}
 
 		// Consume the recovery code (single-use)
 		stored.recoveryCodes.splice(index, 1)
+		stored.failedAttempts = 0
+		stored.lockedUntil = undefined
 		await this.store.save(stored)
 
 		return true
@@ -325,7 +355,10 @@ export class TotpManager {
 			throw new TotpNotVerifiedError(userId)
 		}
 
-		const valid = this.validateCode(stored.secret, totpCode)
+		this.assertNotLocked(stored)
+		// consumeCode (not a bare validation): an observed or already-used code
+		// cannot authorize this a second time.
+		const valid = await this.checkTotp(stored, totpCode)
 		if (!valid) {
 			throw new TotpInvalidCodeError()
 		}
@@ -349,11 +382,13 @@ export class TotpManager {
 			throw new TotpNotEnabledError(userId)
 		}
 
-		// Accept either a TOTP code or a recovery code
+		this.assertNotLocked(stored)
+
+		// Accept either a fresh (never used) TOTP code or a recovery code
 		let authorized = false
 
 		if (stored.verified) {
-			authorized = this.validateCode(stored.secret, code)
+			authorized = this.matchFreshTimeStep(stored, code) !== null
 		}
 
 		if (!authorized) {
@@ -362,6 +397,7 @@ export class TotpManager {
 		}
 
 		if (!authorized) {
+			await this.recordFailure(stored)
 			throw new TotpInvalidCodeError()
 		}
 
@@ -387,8 +423,53 @@ export class TotpManager {
 
 	// --- Private ---
 
-	private validateCode(base32Secret: string, code: string): boolean {
-		return this.matchTimeStep(base32Secret, code) !== null
+	private isLocked(stored: TotpSecret): boolean {
+		return stored.lockedUntil !== undefined && Date.now() < stored.lockedUntil
+	}
+
+	private assertNotLocked(stored: TotpSecret): void {
+		if (stored.lockedUntil !== undefined && Date.now() < stored.lockedUntil) {
+			throw new TotpLockedError(stored.lockedUntil)
+		}
+	}
+
+	/**
+	 * Count a failed code check. After FREE_FAILURES consecutive failures, code
+	 * checks lock for an exponentially growing period (30s, 60s, ... up to 15
+	 * minutes), which bounds online guessing of a 6-digit code (AUTH-10) without
+	 * a permanent lockout an attacker could trigger at will.
+	 */
+	private async recordFailure(stored: TotpSecret): Promise<void> {
+		const failures = (stored.failedAttempts ?? 0) + 1
+		stored.failedAttempts = failures
+		if (failures >= FREE_FAILURES) {
+			const delay = Math.min(LOCK_BASE_MS * 2 ** (failures - FREE_FAILURES), LOCK_MAX_MS)
+			stored.lockedUntil = Date.now() + delay
+		}
+		await this.store.save(stored)
+	}
+
+	/** consumeCode plus failure accounting. */
+	private async checkTotp(stored: TotpSecret, code: string): Promise<boolean> {
+		const ok = await this.consumeCode(stored, code)
+		if (!ok) {
+			await this.recordFailure(stored)
+			return false
+		}
+		if (stored.failedAttempts || stored.lockedUntil !== undefined) {
+			stored.failedAttempts = 0
+			stored.lockedUntil = undefined
+			await this.store.save(stored)
+		}
+		return true
+	}
+
+	/** A matching time-step that has not been consumed yet, or null. */
+	private matchFreshTimeStep(stored: TotpSecret, code: string): number | null {
+		const matched = this.matchTimeStep(stored.secret, code)
+		if (matched === null) return null
+		if (stored.lastUsedTimeStep !== undefined && matched <= stored.lastUsedTimeStep) return null
+		return matched
 	}
 
 	/**
@@ -418,14 +499,10 @@ export class TotpManager {
 	 * replay of an already-consumed time-step. Persists the consumed time-step.
 	 */
 	private async consumeCode(stored: TotpSecret, code: string): Promise<boolean> {
-		const matched = this.matchTimeStep(stored.secret, code)
-		if (matched === null) {
-			return false
-		}
-
 		// Reject replays: a code whose time-step was already used (or predates
 		// the last consumed time-step) must not authenticate a second time.
-		if (stored.lastUsedTimeStep !== undefined && matched <= stored.lastUsedTimeStep) {
+		const matched = this.matchFreshTimeStep(stored, code)
+		if (matched === null) {
 			return false
 		}
 

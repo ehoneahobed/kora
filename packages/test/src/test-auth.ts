@@ -40,7 +40,7 @@ export function createTestAuthBinding(options?: {
 		get state() {
 			return state
 		},
-		auth: async () => ({ token: state.state === 'authenticated' ? state.token : '' }),
+		auth: async () => ({ token: state.state === 'authenticated' ? (state.token ?? '') : '' }),
 		resolveSyncState: async () => state,
 		resolveUserId: async () => (state.state === 'authenticated' ? state.userId : undefined),
 		resolveNodeId: async () => (state.state === 'authenticated' ? 'test-device' : undefined),

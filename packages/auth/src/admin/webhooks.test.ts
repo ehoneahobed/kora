@@ -185,7 +185,17 @@ describe('WebhookManager', () => {
 
 			const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
 			const headers = options.headers as Record<string, string>
-			expect(headers['X-Webhook-Signature']).toMatch(/^sha256=[a-f0-9]+$/)
+			// Updated (AUTH-14): the timestamp is signed with the body.
+			expect(headers['X-Webhook-Signature']).toMatch(/^t=\d+,v1=[a-f0-9]{64}$/)
+			expect(headers['X-Webhook-Timestamp']).toMatch(/^\d+$/)
+			const body = options.body as string
+			expect(
+				await verifyWebhookSignature(
+					body,
+					headers['X-Webhook-Signature'] as string,
+					(await manager.list())[0]?.secret as string,
+				),
+			).toBe(true)
 		})
 
 		test('does nothing when no endpoints match', async () => {
@@ -197,8 +207,41 @@ describe('WebhookManager', () => {
 
 // --- Signature verification ---
 
+async function hmacHex(secret: string, input: string): Promise<string> {
+	const encoder = new TextEncoder()
+	const key = await globalThis.crypto.subtle.importKey(
+		'raw',
+		encoder.encode(secret),
+		{ name: 'HMAC', hash: 'SHA-256' },
+		false,
+		['sign'],
+	)
+	const sig = new Uint8Array(
+		await globalThis.crypto.subtle.sign('HMAC', key, encoder.encode(input)),
+	)
+	return Array.from(sig, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 describe('verifyWebhookSignature', () => {
-	test('verifies valid signature', async () => {
+	test('verifies a fresh timestamped signature and rejects a stale or legacy one', async () => {
+		const payload = '{"event":"user.created"}'
+		const secret = 'whsec_test-secret'
+		const now = Math.floor(Date.now() / 1000)
+		const fresh = `t=${now},v1=${await hmacHex(secret, `${now}.${payload}`)}`
+		expect(await verifyWebhookSignature(payload, fresh, secret)).toBe(true)
+		const old = now - 3600
+		const stale = `t=${old},v1=${await hmacHex(secret, `${old}.${payload}`)}`
+		expect(await verifyWebhookSignature(payload, stale, secret)).toBe(false)
+		expect(await verifyWebhookSignature(payload, stale, secret, { toleranceSeconds: 7200 })).toBe(
+			true,
+		)
+		// The pre-beta.13 format (no timestamp) is no longer accepted.
+		expect(
+			await verifyWebhookSignature(payload, `sha256=${await hmacHex(secret, payload)}`, secret),
+		).toBe(false)
+	})
+
+	test('legacy format test kept for reference: an untimestamped signature fails', async () => {
 		const payload = JSON.stringify({ event: 'user.created', data: { userId: 'u1' } })
 		const secret = 'whsec_test-secret'
 
@@ -219,7 +262,7 @@ describe('verifyWebhookSignature', () => {
 		}
 		const signature = `sha256=${hex}`
 
-		expect(await verifyWebhookSignature(payload, signature, secret)).toBe(true)
+		expect(await verifyWebhookSignature(payload, signature, secret)).toBe(false)
 	})
 
 	test('rejects invalid signature', async () => {
@@ -394,5 +437,54 @@ describe('InMemoryWebhookStore', () => {
 		;(retrieved as NonNullable<typeof retrieved>).url = 'mutated'
 		const again = await store.getEndpoint('1')
 		expect(again?.url).toBe('a')
+	})
+})
+
+describe('webhook targets (AUTH-14 SSRF)', () => {
+	test.each([
+		'http://example.com/hook',
+		'https://localhost/hook',
+		'https://127.0.0.1/hook',
+		'https://10.1.2.3/hook',
+		'https://[::1]/hook',
+		'https://169.254.169.254/latest/meta-data/',
+		'https://[::ffff:192.168.0.1]/hook',
+		'not a url',
+	])('register refuses %s', async (url) => {
+		const manager = new WebhookManager({ store: new InMemoryWebhookStore() })
+		await expect(manager.register({ url, events: ['user.created'] })).rejects.toThrow()
+	})
+
+	test('delivery refuses a public name that resolves to a private address', async () => {
+		const fetchFn = vi.fn()
+		const manager = new WebhookManager({
+			store: new InMemoryWebhookStore(),
+			fetch: fetchFn as unknown as typeof fetch,
+			resolveHost: async () => ['10.0.0.5'],
+		})
+		const ep = await manager.register({
+			url: 'https://rebind.example/hook',
+			events: ['user.created'],
+		})
+		vi.useFakeTimers()
+		try {
+			const run = manager.dispatch('user.created', { userId: 'u1' })
+			await vi.runAllTimersAsync()
+			await run
+		} finally {
+			vi.useRealTimers()
+		}
+		expect(fetchFn).not.toHaveBeenCalled()
+		expect((await manager.getDeliveries(ep.id))[0]?.success).toBe(false)
+	})
+
+	test('allowPrivateTargets permits local development endpoints', async () => {
+		const manager = new WebhookManager({
+			store: new InMemoryWebhookStore(),
+			allowPrivateTargets: true,
+		})
+		await expect(
+			manager.register({ url: 'http://localhost:3000/hook', events: ['user.created'] }),
+		).resolves.toBeDefined()
 	})
 })

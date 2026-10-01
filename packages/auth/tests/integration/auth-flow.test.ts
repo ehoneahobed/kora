@@ -109,13 +109,19 @@ describe('Auth flow integration', () => {
 		expect(newTokens.accessToken).not.toBe(tokens.accessToken)
 		expect(newTokens.refreshToken).not.toBe(tokens.refreshToken)
 
-		// Old refresh token should be consumed (revoked)
+		// Within the rotation grace window, the consumed token may be presented ONCE
+		// more (a response lost on the wire) and returns the SAME successor pair.
 		const secondRefresh = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
-		expect(secondRefresh.status).toBe(401)
+		expect(secondRefresh.status).toBe(200)
+		expect((secondRefresh.body as { data: unknown }).data).toEqual(newTokens)
 
 		// New refresh token works
 		const thirdRefresh = await routes.handleRefresh({ refreshToken: newTokens.refreshToken })
 		expect(thirdRefresh.status).toBe(200)
+
+		// Once the successor has been used, the old token is a plain replay.
+		const replay = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
+		expect(replay.status).toBe(401)
 	})
 
 	test('refresh token reuse is detected and rejected', async () => {
@@ -132,15 +138,26 @@ describe('Auth flow integration', () => {
 		const firstRefresh = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
 		expect(firstRefresh.status).toBe(200)
 
-		// Replay the old refresh token (potential theft — already consumed)
+		// The one grace replay (lost response) is answered; a second replay is theft.
+		const graceReplay = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
+		expect(graceReplay.status).toBe(200)
 		const replay = await routes.handleRefresh({ refreshToken: tokens.refreshToken })
 		expect(replay.status).toBe(401)
 
-		// Device-level revocation was triggered — sync auth should reject
+		// Family-level revocation: every token of that sign-in is dead...
 		const syncAuth = routes.toSyncAuthProvider()
 		const newAccessToken = (firstRefresh.body as { data: { accessToken: string } }).data.accessToken
-		// The access token's JTI is not individually revoked, but device-level
-		// revocation blocks the toSyncAuthProvider path which checks device status
+		expect(await syncAuth.authenticate(newAccessToken)).toBeNull()
+
+		// ...but the device is not banned: a fresh sign-in on it works (NEW-AUTH-1).
+		const again = await routes.handleSignIn({
+			email: 'charlie@example.com',
+			password: 'securePassword123',
+			deviceId: 'device-1',
+		})
+		const freshAccess = (again.body as { data: { tokens: { accessToken: string } } }).data.tokens
+			.accessToken
+		expect(await syncAuth.authenticate(freshAccess)).not.toBeNull()
 	})
 
 	// ========================================================================
@@ -255,7 +272,7 @@ describe('Auth flow integration', () => {
 	// ========================================================================
 
 	test('sign-up → forgot password → reset → sign-in with new password', async () => {
-		const resetManager = new PasswordResetManager({ userStore })
+		const resetManager = new PasswordResetManager({ userStore, exposeTokenForDevelopment: true })
 
 		// Sign up
 		await routes.handleSignUp({
@@ -289,7 +306,7 @@ describe('Auth flow integration', () => {
 	})
 
 	test('reset token is single-use', async () => {
-		const resetManager = new PasswordResetManager({ userStore })
+		const resetManager = new PasswordResetManager({ userStore, exposeTokenForDevelopment: true })
 
 		await routes.handleSignUp({
 			email: 'singleuse@example.com',

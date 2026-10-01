@@ -61,6 +61,9 @@ export function createKoraAuth(options: CreateKoraAuthOptions): AuthClient {
 		storage,
 		fetch: options.fetch,
 		deviceIdentity,
+		requestTimeoutMs: options.requestTimeoutMs,
+		maxOfflineGraceMs: options.maxOfflineGraceMs,
+		refreshBackoff: options.refreshBackoff,
 	})
 }
 

@@ -4,8 +4,8 @@ import {
 	buildScopeMap,
 	extractScopeValuesFromClaims,
 } from '@korajs/core'
-import type { AuthSyncBinding } from '@korajs/core/bindings'
-import type { AuthState } from './auth-client'
+import type { AuthSyncBinding, AuthSyncState } from '@korajs/core/bindings'
+import type { AuthClientSession, AuthState } from './auth-client'
 
 /**
  * Minimal auth client surface required for sync integration.
@@ -15,6 +15,12 @@ export interface AuthSyncClient {
 	getAccessToken(): Promise<string | null>
 	readonly state?: AuthState
 	onAuthChange?(callback: (state: AuthState) => void): () => void
+	/** Stored session freshness (authenticated-offline support). */
+	readonly session?: AuthClientSession | null
+	/** Unverified claims of the stored credentials, available offline. */
+	getStoredClaims?(): Promise<Record<string, unknown> | null>
+	/** Notifies when session freshness changes (fresh, offline, locked). */
+	onSessionChange?(callback: (session: AuthClientSession | null) => void): () => void
 }
 
 /**
@@ -32,8 +38,9 @@ export interface CreateKoraAuthSyncOptions {
 	/** Kora auth client from `createKoraAuth()`. */
 	authClient: AuthSyncClient
 	/**
-	 * Application schema. When provided, scope maps are built automatically
-	 * from JWT claims and schema scope declarations.
+	 * Application schema. When provided, a client-side scope hint is built from
+	 * token claims and schema scope declarations. The server only uses it to
+	 * NARROW its own grant; it never authorizes anything.
 	 */
 	schema?: SchemaDefinition
 	/**
@@ -74,16 +81,22 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
 	}
 }
 
-function readDeviceIdFromClaims(claims: Record<string, unknown>): string | undefined {
-	const dev = claims.dev
-	return typeof dev === 'string' && dev.length > 0 ? dev : undefined
+function readString(claims: Record<string, unknown> | null, key: string): string | undefined {
+	const value = claims?.[key]
+	return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 /**
  * Creates a sync auth binding for `createApp({ sync: { authClient: binding } })`.
  *
- * Wires token refresh, automatic scope maps from JWT claims, and device-bound
- * sync node ids (`dev` claim) separate from the user id (`sub`).
+ * Wires token refresh, a client-side scope hint, and device-bound sync node ids
+ * (`dev` claim) separate from the user id (`sub`).
+ *
+ * Offline-first: identity (user id, device id) comes from the stored session,
+ * not from token freshness. While the auth server is unreachable the binding
+ * keeps reporting the signed-in user (authenticated-offline, `token: null`), so
+ * the user's own local database opens and the app stays usable; only the sync
+ * transport waits for a fresh token.
  *
  * @example
  * ```typescript
@@ -104,6 +117,22 @@ function readDeviceIdFromClaims(claims: Record<string, unknown>): string | undef
 export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSyncBinding {
 	const { authClient, schema, scopeFromClaims, anonymous = 'suspend' } = options
 
+	/**
+	 * Claims of the session: from a fresh token when one can be minted, else from
+	 * the stored credentials while the client is still signed in.
+	 */
+	const resolveClaims = async (): Promise<{
+		claims: Record<string, unknown> | null
+		token: string | null
+	}> => {
+		const token = await authClient.getAccessToken()
+		if (token) return { claims: decodeJwtPayload(token), token }
+		if (authClient.state === 'unauthenticated' || !authClient.getStoredClaims) {
+			return { claims: null, token: null }
+		}
+		return { claims: await authClient.getStoredClaims(), token: null }
+	}
+
 	const binding: AuthSyncBinding = {
 		auth: async () => {
 			const token = await authClient.getAccessToken()
@@ -111,32 +140,32 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 		},
 	}
 
-	binding.resolveSyncState = async () => {
+	binding.resolveSyncState = async (): Promise<AuthSyncState> => {
 		if (authClient.state === 'loading') return { state: 'loading' }
-		const token = await authClient.getAccessToken()
-		if (!token) {
-			return anonymous === 'allow'
-				? { state: 'anonymous', mayConnectAnonymously: true }
-				: { state: 'signed-out', mayConnectAnonymously: false }
-		}
-		const claims = decodeJwtPayload(token)
-		const userId = typeof claims?.sub === 'string' ? claims.sub : ''
+		const { claims, token } = await resolveClaims()
+		const userId = readString(claims, 'sub')
 		if (!userId) {
 			return anonymous === 'allow'
 				? { state: 'anonymous', mayConnectAnonymously: true }
 				: { state: 'signed-out', mayConnectAnonymously: false }
 		}
-		return { state: 'authenticated', userId, token }
+		const deviceId = readString(claims, 'dev')
+		if (token) {
+			return { state: 'authenticated', userId, token, ...(deviceId ? { deviceId } : {}) }
+		}
+		return {
+			state: 'authenticated',
+			userId,
+			token: null,
+			offline: true,
+			locked: authClient.session?.status === 'locked',
+			...(deviceId ? { deviceId } : {}),
+		}
 	}
 
 	if (schema) {
 		binding.resolveScopeMap = async () => {
-			const token = await authClient.getAccessToken()
-			if (!token) {
-				return undefined
-			}
-
-			const claims = decodeJwtPayload(token)
+			const { claims } = await resolveClaims()
 			if (!claims) {
 				return undefined
 			}
@@ -145,40 +174,29 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 				? scopeFromClaims(claims)
 				: extractScopeValuesFromClaims(schema, claims)
 
-			return buildScopeMap(schema, scopeValues)
+			return buildScopeMap(schema, scopeValues) as ScopeMap
 		}
 	}
 
 	binding.resolveNodeId = async () => {
-		const token = await authClient.getAccessToken()
-		if (!token) {
-			return undefined
-		}
-
-		const claims = decodeJwtPayload(token)
-		if (!claims) {
-			return undefined
-		}
-
-		return readDeviceIdFromClaims(claims)
+		const { claims } = await resolveClaims()
+		return readString(claims, 'dev')
 	}
 
 	binding.resolveUserId = async () => {
-		const token = await authClient.getAccessToken()
-		if (!token) {
-			return undefined
-		}
-
-		const claims = decodeJwtPayload(token)
-		if (!claims || typeof claims.sub !== 'string' || claims.sub.length === 0) {
-			return undefined
-		}
-
-		return claims.sub
+		const { claims } = await resolveClaims()
+		return readString(claims, 'sub')
 	}
 
-	if (authClient.onAuthChange) {
-		binding.subscribe = (listener) => authClient.onAuthChange?.(() => listener()) ?? (() => {})
+	if (authClient.onAuthChange || authClient.onSessionChange) {
+		binding.subscribe = (listener) => {
+			const offAuth = authClient.onAuthChange?.(() => listener()) ?? (() => {})
+			const offSession = authClient.onSessionChange?.(() => listener()) ?? (() => {})
+			return () => {
+				offAuth()
+				offSession()
+			}
+		}
 	}
 
 	return binding

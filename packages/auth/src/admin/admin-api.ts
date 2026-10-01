@@ -17,6 +17,19 @@ export interface AdminApiConfig {
 	sessionStore?: SessionStore
 	/** Audit logger (optional) */
 	auditLogger?: AuditLogger
+	/**
+	 * Authorization check for the acting admin. When set, every method that
+	 * takes an `adminId` throws {@link AdminUnauthorizedError} unless it returns
+	 * true. Without it, the app must gate access to AdminApi itself.
+	 */
+	isAdmin?: (adminId: string) => boolean | Promise<boolean>
+	/**
+	 * Revoke every credential of a user (defaults to the user store's token
+	 * revocation store). Called by `revokeUserSessions`, `suspend`-style flows
+	 * and `deleteUser`, so JWTs and refresh tokens die with the session rows.
+	 * Pass `authServer.revokeAllForUser` to also end live sync sessions.
+	 */
+	revokeAllForUser?: (userId: string) => Promise<void>
 }
 
 /**
@@ -107,17 +120,38 @@ export class AdminApi {
 	private readonly userStore: UserStore
 	private readonly sessionStore: SessionStore | null
 	private readonly auditLogger: AuditLogger | null
+	private readonly isAdmin: AdminApiConfig['isAdmin']
+	private readonly revokeAllForUserFn: AdminApiConfig['revokeAllForUser']
 
 	constructor(config: AdminApiConfig) {
 		this.userStore = config.userStore
 		this.sessionStore = config.sessionStore ?? null
 		this.auditLogger = config.auditLogger ?? null
+		this.isAdmin = config.isAdmin
+		this.revokeAllForUserFn = config.revokeAllForUser
+	}
+
+	/** Throws AdminUnauthorizedError unless the configured `isAdmin` accepts the actor. */
+	private async authorize(adminId: string): Promise<void> {
+		if (this.isAdmin && !(await this.isAdmin(adminId))) {
+			throw new AdminUnauthorizedError()
+		}
+	}
+
+	/** Kill every JWT and refresh token of a user, not just session rows (AUTH-7b/AUTH-14). */
+	private async revokeCredentials(userId: string): Promise<void> {
+		if (this.revokeAllForUserFn) {
+			await this.revokeAllForUserFn(userId)
+			return
+		}
+		await this.userStore.getTokenRevocationStore?.()?.revokeAllForUser(userId, Date.now())
 	}
 
 	/**
 	 * Get a user by ID with full details.
 	 */
 	async getUser(adminId: string, userId: string): Promise<AuthUser> {
+		await this.authorize(adminId)
 		const user = await this.userStore.findById(userId)
 		if (!user) {
 			throw new AdminUserNotFoundError(userId)
@@ -160,6 +194,7 @@ export class AdminApi {
 	 * Update a user's profile (admin-level).
 	 */
 	async updateUser(adminId: string, userId: string, updates: AdminUserUpdate): Promise<AuthUser> {
+		await this.authorize(adminId)
 		const user = await this.userStore.findById(userId)
 		if (!user) {
 			throw new AdminUserNotFoundError(userId)
@@ -186,15 +221,17 @@ export class AdminApi {
 	 * Delete a user and all associated sessions.
 	 */
 	async deleteUser(adminId: string, userId: string): Promise<void> {
+		await this.authorize(adminId)
 		const user = await this.userStore.findById(userId)
 		if (!user) {
 			throw new AdminUserNotFoundError(userId)
 		}
 
-		// Revoke all sessions first
+		// Revoke all sessions and credentials first
 		if (this.sessionStore) {
 			await this.sessionStore.deleteAllForUser(userId)
 		}
+		await this.revokeCredentials(userId)
 
 		await this.userStore.delete(userId)
 
@@ -213,6 +250,8 @@ export class AdminApi {
 	 * Revoke all sessions for a user.
 	 */
 	async revokeUserSessions(adminId: string, userId: string): Promise<number> {
+		await this.authorize(adminId)
+		await this.revokeCredentials(userId)
 		if (!this.sessionStore) return 0
 
 		const count = await this.sessionStore.deleteAllForUser(userId)
@@ -226,6 +265,7 @@ export class AdminApi {
 	 * Revoke a specific session.
 	 */
 	async revokeSession(adminId: string, sessionId: string): Promise<void> {
+		await this.authorize(adminId)
 		if (!this.sessionStore) return
 
 		await this.sessionStore.delete(sessionId)

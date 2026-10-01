@@ -19,6 +19,12 @@ export interface AuthContext {
 	uplinkScopes?: Record<string, Record<string, unknown>>
 	/** Arbitrary metadata about the authenticated user */
 	metadata?: Record<string, unknown>
+	/**
+	 * When the credential that authenticated this session expires (ms since
+	 * epoch). A session must not outlive its credential: the sync server can
+	 * close it with a retriable AUTH_EXPIRED so the client refreshes (AUTH-11).
+	 */
+	expiresAt?: number
 }
 
 /**
