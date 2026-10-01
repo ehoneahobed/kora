@@ -679,6 +679,15 @@ export class TokenManager {
 		}
 
 		const consumed = await store.consume(payload.jti, payload.exp)
+		// RT-9: a device or user revocation can land between the check above and the
+		// consume. Its cut-off is older than `consumedAt` (the successors' iat), so
+		// the successors would outlive it. Re-check now that the parent is consumed:
+		// any revocation from here on has a cut-off at or after `consumedAt` and
+		// therefore also covers the successors.
+		const lateReason = await this.revocationReason(payload)
+		if (lateReason !== null) {
+			return { ok: false, reason: lateReason }
+		}
 		if (consumed.firstUse) {
 			return { ok: true, tokens: successor(consumed.consumedAt), payload, replayed: false }
 		}

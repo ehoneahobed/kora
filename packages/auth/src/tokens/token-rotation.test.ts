@@ -143,3 +143,46 @@ describe('TokenManager rotation (AUTH-6, NEW-AUTH-1, NEW-AUTH-3)', () => {
 		expect(await tm.revocationReason(legacy)).toBe('device_revoked')
 	})
 })
+
+describe('rotation re-checks revocation after consuming the parent (RT-9)', () => {
+	class LateRevocationStore extends InMemoryTokenRevocationStore {
+		onConsume: (() => Promise<void>) | null = null
+		override async consume(jti: string, expiresAt: number) {
+			const hook = this.onConsume
+			this.onConsume = null
+			if (hook) await hook()
+			return super.consume(jti, expiresAt)
+		}
+	}
+
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	for (const kind of ['device', 'user'] as const) {
+		it(`refuses the rotation when a ${kind} revocation lands between check and consume`, async () => {
+			vi.useFakeTimers({ toFake: ['Date'] })
+			vi.setSystemTime(1_900_000_000_000)
+			const store = new LateRevocationStore()
+			const { tm } = manager(store)
+			const tokens = tm.issueTokens('u', 'd')
+			vi.setSystemTime(Date.now() + 1000)
+			store.onConsume = async () => {
+				if (kind === 'device') await store.revokeAllForDevice('d', Date.now())
+				else await store.revokeAllForUser('u', Date.now())
+				vi.setSystemTime(Date.now() + 10)
+			}
+			const result = await tm.rotateRefreshToken(tokens.refreshToken)
+			expect(result).toEqual({ ok: false, reason: `${kind}_revoked` })
+		})
+	}
+
+	it('still rotates when nothing was revoked during the rotation', async () => {
+		const store = new LateRevocationStore()
+		const { tm } = manager(store)
+		const tokens = tm.issueTokens('u', 'd')
+		store.onConsume = async () => {}
+		const result = await tm.rotateRefreshToken(tokens.refreshToken)
+		expect(result.ok).toBe(true)
+	})
+})
