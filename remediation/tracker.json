@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. Remaining hardening for CUSTOM providers that return no scopes: ClientSession.handleHandshake must pass resolveSessionScopes(..., { authenticated: this.auth && !(this.auth instanceof NoAuthProvider) }) and may use onUnresolved:'throw' to answer SCOPE_REQUIRED (session/* owned by W1)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -364,14 +364,14 @@
    "severity": "P1",
    "workstream": "W2",
    "phase": 1,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "AUTH-11.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Auth side done: AuthContext.expiresAt populated; createKoraAuthServer().onRevoke() and bindSyncServer({ terminateSessions({userId?, deviceId?}) }) emit on device revoke, sign-out, revokeAllForUser. Needs KoraSyncServer.terminateSessions + ClientSession expiry timer (AUTH_EXPIRED, retriable) in packages/server/src/session|server (W1 owner)."
+   "notes": "W2 step 5. KoraSyncServer.terminateSessions({userId?, deviceId?, code?}) sends retriable AUTH_REVOKED/AUTH_EXPIRED and closes matching sessions (verified principal only; revocations arriving mid-handshake are applied once the principal is known). KoraSyncServer follows AuthProvider.onRevoke automatically (built-in toSyncAuthProvider exposes it; MixedAuthProvider forwards it); createKoraAuthServer().bindSyncServer(server) remains for wrapped/custom providers. ClientSession arms an expiry timer from AuthContext.expiresAt (AUTH_EXPIRED, retriable; already-expired credential refused at handshake; timer cleared on every close path; re-armed past the setTimeout limit). Client: SyncEngine treats AUTH_EXPIRED/AUTH_REVOKED as refresh-then-reconnect (sync auth callback called with {forceRefresh:true}; binding calls AuthClient.refreshAccessToken(); empty token after a forced refresh fails the attempt with AUTH_REFRESH_PENDING instead of handshaking). Password reset/change and AdminApi reach it via onPasswordChanged / revokeAllForUser = authServer.revokeAllForUser. Repro harness: the stolen client's send is wrapped in try/catch because the closed in-memory transport throws."
   },
   {
    "id": "AUTH-12",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
