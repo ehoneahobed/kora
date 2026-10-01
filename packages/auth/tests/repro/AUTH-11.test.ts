@@ -37,16 +37,20 @@ function op(nodeId: string, userId: string, seq: number, title: string): Operati
 describe('AUTH-11: live sync sessions survive revocation', () => {
 	test('revoking a device cuts off its open sync session', async () => {
 		const auth = createKoraAuthServer({ jwtSecret: 'l'.repeat(64) })
-		const laptop = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'laptop' },
-		})).body as { data: { user: { id: string }; tokens: { accessToken: string } } }
-		const phone = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signin',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
-		})).body as { data: { tokens: { accessToken: string } } }
+		const laptop = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'laptop' },
+			})
+		).body as { data: { user: { id: string }; tokens: { accessToken: string } } }
+		const phone = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signin',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
+			})
+		).body as { data: { tokens: { accessToken: string } } }
 		const uid = laptop.data.user.id
 
 		const store = new MemoryServerStore('server-1')
@@ -71,8 +75,12 @@ describe('AUTH-11: live sync sessions survive revocation', () => {
 		}
 		const stolen = conn(laptop.data.tokens.accessToken, 'laptop')
 		const owner = conn(phone.data.tokens.accessToken, 'phone')
-		await vi.waitFor(() => expect(stolen.messages.some((m) => m.type === 'handshake-response')).toBe(true))
-		await vi.waitFor(() => expect(owner.messages.some((m) => m.type === 'handshake-response')).toBe(true))
+		await vi.waitFor(() =>
+			expect(stolen.messages.some((m) => m.type === 'handshake-response')).toBe(true),
+		)
+		await vi.waitFor(() =>
+			expect(owner.messages.some((m) => m.type === 'handshake-response')).toBe(true),
+		)
 
 		// Owner revokes the stolen laptop.
 		const r = await auth.handleRequest({

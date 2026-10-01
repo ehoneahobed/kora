@@ -29,7 +29,10 @@ describe('STORE-15 lows', () => {
 	})
 
 	test('concurrent delivery of the same remote op is idempotent (no throw)', async () => {
-		const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+		const schema = defineSchema({
+			version: 1,
+			collections: { todos: { fields: { title: t.string() } } },
+		})
 		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(':memory:'), nodeId: 'n' })
 		stores.push(store)
 		await store.open()
@@ -47,7 +50,10 @@ describe('STORE-15 lows', () => {
 			},
 			new HybridLogicalClock('peer'),
 		)
-		const results = await Promise.allSettled([store.applyRemoteOperation(op), store.applyRemoteOperation(op)])
+		const results = await Promise.allSettled([
+			store.applyRemoteOperation(op),
+			store.applyRemoteOperation(op),
+		])
 		expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled'])
 	})
 })

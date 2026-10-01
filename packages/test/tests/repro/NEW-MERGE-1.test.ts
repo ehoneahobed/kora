@@ -24,10 +24,7 @@ afterEach(async () => {
 describe('NEW-MERGE-1 unchanged array in a concurrent update must not undo a removal', () => {
 	test('A removes urgent; B saves {title, tags unchanged} => tags []', async () => {
 		network = await createTestNetwork(schema, { devices: 2 })
-		const [a, b] = network.devices as [
-			(typeof network.devices)[0],
-			(typeof network.devices)[0],
-		]
+		const [a, b] = network.devices as [(typeof network.devices)[0], (typeof network.devices)[0]]
 		const rec = await a.collection('tickets').insert({ title: 'x', tags: ['urgent'] })
 		await a.sync()
 		await b.sync()

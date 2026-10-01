@@ -11,8 +11,8 @@ import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
-import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 
 const schema = defineSchema({
 	version: 1,
@@ -96,7 +96,11 @@ describe('ENC-1: same passphrase, different devices', () => {
 		appB.events?.on?.('sync:disconnected', (e: { reason: string }) => failures.push(e.reason))
 		await appA.sync?.connect()
 		const row = await (appA as unknown as { todos: Coll }).todos.insert({ title: 'secret' })
-		for (let i = 0; i < 40 && !serverStore.getAllOperations().some((o) => o.recordId === row.id); i++)
+		for (
+			let i = 0;
+			i < 40 && !serverStore.getAllOperations().some((o) => o.recordId === row.id);
+			i++
+		)
 			await tick()
 		const stored = serverStore.getAllOperations().find((o) => o.recordId === row.id)
 		// Control: the server only ever sees ciphertext.

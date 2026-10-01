@@ -68,9 +68,7 @@ async function setup() {
 		schemaVersion: 1,
 		authToken: 'alice-token',
 	})
-	await vi.waitFor(() =>
-		expect(messages.some((m) => m.type === 'handshake-response')).toBe(true),
-	)
+	await vi.waitFor(() => expect(messages.some((m) => m.type === 'handshake-response')).toBe(true))
 	async function upload(o: Operation): Promise<void> {
 		client.send({
 			type: 'operation-batch',
@@ -101,15 +99,17 @@ async function setup() {
 }
 
 describe('SEC-2: upload scope trusts client previousData / data', () => {
-	test('forged previousData must not let alice edit bob\'s record', async () => {
+	test("forged previousData must not let alice edit bob's record", async () => {
 		const { messages, upload, bobRow } = await setup()
 		const o = op({ data: { title: 'hacked' }, previousData: { userId: 'alice' } })
 		await upload(o)
-		expect.soft(messages.some((m) => m.type === 'operation-rejected' && m.operationId === o.id)).toBe(true)
+		expect
+			.soft(messages.some((m) => m.type === 'operation-rejected' && m.operationId === o.id))
+			.toBe(true)
 		expect((await bobRow())?.title).toBe('bob secret')
 	})
 
-	test('forged previousData must not let alice delete bob\'s record', async () => {
+	test("forged previousData must not let alice delete bob's record", async () => {
 		const { store, upload } = await setup()
 		await upload(op({ type: 'delete', data: null, previousData: { userId: 'alice' } }))
 		// Non-deleted query: bob's record must still be live.
@@ -117,13 +117,13 @@ describe('SEC-2: upload scope trusts client previousData / data', () => {
 		expect(live).toHaveLength(1)
 	})
 
-	test('data:{userId:alice} must not let alice take ownership of bob\'s record', async () => {
+	test("data:{userId:alice} must not let alice take ownership of bob's record", async () => {
 		const { upload, bobRow } = await setup()
 		await upload(op({ data: { userId: 'alice' } }))
 		expect((await bobRow())?.userId).toBe('bob')
 	})
 
-	test('insert reusing bob\'s recordId with userId:alice must not overwrite bob\'s record', async () => {
+	test("insert reusing bob's recordId with userId:alice must not overwrite bob's record", async () => {
 		const { upload, bobRow } = await setup()
 		await upload(op({ type: 'insert', data: { title: 'mine now', userId: 'alice' } }))
 		const row = await bobRow()

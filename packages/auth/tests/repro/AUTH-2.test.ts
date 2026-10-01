@@ -17,16 +17,20 @@ describe('AUTH-2: revoked device keeps working', () => {
 	test('refresh token of a revoked device must be rejected; its access token must not pass HTTP routes', async () => {
 		const auth = createKoraAuthServer({ jwtSecret: SECRET })
 		// Laptop (later stolen) and phone, both signed in by the same user.
-		const laptop = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'laptop' },
-		})).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
-		const phone = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signin',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
-		})).body as { data: { tokens: { accessToken: string } } }
+		const laptop = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'laptop' },
+			})
+		).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		const phone = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signin',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
+			})
+		).body as { data: { tokens: { accessToken: string } } }
 
 		// User revokes the stolen laptop from the phone.
 		const revoke = await auth.handleRequest({

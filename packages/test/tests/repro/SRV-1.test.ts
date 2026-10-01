@@ -59,7 +59,11 @@ async function concurrentEdit(
 	seed: Record<string, unknown>,
 	a: Record<string, unknown>,
 	b: Record<string, unknown>,
-): Promise<{ client: Record<string, unknown> | null; client2: Record<string, unknown> | null; server: Record<string, unknown> | null }> {
+): Promise<{
+	client: Record<string, unknown> | null
+	client2: Record<string, unknown> | null
+	server: Record<string, unknown> | null
+}> {
 	network = await createTestNetwork(schema, { devices: 2 })
 	const [da, db] = network.devices as TestDevice[]
 	const created = await da.collection('tasks').insert({ title: 't', ...seed })
@@ -70,13 +74,18 @@ async function concurrentEdit(
 	const client = await clientRow(da, created.id)
 	const client2 = await clientRow(db, created.id)
 	const server = await serverRow(network, created.id)
-	return { client, client2, server }
 	void field
+	return { client, client2, server }
 }
 
 describe('SRV-1 server materialization equals client convergence', () => {
 	test('array (add-wins) field', async () => {
-		const r = await concurrentEdit('tags', { tags: ['base'] }, { tags: ['base', 'a'] }, { tags: ['base', 'b'] })
+		const r = await concurrentEdit(
+			'tags',
+			{ tags: ['base'] },
+			{ tags: ['base', 'a'] },
+			{ tags: ['base', 'b'] },
+		)
 		const sort = (v: unknown) => [...((v as string[]) ?? [])].sort()
 		expect(sort(r.client?.tags)).toEqual(['a', 'b', 'base'])
 		expect(sort(r.client2?.tags)).toEqual(['a', 'b', 'base'])
@@ -100,5 +109,4 @@ describe('SRV-1 server materialization equals client convergence', () => {
 		expect(r.client2?.qty).toBe(18)
 		expect(r.server?.qty).toBe(r.client?.qty)
 	}, 30000)
-
 })

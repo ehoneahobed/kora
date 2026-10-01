@@ -1,0 +1,1715 @@
+{
+ "version": 1,
+ "source": "remediation/evidence/kora-fix-plan.md",
+ "statuses": [
+  "open",
+  "in_progress",
+  "mitigated",
+  "fixed",
+  "wontfix"
+ ],
+ "problems": [
+  {
+   "id": "SEC-1",
+   "title": "Operation batches accepted before handshake (unauthenticated writes)",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-2",
+   "title": "Upload authorization trusts client previousData/data instead of the stored row",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-3",
+   "title": "op.nodeId not bound to session; forged sequence silently drops a victim's offline writes",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-4",
+   "title": "Handshake response leaks the full server version vector",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-5",
+   "title": "Yjs, awareness and blob relays bypass auth and scope",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-6",
+   "title": "Route-context scope check ignores stored row; limit applied before scope",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-7",
+   "title": "SQL injection via orderBy direction / limit / offset (local store)",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-8",
+   "title": "Auth token sent in the WebSocket URL",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-9a",
+   "title": "request.ip trusts spoofed X-Forwarded-For",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-9.test.ts",
+     "title": "(a)"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-9b",
+   "title": "Unescaped quotes in DDL defaults",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-9.test.ts",
+     "title": "(b)"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SEC-1",
+   "title": "Route-context scope matcher ignores $in",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-SEC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SEC-2",
+   "title": "previousData.id forgery bypasses id-scoped uplink checks",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-8.test.ts",
+     "title": "authorize an update to an out-of-scope record"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "forged previousData.id must not authorize a delete"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "insert whose recordId is in an id-scoped uplink"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-1",
+   "title": "Sync scope is client-controlled; handshake can widen access",
+   "severity": "P0",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-1.test.ts"
+    },
+    {
+     "file": "LMS-11.test.ts",
+     "title": "must NOT be widened"
+    },
+    {
+     "file": "LMS-11.test.ts",
+     "title": "must NOT become writable"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-2",
+   "title": "Revoked device keeps working via refresh and HTTP routes",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-3",
+   "title": "OAuth state not bound to initiator or purpose (link CSRF takeover)",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-4",
+   "title": "Invitations claimable by anyone; cross-org revoke",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-5",
+   "title": "Client-chosen deviceId not bound to user (lockout attack)",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-6",
+   "title": "Concurrent refreshes with one token both succeed",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-7",
+   "title": "Reset token disclosed without callback; reset does not revoke sessions",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-8",
+   "title": "Sign-out does not stop the access token on HTTP routes",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-9",
+   "title": "Account enumeration by timing; weak sign-in rate limit",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-10",
+   "title": "MFA not enforced at issuance; TOTP brute force and replay",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-11",
+   "title": "Live sync sessions never re-checked after revocation or expiry",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-12",
+   "title": "In-memory revocation store in quickstart; no persistent store ships",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-13",
+   "title": "Offline users are signed out and their refresh token destroyed",
+   "severity": "P0",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-13.test.ts"
+    },
+    {
+     "file": "LMS-1.test.ts",
+     "title": "transient refresh failures"
+    },
+    {
+     "file": "LMS-1.test.ts",
+     "title": "bounded in time"
+    },
+    {
+     "file": "LMS-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "AUTH-14",
+   "title": "Passkey UV, external JWT exp/aud/iss, webhook replay/SSRF, AdminApi authz",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "AUTH-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-AUTH-1",
+   "title": "One retried refresh permanently bans the device from sync",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-AUTH-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-AUTH-2",
+   "title": "Two tabs refreshing at once sign out every tab",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-1.test.ts",
+     "title": "two tabs sharing token storage"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-AUTH-3",
+   "title": "Lost rotation response triggers reuse-detection sign-out",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-1.test.ts",
+     "title": "lost refresh response"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-AUTH-4",
+   "title": "restoreSession treats a 401 from /auth/me as offline",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-1",
+   "title": "Own edits leaving a query subset are never uploaded",
+   "severity": "P0",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-1.test.ts"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "must not be silently kept local-only"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-2",
+   "title": "Inbound ops filtered by uplink scope (read-only data dropped)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-2.test.ts"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "downlink {c1,c2}, uplink {c1}"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] read-only learner"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-3",
+   "title": "Non-success apply results advance the watermark (ops lost)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-4",
+   "title": "Acks not matched to batches; handshake-delta ops dropped before ack",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-5",
+   "title": "Engine goes offline without closing the transport; sockets leak",
+   "severity": "P2",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-6",
+   "title": "OutboundQueue seen-set grows forever",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-7",
+   "title": "One far-future op blocks the delivery stream",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-8",
+   "title": "Reconnect backoff never grows",
+   "severity": "P2",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-9",
+   "title": "Protobuf negotiation lossy and unsafe if enabled",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-10",
+   "title": "Timers and async sends outlive stop/close",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-11",
+   "title": "Accepted-scope change wedges sync after first reconnect",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-1",
+   "title": "Duplicate final batch never completes initial sync",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-SYNC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-2",
+   "title": "Reconnect loop can miss a disconnect racing start()",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-SYNC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-3",
+   "title": "Inbound insert dropped under id-scoped downlink",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-8.test.ts",
+     "title": "[fails today] inbound, non-directional"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "[fails today] inbound, directional"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-4",
+   "title": "Fresh client drops an update batched with its insert; watermark advances",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] insert + partial update"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] while the session stays up"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "ENC-1",
+   "title": "Random salt per process: encryption cannot work across devices",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "ENC-2",
+   "title": "Decrypt failure treated as a connection failure (infinite loop)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "ENC-3",
+   "title": "No AAD; plaintext accepted when encryption is on",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-ENC-1",
+   "title": "Schema-aware server rejects every encrypted op",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-ENC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-1",
+   "title": "Server materialization differs from client merge",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-2",
+   "title": "Record moving into scope arrives without its insert",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-3",
+   "title": "Delivery stream re-sends unacked backlog on every write",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-4",
+   "title": "Postgres per-instance vector cache; dedup race; INTEGER overflow",
+   "severity": "P2",
+   "workstream": "W10a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-5",
+   "title": "Delivery stream buffers the whole backlog in memory",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-6",
+   "title": "No heartbeat/timeouts/limits; HTTP sessions never expire; unbounded bodies",
+   "severity": "P1",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-6.test.ts"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "must probe an idle WebSocket"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "must be reaped after inactivity"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-7",
+   "title": "No compaction; each write replays full record history",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-1",
+   "title": "Memory store rebuild scans the whole log per write",
+   "severity": "P3",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-2",
+   "title": "Concurrent duplicate on Postgres runs the cascade twice",
+   "severity": "P3",
+   "workstream": "W10a",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-3",
+   "title": "Orphan updates stay forever after a missed scope entry",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-4",
+   "title": "Postgres backfill reruns fully on every restart",
+   "severity": "P2",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "benchmark:"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-5",
+   "title": "Backfill overwrites live writes during rolling deploy",
+   "severity": "P1",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "must not overwrite a concurrent live write"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-6",
+   "title": "Tombstones lose scope fields; deleted records reappear for scoped clients",
+   "severity": "P1",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "deleted record must keep its scope fields"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-7",
+   "title": "Retract mode looks up records for ops that can never exit scope",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-11.test.ts",
+     "title": "retract policy issues a record lookup"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-8",
+   "title": "Static server: no validators/compression, SPA fallback for missing assets, wrong MIME",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-13.test.ts",
+     "title": "correct behaviour"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-1",
+   "title": "app.transaction reuses sequence numbers; later writes never uploaded",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-2",
+   "title": "Cascade deletes inside transactions collide on sequence numbers",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-3",
+   "title": "Transactional writes skip per-field version stamps",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-4",
+   "title": "Secret fields stored and synced in plaintext via transactions",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-4.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-5",
+   "title": "Backup restore corrupts timestamps and copies device identity",
+   "severity": "P0",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-6",
+   "title": "IndexedDB follower tab overwrites the leader's live DB",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-7",
+   "title": "IndexedDB flushNow re-entrancy loses writes",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-8",
+   "title": "execute/query bypass the adapter mutex",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-9",
+   "title": "Concurrent atomic increments lose updates locally",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-10",
+   "title": "Multi-tab: duplicate apply not notified; per-tab vectors",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-11",
+   "title": "Documented createdAt/updatedAt queries throw",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-12",
+   "title": "Subscription diff re-notifies; errors swallowed",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-13",
+   "title": "Migrations not atomic; backfills never sync",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-13.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-14",
+   "title": "Compaction breaks fold and dedup",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-15",
+   "title": "Dedup race, index name collisions, quota mapping",
+   "severity": "P3",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-15.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-16",
+   "title": "Benchmark gates do not measure the browser path",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-1",
+   "title": "Backfill transform receives raw SQLite rows",
+   "severity": "P2",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-2",
+   "title": "Transactions bypass state machine validation",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-3",
+   "title": "Field-level .transitions() never enforced",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-4",
+   "title": "persist() awaited in startup (can hang ready); result discarded",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-5",
+   "title": "Origin-wide SAH pool vs per-DB leader: second DB non-durable or disjoint",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-5b"
+    },
+    {
+     "browser": "LMS-5c"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-6",
+   "title": "Promoted leader silently runs in memory",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-5f"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-7",
+   "title": "Pool capacity exhaustion bricks writes for every user",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-6a"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-8",
+   "title": "Failed open leaks worker and leader lock",
+   "severity": "P1",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-6c"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-9",
+   "title": "Hung leader not detected; no failover",
+   "severity": "P2",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-7.test.ts"
+    },
+    {
+     "browser": "LMS-7b"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-10",
+   "title": "close() releases leader lock before the pool holder stops",
+   "severity": "P2",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-11",
+   "title": "PRAGMA WAL is a no-op on sahpool; spec says WAL",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "MERGE-1",
+   "title": "Array merge loses one-sided removals",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "MERGE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "MERGE-2",
+   "title": "Pairwise merge diverges permanently for arrays and objects",
+   "severity": "P0",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "MERGE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-MERGE-1",
+   "title": "Unchanged array in a concurrent update undoes a removal (2 devices)",
+   "severity": "P0",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-MERGE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "open"
+   },
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "CORE-1",
+   "title": "Op id hash omits fields; ids never verified on receive",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "CORE-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-1",
+   "title": "Insert/record types are vacuous (FieldBuilder phantom params)",
+   "severity": "P1",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/DX-1.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-2",
+   "title": "where/orderBy/include/transactions/useCollection untyped",
+   "severity": "P2",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/DX-2.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-3",
+   "title": "Docs contradict the code (first-run tutorial crashes)",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-4",
+   "title": "findById before ready returns null silently",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-5",
+   "title": "useMutation unstable identities and resubscribes",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-6",
+   "title": "SSR broken (getServerSnapshot, eager native SQLite)",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-7",
+   "title": "Vue useQuery not reactive to input changes",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-8",
+   "title": "Deploy prompt offers stub platforms",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-9",
+   "title": "Shadowed collection names give no runtime warning",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-1",
+   "title": "useCollaborators has no getServerSnapshot",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-2",
+   "title": "DynamicProtobufSerializer is dead code",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-3",
+   "title": "Scaffolded apps cannot open offline (no service worker)",
+   "severity": "P1",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "NEW-DX-3"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  }
+ ],
+ "rejectedProposalPins": {
+  "description": "Tests that apply a REJECTED external proposal (LMS report) to a scratch copy and prove it is wrong. They are expected to keep failing; they never block and never count as repro tests.",
+  "tests": [
+   {
+    "file": "LMS-8.test.ts",
+    "title": "LMS #8 patch does not close"
+   },
+   {
+    "browser": "LMS-5h",
+    "title": "LMS retry"
+   },
+   {
+    "browser": "LMS-6b"
+   }
+  ]
+ }
+}

@@ -7,7 +7,12 @@
  */
 import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
-import { KoraAuthProvider, KoraSyncServer, MemoryServerStore, MixedAuthProvider } from '@korajs/server'
+import {
+	KoraAuthProvider,
+	KoraSyncServer,
+	MemoryServerStore,
+	MixedAuthProvider,
+} from '@korajs/server'
 import type { AuthProvider } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage } from '@korajs/sync'
@@ -25,7 +30,12 @@ const schema = defineSchema({
 })
 
 let opCounter = 0
-function insert(nodeId: string, collection: string, data: Record<string, unknown>, seq: number): Operation {
+function insert(
+	nodeId: string,
+	collection: string,
+	data: Record<string, unknown>,
+	seq: number,
+): Operation {
 	opCounter++
 	return {
 		id: `op-${nodeId}-${opCounter}`,
@@ -49,7 +59,8 @@ async function signUp(auth: ReturnType<typeof createKoraAuthServer>, email: stri
 		body: { email, password: 'password-123' },
 		ip: '1.1.1.1',
 	})
-	const data = (res.body as { data: { user: { id: string }; tokens: { accessToken: string } } }).data
+	const data = (res.body as { data: { user: { id: string }; tokens: { accessToken: string } } })
+		.data
 	return { userId: data.user.id, token: data.tokens.accessToken }
 }
 
@@ -83,9 +94,7 @@ async function handshake(
 		authToken: token,
 		...(syncScope ? { syncScope } : {}),
 	} as SyncMessage)
-	await vi.waitFor(() =>
-		expect(c.messages.some((m) => m.type === 'handshake-response')).toBe(true),
-	)
+	await vi.waitFor(() => expect(c.messages.some((m) => m.type === 'handshake-response')).toBe(true))
 }
 
 function received(c: ReturnType<typeof connect>): Operation[] {
@@ -113,7 +122,9 @@ describe('AUTH-1: sync scope is client-controlled under the documented auth wiri
 		// Alice syncs normally with her own (client-derived) scope and writes a todo.
 		const a = connect(server)
 		await handshake(a, 'alice-dev', alice.token, { todos: { userId: alice.userId } })
-		await upload(a, [insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1)])
+		await upload(a, [
+			insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1),
+		])
 		expect(await store.getOperationCount()).toBe(1)
 
 		// Mallory (valid token, her own account) hand-crafts a handshake with Alice's scope.
@@ -141,7 +152,9 @@ describe('AUTH-1: sync scope is client-controlled under the documented auth wiri
 		const { server } = await bootServer(auth.auth)
 		const a = connect(server)
 		await handshake(a, 'alice-dev', alice.token, { todos: { userId: alice.userId } })
-		await upload(a, [insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1)])
+		await upload(a, [
+			insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1),
+		])
 
 		const m = connect(server)
 		await handshake(m, 'mallory-dev', mallory.token) // no scope at all
@@ -159,7 +172,9 @@ describe('AUTH-1: sync scope is client-controlled under the documented auth wiri
 		const { server } = await bootServer(mixed)
 		const a = connect(server)
 		await handshake(a, 'alice-dev', alice.token, { todos: { userId: alice.userId } })
-		await upload(a, [insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1)])
+		await upload(a, [
+			insert('alice-dev', 'todos', { title: 'alice secret', userId: alice.userId }, 1),
+		])
 
 		const anon = connect(server)
 		await handshake(anon, 'anon-dev', '', { todos: {} })

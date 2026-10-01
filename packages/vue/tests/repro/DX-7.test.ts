@@ -3,8 +3,8 @@ import { QueryStoreCache } from '@korajs/store'
 import { mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 import { defineComponent, h, nextTick, shallowRef } from 'vue'
-import { koraContextKey } from '../../src/context'
 import { useQuery } from '../../src/composables/use-query'
+import { koraContextKey } from '../../src/context'
 import type { KoraContextValue } from '../../src/types'
 
 /**

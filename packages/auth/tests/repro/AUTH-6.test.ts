@@ -10,11 +10,13 @@ import { createKoraAuthServer } from '../../src/provider/built-in/quickstart-ser
 describe('AUTH-6: concurrent refresh with one refresh token', () => {
 	test('at most one of N concurrent refreshes with the same token succeeds', async () => {
 		const auth = createKoraAuthServer({ jwtSecret: 'r'.repeat(64) })
-		const signup = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'd1' },
-		})).body as { data: { tokens: { refreshToken: string } } }
+		const signup = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'd1' },
+			})
+		).body as { data: { tokens: { refreshToken: string } } }
 		const rt = signup.data.tokens.refreshToken
 
 		const results = await Promise.all(

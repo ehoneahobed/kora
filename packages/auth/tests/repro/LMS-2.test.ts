@@ -81,11 +81,15 @@ describe('LMS-2: offline cold start restores the stored session', () => {
 			const url = String(input)
 			if (url.endsWith('/auth/refresh')) {
 				return new Response(
-					JSON.stringify({ data: { accessToken: token('access', 900), refreshToken: token('refresh', 90 * 86400) } }),
+					JSON.stringify({
+						data: { accessToken: token('access', 900), refreshToken: token('refresh', 90 * 86400) },
+					}),
 					{ status: 200, headers: { 'Content-Type': 'application/json' } },
 				)
 			}
-			return new Response(JSON.stringify({ id: 'user-1', email: 'a@b.c', name: 'A' }), { status: 200 })
+			return new Response(JSON.stringify({ id: 'user-1', email: 'a@b.c', name: 'A' }), {
+				status: 200,
+			})
 		}) as typeof fetch)
 
 		expect(await h.auth.getAccessToken()).not.toBeNull()
@@ -119,11 +123,13 @@ describe('LMS-2: guards (must keep passing)', () => {
 	})
 
 	it('definitive 401 at cold start -> unauthenticated and tokens cleared', async () => {
-		const { auth, storage } = await coldStart((async () =>
-			new Response(JSON.stringify({ error: 'Invalid or expired refresh token.' }), {
-				status: 401,
-				headers: { 'Content-Type': 'application/json' },
-			})) as unknown as typeof fetch)
+		const { auth, storage } = await coldStart(
+			(async () =>
+				new Response(JSON.stringify({ error: 'Invalid or expired refresh token.' }), {
+					status: 401,
+					headers: { 'Content-Type': 'application/json' },
+				})) as unknown as typeof fetch,
+		)
 		expect(auth.state).toBe('unauthenticated')
 		expect(await storage.getRefreshToken()).toBeNull()
 	})

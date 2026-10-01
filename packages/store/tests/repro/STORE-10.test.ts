@@ -6,7 +6,10 @@ import { Store } from '../../src/store/store'
 // STORE-10: two tabs share one DB (leader/follower). When tab A applies a remote
 // op, tab B's later apply of the same op returns 'duplicate'; tab B's live
 // queries must still reflect the row.
-const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const schema = defineSchema({
+	version: 1,
+	collections: { todos: { fields: { title: t.string() } } },
+})
 const ticks = async () => {
 	for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0))
 }
@@ -28,9 +31,12 @@ describe('STORE-10 multi-tab duplicate apply', () => {
 		})
 
 		let latest: unknown[] = []
-		tabB.collection('todos').where({}).subscribe((rows) => {
-			latest = rows
-		})
+		tabB
+			.collection('todos')
+			.where({})
+			.subscribe((rows) => {
+				latest = rows
+			})
 		await ticks()
 
 		const op = await createOperation(

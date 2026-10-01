@@ -24,10 +24,7 @@ afterEach(async () => {
 describe('CORE-1 receive paths verify content-addressed ids', () => {
 	test('server and peers reject an op whose id is not its content hash', async () => {
 		network = await createTestNetwork(schema, { devices: 2 })
-		const [a, b] = network.devices as [
-			(typeof network.devices)[0],
-			(typeof network.devices)[0],
-		]
+		const [a, b] = network.devices as [(typeof network.devices)[0], (typeof network.devices)[0]]
 		const rec = await a.collection('notes').insert({ title: 'original' })
 		await a.sync()
 		await b.sync()

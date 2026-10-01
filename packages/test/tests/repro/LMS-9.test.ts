@@ -39,7 +39,9 @@ function lmsPatch(engine: SyncEngine) {
  * batch handler.
  */
 function splitPatch(engine: SyncEngine) {
-	const e = engine as unknown as { filterAllowedForSync: (ops: Operation[]) => Promise<Operation[]> }
+	const e = engine as unknown as {
+		filterAllowedForSync: (ops: Operation[]) => Promise<Operation[]>
+	}
 	const orig = e.filterAllowedForSync.bind(engine)
 	e.filterAllowedForSync = async (ops) =>
 		new Error().stack?.includes('handleOperationBatch') ? ops : orig(ops)
@@ -200,7 +202,11 @@ describe('Planned split (SYNC-2) vs the same scenarios', () => {
 
 	test('[passes with split] read-only learner', async () => {
 		const { net } = await seed()
-		net.auth.set('st', { userId: 'st', downlinkScopes: { lessons: { courseId: { $in: ['c1'] } } }, uplinkScopes: {} })
+		net.auth.set('st', {
+			userId: 'st',
+			downlinkScopes: { lessons: { courseId: { $in: ['c1'] } } },
+			uplinkScopes: {},
+		})
 		const st = await net.device('st', 'st', splitPatch)
 		await st.sync()
 		expect(byTitle(await st.rows('lessons'))).toEqual({ L1: null })
@@ -223,7 +229,9 @@ describe('LMS-9 patch side effects on OUTBOUND', () => {
 		await ta.collection('notes').insert({ body: 'private draft' })
 		await ta.sync()
 		expect(net.rejections).toEqual([])
-		expect(net.serverStore.getAllOperations().filter((o) => o.collection === 'notes')).toHaveLength(0)
+		expect(net.serverStore.getAllOperations().filter((o) => o.collection === 'notes')).toHaveLength(
+			0,
+		)
 	})
 
 	test('with LMS #9 patch: out-of-uplink local writes are TRANSMITTED to the server and rejected; re-sent on every reconnect', async () => {
@@ -237,14 +245,24 @@ describe('LMS-9 patch side effects on OUTBOUND', () => {
 		await ta.sync()
 		await settle()
 		// Record what happens for the report (not a correctness assertion of the patch).
-		console.log('LMS9-OUTBOUND rejections after 1st sync:', first, 'after 2 reconnects:', net.rejections.length, net.rejections)
+		console.log(
+			'LMS9-OUTBOUND rejections after 1st sync:',
+			first,
+			'after 2 reconnects:',
+			net.rejections.length,
+			net.rejections,
+		)
 		expect(first).toBeGreaterThan(0)
-		expect(net.serverStore.getAllOperations().filter((o) => o.collection === 'notes')).toHaveLength(0)
+		expect(net.serverStore.getAllOperations().filter((o) => o.collection === 'notes')).toHaveLength(
+			0,
+		)
 	})
 
 	test('hasDirectionalScopes is true for a legacy `scopes` session', async () => {
 		const { ta } = await taDevice(false)
-		expect((ta.engine as unknown as { hasDirectionalScopes: boolean }).hasDirectionalScopes).toBe(true)
+		expect((ta.engine as unknown as { hasDirectionalScopes: boolean }).hasDirectionalScopes).toBe(
+			true,
+		)
 	})
 
 	test('[fails today] an edit to a downlink-visible but non-uploadable record must not be silently kept local-only', async () => {
@@ -263,8 +281,20 @@ describe('LMS-9 patch side effects on OUTBOUND', () => {
 		await r.collection('lessons').update(rows[0]?.id as string, { title: 'edited offline' })
 		await r.sync()
 		// Correct: the client surfaces it (rejected store / event) — never a silent fork.
-		const rejected = (await (r.engine as unknown as { getRejectedOperations?: () => Promise<unknown[]> }).getRejectedOperations?.()) ?? []
-		console.log('LMS9-FORK server-title:', (await net.serverStore.queryCollection('lessons', { where: {} }))[0]?.title, 'local:', (await r.rows('lessons'))[0]?.title, 'serverRejections:', net.rejections.length, 'clientRejected:', rejected.length)
+		const rejected =
+			(await (
+				r.engine as unknown as { getRejectedOperations?: () => Promise<unknown[]> }
+			).getRejectedOperations?.()) ?? []
+		console.log(
+			'LMS9-FORK server-title:',
+			(await net.serverStore.queryCollection('lessons', { where: {} }))[0]?.title,
+			'local:',
+			(await r.rows('lessons'))[0]?.title,
+			'serverRejections:',
+			net.rejections.length,
+			'clientRejected:',
+			rejected.length,
+		)
 		expect(rejected.length + net.rejections.length).toBeGreaterThan(0)
 	})
 

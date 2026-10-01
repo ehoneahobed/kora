@@ -71,7 +71,9 @@ describe('SEC-1: operation-batch before handshake', () => {
 			schemaVersion: 1,
 			authToken: 'bob-token',
 		})
-		await vi.waitFor(() => expect(bob.messages.some((m) => m.type === 'handshake-response')).toBe(true))
+		await vi.waitFor(() =>
+			expect(bob.messages.some((m) => m.type === 'handshake-response')).toBe(true),
+		)
 
 		// Attacker: no token, no handshake, just upload.
 		const attacker = connect(server)

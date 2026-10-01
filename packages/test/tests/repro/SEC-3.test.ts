@@ -78,9 +78,7 @@ describe('SEC-3: nodeId not bound to session, op.id not verified', () => {
 			batchIndex: 0,
 		})
 		await new Promise((r) => setTimeout(r, 100))
-		expect(network.server.getAllOperations().some((o) => o.id === 'not-a-content-hash')).toBe(
-			false,
-		)
+		expect(network.server.getAllOperations().some((o) => o.id === 'not-a-content-hash')).toBe(false)
 	})
 
 	test("victim's offline writes still reach the server after an attacker forges its nodeId", async () => {

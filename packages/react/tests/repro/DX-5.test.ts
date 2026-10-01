@@ -52,7 +52,12 @@ describe('DX-5 useMutation referential stability', () => {
 
 	it('works under React.StrictMode (isLoading toggles, result resolves)', async () => {
 		let resolve: (v: string) => void = () => {}
-		const fn = vi.fn(() => new Promise<string>((r) => (resolve = r)))
+		const fn = vi.fn(
+			() =>
+				new Promise<string>((r) => {
+					resolve = r
+				}),
+		)
 		const wrapper = ({ children }: { children: ReactNode }) =>
 			createElement(StrictMode, null, children)
 		const { result } = renderHook(() => useMutation(fn), { wrapper })

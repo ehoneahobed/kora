@@ -7,7 +7,9 @@
 // Run: npx tsc --noEmit --strict --skipLibCheck --module esnext --moduleResolution bundler --target es2022 tests/repro/types/DX-1.ts
 import { createApp, defineSchema, t } from 'korajs'
 
-type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+	? true
+	: false
 const assertTrue = <T extends true>(): T => true as T
 
 const schema = defineSchema({

@@ -63,7 +63,10 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 	test('instance B version vector reflects writes committed through instance A', async () => {
 		const a = await instance('srv-a')
 		const b = await instance('srv-b')
-		const op = mkOp(1, { nodeId: 'vv-node', timestamp: { wallTime: Date.now(), logical: 0, nodeId: 'vv-node' } })
+		const op = mkOp(1, {
+			nodeId: 'vv-node',
+			timestamp: { wallTime: Date.now(), logical: 0, nodeId: 'vv-node' },
+		})
 		expect(await a.applyRemoteOperation(op)).toBe('applied')
 		expect(b.getVersionVector().get('vv-node')).toBe(1)
 	})
@@ -82,11 +85,19 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 		client.onMessage((m) => received.push(m))
 		server.handleConnection(transport)
 		// No lastDeliverySequence: an older client on the version-vector delta path.
-		client.send({ type: 'handshake', messageId: 'hs', nodeId: 'legacy-reader', versionVector: {}, schemaVersion: 1 })
+		client.send({
+			type: 'handshake',
+			messageId: 'hs',
+			nodeId: 'legacy-reader',
+			versionVector: {},
+			schemaVersion: 1,
+		})
 		await vi.waitFor(() =>
 			expect(received.some((m) => m.type === 'operation-batch' && m.isFinal)).toBe(true),
 		)
-		const ids = received.flatMap((m) => (m.type === 'operation-batch' ? m.operations.map((o) => o.id) : []))
+		const ids = received.flatMap((m) =>
+			m.type === 'operation-batch' ? m.operations.map((o) => o.id) : [],
+		)
 		await server.stop()
 		expect(ids).toContain(op.id)
 	})
@@ -96,7 +107,10 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 		const b = await instance('srv-b3')
 		let dupApplied = 0
 		for (let i = 0; i < 20; i++) {
-			const op = mkOp(100 + i, { nodeId: 'race-node', timestamp: { wallTime: Date.now(), logical: i, nodeId: 'race-node' } })
+			const op = mkOp(100 + i, {
+				nodeId: 'race-node',
+				timestamp: { wallTime: Date.now(), logical: i, nodeId: 'race-node' },
+			})
 			const results = await Promise.all([a.applyRemoteOperation(op), b.applyRemoteOperation(op)])
 			if (results.filter((r) => r === 'applied').length > 1) dupApplied++
 		}
@@ -106,7 +120,10 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 	test('sequence numbers above 2^31-1 are stored', async () => {
 		const a = await instance('srv-a4')
 		const big = 2 ** 31
-		const op = mkOp(big, { nodeId: 'big-node', timestamp: { wallTime: Date.now(), logical: 0, nodeId: 'big-node' } })
+		const op = mkOp(big, {
+			nodeId: 'big-node',
+			timestamp: { wallTime: Date.now(), logical: 0, nodeId: 'big-node' },
+		})
 		await expect(a.applyRemoteOperation(op)).resolves.toBe('applied')
 		const range = await a.getOperationRange('big-node', big, big)
 		expect(range.map((o) => o.id)).toEqual([op.id])

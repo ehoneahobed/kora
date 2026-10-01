@@ -22,9 +22,19 @@ async function setup() {
 	const kora = createRouteContext(server, store)
 	// Bob's records created through the same route API, unscoped (e.g. admin seed).
 	for (let i = 0; i < 5; i++) {
-		await kora.apply({ collection: 'notes', type: 'insert', recordId: `bob-${i}`, data: { text: `bob ${i}`, userId: 'bob' } })
+		await kora.apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: `bob-${i}`,
+			data: { text: `bob ${i}`, userId: 'bob' },
+		})
 	}
-	await kora.apply({ collection: 'notes', type: 'insert', recordId: 'alice-1', data: { text: 'alice 1', userId: 'alice' } })
+	await kora.apply({
+		collection: 'notes',
+		type: 'insert',
+		recordId: 'alice-1',
+		data: { text: 'alice 1', userId: 'alice' },
+	})
 	return { store, kora }
 }
 
@@ -34,7 +44,12 @@ describe('SEC-6: route-context scope enforcement', () => {
 	test("update that sets userId to the caller's value must not take over another tenant's record", async () => {
 		const { store, kora } = await setup()
 		const res = await kora.apply(
-			{ collection: 'notes', type: 'update', recordId: 'bob-0', data: { userId: 'alice', text: 'mine' } },
+			{
+				collection: 'notes',
+				type: 'update',
+				recordId: 'bob-0',
+				data: { userId: 'alice', text: 'mine' },
+			},
 			aliceScope,
 		)
 		expect.soft(res.ok).toBe(false)
@@ -44,7 +59,12 @@ describe('SEC-6: route-context scope enforcement', () => {
 	test("insert reusing another tenant's recordId must not overwrite it", async () => {
 		const { store, kora } = await setup()
 		await kora.apply(
-			{ collection: 'notes', type: 'insert', recordId: 'bob-1', data: { text: 'mine', userId: 'alice' } },
+			{
+				collection: 'notes',
+				type: 'insert',
+				recordId: 'bob-1',
+				data: { text: 'mine', userId: 'alice' },
+			},
 			aliceScope,
 		)
 		expect((await store.findRecord('notes', 'bob-1'))?.userId).toBe('bob')

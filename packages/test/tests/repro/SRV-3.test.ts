@@ -25,7 +25,7 @@ afterEach(async () => {
 })
 
 describe('SRV-3 delivery stream re-sends unacked backlog on every push', () => {
-	test('a write during a fresh peer\'s initial sync does not re-send the whole backlog', async () => {
+	test("a write during a fresh peer's initial sync does not re-send the whole backlog", async () => {
 		const counters: Array<{ ops: number }> = []
 		network = await createTestNetwork(schema, {
 			devices: 2,
@@ -66,7 +66,9 @@ describe('SRV-3 delivery stream re-sends unacked backlog on every push', () => {
 		}
 		const bCounter = counters[1]
 		expect((await b.getState('notes')).length).toBe(BACKLOG + 5)
-		console.log(`SRV-3 initial-sync backlog=${BACKLOG}+5 opsSentToB=${bCounter?.ops} amplification=${((bCounter?.ops ?? 0) / (BACKLOG + 5)).toFixed(2)}x`)
+		console.log(
+			`SRV-3 initial-sync backlog=${BACKLOG}+5 opsSentToB=${bCounter?.ops} amplification=${((bCounter?.ops ?? 0) / (BACKLOG + 5)).toFixed(2)}x`,
+		)
 		expect(bCounter?.ops ?? 0).toBeLessThanOrEqual(Math.ceil((BACKLOG + 5) * 1.2))
 	}, 120000)
 
@@ -119,7 +121,9 @@ describe('SRV-3 delivery stream re-sends unacked backlog on every push', () => {
 			await b.sync()
 		}
 		expect((await b.getState('notes')).length).toBe(N)
-		console.log(`SRV-3 N=${N} opsSentToB=${bCounter.ops} batches=${bCounter.batches} bytes=${bCounter.bytes} amplification=${(bCounter.ops / N).toFixed(2)}x`)
+		console.log(
+			`SRV-3 N=${N} opsSentToB=${bCounter.ops} batches=${bCounter.batches} bytes=${bCounter.bytes} amplification=${(bCounter.ops / N).toFixed(2)}x`,
+		)
 		expect(bCounter.ops).toBeLessThanOrEqual(Math.ceil(N * 1.2))
 	}, 60000)
 })

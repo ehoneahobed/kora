@@ -34,7 +34,12 @@ function fakeLeader(channelName: string): { hang(): void; pings(): number } {
 		}
 		// RPC requests are accepted but never answered (long-running / lost response).
 	}
-	return { hang: () => (hung = true), pings: () => pings }
+	return {
+		hang: () => {
+			hung = true
+		},
+		pings: () => pings,
+	}
 }
 
 describe('LMS-7 follower liveness', () => {
@@ -57,7 +62,9 @@ describe('LMS-7 follower liveness', () => {
 		const { error } = await pending
 		const elapsed = Date.now() - t0
 		// eslint-disable-next-line no-console
-		console.log(`[LMS-7] settled after ${elapsed}ms with ${error?.name}; pings answered=${leader.pings()}`)
+		console.log(
+			`[LMS-7] settled after ${elapsed}ms with ${error?.name}; pings answered=${leader.pings()}`,
+		)
 		expect(error).toBeInstanceOf(NoLeaderError)
 		expect(elapsed).toBeLessThan(PROBE_MS * 6 + 500)
 	}, 10_000)
@@ -67,7 +74,9 @@ describe('LMS-7 follower liveness', () => {
 		const bridge = new FollowerBroadcastBridge(name, TIMEOUT_MS, PROBE_MS)
 		open.push({ close: () => bridge.terminate() })
 		const t0 = Date.now()
-		const error = await bridge.send({ id: 1, type: 'query', sql: 'SELECT 1' }).catch((e: Error) => e)
+		const error = await bridge
+			.send({ id: 1, type: 'query', sql: 'SELECT 1' })
+			.catch((e: Error) => e)
 		expect(error).toBeInstanceOf(NoLeaderError)
 		expect(error).not.toBeInstanceOf(WorkerTimeoutError)
 		expect(Date.now() - t0).toBeLessThan(PROBE_MS * 3 + 300)

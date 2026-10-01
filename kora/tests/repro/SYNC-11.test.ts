@@ -12,8 +12,8 @@ import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
-import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 
 const schema = defineSchema({
 	version: 1,
@@ -88,7 +88,11 @@ describe('SYNC-11: server-accepted scope differs from requested scope', () => {
 			store,
 			schemaVersion: 1,
 			// Ordinary (non-directional) server-auth scope: user sees all todos/announcements.
-			auth: { async authenticate() { return { userId: 'u1', scopes: { todos: {}, announcements: {} } } } },
+			auth: {
+				async authenticate() {
+					return { userId: 'u1', scopes: { todos: {}, announcements: {} } }
+				},
+			},
 		})
 		const app = createApp({
 			schema,
@@ -99,7 +103,10 @@ describe('SYNC-11: server-accepted scope differs from requested scope', () => {
 		await app.sync?.connect()
 		const todos = (app as unknown as { todos: Coll }).todos
 		const first = await todos.insert({ title: 'one' })
-		await until(() => store.getAllOperations().some((op) => op.recordId === first.id), 'first uploaded')
+		await until(
+			() => store.getAllOperations().some((op) => op.recordId === first.id),
+			'first uploaded',
+		)
 		await until(() => (app.sync?.getStatus().deliveryWatermark ?? 0) > 0, 'watermark advanced')
 
 		await app.sync?.reconnect()

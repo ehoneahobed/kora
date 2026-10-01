@@ -20,7 +20,9 @@ describe('STORE-9 concurrent local increments', () => {
 		await app.ready
 		const counters = (app as unknown as Record<string, any>).counters
 		const c = await counters.insert({ n: 0 })
-		await Promise.all(Array.from({ length: 10 }, () => counters.update(c.id, { n: op.increment(1) })))
+		await Promise.all(
+			Array.from({ length: 10 }, () => counters.update(c.id, { n: op.increment(1) })),
+		)
 		expect((await counters.findById(c.id)).n).toBe(10)
 	})
 

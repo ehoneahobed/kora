@@ -18,11 +18,13 @@ afterEach(() => {
 
 async function victim() {
 	const auth = createKoraAuthServer({ jwtSecret: 'w'.repeat(64) })
-	const s = (await auth.handleRequest({
-		method: 'POST',
-		path: '/auth/signup',
-		body: { email: 'victim@example.com', password: 'password-123', deviceId: 'd1' },
-	})).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+	const s = (
+		await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'victim@example.com', password: 'password-123', deviceId: 'd1' },
+		})
+	).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
 	return { auth, tokens: s.data.tokens }
 }
 

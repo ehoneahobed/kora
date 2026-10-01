@@ -28,7 +28,10 @@ describe('STORE-4 secret fields in transactions', () => {
 	test('control: app.accounts.insert never stores plaintext', async () => {
 		app = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
 		await app.ready
-		await (app as unknown as Record<string, any>).accounts.insert({ email: 'a@b.c', password: 'hunter2' })
+		await (app as unknown as Record<string, any>).accounts.insert({
+			email: 'a@b.c',
+			password: 'hunter2',
+		})
 		expect(await rawEverywhere(app)).not.toContain('hunter2')
 	})
 
@@ -44,7 +47,10 @@ describe('STORE-4 secret fields in transactions', () => {
 	test('app.mutation update never stores or logs plaintext', async () => {
 		app = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
 		await app.ready
-		const rec = await (app as unknown as Record<string, any>).accounts.insert({ email: 'a@b.c', password: 'x' })
+		const rec = await (app as unknown as Record<string, any>).accounts.insert({
+			email: 'a@b.c',
+			password: 'x',
+		})
 		await app.mutation('changePassword', async (tx) => {
 			await tx.accounts!.update(rec.id, { password: 'correct-horse' })
 		})

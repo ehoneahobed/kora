@@ -10,8 +10,8 @@ import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
-import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 
 const schema = defineSchema({
 	version: 1,
@@ -87,7 +87,8 @@ describe('SYNC-2: inbound filtered by uplink scope', () => {
 			schemaVersion: 1,
 			auth: {
 				async authenticate(token: string) {
-					if (token === 'admin') return { userId: 'admin', scopes: { todos: {}, announcements: {} } }
+					if (token === 'admin')
+						return { userId: 'admin', scopes: { todos: {}, announcements: {} } }
 					// Reader: may READ announcements but only WRITE todos.
 					return {
 						userId: 'reader',

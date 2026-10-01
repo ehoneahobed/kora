@@ -1,0 +1,1034 @@
+{
+ "recordedAt": "2026-10-01T18:13:39.017Z",
+ "commit": "76c5619",
+ "tests": {
+  "kora/tests/repro/DX-3.test.ts::DX-3 docs match the API a useMutation() result object is never called as a function": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-3.test.ts::DX-3 docs match the API React useRichText signature in docs/api/react.md matches (collectionName, recordId, fieldName, options?)": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-3.test.ts::DX-3 docs match the API docs do not claim useQuery has \"no loading state\" (first render returns [] placeholder)": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-3.test.ts::DX-3 docs match the API \"one line\" sync snippet actually connects (autoConnect defaults to off)": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-3.test.ts::DX-3 docs match the API README status line names the current package version": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-4.test.ts::DX-4 findById before ready rejects with AppNotReadyError (consistent with insert)": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/DX-9.test.ts::DX-9 reserved collection names are surfaced, not silently shadowed createApp warns or throws for `events` / `sync` collections": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/ENC-1.test.ts::ENC-1: same passphrase, different devices device B decrypts device A operations": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/ENC-2.test.ts::ENC-2: decrypt failure handled as a transport close one undecryptable op does not tear down and loop the session": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-ENC-1.test.ts::NEW-ENC-1: schema-aware server rejects all encrypted ops an encrypted insert is accepted by a schema-aware server": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-STORE-1.test.ts::backfill transform sees typed record values": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-STORE-2.test.ts::NEW-STORE-2 state machine in transactions control: direct update does not apply draft -> delivered": {
+   "status": "passed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-STORE-2.test.ts::NEW-STORE-2 state machine in transactions transactional update does not apply draft -> delivered": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-STORE-3.test.ts::NEW-STORE-3 field-level transitions control: direct update does not apply draft -> delivered": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-STORE-3.test.ts::NEW-STORE-3 field-level transitions transactional update does not apply draft -> delivered": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/NEW-SYNC-2.test.ts::NEW-SYNC-2: reconnect loop loses a disconnect that races start() keeps retrying until the server accepts a session": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-1.test.ts::STORE-1 sequence uniqueness across app.transaction ops written by app.transaction and a following insert have unique (nodeId, seq)": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-1.test.ts::STORE-1 sequence uniqueness across app.transaction two concurrent app.transaction calls do not share sequence numbers": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-1.test.ts::STORE-1 sequence uniqueness across app.transaction a write after an acked transaction is still reported as unsynced": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-11.test.ts::STORE-11 createdAt / updatedAt in queries documented .orderBy('createdAt', 'desc') works": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-11.test.ts::STORE-11 createdAt / updatedAt in queries where on updatedAt works": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-13.test.ts::STORE-13 migrations a failed migration leaves no partial effect and a retry applies the backfill once": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-13.test.ts::STORE-13 migrations backfilled values produce operations so they can sync": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-14.test.ts::STORE-14 compaction vs log re-fold stale remote update after compaction keeps the record deleted": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-2.test.ts::STORE-2 cascade inside app.transaction cascaded child deletes get fresh sequence numbers": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-3.test.ts::STORE-3 transactional writes vs per-field LWW older remote update does not overwrite a newer app.transaction update": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-3.test.ts::STORE-3 transactional writes vs per-field LWW remote update to an untouched field of a tx-inserted row is applied": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-4.test.ts::STORE-4 secret fields in transactions control: app.accounts.insert never stores plaintext": {
+   "status": "passed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-4.test.ts::STORE-4 secret fields in transactions app.transaction insert never stores or logs plaintext": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-4.test.ts::STORE-4 secret fields in transactions app.mutation update never stores or logs plaintext": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-5.test.ts::STORE-5 backup restore replace-mode round trip preserves every operation exactly": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-5.test.ts::STORE-5 backup restore merge import into another device keeps that device identity and vector": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-9.test.ts::STORE-9 concurrent local increments ten concurrent op.increment(1) calls yield n = 10": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/STORE-9.test.ts::STORE-9 concurrent local increments concurrent increments inside app.transaction also compose": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-1.test.ts::SYNC-1: edits leaving a reactive query subset are never uploaded A marks a todo completed under where({completed:false}); server and B must eventually see completed=true, including after reconnect": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-10.test.ts::SYNC-10: timers and async sends outlive stop/close (a) close after an unrequested disconnect clears engine timers": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-10.test.ts::SYNC-10: timers and async sends outlive stop/close (b) stop() during batch encryption does not send or reject unhandled": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-11.test.ts::SYNC-11: server-accepted scope differs from requested scope after reconnect the client returns to streaming and uploads new writes": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-2.test.ts::SYNC-2: inbound filtered by uplink scope reader with read-only announcements (downlink yes, uplink no) must receive announcements": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-5.test.ts::SYNC-5: engine/transport desync after a transport error a stale socket is closed before reconnecting and cannot sever the new session": {
+   "status": "failed",
+   "observation": false
+  },
+  "kora/tests/repro/SYNC-8.test.ts::SYNC-8: reconnect backoff repeatedly failing sessions back off exponentially": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-1.test.ts::AUTH-1: sync scope is client-controlled under the documented auth wiring createKoraAuthServer().auth: Mallory cannot read or write Alice rows by sending Alice scope": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-1.test.ts::AUTH-1: sync scope is client-controlled under the documented auth wiring createKoraAuthServer().auth: omitting syncScope must not grant every tenant": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-1.test.ts::AUTH-1: sync scope is client-controlled under the documented auth wiring MixedAuthProvider (documented): anonymous handshake cannot add collections beyond anonymousScopes": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-1.test.ts::AUTH-1: sync scope is client-controlled under the documented auth wiring KoraAuthProvider with resolveScopes: handshake cannot add a collection the server never granted": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-10.test.ts::AUTH-10: TOTP brute force and replay (a) after many wrong codes, verification is locked out": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-10.test.ts::AUTH-10: TOTP brute force and replay (b) a code already consumed by verify() cannot be replayed to disable MFA": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-11.test.ts::AUTH-11: live sync sessions survive revocation revoking a device cuts off its open sync session": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-12.test.ts::AUTH-12: in-memory revocation store in the quickstart server a signed-out refresh token stays revoked across restart / other instance": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-13.test.ts::AUTH-13: offline refresh failure signs the user out initialize() while offline keeps the refresh token and does not sign out": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-13.test.ts::AUTH-13: offline refresh failure signs the user out getAccessToken() (called by sync on every reconnect) while offline must not wipe the session": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-14.test.ts::AUTH-14: passkey user-verification flag assertion without UV is rejected when UV is required": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-14.test.ts::AUTH-14: ExternalJwtProvider HS256 token without exp is rejected": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-14.test.ts::AUTH-14: ExternalJwtProvider HS256 token minted for another audience/issuer sharing the secret is rejected": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-14.test.ts::AUTH-14: webhooks signature helper rejects a stale (replayed) payload": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-14.test.ts::AUTH-14: webhooks register() refuses link-local / loopback targets": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-2.test.ts::AUTH-2: revoked device keeps working refresh token of a revoked device must be rejected; its access token must not pass HTTP routes": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-3.test.ts::AUTH-3: OAuth state not bound to initiator/purpose attacker-minted sign-in state cannot be redeemed on the victim /link endpoint": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-4.test.ts::AUTH-4: invitation authorization (a+b) a stranger cannot harvest and redeem an invitation addressed to someone else": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-4.test.ts::AUTH-4: invitation authorization (c) admin of org B cannot revoke an invitation that belongs to org A": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-5.test.ts::AUTH-5: client-chosen deviceId another user cannot obtain tokens for, or revoke, a device id owned by someone else": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-6.test.ts::AUTH-6: concurrent refresh with one refresh token at most one of N concurrent refreshes with the same token succeeds": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-7.test.ts::AUTH-7: password reset (a) reset token is never disclosed to the requester (production, no callback configured)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-7.test.ts::AUTH-7: password reset (b) completing a reset revokes previously issued sessions": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-8.test.ts::AUTH-8: sign-out does not invalidate the access token on HTTP routes /auth/me and /auth/devices reject the access token after sign-out": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-9.test.ts::AUTH-9: account enumeration and per-account brute force (a) unknown-email and wrong-password sign-ins take comparable time": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/AUTH-9.test.ts::AUTH-9: account enumeration and per-account brute force (b) 15 wrong guesses (limit is 10/min) on one account from rotating IPs are eventually throttled": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session fetch rejects (offline / DNS / TLS / CORS) TypeError -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session request aborted (AbortError, e.g. timeout or page hidden) -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 500 from auth server -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 502 HTML from a proxy / load balancer -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 503 with Retry-After -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 504 gateway timeout -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 429 rate limited -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 511 captive portal (network authentication required) -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session HTTP 200 HTML from a captive portal (lie-fi) -> refresh token kept, still authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session control: a definitive 401 from the auth server clears tokens and signs out": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: transient refresh failures must not destroy the session repeated token requests while offline back off instead of hammering /auth/refresh": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: refresh must be bounded in time (lie-fi) a refresh request that never answers settles within a bounded timeout": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: rotation-safe refresh a lost refresh response does not lead to reuse-detection sign-out on the retry": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-1.test.ts::LMS-1: rotation-safe refresh two tabs sharing token storage refresh once, not twice (no reuse-detection logout)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: offline cold start restores the stored session offline (fetch rejects): authenticated as the stored user, tokens preserved": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: offline cold start restores the stored session captive portal (HTTP 200 HTML): authenticated as the stored user, tokens preserved": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: offline cold start restores the stored session when connectivity returns, the preserved refresh token silently renews the session": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: offline cold start restores the stored session sync binding reports the stored user so AuthBoundKoraProvider mounts the local database offline": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: offline cold start restores the stored session namespaceByAuthUser resolves the stored user id offline (not the \"signed-out\" database)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: guards (must keep passing) expired refresh token offline -> unauthenticated (no indefinite offline session)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-2.test.ts::LMS-2: guards (must keep passing) definitive 401 at cold start -> unauthenticated and tokens cleared": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-4.test.ts::LMS-4: persist() must never block app startup createOpfsBlobDirectory resolves while a persist() prompt is pending": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/LMS-4.test.ts::LMS-4: persist() must never block app startup createApp blob-store resolution (initialize-app.ts:153) resolves while a persist() prompt is pending": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/auth/tests/repro/NEW-AUTH-1.test.ts::NEW-AUTH-1: permanent device ban after reuse detection / revocation fresh password sign-in on the same device restores sync access": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/cli/tests/repro/DX-8.test.ts::DX-8 deploy prompt offers only implemented platforms parsed the prompt options": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/cli/tests/repro/DX-8.test.ts::DX-8 deploy prompt offers only implemented platforms \"render\" is either implemented or labelled coming soon": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/cli/tests/repro/DX-8.test.ts::DX-8 deploy prompt offers only implemented platforms \"docker\" is either implemented or labelled coming soon": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/core/tests/repro/CORE-1.test.ts::CORE-1 op id must cover all semantic fields tampering previousData is detected by verifyOperationIntegrity": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/core/tests/repro/CORE-1.test.ts::CORE-1 op id must cover all semantic fields tampering sequenceNumber is detected by verifyOperationIntegrity": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/core/tests/repro/CORE-1.test.ts::CORE-1 op id must cover all semantic fields tampering causalDeps is detected by verifyOperationIntegrity": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/core/tests/repro/CORE-1.test.ts::CORE-1 op id must cover all semantic fields tampering schemaVersion is detected by verifyOperationIntegrity": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/react/tests/repro/DX-5.test.ts::DX-5 useMutation referential stability mutate/mutateAsync/reset keep identity across re-renders": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/react/tests/repro/DX-5.test.ts::DX-5 useMutation referential stability does not resubscribe to the controller on every render": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/react/tests/repro/DX-5.test.ts::DX-5 useMutation referential stability works under React.StrictMode (isLoading toggles, result resolves)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/react/tests/repro/DX-6.test.ts::DX-6 useQuery under SSR renderToString does not throw": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill benchmark: 27 collections, 20000 ops — HEAD vs proposed vs no-op (marker)": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill proposed fix defect: a fixed 500-row batch exceeds the Postgres 65535 bind-parameter limit on wide collections": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill backfill must not overwrite a concurrent live write with a stale replay (rolling deploy)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-10.test.ts::LMS-10: Postgres cold-start backfill backfill of a deleted record must keep its scope fields, or scoped clients never receive the delete": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-11-pg.test.ts::LMS-11: first delivery stream on Postgres benchmark: fresh scoped client, 20000 ops, 27 collections, sees ~5%": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-11.test.ts::LMS-11: first-sync delivery correctness retract policy: a first sync (fromDeliverySeq 0) MUST still carry retractions (report fix #11.3 is unsafe)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-11.test.ts::LMS-11: first-sync delivery correctness a collection the auth provider omits (deny) must NOT be widened by the client handshake syncScope": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-11.test.ts::LMS-11: first-sync delivery correctness an auth-omitted collection must NOT become writable via the client handshake syncScope": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-11.test.ts::LMS-11: lookup counts (HEAD) retract policy issues a record lookup for EVERY out-of-scope op, even inserts/deletes that can never exit scope": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-12.test.ts::LMS-12: liveness HEAD cost: a ghost watermark session re-scans its whole unacked backlog every poll tick": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/server/tests/repro/LMS-12.test.ts::LMS-12: liveness the production server must probe an idle WebSocket (ping) within 35 s": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-12.test.ts::LMS-12: liveness the report's snippet: terminate() on a missed pong runs Kora's close path": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-12.test.ts::LMS-12: liveness a half-open (blackholed) connection is NOT detected by HEAD within 10 s": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/server/tests/repro/LMS-12.test.ts::LMS-12: liveness an abandoned HTTP long-poll client must be reaped after inactivity": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: HEAD static headers (observed) dump headers": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour content-hashed asset is cached immutably for a year": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour index.html, sw.js and the manifest must revalidate (no-cache)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour UNHASHED files Kora copies into dist/assets must NOT be immutable": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour a validator is sent and a conditional request gets 304": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour compressible responses are compressed when the client accepts it": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour a missing hashed asset is 404, not index.html with 200 (stale tab after deploy)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: correct behaviour webmanifest has a proper media type": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects marks Kora-template unhashed sqlite3.wasm immutable for a year (defect)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects marks index.html immutable when the deploy path contains /assets/ (defect)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/LMS-13.test.ts::LMS-13: the report's heuristic (pure function) — defects never matches on Windows paths (defect)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/NEW-SEC-1.test.ts::NEW-SEC-1: route scope ignores $in predicates findById/query honour a $in scope like the sync path does": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-1.test.ts::SEC-1: operation-batch before handshake server must not apply an operation-batch from a session that never authenticated": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-2.test.ts::SEC-2: upload scope trusts client previousData / data forged previousData must not let alice edit bob's record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-2.test.ts::SEC-2: upload scope trusts client previousData / data forged previousData must not let alice delete bob's record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-2.test.ts::SEC-2: upload scope trusts client previousData / data data:{userId:alice} must not let alice take ownership of bob's record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-2.test.ts::SEC-2: upload scope trusts client previousData / data insert reusing bob's recordId with userId:alice must not overwrite bob's record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-4.test.ts::SEC-4: handshake leaks server version vector scoped tenant's handshake-response does not reveal other tenants' node ids": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-5.test.ts::SEC-5: side-channel relays bypass auth and scope unauthenticated connection cannot inject yjs-doc-update / awareness into an authenticated session": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-5.test.ts::SEC-5: side-channel relays bypass auth and scope unauthenticated listener and other-tenant session do not receive bob's yjs-doc-update": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-5.test.ts::SEC-5: side-channel relays bypass auth and scope unauthenticated blob-chunk-request is not forwarded to peers or tracked": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-5.test.ts::SEC-5: side-channel relays bypass auth and scope unauthenticated blob-chunk-push is not persisted": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-6.test.ts::SEC-6: route-context scope enforcement update that sets userId to the caller's value must not take over another tenant's record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-6.test.ts::SEC-6: route-context scope enforcement insert reusing another tenant's recordId must not overwrite it": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-6.test.ts::SEC-6: route-context scope enforcement scoped query applies limit after the scope filter": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-9.test.ts::SEC-9 (a) request.ip is not taken from a spoofed X-Forwarded-For when no trusted proxy is configured": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SEC-9.test.ts::SEC-9 (b) a string default containing a quote yields valid DDL": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-4.test.ts::SRV-4 Postgres multi-instance correctness instance B version vector reflects writes committed through instance A": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-4.test.ts::SRV-4 Postgres multi-instance correctness legacy (version-vector) client handshaking on instance B receives an op written via A": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-4.test.ts::SRV-4 Postgres multi-instance correctness concurrent apply of the same op on two instances reports exactly one \"applied\"": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-4.test.ts::SRV-4 Postgres multi-instance correctness sequence numbers above 2^31-1 are stored": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-5.test.ts::SRV-5 delivery stream memory / scan cost initial-sync delivery stream sends its first batch before scanning the whole log": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-6.test.ts::SRV-6 server resource limits control: 6 ops in one session hit a 5/min limit": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-6.test.ts::SRV-6 server resource limits rate limit is not reset by reconnecting": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-6.test.ts::SRV-6 server resource limits scope-rejected operations count toward the rate limit": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-6.test.ts::SRV-6 server resource limits idle HTTP long-poll sessions expire": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-6.test.ts::SRV-6 server resource limits custom route request bodies are size-capped": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-7.test.ts::SRV-7 per-write cost grows with record history SQLite server store: late writes to a hot record cost about the same as early ones": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/server/tests/repro/SRV-7.test.ts::SRV-7 per-write cost grows with record history memory server store: late writes cost about the same as early ones": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/LMS-7.test.ts::LMS-7 follower liveness leader that hangs AFTER answering the first probe is detected well before the RPC timeout": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/LMS-7.test.ts::LMS-7 follower liveness control: leader already dead before the request -> NoLeaderError after one probe (works today)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/store/tests/repro/SEC-7.test.ts::SEC-7: SQL injection via orderBy direction / limit / offset a non asc/desc direction is rejected instead of being spliced into SQL": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/SEC-7.test.ts::SEC-7: SQL injection via orderBy direction / limit / offset a non-integer limit/offset is rejected instead of being spliced into SQL": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-10.test.ts::STORE-10 multi-tab duplicate apply tab B subscription sees a remote op that tab A applied first": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-12.test.ts::STORE-12 subscription diffing and errors unchanged result with an array field does not re-notify": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-12.test.ts::STORE-12 subscription diffing and errors a failing subscription query does not produce an unhandled rejection": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-15.test.ts::STORE-15 lows indexes on (a_b.c) and (a.b_c) both exist": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-15.test.ts::STORE-15 lows concurrent delivery of the same remote op is idempotent (no throw)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-6.test.ts::STORE-6 IndexedDB follower open must not rewrite the leader live DB a second tab opening does not roll back unflushed leader writes": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-7.test.ts::STORE-7 persistence scheduler re-entrancy flushNow during an in-flight flush persists the latest state": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-8.test.ts::STORE-8 execute/query isolation from open transactions a non-transactional write is not lost when a concurrent transaction rolls back": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/store/tests/repro/STORE-8.test.ts::STORE-8 execute/query isolation from open transactions a reader never observes uncommitted rows of another transaction": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/ENC-3.test.ts::ENC-3: ciphertext not bound to operation; plaintext accepted plaintext op is rejected when encryption is enabled": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/ENC-3.test.ts::ENC-3: ciphertext not bound to operation; plaintext accepted ciphertext moved to a different operation fails authentication": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/NEW-SYNC-1.test.ts::NEW-SYNC-1: duplicate final delivery batch wedges initial sync engine reaches streaming when the server restarts the stream from 0": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/SEC-8.test.ts::SEC-8: auth token in WebSocket URL connect() does not place the auth token in the URL": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/SYNC-6.test.ts::SYNC-6: OutboundQueue seen set acknowledged ids are released (bounded memory, re-enqueue possible)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/SYNC-9.test.ts::SYNC-9: protobuf serializer drops protocol fields handshake fields survive a protobuf round trip": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/sync/tests/repro/SYNC-9.test.ts::SYNC-9: protobuf serializer drops protocol fields handshake-response schema range survives a protobuf round trip": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/CORE-1.test.ts::CORE-1 receive paths verify content-addressed ids server and peers reject an op whose id is not its content hash": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQLite) [control, passes] collection-wide scope delivers both records": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQLite) [fails today] inbound, non-directional: record whose id is in scope reaches the client": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQLite) [passes with LMS #8 client patch] same scenario with the patched client snapshot": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQLite) [passes with planned SYNC-2 split] inbound applies what the server delivered": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQLite) [fails today] inbound, directional (downlink all, uplink id-scoped): client receives everything downlink allows": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes] legit update to an in-scope existing record is accepted": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes] forged data.id is rejected today — but only by schema shape validation (SCHEMA_VALIDATION_ERROR), not by scope": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [fails today] forged previousData.id (allowed by shape validation) must not authorize an update to an out-of-scope record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [fails today] forged previousData.id must not authorize a delete of an out-of-scope record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [fails with LMS patch] LMS #8 patch does not close the previousData.id bypass": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [passes with correct fix] id forced from recordId + stored row authoritative rejects all forgeries": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 server upload with id-scoped uplink [fails today] insert whose recordId is in an id-scoped uplink is accepted (no stored row to backfill id)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-8.test.ts::LMS-8 pure matcher facts shipped matchers let op fields override the stored id (SEC-2 class)": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [fails today] downlink {c1,c2}, uplink {c1}: insert + later status update for a c2 lesson reach the client": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [passes today] downlink == uplink {c1}: partial update {status} of a synced record is NOT dropped (backfill works)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [fails today] read-only learner: downlink {c1}, no uplink for lessons → receives nothing": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 directional scopes (their scenario) [passes with LMS #9 patch] same two scenarios with the patch": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 without directional scopes: the \"incomplete snapshot\" drop is real but elsewhere [fails today] insert + partial update of the same record in ONE delivery batch: update is dropped": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 without directional scopes: the \"incomplete snapshot\" drop is real but elsewhere [fails today] while the session stays up the dropped update is not redelivered (watermark advanced past it)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 without directional scopes: the \"incomplete snapshot\" drop is real but elsewhere [passes today] a reconnect heals it (observed: op re-sent on next handshake, local row now exists for backfill)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 without directional scopes: the \"incomplete snapshot\" drop is real but elsewhere [passes with LMS #9 patch] ALSO \"fixed\" because the server sets acceptedUplinkScopes for ANY scoped session, so hasDirectionalScopes is true even for legacy `scopes`": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::Planned split (SYNC-2) vs the same scenarios [passes with split] directional TA scenario": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::Planned split (SYNC-2) vs the same scenarios [passes with split] same-batch insert+update, legacy scopes": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::Planned split (SYNC-2) vs the same scenarios [passes with split] read-only learner": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 patch side effects on OUTBOUND today: out-of-uplink local writes are silently kept local (never sent, never rejected)": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 patch side effects on OUTBOUND with LMS #9 patch: out-of-uplink local writes are TRANSMITTED to the server and rejected; re-sent on every reconnect": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 patch side effects on OUTBOUND hasDirectionalScopes is true for a legacy `scopes` session": {
+   "status": "passed",
+   "observation": true
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 patch side effects on OUTBOUND [fails today] an edit to a downlink-visible but non-uploadable record must not be silently kept local-only": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/LMS-9.test.ts::LMS-9 patch side effects on OUTBOUND [passes] with LMS #9 patch, an in-scope op after a rejected one still uploads (no ack poisoning observed)": {
+   "status": "passed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-1.test.ts::MERGE-1 add-wins set preserves one-sided removals helper: remove urgent vs add billing => [billing]": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-1.test.ts::MERGE-1 add-wins set preserves one-sided removals end to end: A removes urgent, B adds billing concurrently => all show [billing]": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-1.test.ts::MERGE-1 add-wins set preserves one-sided removals end to end, removal has the later HLC: clients and server must agree on [billing]": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=tags seed=1: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=tags seed=7: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=tags seed=8: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=settings+meta seed=3: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=quantity seed=1: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/MERGE-2.test.ts::MERGE-2 3-replica randomized convergence through the real apply pipeline fields=quantity seed=2: clients converge, and agree with server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/NEW-MERGE-1.test.ts::NEW-MERGE-1 unchanged array in a concurrent update must not undo a removal A removes urgent; B saves {title, tags unchanged} => tags []": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SEC-3.test.ts::SEC-3: nodeId not bound to session, op.id not verified server rejects an op whose nodeId differs from the session nodeId, or whose id is not its content hash": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SEC-3.test.ts::SEC-3: nodeId not bound to session, op.id not verified victim's offline writes still reach the server after an attacker forges its nodeId": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-1.test.ts::SRV-1 server materialization equals client convergence array (add-wins) field": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-1.test.ts::SRV-1 server materialization equals client convergence object (key-merge) field": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-1.test.ts::SRV-1 server materialization equals client convergence custom resolver field": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-2.test.ts::SRV-2 visibility judged per op / current state record reassigned INTO a client scope is fully delivered (insert + update)": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-2.test.ts::SRV-2 visibility judged per op / current state client that first connects after the move-in still receives the record": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-3.test.ts::SRV-3 delivery stream re-sends unacked backlog on every push a write during a fresh peer's initial sync does not re-send the whole backlog": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SRV-3.test.ts::SRV-3 delivery stream re-sends unacked backlog on every push burst of N writes (20ms uplink latency) reaches a streaming peer with ~N ops on the wire": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SYNC-3.test.ts::SYNC-3: non-success apply advances the delivery watermark an op skipped by an old-schema client is delivered after that client upgrades": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SYNC-4.test.ts::SYNC-4: handshake-delta ops treated as acked before the server acks an op rejected retriably during the handshake delta is eventually stored on the server": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/test/tests/repro/SYNC-7.test.ts::SYNC-7: far-future remote op blocks the delivery stream a single far-future op does not stall delivery of later ops forever": {
+   "status": "failed",
+   "observation": false
+  },
+  "packages/vue/tests/repro/DX-7.test.ts::DX-7 Vue useQuery reacts to changing inputs re-runs when the getter-provided query changes (prop-driven filter)": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5a::fact: default pool capacity is 6": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5a::fact: 2nd context installing same pool gets NoModificationAllowedError": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5a::fact: once the holder worker is terminated, a re-install succeeds quickly": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5b::second tab (different dbName) gets durable storage": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5b::bob's write from that session survives reload": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5c::fallback session sees data written in earlier OPFS session": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5c::next OPFS session sees writes made during fallback session": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5d::fact: same-dbName second tab is a follower (does not install the pool)": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5d::promoted follower still sees pre-handoff data": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5d::write made by promoted follower is durable": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5e::after leader tab closes, promoted follower writes are durable": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5f::promoted follower either has durable storage or surfaces a blocking error/event": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5f::write accepted by promoted follower is durable": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5g::every reload re-opens durable OPFS storage": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-5h::LMS retry (same worker, no forceReinitIfPreviouslyFailed) succeeds once holder is gone": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-5h::fact: retry with forceReinitIfPreviouslyFailed:true succeeds": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-6a::8 per-user Kora databases on one origin all open durably and accept writes": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-6a::existing user #1 can still write after pool filled by other users": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-6c::failed adapter.open() releases the SAH pool (another context can install it)": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-6b::fact: with sqlite-wasm 3.51 the thrown error matches the fix regex /SAH pool is full/": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-6b::proposed eviction keeps other users' databases (with unsynced ops)": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-7a::in-flight follower RPC settles within 5s of leader tab death": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-7a::retry after promotion succeeds": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::LMS-7b::in-flight request detects unresponsive leader within ~2 probe intervals (<6s)": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::LMS-7b::follower can still write while leader tab is hung (failover)": {
+   "status": "failed",
+   "observation": false
+  },
+  "browser::NEW-DX-3::control: app shell loads online": {
+   "status": "passed",
+   "observation": false
+  },
+  "browser::NEW-DX-3::app shell reopens offline after one online visit": {
+   "status": "failed",
+   "observation": false
+  },
+  "tsc::kora/tests/repro/types/DX-1.ts": {
+   "status": "failed",
+   "observation": false
+  },
+  "tsc::kora/tests/repro/types/DX-2.ts": {
+   "status": "failed",
+   "observation": false
+  }
+ }
+}

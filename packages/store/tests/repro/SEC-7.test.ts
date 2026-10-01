@@ -7,8 +7,8 @@
 import { defineSchema, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
-import type { OrderByDirection } from '../../src/types'
 import { Store } from '../../src/store/store'
+import type { OrderByDirection } from '../../src/types'
 
 const schema = defineSchema({
 	version: 1,
@@ -37,7 +37,8 @@ describe('SEC-7: SQL injection via orderBy direction / limit / offset', () => {
 		const s = await open()
 		// e.g. `?dir=` from a URL, cast to the declared type.
 		// Boolean oracle over another collection: rows come back iff the secret starts with TOP.
-		const dir = "ASC LIMIT (SELECT COUNT(*) FROM secrets WHERE value LIKE 'TOP%')" as OrderByDirection
+		const dir =
+			"ASC LIMIT (SELECT COUNT(*) FROM secrets WHERE value LIKE 'TOP%')" as OrderByDirection
 		let rows: unknown[] = []
 		let threw = false
 		try {
@@ -52,7 +53,8 @@ describe('SEC-7: SQL injection via orderBy direction / limit / offset', () => {
 
 	test('a non-integer limit/offset is rejected instead of being spliced into SQL', async () => {
 		const s = await open()
-		const evil = "(SELECT CASE WHEN (SELECT value FROM secrets) LIKE 'TOP%' THEN 10 ELSE 0 END)" as unknown as number
+		const evil =
+			"(SELECT CASE WHEN (SELECT value FROM secrets) LIKE 'TOP%' THEN 10 ELSE 0 END)" as unknown as number
 		let threw = false
 		let rows: unknown[] = []
 		try {

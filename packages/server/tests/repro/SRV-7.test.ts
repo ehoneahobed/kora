@@ -56,7 +56,9 @@ describe('SRV-7 per-write cost grows with record history', () => {
 		await store.setSchema(schema)
 		const { early, late } = await measure(store)
 		await store.close()
-		console.log(`SRV-7 sqlite: first300=${early.toFixed(1)}ms last300(after ~2700 ops)=${late.toFixed(1)}ms ratio=${(late / early).toFixed(1)}x`)
+		console.log(
+			`SRV-7 sqlite: first300=${early.toFixed(1)}ms last300(after ~2700 ops)=${late.toFixed(1)}ms ratio=${(late / early).toFixed(1)}x`,
+		)
 		expect(late / early).toBeLessThan(2)
 	}, 120000)
 
@@ -65,7 +67,9 @@ describe('SRV-7 per-write cost grows with record history', () => {
 		await store.setSchema(schema)
 		const { early, late } = await measure(store)
 		await store.close()
-		console.log(`SRV-7 memory: first300=${early.toFixed(1)}ms last300=${late.toFixed(1)}ms ratio=${(late / early).toFixed(1)}x`)
+		console.log(
+			`SRV-7 memory: first300=${early.toFixed(1)}ms last300=${late.toFixed(1)}ms ratio=${(late / early).toFixed(1)}x`,
+		)
 		expect(late / early).toBeLessThan(2)
 	}, 120000)
 })

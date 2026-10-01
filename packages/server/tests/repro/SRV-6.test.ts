@@ -9,8 +9,8 @@ import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { createProductionServer } from '../../src/server/production-server'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
+import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 
@@ -54,14 +54,21 @@ async function connect(server: KoraSyncServer, nodeId: string, token?: string) {
 	async function upload(ops: Operation[]): Promise<void> {
 		const id = `b-${Math.random()}`
 		const before = messages.length
-		client.send({ type: 'operation-batch', messageId: id, operations: ops, isFinal: true, batchIndex: 0 } as SyncMessage)
+		client.send({
+			type: 'operation-batch',
+			messageId: id,
+			operations: ops,
+			isFinal: true,
+			batchIndex: 0,
+		} as SyncMessage)
 		await vi.waitFor(() => expect(messages.length).toBeGreaterThan(before))
 		await new Promise((r) => setTimeout(r, 20))
 	}
 	return { client, messages, upload, close: () => client.disconnect?.() }
 }
 
-const rateLimited = (ms: SyncMessage[]) => ms.some((m) => m.type === 'error' && m.code === 'RATE_LIMIT')
+const rateLimited = (ms: SyncMessage[]) =>
+	ms.some((m) => m.type === 'error' && m.code === 'RATE_LIMIT')
 
 describe('SRV-6 server resource limits', () => {
 	test('control: 6 ops in one session hit a 5/min limit', async () => {
@@ -99,14 +106,18 @@ describe('SRV-6 server resource limits', () => {
 		const server = new KoraSyncServer({
 			store,
 			maxOpsPerMinute: 5,
-			auth: { authenticate: async () => ({ userId: 'alice', scopes: { todos: { userId: 'alice' } } }) },
+			auth: {
+				authenticate: async () => ({ userId: 'alice', scopes: { todos: { userId: 'alice' } } }),
+			},
 		})
 		const c = await connect(server, 'node-s', 'tok')
 		const ops = Array.from({ length: 50 }, () => mkOp('node-s', 'bob'))
 		await c.upload(ops)
 		const rejections = c.messages.filter((m) => m.type === 'operation-rejected').length
 		await server.stop()
-		console.log(`SRV-6 scope-rejected processed=${rejections}/50 rateLimited=${rateLimited(c.messages)}`)
+		console.log(
+			`SRV-6 scope-rejected processed=${rejections}/50 rateLimited=${rateLimited(c.messages)}`,
+		)
 		expect(rejections).toBeLessThanOrEqual(5)
 	})
 
@@ -150,7 +161,9 @@ describe('SRV-6 server resource limits', () => {
 				headers: { 'content-type': 'application/json' },
 				body: big,
 			})
-			console.log(`SRV-6 20MiB unauthenticated body -> status ${res.status}, handler saw ${receivedBytes} bytes`)
+			console.log(
+				`SRV-6 20MiB unauthenticated body -> status ${res.status}, handler saw ${receivedBytes} bytes`,
+			)
 			expect(res.status).toBe(413)
 		} finally {
 			await server.stop()

@@ -15,9 +15,12 @@ type Data<T> = { data: T }
 
 async function setup() {
 	const routes = new OrgRoutes({ orgStore: new InMemoryOrgStore() })
-	const org = ((await routes.createOrg('owner-1', { name: 'Acme', slug: 'acme' })).body as Data<{ id: string }>).data
+	const org = (
+		(await routes.createOrg('owner-1', { name: 'Acme', slug: 'acme' })).body as Data<{ id: string }>
+	).data
 	const inv = (
-		(await routes.createInvitation('owner-1', org.id, { email: 'bob@example.com', role: 'admin' })).body as Data<{
+		(await routes.createInvitation('owner-1', org.id, { email: 'bob@example.com', role: 'admin' }))
+			.body as Data<{
 			id: string
 			token: string
 		}>
@@ -37,17 +40,24 @@ describe('AUTH-4: invitation authorization', () => {
 		// Mallory redeems Bob's admin invitation with her own user id.
 		const accepted = await routes.acceptInvitation('mallory-1', { token: inv.token })
 		expect.soft(accepted.status).toBe(403)
-		const members = (await routes.listMembers('owner-1', org.id)).body as Data<Array<{ userId: string }>>
+		const members = (await routes.listMembers('owner-1', org.id)).body as Data<
+			Array<{ userId: string }>
+		>
 		expect(members.data.map((m) => m.userId)).not.toContain('mallory-1')
 	})
 
 	test('(c) admin of org B cannot revoke an invitation that belongs to org A', async () => {
 		const { routes, org, inv } = await setup()
-		const orgB = ((await routes.createOrg('mallory-1', { name: 'Evil', slug: 'evil' })).body as Data<{ id: string }>)
-			.data
+		const orgB = (
+			(await routes.createOrg('mallory-1', { name: 'Evil', slug: 'evil' })).body as Data<{
+				id: string
+			}>
+		).data
 		const res = await routes.revokeInvitation('mallory-1', orgB.id, inv.id)
 		expect.soft(res.status).toBe(404)
-		const pending = (await routes.listPendingInvitations('owner-1', org.id)).body as Data<Array<{ id: string }>>
+		const pending = (await routes.listPendingInvitations('owner-1', org.id)).body as Data<
+			Array<{ id: string }>
+		>
 		expect(pending.data.map((i) => i.id)).toContain(inv.id)
 	})
 })

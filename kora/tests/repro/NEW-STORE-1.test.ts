@@ -15,7 +15,11 @@ test('backfill transform sees typed record values', async () => {
 	const path = join(dir, 'db.db')
 	const v1 = defineSchema({
 		version: 1,
-		collections: { items: { fields: { done: t.boolean().default(false), tags: t.array(t.string()).default([]) } } },
+		collections: {
+			items: {
+				fields: { done: t.boolean().default(false), tags: t.array(t.string()).default([]) },
+			},
+		},
 	})
 	const a = createApp({ schema: v1, store: { adapter: 'better-sqlite3', name: path } })
 	await a.ready
@@ -25,8 +29,17 @@ test('backfill transform sees typed record values', async () => {
 	const seen: Array<Record<string, unknown>> = []
 	const v2 = defineSchema({
 		version: 2,
-		collections: { items: { fields: { done: t.boolean().default(false), tags: t.array(t.string()).default([]) } } },
-		migrations: { 2: migrate().backfill('items', (r) => (seen.push(r), {})) },
+		collections: {
+			items: {
+				fields: { done: t.boolean().default(false), tags: t.array(t.string()).default([]) },
+			},
+		},
+		migrations: {
+			2: migrate().backfill('items', (r) => {
+				seen.push(r)
+				return {}
+			}),
+		},
 	})
 	const b = createApp({ schema: v2, store: { adapter: 'better-sqlite3', name: path } })
 	await b.ready

@@ -49,9 +49,7 @@ describe('SEC-4: handshake leaks server version vector', () => {
 			schemaVersion: 1,
 			authToken: 'alice',
 		})
-		await vi.waitFor(() =>
-			expect(messages.some((m) => m.type === 'handshake-response')).toBe(true),
-		)
+		await vi.waitFor(() => expect(messages.some((m) => m.type === 'handshake-response')).toBe(true))
 		const resp = messages.find((m) => m.type === 'handshake-response')
 		if (resp?.type !== 'handshake-response') throw new Error('no response')
 		expect(Object.keys(resp.versionVector)).not.toContain('bob-device-node-id')

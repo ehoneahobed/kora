@@ -15,11 +15,13 @@ describe('AUTH-12: in-memory revocation store in the quickstart server', () => {
 		// Persistent user DB shared by both "processes".
 		const userStore = new InMemoryUserStore()
 		const before = createKoraAuthServer({ jwtSecret: SECRET, userStore })
-		const signup = (await before.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'd1' },
-		})).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
+		const signup = (
+			await before.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'd1' },
+			})
+		).body as { data: { tokens: { accessToken: string; refreshToken: string } } }
 		const { accessToken, refreshToken } = signup.data.tokens
 		await before.handleRequest({
 			method: 'POST',
@@ -30,7 +32,11 @@ describe('AUTH-12: in-memory revocation store in the quickstart server', () => {
 
 		// Restart (or a second replica behind the load balancer).
 		const after = createKoraAuthServer({ jwtSecret: SECRET, userStore })
-		const res = await after.handleRequest({ method: 'POST', path: '/auth/refresh', body: { refreshToken } })
+		const res = await after.handleRequest({
+			method: 'POST',
+			path: '/auth/refresh',
+			body: { refreshToken },
+		})
 		expect.soft(res.status).toBe(401)
 		expect(await after.auth.authenticate(accessToken)).toBeNull()
 	})

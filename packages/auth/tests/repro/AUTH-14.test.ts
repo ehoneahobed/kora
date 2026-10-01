@@ -7,7 +7,11 @@
  */
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, test, vi } from 'vitest'
-import { InMemoryWebhookStore, WebhookManager, verifyWebhookSignature } from '../../src/admin/webhooks'
+import {
+	InMemoryWebhookStore,
+	WebhookManager,
+	verifyWebhookSignature,
+} from '../../src/admin/webhooks'
 import { verifyAuthenticationResponse } from '../../src/passkey/passkey-server'
 import { ExternalJwtProvider } from '../../src/provider/external/external-jwt-provider'
 import { encodeJwt } from '../../src/tokens/jwt'
@@ -65,7 +69,10 @@ describe('AUTH-14: ExternalJwtProvider HS256', () => {
 	test('token minted for another audience/issuer sharing the secret is rejected', async () => {
 		const p = new ExternalJwtProvider({ providerName: 'supabase', jwtSecret: secret })
 		const now = Math.floor(Date.now() / 1000)
-		const other = encodeJwt({ sub: 'u1', aud: 'some-other-service', iss: 'evil', exp: now + 600 }, secret)
+		const other = encodeJwt(
+			{ sub: 'u1', aud: 'some-other-service', iss: 'evil', exp: now + 600 },
+			secret,
+		)
 		expect(await p.toSyncAuthProvider().authenticate(other)).toBeNull()
 	})
 })
@@ -74,11 +81,17 @@ describe('AUTH-14: webhooks', () => {
 	test('signature helper rejects a stale (replayed) payload', async () => {
 		let captured: { body: string; sig: string } | null = null
 		const fetchStub = (async (_u: string, init: RequestInit) => {
-			captured = { body: String(init.body), sig: (init.headers as Record<string, string>)['X-Webhook-Signature'] as string }
+			captured = {
+				body: String(init.body),
+				sig: (init.headers as Record<string, string>)['X-Webhook-Signature'] as string,
+			}
 			return new Response('ok')
 		}) as unknown as typeof fetch
 		const mgr = new WebhookManager({ store: new InMemoryWebhookStore(), fetch: fetchStub })
-		const ep = await mgr.register({ url: 'https://hooks.example.com/kora', events: ['user.deleted'] as never })
+		const ep = await mgr.register({
+			url: 'https://hooks.example.com/kora',
+			events: ['user.deleted'] as never,
+		})
 		vi.useFakeTimers({ toFake: ['Date'] })
 		vi.setSystemTime(Date.now() - 24 * 3600_000) // delivery captured a day ago
 		await mgr.dispatch('user.deleted' as never, { userId: 'u1' })
@@ -91,7 +104,10 @@ describe('AUTH-14: webhooks', () => {
 	test('register() refuses link-local / loopback targets', async () => {
 		const mgr = new WebhookManager({ store: new InMemoryWebhookStore() })
 		await expect(
-			mgr.register({ url: 'http://169.254.169.254/latest/meta-data/', events: ['user.created' as never] }),
+			mgr.register({
+				url: 'http://169.254.169.254/latest/meta-data/',
+				events: ['user.created' as never],
+			}),
 		).rejects.toThrow()
 	})
 })

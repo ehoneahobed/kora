@@ -15,7 +15,9 @@ function totp(secretB32: string, at = Date.now()): string {
 	const counter = Math.floor(at / 1000 / 30)
 	const buf = Buffer.alloc(8)
 	buf.writeBigUInt64BE(BigInt(counter))
-	const h = createHmac('sha1', Buffer.from(base32Decode(secretB32))).update(buf).digest()
+	const h = createHmac('sha1', Buffer.from(base32Decode(secretB32)))
+		.update(buf)
+		.digest()
 	const off = (h[h.length - 1] as number) & 0xf
 	const bin = (h.readUInt32BE(off) & 0x7fffffff) % 1_000_000
 	return bin.toString().padStart(6, '0')

@@ -45,7 +45,10 @@ describe('STORE-14 compaction vs log re-fold', () => {
 		}
 		await todos.delete(rec.id)
 		// Server acknowledged both local ops; compact.
-		await store.compact({ mode: 'after-ack', serverVector: new Map([[store.getNodeId(), 2]]) } as never)
+		await store.compact({
+			mode: 'after-ack',
+			serverVector: new Map([[store.getNodeId(), 2]]),
+		} as never)
 
 		const pipeline = (store as unknown as { localMutationHandler: any }).localMutationHandler
 		await pipeline.applyRemote(remote)

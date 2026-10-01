@@ -57,7 +57,10 @@ describe('STORE-5 backup restore', () => {
 		expect(res.success).toBe(true)
 		const meta = await adapter.query("SELECT value FROM _kora_meta WHERE key = 'node_id'")
 		expect(meta[0].value).toBe(bNode)
-		const vv = await adapter.query('SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?', [bNode])
+		const vv = await adapter.query(
+			'SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?',
+			[bNode],
+		)
 		expect(vv[0].sequence_number).toBe(2)
 	})
 })

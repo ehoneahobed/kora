@@ -78,7 +78,12 @@ describe('STORE-3 transactional writes vs per-field LWW', () => {
 			id = (await tx.todos!.insert({ title: 'orig' })).id
 		})
 		const t0 = ins!.timestamp.wallTime
-		const mk = (data: Record<string, unknown>, prev: Record<string, unknown>, wall: number, seq: number) =>
+		const mk = (
+			data: Record<string, unknown>,
+			prev: Record<string, unknown>,
+			wall: number,
+			seq: number,
+		) =>
 			createOperation(
 				{
 					nodeId: 'remote-node',

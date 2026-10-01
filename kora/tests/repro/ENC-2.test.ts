@@ -12,8 +12,8 @@ import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
-import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer, MemoryServerStore } from '../../../packages/server/src/index'
 
 const schema = defineSchema({
 	version: 1,
@@ -92,7 +92,11 @@ describe('ENC-2: decrypt failure handled as a transport close', () => {
 		await appB.ready
 		await appA.sync?.connect()
 		const row = await (appA as unknown as { todos: Coll }).todos.insert({ title: 'x' })
-		for (let i = 0; i < 40 && !serverStore.getAllOperations().some((o) => o.recordId === row.id); i++)
+		for (
+			let i = 0;
+			i < 40 && !serverStore.getAllOperations().some((o) => o.recordId === row.id);
+			i++
+		)
 			await tick()
 
 		const disconnects: string[] = []
@@ -103,7 +107,9 @@ describe('ENC-2: decrypt failure handled as a transport close', () => {
 		await new Promise((r) => setTimeout(r, 2_500)) // > 2 default reconnect intervals
 
 		expect(disconnects, 'decrypt failure tore down the session (and loops)').toEqual([])
-		expect(failures.length, 'undecryptable op never surfaced as an apply failure').toBeGreaterThan(0)
+		expect(failures.length, 'undecryptable op never surfaced as an apply failure').toBeGreaterThan(
+			0,
+		)
 
 		await appA.close()
 		await appB.close()

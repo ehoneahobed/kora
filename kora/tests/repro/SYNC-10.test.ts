@@ -125,7 +125,10 @@ describe('SYNC-10: timers and async sends outlive stop/close', () => {
 			await app.sync?.connect()
 			for (let i = 0; i < 40 && app.sync?.getStatus().status !== 'synced'; i++) await tick()
 			const todos = (app as unknown as { todos: Todos }).todos
-			const engine = app.getSyncEngine() as unknown as { currentBatch: unknown; stop(): Promise<void> }
+			const engine = app.getSyncEngine() as unknown as {
+				currentBatch: unknown
+				stop(): Promise<void>
+			}
 			await todos.insert({ title: 'secret' }) // push -> flushQueue -> async encrypt
 			// Stop exactly while the batch is being encrypted (in flight, not yet sent).
 			for (let i = 0; i < 1000 && !engine.currentBatch; i++) await Promise.resolve()

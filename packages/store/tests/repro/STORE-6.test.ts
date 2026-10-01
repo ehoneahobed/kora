@@ -1,7 +1,11 @@
 import 'fake-indexeddb/auto'
 import { afterEach, describe, expect, test } from 'vitest'
 import { IndexedDbAdapter } from '../../src/adapters/indexeddb-adapter'
-import type { WorkerBridge, WorkerRequest, WorkerResponse } from '../../src/adapters/sqlite-wasm-channel'
+import type {
+	WorkerBridge,
+	WorkerRequest,
+	WorkerResponse,
+} from '../../src/adapters/sqlite-wasm-channel'
 import { MockWorkerBridge } from '../../src/adapters/sqlite-wasm-mock-bridge'
 import { deleteFromIndexedDB } from '../../src/adapters/sqlite-wasm-persistence'
 import { minimalSchema } from '../fixtures/test-schema'
@@ -25,7 +29,12 @@ class BrowserWorkerSim implements WorkerBridge {
 			this.opened = true
 		}
 		if (request.type === 'export') {
-			return { id: request.id, type: 'error', message: 'Export not yet supported in browser worker', code: 'EXPORT_NOT_SUPPORTED' }
+			return {
+				id: request.id,
+				type: 'error',
+				message: 'Export not yet supported in browser worker',
+				code: 'EXPORT_NOT_SUPPORTED',
+			}
 		}
 		if (request.type === 'close') return { id: request.id, type: 'success' }
 		return this.inner.send(request)
@@ -35,7 +44,10 @@ class BrowserWorkerSim implements WorkerBridge {
 
 const DB = 'store-6-repro'
 const insert = (a: IndexedDbAdapter, id: string) =>
-	a.execute('INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)', [id, id, 0, 1, 1])
+	a.execute(
+		'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+		[id, id, 0, 1, 1],
+	)
 
 describe('STORE-6 IndexedDB follower open must not rewrite the leader live DB', () => {
 	afterEach(async () => {
@@ -45,13 +57,21 @@ describe('STORE-6 IndexedDB follower open must not rewrite the leader live DB', 
 	test('a second tab opening does not roll back unflushed leader writes', async () => {
 		const worker = new BrowserWorkerSim()
 		// Large debounce so the second write is deterministically NOT yet flushed.
-		const leader = new IndexedDbAdapter({ bridge: worker, dbName: DB, persistenceDebounceMs: 60_000 })
+		const leader = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
 		await leader.open(minimalSchema)
 		await insert(leader, 'flushed')
 		await leader.flushPersistence()
 		await insert(leader, 'unflushed')
 
-		const follower = new IndexedDbAdapter({ bridge: worker, dbName: DB, persistenceDebounceMs: 60_000 })
+		const follower = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
 		await follower.open(minimalSchema)
 
 		const rows = await leader.query<{ id: string }>('SELECT id FROM todos ORDER BY id')

@@ -66,7 +66,9 @@ describe('STORE-1 sequence uniqueness across app.transaction', () => {
 			await tx.todos!.insert({ title: 'b' })
 		})
 		// Server has acknowledged everything up to the transaction's last op.
-		const serverVector = new Map([[store.getNodeId(), Math.max(...txOps.map((o) => o.sequenceNumber))]])
+		const serverVector = new Map([
+			[store.getNodeId(), Math.max(...txOps.map((o) => o.sequenceNumber))],
+		])
 		await (app as unknown as Record<string, any>).todos.insert({ title: 'post' })
 		const unsynced = await store.getUnsyncedOperations(serverVector)
 		expect(unsynced.map((o) => (o.data as { title: string }).title)).toEqual(['post'])

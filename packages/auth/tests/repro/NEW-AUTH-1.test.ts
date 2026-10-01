@@ -14,11 +14,13 @@ type SignResp = { data: { tokens: { accessToken: string; refreshToken: string } 
 describe('NEW-AUTH-1: permanent device ban after reuse detection / revocation', () => {
 	test('fresh password sign-in on the same device restores sync access', async () => {
 		const auth = createKoraAuthServer({ jwtSecret: 'n'.repeat(64) })
-		const s = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
-		})).body as SignResp
+		const s = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'u@example.com', password: 'password-123', deviceId: 'phone' },
+			})
+		).body as SignResp
 		const rt = s.data.tokens.refreshToken
 
 		// Refresh succeeds server-side but the response is lost; client retries with the same token.

@@ -31,10 +31,7 @@ describe('MERGE-1 add-wins set preserves one-sided removals', () => {
 
 	test('end to end: A removes urgent, B adds billing concurrently => all show [billing]', async () => {
 		network = await createTestNetwork(schema, { devices: 2 })
-		const [a, b] = network.devices as [
-			(typeof network.devices)[0],
-			(typeof network.devices)[0],
-		]
+		const [a, b] = network.devices as [(typeof network.devices)[0], (typeof network.devices)[0]]
 		const rec = await a.collection('tickets').insert({ title: 'x', tags: ['urgent'] })
 		await a.sync()
 		await b.sync()
@@ -62,10 +59,7 @@ describe('MERGE-1 add-wins set preserves one-sided removals', () => {
 
 	test('end to end, removal has the later HLC: clients and server must agree on [billing]', async () => {
 		network = await createTestNetwork(schema, { devices: 2 })
-		const [a, b] = network.devices as [
-			(typeof network.devices)[0],
-			(typeof network.devices)[0],
-		]
+		const [a, b] = network.devices as [(typeof network.devices)[0], (typeof network.devices)[0]]
 		const rec = await a.collection('tickets').insert({ title: 'x', tags: ['urgent'] })
 		await a.sync()
 		await b.sync()

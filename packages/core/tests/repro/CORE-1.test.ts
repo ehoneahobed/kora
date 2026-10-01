@@ -31,7 +31,10 @@ async function baseOp(): Promise<Operation> {
 
 describe('CORE-1 op id must cover all semantic fields', () => {
 	const tampers: Array<[string, (op: Operation) => Operation]> = [
-		['previousData', (op) => ({ ...op, previousData: { tags: ['urgent', 'vip'], ownerId: 'mallory' } })],
+		[
+			'previousData',
+			(op) => ({ ...op, previousData: { tags: ['urgent', 'vip'], ownerId: 'mallory' } }),
+		],
 		['sequenceNumber', (op) => ({ ...op, sequenceNumber: 1_000_000_000 })],
 		['causalDeps', (op) => ({ ...op, causalDeps: [] })],
 		['schemaVersion', (op) => ({ ...op, schemaVersion: 99 })],

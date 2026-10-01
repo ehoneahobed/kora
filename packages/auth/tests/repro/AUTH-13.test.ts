@@ -25,7 +25,11 @@ describe('AUTH-13: offline refresh failure signs the user out', () => {
 		const storage = createMemoryAuthTokenStorage()
 		const tokens = expiredAccessAndValidRefresh()
 		await storage.setTokens(tokens.accessToken, tokens.refreshToken)
-		const client = new AuthClient({ serverUrl: 'http://offline.invalid', storage, fetch: offlineFetch })
+		const client = new AuthClient({
+			serverUrl: 'http://offline.invalid',
+			storage,
+			fetch: offlineFetch,
+		})
 
 		await client.initialize()
 
@@ -37,7 +41,11 @@ describe('AUTH-13: offline refresh failure signs the user out', () => {
 		const storage = createMemoryAuthTokenStorage()
 		const tokens = expiredAccessAndValidRefresh()
 		await storage.setTokens(tokens.accessToken, tokens.refreshToken)
-		const client = new AuthClient({ serverUrl: 'http://offline.invalid', storage, fetch: offlineFetch })
+		const client = new AuthClient({
+			serverUrl: 'http://offline.invalid',
+			storage,
+			fetch: offlineFetch,
+		})
 
 		await client.getAccessToken()
 

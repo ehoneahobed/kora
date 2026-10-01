@@ -4,7 +4,8 @@ import { minimalSchema } from '../fixtures/test-schema'
 
 // STORE-8: adapter.execute()/query() must not run inside another caller's open
 // transaction (they bypass the adapter mutex today).
-const ins = 'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)'
+const ins =
+	'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)'
 
 describe('STORE-8 execute/query isolation from open transactions', () => {
 	let adapter: BetterSqlite3Adapter

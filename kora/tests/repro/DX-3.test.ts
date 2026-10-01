@@ -38,7 +38,9 @@ describe('DX-3 docs match the API', () => {
 
 	test('React useRichText signature in docs/api/react.md matches (collectionName, recordId, fieldName, options?)', () => {
 		const src = read('packages/react/src/hooks/use-rich-text.ts')
-		expect(src).toMatch(/useRichText\(\s*collectionName: string,\s*recordId: string,\s*fieldName: string/)
+		expect(src).toMatch(
+			/useRichText\(\s*collectionName: string,\s*recordId: string,\s*fieldName: string/,
+		)
 		const doc = read('docs/api/react.md')
 		expect(doc).not.toMatch(/useRichText\(\s*recordId: string,\s*field: string\s*\)/)
 		expect(doc).not.toMatch(/useRichText\(noteId, 'content'\)/)

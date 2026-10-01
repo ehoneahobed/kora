@@ -11,7 +11,7 @@ import { WebSocketTransport } from '../../src/transport/websocket-transport'
 describe('SEC-8: auth token in WebSocket URL', () => {
 	test('connect() does not place the auth token in the URL', async () => {
 		const urls: string[] = []
-		const Impl = function (url: string): WebSocketLike {
+		const Impl = ((url: string): WebSocketLike => {
 			urls.push(url)
 			const ws: WebSocketLike & { readyState: number } = {
 				readyState: 0,
@@ -27,7 +27,7 @@ describe('SEC-8: auth token in WebSocket URL', () => {
 				ws.onopen?.({})
 			})
 			return ws
-		} as unknown as WebSocketConstructor
+		}) as unknown as WebSocketConstructor
 		const transport = new WebSocketTransport({ WebSocketImpl: Impl })
 		await transport.connect('wss://sync.example.com/kora', { authToken: 'eyJ.secret.jwt' })
 		expect(urls[0]).not.toContain('eyJ.secret.jwt')

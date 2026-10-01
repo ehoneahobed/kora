@@ -37,7 +37,11 @@ describe('SYNC-7: far-future remote op blocks the delivery stream', () => {
 				data: { title: 'from the future' },
 				sequenceNumber: 9_999,
 				nodeId: 'server-legacy-node',
-				timestamp: { wallTime: Date.now() + 24 * 3600_000, logical: 0, nodeId: 'server-legacy-node' },
+				timestamp: {
+					wallTime: Date.now() + 24 * 3600_000,
+					logical: 0,
+					nodeId: 'server-legacy-node',
+				},
 			}
 			await network.server.store.applyRemoteOperation(future)
 

@@ -2,16 +2,40 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDirs": [".", "../packages/test/src"],
+    "rootDirs": [
+      ".",
+      "../packages/test/src"
+    ],
     "paths": {
-      "korajs": ["./src/index.ts"],
-      "korajs/config": ["./src/config.ts"],
-      "korajs/testing": ["./src/testing.ts"],
-      "korajs/vue": ["./src/vue.ts"],
-      "korajs/react": ["./src/react.ts"],
-      "korajs/svelte": ["./src/svelte.ts"],
-      "@korajs/test": ["../packages/test/src/index.ts"]
+      "korajs": [
+        "./src/index.ts"
+      ],
+      "korajs/config": [
+        "./src/config.ts"
+      ],
+      "korajs/testing": [
+        "./src/testing.ts"
+      ],
+      "korajs/vue": [
+        "./src/vue.ts"
+      ],
+      "korajs/react": [
+        "./src/react.ts"
+      ],
+      "korajs/svelte": [
+        "./src/svelte.ts"
+      ],
+      "@korajs/test": [
+        "../packages/test/src/index.ts"
+      ]
     }
   },
-  "include": ["src", "tests", "tests/typecheck"]
+  "include": [
+    "src",
+    "tests",
+    "tests/typecheck"
+  ],
+  "exclude": [
+    "tests/repro"
+  ]
 }

@@ -41,7 +41,7 @@ describe('SEC-9', () => {
 		}
 	})
 
-	test("(b) a string default containing a quote yields valid DDL", async () => {
+	test('(b) a string default containing a quote yields valid DDL', async () => {
 		const schema = defineSchema({
 			version: 1,
 			collections: { notes: { fields: { status: t.string().default("don't know") } } },

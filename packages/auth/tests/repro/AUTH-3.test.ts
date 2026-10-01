@@ -27,9 +27,14 @@ const provider: OAuthProviderConfig = {
 const idpFetch = (async (url: string, init?: RequestInit) => {
 	if (url === provider.tokenUrl) {
 		const code = new URLSearchParams(String(init?.body)).get('code') ?? ''
-		return new Response(JSON.stringify({ access_token: `at:${code.split(':')[0]}` }), { status: 200 })
+		return new Response(JSON.stringify({ access_token: `at:${code.split(':')[0]}` }), {
+			status: 200,
+		})
 	}
-	const who = String((init?.headers as Record<string, string>).Authorization).replace('Bearer at:', '')
+	const who = String((init?.headers as Record<string, string>).Authorization).replace(
+		'Bearer at:',
+		'',
+	)
 	return new Response(
 		JSON.stringify({ sub: `idp-${who}`, email: `${who}@idp.example`, email_verified: true }),
 		{ status: 200 },
@@ -42,11 +47,13 @@ describe('AUTH-3: OAuth state not bound to initiator/purpose', () => {
 			jwtSecret: 'o'.repeat(64),
 			oauth: { providers: [provider], fetch: idpFetch },
 		})
-		const alice = (await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/signup',
-			body: { email: 'alice@example.com', password: 'password-123' },
-		})).body as { data: { user: { id: string }; tokens: { accessToken: string } } }
+		const alice = (
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: 'alice@example.com', password: 'password-123' },
+			})
+		).body as { data: { user: { id: string }; tokens: { accessToken: string } } }
 
 		// 1. Mallory (no Kora session) starts a sign-in flow and authorizes with HER IdP account.
 		const start = (await auth.handleRequest({ method: 'GET', path: '/auth/oauth/acme' })).body as {

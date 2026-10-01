@@ -33,10 +33,12 @@ describe('STORE-13 migrations', () => {
 			version: 2,
 			collections: { items: { fields: { name: t.string(), qty: t.number().default(1) } } },
 			migrations: {
-				2: migrate().backfill('items', (r) => ({ qty: Number(r.qty) * 10 })).backfill('items', () => {
-					if (fail) throw new Error('crash mid-migration')
-					return {}
-				}),
+				2: migrate()
+					.backfill('items', (r) => ({ qty: Number(r.qty) * 10 }))
+					.backfill('items', () => {
+						if (fail) throw new Error('crash mid-migration')
+						return {}
+					}),
 			},
 		})
 		const a1 = createApp({ schema: v2, store: { adapter: 'better-sqlite3', name: path } })
@@ -62,6 +64,8 @@ describe('STORE-13 migrations', () => {
 		await app.ready
 		const ops = await app.getStore().getAllOperations()
 		await app.close()
-		expect(ops.some((o) => o.type === 'update' && (o.data as Record<string, unknown>)?.qty === 5)).toBe(true)
+		expect(
+			ops.some((o) => o.type === 'update' && (o.data as Record<string, unknown>)?.qty === 5),
+		).toBe(true)
 	})
 })

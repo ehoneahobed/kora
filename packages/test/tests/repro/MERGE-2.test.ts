@@ -116,7 +116,12 @@ async function runScenario(
 	const states: Record<string, unknown> = {}
 	for (const d of [...writers, late]) states[d.name] = await snapshot(d, rec.id)
 	const srv = await network.server.store.findRecord('items', rec.id)
-	states.server = { tags: srv?.tags, settings: srv?.settings, meta: srv?.meta, quantity: srv?.quantity }
+	states.server = {
+		tags: srv?.tags,
+		settings: srv?.settings,
+		meta: srv?.meta,
+		quantity: srv?.quantity,
+	}
 	return { states, log }
 }
 

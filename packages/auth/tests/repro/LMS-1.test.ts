@@ -44,15 +44,24 @@ type RefreshFailure = () => Promise<Response>
 
 /** Transient failures: none of these says anything about refresh-token validity. */
 const TRANSIENT_FAILURES: Array<[string, RefreshFailure]> = [
-	['fetch rejects (offline / DNS / TLS / CORS) TypeError', async () => {
-		throw new TypeError('Failed to fetch')
-	}],
-	['request aborted (AbortError, e.g. timeout or page hidden)', async () => {
-		throw new DOMException('The operation was aborted.', 'AbortError')
-	}],
+	[
+		'fetch rejects (offline / DNS / TLS / CORS) TypeError',
+		async () => {
+			throw new TypeError('Failed to fetch')
+		},
+	],
+	[
+		'request aborted (AbortError, e.g. timeout or page hidden)',
+		async () => {
+			throw new DOMException('The operation was aborted.', 'AbortError')
+		},
+	],
 	['HTTP 500 from auth server', async () => json(500, { error: 'Internal error' })],
 	['HTTP 502 HTML from a proxy / load balancer', async () => html(502)],
-	['HTTP 503 with Retry-After', async () => json(503, { error: 'Unavailable' }, { 'Retry-After': '30' })],
+	[
+		'HTTP 503 with Retry-After',
+		async () => json(503, { error: 'Unavailable' }, { 'Retry-After': '30' }),
+	],
 	['HTTP 504 gateway timeout', async () => html(504)],
 	['HTTP 429 rate limited', async () => json(429, { error: 'Too many requests' })],
 	['HTTP 511 captive portal (network authentication required)', async () => html(511)],
@@ -108,16 +117,19 @@ afterEach(() => {
 })
 
 describe('LMS-1: transient refresh failures must not destroy the session', () => {
-	it.each(TRANSIENT_FAILURES)('%s -> refresh token kept, still authenticated', async (_name, failure) => {
-		const h = await authenticatedSessionWithExpiredAccessToken()
-		h.setRefresh(failure)
+	it.each(TRANSIENT_FAILURES)(
+		'%s -> refresh token kept, still authenticated',
+		async (_name, failure) => {
+			const h = await authenticatedSessionWithExpiredAccessToken()
+			h.setRefresh(failure)
 
-		const result = await h.auth.getAccessToken()
+			const result = await h.auth.getAccessToken()
 
-		expect(result).toBeNull()
-		expect(await h.storage.getRefreshToken()).toBe(h.originalRefresh)
-		expect(h.auth.state).toBe('authenticated')
-	})
+			expect(result).toBeNull()
+			expect(await h.storage.getRefreshToken()).toBe(h.originalRefresh)
+			expect(h.auth.state).toBe('authenticated')
+		},
+	)
 
 	it('control: a definitive 401 from the auth server clears tokens and signs out', async () => {
 		const h = await authenticatedSessionWithExpiredAccessToken()
@@ -155,7 +167,12 @@ describe('LMS-1: refresh must be bounded in time (lie-fi)', () => {
 					reject(new DOMException('aborted', 'AbortError')),
 				)
 			})) as typeof fetch
-		const auth = createKoraAuth({ serverUrl: SERVER, storage, fetch: hangingFetch, deviceIdentity: false })
+		const auth = createKoraAuth({
+			serverUrl: SERVER,
+			storage,
+			fetch: hangingFetch,
+			deviceIdentity: false,
+		})
 
 		let settled = false
 		void auth.getAccessToken().finally(() => {
@@ -217,7 +234,12 @@ describe('LMS-1: rotation-safe refresh', () => {
 		const storage = createMemoryAuthTokenStorage()
 		await storage.setTokens(token('access', -60), issued.refreshToken)
 		const fetchFn = server.fetchFor({ loseNextRefreshResponse: true })
-		const auth = createKoraAuth({ serverUrl: SERVER, storage, fetch: fetchFn, deviceIdentity: false })
+		const auth = createKoraAuth({
+			serverUrl: SERVER,
+			storage,
+			fetch: fetchFn,
+			deviceIdentity: false,
+		})
 
 		expect(await auth.getAccessToken()).toBeNull() // response lost
 		const retried = await auth.getAccessToken() // connectivity back
@@ -232,8 +254,18 @@ describe('LMS-1: rotation-safe refresh', () => {
 		const shared = createMemoryAuthTokenStorage()
 		await shared.setTokens(token('access', -60), issued.refreshToken)
 		const fetchFn = server.fetchFor()
-		const tabA = createKoraAuth({ serverUrl: SERVER, storage: shared, fetch: fetchFn, deviceIdentity: false })
-		const tabB = createKoraAuth({ serverUrl: SERVER, storage: shared, fetch: fetchFn, deviceIdentity: false })
+		const tabA = createKoraAuth({
+			serverUrl: SERVER,
+			storage: shared,
+			fetch: fetchFn,
+			deviceIdentity: false,
+		})
+		const tabB = createKoraAuth({
+			serverUrl: SERVER,
+			storage: shared,
+			fetch: fetchFn,
+			deviceIdentity: false,
+		})
 
 		const [a, b] = await Promise.all([tabA.getAccessToken(), tabB.getAccessToken()])
 

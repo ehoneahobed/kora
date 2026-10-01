@@ -30,7 +30,10 @@ describe('DX-8 deploy prompt offers only implemented platforms', () => {
 			const adapter = createDeployAdapter(value as never)
 			const isStub = adapter instanceof StubDeployAdapter
 			const labelledSoon = /coming soon/i.test(option?.label ?? '')
-			expect({ value, isStub, labelledSoon }).not.toMatchObject({ isStub: true, labelledSoon: false })
+			expect({ value, isStub, labelledSoon }).not.toMatchObject({
+				isStub: true,
+				labelledSoon: false,
+			})
 			if (isStub) await expect(adapter.install()).rejects.toThrow(/not implemented/)
 		})
 	}
