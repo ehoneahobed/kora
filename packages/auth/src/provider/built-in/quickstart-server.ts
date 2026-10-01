@@ -12,7 +12,7 @@ import {
 	InMemoryLinkedIdentityStore,
 	type LinkedIdentityStore,
 } from '../oauth/linked-identity-store'
-import { OAuthManager, type OAuthManagerConfig } from '../oauth/oauth-flow'
+import { OAuthManager, type OAuthManagerConfig, generateOAuthBinding } from '../oauth/oauth-flow'
 import {
 	type LinkedIdentity,
 	OAuthError,
@@ -292,6 +292,8 @@ async function handleAuthRequest(
 			body,
 			query: request.query,
 			token,
+			cookieBinding: readCookie(request.headers, OAUTH_BINDING_COOKIE),
+			pathPrefix,
 		})
 	}
 
@@ -340,9 +342,22 @@ async function handleOAuthRequest(params: {
 	body: Record<string, unknown>
 	query: KoraAuthHttpRequest['query']
 	token: string
+	cookieBinding: string | undefined
+	pathPrefix: string
 }): Promise<AuthRouteResponse<unknown>> {
-	const { oauth, routes, userStore, tokenManager, relativePath, method, body, query, token } =
-		params
+	const {
+		oauth,
+		routes,
+		userStore,
+		tokenManager,
+		relativePath,
+		method,
+		body,
+		query,
+		token,
+		cookieBinding,
+		pathPrefix,
+	} = params
 	if (!oauth) {
 		return notFound()
 	}
@@ -355,7 +370,7 @@ async function handleOAuthRequest(params: {
 			return { status: 200, body: { data: identities } }
 		}
 
-		const match = /^\/oauth\/([^/]+)(?:\/(callback|link))?$/.exec(relativePath)
+		const match = /^\/oauth\/([^/]+)(?:\/(callback|link|link\/start))?$/.exec(relativePath)
 		if (!match) {
 			return notFound()
 		}
@@ -363,12 +378,29 @@ async function handleOAuthRequest(params: {
 		const provider = decodeURIComponent(match[1] as string)
 		const action = match[2]
 
+		// Every flow is bound to its purpose and to the initiating client (AUTH-3):
+		// a random binding goes to the client as an HttpOnly cookie (web) and in the
+		// body (native/PKCE apps keep it in memory); only its hash is stored.
 		if (method === 'GET' && !action) {
+			const binding = generateOAuthBinding()
 			const { url, state } = await oauth.manager.getAuthorizationUrl(
 				provider,
 				metadataFromQuery(query),
+				{ purpose: 'signin', binding },
 			)
-			return { status: 200, body: { data: { url, state } } }
+			return flowStarted(url, state, binding, pathPrefix)
+		}
+
+		if (method === 'POST' && action === 'link/start') {
+			const authUser = await requireAuthUser(routes, token)
+			if ('status' in authUser) return authUser
+			const binding = generateOAuthBinding()
+			const { url, state } = await oauth.manager.getAuthorizationUrl(provider, undefined, {
+				purpose: 'link',
+				userId: authUser.id,
+				binding,
+			})
+			return flowStarted(url, state, binding, pathPrefix)
 		}
 
 		if ((method === 'GET' || method === 'POST') && action === 'callback') {
@@ -377,13 +409,14 @@ async function handleOAuthRequest(params: {
 			if (!code || !state) {
 				return { status: 400, body: { error: 'OAuth callback requires code and state.' } }
 			}
-			return completeOAuthSignIn({
+			return await completeOAuthSignIn({
 				oauth,
 				userStore,
 				tokenManager,
 				provider,
 				code,
 				state,
+				binding: readString(body.binding) ?? cookieBinding,
 				deviceId: readString(body.deviceId),
 				devicePublicKey: readString(body.devicePublicKey),
 			})
@@ -397,7 +430,14 @@ async function handleOAuthRequest(params: {
 			if (!code || !state) {
 				return { status: 400, body: { error: 'OAuth linking requires code and state.' } }
 			}
-			return linkOAuthIdentity(oauth, authUser.id, provider, code, state)
+			return await linkOAuthIdentity(
+				oauth,
+				authUser.id,
+				provider,
+				code,
+				state,
+				readString(body.binding) ?? cookieBinding,
+			)
 		}
 
 		if (method === 'DELETE' && action === 'link') {
@@ -430,12 +470,16 @@ async function completeOAuthSignIn(params: {
 	provider: string
 	code: string
 	state: string
+	binding: string | undefined
 	deviceId?: string
 	devicePublicKey?: string
 }): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens; identity: LinkedIdentity }>> {
 	const { oauth, userStore, tokenManager, provider, code, state, deviceId, devicePublicKey } =
 		params
-	const { userInfo, stateMetadata } = await oauth.manager.handleCallback(provider, code, state)
+	const { userInfo } = await oauth.manager.handleCallback(provider, code, state, {
+		purpose: 'signin',
+		binding: params.binding,
+	})
 	const linkedIdentity = await oauth.linkedIdentityStore.findByProvider(
 		userInfo.provider,
 		userInfo.providerId,
@@ -465,7 +509,6 @@ async function completeOAuthSignIn(params: {
 	// Never trust a device id carried in OAuth state metadata (it comes from the
 	// query string of whoever started the flow), and never default to a per-user
 	// id that every browser of the user would share (AUTH-3, AUTH-5).
-	void stateMetadata
 	const resolvedDeviceId = deviceId ?? `dev-${randomUUID()}`
 	try {
 		await userStore.registerDevice({
@@ -535,8 +578,13 @@ async function linkOAuthIdentity(
 	provider: string,
 	code: string,
 	state: string,
+	binding: string | undefined,
 ): Promise<AuthRouteResponse<LinkedIdentity>> {
-	const { userInfo } = await oauth.manager.handleCallback(provider, code, state)
+	const { userInfo } = await oauth.manager.handleCallback(provider, code, state, {
+		purpose: 'link',
+		userId,
+		binding,
+	})
 	const existing = await oauth.linkedIdentityStore.findByProvider(
 		userInfo.provider,
 		userInfo.providerId,
@@ -576,6 +624,34 @@ async function requireAuthUser(
 		}
 	}
 	return toAuthUser(access.user)
+}
+
+const OAUTH_BINDING_COOKIE = 'kora_oauth_binding'
+
+function flowStarted(
+	url: string,
+	state: string,
+	binding: string,
+	pathPrefix: string,
+): AuthRouteResponse<{ url: string; state: string; binding: string }> {
+	return {
+		status: 200,
+		body: { data: { url, state, binding } },
+		headers: {
+			'Set-Cookie': `${OAUTH_BINDING_COOKIE}=${binding}; Path=${pathPrefix}/oauth; Max-Age=600; HttpOnly; Secure; SameSite=Lax`,
+		},
+	}
+}
+
+function readCookie(headers: KoraAuthHttpRequest['headers'], name: string): string | undefined {
+	const raw = headers?.cookie ?? headers?.Cookie
+	const value = Array.isArray(raw) ? raw.join('; ') : raw
+	if (!value) return undefined
+	for (const part of value.split(';')) {
+		const [key, ...rest] = part.trim().split('=')
+		if (key === name) return rest.join('=')
+	}
+	return undefined
 }
 
 function extractBearerToken(headers: KoraAuthHttpRequest['headers']): string {

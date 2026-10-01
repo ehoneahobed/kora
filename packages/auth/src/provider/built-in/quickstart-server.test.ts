@@ -146,6 +146,7 @@ describe('createKoraAuthServer', () => {
 			body: {
 				code: 'code-1',
 				state: start.body.data.state,
+				binding: (start.body.data as { binding: string }).binding,
 				deviceId: 'desktop-1',
 				devicePublicKey: 'public-key',
 			},
@@ -193,6 +194,7 @@ describe('createKoraAuthServer', () => {
 		const callback = await auth.handleRequest({
 			method: 'GET',
 			path: '/auth/oauth/test/callback',
+			headers: { cookie: bindingCookie(start) },
 			query: {
 				code: 'code-1',
 				state: start.body.data.state,
@@ -409,9 +411,105 @@ async function completeOAuthResponse(
 	return auth.handleRequest({
 		method: 'GET',
 		path: '/auth/oauth/test/callback',
+		headers: { cookie: bindingCookie(start) },
 		query: {
 			code: 'code-1',
 			state: start.body.data.state,
 		},
 	})
 }
+
+/** The `kora_oauth_binding=...` pair a browser would send back from the start response. */
+function bindingCookie(start: { headers?: Record<string, string> }): string {
+	return (start.headers?.['Set-Cookie'] ?? '').split(';')[0] ?? ''
+}
+
+describe('OAuth flow binding (AUTH-3)', () => {
+	const profile = { id: 'idp-1', email: 'mallory@example.com', email_verified: true, name: 'M' }
+
+	it('sets an HttpOnly, SameSite binding cookie scoped to the OAuth routes', async () => {
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			oauth: { providers: [TEST_PROVIDER], fetch: createOAuthFetch(profile) },
+		})
+		const start = await auth.handleRequest({ method: 'GET', path: '/auth/oauth/test' })
+		const cookie = start.headers?.['Set-Cookie'] ?? ''
+		expect(cookie).toMatch(/^kora_oauth_binding=[A-Za-z0-9_-]{20,};/)
+		expect(cookie).toContain('HttpOnly')
+		expect(cookie).toContain('SameSite=Lax')
+		expect(cookie).toContain('Path=/auth/oauth')
+	})
+
+	it('refuses a callback that does not carry the initiating client binding (login CSRF)', async () => {
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			oauth: { providers: [TEST_PROVIDER], fetch: createOAuthFetch(profile) },
+		})
+		const start = await auth.handleRequest({ method: 'GET', path: '/auth/oauth/test' })
+		if (!('data' in start.body)) throw new Error('no state')
+		const victim = await auth.handleRequest({
+			method: 'GET',
+			path: '/auth/oauth/test/callback',
+			headers: { cookie: 'kora_oauth_binding=victims-own-binding' },
+			query: { code: 'attacker-code', state: start.body.data.state },
+		})
+		expect(victim.status).toBe(400)
+	})
+
+	it('links only through an authenticated link/start bound to the same user', async () => {
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			oauth: { providers: [TEST_PROVIDER], fetch: createOAuthFetch(profile) },
+		})
+		const alice = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'alice@example.com', password: 'password-123' },
+		})
+		const bob = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'bob@example.com', password: 'password-123' },
+		})
+		const aliceToken = (alice.body as { data: { tokens: { accessToken: string } } }).data.tokens
+			.accessToken
+		const bobToken = (bob.body as { data: { tokens: { accessToken: string } } }).data.tokens
+			.accessToken
+
+		const unauthenticated = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/oauth/test/link/start',
+		})
+		expect(unauthenticated.status).toBe(401)
+
+		const start = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/oauth/test/link/start',
+			headers: { authorization: `Bearer ${bobToken}` },
+		})
+		const flow = (start.body as { data: { state: string; binding: string } }).data
+
+		// Bob's link state cannot be redeemed by Alice, even with the binding.
+		const stolen = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/oauth/test/link',
+			headers: { authorization: `Bearer ${aliceToken}` },
+			body: { code: 'c', state: flow.state, binding: flow.binding },
+		})
+		expect(stolen.status).toBe(400)
+
+		const start2 = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/oauth/test/link/start',
+			headers: { authorization: `Bearer ${bobToken}` },
+		})
+		const flow2 = (start2.body as { data: { state: string; binding: string } }).data
+		const linked = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/oauth/test/link',
+			headers: { authorization: `Bearer ${bobToken}` },
+			body: { code: 'c', state: flow2.state, binding: flow2.binding },
+		})
+		expect(linked.status).toBe(201)
+	})
+})

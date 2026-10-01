@@ -16,6 +16,35 @@ import {
 // InMemoryOAuthStateStore
 // ============================================================================
 
+/**
+ * Reserved metadata key holding the flow binding. Stored inside the state's
+ * metadata so every persisted state store round-trips it without a migration,
+ * and stripped from the metadata handed back to callers.
+ */
+const BINDING_METADATA_KEY = '__kora_oauth_binding'
+
+/** What an OAuth flow is for. A state minted for one purpose is useless for the other. */
+export type OAuthFlowPurpose = 'signin' | 'link'
+
+/** Binding requested when an authorization URL is created (AUTH-3). */
+export interface OAuthFlowBinding {
+	/** The flow purpose. Defaults to `'signin'`. */
+	purpose?: OAuthFlowPurpose
+	/** For `'link'`: the authenticated Kora user starting the flow. */
+	userId?: string
+	/**
+	 * A random secret held only by the initiating client (an HttpOnly cookie on
+	 * the web, memory for native/PKCE). Only its SHA-256 is stored server-side.
+	 */
+	binding?: string
+}
+
+interface StoredBinding {
+	purpose: OAuthFlowPurpose
+	userId?: string
+	bindingHash?: string
+}
+
 /** Default state TTL: 10 minutes */
 const DEFAULT_STATE_TTL_MS = 10 * 60 * 1000
 const PKCE_VERIFIER_BYTES = 32
@@ -123,8 +152,20 @@ export class OAuthManager {
 	async getAuthorizationUrl(
 		providerId: string,
 		metadata?: Record<string, unknown>,
+		flow: OAuthFlowBinding = {},
 	): Promise<{ url: string; state: string }> {
 		const provider = this.getProvider(providerId)
+		const purpose = flow.purpose ?? 'signin'
+		if (purpose === 'link' && !flow.userId) {
+			throw new OAuthStateMismatchError()
+		}
+		const stored: StoredBinding = {
+			purpose,
+			...(flow.userId ? { userId: flow.userId } : {}),
+			...(flow.binding ? { bindingHash: await sha256Base64Url(flow.binding) } : {}),
+		}
+		const userMetadata = { ...(metadata ?? {}) }
+		delete userMetadata[BINDING_METADATA_KEY]
 
 		const state = generateState()
 		const codeVerifier = provider.pkce ? generateCodeVerifier() : undefined
@@ -137,7 +178,7 @@ export class OAuthManager {
 			redirectUri: provider.redirectUri,
 			createdAt: now,
 			expiresAt: now + this.stateTtlMs,
-			metadata,
+			metadata: { ...userMetadata, [BINDING_METADATA_KEY]: stored },
 			codeVerifier,
 		}
 
@@ -164,15 +205,21 @@ export class OAuthManager {
 	 * Validates the state parameter, exchanges the code for tokens,
 	 * and fetches user info.
 	 *
+	 * The state is single-use and is redeemable only for the purpose it was
+	 * minted for, by the same user (for linking) and the same client binding.
+	 * A mismatch is rejected before the code is exchanged.
+	 *
 	 * @param providerId - The OAuth provider
 	 * @param code - The authorization code from the callback
 	 * @param state - The state parameter from the callback
+	 * @param expected - The purpose, user and client binding of this callback
 	 * @returns Tokens and user info from the provider
 	 */
 	async handleCallback(
 		providerId: string,
 		code: string,
 		state: string,
+		expected: OAuthFlowBinding = {},
 	): Promise<{
 		tokens: OAuthTokens
 		userInfo: OAuthUserInfo
@@ -185,6 +232,7 @@ export class OAuthManager {
 		if (!oauthState || oauthState.provider !== providerId) {
 			throw new OAuthStateMismatchError()
 		}
+		await assertBindingMatches(oauthState, expected)
 
 		// Exchange code for tokens
 		const tokens = await this.exchangeCodeForTokens(provider, code, oauthState)
@@ -192,7 +240,7 @@ export class OAuthManager {
 		// Fetch user info
 		const userInfo = await this.fetchUserInfo(provider, tokens.accessToken)
 
-		return { tokens, userInfo, stateMetadata: oauthState.metadata }
+		return { tokens, userInfo, stateMetadata: withoutBinding(oauthState.metadata) }
 	}
 
 	/**
@@ -416,6 +464,64 @@ export function microsoftProvider(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+function readStoredBinding(state: OAuthState): StoredBinding {
+	const raw = state.metadata?.[BINDING_METADATA_KEY]
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+		const value = raw as Record<string, unknown>
+		return {
+			purpose: value.purpose === 'link' ? 'link' : 'signin',
+			...(typeof value.userId === 'string' ? { userId: value.userId } : {}),
+			...(typeof value.bindingHash === 'string' ? { bindingHash: value.bindingHash } : {}),
+		}
+	}
+	// States minted before beta.13 carry no binding: they are sign-in states.
+	return { purpose: 'signin' }
+}
+
+async function assertBindingMatches(state: OAuthState, expected: OAuthFlowBinding): Promise<void> {
+	const stored = readStoredBinding(state)
+	const purpose = expected.purpose ?? 'signin'
+	if (stored.purpose !== purpose) throw new OAuthStateMismatchError()
+	if (purpose === 'link' && (!expected.userId || stored.userId !== expected.userId)) {
+		throw new OAuthStateMismatchError()
+	}
+	if (stored.bindingHash !== undefined) {
+		if (!expected.binding) throw new OAuthStateMismatchError()
+		const presented = await sha256Base64Url(expected.binding)
+		if (!constantTimeEqual(presented, stored.bindingHash)) throw new OAuthStateMismatchError()
+	}
+}
+
+function withoutBinding(
+	metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	if (!metadata) return undefined
+	const copy = { ...metadata }
+	delete copy[BINDING_METADATA_KEY]
+	return Object.keys(copy).length > 0 ? copy : undefined
+}
+
+async function sha256Base64Url(value: string): Promise<string> {
+	const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+	return toBase64Url(new Uint8Array(digest))
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false
+	let diff = 0
+	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+	return diff === 0
+}
+
+/**
+ * Generate a random client binding for an OAuth flow (32 bytes, base64url).
+ */
+export function generateOAuthBinding(): string {
+	const bytes = new Uint8Array(32)
+	globalThis.crypto.getRandomValues(bytes)
+	return toBase64Url(bytes)
+}
 
 function generateState(): string {
 	const bytes = new Uint8Array(32)

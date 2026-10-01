@@ -81,6 +81,12 @@ export interface LinkedOAuthAccount {
 export interface OAuthAuthorizationResult {
 	url: string
 	state: string
+	/**
+	 * Client binding for this flow (AUTH-3). The client keeps it (session storage
+	 * on the web, memory on native) and presents it with the callback; a callback
+	 * carrying someone else's code and state is then refused.
+	 */
+	binding?: string
 }
 
 export interface OAuthAuthorizationOptions {
@@ -104,6 +110,8 @@ export interface OAuthAuthorizationOptions {
 export interface OAuthCallbackParams {
 	code: string
 	state: string
+	/** Flow binding; looked up from the started flow when omitted. */
+	binding?: string
 	deviceId?: string
 	devicePublicKey?: string
 }
@@ -295,6 +303,17 @@ function redirectCurrentWindow(url: string): void {
 		)
 	}
 	globalThis.window.location.assign(url)
+}
+
+const OAUTH_BINDING_PREFIX = 'kora_oauth_binding:'
+
+function getSessionStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null {
+	try {
+		const storage = (globalThis as { sessionStorage?: Storage }).sessionStorage
+		return storage && typeof storage.getItem === 'function' ? storage : null
+	} catch {
+		return null
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -715,11 +734,12 @@ export class AuthClient {
 	 */
 	async completeOAuthSignIn(provider: string, params: OAuthCallbackParams): Promise<AuthUser> {
 		const body = await this.withDeviceIdentity(params)
+		const binding = params.binding ?? this.takeOAuthBinding(params.state)
 		const response = await this.request<OAuthSignInResponse>(
 			`/auth/oauth/${encodeURIComponent(provider)}/callback`,
 			{
 				method: 'POST',
-				body: { ...body },
+				body: { ...body, ...(binding ? { binding } : {}) },
 			},
 		)
 
@@ -735,9 +755,17 @@ export class AuthClient {
 	 */
 	async getOAuthAuthorizationUrl(
 		provider: string,
-		options: OAuthAuthorizationOptions = {},
+		_options: OAuthAuthorizationOptions = {},
 	): Promise<OAuthAuthorizationResult> {
-		return this.createOAuthAuthorization(provider, { ...options, redirect: false })
+		// Linking starts from an authenticated endpoint so the state is bound to
+		// this user and can never be redeemed by anyone else (AUTH-3).
+		const token = await this.requireAccessToken()
+		const result = await this.request<OAuthAuthorizationResult>(
+			`/auth/oauth/${encodeURIComponent(provider)}/link/start`,
+			{ method: 'POST', body: {}, token },
+		)
+		this.rememberOAuthBinding(result)
+		return result
 	}
 
 	/**
@@ -745,11 +773,13 @@ export class AuthClient {
 	 */
 	async linkOAuth(provider: string, params: OAuthCallbackParams): Promise<LinkedOAuthAccount> {
 		const token = await this.requireAccessToken()
+		const binding = params.binding ?? this.takeOAuthBinding(params.state)
 		return this.request<LinkedOAuthAccount>(`/auth/oauth/${encodeURIComponent(provider)}/link`, {
 			method: 'POST',
 			body: {
 				code: params.code,
 				state: params.state,
+				...(binding ? { binding } : {}),
 			},
 			token,
 		})
@@ -1104,12 +1134,42 @@ export class AuthClient {
 		}
 
 		const query = params.toString()
-		return this.request<OAuthAuthorizationResult>(
+		const result = await this.request<OAuthAuthorizationResult>(
 			`/auth/oauth/${encodeURIComponent(provider)}${query ? `?${query}` : ''}`,
 			{
 				method: 'GET',
 			},
 		)
+		this.rememberOAuthBinding(result)
+		return result
+	}
+
+	/** Bindings of flows this client started, by state (survives the redirect on web). */
+	private readonly oauthBindings = new Map<string, string>()
+
+	private rememberOAuthBinding(result: OAuthAuthorizationResult): void {
+		if (!result.binding || !result.state) return
+		this.oauthBindings.set(result.state, result.binding)
+		const session = getSessionStorage()
+		try {
+			session?.setItem(`${OAUTH_BINDING_PREFIX}${result.state}`, result.binding)
+		} catch {
+			// Session storage full or blocked: the in-memory copy still serves native flows.
+		}
+	}
+
+	private takeOAuthBinding(state: string): string | undefined {
+		const inMemory = this.oauthBindings.get(state)
+		this.oauthBindings.delete(state)
+		const session = getSessionStorage()
+		let stored: string | null = null
+		try {
+			stored = session?.getItem(`${OAUTH_BINDING_PREFIX}${state}`) ?? null
+			session?.removeItem(`${OAUTH_BINDING_PREFIX}${state}`)
+		} catch {
+			stored = null
+		}
+		return inMemory ?? stored ?? undefined
 	}
 
 	private async withDeviceIdentity<T extends { deviceId?: string; devicePublicKey?: string }>(
