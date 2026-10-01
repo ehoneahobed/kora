@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1859,6 +1859,126 @@
    ],
    "pr": null,
    "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: applyServerOperation authorizeSideEffect: every cascade/set-null of an untrusted delete is checked against the writer uplink scope (child stored row) before the delete applies; any refusal rejects the whole delete. Decision: integrity judges ALL children in every tenant, but untrusted writers get one generic RESTRICTED rejection (no ids, no counts) for both restrict violations and unauthorized side effects; trusted server deletes keep REFERENTIAL_INTEGRITY. Wired in ClientSession and scoped route-context apply (conditional apply path has no referential side effects)."
+  },
+  {
+   "id": "RT-11",
+   "title": "Blob reference forging: writing a record that references a foreign hash grants read access (hash acts as capability)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-12",
+   "title": "Anonymous node-id hijack via shared kora:anonymous claim owner; forged high seq silently drops victim uploads",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-13",
+   "title": "Cross-tenant dangling child: uplink does not authorize foreign-key targets; owner can never delete parent",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-13.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-14",
+   "title": "Ownership transfer discloses full pre-transfer edit history (historical ops judged on current row)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-15",
+   "title": "Retraction injection via writer previousData (noise in other tenants' delivery logs)",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-15.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-16",
+   "title": "Directional uplink grants bypass resolveSessionScopes ($claims not resolved; fails closed)",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-16.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-17",
+   "title": "Blob requests not rate-limited; cache invalidation triggers full scope rescans per write",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-17.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
+  },
+  {
+   "id": "RT-18",
+   "title": "Revocation listeners are in-process: other server instances keep revoked sessions until token expiry",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-18.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md)."
   }
  ],
  "rejectedProposalPins": {
