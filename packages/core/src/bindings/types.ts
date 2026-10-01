@@ -78,8 +78,12 @@ export interface UseMutationResultBase<TData, TArgs extends unknown[]> {
  * Created by `createKoraAuthSync()` in `@korajs/auth`.
  */
 export interface AuthSyncBinding {
-	/** Returns the access token for sync handshake (empty string when signed out). */
-	auth: () => Promise<{ token: string }>
+	/**
+	 * Returns the access token for sync handshake (empty string when signed out).
+	 * Called with `{ forceRefresh: true }` after the server ended the session with
+	 * `AUTH_EXPIRED` / `AUTH_REVOKED`: refresh instead of returning the cached token.
+	 */
+	auth: (options?: { forceRefresh?: boolean }) => Promise<{ token: string }>
 	/** Resolve whether sync may currently open a transport. Tokens are never used as readiness signals. */
 	resolveSyncState?: () => Promise<AuthSyncState>
 	/** Builds a scope map from the current token and schema. */

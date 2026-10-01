@@ -1,5 +1,5 @@
 import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@korajs/core'
-import { SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
+import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
@@ -26,6 +26,7 @@ import type {
 	HttpSyncResponse,
 	KoraSyncServerConfig,
 	ServerStatus,
+	TerminateSessionsFilter,
 } from '../types'
 import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
 
@@ -127,6 +128,8 @@ export class KoraSyncServer {
 	private deliveryPollTimer: ReturnType<typeof setInterval> | null = null
 	private lastObservedDeliverySequence = 0
 	private deliveryPollInFlight = false
+	/** Unsubscribes from the auth provider's revocation feed (AUTH-11). */
+	private revocationUnsubscribe: (() => void) | null = null
 	/**
 	 * Relay operations a client never acknowledged before it disconnected, buffered by
 	 * client node id so they can be redelivered on its next connection. Bounded per
@@ -201,6 +204,73 @@ export class KoraSyncServer {
 		if (!this.emitter) {
 			this.emitter = new SimpleEventEmitter()
 		}
+
+		this.ensureRevocationSubscribed()
+	}
+
+	/**
+	 * Follow the auth provider's revocation feed, when it has one, so revoking a
+	 * device or user ends its live sessions without any wiring by the app.
+	 */
+	private ensureRevocationSubscribed(): void {
+		if (this.revocationUnsubscribe || !this.auth?.onRevoke) return
+		this.revocationUnsubscribe = this.auth.onRevoke((event) => {
+			this.terminateSessions({
+				...(event.userId !== undefined ? { userId: event.userId } : {}),
+				...(event.deviceId !== undefined ? { deviceId: event.deviceId } : {}),
+			})
+		})
+	}
+
+	/**
+	 * End live sync sessions whose credential was revoked (AUTH-11).
+	 *
+	 * Each matching session receives a retriable `AUTH_REVOKED` (or `AUTH_EXPIRED`)
+	 * error and is closed. The client refreshes its credentials and re-handshakes,
+	 * so the server authenticates it again: a still-valid device reconnects, a
+	 * revoked one is refused. Sessions still in their handshake are refused as soon
+	 * as their principal is known.
+	 *
+	 * `createKoraAuthServer().bindSyncServer(server)` calls this on device revoke,
+	 * sign-out, password reset or change, and admin revoke. A provider exposing
+	 * `onRevoke` (the built-in one does) is followed automatically.
+	 *
+	 * @param filter - `userId` ends every session of that user; with `deviceId`,
+	 *   only that device's sessions. At least one of the two is required.
+	 * @returns The number of established sessions that were closed
+	 *
+	 * @example
+	 * ```typescript
+	 * server.terminateSessions({ userId: 'u1', deviceId: 'laptop' })
+	 * ```
+	 */
+	terminateSessions(filter: TerminateSessionsFilter): number {
+		if (filter.userId === undefined && filter.deviceId === undefined) {
+			throw new KoraError(
+				'terminateSessions needs a userId or a deviceId; refusing to end every session.',
+				'INVALID_TERMINATE_FILTER',
+				{ fix: 'Pass { userId } to end a user, or { userId, deviceId } to end one device.' },
+			)
+		}
+		const code = filter.code ?? 'AUTH_REVOKED'
+		let terminated = 0
+		for (const session of [...this.sessions.values()]) {
+			if (session.terminateIfMatches(filter, code)) terminated++
+		}
+		if (terminated > 0) {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'info',
+				event: 'sessions.terminated',
+				count: terminated,
+				details: {
+					code,
+					...(filter.userId !== undefined ? { userId: filter.userId } : {}),
+					...(filter.deviceId !== undefined ? { deviceId: filter.deviceId } : {}),
+				},
+			})
+		}
+		return terminated
 	}
 
 	private ensureBackgroundTimersStarted(): void {
@@ -482,6 +552,8 @@ export class KoraSyncServer {
 			this.deliveryPollTimer = null
 		}
 		this.orphanedRelaysByNode.clear()
+		this.revocationUnsubscribe?.()
+		this.revocationUnsubscribe = null
 
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
@@ -557,6 +629,7 @@ export class KoraSyncServer {
 	 * @returns The session ID
 	 */
 	handleConnection(transport: ServerTransport): string {
+		this.ensureRevocationSubscribed()
 		// Check max connections
 		if (this.maxConnections > 0 && this.sessions.size >= this.maxConnections) {
 			transport.send({

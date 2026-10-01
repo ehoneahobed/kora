@@ -52,6 +52,16 @@ export interface SyncAuthContext {
 /** Structural `AuthProvider` returned by `toSyncAuthProvider()`. */
 export interface SyncAuthProvider {
 	authenticate(token: string): Promise<SyncAuthContext | null>
+	/**
+	 * Revocation feed (device revoke, sign-out, password reset or change, admin
+	 * revoke). `KoraSyncServer` subscribes automatically and terminates the
+	 * matching live sessions (AUTH-11).
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRevoke?(
+		listener: (event: { userId: string; deviceId?: string }) => void | Promise<void>,
+	): () => void
 }
 
 /**

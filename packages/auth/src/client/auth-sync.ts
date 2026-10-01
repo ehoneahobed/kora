@@ -13,6 +13,11 @@ import type { AuthClientSession, AuthState } from './auth-client'
  */
 export interface AuthSyncClient {
 	getAccessToken(): Promise<string | null>
+	/**
+	 * Force a refresh even if the cached token looks valid locally. Called after
+	 * the sync server ends a session with `AUTH_EXPIRED` / `AUTH_REVOKED`.
+	 */
+	refreshAccessToken?(): Promise<string | null>
 	readonly state?: AuthState
 	onAuthChange?(callback: (state: AuthState) => void): () => void
 	/** Stored session freshness (authenticated-offline support). */
@@ -134,8 +139,13 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 	}
 
 	const binding: AuthSyncBinding = {
-		auth: async () => {
-			const token = await authClient.getAccessToken()
+		auth: async (request) => {
+			// After the server ended the session for an expired or revoked credential,
+			// the cached token is known bad: refresh instead of re-presenting it.
+			const token =
+				request?.forceRefresh && authClient.refreshAccessToken
+					? await authClient.refreshAccessToken()
+					: await authClient.getAccessToken()
 			return { token: token ?? '' }
 		},
 	}

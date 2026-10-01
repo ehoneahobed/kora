@@ -116,6 +116,15 @@ export type SyncSettlementResult =
  */
 export type SyncScopeMap = Record<string, Record<string, unknown>>
 
+/** Options passed to {@link SyncConfig.auth}. */
+export interface SyncAuthRequest {
+	/**
+	 * True when the server ended the previous session because its credential
+	 * expired or was revoked. A cached token must not be reused.
+	 */
+	forceRefresh?: boolean
+}
+
 /**
  * Sync configuration provided by the developer.
  */
@@ -124,8 +133,13 @@ export interface SyncConfig {
 	url: string
 	/** Transport type to use. Defaults to 'websocket'. */
 	transport?: 'websocket' | 'http'
-	/** Auth provider function. Called before each connection attempt. */
-	auth?: () => Promise<{ token: string }>
+	/**
+	 * Auth provider function. Called before each connection attempt. After the
+	 * server ends a session with `AUTH_EXPIRED` or `AUTH_REVOKED` it is called
+	 * with `{ forceRefresh: true }`: return a freshly refreshed token, never the
+	 * cached one the server just refused.
+	 */
+	auth?: (options?: SyncAuthRequest) => Promise<{ token: string }>
 	/** Auth readiness gate. A suspended result prevents transport creation and retries. */
 	authState?: () => Promise<{
 		state: 'loading' | 'signed-out' | 'anonymous' | 'authenticated'

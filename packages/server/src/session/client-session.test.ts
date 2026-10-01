@@ -490,7 +490,10 @@ describe('ClientSession', () => {
 			warn.mockRestore()
 		})
 
-		test('does not warn when the client handshake supplies a sync scope', async () => {
+		test('still warns when only the client handshake supplies a sync scope', async () => {
+			// AUTH-1: a handshake scope only narrows the server grant; it isolates
+			// nothing, because a hostile client simply omits it. With no grant from the
+			// provider every user can still read every unscoped collection.
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 			const auth: AuthProvider = {
 				authenticate: vi.fn().mockResolvedValue({ userId: 'user-1' } satisfies AuthContext),
@@ -512,26 +515,43 @@ describe('ClientSession', () => {
 			})
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
 			warn.mockRestore()
 		})
 
-		test('warns even when schema sync rules are declared but no per-user values are wired', async () => {
+		test('refuses with SCOPE_REQUIRED when schema sync rules are declared but no per-user values are wired', async () => {
 			// Declaring `sync` rules in the schema describes the shape of scoping but
 			// does not by itself produce effective scopes at the session layer — the
 			// per-user values must come from the auth provider. So an app that declared
 			// sync rules yet wired no scope resolver is still fully exposed, and the
 			// guardrail must still fire. This is the highest-value case: the developer
 			// believes they are isolated but are not.
-			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			// AUTH-1: such a session is now refused outright (fail closed) instead of
+			// warned about and served everyone's rows.
 			const auth: AuthProvider = {
 				authenticate: vi.fn().mockResolvedValue({ userId: 'user-1' } satisfies AuthContext),
 			}
+			const store = new MemoryServerStore('server-1')
+			await store.setSchema(scopedGuardrailSchema)
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({
+				sessionId: 'sess-scoped',
+				transport: server,
+				store,
+				auth,
+			})
+			session.start()
+			sendHandshake(client, {
+				authToken: 'valid-token',
+				syncScope: { todos: { userId: 'user-1' } },
+			})
+			await vi.waitFor(() => expect(session.getState()).toBe('closed'))
 
-			await handshakeWith({ auth, schema: scopedGuardrailSchema })
-
-			expect(warn).toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
-			warn.mockRestore()
+			expect(messages).toContainEqual(
+				expect.objectContaining({ type: 'error', code: 'SCOPE_REQUIRED', retriable: false }),
+			)
+			expect(messages.some((m) => m.type === 'handshake-response')).toBe(false)
 		})
 
 		test('does not warn for NoAuthProvider (single-tenant dev/testing)', async () => {

@@ -40,7 +40,7 @@ import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
-import { resolveSessionScopes } from '../scopes/resolve-session-scopes'
+import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import {
 	type ScopeMap,
 	type UplinkAuthorizationResult,
@@ -55,7 +55,7 @@ import {
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type { DeliveredOperation, MaterializedRecord, ServerStore } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
-import type { AuthContext, AuthProvider } from '../types'
+import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import {
 	DEFAULT_MAX_OPERATION_BYTES,
@@ -66,6 +66,22 @@ import {
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+/** setTimeout's largest delay; longer credential lifetimes are re-armed in steps. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+/** Revocations remembered for a session whose handshake has not resolved its principal. */
+const MAX_PENDING_REVOCATIONS = 32
+
+/** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
+export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
+
+function revocationMatches(principal: AuthContext, filter: SessionRevocation): boolean {
+	if (filter.userId === undefined && filter.deviceId === undefined) return false
+	if (filter.userId !== undefined && principal.userId !== filter.userId) return false
+	if (filter.deviceId !== undefined && principal.metadata?.deviceId !== filter.deviceId) {
+		return false
+	}
+	return true
+}
 
 /**
  * Tracks auth providers we have already warned about, so the multi-tenant
@@ -289,6 +305,16 @@ export class ClientSession {
 	private state: SessionState = 'connected'
 	private clientNodeId: string | null = null
 	private authContext: AuthContext | null = null
+	/**
+	 * The context the auth provider returned, kept apart from {@link authContext}
+	 * (which an unauthenticated session also gets, keyed by node id) so revocation
+	 * only ever matches a verified principal.
+	 */
+	private principal: AuthContext | null = null
+	/** Closes the session when its credential expires (AUTH-11). */
+	private expiryTimer: ReturnType<typeof setTimeout> | null = null
+	/** Revocations that arrived while the handshake was still authenticating. */
+	private readonly pendingRevocations: SessionRevocation[] = []
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	private resumeDeltaCursor: DeltaCursor | null = null
@@ -605,6 +631,7 @@ export class ClientSession {
 	close(reason?: string): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
+		this.clearExpiryTimer()
 		this.flushOrphanedRelays()
 
 		if (this.transport.isConnected()) {
@@ -612,6 +639,70 @@ export class ClientSession {
 		}
 
 		this.onClose?.(this.sessionId)
+	}
+
+	/**
+	 * End this session if its verified principal matches a credential revocation
+	 * (AUTH-11): send a retriable `code` error so the client refreshes and
+	 * re-handshakes, then close. A session still authenticating remembers the
+	 * revocation and applies it as soon as its principal is known.
+	 *
+	 * @returns True when the session was closed by this call
+	 */
+	terminateIfMatches(filter: SessionRevocation, code: SessionTerminationCode): boolean {
+		if (this.state === 'closed') return false
+		if (!this.principal) {
+			if (this.state === 'connected' && this.pendingRevocations.length < MAX_PENDING_REVOCATIONS) {
+				this.pendingRevocations.push({ ...filter })
+			}
+			return false
+		}
+		if (!revocationMatches(this.principal, filter)) return false
+		this.terminate(code)
+		return true
+	}
+
+	private terminate(code: SessionTerminationCode): void {
+		const message =
+			code === 'AUTH_EXPIRED'
+				? 'The credential for this sync session expired. Refresh it and reconnect.'
+				: 'The credential for this sync session was revoked. Refresh it and reconnect.'
+		this.sendError(code, message, true)
+		this.close(code === 'AUTH_EXPIRED' ? 'credential expired' : 'credential revoked')
+	}
+
+	/**
+	 * Arm the expiry timer from `AuthContext.expiresAt`. Returns false when the
+	 * credential has already expired (the caller refuses the handshake).
+	 */
+	private armExpiryTimer(expiresAt: number | undefined): boolean {
+		this.clearExpiryTimer()
+		if (expiresAt === undefined || !Number.isFinite(expiresAt)) return true
+		const remaining = expiresAt - Date.now()
+		if (remaining <= 0) return false
+		this.expiryTimer = setTimeout(
+			() => {
+				this.expiryTimer = null
+				if (this.state === 'closed') return
+				if (Date.now() >= expiresAt) {
+					this.terminate('AUTH_EXPIRED')
+				} else {
+					this.armExpiryTimer(expiresAt)
+				}
+			},
+			Math.min(remaining, MAX_TIMER_DELAY_MS),
+		)
+		// A pending expiry must not keep a Node process alive on its own.
+		const timer = this.expiryTimer as { unref?: () => void }
+		timer.unref?.()
+		return true
+	}
+
+	private clearExpiryTimer(): void {
+		if (this.expiryTimer !== null) {
+			clearTimeout(this.expiryTimer)
+			this.expiryTimer = null
+		}
 	}
 
 	// --- Getters ---
@@ -834,6 +925,29 @@ export class ClientSession {
 				this.close('node id claimed by another user')
 				return
 			}
+			// A revocation that landed while this handshake was authenticating applies now.
+			if (this.pendingRevocations.some((filter) => revocationMatches(context, filter))) {
+				this.pendingRevocations.length = 0
+				this.sendError(
+					'AUTH_REVOKED',
+					'The credential for this sync session was revoked. Refresh it and reconnect.',
+					true,
+				)
+				this.close('credential revoked')
+				return
+			}
+			this.pendingRevocations.length = 0
+			// The session must not outlive the credential that opened it (AUTH-11).
+			if (!this.armExpiryTimer(context.expiresAt)) {
+				this.sendError(
+					'AUTH_EXPIRED',
+					'The credential presented at handshake has expired. Refresh it and reconnect.',
+					true,
+				)
+				this.close('credential expired')
+				return
+			}
+			this.principal = context
 			this.authContext = context
 			this.state = 'authenticated'
 		}
@@ -848,10 +962,28 @@ export class ClientSession {
 		const uplinkAuthScopes = directionalScopesConfigured
 			? (this.authContext?.uplinkScopes ?? this.authContext?.scopes ?? {})
 			: this.authContext?.scopes
-		const rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
-			handshakeScope: msg.syncScope,
-			authScopes: downlinkAuthScopes,
-		})
+		// A real auth provider that grants nothing for a schema-scoped collection is
+		// refused, never handed the scope the client asked for (AUTH-1). A schemaless
+		// server has no scoped collections to protect, so it keeps the provider's
+		// (absent) grant as "unscoped" and the multi-tenant warning below.
+		const authenticated =
+			this.auth !== null &&
+			!(this.auth instanceof NoAuthProvider) &&
+			this.store.getSchema() !== null
+		let rawResolvedDownlinkScopes: ReturnType<typeof resolveSessionScopes>
+		try {
+			rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
+				handshakeScope: msg.syncScope,
+				authScopes: downlinkAuthScopes,
+				authenticated,
+				onUnresolved: 'throw',
+			})
+		} catch (error) {
+			if (!(error instanceof ScopeRequiredError)) throw error
+			this.sendError('SCOPE_REQUIRED', error.message, false)
+			this.close('sync scope required')
+			return
+		}
 		const rawResolvedUplinkScopes = directionalScopesConfigured
 			? uplinkAuthScopes
 			: rawResolvedDownlinkScopes
@@ -898,7 +1030,14 @@ export class ClientSession {
 			}
 		}
 
-		warnIfMultiTenantWithoutScopes(this.auth, resolvedDownlinkScopes, this.store.getSchema())
+		// Judge the provider's own grant: with `authenticated`, the resolved map is never
+		// empty-handed, but a provider that granted nothing still shares every unscoped
+		// collection across tenants.
+		warnIfMultiTenantWithoutScopes(
+			this.auth,
+			authenticated ? downlinkAuthScopes : resolvedDownlinkScopes,
+			this.store.getSchema(),
+		)
 
 		if (msg.syncQueries && msg.syncQueries.length > 0) {
 			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)
@@ -1657,6 +1796,7 @@ export class ClientSession {
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
+		this.clearExpiryTimer()
 		this.flushOrphanedRelays()
 		this.emitter?.emit({ type: 'sync:disconnected', reason: 'transport closed' })
 		this.onClose?.(this.sessionId)

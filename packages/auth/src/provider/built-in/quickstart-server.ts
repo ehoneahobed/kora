@@ -134,7 +134,9 @@ export interface KoraAuthServer {
 	/**
 	 * End live sync sessions when their credentials are revoked (AUTH-11).
 	 * Requires a sync server exposing `terminateSessions({ userId, deviceId })`.
-	 * Returns an unsubscribe function.
+	 * A `KoraSyncServer` constructed with this server's `auth` provider already
+	 * follows its revocations; call this for a server built with a wrapping or
+	 * custom provider. Binding both is harmless. Returns an unsubscribe function.
 	 */
 	bindSyncServer(server: SyncSessionTerminator): () => void
 }

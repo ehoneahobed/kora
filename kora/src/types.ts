@@ -103,8 +103,12 @@ export interface SyncOptions {
 	url: string
 	/** Transport type. Defaults to 'websocket'. */
 	transport?: 'websocket' | 'http'
-	/** Auth provider function. Called before each connection attempt. */
-	auth?: () => Promise<{ token: string }>
+	/**
+	 * Auth provider function. Called before each connection attempt, with
+	 * `{ forceRefresh: true }` after the server ended a session because its
+	 * credential expired or was revoked (return a freshly refreshed token then).
+	 */
+	auth?: (options?: { forceRefresh?: boolean }) => Promise<{ token: string }>
 	/**
 	 * Pre-built auth binding from `createKoraAuthSync({ authClient, schema })`.
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
