@@ -367,6 +367,20 @@ export function createSampleEvent<T extends KoraEventType>(
 			dbName: 'kora-db',
 			message: 'Another runtime is already using this database name',
 		},
+		'store:storage-blocked': {
+			type: 'store:storage-blocked',
+			dbName: 'kora-db',
+			resource: 'pool',
+			state: 'waiting',
+			message: 'Waiting for another holder of the OPFS pool',
+		},
+		'store:storage-migrated': {
+			type: 'store:storage-migrated',
+			dbName: 'kora-db',
+			from: 'legacy-opfs-pool',
+			to: 'opfs',
+			message: 'Moved to its own OPFS pool',
+		},
 		'replay:completed': {
 			type: 'replay:completed',
 			targetOperationId: 'op-target',

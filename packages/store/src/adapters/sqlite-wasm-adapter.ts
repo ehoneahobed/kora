@@ -1,11 +1,15 @@
 import { generateFullDDL } from '@korajs/core'
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
-import { AdapterError, StorageDurabilityError, StoreNotOpenError } from '../errors'
+import {
+	AdapterError,
+	BridgeTerminatedError,
+	StorageDurabilityError,
+	StoreNotOpenError,
+} from '../errors'
 import {
 	FollowerBroadcastBridge,
-	TransactionSerializingWorkerBridge,
+	type TabStorageSession,
 	acquireTabStorageSession,
-	startLeaderRpcRelay,
 } from '../multi-tab/tab-storage'
 import type {
 	MigrationPlan,
@@ -14,11 +18,36 @@ import type {
 	StorageOpenState,
 	Transaction,
 } from '../types'
+import { restoreDumpStatements } from './database-dump'
+import type { DatabaseDump } from './database-dump'
 import { Mutex } from './sqlite-wasm-channel'
-import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
+import type {
+	WebWorkerBridge,
+	WorkerBridge,
+	WorkerRequest,
+	WorkerResponse,
+	WorkerSendOptions,
+	WorkerStatusEvent,
+} from './sqlite-wasm-channel'
+import { deleteFromIndexedDB, loadDumpFromIndexedDB } from './sqlite-wasm-persistence'
+import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
 
 type WorkerSuccessResponse = Extract<WorkerResponse, { type: 'success' }>
 let warnedSharedWorkerDeprecated = false
+
+/** Per-request options for {@link SqliteWasmAdapter.execute} and `query`. */
+export interface StorageRequestOptions {
+	/**
+	 * Stop waiting for the response. The leader may still apply a write that
+	 * already reached it; retry with the same `requestId` to stay idempotent.
+	 */
+	signal?: AbortSignal
+	/**
+	 * Stable id for this request. A follower tab's retry with the same id is
+	 * answered from the leader's response cache instead of being applied twice.
+	 */
+	requestId?: string
+}
 
 /**
  * Options for creating a SqliteWasmAdapter.
@@ -31,7 +60,7 @@ export interface SqliteWasmAdapterOptions {
 	bridge?: WorkerBridge
 
 	/**
-	 * Database name for persistence. Used as the OPFS file name or IDB key.
+	 * Database name for persistence. Each database gets its own OPFS pool.
 	 */
 	dbName?: string
 
@@ -75,19 +104,59 @@ export interface SqliteWasmAdapterOptions {
 	deferOpenDurabilityCheck?: boolean
 
 	/**
-	 * When set, storage diagnostics are emitted here: `store:opfs-unavailable` when
-	 * persistence silently degraded to a non-persistent in-memory database, and
-	 * `store:db-name-collision` when another runtime on this origin was already
-	 * using this database name.
+	 * Release storage ownership when the page is frozen or hidden into the
+	 * back/forward cache (`freeze` / `pagehide`), so a visible tab can take over
+	 * instead of waiting on a tab that cannot run; ownership is re-acquired on
+	 * `resume` / `pageshow`. Defaults to true.
+	 */
+	releaseOnFreeze?: boolean
+
+	/**
+	 * When set, storage diagnostics are emitted here: `store:opfs-unavailable`,
+	 * `store:durability-lost`, `store:storage-blocked` (another holder has the
+	 * storage; the open waits), `store:storage-migrated` and
+	 * `store:db-name-collision`.
 	 */
 	emitter?: KoraEventEmitter
+
+	/**
+	 * @internal Used by the IndexedDB adapter: open an in-memory database that
+	 * never touches OPFS (the IndexedDB adapter persists snapshots itself).
+	 */
+	storage?: 'opfs' | 'memory'
+
+	/**
+	 * @internal Do not read or write the storage manifest (the IndexedDB adapter's
+	 * inner database and its one-shot OPFS reader manage the manifest themselves).
+	 */
+	skipBackendRecord?: boolean
+}
+
+interface Gate {
+	promise: Promise<void>
+	open(): void
+}
+
+function createGate(): Gate {
+	let open: () => void = () => {}
+	const promise = new Promise<void>((resolve) => {
+		open = resolve
+	})
+	return { promise, open }
 }
 
 /**
  * SQLite WASM adapter that communicates with a SQLite instance through a WorkerBridge.
  *
- * In browsers, the bridge is backed by a Web Worker running SQLite WASM with OPFS persistence.
- * In Node.js tests, the bridge is backed by MockWorkerBridge wrapping better-sqlite3.
+ * In browsers, one tab per database (the leader) runs a dedicated worker that
+ * owns the database's OPFS pool; other tabs reach that worker over a
+ * BroadcastChannel. In Node.js tests, the bridge is backed by MockWorkerBridge
+ * wrapping better-sqlite3.
+ *
+ * Storage is durable or loud, never silently in memory (W8a): another holder of
+ * the storage makes the open wait (reported with `store:storage-blocked`); only a
+ * runtime without OPFS SAH support gets a non-durable database, which refuses
+ * writes unless the app opted in with `allowNonDurable`.
  *
  * @example
  * ```typescript
@@ -101,6 +170,8 @@ export interface SqliteWasmAdapterOptions {
  */
 export class SqliteWasmAdapter implements StorageAdapter {
 	private bridge: WorkerBridge | null = null
+	/** The dedicated worker this tab runs while it is the database's leader. */
+	private ownWorker: WebWorkerBridge | null = null
 	private opened = false
 	private readonly mutex = new Mutex()
 	private readonly injectedBridge: WorkerBridge | undefined
@@ -109,14 +180,22 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly workerResponseTimeoutMs: number
 	private readonly dbName: string
 	private readonly emitter: KoraEventEmitter | undefined
-	private tabSession: Awaited<ReturnType<typeof acquireTabStorageSession>> | null = null
+	private tabSession: TabStorageSession | null = null
 	private readonly emitNonPersistentDiagnostic: boolean
 	private storageOpenState: StorageOpenState | null = null
 	/** Retained so a follower promoted to leader can re-open its own worker. */
 	private schema: SchemaDefinition | null = null
 	private promoting = false
+	private closing = false
+	private suspended = false
+	/** Requests wait here while leadership changes hands (promotion, resume). */
+	private gate: Gate | null = null
+	private removeLifecycleListeners: (() => void) | null = null
 	private readonly allowNonDurable: boolean
 	private readonly deferOpenDurabilityCheck: boolean
+	private readonly releaseOnFreeze: boolean
+	private readonly storage: 'opfs' | 'memory'
+	private readonly skipBackendRecord: boolean
 	/** Set when this adapter lost (or never had) durable storage; writes are refused. */
 	private durabilityLoss: { phase: 'open' | 'promotion'; reason: string } | null = null
 
@@ -130,6 +209,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.emitNonPersistentDiagnostic = options.emitNonPersistentDiagnostic ?? true
 		this.allowNonDurable = options.allowNonDurable ?? false
 		this.deferOpenDurabilityCheck = options.deferOpenDurabilityCheck ?? false
+		this.releaseOnFreeze = options.releaseOnFreeze ?? true
+		this.storage = options.storage ?? 'opfs'
+		this.skipBackendRecord = options.skipBackendRecord ?? false
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
@@ -146,11 +228,19 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 		if (this.workerUrl) {
 			this.warnSharedWorkerDeprecated()
-			await this.openDurableWorkerBridge(schema)
-			const response = await this.openCurrentBridge(ddlStatements)
-			this.reportStorageMode(response.data)
-			this.enforceDurability('open')
-			this.opened = true
+			this.schema = schema
+			try {
+				const response = await this.attachAndOpen(ddlStatements)
+				this.reportStorageMode(response.data)
+				this.enforceDurability('open')
+				await this.afterLeaderOpen(response.data)
+				this.opened = true
+			} catch (error) {
+				// A failed open must not keep the worker, the OPFS pool or the leader
+				// lock for the rest of the page's life (NEW-STORE-8).
+				await this.teardown()
+				throw error
+			}
 			return
 		}
 		throw new AdapterError(
@@ -159,30 +249,37 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		)
 	}
 
-	private async openDurableWorkerBridge(schema: SchemaDefinition): Promise<void> {
-		if (!this.workerUrl) {
+	/**
+	 * Join the database as leader (own worker) or follower (RPC to the leader's
+	 * worker), then open it. The open waits, without a timeout, while another
+	 * holder still has the storage; the worker reports that as a blocking state.
+	 */
+	private async attachAndOpen(ddlStatements: string[]): Promise<WorkerSuccessResponse> {
+		const workerUrl = this.workerUrl
+		if (!workerUrl) {
 			throw new AdapterError('Durable SQLite WASM storage requires workerUrl.')
 		}
-
-		this.schema = schema
-		this.tabSession = await acquireTabStorageSession(this.dbName, {
+		const session = await acquireTabStorageSession(this.dbName, {
 			onPromote: () => {
 				void this.promoteToLeader()
 			},
 		})
-		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+		this.tabSession = session
 
-		if (this.tabSession.role === 'leader') {
-			const workerBridge = new TransactionSerializingWorkerBridge(
-				new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs),
-			)
-			this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
-			this.bridge = workerBridge
-			return
+		if (session.role === 'leader') {
+			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+			const worker = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
+				onEvent: (event) => this.onWorkerEvent(event),
+			})
+			this.ownWorker = worker
+			this.bridge = worker
+			const response = await this.openLeaderWorker(worker, ddlStatements)
+			this.installLifecycleListeners()
+			return response
 		}
 
 		const followerBridge = new FollowerBroadcastBridge(
-			this.tabSession.channelName,
+			session.channelName,
 			this.workerResponseTimeoutMs,
 		)
 		this.bridge = followerBridge
@@ -197,24 +294,159 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		})
 		// Readiness handshake: give the leader relay a moment to answer before the
 		// first RPC, so a follower opened during a leader's startup race retries the
-		// handshake instead of firing into the void and waiting out the full timeout.
+		// handshake instead of firing into the void.
 		await followerBridge.waitForLeader()
+		this.installLifecycleListeners()
+		return this.checkedOpen(followerBridge, ddlStatements)
 	}
 
-	private async openCurrentBridge(ddlStatements: string[]): Promise<WorkerSuccessResponse> {
-		const response = await this.sendRequest({
-			id: 0,
-			type: 'open',
-			ddlStatements,
-			dbName: this.dbName,
-		})
+	/** Open the database in this tab's own worker and start serving followers. */
+	private async openLeaderWorker(
+		worker: WebWorkerBridge,
+		ddlStatements: string[],
+	): Promise<WorkerSuccessResponse> {
+		const pending = this.checkedOpen(worker, ddlStatements)
+		// Posted after the open so follower requests queue behind it in the worker.
+		worker.post({ id: 0, type: 'serve', channelName: this.tabSession?.channelName ?? '' })
+		return pending
+	}
+
+	private async checkedOpen(
+		bridge: WorkerBridge,
+		ddlStatements: string[],
+	): Promise<WorkerSuccessResponse> {
+		const response = await bridge.send(
+			{
+				id: 0,
+				type: 'open',
+				ddlStatements,
+				dbName: this.dbName,
+				...(this.storage === 'memory' ? { storage: 'memory' as const } : {}),
+			},
+			undefined,
+			{ timeoutMs: Number.POSITIVE_INFINITY },
+		)
 		if (response.type === 'error') {
 			throw new AdapterError(`Failed to open database: ${response.message}`, {
 				code: response.code,
 				dbName: this.dbName,
+				...(response.context ?? {}),
 			})
 		}
 		return response
+	}
+
+	private async openCurrentBridge(ddlStatements: string[]): Promise<WorkerSuccessResponse> {
+		const bridge = this.bridge
+		if (!bridge) throw new StoreNotOpenError()
+		return this.checkedOpen(bridge, ddlStatements)
+	}
+
+	private onWorkerEvent(event: WorkerStatusEvent): void {
+		if (!this.emitter) return
+		const holder =
+			event.resource === 'legacy-pool'
+				? 'the shared OPFS pool used by older Kora versions (a tab running an older version of this app may still be open)'
+				: 'another tab or worker that is still releasing it'
+		if (event.kind === 'storage-blocked') {
+			this.emitter.emit({
+				type: 'store:storage-blocked',
+				dbName: this.dbName,
+				resource: event.resource,
+				state: 'waiting',
+				message: `Database "${this.dbName}" is waiting for ${holder}. Close other tabs of this app if this persists; Kora will not fall back to non-durable storage.`,
+			})
+			return
+		}
+		this.emitter.emit({
+			type: 'store:storage-blocked',
+			dbName: this.dbName,
+			resource: event.resource,
+			state: 'resolved',
+			waitedMs: event.waitedMs,
+			message: `Database "${this.dbName}" obtained its storage after waiting ${event.waitedMs}ms.`,
+		})
+	}
+
+	/**
+	 * Leader-only bookkeeping after a durable open: report a legacy-pool
+	 * migration, move an IndexedDB-held copy into OPFS explicitly (never two
+	 * disjoint copies), and record OPFS as this database's backend.
+	 */
+	private async afterLeaderOpen(data: unknown): Promise<void> {
+		if (!this.ownWorker || this.skipBackendRecord || this.storageOpenState?.persistent !== true) {
+			return
+		}
+		const info = (typeof data === 'object' && data !== null ? data : {}) as {
+			migratedFromLegacy?: boolean
+		}
+		if (info.migratedFromLegacy === true) {
+			this.emitter?.emit({
+				type: 'store:storage-migrated',
+				dbName: this.dbName,
+				from: 'legacy-opfs-pool',
+				to: 'opfs',
+				message: `Database "${this.dbName}" moved from the shared pre-1.0 OPFS pool into its own pool.`,
+			})
+		}
+		if (!isManifestAvailable()) return
+
+		let recordedBackend: string | null = null
+		try {
+			recordedBackend = (await readManifestRecord(this.dbName))?.backend ?? null
+		} catch (error) {
+			console.warn(`[kora] Could not read the storage manifest for "${this.dbName}":`, error)
+		}
+		if (recordedBackend === 'indexeddb') {
+			// The authoritative copy is in IndexedDB (an earlier session ran without
+			// OPFS). Move it here before anything reads or writes; a failure fails
+			// the open instead of showing the older OPFS copy.
+			const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
+			if (dump) {
+				await this.applyDumpThroughWorker(this.ownWorker, dump)
+			}
+			this.emitter?.emit({
+				type: 'store:storage-migrated',
+				dbName: this.dbName,
+				from: 'indexeddb',
+				to: 'opfs',
+				message: `Database "${this.dbName}" moved from IndexedDB into OPFS.`,
+			})
+		}
+		try {
+			await recordDatabase({
+				dbName: this.dbName,
+				backend: 'opfs',
+				...(this.storageOpenState.poolName ? { poolName: this.storageOpenState.poolName } : {}),
+			})
+			if (recordedBackend === 'indexeddb') {
+				await deleteFromIndexedDB(this.dbName)
+			}
+		} catch (error) {
+			console.warn(`[kora] Could not update the storage manifest for "${this.dbName}":`, error)
+		}
+	}
+
+	private async applyDumpThroughWorker(worker: WorkerBridge, dump: DatabaseDump): Promise<void> {
+		const check = async (request: WorkerRequest, what: string): Promise<void> => {
+			const response = await worker.send(request)
+			if (response.type === 'error') {
+				throw new AdapterError(`${what} failed: ${response.message}`, { dbName: this.dbName })
+			}
+		}
+		await check({ id: 0, type: 'begin' }, 'BEGIN IndexedDB import')
+		try {
+			for (const statement of restoreDumpStatements(dump)) {
+				await check(
+					{ id: 0, type: 'execute', sql: statement.sql, params: statement.params },
+					'IndexedDB import',
+				)
+			}
+			await check({ id: 0, type: 'commit' }, 'COMMIT IndexedDB import')
+		} catch (error) {
+			await worker.send({ id: 0, type: 'rollback' }).catch(() => undefined)
+			throw error
+		}
 	}
 
 	/**
@@ -228,7 +460,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		if (!this.emitNonPersistentDiagnostic || !this.emitter || !this.storageOpenState) {
 			return
 		}
-		if (this.storageOpenState.persistent === false) {
+		if (this.storageOpenState.persistent === false && this.storage === 'opfs') {
 			const reason = this.storageOpenState.fallbackReason ?? 'unsupported'
 			this.emitter.emit({
 				type: 'store:opfs-unavailable',
@@ -244,23 +476,24 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	}
 
 	/**
-	 * Durable or loud, never silent (NEW-STORE-6, interim). When the open or a
-	 * promotion ended on non-persistent storage and the app did not opt into that,
-	 * emit the blocking `store:durability-lost` event and refuse every later write.
-	 * A bridge that reports no mode (the Node mock) is not judged.
+	 * Durable or loud, never silent (NEW-STORE-6). When the open or a promotion
+	 * ended on non-persistent storage and the app did not opt into that, emit the
+	 * blocking `store:durability-lost` event and refuse every later write. A
+	 * bridge that reports no mode (the Node mock) is not judged.
 	 */
 	private enforceDurability(
 		phase: 'open' | 'promotion',
 		failure?: { reason: 'open-failed'; message: string },
 	): void {
 		if (this.allowNonDurable) return
-		if (phase === 'open' && this.deferOpenDurabilityCheck) return
+		if (phase === 'open' && this.deferOpenDurabilityCheck && !failure) return
 		let reason: 'lock-conflict' | 'timeout' | 'unsupported' | 'open-failed'
 		if (failure) {
 			reason = failure.reason
 		} else if (this.storageOpenState?.persistent === false) {
 			reason = this.storageOpenState.fallbackReason ?? 'unsupported'
 		} else {
+			this.durabilityLoss = null
 			return
 		}
 		this.durabilityLoss = { phase, reason }
@@ -297,91 +530,253 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		)
 	}
 
+	/**
+	 * Close the database. A leader closes the database file and releases the OPFS
+	 * pool inside its worker, terminates the worker, and only then releases the
+	 * tab leader lock, so the next leader never races a still-running worker for
+	 * the file handles (NEW-STORE-10). A follower just leaves.
+	 */
 	async close(): Promise<void> {
-		if (!this.bridge) return
-
+		if (!this.bridge && !this.tabSession) return
+		this.closing = true
 		try {
-			await this.sendRequest({ id: 0, type: 'close' })
-		} finally {
-			this.tabSession?.stopRelay?.()
-			this.tabSession?.cancelPromotionWatch?.()
-			if (this.tabSession?.releaseLock) {
-				await this.tabSession.releaseLock()
+			if (this.injectedBridge && this.bridge) {
+				await this.bridge.send({ id: 0, type: 'close' })
+			} else if (this.ownWorker && !this.ownWorker.isTerminated()) {
+				const response = await this.ownWorker
+					.send({ id: 0, type: 'close' }, undefined, { timeoutMs: 5000 })
+					.catch((error: unknown) => ({
+						id: 0,
+						type: 'error' as const,
+						message: error instanceof Error ? error.message : String(error),
+						code: 'CLOSE_FAILED',
+					}))
+				if (response.type === 'error') {
+					// Terminating the worker below still releases the pool.
+					console.warn(`[kora] Closing "${this.dbName}" in its worker failed:`, response.message)
+				}
 			}
-			this.tabSession = null
-			this.bridge.terminate()
-			this.bridge = null
-			this.opened = false
+		} finally {
+			await this.teardown()
+			this.closing = false
 		}
 	}
 
 	/**
+	 * Release everything this adapter holds, in ownership order: lifecycle
+	 * listeners, then the worker (which holds the OPFS pool and its Web Lock),
+	 * then the tab leader lock or queued promotion request.
+	 */
+	private async teardown(): Promise<void> {
+		this.removeLifecycleListeners?.()
+		this.removeLifecycleListeners = null
+		const session = this.tabSession
+		this.tabSession = null
+		session?.stopRelay?.()
+		this.bridge?.terminate()
+		this.bridge = null
+		this.ownWorker = null
+		if (session) {
+			if (session.releaseLock) {
+				await session.releaseLock()
+			}
+			session.cancelPromotionWatch?.()
+		}
+		this.opened = false
+		this.suspended = false
+		const gate = this.gate
+		this.gate = null
+		gate?.open()
+	}
+
+	/**
 	 * Promotes a follower to leader after the previous leader released the storage
-	 * lock (its tab closed or crashed). The lock is only granted once the old leader
-	 * is gone, so opening our own worker here is safe from the OPFS single-writer
-	 * rule. In-flight follower RPCs are rejected and left to the caller / reactive
-	 * layer to retry against the new leader.
+	 * lock (its tab closed, crashed, or suspended on freeze). The new worker waits
+	 * on the pool's Web Lock and handles, so it never races the previous worker.
+	 * Requests issued during the hand-off wait for it; requests that were in
+	 * flight to the old leader fail with a retriable `BridgeTerminatedError`.
 	 */
 	private async promoteToLeader(): Promise<void> {
-		if (this.promoting || !this.opened || this.workerUrl === undefined || this.schema === null) {
+		if (
+			this.promoting ||
+			this.closing ||
+			!this.opened ||
+			this.workerUrl === undefined ||
+			this.schema === null
+		) {
 			return
 		}
 		this.promoting = true
+		const gate = createGate()
+		this.gate = gate
 
-		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
-		const workerBridge = new TransactionSerializingWorkerBridge(
-			new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs),
-		)
-
-		const previousBridge = this.bridge
-		this.bridge = workerBridge
-		if (this.tabSession) {
-			this.tabSession.role = 'leader'
-			this.tabSession.stopRelay = startLeaderRpcRelay(this.tabSession.channelName, workerBridge)
-		}
-		previousBridge?.terminate()
-
-		// Re-open against our own worker. DDL is idempotent, and the OPFS data the old
-		// leader persisted is now readable by this worker.
-		const ddlStatements = generateFullDDL(this.schema)
-		let response: WorkerResponse
 		try {
-			response = await this.sendRequest({ id: 0, type: 'open', ddlStatements, dbName: this.dbName })
-		} catch (error) {
-			response = {
-				id: 0,
-				type: 'error',
-				message: error instanceof Error ? error.message : String(error),
-				code: 'PROMOTION_OPEN_FAILED',
+			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+			if (this.closing || !this.opened) return
+			const worker = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs, {
+				onEvent: (event) => this.onWorkerEvent(event),
+			})
+			const previousBridge = this.bridge
+			this.bridge = worker
+			this.ownWorker = worker
+			if (this.tabSession) {
+				this.tabSession.role = 'leader'
 			}
+			previousBridge?.terminate()
+
+			// Re-open against our own worker. DDL is idempotent, and the OPFS data the
+			// old leader persisted is readable once its worker is gone.
+			const ddlStatements = generateFullDDL(this.schema)
+			let response: WorkerSuccessResponse
+			try {
+				response = await this.openLeaderWorker(worker, ddlStatements)
+			} catch (error) {
+				// The promoted worker could not obtain durable storage. Never let it
+				// run silently in memory.
+				this.storageOpenState = { persistent: false, mode: 'memory' }
+				this.enforceDurability('promotion', {
+					reason: 'open-failed',
+					message: error instanceof Error ? error.message : String(error),
+				})
+				return
+			}
+			this.storageOpenState = parseStorageOpenState(response.data) ?? this.storageOpenState
+			this.enforceDurability('promotion')
+			try {
+				await this.afterLeaderOpen(response.data)
+			} catch (error) {
+				this.enforceDurability('promotion', {
+					reason: 'open-failed',
+					message: error instanceof Error ? error.message : String(error),
+				})
+			}
+		} finally {
+			this.promoting = false
+			if (this.gate === gate) this.gate = null
+			gate.open()
 		}
-		// The promoted worker may not have obtained the OPFS pool (another database
-		// or app on the origin holds it). Never let it run silently in memory.
-		if (response.type === 'error') {
-			this.storageOpenState = { persistent: false, mode: 'memory' }
-			this.enforceDurability('promotion', { reason: 'open-failed', message: response.message })
-			return
-		}
-		this.storageOpenState = parseStorageOpenState(response.data) ?? this.storageOpenState
-		this.enforceDurability('promotion')
 	}
 
-	async execute(sql: string, params?: unknown[]): Promise<void> {
+	/**
+	 * Page Lifecycle: a frozen or bfcached page cannot run, so it must not keep
+	 * other tabs waiting on its storage. Leaders terminate their worker (freeing
+	 * the OPFS pool) and then release the leader lock, so a visible tab is
+	 * promoted; followers withdraw their queued lock request so a frozen tab is
+	 * never granted leadership it cannot use. Never uses Web Locks `steal`.
+	 */
+	private installLifecycleListeners(): void {
+		if (!this.releaseOnFreeze || this.removeLifecycleListeners) return
+		if (typeof addEventListener !== 'function' || typeof document === 'undefined') return
+		const onFreeze = (): void => this.suspend()
+		const onPageHide = (): void => this.suspend()
+		const onResume = (): void => {
+			void this.resume()
+		}
+		const onPageShow = (event: Event): void => {
+			if ((event as PageTransitionEvent).persisted) void this.resume()
+		}
+		document.addEventListener('freeze', onFreeze)
+		document.addEventListener('resume', onResume)
+		addEventListener('pagehide', onPageHide)
+		addEventListener('pageshow', onPageShow)
+		this.removeLifecycleListeners = () => {
+			document.removeEventListener('freeze', onFreeze)
+			document.removeEventListener('resume', onResume)
+			removeEventListener('pagehide', onPageHide)
+			removeEventListener('pageshow', onPageShow)
+		}
+	}
+
+	/** Synchronous by necessity: a `freeze` handler gets no further turns. */
+	private suspend(): void {
+		if (!this.opened || this.suspended || this.closing || this.promoting) return
+		this.suspended = true
+		this.gate = createGate()
+		const session = this.tabSession
+		this.tabSession = null
+		// Worker (pool holder) first, then the leader lock (NEW-STORE-10).
+		this.bridge?.terminate()
+		this.bridge = null
+		this.ownWorker = null
+		if (session) {
+			void session.releaseLock?.()
+			session.cancelPromotionWatch?.()
+		}
+	}
+
+	private async resume(): Promise<void> {
+		if (!this.suspended || this.closing || this.schema === null) return
+		const gate = this.gate
+		try {
+			const response = await this.attachAndOpen(generateFullDDL(this.schema))
+			this.reportStorageMode(response.data)
+			this.enforceDurability('promotion')
+			await this.afterLeaderOpen(response.data)
+		} catch (error) {
+			this.enforceDurability('promotion', {
+				reason: 'open-failed',
+				message: error instanceof Error ? error.message : String(error),
+			})
+		} finally {
+			this.suspended = false
+			if (this.gate === gate) this.gate = null
+			gate?.open()
+		}
+	}
+
+	/**
+	 * Non-transactional write. Takes the same mutex as {@link transaction}, so it
+	 * never lands inside this tab's open transaction and is never rolled back
+	 * with it (STORE-8). Inside a transaction callback, use the `tx` handle.
+	 */
+	async execute(sql: string, params?: unknown[], options?: StorageRequestOptions): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
-		const response = await this.sendRequest({ id: 0, type: 'execute', sql, params })
-		if (response.type === 'error') {
-			throw new AdapterError(`Execute failed: ${response.message}`, { sql, params })
+		const release = await this.mutex.acquire()
+		try {
+			const response = await this.sendRequest(
+				{
+					id: 0,
+					type: 'execute',
+					sql,
+					params,
+					...(options?.requestId ? { requestId: options.requestId } : {}),
+				},
+				options?.signal ? { signal: options.signal } : undefined,
+			)
+			if (response.type === 'error') {
+				throw new AdapterError(`Execute failed: ${response.message}`, { sql, params })
+			}
+		} finally {
+			release()
 		}
 	}
 
-	async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+	/**
+	 * Non-transactional read. Waits for this tab's open transaction to finish, so
+	 * it never observes uncommitted (possibly rolled-back) rows (STORE-8).
+	 */
+	async query<T>(sql: string, params?: unknown[], options?: StorageRequestOptions): Promise<T[]> {
 		this.guardOpen()
-		const response = await this.sendRequest({ id: 0, type: 'query', sql, params })
-		if (response.type === 'error') {
-			throw new AdapterError(`Query failed: ${response.message}`, { sql, params })
+		const release = await this.mutex.acquire()
+		try {
+			const response = await this.sendRequest(
+				{
+					id: 0,
+					type: 'query',
+					sql,
+					params,
+					...(options?.requestId ? { requestId: options.requestId } : {}),
+				},
+				options?.signal ? { signal: options.signal } : undefined,
+			)
+			if (response.type === 'error') {
+				throw new AdapterError(`Query failed: ${response.message}`, { sql, params })
+			}
+			return (response.data as T[]) ?? []
+		} finally {
+			release()
 		}
-		return (response.data as T[]) ?? []
 	}
 
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
@@ -389,12 +784,31 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.guardDurableWrite()
 
 		const release = await this.mutex.acquire()
+		let txBridge: WorkerBridge | null = null
+		// Every statement of the span must reach the worker that ran BEGIN. If
+		// leadership changed hands mid-transaction, the old worker rolled it back
+		// (or is gone); sending the rest to the new worker would autocommit a
+		// partial transaction, so fail with a retriable error instead.
+		const sendInSpan = async (request: WorkerRequest): Promise<WorkerResponse> => {
+			if (txBridge === null || this.bridge !== txBridge) {
+				throw new BridgeTerminatedError(request.type, 'storage leader changed during transaction')
+			}
+			return txBridge.send(request)
+		}
 		try {
-			await this.sendChecked({ id: 0, type: 'begin' }, 'BEGIN transaction')
+			while (this.gate) {
+				await this.gate.promise
+			}
+			txBridge = this.bridge
+			if (!txBridge) throw new StoreNotOpenError()
+			const begin = await sendInSpan({ id: 0, type: 'begin' })
+			if (begin.type === 'error') {
+				throw new AdapterError(`BEGIN transaction failed: ${begin.message}`)
+			}
 
 			const tx: Transaction = {
 				execute: async (sql: string, params?: unknown[]): Promise<void> => {
-					const response = await this.sendRequest({ id: 0, type: 'execute', sql, params })
+					const response = await sendInSpan({ id: 0, type: 'execute', sql, params })
 					if (response.type === 'error') {
 						throw new AdapterError(`Transaction execute failed: ${response.message}`, {
 							sql,
@@ -403,7 +817,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 					}
 				},
 				query: async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
-					const response = await this.sendRequest({ id: 0, type: 'query', sql, params })
+					const response = await sendInSpan({ id: 0, type: 'query', sql, params })
 					if (response.type === 'error') {
 						throw new AdapterError(`Transaction query failed: ${response.message}`, { sql, params })
 					}
@@ -412,11 +826,17 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			}
 
 			await fn(tx)
-			await this.sendChecked({ id: 0, type: 'commit' }, 'COMMIT transaction')
+			const commit = await sendInSpan({ id: 0, type: 'commit' })
+			if (commit.type === 'error') {
+				throw new AdapterError(`COMMIT transaction failed: ${commit.message}`)
+			}
 		} catch (error) {
-			// Attempt rollback, but don't mask the original error
+			// Attempt rollback on the worker that ran BEGIN, but don't mask the
+			// original error.
 			try {
-				await this.sendRequest({ id: 0, type: 'rollback' })
+				if (txBridge && this.bridge === txBridge) {
+					await txBridge.send({ id: 0, type: 'rollback' })
+				}
 			} catch {
 				// Rollback failure is secondary to the original error
 			}
@@ -467,14 +887,19 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 */
 	async exportDatabase(): Promise<Uint8Array> {
 		this.guardOpen()
-		const response = await this.sendRequest({ id: 0, type: 'export' })
-		if (response.type === 'error') {
-			throw new AdapterError(`Export failed: ${response.message}`, {
-				code: response.code,
-				context: response.context,
-			})
+		const release = await this.mutex.acquire()
+		try {
+			const response = await this.sendRequest({ id: 0, type: 'export' })
+			if (response.type === 'error') {
+				throw new AdapterError(`Export failed: ${response.message}`, {
+					code: response.code,
+					context: response.context,
+				})
+			}
+			return response.data as Uint8Array
+		} finally {
+			release()
 		}
-		return response.data as Uint8Array
 	}
 
 	/**
@@ -483,25 +908,37 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	async importDatabase(data: Uint8Array): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
-		const response = await this.sendRequest({ id: 0, type: 'import', data })
-		if (response.type === 'error') {
-			throw new AdapterError(`Import failed: ${response.message}`)
+		const release = await this.mutex.acquire()
+		try {
+			const response = await this.sendRequest({ id: 0, type: 'import', data })
+			if (response.type === 'error') {
+				throw new AdapterError(`Import failed: ${response.message}`)
+			}
+		} finally {
+			release()
 		}
 	}
 
 	private guardOpen(): void {
-		if (!this.opened || !this.bridge) {
+		if (!this.opened || (!this.bridge && !this.gate)) {
 			throw new StoreNotOpenError()
 		}
 	}
 
-	private async sendRequest(request: WorkerRequest): Promise<WorkerResponse> {
-		// guardOpen() is always called before sendRequest, so bridge is guaranteed non-null
+	private async sendRequest(
+		request: WorkerRequest,
+		options?: WorkerSendOptions,
+	): Promise<WorkerResponse> {
+		// While leadership changes hands, wait for the new bridge instead of
+		// sending into a torn-down one.
+		while (this.gate) {
+			await this.gate.promise
+		}
 		const bridge = this.bridge
 		if (!bridge) {
 			throw new StoreNotOpenError()
 		}
-		return bridge.send(request)
+		return bridge.send(request, undefined, options)
 	}
 
 	private async sendChecked(request: WorkerRequest, description: string): Promise<void> {
@@ -519,6 +956,7 @@ function parseStorageOpenState(data: unknown): StorageOpenState | null {
 	const mode = data as {
 		persistent?: boolean
 		fallbackReason?: StorageFallbackReason
+		poolName?: string
 	}
 	if (typeof mode.persistent !== 'boolean') {
 		return null
@@ -527,5 +965,6 @@ function parseStorageOpenState(data: unknown): StorageOpenState | null {
 		persistent: mode.persistent,
 		mode: mode.persistent ? 'opfs' : 'memory',
 		...(mode.fallbackReason ? { fallbackReason: mode.fallbackReason } : {}),
+		...(typeof mode.poolName === 'string' ? { poolName: mode.poolName } : {}),
 	}
 }

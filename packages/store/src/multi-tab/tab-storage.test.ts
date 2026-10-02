@@ -189,4 +189,127 @@ describe('multi-tab tab storage RPC', () => {
 		bridge.terminate()
 		vi.useRealTimers()
 	})
+
+	describe('hung-leader detection and request ids (NEW-STORE-9)', () => {
+		function slowBridge(): {
+			bridge: { send: ReturnType<typeof vi.fn>; terminate: ReturnType<typeof vi.fn> }
+			finish: () => void
+		} {
+			let finish: () => void = () => {}
+			const bridge = {
+				send: vi.fn(
+					(request: WorkerRequest): Promise<WorkerResponse> =>
+						new Promise((resolve) => {
+							finish = () => resolve({ id: request.id, type: 'success' })
+						}),
+				),
+				terminate: vi.fn(),
+			}
+			return { bridge, finish: () => finish() }
+		}
+
+		test('a leader that keeps sending heartbeats is waited for, however long the request', async () => {
+			vi.useFakeTimers()
+			const channelName = 'kora-storage-busy-db'
+			const { bridge, finish } = slowBridge()
+			const stop = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const pending = follower.send({ id: 1, type: 'query', sql: 'SELECT 1' })
+			await vi.advanceTimersByTimeAsync(1000)
+			finish()
+			await expect(pending).resolves.toMatchObject({ type: 'success' })
+			follower.terminate()
+			stop()
+			vi.useRealTimers()
+		})
+
+		test('a leader that goes silent fails pending requests with a retriable LeaderUnresponsiveError', async () => {
+			vi.useFakeTimers()
+			const channelName = 'kora-storage-hung-db'
+			const { bridge } = slowBridge()
+			const stop = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const pending = follower.send({ id: 1, type: 'execute', sql: 'INSERT', requestId: 'r-1' })
+			const settled = pending.catch((error: unknown) => error)
+			await vi.advanceTimersByTimeAsync(60)
+			// The leader hangs: no heartbeats, no pongs, no response.
+			stop()
+			await vi.advanceTimersByTimeAsync(100)
+			await expect(settled).resolves.toMatchObject({
+				name: 'LeaderUnresponsiveError',
+				code: 'LEADER_UNRESPONSIVE',
+				context: expect.objectContaining({ requestId: 'r-1', retriable: true }),
+			})
+			follower.terminate()
+			vi.useRealTimers()
+		})
+
+		test('the leader answers a retried request id from its cache instead of applying it twice', async () => {
+			const channelName = 'kora-storage-dedup-db'
+			const bridge = {
+				send: vi.fn(
+					async (r: WorkerRequest): Promise<WorkerResponse> => ({ id: r.id, type: 'success' }),
+				),
+				terminate: vi.fn(),
+			}
+			const stop = startLeaderRpcRelay(channelName, bridge)
+			const follower = new FollowerBroadcastBridge(channelName, 5000)
+			const request: WorkerRequest = { id: 1, type: 'execute', sql: 'INSERT', requestId: 'same' }
+			await follower.send(request)
+			await follower.send(request)
+			expect(bridge.send).toHaveBeenCalledOnce()
+			follower.terminate()
+			stop()
+		})
+
+		test('an AbortSignal cancels the wait with RequestAbortedError', async () => {
+			const channelName = 'kora-storage-abort-db'
+			const { bridge } = slowBridge()
+			const stop = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const controller = new AbortController()
+			const pending = follower.send({ id: 1, type: 'query', sql: 'SELECT 1' }, undefined, {
+				signal: controller.signal,
+			})
+			controller.abort()
+			await expect(pending).rejects.toMatchObject({ code: 'REQUEST_ABORTED' })
+			follower.terminate()
+			stop()
+		})
+
+		test('terminating a follower bridge rejects pending requests with a retriable error', async () => {
+			const channelName = 'kora-storage-terminate-db'
+			const { bridge } = slowBridge()
+			const stop = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const pending = follower.send({ id: 1, type: 'query', sql: 'SELECT 1' })
+			follower.terminate()
+			await expect(pending).rejects.toMatchObject({
+				code: 'BRIDGE_TERMINATED',
+				context: expect.objectContaining({ retriable: true }),
+			})
+			stop()
+		})
+
+		test('a follower cannot close or destroy the leader database', async () => {
+			const channelName = 'kora-storage-close-db'
+			const bridge = {
+				send: vi.fn(
+					async (r: WorkerRequest): Promise<WorkerResponse> => ({ id: r.id, type: 'success' }),
+				),
+				terminate: vi.fn(),
+			}
+			const stop = startLeaderRpcRelay(channelName, bridge)
+			const follower = new FollowerBroadcastBridge(channelName, 5000)
+			await expect(follower.send({ id: 1, type: 'close' })).resolves.toMatchObject({
+				type: 'success',
+			})
+			await expect(follower.send({ id: 2, type: 'destroy' })).resolves.toMatchObject({
+				type: 'success',
+			})
+			expect(bridge.send).not.toHaveBeenCalled()
+			follower.terminate()
+			stop()
+		})
+	})
 })

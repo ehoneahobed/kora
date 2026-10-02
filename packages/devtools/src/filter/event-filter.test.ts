@@ -44,6 +44,8 @@ describe('getEventCategory', () => {
 			'store:opfs-unavailable': 'connection',
 			'store:durability-lost': 'connection',
 			'store:db-name-collision': 'connection',
+			'store:storage-blocked': 'connection',
+			'store:storage-migrated': 'connection',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',
