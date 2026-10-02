@@ -69,10 +69,15 @@ const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT INTO sequence_pairs (node_id, sequen
 	GROUP BY node_id, sequence_number HAVING COUNT(*) > 1
 	ON CONFLICT DO NOTHING`
 
-/** Drop resolutions above their node's restored log (see importBackup). */
+/**
+ * Drop resolutions above their node's restored log, and every `stored-elsewhere`
+ * resolution whose operation the restored log does not hold (RT-51; see importBackup).
+ */
 const PRUNE_RESOLUTIONS_PAST_LOG_SQL = `DELETE FROM operation_resolutions r
 	WHERE r.sequence_number > COALESCE(
-		(SELECT s.max_sequence_number FROM sync_state s WHERE s.node_id = r.node_id), 0)`
+		(SELECT s.max_sequence_number FROM sync_state s WHERE s.node_id = r.node_id), 0)
+	OR (r.outcome = 'stored-elsewhere'
+		AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.id = r.op_id))`
 
 /** Postgres unique_violation. */
 const PG_UNIQUE_VIOLATION = '23505'
@@ -807,6 +812,14 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 		return found
+	}
+
+	async deleteOperationResolution(nodeId: string, operationId: string): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`DELETE FROM operation_resolutions WHERE node_id = ${nodeId} AND op_id = ${operationId}`,
+		)
 	}
 
 	async getResolvedThrough(nodeId: string): Promise<number> {

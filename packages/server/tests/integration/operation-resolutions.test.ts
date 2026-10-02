@@ -270,6 +270,58 @@ describe.each(kinds)('operation resolutions: store contract (%s store)', (kind) 
 		expect((await store.findOperationResolutions?.('n', ['before']))?.size).toBe(1)
 	})
 
+	test('a replace-mode import drops stored-elsewhere records whose op the restored log lacks (RT-51)', async () => {
+		const store = await openStore(kind)
+		await store.setSchema(schema)
+		const kept = makeOp('n', 1, 'kept')
+		for (const op of [kept, makeOp('n', 2), makeOp('n', 3)]) await store.applyRemoteOperation(op)
+		const backup = await store.exportBackup()
+		// Both records sit at or below the restored maximum (3).
+		for (const operationId of [kept.id, 'lost-by-restore']) {
+			await store.recordOperationResolution?.({
+				operationId,
+				nodeId: 'n',
+				sequenceNumber: 2,
+				outcome: 'stored-elsewhere',
+				code: null,
+				message: null,
+			})
+		}
+		await store.recordOperationResolution?.({
+			operationId: 'refused-before',
+			nodeId: 'n',
+			sequenceNumber: 2,
+			outcome: 'refused',
+			code: 'X',
+			message: 'x',
+		})
+		await store.importBackup(backup, false)
+		const found = await store.findOperationResolutions?.('n', [
+			kept.id,
+			'lost-by-restore',
+			'refused-before',
+		])
+		expect([...(found?.keys() ?? [])].sort()).toEqual([kept.id, 'refused-before'].sort())
+	})
+
+	test('deleteOperationResolution forgets one record of its node only', async () => {
+		const store = await openStore(kind)
+		await store.setSchema(schema)
+		await store.recordOperationResolution?.({
+			operationId: 'op-d',
+			nodeId: 'n',
+			sequenceNumber: 7,
+			outcome: 'stored-elsewhere',
+			code: null,
+			message: null,
+		})
+		await store.deleteOperationResolution?.('other', 'op-d')
+		expect((await store.findOperationResolutions?.('n', ['op-d']))?.size).toBe(1)
+		await store.deleteOperationResolution?.('n', 'op-d')
+		expect((await store.findOperationResolutions?.('n', ['op-d']))?.size).toBe(0)
+		expect(await store.getResolvedThrough?.('n')).toBe(0)
+	})
+
 	test('legacy pairs are indexed at append and rebuilt by a replace-mode import', async () => {
 		const store = await openStore(kind)
 		await store.setSchema(schema)
@@ -446,6 +498,42 @@ describe.each(kinds)('operation resolutions: sessions (%s store)', (kind) => {
 		await acked(c, 2)
 		c.close()
 		expect(handshakeVector(await login('repair')).repair).toBe(3)
+	})
+
+	test('a stale stored-elsewhere record never acks an unstored op; its real outcome replaces it (RT-51)', async () => {
+		const store = await openStore(kind)
+		let refuse = false
+		const validateOperation: OperationValidator = async () =>
+			refuse
+				? { action: 'reject', code: 'NOPE', message: 'refused now', retriable: false }
+				: { action: 'accept' }
+		const { login } = await startServer(store, { validateOperation })
+		const stale = makeOp('stale', 1, 'a')
+		const other = makeOp('stale', 2, 'b')
+		// Records claiming copies the server does not hold (as a restore can leave them).
+		for (const op of [stale, other]) {
+			await store.recordOperationResolution?.({
+				operationId: op.id,
+				nodeId: 'stale',
+				sequenceNumber: op.sequenceNumber,
+				outcome: 'stored-elsewhere',
+				code: null,
+				message: null,
+			})
+		}
+		const c = await login('stale')
+		c.send(batch([stale]))
+		await acked(c, 1)
+		// Judged normally and stored, not acknowledged as a duplicate of nothing.
+		expect((await store.findStoredOperations?.([stale.id]))?.has(stale.id)).toBe(true)
+		// A stale record for an op the validator now refuses: the refusal is remembered.
+		refuse = true
+		c.send(batch([other]))
+		await vi.waitFor(() => expect(rejections(c.messages).map((r) => r.code)).toContain('NOPE'))
+		expect(
+			(await store.findOperationResolutions?.('stale', [other.id]))?.get(other.id)?.outcome,
+		).toBe('refused')
+		expect((await store.findStoredOperations?.([other.id]))?.has(other.id) ?? false).toBe(false)
 	})
 
 	test('a version-vector client receives the second op of a legacy pair it straddles (RT-48)', async () => {
