@@ -59,6 +59,18 @@ export interface SyncStore {
 	switchNodeId?(nodeId: string): Promise<void>
 
 	/**
+	 * Optional: bind local writes to the signed-in user (RT-42). Moves the store to the
+	 * user's own node (or a fresh one) when the current node belongs to another user.
+	 * `conflict`: the node id is pinned and belongs to another user.
+	 */
+	bindPrincipal?(principal: string): Promise<{
+		nodeId: string
+		previousNodeId: string
+		switched: boolean
+		conflict: boolean
+	}>
+
+	/**
 	 * Optional durability barrier (RT-35): resolve once every write committed so far is
 	 * durable on this device; reject when it cannot be made durable. The engine awaits it
 	 * before any operation leaves the device, so the server never holds an operation the

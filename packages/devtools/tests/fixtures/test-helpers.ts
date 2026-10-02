@@ -320,6 +320,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			repeatCount: 3,
 			reason: 'unacknowledged-delivery',
 		},
+		'sync:durability-degraded': {
+			type: 'sync:durability-degraded',
+			message: 'QuotaExceededError',
+			failedAttempts: 3,
+		},
+		'sync:durability-restored': { type: 'sync:durability-restored' },
 		'awareness:updated': { type: 'awareness:updated', states: new Map() },
 		'state-machine:transition': {
 			type: 'state-machine:transition',

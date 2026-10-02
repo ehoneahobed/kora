@@ -14,6 +14,9 @@ const SYNC_EVENT_TYPES = [
 	'sync:diagnostics',
 	'sync:bandwidth',
 	'sync:initial-sync-progress',
+	'sync:durability-degraded',
+	'sync:durability-restored',
+	'sync:local-node',
 ] as const
 
 /**

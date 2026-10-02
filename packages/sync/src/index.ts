@@ -22,6 +22,7 @@ export type {
 	ActiveApplyFailure,
 	DeltaCursor,
 	LocalNodeInfo,
+	AdoptionScheduleInfo,
 	TerminalRejectionRecord,
 } from './types'
 

@@ -345,9 +345,10 @@ describe('upload: acks resolve only their batch, prefix is contiguous (W3)', () 
 		expect(persisted.prefix()).toBe(200)
 		await engine.stop()
 
-		// Restart: resumes above the persisted prefix, never from 0 again.
+		// Restart: resumes above the persisted prefix, never from 0 again. The server
+		// advertises what it stores (an absent own entry would mean it holds none, RT-45).
 		const second = createMemoryTransportPair()
-		const server2 = makeServer(second.server, { autoAck: true })
+		const server2 = makeServer(second.server, { autoAck: true, vector: { [NODE]: 200 } })
 		const restarted = new SyncEngine({
 			transport: second.client,
 			store,

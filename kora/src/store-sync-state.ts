@@ -3,6 +3,7 @@ import { mergeVersionVectors } from '@korajs/store'
 import type { Store } from '@korajs/store'
 import { decodeDeltaCursor, encodeDeltaCursor, operationMatchesScope } from '@korajs/sync'
 import type {
+	AdoptionScheduleInfo,
 	DeltaCursor,
 	LocalNodeInfo,
 	QuarantinedOperation,
@@ -118,12 +119,22 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	/** The node ids this database authored under (RT-38, RT-40). */
 	async listLocalNodes(): Promise<LocalNodeInfo[]> {
 		const nodes = await this.store.listLocalNodes()
-		return nodes.map(({ nodeId, accepted, held, refusedCycle }) => ({
+		return nodes.map(({ nodeId, accepted, held, refusedCycle, principal }) => ({
 			nodeId,
 			accepted,
 			held,
 			refusedCycle,
+			principal,
 		}))
+	}
+
+	/** Parked adoptions and the upload-progress counter (RT-46). */
+	loadAdoptionSchedule(): Promise<AdoptionScheduleInfo> {
+		return this.store.loadAdoptionSchedule()
+	}
+
+	async saveAdoptionSchedule(schedule: AdoptionScheduleInfo): Promise<void> {
+		await this.store.saveAdoptionSchedule(schedule)
 	}
 
 	async markLocalNodeAccepted(nodeId: string): Promise<void> {

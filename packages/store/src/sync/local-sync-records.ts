@@ -59,8 +59,15 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   created_at INTEGER NOT NULL,
   accepted INTEGER NOT NULL DEFAULT 0,
   held INTEGER NOT NULL DEFAULT 0,
-  refused_cycle INTEGER
+  refused_cycle INTEGER,
+  principal TEXT
 )`
+
+/** Meta key: per-node adoption schedule (parked adoptions, upload progress; RT-46). */
+export const ADOPTION_SCHEDULE_META_KEY = 'sync_adoption_schedule_v1'
+
+/** Adapters whose `_kora_local_nodes` table is known to have every column (this process). */
+const migratedAdapters = new WeakSet<StorageAdapter>()
 
 /** A terminal rejection to record (RT-36). */
 export interface TerminalRejection {
@@ -87,6 +94,12 @@ export interface LocalNodeRecord {
 	held: boolean
 	/** {@link ACCEPTED_CYCLE_META_KEY} value when the server last refused it, or null. */
 	refusedCycle: number | null
+	/**
+	 * The signed-in user the node's writes belong to (RT-42), or null when the app never
+	 * told the store who was signed in while it was in use. A node bound to one user is
+	 * never used for, uploaded under, or adopted by another user's session.
+	 */
+	principal: string | null
 }
 
 interface LocalNodeRow {
@@ -95,6 +108,29 @@ interface LocalNodeRow {
 	accepted: number
 	held: number
 	refused_cycle: number | null
+	principal: string | null
+}
+
+/** A parked adoption (RT-46): the node made no upload progress in its last session. */
+export interface ParkedAdoption {
+	/** {@link AdoptionSchedule.progress} when it was parked: retried once it moves. */
+	progressMark: number
+	/** Wall-clock time (ms) after which it is retried anyway. Scheduling only. */
+	untilMs: number
+	/** Consecutive parks (backoff exponent). */
+	count: number
+	/** Wall-clock time (ms) it was parked. Scheduling only. */
+	parkedAtMs: number
+}
+
+/**
+ * Which local nodes' adoptions are parked (RT-46), and a counter of upload progress on
+ * this database: a parked node is retried once anything else uploaded (its deferral may
+ * have depended on it) or after its backoff.
+ */
+export interface AdoptionSchedule {
+	progress: number
+	parked: Record<string, ParkedAdoption>
 }
 
 /**
@@ -105,6 +141,13 @@ interface LocalNodeRow {
 export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Promise<void> {
 	await adapter.execute(TERMINAL_REJECTIONS_DDL)
 	await adapter.execute(LOCAL_NODES_DDL)
+	if (migratedAdapters.has(adapter)) return
+	// A table created by an earlier release lacks the principal column (RT-42).
+	const columns = await adapter.query<{ name: string }>(`PRAGMA table_info(${LOCAL_NODES_TABLE})`)
+	if (!columns.some((column) => column.name === 'principal')) {
+		await adapter.execute(`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN principal TEXT`)
+	}
+	migratedAdapters.add(adapter)
 }
 
 /** Record terminal rejections (idempotent by operation id; the first record wins). */
@@ -183,6 +226,7 @@ function rowToRecord(row: LocalNodeRow): LocalNodeRecord {
 		accepted: Number(row.accepted) === 1,
 		held: Number(row.held) === 1,
 		refusedCycle: row.refused_cycle === null ? null : Number(row.refused_cycle),
+		principal: typeof row.principal === 'string' ? row.principal : null,
 	}
 }
 
@@ -245,7 +289,7 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 /** Every registered local node, oldest first. */
 export async function listLocalNodes(adapter: StorageAdapter): Promise<LocalNodeRecord[]> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
 	)
 	return rows.map(rowToRecord)
 }
@@ -312,6 +356,54 @@ export async function forgetLocalNode(adapter: StorageAdapter, nodeId: string): 
 		`DELETE FROM ${LOCAL_NODES_TABLE} WHERE node_id = ? AND held = 0 AND node_id NOT IN (SELECT value FROM _kora_meta WHERE key = 'node_id')`,
 		[nodeId],
 	)
+}
+
+/**
+ * Bind a local node to the signed-in user whose writes it carries (RT-42). The node is
+ * registered if it is not yet.
+ */
+export async function setLocalNodePrincipal(
+	adapter: StorageAdapter,
+	nodeId: string,
+	principal: string,
+): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.execute(
+		`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, principal) VALUES (?, ?, 0, 0, NULL, ?)
+       ON CONFLICT(node_id) DO UPDATE SET principal = excluded.principal`,
+		[nodeId, Date.now(), principal],
+	)
+}
+
+/** The adoption schedule (RT-46); empty when none was saved. */
+export async function loadAdoptionSchedule(adapter: StorageAdapter): Promise<AdoptionSchedule> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		ADOPTION_SCHEDULE_META_KEY,
+	])
+	const empty: AdoptionSchedule = { progress: 0, parked: {} }
+	const raw = rows[0]?.value
+	if (!raw) return empty
+	try {
+		const parsed = JSON.parse(raw) as Partial<AdoptionSchedule>
+		return {
+			progress: typeof parsed.progress === 'number' ? parsed.progress : 0,
+			parked: parsed.parked && typeof parsed.parked === 'object' ? parsed.parked : {},
+		}
+	} catch {
+		// An unreadable schedule only costs an earlier retry of a parked adoption.
+		return empty
+	}
+}
+
+/** Persist the adoption schedule (RT-46). */
+export async function saveAdoptionSchedule(
+	adapter: StorageAdapter,
+	schedule: AdoptionSchedule,
+): Promise<void> {
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		ADOPTION_SCHEDULE_META_KEY,
+		JSON.stringify(schedule),
+	])
 }
 
 /** The current refusal cycle (count of accepted handshakes on this database). */

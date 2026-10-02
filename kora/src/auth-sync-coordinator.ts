@@ -25,6 +25,31 @@ export function transportAuthState(
 }
 
 /**
+ * The signed-in user as the auth binding reports it (RT-42): a user id when
+ * authenticated (online or offline), null when signed out or anonymous, undefined while
+ * auth is still loading or when the binding cannot tell.
+ *
+ * @param binding - The app's auth sync binding
+ * @returns A resolver for the sync engine's `principal`, or undefined
+ */
+export function authPrincipal(
+	binding: AuthSyncBinding | null,
+): (() => Promise<string | null | undefined>) | undefined {
+	if (!binding) return undefined
+	const { resolveSyncState, resolveUserId } = binding
+	if (resolveSyncState) {
+		return async () => {
+			const state = await resolveSyncState()
+			if (state.state === 'authenticated') return state.userId
+			if (state.state === 'loading') return undefined
+			return null
+		}
+	}
+	if (resolveUserId) return async () => (await resolveUserId()) ?? undefined
+	return undefined
+}
+
+/**
  * Serializes auth-driven sync reconnects so overlapping token refresh events
  * do not stack concurrent stop/start cycles on the sync engine.
  */
@@ -68,6 +93,9 @@ export class AuthSyncCoordinator {
 			return
 		}
 		engine.notifyAuthChanged?.()
+		// Another user signed in: the next local write must be authored under that user's
+		// node, and the previous user's session must not upload it (RT-42).
+		await engine.refreshPrincipal?.()
 
 		const authState = await transportAuthState(this.authBinding)?.()
 		if (authState?.state === 'loading' || authState?.state === 'signed-out') {

@@ -17,6 +17,11 @@
  *
  * Asserts the CORRECT behaviour (fails today): a write is only ever submitted on the
  * session of the principal that made it, and Bob's own write syncs while he is signed in.
+ *
+ * The device knows who is signed in, as an app with an auth binding does (`createApp`
+ * with `sync.authClient`, modelled by TestDevice's `principal` and `authChanged()`, which
+ * the app's auth subscription triggers). A client that is never told who is signed in
+ * cannot tell two users' writes apart before the server answers (documented residual).
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -81,6 +86,7 @@ async function setup(name: string) {
 		schema,
 		server: viaToken,
 		tmpDir: tmp,
+		principal: () => auth.token,
 		createTransportPair: () => {
 			const pair = createServerTransportPair()
 			return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }
@@ -108,12 +114,14 @@ describe('RT-42: unsynced writes are bound to a node, not to the principal that 
 		// Alice signs out; Bob signs in and writes before his first handshake completes.
 		await device.disconnect()
 		auth.token = 'bob'
+		await device.authChanged()
 		await device.collection('notes').insert({ body: 'bob first note', team: 't1' })
 		await cycle()
 		const bobSeesHeld = device.getSyncEngine()?.getStatus().heldOperations ?? 0
 
 		// Alice signs back in on the same laptop.
 		auth.token = 'alice'
+		await device.authChanged()
 		await cycle()
 
 		expect({
@@ -127,6 +135,7 @@ describe('RT-42: unsynced writes are bound to a node, not to the principal that 
 		// Alice installs the app offline, writes, signs out before ever connecting.
 		await device.collection('notes').insert({ body: 'alice offline only', team: 't1' })
 		auth.token = 'bob'
+		await device.authChanged()
 		await cycle()
 		expect(submittedBy.get('alice offline only') ?? null).not.toBe('bob')
 	})

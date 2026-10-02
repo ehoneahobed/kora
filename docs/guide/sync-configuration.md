@@ -362,6 +362,8 @@ function SyncIndicator() {
 | `status` | `'connected' \| 'syncing' \| 'synced' \| 'offline' \| 'clock-error' \| 'error' \| 'schema-mismatch'` | Current sync status |
 | `pendingOperations` | `number` | Operations queued but not yet sent |
 | `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
+| `heldOperations` | `number` | Unsynced writes of another user of this device's shared local database. They upload only when that user signs in again here, never on the current user's session. Show them as waiting for another user, not as pending. |
+| `localDurability` | `'durable' \| 'degraded'` | `degraded` when the local database could not be made durable several times in a row (storage quota exceeded, IndexedDB broken). Uploads continue so the server keeps a copy, and a reload recovers from it; writes made while offline in this state can be lost if the page closes. Warn the user (free up storage, stay online). `sync:durability-degraded` / `sync:durability-restored` announce the changes. |
 
 ## Server-Side Scoping
 

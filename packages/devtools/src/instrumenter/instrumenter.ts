@@ -30,6 +30,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'sync:diagnostics',
 	'sync:bandwidth',
 	'sync:initial-sync-progress',
+	'sync:durability-degraded',
+	'sync:durability-restored',
 	'store:persistence-error',
 	'store:quota-exceeded',
 	'store:storage-fallback',

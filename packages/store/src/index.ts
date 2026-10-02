@@ -57,7 +57,13 @@ export {
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
 export type { UnappliedOperation } from './sync/sync-durability'
-export type { LocalNodeRecord, TerminalRejection } from './sync/local-sync-records'
+export type {
+	AdoptionSchedule,
+	LocalNodeRecord,
+	ParkedAdoption,
+	TerminalRejection,
+} from './sync/local-sync-records'
+export type { PrincipalBinding } from './store/store'
 
 // === Sync state helpers ===
 export {

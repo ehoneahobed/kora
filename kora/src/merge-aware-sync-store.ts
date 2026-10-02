@@ -85,6 +85,10 @@ export class MergeAwareSyncStore implements SyncStore {
 	}
 
 	/** Move back to a node id this database used before (RT-38). */
+	bindPrincipal(principal: string): ReturnType<Store['bindPrincipal']> {
+		return this.store.bindPrincipal(principal)
+	}
+
 	async switchNodeId(nodeId: string): Promise<void> {
 		await this.store.switchNodeId(nodeId)
 	}

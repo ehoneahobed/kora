@@ -55,17 +55,21 @@ import {
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
 import {
+	type AdoptionSchedule,
 	type LocalNodeRecord,
 	type TerminalRejection,
 	findTerminalRejections,
 	forgetLocalNode,
 	listLocalNodes,
 	loadAcceptedCycle,
+	loadAdoptionSchedule,
 	markLocalNodeAccepted,
 	markLocalNodeRefused,
 	recordTerminalRejections,
 	registerLocalNode,
+	saveAdoptionSchedule,
 	seedTerminalRejectionsOnce,
+	setLocalNodePrincipal,
 } from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
@@ -82,6 +86,7 @@ import {
 	saveUnappliedOperations,
 } from '../sync/sync-durability'
 import {
+	NODE_TOKEN_META_KEY,
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
 	loadAllDeliveryWatermarks,
@@ -90,6 +95,7 @@ import {
 	loadLastAckedServerVector,
 	loadNodeToken,
 	mergeVersionVectors,
+	nodeTokenKey,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
@@ -120,6 +126,7 @@ import {
 	loadRetainedConflictRows,
 	repairSequenceUniqueness,
 } from './sequence-repair'
+import { savePerTabNodeId } from './tab-node-id'
 import { resolvePerTabNodeId } from './tab-node-id'
 
 /**
@@ -136,6 +143,40 @@ import { resolvePerTabNodeId } from './tab-node-id'
  * await store.close()
  * ```
  */
+/**
+ * Make `nodeId` the database's node id (`_kora_meta.node_id`). The unkeyed legacy node
+ * token belongs to the node id it replaces, so it moves to that node's own key first:
+ * it must never be presented as the new node's token.
+ */
+async function moveDatabaseNodeId(tx: Transaction, nodeId: string): Promise<void> {
+	const meta = await tx.query<MetaRow>("SELECT value FROM _kora_meta WHERE key = 'node_id'")
+	const previous = meta[0]?.value
+	if (previous === nodeId) return
+	const legacy = await tx.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		NODE_TOKEN_META_KEY,
+	])
+	if (legacy[0] && previous) {
+		await tx.execute('INSERT OR IGNORE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			nodeTokenKey(previous),
+			legacy[0].value,
+		])
+	}
+	await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
+	await tx.execute("INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)", [nodeId])
+}
+
+/** Result of {@link Store.bindPrincipal} (RT-42). */
+export interface PrincipalBinding {
+	/** The node id local writes use from now on. */
+	nodeId: string
+	/** The node id in use before the call. */
+	previousNodeId: string
+	/** The store moved to another node id. */
+	switched: boolean
+	/** The node id is pinned and belongs to another user: nothing may upload it now. */
+	conflict: boolean
+}
+
 export class Store implements OperationLog {
 	private opened = false
 	private nodeId = ''
@@ -1448,10 +1489,12 @@ export class Store implements OperationLog {
 				{ nodeId },
 			)
 		}
-		await this.adapter.execute(
-			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
-			[nodeId],
-		)
+		await this.adapter.transaction((tx) => moveDatabaseNodeId(tx, nodeId))
+		await this.rebindToNode(nodeId)
+	}
+
+	/** Point the clock, sequence counter and collections at `nodeId` (already persisted). */
+	private async rebindToNode(nodeId: string): Promise<void> {
 		const oldClock = this.clock
 		this.nodeId = nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
@@ -1469,6 +1512,81 @@ export class Store implements OperationLog {
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
+	}
+
+	/**
+	 * Bind this database's writes to the signed-in user (RT-42). Call it whenever the
+	 * signed-in user is known or changes, BEFORE the next local write (`createApp` does
+	 * so at start and on every auth change of `sync.authClient`).
+	 *
+	 * - The current node is unbound: it is bound to `principal` (its writes so far were
+	 *   made while nobody else was known to be signed in).
+	 * - The current node belongs to `principal`: nothing changes.
+	 * - It belongs to another user: the store moves to `principal`'s own local node (the
+	 *   most recent one, not held), or to a fresh node bound to `principal`. Nothing is
+	 *   rewritten: the other user's unsynced writes stay under their node, and sync never
+	 *   uploads them on this user's session (they count as `heldOperations`).
+	 *
+	 * A pinned node id (`StoreConfig.nodeId`, such as an auth device id) cannot move:
+	 * `conflict` is then true when it belongs to another user, and sync refuses to
+	 * upload it under `principal`. Under `per-tab` isolation the tab moves to a fresh
+	 * per-tab node.
+	 *
+	 * @param principal - The signed-in user id
+	 * @returns The node now in use and whether it changed
+	 */
+	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		this.ensureOpen()
+		const previousNodeId = this.nodeId
+		const nodes = await listLocalNodes(this.adapter)
+		const current = nodes.find((node) => node.nodeId === this.nodeId)
+		const owner = current?.principal ?? null
+		if (owner === principal) {
+			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+		}
+		if (owner === null) {
+			await setLocalNodePrincipal(this.adapter, this.nodeId, principal)
+			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+		}
+		if (this.configNodeId) {
+			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: true }
+		}
+		if (this.isolation === 'per-tab') {
+			// A per-tab node belongs to its tab; another user in this tab gets a fresh one.
+			const fresh = generateUUIDv7()
+			await registerLocalNode(this.adapter, fresh)
+			await setLocalNodePrincipal(this.adapter, fresh, principal)
+			savePerTabNodeId(this.dbName, fresh)
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, fresh))
+			await this.rebindToNode(fresh)
+			return { nodeId: fresh, previousNodeId, switched: true, conflict: false }
+		}
+		const own = nodes
+			.filter((node) => node.principal === principal && !node.held)
+			.sort((a, b) => b.createdAt - a.createdAt)[0]
+		if (own) {
+			await this.switchNodeId(own.nodeId)
+			return { nodeId: own.nodeId, previousNodeId, switched: true, conflict: false }
+		}
+		const fresh = generateUUIDv7()
+		await this.adapter.transaction((tx) => moveDatabaseNodeId(tx, fresh))
+		await registerLocalNode(this.adapter, fresh)
+		await setLocalNodePrincipal(this.adapter, fresh, principal)
+		await this.rebindToNode(fresh)
+		return { nodeId: fresh, previousNodeId, switched: true, conflict: false }
+	}
+
+	/** The adoption schedule of this database's local nodes (RT-46). */
+	async loadAdoptionSchedule(): Promise<AdoptionSchedule> {
+		this.ensureOpen()
+		return loadAdoptionSchedule(this.adapter)
+	}
+
+	/** Persist the adoption schedule (RT-46). */
+	async saveAdoptionSchedule(schedule: AdoptionSchedule): Promise<void> {
+		this.ensureOpen()
+		await saveAdoptionSchedule(this.adapter, schedule)
 	}
 
 	/**

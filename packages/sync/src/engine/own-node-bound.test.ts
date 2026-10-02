@@ -64,7 +64,7 @@ function persistence(ops: Operation[], ackedOwn: number, token: string | null = 
 /** A server that advertises `ownSeq` for the device and records the uploaded op ids. */
 function server(
 	transport: MemoryTransport,
-	ownSeq: number,
+	ownSeq: number | null,
 	issue?: string,
 ): { uploaded: string[]; handshakes: HandshakeMessage[] } {
 	const uploaded: string[] = []
@@ -76,7 +76,8 @@ function server(
 				type: 'handshake-response',
 				messageId: 'resp',
 				nodeId: 'server',
-				versionVector: { [NODE]: ownSeq },
+				// null: the server names no entry for the node (it holds none of its ops).
+				versionVector: ownSeq === null ? { peer: 4 } : { [NODE]: ownSeq },
 				schemaVersion: 1,
 				accepted: true,
 				...(issue ? { nodeToken: issue } : {}),
@@ -138,6 +139,65 @@ describe('SyncEngine: the server-advertised entry for the own node (RT-12)', () 
 		})
 		await engine.start()
 		await vi.waitFor(() => expect(srv.uploaded).toEqual(expect.arrayContaining(['op-2', 'op-3'])))
+		await engine.stop()
+	})
+
+	test('an own entry of 0 (server restored without this node) re-uploads everything (RT-45)', async () => {
+		const ops = [op(1), op(2), op(3)]
+		const { client, server: transport } = createMemoryTransportPair()
+		const srv = server(transport, 0)
+		const p = persistence(ops, 3)
+		const events: string[] = []
+		const emitter = {
+			emit: (e: { type: string; action?: string }) => {
+				if (e.type === 'sync:local-node' && e.action) events.push(e.action)
+			},
+			on: () => () => {},
+			off: () => {},
+		}
+		const engine = new SyncEngine({
+			transport: client,
+			store: storeWith(ops),
+			syncState: p.state,
+			config: { url: 'ws://test' },
+			emitter: emitter as never,
+		})
+		await engine.start()
+		await vi.waitFor(() => expect([...srv.uploaded].sort()).toEqual(['op-1', 'op-2', 'op-3']))
+		await vi.waitFor(() => expect(engine.getStatus().pendingOperations).toBe(0))
+		expect(events).toContain('server-behind')
+		expect(p.lastAcked().get(NODE)).toBe(3)
+		await engine.stop()
+	})
+
+	test('an ABSENT own entry is read as 0, not as "no information" (RT-45)', async () => {
+		const ops = [op(1), op(2), op(3)]
+		const { client, server: transport } = createMemoryTransportPair()
+		const srv = server(transport, null)
+		const engine = new SyncEngine({
+			transport: client,
+			store: storeWith(ops),
+			syncState: persistence(ops, 3).state,
+			config: { url: 'ws://test' },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect([...srv.uploaded].sort()).toEqual(['op-1', 'op-2', 'op-3']))
+		await engine.stop()
+	})
+
+	test('a fresh device (nothing acknowledged) is not disturbed by an absent entry', async () => {
+		const ops = [op(1)]
+		const { client, server: transport } = createMemoryTransportPair()
+		const srv = server(transport, null)
+		const engine = new SyncEngine({
+			transport: client,
+			store: storeWith(ops),
+			syncState: persistence(ops, 0).state,
+			config: { url: 'ws://test' },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(srv.uploaded).toEqual(['op-1']))
+		await vi.waitFor(() => expect(engine.getStatus().pendingOperations).toBe(0))
 		await engine.stop()
 	})
 
