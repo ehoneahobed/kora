@@ -566,7 +566,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Server half of W3 step 4 landed in Phase 2: all three stores refuse a second, different op under an existing (nodeId, sequenceNumber) with a non-retriable SEQUENCE_CONFLICT (unique index where the existing log allows it). Caution until W3 step 5 (single upload leader) lands: tabs sharing one nodeId with per-tab sequence counters (STORE-10) now get the colliding op rejected instead of stored twice."
   },
   {
    "id": "SYNC-5",
@@ -574,14 +574,14 @@
    "severity": "P2",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W5 step 1, transport half): WebSocketTransport.connect closes and detaches any previous socket, and every socket callback is bound to its generation, so a superseded socket can neither sever nor feed the live session; disconnect() invalidates the generation. The repro passes on this half alone. The engine half (engine-initiated moves to disconnected call transport.disconnect()) is the engine owner's and still to land. Tests: sync/src/transport/websocket-liveness.test.ts."
   },
   {
    "id": "SYNC-6",
@@ -604,14 +604,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "SYNC-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 server part landed: every ingest path validates timestamps against server time (applyServerOperation covers sync, route kora.apply and applyLocalOperation; conditional route ops are checked inside the locked build; backup import refuses a backup holding a far-future or malformed op, whole, with BackupValidationError -> 400 from /__kora/backup/import). The repro still fails by design: it writes the far-future op straight into the store (bypassing ingest), and the client quarantine (W4 step 2) is the engine owner's."
   },
   {
    "id": "SYNC-8",
@@ -619,14 +619,14 @@
    "severity": "P2",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W5 step 2): a reconnect attempt succeeds only when the engine reaches streaming (sync-lifecycle waits on the new SyncEngine.onStateChange hook, the one engine change, flagged to the engine owner); the ReconnectionManager attempt counter persists across runs and resets only after the connection stayed streaming for stableAfterMs (10 s, reportConnected/reportDisconnected); reset() no longer clears stopped. Tests: sync/src/engine/reconnection-backoff.test.ts."
   },
   {
    "id": "SYNC-9",
@@ -694,14 +694,14 @@
    "severity": "P3",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-SYNC-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W5 step 2): a disconnect while an attempt is in flight calls ReconnectionManager.requestRetry() (pendingRetry), which makes that attempt count as failed so the loop retries with backoff; success also requires reaching streaming (SYNC-8)."
   },
   {
    "id": "NEW-SYNC-3",
@@ -839,14 +839,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W4 step 5): ClientSession keeps lastSentDeliverySeq; live pushes chain from it (base = lastSent) and carry only new operations. The stream rewinds to lastAcked only on a retransmit timeout: an RFC 6298-style RTO from per-batch ack round trips (Karn: no samples from re-sent ranges; floor 1 s, initial 2 s), doubled per re-send and kept until a fresh sample, capped at 5 min; the delivery poll is a safety net with the same window. No client gap report exists yet (engine side), so a dropped batch is recovered after the RTO. Measured with the repro: initial-sync write amplification 2.00x -> 1.00x, steady writes at 20 ms RTT 2.34x -> 1.00x. Unit tests: session/delivery-cursor-liveness.test.ts."
   },
   {
    "id": "SRV-4",
@@ -854,14 +854,14 @@
    "severity": "P2",
    "workstream": "W10a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W10 step 1): PostgresServerStore.applyRemoteOperation takes the delivery-counter lock first, then INSERT ... ON CONFLICT (id) DO NOTHING RETURNING; a duplicate rolls back (no delivery seq burned, no cascade). New ServerStore.readVersionVector() reads sync_state; sessions use it at handshake and for the legacy delta (repro test 1 now awaits readVersionVector(): the synchronous getVersionVector() can only reflect the instance's own writes). sequence_number and max_sequence_number migrate to BIGINT once at startup (information_schema-guarded ALTER, under the ensure-tables advisory lock; rewrites the table under an exclusive lock, so expect a pause proportional to log size on first start). sequenceNumber is validated as a safe positive integer on every ingest path (INVALID_SEQUENCE_NUMBER). Tests: store/ingest-integrity.test.ts (Postgres part with KORA_PG_TEST_URL)."
   },
   {
    "id": "SRV-5",
@@ -869,14 +869,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W4 step 6): the delivery stream is filtered and sent per scan chunk (batchSize*5) with a one-batch lookahead for isFinal, so a stream holds at most one chunk plus two batches; the handshake stream runs on the delivery chain after the response (acks and uploads keep flowing) and pauses while the transport reports more than deliveryHighWaterBytes (1 MiB) queued. MemoryServerStore seeks by binary search. LMS #11: records the visibility decisions need are prefetched once per chunk and collection (new optional ServerStore.findRecordsByIds: Postgres/SQLite IN (...), memory map). The handshake vector of a delivery client is the full vector when unscoped and, when scoped, the nodes a metadata pre-pass finds visible (RT-7 kept; the client still needs those entries for its pending count). Repro: 5000 ops scanned before the first send -> 500."
   },
   {
    "id": "SRV-6",
@@ -884,7 +884,7 @@
    "severity": "P1",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-6.test.ts"
@@ -896,10 +896,14 @@
     {
      "file": "LMS-12.test.ts",
      "title": "must be reaped after inactivity"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "is not re-scanned from its unacked watermark"
     }
    ],
    "pr": null,
-   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat."
+   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat. Phase 2 (W5 step 4, W10 step 2, LMS #12): WsServerTransport pings every heartbeatIntervalMs (default 25 s) and terminates after 2 unanswered pings (Kora close path), for the standalone server and createProductionServer (new KoraSyncServer.handleWebSocket); slow-consumer ceiling maxBufferedBytes (32 MiB) on WS and HTTP queues; handshake deadline (handshakeTimeoutMs, default 10 s); application heartbeat message for clients that advertise supportsHeartbeat (client transport closes after 2.5 silent intervals); ingest rate limiter keyed by node id across reconnects (server-level map, TTL 2 windows, LRU 100k); default maxConnections 10,000; route bodies capped at 1 MiB (413, maxRequestBodyBytes), backup import at 256 MiB; permessage-deflate on by default (threshold 1 KiB, no context takeover; perMessageDeflate option). Stuck deliveries back off instead of being re-pushed forever (see SRV-3). LMS-12: the HEAD-cost observation is inverted (ghost re-scans now <= 5 in 1 s at a 50 ms poll; was ~18); the ping and half-open tests send a handshake first, since a connection that never handshakes is now closed by the 10 s deadline. Tests: transport/transport-liveness.test.ts, session/delivery-cursor-liveness.test.ts, tests/integration/server-limits.test.ts."
   },
   {
    "id": "SRV-7",
@@ -934,11 +938,14 @@
    "severity": "P3",
    "workstream": "W10a",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-SRV-2.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed with SRV-4 (atomic dedup inside the append transaction). Repro: tests/repro/NEW-SRV-2.test.ts (Postgres): 10/10 rounds cascaded twice before, 0/10 after."
   },
   {
    "id": "NEW-SRV-3",

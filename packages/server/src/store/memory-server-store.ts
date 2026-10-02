@@ -336,6 +336,15 @@ export class MemoryServerStore implements ServerStore {
 		return this.materializeFromOps(collection)
 	}
 
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		const nodes = new Set<string>()
+		for (const op of this.operations) {
+			if ((this.deliverySeqByOpId.get(op.id) ?? 0) > afterDeliverySequence) nodes.add(op.nodeId)
+		}
+		return [...nodes]
+	}
+
 	async findRecordsByIds(
 		collection: string,
 		ids: string[],

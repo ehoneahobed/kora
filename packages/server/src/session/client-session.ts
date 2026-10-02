@@ -102,7 +102,7 @@ export const MAX_DELIVERY_RETRANSMIT_BACKOFF_MS = 5 * 60_000
 /** Delivery retransmit timeout before any round trip was measured. */
 const INITIAL_DELIVERY_RTO_MS = 2_000
 /** Floor of the measured delivery retransmit timeout. */
-const MIN_DELIVERY_RTO_MS = 250
+const MIN_DELIVERY_RTO_MS = 1_000
 /** Ceiling of the measured delivery retransmit timeout (before backoff). */
 const MAX_DELIVERY_RTO_MS = 60_000
 /** Unacknowledged batches remembered for round-trip samples. */
@@ -960,12 +960,12 @@ export class ClientSession {
 		)
 	}
 
-	/** The current retransmit window: the timeout, doubled per re-send without progress. */
+	/**
+	 * The current retransmit window: the timeout, which each re-send doubled (up to
+	 * five minutes) and which only a fresh round-trip sample brings back down.
+	 */
 	private retransmitWindowMs(): number {
-		return Math.min(
-			this.retransmitTimeoutMs * 2 ** Math.min(this.deliveryRewinds, 16),
-			MAX_DELIVERY_RETRANSMIT_BACKOFF_MS,
-		)
+		return Math.min(this.retransmitTimeoutMs, MAX_DELIVERY_RETRANSMIT_BACKOFF_MS)
 	}
 
 	/**
@@ -1013,6 +1013,12 @@ export class ClientSession {
 	/** Re-send the outstanding delivery from the acknowledged position. */
 	private rewindDelivery(trackStall: boolean): void {
 		this.deliveryRewinds += 1
+		// Exponential backoff that survives acknowledgment progress until a fresh
+		// round-trip sample (RFC 6298 5.5-5.7): acks of re-sent batches give no sample.
+		this.retransmitTimeoutMs = Math.min(
+			this.retransmitTimeoutMs * 2,
+			MAX_DELIVERY_RETRANSMIT_BACKOFF_MS,
+		)
 		if (trackStall && this.deliveryRewinds >= 3) {
 			this.emitter?.emit({
 				type: 'sync:delivery-stalled',
@@ -2018,9 +2024,20 @@ export class ClientSession {
 	 */
 	private async collectVisibleNodeIds(fromDeliverySeq: number): Promise<Set<string>> {
 		const visible = new Set<string>()
-		const scanChunk = Math.max(this.batchSize, 1) * 5
+		// With the candidate list, the scan stops as soon as every candidate is known
+		// visible (typically after a few chunks); only nodes that never become visible
+		// (other tenants' devices) make it read to the end.
+		let pending: Set<string> | null = null
+		if (this.store.getNodeIdsAfterDelivery) {
+			try {
+				pending = new Set(await this.store.getNodeIdsAfterDelivery(fromDeliverySeq))
+			} catch {
+				pending = null
+			}
+		}
+		const scanChunk = Math.max(this.batchSize, 1) * 20
 		let cursor = fromDeliverySeq
-		while (this.state !== 'closed') {
+		while (this.state !== 'closed' && (pending === null || pending.size > 0)) {
 			const chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
 			const last = chunk[chunk.length - 1]
 			if (last === undefined) break
@@ -2029,6 +2046,7 @@ export class ClientSession {
 				if (visible.has(op.nodeId)) continue
 				if (await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null)) {
 					visible.add(op.nodeId)
+					pending?.delete(op.nodeId)
 				}
 			}
 			cursor = last.deliverySequence

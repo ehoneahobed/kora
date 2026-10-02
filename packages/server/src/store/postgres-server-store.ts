@@ -682,6 +682,15 @@ export class PostgresServerStore implements ServerStore {
 		return this.materializeFromOpsLog(collection)
 	}
 
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
+		)) as unknown as { node_id: string }[]
+		return rows.map((row) => row.node_id)
+	}
+
 	async findRecordsByIds(
 		collection: string,
 		ids: string[],

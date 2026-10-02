@@ -433,6 +433,14 @@ export class SqliteServerStore implements ServerStore {
 		return this.materializeFromOpsLog(collection)
 	}
 
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		const rows = this.db.all<{ node_id: string }>(
+			sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
+		)
+		return rows.map((row) => row.node_id)
+	}
+
 	async findRecordsByIds(
 		collection: string,
 		ids: string[],

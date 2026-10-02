@@ -227,6 +227,13 @@ export interface ServerStore extends SyncStore {
 	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
 
 	/**
+	 * The distinct node ids of the operations with `deliverySequence >
+	 * afterDeliverySequence`. Optional; lets a handshake stop judging which nodes a
+	 * scoped client will hear from as soon as every candidate was found visible.
+	 */
+	getNodeIdsAfterDelivery?(afterDeliverySequence: number): Promise<string[]>
+
+	/**
 	 * Bind a client node id to the authenticated principal that first used it.
 	 * Returns true when the node id is already owned by `userId`, was released by an
 	 * admin (see {@link releaseNodeClaim}; the caller takes it over), or is unclaimed
