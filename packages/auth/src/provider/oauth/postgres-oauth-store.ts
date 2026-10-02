@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { ensurePostgresSchema } from '../../postgres/ensure-schema'
 import { DuplicateLinkedIdentityError, type LinkedIdentityStore } from './linked-identity-store'
 import type { LinkedIdentity, OAuthState, OAuthStateStore } from './oauth-types'
 
@@ -87,22 +88,25 @@ export class PostgresOAuthStateStore implements OAuthStateStore {
 	}
 
 	private async ensureTables(): Promise<void> {
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_oauth_states (
-				state TEXT PRIMARY KEY,
-				provider TEXT NOT NULL,
-				redirect_uri TEXT NOT NULL,
-				created_at BIGINT NOT NULL,
-				expires_at BIGINT NOT NULL,
-				metadata_json TEXT,
-				code_verifier TEXT
-			)
-		`
+		// Concurrency-safe on an empty database shared by several instances.
+		await ensurePostgresSchema(this.sql, async (sql) => {
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_oauth_states (
+					state TEXT PRIMARY KEY,
+					provider TEXT NOT NULL,
+					redirect_uri TEXT NOT NULL,
+					created_at BIGINT NOT NULL,
+					expires_at BIGINT NOT NULL,
+					metadata_json TEXT,
+					code_verifier TEXT
+				)
+			`
 
-		await this.sql`
-			CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_expires_at
-				ON auth_oauth_states(expires_at)
-		`
+			await sql`
+				CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_expires_at
+					ON auth_oauth_states(expires_at)
+			`
+		})
 	}
 }
 
@@ -184,23 +188,26 @@ export class PostgresLinkedIdentityStore implements LinkedIdentityStore {
 	}
 
 	private async ensureTables(): Promise<void> {
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_linked_identities (
-				id TEXT PRIMARY KEY,
-				user_id TEXT NOT NULL,
-				provider TEXT NOT NULL,
-				provider_user_id TEXT NOT NULL,
-				email TEXT,
-				linked_at BIGINT NOT NULL,
-				UNIQUE(provider, provider_user_id),
-				UNIQUE(user_id, provider)
-			)
-		`
+		// Concurrency-safe on an empty database shared by several instances.
+		await ensurePostgresSchema(this.sql, async (sql) => {
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_linked_identities (
+					id TEXT PRIMARY KEY,
+					user_id TEXT NOT NULL,
+					provider TEXT NOT NULL,
+					provider_user_id TEXT NOT NULL,
+					email TEXT,
+					linked_at BIGINT NOT NULL,
+					UNIQUE(provider, provider_user_id),
+					UNIQUE(user_id, provider)
+				)
+			`
 
-		await this.sql`
-			CREATE INDEX IF NOT EXISTS idx_auth_linked_identities_user_id
-				ON auth_linked_identities(user_id)
-		`
+			await sql`
+				CREATE INDEX IF NOT EXISTS idx_auth_linked_identities_user_id
+					ON auth_linked_identities(user_id)
+			`
+		})
 	}
 }
 

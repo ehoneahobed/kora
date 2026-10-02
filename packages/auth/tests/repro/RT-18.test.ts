@@ -164,8 +164,8 @@ describe('RT-18: cross-instance revocation', () => {
 					})
 				).body as { data: { tokens: { accessToken: string } } }
 				const token = signup.data.tokens.accessToken
-				// Instance B starts after A created the tables (PostgresUserStore's cold-start
-				// DDL is not safe against a concurrent first start; see the RT-18 notes).
+				// Instance B starts after A created the tables (a concurrent first start is
+				// covered by src/postgres/ensure-schema.test.ts).
 				const storeB = new PostgresUserStore(poolB as unknown as Client)
 				const authB = createKoraAuthServer({ jwtSecret: SECRET, userStore: storeB })
 

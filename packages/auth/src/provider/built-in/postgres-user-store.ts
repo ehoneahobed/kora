@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { ensurePostgresSchema } from '../../postgres/ensure-schema'
 import { PostgresTokenRevocationStore } from '../../tokens/postgres-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
@@ -54,38 +55,41 @@ export class PostgresUserStore implements UserStore {
 	}
 
 	private async ensureTables(): Promise<void> {
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_users (
-				id TEXT PRIMARY KEY,
-				email TEXT NOT NULL UNIQUE,
-				name TEXT NOT NULL,
-				email_verified BOOLEAN NOT NULL DEFAULT FALSE,
-				created_at BIGINT NOT NULL,
-				password_hash TEXT NOT NULL,
-				salt TEXT NOT NULL
-			)
-		`
+		// Concurrency-safe on an empty database shared by several instances.
+		await ensurePostgresSchema(this.sql, async (sql) => {
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_users (
+					id TEXT PRIMARY KEY,
+					email TEXT NOT NULL UNIQUE,
+					name TEXT NOT NULL,
+					email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+					created_at BIGINT NOT NULL,
+					password_hash TEXT NOT NULL,
+					salt TEXT NOT NULL
+				)
+			`
 
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_devices (
-				id TEXT PRIMARY KEY,
-				user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-				public_key TEXT NOT NULL,
-				name TEXT NOT NULL,
-				revoked BOOLEAN NOT NULL DEFAULT FALSE,
-				created_at BIGINT NOT NULL,
-				last_seen_at BIGINT NOT NULL
-			)
-		`
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_devices (
+					id TEXT PRIMARY KEY,
+					user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+					public_key TEXT NOT NULL,
+					name TEXT NOT NULL,
+					revoked BOOLEAN NOT NULL DEFAULT FALSE,
+					created_at BIGINT NOT NULL,
+					last_seen_at BIGINT NOT NULL
+				)
+			`
 
-		await this.sql`
-			CREATE INDEX IF NOT EXISTS idx_auth_devices_user_id ON auth_devices(user_id)
-		`
+			await sql`
+				CREATE INDEX IF NOT EXISTS idx_auth_devices_user_id ON auth_devices(user_id)
+			`
 
-		// Case-insensitive unique index on email for consistent lookups
-		await this.sql`
-			CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_lower ON auth_users(LOWER(email))
-		`
+			// Case-insensitive unique index on email for consistent lookups
+			await sql`
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_lower ON auth_users(LOWER(email))
+			`
+		})
 	}
 
 	async createUser(params: {
