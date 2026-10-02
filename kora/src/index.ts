@@ -12,6 +12,8 @@ export type {
 	BlobOptions,
 	KoraApp,
 	KoraConfig,
+	LocalDatabaseInfo,
+	StorageApi,
 	StoreOptions,
 	StoreInfo,
 	SyncControl,

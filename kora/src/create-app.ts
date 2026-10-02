@@ -10,6 +10,7 @@ import { createCollectionAccessor } from './collection-accessor'
 import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
+import { createStorageApi } from './storage-accessor'
 import { createSyncControl } from './sync-control'
 import {
 	type SyncRuntimeState,
@@ -148,6 +149,7 @@ export function createApp<const S extends SchemaInput>(
 				return requireBlobApi().gc(options)
 			},
 		},
+		storage: createStorageApi(config),
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')

@@ -89,6 +89,27 @@ export interface StoreInfo {
 	isolationState: 'ready' | 'switching' | 'closed' | 'failed'
 }
 
+/** One local database Kora recorded on this origin (see `app.storage`). */
+export type LocalDatabaseInfo = import('@korajs/store/sqlite-wasm').LocalDatabaseRecord
+
+/**
+ * Explicit management of this origin's local (browser) databases, for example
+ * the per-user databases of `store.namespaceByAuthUser` on a shared device.
+ * Kora never evicts a database automatically.
+ */
+export interface StorageApi {
+	/** Databases Kora created or opened on this origin. Empty outside browsers. */
+	listDatabases(): Promise<LocalDatabaseInfo[]>
+	/**
+	 * Permanently delete a local database. Refuses with `StorageInUseError` while
+	 * any tab has it open (close the app first) and with `UnsyncedDataError` while
+	 * it holds operations the server never acknowledged, unless `force` is set.
+	 *
+	 * @returns true when a database was deleted, false when none existed
+	 */
+	deleteDatabase(name: string, options?: { force?: boolean }): Promise<boolean>
+}
+
 /**
  * Pre-built auth binding from `createKoraAuthSync()` in `@korajs/auth`.
  * Canonical definition lives in `@korajs/core/bindings`.
@@ -375,6 +396,8 @@ export interface KoraApp {
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
 	blobs: BlobApi
+	/** List and explicitly delete this origin's local databases. */
+	storage: StorageApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
@@ -474,6 +497,7 @@ type KoraFrameworkProperty =
 	| 'sync'
 	| 'sequences'
 	| 'blobs'
+	| 'storage'
 	| 'getStore'
 	| 'getSyncEngine'
 	| 'getQueryStoreCache'
@@ -510,6 +534,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
 	blobs: BlobApi
+	/** List and explicitly delete this origin's local databases. */
+	storage: StorageApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
