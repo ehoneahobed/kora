@@ -191,7 +191,9 @@ describe('RT-35: durability before upload', () => {
 		const engine = new SyncEngine({ transport: client, store, config: { url: 'ws://t' } })
 		await engine.start()
 		await tick()
-		expect(uploadedAtBarrier).toEqual([0])
+		// Every barrier ran before anything was uploaded.
+		expect(uploadedAtBarrier.length).toBeGreaterThan(0)
+		expect(uploadedAtBarrier.every((uploaded) => uploaded === 0)).toBe(true)
 		expect(srv.uploaded).toEqual([log[0]?.id])
 		await engine.stop()
 	})

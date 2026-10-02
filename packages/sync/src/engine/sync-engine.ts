@@ -1921,6 +1921,16 @@ export class SyncEngine {
 
 		const totalBatches = entries.length
 		this.initialSyncTotalBatches = Math.max(this.initialSyncTotalBatches, totalBatches)
+		// One durability barrier for the whole delta (RT-35), not one per batch: flag every
+		// batch sent first (flagging writes, which would dirty the store again between
+		// batches), then make it all durable. sendUpload re-checks both, as no-ops; a
+		// failure here surfaces there, per batch, and postpones that batch.
+		try {
+			for (const entry of entries) await this.outboundQueue.markSent(entry.batch.batchId)
+			await this.store.ensureDurable?.()
+		} catch {
+			// Reported by sendUpload, which retries the barrier before each batch.
+		}
 		for (const [i, entry] of entries.entries()) {
 			if (this.sessionEpoch !== epoch) {
 				// The session ended mid-delta: the rest goes back to the queue.
