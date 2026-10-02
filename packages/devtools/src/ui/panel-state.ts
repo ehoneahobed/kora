@@ -204,6 +204,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
 		case 'sync:node-id-rotated':
 			return `node id rotated (${event.reenqueuedCount} ops re-queued)`
+		case 'sync:local-node':
+			return `local node ${event.nodeId} ${event.action}`
 		case 'sync:clock-rebase':
 			return `clock rebase ${event.rebasedCount} ops (${Math.round(event.maxSkewMs / 1000)}s ahead)`
 		case 'sync:schema-mismatch':

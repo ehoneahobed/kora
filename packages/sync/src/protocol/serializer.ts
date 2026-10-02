@@ -434,6 +434,8 @@ interface ProtoEnvelope {
 	/** Fields 43-44: the accepted view a handshake resumes (SYNC-11). */
 	acceptedScopeKey?: string
 	acceptedScopeWatermark?: number
+	/** Field 45: the client reserves sequence numbers transactionally (handshake, RT-37). */
+	sequenceReservation?: boolean
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -461,6 +463,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 					: {}),
 				scopeExitPolicy: message.scopeExitPolicy,
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
+				...(message.sequenceReservation === true ? { sequenceReservation: true } : {}),
 			}
 		case 'handshake-response':
 			return {
@@ -608,6 +611,7 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 					? { scopeExitPolicy: envelope.scopeExitPolicy }
 					: {}),
 				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
+				...(envelope.sequenceReservation === true ? { sequenceReservation: true } : {}),
 			}
 		case 'handshake-response':
 			return {
@@ -937,6 +941,8 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.acceptedScopeKey !== undefined) writer.uint32(346).string(envelope.acceptedScopeKey)
 	if (envelope.acceptedScopeWatermark !== undefined)
 		writer.uint32(352).int64(envelope.acceptedScopeWatermark)
+	// Field 45 (bool, wiretype 0): 45 << 3 = 360.
+	if (envelope.sequenceReservation === true) writer.uint32(360).bool(true)
 	return writer.finish()
 }
 
@@ -1081,6 +1087,9 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 44:
 				envelope.acceptedScopeWatermark = longToNumber(reader.int64())
+				break
+			case 45:
+				envelope.sequenceReservation = reader.bool()
 				break
 			default:
 				reader.skipType(tag & 7)

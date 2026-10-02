@@ -80,6 +80,15 @@ export interface HandshakeMessage {
 	 * it cannot decode. Old servers ignore it.
 	 */
 	supportsHeartbeat?: boolean
+	/**
+	 * The client reserves every local sequence number inside the transaction that writes
+	 * the operation (W6), so two different operations of its node never share a number.
+	 * A server may then refuse a (node, sequence) pair it already holds with
+	 * `SEQUENCE_CONFLICT`, which this client recovers from (it renumbers the write and
+	 * fetches the operation it lost, RT-35). Clients that do not send it (beta.13 and
+	 * older) can still produce legacy duplicate pairs (RT-37). Old servers ignore it.
+	 */
+	sequenceReservation?: boolean
 }
 
 /**

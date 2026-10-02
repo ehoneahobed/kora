@@ -77,6 +77,13 @@ export interface SyncStatusInfo {
 	lastSuccessfulPull: number | null
 	/** Number of merge conflicts encountered during this session */
 	conflicts: number
+	/**
+	 * Unsynced writes of another user who shared this local database (RT-38): the server
+	 * refused their node for the signed-in principal, so they wait, not counted in
+	 * `pendingOperations`, until that user signs in again on this device. Use
+	 * `store.namespaceByAuthUser` to give each user their own database instead.
+	 */
+	heldOperations?: number
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
 	inFlightUploadOperations?: number
@@ -245,8 +252,12 @@ export interface SyncStatePersistence {
 	 * claim (RT-12), stored next to the node id so the device can reconnect with it.
 	 * Optional: without it the token lives only as long as the sync engine.
 	 */
-	loadNodeToken?(): Promise<string | null>
-	saveNodeToken?(token: string): Promise<void>
+	loadNodeToken?(nodeId?: string): Promise<string | null>
+	/**
+	 * `nodeId` names the node the token was issued for: a database that authors under
+	 * several node ids (a rotated identity, per-tab isolation) keeps one token per node.
+	 */
+	saveNodeToken?(token: string, nodeId?: string): Promise<void>
 	/**
 	 * The contiguous acknowledged prefix of this device's own operations (W3): the highest
 	 * sequence s such that every own operation with sequence <= s is stored on the server,
@@ -283,6 +294,49 @@ export interface SyncStatePersistence {
 	 */
 	loadAcceptedDownlinkScope?(): Promise<SyncScopeMap | null>
 	saveAcceptedDownlinkScope?(scope: SyncScopeMap | null): Promise<void>
+	/**
+	 * Durable terminal-rejection markers (RT-36): operations the server refused with a
+	 * non-retriable rejection. Never cleared (unlike the app's rejected list), so a
+	 * rescan of the device's own history never submits a refused operation again.
+	 * Optional: without them the engine remembers refusals for its own lifetime only.
+	 */
+	recordTerminalRejections?(entries: TerminalRejectionRecord[]): Promise<void>
+	/** Which of these operation ids carry a terminal-rejection marker. */
+	findTerminalRejections?(operationIds: string[]): Promise<Set<string>>
+	/**
+	 * The node ids this database authored operations under (RT-38, RT-40), with what the
+	 * sync server said about each. Optional: without it the engine tracks only the
+	 * current node and keeps the pre-Phase-2 behaviour for refused nodes.
+	 */
+	listLocalNodes?(): Promise<LocalNodeInfo[]>
+	/** Record an accepted handshake as `nodeId`; starts a new refusal cycle. */
+	markLocalNodeAccepted?(nodeId: string): Promise<void>
+	/** Record that the server refused `nodeId`; `held` holds its unsynced writes. */
+	markLocalNodeRefused?(nodeId: string, held: boolean): Promise<void>
+	/** The current refusal cycle (count of accepted handshakes). */
+	loadAcceptedCycle?(): Promise<number>
+	/** Forget a non-current local node with nothing left to upload (bounds the registry). */
+	forgetLocalNode?(nodeId: string): Promise<void>
+}
+
+/** A terminally rejected operation, as recorded in the durable markers (RT-36). */
+export interface TerminalRejectionRecord {
+	operationId: string
+	nodeId: string | null
+	sequenceNumber: number | null
+	code: string
+	rejectedAt: number
+}
+
+/** A node id this database authored operations under (RT-38, RT-40). */
+export interface LocalNodeInfo {
+	nodeId: string
+	/** A handshake as this node was accepted at least once. */
+	accepted: boolean
+	/** Refused after acceptance: its unsynced writes belong to a principal not signed in. */
+	held: boolean
+	/** Refusal cycle in which the server last refused it, or null. */
+	refusedCycle: number | null
 }
 
 /**

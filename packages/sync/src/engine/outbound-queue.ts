@@ -98,15 +98,42 @@ export class OutboundQueue {
 	 * Moves them to in-flight status. Returns null if queue is empty.
 	 *
 	 * @param batchSize - Maximum number of operations in the batch
+	 * @param accept - Only operations it accepts are taken (in queue order); the others
+	 *   stay queued. The engine passes "authored under this session's node id": a session
+	 *   may only upload its own node's operations (RT-38, RT-40).
 	 */
-	takeBatch(batchSize: number): OutboundBatch | null {
+	takeBatch(batchSize: number, accept?: (op: Operation) => boolean): OutboundBatch | null {
 		if (this.queue.length === 0) return null
 
-		const ops = this.queue.splice(0, batchSize)
+		let ops: Operation[]
+		if (accept) {
+			ops = []
+			const kept: Operation[] = []
+			for (const op of this.queue) {
+				if (ops.length < batchSize && accept(op)) ops.push(op)
+				else kept.push(op)
+			}
+			if (ops.length === 0) return null
+			this.queue = kept
+		} else {
+			ops = this.queue.splice(0, batchSize)
+		}
 		const batchId = `batch-${this.nextBatchId++}`
 		this.inFlight.set(batchId, ops)
 
 		return { batchId, operations: ops }
+	}
+
+	/** Whether any queued (not in-flight) operation satisfies `accept`. */
+	hasOperationsMatching(accept: (op: Operation) => boolean): boolean {
+		return this.queue.some(accept)
+	}
+
+	/** Number of queued (not in-flight) operations that satisfy `accept`. */
+	countMatching(accept: (op: Operation) => boolean): number {
+		let count = 0
+		for (const op of this.queue) if (accept(op)) count++
+		return count
 	}
 
 	/**

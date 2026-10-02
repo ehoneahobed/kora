@@ -84,6 +84,35 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.rotateNodeId(ids)
 	}
 
+	/** Move back to a node id this database used before (RT-38). */
+	async switchNodeId(nodeId: string): Promise<void> {
+		await this.store.switchNodeId(nodeId)
+	}
+
+	/** Durability barrier before an upload (RT-35). */
+	async ensureDurable(): Promise<void> {
+		await this.store.ensureDurable()
+	}
+
+	/** Raise a local node's sequence counter past numbers the server holds (RT-35). */
+	raiseSequenceFloor(nodeId: string, floor: number): Promise<boolean> {
+		return this.store.raiseSequenceFloor(nodeId, floor)
+	}
+
+	/** Renumber an operation refused with SEQUENCE_CONFLICT, keeping its id (RT-35). */
+	resequenceOperation(
+		operationId: string,
+		nodeId: string,
+		floor: number,
+	): Promise<Operation | null> {
+		return this.store.resequenceOperation(operationId, nodeId, floor)
+	}
+
+	/** Take over a closed tab's node id (RT-40). */
+	claimLocalNode(nodeId: string): Promise<(() => void) | null> {
+		return this.store.claimLocalNode(nodeId)
+	}
+
 	/**
 	 * Delegates timestamp rebase to the store so the sync engine can re-stamp
 	 * never-acknowledged operations after a fast device clock is corrected.
