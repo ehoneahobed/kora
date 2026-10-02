@@ -39,6 +39,9 @@ const SYNC_STATUS_EVENT_TYPES = [
 	'sync:delivery-gap',
 	'sync:diagnostics',
 	'sync:initial-sync-progress',
+	'sync:durability-degraded',
+	'sync:durability-restored',
+	'sync:local-node',
 ] as const satisfies readonly KoraEventType[]
 
 export interface SyncStatusControllerOptions {

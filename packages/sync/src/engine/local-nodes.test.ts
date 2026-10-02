@@ -226,6 +226,68 @@ describe('RT-35: durability before upload', () => {
 		await engine.stop()
 	})
 
+	test('a persistently failing barrier degrades: the upload proceeds and the status says so (RT-49)', async () => {
+		const log = [op(1)]
+		let broken = true
+		const barrier = vi.fn(async () => {
+			if (broken) {
+				const error = new Error('QuotaExceededError: snapshot not written')
+				error.name = 'QuotaExceededError'
+				throw error
+			}
+		})
+		const store = fakeStore(log, { ensureDurable: barrier })
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', outboundRetryBaseDelayMs: 5 },
+			emitter: emitter as never,
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(srv.uploaded).toEqual([log[0]?.id]))
+		// Bounded: exactly the threshold of failed attempts before uploading anyway.
+		expect(barrier).toHaveBeenCalledTimes(3)
+		expect(engine.getStatus().localDurability).toBe('degraded')
+		const degraded = emitter.events.filter((e) => e.type === 'sync:durability-degraded')
+		expect(degraded).toHaveLength(1)
+		expect(degraded[0]).toMatchObject({ failedAttempts: 3 })
+		await vi.waitFor(() => expect(engine.getStatus().pendingOperations).toBe(0))
+
+		// Storage recovers: the next barrier succeeds and leaves degraded mode.
+		broken = false
+		log.push(op(2))
+		store.vector.set(NODE, 2)
+		await engine.pushOperation(op(2))
+		await vi.waitFor(() => expect(srv.uploaded).toContain(op(2).id))
+		expect(engine.getStatus().localDurability).toBe('durable')
+		expect(emitter.events.some((e) => e.type === 'sync:durability-restored')).toBe(true)
+		await engine.stop()
+	})
+
+	test('a transient barrier failure only postpones (stays durable)', async () => {
+		const log = [op(1)]
+		let failures = 1
+		const store = fakeStore(log, {
+			ensureDurable: vi.fn(async () => {
+				if (failures-- > 0) throw new Error('busy')
+			}),
+		})
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', outboundRetryBaseDelayMs: 5 },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(srv.uploaded).toEqual([log[0]?.id]))
+		expect(engine.getStatus().localDurability).toBe('durable')
+		await engine.stop()
+	})
+
 	test('the handshake advertises sequenceReservation', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const srv = scriptedServer(server)

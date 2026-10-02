@@ -91,16 +91,30 @@ export type KoraEvent =
 			 *   uploads the unsynced writes of a node no live tab uses (RT-40).
 			 * - `held`: the server refused this node for the signed-in principal; its unsynced
 			 *   writes wait for the principal that owns it (RT-38).
+			 * - `server-behind`: the server holds fewer of this node's operations than the
+			 *   device had acknowledged (a server restored from a backup, RT-45); the device
+			 *   re-uploads them from the server's position.
+			 * - `adoption-parked`: an adopted node made no upload progress for a whole session
+			 *   (for example a write the server keeps deferring); the next session tries the
+			 *   other nodes first (RT-46).
+			 * - `clone-detected`: another live copy of this database uses the same node id
+			 *   (copied app data, a restored image); this copy moved to a fresh node id (RT-44).
+			 * - `principal-switched`: the signed-in user changed; local writes from now on are
+			 *   authored under that user's own node (RT-42).
 			 */
 			type: 'sync:local-node'
 			nodeId: string
 			action:
 				| 'history-behind'
+				| 'server-behind'
 				| 'adoption-started'
 				| 'adoption-completed'
 				| 'adoption-refused'
+				| 'adoption-parked'
 				| 'held'
-			/** For `history-behind`: the device's highest sequence and the server's. */
+				| 'clone-detected'
+				| 'principal-switched'
+			/** For `history-behind` / `server-behind`: the device's sequence and the server's. */
 			localSequence?: number
 			serverSequence?: number
 			/** Unsynced operations concerned, when known. */
@@ -210,6 +224,19 @@ export type KoraEvent =
 			message: string
 			code: string
 	  }
+	| {
+			/**
+			 * The local database could not be made durable before an upload several times in
+			 * a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads no longer wait
+			 * for it, so the server holds the only durable copy of new writes (a reload
+			 * recovers them from it) until `sync:durability-restored`. Writes are still
+			 * accepted; warn the user (free up storage, stay online).
+			 */
+			type: 'sync:durability-degraded'
+			message: string
+			failedAttempts: number
+	  }
+	| { type: 'sync:durability-restored' }
 	| {
 			type: 'store:quota-exceeded'
 			dbName: string

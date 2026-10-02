@@ -97,6 +97,15 @@ const OWN_LOG_SCAN_CHUNK = 2000
  * is quarantined instead of applied (SYNC-7). Matches the HLC's own refusal threshold.
  */
 const MAX_REMOTE_FUTURE_MS = 5 * 60_000
+/**
+ * Consecutive failed durability barriers before uploads stop waiting for local durability
+ * (RT-49). A transient failure (a busy IndexedDB transaction) postpones the upload and
+ * retries; a persistent one (quota exceeded, a broken store) would otherwise withhold every
+ * write from the reachable server while the app keeps writing into memory. Once the device
+ * may lose its local tail anyway, the server is the better place for it: RT-35 recovery
+ * (handshake raise, full resync, renumber on SEQUENCE_CONFLICT) restores it after a reload.
+ */
+const DURABILITY_FAILURES_BEFORE_DEGRADED = 3
 /** Quarantine reason codes for inbound operations the client did not apply (W4). */
 const QUARANTINE_CODES = {
 	DECRYPT_FAILED: 'DECRYPT_FAILED',
@@ -369,6 +378,10 @@ export class SyncEngine {
 	 * The session ends once its in-flight uploads are resolved.
 	 */
 	private ownRecoveryPending = false
+	/** Consecutive failed durability barriers before an upload (RT-49). */
+	private durabilityFailures = 0
+	/** Uploads proceed without local durability: the barrier failed persistently (RT-49). */
+	private durabilityDegraded = false
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -844,6 +857,7 @@ export class SyncEngine {
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
 			heldOperations: this.computeHeldCount(),
+			localDurability: this.durabilityDegraded ? ('degraded' as const) : ('durable' as const),
 			clockSkewMs: this.clockSkewMs,
 			inFlightUploadOperations: this.inFlightUploadCount(),
 			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
@@ -1631,9 +1645,20 @@ export class SyncEngine {
 		// A server that holds FEWER of this device's operations than the device believes
 		// (a restored backup) lowers the acknowledged prefix, so the device re-uploads
 		// them; the server dedups by id. A higher value is never trusted (RT-12, W3).
-		if (advertisedOwn !== undefined && advertisedOwn < this.ownAckedThrough) {
+		// An ABSENT own entry means the server holds none of them (RT-45): every server
+		// names the session's own node whenever it holds an operation of it (the entry is
+		// never scope-filtered), so absence is the strongest "behind", never "unknown".
+		const serverHoldsOwn = advertisedOwn ?? 0
+		if (serverHoldsOwn < this.ownAckedThrough && this.ownTrackingNodeId === sessionNode) {
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: sessionNode,
+				action: 'server-behind',
+				localSequence: this.ownAckedThrough,
+				serverSequence: serverHoldsOwn,
+			})
 			await this.withOwnTracking(async () => {
-				await this.lowerOwnPrefixLocked(advertisedOwn)
+				await this.lowerOwnPrefixLocked(serverHoldsOwn)
 				await this.advanceOwnPrefixLocked()
 			})
 		}
@@ -1927,7 +1952,7 @@ export class SyncEngine {
 		// failure here surfaces there, per batch, and postpones that batch.
 		try {
 			for (const entry of entries) await this.outboundQueue.markSent(entry.batch.batchId)
-			await this.store.ensureDurable?.()
+			await this.awaitUploadDurability()
 		} catch {
 			// Reported by sendUpload, which retries the barrier before each batch.
 		}
@@ -2076,7 +2101,7 @@ export class SyncEngine {
 		// lose. The in-memory flag is set synchronously, before the first await.
 		try {
 			await this.outboundQueue.markSent(entry.batch.batchId)
-			await this.store.ensureDurable?.()
+			await this.awaitUploadDurability()
 		} catch (error) {
 			if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
 			this.emitter?.emit({
@@ -2125,6 +2150,46 @@ export class SyncEngine {
 		})
 		this.notifyStatusChange()
 		return messageId
+	}
+
+	/**
+	 * The durability barrier before an upload (RT-35), with a bounded number of failures
+	 * (RT-49). Throws while the failures may be transient; after
+	 * {@link DURABILITY_FAILURES_BEFORE_DEGRADED} consecutive failures it returns anyway
+	 * (degraded mode, `localDurability: 'degraded'`, `sync:durability-degraded`) so the
+	 * server keeps a durable copy. The barrier is still attempted every time: the first
+	 * success leaves degraded mode (`sync:durability-restored`).
+	 */
+	private async awaitUploadDurability(): Promise<void> {
+		if (!this.store.ensureDurable) return
+		try {
+			await this.store.ensureDurable()
+		} catch (error) {
+			this.durabilityFailures++
+			if (this.durabilityDegraded) return
+			if (this.durabilityFailures < DURABILITY_FAILURES_BEFORE_DEGRADED) throw error
+			this.durabilityDegraded = true
+			const message = error instanceof Error ? error.message : 'The local database is not durable'
+			this.emitter?.emit({
+				type: 'sync:durability-degraded',
+				message,
+				failedAttempts: this.durabilityFailures,
+			})
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: `Uploading without local durability after ${this.durabilityFailures} failed attempts; the server holds the only durable copy of new writes (${message})`,
+				code: 'DURABILITY_DEGRADED',
+			})
+			this.notifyStatusChange()
+			return
+		}
+		this.durabilityFailures = 0
+		if (this.durabilityDegraded) {
+			this.durabilityDegraded = false
+			this.emitter?.emit({ type: 'sync:durability-restored' })
+			this.notifyStatusChange()
+		}
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {

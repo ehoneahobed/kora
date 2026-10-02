@@ -248,6 +248,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `delivery gap expected ${event.expectedBase} received ${event.receivedBase}`
 		case 'sync:delivery-stalled':
 			return `delivery unacknowledged ${event.watermark} → ${event.outstandingMaxDeliverySequence} (${event.repeatCount} repeats)`
+		case 'sync:durability-degraded':
+			return `local durability degraded after ${event.failedAttempts} failed barriers: ${event.message}`
+		case 'sync:durability-restored':
+			return 'local durability restored'
 		case 'awareness:updated':
 			return `awareness ${event.states.size} peers`
 		case 'state-machine:transition':

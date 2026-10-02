@@ -84,6 +84,14 @@ export interface SyncStatusInfo {
 	 * `store.namespaceByAuthUser` to give each user their own database instead.
 	 */
 	heldOperations?: number
+	/**
+	 * `degraded` when this device's local database could not be made durable several times
+	 * in a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads continue so the
+	 * server keeps a durable copy, and a later reload recovers its writes from the server;
+	 * writes made while offline in this state may be lost if the page closes. Show the user
+	 * a warning (free up storage, stay online). `durable` otherwise.
+	 */
+	localDurability?: 'durable' | 'degraded'
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
 	inFlightUploadOperations?: number
