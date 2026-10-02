@@ -9,12 +9,14 @@ import type {
 import {
 	APPLY_FAILURE_CODES,
 	ClockDriftError,
+	HybridLogicalClock,
+	InvalidTimestampError,
 	KoraError,
+	RemoteClockDriftError,
 	SyncError,
 	applyOperationTransforms,
 	defaultApplyFailureReason,
 } from '@korajs/core'
-import { topologicalSort } from '@korajs/core/internal'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
 import { BlobChunkChannel } from '../blob/blob-chunk-channel'
@@ -52,7 +54,6 @@ import { RichtextDocChannel } from '../richtext/richtext-doc-channel'
 import {
 	type SyncQuerySubset,
 	dedupeQuerySubsets,
-	operationMatchesQuerySubsets,
 	querySubsetContains,
 } from '../scopes/query-subset'
 import { operationMatchesScope } from '../scopes/scope-filter'
@@ -60,6 +61,7 @@ import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
 import {
 	MemoryRejectedOperationStorage,
+	type QuarantinedOperation,
 	type QueueStorage,
 	type RejectedOperation,
 	type RejectedOperationStorage,
@@ -79,6 +81,34 @@ const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
 const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
+/**
+ * How many own sequence numbers the engine reads from the op log at a time when it
+ * (re)builds the upload set. Bounds memory during the one-time upgrade re-upload of a
+ * device's whole history: the next chunk is read only once the previous one is resolved.
+ */
+const OWN_LOG_SCAN_CHUNK = 500
+/**
+ * A delivered operation stamped further than this ahead of the trusted reference time
+ * is quarantined instead of applied (SYNC-7). Matches the HLC's own refusal threshold.
+ */
+const MAX_REMOTE_FUTURE_MS = 5 * 60_000
+/** Quarantine reason codes for inbound operations the client did not apply (W4). */
+const QUARANTINE_CODES = {
+	DECRYPT_FAILED: 'DECRYPT_FAILED',
+	REMOTE_CLOCK_DRIFT: 'REMOTE_CLOCK_DRIFT',
+	TRANSFORM_UNAVAILABLE: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+} as const
+
+/** A taken outbound batch, from the moment it leaves the queue until it is resolved. */
+interface InFlightUpload {
+	batch: OutboundBatch
+	/** Wire message id once sent; acks are matched to batches by it (SYNC-4). */
+	messageId: string | null
+	/** Session the batch was taken in; a batch from an older session is never sent. */
+	epoch: number
+	/** A retriable rejection hit this batch: back off before flushing again. */
+	retryBackoff: boolean
+}
 
 /**
  * Valid state transitions for the sync engine state machine.
@@ -232,9 +262,39 @@ export class SyncEngine {
 	private lastSuccessfulPush: number | null = null
 	private lastSuccessfulPull: number | null = null
 	private conflictCount = 0
-	private currentBatch: OutboundBatch | null = null
-	private currentBatchRequiresPartialAck = false
-	private currentBatchRequiresRetryBackoff = false
+	/**
+	 * Every outbound batch taken from the queue and not yet resolved, keyed by queue batch
+	 * id: handshake-delta and streaming batches alike. An ack resolves only the batch it
+	 * names (SYNC-4); a close returns all of them to the queue.
+	 */
+	private readonly inFlightUploads = new Map<string, InFlightUpload>()
+	/** Wire message id -> queue batch id, for ack and rejection correlation. */
+	private readonly uploadByMessageId = new Map<string, string>()
+	/** Incremented on every connect and every disconnect; stale async sends check it. */
+	private sessionEpoch = 0
+	/** Set by destroy(): the engine never connects or arms a timer again. */
+	private destroyed = false
+	private readonly statusListeners = new Set<() => void>()
+	/**
+	 * Contiguous acknowledged prefix of this device's own operations (W3 step 2): every
+	 * own op with sequence <= this is stored on the server, terminally rejected and
+	 * recorded, or not upload-eligible. Never advanced by a server-advertised vector.
+	 */
+	private ownAckedThrough = 0
+	/** Node id the prefix belongs to (a rotation starts a new prefix at 0). */
+	private ownTrackingNodeId: string | null = null
+	/** Highest own sequence read from the op log this session (above the prefix). */
+	private ownScannedThrough = 0
+	/**
+	 * Own sequences above the prefix that this session knows about, mapped to the ids of
+	 * their operations that are still unresolved. An empty set marks a sequence resolved.
+	 */
+	private readonly ownUnresolved = new Map<number, Set<string>>()
+	/** Ids resolved at sequences the log scan has not reached yet (skip on scan). */
+	private readonly ownResolvedAhead = new Map<string, number>()
+	private ownTrackingChain: Promise<void> = Promise.resolve()
+	/** Inbound quarantine kept in memory when the engine has no sync-state persistence. */
+	private readonly memoryQuarantine = new Map<string, QuarantinedOperation>()
 	private outboundRetryAttempt = 0
 	private outboundRetryTimer: ReturnType<typeof setTimeout> | null = null
 	private reconnecting = false
@@ -265,8 +325,6 @@ export class SyncEngine {
 	private deltaBatchesReceived = 0
 	private deltaReceiveComplete = false
 	private deltaSendComplete = false
-	/** Op ids sent during handshake delta — removed from outbound queue to avoid duplicate send */
-	private deltaSentOpIds: string[] = []
 	/** Outbound delta batch message IDs awaiting ACK when strictHandshake is enabled */
 	private pendingDeltaBatchAcks = new Set<string>()
 
@@ -278,7 +336,6 @@ export class SyncEngine {
 	private activeScope: SyncScopeMap | undefined
 	/** Server-authoritative upload authorization, separate from the downloaded view. */
 	private activeUplinkScope: SyncScopeMap | undefined
-	private hasDirectionalScopes = false
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -409,6 +466,7 @@ export class SyncEngine {
 			await this.nodeRotation
 		}
 		if (this.state === 'streaming') return
+		if (this.destroyed) return
 		if (this.state !== 'disconnected') {
 			await this.stop()
 		}
@@ -432,6 +490,12 @@ export class SyncEngine {
 		await this.outboundQueue.initialize()
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
+			if (this.activeScope === this.config.scopeMap && this.syncState.loadAcceptedDownlinkScope) {
+				// Read the watermark of the view the server actually served last time
+				// (SYNC-11): the accepted scope, not the requested one.
+				const accepted = await this.syncState.loadAcceptedDownlinkScope()
+				if (accepted) this.activeScope = accepted
+			}
 			if (this.nodeToken === null && this.syncState.loadNodeToken) {
 				this.nodeToken = await this.syncState.loadNodeToken()
 			}
@@ -453,8 +517,11 @@ export class SyncEngine {
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
 		}
+		await this.loadOwnTracking()
 		await this.reconcileOutboundFromOpLog()
+		await this.replayQuarantine()
 		await this.refreshPendingCount()
+		if (this.destroyed) return
 
 		// Set up transport handlers
 		this.transport.onMessage((msg) => this.enqueueMessage(msg))
@@ -490,10 +557,12 @@ export class SyncEngine {
 			}
 
 			await this.transport.connect(this.config.url, { authToken })
-			if (this.state !== 'connecting') {
+			if (this.state !== 'connecting' || this.destroyed) {
 				await this.transport.disconnect()
+				this.ensureDisconnected()
 				return
 			}
+			this.sessionEpoch++
 			this.transitionTo('handshaking')
 
 			// Send handshake
@@ -541,19 +610,18 @@ export class SyncEngine {
 	}
 
 	private async stopInternal(): Promise<void> {
-		this.clearOutboundAckTimer()
-		this.clearOutboundRetryTimer()
-		if (this.state === 'disconnected') return
+		// Every timer goes first, before any early return (SYNC-10): an engine that is
+		// already disconnected (the server closed the session) still owns the awareness
+		// cleanup interval and a pending query-subset reconnect.
+		this.clearAllTimers()
+		this.sessionEpoch++
+		this.returnAllInFlightUploads()
 
-		// Stop awareness tracking
-		this.awarenessManager.stopCleanupTimer()
-
-		// Return any in-flight batch back to queue
-		if (this.currentBatch) {
-			this.outboundQueue.returnBatch(this.currentBatch.batchId)
-			this.currentBatch = null
-			this.currentBatchRequiresPartialAck = false
-			this.currentBatchRequiresRetryBackoff = false
+		if (this.state === 'disconnected') {
+			// The session may have ended without the transport being closed (an error the
+			// engine gave up on): close it now so no socket is left open (SYNC-5).
+			await this.closeTransportQuietly()
+			return
 		}
 
 		try {
@@ -562,6 +630,70 @@ export class SyncEngine {
 			// The transport.disconnect() callback may have already transitioned
 			// to 'disconnected' via handleTransportClose. Re-read the mutable field.
 			this.ensureDisconnected()
+		}
+	}
+
+	/**
+	 * Stop for good (`app.close()`): disconnect, clear every timer and listener, and refuse
+	 * any later start. Unlike stop(), nothing the engine scheduled can run afterwards.
+	 */
+	async destroy(): Promise<void> {
+		this.destroyed = true
+		await this.stop()
+		this.clearAllTimers()
+		this.statusListeners.clear()
+	}
+
+	/** Clear every timer the engine owns. */
+	private clearAllTimers(): void {
+		this.clearOutboundAckTimer()
+		this.clearOutboundRetryTimer()
+		this.awarenessManager.stopCleanupTimer()
+		if (this.querySubsetReconnectTimer) {
+			clearTimeout(this.querySubsetReconnectTimer)
+			this.querySubsetReconnectTimer = null
+		}
+	}
+
+	/** Close the transport, logging nothing: it may already be closed. */
+	private async closeTransportQuietly(): Promise<void> {
+		try {
+			await this.transport.disconnect()
+		} catch {
+			// Already closed or never opened; the engine is disconnected either way.
+		}
+	}
+
+	/**
+	 * The engine gave up on this session (a message it could not process, a transport
+	 * error, a server error): move to disconnected and close the transport (SYNC-5). The
+	 * close starts synchronously in this same frame, so the socket is released before
+	 * auto-reconnect (which is asynchronous) can open another one.
+	 */
+	private abandonSession(reason: string): void {
+		this.handleTransportClose(reason)
+		void this.closeTransportQuietly()
+	}
+
+	/**
+	 * Subscribe to status changes that no event announces (an upload ack lowering the
+	 * pending count, reaching streaming). Status bridges refresh on it, so a waiter such
+	 * as `waitForSettled` sees the change immediately (RT-28).
+	 */
+	onStatusChange(listener: () => void): () => void {
+		this.statusListeners.add(listener)
+		return () => {
+			this.statusListeners.delete(listener)
+		}
+	}
+
+	private notifyStatusChange(): void {
+		for (const listener of this.statusListeners) {
+			try {
+				listener()
+			} catch {
+				// A listener's failure must not affect sync.
+			}
 		}
 	}
 
@@ -588,17 +720,19 @@ export class SyncEngine {
 	async pushOperation(op: Operation): Promise<void> {
 		if (!(await this.operationAllowedForUpload(op))) {
 			await this.recordOutOfUplinkScope(op)
+			// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
+			await this.withOwnTracking(async () => {
+				this.trackOwnOperation(op, false)
+				await this.advanceOwnPrefixLocked()
+			})
 			return
 		}
 
-		if (this.syncState) {
-			this.cachedUnsyncedCount++
-		}
-
-		await this.outboundQueue.enqueue(op)
-		if (this.syncState) {
-			await this.refreshPendingCount()
-		}
+		await this.withOwnTracking(async () => {
+			await this.outboundQueue.enqueue(op)
+			this.trackOwnOperation(op, true)
+		})
+		await this.refreshPendingCount()
 		if (this.state === 'streaming') {
 			this.flushQueue()
 		}
@@ -618,9 +752,7 @@ export class SyncEngine {
 	 * Get the current developer-facing sync status.
 	 */
 	getStatus(): SyncStatusInfo {
-		const pendingOperations = this.syncState
-			? this.cachedUnsyncedCount
-			: this.outboundQueue.totalPending
+		const pendingOperations = this.computePendingCount()
 		const base = {
 			phase: this.resolvePhase(),
 			...(this.suspensionReason ? { reason: this.suspensionReason } : {}),
@@ -631,7 +763,7 @@ export class SyncEngine {
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
 			clockSkewMs: this.clockSkewMs,
-			inFlightUploadOperations: this.currentBatch?.operations.length ?? 0,
+			inFlightUploadOperations: this.inFlightUploadCount(),
 			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
 			activeViewId: this.deliverySignature(),
 			activeViewComplete:
@@ -682,7 +814,7 @@ export class SyncEngine {
 		if (this.suspensionReason) return 'suspended'
 		if (this.blockedFailure || this.schemaBlocked || this.clockBlocked) return 'blocked'
 		if (this.hasInFlightDeliveryBatch) return 'applying'
-		if (this.currentBatch) return 'uploading'
+		if (this.inFlightUploads.size > 0) return 'uploading'
 		switch (this.state) {
 			case 'disconnected':
 				return 'offline'
@@ -751,21 +883,28 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Count of local operations not yet covered by the last acked server vector (op-log source of truth).
+	 * Count of this device's own operations not yet stored on the server (or terminally
+	 * rejected and recorded): queued, in flight, or above the acknowledged prefix.
 	 */
 	async getUnsyncedOperationCount(): Promise<number> {
 		await this.refreshPendingCount()
 		return this.getStatus().pendingOperations
 	}
 
+	/**
+	 * Surface an inbound apply failure. `blocking` marks the stream as stalled on this op
+	 * (the watermark does not pass it); `quarantined` means the op is durably recorded and
+	 * the stream moves on, so it never marks the stream blocked, whatever `retriable` says
+	 * (retriable there means the quarantine replays it later).
+	 */
 	private emitApplyFailure(
 		op: Operation,
 		result: Exclude<ApplyResult, 'applied' | 'duplicate'>,
 		overrides?: Partial<ApplyFailureReason>,
-		blocking = false,
+		mode: 'default' | 'blocking' | 'quarantined' = 'default',
 	): void {
 		const reason = defaultApplyFailureReason(result, overrides)
-		if (blocking || reason.retriable) {
+		if (mode === 'blocking' || (mode === 'default' && reason.retriable)) {
 			const prior = this.blockedFailure
 			this.blockedFailure = {
 				operationId: op.id,
@@ -850,7 +989,7 @@ export class SyncEngine {
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
 			pendingOperations: this.outboundQueue.totalPending,
-			hasInFlightBatch: this.currentBatch !== null,
+			hasInFlightBatch: this.inFlightUploads.size > 0,
 			reconnecting: this.reconnecting,
 			deliveryWatermark: this.deliveryWatermark,
 			deliveryGapRepeatCount: this.deliveryGapRepeatCount,
@@ -890,7 +1029,6 @@ export class SyncEngine {
 		// Until the server accepts distinct directional maps, preserve the legacy
 		// shorthand semantics locally as well.
 		this.activeUplinkScope = scopeMap
-		this.hasDirectionalScopes = false
 		// Also update the config so that the next handshake sends the new scope
 		this.config.scopeMap = scopeMap
 		this.switchDeliveryView(previousSignature)
@@ -1174,7 +1312,7 @@ export class SyncEngine {
 	private handleMessageFailure(error: unknown): void {
 		this.hasInFlightDeliveryBatch = false
 		const reason = error instanceof Error ? error.message : 'Message handling failed'
-		this.handleTransportClose(reason)
+		this.abandonSession(reason)
 	}
 
 	/**
@@ -1251,6 +1389,7 @@ export class SyncEngine {
 				reason,
 			})
 			this.transitionTo('disconnected')
+			void this.closeTransportQuietly()
 			return
 		}
 
@@ -1275,6 +1414,21 @@ export class SyncEngine {
 		this.remoteVector = wireToVersionVector(msg.versionVector)
 		void this.persistLastAckedServerVector(this.remoteVector)
 
+		// The server's accepted downlink scope is authoritative for what it delivers, so
+		// the delivery watermark belongs to that view. When it differs from the view the
+		// watermark was read under, switch views (SYNC-11), and remember it so a restart
+		// reads the right view's watermark before its first handshake.
+		const previousSignature = this.deliverySignature()
+		const acceptedDownlink = msg.acceptedDownlinkScopes ?? msg.acceptedScope
+		if (acceptedDownlink) {
+			this.activeScope = acceptedDownlink
+		}
+		this.activeUplinkScope = msg.acceptedUplinkScopes ?? msg.acceptedScope ?? this.activeScope
+		this.switchDeliveryView(previousSignature)
+		if (acceptedDownlink && this.syncState?.saveAcceptedDownlinkScope) {
+			await this.syncState.saveAcceptedDownlinkScope(acceptedDownlink)
+		}
+
 		// If our watermark is ahead of the server's frontier, the server's log was rolled
 		// back (for example a backup restore reset the delivery sequence). Reset to a full
 		// resync so we do not sit above operations the server will re-send from the start.
@@ -1294,21 +1448,24 @@ export class SyncEngine {
 			this.setSerializerWireFormat(msg.selectedWireFormat)
 		}
 
-		// If the server sent back an accepted scope, use it as the authoritative scope.
-		// The server may have narrowed or augmented the client's requested scope
-		// based on the auth context.
-		if (msg.acceptedDownlinkScopes ?? msg.acceptedScope) {
-			this.activeScope = msg.acceptedDownlinkScopes ?? msg.acceptedScope
-		}
-		this.hasDirectionalScopes = msg.acceptedUplinkScopes !== undefined
-		this.activeUplinkScope = msg.acceptedUplinkScopes ?? msg.acceptedScope ?? this.activeScope
 		if (this.config.scopeExit === 'retract' && this.activeScope && this.store.applyScopeNarrowing) {
 			const narrowed = await this.store.applyScopeNarrowing(this.activeScope)
 			for (const retraction of narrowed) {
 				await this.applyScopeRetraction(retraction, false)
 			}
-			await this.refreshPendingCount()
 		}
+
+		// A server that holds FEWER of this device's operations than the device believes
+		// (a restored backup) lowers the acknowledged prefix, so the device re-uploads
+		// them; the server dedups by id. A higher value is never trusted (RT-12, W3).
+		const advertisedOwn = this.remoteVector.get(this.store.getNodeId())
+		if (advertisedOwn !== undefined && advertisedOwn < this.ownAckedThrough) {
+			await this.withOwnTracking(async () => {
+				await this.lowerOwnPrefixLocked(advertisedOwn)
+				await this.advanceOwnPrefixLocked()
+			})
+		}
+		await this.refreshPendingCount()
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: this.store.getNodeId() })
 		this.metricsCollector.recordConnected()
@@ -1319,7 +1476,6 @@ export class SyncEngine {
 		this.deltaBatchesReceived = 0
 		this.deltaReceiveComplete = false
 		this.deltaSendComplete = false
-		this.deltaSentOpIds = []
 		this.pendingDeltaBatchAcks.clear()
 		this.initialSyncTotalBatches = 0
 
@@ -1329,8 +1485,12 @@ export class SyncEngine {
 			await this.maybeRebaseQueuedOperations(msg.serverTime)
 		}
 
-		// Send our delta to the server
-		this.sendDelta()
+		// Send our delta to the server. Not awaited: the outbound preparer (blob bytes)
+		// may need server messages that this message chain has yet to process.
+		void this.sendDelta().catch((error) => {
+			this.abandonSession(error instanceof Error ? error.message : 'Delta upload failed')
+		})
+		this.notifyStatusChange()
 	}
 
 	/**
@@ -1347,14 +1507,36 @@ export class SyncEngine {
 		}
 		const previousNodeId = this.store.getNodeId()
 		try {
-			const ids = new Set(this.outboundQueue.getAll().map((op) => op.id))
-			if (this.syncState) {
-				const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
-				for (const op of unsynced) if (op.nodeId === previousNodeId) ids.add(op.id)
+			this.returnAllInFlightUploads()
+			const ids = new Set(
+				this.outboundQueue
+					.getAll()
+					.filter((op) => op.nodeId === previousNodeId)
+					.map((op) => op.id),
+			)
+			// Own operations above the acknowledged prefix that were never read into the
+			// queue (the unscanned tail) are unsynced too.
+			const localSeq = this.store.getVersionVector().get(previousNodeId) ?? 0
+			if (localSeq > this.ownAckedThrough) {
+				const above = await this.store.getOperationRange(
+					previousNodeId,
+					this.ownAckedThrough + 1,
+					localSeq,
+				)
+				for (const op of above) {
+					if (op.nodeId !== previousNodeId || op.sequenceNumber <= this.ownAckedThrough) continue
+					if (this.isOwnOperationResolved(op)) continue
+					ids.add(op.id)
+				}
 			}
 			const result = await rotate([...ids])
 			await this.outboundQueue.replaceAll(result.operations)
 			this.nodeToken = null
+			// The new node id starts its own acknowledged prefix.
+			await this.withOwnTracking(async () => {
+				this.ownTrackingNodeId = null
+				await this.loadOwnTrackingLocked()
+			})
 			await this.refreshPendingCount()
 			this.emitter?.emit({
 				type: 'sync:node-id-rotated',
@@ -1385,7 +1567,10 @@ export class SyncEngine {
 		const rebase = this.store.rebaseUnsyncedOperations?.bind(this.store)
 		if (!rebase) return
 
-		const queued = this.outboundQueue.getAll()
+		// Only operations that never reached the wire may be re-stamped (W3 step 4): a
+		// sent one may already be stored on the server with its ack lost, and re-stamping
+		// it would upload the same change twice under two ids.
+		const queued = this.outboundQueue.getAll().filter((op) => !this.outboundQueue.wasSent(op.id))
 		if (queued.length === 0) return
 
 		let maxQueuedWallTime = Number.NEGATIVE_INFINITY
@@ -1405,7 +1590,18 @@ export class SyncEngine {
 				queued.map((op) => op.id),
 				serverTime,
 			)
-			await this.outboundQueue.replaceAll(result.operations)
+			await this.withOwnTracking(async () => {
+				await this.outboundQueue.replace(
+					queued.map((op) => op.id),
+					result.operations,
+				)
+				// The rewritten ops keep their sequence numbers but get new ids.
+				for (const [oldId, newId] of Object.entries(result.idMapping)) {
+					for (const ids of this.ownUnresolved.values()) {
+						if (ids.delete(oldId)) ids.add(newId)
+					}
+				}
+			})
 			this.emitter?.emit({
 				type: 'sync:clock-rebase',
 				rebasedCount: result.rebasedCount,
@@ -1425,17 +1621,23 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Upload this device's unsynced operations as the handshake delta. The delta is the
+	 * outbound queue itself (rebuilt from the op log above the acknowledged prefix), sent
+	 * as tracked batches: nothing leaves the queue until the server acknowledges the batch
+	 * that carried it (SYNC-4).
+	 */
 	private async sendDelta(): Promise<void> {
-		const localVector = this.store.getVersionVector()
-		const allMissingOps = await this.collectDelta(localVector, this.uploadBaseVector())
+		const epoch = this.sessionEpoch
+		const strict = this.config.strictHandshake === true
+		const entries: InFlightUpload[] = []
+		for (let entry = this.takeUpload(); entry; entry = this.takeUpload()) {
+			entries.push(entry)
+		}
 
-		const missingOps = await this.filterAllowedForUpload(allMissingOps)
-
-		this.deltaSentOpIds = missingOps.map((op) => op.id)
-
-		if (missingOps.length === 0) {
+		if (entries.length === 0) {
 			const messageId = generateMessageId()
-			if (this.config.strictHandshake) {
+			if (strict) {
 				this.pendingDeltaBatchAcks.add(messageId)
 			}
 			const emptyBatch: SyncMessage = {
@@ -1447,58 +1649,34 @@ export class SyncEngine {
 				totalBatches: 1,
 			}
 			this.transport.send(emptyBatch)
-			if (!this.config.strictHandshake) {
+			if (!strict) {
 				this.deltaSendComplete = true
 				void this.checkDeltaComplete()
 			}
 			return
 		}
 
-		// Paginate into batches
-		const sorted = topologicalSort(missingOps)
-		const totalBatches = Math.ceil(sorted.length / this.batchSize)
+		const totalBatches = entries.length
 		this.initialSyncTotalBatches = Math.max(this.initialSyncTotalBatches, totalBatches)
-
-		for (let i = 0; i < totalBatches; i++) {
-			const start = i * this.batchSize
-			const batchOps = sorted.slice(start, start + this.batchSize)
-			const batchCursor = createDeltaCursorFromBatch(batchOps, i)
-			if (this.outboundPreparer) {
-				try {
-					await this.outboundPreparer(batchOps)
-				} catch {
-					// Best effort: the server decides on the operations themselves.
-				}
+		for (const [i, entry] of entries.entries()) {
+			if (this.sessionEpoch !== epoch) {
+				// The session ended mid-delta: the rest goes back to the queue.
+				if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
+				continue
 			}
-
-			// Encrypt data fields before serialization if E2E encryption is enabled
-			const opsToSerialize = this.encryptor ? await this.encryptor.encryptBatch(batchOps) : batchOps
-
-			const serializedOps = opsToSerialize.map((op) => this.serializer.encodeOperation(op))
-
-			const messageId = generateMessageId()
-			if (this.config.strictHandshake) {
-				this.pendingDeltaBatchAcks.add(messageId)
-			}
-			const batchMsg: SyncMessage = {
-				type: 'operation-batch',
-				messageId,
-				operations: serializedOps,
+			const cursor = createDeltaCursorFromBatch(entry.batch.operations, i)
+			await this.sendUpload(entry, {
 				isFinal: i === totalBatches - 1,
 				batchIndex: i,
 				totalBatches,
-				...(batchCursor ? { cursor: encodeDeltaCursor(batchCursor) } : {}),
-			}
-			this.transport.send(batchMsg)
-
-			this.emitter?.emit({
-				type: 'sync:sent',
-				operations: batchOps,
-				batchSize: batchOps.length,
+				...(cursor ? { cursor: encodeDeltaCursor(cursor) } : {}),
+				beforeSend: (messageId) => {
+					if (strict) this.pendingDeltaBatchAcks.add(messageId)
+				},
 			})
 		}
 
-		if (!this.config.strictHandshake) {
+		if (!strict && this.sessionEpoch === epoch) {
 			this.deltaSendComplete = true
 			void this.checkDeltaComplete()
 		}
@@ -1512,34 +1690,171 @@ export class SyncEngine {
 		void this.checkDeltaComplete()
 	}
 
-	/**
-	 * Local operations the server has not seen. Only this node's own operations are
-	 * uploaded: operations relayed from other nodes reached this client through the
-	 * server, so re-uploading them is redundant and would be refused once the server
-	 * binds nodeId to the session (W3 step 1b).
-	 */
-	private async collectDelta(
-		localVector: VersionVector,
-		remoteVector: VersionVector,
-	): Promise<Operation[]> {
-		const localNodeId = this.store.getNodeId()
-		const localSeq = localVector.get(localNodeId) ?? 0
-		const remoteSeq = remoteVector.get(localNodeId) ?? 0
-		if (localSeq <= remoteSeq) {
-			return []
+	/** Take the next batch from the queue and track it until it is resolved. */
+	private takeUpload(): InFlightUpload | null {
+		const batch = this.outboundQueue.takeBatch(this.batchSize)
+		if (!batch) return null
+		const entry: InFlightUpload = {
+			batch,
+			messageId: null,
+			epoch: this.sessionEpoch,
+			retryBackoff: false,
 		}
-		const ops = await this.store.getOperationRange(localNodeId, remoteSeq + 1, localSeq)
-		return ops.filter((op) => op.nodeId === localNodeId)
+		this.inFlightUploads.set(batch.batchId, entry)
+		return entry
+	}
+
+	/** Whether a taken batch still belongs to the live session (SYNC-10). */
+	private isUploadCurrent(entry: InFlightUpload): boolean {
+		return (
+			this.inFlightUploads.get(entry.batch.batchId) === entry &&
+			entry.epoch === this.sessionEpoch &&
+			(this.state === 'syncing' || this.state === 'streaming')
+		)
+	}
+
+	/** Return one taken batch to the queue and forget its tracking. */
+	private returnUpload(entry: InFlightUpload): void {
+		this.outboundQueue.returnBatch(entry.batch.batchId)
+		this.inFlightUploads.delete(entry.batch.batchId)
+		if (entry.messageId) this.uploadByMessageId.delete(entry.messageId)
+		if (this.inFlightUploads.size === 0) this.clearOutboundAckTimer()
+	}
+
+	/** Return every taken batch to the queue (the session ended; nothing was resolved). */
+	private returnAllInFlightUploads(): void {
+		for (const entry of [...this.inFlightUploads.values()]) {
+			this.outboundQueue.returnBatch(entry.batch.batchId)
+		}
+		this.inFlightUploads.clear()
+		this.uploadByMessageId.clear()
+		this.clearOutboundAckTimer()
+	}
+
+	/**
+	 * The oldest batch taken from the queue and not yet resolved (diagnostics and
+	 * tests); null when nothing is in flight.
+	 */
+	private get currentBatch(): OutboundBatch | null {
+		const first = this.inFlightUploads.values().next()
+		return first.done ? null : first.value.batch
+	}
+
+	private inFlightUploadCount(): number {
+		let count = 0
+		for (const entry of this.inFlightUploads.values()) count += entry.batch.operations.length
+		return count
+	}
+
+	/**
+	 * Prepare, encrypt and send one taken batch, then register its message id so the ack
+	 * that names it resolves exactly this batch. Every await is followed by a check that
+	 * the batch still belongs to the live session; a send that throws returns the batch
+	 * to the queue instead of rejecting unhandled (SYNC-10).
+	 *
+	 * @returns The wire message id, or null when the batch was not sent.
+	 */
+	private async sendUpload(
+		entry: InFlightUpload,
+		frame: {
+			isFinal: boolean
+			batchIndex: number
+			totalBatches?: number
+			cursor?: string
+			beforeSend?: (messageId: string) => void
+		},
+	): Promise<string | null> {
+		// The server acknowledges a batch as "processed through sequence n", in the order
+		// it processes them; sending own operations in sequence order keeps that a prefix.
+		const operations = [...entry.batch.operations].sort(compareForUpload)
+		const preparer = this.outboundPreparer
+		if (preparer) {
+			// Let the app send what the server needs BEFORE these operations (blob bytes,
+			// so the server sees proof of possession before the reference, RT-11).
+			try {
+				await preparer(operations)
+			} catch {
+				// Best effort: the server decides on the operations themselves.
+			}
+			if (!this.isUploadCurrent(entry)) return null
+		}
+
+		let wireOperations = operations
+		if (this.encryptor) {
+			try {
+				wireOperations = await this.encryptor.encryptBatch(operations)
+			} catch (err) {
+				// Nothing was sent: return the batch so no data is lost.
+				if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
+				this.emitter?.emit({
+					type: 'sync:disconnected',
+					reason: err instanceof Error ? err.message : 'Encryption failed',
+				})
+				return null
+			}
+			if (!this.isUploadCurrent(entry)) return null
+		}
+
+		if (!this.isUploadCurrent(entry)) return null
+		// Flag the operations as sent BEFORE they reach the wire: from then on they may be
+		// stored on the server even if no ack ever arrives, so a rebase must leave them.
+		// The in-memory flag is set synchronously; persisting it completes below.
+		const marking = this.outboundQueue.markSent(entry.batch.batchId)
+
+		const messageId = generateMessageId()
+		const message: SyncMessage = {
+			type: 'operation-batch',
+			messageId,
+			operations: wireOperations.map((op) => this.serializer.encodeOperation(op)),
+			isFinal: frame.isFinal,
+			batchIndex: frame.batchIndex,
+			...(frame.totalBatches !== undefined ? { totalBatches: frame.totalBatches } : {}),
+			...(frame.cursor !== undefined ? { cursor: frame.cursor } : {}),
+		}
+		entry.messageId = messageId
+		this.uploadByMessageId.set(messageId, entry.batch.batchId)
+		frame.beforeSend?.(messageId)
+		try {
+			this.transport.send(message)
+		} catch (error) {
+			this.returnUpload(entry)
+			this.pendingDeltaBatchAcks.delete(messageId)
+			this.emitter?.emit({
+				type: 'sync:disconnected',
+				reason: error instanceof Error ? error.message : 'Send failed',
+			})
+			return null
+		}
+		this.startOutboundAckTimer()
+		this.emitter?.emit({
+			type: 'sync:sent',
+			operations,
+			batchSize: operations.length,
+		})
+		this.notifyStatusChange()
+		try {
+			await marking
+		} catch (error) {
+			// The flag still holds in memory for this engine's lifetime.
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-sync-queue',
+				message: error instanceof Error ? error.message : 'Failed to persist sent flag',
+				code: 'QUEUE_PERSISTENCE_FAILED',
+			})
+		}
+		return messageId
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
 		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
 
 		// Delivery-stream chain control. The server sends in-scope operations in delivery
-		// order, each batch chaining base -> max. Three cases keep the watermark a sound,
-		// gap-free lower bound and let a dropped batch recover without a lost operation:
+		// order, each batch chaining base -> max. The watermark stays a sound, gap-free
+		// lower bound, and a dropped batch recovers without a lost operation:
 		if (isDeliveryBatch) {
 			const base = msg.baseDeliverySequence ?? 0
+			const max = msg.maxDeliverySequence ?? base
 			if (base > this.deliveryWatermark) {
 				// A gap: an earlier batch has not arrived. Do not apply out of order and do
 				// not acknowledge, so the server's reliable retransmit (or the next handshake
@@ -1558,37 +1873,29 @@ export class SyncEngine {
 				})
 				return
 			}
-			if (base < this.deliveryWatermark) {
-				// A duplicate of an already-applied batch (a retransmit that crossed an ack).
-				// Re-acknowledge so the server can release it, but do not re-apply or move the
-				// watermark backward.
+			if (base < this.deliveryWatermark && max <= this.deliveryWatermark) {
+				// Entirely below the watermark: a retransmit that crossed an ack, or a server
+				// restarting the stream from 0 (it does so whenever the resolved scope differs
+				// from the handshake scope). Re-acknowledge without re-applying, but still run
+				// the initial-sync bookkeeping: a final batch must complete the handshake, or
+				// the engine would sit in 'syncing' forever (NEW-SYNC-1).
 				this.sendDeliveryAck(msg.messageId, this.deliveryWatermark)
+				await this.recordReceivedBatch(msg, true, true, [], [])
 				return
 			}
-			// base === watermark: this batch continues the chain; apply it in order below.
+			// base === watermark continues the chain. base < watermark < max straddles it:
+			// the batch is applied whole (re-applying the part below the watermark is an
+			// idempotent no-op) and the watermark advances to its max, so the next chained
+			// batch (base == max) is not mistaken for a gap.
 			this.hasInFlightDeliveryBatch = true
 		}
 
-		const deserialized = msg.operations.map((s) => this.serializer.decodeOperation(s))
+		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
+		const deliverySequence = isDeliveryBatch ? (msg.maxDeliverySequence ?? null) : null
 
-		// Decrypt data fields after deserialization if E2E encryption is enabled
-		const operations = this.encryptor
-			? await this.encryptor.decryptBatch(deserialized)
-			: deserialized
-
-		// Inbound filtering still uses the combined predicate; removing it is SYNC-2 (W4).
-		// It is judged per operation, in apply order: a partial update that does not
-		// restate the scope field is judged on the record as materialized by the earlier
-		// operations of the same batch (its insert, or a scope-entry insert, RT-19).
-		const inScopeOps: Operation[] = []
-
-		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
-		const transforms = this.config.operationTransforms ?? []
-
-		// Whether every operation in this batch was durably applied (or was a harmless
-		// duplicate). A retriable failure clears this so the delivery watermark does not
-		// advance past the failed operation, which is what makes a transient apply failure
-		// recoverable instead of silently skipped.
+		// Whether every operation in this batch was durably applied, was a harmless
+		// duplicate, or was durably quarantined. A retriable failure clears this so the
+		// delivery watermark does not advance past the failed operation.
 		let fullyApplied = true
 
 		for (const retraction of msg.retractions ?? []) {
@@ -1598,87 +1905,70 @@ export class SyncEngine {
 				fullyApplied = false
 			}
 		}
-		await this.refreshPendingCount()
-
-		// Apply each in-scope operation; per-op failures must not block batch ACK
-		for (const op of operations) {
-			if ((await this.filterAllowedForSync([op])).length === 0) {
-				continue
-			}
-			inScopeOps.push(op)
-			const transformed =
-				transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
-			if (transformed === null) {
-				continue
-			}
-
-			try {
-				const result = await this.store.applyRemoteOperation(transformed)
-				if (result === 'skipped' || result === 'rejected' || result === 'deferred') {
-					this.emitApplyFailure(transformed, result)
-				}
-			} catch (error) {
-				// Any throw means the store did NOT take custody of the operation, so the
-				// delivery watermark must not advance past it (whether the error is retriable
-				// or terminal). Inbound operations are authoritative and are not diverted to a
-				// rejected store the way the client's own rejected outbound operations are, so
-				// advancing here would silently lose the operation with no way to recover it.
-				// Stalling instead surfaces the failure (an emitted event) and re-fetches the
-				// operation on the next exchange; a genuinely un-appliable inbound operation
-				// (for example a scope that includes a child but excludes its parent) becomes a
-				// visible, diagnosable stall rather than silent data loss.
-				fullyApplied = false
-				if (error instanceof ClockDriftError) {
-					this.emitApplyFailure(
-						transformed,
-						'rejected',
-						{
-							code: APPLY_FAILURE_CODES.CLOCK_DRIFT,
-							message: error.message,
-							retriable: false,
-						},
-						true,
-					)
-					continue
-				}
-				const message = error instanceof Error ? error.message : 'Apply failed'
-				const code =
-					error instanceof SyncError
-						? error.code
-						: error instanceof KoraError
-							? error.code
-							: error instanceof Error && 'code' in error && typeof error.code === 'string'
-								? error.code
-								: APPLY_FAILURE_CODES.APPLY_FAILED
-				const retriable = code !== APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY
-				this.emitApplyFailure(transformed, 'rejected', { code, message, retriable }, true)
-			}
+		if ((msg.retractions?.length ?? 0) > 0) {
+			await this.refreshPendingCount()
 		}
 
-		if (inScopeOps.length > 0) {
+		// Apply what the server delivered, in order (SYNC-2, NEW-SYNC-3): the server already
+		// enforced the downlink scope and query view, and judging delivered operations
+		// against the client's uplink scope dropped read-only data. Anything the client
+		// deliberately does not apply is quarantined, never silently skipped.
+		const received: Operation[] = []
+		const quarantined: QuarantinedOperation[] = []
+		for (const delivered of operations) {
+			const outcome = await this.applyInbound(delivered, deliverySequence)
+			if (outcome.operation) received.push(outcome.operation)
+			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
+			else if (outcome.kind === 'stall') fullyApplied = false
+		}
+
+		if (received.length > 0) {
 			this.lastSuccessfulPull = Date.now()
 			this.emitter?.emit({
 				type: 'sync:received',
-				operations: inScopeOps,
-				batchSize: inScopeOps.length,
+				operations: received,
+				batchSize: received.length,
 			})
+		}
+
+		// Make the outcome durable BEFORE acknowledging. For a chained delivery batch the
+		// quarantine rows and the watermark advance commit in one transaction, so the
+		// watermark never passes an operation that is neither applied nor quarantined.
+		const advance = isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined
+		if (advance && msg.maxDeliverySequence !== undefined) {
+			this.deliveryGapRepeatCount = 0
+			this.lastDeliveryGapKey = null
+			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
+			await this.commitDeliveryProgress(quarantined, watermark)
+			this.deliveryWatermark = watermark
+			this.setViewWatermark(this.deliverySignature(), watermark)
+			if (
+				this.blockedFailure &&
+				received.some((op) => op.id === this.blockedFailure?.operationId)
+			) {
+				const recovered = this.blockedFailure
+				this.blockedFailure = null
+				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
+			}
+		} else if (!isDeliveryBatch && quarantined.length > 0) {
+			// A legacy (version-vector) or relay batch has no watermark to move, but its
+			// quarantined operations must still be recorded before the ack releases them.
+			await this.commitDeliveryProgress(quarantined, null)
 		}
 
 		// Acknowledge the batch. A legacy (version-vector) batch is always acknowledged.
 		// A delivery-stream batch is acknowledged only when it fully applied: a failed
 		// delivery batch must NOT be acknowledged, so the server keeps re-sending it from
-		// the client's last acknowledged position rather than releasing it (which would
-		// strand the client until an unrelated reconnect).
-		const deliveryFullyApplied = isDeliveryBatch && fullyApplied
-		if (!isDeliveryBatch || deliveryFullyApplied) {
+		// the client's last acknowledged position rather than releasing it.
+		if (!isDeliveryBatch || advance) {
 			const lastOp = operations[operations.length - 1]
 			const ack: SyncMessage = {
 				type: 'acknowledgment',
 				messageId: generateMessageId(),
 				acknowledgedMessageId: msg.messageId,
 				lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-				...(deliveryFullyApplied && msg.maxDeliverySequence !== undefined
-					? { deliverySequence: msg.maxDeliverySequence }
+				...(advance && msg.maxDeliverySequence !== undefined
+					? { deliverySequence: this.deliveryWatermark }
 					: {}),
 			}
 			this.transport.send(ack)
@@ -1688,63 +1978,310 @@ export class SyncEngine {
 				sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
 			})
 		}
-
-		// Advance the delivery watermark only for a chained delivery batch that fully
-		// applied. This is the single place the watermark moves, so it always reflects a
-		// gap-free prefix of the server's in-scope stream.
-		if (isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined) {
-			this.deliveryGapRepeatCount = 0
-			this.lastDeliveryGapKey = null
-			this.deliveryWatermark = msg.maxDeliverySequence
-			this.setViewWatermark(this.deliverySignature(), this.deliveryWatermark)
-			await this.persistDeliveryWatermark(this.deliveryWatermark)
-			if (
-				this.blockedFailure &&
-				inScopeOps.some((op) => op.id === this.blockedFailure?.operationId)
-			) {
-				const recovered = this.blockedFailure
-				this.blockedFailure = null
-				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
-			}
-		}
 		this.hasInFlightDeliveryBatch = false
 
-		if (this.state === 'syncing') {
-			this.deltaBatchesReceived++
-			const totalBatches = msg.totalBatches ?? this.initialSyncTotalBatches
-			if (msg.totalBatches !== undefined) {
-				this.initialSyncTotalBatches = msg.totalBatches
-			}
-			this.metricsCollector.updateInitialSyncProgress(this.deltaBatchesReceived, totalBatches)
+		await this.recordReceivedBatch(msg, isDeliveryBatch, fullyApplied, received, operations)
+		this.notifyStatusChange()
+	}
 
-			// The version-vector resume cursor is only used for the legacy (non-delivery)
-			// delta path. A delivery stream resumes from the watermark instead, so leave the
-			// cursor untouched for those batches.
-			if (!isDeliveryBatch) {
-				const cursorFromBatch =
-					msg.cursor !== undefined
-						? decodeDeltaCursor(msg.cursor)
-						: createDeltaCursorFromBatch(
-								inScopeOps.length > 0 ? inScopeOps : operations,
-								msg.batchIndex,
-							)
-				if (cursorFromBatch) {
-					this.resumeDeltaCursor = cursorFromBatch
-					await this.persistDeltaCursor(cursorFromBatch)
-				}
-			}
+	/**
+	 * Initial-sync bookkeeping for a received batch: progress, the legacy resume cursor,
+	 * and completion on the final batch. Runs for duplicate batches too (NEW-SYNC-1).
+	 */
+	private async recordReceivedBatch(
+		msg: OperationBatchMessage,
+		isDeliveryBatch: boolean,
+		fullyApplied: boolean,
+		received: Operation[],
+		operations: Operation[],
+	): Promise<void> {
+		if (this.state !== 'syncing') {
+			return
+		}
+		this.deltaBatchesReceived++
+		const totalBatches = msg.totalBatches ?? this.initialSyncTotalBatches
+		if (msg.totalBatches !== undefined) {
+			this.initialSyncTotalBatches = msg.totalBatches
+		}
+		this.metricsCollector.updateInitialSyncProgress(this.deltaBatchesReceived, totalBatches)
 
-			// A delivery stream advances the watermark only when the batch fully applied; a
-			// batch with a retriable failure must not complete initial sync (its operations
-			// still need to arrive), so gate completion on fullyApplied for delivery batches.
-			if (msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
-				this.deltaReceiveComplete = true
-				this.resumeDeltaCursor = null
-				await this.persistDeltaCursor(null)
-				this.metricsCollector.recordSyncCompleted()
-				void this.checkDeltaComplete()
+		// The version-vector resume cursor is only used for the legacy (non-delivery)
+		// delta path. A delivery stream resumes from the watermark instead.
+		if (!isDeliveryBatch) {
+			const cursorFromBatch =
+				msg.cursor !== undefined
+					? decodeDeltaCursor(msg.cursor)
+					: createDeltaCursorFromBatch(received.length > 0 ? received : operations, msg.batchIndex)
+			if (cursorFromBatch) {
+				this.resumeDeltaCursor = cursorFromBatch
+				await this.persistDeltaCursor(cursorFromBatch)
 			}
 		}
+
+		// A delivery batch with a retriable failure must not complete initial sync (its
+		// operations still need to arrive), so completion is gated on fullyApplied.
+		if (msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
+			this.deltaReceiveComplete = true
+			this.resumeDeltaCursor = null
+			await this.persistDeltaCursor(null)
+			this.metricsCollector.recordSyncCompleted()
+			await this.checkDeltaComplete()
+		}
+	}
+
+	/**
+	 * Apply one delivered operation. Outcomes:
+	 * - `applied`: applied, a duplicate, or a merge-decided skip (the record is settled);
+	 * - `quarantine`: deliberately not applied and to be recorded durably (unknown
+	 *   collection, transform unavailable, rejected or deferred apply, far-future
+	 *   timestamp, undecryptable payload, referential failure), with `sync:apply-failed`;
+	 * - `stall`: a retriable failure; the watermark must not pass it (or the engine
+	 *   cannot record a quarantine durably), so the server re-sends it.
+	 */
+	private async applyInbound(
+		delivered: Operation,
+		deliverySequence: number | null,
+	): Promise<
+		| { kind: 'applied'; operation: Operation }
+		| { kind: 'quarantine'; entry: QuarantinedOperation; operation: Operation | null }
+		| { kind: 'stall'; operation: Operation | null }
+	> {
+		const quarantine = (
+			op: Operation,
+			code: string,
+			message: string,
+			result: Exclude<ApplyResult, 'applied' | 'duplicate'>,
+			retriable: boolean,
+			decrypted: Operation | null,
+		):
+			| { kind: 'quarantine'; entry: QuarantinedOperation; operation: Operation | null }
+			| { kind: 'stall'; operation: Operation | null } => {
+			if (!this.canQuarantine()) {
+				// No durable quarantine next to a durable watermark: stall rather than lose.
+				this.emitApplyFailure(op, result, { code, message, retriable }, 'blocking')
+				return { kind: 'stall', operation: decrypted }
+			}
+			this.emitApplyFailure(op, result, { code, message, retriable }, 'quarantined')
+			return {
+				kind: 'quarantine',
+				operation: decrypted,
+				entry: { operation: op, deliverySequence, code, message, quarantinedAt: Date.now() },
+			}
+		}
+
+		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
+		// corrupted payload) is quarantined; the session and every other operation go on.
+		let op = delivered
+		if (this.encryptor) {
+			try {
+				op = await this.encryptor.decryptOperation(delivered)
+			} catch (error) {
+				return quarantine(
+					delivered,
+					QUARANTINE_CODES.DECRYPT_FAILED,
+					error instanceof Error ? error.message : 'Failed to decrypt operation',
+					'rejected',
+					true,
+					null,
+				)
+			}
+		}
+
+		// A far-future timestamp is never applied: adopting it would make every later
+		// local edit lose to it until real time caught up (SYNC-7). The HLC also refuses
+		// it once warm; this check covers a cold clock and does not depend on the store.
+		const reference = Date.now() + (this.clockSkewMs ?? 0)
+		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) {
+			return quarantine(
+				op,
+				QUARANTINE_CODES.REMOTE_CLOCK_DRIFT,
+				`Operation timestamp ${op.timestamp.wallTime} is more than ${MAX_REMOTE_FUTURE_MS}ms ahead of the reference time ${reference}; it is kept and retried once time catches up.`,
+				'rejected',
+				true,
+				op,
+			)
+		}
+
+		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		const transforms = this.config.operationTransforms ?? []
+		const transformed =
+			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
+		if (transformed === null) {
+			return quarantine(
+				op,
+				QUARANTINE_CODES.TRANSFORM_UNAVAILABLE,
+				`No transform from schema v${op.schemaVersion} to v${targetSchemaVersion} for this operation; it is kept and replayed after an upgrade.`,
+				'skipped',
+				false,
+				op,
+			)
+		}
+
+		try {
+			const result = await this.store.applyRemoteOperation(transformed)
+			if (result === 'applied' || result === 'duplicate') {
+				return { kind: 'applied', operation: op }
+			}
+			if (result === 'skipped' && this.store.hasCollection?.(transformed.collection) === true) {
+				// A merge decision (for example a local update outranking a remote delete):
+				// the record is settled; nothing to keep.
+				this.emitApplyFailure(transformed, result, undefined, 'quarantined')
+				return { kind: 'applied', operation: op }
+			}
+			const reason = defaultApplyFailureReason(result)
+			return quarantine(transformed, reason.code, reason.message, result, reason.retriable, op)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Apply failed'
+			const code =
+				error instanceof SyncError
+					? error.code
+					: error instanceof KoraError
+						? error.code
+						: error instanceof Error && 'code' in error && typeof error.code === 'string'
+							? error.code
+							: APPLY_FAILURE_CODES.APPLY_FAILED
+			if (error instanceof ClockDriftError) {
+				// This device's own clock is broken: a local condition, not the operation's
+				// fault. Stall (blocking) so it is retried once the clock is fixed.
+				this.emitApplyFailure(
+					transformed,
+					'rejected',
+					{ code: APPLY_FAILURE_CODES.CLOCK_DRIFT, message: error.message, retriable: false },
+					'blocking',
+				)
+				return { kind: 'stall', operation: op }
+			}
+			if (error instanceof RemoteClockDriftError || error instanceof InvalidTimestampError) {
+				return quarantine(transformed, code, message, 'rejected', true, op)
+			}
+			if (code === APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY) {
+				// Not appliable now (for example a child whose parent is outside this view);
+				// kept and replayed rather than stalling every later operation.
+				return quarantine(transformed, code, message, 'rejected', false, op)
+			}
+			// Anything else may be transient (a busy database): the store did not take
+			// custody, so stall; the server re-sends it.
+			this.emitApplyFailure(transformed, 'rejected', { code, message, retriable: true }, 'blocking')
+			return { kind: 'stall', operation: op }
+		}
+	}
+
+	/**
+	 * Whether a not-applied operation can be recorded so the watermark may pass it: with
+	 * a durable quarantine, or when nothing is durable (no persisted watermark either, so
+	 * a restart re-delivers everything anyway).
+	 */
+	private canQuarantine(): boolean {
+		if (!this.syncState) return true
+		if (this.syncState.saveQuarantine) return true
+		return !this.syncState.saveDeliveryWatermark
+	}
+
+	/**
+	 * Record quarantined operations and (for a delivery batch) the watermark advance in
+	 * one durable step.
+	 */
+	private async commitDeliveryProgress(
+		quarantined: QuarantinedOperation[],
+		watermark: number | null,
+	): Promise<void> {
+		const signature = this.deliverySignature()
+		if (quarantined.length > 0 && this.syncState?.saveQuarantine) {
+			await this.syncState.saveQuarantine(
+				quarantined,
+				watermark === null ? undefined : { signature, watermark },
+			)
+			return
+		}
+		for (const entry of quarantined) {
+			this.memoryQuarantine.set(entry.operation.id, entry)
+		}
+		if (watermark !== null) {
+			await this.persistDeliveryWatermark(watermark, signature)
+		}
+	}
+
+	/** Every inbound operation held in quarantine (durable when persistence supports it). */
+	async getQuarantinedOperations(): Promise<QuarantinedOperation[]> {
+		if (this.syncState?.loadQuarantine) {
+			return this.syncState.loadQuarantine()
+		}
+		return [...this.memoryQuarantine.values()]
+	}
+
+	/**
+	 * Try to apply every quarantined operation again, oldest delivery first and in HLC
+	 * order within a delivery. Runs on start (after a schema upgrade the unknown
+	 * collection now exists; after time catches up a far-future op is acceptable) and on
+	 * demand. Applied operations leave the quarantine; the rest stay.
+	 *
+	 * @returns How many operations left the quarantine.
+	 */
+	async retryQuarantinedOperations(): Promise<number> {
+		return this.replayQuarantine()
+	}
+
+	private async replayQuarantine(): Promise<number> {
+		const entries = await this.getQuarantinedOperations()
+		if (entries.length === 0) return 0
+		entries.sort(
+			(a, b) =>
+				(a.deliverySequence ?? 0) - (b.deliverySequence ?? 0) ||
+				HybridLogicalClock.compare(a.operation.timestamp, b.operation.timestamp),
+		)
+		const released: string[] = []
+		for (const entry of entries) {
+			let outcome: Awaited<ReturnType<SyncEngine['applyInboundQuietly']>>
+			try {
+				outcome = await this.applyInboundQuietly(entry.operation)
+			} catch {
+				outcome = false
+			}
+			if (outcome) {
+				released.push(entry.operation.id)
+				this.emitter?.emit({
+					type: 'sync:apply-recovered',
+					failure: {
+						operationId: entry.operation.id,
+						collection: entry.operation.collection,
+						recordId: entry.operation.recordId,
+						code: entry.code,
+						message: entry.message,
+						retriable: true,
+						firstSeenAt: entry.quarantinedAt,
+						retryCount: 0,
+					},
+				})
+			}
+		}
+		if (released.length === 0) return 0
+		if (this.syncState?.removeQuarantine) {
+			await this.syncState.removeQuarantine(released)
+		}
+		for (const id of released) this.memoryQuarantine.delete(id)
+		return released.length
+	}
+
+	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
+	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
+		let op = stored
+		if (this.encryptor) {
+			try {
+				op = await this.encryptor.decryptOperation(stored)
+			} catch {
+				return false
+			}
+		}
+		const reference = Date.now() + (this.clockSkewMs ?? 0)
+		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) return false
+		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		const transforms = this.config.operationTransforms ?? []
+		const transformed =
+			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
+		if (transformed === null) return false
+		const result = await this.store.applyRemoteOperation(transformed)
+		if (result === 'applied' || result === 'duplicate') return true
+		return result === 'skipped' && this.store.hasCollection?.(transformed.collection) === true
 	}
 
 	/** Acknowledge a delivery batch (used for duplicates) without re-applying it. */
@@ -1759,59 +2296,78 @@ export class SyncEngine {
 		this.transport.send(ack)
 	}
 
+	/**
+	 * An acknowledgment resolves exactly the upload batch it names (SYNC-4): operations
+	 * the server processed (sequence <= `lastSequenceNumber`) leave the queue and count
+	 * toward the acknowledged prefix; the rest return to the queue for retry. An ack that
+	 * names no tracked batch (a node-token confirmation echo, a batch from an older
+	 * session) resolves nothing.
+	 */
 	private async handleAcknowledgment(msg: AcknowledgmentMessage): Promise<void> {
-		this.clearOutboundAckTimer()
-		const requiresRetryBackoff = this.currentBatchRequiresRetryBackoff
 		if (this.state === 'syncing' && this.config.strictHandshake) {
 			this.pendingDeltaBatchAcks.delete(msg.acknowledgedMessageId)
 			this.markDeltaSendCompleteIfReady()
 		}
 
-		if (this.currentBatch) {
-			if (this.currentBatchRequiresPartialAck) {
-				await this.outboundQueue.acknowledgeThrough(
-					this.currentBatch.batchId,
-					msg.lastSequenceNumber,
-				)
-			} else {
-				await this.outboundQueue.acknowledge(this.currentBatch.batchId)
-			}
-			this.currentBatch = null
-			this.currentBatchRequiresPartialAck = false
-			this.currentBatchRequiresRetryBackoff = false
+		const batchId = this.uploadByMessageId.get(msg.acknowledgedMessageId)
+		const entry = batchId === undefined ? undefined : this.inFlightUploads.get(batchId)
+		if (!entry || batchId === undefined) {
+			return
+		}
+		this.uploadByMessageId.delete(msg.acknowledgedMessageId)
+		this.inFlightUploads.delete(batchId)
+		if (this.inFlightUploads.size === 0) {
+			this.clearOutboundAckTimer()
+		} else {
+			this.startOutboundAckTimer()
+		}
+
+		const { acknowledged, returned } = await this.outboundQueue.acknowledgeThrough(
+			batchId,
+			msg.lastSequenceNumber,
+		)
+		if (acknowledged.length > 0) {
 			const now = Date.now()
 			this.lastSyncedAt = now
 			this.lastSuccessfulPush = now
 		}
-
-		await this.advanceLastAckedForLocalNode(msg.lastSequenceNumber)
+		await this.withOwnTracking(async () => {
+			for (const op of acknowledged) this.markOwnResolved(op)
+			await this.advanceOwnPrefixLocked()
+		})
 		await this.refreshPendingCount()
 
 		// Continue flushing if more ops in queue
+		const backoff = entry.retryBackoff || returned.length > 0
 		if (this.state === 'streaming' && this.outboundQueue.hasOperations) {
-			if (requiresRetryBackoff) {
+			if (backoff) {
 				this.scheduleOutboundRetry()
 			} else {
 				this.outboundRetryAttempt = 0
 				this.flushQueue()
 			}
-		} else if (!requiresRetryBackoff) {
+		} else if (!backoff) {
 			this.outboundRetryAttempt = 0
 		}
+		this.notifyStatusChange()
 	}
 
 	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
-		this.clearOutboundAckTimer()
-		// An in-flight outbound batch will never be acknowledged now. Return it to the
-		// queue so it is retried, instead of leaving `currentBatch` set — which would
-		// wedge every future flush behind a batch that can never clear (real-time
-		// outbound sync would stall until the transport happened to reconnect).
-		if (this.currentBatch) {
-			this.outboundQueue.returnBatch(this.currentBatch.batchId)
-			this.currentBatch = null
-			this.currentBatchRequiresPartialAck = false
-			this.currentBatchRequiresRetryBackoff = false
+		if (msg.code === 'INVALID_TIMESTAMP') {
+			// The server refused the batch at its first future-stamped operation and stored
+			// none of the future-stamped ones, so a clock rebase may re-stamp them.
+			const limit = Date.now() + (this.clockSkewMs ?? 0) + 60_000
+			const refused = this.outboundQueue
+				.getInFlight()
+				.filter((op) => op.timestamp.wallTime > limit)
+				.map((op) => op.id)
+			this.outboundQueue.clearSent(refused)
 		}
+		// In-flight outbound batches will never be acknowledged now. Return them to the
+		// queue so they are retried, instead of wedging every future flush behind a batch
+		// that can never clear.
+		this.sessionEpoch++
+		this.returnAllInFlightUploads()
 		// The server usually closes the socket right after an error, so the close may
 		// already have moved the engine to disconnected. The error still carries
 		// meaning (auth rejection, clock block, credential refresh): record it either way.
@@ -1854,11 +2410,15 @@ export class SyncEngine {
 			if (live) {
 				this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
 			}
+			// Stay in 'error' (clock-error status) until the server closes the session or
+			// the app clears the block; the block, not the socket, is what stops sync.
 			return
 		}
 		if (live) {
 			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
 			this.transitionTo('disconnected')
+			// The engine ended this session: release the socket too (SYNC-5).
+			void this.closeTransportQuietly()
 		}
 	}
 
@@ -1894,6 +2454,12 @@ export class SyncEngine {
 				rejectedAt: Date.now(),
 			})
 		}
+		if (quarantined.length > 0) {
+			await this.withOwnTracking(async () => {
+				for (const operation of quarantined) this.markOwnResolved(operation)
+				await this.advanceOwnPrefixLocked()
+			})
+		}
 		this.emitter?.emit({
 			type: 'sync:scope-retracted',
 			collection: retraction.collection,
@@ -1904,8 +2470,13 @@ export class SyncEngine {
 
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
 		if (msg.retriable) {
-			this.currentBatchRequiresPartialAck = true
-			this.currentBatchRequiresRetryBackoff = true
+			// The op stays in its batch; the batch's ack stops short of it and returns it
+			// to the queue. Back off before retrying that batch's leftovers.
+			for (const entry of this.inFlightUploads.values()) {
+				if (entry.batch.operations.some((op) => op.id === msg.operationId)) {
+					entry.retryBackoff = true
+				}
+			}
 			await this.refreshPendingCount()
 			this.emitter?.emit({
 				type: 'sync:operation-rejected',
@@ -1919,7 +2490,7 @@ export class SyncEngine {
 			return
 		}
 
-		await this.outboundQueue.reject(msg.operationId)
+		const removed = await this.outboundQueue.reject(msg.operationId)
 
 		await this.rejectedStorage.record({
 			operationId: msg.operationId,
@@ -1930,6 +2501,13 @@ export class SyncEngine {
 			retriable: msg.retriable,
 			rejectedAt: Date.now(),
 		})
+		// Terminally rejected AND recorded: resolved for the acknowledged prefix.
+		if (removed) {
+			await this.withOwnTracking(async () => {
+				this.markOwnResolved(removed)
+				await this.advanceOwnPrefixLocked()
+			})
+		}
 
 		// The rejected op left the pending set, so the app-visible pending count
 		// must be refreshed or it would over-count forever.
@@ -1985,246 +2563,308 @@ export class SyncEngine {
 			this.awarenessManager.setLocalState(localState)
 		}
 
-		// Ops already sent in sendDelta() must not be flushed again from the outbound queue
-		if (this.deltaSentOpIds.length > 0) {
-			await this.outboundQueue.removeByIds(this.deltaSentOpIds)
-			this.deltaSentOpIds = []
-		}
-
-		if (this.syncState) {
-			const localNodeId = this.store.getNodeId()
-			const localSeq = this.store.getVersionVector().get(localNodeId) ?? 0
-			if (localSeq > 0) {
-				await this.advanceLastAckedForLocalNode(localSeq)
-			}
-		}
-
-		// Flush any queued operations accumulated during delta exchange
+		// Flush any queued operations accumulated during delta exchange. Delta batches
+		// still awaiting their acks stay in flight: only their acks resolve them.
 		if (this.outboundQueue.hasOperations) {
 			this.flushQueue()
 		}
 
 		await this.refreshPendingCount()
+		this.notifyStatusChange()
 	}
 
-	/**
-	 * Effective server vector: persisted last-ack merged with live handshake remote vector.
-	 */
-	private getEffectiveServerVector(): VersionVector {
-		if (!this.syncState) {
-			return this.remoteVector
-		}
-		const merged = this.syncState.mergeServerVectors(
-			this.lastAckedServerVector,
-			this.withoutOwnNode(this.remoteVector),
+	// --- Own-operation upload tracking (W3: contiguous acknowledged prefix) ---
+
+	/** Serialize every read-modify-write of the own-operation tracking. */
+	private withOwnTracking<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.ownTrackingChain.then(fn)
+		this.ownTrackingChain = run.then(
+			() => undefined,
+			() => undefined,
 		)
-		const own = this.ownAcknowledgedSequence()
-		const localNodeId = this.store.getNodeId()
-		if (own > 0) merged.set(localNodeId, own)
-		else merged.delete(localNodeId)
-		return merged
+		return run
+	}
+
+	private async loadOwnTracking(): Promise<void> {
+		await this.withOwnTracking(() => this.loadOwnTrackingLocked())
 	}
 
 	/**
-	 * How far the server holds THIS device's own operations, as far as the device can
-	 * trust it (RT-12). The server-advertised entry for the own node is never trusted
-	 * above what the server actually acknowledged: a forged high sequence (another
-	 * client that uploaded under this node id) would otherwise make the device treat
-	 * its unsynced writes as already uploaded and never send them. Bounded by
-	 * min(serverVector[self], last acknowledged own sequence); a lower server value
-	 * (a restored backup) is honoured so the device re-uploads what the server lost.
-	 *
-	 * Without sync-state persistence the acknowledged sequence is not tracked, and the
-	 * server's value is used as before; that mode re-enqueues the device's whole own
-	 * history from the op log on every start, so a forged value cannot hide a write.
+	 * Load the acknowledged prefix for the current node id, once per node id (an engine
+	 * restart keeps its in-memory progress). A persistence layer that has never stored a
+	 * prefix under this contract means an upgrade from a release that persisted a MAX:
+	 * that value can hide a lost op below it, so the prefix restarts at 0 and the device
+	 * re-uploads its own history once, chunk by chunk (the server dedups by id). The
+	 * prefix is persisted as it advances, so the re-upload resumes where it stopped.
 	 */
-	private ownAcknowledgedSequence(): number {
-		const localNodeId = this.store.getNodeId()
-		const remote = this.remoteVector.get(localNodeId)
-		if (!this.syncState) return remote ?? 0
-		const acked = this.lastAckedServerVector.get(localNodeId) ?? 0
-		return remote === undefined ? acked : Math.min(remote, acked)
+	private async loadOwnTrackingLocked(): Promise<void> {
+		const nodeId = this.store.getNodeId()
+		if (this.ownTrackingNodeId === nodeId) return
+		let prefix = 0
+		if (this.syncState?.loadOwnAckedThrough) {
+			const stored = await this.syncState.loadOwnAckedThrough(nodeId)
+			if (stored === null) {
+				await this.syncState.saveOwnAckedThrough?.(nodeId, 0)
+			} else {
+				prefix = stored
+			}
+		} else if (this.syncState) {
+			prefix = this.lastAckedServerVector.get(nodeId) ?? 0
+		}
+		this.ownTrackingNodeId = nodeId
+		this.ownAckedThrough = prefix
+		this.ownScannedThrough = prefix
+		this.ownUnresolved.clear()
+		this.ownResolvedAhead.clear()
 	}
 
-	/** The server vector the handshake upload is computed against (own entry bounded, RT-12). */
-	private uploadBaseVector(): VersionVector {
-		const base = new Map(this.remoteVector)
-		const own = this.ownAcknowledgedSequence()
-		base.set(this.store.getNodeId(), own)
-		return base
+	/**
+	 * Register an own operation. `unresolved` ops are queued for upload; the others are
+	 * already resolved (not upload-eligible). An op at or below the prefix (a sequence
+	 * that was a gap when the prefix passed it) lowers the prefix: re-uploading is safe,
+	 * skipping is not.
+	 */
+	private trackOwnOperation(op: Operation, unresolved: boolean): void {
+		if (op.nodeId !== this.ownTrackingNodeId) return
+		const seq = op.sequenceNumber
+		if (seq <= this.ownAckedThrough) {
+			if (!unresolved) return
+			this.ownAckedThrough = seq - 1
+			this.ownScannedThrough = Math.min(this.ownScannedThrough, seq - 1)
+			void this.persistOwnPrefix()
+		}
+		const ids = this.ownUnresolved.get(seq) ?? new Set<string>()
+		if (unresolved) ids.add(op.id)
+		this.ownUnresolved.set(seq, ids)
 	}
 
-	private withoutOwnNode(vector: VersionVector): VersionVector {
-		const copy = new Map(vector)
-		copy.delete(this.store.getNodeId())
-		return copy
+	/** Mark an own operation resolved (stored, terminally rejected, or not eligible). */
+	private markOwnResolved(op: Operation): void {
+		if (op.nodeId !== this.ownTrackingNodeId || op.sequenceNumber <= this.ownAckedThrough) return
+		const ids = this.ownUnresolved.get(op.sequenceNumber)
+		if (ids) {
+			ids.delete(op.id)
+		} else if (op.sequenceNumber <= this.ownScannedThrough) {
+			this.ownUnresolved.set(op.sequenceNumber, new Set())
+		}
+		if (op.sequenceNumber > this.ownScannedThrough) {
+			// The scan has not reached this sequence: remember the id so the scan does not
+			// take the op for an unsent one and upload it again.
+			this.ownResolvedAhead.set(op.id, op.sequenceNumber)
+		}
+	}
+
+	private isOwnOperationResolved(op: Operation): boolean {
+		if (op.sequenceNumber <= this.ownAckedThrough) return true
+		const ids = this.ownUnresolved.get(op.sequenceNumber)
+		return ids !== undefined && !ids.has(op.id) && !this.outboundQueue.has(op.id)
+	}
+
+	/**
+	 * Lower the prefix (the server holds fewer of this device's operations than it
+	 * believed) and forget what this session knew above it: the next advance rescans the
+	 * log from there and re-enqueues what is missing.
+	 */
+	private async lowerOwnPrefixLocked(sequence: number): Promise<void> {
+		const target = Math.max(0, sequence)
+		if (target >= this.ownAckedThrough) return
+		this.ownAckedThrough = target
+		this.ownScannedThrough = target
+		this.ownUnresolved.clear()
+		this.ownResolvedAhead.clear()
+		await this.persistOwnPrefix()
+	}
+
+	/**
+	 * Advance the prefix over every resolved own sequence, reading the next chunk of the
+	 * op log whenever it reaches a sequence this session has not examined yet. Reading a
+	 * chunk enqueues its upload-eligible operations (and flushes when streaming), so the
+	 * one-time upgrade re-upload proceeds chunk by chunk as acks arrive.
+	 */
+	private async advanceOwnPrefixLocked(): Promise<void> {
+		if (this.ownTrackingNodeId !== this.store.getNodeId()) return
+		const localSeq = this.store.getVersionVector().get(this.ownTrackingNodeId) ?? 0
+		const start = this.ownAckedThrough
+		let scanned = false
+		for (;;) {
+			const next = this.ownAckedThrough + 1
+			if (next > localSeq && !this.ownUnresolved.has(next)) break
+			const ids = this.ownUnresolved.get(next)
+			if (ids === undefined) {
+				if (next > this.ownScannedThrough) {
+					await this.scanOwnLog(next, Math.min(localSeq, next + OWN_LOG_SCAN_CHUNK - 1))
+					scanned = true
+					continue
+				}
+				// Examined, yet nothing registered: a hole in the log (a compacted or never
+				// written sequence). Nothing there can be uploaded.
+				this.ownUnresolved.set(next, new Set())
+				continue
+			}
+			if (ids.size > 0) break
+			this.ownUnresolved.delete(next)
+			this.ownAckedThrough = next
+			// Everything at or below the prefix is settled, so it counts as examined.
+			if (next > this.ownScannedThrough) this.ownScannedThrough = next
+		}
+		if (this.ownAckedThrough !== start) {
+			for (const [id, seq] of this.ownResolvedAhead) {
+				if (seq <= this.ownScannedThrough) this.ownResolvedAhead.delete(id)
+			}
+			await this.persistOwnPrefix()
+		}
+		if (scanned && this.state === 'streaming' && this.outboundQueue.hasOperations) {
+			this.flushQueue()
+		}
+	}
+
+	/**
+	 * Read own operations [from, to] from the op log and register each sequence: an
+	 * upload-eligible op not yet queued is enqueued; an ineligible one is recorded and
+	 * resolved; a sequence with no op is resolved. Every sequence in the range ends up
+	 * registered, which guarantees the advance loop makes progress.
+	 */
+	private async scanOwnLog(from: number, to: number): Promise<void> {
+		const nodeId = this.ownTrackingNodeId
+		if (nodeId === null || to < from) {
+			this.ownScannedThrough = Math.max(this.ownScannedThrough, to)
+			return
+		}
+		const ops = await this.store.getOperationRange(nodeId, from, to)
+		const bySeq = new Map<number, Operation[]>()
+		for (const op of ops) {
+			if (op.nodeId !== nodeId || op.sequenceNumber < from || op.sequenceNumber > to) continue
+			const list = bySeq.get(op.sequenceNumber) ?? []
+			list.push(op)
+			bySeq.set(op.sequenceNumber, list)
+		}
+		for (let seq = from; seq <= to; seq++) {
+			const ids = this.ownUnresolved.get(seq) ?? new Set<string>()
+			this.ownUnresolved.set(seq, ids)
+			for (const op of bySeq.get(seq) ?? []) {
+				if (this.ownResolvedAhead.delete(op.id)) continue
+				if (ids.has(op.id)) continue
+				if (this.outboundQueue.has(op.id)) {
+					ids.add(op.id)
+					continue
+				}
+				if (await this.operationAllowedForUpload(op)) {
+					await this.outboundQueue.enqueue(op)
+					ids.add(op.id)
+				} else {
+					await this.recordOutOfUplinkScope(op)
+				}
+			}
+		}
+		this.ownScannedThrough = Math.max(this.ownScannedThrough, to)
+	}
+
+	private async persistOwnPrefix(): Promise<void> {
+		const nodeId = this.ownTrackingNodeId
+		if (!this.syncState || nodeId === null) return
+		const prefix = this.ownAckedThrough
+		await this.syncState.saveOwnAckedThrough?.(nodeId, prefix)
+		// Mirror the prefix (exactly, never a max) into the acked server vector, which
+		// compaction reads to decide which own operations the server already holds.
+		const vector = new Map(this.lastAckedServerVector)
+		vector.set(nodeId, prefix)
+		this.lastAckedServerVector = vector
+		await this.syncState.saveLastAckedServerVector(vector)
 	}
 
 	private async persistLastAckedServerVector(vector: VersionVector): Promise<void> {
 		if (!this.syncState) {
 			return
 		}
-		// The own-node entry is only ever advanced by acknowledgments of this device's
-		// uploads (advanceLastAckedForLocalNode), never by what a handshake advertises.
-		this.lastAckedServerVector = this.syncState.mergeServerVectors(
-			this.lastAckedServerVector,
-			this.withoutOwnNode(vector),
-		)
-		await this.syncState.saveLastAckedServerVector(this.lastAckedServerVector)
-	}
-
-	private async advanceLastAckedForLocalNode(lastSequenceNumber: number): Promise<void> {
-		if (!this.syncState || lastSequenceNumber <= 0) {
-			return
-		}
+		// Other nodes' entries record what the server advertised; the own-node entry is
+		// only ever the acknowledged prefix (persistOwnPrefix), never an advertised value.
 		const nodeId = this.store.getNodeId()
-		const merged = new Map(this.lastAckedServerVector)
-		merged.set(nodeId, Math.max(merged.get(nodeId) ?? 0, lastSequenceNumber))
+		const others = new Map(vector)
+		others.delete(nodeId)
+		const merged = this.syncState.mergeServerVectors(this.lastAckedServerVector, others)
+		if (this.ownTrackingNodeId === nodeId) merged.set(nodeId, this.ownAckedThrough)
 		this.lastAckedServerVector = merged
 		await this.syncState.saveLastAckedServerVector(merged)
 	}
 
 	/**
-	 * Refresh cached unsynced count from op log vs effective server vector.
+	 * Refresh the pending count: own operations not yet stored on the server (queued or
+	 * in flight), plus the own operations above the prefix not read from the log yet.
+	 * Computed from the client's own acknowledgments only, so it drops the moment the
+	 * server acknowledges, without waiting for a later handshake (RT-28).
 	 */
 	async refreshPendingCount(): Promise<void> {
-		if (!this.syncState) {
-			this.cachedUnsyncedCount = this.outboundQueue.totalPending
-			return
+		const previous = this.cachedUnsyncedCount
+		this.cachedUnsyncedCount = this.computePendingCount()
+		if (this.cachedUnsyncedCount !== previous) this.notifyStatusChange()
+	}
+
+	/** Synchronous pending count (see {@link refreshPendingCount}). */
+	private computePendingCount(): number {
+		let unscanned = 0
+		const nodeId = this.ownTrackingNodeId
+		if (nodeId !== null) {
+			const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
+			unscanned = Math.max(0, localSeq - this.ownScannedThrough)
+			for (const seq of this.ownUnresolved.keys()) {
+				if (seq > this.ownScannedThrough && seq <= localSeq) unscanned--
+			}
+			unscanned = Math.max(0, unscanned)
 		}
-		this.cachedUnsyncedCount = await this.syncState.countUnsyncedOperations(
-			this.getEffectiveServerVector(),
-		)
+		return this.outboundQueue.totalPending + unscanned
 	}
 
 	/**
-	 * Returns operations the server has not yet acknowledged (op-log source of truth).
+	 * This device's operations not yet stored on the server (queued or in flight).
 	 */
 	async getPendingSyncOperations(): Promise<Operation[]> {
-		if (!this.syncState) {
-			return this.outboundQueue.peek(Number.MAX_SAFE_INTEGER)
-		}
-		return this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
+		return [
+			...this.outboundQueue.getInFlight(),
+			...this.outboundQueue.peek(Number.MAX_SAFE_INTEGER),
+		]
 	}
 
 	/**
-	 * Hydrate the outbound queue from unsynced ops in the op log (deduped by operation id).
+	 * Rebuild the upload set from the op log: every own operation above the acknowledged
+	 * prefix that is upload-eligible is queued (first chunk now, the rest as acks move
+	 * the prefix). Persisted queue entries that are already resolved are dropped.
 	 */
 	private async reconcileOutboundFromOpLog(): Promise<void> {
-		const localNodeId = this.store.getNodeId()
-		if (this.syncState) {
-			const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
-			const own = unsynced.filter((op) => op.nodeId === localNodeId)
-			for (const op of await this.filterAllowedForUpload(own)) {
-				await this.outboundQueue.enqueue(op)
+		await this.withOwnTracking(async () => {
+			const nodeId = this.ownTrackingNodeId
+			const stale = this.outboundQueue
+				.getAll()
+				.filter((op) => op.nodeId === nodeId && op.sequenceNumber <= this.ownAckedThrough)
+				.map((op) => op.id)
+			if (stale.length > 0) {
+				await this.outboundQueue.removeByIds(stale)
 			}
-			return
-		}
-
-		const localVector = this.store.getVersionVector()
-		const localSeq = localVector.get(localNodeId) ?? 0
-		if (localSeq === 0) {
-			return
-		}
-
-		const ops = await this.store.getOperationRange(localNodeId, 1, localSeq)
-		const inScope = await this.filterAllowedForUpload(ops)
-		for (const op of inScope) {
-			await this.outboundQueue.enqueue(op)
-		}
+			for (const op of this.outboundQueue.getAll()) {
+				this.trackOwnOperation(op, true)
+			}
+			await this.advanceOwnPrefixLocked()
+		})
 	}
 
 	private flushQueue(): void {
-		if (this.currentBatch) return // Already have an in-flight batch
+		if (this.state !== 'streaming') return
+		if (this.inFlightUploads.size > 0) return // one streaming batch in flight at a time
 		if (this.outboundRetryTimer) return // Transient rejection backoff is active
 		if (!this.outboundQueue.hasOperations) return
 
-		const batch = this.outboundQueue.takeBatch(this.batchSize)
-		if (!batch) return
-
-		this.currentBatch = batch
-		this.currentBatchRequiresPartialAck = false
-		this.currentBatchRequiresRetryBackoff = false
-
-		const preparer = this.outboundPreparer
-		if (preparer) {
-			// Let the app send what the server needs BEFORE these operations (blob bytes,
-			// so the server sees proof of possession before the reference, RT-11). A
-			// batch returned to the queue meanwhile (disconnect) is not sent here.
-			void preparer(batch.operations)
-				.catch(() => {
-					// Best effort: the server decides on the operations themselves.
-				})
-				.then(() => {
-					if (this.currentBatch !== batch || this.state !== 'streaming') return
-					this.sendTakenBatch(batch)
-				})
-			return
-		}
-		this.sendTakenBatch(batch)
+		const entry = this.takeUpload()
+		if (!entry) return
+		void this.sendUpload(entry, { isFinal: true, batchIndex: 0 }).catch(() => {
+			if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
+		})
 	}
 
-	/** Encode and send a batch already taken from the outbound queue. */
-	private sendTakenBatch(batch: OutboundBatch): void {
-		if (this.encryptor) {
-			// Encryption is async — encrypt then send. Errors return the batch to the queue.
-			this.encryptor.encryptBatch(batch.operations).then(
-				(encrypted) => {
-					const serializedOps = encrypted.map((op) => this.serializer.encodeOperation(op))
-					const batchMsg: SyncMessage = {
-						type: 'operation-batch',
-						messageId: generateMessageId(),
-						operations: serializedOps,
-						isFinal: true,
-						batchIndex: 0,
-					}
-					this.transport.send(batchMsg)
-					this.startOutboundAckTimer(batch.batchId)
-
-					this.emitter?.emit({
-						type: 'sync:sent',
-						operations: batch.operations,
-						batchSize: batch.operations.length,
-					})
-				},
-				(err) => {
-					// If encryption fails, return the batch to the queue so no data is lost
-					this.outboundQueue.returnBatch(batch.batchId)
-					this.currentBatch = null
-					this.currentBatchRequiresPartialAck = false
-					this.currentBatchRequiresRetryBackoff = false
-					this.emitter?.emit({
-						type: 'sync:disconnected',
-						reason: err instanceof Error ? err.message : 'Encryption failed',
-					})
-				},
-			)
-		} else {
-			const serializedOps = batch.operations.map((op) => this.serializer.encodeOperation(op))
-			const batchMsg: SyncMessage = {
-				type: 'operation-batch',
-				messageId: generateMessageId(),
-				operations: serializedOps,
-				isFinal: true,
-				batchIndex: 0,
-			}
-			this.transport.send(batchMsg)
-			this.startOutboundAckTimer(batch.batchId)
-
-			this.emitter?.emit({
-				type: 'sync:sent',
-				operations: batch.operations,
-				batchSize: batch.operations.length,
-			})
-		}
-	}
-
-	private startOutboundAckTimer(batchId: string): void {
+	private startOutboundAckTimer(): void {
 		this.clearOutboundAckTimer()
-		if (this.outboundAckTimeoutMs <= 0) return
-
+		if (this.outboundAckTimeoutMs <= 0 || this.destroyed) return
+		const epoch = this.sessionEpoch
 		this.outboundAckTimer = setTimeout(() => {
-			void this.handleOutboundAckTimeout(batchId)
+			void this.handleOutboundAckTimeout(epoch)
 		}, this.outboundAckTimeoutMs)
 	}
 
@@ -2235,7 +2875,7 @@ export class SyncEngine {
 	}
 
 	private scheduleOutboundRetry(): void {
-		if (this.outboundRetryTimer || !this.outboundQueue.hasOperations) return
+		if (this.outboundRetryTimer || !this.outboundQueue.hasOperations || this.destroyed) return
 		const delay = Math.min(
 			this.outboundRetryMaxDelayMs,
 			this.outboundRetryBaseDelayMs * 2 ** this.outboundRetryAttempt,
@@ -2253,19 +2893,19 @@ export class SyncEngine {
 		this.outboundRetryTimer = null
 	}
 
-	private async handleOutboundAckTimeout(batchId: string): Promise<void> {
-		if (!this.currentBatch || this.currentBatch.batchId !== batchId) return
+	/** No ack arrived in time: return every batch in flight and reconnect. */
+	private async handleOutboundAckTimeout(epoch: number): Promise<void> {
+		this.outboundAckTimer = null
+		if (epoch !== this.sessionEpoch || this.inFlightUploads.size === 0) return
 
-		this.outboundQueue.returnBatch(batchId)
-		this.currentBatch = null
-		this.currentBatchRequiresPartialAck = false
-		this.currentBatchRequiresRetryBackoff = false
-		this.clearOutboundAckTimer()
+		const batchIds = [...this.inFlightUploads.keys()].join(', ')
+		this.sessionEpoch++
+		this.returnAllInFlightUploads()
 		await this.refreshPendingCount()
 
 		if (this.state === 'disconnected') return
 
-		const reason = `Timed out waiting for acknowledgment of outbound batch ${batchId}`
+		const reason = `Timed out waiting for acknowledgment of outbound batch ${batchIds}`
 		try {
 			await this.transport.disconnect()
 		} finally {
@@ -2284,15 +2924,11 @@ export class SyncEngine {
 	}
 
 	private handleTransportClose(reason: string): void {
-		this.clearOutboundAckTimer()
 		this.clearOutboundRetryTimer()
-		// Return in-flight batch to queue
-		if (this.currentBatch) {
-			this.outboundQueue.returnBatch(this.currentBatch.batchId)
-			this.currentBatch = null
-			this.currentBatchRequiresPartialAck = false
-			this.currentBatchRequiresRetryBackoff = false
-		}
+		this.awarenessManager.stopCleanupTimer()
+		// Return in-flight batches to the queue: nothing unacknowledged is resolved.
+		this.sessionEpoch++
+		this.returnAllInFlightUploads()
 
 		if (this.schemaBlocked) {
 			return
@@ -2301,15 +2937,21 @@ export class SyncEngine {
 		if (this.state !== 'disconnected') {
 			this.emitter?.emit({ type: 'sync:disconnected', reason })
 			this.transitionTo('disconnected')
+			this.notifyStatusChange()
 		}
 	}
 
 	private handleTransportError(err: Error): void {
-		// Transport errors during connecting should transition to error
+		// A transport error ends the session; close the transport so the socket is
+		// released before any reconnect opens another (SYNC-5).
 		if (this.state !== 'disconnected') {
 			this.transitionTo('error')
 			this.emitter?.emit({ type: 'sync:disconnected', reason: err.message })
 			this.transitionTo('disconnected')
+			this.sessionEpoch++
+			this.returnAllInFlightUploads()
+			void this.closeTransportQuietly()
+			this.notifyStatusChange()
 		}
 	}
 
@@ -2337,7 +2979,7 @@ export class SyncEngine {
 	 */
 	private async operationAllowedForUpload(op: Operation): Promise<boolean> {
 		// Fast path: the bare operation already carries the scope fields.
-		if (this.matchesScopeAndSubsets(op, undefined, 'upload')) {
+		if (this.matchesUplinkScope(op)) {
 			return true
 		}
 		// A partial update or delete may not restate the scope fields. Backfill the
@@ -2347,7 +2989,7 @@ export class SyncEngine {
 		if (!fullRecord) {
 			return false
 		}
-		return this.matchesScopeAndSubsets(op, fullRecord, 'upload')
+		return this.matchesUplinkScope(op, fullRecord)
 	}
 
 	/**
@@ -2356,8 +2998,8 @@ export class SyncEngine {
 	 * collections that are not synced in either direction are local-only by design
 	 * and are not recorded.
 	 *
-	 * Interim (S1): the durable "out of uplink scope at creation" bookkeeping and the
-	 * contiguous acknowledged prefix come with W3 step 2.
+	 * Such an operation counts as resolved for the contiguous acknowledged prefix: it is
+	 * recorded here and never uploaded (W3 step 2).
 	 */
 	private async recordOutOfUplinkScope(op: Operation): Promise<void> {
 		const uplink = this.activeUplinkScope
@@ -2388,51 +3030,16 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Inbound predicate (unchanged): uplink scope plus query subsets. Judging
-	 * delivered operations against the uplink scope is SYNC-2, fixed in W4.
+	 * Whether an operation falls inside the uplink scope. Query subsets never apply to
+	 * uploads (SYNC-1), and nothing applies to inbound operations: the client applies
+	 * what the server delivered (SYNC-2).
 	 */
-	private async operationAllowedForSync(op: Operation): Promise<boolean> {
-		// Fast path: the bare operation already carries the scope / subset fields
-		// (inserts, or an op that restates them). No record read needed.
-		if (this.matchesScopeAndSubsets(op)) {
-			return true
-		}
-		// It failed on the bare op. That may be a genuine out-of-scope op, OR a partial
-		// update / delete that simply does not restate the scope / subset field. Backfill
-		// the record's current fields and re-check before dropping it.
-		const fullRecord = await this.readRecordForBackfill(op)
-		if (!fullRecord) {
-			return false
-		}
-		return this.matchesScopeAndSubsets(op, fullRecord)
-	}
-
-	/**
-	 * The uplink scope always applies. Query subsets apply only to the inbound
-	 * direction: they describe what this client downloads, never what it may
-	 * upload (SYNC-1).
-	 */
-	private matchesScopeAndSubsets(
-		op: Operation,
-		fullRecord?: Record<string, unknown> | null,
-		direction: 'inbound' | 'upload' = 'inbound',
-	): boolean {
+	private matchesUplinkScope(op: Operation, fullRecord?: Record<string, unknown> | null): boolean {
 		// A client judging its own local view may trust previousData: this is not a
 		// cross-tenant visibility decision (the server judges those on its own rows).
-		if (
-			!operationMatchesScope(op, this.activeUplinkScope, fullRecord, { includePreviousData: true })
-		) {
-			return false
-		}
-		if (direction === 'upload') {
-			return true
-		}
-		return (
-			this.hasDirectionalScopes ||
-			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord, {
-				includePreviousData: true,
-			})
-		)
+		return operationMatchesScope(op, this.activeUplinkScope, fullRecord, {
+			includePreviousData: true,
+		})
 	}
 
 	private async readRecordForBackfill(op: Operation): Promise<Record<string, unknown> | null> {
@@ -2444,26 +3051,6 @@ export class SyncEngine {
 		} catch {
 			return null
 		}
-	}
-
-	private async filterAllowedForUpload(ops: Operation[]): Promise<Operation[]> {
-		const allowed: Operation[] = []
-		for (const op of ops) {
-			if (await this.operationAllowedForUpload(op)) {
-				allowed.push(op)
-			}
-		}
-		return allowed
-	}
-
-	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {
-		const allowed: Operation[] = []
-		for (const op of ops) {
-			if (await this.operationAllowedForSync(op)) {
-				allowed.push(op)
-			}
-		}
-		return allowed
 	}
 
 	private async persistDeltaCursor(cursor: DeltaCursor | null): Promise<void> {
@@ -2499,6 +3086,16 @@ export class SyncEngine {
 	private async reconnectForQuerySubsets(): Promise<void> {
 		await this.reconnect()
 	}
+}
+
+/**
+ * Upload order inside a batch: by node, then sequence. For this device's own operations
+ * sequence order is a causal order (each local op follows the ones before it), and it
+ * makes the server's "processed through sequence n" ack an exact prefix of the batch.
+ */
+function compareForUpload(a: Operation, b: Operation): number {
+	if (a.nodeId !== b.nodeId) return a.nodeId < b.nodeId ? -1 : 1
+	return a.sequenceNumber - b.sequenceNumber
 }
 
 // --- Awareness wire format conversion helpers ---

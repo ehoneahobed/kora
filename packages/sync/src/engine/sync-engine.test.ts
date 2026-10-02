@@ -174,13 +174,15 @@ function setupServerResponder(
 			}
 		} else if (msg.type === 'operation-batch') {
 			if (options?.acknowledgeOperations === false) return
-			// Acknowledge operation batches
+			// Acknowledge operation batches the way the server does: "processed through"
+			// the last operation's sequence number (0 means nothing was processed).
 			const batch = msg as OperationBatchMessage
+			const last = batch.operations[batch.operations.length - 1]
 			const ack: AcknowledgmentMessage = {
 				type: 'acknowledgment',
 				messageId: `ack-${batch.messageId}`,
 				acknowledgedMessageId: batch.messageId,
-				lastSequenceNumber: 0,
+				lastSequenceNumber: last?.sequenceNumber ?? 0,
 			}
 			server.send(ack)
 		}
@@ -1563,7 +1565,11 @@ describe('SyncEngine scope', () => {
 		expect(opBatch?.operations).toHaveLength(1)
 	})
 
-	test('incoming operations outside scope are filtered out (defense in depth)', async () => {
+	// Inverted for SYNC-2: this test encoded the bug. The client judged delivered operations
+	// against its own scope and silently dropped them (a reader with a read-only downlink
+	// lost every announcement, and the watermark moved past them). The server enforces the
+	// downlink scope; the client applies what it delivered.
+	test('applies every delivered operation; the server, not the client, enforces scope (SYNC-2)', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const applyFn = vi.fn(async (_op: Operation) => 'applied' as const)
 		const store = createMockStore({ applyRemoteOperation: applyFn })
@@ -1631,10 +1637,10 @@ describe('SyncEngine scope', () => {
 
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
-		// Only the in-scope op should be applied
+		// Both are applied: nothing delivered is silently dropped.
 		const appliedOps = applyFn.mock.calls.map((call) => (call[0] as Operation).id)
 		expect(appliedOps).toContain('in')
-		expect(appliedOps).not.toContain('out')
+		expect(appliedOps).toContain('out')
 	})
 
 	test('applies authorization retractions and acknowledges only after local removal', async () => {

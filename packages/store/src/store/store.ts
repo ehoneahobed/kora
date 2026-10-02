@@ -57,6 +57,16 @@ import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
+import type { UnappliedOperation } from '../sync/sync-durability'
+import {
+	loadAcceptedDownlinkScope,
+	loadOwnAckedThrough,
+	loadUnappliedOperations,
+	removeUnappliedOperations,
+	saveAcceptedDownlinkScope,
+	saveOwnAckedThrough,
+	saveUnappliedOperations,
+} from '../sync/sync-durability'
 import {
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
@@ -1192,6 +1202,61 @@ export class Store implements OperationLog {
 	async deleteDeliveryWatermark(signature: string): Promise<void> {
 		this.ensureOpen()
 		await deleteDeliveryWatermark(this.adapter, signature)
+	}
+
+	/**
+	 * Record delivered operations the sync engine deliberately did not apply (inbound
+	 * quarantine, W4) and, when given, advance a view's delivery watermark in the same
+	 * transaction, so the watermark never passes an operation that is neither applied nor
+	 * recorded.
+	 */
+	async saveInboundQuarantine(
+		entries: UnappliedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void> {
+		this.ensureOpen()
+		await saveUnappliedOperations(this.adapter, entries, watermark)
+	}
+
+	/** Every quarantined inbound operation, oldest delivery first. */
+	async loadInboundQuarantine(): Promise<UnappliedOperation[]> {
+		this.ensureOpen()
+		return loadUnappliedOperations(this.adapter)
+	}
+
+	/** Remove quarantined inbound operations (applied on replay, or reconciled). */
+	async removeInboundQuarantine(operationIds: string[]): Promise<void> {
+		this.ensureOpen()
+		await removeUnappliedOperations(this.adapter, operationIds)
+	}
+
+	/**
+	 * The contiguous acknowledged prefix of this device's own operations for a node id,
+	 * or null when none was recorded under that contract (W3).
+	 */
+	async loadOwnAckedThrough(nodeId: string): Promise<number | null> {
+		this.ensureOpen()
+		return loadOwnAckedThrough(this.adapter, nodeId)
+	}
+
+	/** Persist the contiguous acknowledged own-operation prefix for a node id. */
+	async saveOwnAckedThrough(nodeId: string, sequence: number): Promise<void> {
+		this.ensureOpen()
+		await saveOwnAckedThrough(this.adapter, nodeId, sequence)
+	}
+
+	/** The downlink scope the sync server last accepted (null when none). */
+	async loadAcceptedDownlinkScope(): Promise<Record<string, Record<string, unknown>> | null> {
+		this.ensureOpen()
+		return loadAcceptedDownlinkScope(this.adapter)
+	}
+
+	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	async saveAcceptedDownlinkScope(
+		scope: Record<string, Record<string, unknown>> | null,
+	): Promise<void> {
+		this.ensureOpen()
+		await saveAcceptedDownlinkScope(this.adapter, scope)
 	}
 
 	/**

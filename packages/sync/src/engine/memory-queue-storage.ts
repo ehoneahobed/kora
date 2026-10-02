@@ -8,6 +8,7 @@ import type { QueueStorage } from '../types'
  */
 export class MemoryQueueStorage implements QueueStorage {
 	private operations: Map<string, Operation> = new Map()
+	private readonly sent = new Set<string>()
 
 	async load(): Promise<Operation[]> {
 		return [...this.operations.values()]
@@ -20,7 +21,18 @@ export class MemoryQueueStorage implements QueueStorage {
 	async dequeue(ids: string[]): Promise<void> {
 		for (const id of ids) {
 			this.operations.delete(id)
+			this.sent.delete(id)
 		}
+	}
+
+	async markSent(ops: Operation[]): Promise<void> {
+		for (const op of ops) {
+			if (this.operations.has(op.id)) this.sent.add(op.id)
+		}
+	}
+
+	async loadSentIds(): Promise<string[]> {
+		return [...this.sent]
 	}
 
 	async count(): Promise<number> {
