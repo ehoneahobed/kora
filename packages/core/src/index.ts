@@ -90,8 +90,15 @@ export type { ApplyFailureReason, ApplyResult } from './operations/apply-result'
 export {
 	createOperation,
 	isValidOperation,
+	verifyOperationId,
 	verifyOperationIntegrity,
 } from './operations/operation'
+export type { CreateOperationOptions } from './operations/operation'
+export {
+	DEFAULT_OPERATION_HASH_VERSION,
+	computeOperationId,
+} from './operations/content-hash'
+export type { HashableOperation, OperationHashVersion } from './operations/content-hash'
 
 // === Atomic Operations ===
 export {
