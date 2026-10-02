@@ -2219,6 +2219,21 @@
    ],
    "pr": null,
    "notes": "Phase 2 seam (W6 sequence repair x SRV-4 SEQUENCE_CONFLICT). Fixed with a server sequence-enforcement epoch: on the first start of this release each SQL store records MAX(delivery_seq) in kora_server_meta.sequence_enforcement_epoch (memory store: 0). SEQUENCE_CONFLICT is raised only when a holder of the (node, seq) was stored after the epoch; a legacy-only holder is accepted and stored with a console warning (as beta.12 did). The conditional full unique index is replaced by a partial unique index idx_node_seq_unique_after_epoch ON operations(node_id, sequence_number) WHERE delivery_seq > epoch, which always exists. Replace-mode backup import moves the epoch to the restored log's end. Postgres insertOperationRow now checks every holder (re-applying one op of a legacy pair was a false conflict with LIMIT 1). Store tests: packages/server/src/store/sequence-enforcement-epoch.test.ts (SQLite, Postgres via KORA_PG_TEST_URL, memory). E2E repro packages/test/tests/repro/RT-32.test.ts."
+  },
+  {
+   "id": "RT-33",
+   "title": "SYNC-11 server half: an auth-scoped client's reconnect restarts the delivery stream from 0 (full rescan and resend every reconnect)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-33.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "The client reports the watermark of its REQUESTED scope; when the server resolves a different scope it could not trust it and restarted at 0 on every reconnect. Fixed: the client persists the downlink scope the server last accepted (SyncStatePersistence load/saveAcceptedDownlinkScope, restored) and its handshake additionally sends acceptedScopeKey (scopeViewKey: canonical JSON of the normalized scope map, packages/sync/src/scopes/scope-view-key.ts, shared by client and server) and acceptedScopeWatermark (that view's own watermark). New optional protocol fields, JSON and protobuf 43/44. The server computes scopeViewKey of the scope it resolves now and resumes from acceptedScopeWatermark when the keys match, else starts the view from 0 (a widened grant delivers the newly visible records). The accepted scope is never sent as the requested scope. A grant equal (by key) to the request keeps the requested view on the client. Repro packages/test/tests/repro/RT-33.test.ts (resume counts sent ops and scan cursors; widened grant). The handshake node pre-scan for scoped clients stays (beta.13 clients count pending from the handshake vector; kora compact uses peer entries); it now starts at the resumed watermark."
   }
  ],
  "rejectedProposalPins": {

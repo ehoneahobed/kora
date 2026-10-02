@@ -60,9 +60,11 @@ import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
 import {
+	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
 	loadUnappliedOperations,
 	removeUnappliedOperations,
+	saveAcceptedDownlinkScope,
 	saveOwnAckedThrough,
 	saveUnappliedOperations,
 } from '../sync/sync-durability'
@@ -1297,6 +1299,20 @@ export class Store implements OperationLog {
 	async saveOwnAckedThrough(nodeId: string, sequence: number): Promise<void> {
 		this.ensureOpen()
 		await saveOwnAckedThrough(this.adapter, nodeId, sequence)
+	}
+
+	/** The downlink scope the sync server last accepted (null when none). */
+	async loadAcceptedDownlinkScope(): Promise<Record<string, Record<string, unknown>> | null> {
+		this.ensureOpen()
+		return loadAcceptedDownlinkScope(this.adapter)
+	}
+
+	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	async saveAcceptedDownlinkScope(
+		scope: Record<string, Record<string, unknown>> | null,
+	): Promise<void> {
+		this.ensureOpen()
+		await saveAcceptedDownlinkScope(this.adapter, scope)
 	}
 
 	/**

@@ -431,6 +431,9 @@ interface ProtoEnvelope {
 	/** Fields 41-42: a throttled blob-chunk-response and its retry delay (RT-24). */
 	throttled?: boolean
 	retryAfterMs?: number
+	/** Fields 43-44: the accepted view a handshake resumes (SYNC-11). */
+	acceptedScopeKey?: string
+	acceptedScopeWatermark?: number
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -449,6 +452,12 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				supportedWireFormats: message.supportedWireFormats,
 				...(message.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: message.lastDeliverySequence }
+					: {}),
+				...(message.acceptedScopeKey !== undefined
+					? { acceptedScopeKey: message.acceptedScopeKey }
+					: {}),
+				...(message.acceptedScopeWatermark !== undefined
+					? { acceptedScopeWatermark: message.acceptedScopeWatermark }
 					: {}),
 				scopeExitPolicy: message.scopeExitPolicy,
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
@@ -588,6 +597,12 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				),
 				...(envelope.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: envelope.lastDeliverySequence }
+					: {}),
+				...(envelope.acceptedScopeKey !== undefined
+					? { acceptedScopeKey: envelope.acceptedScopeKey }
+					: {}),
+				...(envelope.acceptedScopeWatermark !== undefined
+					? { acceptedScopeWatermark: envelope.acceptedScopeWatermark }
 					: {}),
 				...(envelope.scopeExitPolicy === 'retain' || envelope.scopeExitPolicy === 'retract'
 					? { scopeExitPolicy: envelope.scopeExitPolicy }
@@ -919,6 +934,9 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 		writer.uint32(320).bool(envelope.blobPossessionProof)
 	if (envelope.throttled) writer.uint32(328).bool(envelope.throttled)
 	if (envelope.retryAfterMs !== undefined) writer.uint32(336).int64(envelope.retryAfterMs)
+	if (envelope.acceptedScopeKey !== undefined) writer.uint32(346).string(envelope.acceptedScopeKey)
+	if (envelope.acceptedScopeWatermark !== undefined)
+		writer.uint32(352).int64(envelope.acceptedScopeWatermark)
 	return writer.finish()
 }
 
@@ -1057,6 +1075,12 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 42:
 				envelope.retryAfterMs = longToNumber(reader.int64())
+				break
+			case 43:
+				envelope.acceptedScopeKey = reader.string()
+				break
+			case 44:
+				envelope.acceptedScopeWatermark = longToNumber(reader.int64())
 				break
 			default:
 				reader.skipType(tag & 7)

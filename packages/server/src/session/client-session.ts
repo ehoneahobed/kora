@@ -37,6 +37,7 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
+import { scopeViewKey } from '@korajs/sync/internal'
 import { applyServerOperation } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
@@ -1840,16 +1841,25 @@ export class ClientSession {
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
 		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
 		// A delivery watermark is valid only for the exact server-visible view that
-		// earned it. When the server resolves a different scope than the client sent
-		// (common with server-auth scopes, promotions, or invite acceptance), the client
-		// cannot have keyed its local watermark by that authoritative view before this
-		// handshake. Reset to a full scoped backfill instead of trusting a cursor that may
-		// have advanced over previously hidden operations.
+		// earned it. `lastDeliverySequence` belongs to the scope the client REQUESTED.
+		// When the server resolves a different scope (server-auth scopes, promotions,
+		// invite acceptance), it resumes from the watermark the client reports for the
+		// accepted scope it last streamed under, if that scope has the same canonical key
+		// as the one resolved now (SYNC-11). Otherwise the resolved view is new to the
+		// client (for example a widened grant): a full scoped backfill from 0, never a
+		// cursor that may have advanced over operations hidden from its earlier view.
 		if (
 			this.clientDeliveryWatermark !== null &&
 			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes)
 		) {
-			this.clientDeliveryWatermark = 0
+			const acceptedWatermark = msg.acceptedScopeWatermark
+			const resumable =
+				typeof msg.acceptedScopeKey === 'string' &&
+				typeof acceptedWatermark === 'number' &&
+				Number.isSafeInteger(acceptedWatermark) &&
+				acceptedWatermark >= 0 &&
+				msg.acceptedScopeKey === scopeViewKey(this.authContext?.downlinkScopes)
+			this.clientDeliveryWatermark = resumable ? acceptedWatermark : 0
 		}
 
 		// Only read the server's delivery frontier when the client actually uses the
@@ -1918,6 +1928,10 @@ export class ClientSession {
 		// as its own pending uploads. A delivery-stream client's stream is not collected
 		// in advance (SRV-5): an unscoped session may see every operation, so it gets the
 		// whole vector; a scoped one gets the nodes a metadata pre-pass finds visible.
+		// Clients of this release count pending from their own acks (RT-28) and would not
+		// need the pre-pass, but beta.13 clients count every node ahead of this vector as
+		// pending (and `kora compact` uses the persisted peer entries), so it stays. It
+		// starts at the resumed watermark (SYNC-11), so a reconnect scans only new ops.
 		const visibleNodes = new Set<string>([msg.nodeId])
 		for (const op of deltaPlan) {
 			visibleNodes.add(op.nodeId)
