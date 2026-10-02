@@ -1201,7 +1201,8 @@ export class SqliteServerStore implements ServerStore {
 			const stored = tx.all<{ value: string }>(
 				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}`,
 			)[0]?.value
-			const epoch = Number(stored)
+			// Absent only if the row could not be written: enforce everything (epoch 0).
+			const epoch = stored === undefined ? 0 : Number(stored)
 			if (!Number.isSafeInteger(epoch) || epoch < 0) {
 				throw new Error(
 					`kora_server_meta.${SEQUENCE_ENFORCEMENT_EPOCH_KEY} holds "${String(stored)}", not a delivery sequence. Restore it from a backup or delete the row to re-derive it.`,

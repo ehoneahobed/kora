@@ -1561,7 +1561,8 @@ export class PostgresServerStore implements ServerStore {
 			const epochRows = (await tx.execute(
 				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}`,
 			)) as unknown as { value: string }[]
-			const epoch = Number(epochRows[0]?.value)
+			// Absent only if the row could not be written: enforce everything (epoch 0).
+			const epoch = epochRows[0] === undefined ? 0 : Number(epochRows[0].value)
 			if (!Number.isSafeInteger(epoch) || epoch < 0) {
 				throw new Error(
 					`kora_server_meta.${SEQUENCE_ENFORCEMENT_EPOCH_KEY} holds "${String(epochRows[0]?.value)}", not a delivery sequence. Restore it from a backup or delete the row to re-derive it.`,
