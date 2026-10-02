@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1042,7 +1042,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-1.test.ts"
@@ -1054,7 +1054,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
+   "notes": "W6: one local write path. Transaction entries are buffered as intent and written at commit inside the commit's storage transaction through the same builders as single-record writes (mutations/write-ops.ts); every sequence number is reserved through that transaction (UPSERT ... RETURNING) and each op is built only after its number is reserved. TransactionSequenceAllocator and the out-of-transaction allocator are removed; remote applies write the vector with MAX. A repair migration re-sequences beta.12 duplicates and a UNIQUE (node_id, sequence_number) index is created on every op table. Earlier: S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
   },
   {
    "id": "STORE-2",
@@ -1062,14 +1062,14 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: cascades/set-null are written by RelationEnforcer through writeDeleteInTx/writeUpdateInTx inside the commit, after the parent, so they take the next numbers of the same contiguous block. ApplyPipeline.commitTransaction and build-side-effect-entry are removed; the merge-package referential check runs as LocalMutationHandler.beforeLocalDelete inside the transaction (traces + restrict)."
   },
   {
    "id": "STORE-3",
@@ -1077,14 +1077,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: transaction inserts/updates, set-null cascades and deletes go through the shared builders, which stamp _field_versions per field (stampFieldVersions: field -> HLC register, monotonic) and _version."
   },
   {
    "id": "STORE-4",
@@ -1172,14 +1172,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: writeUpdateInTx reads the row through the write transaction, so atomic ops and previousData resolve against committed state; transactions are serialized, so concurrent increments compose on both the single-record and the transaction path."
   },
   {
    "id": "STORE-10",
@@ -1187,14 +1187,14 @@
    "severity": "P2",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: a duplicate apply still records the sequence in the in-memory vector and notifies subscriptions; Store emits operation:applied after remote applies and the local-operation bus relays it to other tabs."
   },
   {
    "id": "STORE-11",
@@ -1262,14 +1262,14 @@
    "severity": "P3",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-15.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: dedup inside the apply transaction (op log + retained conflicts), in-memory vector updated only after commit on every path, collision-free index names idx_<len>_<collection>_<field> (legacy indexes dropped on open once replaced), SQLITE_FULL/quota errors on any write path emit store:quota-exceeded (Store.reportStorageError)."
   },
   {
    "id": "STORE-16",
@@ -1304,14 +1304,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: writeUpdateInTx validates the state machine against the row read inside the commit transaction for every local update, including app.transaction / app.mutation (also checked early at the call site)."
   },
   {
    "id": "NEW-STORE-3",
@@ -1319,14 +1319,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: defineSchema derives the collection stateMachine (mode reject) from an enum field with .transitions(); a collection-level stateMachine on the same field wins; transitions on a second field are a schema error."
   },
   {
    "id": "NEW-STORE-4",
@@ -1476,7 +1476,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -2136,7 +2136,7 @@
    "tests": [],
    "acceptance": "Write a repro when the workstream starts.",
    "pr": null,
-   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan \u00a76). Investigate in Phase 2."
+   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan §6). Investigate in Phase 2."
   },
   {
    "id": "RT-29",

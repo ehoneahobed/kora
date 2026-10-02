@@ -218,7 +218,7 @@ describe('Store schema migrations', () => {
 		await store2.open()
 
 		const indexes = await adapter2.query<{ name: string }>(
-			"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_products_category'",
+			"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_8_products_category'",
 		)
 		expect(indexes).toHaveLength(1)
 		await store2.close()
@@ -421,7 +421,7 @@ describe('Store schema migrations', () => {
 		await store2.open()
 
 		const indexes = await adapter2.query<{ name: string }>(
-			"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_products_category'",
+			"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_8_products_category'",
 		)
 		expect(indexes).toHaveLength(0)
 		await store2.close()

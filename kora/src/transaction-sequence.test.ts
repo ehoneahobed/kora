@@ -4,10 +4,10 @@ import { createApp } from './create-app'
 import type { KoraApp } from './types'
 
 /**
- * STORE-1 stopgap: ApplyPipeline.commitTransaction persists the node's sequence
- * counter inside the commit transaction as MAX(existing, highest seq in batch),
- * so a later single-record write never reuses a sequence number the transaction
- * already consumed (and is therefore never mistaken for an acknowledged op).
+ * STORE-1 (W6): app.transaction reserves its sequence numbers inside the commit's
+ * storage transaction, from the persisted counter, so the counter always covers
+ * every logged operation and a later single-record write never reuses a number
+ * the transaction consumed (and is never mistaken for an acknowledged op).
  */
 const schema = defineSchema({
 	version: 1,
@@ -32,7 +32,7 @@ async function persistedCounter(app: KoraApp): Promise<number> {
 	return rows[0]?.sequence_number ?? 0
 }
 
-describe('ApplyPipeline.commitTransaction sequence counter', () => {
+describe('app.transaction sequence counter', () => {
 	let app: KoraApp | undefined
 	afterEach(async () => {
 		await app?.close()

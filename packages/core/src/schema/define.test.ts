@@ -429,4 +429,64 @@ describe('defineSchema', () => {
 			).toThrow(SchemaValidationError)
 		})
 	})
+
+	describe('field-level transitions (NEW-STORE-3)', () => {
+		const status = () =>
+			t
+				.enum(['draft', 'submitted', 'delivered'])
+				.default('draft')
+				.transitions({ draft: ['submitted'], submitted: ['delivered'], delivered: [] })
+
+		test('derive the collection state machine with the default reject mode', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: { orders: { fields: { status: status() } } },
+			})
+			expect(schema.collections.orders?.stateMachine).toEqual({
+				field: 'status',
+				transitions: { draft: ['submitted'], submitted: ['delivered'], delivered: [] },
+				onInvalidTransition: 'reject',
+			})
+		})
+
+		test('a collection-level state machine on the same field wins', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					orders: {
+						fields: { status: status() },
+						stateMachine: {
+							field: 'status',
+							transitions: { draft: ['submitted', 'delivered'] },
+							onInvalidTransition: 'last-valid-state',
+						},
+					},
+				},
+			})
+			expect(schema.collections.orders?.stateMachine?.onInvalidTransition).toBe('last-valid-state')
+			expect(schema.collections.orders?.stateMachine?.transitions.draft).toEqual([
+				'submitted',
+				'delivered',
+			])
+		})
+
+		test('several transition fields keep their own maps and derive no single machine', () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					orders: {
+						fields: {
+							status: status(),
+							payment: t.enum(['open', 'paid']).transitions({ open: ['paid'], paid: [] }),
+						},
+					},
+				},
+			})
+			expect(schema.collections.orders?.stateMachine).toBeUndefined()
+			expect(schema.collections.orders?.fields.payment?.transitions).toEqual({
+				open: ['paid'],
+				paid: [],
+			})
+		})
+	})
 })

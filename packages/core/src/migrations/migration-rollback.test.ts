@@ -469,7 +469,7 @@ describe('backward compatibility', () => {
 		expect(sql).toEqual([
 			'ALTER TABLE "products" ADD COLUMN "taxInclusive" INTEGER DEFAULT 0',
 			'ALTER TABLE "products" RENAME COLUMN "cost" TO "costPrice"',
-			'CREATE INDEX IF NOT EXISTS idx_products_costPrice ON "products" ("costPrice")',
+			'CREATE INDEX IF NOT EXISTS "idx_8_products_costPrice" ON "products" ("costPrice")',
 		])
 	})
 })

@@ -1,5 +1,4 @@
 import type {
-	AtomicOp,
 	CausalTracker,
 	CollectionDefinition,
 	HybridLogicalClock,
@@ -8,48 +7,52 @@ import type {
 	SecretKeyProvider,
 } from '@korajs/core'
 import {
-	createOperation,
+	KoraError,
 	generateUUIDv7,
 	isAtomicOp,
 	quoteIdent,
 	resolveAtomicOp,
-	toAtomicOp,
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
-import { serializeRowVersion } from '../lww/row-version'
 import { toAtRestWriteData } from '../mutations/secret-write'
-import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
-import type { RelationEnforcer } from '../relations/relation-enforcer'
 import {
-	decodeRichtextFieldsFromOpData,
-	encodeRichtextFieldsForOpData,
-} from '../serialization/op-data-encoding'
-import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
-import type {
-	CollectionRecord,
-	LocalMutationHandler,
-	RawCollectionRow,
-	StorageAdapter,
-	Transaction,
-} from '../types'
+	CausalScope,
+	type LocalDeleteHook,
+	type WriteEnv,
+	withWriteScope,
+} from '../mutations/write-context'
+import {
+	type PreparedInsert,
+	type WriteResult,
+	prepareInsert,
+	writeDeleteInTx,
+	writeInsertInTx,
+	writeUpdateInTx,
+} from '../mutations/write-ops'
+import type { RelationEnforcer } from '../relations/relation-enforcer'
+import { deserializeRecord } from '../serialization/serializer'
+import { validateUpdateStateMachine } from '../state-machine/state-validator'
+import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../types'
 
 /**
- * A buffered SQL command to be executed during commit.
+ * A buffered mutation. Buffered entries hold the developer's INTENT, not built
+ * operations: they are written at commit, inside the commit's storage
+ * transaction, through the same single local write path as single-record writes
+ * (W6). That is what gives transaction writes in-transaction sequence
+ * reservation, per-field version stamps, state-machine validation and atomic ops
+ * resolved against the committed row.
  */
-interface BufferedCommand {
-	sql: string
-	params: unknown[]
-}
-
-/**
- * A buffered operation with its associated SQL commands.
- */
-interface BufferedEntry {
-	operation: Operation
-	commands: BufferedCommand[]
-	collection: string
-}
+type BufferedEntry =
+	| { readonly kind: 'insert'; readonly collection: string; readonly insert: PreparedInsert }
+	| {
+			readonly kind: 'update'
+			readonly collection: string
+			readonly id: string
+			/** Schema-validated update data; may contain atomic op descriptors. */
+			readonly data: Record<string, unknown>
+	  }
+	| { readonly kind: 'delete'; readonly collection: string; readonly id: string }
 
 /**
  * Internal configuration for creating a TransactionContext.
@@ -60,15 +63,17 @@ export interface TransactionContextConfig {
 	adapter: StorageAdapter
 	clock: HybridLogicalClock
 	nodeId: string
-	sequenceAllocator: import('./transaction-sequence').TransactionSequenceAllocator
 	relationEnforcer: RelationEnforcer | null
 	causalTracker: CausalTracker | null
-	localMutationHandler: LocalMutationHandler | null
 	/**
 	 * Key provider for `t.secret()` encrypted fields. Transaction writes transform
 	 * secret fields through the same helper as single-record writes (STORE-4).
 	 */
 	secretKeyProvider?: SecretKeyProvider
+	/** Referential hook run for every local delete inside the commit (see {@link LocalDeleteHook}). */
+	beforeLocalDelete?: LocalDeleteHook
+	/** Called when the commit's storage transaction fails, before the error propagates. */
+	onStorageError?: (error: unknown) => void
 }
 
 /**
@@ -85,8 +90,10 @@ export interface TransactionCollectionAccessor {
 /**
  * TransactionContext provides atomic multi-collection operations.
  *
- * All mutations are buffered and committed in a single StorageAdapter.transaction()
- * call. All operations share the same transactionId (UUID v7).
+ * Mutations are validated and buffered when called (so errors surface at the
+ * call site and `insert` returns the new id immediately), then written in a
+ * single `StorageAdapter.transaction()` at commit. All operations share the
+ * same transactionId (UUID v7) and one contiguous block of sequence numbers.
  *
  * Subscription notifications are deferred until after commit.
  *
@@ -133,30 +140,44 @@ export class TransactionContext {
 	collection(name: string): TransactionCollectionAccessor {
 		const definition = this.config.schema.collections[name]
 		if (!definition) {
-			throw new Error(
+			throw new KoraError(
 				`Unknown collection "${name}". Available: ${Object.keys(this.config.schema.collections).join(', ')}`,
+				'UNKNOWN_COLLECTION',
+				{ collection: name },
 			)
 		}
 
 		return {
-			insert: (data: Record<string, unknown>) => this.insert(name, definition, data),
+			insert: (data: Record<string, unknown>) => this.insert(name, data),
 			update: (id: string, data: Record<string, unknown>) =>
 				this.update(name, definition, id, data),
 			delete: (id: string) => this.deleteRecord(name, definition, id),
-			findById: (id: string) => this.findById(name, definition, id),
+			findById: (id: string) => this.getEffectiveRecord(name, definition, id),
 		}
 	}
 
 	/**
-	 * Commit all buffered operations atomically.
+	 * Commit all buffered mutations atomically.
+	 *
+	 * Every entry is written, in call order, inside ONE storage transaction through
+	 * the single local write path: sequence numbers are reserved inside the
+	 * transaction (one contiguous block covering referential side effects too) and
+	 * each operation is built only after its number is reserved.
+	 *
 	 * Returns the list of operations and affected collections for subscription notification.
 	 */
 	async commit(): Promise<{ operations: Operation[]; affectedCollections: Set<string> }> {
 		if (this.committed) {
-			throw new Error('Transaction already committed.')
+			throw new KoraError('Transaction already committed.', 'TRANSACTION_COMMITTED', {
+				transactionId: this.transactionId,
+			})
 		}
 		if (this.rolledBack) {
-			throw new Error('Transaction was rolled back and cannot be committed.')
+			throw new KoraError(
+				'Transaction was rolled back and cannot be committed.',
+				'TRANSACTION_ROLLED_BACK',
+				{ transactionId: this.transactionId },
+			)
 		}
 
 		this.committed = true
@@ -165,55 +186,38 @@ export class TransactionContext {
 			return { operations: [], affectedCollections: new Set() }
 		}
 
-		const handler = this.config.localMutationHandler
-		if (handler?.commitTransaction) {
-			return handler.commitTransaction({
-				entries: this.buffer.map((entry) => ({
-					operation: entry.operation,
-					commands: entry.commands,
-					collection: entry.collection,
-				})),
-				transactionId: this.transactionId,
-				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
+		const env = this.writeEnv()
+		const causal = new CausalScope(this.config.causalTracker, true)
+		const operations: Operation[] = []
+
+		try {
+			await this.config.adapter.transaction(async (tx) => {
+				await withWriteScope(tx, env.nodeId, causal, async (scope) => {
+					for (const entry of this.buffer) {
+						let result: WriteResult
+						switch (entry.kind) {
+							case 'insert':
+								result = await writeInsertInTx(env, scope, entry.insert)
+								break
+							case 'update':
+								result = await writeUpdateInTx(env, scope, entry.collection, entry.id, entry.data)
+								break
+							case 'delete':
+								result = await writeDeleteInTx(env, scope, entry.collection, entry.id)
+								break
+						}
+						if (result.operation) operations.push(result.operation)
+						operations.push(...result.sideEffects)
+					}
+				})
 			})
+		} catch (error) {
+			this.config.onStorageError?.(error)
+			throw error
 		}
 
-		const operations: Operation[] = []
-		const affectedCollections = new Set<string>()
-
-		// Execute all buffered commands in a single adapter transaction
-		await this.config.adapter.transaction(async (tx: Transaction) => {
-			for (const entry of this.buffer) {
-				if (entry.operation.type === 'delete' && this.config.relationEnforcer) {
-					const cascadeResult = await this.config.relationEnforcer.enforceDelete(
-						entry.collection,
-						entry.operation.recordId,
-						tx,
-						[entry.operation.id],
-					)
-					for (const cascadedOp of cascadeResult.operations) {
-						operations.push(cascadedOp)
-						affectedCollections.add(cascadedOp.collection)
-						this.config.causalTracker?.afterOperation(cascadedOp.collection, cascadedOp.id, true)
-					}
-				}
-
-				for (const cmd of entry.commands) {
-					await tx.execute(cmd.sql, cmd.params)
-				}
-				operations.push(entry.operation)
-				affectedCollections.add(entry.collection)
-			}
-
-			const finalSeq = this.config.sequenceAllocator.getHighWaterMark()
-			if (finalSeq > 0) {
-				await tx.execute(
-					'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-					[this.config.nodeId, finalSeq],
-				)
-			}
-		})
-
+		causal.publish()
+		const affectedCollections = new Set(operations.map((op) => op.collection))
 		return { operations, affectedCollections }
 	}
 
@@ -232,92 +236,51 @@ export class TransactionContext {
 		return this.transactionId
 	}
 
+	private writeEnv(): WriteEnv {
+		return {
+			schema: this.config.schema,
+			clock: this.config.clock,
+			nodeId: this.config.nodeId,
+			relationEnforcer: this.config.relationEnforcer,
+			transactionId: this.transactionId,
+			...(this.config.secretKeyProvider
+				? { secretKeyProvider: this.config.secretKeyProvider }
+				: {}),
+			...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
+			...(this.config.beforeLocalDelete
+				? { beforeLocalDelete: this.config.beforeLocalDelete }
+				: {}),
+		}
+	}
+
 	private ensureActive(): void {
 		if (this.committed) {
-			throw new Error('Cannot perform operations on a committed transaction.')
+			throw new KoraError(
+				'Cannot perform operations on a committed transaction.',
+				'TRANSACTION_COMMITTED',
+				{ transactionId: this.transactionId },
+			)
 		}
 		if (this.rolledBack) {
-			throw new Error('Cannot perform operations on a rolled-back transaction.')
+			throw new KoraError(
+				'Cannot perform operations on a rolled-back transaction.',
+				'TRANSACTION_ROLLED_BACK',
+				{ transactionId: this.transactionId },
+			)
 		}
 	}
 
 	private async insert(
 		collectionName: string,
-		definition: CollectionDefinition,
 		data: Record<string, unknown>,
 	): Promise<CollectionRecord> {
 		this.ensureActive()
-
-		const validated = validateRecord(collectionName, definition, data, 'insert')
-		const recordId = generateUUIDv7()
+		const insert = await prepareInsert(this.writeEnv(), collectionName, data)
+		this.buffer.push({ kind: 'insert', collection: collectionName, insert })
 		const now = Date.now()
-
-		// Set auto timestamp fields
-		for (const [fieldName, descriptor] of Object.entries(definition.fields)) {
-			if (descriptor.auto && descriptor.kind === 'timestamp') {
-				validated[fieldName] = now
-			}
-		}
-
-		// Secret fields reach their at-rest form (hash/ciphertext) BEFORE the
-		// operation is built, exactly like executeInsert, so plaintext never
-		// enters the op log, the row, or the wire (STORE-4).
-		const writeData = await toAtRestWriteData(validated, definition, this.config.secretKeyProvider)
-
-		const sequenceNumber = await this.config.sequenceAllocator.allocate()
-		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
-		const operation = await createOperation(
-			{
-				nodeId: this.config.nodeId,
-				type: 'insert',
-				collection: collectionName,
-				recordId,
-				// Binary richtext values are tagged as canonical JSON before the
-				// operation is content-hashed (see encodeRichtextFieldsForOpData).
-				data: encodeRichtextFieldsForOpData(writeData, definition.fields),
-				previousData: null,
-				sequenceNumber,
-				causalDeps,
-				schemaVersion: this.config.schema.version,
-				transactionId: this.transactionId,
-				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
-			},
-			this.config.clock,
-		)
-		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
-
-		const serializedData = serializeRecord(writeData, definition.fields)
-		const version = serializeRowVersion(operation.timestamp)
-		const record: Record<string, unknown> = {
-			id: recordId,
-			...serializedData,
-			_created_at: operation.timestamp.wallTime,
-			_updated_at: operation.timestamp.wallTime,
-			_version: version,
-		}
-
-		const insertQuery = buildInsertQuery(collectionName, record)
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${collectionName}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		this.buffer.push({
-			operation,
-			collection: collectionName,
-			commands: [
-				{ sql: insertQuery.sql, params: insertQuery.params },
-				{ sql: opInsert.sql, params: opInsert.params },
-			],
-		})
-
-		return {
-			id: recordId,
-			...writeData,
-			createdAt: now,
-			updatedAt: now,
-		}
+		// The returned record carries the at-rest form (secrets hashed/encrypted),
+		// exactly like a single-record insert.
+		return { id: insert.recordId, ...insert.data, createdAt: now, updatedAt: now }
 	}
 
 	private async update(
@@ -328,92 +291,26 @@ export class TransactionContext {
 	): Promise<CollectionRecord> {
 		this.ensureActive()
 
-		// Check for buffered inserts/updates for this record to get current state
 		const currentRecord = await this.getEffectiveRecord(collectionName, definition, id)
 		if (!currentRecord) {
 			throw new RecordNotFoundError(collectionName, id)
 		}
 
 		const validated = validateRecord(collectionName, definition, data, 'update')
-		const now = Date.now()
-
-		const previousData: Record<string, unknown> = {}
-		const resolvedData: Record<string, unknown> = {}
-		const atomicOps: Record<string, AtomicOp> = {}
-
-		for (const key of Object.keys(validated)) {
-			const value = validated[key]
-			previousData[key] = currentRecord[key]
-
-			if (isAtomicOp(value)) {
-				resolvedData[key] = resolveAtomicOp(currentRecord[key], value)
-				atomicOps[key] = toAtomicOp(value)
-			} else {
-				resolvedData[key] = value
-			}
-		}
-
-		const hasAtomicOps = Object.keys(atomicOps).length > 0
-
-		// Same transform as executeUpdate. previousData already holds the stored
-		// (at-rest) value read from the row or the buffer, so it needs none.
-		const writeData = await toAtRestWriteData(
-			resolvedData,
+		// Early check so an invalid transition fails at the call site. The commit
+		// re-validates against the row read inside the write transaction, which is
+		// authoritative.
+		const allowed = validateUpdateStateMachine(
+			collectionName,
+			id,
 			definition,
-			this.config.secretKeyProvider,
+			currentRecord,
+			validated,
 		)
+		this.buffer.push({ kind: 'update', collection: collectionName, id, data: validated })
 
-		const sequenceNumber = await this.config.sequenceAllocator.allocate()
-		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
-		const operation = await createOperation(
-			{
-				nodeId: this.config.nodeId,
-				type: 'update',
-				collection: collectionName,
-				recordId: id,
-				// Binary richtext values (new and previous) are tagged as canonical
-				// JSON before the operation is content-hashed.
-				data: encodeRichtextFieldsForOpData(writeData, definition.fields),
-				previousData: encodeRichtextFieldsForOpData(previousData, definition.fields),
-				sequenceNumber,
-				causalDeps,
-				schemaVersion: this.config.schema.version,
-				transactionId: this.transactionId,
-				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
-				...(hasAtomicOps ? { atomicOps } : {}),
-			},
-			this.config.clock,
-		)
-		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
-
-		const serializedChanges = serializeRecord(writeData, definition.fields)
-		const version = serializeRowVersion(operation.timestamp)
-		const updateQuery = buildUpdateQuery(collectionName, id, {
-			...serializedChanges,
-			_updated_at: operation.timestamp.wallTime,
-			_version: version,
-		})
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${collectionName}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		this.buffer.push({
-			operation,
-			collection: collectionName,
-			commands: [
-				{ sql: updateQuery.sql, params: updateQuery.params },
-				{ sql: opInsert.sql, params: opInsert.params },
-			],
-		})
-
-		// Merge current record with resolved changes for return value
-		return {
-			...currentRecord,
-			...writeData,
-			updatedAt: now,
-		} as CollectionRecord
+		const preview = await this.previewUpdate(definition, currentRecord, allowed)
+		return { ...currentRecord, ...preview, updatedAt: Date.now() } as CollectionRecord
 	}
 
 	private async deleteRecord(
@@ -427,106 +324,62 @@ export class TransactionContext {
 		if (!currentRecord) {
 			throw new RecordNotFoundError(collectionName, id)
 		}
-
-		const now = Date.now()
-		const sequenceNumber = await this.config.sequenceAllocator.allocate()
-		const causalDeps = this.config.causalTracker?.nextCausalDeps(collectionName, true) ?? []
-		const operation = await createOperation(
-			{
-				nodeId: this.config.nodeId,
-				type: 'delete',
-				collection: collectionName,
-				recordId: id,
-				data: null,
-				previousData: null,
-				sequenceNumber,
-				causalDeps,
-				schemaVersion: this.config.schema.version,
-				transactionId: this.transactionId,
-				...(this.mutationName !== undefined ? { mutationName: this.mutationName } : {}),
-			},
-			this.config.clock,
-		)
-		this.config.causalTracker?.afterOperation(collectionName, operation.id, true)
-
-		const deleteQuery = buildSoftDeleteQuery(collectionName, id, now)
-		const opRow = serializeOperation(operation)
-		const opInsert = buildInsertQuery(
-			`_kora_ops_${collectionName}`,
-			opRow as unknown as Record<string, unknown>,
-		)
-
-		this.buffer.push({
-			operation,
-			collection: collectionName,
-			commands: [
-				{ sql: deleteQuery.sql, params: deleteQuery.params },
-				{ sql: opInsert.sql, params: opInsert.params },
-			],
-		})
-	}
-
-	private async findById(
-		collectionName: string,
-		definition: CollectionDefinition,
-		id: string,
-	): Promise<CollectionRecord | null> {
-		return this.getEffectiveRecord(collectionName, definition, id)
+		this.buffer.push({ kind: 'delete', collection: collectionName, id })
 	}
 
 	/**
-	 * Get the effective state of a record, considering both the database and buffered operations.
-	 * Buffered inserts/updates take precedence over the database state.
+	 * The values an update will write, resolved against `current` (the effective
+	 * record) for read-your-writes inside the transaction. Secret fields are shown
+	 * in their at-rest form, like the record a committed update returns.
+	 */
+	private async previewUpdate(
+		definition: CollectionDefinition,
+		current: CollectionRecord,
+		data: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		const resolved: Record<string, unknown> = {}
+		for (const [key, value] of Object.entries(data)) {
+			resolved[key] = isAtomicOp(value) ? resolveAtomicOp(current[key], value) : value
+		}
+		return toAtRestWriteData(resolved, definition, this.config.secretKeyProvider)
+	}
+
+	/**
+	 * The effective state of a record: the committed row overlaid with this
+	 * transaction's buffered mutations, in call order.
 	 */
 	private async getEffectiveRecord(
 		collectionName: string,
 		definition: CollectionDefinition,
 		id: string,
 	): Promise<CollectionRecord | null> {
-		// Check if there's a buffered delete for this record (scan from newest to oldest)
-		for (let i = this.buffer.length - 1; i >= 0; i--) {
-			const entry = this.buffer[i] as BufferedEntry
-			if (entry.collection === collectionName && entry.operation.recordId === id) {
-				if (entry.operation.type === 'delete') {
-					return null
-				}
-				// For buffered inserts/updates, reconstruct the record from the database + buffered changes
-				break
-			}
-		}
-
-		// Read from database first
 		const rows = await this.config.adapter.query<RawCollectionRow>(
 			`SELECT * FROM ${quoteIdent(collectionName)} WHERE id = ? AND _deleted = 0`,
 			[id],
 		)
-
 		let record: CollectionRecord | null = rows[0]
 			? deserializeRecord(rows[0], definition.fields)
 			: null
 
-		// Apply buffered operations on top
 		for (const entry of this.buffer) {
-			if (entry.collection !== collectionName || entry.operation.recordId !== id) {
-				continue
-			}
-
-			if (entry.operation.type === 'insert' && entry.operation.data) {
-				record = {
-					id,
-					// op.data stores binary richtext as tagged JSON; the effective
-					// record must expose record-shaped values (Uint8Array/string).
-					...decodeRichtextFieldsFromOpData(entry.operation.data, definition.fields),
-					createdAt: entry.operation.timestamp.wallTime,
-					updatedAt: entry.operation.timestamp.wallTime,
+			if (entry.collection !== collectionName) continue
+			if (entry.kind === 'insert') {
+				if (entry.insert.recordId !== id) continue
+				const now = Date.now()
+				record = { id, ...entry.insert.data, createdAt: now, updatedAt: now }
+			} else if (entry.id === id && entry.kind === 'update') {
+				if (record) {
+					let allowed: Record<string, unknown>
+					try {
+						allowed = validateUpdateStateMachine(collectionName, id, definition, record, entry.data)
+					} catch {
+						// Already reported to the caller when the update was buffered.
+						allowed = {}
+					}
+					const preview = await this.previewUpdate(definition, record, allowed)
+					record = { ...record, ...preview, updatedAt: Date.now() }
 				}
-			} else if (entry.operation.type === 'update' && entry.operation.data && record) {
-				record = {
-					...record,
-					...decodeRichtextFieldsFromOpData(entry.operation.data, definition.fields),
-					updatedAt: entry.operation.timestamp.wallTime,
-				}
-			} else if (entry.operation.type === 'delete') {
+			} else if (entry.id === id) {
 				record = null
 			}
 		}

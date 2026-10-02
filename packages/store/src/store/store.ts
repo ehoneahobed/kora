@@ -35,6 +35,7 @@ import {
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import type { LocalMutationContext } from '../mutations/types'
+import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -72,7 +73,6 @@ import {
 	saveNodeToken,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
-import { TransactionSequenceAllocator } from '../transaction/transaction-sequence'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -88,7 +88,13 @@ import type {
 	Transaction,
 	VersionVectorRow,
 } from '../types'
-import { allocateNextSequenceNumber } from './sequence-allocator'
+import { dropLegacyIndexes } from './legacy-indexes'
+import {
+	insertConflictRow,
+	isOperationLogged,
+	loadRetainedConflictRows,
+	repairSequenceUniqueness,
+} from './sequence-repair'
 import { resolvePerTabNodeId } from './tab-node-id'
 
 /**
@@ -150,11 +156,18 @@ export class Store implements OperationLog {
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
 
+		// Indexes named under the old, colliding scheme are replaced (STORE-15).
+		await dropLegacyIndexes(this.adapter, this.schema)
+
 		// Run schema migrations if needed
 		await this.runMigrationsIfNeeded()
 
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
+
+		// (node_id, sequence_number) is unique in the operation log: repair any
+		// duplicates an earlier version wrote, then enforce it with an index (W6).
+		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
 
@@ -169,14 +182,7 @@ export class Store implements OperationLog {
 		// The enforcer is shared across all Collection instances so that
 		// cascading deletes can cross collection boundaries.
 		const hasRelations = Object.keys(this.schema.relations).length > 0
-		this.relationEnforcer = hasRelations
-			? new RelationEnforcer({
-					schema: this.schema,
-					adapter: this.adapter,
-					clock: this.clock,
-					nodeId: this.nodeId,
-				})
-			: null
+		this.relationEnforcer = hasRelations ? new RelationEnforcer({ schema: this.schema }) : null
 
 		// Create collection instances
 		for (const [name, definition] of Object.entries(this.schema.collections)) {
@@ -187,18 +193,12 @@ export class Store implements OperationLog {
 				this.adapter,
 				this.clock,
 				this.nodeId,
-				() => this.allocateSequenceNumber(),
-				(collectionName, operation) => {
-					this.recordOperationSequence(operation)
-					this.subscriptionManager.notify(collectionName, operation)
-					if (this.emitter) {
-						this.emitter.emit({ type: 'operation:created', operation })
-					}
-				},
+				(collectionName, operation) => this.publishLocalOperation(collectionName, operation),
 				this.relationEnforcer,
 				this.localMutationHandler,
 				this.causalTracker,
 				this.secretKeyProvider,
+				(error) => this.reportStorageError(error),
 			)
 			this.collections.set(name, col)
 		}
@@ -291,38 +291,6 @@ export class Store implements OperationLog {
 			return 'skipped'
 		}
 
-		// Check for duplicate (content-addressed dedup)
-		const existing = await this.adapter.query<{ id: string }>(
-			`SELECT id FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE id = ?`,
-			[op.id],
-		)
-		if (existing.length > 0) {
-			const retracted = await this.adapter.query<{ record_id: string }>(
-				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-				[collection, op.recordId],
-			)
-			if (retracted.length > 0) {
-				await this.adapter.transaction(async (tx) => {
-					await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
-						op.recordId,
-					])
-					await tx.execute(
-						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-						[collection, op.recordId],
-					)
-				})
-				this.subscriptionManager.invalidate(collection)
-			}
-			return 'duplicate'
-		}
-
-		// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
-		if (this.clock) {
-			// A scope entry's newest field version can be later than its timestamp (the
-			// record's creation, RT-27): the clock must move past every version it carries.
-			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
-		}
-
 		// Materialization may use overridden data/timestamp (authoritative merge
 		// results), but the LOG below always stores the canonical operation:
 		// operations are immutable and content-addressed, so merged values must
@@ -331,284 +299,365 @@ export class Store implements OperationLog {
 		const remoteVersion = serializeRowVersion(materializeTimestamp)
 		const wallTime = materializeTimestamp.wallTime
 		const materializeSource = options?.materializeData ?? op.data
+		// Duration is reported to DevTools only; it never orders anything.
+		const startedAt = Date.now()
+		const outcome = { duplicate: false, revived: false }
 
 		// Apply the operation to the data table (LWW-guarded; op log always appended below)
-		await this.adapter.transaction(async (tx) => {
-			// Optimistic-concurrency guard: if the caller computed its data from a
-			// snapshot, verify the row hasn't changed since. Throwing rolls the
-			// whole transaction back (nothing written, op NOT logged) so the caller
-			// can recompute against fresh state and retry.
-			const checkGuard = (row: RawCollectionRow | undefined): void => {
-				const guard = options?.guardRowState
-				if (!guard) {
-					return
-				}
-				const version = typeof row?._version === 'string' ? row._version : null
-				const fieldVersions = typeof row?._field_versions === 'string' ? row._field_versions : null
-				if (version !== guard.version || fieldVersions !== guard.fieldVersions) {
-					throw new OptimisticLockError(collection, op.recordId)
-				}
-			}
-
-			if (options?.logOnly) {
-				// Append-only: the caller (after folding the record's log) determined
-				// this op does not change the authoritative row. Persist it for future
-				// folds but leave the row untouched. Fall through to op-log insert + VV.
-			} else if (
-				op.type === 'insert' &&
-				op.data &&
-				op.fieldVersions &&
-				!options?.materializeData &&
-				!options?.forceMaterialize &&
-				!options?.materializeTimestamp
-			) {
-				// Server scope-entry insert (RT-27): every field carries its own version.
-				await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
-			} else if (op.type === 'insert' && materializeSource) {
-				const serializedData = serializeRecord(materializeSource, definition.fields)
-				const existing = await tx.query<RawCollectionRow>(
-					`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
-					[op.recordId],
-				)
-				const row = existing[0]
-				checkGuard(row)
-
-				if (!row) {
-					const record: Record<string, unknown> = {
-						id: op.recordId,
-						...serializedData,
-						_created_at: wallTime,
-						_updated_at: wallTime,
-						_version: remoteVersion,
-						// Stamp every inserted field so per-field LWW has a real baseline.
-						_field_versions: serializeFieldVersions(
-							fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
-						),
-					}
-					const insertQuery = buildInsertQuery(collection, record)
-					await tx.execute(insertQuery.sql, insertQuery.params)
-
-					// Catch up on operations delivered BEFORE this insert (transports may
-					// reorder): any update/delete already logged for this record was
-					// applied while no row existed, so it never materialized. The row is
-					// a fold of the log — fold the orphans now, in timestamp order,
-					// inside this same transaction. Per-field LWW makes the result
-					// identical to what an in-order device computed.
-					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
-				} else if (
-					row._deleted === 1 &&
-					(
-						await tx.query<{ record_id: string }>(
-							'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-							[collection, op.recordId],
-						)
-					).length > 0
-				) {
-					// The row is hidden by a scope retraction (a view change, not a domain
-					// delete) and the record is entering the scope again, typically through
-					// a server scope-entry insert (RT-19). Show it again and merge per field,
-					// exactly like an insert collision on a live row: fields this device
-					// holds newer versions of are kept.
-					const { winners, merged } = resolvePerFieldLww(
-						parseFieldVersions(row._field_versions),
-						Object.keys(serializedData),
-						remoteVersion,
-						typeof row._version === 'string' ? row._version : undefined,
-					)
-					const fieldChanges: Record<string, unknown> = {
-						_deleted: 0,
-						_field_versions: serializeFieldVersions(merged),
-					}
-					for (const field of winners) {
-						fieldChanges[field] = serializedData[field]
-					}
-					// `_created_at` is left alone: the record was created long before it
-					// re-entered this device's view.
-					const reactivate = buildFieldFastForwardUpdateQuery(
-						collection,
-						op.recordId,
-						fieldChanges,
-						remoteVersion,
-						wallTime,
-					)
-					await tx.execute(reactivate.sql, reactivate.params)
-					await tx.execute(
-						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+		try {
+			await this.adapter.transaction(async (tx) => {
+				// Content-addressed dedup INSIDE the write transaction: two concurrent
+				// deliveries of one operation serialize here, and the second sees the
+				// first's row instead of failing on the primary key (STORE-15).
+				if (await isOperationLogged(tx, collection, op.id)) {
+					outcome.duplicate = true
+					const retracted = await tx.query<{ record_id: string }>(
+						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 						[collection, op.recordId],
 					)
-				} else if (row._deleted === 1) {
-					// Insert vs tombstone: a strictly newer insert resurrects the record
-					// with its full field set; an older one is stale (delete wins).
-					if (isIncomingNewerThanRow(materializeTimestamp, row)) {
-						const fieldChanges: Record<string, unknown> = {
+					if (retracted.length > 0) {
+						await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
+							op.recordId,
+						])
+						await tx.execute(
+							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+						outcome.revived = true
+					}
+					return
+				}
+
+				// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
+				if (this.clock) {
+					// A scope entry's newest field version can be later than its timestamp (the
+					// record's creation, RT-27): the clock must move past every version it carries.
+					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+				}
+
+				// Optimistic-concurrency guard: if the caller computed its data from a
+				// snapshot, verify the row hasn't changed since. Throwing rolls the
+				// whole transaction back (nothing written, op NOT logged) so the caller
+				// can recompute against fresh state and retry.
+				const checkGuard = (row: RawCollectionRow | undefined): void => {
+					const guard = options?.guardRowState
+					if (!guard) {
+						return
+					}
+					const version = typeof row?._version === 'string' ? row._version : null
+					const fieldVersions =
+						typeof row?._field_versions === 'string' ? row._field_versions : null
+					if (version !== guard.version || fieldVersions !== guard.fieldVersions) {
+						throw new OptimisticLockError(collection, op.recordId)
+					}
+				}
+
+				if (options?.logOnly) {
+					// Append-only: the caller (after folding the record's log) determined
+					// this op does not change the authoritative row. Persist it for future
+					// folds but leave the row untouched. Fall through to op-log insert + VV.
+				} else if (
+					op.type === 'insert' &&
+					op.data &&
+					op.fieldVersions &&
+					!options?.materializeData &&
+					!options?.forceMaterialize &&
+					!options?.materializeTimestamp
+				) {
+					// Server scope-entry insert (RT-27): every field carries its own version.
+					await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
+				} else if (op.type === 'insert' && materializeSource) {
+					const serializedData = serializeRecord(materializeSource, definition.fields)
+					const existing = await tx.query<RawCollectionRow>(
+						`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
+						[op.recordId],
+					)
+					const row = existing[0]
+					checkGuard(row)
+
+					if (!row) {
+						const record: Record<string, unknown> = {
+							id: op.recordId,
 							...serializedData,
-							_deleted: 0,
+							_created_at: wallTime,
+							_updated_at: wallTime,
+							_version: remoteVersion,
+							// Stamp every inserted field so per-field LWW has a real baseline.
 							_field_versions: serializeFieldVersions(
 								fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
 							),
 						}
-						const upsert = buildFieldFastForwardUpdateQuery(
+						const insertQuery = buildInsertQuery(collection, record)
+						await tx.execute(insertQuery.sql, insertQuery.params)
+
+						// Catch up on operations delivered BEFORE this insert (transports may
+						// reorder): any update/delete already logged for this record was
+						// applied while no row existed, so it never materialized. The row is
+						// a fold of the log — fold the orphans now, in timestamp order,
+						// inside this same transaction. Per-field LWW makes the result
+						// identical to what an in-order device computed.
+						await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+					} else if (
+						row._deleted === 1 &&
+						(
+							await tx.query<{ record_id: string }>(
+								'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+								[collection, op.recordId],
+							)
+						).length > 0
+					) {
+						// The row is hidden by a scope retraction (a view change, not a domain
+						// delete) and the record is entering the scope again, typically through
+						// a server scope-entry insert (RT-19). Show it again and merge per field,
+						// exactly like an insert collision on a live row: fields this device
+						// holds newer versions of are kept.
+						const { winners, merged } = resolvePerFieldLww(
+							parseFieldVersions(row._field_versions),
+							Object.keys(serializedData),
+							remoteVersion,
+							typeof row._version === 'string' ? row._version : undefined,
+						)
+						const fieldChanges: Record<string, unknown> = {
+							_deleted: 0,
+							_field_versions: serializeFieldVersions(merged),
+						}
+						for (const field of winners) {
+							fieldChanges[field] = serializedData[field]
+						}
+						// `_created_at` is left alone: the record was created long before it
+						// re-entered this device's view.
+						const reactivate = buildFieldFastForwardUpdateQuery(
 							collection,
 							op.recordId,
 							fieldChanges,
+							remoteVersion,
+							wallTime,
+						)
+						await tx.execute(reactivate.sql, reactivate.params)
+						await tx.execute(
+							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+					} else if (row._deleted === 1) {
+						// Insert vs tombstone: a strictly newer insert resurrects the record
+						// with its full field set; an older one is stale (delete wins).
+						if (isIncomingNewerThanRow(materializeTimestamp, row)) {
+							const fieldChanges: Record<string, unknown> = {
+								...serializedData,
+								_deleted: 0,
+								_field_versions: serializeFieldVersions(
+									fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
+								),
+							}
+							const upsert = buildFieldFastForwardUpdateQuery(
+								collection,
+								op.recordId,
+								fieldChanges,
+								remoteVersion,
+								wallTime,
+								{ maxCreatedAt: wallTime },
+							)
+							await tx.execute(upsert.sql, upsert.params)
+						}
+					} else {
+						// Insert collision on a LIVE row (relayed insert racing a local one,
+						// or an insert-vs-insert merge). A plain INSERT would violate the
+						// primary key; resolve per-field instead, exactly like an update, so
+						// every node converges no matter which insert (or interleaved
+						// update) it saw first. `_created_at` converges to the max insert
+						// wall time seen, applied even when every field loses.
+						const currentVersions = parseFieldVersions(row._field_versions)
+						const rowVersion = typeof row._version === 'string' ? row._version : undefined
+						const fieldChanges: Record<string, unknown> = {}
+						let fieldVersionsJson: string
+						if (options?.forceMaterialize) {
+							// Authoritative merged insert: every field is written.
+							const merged = { ...currentVersions }
+							for (const field of Object.keys(serializedData)) {
+								fieldChanges[field] = serializedData[field]
+								merged[field] = remoteVersion
+							}
+							fieldVersionsJson = serializeFieldVersions(merged)
+						} else {
+							const { winners, merged } = resolvePerFieldLww(
+								currentVersions,
+								Object.keys(serializedData),
+								remoteVersion,
+								rowVersion,
+							)
+							for (const field of winners) {
+								fieldChanges[field] = serializedData[field]
+							}
+							fieldVersionsJson = serializeFieldVersions(merged)
+						}
+						const upsert = buildFieldFastForwardUpdateQuery(
+							collection,
+							op.recordId,
+							{ ...fieldChanges, _field_versions: fieldVersionsJson },
 							remoteVersion,
 							wallTime,
 							{ maxCreatedAt: wallTime },
 						)
 						await tx.execute(upsert.sql, upsert.params)
 					}
-				} else {
-					// Insert collision on a LIVE row (relayed insert racing a local one,
-					// or an insert-vs-insert merge). A plain INSERT would violate the
-					// primary key; resolve per-field instead, exactly like an update, so
-					// every node converges no matter which insert (or interleaved
-					// update) it saw first. `_created_at` converges to the max insert
-					// wall time seen, applied even when every field loses.
-					const currentVersions = parseFieldVersions(row._field_versions)
-					const rowVersion = typeof row._version === 'string' ? row._version : undefined
-					const fieldChanges: Record<string, unknown> = {}
-					let fieldVersionsJson: string
-					if (options?.forceMaterialize) {
-						// Authoritative merged insert: every field is written.
-						const merged = { ...currentVersions }
-						for (const field of Object.keys(serializedData)) {
-							fieldChanges[field] = serializedData[field]
-							merged[field] = remoteVersion
-						}
-						fieldVersionsJson = serializeFieldVersions(merged)
-					} else {
-						const { winners, merged } = resolvePerFieldLww(
-							currentVersions,
-							Object.keys(serializedData),
-							remoteVersion,
-							rowVersion,
-						)
-						for (const field of winners) {
-							fieldChanges[field] = serializedData[field]
-						}
-						fieldVersionsJson = serializeFieldVersions(merged)
-					}
-					const upsert = buildFieldFastForwardUpdateQuery(
-						collection,
-						op.recordId,
-						{ ...fieldChanges, _field_versions: fieldVersionsJson },
-						remoteVersion,
-						wallTime,
-						{ maxCreatedAt: wallTime },
+				} else if (op.type === 'update' && materializeSource) {
+					const serializedChanges = serializeRecord(materializeSource, definition.fields)
+					const changedFields = Object.keys(serializedChanges)
+
+					// Read the current per-field versions INSIDE the transaction so the
+					// resolve-then-write is atomic with respect to any concurrent local
+					// mutation — this is what prevents a relayed remote op from clobbering
+					// a newer local edit that lands between the read and the write.
+					const currentRows = await tx.query<RawCollectionRow>(
+						`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
+						[op.recordId],
 					)
-					await tx.execute(upsert.sql, upsert.params)
-				}
-			} else if (op.type === 'update' && materializeSource) {
-				const serializedChanges = serializeRecord(materializeSource, definition.fields)
-				const changedFields = Object.keys(serializedChanges)
+					const currentRow = currentRows[0]
+					checkGuard(currentRow)
 
-				// Read the current per-field versions INSIDE the transaction so the
-				// resolve-then-write is atomic with respect to any concurrent local
-				// mutation — this is what prevents a relayed remote op from clobbering
-				// a newer local edit that lands between the read and the write.
-				const currentRows = await tx.query<RawCollectionRow>(
-					`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
-					[op.recordId],
-				)
-				const currentRow = currentRows[0]
-				checkGuard(currentRow)
+					if (currentRow) {
+						const currentVersions = parseFieldVersions(currentRow._field_versions)
+						const rowVersion =
+							typeof currentRow._version === 'string' ? currentRow._version : undefined
 
-				if (currentRow) {
-					const currentVersions = parseFieldVersions(currentRow._field_versions)
-					const rowVersion =
-						typeof currentRow._version === 'string' ? currentRow._version : undefined
-
-					if (options?.forceMaterialize) {
-						// Authoritative merged result (richtext / add-wins-set / constraint
-						// resolution computed by the merge engine): write every changed
-						// field and stamp its per-field version to this op's version, while
-						// advancing the row watermark monotonically.
-						const merged = { ...currentVersions }
-						for (const field of changedFields) {
-							merged[field] = remoteVersion
-						}
-						const fieldChanges: Record<string, unknown> = {
-							...serializedChanges,
-							_field_versions: serializeFieldVersions(merged),
-						}
-						if (options?.reactivateIfDeleted) {
-							fieldChanges._deleted = 0
-						}
-						const forceQuery = buildFieldFastForwardUpdateQuery(
-							collection,
-							op.recordId,
-							fieldChanges,
-							remoteVersion,
-							wallTime,
-						)
-						await tx.execute(forceQuery.sql, forceQuery.params)
-					} else {
-						// Deterministic field-level LWW: write only the fields this op
-						// wins (strictly newer than the field's stored version). Same
-						// result on every node regardless of arrival order.
-						const { winners, merged } = resolvePerFieldLww(
-							currentVersions,
-							changedFields,
-							remoteVersion,
-							rowVersion,
-						)
-						if (winners.length > 0 || options?.reactivateIfDeleted) {
-							const winningChanges: Record<string, unknown> = {
+						if (options?.forceMaterialize) {
+							// Authoritative merged result (richtext / add-wins-set / constraint
+							// resolution computed by the merge engine): write every changed
+							// field and stamp its per-field version to this op's version, while
+							// advancing the row watermark monotonically.
+							const merged = { ...currentVersions }
+							for (const field of changedFields) {
+								merged[field] = remoteVersion
+							}
+							const fieldChanges: Record<string, unknown> = {
+								...serializedChanges,
 								_field_versions: serializeFieldVersions(merged),
 							}
-							for (const field of winners) {
-								winningChanges[field] = serializedChanges[field]
-							}
 							if (options?.reactivateIfDeleted) {
-								winningChanges._deleted = 0
+								fieldChanges._deleted = 0
 							}
 							const forceQuery = buildFieldFastForwardUpdateQuery(
 								collection,
 								op.recordId,
-								winningChanges,
+								fieldChanges,
 								remoteVersion,
 								wallTime,
 							)
 							await tx.execute(forceQuery.sql, forceQuery.params)
+						} else {
+							// Deterministic field-level LWW: write only the fields this op
+							// wins (strictly newer than the field's stored version). Same
+							// result on every node regardless of arrival order.
+							const { winners, merged } = resolvePerFieldLww(
+								currentVersions,
+								changedFields,
+								remoteVersion,
+								rowVersion,
+							)
+							if (winners.length > 0 || options?.reactivateIfDeleted) {
+								const winningChanges: Record<string, unknown> = {
+									_field_versions: serializeFieldVersions(merged),
+								}
+								for (const field of winners) {
+									winningChanges[field] = serializedChanges[field]
+								}
+								if (options?.reactivateIfDeleted) {
+									winningChanges._deleted = 0
+								}
+								const forceQuery = buildFieldFastForwardUpdateQuery(
+									collection,
+									op.recordId,
+									winningChanges,
+									remoteVersion,
+									wallTime,
+								)
+								await tx.execute(forceQuery.sql, forceQuery.params)
+							}
 						}
 					}
+					// currentRow absent: nothing materialized to update (insert not yet
+					// applied, or hard-absent). The op is still appended to the log below;
+					// the pipeline handles tombstone reactivation separately.
+				} else if (op.type === 'delete') {
+					const deleteQuery = buildLwwSoftDeleteQuery(
+						collection,
+						op.recordId,
+						wallTime,
+						remoteVersion,
+					)
+					await tx.execute(deleteQuery.sql, deleteQuery.params)
 				}
-				// currentRow absent: nothing materialized to update (insert not yet
-				// applied, or hard-absent). The op is still appended to the log below;
-				// the pipeline handles tombstone reactivation separately.
-			} else if (op.type === 'delete') {
-				const deleteQuery = buildLwwSoftDeleteQuery(
-					collection,
-					op.recordId,
-					wallTime,
-					remoteVersion,
-				)
-				await tx.execute(deleteQuery.sql, deleteQuery.params)
-			}
 
-			// Persist the operation
-			const opRow = serializeOperation(op)
-			const opInsert = buildInsertQuery(
-				`_kora_ops_${collection}`,
-				opRow as unknown as Record<string, unknown>,
-			)
-			await tx.execute(opInsert.sql, opInsert.params)
+				// Persist the operation
+				await this.appendRemoteOperationRow(tx, op)
 
-			// Update version vector
-			const currentSeq = this.versionVector.get(op.nodeId) ?? 0
-			if (op.sequenceNumber > currentSeq) {
-				this.versionVector.set(op.nodeId, op.sequenceNumber)
+				// Version vector: MAX with the stored value, never a value computed outside
+				// this transaction (another tab may have advanced it). The in-memory
+				// vector is updated only after commit.
 				await tx.execute(
-					'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
 					[op.nodeId, op.sequenceNumber],
 				)
+			})
+		} catch (error) {
+			this.reportStorageError(error)
+			throw error
+		}
+
+		// Committed. A duplicate still advances this runtime's vector and refreshes
+		// its queries: another tab sharing the database may have applied the
+		// operation first, and this tab must not stay blind to it (STORE-10).
+		this.recordOperationSequence(op)
+		if (outcome.duplicate) {
+			if (outcome.revived) {
+				this.subscriptionManager.invalidate(collection)
+			} else {
+				this.subscriptionManager.notify(collection, op)
 			}
+			return 'duplicate'
+		}
+
+		this.subscriptionManager.notify(collection, op)
+		this.emitter?.emit({
+			type: 'operation:applied',
+			operation: op,
+			duration: Date.now() - startedAt,
 		})
 
-		// Notify subscriptions
-		this.subscriptionManager.notify(collection, op)
-
 		return 'applied'
+	}
+
+	/**
+	 * Append a remote operation to the log. If another operation of the same node
+	 * already holds its sequence number (a beta.12 device could produce such
+	 * pairs), the log keeps the existing row and this one is recorded in the
+	 * sequence-conflicts table, where dedup and record folds still see it.
+	 */
+	private async appendRemoteOperationRow(tx: Transaction, op: Operation): Promise<void> {
+		const table = quoteIdent(`_kora_ops_${op.collection}`)
+		const holder = await tx.query<{ id: string }>(
+			`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
+			[op.nodeId, op.sequenceNumber],
+		)
+		const opRow = serializeOperation(op)
+		if (holder.length > 0) {
+			await insertConflictRow(
+				tx,
+				op.collection,
+				opRow,
+				'remote-sequence-conflict',
+				null,
+				null,
+				Date.now(),
+			)
+			return
+		}
+		const opInsert = buildInsertQuery(
+			`_kora_ops_${op.collection}`,
+			opRow as unknown as Record<string, unknown>,
+		)
+		await tx.execute(opInsert.sql, opInsert.params)
 	}
 
 	/**
@@ -789,10 +838,18 @@ export class Store implements OperationLog {
 		recordId: string,
 		insertOp: Operation,
 	): Promise<void> {
-		const orphanRows = await tx.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND type IN ('update', 'delete')`,
-			[recordId],
-		)
+		const orphanRows = [
+			...(await tx.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND type IN ('update', 'delete')`,
+				[recordId],
+			)),
+			...(await loadRetainedConflictRows(
+				(sql, params) => tx.query(sql, params),
+				collection,
+				recordId,
+				['update', 'delete'],
+			)),
+		]
 		if (orphanRows.length === 0) {
 			return
 		}
@@ -1022,17 +1079,19 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Build mutation context for a collection (used by ApplyPipeline side effects).
+	 * Build the local write context for a collection: everything the single local
+	 * write path needs (used by Collection writes and by ApplyPipeline).
 	 */
 	createMutationContext(
 		collection: string,
-		options?: { inTransaction?: boolean; extraCausalDeps?: string[] },
+		options?: { extraCausalDeps?: string[] },
 	): LocalMutationContext {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
 		if (!definition || !this.clock) {
 			throw new StoreNotOpenError()
 		}
+		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		return {
 			collection,
 			definition,
@@ -1040,19 +1099,16 @@ export class Store implements OperationLog {
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			allocateSequenceNumber: () => this.allocateSequenceNumber(),
-			onMutation: (collectionName, operation) => {
-				this.recordOperationSequence(operation)
-				this.subscriptionManager.notify(collectionName, operation)
-				if (this.emitter) {
-					this.emitter.emit({ type: 'operation:created', operation })
-				}
-			},
+			onMutation: (collectionName, operation) =>
+				this.publishLocalOperation(collectionName, operation),
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
-			inTransaction: options?.inTransaction ?? false,
-			extraCausalDeps: options?.extraCausalDeps,
-			secretKeyProvider: this.secretKeyProvider,
+			...(options?.extraCausalDeps ? { extraCausalDeps: options.extraCausalDeps } : {}),
+			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(beforeLocalDelete
+				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
+				: {}),
+			onStorageError: (error) => this.reportStorageError(error),
 		}
 	}
 
@@ -1262,14 +1318,6 @@ export class Store implements OperationLog {
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
 		this.sequenceNumber = result.operations.length
 		this.versionVector = await this.loadVersionVector()
-		this.relationEnforcer = this.relationEnforcer
-			? new RelationEnforcer({
-					schema: this.schema,
-					adapter: this.adapter,
-					clock,
-					nodeId: this.nodeId,
-				})
-			: null
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
@@ -1368,10 +1416,19 @@ export class Store implements OperationLog {
 	 */
 	async getOperationsForRecord(collection: string, recordId: string): Promise<Operation[]> {
 		this.ensureOpen()
-		const rows = await this.adapter.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
-			[recordId],
-		)
+		const rows = [
+			...(await this.adapter.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
+				[recordId],
+			)),
+			// Other nodes' operations kept only in the sequence-conflicts table still
+			// belong to the record's history.
+			...(await loadRetainedConflictRows(
+				(sql, params) => this.adapter.query(sql, params),
+				collection,
+				recordId,
+			)),
+		]
 		const ops = rows.map((row) => deserializeOperationWithCollection(row, collection))
 		ops.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
 		return ops
@@ -1406,16 +1463,19 @@ export class Store implements OperationLog {
 		if (!this.clock) {
 			throw new StoreNotOpenError()
 		}
+		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		return new TransactionContext({
 			schema: this.schema,
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			sequenceAllocator: new TransactionSequenceAllocator(this.adapter, this.nodeId),
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
-			localMutationHandler: this.localMutationHandler,
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(beforeLocalDelete
+				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
+				: {}),
+			onStorageError: (error) => this.reportStorageError(error),
 		})
 	}
 
@@ -1431,28 +1491,20 @@ export class Store implements OperationLog {
 	 */
 	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
 		const tx = this.createTransaction()
-		this.causalTracker?.beginTransaction()
 		try {
 			await fn(tx)
-			const { operations } = await tx.commit()
-
-			this.causalTracker?.clearTransaction()
-
-			// Notify subscriptions and emit events after commit
-			for (const op of operations) {
-				this.recordOperationSequence(op)
-				this.subscriptionManager.notify(op.collection, op)
-				if (this.emitter) {
-					this.emitter.emit({ type: 'operation:created', operation: op })
-				}
-			}
-
-			return operations
 		} catch (error) {
 			tx.rollback()
-			this.causalTracker?.clearTransaction()
 			throw error
 		}
+		const { operations } = await tx.commit()
+
+		// Notify subscriptions and emit events after commit
+		for (const op of operations) {
+			this.publishLocalOperation(op.collection, op)
+		}
+
+		return operations
 	}
 
 	/**
@@ -1501,11 +1553,25 @@ export class Store implements OperationLog {
 		}
 	}
 
-	private async allocateSequenceNumber(): Promise<number> {
-		const seq = await allocateNextSequenceNumber(this.adapter, this.nodeId)
-		this.sequenceNumber = seq
-		this.versionVector.set(this.nodeId, seq)
-		return seq
+	/** Post-commit publication of a committed local operation. */
+	private publishLocalOperation(collection: string, operation: Operation): void {
+		this.recordOperationSequence(operation)
+		this.subscriptionManager.notify(collection, operation)
+		this.emitter?.emit({ type: 'operation:created', operation })
+	}
+
+	/**
+	 * Map an out-of-space storage failure to `store:quota-exceeded` (STORE-15).
+	 * The error itself still propagates to the caller; this only makes the
+	 * condition observable on every adapter, not just IndexedDB.
+	 */
+	private reportStorageError(error: unknown): void {
+		if (!isStorageFullError(error)) return
+		this.emitter?.emit({
+			type: 'store:quota-exceeded',
+			dbName: this.dbName,
+			message: error instanceof Error ? error.message : String(error),
+		})
 	}
 
 	/**
