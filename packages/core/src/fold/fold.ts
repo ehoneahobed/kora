@@ -39,6 +39,8 @@
  *   back to the write's value (reported on the trace and the state).
  * - Richtext ('rt'): a set of opaque Yjs updates merged by the caller-supplied
  *   merger; a plain-string write is a reset that hides updates written before it.
+ *   With `richtextSubsumes`, only maximal updates are kept (an update another one
+ *   contains, with a stamp not later, is dropped): same materializations, bounded state.
  * - Record: exists once an insert is merged; live iff newest insert/update >
  *   newest delete. Insert onto an existing row merges per field.
  *
