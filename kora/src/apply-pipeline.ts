@@ -1,5 +1,5 @@
 import type { KoraEventEmitter, MergeTrace, Operation, SchemaDefinition } from '@korajs/core'
-import { KoraError, quoteIdent } from '@korajs/core'
+import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
 import type { MergeEngine, ReferentialMergeContext, SideEffectOp } from '@korajs/merge'
 import {
 	buildMergeRelationLookup,
@@ -171,7 +171,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 		if (row && !row.deleted) {
 			return result
 		}
-		await applySideEffectOps(this.deps.store, check.sideEffectOps, op.id)
+		await applySideEffectOps(this.deps.store, check.sideEffectOps, op)
 		return result
 	}
 
@@ -288,14 +288,28 @@ function createReferentialMergeContext(store: Store): ReferentialMergeContext {
 	}
 }
 
+/**
+ * The cascades / set-nulls of a REMOTE delete, written as this device's operations.
+ *
+ * They are stamped right after the delete (its HLC, next logical ticks, this node),
+ * exactly like the server's deterministic copy (`timestampAfter`), never with this
+ * device's current time: a concurrent write to the child that is later than the delete
+ * then wins over every copy, so the outcome does not depend on when this device
+ * happened to apply the delete (Phase 3 seam 5). The copies are idempotent in effect
+ * (two deletes, two writes of null).
+ */
 async function applySideEffectOps(
 	store: Store,
 	sideEffects: SideEffectOp[],
-	parentOpId: string,
+	parentOp: Operation,
 ): Promise<void> {
+	const parent = parentOp.timestamp
+	const clock = new HybridLogicalClock(store.getNodeId(), { now: () => parent.wallTime })
+	clock.advanceTo(parent)
 	for (const effect of sideEffects) {
 		const ctx = store.createMutationContext(effect.collection, {
-			extraCausalDeps: [parentOpId],
+			extraCausalDeps: [parentOp.id],
+			clock,
 		})
 		if (effect.type === 'delete') {
 			await executeDelete(ctx, effect.recordId, { skipReferentialEnforcement: true })

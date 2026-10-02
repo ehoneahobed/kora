@@ -1515,7 +1515,15 @@ export class Store implements OperationLog {
 	 */
 	createMutationContext(
 		collection: string,
-		options?: { extraCausalDeps?: string[] },
+		options?: {
+			extraCausalDeps?: string[]
+			/**
+			 * Stamp the writes with this clock instead of the store's (it must be this
+			 * node's). Used for the side effects of a remote delete, stamped right after
+			 * the delete like the server's copy (seam 5), never with the device's "now".
+			 */
+			clock?: HybridLogicalClock
+		},
 	): LocalMutationContext {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
@@ -1530,7 +1538,7 @@ export class Store implements OperationLog {
 			definition,
 			schema: this.schema,
 			adapter: this.adapter,
-			clock: this.clock,
+			clock: options?.clock ?? this.clock,
 			nodeId: this.nodeId,
 			onMutation: (collectionName, operation) =>
 				this.publishLocalOperation(collectionName, operation),
