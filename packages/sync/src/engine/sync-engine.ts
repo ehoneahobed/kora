@@ -199,6 +199,8 @@ function stableStringify(value: unknown): string {
  */
 export class SyncEngine {
 	private state: SyncState = 'disconnected'
+	/** Listeners registered through {@link onStateChange}. */
+	private readonly stateListeners = new Set<(state: SyncState) => void>()
 	private readonly transport: SyncTransport
 	private readonly store: SyncStore
 	private readonly config: SyncConfig
@@ -863,6 +865,21 @@ export class SyncEngine {
 	 */
 	getState(): SyncState {
 		return this.state
+	}
+
+	/**
+	 * Subscribe to internal state changes (SYNC-8). The reconnection loop uses it to
+	 * count an attempt as successful only once the session reaches `streaming`, not
+	 * when the handshake is merely sent.
+	 *
+	 * @param listener - Called with the new state after every transition
+	 * @returns Unsubscribe function
+	 */
+	onStateChange(listener: (state: SyncState) => void): () => void {
+		this.stateListeners.add(listener)
+		return () => {
+			this.stateListeners.delete(listener)
+		}
 	}
 
 	/**
@@ -2322,6 +2339,13 @@ export class SyncEngine {
 			})
 		}
 		this.state = newState
+		for (const listener of [...this.stateListeners]) {
+			try {
+				listener(newState)
+			} catch {
+				// A listener must never break a state transition.
+			}
+		}
 	}
 
 	private setSerializerWireFormat(format: WireFormat): void {
