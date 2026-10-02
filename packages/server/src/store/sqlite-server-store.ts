@@ -37,7 +37,7 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER } from './server-store'
+import { RELEASED_NODE_OWNER, SequenceConflictError } from './server-store'
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -141,6 +141,14 @@ export class SqliteServerStore implements ServerStore {
 			)
 			if (existing.length > 0) {
 				return 'duplicate' as const
+			}
+			// A different operation under the same (node, sequence) is refused (W3 step 4),
+			// inside the write transaction so no concurrent writer can slip one in.
+			const holder = tx.all<{ id: string }>(
+				sql`SELECT id FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber} LIMIT 1`,
+			)
+			if (holder[0] !== undefined) {
+				throw new SequenceConflictError(op, holder[0].id)
 			}
 
 			// Authorization re-check inside the write transaction: better-sqlite3 runs
@@ -425,6 +433,36 @@ export class SqliteServerStore implements ServerStore {
 		return this.materializeFromOpsLog(collection)
 	}
 
+	async findRecordsByIds(
+		collection: string,
+		ids: string[],
+	): Promise<Map<string, MaterializedRecord>> {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
+		const result = new Map<string, MaterializedRecord>()
+		// Chunked to stay far below SQLite's bound-parameter limit.
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500)
+			if (chunk.length === 0) continue
+			const rows = this.db.all<Record<string, unknown>>(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) {
+				const record = this.deserializeRow(row, collectionDef)
+				result.set(record.id, record)
+			}
+		}
+		return result
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
@@ -608,16 +646,12 @@ export class SqliteServerStore implements ServerStore {
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
-		const { parseServerBackup } = await import('./server-backup')
+		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
 		const { operations: ops, versionVector } = parseServerBackup(data)
 
 		if (merge) {
-			let restored = 0
-			for (const op of ops) {
-				const result = await this.applyRemoteOperation(op)
-				if (result === 'applied') restored++
-			}
-			return { operationsRestored: restored, success: true }
+			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
+			return merged
 		}
 
 		// Replace mode: DROP and recreate
@@ -1026,6 +1060,22 @@ export class SqliteServerStore implements ServerStore {
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
 		`)
+		// One operation per (node, sequence) (W3 step 4), enforced by the database where
+		// the existing log allows it. A log written by an older release may already hold
+		// two operations under one sequence; it keeps working, guarded by the check in
+		// applyRemoteOperation alone.
+		try {
+			this.db.run(sql`
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_node_seq_unique ON operations (node_id, sequence_number)
+			`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!`${msg} ${causeMsg}`.includes('UNIQUE')) throw e
+			console.warn(
+				'[kora] The operation log holds operations that share a (node, sequence) pair, so the unique index idx_node_seq_unique was not created. New conflicting writes are still refused (SEQUENCE_CONFLICT).',
+			)
+		}
 
 		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 		this.db.run(sql`

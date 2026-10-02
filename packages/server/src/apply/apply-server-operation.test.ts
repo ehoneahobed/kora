@@ -5,6 +5,14 @@ import { authorizeUplinkWrite } from '../scopes/server-scope-filter'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { applyServerOperation } from './apply-server-operation'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 const schema = defineSchema({
 	version: 1,
 	collections: {
@@ -67,7 +75,7 @@ function makeOp(overrides: Partial<Operation> = {}): Operation {
 		data: { title: 'test' },
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'client-1' },
-		sequenceNumber: 1,
+		sequenceNumber: nextFixtureSequence(),
 		causalDeps: [],
 		schemaVersion: 1,
 		...overrides,

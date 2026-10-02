@@ -44,7 +44,16 @@ export function nextServerSequenceNumber(store: ServerStore): number {
 	if (store.reserveSequenceNumber) {
 		return store.reserveSequenceNumber()
 	}
+	// Serialized stores: never hand out the same number twice, even when several
+	// operations are built before any is applied (a conditional route set prepares all
+	// of its mutations first). The store refuses a second operation under one sequence
+	// number (SEQUENCE_CONFLICT), so the reservation must run ahead of the vector.
 	const nodeId = store.getNodeId()
 	const current = store.getVersionVector().get(nodeId) ?? 0
-	return current + 1
+	const next = Math.max(current, reservedServerSequence.get(store) ?? 0) + 1
+	reservedServerSequence.set(store, next)
+	return next
 }
+
+/** Highest server sequence number handed out per store (serialized stores only). */
+const reservedServerSequence = new WeakMap<ServerStore, number>()

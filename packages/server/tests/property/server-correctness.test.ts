@@ -10,10 +10,12 @@ const operationArb = fc
 	.record({
 		seqNum: fc.integer({ min: 1, max: 1000 }),
 		nodeIndex: fc.integer({ min: 0, max: 9 }),
-		collection: fc.constantFrom('todos', 'projects', 'users'),
 	})
-	.map(({ seqNum, nodeIndex, collection }) => {
+	.map(({ seqNum, nodeIndex }) => {
 		const nodeId = `node-${nodeIndex}`
+		// One operation per (node, sequence): a node never reuses a sequence number for
+		// different content (W3 step 4), so the collection follows from the sequence.
+		const collection = (['todos', 'projects', 'users'] as const)[seqNum % 3] ?? 'todos'
 		return {
 			id: `${nodeId}-${collection}-${seqNum}`,
 			nodeId,
