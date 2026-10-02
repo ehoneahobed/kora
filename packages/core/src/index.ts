@@ -123,6 +123,46 @@ export type {
 	VersionedReplayOperation,
 } from './operations/replay-record'
 
+// === Record fold: one deterministic per-field CRDT merge (W7) ===
+export {
+	FOLD_RECORD_TRACE_FIELD,
+	createFoldState,
+	foldRecord,
+	getFoldFieldVersions,
+	isFoldStateLive,
+	joinStates,
+	materialize,
+	mergeOp,
+} from './fold/fold'
+export { deserializeFoldState, serializeFoldState } from './fold/serialize'
+export { toMergeTrace } from './fold/trace'
+export { deriveSideEffectOpId } from './fold/side-effect-id'
+export { FoldConfigurationError, FoldStateError } from './fold/errors'
+export { FOLD_STATE_VERSION } from './fold/types'
+export type {
+	CounterFieldState,
+	ElementSetFieldState,
+	ElementState,
+	ExtremumFieldState,
+	FieldLogEntry,
+	FieldState,
+	FoldFieldKind,
+	FoldFieldVersions,
+	FoldOptions,
+	FoldRecordResult,
+	FoldState,
+	FoldTrace,
+	FoldTraceMode,
+	KeyMapFieldState,
+	KeyState,
+	MergeOpResult,
+	RegisterFieldState,
+	ResolverFieldState,
+	RichtextFieldState,
+	RichtextUpdateMerger,
+	Stamp,
+} from './fold/types'
+
 // === Binary op-data encoding ===
 export {
 	base64ToBytes,
