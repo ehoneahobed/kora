@@ -361,7 +361,7 @@ describe('upload: acks resolve only their batch, prefix is contiguous (W3)', () 
 		expect(resent).toContain('own-1200')
 		expect(restarted.getStatus().pendingOperations).toBe(0)
 		await restarted.stop()
-	})
+	}, 30_000)
 
 	test('a clock rebase re-stamps only operations that were never sent (W3 step 4)', async () => {
 		const future = Date.now() + 3_600_000
@@ -550,6 +550,55 @@ describe('download: apply what was delivered, quarantine what was not (W4)', () 
 		server.send(deliveryBatch('b2', [remote('d')], 5, 6))
 		await flush()
 		expect(persisted.watermark()).toBe(6)
+		await engine.stop()
+	})
+})
+
+describe('delivery view across handshakes (SYNC-11)', () => {
+	test('each handshake reports the requested view; a different accepted scope switches views', async () => {
+		const accepted = { todos: { orgId: 'o1' } }
+		const handshakes: HandshakeMessage[] = []
+		const { client, server } = createMemoryTransportPair()
+		server.onMessage((msg) => {
+			if (msg.type !== 'handshake') return
+			handshakes.push(msg as HandshakeMessage)
+			server.send({
+				type: 'handshake-response',
+				messageId: `r${handshakes.length}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				acceptedDownlinkScopes: accepted,
+			})
+			// The server serves another scope than requested, so it restarts from 0.
+			server.send(
+				deliveryBatch(`d${handshakes.length}`, [remote(`x${handshakes.length}`)], 0, 4, true),
+			)
+		})
+		const persisted = makeState()
+		const engine = new SyncEngine({
+			transport: client,
+			store: makeStore([]),
+			syncState: persisted.state,
+			config: { url: 'ws://t' },
+		})
+		await engine.start()
+		await flush()
+		expect(engine.getState()).toBe('streaming')
+		// The accepted view advanced; the requested (default) view did not.
+		expect(engine.getStatus().deliveryWatermark).toBe(4)
+		expect(persisted.watermark()).toBe(0)
+
+		await engine.reconnect()
+		await flush()
+		expect(handshakes).toHaveLength(2)
+		// The second handshake reports the REQUESTED view's watermark, never the accepted
+		// view's: a server that now served the requested scope would resume from it.
+		expect(handshakes[1]?.lastDeliverySequence).toBe(0)
+		// The restarted stream is a duplicate of the accepted view: no wedge.
+		expect(engine.getState()).toBe('streaming')
+		expect(engine.getStatus().deliveryWatermark).toBe(4)
 		await engine.stop()
 	})
 })

@@ -671,7 +671,7 @@
     }
    ],
    "pr": null,
-   "notes": "Accepted downlink scope switches the delivery view (switchDeliveryView) and is persisted so a restart reads that view; NEW-SYNC-1 makes the server-side restart from 0 harmless. Handshake still sends the configured scope: sending the accepted scope would pin $in narrowing and hide later grant widening (see report); the server should compare against its last resolved scope to avoid the rescan."
+   "notes": "Each handshake reports the watermark of the REQUESTED view; an accepted scope that differs switches to that view (switchDeliveryView), and NEW-SYNC-1 makes the server restart from 0 harmless. Handshake syncScope stays the configured scope: echoing the accepted scope would pin $in narrowing and hide later grant widening. Residual (server): it restarts the stream from 0 on every reconnect when accepted != requested; it should compare against the scope it last resolved for the node."
   },
   {
    "id": "NEW-SYNC-1",

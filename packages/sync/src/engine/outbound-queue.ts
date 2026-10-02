@@ -76,6 +76,24 @@ export class OutboundQueue {
 	}
 
 	/**
+	 * Add several operations at once: deduplicated by id, persisted, and causally
+	 * re-sorted once (rather than once per operation).
+	 */
+	async enqueueMany(ops: Operation[]): Promise<void> {
+		let added = false
+		for (const op of ops) {
+			if (this.seen.has(op.id)) continue
+			this.seen.add(op.id)
+			this.queue.push(op)
+			await this.storage.enqueue(op)
+			added = true
+		}
+		if (added && this.queue.length > 1) {
+			this.queue = topologicalSort(this.queue)
+		}
+	}
+
+	/**
 	 * Take a batch of operations from the front of the queue.
 	 * Moves them to in-flight status. Returns null if queue is empty.
 	 *

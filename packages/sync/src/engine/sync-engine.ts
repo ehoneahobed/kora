@@ -487,15 +487,19 @@ export class SyncEngine {
 			}
 		}
 		this.suspensionReason = null
+		// Each handshake reports the watermark of the REQUESTED view (SYNC-11). The server
+		// resumes from it only when it serves exactly the requested scope; when it serves
+		// another (it restarts that stream from 0), the response switches to that view.
+		// Reporting the previously accepted view's watermark instead could make a server
+		// that now serves the requested scope skip operations of it.
+		{
+			const previousSignature = this.deliverySignature()
+			this.activeScope = this.config.scopeMap
+			this.switchDeliveryView(previousSignature)
+		}
 		await this.outboundQueue.initialize()
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
-			if (this.activeScope === this.config.scopeMap && this.syncState.loadAcceptedDownlinkScope) {
-				// Read the watermark of the view the server actually served last time
-				// (SYNC-11): the accepted scope, not the requested one.
-				const accepted = await this.syncState.loadAcceptedDownlinkScope()
-				if (accepted) this.activeScope = accepted
-			}
 			if (this.nodeToken === null && this.syncState.loadNodeToken) {
 				this.nodeToken = await this.syncState.loadNodeToken()
 			}
@@ -1415,9 +1419,10 @@ export class SyncEngine {
 		void this.persistLastAckedServerVector(this.remoteVector)
 
 		// The server's accepted downlink scope is authoritative for what it delivers, so
-		// the delivery watermark belongs to that view. When it differs from the view the
-		// watermark was read under, switch views (SYNC-11), and remember it so a restart
-		// reads the right view's watermark before its first handshake.
+		// the delivery watermark belongs to that view. When it differs from the requested
+		// view (the one the handshake watermark was read under), switch views (SYNC-11):
+		// the server restarts such a stream from 0, and only that view's own watermark
+		// can tell the duplicates in it from operations this client never saw.
 		const previousSignature = this.deliverySignature()
 		const acceptedDownlink = msg.acceptedDownlinkScopes ?? msg.acceptedScope
 		if (acceptedDownlink) {
@@ -1425,9 +1430,6 @@ export class SyncEngine {
 		}
 		this.activeUplinkScope = msg.acceptedUplinkScopes ?? msg.acceptedScope ?? this.activeScope
 		this.switchDeliveryView(previousSignature)
-		if (acceptedDownlink && this.syncState?.saveAcceptedDownlinkScope) {
-			await this.syncState.saveAcceptedDownlinkScope(acceptedDownlink)
-		}
 
 		// If our watermark is ahead of the server's frontier, the server's log was rolled
 		// back (for example a backup restore reset the delivery sequence). Reset to a full
@@ -2738,6 +2740,7 @@ export class SyncEngine {
 			list.push(op)
 			bySeq.set(op.sequenceNumber, list)
 		}
+		const eligible: Operation[] = []
 		for (let seq = from; seq <= to; seq++) {
 			const ids = this.ownUnresolved.get(seq) ?? new Set<string>()
 			this.ownUnresolved.set(seq, ids)
@@ -2749,13 +2752,15 @@ export class SyncEngine {
 					continue
 				}
 				if (await this.operationAllowedForUpload(op)) {
-					await this.outboundQueue.enqueue(op)
+					eligible.push(op)
 					ids.add(op.id)
 				} else {
 					await this.recordOutOfUplinkScope(op)
 				}
 			}
 		}
+		// One causal re-sort for the whole chunk, not one per operation.
+		await this.outboundQueue.enqueueMany(eligible)
 		this.ownScannedThrough = Math.max(this.ownScannedThrough, to)
 	}
 

@@ -274,12 +274,6 @@ export interface SyncStatePersistence {
 	loadQuarantine?(): Promise<QuarantinedOperation[]>
 	/** Remove quarantined operations once applied (replay) or reconciled. */
 	removeQuarantine?(operationIds: string[]): Promise<void>
-	/**
-	 * The downlink scope the server last accepted for this device. Restored at start so
-	 * the delivery watermark is read from the view the server actually serves (SYNC-11).
-	 */
-	loadAcceptedDownlinkScope?(): Promise<SyncScopeMap | null>
-	saveAcceptedDownlinkScope?(scope: SyncScopeMap | null): Promise<void>
 }
 
 /**
