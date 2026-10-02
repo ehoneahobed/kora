@@ -38,4 +38,12 @@ export interface ServerTransport {
 
 	/** Close the connection to the client */
 	close(code?: number, reason?: string): void
+
+	/**
+	 * Bytes queued for the client but not yet written to the network. The delivery
+	 * stream pauses while this is above its high-water mark (backpressure), so a slow
+	 * client cannot make the server buffer its whole backlog. Optional: transports
+	 * that cannot tell are treated as always drained.
+	 */
+	bufferedAmount?(): number
 }

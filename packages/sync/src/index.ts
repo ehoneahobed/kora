@@ -56,6 +56,7 @@ export type {
 	AcknowledgmentMessage,
 	ErrorMessage,
 	HandshakeMessage,
+	HeartbeatMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	OperationRejectedMessage,

@@ -18,8 +18,9 @@ import { WsServerTransport } from '../../src/transport/ws-server-transport'
 /**
  * LMS-12 (external report, Part D #12): connection liveness.
  *
- * 1. HEAD: a ghost (half-open) delivery-watermark session is re-scanned from its
- *    unacknowledged watermark on every delivery-poll tick, forever.
+ * 1. Fixed (was HEAD): a ghost (half-open) delivery-watermark session was re-scanned
+ *    from its unacknowledged watermark on every delivery-poll tick, forever. Re-sends
+ *    now back off exponentially while a delivery stays unacknowledged.
  * 2. HEAD: the production server never pings an idle WebSocket (no liveness probe).
  * 3. The report's snippet, replicated: terminate() on a missed pong DOES run Kora's
  *    normal close path (session + relay registrations removed).
@@ -45,6 +46,15 @@ function op(): Operation {
 	}
 }
 
+const handshakeFrame = (nodeId: string): string =>
+	json.encode({
+		type: 'handshake',
+		messageId: `hs-${nodeId}`,
+		nodeId,
+		versionVector: {},
+		schemaVersion: 1,
+	} as SyncMessage) as string
+
 const cleanups: Array<() => Promise<void> | void> = []
 afterEach(async () => {
 	vi.useRealTimers()
@@ -52,7 +62,7 @@ afterEach(async () => {
 })
 
 describe('LMS-12: liveness', () => {
-	test('HEAD cost: a ghost watermark session re-scans its whole unacked backlog every poll tick', async () => {
+	test('a ghost watermark session is not re-scanned from its unacked watermark on every poll tick', async () => {
 		const store = new MemoryServerStore('srv')
 		for (let i = 0; i < 2_000; i++) await store.applyRemoteOperation(op())
 		const server = new KoraSyncServer({ store, deliveryPollIntervalMs: 50 })
@@ -78,12 +88,14 @@ describe('LMS-12: liveness', () => {
 		console.log(
 			`[LMS-12] ghost session over 1 s at 50 ms poll: ${scannedRows} scan queries, ${calls} restarted from watermark 0 (2,001-op backlog each)`,
 		)
-		// Correct behaviour would bound this (liveness reaping or backoff). HEAD re-scans
-		// from 0 on roughly every tick for as long as the socket looks open.
-		expect(calls).toBeGreaterThan(5)
+		// HEAD re-scanned from 0 on roughly every tick (about 18 times) for as long as the
+		// socket looked open. Re-sends now back off exponentially (50, 100, 200, 400 ms).
+		expect(calls).toBeLessThanOrEqual(5)
 	}, 20_000)
 
 	test('the production server must probe an idle WebSocket (ping) within 35 s', async () => {
+		// An idle connection is an established (handshaken) session that goes quiet; one
+		// that never handshakes is closed by the 10 s handshake deadline instead.
 		const store = new MemoryServerStore('srv')
 		const prod = createProductionServer({ store, port: 0, staticDir: '/nonexistent' })
 		const port = Number(new URL(await prod.start()).port)
@@ -95,6 +107,7 @@ describe('LMS-12: liveness', () => {
 			pinged = true
 		})
 		await new Promise((r) => ws.once('open', r))
+		ws.send(handshakeFrame('idle-phone'))
 		await new Promise((r) => setTimeout(r, 35_000))
 		expect(pinged).toBe(true)
 	}, 45_000)
@@ -172,6 +185,9 @@ describe('LMS-12: liveness', () => {
 		const ws = new WebSocket(`ws://127.0.0.1:${proxyPort}/kora-sync`)
 		cleanups.push(() => ws.terminate())
 		await new Promise((r) => ws.once('open', r))
+		// A handshaken session (one that never handshakes is closed by the deadline).
+		ws.send(handshakeFrame('blackholed-phone'))
+		await new Promise((r) => setTimeout(r, 200))
 		const statusBefore = await (await fetch(`http://127.0.0.1:${port}/health`)).json()
 		blackhole = true
 		await new Promise((r) => setTimeout(r, 10_000))
@@ -179,7 +195,8 @@ describe('LMS-12: liveness', () => {
 		console.log(
 			`[LMS-12] blackholed peer: connectedClients before=${statusBefore.connectedClients} after 10 s=${statusAfter.connectedClients}`,
 		)
-		// Documented HEAD behaviour (not a target): the ghost is still counted.
+		// Still counted after 10 s, by design: the ping/pong probe (25 s interval, two
+		// missed pongs) reaps it within about 75 s, not 10 s. Not a target.
 		expect(statusAfter.connectedClients).toBe(1)
 	}, 20_000)
 

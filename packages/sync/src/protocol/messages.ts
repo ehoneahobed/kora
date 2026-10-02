@@ -64,6 +64,24 @@ export interface HandshakeMessage {
 	 * over (RT-12). Stored by the client next to its node id; never sent elsewhere.
 	 */
 	nodeToken?: string
+	/**
+	 * Set by a client transport that understands `heartbeat` messages (LMS #12). Only
+	 * then does the server send them, so an older client never receives a message type
+	 * it cannot decode. Old servers ignore it.
+	 */
+	supportsHeartbeat?: boolean
+}
+
+/**
+ * Application-level liveness message (LMS #12). A server sends it every
+ * `HandshakeResponseMessage.heartbeatIntervalMs` to a client that set
+ * `HandshakeMessage.supportsHeartbeat`. Browsers cannot see WebSocket ping frames, so
+ * this is how a client notices a half-open connection: no inbound traffic for about
+ * two intervals means the connection is dead. Carries no data; never acknowledged.
+ */
+export interface HeartbeatMessage {
+	type: 'heartbeat'
+	messageId: string
 }
 
 /**
@@ -119,6 +137,11 @@ export interface HandshakeResponseMessage {
 	 * their hash, records possession, and drops them (RT-23).
 	 */
 	blobPossessionProof?: boolean
+	/**
+	 * Interval of the server's `heartbeat` messages, in ms, present when the client set
+	 * `supportsHeartbeat` and the server sends them (LMS #12).
+	 */
+	heartbeatIntervalMs?: number
 }
 
 /**
@@ -338,6 +361,7 @@ export type SyncMessage =
 	| BlobChunkRequestMessage
 	| BlobChunkResponseMessage
 	| BlobChunkPushMessage
+	| HeartbeatMessage
 
 // --- Type Guards ---
 
@@ -371,6 +395,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isBlobChunkResponseMessage(value)
 		case 'blob-chunk-push':
 			return isBlobChunkPushMessage(value)
+		case 'heartbeat':
+			return true
 		default:
 			return false
 	}
