@@ -1,5 +1,11 @@
-import type { AtomicOp, HLCTimestamp, SchemaDefinition } from '@korajs/core'
-import { replayOperationsForRecord } from './materialization'
+import type { FoldState, Operation, SchemaDefinition } from '@korajs/core'
+import {
+	REFOLD_REQUIRED,
+	type ServerFoldOptions,
+	mergeIntoFoldState,
+	projectFoldState,
+	refoldRecord,
+} from './record-fold'
 import { MAX_SCOPE_SNAPSHOT_STRING_LENGTH, type OperationScopeSnapshot } from './server-store'
 
 /** Field kinds a scope predicate can match (compared with `Object.is`). */
@@ -74,22 +80,14 @@ export function parseScopeSnapshot(raw: unknown): OperationScopeSnapshot | null 
 	}
 }
 
-/** One stored operation of a record, as the snapshot backfill replays it. */
-export interface SnapshotReplayOperation {
-	id: string
-	type: string
-	data: Record<string, unknown> | null
-	atomicOps: Record<string, AtomicOp> | null
-	timestamp: HLCTimestamp
-}
-
 /**
  * Rebuild the snapshot each operation of one record would have received when it was
  * applied, from the server's own log (migration backfill, RT-14). `operations` are
- * in delivery (commit) order; each operation's state is the HLC-ordered replay of the
- * operations committed up to and including it, exactly what materialization held.
+ * in delivery (commit) order; each operation's state is the fold of the operations
+ * committed up to and including it, exactly what materialization held (W7: the fold
+ * depends only on the set of operations, so merging in commit order is that state).
  *
- * Quadratic in the operations of one record; it runs once per legacy record.
+ * Linear in the operations of one record (one incremental merge per operation).
  *
  * @returns Snapshot per operation id
  */
@@ -97,40 +95,21 @@ export function replayScopeSnapshots(
 	schema: SchemaDefinition,
 	collection: string,
 	recordId: string,
-	operations: SnapshotReplayOperation[],
+	operations: readonly Operation[],
+	options: ServerFoldOptions,
 ): Map<string, OperationScopeSnapshot> {
 	const result = new Map<string, OperationScopeSnapshot>()
-	const committed: SnapshotReplayOperation[] = []
+	const committed: Operation[] = []
+	let state: FoldState | null = null
 	let pre: Record<string, unknown> | null = null
 	for (const operation of operations) {
 		committed.push(operation)
-		const ordered = [...committed].sort(compareReplayTimestamps)
-		const state = replayOperationsForRecord(ordered.map(toReplay))
-		const lastKnown =
-			state ?? replayOperationsForRecord(ordered.filter((op) => op.type !== 'delete').map(toReplay))
-		const post = scopeValuesOf(schema, collection, recordId, lastKnown ? { ...lastKnown } : null)
+		const merged = mergeIntoFoldState(state, [operation], schema, options)
+		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
+		const row = state ? projectFoldState(state, options) : null
+		const post = row ? scopeValuesOf(schema, collection, recordId, { ...row.values }) : null
 		result.set(operation.id, { pre, post })
-		// A deleted record has no pre-image for the next operation (it was not visible).
-		pre = state ? post : null
+		pre = row && !row.deleted ? post : null
 	}
 	return result
-}
-
-function toReplay(op: SnapshotReplayOperation): {
-	type: string
-	data: Record<string, unknown> | null
-	atomicOps: Record<string, AtomicOp> | null
-} {
-	return { type: op.type, data: op.data, atomicOps: op.atomicOps }
-}
-
-function compareReplayTimestamps(a: SnapshotReplayOperation, b: SnapshotReplayOperation): number {
-	if (a.timestamp.wallTime !== b.timestamp.wallTime)
-		return a.timestamp.wallTime - b.timestamp.wallTime
-	if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
-	return a.timestamp.nodeId < b.timestamp.nodeId
-		? -1
-		: a.timestamp.nodeId > b.timestamp.nodeId
-			? 1
-			: 0
 }

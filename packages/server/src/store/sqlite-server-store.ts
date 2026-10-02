@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module'
 import type {
 	AtomicOp,
+	FoldState,
 	HLCTimestamp,
 	Operation,
 	RecordFieldVersions,
@@ -25,11 +26,25 @@ import {
 import {
 	deserializeFieldValue,
 	generateAllCollectionDDL,
-	replayOperationsForRecord,
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import { type FieldVersionRow, foldFieldVersionRows } from './record-field-versions'
+import {
+	EMPTY_FOLD_SCHEMA,
+	FOLD_MIGRATION_BATCH,
+	FOLD_PLAN_FINGERPRINT_KEY,
+	type FoldMigrationReport,
+	REFOLD_REQUIRED,
+	type ServerFoldOptions,
+	foldFieldVersions,
+	foldPlanFingerprint,
+	mergeIntoFoldState,
+	parseStoredFoldState,
+	projectFoldState,
+	refoldRecord,
+	serializeServerFoldState,
+	serverFoldOptions,
+} from './record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	parseScopeSnapshot,
@@ -123,11 +138,34 @@ export class SqliteServerStore implements ServerStore {
 		ran: false,
 		totalQuarantined: 0,
 	}
+	private readonly authoritativeNodeIds: string[]
+	private readonly foldOptions: ServerFoldOptions
+	private foldMigration: FoldMigrationReport = {
+		ran: false,
+		records: 0,
+		skippedUnclean: 0,
+		fullRefold: false,
+	}
 
-	constructor(db: BetterSQLite3Database, nodeId?: string) {
+	constructor(
+		db: BetterSQLite3Database,
+		nodeId?: string,
+		options: { authoritativeNodeIds?: string[] } = {},
+	) {
 		this.db = db
 		this.nodeId = nodeId ?? generateUUIDv7()
+		this.authoritativeNodeIds = [...new Set([this.nodeId, ...(options.authoritativeNodeIds ?? [])])]
+		this.foldOptions = serverFoldOptions(this.authoritativeNodeIds)
 		this.ensureTables()
+	}
+
+	getAuthoritativeNodeIds(): string[] {
+		return [...this.authoritativeNodeIds]
+	}
+
+	/** What the last startup re-materialization did (W7 step 7). */
+	getFoldMigrationReport(): FoldMigrationReport {
+		return { ...this.foldMigration }
 	}
 
 	getVersionVector(): VersionVector {
@@ -173,8 +211,8 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
-		// Backfill materialized tables from existing operations
-		await this.backfillAllCollections()
+		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
+		this.foldMigration = this.rematerialize()
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
 		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
 		// mid-way only repeats the rebuild at the next start.
@@ -245,12 +283,8 @@ export class SqliteServerStore implements ServerStore {
 			const materialized = this.schema?.collections[op.collection] !== undefined
 			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
 
-			const row = this.serializeOperation(
-				op,
-				now,
-				this.nextDeliverySeq(tx),
-				decision.verdict === 'free',
-			)
+			const deliverySeq = this.nextDeliverySeq(tx)
+			const row = this.serializeOperation(op, now, deliverySeq, decision.verdict === 'free')
 			tx.insert(operations).values(row).run()
 			// A legacy pair: index its sequence so version-vector clients get both (RT-48).
 			if (decision.verdict === 'legacy') {
@@ -277,7 +311,7 @@ export class SqliteServerStore implements ServerStore {
 
 			// Dual-write: update materialized collection table if schema is set
 			if (materialized) {
-				this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+				this.mergeIntoRecord(tx, op, deliverySeq)
 				// The record's scope values around this write, from the store's own rows.
 				const snapshot: OperationScopeSnapshot = {
 					pre,
@@ -389,11 +423,35 @@ export class SqliteServerStore implements ServerStore {
 		recordId: string,
 	): Promise<RecordFieldVersions | null> {
 		this.assertOpen()
-		const rows = this.db.all<FieldVersionRow>(
-			sql`SELECT type, data, wall_time, logical, timestamp_node_id FROM operations
-				WHERE collection = ${collection} AND record_id = ${recordId}`,
-		)
-		return foldFieldVersionRows(rows)
+		return foldFieldVersions(this.readFoldState(this.db, collection, recordId))
+	}
+
+	async getRecordFoldState(collection: string, recordId: string): Promise<FoldState | null> {
+		this.assertOpen()
+		return this.readFoldState(this.db, collection, recordId)
+	}
+
+	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
+		this.assertOpen()
+		return this.readRecordOperations(this.db, collection, recordId, 0)
+	}
+
+	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
+		this.assertOpen()
+		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
+		const current = this.readFoldState(this.db, op.collection, op.recordId)
+		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
+		const state =
+			merged === REFOLD_REQUIRED
+				? refoldRecord(
+						[...this.readRecordOperations(this.db, op.collection, op.recordId, 0), op],
+						schema,
+						this.foldOptions,
+					)
+				: merged
+		const row = state ? projectFoldState(state, this.foldOptions) : null
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -487,16 +545,8 @@ export class SqliteServerStore implements ServerStore {
 					schema,
 					target.collection,
 					target.record_id,
-					rows.map((row) => {
-						const op = this.deserializeOperation(row)
-						return {
-							id: op.id,
-							type: op.type,
-							data: op.data,
-							atomicOps: op.atomicOps ?? null,
-							timestamp: op.timestamp,
-						}
-					}),
+					rows.map((row) => this.deserializeOperation(row)),
+					this.foldOptions,
 				)
 				for (const row of rows) {
 					if (row.scopeSnapshot !== null) continue
@@ -787,24 +837,11 @@ export class SqliteServerStore implements ServerStore {
 			const row = rows[0]
 			return row ? this.deserializeRow(row, collectionDef) : null
 		}
-		const ops = txOrDb
-			.select({ type: operations.type, data: operations.data, atomicOps: operations.atomicOps })
-			.from(operations)
-			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
-			.all()
+		const ops = this.readRecordOperations(txOrDb, collection, recordId, 0)
 		if (ops.length === 0) return null
-		const lastKnown = replayOperationsForRecord(
-			ops
-				.filter((o) => o.type !== 'delete')
-				.map((o) => ({
-					type: o.type,
-					data: o.data !== null ? JSON.parse(o.data) : null,
-					atomicOps:
-						o.atomicOps != null ? (JSON.parse(o.atomicOps) as Record<string, AtomicOp>) : null,
-				})),
-		)
-		return { ...(lastKnown ?? {}), id: recordId }
+		const state = refoldRecord(ops, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
+		const lastKnown = state ? projectFoldState(state, this.foldOptions) : null
+		return { ...(lastKnown?.values ?? {}), id: recordId }
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -870,6 +907,14 @@ export class SqliteServerStore implements ServerStore {
 			)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
+		// Every restored record is re-materialized through the fold from the restored log.
+		this.db.transaction((tx) => {
+			tx.run(sql.raw('DELETE FROM kora_fold_state'))
+			for (const collection of Object.keys(this.schema?.collections ?? {})) {
+				tx.run(sql.raw(`DELETE FROM ${quoteIdent(collection)}`))
+			}
+		})
+		if (this.schema) this.foldMigration = this.rematerialize()
 		this.backfillScopeSnapshots()
 
 		return { operationsRestored: ops.length, success: true }
@@ -880,67 +925,178 @@ export class SqliteServerStore implements ServerStore {
 	// ---------------------------------------------------------------------------
 
 	/**
-	 * Rebuild a single record in the materialized collection table by replaying
-	 * all operations for that record. Called within the applyRemoteOperation
-	 * transaction for atomic dual-write.
+	 * Merge a just-appended operation (stored under `deliverySeq`) into its record's
+	 * fold state and project the row, inside the append transaction. O(fields the
+	 * operation touches): the stored state is read by primary key and the freshness
+	 * check is one index probe, never a scan of the record's history (SRV-7).
+	 *
+	 * The stored state records the highest delivery sequence it covers. If another
+	 * writer appended operations to this record without folding them (an older release
+	 * during a rolling upgrade), the missing tail is merged first; if the stored state
+	 * is unreadable, newer than the log, or built under an incompatible field kind,
+	 * the record is re-folded from its log.
 	 */
-	private rebuildMaterializedRecord(
+	private mergeIntoRecord(tx: BetterSQLite3Database, op: Operation, deliverySeq: number): void {
+		const schema = this.schema
+		if (!schema?.collections[op.collection]) return
+		const stored = tx.all<{ state: string; covered_seq: number; covered_op_id: string }>(
+			sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+		)[0]
+		// The record's newest operation before this one: the stored state is current iff
+		// it covers exactly that operation (sequence AND id, so a state left behind by a
+		// dropped or restored log is never mistaken for current).
+		const last = tx.all<{ id: string; d: number }>(
+			sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1`,
+		)[0]
+		const prior = Number(last?.d ?? 0)
+		const parsed = stored ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
+		const covered = stored ? Number(stored.covered_seq) : 0
+		let state: FoldState | null | typeof REFOLD_REQUIRED
+		if (!stored && !last) {
+			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
+		} else if (parsed && covered === prior && stored?.covered_op_id === last?.id) {
+			state = mergeIntoFoldState(parsed, [op], schema, this.foldOptions)
+		} else if (
+			parsed &&
+			covered > 0 &&
+			covered < prior &&
+			this.coversStoredOperation(tx, op.collection, op.recordId, covered, stored?.covered_op_id)
+		) {
+			// Operations appended without folding (an older release during a rolling
+			// upgrade): merge the missing tail.
+			state = mergeIntoFoldState(
+				parsed,
+				this.readRecordOperations(tx, op.collection, op.recordId, covered),
+				schema,
+				this.foldOptions,
+			)
+		} else {
+			state = REFOLD_REQUIRED
+		}
+		if (state === REFOLD_REQUIRED) {
+			state = refoldRecord(
+				this.readRecordOperations(tx, op.collection, op.recordId, 0),
+				schema,
+				this.foldOptions,
+			)
+		}
+		this.writeFoldedRecord(tx, op.collection, op.recordId, state, deliverySeq, op.id)
+	}
+
+	/** True when the record's operation at delivery sequence `seq` has id `opId`. */
+	private coversStoredOperation(
 		txOrDb: BetterSQLite3Database,
 		collection: string,
 		recordId: string,
+		seq: number,
+		opId: string | undefined,
+	): boolean {
+		if (!opId) return false
+		return (
+			txOrDb.all<{ one: number }>(
+				sql`SELECT 1 AS one FROM operations WHERE id = ${opId} AND collection = ${collection} AND record_id = ${recordId} AND delivery_seq = ${seq}`,
+			).length > 0
+		)
+	}
+
+	/**
+	 * The record's current fold state for a read: the stored one when it covers the
+	 * record's whole log, else folded from the log (nothing is written).
+	 */
+	private readFoldState(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): FoldState | null {
+		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
+		if (schema.collections[collection]) {
+			const stored = txOrDb.all<{ state: string; covered_seq: number; covered_op_id: string }>(
+				sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			)[0]
+			const last = txOrDb.all<{ id: string; d: number }>(
+				sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${collection} AND record_id = ${recordId} ORDER BY delivery_seq DESC LIMIT 1`,
+			)[0]
+			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
+			if (
+				parsed &&
+				last &&
+				Number(stored?.covered_seq) === Number(last.d) &&
+				stored?.covered_op_id === last.id
+			) {
+				return parsed
+			}
+		}
+		const ops = this.readRecordOperations(txOrDb, collection, recordId, 0)
+		return ops.length > 0 ? refoldRecord(ops, schema, this.foldOptions) : null
+	}
+
+	/** A record's operations stored after `afterDeliverySeq`, in delivery order. */
+	private readRecordOperations(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		afterDeliverySeq: number,
+	): Operation[] {
+		return txOrDb
+			.select()
+			.from(operations)
+			.where(
+				and(
+					eq(operations.collection, collection),
+					eq(operations.recordId, recordId),
+					gt(operations.deliverySeq, afterDeliverySeq),
+				),
+			)
+			.orderBy(asc(operations.deliverySeq))
+			.all()
+			.map((row) => this.deserializeOperation(row))
+	}
+
+	/**
+	 * Persist a record's fold state (covering the log up to `coveredSeq`) and project
+	 * it onto the materialized row.
+	 */
+	private writeFoldedRecord(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		state: FoldState | null,
+		coveredSeq: number,
+		coveredOpId: string,
 	): void {
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
-
-		// Fetch all ops for this specific record, in HLC total order (wallTime,
-		// logical, nodeId) so atomic composition and LWW converge like the merge engine.
-		const ops = txOrDb
-			.select({
-				type: operations.type,
-				data: operations.data,
-				atomicOps: operations.atomicOps,
-				previousData: operations.previousData,
-				wallTime: operations.wallTime,
-			})
-			.from(operations)
-			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
-			.all()
-
-		// Replay to get current state
-		const parsedOps = ops.map((op) => ({
-			type: op.type,
-			data: op.data !== null ? JSON.parse(op.data) : null,
-			atomicOps:
-				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
-			previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
-		}))
-		const recordData = replayOperationsForRecord(parsedOps)
-
-		const fieldNames = Object.keys(collectionDef.fields)
-
-		if (recordData) {
-			// Compute timestamps from operations
-			const createdAt = ops.length > 0 ? (ops[0] as (typeof ops)[0]).wallTime : Date.now()
-			const updatedAt =
-				ops.length > 0 ? (ops[ops.length - 1] as (typeof ops)[0]).wallTime : Date.now()
-
-			this.upsertMaterializedRecord(
-				txOrDb,
-				collection,
-				recordId,
-				recordData,
-				fieldNames,
-				collectionDef,
-				createdAt,
-				updatedAt,
+		if (state) {
+			txOrDb.run(
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)
+					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id`,
 			)
 		} else {
-			// Record was deleted — soft-delete in materialized table
 			txOrDb.run(
-				sql`UPDATE ${sql.raw(quoteIdent(collection))} SET _deleted = 1, _updated_at = ${Date.now()} WHERE id = ${recordId}`,
+				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
 			)
 		}
+		const row = state ? projectFoldState(state, this.foldOptions) : null
+		if (!row) {
+			// Never inserted (an update with no merged insert): no visible row. A row an
+			// earlier (replay) materialization produced for it is hidden.
+			txOrDb.run(
+				sql`UPDATE ${sql.raw(quoteIdent(collection))} SET _deleted = 1 WHERE id = ${recordId}`,
+			)
+			return
+		}
+		this.upsertMaterializedRecord(
+			txOrDb,
+			collection,
+			recordId,
+			row.values,
+			Object.keys(collectionDef.fields),
+			collectionDef,
+			row.createdAt,
+			row.updatedAt,
+			row.deleted,
+		)
 	}
 
 	/**
@@ -956,6 +1112,7 @@ export class SqliteServerStore implements ServerStore {
 		collectionDef: { fields: Record<string, import('@korajs/core').FieldDescriptor> },
 		createdAt: number,
 		updatedAt: number,
+		deleted: boolean,
 	): void {
 		const allColumns = ['id', ...fieldNames, '_created_at', '_updated_at', '_deleted']
 		const values: unknown[] = [
@@ -966,7 +1123,7 @@ export class SqliteServerStore implements ServerStore {
 			}),
 			createdAt,
 			updatedAt,
-			0, // _deleted = false
+			deleted ? 1 : 0,
 		]
 
 		const columnsSql = sql.raw(allColumns.map((c) => quoteIdent(c)).join(', '))
@@ -987,85 +1144,115 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Backfill all materialized collection tables from the existing operation log.
-	 * Called when setSchema() is invoked and operations already exist.
+	 * Re-materialization migration (W7 step 7), run by setSchema and after a
+	 * replace-mode restore. Every record whose fold state is missing, stale (it covers
+	 * less, or more, of the log than is stored) or built under a different fold plan
+	 * (field kind, merge strategy, resolver) is re-folded from its log and its row
+	 * rewritten; nothing else is touched, so a restart on an up-to-date database does
+	 * one aggregate read.
+	 *
+	 * - Runs only on a log the W8b integrity scan reports clean. With quarantined rows,
+	 *   rows materialized before the fold existed are kept as they are (re-folding a
+	 *   log that lost operations would bake the loss in) and the skip is logged loudly;
+	 *   such a record is folded from its remaining log on its next write. Records with
+	 *   no row yet, and fold states this release already wrote, are still processed.
+	 * - Idempotent and resumable: each batch commits on its own, and staleness is
+	 *   re-derived from the tables at every start, so a crash resumes where it stopped.
+	 *   A plan change first marks every stored state stale (one statement), then
+	 *   records the new fingerprint, so it is resumable too.
 	 */
-	private async backfillAllCollections(): Promise<void> {
-		if (!this.schema) return
-
-		for (const collectionName of Object.keys(this.schema.collections)) {
-			this.backfillCollection(collectionName)
+	private rematerialize(): FoldMigrationReport {
+		const schema = this.schema
+		const report: FoldMigrationReport = {
+			ran: true,
+			records: 0,
+			skippedUnclean: 0,
+			fullRefold: false,
 		}
-	}
-
-	/**
-	 * Backfill a single collection's materialized table from operations.
-	 */
-	private backfillCollection(collectionName: string): void {
-		const collectionDef = this.schema?.collections[collectionName]
-		if (!collectionDef) return
-
-		// Fetch all ops for this collection, in HLC total order (wallTime, logical, nodeId).
-		const allOps = this.db
-			.select({
-				recordId: operations.recordId,
-				type: operations.type,
-				data: operations.data,
-				atomicOps: operations.atomicOps,
-				previousData: operations.previousData,
-				wallTime: operations.wallTime,
+		if (!schema) return { ...report, ran: false }
+		const clean = this.logIntegrity.totalQuarantined === 0
+		const fingerprint = foldPlanFingerprint(schema)
+		const storedFingerprint = this.db.all<{ value: string }>(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
+		)[0]?.value
+		if (storedFingerprint !== fingerprint) {
+			report.fullRefold = storedFingerprint !== undefined
+			this.db.transaction((tx) => {
+				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1`)
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})`,
+				)
 			})
-			.from(operations)
-			.where(eq(operations.collection, collectionName))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
-			.all()
-
-		if (allOps.length === 0) return
-
-		// Group by recordId
-		const grouped = new Map<string, typeof allOps>()
-		for (const op of allOps) {
-			let group = grouped.get(op.recordId)
-			if (!group) {
-				group = []
-				grouped.set(op.recordId, group)
-			}
-			group.push(op)
 		}
-
-		// Rebuild each record inside a single transaction for efficiency
-		const fieldNames = Object.keys(collectionDef.fields)
-		this.db.transaction((tx) => {
-			for (const [recordId, recordOps] of grouped) {
-				const parsedOps = recordOps.map((op) => ({
-					type: op.type,
-					data: op.data !== null ? JSON.parse(op.data) : null,
-					atomicOps:
-						op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
-					previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
-				}))
-				const recordData = replayOperationsForRecord(parsedOps)
-
-				if (recordData) {
-					const createdAt = (recordOps[0] as (typeof recordOps)[0]).wallTime
-					const updatedAt = (recordOps[recordOps.length - 1] as (typeof recordOps)[0]).wallTime
-					this.upsertMaterializedRecord(
-						tx,
-						collectionName,
-						recordId,
-						recordData,
-						fieldNames,
-						collectionDef,
-						createdAt,
-						updatedAt,
+		for (const collection of Object.keys(schema.collections)) {
+			let cursor = ''
+			for (;;) {
+				const page = this.db.all<{
+					record_id: string
+					max_seq: number
+					covered: number | null
+					has_row: number
+				}>(
+					sql`SELECT o.record_id AS record_id, MAX(o.delivery_seq) AS max_seq,
+						(SELECT f.covered_seq FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered,
+						(SELECT f.covered_op_id FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered_op_id,
+						EXISTS (SELECT 1 FROM ${sql.raw(quoteIdent(collection))} c WHERE c.id = o.record_id) AS has_row
+					FROM operations o
+					WHERE o.collection = ${collection} AND o.record_id > ${cursor}
+					GROUP BY o.record_id
+					HAVING covered IS NULL OR covered <> MAX(o.delivery_seq) OR NOT EXISTS (
+						SELECT 1 FROM operations x WHERE x.id = covered_op_id AND x.delivery_seq = covered
 					)
-				} else {
-					tx.run(
-						sql`INSERT INTO ${sql.raw(quoteIdent(collectionName))} (id, _deleted, _created_at, _updated_at) VALUES (${recordId}, 1, ${Date.now()}, ${Date.now()}) ON CONFLICT (id) DO UPDATE SET _deleted = 1, _updated_at = ${Date.now()}`,
-					)
-				}
+					ORDER BY o.record_id
+					LIMIT ${FOLD_MIGRATION_BATCH}`,
+				)
+				if (page.length === 0) break
+				cursor = page[page.length - 1]?.record_id ?? cursor
+				this.db.transaction((tx) => {
+					for (const candidate of page) {
+						if (!clean && candidate.covered === null && Number(candidate.has_row) === 1) {
+							report.skippedUnclean++
+							continue
+						}
+						const rows = tx
+							.select()
+							.from(operations)
+							.where(
+								and(
+									eq(operations.collection, collection),
+									eq(operations.recordId, candidate.record_id),
+								),
+							)
+							.all()
+						let covered = 0
+						let coveredOpId = ''
+						for (const row of rows) {
+							if ((row.deliverySeq ?? 0) > covered) {
+								covered = row.deliverySeq ?? 0
+								coveredOpId = row.id
+							}
+						}
+						const ops = rows.map((row) => this.deserializeOperation(row))
+						this.writeFoldedRecord(
+							tx,
+							collection,
+							candidate.record_id,
+							refoldRecord(ops, schema, this.foldOptions),
+							covered,
+							coveredOpId,
+						)
+						report.records++
+					}
+				})
+				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
-		})
+		}
+		if (report.skippedUnclean > 0) {
+			console.error(
+				`[kora] Fold re-materialization skipped ${report.skippedUnclean} record(s): the operation log has ${this.logIntegrity.totalQuarantined} quarantined row(s) (see operations_quarantine). Their rows keep their pre-fold values until their next write. Repair or release the quarantined rows, then restart to re-materialize.`,
+			)
+		}
+		return report
 	}
 
 	// ---------------------------------------------------------------------------
@@ -1144,45 +1331,17 @@ export class SqliteServerStore implements ServerStore {
 	// ---------------------------------------------------------------------------
 
 	private materializeFromOpsLog(collection: string): MaterializedRecord[] {
-		const rows = this.db
-			.select()
-			.from(operations)
-			.where(eq(operations.collection, collection))
-			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.sequenceNumber))
-			.all()
-
-		const records = new Map<string, Record<string, unknown>>()
-		const deleted = new Set<string>()
-
-		for (const row of rows) {
-			const recordId = row.recordId
-			const data = row.data !== null ? JSON.parse(row.data) : null
-
-			switch (row.type) {
-				case 'insert':
-					if (data) {
-						records.set(recordId, { id: recordId, ...data })
-						deleted.delete(recordId)
-					}
-					break
-				case 'update':
-					if (data) {
-						const existing = records.get(recordId) ?? { id: recordId }
-						records.set(recordId, { ...existing, ...data })
-						deleted.delete(recordId)
-					}
-					break
-				case 'delete':
-					deleted.add(recordId)
-					break
-			}
+		const ids = this.db.all<{ record_id: string }>(
+			sql`SELECT DISTINCT record_id FROM operations WHERE collection = ${collection} ORDER BY record_id`,
+		)
+		const records: MaterializedRecord[] = []
+		for (const { record_id: recordId } of ids) {
+			const ops = this.readRecordOperations(this.db, collection, recordId, 0)
+			const state = refoldRecord(ops, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
+			const row = state ? projectFoldState(state, this.foldOptions) : null
+			if (row && !row.deleted) records.push({ id: recordId, ...row.values })
 		}
-
-		for (const id of deleted) {
-			records.delete(id)
-		}
-
-		return Array.from(records.values()) as MaterializedRecord[]
+		return records
 	}
 
 	// ---------------------------------------------------------------------------
@@ -1265,8 +1424,32 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Content-hash version of the stored id (CORE-1, protocol v2). Null means 1.
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN hash_version INTEGER`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
+		`)
+		// Per-record fold state (W7): the materialized row is projected from it.
+		// `covered_seq` / `covered_op_id`: the delivery sequence and id of the record's
+		// newest operation merged into it (the state covers every operation up to it).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_fold_state (
+				collection TEXT NOT NULL,
+				record_id TEXT NOT NULL,
+				state TEXT NOT NULL,
+				covered_seq INTEGER NOT NULL,
+				covered_op_id TEXT NOT NULL DEFAULT '',
+				PRIMARY KEY (collection, record_id)
+			)
 		`)
 		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 		this.db.run(sql`
@@ -1316,6 +1499,10 @@ export class SqliteServerStore implements ServerStore {
 		// Index for efficient per-record operation lookups during materialization
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)
+		`)
+		// A record's newest delivery sequence in one probe (the fold freshness check).
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_collection_record_delivery ON operations (collection, record_id, delivery_seq)
 		`)
 
 		this.db.run(sql`
@@ -1590,6 +1777,7 @@ export class SqliteServerStore implements ServerStore {
 			receivedAt,
 			deliverySeq,
 			seqUnique: soleHolder ? 1 : 0,
+			hashVersion: op.hashVersion ?? null,
 		}
 	}
 
@@ -1613,6 +1801,7 @@ export class SqliteServerStore implements ServerStore {
 			causalDeps: JSON.parse(row.causalDeps),
 			schemaVersion: row.schemaVersion,
 			...(atomicOps ? { atomicOps } : {}),
+			...(row.hashVersion === 1 || row.hashVersion === 2 ? { hashVersion: row.hashVersion } : {}),
 		}
 	}
 
@@ -1668,6 +1857,8 @@ export class SqliteServerStore implements ServerStore {
 export function createSqliteServerStore(options: {
 	filename?: string
 	nodeId?: string
+	/** Node ids, besides the store's own, whose operations win server-authoritative fields. */
+	authoritativeNodeIds?: string[]
 }): SqliteServerStore {
 	// better-sqlite3 is a native CJS addon — use esmRequire (from createRequire)
 	// so this works in both ESM and CJS contexts.
@@ -1681,5 +1872,7 @@ export function createSqliteServerStore(options: {
 	sqlite.pragma('journal_mode = WAL')
 
 	const db = drizzle(sqlite)
-	return new SqliteServerStore(db, options.nodeId)
+	return new SqliteServerStore(db, options.nodeId, {
+		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
+	})
 }

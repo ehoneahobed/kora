@@ -1,6 +1,7 @@
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryServerStore } from './memory-server-store'
+import { serverFoldOptions } from './record-fold'
 import { replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
 import type { ServerStore } from './server-store'
 import { MAX_SCOPE_SNAPSHOT_STRING_LENGTH } from './server-store'
@@ -68,18 +69,7 @@ describe('scopeValuesOf', () => {
 describe('replayScopeSnapshots (migration backfill)', () => {
 	test('each operation gets the scope values before and after it, from the log', () => {
 		const ops = history()
-		const snapshots = replayScopeSnapshots(
-			schema,
-			'todos',
-			'todo-1',
-			ops.map((o) => ({
-				id: o.id,
-				type: o.type,
-				data: o.data,
-				atomicOps: null,
-				timestamp: o.timestamp,
-			})),
-		)
+		const snapshots = replayScopeSnapshots(schema, 'todos', 'todo-1', ops, serverFoldOptions(['s']))
 		const [insert, edit, transfer, remove] = ops.map((o) => snapshots.get(o.id))
 		expect(insert).toEqual({
 			pre: null,
