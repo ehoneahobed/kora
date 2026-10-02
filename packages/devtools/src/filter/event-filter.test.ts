@@ -22,6 +22,7 @@ describe('getEventCategory', () => {
 			'sync:apply-abandoned': 'sync',
 			'sync:clock-skew': 'sync',
 			'sync:node-id-rotated': 'sync',
+			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',
 			'sync:schema-mismatch': 'sync',
 			'sync:apply-failed': 'sync',

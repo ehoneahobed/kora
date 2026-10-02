@@ -54,6 +54,19 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
+import {
+	type LocalNodeRecord,
+	type TerminalRejection,
+	findTerminalRejections,
+	forgetLocalNode,
+	listLocalNodes,
+	loadAcceptedCycle,
+	markLocalNodeAccepted,
+	markLocalNodeRefused,
+	recordTerminalRejections,
+	registerLocalNode,
+	seedTerminalRejectionsOnce,
+} from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
@@ -99,6 +112,8 @@ import type {
 	VersionVectorRow,
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
+import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
 	insertConflictRow,
 	isOperationLogged,
@@ -141,6 +156,8 @@ export class Store implements OperationLog {
 	private relationEnforcer: RelationEnforcer | null = null
 	private causalTracker: CausalTracker | null = null
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
+	/** Releases the per-tab node lock (RT-40); null when none is held. */
+	private releaseNodeLock: (() => void) | null = null
 
 	constructor(config: StoreConfig) {
 		this.schema = config.schema
@@ -178,6 +195,16 @@ export class Store implements OperationLog {
 		// (node_id, sequence_number) is unique in the operation log: repair any
 		// duplicates an earlier version wrote, then enforce it with an index (W6).
 		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
+		// Every node id this database authors under is registered (RT-38, RT-40), and the
+		// terminal rejections an earlier release kept only in the app's list become
+		// durable markers (RT-36).
+		await registerLocalNode(this.adapter, this.nodeId)
+		await seedTerminalRejectionsOnce(this.adapter)
+		if (this.isolation === 'per-tab' && !this.configNodeId) {
+			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
+			// writes only after this tab is gone (RT-40).
+			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId))
+		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
 
@@ -223,7 +250,12 @@ export class Store implements OperationLog {
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
-		await this.adapter.close()
+		try {
+			await this.adapter.close()
+		} finally {
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = null
+		}
 	}
 
 	/**
@@ -1198,17 +1230,17 @@ export class Store implements OperationLog {
 	/**
 	 * Load the per-device node token the sync server issued for this node id (RT-12).
 	 */
-	async loadNodeToken(): Promise<string | null> {
+	async loadNodeToken(nodeId?: string): Promise<string | null> {
 		this.ensureOpen()
-		return loadNodeToken(this.adapter)
+		return loadNodeToken(this.adapter, nodeId ?? this.nodeId)
 	}
 
 	/**
-	 * Persist the per-device node token next to the node id.
+	 * Persist the per-device node token under its node id (the current one by default).
 	 */
-	async saveNodeToken(token: string): Promise<void> {
+	async saveNodeToken(token: string, nodeId?: string): Promise<void> {
 		this.ensureOpen()
-		await saveNodeToken(this.adapter, token)
+		await saveNodeToken(this.adapter, token, nodeId ?? this.nodeId)
 	}
 
 	/**
@@ -1370,6 +1402,7 @@ export class Store implements OperationLog {
 			oldNodeId,
 			generateUUIDv7(),
 		)
+		await registerLocalNode(this.adapter, result.nodeId)
 		this.nodeId = result.nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
 		if (oldClock) {
@@ -1388,6 +1421,210 @@ export class Store implements OperationLog {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
 		return result
+	}
+
+	/**
+	 * Move this database back to a node id it authored under before (RT-38): after the
+	 * sync server refused the current node, the device tries a node a returning user
+	 * owns. Nothing is rewritten; later writes use `nodeId`.
+	 *
+	 * @throws {KoraError} When the node id is pinned, or `nodeId` is not a local node
+	 */
+	async switchNodeId(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (this.configNodeId || this.isolation === 'per-tab') {
+			throw new KoraError(
+				'This store uses a pinned node id, so it cannot switch to another one.',
+				'NODE_ID_PINNED',
+				{ nodeId: this.nodeId },
+			)
+		}
+		if (nodeId === this.nodeId) return
+		const known = (await listLocalNodes(this.adapter)).some((node) => node.nodeId === nodeId)
+		if (!known) {
+			throw new KoraError(
+				`Node id "${nodeId}" was never used by this database, so the store cannot switch to it.`,
+				'NODE_ID_UNKNOWN',
+				{ nodeId },
+			)
+		}
+		await this.adapter.execute(
+			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
+			[nodeId],
+		)
+		const oldClock = this.clock
+		this.nodeId = nodeId
+		const clock = new HybridLogicalClock(this.nodeId)
+		if (oldClock) {
+			const last = oldClock.now()
+			clock.advanceTo({ ...last, nodeId: this.nodeId })
+			const offset = oldClock.getReferenceOffset()
+			if (offset !== null) clock.setReferenceOffset(offset)
+		}
+		this.clock = clock
+		this.causalTracker = new CausalTracker()
+		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
+		this.versionVector = await this.loadVersionVector()
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? 0
+		for (const collection of this.collections.values()) {
+			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
+		}
+	}
+
+	/**
+	 * Raise a local node's sequence counter to at least `floor`, in a transaction (the
+	 * same MAX every reservation uses, W6), so the next write never reuses a number the
+	 * server already holds (RT-35: the device lost the tail of its log, for example on a
+	 * reload inside the IndexedDB snapshot window or after restoring an older copy).
+	 *
+	 * @returns Whether the counter moved
+	 */
+	async raiseSequenceFloor(nodeId: string, floor: number): Promise<boolean> {
+		this.ensureOpen()
+		let raised = false
+		await this.adapter.transaction(async (tx) => {
+			const rows = await tx.query<VersionVectorRow>(
+				'SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?',
+				[nodeId],
+			)
+			const current = rows[0]?.sequence_number ?? 0
+			if (floor <= current) return
+			await tx.execute(
+				`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+				[nodeId, floor],
+			)
+			raised = true
+		})
+		if (raised) {
+			const previous = this.versionVector.get(nodeId) ?? 0
+			this.versionVector.set(nodeId, Math.max(previous, floor))
+			if (nodeId === this.nodeId) this.sequenceNumber = Math.max(this.sequenceNumber, floor)
+		}
+		return raised
+	}
+
+	/**
+	 * Give one of a local node's operations a fresh sequence number above `floor`
+	 * (RT-35): the server refused it with `SEQUENCE_CONFLICT` because it holds another
+	 * operation of this node under that number (one this device lost). The operation
+	 * keeps its id and content (protocol v1 does not hash the sequence number), exactly
+	 * like the W6 sequence repair, and the old identity is recorded in
+	 * `_kora_seq_conflicts`.
+	 *
+	 * @returns The renumbered operation, or null when it is not in the log
+	 */
+	async resequenceOperation(
+		operationId: string,
+		nodeId: string,
+		floor: number,
+	): Promise<Operation | null> {
+		this.ensureOpen()
+		const found: { op: Operation | null } = { op: null }
+		await this.adapter.transaction(async (tx) => {
+			for (const collection of Object.keys(this.schema.collections)) {
+				const table = quoteIdent(`_kora_ops_${collection}`)
+				const rows = await tx.query<OperationRow>(
+					`SELECT * FROM ${table} WHERE id = ? AND node_id = ?`,
+					[operationId, nodeId],
+				)
+				const row = rows[0]
+				if (!row) continue
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[nodeId, floor],
+				)
+				const sequence = await allocateNextSequenceInTransaction(tx, nodeId)
+				await insertConflictRow(
+					tx,
+					collection,
+					row,
+					'server-sequence-conflict',
+					row.id,
+					sequence,
+					Date.now(),
+				)
+				await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [sequence, row.id])
+				found.op = deserializeOperationWithCollection(
+					{ ...row, sequence_number: sequence },
+					collection,
+				)
+				return
+			}
+		})
+		if (found.op) this.recordOperationSequence(found.op)
+		return found.op
+	}
+
+	/**
+	 * Durability barrier (RT-35): resolves once every write committed so far is durable
+	 * on this device. Sync awaits it before an operation leaves the device.
+	 */
+	async ensureDurable(): Promise<void> {
+		this.ensureOpen()
+		await this.adapter.ensureDurable?.()
+	}
+
+	/** Record operations the server refused for good (RT-36). Never cleared. */
+	async recordTerminalRejections(entries: TerminalRejection[]): Promise<void> {
+		this.ensureOpen()
+		await recordTerminalRejections(this.adapter, entries)
+	}
+
+	/** Which of these operation ids the server refused for good (RT-36). */
+	async findTerminalRejections(operationIds: string[]): Promise<Set<string>> {
+		this.ensureOpen()
+		return findTerminalRejections(this.adapter, operationIds)
+	}
+
+	/** Every node id this database authored operations under (RT-38, RT-40). */
+	async listLocalNodes(): Promise<LocalNodeRecord[]> {
+		this.ensureOpen()
+		return listLocalNodes(this.adapter)
+	}
+
+	/** Forget a drained local node other than this store's own (RT-40). */
+	async forgetLocalNode(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await forgetLocalNode(this.adapter, nodeId)
+	}
+
+	/** The current refusal cycle: the count of accepted sync handshakes (RT-38). */
+	async loadAcceptedCycle(): Promise<number> {
+		this.ensureOpen()
+		return loadAcceptedCycle(this.adapter)
+	}
+
+	/** Record an accepted sync handshake as `nodeId` (RT-38). */
+	async markLocalNodeAccepted(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		await markLocalNodeAccepted(this.adapter, nodeId)
+	}
+
+	/** Record that the sync server refused `nodeId`; `held` holds its writes (RT-38). */
+	async markLocalNodeRefused(nodeId: string, held: boolean): Promise<void> {
+		this.ensureOpen()
+		await markLocalNodeRefused(this.adapter, nodeId, held)
+	}
+
+	/**
+	 * Take over another local node's unsynced writes (RT-40): resolves to a release
+	 * function when no live tab uses `nodeId` (its lock is free), or null when one does.
+	 * Without Web Locks (Node, old browsers) the node is assumed free.
+	 */
+	async claimLocalNode(nodeId: string): Promise<(() => void) | null> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return null
+		return tryAcquireNodeLock(nodeLockName(this.dbName, nodeId))
+	}
+
+	/** Whether a live tab holds `nodeId` (per-tab isolation, RT-40). */
+	async isLocalNodeLive(nodeId: string): Promise<boolean> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return true
+		return isNodeLockHeld(nodeLockName(this.dbName, nodeId))
 	}
 
 	async rebaseUnsyncedOperations(

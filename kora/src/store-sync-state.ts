@@ -4,9 +4,11 @@ import type { Store } from '@korajs/store'
 import { decodeDeltaCursor, encodeDeltaCursor, operationMatchesScope } from '@korajs/sync'
 import type {
 	DeltaCursor,
+	LocalNodeInfo,
 	QuarantinedOperation,
 	SyncScopeMap,
 	SyncStatePersistence,
+	TerminalRejectionRecord,
 } from '@korajs/sync'
 
 /**
@@ -64,12 +66,12 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		await this.store.deleteDeliveryWatermark(signature)
 	}
 
-	loadNodeToken(): Promise<string | null> {
-		return this.store.loadNodeToken()
+	loadNodeToken(nodeId?: string): Promise<string | null> {
+		return this.store.loadNodeToken(nodeId)
 	}
 
-	async saveNodeToken(token: string): Promise<void> {
-		await this.store.saveNodeToken(token)
+	async saveNodeToken(token: string, nodeId?: string): Promise<void> {
+		await this.store.saveNodeToken(token, nodeId)
 	}
 
 	loadOwnAckedThrough(nodeId: string): Promise<number | null> {
@@ -102,5 +104,41 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 
 	async saveAcceptedDownlinkScope(scope: SyncScopeMap | null): Promise<void> {
 		await this.store.saveAcceptedDownlinkScope(scope)
+	}
+
+	/** Durable terminal-rejection markers (RT-36); the app cannot clear them. */
+	async recordTerminalRejections(entries: TerminalRejectionRecord[]): Promise<void> {
+		await this.store.recordTerminalRejections(entries)
+	}
+
+	findTerminalRejections(operationIds: string[]): Promise<Set<string>> {
+		return this.store.findTerminalRejections(operationIds)
+	}
+
+	/** The node ids this database authored under (RT-38, RT-40). */
+	async listLocalNodes(): Promise<LocalNodeInfo[]> {
+		const nodes = await this.store.listLocalNodes()
+		return nodes.map(({ nodeId, accepted, held, refusedCycle }) => ({
+			nodeId,
+			accepted,
+			held,
+			refusedCycle,
+		}))
+	}
+
+	async markLocalNodeAccepted(nodeId: string): Promise<void> {
+		await this.store.markLocalNodeAccepted(nodeId)
+	}
+
+	async markLocalNodeRefused(nodeId: string, held: boolean): Promise<void> {
+		await this.store.markLocalNodeRefused(nodeId, held)
+	}
+
+	loadAcceptedCycle(): Promise<number> {
+		return this.store.loadAcceptedCycle()
+	}
+
+	async forgetLocalNode(nodeId: string): Promise<void> {
+		await this.store.forgetLocalNode(nodeId)
 	}
 }

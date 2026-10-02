@@ -240,6 +240,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			nodeId: 'node-new',
 			reenqueuedCount: 2,
 		},
+		'sync:local-node': {
+			type: 'sync:local-node',
+			nodeId: 'node-a',
+			action: 'history-behind',
+			localSequence: 1,
+			serverSequence: 2,
+		},
 		'sync:clock-rebase': {
 			type: 'sync:clock-rebase',
 			rebasedCount: 3,

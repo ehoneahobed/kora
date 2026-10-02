@@ -51,6 +51,46 @@ export interface SyncStore {
 	 */
 	rotateNodeId?(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }>
 
+	/**
+	 * Optional: move the device back to a node id this database authored under before
+	 * (RT-38), without rewriting anything. Used after the server refused the current node
+	 * (another principal owns it) to try a node the signed-in principal owns.
+	 */
+	switchNodeId?(nodeId: string): Promise<void>
+
+	/**
+	 * Optional durability barrier (RT-35): resolve once every write committed so far is
+	 * durable on this device; reject when it cannot be made durable. The engine awaits it
+	 * before any operation leaves the device, so the server never holds an operation the
+	 * device could lose on reload.
+	 */
+	ensureDurable?(): Promise<void>
+
+	/**
+	 * Optional: raise a local node's sequence counter to at least `floor`, in a
+	 * transaction (RT-35: the server holds operations of this node the device lost).
+	 * @returns Whether the counter moved
+	 */
+	raiseSequenceFloor?(nodeId: string, floor: number): Promise<boolean>
+
+	/**
+	 * Optional: give a local operation a fresh sequence number above `floor`, keeping its
+	 * id (RT-35: the server refused it with `SEQUENCE_CONFLICT` because it holds another
+	 * operation of this node, lost locally, under that number).
+	 * @returns The renumbered operation, or null when it is not in the log
+	 */
+	resequenceOperation?(
+		operationId: string,
+		nodeId: string,
+		floor: number,
+	): Promise<Operation | null>
+
+	/**
+	 * Optional: take over another local node id's unsynced writes (RT-40). Resolves to a
+	 * release function when no live tab uses it, or null when one does.
+	 */
+	claimLocalNode?(nodeId: string): Promise<(() => void) | null>
+
 	rebaseUnsyncedOperations?(
 		ids: string[],
 		correctedNowMs: number,

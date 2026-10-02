@@ -22,6 +22,15 @@ export class IndexedDbPersistenceScheduler {
 	private timer: ReturnType<typeof setTimeout> | null = null
 	private inFlight: Promise<void> | null = null
 	private disposed = false
+	/**
+	 * Mutation generations (RT-35): `scheduled` counts schedule() calls (one per committed
+	 * write), `persisted` is the generation the last SUCCESSFUL snapshot covered. A
+	 * snapshot covers every generation scheduled before it started.
+	 */
+	private scheduledGeneration = 0
+	private persistedGeneration = 0
+	/** Error of the last snapshot attempt, cleared by the next success. */
+	private lastFlushError: unknown = null
 	private readonly onVisibilityChange: () => void
 
 	constructor(options: IndexedDbPersistenceSchedulerOptions) {
@@ -41,6 +50,7 @@ export class IndexedDbPersistenceScheduler {
 	/** Schedule a debounced snapshot write. */
 	schedule(): void {
 		if (this.disposed) return
+		this.scheduledGeneration++
 		if (this.debounceMs <= 0) {
 			void this.flushNow()
 			return
@@ -73,6 +83,48 @@ export class IndexedDbPersistenceScheduler {
 		}
 	}
 
+	/**
+	 * Durability barrier (RT-35): resolve once every write scheduled before this call is
+	 * in a snapshot persisted to IndexedDB. A snapshot already in flight may predate the
+	 * latest write, so the barrier waits for it and then writes a fresh one when needed.
+	 * Rejects when the snapshot cannot be written: the caller must treat the writes as
+	 * not durable (for example, not upload them yet).
+	 */
+	async flushBarrier(): Promise<void> {
+		const target = this.scheduledGeneration
+		if (this.persistedGeneration >= target) return
+		if (this.disposed) {
+			throw new Error('IndexedDB persistence was disposed before the writes were persisted')
+		}
+		if (this.timer !== null) {
+			clearTimeout(this.timer)
+			this.timer = null
+		}
+		// At most two rounds: one that may have started before `target`, then one after.
+		for (let round = 0; round < 3 && this.persistedGeneration < target; round++) {
+			if (this.inFlight) {
+				try {
+					await this.inFlight
+				} catch {
+					// runFlush never rejects; the error is in lastFlushError.
+				}
+				continue
+			}
+			this.inFlight = this.runFlush()
+			try {
+				await this.inFlight
+			} finally {
+				this.inFlight = null
+			}
+			if (this.persistedGeneration < target) break
+		}
+		if (this.persistedGeneration < target) {
+			throw this.lastFlushError instanceof Error
+				? this.lastFlushError
+				: new Error('IndexedDB snapshot was not persisted')
+		}
+	}
+
 	dispose(): void {
 		this.disposed = true
 		if (this.timer !== null) {
@@ -85,9 +137,13 @@ export class IndexedDbPersistenceScheduler {
 	}
 
 	private async runFlush(): Promise<void> {
+		const generation = this.scheduledGeneration
 		try {
 			await this.flush()
+			this.persistedGeneration = Math.max(this.persistedGeneration, generation)
+			this.lastFlushError = null
 		} catch (error) {
+			this.lastFlushError = error
 			this.onError?.(error)
 		}
 	}

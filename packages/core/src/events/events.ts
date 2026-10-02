@@ -75,6 +75,36 @@ export type KoraEvent =
 			nodeId: string
 			/** Unsynced operations re-authored under the new node id. */
 			reenqueuedCount: number
+			/**
+			 * Unsynced operations left under the previous node id, held for the principal
+			 * that owns it (RT-38): they upload when that user signs in again on this device.
+			 */
+			heldCount?: number
+	  }
+	| {
+			/**
+			 * Sync bookkeeping of one of this database's own node ids (Phase 2):
+			 * - `history-behind`: the server holds more of this node's operations than the
+			 *   device (its log lost a tail, RT-35); the counter was raised past them and a
+			 *   full resync fetches them back.
+			 * - `adoption-started` / `adoption-completed` / `adoption-refused`: the engine
+			 *   uploads the unsynced writes of a node no live tab uses (RT-40).
+			 * - `held`: the server refused this node for the signed-in principal; its unsynced
+			 *   writes wait for the principal that owns it (RT-38).
+			 */
+			type: 'sync:local-node'
+			nodeId: string
+			action:
+				| 'history-behind'
+				| 'adoption-started'
+				| 'adoption-completed'
+				| 'adoption-refused'
+				| 'held'
+			/** For `history-behind`: the device's highest sequence and the server's. */
+			localSequence?: number
+			serverSequence?: number
+			/** Unsynced operations concerned, when known. */
+			operationCount?: number
 	  }
 	| {
 			type: 'sync:clock-rebase'

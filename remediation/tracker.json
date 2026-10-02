@@ -2253,14 +2253,14 @@
    "severity": "P1",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-35.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Locations: store/src/adapters/indexeddb-adapter.ts:95 (debounced snapshot; flushPersistence has no caller in sync); sync/src/engine/sync-engine.ts:1541 (only a LOWER advertised own entry is acted on; the local counter is never raised to the server's); server/src/session/client-session.ts:2010, 2649-2657 (own ops excluded from a resumed stream); server/src/apply/apply-server-operation.ts:256 (SEQUENCE_CONFLICT terminal). Same outcome after restoring an older local copy (OS/Electron backup). Required fix: flush the IndexedDB snapshot before an op is marked sent; at handshake raise the local counter above an advertised own entry (MAX, in a transaction) and have the server re-send own ops above the client's own vector entry regardless of watermark; treat SEQUENCE_CONFLICT against the device's own lost op as recoverable (fetch the holder, renumber the new write). Repro simulates the lost tail by restoring a VACUUM INTO snapshot."
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Locations: store/src/adapters/indexeddb-adapter.ts:95 (debounced snapshot; flushPersistence has no caller in sync); sync/src/engine/sync-engine.ts:1541 (only a LOWER advertised own entry is acted on; the local counter is never raised to the server's); server/src/session/client-session.ts:2010, 2649-2657 (own ops excluded from a resumed stream); server/src/apply/apply-server-operation.ts:256 (SEQUENCE_CONFLICT terminal). Same outcome after restoring an older local copy (OS/Electron backup). Required fix: flush the IndexedDB snapshot before an op is marked sent; at handshake raise the local counter above an advertised own entry (MAX, in a transaction) and have the server re-send own ops above the client's own vector entry regardless of watermark; treat SEQUENCE_CONFLICT against the device's own lost op as recoverable (fetch the holder, renumber the new write). Repro simulates the lost tail by restoring a VACUUM INTO snapshot. FIXED (client, branch worktree-agent-ac713ddaf488cccee): upload batches are flagged sent (persisted) and the store durability barrier (StorageAdapter.ensureDurable; IndexedDB generation-tracked snapshot barrier) is awaited before the wire; handshake raises the persisted counter past an advertised own entry (in-tx MAX), resets delivery to a full resync (own ops included) and reconnects; SEQUENCE_CONFLICT on an own upload renumbers it (same id) above the server entry and resyncs. Client advertises handshake sequenceReservation: true. Server-side targeted resend of own ops above the client vector not done (client full resync instead)."
   },
   {
    "id": "RT-36",
@@ -2268,14 +2268,14 @@
    "severity": "P1",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-36.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2807-2840 scanOwnLog enqueues every own op not queued and inside the uplink scope, never consulting the rejected store; the prefix restarts at 0 on upgrade (2680) or is lowered by lowerOwnPrefixLocked. Repro: a withdrawal refused (INSUFFICIENT_FUNDS, non-retriable) is applied after the upgrade re-upload once the balance allows it. Required fix: persist terminal rejections as resolved per op id in a durable marker the app cannot clear, and skip them in scanOwnLog and rotation; optionally the server remembers refused ids and answers a resubmission with the original rejection. Fix RT-37 first (beta.13 SEQUENCE_CONFLICT losses are currently only rescued by this bug)."
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2807-2840 scanOwnLog enqueues every own op not queued and inside the uplink scope, never consulting the rejected store; the prefix restarts at 0 on upgrade (2680) or is lowered by lowerOwnPrefixLocked. Repro: a withdrawal refused (INSUFFICIENT_FUNDS, non-retriable) is applied after the upgrade re-upload once the balance allows it. Required fix: persist terminal rejections as resolved per op id in a durable marker the app cannot clear, and skip them in scanOwnLog and rotation; optionally the server remembers refused ids and answers a resubmission with the original rejection. Fix RT-37 first (beta.13 SEQUENCE_CONFLICT losses are currently only rescued by this bug). FIXED (client): durable _kora_terminal_rejections markers (app cannot clear), written before the prefix passes the op; scanOwnLog and RT-21 re-authoring skip them; seeded once from _kora_sync_rejected excluding SEQUENCE_CONFLICT/NODE_ID_MISMATCH/OUT_OF_UPLINK_SCOPE so beta.13 SEQUENCE_CONFLICT writes still re-upload (and are renumbered if refused again)."
   },
   {
    "id": "RT-37",
@@ -2298,14 +2298,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-38.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:1582-1640 rotateNodeIdentity re-queues every own op above the prefix regardless of who wrote it; NODE_ID_CLAIMED is exactly what a second user on the same database receives. Repro: Alice's offline note is submitted with ctx.auth.userId = bob. A rotated op that was sent but not acknowledged keeps its old copy on the server and gains a re-authored copy (atomic increments double). Required fix: bind unsynced ops to the principal that wrote them; on NODE_ID_CLAIMED for a different principal hold the other user's ops (surface them; upload when that user signs in) or require namespaceByAuthUser with auth; never rotate ops flagged sent."
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:1582-1640 rotateNodeIdentity re-queues every own op above the prefix regardless of who wrote it; NODE_ID_CLAIMED is exactly what a second user on the same database receives. Repro: Alice's offline note is submitted with ctx.auth.userId = bob. A rotated op that was sent but not acknowledged keeps its old copy on the server and gains a re-authored copy (atomic increments double). Required fix: bind unsynced ops to the principal that wrote them; on NODE_ID_CLAIMED for a different principal hold the other user's ops (surface them; upload when that user signs in) or require namespaceByAuthUser with auth; never rotate ops flagged sent. FIXED (client): uploads bound to the session node; on NODE_ID_CLAIMED for a previously accepted node its unsynced writes are held (status.heldOperations) and the device switches to a held node untried in this refusal cycle or a fresh one; never-accepted nodes keep RT-21 re-authoring minus ops flagged sent (the double-store cause). namespaceByAuthUser default unchanged (see report)."
   },
   {
    "id": "RT-39",
@@ -2328,14 +2328,14 @@
    "severity": "P1",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-40.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2680-2700 and 2761-2800 (own tracking bound to store.getNodeId()); store/src/store/tab-node-id.ts (sessionStorage node per tab). Required fix: persist the set of node ids this database authored with a prefix per node; a starting engine adopts orphaned per-tab nodes under a Web Lock and uploads their unacknowledged ops (server side: node-claim handover for those nodes under auth)."
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2680-2700 and 2761-2800 (own tracking bound to store.getNodeId()); store/src/store/tab-node-id.ts (sessionStorage node per tab). Required fix: persist the set of node ids this database authored with a prefix per node; a starting engine adopts orphaned per-tab nodes under a Web Lock and uploads their unacknowledged ops (server side: node-claim handover for those nodes under auth). FIXED (client): local node registry + per-tab Web Lock; a starting engine adopts a local node with unsynced writes and a free lock, runs a session as that node (original ids), then reconnects; other local nodes count as pending."
   },
   {
    "id": "RT-41",
@@ -2343,14 +2343,14 @@
    "severity": "P2",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-41.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: kora/src/storage-accessor.ts:15-36 hasUnsyncedOperations. Required fix: unsynced = queue rows OR any own op (any local node id) above its own_acked_through OR a node with no recorded prefix; keep the local-only branch."
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: kora/src/storage-accessor.ts:15-36 hasUnsyncedOperations. Required fix: unsynced = queue rows OR any own op (any local node id) above its own_acked_through OR a node with no recorded prefix; keep the local-only branch. FIXED: deleteDatabase unsynced check = queue OR any local node own op above its prefix (no prefix: from 0) minus terminal rejections (store/internal hasUnsyncedOwnOperations)."
   }
  ],
  "rejectedProposalPins": {

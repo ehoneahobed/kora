@@ -64,6 +64,14 @@ export interface StorageAdapter {
 	 * fallback before app code starts reading or writing user data.
 	 */
 	getStorageOpenState?(): StorageOpenState | null
+
+	/**
+	 * Optional durability barrier (RT-35): resolve once every write committed before the
+	 * call is durable, reject when it cannot be made durable. Adapters whose commits are
+	 * durable when they resolve (SQLite on a file or OPFS) omit it; an adapter that
+	 * persists asynchronously (the IndexedDB snapshot fallback) must implement it.
+	 */
+	ensureDurable?(): Promise<void>
 }
 
 /**

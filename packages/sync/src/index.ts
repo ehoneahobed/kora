@@ -21,6 +21,8 @@ export type {
 	SyncSettlementResult,
 	ActiveApplyFailure,
 	DeltaCursor,
+	LocalNodeInfo,
+	TerminalRejectionRecord,
 } from './types'
 
 export {

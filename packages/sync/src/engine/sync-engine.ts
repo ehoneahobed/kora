@@ -61,6 +61,7 @@ import { scopeViewKey } from '../scopes/scope-view-key'
 import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
 import {
+	type LocalNodeInfo,
 	MemoryRejectedOperationStorage,
 	type QuarantinedOperation,
 	type QueueStorage,
@@ -190,6 +191,17 @@ let nextQuerySubsetId = 0
 
 /** Rejection code for a local operation the uplink scope refuses (recorded client-side). */
 const OUT_OF_UPLINK_SCOPE = 'OUT_OF_UPLINK_SCOPE'
+/** The server holds another operation of this node under the sequence number (RT-35). */
+const SEQUENCE_CONFLICT = 'SEQUENCE_CONFLICT'
+/**
+ * Non-retriable rejection codes that never become a durable terminal marker (RT-36): the
+ * operation was not refused for its content, so uploading it later may succeed.
+ */
+const NON_TERMINAL_REJECTION_CODES: ReadonlySet<string> = new Set([
+	SEQUENCE_CONFLICT,
+	'NODE_ID_MISMATCH',
+	OUT_OF_UPLINK_SCOPE,
+])
 function generateMessageId(): string {
 	return `msg-${Date.now()}-${nextMessageId++}`
 }
@@ -326,6 +338,37 @@ export class SyncEngine {
 	private reconnectPromise: Promise<void> | null = null
 	/** A node-id rotation started by NODE_ID_CLAIMED; the next connect waits for it (RT-21). */
 	private nodeRotation: Promise<void> | null = null
+	/**
+	 * Node id of the current (or last) session. Usually the store's node id; while the
+	 * engine adopts the unsynced writes of a node no live tab uses (RT-40) it is that
+	 * node. A session uploads only operations authored under its node id.
+	 */
+	private sessionNodeId: string | null = null
+	/** Node id the in-memory node token belongs to. */
+	private nodeTokenNodeId: string | null = null
+	/** Releases the lock held on an adopted node (RT-40); null when not adopting. */
+	private releaseAdoption: (() => void) | null = null
+	/**
+	 * Ids of operations the server refused for good (RT-36). Cache of the durable markers,
+	 * and the only record when the persistence layer has none (engine lifetime).
+	 */
+	private readonly terminalRejected = new Set<string>()
+	/** Nodes accepted at a handshake, when the persistence layer keeps no registry. */
+	private readonly memoryAcceptedNodes = new Set<string>()
+	/** Every node id this database authored operations under (loaded at start). */
+	private localNodeIds = new Set<string>()
+	/** Local nodes whose unsynced writes are held for another principal (RT-38). */
+	private heldNodeIds = new Set<string>()
+	/** Unsynced, unqueued operations of other uploadable local nodes (RT-40), counted pending. */
+	private otherNodesPending = 0
+	/** Unsynced, unqueued operations of held nodes (RT-38), reported separately. */
+	private heldPending = 0
+	/**
+	 * The server holds operations of this node that the device lost (RT-35): the delivery
+	 * watermark was reset so the next session resyncs from 0, which fetches them back.
+	 * The session ends once its in-flight uploads are resolved.
+	 */
+	private ownRecoveryPending = false
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -511,10 +554,20 @@ export class SyncEngine {
 			this.switchDeliveryView(previousSignature)
 		}
 		await this.outboundQueue.initialize()
+		this.ownRecoveryPending = false
+		await this.chooseSessionNode()
+		{
+			const sessionNode = this.currentNodeId()
+			if (this.nodeTokenNodeId !== sessionNode) {
+				// A token belongs to one node id: never present another node's (RT-38, RT-40).
+				this.nodeToken = null
+				this.nodeTokenNodeId = sessionNode
+			}
+		}
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
 			if (this.nodeToken === null && this.syncState.loadNodeToken) {
-				this.nodeToken = await this.syncState.loadNodeToken()
+				this.nodeToken = await this.syncState.loadNodeToken(this.currentNodeId())
 			}
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
@@ -591,7 +644,7 @@ export class SyncEngine {
 			const handshake: SyncMessage = {
 				type: 'handshake',
 				messageId: generateMessageId(),
-				nodeId: this.store.getNodeId(),
+				nodeId: this.currentNodeId(),
 				versionVector: versionVectorToWire(localVector),
 				schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 				authToken,
@@ -610,6 +663,10 @@ export class SyncEngine {
 				// (SYNC-11): a server that resolves the same scope again resumes from it.
 				...this.acceptedViewHandshakeFields(),
 				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
+				// Sequence numbers are reserved inside the writing transaction (W6), and a
+				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
+				// (node, sequence) uniqueness against this client (RT-37).
+				sequenceReservation: true,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -664,6 +721,7 @@ export class SyncEngine {
 		this.destroyed = true
 		await this.stop()
 		this.clearAllTimers()
+		this.endAdoption()
 		this.statusListeners.clear()
 	}
 
@@ -785,6 +843,7 @@ export class SyncEngine {
 			lastSuccessfulPush: this.lastSuccessfulPush,
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
+			heldOperations: this.computeHeldCount(),
 			clockSkewMs: this.clockSkewMs,
 			inFlightUploadOperations: this.inFlightUploadCount(),
 			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
@@ -1004,7 +1063,7 @@ export class SyncEngine {
 		return {
 			state: this.state,
 			status: this.getStatus(),
-			nodeId: this.store.getNodeId(),
+			nodeId: this.currentNodeId(),
 			url: this.config.url,
 			schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 			lastSyncedAt: this.lastSyncedAt,
@@ -1471,9 +1530,15 @@ export class SyncEngine {
 			return
 		}
 
+		const sessionNode = this.currentNodeId()
+		// Accepted as this node: from now on a refusal of it means another principal owns
+		// it (RT-38). Recorded before anything is uploaded in this session.
+		await this.recordNodeAccepted(sessionNode)
+
 		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
 			this.nodeToken = msg.nodeToken
-			await this.syncState?.saveNodeToken?.(msg.nodeToken)
+			this.nodeTokenNodeId = sessionNode
+			await this.syncState?.saveNodeToken?.(msg.nodeToken, sessionNode)
 			// The claim stays provisional until the server knows the token is saved:
 			// confirm it now, so a lost response never locks this device out (RT-21).
 			// Without persistence the token lives for this engine only; confirming would
@@ -1535,10 +1600,37 @@ export class SyncEngine {
 			}
 		}
 
+		// A server that holds MORE of this node's operations than the device's log (the
+		// device lost the tail of its log, RT-35) is never trusted as an acknowledgment,
+		// but the numbers it holds are taken: the counter moves past them before the next
+		// write, and a full resync fetches the operations back.
+		const advertisedOwn = this.remoteVector.get(sessionNode)
+		const localOwn = this.store.getVersionVector().get(sessionNode) ?? 0
+		// The persisted counter decides (raiseSequenceFloor reads it in a transaction): the
+		// in-memory vector of a tab sharing the node may simply lag another tab's writes.
+		if (
+			advertisedOwn !== undefined &&
+			advertisedOwn > localOwn &&
+			this.store.raiseSequenceFloor &&
+			(await this.store.raiseSequenceFloor(sessionNode, advertisedOwn))
+		) {
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: sessionNode,
+				action: 'history-behind',
+				localSequence: localOwn,
+				serverSequence: advertisedOwn,
+			})
+			await this.resetDeliveryForFullResync()
+			this.abandonSession(
+				'The server holds operations of this device that its local database lost; resyncing them',
+			)
+			return
+		}
+
 		// A server that holds FEWER of this device's operations than the device believes
 		// (a restored backup) lowers the acknowledged prefix, so the device re-uploads
 		// them; the server dedups by id. A higher value is never trusted (RT-12, W3).
-		const advertisedOwn = this.remoteVector.get(this.store.getNodeId())
 		if (advertisedOwn !== undefined && advertisedOwn < this.ownAckedThrough) {
 			await this.withOwnTracking(async () => {
 				await this.lowerOwnPrefixLocked(advertisedOwn)
@@ -1547,7 +1639,7 @@ export class SyncEngine {
 		}
 		await this.refreshPendingCount()
 
-		this.emitter?.emit({ type: 'sync:connected', nodeId: this.store.getNodeId() })
+		this.emitter?.emit({ type: 'sync:connected', nodeId: sessionNode })
 		this.metricsCollector.recordConnected()
 		this.metricsCollector.updateStatus('syncing')
 		this.metricsCollector.recordSyncStarted()
@@ -1574,56 +1666,43 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Move this device to a fresh node id after the server refused the current one
-	 * (RT-21). Every unsynced own operation (queued, or in the log above the server's
-	 * acknowledged position) is re-authored under the new id and re-queued, so no
-	 * write is lost. Without store support the engine stays refused and reports it.
+	 * The server refused this session's node id (`NODE_ID_CLAIMED`). What happens to the
+	 * node's unsynced writes depends on whether this database was ever accepted as it:
+	 *
+	 * - Never accepted (RT-21: the claim's token was lost before the device saw it, or
+	 *   another device took the id first): no principal ever received these writes under
+	 *   this node, so the never-sent ones are re-authored under a fresh node id and
+	 *   uploaded. An operation flagged sent is never re-authored (RT-38): it may already
+	 *   be stored, and a copy under a new id would store the change twice.
+	 * - Accepted before (RT-38: another user signed in on a database shared between
+	 *   users): the node belongs to the principal that used it, so its unsynced writes
+	 *   are held for that principal, never re-authored or uploaded under another one. The
+	 *   device moves to a node the signed-in principal may own (a held node not yet tried
+	 *   in this refusal cycle, typically that user's own earlier node) or to a fresh one.
+	 * - An adopted node (RT-40) is held; the store's own node is left as it is.
 	 */
 	private async rotateNodeIdentity(): Promise<void> {
-		const rotate = this.store.rotateNodeId?.bind(this.store)
-		if (!rotate) {
-			this.emitter?.emit({ type: 'sync:suspended', reason: 'node-id-claimed' })
-			return
-		}
-		const previousNodeId = this.store.getNodeId()
+		const refused = this.currentNodeId()
+		const storeNode = this.store.getNodeId()
+		this.returnAllInFlightUploads()
 		try {
-			this.returnAllInFlightUploads()
-			const ids = new Set(
-				this.outboundQueue
-					.getAll()
-					.filter((op) => op.nodeId === previousNodeId)
-					.map((op) => op.id),
-			)
-			// Own operations above the acknowledged prefix that were never read into the
-			// queue (the unscanned tail) are unsynced too.
-			const localSeq = this.store.getVersionVector().get(previousNodeId) ?? 0
-			if (localSeq > this.ownAckedThrough) {
-				const above = await this.store.getOperationRange(
-					previousNodeId,
-					this.ownAckedThrough + 1,
-					localSeq,
-				)
-				for (const op of above) {
-					if (op.nodeId !== previousNodeId || op.sequenceNumber <= this.ownAckedThrough) continue
-					if (this.isOwnOperationResolved(op)) continue
-					ids.add(op.id)
-				}
+			if (refused !== storeNode) {
+				await this.syncState?.markLocalNodeRefused?.(refused, true)
+				this.heldNodeIds.add(refused)
+				this.endAdoption()
+				this.emitter?.emit({ type: 'sync:local-node', nodeId: refused, action: 'adoption-refused' })
+				return
 			}
-			const result = await rotate([...ids])
-			await this.outboundQueue.replaceAll(result.operations)
-			this.nodeToken = null
-			// The new node id starts its own acknowledged prefix.
-			await this.withOwnTracking(async () => {
-				this.ownTrackingNodeId = null
-				await this.loadOwnTrackingLocked()
-			})
-			await this.refreshPendingCount()
-			this.emitter?.emit({
-				type: 'sync:node-id-rotated',
-				previousNodeId,
-				nodeId: result.nodeId,
-				reenqueuedCount: result.operations.length,
-			})
+			const rotate = this.store.rotateNodeId?.bind(this.store)
+			if (!rotate) {
+				this.emitter?.emit({ type: 'sync:suspended', reason: 'node-id-claimed' })
+				return
+			}
+			if (await this.wasNodeAccepted(refused)) {
+				await this.holdNodeAndSwitch(refused, rotate)
+			} else {
+				await this.reauthorUnsentAndRotate(refused, rotate)
+			}
 		} catch (error) {
 			this.emitter?.emit({
 				type: 'store:persistence-error',
@@ -1632,6 +1711,108 @@ export class SyncEngine {
 				code: 'NODE_ROTATION_FAILED',
 			})
 		}
+	}
+
+	/** RT-38: hold a refused, previously accepted node's writes and move to another node. */
+	private async holdNodeAndSwitch(
+		refused: string,
+		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+	): Promise<void> {
+		await this.syncState?.markLocalNodeRefused?.(refused, true)
+		const held = await this.countUnsyncedOfNode(refused)
+		this.emitter?.emit({
+			type: 'sync:local-node',
+			nodeId: refused,
+			action: 'held',
+			operationCount: held.count,
+		})
+		let target: string | null = null
+		const switchTo = this.store.switchNodeId?.bind(this.store)
+		if (switchTo && this.syncState?.listLocalNodes) {
+			// A held node refused before the last accepted handshake was not tried in this
+			// refusal cycle: it may be the signed-in principal's own node.
+			const cycle = (await this.syncState.loadAcceptedCycle?.()) ?? 0
+			const nodes = await this.syncState.listLocalNodes()
+			const candidate = nodes.find(
+				(node) =>
+					node.nodeId !== refused &&
+					node.held &&
+					(node.refusedCycle === null || node.refusedCycle < cycle),
+			)
+			if (candidate) {
+				await switchTo(candidate.nodeId)
+				target = candidate.nodeId
+			}
+		}
+		if (target === null) target = (await rotate([])).nodeId
+		await this.afterIdentityChange()
+		this.emitter?.emit({
+			type: 'sync:node-id-rotated',
+			previousNodeId: refused,
+			nodeId: target,
+			reenqueuedCount: 0,
+			heldCount: held.count,
+		})
+	}
+
+	/** RT-21: re-author a never-accepted node's never-sent writes under a fresh node. */
+	private async reauthorUnsentAndRotate(
+		refused: string,
+		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+	): Promise<void> {
+		await this.syncState?.markLocalNodeRefused?.(refused, false)
+		const queuedIds = this.outboundQueue
+			.getAll()
+			.filter((op) => op.nodeId === refused && !this.outboundQueue.wasSent(op.id))
+			.map((op) => op.id)
+		const ids = new Set(queuedIds)
+		// Own operations above the acknowledged prefix that were never read into the
+		// queue (the unscanned tail) are unsynced too.
+		const localSeq = this.store.getVersionVector().get(refused) ?? 0
+		if (localSeq > this.ownAckedThrough) {
+			const above = await this.store.getOperationRange(refused, this.ownAckedThrough + 1, localSeq)
+			const candidates = above.filter(
+				(op) =>
+					op.nodeId === refused &&
+					op.sequenceNumber > this.ownAckedThrough &&
+					!this.isOwnOperationResolved(op) &&
+					!this.outboundQueue.wasSent(op.id),
+			)
+			const terminal = await this.findTerminalRejections(candidates.map((op) => op.id))
+			for (const op of candidates) {
+				if (!terminal.has(op.id)) ids.add(op.id)
+			}
+		}
+		const result = await rotate([...ids])
+		await this.outboundQueue.replace(queuedIds, result.operations)
+		await this.afterIdentityChange()
+		this.emitter?.emit({
+			type: 'sync:node-id-rotated',
+			previousNodeId: refused,
+			nodeId: result.nodeId,
+			reenqueuedCount: result.operations.length,
+		})
+	}
+
+	/** The store moved to another node id: the next session starts from it. */
+	private async afterIdentityChange(): Promise<void> {
+		this.nodeToken = null
+		this.nodeTokenNodeId = null
+		this.sessionNodeId = this.store.getNodeId()
+		// The new node id has its own acknowledged prefix.
+		await this.withOwnTracking(async () => {
+			this.ownTrackingNodeId = null
+			await this.loadOwnTrackingLocked()
+		})
+		await this.refreshPendingCount()
+	}
+
+	/** Whether a handshake as `nodeId` was ever accepted on this database. */
+	private async wasNodeAccepted(nodeId: string): Promise<boolean> {
+		if (this.memoryAcceptedNodes.has(nodeId)) return true
+		if (!this.syncState?.listLocalNodes) return false
+		const nodes = await this.syncState.listLocalNodes()
+		return nodes.some((node) => node.nodeId === nodeId && node.accepted)
 	}
 
 	/**
@@ -1650,7 +1831,9 @@ export class SyncEngine {
 		// Only operations that never reached the wire may be re-stamped (W3 step 4): a
 		// sent one may already be stored on the server with its ack lost, and re-stamping
 		// it would upload the same change twice under two ids.
-		const queued = this.outboundQueue.getAll().filter((op) => !this.outboundQueue.wasSent(op.id))
+		const queued = this.outboundQueue
+			.getAll()
+			.filter((op) => op.nodeId === this.currentNodeId() && !this.outboundQueue.wasSent(op.id))
 		if (queued.length === 0) return
 
 		let maxQueuedWallTime = Number.NEGATIVE_INFINITY
@@ -1738,6 +1921,16 @@ export class SyncEngine {
 
 		const totalBatches = entries.length
 		this.initialSyncTotalBatches = Math.max(this.initialSyncTotalBatches, totalBatches)
+		// One durability barrier for the whole delta (RT-35), not one per batch: flag every
+		// batch sent first (flagging writes, which would dirty the store again between
+		// batches), then make it all durable. sendUpload re-checks both, as no-ops; a
+		// failure here surfaces there, per batch, and postpones that batch.
+		try {
+			for (const entry of entries) await this.outboundQueue.markSent(entry.batch.batchId)
+			await this.store.ensureDurable?.()
+		} catch {
+			// Reported by sendUpload, which retries the barrier before each batch.
+		}
 		for (const [i, entry] of entries.entries()) {
 			if (this.sessionEpoch !== epoch) {
 				// The session ended mid-delta: the rest goes back to the queue.
@@ -1772,7 +1965,7 @@ export class SyncEngine {
 
 	/** Take the next batch from the queue and track it until it is resolved. */
 	private takeUpload(): InFlightUpload | null {
-		const batch = this.outboundQueue.takeBatch(this.batchSize)
+		const batch = this.outboundQueue.takeBatch(this.batchSize, this.isSessionOperation)
 		if (!batch) return null
 		const entry: InFlightUpload = {
 			batch,
@@ -1877,9 +2070,28 @@ export class SyncEngine {
 
 		if (!this.isUploadCurrent(entry)) return null
 		// Flag the operations as sent BEFORE they reach the wire: from then on they may be
-		// stored on the server even if no ack ever arrives, so a rebase must leave them.
-		// The in-memory flag is set synchronously; persisting it completes below.
-		const marking = this.outboundQueue.markSent(entry.batch.batchId)
+		// stored on the server even if no ack ever arrives, so a rebase or a node rotation
+		// must leave them (RT-38). Then make every local write durable (RT-35): the server
+		// must never hold an operation, or the device lack a sent flag, that a reload could
+		// lose. The in-memory flag is set synchronously, before the first await.
+		try {
+			await this.outboundQueue.markSent(entry.batch.batchId)
+			await this.store.ensureDurable?.()
+		} catch (error) {
+			if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message:
+					error instanceof Error
+						? `Upload postponed: local writes are not durable yet (${error.message})`
+						: 'Upload postponed: local writes are not durable yet',
+				code: 'UPLOAD_NOT_DURABLE',
+			})
+			this.scheduleOutboundRetry()
+			return null
+		}
+		if (!this.isUploadCurrent(entry)) return null
 
 		const messageId = generateMessageId()
 		const message: SyncMessage = {
@@ -1912,17 +2124,6 @@ export class SyncEngine {
 			batchSize: operations.length,
 		})
 		this.notifyStatusChange()
-		try {
-			await marking
-		} catch (error) {
-			// The flag still holds in memory for this engine's lifetime.
-			this.emitter?.emit({
-				type: 'store:persistence-error',
-				dbName: 'kora-sync-queue',
-				message: error instanceof Error ? error.message : 'Failed to persist sent flag',
-				code: 'QUEUE_PERSISTENCE_FAILED',
-			})
-		}
 		return messageId
 	}
 
@@ -2416,10 +2617,11 @@ export class SyncEngine {
 			await this.advanceOwnPrefixLocked()
 		})
 		await this.refreshPendingCount()
+		if (this.maybeEndSessionForNodeWork()) return
 
 		// Continue flushing if more ops in queue
 		const backoff = entry.retryBackoff || returned.length > 0
-		if (this.state === 'streaming' && this.outboundQueue.hasOperations) {
+		if (this.state === 'streaming' && this.hasUploadable()) {
 			if (backoff) {
 				this.scheduleOutboundRetry()
 			} else {
@@ -2523,6 +2725,7 @@ export class SyncEngine {
 			retraction.collection,
 			retraction.recordId,
 		)
+		await this.recordTerminalRejections(quarantined, 'SCOPE_RETRACTED')
 		for (const operation of quarantined) {
 			await this.rejectedStorage.record({
 				operationId: operation.id,
@@ -2570,6 +2773,16 @@ export class SyncEngine {
 			return
 		}
 
+		if (msg.code === SEQUENCE_CONFLICT && (await this.recoverSequenceConflict(msg.operationId))) {
+			return
+		}
+
+		// The durable marker comes first (RT-36): once the prefix passes this op, only the
+		// marker stops a later rescan of the device's history from submitting it again.
+		const refusedOp = this.findQueuedOperation(msg.operationId)
+		if (refusedOp && !NON_TERMINAL_REJECTION_CODES.has(msg.code)) {
+			await this.recordTerminalRejections([refusedOp], msg.code)
+		}
 		const removed = await this.outboundQueue.reject(msg.operationId)
 
 		await this.rejectedStorage.record({
@@ -2645,12 +2858,13 @@ export class SyncEngine {
 
 		// Flush any queued operations accumulated during delta exchange. Delta batches
 		// still awaiting their acks stay in flight: only their acks resolve them.
-		if (this.outboundQueue.hasOperations) {
+		if (this.hasUploadable()) {
 			this.flushQueue()
 		}
 
 		await this.refreshPendingCount()
 		this.notifyStatusChange()
+		this.maybeEndSessionForNodeWork()
 	}
 
 	// --- Own-operation upload tracking (W3: contiguous acknowledged prefix) ---
@@ -2678,7 +2892,7 @@ export class SyncEngine {
 	 * prefix is persisted as it advances, so the re-upload resumes where it stopped.
 	 */
 	private async loadOwnTrackingLocked(): Promise<void> {
-		const nodeId = this.store.getNodeId()
+		const nodeId = this.currentNodeId()
 		if (this.ownTrackingNodeId === nodeId) return
 		let prefix = 0
 		if (this.syncState?.loadOwnAckedThrough) {
@@ -2762,7 +2976,7 @@ export class SyncEngine {
 	 * one-time upgrade re-upload proceeds chunk by chunk as acks arrive.
 	 */
 	private async advanceOwnPrefixLocked(): Promise<void> {
-		if (this.ownTrackingNodeId !== this.store.getNodeId()) return
+		if (this.ownTrackingNodeId !== this.currentNodeId()) return
 		const localSeq = this.store.getVersionVector().get(this.ownTrackingNodeId) ?? 0
 		const start = this.ownAckedThrough
 		let scanned = false
@@ -2793,7 +3007,7 @@ export class SyncEngine {
 			}
 			await this.persistOwnPrefix()
 		}
-		if (scanned && this.state === 'streaming' && this.outboundQueue.hasOperations) {
+		if (scanned && this.state === 'streaming' && this.hasUploadable()) {
 			this.flushQueue()
 		}
 	}
@@ -2818,6 +3032,11 @@ export class SyncEngine {
 			list.push(op)
 			bySeq.set(op.sequenceNumber, list)
 		}
+		// Operations the server refused for good stay refused (RT-36): they are resolved,
+		// never enqueued again, whatever today's state would make of them.
+		const terminal = await this.findTerminalRejections(
+			ops.filter((op) => !this.outboundQueue.has(op.id)).map((op) => op.id),
+		)
 		const eligible: Operation[] = []
 		for (let seq = from; seq <= to; seq++) {
 			const ids = this.ownUnresolved.get(seq) ?? new Set<string>()
@@ -2825,6 +3044,7 @@ export class SyncEngine {
 			for (const op of bySeq.get(seq) ?? []) {
 				if (this.ownResolvedAhead.delete(op.id)) continue
 				if (ids.has(op.id)) continue
+				if (terminal.has(op.id)) continue
 				if (this.outboundQueue.has(op.id)) {
 					ids.add(op.id)
 					continue
@@ -2859,11 +3079,13 @@ export class SyncEngine {
 		if (!this.syncState) {
 			return
 		}
-		// Other nodes' entries record what the server advertised; the own-node entry is
-		// only ever the acknowledged prefix (persistOwnPrefix), never an advertised value.
-		const nodeId = this.store.getNodeId()
+		// Other nodes' entries record what the server advertised; a local node's entry is
+		// only ever its acknowledged prefix (persistOwnPrefix), never an advertised value:
+		// compaction reads it, and an advertised max can hide an unsynced op below it.
+		const nodeId = this.currentNodeId()
 		const others = new Map(vector)
 		others.delete(nodeId)
+		for (const local of this.localNodeIds) others.delete(local)
 		const merged = this.syncState.mergeServerVectors(this.lastAckedServerVector, others)
 		if (this.ownTrackingNodeId === nodeId) merged.set(nodeId, this.ownAckedThrough)
 		this.lastAckedServerVector = merged
@@ -2894,7 +3116,20 @@ export class SyncEngine {
 			}
 			unscanned = Math.max(0, unscanned)
 		}
-		return this.outboundQueue.totalPending + unscanned
+		// Queued operations of held nodes are reported separately (heldOperations, RT-38).
+		const heldQueued =
+			this.heldNodeIds.size === 0
+				? 0
+				: this.outboundQueue.countMatching((op) => this.heldNodeIds.has(op.nodeId))
+		return this.outboundQueue.totalPending - heldQueued + unscanned + this.otherNodesPending
+	}
+
+	/** Unsynced operations held for a principal that is not signed in (RT-38). */
+	private computeHeldCount(): number {
+		if (this.heldNodeIds.size === 0) return 0
+		return (
+			this.heldPending + this.outboundQueue.countMatching((op) => this.heldNodeIds.has(op.nodeId))
+		)
 	}
 
 	/**
@@ -2929,11 +3164,285 @@ export class SyncEngine {
 		})
 	}
 
+	// --- Local nodes, terminal rejections and own-history recovery (Phase 2) ---
+
+	/** Node id of the current session: the store's own, or an adopted node's (RT-40). */
+	private currentNodeId(): string {
+		return this.sessionNodeId ?? this.store.getNodeId()
+	}
+
+	/** A session uploads only operations authored under its own node id (RT-38, RT-40). */
+	private readonly isSessionOperation = (op: Operation): boolean =>
+		op.nodeId === this.currentNodeId()
+
+	/** Whether the queue holds an operation this session may upload. */
+	private hasUploadable(): boolean {
+		return this.outboundQueue.hasOperationsMatching(this.isSessionOperation)
+	}
+
+	/** A queued or in-flight operation by id. */
+	private findQueuedOperation(operationId: string): Operation | undefined {
+		return (
+			this.outboundQueue.getInFlight().find((op) => op.id === operationId) ??
+			this.outboundQueue.getAll().find((op) => op.id === operationId)
+		)
+	}
+
+	/**
+	 * Pick the node this session runs as (RT-40). A local node other than the store's own
+	 * that still has unsynced writes, is not held for another principal (RT-38), was not
+	 * refused in this refusal cycle, and is used by no live tab (its lock is free) is
+	 * adopted: the session runs as that node, uploads its writes with their original
+	 * identity (no re-authoring, so a write its tab sent before closing is deduplicated by
+	 * id), and ends once they are stored; the next session picks again. Also counts the
+	 * other local nodes' unsynced writes, so they are reported (pending, or held).
+	 */
+	private async chooseSessionNode(): Promise<void> {
+		this.endAdoption()
+		const storeNode = this.store.getNodeId()
+		this.sessionNodeId = storeNode
+		this.otherNodesPending = 0
+		this.heldPending = 0
+		this.heldNodeIds = new Set()
+		this.localNodeIds = new Set([storeNode])
+		const syncState = this.syncState
+		if (!syncState?.listLocalNodes) return
+		let nodes: LocalNodeInfo[]
+		let cycle = 0
+		try {
+			nodes = await syncState.listLocalNodes()
+			cycle = (await syncState.loadAcceptedCycle?.()) ?? 0
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Reading the local node registry failed',
+				code: 'NODE_REGISTRY_FAILED',
+			})
+			return
+		}
+		for (const node of nodes) this.localNodeIds.add(node.nodeId)
+		let adopted = false
+		for (const node of nodes) {
+			if (node.nodeId === storeNode) continue
+			if (node.held) this.heldNodeIds.add(node.nodeId)
+			const unsynced = await this.countUnsyncedOfNode(node.nodeId)
+			if (unsynced.count === 0) {
+				if (!node.held) await this.forgetDrainedNode(node.nodeId)
+				continue
+			}
+			if (node.held) {
+				this.heldPending += unsynced.notQueued
+				continue
+			}
+			const refusedThisCycle = node.refusedCycle !== null && node.refusedCycle >= cycle
+			if (!adopted && !refusedThisCycle && this.store.claimLocalNode) {
+				const release = await this.store.claimLocalNode(node.nodeId)
+				if (release) {
+					adopted = true
+					this.releaseAdoption = release
+					this.sessionNodeId = node.nodeId
+					this.emitter?.emit({
+						type: 'sync:local-node',
+						nodeId: node.nodeId,
+						action: 'adoption-started',
+						operationCount: unsynced.count,
+					})
+					continue
+				}
+			}
+			this.otherNodesPending += unsynced.notQueued
+		}
+		if (adopted) {
+			// While adopting, the store's own unsynced tail is not tracked by this session.
+			this.otherNodesPending += (await this.countUnsyncedOfNode(storeNode)).notQueued
+		}
+	}
+
+	/**
+	 * A local node's own operations above its acknowledged prefix that are not
+	 * terminally rejected: `count` all of them, `notQueued` those not in the queue.
+	 */
+	private async countUnsyncedOfNode(nodeId: string): Promise<{ count: number; notQueued: number }> {
+		const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
+		let prefix = 0
+		if (this.syncState?.loadOwnAckedThrough) {
+			prefix = (await this.syncState.loadOwnAckedThrough(nodeId)) ?? 0
+		} else {
+			prefix = this.lastAckedServerVector.get(nodeId) ?? 0
+		}
+		if (localSeq <= prefix) return { count: 0, notQueued: 0 }
+		const ops = (await this.store.getOperationRange(nodeId, prefix + 1, localSeq)).filter(
+			(op) => op.nodeId === nodeId && op.sequenceNumber > prefix,
+		)
+		const terminal = await this.findTerminalRejections(ops.map((op) => op.id))
+		const unsynced = ops.filter((op) => !terminal.has(op.id))
+		return {
+			count: unsynced.length,
+			notQueued: unsynced.filter((op) => !this.outboundQueue.has(op.id)).length,
+		}
+	}
+
+	/** Forget a drained, non-held local node no live tab uses (bounds the registry). */
+	private async forgetDrainedNode(nodeId: string): Promise<void> {
+		if (!this.syncState?.forgetLocalNode || !this.store.claimLocalNode) return
+		const release = await this.store.claimLocalNode(nodeId)
+		if (!release) return
+		try {
+			await this.syncState.forgetLocalNode(nodeId)
+			this.localNodeIds.delete(nodeId)
+		} finally {
+			release()
+		}
+	}
+
+	/** Release the lock on an adopted node (RT-40). */
+	private endAdoption(): void {
+		const release = this.releaseAdoption
+		this.releaseAdoption = null
+		release?.()
+	}
+
+	/** Record an accepted handshake as `nodeId` (RT-38), durably when supported. */
+	private async recordNodeAccepted(nodeId: string): Promise<void> {
+		this.memoryAcceptedNodes.add(nodeId)
+		this.heldNodeIds.delete(nodeId)
+		try {
+			await this.syncState?.markLocalNodeAccepted?.(nodeId)
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Recording the accepted node failed',
+				code: 'NODE_REGISTRY_FAILED',
+			})
+		}
+	}
+
+	/** Which of these operation ids the server refused for good (RT-36). */
+	private async findTerminalRejections(operationIds: string[]): Promise<Set<string>> {
+		const found = new Set<string>()
+		const unknown: string[] = []
+		for (const id of operationIds) {
+			if (this.terminalRejected.has(id)) found.add(id)
+			else unknown.push(id)
+		}
+		if (unknown.length > 0 && this.syncState?.findTerminalRejections) {
+			for (const id of await this.syncState.findTerminalRejections(unknown)) {
+				found.add(id)
+				this.terminalRejected.add(id)
+			}
+		}
+		return found
+	}
+
+	/** Record durable terminal-rejection markers (RT-36). */
+	private async recordTerminalRejections(operations: Operation[], code: string): Promise<void> {
+		if (operations.length === 0 || NON_TERMINAL_REJECTION_CODES.has(code)) return
+		for (const op of operations) this.terminalRejected.add(op.id)
+		const rejectedAt = Date.now()
+		await this.syncState?.recordTerminalRejections?.(
+			operations.map((op) => ({
+				operationId: op.id,
+				nodeId: op.nodeId,
+				sequenceNumber: op.sequenceNumber,
+				code,
+				rejectedAt,
+			})),
+		)
+	}
+
+	/**
+	 * Restart server->client delivery from 0 at the next session, for the requested and the
+	 * accepted views. A full resync includes this client's own operations (a resumed one
+	 * does not), which is how operations the device lost come back (RT-35).
+	 */
+	private async resetDeliveryForFullResync(): Promise<void> {
+		const signatures = new Set([
+			this.deliverySignature(),
+			this.deliverySignatureFor(this.config.scopeMap),
+		])
+		if (this.lastAcceptedScope) signatures.add(this.deliverySignatureFor(this.lastAcceptedScope))
+		this.deliveryWatermark = 0
+		for (const signature of signatures) {
+			this.setViewWatermark(signature, 0)
+			await this.persistDeliveryWatermark(0, signature)
+		}
+	}
+
+	/**
+	 * The server refused an upload with `SEQUENCE_CONFLICT`: it holds another operation of
+	 * this node under that number, one this device lost (RT-35: a reload inside the
+	 * IndexedDB snapshot window, a restored older copy). Not a refusal of the write: it
+	 * gets a fresh number above everything the server holds (same id and content) and is
+	 * uploaded again, and the session ends once its uploads are resolved so the next one
+	 * resyncs from 0 and fetches the lost operation back.
+	 *
+	 * @returns Whether the conflict was recovered (false: treat as a plain rejection)
+	 */
+	private async recoverSequenceConflict(operationId: string): Promise<boolean> {
+		const node = this.currentNodeId()
+		const op = this.findQueuedOperation(operationId)
+		const resequence = this.store.resequenceOperation?.bind(this.store)
+		if (!op || op.nodeId !== node || !resequence) return false
+		const floor = Math.max(this.remoteVector.get(node) ?? 0, op.sequenceNumber)
+		const renumbered = await resequence(op.id, node, floor)
+		await this.withOwnTracking(async () => {
+			// Out of its batch, so the batch's ack cannot resolve it under the old number.
+			await this.outboundQueue.reject(op.id)
+			// The old number belongs to the server's operation.
+			this.markOwnResolved(op)
+			if (renumbered) {
+				await this.outboundQueue.enqueue(renumbered)
+				this.trackOwnOperation(renumbered, true)
+			}
+			await this.advanceOwnPrefixLocked()
+		})
+		this.emitter?.emit({
+			type: 'sync:local-node',
+			nodeId: node,
+			action: 'history-behind',
+			localSequence: op.sequenceNumber,
+			serverSequence: floor,
+		})
+		await this.resetDeliveryForFullResync()
+		this.ownRecoveryPending = true
+		await this.refreshPendingCount()
+		this.maybeEndSessionForNodeWork()
+		return true
+	}
+
+	/**
+	 * End the session when it has done its node work and nothing is in flight: an own-
+	 * history recovery is pending (RT-35: reconnect to resync from 0), or an adopted node's
+	 * writes are all stored (RT-40: reconnect as the next node, or this tab's own).
+	 *
+	 * @returns Whether the session was ended
+	 */
+	private maybeEndSessionForNodeWork(): boolean {
+		if (this.state !== 'streaming' && this.state !== 'syncing') return false
+		if (this.inFlightUploads.size > 0) return false
+		if (this.ownRecoveryPending) {
+			this.ownRecoveryPending = false
+			this.abandonSession('Resyncing operations of this device that its local database lost')
+			return true
+		}
+		const node = this.currentNodeId()
+		if (node === this.store.getNodeId() || this.state !== 'streaming') return false
+		if (this.hasUploadable()) return false
+		const localSeq = this.store.getVersionVector().get(node) ?? 0
+		if (this.ownTrackingNodeId !== node || this.ownAckedThrough < localSeq) return false
+		this.emitter?.emit({ type: 'sync:local-node', nodeId: node, action: 'adoption-completed' })
+		this.endAdoption()
+		this.abandonSession('Uploaded the unsynced writes of a closed tab; reconnecting')
+		return true
+	}
+
 	private flushQueue(): void {
 		if (this.state !== 'streaming') return
 		if (this.inFlightUploads.size > 0) return // one streaming batch in flight at a time
 		if (this.outboundRetryTimer) return // Transient rejection backoff is active
-		if (!this.outboundQueue.hasOperations) return
+		if (!this.hasUploadable()) return
 
 		const entry = this.takeUpload()
 		if (!entry) return
@@ -2958,7 +3467,7 @@ export class SyncEngine {
 	}
 
 	private scheduleOutboundRetry(): void {
-		if (this.outboundRetryTimer || !this.outboundQueue.hasOperations || this.destroyed) return
+		if (this.outboundRetryTimer || !this.hasUploadable() || this.destroyed) return
 		const delay = Math.min(
 			this.outboundRetryMaxDelayMs,
 			this.outboundRetryBaseDelayMs * 2 ** this.outboundRetryAttempt,
