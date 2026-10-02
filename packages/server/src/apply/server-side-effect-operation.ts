@@ -1,5 +1,5 @@
-import { deriveSideEffectOpId } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import { HybridLogicalClock, deriveSideEffectOpId } from '@korajs/core'
+import type { HLCTimestamp, Operation } from '@korajs/core'
 import type { SideEffectOp } from '@korajs/merge'
 import { SERVER_RULE_PREFIX, timestampAfter } from '../constraints/constraint-authority'
 import type { ServerStore } from '../store/server-store'
@@ -74,3 +74,27 @@ export function nextServerSequenceNumber(store: ServerStore): number {
 
 /** Highest server sequence number handed out per store (serialized stores only). */
 const reservedServerSequence = new WeakMap<ServerStore, number>()
+
+/** The clock of each store's server node (see {@link serverClock}). */
+const serverClocks = new WeakMap<ServerStore, HybridLogicalClock>()
+
+/**
+ * The one hybrid logical clock of a store's server node, for server-authored writes
+ * (route mutations). One clock per store, never a fresh one per write: two writes in
+ * the same millisecond must get increasing timestamps, because the fold orders a
+ * record's writes by HLC (then op id), not by arrival. With `after`, the clock is first
+ * advanced past that timestamp (the newest write the caller read), so the new write
+ * sorts after every write it was based on.
+ *
+ * @param store - The server store whose node authors the write
+ * @param after - The newest timestamp the write must follow, if any
+ */
+export function serverClock(store: ServerStore, after?: HLCTimestamp | null): HybridLogicalClock {
+	let clock = serverClocks.get(store)
+	if (!clock) {
+		clock = new HybridLogicalClock(store.getNodeId())
+		serverClocks.set(store, clock)
+	}
+	if (after) clock.advanceTo(after)
+	return clock
+}

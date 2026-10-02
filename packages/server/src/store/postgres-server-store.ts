@@ -1700,6 +1700,9 @@ export class PostgresServerStore implements ServerStore {
 
 		if ('_created_at' in row) record._created_at = row._created_at
 		if ('_updated_at' in row) record._updated_at = row._updated_at
+		// A soft-deleted row (only returned when deleted rows are asked for) says so, so a
+		// caller never mistakes the last values the fold keeps on it for a live record.
+		if (Number(row._deleted) === 1) record._deleted = 1
 
 		return record
 	}
@@ -1867,6 +1870,11 @@ export class PostgresServerStore implements ServerStore {
 					PRIMARY KEY (collection, record_id)
 				)
 			`)
+			// A pre-release table may lack it; '' never matches an operation id, so such a
+			// state is re-folded on its next use.
+			await tx.execute(
+				sql`ALTER TABLE kora_fold_state ADD COLUMN IF NOT EXISTS covered_op_id TEXT NOT NULL DEFAULT ''`,
+			)
 			// A record's newest delivery sequence in one probe (the fold freshness check),
 			// and the migration's record paging.
 			await tx.execute(

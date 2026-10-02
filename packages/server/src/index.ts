@@ -96,7 +96,8 @@ export type { KoraAuthProviderOptions } from './auth/kora-auth-provider'
 export type { MixedAuthProviderOptions } from './auth/mixed-auth-provider'
 
 // === Classes ===
-export { MemoryServerStore } from './store/memory-server-store'
+export { MemoryServerStore, type MemoryServerStoreOptions } from './store/memory-server-store'
+export type { FoldMigrationReport } from './store/record-fold'
 export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
 export { HttpServerTransport } from './transport/http-server-transport'

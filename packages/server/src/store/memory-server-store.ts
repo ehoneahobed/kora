@@ -538,7 +538,7 @@ export class MemoryServerStore implements ServerStore {
 		const result = new Map<string, MaterializedRecord>()
 		for (const id of ids) {
 			const record = records?.get(id)
-			if (record) result.set(id, record)
+			if (record) result.set(id, { ...record })
 		}
 		return result
 	}
@@ -615,6 +615,8 @@ export class MemoryServerStore implements ServerStore {
 			}
 			if ('_created_at' in r) clean._created_at = r._created_at
 			if ('_updated_at' in r) clean._updated_at = r._updated_at
+			// A soft-deleted row (returned only with includeDeleted) says so.
+			if (r._deleted === 1) clean._deleted = 1
 			return clean
 		})
 	}
