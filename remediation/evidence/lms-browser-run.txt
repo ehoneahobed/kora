@@ -1,0 +1,103 @@
+
+=== LMS-5a
+       first install: {"ms":33.044999999925494,"capacity":6,"files":[]}; second: {"name":"NoModificationAllowedError","message":"Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."}
+PASS [LMS-5a] fact: default pool capacity is 6
+       capacity=6
+PASS [LMS-5a] fact: 2nd context installing same pool gets NoModificationAllowedError
+       {"name":"NoModificationAllowedError","message":"Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."}
+PASS [LMS-5a] fact: once the holder worker is terminated, a re-install succeeds quickly
+       succeeded after 97ms / 1 tries
+
+=== LMS-5b
+       alice: {"ok":true,"ms":286.1199999998789,"state":{"persistent":true,"mode":"opfs"},"role":"leader"}
+       bob:   {"ok":true,"ms":135.09000000008382,"state":{"persistent":false,"mode":"memory","fallbackReason":"lock-conflict"},"role":"leader"}
+FAIL [LMS-5b] second tab (different dbName) gets durable storage
+       bob state={"persistent":false,"mode":"memory","fallbackReason":"lock-conflict"} role=leader
+       bob events: ["store:opfs-unavailable"]
+FAIL [LMS-5b] bob's write from that session survives reload
+       reopen state={"persistent":true,"mode":"opfs"} titles=[]
+
+=== LMS-5c
+       session-2 (IDB fallback) open={"ok":true,"ms":147.1500000001397,"state":{"persistent":true,"mode":"indexeddb"},"role":"leader"} titles=[]
+FAIL [LMS-5c] fallback session sees data written in earlier OPFS session
+       titles=[]
+FAIL [LMS-5c] next OPFS session sees writes made during fallback session
+       state={"persistent":true,"mode":"opfs"} titles=["opfs-row-session-1"]
+
+=== LMS-5d
+PASS [LMS-5d] fact: same-dbName second tab is a follower (does not install the pool)
+       role=follower
+       B role=leader insert={"ok":true,"ms":21.270000000018626} titles=["after-handoff","before-handoff"] events=["store:db-name-collision"]
+PASS [LMS-5d] promoted follower still sees pre-handoff data
+       titles=["after-handoff","before-handoff"]
+PASS [LMS-5d] write made by promoted follower is durable
+       titles after reopen=["after-handoff","before-handoff"]
+
+=== LMS-5e
+       B role=leader insert={"ok":true,"ms":19.489999999990687} titles=["after-close","before-close"]
+PASS [LMS-5e] after leader tab closes, promoted follower writes are durable
+       titles=["after-close","before-close"]
+
+=== LMS-5f
+       D got pool after 0 tries; B role=leader write={"ok":true,"ms":1.8299999998416752} titles=["after-promotion"] events=["store:db-name-collision"]
+FAIL [LMS-5f] promoted follower either has durable storage or surfaces a blocking error/event
+       titles=["after-promotion"] events=["store:db-name-collision"]
+FAIL [LMS-5f] write accepted by promoted follower is durable
+       titles after reopen=["before-promotion"]
+
+=== LMS-5g
+       modes across reloads: ["opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs"]
+PASS [LMS-5g] every reload re-opens durable OPFS storage
+       ["opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs","opfs"]
+
+=== LMS-5h
+       first: NoModificationAllowedError; retry after holder released (LMS patch args): {"name":"NoModificationAllowedError","message":"Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."}
+FAIL [LMS-5h] LMS retry (same worker, no forceReinitIfPreviouslyFailed) succeeds once holder is gone
+       {"name":"NoModificationAllowedError","message":"Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."}
+PASS [LMS-5h] fact: retry with forceReinitIfPreviouslyFailed:true succeeds
+       {"ms":12.004999999888241,"capacity":6,"files":[]}
+
+=== LMS-6a
+       user1: open={"persistent":true,"mode":"opfs"} insert=ok
+       user2: open={"persistent":true,"mode":"opfs"} insert=ok
+       user3: open={"persistent":true,"mode":"opfs"} insert=ok
+       user4: open={"persistent":true,"mode":"opfs"} insert=ok
+       user5: open={"persistent":true,"mode":"opfs"} insert=ok
+       user6: open="Failed to open database: SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file" insert=not opened
+       user7: open="Failed to open database: SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file" insert=not opened
+       user8: open="Failed to open database: SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file" insert=not opened
+FAIL [LMS-6a] 8 per-user Kora databases on one origin all open durably and accept writes
+       first failure at user #6
+FAIL [LMS-6a] existing user #1 can still write after pool filled by other users
+       open={"persistent":true,"mode":"opfs"} write={"ok":false,"ms":9.425000000046566,"error":"Execute failed: SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file","name":"AdapterError"}
+
+=== LMS-6c
+       open on full pool: {"ok":false,"error":"Failed to open database: SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file","code":"INIT_ERROR"}
+FAIL [LMS-6c] failed adapter.open() releases the SAH pool (another context can install it)
+       {"name":"NoModificationAllowedError","message":"Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."}
+
+=== LMS-6b
+       verbatim fix (regex /SAH pool is full/ on error.message): {"id":20,"ok":false,"error":{"name":"SQLite3Error","message":"SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file"}}
+FAIL [LMS-6b] fact: with sqlite-wasm 3.51 the thrown error matches the fix regex /SAH pool is full/
+       {"name":"SQLite3Error","message":"SQLITE_CANTOPEN: sqlite3 result code 14: unable to open database file"}
+       fix with matcher widened to CANTOPEN: {"id":21,"ok":true,"data":{"evicted":["/alice.db","/bob.db","/carol.db","/dave.db","/erin.db","/frank.db"],"files":["/grace.db"]}}
+FAIL [LMS-6b] proposed eviction keeps other users' databases (with unsynced ops)
+       evicted=["/alice.db","/bob.db","/carol.db","/dave.db","/erin.db","/frank.db"]
+
+=== LMS-7a
+       calibration: 3e6 rows in 891ms -> using n=20211774 (~6s)
+       in-flight result after leader tab close: {"ok":false,"ms":519.2399999999907,"error":"Follower bridge terminated","name":"Error"} (21ms after close)
+PASS [LMS-7a] in-flight follower RPC settles within 5s of leader tab death
+       21ms, Follower bridge terminated
+PASS [LMS-7a] retry after promotion succeeds
+       {"ok":true,"ms":178.54000000003725}
+
+=== LMS-7b
+       in-flight result: {"ok":false,"ms":30000.62999999989,"error":"Worker did not respond within 30000ms for operation \"follower-rpc:query\"","name":"WorkerTimeoutError"} (26996ms after leader hang)
+FAIL [LMS-7b] in-flight request detects unresponsive leader within ~2 probe intervals (<6s)
+       26996ms -> Worker did not respond within 30000ms for operation "follower-rpc:query"
+       new write while leader hung: {"ok":false,"ms":4001.4849999998696,"error":"No live leader tab is answering multi-tab storage RPC for operation \"follower-rpc:execute\"","name":"NoLeaderError"} (4005ms)
+FAIL [LMS-7b] follower can still write while leader tab is hung (failover)
+       {"ok":false,"ms":4001.4849999998696,"error":"No live leader tab is answering multi-tab storage RPC for operation \"follower-rpc:execute\"","name":"NoLeaderError"}
+
+11/25 checks passed

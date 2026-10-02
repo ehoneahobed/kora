@@ -13,6 +13,7 @@ import { SyncEncryptor, SyncEngine } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { ApplyPipeline } from './apply-pipeline'
 import { wireAuditPersistence } from './audit-bridge'
+import { transportAuthState } from './auth-sync-coordinator'
 import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
@@ -65,6 +66,9 @@ export async function initializeApp(
 		config.store?.workerResponseTimeoutMs,
 		config.store?.sharedWorkerUrl,
 		adapterType === 'sqlite-wasm',
+		// createApp inspects the open state below and moves to durable IndexedDB
+		// itself; a later leader promotion that loses durability is still refused.
+		{ allowNonDurable: config.store?.allowNonDurable === true, deferOpenCheck: true },
 	)
 
 	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
@@ -131,6 +135,10 @@ export async function initializeApp(
 				config.store?.workerResponseTimeoutMs,
 				config.store?.sharedWorkerUrl,
 				true,
+				// Neither OPFS nor IndexedDB is durable here. Without an explicit
+				// opt-in the adapter emits store:durability-lost and refuses writes
+				// (NEW-STORE-6) instead of running silently in memory.
+				{ allowNonDurable: config.store?.allowNonDurable === true },
 			)
 			store = buildStore(adapter)
 			await store.open()
@@ -180,7 +188,7 @@ export async function initializeApp(
 				url: config.sync.url,
 				transport: config.sync.transport,
 				auth: syncAuth,
-				authState: authBinding?.resolveSyncState,
+				authState: transportAuthState(authBinding),
 				querySubsets: config.sync.querySubsets,
 				scopeExit: config.sync.scopeExit,
 				batchSize: config.sync.batchSize,

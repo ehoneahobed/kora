@@ -1,0 +1,2178 @@
+{
+ "version": 1,
+ "source": "remediation/evidence/kora-fix-plan.md",
+ "statuses": [
+  "open",
+  "in_progress",
+  "mitigated",
+  "fixed",
+  "wontfix"
+ ],
+ "problems": [
+  {
+   "id": "SEC-1",
+   "title": "Operation batches accepted before handshake (unauthenticated writes)",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "ClientSession.handleMessageAsync refuses every non-handshake message before syncing/streaming (HANDSHAKE_REQUIRED, close); uplink scopes fail closed when auth is set but unauthenticated."
+  },
+  {
+   "id": "SEC-2",
+   "title": "Upload authorization trusts client previousData/data instead of the stored row",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Shared authorizeUplinkWrite (stored row incl. deleted + post-image in scope, never previousData) used by sync uploads and re-checked inside each store apply (memory sync apply, SQLite write tx, Postgres tx under the delivery-counter lock)."
+  },
+  {
+   "id": "SEC-3",
+   "title": "op.nodeId not bound to session; forged sequence silently drops a victim's offline writes",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Server half done: NODE_ID_MISMATCH for op.nodeId/timestamp.nodeId != session node (stored echoes ack as duplicates), ServerStore.claimNode at authenticated handshake (NODE_ID_CLAIMED). Client half (never trust server vector for own node, upload only own ops; W3 step 1b) still open. Server half (NODE_ID_MISMATCH, claimNode) + client uploads only own ops (S1). Client-side defence in depth (never trust server vector for own node) lands with W3 step 2."
+  },
+  {
+   "id": "SEC-4",
+   "title": "Handshake response leaks the full server version vector",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Handshake response vector limited to nodes the client reported, its own, and nodes whose in-scope ops it is about to receive (stream collected before answering); reject path sends {}."
+  },
+  {
+   "id": "SEC-5",
+   "title": "Yjs, awareness and blob relays bypass auth and scope",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Relays joined only at streaming (onReady); yjs updates write-checked and delivered only to sessions whose downlink scope holds the stored record; awareness binds clientId and partitions by scope; blob pending capped per session with TTL and request-id hijack refused; push size + per-session quota; ws maxPayload 32 MiB. Remainder: blob push not yet restricted to hashes referenced by the session ops. REOPENED by red team (RT-1): blob relay still forwards requests/answers across tenants and the central store answers any hash. RT-1 fixed: blob requests are served/forwarded only within the requester tenant (central store only for hashes referenced by a live record in its download scope), responses only from asked peers and hash-verified. Remaining hardening (not a repro): blob push is still not restricted to hashes referenced by the session ops."
+  },
+  {
+   "id": "SEC-6",
+   "title": "Route-context scope check ignores stored row; limit applied before scope",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Route prepareMutation and the conditional store path use authorizeUplinkWrite against the stored row (in-store re-check on commit; Postgres conditional reads in its tx); query pushes equality scope into where and paginates after $in filtering."
+  },
+  {
+   "id": "SEC-7",
+   "title": "SQL injection via orderBy direction / limit / offset (local store)",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SEC-8",
+   "title": "Auth token sent in the WebSocket URL",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "WebSocketTransport no longer puts the token in the URL; opt-in tokenInUrl; tests inverted, docs updated; repro fixed to use a constructible fake."
+  },
+  {
+   "id": "SEC-9a",
+   "title": "request.ip trusts spoofed X-Forwarded-For",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SEC-9.test.ts",
+     "title": "(a)"
+    }
+   ],
+   "pr": null,
+   "notes": "createProductionServer trustProxy (hop count or IP/CIDR list, IPv4/IPv6); default request.ip is the socket address."
+  },
+  {
+   "id": "SEC-9b",
+   "title": "Unescaped quotes in DDL defaults",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SEC-9.test.ts",
+     "title": "(b)"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SEC-1",
+   "title": "Route-context scope matcher ignores $in",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-SEC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Route recordMatchesScope uses the shared matcher (adds $in) for query and findById."
+  },
+  {
+   "id": "NEW-SEC-2",
+   "title": "previousData.id forgery bypasses id-scoped uplink checks",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-8.test.ts",
+     "title": "authorize an update to an out-of-scope record"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "forged previousData.id must not authorize a delete"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "insert whose recordId is in an id-scoped uplink"
+    }
+   ],
+   "pr": null,
+   "notes": "One shared buildScopeSnapshot (@korajs/sync/internal) sets id = recordId last for client scope, query-subset and server filters; authorizeUplinkWrite rejects data/previousData id != recordId (INVALID_OPERATION); stored row always loaded for scoped uploads."
+  },
+  {
+   "id": "AUTH-1",
+   "title": "Sync scope is client-controlled; handshake can widen access",
+   "severity": "P0",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-1.test.ts"
+    },
+    {
+     "file": "LMS-11.test.ts",
+     "title": "must NOT be widened"
+    },
+    {
+     "file": "LMS-11.test.ts",
+     "title": "must NOT become writable"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+  },
+  {
+   "id": "AUTH-2",
+   "title": "Revoked device keeps working via refresh and HTTP routes",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 2. BuiltInAuthRoutes.authenticateAccess() used by every route, requireAuthUser and the sync provider; refresh checks device record and user."
+  },
+  {
+   "id": "AUTH-3",
+   "title": "OAuth state not bound to initiator or purpose (link CSRF takeover)",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 7. OAuth state bound to purpose/user/client binding (HttpOnly cookie or body); POST /oauth/:p/link/start; device id never from state metadata."
+  },
+  {
+   "id": "AUTH-4",
+   "title": "Invitations claimable by anyone; cross-org revoke",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 8. listMyInvitations(userId) resolves verified email server-side and strips tokens; accept requires verified email match (checked before consume); OrgStore.revokeInvitation(orgId, id)."
+  },
+  {
+   "id": "AUTH-5",
+   "title": "Client-chosen deviceId not bound to user (lockout attack)",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 3. registerDevice throws DeviceOwnershipError (409) in memory/SQLite/Postgres stores; random default device id; OAuth ignores state device ids."
+  },
+  {
+   "id": "AUTH-6",
+   "title": "Concurrent refreshes with one token both succeed",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 4. TokenRevocationStore.consume() atomic (SQLite/Postgres INSERT ON CONFLICT); same-instance duplicates get 409 REFRESH_IN_PROGRESS. Postgres contract test passes against PG16 (KORA_PG_TEST_URL)."
+  },
+  {
+   "id": "AUTH-7",
+   "title": "Reset token disclosed without callback; reset does not revoke sessions",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 steps 2+9. Reset token never disclosed (exposeTokenForDevelopment opt-in, never in production; loud error when no callback, no constructor throw because the repro constructs one); reset/change revoke all earlier credentials; atomic reset-token consume. Repro AUTH-7 opts into allowInMemory for its production case."
+  },
+  {
+   "id": "AUTH-8",
+   "title": "Sign-out does not stop the access token on HTTP routes",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 2 (authenticateAccess on HTTP routes)."
+  },
+  {
+   "id": "AUTH-9",
+   "title": "Account enumeration by timing; weak sign-in rate limit",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 9. Dummy-hash KDF for unknown emails; per-account and per-IP limiter keys. Client IP trust is W1 step 7 (SEC-9a)."
+  },
+  {
+   "id": "AUTH-10",
+   "title": "MFA not enforced at issuance; TOTP brute force and replay",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 10. MFA challenge at issuance (mfa_pending token, POST /auth/mfa/verify, amr); TOTP failure backoff persisted; consumeCode in disable/regenerate."
+  },
+  {
+   "id": "AUTH-11",
+   "title": "Live sync sessions never re-checked after revocation or expiry",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 5. KoraSyncServer.terminateSessions({userId?, deviceId?, code?}) sends retriable AUTH_REVOKED/AUTH_EXPIRED and closes matching sessions (verified principal only; revocations arriving mid-handshake are applied once the principal is known). KoraSyncServer follows AuthProvider.onRevoke automatically (built-in toSyncAuthProvider exposes it; MixedAuthProvider forwards it); createKoraAuthServer().bindSyncServer(server) remains for wrapped/custom providers. ClientSession arms an expiry timer from AuthContext.expiresAt (AUTH_EXPIRED, retriable; already-expired credential refused at handshake; timer cleared on every close path; re-armed past the setTimeout limit). Client: SyncEngine treats AUTH_EXPIRED/AUTH_REVOKED as refresh-then-reconnect (sync auth callback called with {forceRefresh:true}; binding calls AuthClient.refreshAccessToken(); empty token after a forced refresh fails the attempt with AUTH_REFRESH_PENDING instead of handshaking). Password reset/change and AdminApi reach it via onPasswordChanged / revokeAllForUser = authServer.revokeAllForUser. Repro harness: the stolen client's send is wrapped in try/catch because the closed in-memory transport throws."
+  },
+  {
+   "id": "AUTH-12",
+   "title": "In-memory revocation store in quickstart; no persistent store ships",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 4. SqliteTokenRevocationStore / PostgresTokenRevocationStore; user stores expose getTokenRevocationStore() used by default; production refuses in-memory stores unless allowInMemory; templates use persistent user stores."
+  },
+  {
+   "id": "AUTH-13",
+   "title": "Offline users are signed out and their refresh token destroyed",
+   "severity": "P0",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-13.test.ts"
+    },
+    {
+     "file": "LMS-1.test.ts",
+     "title": "transient refresh failures"
+    },
+    {
+     "file": "LMS-1.test.ts",
+     "title": "bounded in time"
+    },
+    {
+     "file": "LMS-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 6. Only a Kora JSON 401 / 400 invalid_grant clears tokens; request timeout; backoff + Retry-After; Web Locks single refresher; authenticated-offline session (identity from stored credentials) used by createKoraAuthSync, namespaceByAuthUser and AuthBoundKoraProvider; maxOfflineGraceMs lock; clock-rollback guard."
+  },
+  {
+   "id": "AUTH-14",
+   "title": "Passkey UV, external JWT exp/aud/iss, webhook replay/SSRF, AdminApi authz",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "AUTH-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 11. Passkey UV enforced; ExternalJwt exp required + aud/iss (supabase default aud); webhook timestamped signatures + https/public targets + DNS check; AdminApi isAdmin + credential revocation."
+  },
+  {
+   "id": "NEW-AUTH-1",
+   "title": "One retried refresh permanently bans the device from sync",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-AUTH-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 3. Device revocation is a cut-off (revokedBefore); reuse revokes the token family."
+  },
+  {
+   "id": "NEW-AUTH-2",
+   "title": "Two tabs refreshing at once sign out every tab",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-1.test.ts",
+     "title": "two tabs sharing token storage"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 6. Web Locks single refresher with storage re-read (in-realm fallback), and the server grace replay covers cross-realm races."
+  },
+  {
+   "id": "NEW-AUTH-3",
+   "title": "Lost rotation response triggers reuse-detection sign-out",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-1.test.ts",
+     "title": "lost refresh response"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 3. One grace replay within 30s returns the byte-identical successor pair (deterministic jtis, nothing stored); closed once the successor is used."
+  },
+  {
+   "id": "NEW-AUTH-4",
+   "title": "restoreSession treats a 401 from /auth/me as offline",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-AUTH-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W2 step 6. restoreSession treats a Kora JSON 401 from /auth/me as definitive. Repro written: packages/auth/tests/repro/NEW-AUTH-4.test.ts (fails at beta.12)."
+  },
+  {
+   "id": "SYNC-1",
+   "title": "Own edits leaving a query subset are never uploaded",
+   "severity": "P0",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SYNC-1.test.ts"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "must not be silently kept local-only"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1/W3 step 1(a)(b): uploads (pushOperation, sendDelta, reconcile) check the uplink scope only, never query subsets; collectDelta and reconcile upload only own-node ops. An own op on a synced collection outside the uplink scope is recorded in the rejected store (OUT_OF_UPLINK_SCOPE) and emitted as sync:operation-rejected instead of being kept silently. Interim: durable 'not upload-eligible' bookkeeping and the contiguous acked prefix remain W3 step 2. Inbound filtering unchanged (SYNC-2, W4)."
+  },
+  {
+   "id": "SYNC-2",
+   "title": "Inbound ops filtered by uplink scope (read-only data dropped)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-2.test.ts"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "downlink {c1,c2}, uplink {c1}"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] read-only learner"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-3",
+   "title": "Non-success apply results advance the watermark (ops lost)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-4",
+   "title": "Acks not matched to batches; handshake-delta ops dropped before ack",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-5",
+   "title": "Engine goes offline without closing the transport; sockets leak",
+   "severity": "P2",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-6",
+   "title": "OutboundQueue seen-set grows forever",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-7",
+   "title": "One far-future op blocks the delivery stream",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-8",
+   "title": "Reconnect backoff never grows",
+   "severity": "P2",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-9",
+   "title": "Protobuf negotiation lossy and unsafe if enabled",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-10",
+   "title": "Timers and async sends outlive stop/close",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SYNC-11",
+   "title": "Accepted-scope change wedges sync after first reconnect",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SYNC-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-1",
+   "title": "Duplicate final batch never completes initial sync",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-SYNC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-2",
+   "title": "Reconnect loop can miss a disconnect racing start()",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-SYNC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-3",
+   "title": "Inbound insert dropped under id-scoped downlink",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-8.test.ts",
+     "title": "[fails today] inbound, non-directional"
+    },
+    {
+     "file": "LMS-8.test.ts",
+     "title": "[fails today] inbound, directional"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SYNC-4",
+   "title": "Fresh client drops an update batched with its insert; watermark advances",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] insert + partial update"
+    },
+    {
+     "file": "LMS-9.test.ts",
+     "title": "[fails today] while the session stays up"
+    }
+   ],
+   "pr": null,
+   "notes": "Fixed alongside RT-19: the client's inbound scope filter is judged per operation in apply order, so a partial update delivered in the same batch as its insert is judged on the row the insert just materialized instead of being dropped (and skipped by the watermark). LMS-9 '[fails today] insert + partial update' and '...session stays up' pass."
+  },
+  {
+   "id": "ENC-1",
+   "title": "Random salt per process: encryption cannot work across devices",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "ENC-2",
+   "title": "Decrypt failure treated as a connection failure (infinite loop)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "ENC-3",
+   "title": "No AAD; plaintext accepted when encryption is on",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "ENC-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-ENC-1",
+   "title": "Schema-aware server rejects every encrypted op",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-ENC-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-1",
+   "title": "Server materialization differs from client merge",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Array case now agrees (S1 interim: replayOperationsForRecord uses mergeArraySet against previousData). Object and custom-resolver cases remain for W7."
+  },
+  {
+   "id": "SRV-2",
+   "title": "Record moving into scope arrives without its insert",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "SRV-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Fixed by RT-19 (server-built scope-entry insert; RT-14 forbids sending the earlier history the plan proposed). SRV-2.test.ts passes."
+  },
+  {
+   "id": "SRV-3",
+   "title": "Delivery stream re-sends unacked backlog on every write",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-4",
+   "title": "Postgres per-instance vector cache; dedup race; INTEGER overflow",
+   "severity": "P2",
+   "workstream": "W10a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-5",
+   "title": "Delivery stream buffers the whole backlog in memory",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "SRV-6",
+   "title": "No heartbeat/timeouts/limits; HTTP sessions never expire; unbounded bodies",
+   "severity": "P1",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-6.test.ts"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "must probe an idle WebSocket"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "must be reaped after inactivity"
+    }
+   ],
+   "pr": null,
+   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat."
+  },
+  {
+   "id": "SRV-7",
+   "title": "No compaction; each write replays full record history",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "SRV-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-1",
+   "title": "Memory store rebuild scans the whole log per write",
+   "severity": "P3",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-2",
+   "title": "Concurrent duplicate on Postgres runs the cascade twice",
+   "severity": "P3",
+   "workstream": "W10a",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-3",
+   "title": "Orphan updates stay forever after a missed scope entry",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-19.test.ts",
+     "title": "NEW-SRV-3"
+    }
+   ],
+   "pr": null,
+   "notes": "Fixed by RT-19: the new owner materializes the record from the scope-entry insert and later edits apply on top (client folds any orphaned update when the insert lands). Acceptance: RT-19.test.ts \"NEW-SRV-3\"."
+  },
+  {
+   "id": "NEW-SRV-4",
+   "title": "Postgres backfill reruns fully on every restart",
+   "severity": "P2",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "benchmark:"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-5",
+   "title": "Backfill overwrites live writes during rolling deploy",
+   "severity": "P1",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "must not overwrite a concurrent live write"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-SRV-6",
+   "title": "Tombstones lose scope fields; deleted records reappear for scoped clients",
+   "severity": "P1",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-10.test.ts",
+     "title": "deleted record must keep its scope fields"
+    }
+   ],
+   "pr": null,
+   "notes": "Fixed by RT-14 (delivery symptom): the snapshot backfill replays the log, so a delete keeps the record last values in its scope snapshot and scoped clients receive it. The Postgres materialized tombstone written by the backfill still has NULL fields; delivery no longer depends on it."
+  },
+  {
+   "id": "NEW-SRV-7",
+   "title": "Retract mode looks up records for ops that can never exit scope",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "LMS-11.test.ts",
+     "title": "retract policy issues a record lookup"
+    }
+   ],
+   "pr": null,
+   "notes": "Fixed by RT-14/RT-15: retraction is judged on the per-operation scope snapshot (snapshotExitsScopes; only updates can exit), so retract mode issues no record lookups."
+  },
+  {
+   "id": "NEW-SRV-8",
+   "title": "Static server: no validators/compression, SPA fallback for missing assets, wrong MIME",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-13.test.ts",
+     "title": "correct behaviour"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-1",
+   "title": "app.transaction reuses sequence numbers; later writes never uploaded",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "mitigated",
+   "tests": [
+    {
+     "file": "STORE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
+  },
+  {
+   "id": "STORE-2",
+   "title": "Cascade deletes inside transactions collide on sequence numbers",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-3",
+   "title": "Transactional writes skip per-field version stamps",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-4",
+   "title": "Secret fields stored and synced in plaintext via transactions",
+   "severity": "P0",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "STORE-4.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 stopgap: TransactionContext insert/update route secret fields through the shared toAtRestWriteData helper (same as executeInsert/executeUpdate). W6 keeps the helper."
+  },
+  {
+   "id": "STORE-5",
+   "title": "Backup restore corrupts timestamps and copies device identity",
+   "severity": "P0",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-6",
+   "title": "IndexedDB follower tab overwrites the leader's live DB",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-7",
+   "title": "IndexedDB flushNow re-entrancy loses writes",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-8",
+   "title": "execute/query bypass the adapter mutex",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-9",
+   "title": "Concurrent atomic increments lose updates locally",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-10",
+   "title": "Multi-tab: duplicate apply not notified; per-tab vectors",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-11",
+   "title": "Documented createdAt/updatedAt queries throw",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-12",
+   "title": "Subscription diff re-notifies; errors swallowed",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-13",
+   "title": "Migrations not atomic; backfills never sync",
+   "severity": "P1",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-13.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-14",
+   "title": "Compaction breaks fold and dedup",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-15",
+   "title": "Dedup race, index name collisions, quota mapping",
+   "severity": "P3",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "STORE-15.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "STORE-16",
+   "title": "Benchmark gates do not measure the browser path",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-1",
+   "title": "Backfill transform receives raw SQLite rows",
+   "severity": "P2",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-2",
+   "title": "Transactions bypass state machine validation",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-3",
+   "title": "Field-level .transitions() never enforced",
+   "severity": "P1",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "NEW-STORE-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-4",
+   "title": "persist() awaited in startup (can hang ready); result discarded",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-5",
+   "title": "Origin-wide SAH pool vs per-DB leader: second DB non-durable or disjoint",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-5b"
+    },
+    {
+     "browser": "LMS-5c"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-6",
+   "title": "Promoted leader silently runs in memory",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "mitigated",
+   "tests": [
+    {
+     "browser": "LMS-5f"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 interim: SqliteWasmAdapter open() and promoteToLeader() that end non-durable (or a failed promotion re-open) emit the blocking store:durability-lost event and refuse writes with StorageDurabilityError unless allowNonDurable is set (createApp: store.allowNonDurable; its OPFS probe defers only the open check because it falls back to IndexedDB itself). Real Chromium LMS-5f: blocking check passes; 'write accepted by promoted follower is durable' still fails by design (the write is refused, not made durable) until W8a per-database pools."
+  },
+  {
+   "id": "NEW-STORE-7",
+   "title": "Pool capacity exhaustion bricks writes for every user",
+   "severity": "P0",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "mitigated",
+   "tests": [
+    {
+     "browser": "LMS-6a"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 interim: the SQLite WASM worker calls pool.reserveMinimumCapacity(fileCount + 2 + headroom 2) before every OPFS SAH pool open. Real Chromium LMS-6a both checks pass (8 per-user DBs durable; user #1 still writes). No eviction. Manifest, listDatabases/deleteDatabase and per-database pools remain W8a."
+  },
+  {
+   "id": "NEW-STORE-8",
+   "title": "Failed open leaks worker and leader lock",
+   "severity": "P1",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "LMS-6c"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-9",
+   "title": "Hung leader not detected; no failover",
+   "severity": "P2",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "LMS-7.test.ts"
+    },
+    {
+     "browser": "LMS-7b"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-10",
+   "title": "close() releases leader lock before the pool holder stops",
+   "severity": "P2",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-STORE-11",
+   "title": "PRAGMA WAL is a no-op on sahpool; spec says WAL",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "MERGE-1",
+   "title": "Array merge loses one-sided removals",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "mitigated",
+   "tests": [
+    {
+     "file": "MERGE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+  },
+  {
+   "id": "MERGE-2",
+   "title": "Pairwise merge diverges permanently for arrays and objects",
+   "severity": "P0",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "MERGE-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-MERGE-1",
+   "title": "Unchanged array in a concurrent update undoes a removal (2 devices)",
+   "severity": "P0",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "mitigated",
+   "tests": [
+    {
+     "file": "NEW-MERGE-1.test.ts"
+    }
+   ],
+   "stopgap": {
+    "workstream": "S1",
+    "phase": 1,
+    "status": "fixed"
+   },
+   "pr": null,
+   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7."
+  },
+  {
+   "id": "CORE-1",
+   "title": "Op id hash omits fields; ids never verified on receive",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "CORE-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-1",
+   "title": "Insert/record types are vacuous (FieldBuilder phantom params)",
+   "severity": "P1",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/DX-1.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-2",
+   "title": "where/orderBy/include/transactions/useCollection untyped",
+   "severity": "P2",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/DX-2.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-3",
+   "title": "Docs contradict the code (first-run tutorial crashes)",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-4",
+   "title": "findById before ready returns null silently",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-5",
+   "title": "useMutation unstable identities and resubscribes",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-6",
+   "title": "SSR broken (getServerSnapshot, eager native SQLite)",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-7",
+   "title": "Vue useQuery not reactive to input changes",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-8",
+   "title": "Deploy prompt offers stub platforms",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "DX-9",
+   "title": "Shadowed collection names give no runtime warning",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "DX-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-1",
+   "title": "useCollaborators has no getServerSnapshot",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-2",
+   "title": "DynamicProtobufSerializer is dead code",
+   "severity": "P3",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-DX-3",
+   "title": "Scaffolded apps cannot open offline (no service worker)",
+   "severity": "P1",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "browser": "NEW-DX-3"
+    }
+   ],
+   "pr": null,
+   "notes": ""
+  },
+  {
+   "id": "NEW-TEST-1",
+   "title": "Timing-dependent tests flake under load (indexeddb debounce, apply-order-determinism 5s timeout)",
+   "severity": "P3",
+   "workstream": "W0",
+   "phase": 0,
+   "status": "fixed",
+   "tests": [],
+   "acceptance": "Make both tests deterministic (fake timers / no wall-clock budget); CLAUDE.md anti-pattern #9.",
+   "pr": null,
+   "notes": "Found 2026-10-01: both failed in a full pnpm test run while other heavy jobs ran; pass in isolation. Fixed 2026-10-02: the indexeddb debounce test runs on fake setTimeout and asserts exactly one flush; apply-order-determinism carries a 300 s ceiling instead of the 5 s default; production-server, trust-proxy, route-context, SEC-9, SRV-6, LMS-12 and LMS-13 tests bind port 0 (EADDRINUSE under parallel load).",
+   "acceptanceTest": "packages/store/src/adapters/indexeddb-adapter.test.ts \"coalesces rapid executes into one debounced persist\" (fake timers, counts flushes); packages/store/tests/integration/apply-order-determinism.test.ts (no tight wall-clock budget); server HTTP tests bind port 0 (createProductionServer.start() returns the bound URL). Root pnpm test passed twice, including one uncached turbo run."
+  },
+  {
+   "id": "RT-1",
+   "title": "Blob chunk requests/responses relayed across tenants; central store serves any hash to any session",
+   "severity": "P0",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-1.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: BlobAccessIndex (server/src/richtext/blob-access-index.ts) answers whether a live record in a download scope references a hash (BlobRef.hash, manifestHash, or a chunk of a manifest read from the central store or learned from relay-verified bytes); scoped query over blob collections, cached per scope, invalidated on every local write / delivery-log advance / 5 s TTL (cost O(records in scope with blobs) per rebuild; a store hash index is the follow-up). BlobChunkRelay takes a BlobAccessPolicy: central store serves only requesters whose scope references the hash; requests are forwarded only to peers with the same download scope (partition key) or, across scopes, when both reference the hash; responses accepted only from asked peers and only when bytes hash to the requested hash; otherwise bytes:null. Policy errors fail closed."
+  },
+  {
+   "id": "RT-2",
+   "title": "HTTP long-poll: clientId alone binds a request to an authenticated session (session hijack)",
+   "severity": "P0",
+   "workstream": "W5",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-2.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: HttpSyncRequest drops clientId, gains sessionId (x-kora-session) and authorization. The handshake POST opens a session and the 202 returns a server-issued 256-bit id; unknown ids are 404. With auth, every request is authenticated and must match user+device+anonymity of the opener and of the handshake principal (401/403; mismatch ends the session). HTTP sessions idle for httpSessionIdleTimeoutMs (default 2 min) close. HttpLongPollingTransport polls only after the id is issued, sends id + bearer on every request, serializes POSTs, closes on 401/403/404/410. Integration test: tests/integration/http-long-poll.test.ts."
+  },
+  {
+   "id": "RT-3",
+   "title": "Download visibility trusts writer previousData: cross-tenant op injection into other tenants' logs",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-3.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: buildScopeSnapshot layers previousData only with { includePreviousData: true }. Server visibility (live relay, version-vector delta, delivery stream, query subsets) uses the materialized row + op.data only; the client SyncEngine opts in for its own local view. Residual: scope-exit retraction still reads the writer previousData for the prior snapshot (can reveal a record id, never data)."
+  },
+  {
+   "id": "RT-4",
+   "title": "Live sessions survive revocation and expiry; bindSyncServer called a non-existent terminateSessions",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed by the AUTH-11 merge. Confirmed by packages/auth/tests/repro/RT-4.test.ts: bindSyncServer behind a wrapped provider (no onRevoke) ends a revoked device session, and a session ends with AUTH_EXPIRED when its access token expires."
+  },
+  {
+   "id": "RT-5",
+   "title": "claimNode: anonymous MixedAuthProvider clients locked out on reconnect; node ids squattable at upgrade; no admin release",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-5.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: AuthContext.anonymous (set by MixedAuthProvider) -> claims keyed by the stable anonymous owner (kora:anonymous); anonymous cannot take a user node. NoAuthProvider no longer claims. claimNode refuses an unclaimed node with op history (pre-claims history has no writer); going forward every write follows a claim. KoraSyncServer.releaseNodeClaim(nodeId) (store releaseNodeClaim, memory/SQLite/Postgres, atomic single winner) hands the node to the next claimant and ends live sessions with retriable NODE_RELEASED. Postgres test: src/store/postgres-node-claims.test.ts."
+  },
+  {
+   "id": "RT-6",
+   "title": "Refused ops each cost a store read before the rate limiter; no per-batch op cap",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-6.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: the rate limiter is charged first for every uploaded op (before the foreign-node duplicate lookup, uplink authorization read, timestamp check). maxOpsPerBatch (default 1000) refuses an oversized batch whole with BATCH_TOO_LARGE before decoding; nothing is acknowledged. ClientSession.getIngestLimitCounts()."
+  },
+  {
+   "id": "RT-7",
+   "title": "Handshake echoes write counts for any node id the client names",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-7.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: the handshake vector carries only the client own node and nodes whose in-scope ops it is about to receive; names in the client vector are never echoed."
+  },
+  {
+   "id": "RT-8",
+   "title": "Scope grant with undefined/null value matches records lacking the field",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-8.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: normalizeScopeMap and resolveSessionScopes (explicit grant, intersected result, handshake-only scope) throw InvalidScopePredicateError for undefined/null values (also inside $in); handshake refused with INVALID_SCOPE_PREDICATE. matchesScopePredicate never matches undefined/null. $in limit errors are ScopePredicateLimitError."
+  },
+  {
+   "id": "RT-9",
+   "title": "Refresh racing a device revocation can mint tokens that survive it",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-9.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: TokenManager.rotate() re-checks revocation after consume; any later revocation has a cut-off >= consumedAt (the successors iat). Deterministic race tests in token-rotation.test.ts."
+  },
+  {
+   "id": "RT-10",
+   "title": "Cascade side-effect ops not re-authorized; restrict check counts other tenants' children",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-10.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team review 2026-10-01 (remediation/evidence/redteam-phase1.md). Fixed: applyServerOperation authorizeSideEffect: every cascade/set-null of an untrusted delete is checked against the writer uplink scope (child stored row) before the delete applies; any refusal rejects the whole delete. Decision: integrity judges ALL children in every tenant, but untrusted writers get one generic RESTRICTED rejection (no ids, no counts) for both restrict violations and unauthorized side effects; trusted server deletes keep REFERENTIAL_INTEGRITY. Wired in ClientSession and scoped route-context apply (conditional apply path has no referential side effects)."
+  },
+  {
+   "id": "RT-11",
+   "title": "Blob reference forging: writing a record that references a foreign hash grants read access (hash acts as capability)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-11.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: a blob reference is authorized at ingest (sync uploads, scoped routes incl. the store conditional path) by BlobAccessIndex.authorizeReference: allowed when the stored record already referenced it, a live record in the writer DOWNLINK scope references it, the writer owns it (pushed the bytes = proof of possession), or nobody references/owns/stores it (atomic first claim). Ownership persisted in blob_owners (memory/SQLite/Postgres; claimBlobIfUnowned atomic, Postgres via advisory xact lock). A chunked reference is readable by its manifestHash only (the whole-blob hash grants nothing). Manifest pushes are refused (BLOB_REFERENCE_FORBIDDEN) unless the pusher may reference every listed chunk; an owned chunk is reachable only via a manifest sharing an owner. Anonymous sessions are their own blob partition (getBlobPartitionKey). Client now uploads blob bytes BEFORE the referencing batch (SyncEngine.setOutboundPreparer; pushes allowed while syncing). Documented: a content hash is not a secret (docs/guide/production-server.md). Test change: RT-1 fixture uploads the bytes before referencing them. Residual: peer-to-peer mode cannot prove possession, so identical content first referenced by another tenant is refused; a crafted manifest learned via the relay before the honest one can still adopt unowned P2P chunks if the attacker already knows the chunk hashes."
+  },
+  {
+   "id": "RT-12",
+   "title": "Anonymous node-id hijack via shared kora:anonymous claim owner; forged high seq silently drops victim uploads",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-12.test.ts"
+    },
+    {
+     "file": "RT-12-client.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: anonymous node claims are keyed by kora:anon-node:<sha256(node token)>; the server issues a 256-bit node token at the first anonymous claim (handshake-response nodeToken, JSON + protobuf field 39), the client stores it next to its node id (_kora_meta sync_node_token via SyncStatePersistence load/saveNodeToken) and presents it on every handshake; without it the node is NODE_ID_CLAIMED. Provider user ids in the reserved kora: namespace are refused (AUTH_FAILED). Client half (W3 step 2, minimal): the engine never trusts the advertised own-node sequence above min(serverVector[self], last acknowledged own seq) for uploads and pending counts, and never persists the advertised own entry. Test change: RT-5 anonymous reconnect now presents the issued token. Migration: legacy kora:anonymous claims (only from pre-release builds of this branch) are not adopted; release them with releaseNodeClaim."
+  },
+  {
+   "id": "RT-13",
+   "title": "Cross-tenant dangling child: uplink does not authorize foreign-key targets; owner can never delete parent",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-13.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: authorizeOperationReferences (server/src/scopes/reference-authorization.ts): for an insert, or an update that changes a relation field, the referenced parent must exist (soft-deleted counts, as stored) and be inside the writer DOWNLINK scope, else non-retriable SCOPE_VIOLATION naming only the writer record/field. Wired in ClientSession (after the validator, before apply) and scoped routes (prepareMutation and the store conditional path, reading inside the locked transaction). Only for authenticated scoped sessions (no tenant boundary otherwise). Test change: RT-10 seeds its cross-tenant children directly in the store (legacy data), since sync now refuses them. Residual: pre-check, not re-evaluated inside the apply critical section (a parent moved out of scope concurrently can still be referenced once)."
+  },
+  {
+   "id": "RT-14",
+   "title": "Ownership transfer discloses full pre-transfer edit history (historical ops judged on current row)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-14.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: every store captures an OperationScopeSnapshot {pre, post} (id + scalar fields, strings <= 512 chars) from its own rows inside the apply transaction (applyRemoteOperation, Postgres applyConditional) into operations.scope_snapshot (memory: map). Delivery stream (DeliveredOperation.scopeSnapshot), version-vector delta and live relay (getOperationScopeSnapshots) judge download scope on post; query subsets still use the current row. Migration: missing snapshots are backfilled from the log at setSchema (and after replace-mode backup import) by replaying each record in delivery order; ops without a snapshot (collections outside the schema, custom stores) fall back to the previous current-row rule. Behaviour change: a record that moves INTO a scope is delivered from the entering op only (no history; conflicts with the SRV-2 / W4 step 4 send-history design, which now needs a server-built snapshot instead); a previous owner resyncing receives the history written while it owned the record. LMS-11-pg benchmark assertion updated accordingly."
+  },
+  {
+   "id": "RT-15",
+   "title": "Retraction injection via writer previousData (noise in other tenants' delivery logs)",
+   "severity": "P3",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-15.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: scope-exit retractions use snapshotExitsScopes on the store-captured pre/post values (pre = stored row before apply, a deleted row counts as absent); the writer previousData is never consulted. Ops without a snapshot never produce a retraction. Test change: client-session.test retract-mode test now inserts the record server-side first (its pre-image previously came from previousData)."
+  },
+  {
+   "id": "RT-16",
+   "title": "Directional uplink grants bypass resolveSessionScopes ($claims not resolved; fails closed)",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-16.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: directional uplink grants go through resolveSessionScopes like the downlink (verified $claims bound to the schema, onUnresolved deny so a missing binding only removes write access, the handshake can only narrow, undefined/null values refused)."
+  },
+  {
+   "id": "RT-17",
+   "title": "Blob requests not rate-limited; cache invalidation triggers full scope rescans per write",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-17.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: blob-chunk-request charged to the session rate limiter (over budget answered \"not held\", no disconnect; counted in getIngestLimitCounts().rateLimitedBlobRequests). BlobAccessIndex shares one in-flight rebuild per scope and invalidates by collection generation (writes to collections without blob fields drop nothing; a rebuild invalidated mid-flight is not cached); the delivery poll invalidates only the collections written since the last poll (all beyond 1000 ops)."
+  },
+  {
+   "id": "RT-18",
+   "title": "Revocation listeners are in-process: other server instances keep revoked sessions until token expiry",
+   "severity": "P2",
+   "workstream": "W2",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-18.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: KoraSyncServer re-validates every live session credential with its auth provider every sessionRevalidationIntervalMs (default 30 s, 0 disables; also driven by the delivery poll tick) and on demand via revalidateSessions(); a refused credential or a different principal ends the session with retriable AUTH_REVOKED (AUTH_EXPIRED when past expiry); provider errors end nothing. Two-instance tests: shared in-memory user store, two SQLite handles on one file, two Postgres pools on one database (packages/auth/tests/repro/RT-18.test.ts). Not done: Postgres LISTEN/NOTIFY push (optional). Found while testing: PostgresUserStore cold-start DDL raced when two instances started at once (type already exists); fixed later: every auth Postgres store creates its tables in one transaction under an advisory lock, retrying an idempotent DDL that still loses a creation race (packages/auth/src/postgres/ensure-schema.ts)."
+  },
+  {
+   "id": "RT-19",
+   "title": "Record moving into scope never appears for the new owner (only the scope-changing update is delivered)",
+   "severity": "P0",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-19.test.ts"
+    },
+    {
+     "file": "RT-19-streams.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: when an operation moves an existing record into a session's download scope (store snapshot pre out, post in; scope fields a snapshot lacks judged on the current row), the server sends a synthesized scope-entry insert before the trigger on every path (delivery stream initial + live push, legacy version-vector delta, legacy relay). Built from the CURRENT materialized row (only while live and still in scope), id derived from (collection, recordId, trigger op id) (stable across paths and resends; delivery sequences are not available on the legacy paths), node 'kora:scope-entry', sequence 0, no deps, timestamp = record's newest HLC (new optional ServerStore.getRecordLatestTimestamp, memory/SQLite/Postgres) so it never overrides a newer client field. Delivery batches never end on an entry (entry and trigger share a delivery sequence). No pre-transfer history is sent (RT-14 tests unchanged). Client: inbound scope filter judged per op in apply order (a partial update in the same batch as its insert was dropped); an insert for a scope-retracted row reactivates it with per-field LWW. kora: node ids refused at handshake (INVALID_NODE_ID). The entry's single whole-row timestamp (createdAt = latest edit; a newer unsynced local edit of an older field overwritten, then diverging) is superseded by per-field versions: see RT-27."
+  },
+  {
+   "id": "RT-20",
+   "title": "Schema migration adding/renaming a scope field: scope snapshots not recomputed, history hidden from fresh devices",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-20.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: stores fingerprint the scalar fields scope snapshots capture (memory field; kora_server_meta table in SQLite/Postgres) and, when it changes at setSchema, null every snapshot and rebuild them from the log (fingerprint written last; idempotent). Visibility, exits and entries judge a scope field ABSENT from a snapshot on the record's current row; a present value (including null, which over-long strings are now recorded as) still fails closed. Migration: the first start on this build recomputes every snapshot once (fingerprint absent)."
+  },
+  {
+   "id": "RT-21",
+   "title": "Anonymous device locked out permanently if node token is lost; legacy anonymous clients refused",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-21.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: anonymous claims are provisional (kora:anon-pending:<sha256(token)>:<expiresAt>) until the client acknowledges the handshake response with the saved token (AcknowledgmentMessage.nodeToken, protobuf field 39) or presents it at a later handshake (both confirm via CAS to kora:anon-node:<hash>). A provisional claim is re-issued to a token-less device when no live session (this instance) holds the node and it is younger than anonymousClaimTtlMs (default 24h). Expired provisional claims and legacy 'kora:anonymous' claims are re-issued only with allowLegacyAnonymousClaims (default true for beta.13, warns session.legacy_anonymous_claim). New optional store methods getNodeClaimOwner / replaceNodeClaim (memory/SQLite/Postgres). Client: NODE_ID_CLAIMED triggers Store.rotateNodeId (fresh UUIDv7 node, unsynced ops re-authored with seq 1..n, recomputed ids, remapped deps, re-stamped field versions, node token cleared, old node vector entry lowered), outbound queue replaced, event sync:node-id-rotated. Residual: an unconfirmed claim can be taken by any token-less anonymous device while its holder is disconnected (the holder then rotates; no data loss); liveness is per instance. A pinned StoreConfig.nodeId cannot rotate (NODE_ID_PINNED)."
+  },
+  {
+   "id": "RT-22",
+   "title": "FK target authorized against downlink only: children of uplink-only parents rejected (forms/surveys)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-22.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: authorizeOperationReferences accepts a foreign-key parent inside the writer's downlink OR uplink scope (ReferenceAuthorizationContext.uplinkScopes, passed by sync sessions). A parent in neither is still SCOPE_VIOLATION (RT-13 tests unchanged). Residual: with an uplink predicate wider than the downlink, existence of parent ids inside the uplink scope is observable via accept/refuse."
+  },
+  {
+   "id": "RT-23",
+   "title": "Peer-relay mode (no central blob store): identical content in a second tenant permanently rejected",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-23.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: in peer-relay mode (no persistBlobChunk) the handshake response sets blobPossessionProof (protobuf field 40); the client upload coordinator pushes the bytes behind each reference; the session hash-verifies them, applies the size/quota and manifest checks, records the pusher in blob_owners and drops the bytes. Cross-tenant reads still refused (RT-1/RT-11 tests). Cost: each device uploads each blob once to the server even in P2P mode."
+  },
+  {
+   "id": "RT-24",
+   "title": "Blob downloads share the op rate budget; \"not held\" treated as hard failure; large blobs fail",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-24.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: blob chunk requests use their own budget (blobLimits.maxRequestsPerMinute, default 6000/min) instead of maxOpsPerMinute; over budget the answer is a retriable {bytes:null, throttled:true, retryAfterMs} (protobuf fields 41-42), and createRemoteChunkProvider re-sends after max(minThrottleDelayMs, retryAfterMs) bounded by maxThrottleDelayMs until maxThrottleWaitMs (default 10 min)."
+  },
+  {
+   "id": "RT-25",
+   "title": "Content-hash existence oracle; pre-claimed hash lets claimer read bytes another tenant uploads later",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-25.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: with a central store (resolveBlobChunk) BlobAccessIndex.authorizeReference never claims an unowned hash; a reference is accepted only if the writer pushed the bytes or can already read a record referencing them. The store serves owners (BlobAccessIndex.isOwnedBy) or in-scope referencers. RT-11 guard test updated to push before referencing (the client's order since RT-11). Residual existence oracle (P2P bare-reference claims; non-constant timing) documented in docs/guide/production-server.md."
+  },
+  {
+   "id": "RT-26",
+   "title": "Session revalidation checks identity only; scope/role changes apply at token expiry (document or compare scopes)",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-26.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: revalidateCredential re-resolves the session's scopes (computeSessionScopes, shared with the handshake, using the handshake's syncScope) and ends a session whose downlink or uplink scope changed, or no longer resolves, with retriable SCOPE_CHANGED. Documented in docs/guide/production-server.md."
+  },
+  {
+   "id": "RT-27",
+   "title": "Scope-entry insert carries one whole-row timestamp: overwrites a device's newer unsynced edit of an older field, then client and server diverge (and createdAt = latest edit)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-27.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Follow-up to RT-19 (remediation/evidence/redteam-phase1-round3.md). The synthesized scope-entry insert was stamped with the record's newest HLC for every field; under per-field LWW it beat a device's unsynced edit (t5) of a field the server last wrote earlier (t1) whenever any other field was newer (t7), after which the device's own op uploaded and won on the server: device and server diverged. Fixed: Operation gains optional fieldVersions (field -> HLC; server-authored only, not in the content hash). The server folds them from the record's stored operations exactly like the materialization (core replayFieldVersionsForRecord; new optional ServerStore.getRecordFieldVersions on memory/SQLite/Postgres, ordered in JS by HLC.compare); the entry carries them, and its timestamp is the record's first operation (server _created_at), so a fresh device's createdAt is the real creation time. Fields no op wrote get the creation version. Wire: JSON field + protobuf __kora_field_versions__ in the data JSON (static and dynamic serializers), validated on decode; the server strips fieldVersions from device-uploaded ops. Client: the apply pipeline routes an entry with fieldVersions straight to the store, which resolves each field by LWW against _field_versions (absent row: per-field stamps + orphan fold; live or scope-retracted row: per-field LWW; domain tombstone: revived only when the newest field version is newer), never a whole-row stamp; the clock receives the newest version; the client op log persists fieldVersions and record folds expand an entry into insert@creation + per-version updates (core expandFieldVersionedOperations). Stores without getRecordFieldVersions fall back to the RT-19 single stamp. Residual: richtext and atomic (counter) fields resolve by plain LWW in the entry path (a device's unsynced richtext/atomic edit older than the server's latest write to that field is overwritten locally while its op still merges on the server). Found while running the round-3 code on Postgres (none of it had run there): (1) the Postgres store ordered node-id ties by the database collation when folding a record (materialization, backfill, latest-timestamp), so under a linguistic collation (en_US/ICU: node-a < node-Z) the server row diverged from HLC.compare used by clients, memory and SQLite; now COLLATE \"C\" (postgres-round3.test.ts forces an ICU column collation); (2) LMS-11-pg counted RT-19 scope entries as unexplained extra ops; its reference now counts entries separately. The rt-fixture / scoped-network harnesses run on Postgres with KORA_REPRO_STORE=postgres."
+  },
+  {
+   "id": "RT-28",
+   "title": "Ops made while offline stay counted as pending after the server has them (status accuracy)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan \u00a76). Investigate in Phase 2."
+  },
+  {
+   "id": "RT-29",
+   "title": "Scope entry: richtext and counter fields resolved by plain LWW; renamed fields lose versions; no MergeTrace",
+   "severity": "P3",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state."
+  },
+  {
+   "id": "RT-30",
+   "title": "Live-Postgres parity tests fail under vitest with DATABASE_URL (dynamic import of postgres)",
+   "severity": "P3",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Found during RT-27 Postgres verification."
+  }
+ ],
+ "rejectedProposalPins": {
+  "description": "Tests that apply a REJECTED external proposal (LMS report) to a scratch copy and prove it is wrong. They are expected to keep failing; they never block and never count as repro tests.",
+  "tests": [
+   {
+    "browser": "LMS-5h",
+    "title": "LMS retry"
+   },
+   {
+    "browser": "LMS-6b"
+   }
+  ]
+ }
+}

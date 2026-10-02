@@ -58,4 +58,12 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	async deleteDeliveryWatermark(signature: string): Promise<void> {
 		await this.store.deleteDeliveryWatermark(signature)
 	}
+
+	loadNodeToken(): Promise<string | null> {
+		return this.store.loadNodeToken()
+	}
+
+	async saveNodeToken(token: string): Promise<void> {
+		await this.store.saveNodeToken(token)
+	}
 }

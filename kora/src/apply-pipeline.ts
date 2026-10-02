@@ -9,6 +9,7 @@ import {
 	HybridLogicalClock,
 	KoraError,
 	createOperation,
+	expandFieldVersionedOperations,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
@@ -198,6 +199,14 @@ export class ApplyPipeline implements LocalMutationHandler {
 			{ inTransaction: true },
 		)
 
+		// Highest own sequence number in this batch (buffered entries + side effects).
+		let highestOwnSeq = 0
+		for (const op of sortedOps) {
+			if (op.nodeId === ctx.nodeId && op.sequenceNumber > highestOwnSeq) {
+				highestOwnSeq = op.sequenceNumber
+			}
+		}
+
 		await ctx.adapter.transaction(async (tx) => {
 			for (const op of sortedOps) {
 				const commands = commandsByOpId.get(op.id)
@@ -207,6 +216,20 @@ export class ApplyPipeline implements LocalMutationHandler {
 				for (const cmd of commands) {
 					await tx.execute(cmd.sql, cmd.params)
 				}
+			}
+			// STORE-1 stopgap: persist the sequence counter inside the commit, and never
+			// lower it. Without this the next single-record write re-allocates a
+			// sequence number this transaction already used, so the server's ack of the
+			// transaction makes that later write look synced and it is never uploaded.
+			// MAX(existing, batch) also undoes any side-effect command that wrote an
+			// older value. Concurrent transactions can still collide on the same numbers
+			// until W6 reserves a block inside the transaction.
+			if (highestOwnSeq > 0) {
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[ctx.nodeId, highestOwnSeq],
+				)
 			}
 		})
 
@@ -471,9 +494,8 @@ export class ApplyPipeline implements LocalMutationHandler {
 		// atomic chain. Folding fixes both: delete-vs-newer-update convergence and
 		// atomic resurrection (increments before and after the delete compose correctly).
 		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
-		const ops = [...priorOps, op].sort((a, b) =>
-			HybridLogicalClock.compare(a.timestamp, b.timestamp),
-		)
+		// Scope-entry inserts expand into their per-field writes (RT-27); HLC order.
+		const ops = expandFieldVersionedOperations([...priorOps, op])
 		const folded = replayOperationsForRecord(ops)
 
 		if (!folded) {
@@ -520,7 +542,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 		const { atomicOps: _remoteAtomicOps, ...opWithoutAtomic } = op
 		const localOp: Operation = {
 			...opWithoutAtomic,
-			data: buildLocalDiff(baseState, currentRecord, Object.keys(op.data ?? {})),
+			data: buildLocalDiff(baseState, currentRecord, Object.keys(op.data ?? {}), collectionDef),
 			previousData: op.previousData,
 			nodeId: this.deps.store.getNodeId(),
 			timestamp: localTimestamp,
@@ -591,10 +613,9 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return mergedData
 		}
 		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
-		// The op being applied is not in the log yet; fold it in at its HLC position.
-		const ops = [...priorOps, op].sort((a, b) =>
-			HybridLogicalClock.compare(a.timestamp, b.timestamp),
-		)
+		// The op being applied is not in the log yet; fold it in at its HLC position
+		// (scope-entry inserts expand into their per-field writes, RT-27).
+		const ops = expandFieldVersionedOperations([...priorOps, op])
 		const folded = replayOperationsForRecord(ops)
 		if (!folded) {
 			return mergedData
@@ -639,9 +660,12 @@ export class ApplyPipeline implements LocalMutationHandler {
 		)) ?? { version: null, fieldVersions: null }
 
 		const snapshot = await this.deps.store.findMaterializedRow(op.collection, op.recordId)
-		if (!snapshot || snapshot.deleted) {
+		if (!snapshot || snapshot.deleted || op.fieldVersions) {
 			// Absent row and insert-vs-tombstone are resolved atomically inside the
-			// store; guard against a local write racing this decision.
+			// store; guard against a local write racing this decision. A server
+			// scope-entry insert (per-field versions, RT-27) is resolved there too, field
+			// by field against `_field_versions`: never as one whole-op merge, whose
+			// single timestamp would override a newer local edit of an older field.
 			return this.deps.store.applyRemoteOperation(op, { guardRowState: guard })
 		}
 
@@ -832,14 +856,33 @@ function updateNeedsMergeEngine(op: Operation, collectionDef: CollectionDefiniti
 	return false
 }
 
+/**
+ * The local side of a pairwise merge: only the fields the remote op touches
+ * whose LOCAL value actually differs from the base the remote op wrote from.
+ *
+ * A field the local device left unchanged is not a concurrent edit. Treating it
+ * as one let the local copy of the base value compete with the remote change:
+ * for arrays it resurrected elements the remote side removed, and for scalars a
+ * newer local timestamp could restore the old value (NEW-MERGE-1). Interim (S1);
+ * W7 replaces the pairwise merge with a per-field fold.
+ */
 function buildLocalDiff(
 	baseState: Record<string, unknown>,
 	currentRecord: Record<string, unknown>,
 	fields: string[],
+	collectionDef: CollectionDefinition,
 ): Record<string, unknown> {
 	const diff: Record<string, unknown> = {}
 	for (const field of fields) {
-		diff[field] = currentRecord[field]
+		const local = currentRecord[field]
+		const base = baseState[field]
+		const unchanged =
+			collectionDef.fields[field]?.kind === 'richtext'
+				? richtextStatesEqual(local, base)
+				: deepEqual(local, base)
+		if (!unchanged) {
+			diff[field] = local
+		}
 	}
 	return diff
 }

@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError, type ScopeMap, claimScopes } from '@korajs/core'
 import { decodeJwt, isExpired, verifyJwt } from '../../tokens/jwt'
 import type { AuthTokens } from '../../types'
 import type { AuthProviderAdapter, SignInParams, SignUpParams } from '../adapter'
@@ -161,6 +161,26 @@ export interface ExternalJwtProviderConfig {
 	 * ```
 	 */
 	mapClaims?: (claims: Record<string, unknown>) => ExternalUserInfo
+
+	/**
+	 * Accepted audience(s) (`aud`). When set, tokens for any other audience are
+	 * rejected, even if they share the signing secret. Defaults to
+	 * `'authenticated'` when `providerName` is `'supabase'`.
+	 */
+	audience?: string | string[]
+
+	/** Accepted issuer(s) (`iss`). When set, tokens from any other issuer are rejected. */
+	issuer?: string | string[]
+
+	/**
+	 * Verified scope values for the sync grant, derived from the validated claims
+	 * (AUTH-1). Merged over `{ userId }`; every schema-scoped collection is bound
+	 * from them, and a collection whose binding is missing is denied.
+	 */
+	scopeValues?: (claims: Record<string, unknown>) => Record<string, unknown>
+
+	/** Full explicit sync grant from the validated claims (replaces the default). */
+	resolveScopes?: (claims: Record<string, unknown>) => ScopeMap | Promise<ScopeMap>
 }
 
 // ============================================================================
@@ -212,6 +232,10 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 		| ((token: string) => Promise<{ sub: string; [key: string]: unknown } | null>)
 		| undefined
 	private readonly mapClaims: (claims: Record<string, unknown>) => ExternalUserInfo
+	private readonly audiences: string[] | null
+	private readonly issuers: string[] | null
+	private readonly scopeValues: ExternalJwtProviderConfig['scopeValues']
+	private readonly resolveScopes: ExternalJwtProviderConfig['resolveScopes']
 
 	constructor(config: ExternalJwtProviderConfig) {
 		if (config.validateToken === undefined && config.jwtSecret === undefined) {
@@ -226,6 +250,17 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 		this.jwtSecret = config.jwtSecret
 		this.customValidateToken = config.validateToken
 		this.mapClaims = config.mapClaims ?? defaultMapClaims
+		const audience =
+			config.audience ?? (config.providerName === 'supabase' ? 'authenticated' : undefined)
+		this.audiences = audience === undefined ? null : Array.isArray(audience) ? audience : [audience]
+		this.issuers =
+			config.issuer === undefined
+				? null
+				: Array.isArray(config.issuer)
+					? config.issuer
+					: [config.issuer]
+		this.scopeValues = config.scopeValues
+		this.resolveScopes = config.resolveScopes
 	}
 
 	/**
@@ -379,8 +414,14 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 					return null
 				}
 
+				// Server-derived grant (AUTH-1): never let the client handshake pick.
+				const scopes = this.resolveScopes
+					? await this.resolveScopes(claims)
+					: claimScopes({ ...(this.scopeValues?.(claims) ?? {}), userId: userInfo.userId })
+
 				return {
 					userId: userInfo.userId,
+					scopes,
 					metadata: {
 						provider: this.providerName,
 						email: userInfo.email,
@@ -409,7 +450,8 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 				if (result === null) {
 					return null
 				}
-				return result as Record<string, unknown>
+				const claims = result as Record<string, unknown>
+				return this.audienceAndIssuerMatch(claims) ? claims : null
 			} catch {
 				return null
 			}
@@ -422,15 +464,28 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 				return null
 			}
 
-			// Check expiration if the token has an exp claim
-			if (isExpired(claims as { exp?: number })) {
+			// A token without a numeric exp would be valid forever (AUTH-14).
+			if (typeof claims.exp !== 'number' || isExpired(claims as { exp?: number })) {
 				return null
 			}
 
-			return claims
+			return this.audienceAndIssuerMatch(claims) ? claims : null
 		}
 
 		// Should not reach here due to constructor validation, but handle defensively
 		return null
+	}
+
+	/** Enforce configured `aud` / `iss` so tokens for another service are refused. */
+	private audienceAndIssuerMatch(claims: Record<string, unknown>): boolean {
+		if (this.audiences) {
+			const aud = claims.aud
+			const values = Array.isArray(aud) ? aud : [aud]
+			if (!values.some((v) => typeof v === 'string' && this.audiences?.includes(v))) return false
+		}
+		if (this.issuers) {
+			if (typeof claims.iss !== 'string' || !this.issuers.includes(claims.iss)) return false
+		}
+		return true
 	}
 }

@@ -361,7 +361,10 @@ describe('AuthClient', () => {
 	// -----------------------------------------------------------------------
 
 	describe('OAuth', () => {
-		it('creates an OAuth authorization URL with device metadata', async () => {
+		// Updated (AUTH-3): the device identity is no longer put in the authorization
+		// URL (the server never trusts state metadata for it); it is sent with the
+		// POST callback instead.
+		it('creates an OAuth authorization URL without device identity in the query', async () => {
 			const client = new AuthClient({
 				serverUrl: 'http://localhost:3001',
 				deviceIdentity: {
@@ -396,8 +399,8 @@ describe('AuthClient', () => {
 			const parsed = new URL(calledUrl)
 			expect(parsed.searchParams.get('returnTo')).toBe('/dashboard')
 			expect(parsed.searchParams.get('tenant')).toBe('acme')
-			expect(parsed.searchParams.get('deviceId')).toBe('stable-device')
-			expect(parsed.searchParams.get('devicePublicKey')).toBe('{"kty":"EC"}')
+			expect(parsed.searchParams.get('deviceId')).toBeNull()
+			expect(parsed.searchParams.get('devicePublicKey')).toBeNull()
 		})
 
 		it('completes OAuth sign-in and stores Kora tokens', async () => {

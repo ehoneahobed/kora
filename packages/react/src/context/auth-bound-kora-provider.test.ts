@@ -16,7 +16,7 @@ function authController(initial: AuthSyncState): {
 	const listeners = new Set<() => void>()
 	return {
 		binding: {
-			auth: async () => ({ token: state.state === 'authenticated' ? state.token : '' }),
+			auth: async () => ({ token: state.state === 'authenticated' ? (state.token ?? '') : '' }),
 			resolveSyncState: async () => state,
 			subscribe(listener) {
 				listeners.add(listener)
@@ -178,5 +178,41 @@ describe('AuthBoundKoraProvider', () => {
 		await screen.findByText('signed out')
 		expect(screen.queryByText('private app')).toBeNull()
 		expect(close).toHaveBeenCalledTimes(1)
+	})
+
+	test('mounts the user database while authenticated-offline and keeps it across freshness changes', async () => {
+		const lifecycle: string[] = []
+		const auth = authController({
+			state: 'authenticated',
+			userId: 'u1',
+			token: null,
+			offline: true,
+			locked: false,
+		})
+		const createApp = vi.fn((session: { userId: string }) => {
+			lifecycle.push(`create:${session.userId}`)
+			return mockApp(session.userId, lifecycle)
+		})
+		render(
+			createElement(
+				AuthBoundKoraProvider,
+				{
+					authClient: auth.binding,
+					createApp,
+					signedOut: createElement('p', null, 'signed out'),
+					locked: createElement('p', null, 'locked'),
+				},
+				createElement('p', null, 'workspace'),
+			),
+		)
+		await screen.findByText('workspace')
+
+		// Locked: the lock screen replaces the UI, the app is NOT closed.
+		auth.set({ state: 'authenticated', userId: 'u1', token: null, offline: true, locked: true })
+		await screen.findByText('locked')
+		// Back online with a fresh token: same app, no re-creation.
+		auth.set({ state: 'authenticated', userId: 'u1', token: 'fresh' })
+		await screen.findByText('workspace')
+		expect(lifecycle).toEqual(['create:u1'])
 	})
 })

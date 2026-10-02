@@ -1,9 +1,21 @@
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { computePublicKeyThumbprint, verifyChallenge } from '../../device/device-identity'
 import type { TokenManager } from '../../tokens/token-manager'
-import type { AuthTokens } from '../../types'
+import type { AuthTokens, TokenPayload } from '../../types'
 import { hashPassword, verifyPassword } from './password-hash'
-import type { AuthDevice, AuthUser, UserStore } from './user-store'
+import {
+	type SyncAuthProvider,
+	type SyncScopeOptions,
+	type VerifiedSyncClaims,
+	resolveSyncGrant,
+} from './sync-scopes'
+import {
+	type AuthDevice,
+	type AuthUser,
+	DeviceOwnershipError,
+	type StoredUser,
+	type UserStore,
+} from './user-store'
 
 // ============================================================================
 // Challenge Store
@@ -167,6 +179,54 @@ export interface AuthRoutesConfig {
 	 * (10 attempts per minute).
 	 */
 	rateLimiter?: RateLimiter
+	/**
+	 * Called after credentials are revoked (sign-out, device revocation, user-wide
+	 * revocation). `createKoraAuthServer().bindSyncServer()` uses it to end live
+	 * sync sessions (AUTH-11).
+	 */
+	onRevoke?: (event: AuthRevocationEvent) => void | Promise<void>
+	/**
+	 * Second-factor verifier (a `TotpManager` fits). When configured, users with
+	 * MFA enabled get `{ mfaRequired, mfaToken }` from sign-in instead of tokens,
+	 * and only `POST /auth/mfa/verify` issues their session (AUTH-10).
+	 */
+	mfa?: MfaVerifier
+}
+
+/** Second-factor checks used at sign-in. `TotpManager` implements this. */
+export interface MfaVerifier {
+	isEnabled(userId: string): Promise<boolean>
+	verify(userId: string, code: string): Promise<boolean>
+	verifyRecoveryCode?(userId: string, recoveryCode: string): Promise<boolean>
+}
+
+/** Sign-in result for a user who still has to pass the second factor. */
+export interface MfaChallenge {
+	mfaRequired: true
+	/** Short-lived token accepted only by `POST /auth/mfa/verify`. */
+	mfaToken: string
+}
+
+/** Successful primary authentication: a session, or an MFA challenge. */
+export type SignInResult = { user: AuthUser; tokens: AuthTokens } | MfaChallenge
+
+/**
+ * Describes credentials that were just revoked, so live sessions holding them
+ * (for example open sync connections) can be terminated.
+ */
+export type AuthRevocationEvent =
+	| { kind: 'device'; userId: string; deviceId: string }
+	| { kind: 'user'; userId: string }
+	| { kind: 'session'; userId: string; deviceId: string; family: string | null }
+
+/** Result of {@link BuiltInAuthRoutes.authenticateAccess}. */
+export interface AuthenticatedAccess {
+	/** Verified access-token payload. */
+	payload: TokenPayload
+	/** The token's user, as stored. */
+	user: StoredUser
+	/** The token's device record (null when the token was minted without one). */
+	device: AuthDevice | null
 }
 
 /**
@@ -178,8 +238,38 @@ export interface AuthRoutesConfig {
 export interface AuthRouteResponse<T> {
 	/** HTTP status code */
 	status: number
-	/** Either the success payload or an error message */
-	body: { data: T } | { error: string }
+	/**
+	 * Either the success payload or an error message. `code` is a stable,
+	 * machine-readable Kora error code; clients use it to tell a definitive
+	 * rejection from a proxy or captive-portal response.
+	 */
+	body: { data: T } | { error: string; code?: string }
+	/** Optional response headers (for example `Retry-After`). */
+	headers?: Record<string, string>
+}
+
+/** 401 returned for any unusable access token. */
+function invalidAccessToken(): AuthRouteResponse<never> {
+	return {
+		status: 401,
+		body: { error: 'Invalid or expired access token.', code: 'ACCESS_TOKEN_INVALID' },
+	}
+}
+
+/** Server-assigned default device id: random per sign-in, never derived from the user. */
+function generateDeviceId(): string {
+	return `dev-${randomUUID()}`
+}
+
+function deviceConflict(): AuthRouteResponse<never> {
+	return {
+		status: 409,
+		body: {
+			error:
+				'This device id is registered to another account. Use a device id generated for this install.',
+			code: 'DEVICE_OWNERSHIP_CONFLICT',
+		},
+	}
 }
 
 /** Minimum password length enforced at sign-up. */
@@ -288,12 +378,189 @@ export class BuiltInAuthRoutes {
 	private readonly tokenManager: TokenManager
 	private readonly challengeStore: ChallengeStore
 	private readonly rateLimiter: RateLimiter
+	private readonly revokeListeners = new Set<(event: AuthRevocationEvent) => void | Promise<void>>()
+	/** Lazily computed hash used to equalize sign-in timing for unknown emails. */
+	private dummyCredential: Promise<{ hash: string; salt: string }> | null = null
+	private readonly mfa: MfaVerifier | undefined
 
 	constructor(config: AuthRoutesConfig) {
 		this.userStore = config.userStore
 		this.tokenManager = config.tokenManager
 		this.challengeStore = config.challengeStore ?? new InMemoryChallengeStore()
 		this.rateLimiter = config.rateLimiter ?? new InMemoryRateLimiter()
+		if (config.onRevoke) this.revokeListeners.add(config.onRevoke)
+		this.mfa = config.mfa
+	}
+
+	/**
+	 * Finish a successful primary authentication (password, OAuth): issue a
+	 * session, or an MFA challenge when the user is enrolled in MFA. No
+	 * full-privilege token is ever issued to an MFA user without a fresh second
+	 * factor.
+	 *
+	 * @param user - The authenticated user
+	 * @param deviceId - The (already registered) device
+	 * @param amr - Methods satisfied so far (for example `['pwd']`)
+	 */
+	async completePrimaryAuthentication(
+		user: AuthUser,
+		deviceId: string,
+		amr: string[],
+	): Promise<AuthRouteResponse<SignInResult>> {
+		if (this.mfa && (await this.mfa.isEnabled(user.id))) {
+			return {
+				status: 200,
+				body: {
+					data: {
+						mfaRequired: true,
+						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr),
+					},
+				},
+			}
+		}
+		const tokens = this.tokenManager.issueTokens(user.id, deviceId, undefined, { amr })
+		return { status: 200, body: { data: { user, tokens } } }
+	}
+
+	/**
+	 * Handle the second factor (POST /auth/mfa/verify).
+	 *
+	 * Exchanges an `mfa_pending` token plus a TOTP code (or recovery code) for a
+	 * session whose tokens carry `amr` including `otp` (or `rcv`). The pending
+	 * token is redeemed once; a wrong code can be retried until it expires.
+	 */
+	async handleMfaVerify(body: {
+		mfaToken?: unknown
+		code?: unknown
+		recoveryCode?: unknown
+	}): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+		const invalidToken: AuthRouteResponse<never> = {
+			status: 401,
+			body: { error: 'Invalid or expired MFA session. Sign in again.', code: 'MFA_TOKEN_INVALID' },
+		}
+		if (!this.mfa || typeof body?.mfaToken !== 'string') return invalidToken
+		const pending = await this.tokenManager.verifyMfaPendingToken(body.mfaToken)
+		if (!pending) return invalidToken
+
+		const storedUser = await this.userStore.findById(pending.sub)
+		const device = await this.userStore.findDevice(pending.dev)
+		if (!storedUser || (device && (device.revoked || device.userId !== pending.sub))) {
+			return invalidToken
+		}
+
+		let method: 'otp' | 'rcv' | null = null
+		if (typeof body.code === 'string' && (await this.mfa.verify(pending.sub, body.code))) {
+			method = 'otp'
+		} else if (
+			typeof body.recoveryCode === 'string' &&
+			this.mfa.verifyRecoveryCode &&
+			(await this.mfa.verifyRecoveryCode(pending.sub, body.recoveryCode))
+		) {
+			method = 'rcv'
+		}
+		if (method === null) {
+			return { status: 401, body: { error: 'Invalid MFA code.', code: 'MFA_CODE_INVALID' } }
+		}
+		if (!(await this.tokenManager.redeemMfaPendingToken(pending))) return invalidToken
+
+		const tokens = this.tokenManager.issueTokens(pending.sub, pending.dev, undefined, {
+			amr: [...new Set([...pending.amr, method])],
+		})
+		const user: AuthUser = {
+			id: storedUser.id,
+			email: storedUser.email,
+			name: storedUser.name,
+			emailVerified: storedUser.emailVerified,
+			createdAt: storedUser.createdAt,
+		}
+		return { status: 200, body: { data: { user, tokens } } }
+	}
+
+	/**
+	 * Subscribe to credential revocations (sign-out, device revocation,
+	 * user-wide revocation).
+	 *
+	 * @param listener - Called after each revocation is persisted
+	 * @returns An unsubscribe function
+	 */
+	onRevoke(listener: (event: AuthRevocationEvent) => void | Promise<void>): () => void {
+		this.revokeListeners.add(listener)
+		return () => {
+			this.revokeListeners.delete(listener)
+		}
+	}
+
+	/**
+	 * Authenticate an access token for any request-authorization path.
+	 *
+	 * The single check used by every HTTP route and by the sync provider: it
+	 * verifies signature and expiry, the token's own revocation, its family, the
+	 * device cut-off, the per-user cut-off, that the user still exists, and that
+	 * the device record is neither revoked nor owned by someone else.
+	 *
+	 * @param token - Raw access token (without "Bearer ")
+	 * @returns The verified access, or null when the token must be rejected
+	 */
+	async authenticateAccess(token: string): Promise<AuthenticatedAccess | null> {
+		if (typeof token !== 'string' || token.length === 0) return null
+		const payload = await this.tokenManager.validateTokenWithRevocation(token)
+		if (payload === null || payload.type !== 'access') return null
+		const user = await this.userStore.findById(payload.sub)
+		if (user === null) return null
+		const device = await this.userStore.findDevice(payload.dev)
+		if (device && (device.revoked || device.userId !== payload.sub)) return null
+		return { payload, user, device }
+	}
+
+	/**
+	 * Revoke every credential a user holds (password reset or change, admin
+	 * session revocation, account deletion) and notify revocation listeners.
+	 *
+	 * @param userId - The user whose sessions end now
+	 */
+	async revokeAllForUser(userId: string): Promise<void> {
+		await this.tokenManager.revokeAllForUser(userId)
+		await this.emitRevoke({ kind: 'user', userId })
+	}
+
+	private async emitRevoke(event: AuthRevocationEvent): Promise<void> {
+		for (const listener of this.revokeListeners) {
+			try {
+				await listener(event)
+			} catch (error) {
+				// A failing listener (for example a sync server that is shutting down)
+				// must not undo or block the revocation itself, but it must be visible.
+				console.error('[kora] auth revocation listener failed', error)
+			}
+		}
+	}
+
+	/**
+	 * Register the device for a successful primary authentication, refusing ids
+	 * owned by another user.
+	 */
+	private async registerSignInDevice(params: {
+		userId: string
+		deviceId: string | undefined
+		publicKey: string | undefined
+		named: string
+	}): Promise<string | AuthRouteResponse<never>> {
+		const deviceId =
+			typeof params.deviceId === 'string' && params.deviceId.length > 0
+				? params.deviceId
+				: generateDeviceId()
+		try {
+			await this.userStore.registerDevice({
+				id: deviceId,
+				userId: params.userId,
+				publicKey: params.publicKey ?? '',
+				name: params.named,
+			})
+		} catch (error) {
+			if (error instanceof DeviceOwnershipError) return deviceConflict()
+			throw error
+		}
+		return deviceId
 	}
 
 	/**
@@ -389,19 +656,19 @@ export class BuiltInAuthRoutes {
 			throw err
 		}
 
-		// Use provided deviceId or generate a placeholder
-		const deviceId = body.deviceId ?? `device-${user.id}`
-
-		// Always register a device — use provided info or create a basic record
-		await this.userStore.registerDevice({
-			id: deviceId,
+		// A client-chosen id must be owned by this user; without one the server
+		// assigns a random id (never `device-${userId}`, which every browser of the
+		// user would share).
+		const deviceId = await this.registerSignInDevice({
 			userId: user.id,
-			publicKey: body.devicePublicKey ?? '',
-			name: body.deviceId ? 'Primary Device' : 'Browser',
+			deviceId: body.deviceId,
+			publicKey: body.devicePublicKey,
+			named: body.deviceId ? 'Primary Device' : 'Browser',
 		})
+		if (typeof deviceId !== 'string') return deviceId
 
 		// Issue tokens
-		const tokens = this.tokenManager.issueTokens(user.id, deviceId)
+		const tokens = this.tokenManager.issueTokens(user.id, deviceId, undefined, { amr: ['pwd'] })
 
 		return {
 			status: 201,
@@ -431,7 +698,7 @@ export class BuiltInAuthRoutes {
 			devicePublicKey?: string
 		},
 		clientIp?: string,
-	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
+	): Promise<AuthRouteResponse<SignInResult>> {
 		// Request bodies are untyped at runtime (JSON.parse'd network input, not
 		// a checked call site), so a missing/malformed `email` or `password`
 		// field reaches here as `undefined` despite the `string` type. Reject it
@@ -443,54 +710,52 @@ export class BuiltInAuthRoutes {
 			}
 		}
 
-		// Rate limiting (use email + IP composite key for per-account protection)
-		const rateLimitKey = clientIp
-			? `signin:${body.email.toLowerCase()}:${clientIp}`
-			: `signin:${body.email.toLowerCase()}`
-
-		if (!(await this.rateLimiter.isAllowed(rateLimitKey))) {
+		// Two independent limits (AUTH-9): one per account, so rotating source IPs
+		// cannot buy unlimited guesses against one user, and one per client IP, so
+		// one client cannot spray many accounts. The IP must come from a trusted
+		// source (the socket, or a configured proxy hop), never a raw header.
+		const accountKey = `signin:account:${body.email.trim().toLowerCase()}`
+		const ipKey = clientIp ? `signin:ip:${clientIp}` : null
+		if (
+			!(await this.rateLimiter.isAllowed(accountKey)) ||
+			(ipKey !== null && !(await this.rateLimiter.isAllowed(ipKey)))
+		) {
 			return {
 				status: 429,
-				body: { error: 'Too many sign-in attempts. Please try again later.' },
+				body: {
+					error: 'Too many sign-in attempts. Please try again later.',
+					code: 'RATE_LIMITED',
+				},
+				headers: { 'Retry-After': '60' },
 			}
 		}
-		await this.rateLimiter.record(rateLimitKey)
+		await this.rateLimiter.record(accountKey)
+		if (ipKey !== null) await this.rateLimiter.record(ipKey)
 
 		const storedUser = await this.userStore.findByEmail(body.email)
-		if (storedUser === null) {
+		// Always run the password KDF, against a fixed dummy credential when the
+		// account does not exist, so response time does not reveal registration.
+		const credential = storedUser
+			? { hash: storedUser.passwordHash, salt: storedUser.salt }
+			: await this.getDummyCredential()
+		const passwordValid = await verifyPassword(body.password, credential.hash, credential.salt)
+		if (storedUser === null || !passwordValid) {
 			return {
 				status: 401,
-				body: { error: 'Invalid email or password.' },
+				body: { error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' },
 			}
 		}
 
-		const passwordValid = await verifyPassword(
-			body.password,
-			storedUser.passwordHash,
-			storedUser.salt,
-		)
-		if (!passwordValid) {
-			return {
-				status: 401,
-				body: { error: 'Invalid email or password.' },
-			}
-		}
+		// Successful login: clear this account's failure budget only.
+		await this.rateLimiter.reset(accountKey)
 
-		// Successful login — reset rate limit for this key
-		await this.rateLimiter.reset(rateLimitKey)
-
-		// Use provided deviceId or generate a placeholder
-		const deviceId = body.deviceId ?? `device-${storedUser.id}`
-
-		// Always register a device — use provided info or create a basic record
-		await this.userStore.registerDevice({
-			id: deviceId,
+		const deviceId = await this.registerSignInDevice({
 			userId: storedUser.id,
-			publicKey: body.devicePublicKey ?? '',
-			name: body.deviceId ? 'Device' : 'Browser',
+			deviceId: body.deviceId,
+			publicKey: body.devicePublicKey,
+			named: body.deviceId ? 'Device' : 'Browser',
 		})
-
-		const tokens = this.tokenManager.issueTokens(storedUser.id, deviceId)
+		if (typeof deviceId !== 'string') return deviceId
 
 		const user: AuthUser = {
 			id: storedUser.id,
@@ -500,10 +765,7 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return {
-			status: 200,
-			body: { data: { user, tokens } },
-		}
+		return this.completePrimaryAuthentication(user, deviceId, ['pwd'])
 	}
 
 	/**
@@ -520,18 +782,41 @@ export class BuiltInAuthRoutes {
 	async handleRefresh(body: {
 		refreshToken: string
 	}): Promise<AuthRouteResponse<AuthTokens>> {
-		const result = await this.tokenManager.refreshAccessToken(body.refreshToken)
+		const rejected: AuthRouteResponse<never> = {
+			status: 401,
+			body: { error: 'Invalid or expired refresh token.', code: 'REFRESH_TOKEN_INVALID' },
+		}
+		const refreshToken = body?.refreshToken
+		const presented =
+			typeof refreshToken === 'string' ? this.tokenManager.validateToken(refreshToken) : null
+		if (presented === null || presented.type !== 'refresh') {
+			return rejected
+		}
 
-		if (result === null) {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired refresh token.' },
+		// The device and the user must still be in good standing (AUTH-2): a revoked
+		// device keeps no refresh rights, whatever the revocation store says.
+		const user = await this.userStore.findById(presented.sub)
+		const device = await this.userStore.findDevice(presented.dev)
+		if (user === null || (device && (device.revoked || device.userId !== presented.sub))) {
+			return rejected
+		}
+
+		const result = await this.tokenManager.rotateRefreshToken(refreshToken as string)
+		if (!result.ok) {
+			if (result.reason === 'in_progress') {
+				// A duplicate of a rotation still running on this instance: transient.
+				return {
+					status: 409,
+					body: { error: 'A refresh with this token is in progress.', code: 'REFRESH_IN_PROGRESS' },
+					headers: { 'Retry-After': '1' },
+				}
 			}
+			return rejected
 		}
 
 		return {
 			status: 200,
-			body: { data: result },
+			body: { data: result.tokens },
 		}
 	}
 
@@ -551,24 +836,41 @@ export class BuiltInAuthRoutes {
 		accessToken: string,
 		body: { refreshToken?: string },
 	): Promise<AuthRouteResponse<{ success: boolean }>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
+		const { payload } = access
 
 		// Revoke the access token itself
 		await this.tokenManager.revokeToken(payload.jti, payload.exp)
 
-		// Revoke the refresh token if provided
-		if (body.refreshToken) {
+		// Revoke the refresh token if provided, and its whole family, so a successor
+		// minted by a just-completed rotation (or its grace replay) dies with it.
+		let refreshExp = payload.exp
+		if (body?.refreshToken) {
 			const refreshPayload = this.tokenManager.validateToken(body.refreshToken)
-			if (refreshPayload !== null && refreshPayload.type === 'refresh') {
+			if (
+				refreshPayload !== null &&
+				refreshPayload.type === 'refresh' &&
+				refreshPayload.sub === payload.sub
+			) {
 				await this.tokenManager.revokeToken(refreshPayload.jti, refreshPayload.exp)
+				refreshExp = Math.max(refreshExp, refreshPayload.exp)
+				if (refreshPayload.fam) {
+					await this.tokenManager.revokeFamily(refreshPayload.fam, refreshPayload.exp)
+				}
 			}
 		}
+		if (payload.fam) {
+			await this.tokenManager.revokeFamily(payload.fam, refreshExp)
+		}
+		await this.emitRevoke({
+			kind: 'session',
+			userId: payload.sub,
+			deviceId: payload.dev,
+			family: payload.fam ?? null,
+		})
 
 		return {
 			status: 200,
@@ -585,21 +887,11 @@ export class BuiltInAuthRoutes {
 	 * @returns Auth response with the user profile, or an error
 	 */
 	async handleGetMe(accessToken: string): Promise<AuthRouteResponse<AuthUser>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
-
-		const storedUser = await this.userStore.findById(payload.sub)
-		if (storedUser === null) {
-			return {
-				status: 404,
-				body: { error: 'User not found.' },
-			}
-		}
+		const storedUser = access.user
 
 		const user: AuthUser = {
 			id: storedUser.id,
@@ -624,15 +916,12 @@ export class BuiltInAuthRoutes {
 	 * @returns Auth response with the device list, or an error
 	 */
 	async handleListDevices(accessToken: string): Promise<AuthRouteResponse<AuthDevice[]>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
 
-		const devices = await this.userStore.listDevices(payload.sub)
+		const devices = await this.userStore.listDevices(access.payload.sub)
 
 		return {
 			status: 200,
@@ -654,13 +943,11 @@ export class BuiltInAuthRoutes {
 		accessToken: string,
 		deviceId: string,
 	): Promise<AuthRouteResponse<{ success: boolean }>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
+		const { payload } = access
 
 		// Verify the device belongs to the authenticated user
 		const device = await this.userStore.findDevice(deviceId)
@@ -680,8 +967,10 @@ export class BuiltInAuthRoutes {
 
 		await this.userStore.revokeDevice(deviceId)
 
-		// Invalidate all tokens for this device
+		// Invalidate every token issued to this device so far. A later sign-in on
+		// the same device issues fresh tokens that are accepted (NEW-AUTH-1).
 		await this.tokenManager.revokeDeviceTokens(deviceId)
+		await this.emitRevoke({ kind: 'device', userId: payload.sub, deviceId })
 
 		return {
 			status: 200,
@@ -710,13 +999,11 @@ export class BuiltInAuthRoutes {
 			name: string
 		},
 	): Promise<AuthRouteResponse<{ device: AuthDevice; deviceCredential: string }>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
+		const { payload } = access
 
 		// Sanitize the device name
 		const deviceName = sanitizeName(body.name)
@@ -751,13 +1038,19 @@ export class BuiltInAuthRoutes {
 			}
 		}
 
-		// Register the device in the user store
-		const device = await this.userStore.registerDevice({
-			id: body.deviceId,
-			userId: payload.sub,
-			publicKey: body.publicKey,
-			name: deviceName,
-		})
+		// Register the device in the user store (refused if another user owns the id)
+		let device: AuthDevice
+		try {
+			device = await this.userStore.registerDevice({
+				id: body.deviceId,
+				userId: payload.sub,
+				publicKey: body.publicKey,
+				name: deviceName,
+			})
+		} catch (error) {
+			if (error instanceof DeviceOwnershipError) return deviceConflict()
+			throw error
+		}
 
 		// Issue a device credential token bound to the public key thumbprint
 		const deviceCredential = this.tokenManager.issueDeviceCredential(
@@ -788,13 +1081,11 @@ export class BuiltInAuthRoutes {
 		accessToken: string,
 		deviceId: string,
 	): Promise<AuthRouteResponse<{ challenge: string }>> {
-		const payload = this.tokenManager.validateToken(accessToken)
-		if (payload === null || payload.type !== 'access') {
-			return {
-				status: 401,
-				body: { error: 'Invalid or expired access token.' },
-			}
+		const access = await this.authenticateAccess(accessToken)
+		if (access === null) {
+			return invalidAccessToken()
 		}
+		const { payload } = access
 
 		// Verify the device exists and belongs to this user
 		const device = await this.userStore.findDevice(deviceId)
@@ -941,17 +1232,30 @@ export class BuiltInAuthRoutes {
 		return randomBytes(32).toString('hex')
 	}
 
+	private getDummyCredential(): Promise<{ hash: string; salt: string }> {
+		if (!this.dummyCredential) {
+			this.dummyCredential = hashPassword(randomUUID())
+		}
+		return this.dummyCredential
+	}
+
 	/**
 	 * Creates a sync server auth provider compatible with `@korajs/server`.
 	 *
 	 * The returned object implements the `AuthProvider` interface from
 	 * `@korajs/server`, validating access tokens and returning an auth
-	 * context containing the user ID and device metadata. This bridges
-	 * the built-in auth system with the sync server's authentication layer.
+	 * context containing the user ID, device metadata and a SERVER-DERIVED
+	 * scope grant. The client handshake can only narrow that grant (AUTH-1).
+	 *
+	 * By default the grant binds every schema-scoped collection from
+	 * `{ userId: <verified sub> }`. Collections scoped by any other key (for
+	 * example `orgId`) are denied until `scopeValues` or `resolveScopes`
+	 * supplies it; they are never widened to "every tenant".
 	 *
 	 * Also checks device revocation status during authentication, ensuring
 	 * that revoked devices are rejected even if their tokens haven't expired.
 	 *
+	 * @param options - Optional server-side scope derivation
 	 * @returns An object with an `authenticate` method suitable for KoraSyncServer's `auth` config
 	 *
 	 * @example
@@ -959,44 +1263,36 @@ export class BuiltInAuthRoutes {
 	 * const routes = new BuiltInAuthRoutes({ userStore, tokenManager })
 	 * const syncServer = new KoraSyncServer({
 	 *   store,
-	 *   auth: routes.toSyncAuthProvider(),
+	 *   auth: routes.toSyncAuthProvider({
+	 *     scopeValues: async ({ userId }) => ({ orgId: await orgOf(userId) }),
+	 *   }),
 	 * })
 	 * ```
 	 */
-	toSyncAuthProvider(): {
-		authenticate(token: string): Promise<{
-			userId: string
-			scopes?: Record<string, Record<string, unknown>>
-			metadata?: Record<string, unknown>
-		} | null>
-	} {
-		const tokenManager = this.tokenManager
-		const userStore = this.userStore
-
+	toSyncAuthProvider(options: SyncScopeOptions = {}): SyncAuthProvider {
 		return {
-			async authenticate(token: string) {
-				const payload = await tokenManager.validateTokenWithRevocation(token)
-				if (payload === null || payload.type !== 'access') {
+			authenticate: async (token: string) => {
+				const authenticated = await this.authenticateAccess(token)
+				if (!authenticated) {
 					return null
 				}
-
-				// Verify the user still exists
-				const user = await userStore.findById(payload.sub)
-				if (user === null) {
-					return null
-				}
-
-				// Check device revocation status
-				const device = await userStore.findDevice(payload.dev)
-				if (device?.revoked) {
-					return null
-				}
+				const { user, payload } = authenticated
 
 				// Touch the device to update last-seen timestamp
-				await userStore.touchDevice(payload.dev)
+				await this.userStore.touchDevice(payload.dev)
+
+				const claims: VerifiedSyncClaims = {
+					userId: payload.sub,
+					deviceId: payload.dev,
+					email: user.email,
+					name: user.name,
+				}
+				const scopes = await resolveSyncGrant(claims, options)
 
 				return {
 					userId: payload.sub,
+					scopes,
+					expiresAt: payload.exp * 1000,
 					metadata: {
 						deviceId: payload.dev,
 						email: user.email,
@@ -1004,6 +1300,14 @@ export class BuiltInAuthRoutes {
 					},
 				}
 			},
+			onRevoke: (listener) =>
+				this.onRevoke((event) =>
+					listener(
+						event.kind === 'user'
+							? { userId: event.userId }
+							: { userId: event.userId, deviceId: event.deviceId },
+					),
+				),
 		}
 	}
 }

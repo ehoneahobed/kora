@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto'
+import { KoraError } from '@korajs/core'
 import {
 	InMemoryTokenRevocationStore,
 	TokenManager,
 	type TokenManagerConfig,
+	type TokenRevocationStore,
 } from '../../tokens/token-manager'
 import type { AuthTokens } from '../../types'
 import {
@@ -10,7 +12,7 @@ import {
 	InMemoryLinkedIdentityStore,
 	type LinkedIdentityStore,
 } from '../oauth/linked-identity-store'
-import { OAuthManager, type OAuthManagerConfig } from '../oauth/oauth-flow'
+import { OAuthManager, type OAuthManagerConfig, generateOAuthBinding } from '../oauth/oauth-flow'
 import {
 	type LinkedIdentity,
 	OAuthError,
@@ -18,14 +20,24 @@ import {
 	type OAuthUserInfo,
 } from '../oauth/oauth-types'
 import {
+	type AuthRevocationEvent,
 	type AuthRouteResponse,
 	type AuthRoutesConfig,
 	BuiltInAuthRoutes,
 	type ChallengeStore,
+	type MfaVerifier,
 	type RateLimiter,
+	type SignInResult,
 } from './auth-routes'
 import { hashPassword } from './password-hash'
-import { type AuthUser, InMemoryUserStore, type StoredUser, type UserStore } from './user-store'
+import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
+import {
+	type AuthUser,
+	DeviceOwnershipError,
+	InMemoryUserStore,
+	type StoredUser,
+	type UserStore,
+} from './user-store'
 
 type SignUpBody = Parameters<BuiltInAuthRoutes['handleSignUp']>[0]
 type SignInBody = Parameters<BuiltInAuthRoutes['handleSignIn']>[0]
@@ -60,9 +72,21 @@ export interface OAuthServerConfig extends Omit<OAuthManagerConfig, 'providers'>
 	allowUnlinkLastIdentity?: boolean
 }
 
-export interface CreateKoraAuthServerOptions {
+export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	/** Existing user store. Defaults to InMemoryUserStore for development. */
 	userStore?: UserStore
+	/**
+	 * Token revocation store. Defaults to the user store's own revocation store
+	 * (`userStore.getTokenRevocationStore()`), so revocations persist and are shared
+	 * exactly as far as the users are.
+	 */
+	revocationStore?: TokenRevocationStore
+	/**
+	 * Allow in-memory user or revocation stores when `NODE_ENV=production`.
+	 * In-memory stores lose every account and every revocation on restart and are
+	 * not shared between instances, so production refuses them by default.
+	 */
+	allowInMemory?: boolean
 	/** Existing token manager. Overrides `jwtSecret` and `tokenManager` options. */
 	tokenManager?: TokenManager
 	/** JWT secret. Required in production when `tokenManager` is not provided. */
@@ -75,6 +99,20 @@ export interface CreateKoraAuthServerOptions {
 	oauth?: OAuthServerConfig
 	challengeStore?: ChallengeStore
 	rateLimiter?: RateLimiter
+	/**
+	 * Second-factor verifier (for example a `TotpManager`). Users with MFA enabled
+	 * then sign in in two steps: `{ mfaRequired, mfaToken }`, then
+	 * `POST /auth/mfa/verify` with `{ mfaToken, code }`.
+	 */
+	mfa?: MfaVerifier
+}
+
+/**
+ * The part of `KoraSyncServer` the auth server needs to end live sessions.
+ * Structural, so `@korajs/auth` does not depend on `@korajs/server`.
+ */
+export interface SyncSessionTerminator {
+	terminateSessions(filter: { userId?: string; deviceId?: string }): unknown
 }
 
 export interface KoraAuthServer {
@@ -83,8 +121,44 @@ export interface KoraAuthServer {
 	tokenManager: TokenManager
 	oauth?: OAuthManager
 	linkedIdentityStore?: LinkedIdentityStore
-	auth: ReturnType<BuiltInAuthRoutes['toSyncAuthProvider']>
+	/** Sync auth provider with server-derived scopes (pass to `KoraSyncServer`). */
+	auth: SyncAuthProvider
 	handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
+	/**
+	 * Revoke every credential a user holds (call after a password change made
+	 * outside these routes, an admin action or an account deletion).
+	 */
+	revokeAllForUser(userId: string): Promise<void>
+	/** Subscribe to credential revocations. Returns an unsubscribe function. */
+	onRevoke(listener: (event: AuthRevocationEvent) => void | Promise<void>): () => void
+	/**
+	 * End live sync sessions when their credentials are revoked (AUTH-11).
+	 * Requires a sync server exposing `terminateSessions({ userId, deviceId })`.
+	 * A `KoraSyncServer` constructed with this server's `auth` provider already
+	 * follows its revocations; call this for a server built with a wrapping or
+	 * custom provider. Binding both is harmless. Returns an unsubscribe function.
+	 */
+	bindSyncServer(server: SyncSessionTerminator): () => void
+}
+
+/**
+ * Thrown by `createKoraAuthServer` in production when a store would silently
+ * lose accounts or revocations on restart.
+ */
+export class InMemoryAuthStoreError extends KoraError {
+	constructor(which: 'userStore' | 'revocationStore') {
+		super(
+			`createKoraAuthServer refuses an in-memory ${which} in production: it loses every ${
+				which === 'userStore' ? 'account' : 'sign-out and revocation'
+			} on restart and is not shared between instances.`,
+			'IN_MEMORY_AUTH_STORE',
+			{
+				which,
+				fix: 'Pass a persistent store (createSqliteUserStore / createPostgresUserStore, whose getTokenRevocationStore() is used automatically), or set allowInMemory: true for a throwaway deployment.',
+			},
+		)
+		this.name = 'InMemoryAuthStoreError'
+	}
 }
 
 interface OAuthServerRuntime {
@@ -103,12 +177,25 @@ interface OAuthServerRuntime {
  */
 export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}): KoraAuthServer {
 	const userStore = options.userStore ?? new InMemoryUserStore()
-	const tokenManager = options.tokenManager ?? createDefaultTokenManager(options)
+	const revocationStore =
+		options.revocationStore ??
+		options.tokenManagerOptions?.revocationStore ??
+		userStore.getTokenRevocationStore?.() ??
+		new InMemoryTokenRevocationStore()
+	const tokenManager = options.tokenManager ?? createDefaultTokenManager(options, revocationStore)
+	if (isProduction() && !options.allowInMemory) {
+		if (userStore instanceof InMemoryUserStore) throw new InMemoryAuthStoreError('userStore')
+		const effectiveRevocation = tokenManager.getRevocationStore()
+		if (!effectiveRevocation || effectiveRevocation instanceof InMemoryTokenRevocationStore) {
+			throw new InMemoryAuthStoreError('revocationStore')
+		}
+	}
 	const routes = new BuiltInAuthRoutes({
 		userStore,
 		tokenManager,
 		challengeStore: options.challengeStore,
 		rateLimiter: options.rateLimiter,
+		mfa: options.mfa,
 	})
 	const oauth = options.oauth ? createOAuthRuntime(options.oauth) : undefined
 	const path = normalizePath(options.path ?? '/auth')
@@ -119,14 +206,35 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		tokenManager,
 		oauth: oauth?.manager,
 		linkedIdentityStore: oauth?.linkedIdentityStore,
-		auth: routes.toSyncAuthProvider(),
+		auth: routes.toSyncAuthProvider({
+			scopeValues: options.scopeValues,
+			resolveScopes: options.resolveScopes,
+		}),
 		handleRequest(request) {
 			return handleAuthRequest(routes, path, request, oauth, userStore, tokenManager)
+		},
+		revokeAllForUser(userId) {
+			return routes.revokeAllForUser(userId)
+		},
+		onRevoke(listener) {
+			return routes.onRevoke(listener)
+		},
+		bindSyncServer(server) {
+			return routes.onRevoke((event) => {
+				if (event.kind === 'user') {
+					server.terminateSessions({ userId: event.userId })
+				} else {
+					server.terminateSessions({ userId: event.userId, deviceId: event.deviceId })
+				}
+			})
 		},
 	}
 }
 
-function createDefaultTokenManager(options: CreateKoraAuthServerOptions): TokenManager {
+function createDefaultTokenManager(
+	options: CreateKoraAuthServerOptions,
+	revocationStore: TokenRevocationStore,
+): TokenManager {
 	const secret = options.jwtSecret ?? readEnvSecret()
 	if (!secret && isProduction()) {
 		throw new Error(
@@ -151,8 +259,8 @@ function createDefaultTokenManager(options: CreateKoraAuthServerOptions): TokenM
 
 	return new TokenManager({
 		secret: secret ?? TokenManager.generateSecret(),
-		revocationStore: new InMemoryTokenRevocationStore(),
 		...options.tokenManagerOptions,
+		revocationStore,
 	})
 }
 
@@ -187,6 +295,7 @@ async function handleAuthRequest(
 	if (relativePath.startsWith('/oauth/')) {
 		return handleOAuthRequest({
 			oauth,
+			routes,
 			userStore,
 			tokenManager,
 			relativePath,
@@ -194,6 +303,8 @@ async function handleAuthRequest(
 			body,
 			query: request.query,
 			token,
+			cookieBinding: readCookie(request.headers, OAUTH_BINDING_COOKIE),
+			pathPrefix,
 		})
 	}
 
@@ -202,6 +313,9 @@ async function handleAuthRequest(
 	}
 	if (method === 'POST' && relativePath === '/signin') {
 		return routes.handleSignIn(body as SignInBody, request.ip)
+	}
+	if (method === 'POST' && relativePath === '/mfa/verify') {
+		return routes.handleMfaVerify(body)
 	}
 	if (method === 'POST' && relativePath === '/refresh') {
 		return routes.handleRefresh(body as RefreshBody)
@@ -234,6 +348,7 @@ async function handleAuthRequest(
 
 async function handleOAuthRequest(params: {
 	oauth: OAuthServerRuntime | undefined
+	routes: BuiltInAuthRoutes
 	userStore: UserStore
 	tokenManager: TokenManager
 	relativePath: string
@@ -241,21 +356,35 @@ async function handleOAuthRequest(params: {
 	body: Record<string, unknown>
 	query: KoraAuthHttpRequest['query']
 	token: string
+	cookieBinding: string | undefined
+	pathPrefix: string
 }): Promise<AuthRouteResponse<unknown>> {
-	const { oauth, userStore, tokenManager, relativePath, method, body, query, token } = params
+	const {
+		oauth,
+		routes,
+		userStore,
+		tokenManager,
+		relativePath,
+		method,
+		body,
+		query,
+		token,
+		cookieBinding,
+		pathPrefix,
+	} = params
 	if (!oauth) {
 		return notFound()
 	}
 
 	try {
 		if (method === 'GET' && relativePath === '/oauth/links') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const identities = await oauth.linkedIdentityStore.findByUser(authUser.id)
 			return { status: 200, body: { data: identities } }
 		}
 
-		const match = /^\/oauth\/([^/]+)(?:\/(callback|link))?$/.exec(relativePath)
+		const match = /^\/oauth\/([^/]+)(?:\/(callback|link|link\/start))?$/.exec(relativePath)
 		if (!match) {
 			return notFound()
 		}
@@ -263,12 +392,29 @@ async function handleOAuthRequest(params: {
 		const provider = decodeURIComponent(match[1] as string)
 		const action = match[2]
 
+		// Every flow is bound to its purpose and to the initiating client (AUTH-3):
+		// a random binding goes to the client as an HttpOnly cookie (web) and in the
+		// body (native/PKCE apps keep it in memory); only its hash is stored.
 		if (method === 'GET' && !action) {
+			const binding = generateOAuthBinding()
 			const { url, state } = await oauth.manager.getAuthorizationUrl(
 				provider,
 				metadataFromQuery(query),
+				{ purpose: 'signin', binding },
 			)
-			return { status: 200, body: { data: { url, state } } }
+			return flowStarted(url, state, binding, pathPrefix)
+		}
+
+		if (method === 'POST' && action === 'link/start') {
+			const authUser = await requireAuthUser(routes, token)
+			if ('status' in authUser) return authUser
+			const binding = generateOAuthBinding()
+			const { url, state } = await oauth.manager.getAuthorizationUrl(provider, undefined, {
+				purpose: 'link',
+				userId: authUser.id,
+				binding,
+			})
+			return flowStarted(url, state, binding, pathPrefix)
 		}
 
 		if ((method === 'GET' || method === 'POST') && action === 'callback') {
@@ -277,31 +423,39 @@ async function handleOAuthRequest(params: {
 			if (!code || !state) {
 				return { status: 400, body: { error: 'OAuth callback requires code and state.' } }
 			}
-			return completeOAuthSignIn({
+			return await completeOAuthSignIn({
 				oauth,
+				routes,
 				userStore,
-				tokenManager,
 				provider,
 				code,
 				state,
+				binding: readString(body.binding) ?? cookieBinding,
 				deviceId: readString(body.deviceId),
 				devicePublicKey: readString(body.devicePublicKey),
 			})
 		}
 
 		if (method === 'POST' && action === 'link') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const code = readString(body.code)
 			const state = readString(body.state)
 			if (!code || !state) {
 				return { status: 400, body: { error: 'OAuth linking requires code and state.' } }
 			}
-			return linkOAuthIdentity(oauth, authUser.id, provider, code, state)
+			return await linkOAuthIdentity(
+				oauth,
+				authUser.id,
+				provider,
+				code,
+				state,
+				readString(body.binding) ?? cookieBinding,
+			)
 		}
 
 		if (method === 'DELETE' && action === 'link') {
-			const authUser = await requireAuthUser(tokenManager, userStore, token)
+			const authUser = await requireAuthUser(routes, token)
 			if ('status' in authUser) return authUser
 			const identities = await oauth.linkedIdentityStore.findByUser(authUser.id)
 			if (!oauth.allowUnlinkLastIdentity && identities.length <= 1) {
@@ -325,17 +479,20 @@ async function handleOAuthRequest(params: {
 
 async function completeOAuthSignIn(params: {
 	oauth: OAuthServerRuntime
+	routes: BuiltInAuthRoutes
 	userStore: UserStore
-	tokenManager: TokenManager
 	provider: string
 	code: string
 	state: string
+	binding: string | undefined
 	deviceId?: string
 	devicePublicKey?: string
-}): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens; identity: LinkedIdentity }>> {
-	const { oauth, userStore, tokenManager, provider, code, state, deviceId, devicePublicKey } =
-		params
-	const { userInfo, stateMetadata } = await oauth.manager.handleCallback(provider, code, state)
+}): Promise<AuthRouteResponse<SignInResult & { identity: LinkedIdentity }>> {
+	const { oauth, routes, userStore, provider, code, state, deviceId, devicePublicKey } = params
+	const { userInfo } = await oauth.manager.handleCallback(provider, code, state, {
+		purpose: 'signin',
+		binding: params.binding,
+	})
 	const linkedIdentity = await oauth.linkedIdentityStore.findByProvider(
 		userInfo.provider,
 		userInfo.providerId,
@@ -362,16 +519,34 @@ async function completeOAuthSignIn(params: {
 		})
 	}
 
-	const resolvedDeviceId = deviceId ?? readString(stateMetadata?.deviceId) ?? `device-${user.id}`
-	await userStore.registerDevice({
-		id: resolvedDeviceId,
-		userId: user.id,
-		publicKey: devicePublicKey ?? readString(stateMetadata?.devicePublicKey) ?? '',
-		name: deviceId ? 'Device' : 'Browser',
-	})
+	// Never trust a device id carried in OAuth state metadata (it comes from the
+	// query string of whoever started the flow), and never default to a per-user
+	// id that every browser of the user would share (AUTH-3, AUTH-5).
+	const resolvedDeviceId = deviceId ?? `dev-${randomUUID()}`
+	try {
+		await userStore.registerDevice({
+			id: resolvedDeviceId,
+			userId: user.id,
+			publicKey: devicePublicKey ?? '',
+			name: deviceId ? 'Device' : 'Browser',
+		})
+	} catch (error) {
+		if (error instanceof DeviceOwnershipError) {
+			return {
+				status: 409,
+				body: {
+					error: 'This device id is registered to another account.',
+					code: 'DEVICE_OWNERSHIP_CONFLICT',
+				},
+			}
+		}
+		throw error
+	}
 
-	const tokens = tokenManager.issueTokens(user.id, resolvedDeviceId)
-	return { status: 200, body: { data: { user, tokens, identity } } }
+	// Same rule as password sign-in: an MFA user gets a challenge, not tokens.
+	const result = await routes.completePrimaryAuthentication(user, resolvedDeviceId, ['oauth'])
+	if (!('data' in result.body)) return result as AuthRouteResponse<never>
+	return { status: result.status, body: { data: { ...result.body.data, identity } } }
 }
 
 async function resolveOAuthUser(
@@ -418,8 +593,13 @@ async function linkOAuthIdentity(
 	provider: string,
 	code: string,
 	state: string,
+	binding: string | undefined,
 ): Promise<AuthRouteResponse<LinkedIdentity>> {
-	const { userInfo } = await oauth.manager.handleCallback(provider, code, state)
+	const { userInfo } = await oauth.manager.handleCallback(provider, code, state, {
+		purpose: 'link',
+		userId,
+		binding,
+	})
 	const existing = await oauth.linkedIdentityStore.findByProvider(
 		userInfo.provider,
 		userInfo.providerId,
@@ -441,22 +621,52 @@ async function linkOAuthIdentity(
 }
 
 async function requireAuthUser(
-	tokenManager: TokenManager,
-	userStore: UserStore,
+	routes: BuiltInAuthRoutes,
 	token: string,
 ): Promise<AuthUser | AuthRouteResponse<never>> {
 	if (!token) {
-		return { status: 401, body: { error: 'Authorization token required.' } }
+		return {
+			status: 401,
+			body: { error: 'Authorization token required.', code: 'ACCESS_TOKEN_REQUIRED' },
+		}
 	}
-	const payload = await tokenManager.validateToken(token)
-	if (!payload || payload.type !== 'access') {
-		return { status: 401, body: { error: 'Invalid or expired token.' } }
+	// The same revocation-aware check every route uses (AUTH-2, AUTH-8).
+	const access = await routes.authenticateAccess(token)
+	if (!access) {
+		return {
+			status: 401,
+			body: { error: 'Invalid or expired token.', code: 'ACCESS_TOKEN_INVALID' },
+		}
 	}
-	const user = await userStore.findById(payload.sub)
-	if (!user) {
-		return { status: 401, body: { error: 'User not found.' } }
+	return toAuthUser(access.user)
+}
+
+const OAUTH_BINDING_COOKIE = 'kora_oauth_binding'
+
+function flowStarted(
+	url: string,
+	state: string,
+	binding: string,
+	pathPrefix: string,
+): AuthRouteResponse<{ url: string; state: string; binding: string }> {
+	return {
+		status: 200,
+		body: { data: { url, state, binding } },
+		headers: {
+			'Set-Cookie': `${OAUTH_BINDING_COOKIE}=${binding}; Path=${pathPrefix}/oauth; Max-Age=600; HttpOnly; Secure; SameSite=Lax`,
+		},
 	}
-	return toAuthUser(user)
+}
+
+function readCookie(headers: KoraAuthHttpRequest['headers'], name: string): string | undefined {
+	const raw = headers?.cookie ?? headers?.Cookie
+	const value = Array.isArray(raw) ? raw.join('; ') : raw
+	if (!value) return undefined
+	for (const part of value.split(';')) {
+		const [key, ...rest] = part.trim().split('=')
+		if (key === name) return rest.join('=')
+	}
+	return undefined
 }
 
 function extractBearerToken(headers: KoraAuthHttpRequest['headers']): string {

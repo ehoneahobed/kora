@@ -9,9 +9,17 @@ export type {
 	HttpSyncResponse,
 	KoraSyncServerConfig,
 	ServerStatus,
+	SessionRevocation,
+	TerminateSessionsFilter,
 } from './types'
 
-export type { ServerStore, MaterializedRecord, CollectionQueryOptions } from './store/server-store'
+export type {
+	ApplyRemoteOptions,
+	ServerStore,
+	MaterializedRecord,
+	CollectionQueryOptions,
+} from './store/server-store'
+export type { TrustProxySetting } from './server/trust-proxy'
 
 export type {
 	ServerCloseHandler,
@@ -92,7 +100,7 @@ export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
 export { HttpServerTransport } from './transport/http-server-transport'
 export { WsServerTransport } from './transport/ws-server-transport'
-export { ClientSession } from './session/client-session'
+export { ClientSession, type SessionTerminationCode } from './session/client-session'
 export { KoraSyncServer } from './server/kora-sync-server'
 export { NoAuthProvider } from './auth/no-auth'
 export { TokenAuthProvider } from './auth/token-auth'
@@ -100,9 +108,28 @@ export { KoraAuthProvider } from './auth/kora-auth-provider'
 export { MixedAuthProvider } from './auth/mixed-auth-provider'
 export {
 	DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
+	UplinkAuthorizationError,
+	authorizeUplinkWrite,
 	normalizeScopeMap,
 	operationMatchesScopes,
+	type UplinkAuthorizationCode,
+	type UplinkAuthorizationResult,
 } from './scopes/server-scope-filter'
+export {
+	InvalidScopePredicateError,
+	ScopePredicateLimitError,
+} from './scopes/scope-predicate-errors'
+export {
+	ScopeRequiredError,
+	resolveSessionScopeGrant,
+	resolveSessionScopes,
+} from './scopes/resolve-session-scopes'
+export type {
+	DeniedScopeCollection,
+	ResolveSessionScopesOptions,
+	ResolvedSessionScopeGrant,
+} from './scopes/resolve-session-scopes'
+export { SCOPE_CLAIMS_KEY, claimScopes } from '@korajs/core'
 
 // === Awareness ===
 export { AwarenessRelay } from './awareness/awareness-relay'

@@ -19,6 +19,19 @@ export interface AuthContext {
 	uplinkScopes?: Record<string, Record<string, unknown>>
 	/** Arbitrary metadata about the authenticated user */
 	metadata?: Record<string, unknown>
+	/**
+	 * True for an unauthenticated (anonymous) principal, such as the fallback of
+	 * `MixedAuthProvider`. Its `userId` is not stable across connections, so node-id
+	 * claims are keyed by the shared anonymous owner instead: an anonymous device can
+	 * reconnect with its node id, but can never take a signed-in user's node id.
+	 */
+	anonymous?: boolean
+	/**
+	 * When the credential that authenticated this session expires (ms since
+	 * epoch). A session must not outlive its credential: the sync server can
+	 * close it with a retriable AUTH_EXPIRED so the client refreshes (AUTH-11).
+	 */
+	expiresAt?: number
 }
 
 /**
@@ -32,6 +45,35 @@ export interface AuthProvider {
 	 * @returns AuthContext if valid, null if rejected
 	 */
 	authenticate(token: string): Promise<AuthContext | null>
+	/**
+	 * Optional revocation feed. When present, `KoraSyncServer` subscribes on
+	 * construction and calls {@link KoraSyncServer.terminateSessions} for every
+	 * event, so a revoked device or user loses its live sync sessions immediately
+	 * (AUTH-11). The built-in `createKoraAuthServer().auth` provides it.
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRevoke?(listener: (event: SessionRevocation) => void | Promise<void>): () => void
+}
+
+/**
+ * Which live sync sessions a credential revocation ends. `userId` alone ends
+ * every session of that user; with `deviceId` only that device's sessions
+ * (matched against `AuthContext.metadata.deviceId`).
+ */
+export interface SessionRevocation {
+	userId?: string
+	deviceId?: string
+}
+
+/** Options for {@link KoraSyncServer.terminateSessions}. */
+export interface TerminateSessionsFilter extends SessionRevocation {
+	/**
+	 * Error code sent to the client before the session closes. Both are retriable:
+	 * the client refreshes its credentials and re-handshakes, and the server then
+	 * decides again. Defaults to `'AUTH_REVOKED'`.
+	 */
+	code?: 'AUTH_REVOKED' | 'AUTH_EXPIRED'
 }
 
 /**
@@ -108,6 +150,32 @@ export interface KoraSyncServerConfig {
 	 */
 	persistBlobChunk?: (hash: string, bytes: Uint8Array) => Promise<void> | void
 	/**
+	 * Limits on the blob side channel. `maxChunkBytes` (default 1 MiB) caps one
+	 * pushed chunk or manifest, `maxBytesPerSession` (default 256 MiB) caps the total
+	 * a session may push for central persistence, `maxPendingRequestsPerSession`
+	 * (default 256) and `pendingRequestTtlMs` (default 60s) bound the chunk requests
+	 * the relay remembers per session.
+	 */
+	blobLimits?: {
+		maxChunkBytes?: number
+		maxBytesPerSession?: number
+		maxPendingRequestsPerSession?: number
+		pendingRequestTtlMs?: number
+		/**
+		 * Blob chunk requests one session may make per minute, a budget separate from
+		 * `maxOpsPerMinute` (one request per chunk, so a large blob makes many). Over
+		 * it, a request is answered with a retriable `throttled` response the client
+		 * backs off on (RT-24). Defaults to 6000.
+		 */
+		maxRequestsPerMinute?: number
+	}
+	/**
+	 * Largest WebSocket message the standalone server (and `createProductionServer`)
+	 * accepts, in bytes. Larger frames are refused by the socket layer before they are
+	 * buffered. Defaults to 32 MiB (the `ws` library default is 100 MiB).
+	 */
+	maxMessageBytes?: number
+	/**
 	 * Maximum serialized byte size of a single client operation accepted at sync
 	 * ingest. Operations larger than this are rejected before materialization.
 	 * Defaults to 256 KiB. Set once here to enforce one payload cap across every
@@ -120,6 +188,41 @@ export interface KoraSyncServerConfig {
 	 * 600. Set once here to enforce one rate cap across every connected client.
 	 */
 	maxOpsPerMinute?: number
+	/**
+	 * Largest operation batch accepted from a client in one message. A larger batch is
+	 * refused whole with `BATCH_TOO_LARGE` before the server decodes it or reads the
+	 * store, so one message cannot buy unbounded work. Defaults to 1000 (the client
+	 * sends batches of 100 by default).
+	 */
+	maxOpsPerBatch?: number
+	/**
+	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
+	 * nodes held by the pre-release shared anonymous owner, and provisional claims
+	 * that expired without the device ever confirming its node token (clients without
+	 * token support). Accepted with a deprecation warning and re-issued a token.
+	 * Defaults to `true` for 1.0.0-beta.13; the default flips to `false` in the next
+	 * release, after which such devices rotate to a fresh node id instead.
+	 */
+	allowLegacyAnonymousClaims?: boolean
+	/**
+	 * How long an anonymous device's provisional node claim may stay unconfirmed and
+	 * still be re-issued to a device that presents no token (a handshake response lost
+	 * in transit), in milliseconds (RT-21). Defaults to 24 hours.
+	 */
+	anonymousClaimTtlMs?: number
+	/**
+	 * How often every live session's credential is re-validated with the auth
+	 * provider, in milliseconds (RT-18). A revocation persisted by another server
+	 * instance ends the session here within this interval. Defaults to 30 seconds; 0
+	 * disables it (sessions then end only through this process's `onRevoke` feed,
+	 * `terminateSessions`, or credential expiry).
+	 */
+	sessionRevalidationIntervalMs?: number
+	/**
+	 * How long an HTTP long-poll session may go without any request before the server
+	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
+	 */
+	httpSessionIdleTimeoutMs?: number
 	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *
@@ -136,12 +239,25 @@ export interface KoraSyncServerConfig {
 
 /**
  * Request envelope for the server-side HTTP sync endpoint.
+ *
+ * Map it from your HTTP framework: `sessionId` from the `x-kora-session` header and
+ * `authorization` from the `Authorization` header, on every request.
  */
 export interface HttpSyncRequest {
-	/** Stable client identifier for binding HTTP requests to a server session */
-	clientId: string
 	/** HTTP method */
 	method: 'GET' | 'POST'
+	/**
+	 * The server-issued session id (`x-kora-session` request header). Absent only on
+	 * the POST that opens a session (the handshake); the response to that POST
+	 * carries the new id in its `x-kora-session` header. Never chosen by the client.
+	 */
+	sessionId?: string
+	/**
+	 * The raw `Authorization` header (`Bearer <token>`). With an auth provider
+	 * configured, EVERY request is authenticated and must resolve to the same
+	 * principal and device as the session it names (RT-2).
+	 */
+	authorization?: string
 	/** Optional raw request payload for POST */
 	body?: string | Uint8Array
 	/** Value of the Content-Type header for POST payloads */
@@ -155,7 +271,7 @@ export interface HttpSyncRequest {
  */
 export interface HttpSyncResponse {
 	/** HTTP status code */
-	status: 200 | 202 | 204 | 304 | 400 | 405 | 410
+	status: 200 | 202 | 204 | 304 | 400 | 401 | 403 | 404 | 405 | 410
 	/** Optional raw response payload */
 	body?: string | Uint8Array
 	/** Optional response headers */

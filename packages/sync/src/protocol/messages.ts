@@ -25,6 +25,8 @@ export interface SerializedOperation {
 	transactionId?: string
 	/** Human-readable name for the mutation group. For DevTools display. */
 	mutationName?: string
+	/** Per-field versions of a server scope-entry insert (RT-27). Server-authored only. */
+	fieldVersions?: Record<string, HLCTimestamp>
 }
 
 /**
@@ -55,6 +57,13 @@ export interface HandshakeMessage {
 	lastDeliverySequence?: number
 	/** Opt in to client-local removal when records leave the accepted downlink view. */
 	scopeExitPolicy?: 'retain' | 'retract'
+	/**
+	 * The per-device secret the server issued at this node id's first claim
+	 * (`HandshakeResponseMessage.nodeToken`). An anonymous principal must present it
+	 * to reconnect with its node id, so another anonymous client cannot take the node
+	 * over (RT-12). Stored by the client next to its node id; never sent elsewhere.
+	 */
+	nodeToken?: string
 }
 
 /**
@@ -94,6 +103,22 @@ export interface HandshakeResponseMessage {
 	 * from the beginning instead of sitting above a frontier that no longer exists.
 	 */
 	serverMaxDeliverySequence?: number
+	/**
+	 * A per-device secret issued when this handshake made the first claim of the node
+	 * id for an anonymous principal (RT-12). The client stores it next to its node id
+	 * and presents it in every later handshake (`HandshakeMessage.nodeToken`).
+	 *
+	 * The claim stays provisional until the client proves it saved the token, by
+	 * presenting it in a later handshake or by echoing it in an acknowledgment of this
+	 * response (`AcknowledgmentMessage.nodeToken`) right after persisting it (RT-21).
+	 */
+	nodeToken?: string
+	/**
+	 * Peer-relay servers (no central blob storage) set this to ask the client to push
+	 * the bytes behind its blob references anyway: the server verifies them against
+	 * their hash, records possession, and drops them (RT-23).
+	 */
+	blobPossessionProof?: boolean
 }
 
 /**
@@ -148,6 +173,12 @@ export interface AcknowledgmentMessage {
 	 * stream batch. `lastSequenceNumber` stays for existing per-node behavior.
 	 */
 	deliverySequence?: number
+	/**
+	 * Claim confirmation (RT-21): the node token from a handshake response, echoed
+	 * once the client has persisted it, so the server makes the provisional claim of
+	 * the node id permanent. Sent with `acknowledgedMessageId` set to the response id.
+	 */
+	nodeToken?: string
 }
 
 /**
@@ -241,11 +272,12 @@ export interface YjsDocUpdateMessage {
  * out-of-band blob transfer over the sync connection; never persisted in the
  * operation log (durable state is the BlobRef inside a record's fields).
  *
- * Possession of a chunk hash is itself the capability to request it: hashes are
- * only learned from BlobRefs inside records the peer already received through
- * its (scope-filtered) sync, and SHA-256 preimage resistance makes guessing a
- * hash infeasible. The server therefore relays chunk requests among peers
- * without a separate ACL.
+ * Knowing a hash is not a capability: the server serves (from its central store)
+ * or forwards a request only when a live record inside the requester's download
+ * scope references the hash (as a blob, a manifest, or a chunk of one), forwards it
+ * only to peers whose own scope references it, accepts the answer only from a peer
+ * it asked and only when the bytes hash to the requested hash. Any other request
+ * is answered `bytes: null`, exactly like an unknown hash.
  */
 export interface BlobChunkRequestMessage {
 	type: 'blob-chunk-request'
@@ -267,6 +299,13 @@ export interface BlobChunkResponseMessage {
 	requestId: string
 	/** Base64-encoded chunk bytes, or null when the responder does not hold the hash. */
 	bytes: string | null
+	/**
+	 * True when the server refused the request for rate (RT-24), not because the
+	 * chunk is missing: retry after `retryAfterMs`. Absent (or false) otherwise.
+	 */
+	throttled?: boolean
+	/** With `throttled`: milliseconds until the request may be retried. */
+	retryAfterMs?: number
 }
 
 /**

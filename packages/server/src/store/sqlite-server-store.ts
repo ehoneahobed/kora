@@ -1,10 +1,18 @@
 import { createRequire } from 'node:module'
-import type { AtomicOp, Operation, SchemaDefinition, VersionVector } from '@korajs/core'
+import type {
+	AtomicOp,
+	HLCTimestamp,
+	Operation,
+	RecordFieldVersions,
+	SchemaDefinition,
+	VersionVector,
+} from '@korajs/core'
 import { generateUUIDv7, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
 	deserializeFieldValue,
@@ -13,12 +21,23 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { type FieldVersionRow, foldFieldVersionRows } from './record-field-versions'
+import {
+	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	parseScopeSnapshot,
+	replayScopeSnapshots,
+	scopeSnapshotFingerprint,
+	scopeValuesOf,
+} from './scope-snapshot'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -90,9 +109,25 @@ export class SqliteServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot: drop them
+		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
+		// mid-way only repeats the rebuild at the next start.
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		const stored = this.db.all<{ value: string }>(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
+		)[0]?.value
+		if (stored !== fingerprint) {
+			this.db.run(sql`UPDATE operations SET scope_snapshot = NULL`)
+		}
+		this.backfillScopeSnapshots()
+		if (stored !== fingerprint) {
+			this.db.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
+			)
+		}
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 
 		const now = Date.now()
@@ -107,6 +142,23 @@ export class SqliteServerStore implements ServerStore {
 			if (existing.length > 0) {
 				return 'duplicate' as const
 			}
+
+			// Authorization re-check inside the write transaction: better-sqlite3 runs
+			// it synchronously under SQLite's single writer lock, so the row it sees is
+			// the row this write commits against. Throwing rolls the transaction back.
+			if (options?.authorize) {
+				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId))
+				if (!decision.allowed) {
+					throw new UplinkAuthorizationError(decision.code, decision.message, {
+						operationId: op.id,
+						collection: op.collection,
+						recordId: op.recordId,
+					})
+				}
+			}
+
+			const materialized = this.schema?.collections[op.collection] !== undefined
+			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
 
 			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
 			tx.insert(operations).values(row).run()
@@ -128,8 +180,16 @@ export class SqliteServerStore implements ServerStore {
 				.run()
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema?.collections[op.collection]) {
+			if (materialized) {
 				this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+				// The record's scope values around this write, from the store's own rows.
+				const snapshot: OperationScopeSnapshot = {
+					pre,
+					post: this.readScopeValues(tx, op.collection, op.recordId, true),
+				}
+				tx.run(
+					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
+				)
 			}
 
 			return 'applied' as const
@@ -181,7 +241,176 @@ export class SqliteServerStore implements ServerStore {
 		return rows.map((row) => ({
 			operation: this.deserializeOperation(row),
 			deliverySequence: row.deliverySeq ?? 0,
+			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 		}))
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (let i = 0; i < operationIds.length; i += 500) {
+			const ids = operationIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const rows = this.db.all<{ id: string; scope_snapshot: string | null }>(
+				sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
+					ids.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) {
+				const snapshot = parseScopeSnapshot(row.scope_snapshot)
+				if (snapshot) result.set(row.id, snapshot)
+			}
+		}
+		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ wall_time: number; logical: number; timestamp_node_id: string }>(
+			sql`SELECT wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}
+				ORDER BY wall_time DESC, logical DESC, timestamp_node_id DESC LIMIT 1`,
+		)
+		const row = rows[0]
+		return row
+			? {
+					wallTime: Number(row.wall_time),
+					logical: Number(row.logical),
+					nodeId: row.timestamp_node_id,
+				}
+			: null
+	}
+
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		const rows = this.db.all<FieldVersionRow>(
+			sql`SELECT type, data, wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}`,
+		)
+		return foldFieldVersionRows(rows)
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})`,
+		)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
+		for (let i = 0; i < hashes.length; i += 500) {
+			const slice = hashes.slice(i, i + 500)
+			if (slice.length === 0) continue
+			const rows = this.db.all<{ hash: string; owner: string }>(
+				sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
+					slice.map((hash) => sql`${hash}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) result.get(row.hash)?.push(row.owner)
+		}
+		return result
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		// better-sqlite3 runs both statements synchronously under SQLite's writer lock,
+		// so no other claim interleaves (and the file lock covers other processes).
+		this.db.run(
+			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at)
+				SELECT ${hash}, ${owner}, ${Date.now()}
+				WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${hash})`,
+		)
+		const rows = this.db.all<{ one: number }>(
+			sql`SELECT 1 AS one FROM blob_owners WHERE hash = ${hash} AND owner = ${owner} LIMIT 1`,
+		)
+		return rows.length > 0
+	}
+
+	/**
+	 * Scope values of a record as stored, for an operation's scope snapshot. With
+	 * `includeDeleted` false a soft-deleted row counts as absent (the pre-image of a
+	 * write to a deleted record); with true it keeps its last values (a delete's
+	 * post-image).
+	 */
+	private readScopeValues(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		includeDeleted: boolean,
+	): Record<string, unknown> | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return null
+		const rows = txOrDb.all<Record<string, unknown>>(
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+		)
+		const row = rows[0]
+		if (!row) return null
+		if (!includeDeleted && Number(row._deleted) === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, this.deserializeRow(row, collectionDef))
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a database written
+	 * before snapshots existed), replaying each affected record in commit order.
+	 */
+	private backfillScopeSnapshots(): void {
+		const schema = this.schema
+		if (!schema) return
+		const pending = this.db.all<{ collection: string; record_id: string }>(
+			sql`SELECT DISTINCT collection, record_id FROM operations WHERE scope_snapshot IS NULL`,
+		)
+		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
+		if (targets.length === 0) return
+		this.db.transaction((tx) => {
+			for (const target of targets) {
+				const rows = tx
+					.select()
+					.from(operations)
+					.where(
+						and(
+							eq(operations.collection, target.collection),
+							eq(operations.recordId, target.record_id),
+						),
+					)
+					.orderBy(asc(operations.deliverySeq))
+					.all()
+				const replayed = replayScopeSnapshots(
+					schema,
+					target.collection,
+					target.record_id,
+					rows.map((row) => {
+						const op = this.deserializeOperation(row)
+						return {
+							id: op.id,
+							type: op.type,
+							data: op.data,
+							atomicOps: op.atomicOps ?? null,
+							timestamp: op.timestamp,
+						}
+					}),
+				)
+				for (const row of rows) {
+					if (row.scopeSnapshot !== null) continue
+					const snapshot = replayed.get(row.id)
+					if (!snapshot) continue
+					tx.run(
+						sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${row.id}`,
+					)
+				}
+			}
+		})
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -263,6 +492,103 @@ export class SqliteServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		const now = Date.now()
+		// better-sqlite3 runs these synchronously, so no other claim interleaves.
+		// A fresh claim is only created for a node without history: history with no
+		// claim predates node claims, so its writer is unknown (RT-5).
+		this.db.run(
+			sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at)
+				SELECT ${nodeId}, ${userId}, ${now}
+				WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)
+		// An admin-released node is taken over by its next claimant.
+		this.db.run(
+			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
+				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
+		)
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id === userId
+	}
+
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		const rows = this.db.all<{ node_id: string }>(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)
+		return rows.length > 0
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		const known = this.db.all<{ one: number }>(
+			sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
+				OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)
+		if (known.length === 0) return false
+		this.db.run(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
+		)
+		return true
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private readStoredRow(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): MaterializedRecord | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const rows = txOrDb.all<Record<string, unknown>>(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+			)
+			const row = rows[0]
+			return row ? this.deserializeRow(row, collectionDef) : null
+		}
+		const ops = txOrDb
+			.select({ type: operations.type, data: operations.data, atomicOps: operations.atomicOps })
+			.from(operations)
+			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
+			.orderBy(asc(operations.wallTime), asc(operations.logical), asc(operations.timestampNodeId))
+			.all()
+		if (ops.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			ops
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({
+					type: o.type,
+					data: o.data !== null ? JSON.parse(o.data) : null,
+					atomicOps:
+						o.atomicOps != null ? (JSON.parse(o.atomicOps) as Record<string, AtomicOp>) : null,
+				})),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
+	}
+
 	async exportBackup(): Promise<Uint8Array> {
 		this.assertOpen()
 
@@ -315,6 +641,7 @@ export class SqliteServerStore implements ServerStore {
 			}
 			tx.update(deliveryCounter).set({ value: deliverySeq }).where(eq(deliveryCounter.id, 1)).run()
 		})
+		this.backfillScopeSnapshots()
 
 		return { operationsRestored: ops.length, success: true }
 	}
@@ -343,6 +670,7 @@ export class SqliteServerStore implements ServerStore {
 				type: operations.type,
 				data: operations.data,
 				atomicOps: operations.atomicOps,
+				previousData: operations.previousData,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
@@ -356,6 +684,7 @@ export class SqliteServerStore implements ServerStore {
 			data: op.data !== null ? JSON.parse(op.data) : null,
 			atomicOps:
 				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+			previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -454,6 +783,7 @@ export class SqliteServerStore implements ServerStore {
 				type: operations.type,
 				data: operations.data,
 				atomicOps: operations.atomicOps,
+				previousData: operations.previousData,
 				wallTime: operations.wallTime,
 			})
 			.from(operations)
@@ -483,6 +813,7 @@ export class SqliteServerStore implements ServerStore {
 					data: op.data !== null ? JSON.parse(op.data) : null,
 					atomicOps:
 						op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+					previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 				}))
 				const recordData = replayOperationsForRecord(parsedOps)
 
@@ -680,8 +1011,47 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Backward-compatible migration: the per-operation scope snapshot (RT-14). Rows
+		// written before it are backfilled from the log when the schema is set.
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN scope_snapshot TEXT`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
+		`)
+
+		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS blob_owners (
+				hash TEXT NOT NULL,
+				owner TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (hash, owner)
+			)
+		`)
+
+		// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_server_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			)
+		`)
+
+		// Node id -> principal binding (see claimNode). One row per device node id.
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS node_claims (
+				node_id TEXT PRIMARY KEY,
+				user_id TEXT NOT NULL,
+				claimed_at INTEGER NOT NULL
+			)
 		`)
 
 		this.db.run(sql`

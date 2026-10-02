@@ -4,6 +4,15 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["src", "tests"],
-  "exclude": ["dist", "node_modules", "**/*.test.ts", "tests"]
+  "include": [
+    "src",
+    "tests"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules",
+    "**/*.test.ts",
+    "tests",
+    "tests/repro"
+  ]
 }

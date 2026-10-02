@@ -96,7 +96,10 @@ function collectClientMessages(
 
 describe('ClientSession', () => {
 	describe('handshake', () => {
-		test('responds with correct version vector', async () => {
+		// SEC-4: the response carries only vector entries for nodes the client reported
+		// (plus its own). This test used to send an empty client vector and expect every
+		// server entry back, which leaked other devices' ids and write counts.
+		test('responds with the version vector entries for nodes the client reported', async () => {
 			const store = new MemoryServerStore('server-1')
 			// Pre-populate server store
 			await store.applyRemoteOperation(
@@ -113,7 +116,7 @@ describe('ClientSession', () => {
 			})
 			session.start()
 
-			sendHandshake(client)
+			sendHandshake(client, { versionVector: { 'node-a': 1 } })
 
 			// Wait for async handshake processing
 			await vi.waitFor(() => {
@@ -128,6 +131,60 @@ describe('ClientSession', () => {
 				expect(response.nodeId).toBe('server-1')
 				expect(response.selectedWireFormat).toBe('protobuf')
 			}
+		})
+
+		test('hides vector entries for out-of-scope nodes, but includes its own and in-scope senders', async () => {
+			const store = new MemoryServerStore('server-1')
+			// History written through a session is always preceded by its node claim; an
+			// unclaimed node with history is refused (RT-5), so seed the claim as well.
+			await store.claimNode('client-1', 'me')
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-other',
+					nodeId: 'other-tenant-device',
+					recordId: 'other-rec',
+					data: { title: 'theirs', userId: 'other' },
+					sequenceNumber: 42,
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-peer',
+					nodeId: 'my-other-device',
+					recordId: 'peer-rec',
+					data: { title: 'mine', userId: 'me' },
+					sequenceNumber: 7,
+				}),
+			)
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'op-own',
+					nodeId: 'client-1',
+					recordId: 'own-rec',
+					data: { title: 'own', userId: 'me' },
+					sequenceNumber: 3,
+				}),
+			)
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			new ClientSession({
+				sessionId: 'sess-vv',
+				transport: server,
+				store,
+				auth: {
+					authenticate: async () => ({ userId: 'me', scopes: { todos: { userId: 'me' } } }),
+				},
+			}).start()
+			sendHandshake(client, { versionVector: {}, authToken: 't' })
+			await vi.waitFor(() => {
+				expect(messages.some((m) => m.type === 'handshake-response')).toBe(true)
+			})
+			const response = messages.find((m) => m.type === 'handshake-response')
+			if (response?.type !== 'handshake-response') throw new Error('no handshake-response')
+			// Its own entry, plus the node whose in-scope op it is about to receive (so the
+			// client does not mistake that op for one it still has to upload); never the
+			// other tenant's device.
+			expect(response.versionVector).toEqual({ 'client-1': 3, 'my-other-device': 7 })
 		})
 
 		test('sends delta operations to client', async () => {
@@ -436,7 +493,10 @@ describe('ClientSession', () => {
 			warn.mockRestore()
 		})
 
-		test('does not warn when the client handshake supplies a sync scope', async () => {
+		test('still warns when only the client handshake supplies a sync scope', async () => {
+			// AUTH-1: a handshake scope only narrows the server grant; it isolates
+			// nothing, because a hostile client simply omits it. With no grant from the
+			// provider every user can still read every unscoped collection.
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 			const auth: AuthProvider = {
 				authenticate: vi.fn().mockResolvedValue({ userId: 'user-1' } satisfies AuthContext),
@@ -458,26 +518,43 @@ describe('ClientSession', () => {
 			})
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
 			warn.mockRestore()
 		})
 
-		test('warns even when schema sync rules are declared but no per-user values are wired', async () => {
+		test('refuses with SCOPE_REQUIRED when schema sync rules are declared but no per-user values are wired', async () => {
 			// Declaring `sync` rules in the schema describes the shape of scoping but
 			// does not by itself produce effective scopes at the session layer — the
 			// per-user values must come from the auth provider. So an app that declared
 			// sync rules yet wired no scope resolver is still fully exposed, and the
 			// guardrail must still fire. This is the highest-value case: the developer
 			// believes they are isolated but are not.
-			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			// AUTH-1: such a session is now refused outright (fail closed) instead of
+			// warned about and served everyone's rows.
 			const auth: AuthProvider = {
 				authenticate: vi.fn().mockResolvedValue({ userId: 'user-1' } satisfies AuthContext),
 			}
+			const store = new MemoryServerStore('server-1')
+			await store.setSchema(scopedGuardrailSchema)
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({
+				sessionId: 'sess-scoped',
+				transport: server,
+				store,
+				auth,
+			})
+			session.start()
+			sendHandshake(client, {
+				authToken: 'valid-token',
+				syncScope: { todos: { userId: 'user-1' } },
+			})
+			await vi.waitFor(() => expect(session.getState()).toBe('closed'))
 
-			await handshakeWith({ auth, schema: scopedGuardrailSchema })
-
-			expect(warn).toHaveBeenCalledWith(expect.stringContaining('no sync scopes'))
-			warn.mockRestore()
+			expect(messages).toContainEqual(
+				expect.objectContaining({ type: 'error', code: 'SCOPE_REQUIRED', retriable: false }),
+			)
+			expect(messages.some((m) => m.type === 'handshake-response')).toBe(false)
 		})
 
 		test('does not warn for NoAuthProvider (single-tenant dev/testing)', async () => {
@@ -915,12 +992,24 @@ describe('ClientSession', () => {
 			sendHandshake(client, { authToken: 'ok', scopeExitPolicy: 'retract' })
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
+			// The pre-image comes from the server's own row (RT-15), never from the
+			// writer's previousData, so the record must exist on the server first.
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'publish-1',
+					type: 'insert',
+					recordId: 'announcement-1',
+					data: { status: 'published', title: 'News' },
+				}),
+			)
 			const archived = createTestOp({
 				id: 'archive-1',
 				type: 'update',
 				recordId: 'announcement-1',
 				data: { status: 'archived' },
 				previousData: { status: 'published', title: 'News' },
+				timestamp: { wallTime: 1001, logical: 0, nodeId: 'client-1' },
+				sequenceNumber: 2,
 			})
 			await store.applyRemoteOperation(archived)
 			session.relayOperations([archived])

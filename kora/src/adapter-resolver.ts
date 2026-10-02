@@ -61,6 +61,7 @@ export async function createAdapter(
 	workerResponseTimeoutMs?: number,
 	sharedWorkerUrl?: string | URL,
 	suppressNonPersistentDiagnostic = false,
+	durability: { allowNonDurable?: boolean; deferOpenCheck?: boolean } = {},
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
@@ -95,6 +96,8 @@ export async function createAdapter(
 				workerResponseTimeoutMs,
 				emitter,
 				emitNonPersistentDiagnostic: !suppressNonPersistentDiagnostic,
+				...(durability.allowNonDurable ? { allowNonDurable: true } : {}),
+				...(durability.deferOpenCheck ? { deferOpenDurabilityCheck: true } : {}),
 			})
 		}
 		case 'indexeddb': {

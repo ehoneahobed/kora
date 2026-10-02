@@ -1,3 +1,4 @@
+import { SCOPE_CLAIMS_KEY } from '@korajs/core'
 import { describe, expect, it, vi } from 'vitest'
 import { KoraAuthProvider } from './kora-auth-provider'
 
@@ -134,11 +135,14 @@ describe('KoraAuthProvider', () => {
 		})
 	})
 
-	it('does not include scopes when no resolver is provided', async () => {
+	// Inverted (AUTH-1): without a resolver the provider used to return no scopes,
+	// which let the client handshake choose whose data it synced. The default grant
+	// now binds scoped collections to the verified user id.
+	it('grants a claim-bound scope from the verified user id when no resolver is provided', async () => {
 		const provider = new KoraAuthProvider({ tokenValidator, userLookup })
 
 		const context = await provider.authenticate(VALID_TOKEN)
 		expect(context).not.toBeNull()
-		expect(context?.scopes).toBeUndefined()
+		expect(context?.scopes).toEqual({ [SCOPE_CLAIMS_KEY]: { userId: 'user-1' } })
 	})
 })

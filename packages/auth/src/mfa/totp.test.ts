@@ -3,6 +3,7 @@ import {
 	InMemoryTotpStore,
 	TotpAlreadyEnabledError,
 	TotpInvalidCodeError,
+	TotpLockedError,
 	TotpManager,
 	TotpNotEnabledError,
 	TotpNotVerifiedError,
@@ -15,6 +16,13 @@ import {
 function generateValidCode(base32Secret: string, period = 30, digits = 6): string {
 	const secret = base32Decode(base32Secret)
 	const counter = Math.floor(Date.now() / 1000 / period)
+	return generateHotpCode(secret, counter, digits)
+}
+
+/** A code for the NEXT time-step (still inside the default window of 1). */
+function nextValidCode(base32Secret: string, period = 30, digits = 6): string {
+	const secret = base32Decode(base32Secret)
+	const counter = Math.floor(Date.now() / 1000 / period) + 1
 	return generateHotpCode(secret, counter, digits)
 }
 
@@ -374,7 +382,8 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			const newCode = generateValidCode(setup.secret)
+			// Updated (AUTH-10): the setup consumed this time-step; reusing it is a replay.
+			const newCode = nextValidCode(setup.secret)
 			const newCodes = await manager.regenerateRecoveryCodes('user-1', newCode)
 
 			expect(newCodes).toHaveLength(8)
@@ -387,7 +396,8 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			const newCode = generateValidCode(setup.secret)
+			// Updated (AUTH-10): the setup consumed this time-step; reusing it is a replay.
+			const newCode = nextValidCode(setup.secret)
 			await manager.regenerateRecoveryCodes('user-1', newCode)
 
 			// Old codes should fail
@@ -420,7 +430,8 @@ describe('TotpManager', () => {
 			const code = generateValidCode(setup.secret)
 			await manager.verifySetup('user-1', code)
 
-			const disableCode = generateValidCode(setup.secret)
+			// Updated (AUTH-10): the setup consumed this time-step; reusing it is a replay.
+			const disableCode = nextValidCode(setup.secret)
 			await manager.disable('user-1', disableCode)
 
 			expect(await manager.isEnabled('user-1')).toBe(false)
@@ -641,5 +652,30 @@ describe('TOTP RFC 6238 test vectors', () => {
 		const secret = new TextEncoder().encode('12345678901234567890')
 		const code = generateHotpCode(secret, 0, 6)
 		expect(code).toBe('755224')
+	})
+
+	describe('failure backoff (AUTH-10)', () => {
+		test('locks code checks after repeated failures, then recovers', async () => {
+			vi.useFakeTimers({ toFake: ['Date'] })
+			const store = new InMemoryTotpStore()
+			const manager = new TotpManager({ issuer: 'Kora', store })
+			try {
+				const setup = await manager.enable('user-1', 'alice@example.com')
+				await manager.verifySetup('user-1', generateValidCode(setup.secret))
+				for (let i = 0; i < 5; i++) expect(await manager.verify('user-1', '000000')).toBe(false)
+				const stored = await store.getByUserId('user-1')
+				expect(stored?.lockedUntil).toBeGreaterThan(Date.now())
+				// Locked: even the right (fresh) code fails, and disable throws TotpLockedError.
+				expect(await manager.verify('user-1', nextValidCode(setup.secret))).toBe(false)
+				await expect(manager.disable('user-1', nextValidCode(setup.secret))).rejects.toThrow(
+					TotpLockedError,
+				)
+				vi.advanceTimersByTime(31_000)
+				expect(await manager.verify('user-1', generateValidCode(setup.secret))).toBe(true)
+				expect((await store.getByUserId('user-1'))?.failedAttempts).toBe(0)
+			} finally {
+				vi.useRealTimers()
+			}
+		})
 	})
 })

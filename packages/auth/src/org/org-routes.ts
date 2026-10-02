@@ -40,6 +40,28 @@ export interface OrgRouteResponse<T> {
 export interface OrgRoutesConfig {
 	/** The organization store backing all org operations */
 	orgStore: OrgStore
+	/**
+	 * Resolves a user's email and its verification status (a `UserStore`
+	 * satisfies this). Invitations are listed and accepted only for the caller's
+	 * own VERIFIED email; without a lookup, pass the verified identity to
+	 * `acceptInvitation` / `listMyInvitations` explicitly.
+	 */
+	userLookup?: {
+		findById(userId: string): Promise<{ email: string; emailVerified: boolean } | null>
+	}
+}
+
+/** A server-verified email identity used to match invitations. */
+export interface VerifiedEmailIdentity {
+	email: string
+	emailVerified: boolean
+}
+
+/** Invitation as shown to its invitee: the secret token is never included. */
+export type InviteeInvitation = Omit<OrgInvitation, 'token'>
+
+function normalizeEmail(email: string): string {
+	return email.trim().toLowerCase()
 }
 
 /** Maximum length for org name */
@@ -99,8 +121,11 @@ function sanitize(value: string): string {
 export class OrgRoutes {
 	private readonly store: OrgStore
 
+	private readonly userLookup: OrgRoutesConfig['userLookup']
+
 	constructor(config: OrgRoutesConfig) {
 		this.store = config.orgStore
+		this.userLookup = config.userLookup
 	}
 
 	// --- Organizations ---
@@ -559,17 +584,41 @@ export class OrgRoutes {
 	}
 
 	/**
-	 * Accept an invitation by its token. The authenticated user joins the org.
+	 * Accept an invitation by its token. The authenticated user joins the org
+	 * only if the invitation was addressed to the user's own verified email.
+	 *
+	 * @param userId - The authenticated user
+	 * @param params - The invitation token
+	 * @param identity - The user's verified email identity; resolved through
+	 *   `userLookup` when omitted
 	 */
 	async acceptInvitation(
 		userId: string,
 		params: { token?: unknown },
+		identity?: VerifiedEmailIdentity,
 	): Promise<OrgRouteResponse<Membership>> {
 		if (typeof params.token !== 'string' || params.token.length === 0) {
 			return { status: 400, body: { error: 'Invitation token is required.' } }
 		}
 
+		const verified = await this.resolveIdentity(userId, identity)
+		if (!verified) {
+			return {
+				status: 403,
+				body: { error: 'A verified email address is required to accept invitations.' },
+			}
+		}
+
 		try {
+			// Check the addressee BEFORE consuming, so a stranger holding a leaked
+			// token can neither join nor burn the invitation.
+			const pending = await this.store.getInvitationByToken(params.token)
+			if (pending && normalizeEmail(pending.email) !== normalizeEmail(verified.email)) {
+				return {
+					status: 403,
+					body: { error: 'This invitation was sent to a different email address.' },
+				}
+			}
 			const invitation = await this.store.consumeInvitation(params.token)
 
 			// Add the user as a member with the invited role
@@ -606,7 +655,7 @@ export class OrgRoutes {
 		if (authResult) return authResult
 
 		try {
-			await this.store.revokeInvitation(invitationId)
+			await this.store.revokeInvitation(orgId, invitationId)
 			return { status: 200, body: { data: { revoked: true } } }
 		} catch (err) {
 			if (err instanceof InvitationNotFoundError) {
@@ -638,15 +687,39 @@ export class OrgRoutes {
 	}
 
 	/**
-	 * List pending invitations for the authenticated user's email.
+	 * List pending invitations addressed to the authenticated user's own
+	 * verified email. The email is resolved server-side (never taken from the
+	 * request) and invitation tokens are never returned.
+	 *
+	 * @param userId - The authenticated user
+	 * @param identity - The user's verified identity; resolved through `userLookup` when omitted
 	 */
-	async listMyInvitations(email: string): Promise<OrgRouteResponse<OrgInvitation[]>> {
-		if (!isValidEmail(email)) {
-			return { status: 400, body: { error: 'A valid email address is required.' } }
+	async listMyInvitations(
+		userId: string,
+		identity?: VerifiedEmailIdentity,
+	): Promise<OrgRouteResponse<InviteeInvitation[]>> {
+		const verified = await this.resolveIdentity(userId, identity)
+		if (!verified || !isValidEmail(verified.email)) {
+			return {
+				status: 403,
+				body: { error: 'A verified email address is required to list invitations.' },
+			}
 		}
 
-		const invitations = await this.store.listInvitationsForEmail(email)
-		return { status: 200, body: { data: invitations } }
+		const invitations = await this.store.listInvitationsForEmail(normalizeEmail(verified.email))
+		return {
+			status: 200,
+			body: { data: invitations.map(({ token: _token, ...rest }) => rest) },
+		}
+	}
+
+	private async resolveIdentity(
+		userId: string,
+		identity: VerifiedEmailIdentity | undefined,
+	): Promise<VerifiedEmailIdentity | null> {
+		const resolved = identity ?? (this.userLookup ? await this.userLookup.findById(userId) : null)
+		if (!resolved || !resolved.emailVerified || typeof resolved.email !== 'string') return null
+		return { email: resolved.email, emailVerified: true }
 	}
 
 	// --- Private helpers ---

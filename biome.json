@@ -59,6 +59,16 @@
 					}
 				}
 			}
+		},
+		{
+			"include": ["**/tests/repro/**"],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noExplicitAny": "off"
+					}
+				}
+			}
 		}
 	]
 }

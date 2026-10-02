@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
+import { ensurePostgresSchema } from '../../postgres/ensure-schema'
+import { PostgresTokenRevocationStore } from '../../tokens/postgres-token-revocation-store'
+import type { TokenRevocationStore } from '../../tokens/token-manager'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
-import { DuplicateEmailError } from './user-store'
+import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
 /**
  * Minimal typed subset of a postgres-js SQL tag for our queries.
@@ -36,44 +39,57 @@ export class PostgresUserStore implements UserStore {
 	private readonly sql: PostgresClient
 	private readonly ready: Promise<void>
 
+	private revocationStore: PostgresTokenRevocationStore | null = null
+
 	constructor(sql: PostgresClient) {
 		this.sql = sql
 		this.ready = this.ensureTables()
 	}
 
+	/** Token revocations stored in the same Postgres database as the users. */
+	getTokenRevocationStore(): TokenRevocationStore {
+		if (!this.revocationStore) {
+			this.revocationStore = new PostgresTokenRevocationStore(this.sql)
+		}
+		return this.revocationStore
+	}
+
 	private async ensureTables(): Promise<void> {
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_users (
-				id TEXT PRIMARY KEY,
-				email TEXT NOT NULL UNIQUE,
-				name TEXT NOT NULL,
-				email_verified BOOLEAN NOT NULL DEFAULT FALSE,
-				created_at BIGINT NOT NULL,
-				password_hash TEXT NOT NULL,
-				salt TEXT NOT NULL
-			)
-		`
+		// Concurrency-safe on an empty database shared by several instances.
+		await ensurePostgresSchema(this.sql, async (sql) => {
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_users (
+					id TEXT PRIMARY KEY,
+					email TEXT NOT NULL UNIQUE,
+					name TEXT NOT NULL,
+					email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+					created_at BIGINT NOT NULL,
+					password_hash TEXT NOT NULL,
+					salt TEXT NOT NULL
+				)
+			`
 
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_devices (
-				id TEXT PRIMARY KEY,
-				user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-				public_key TEXT NOT NULL,
-				name TEXT NOT NULL,
-				revoked BOOLEAN NOT NULL DEFAULT FALSE,
-				created_at BIGINT NOT NULL,
-				last_seen_at BIGINT NOT NULL
-			)
-		`
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_devices (
+					id TEXT PRIMARY KEY,
+					user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+					public_key TEXT NOT NULL,
+					name TEXT NOT NULL,
+					revoked BOOLEAN NOT NULL DEFAULT FALSE,
+					created_at BIGINT NOT NULL,
+					last_seen_at BIGINT NOT NULL
+				)
+			`
 
-		await this.sql`
-			CREATE INDEX IF NOT EXISTS idx_auth_devices_user_id ON auth_devices(user_id)
-		`
+			await sql`
+				CREATE INDEX IF NOT EXISTS idx_auth_devices_user_id ON auth_devices(user_id)
+			`
 
-		// Case-insensitive unique index on email for consistent lookups
-		await this.sql`
-			CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_lower ON auth_users(LOWER(email))
-		`
+			// Case-insensitive unique index on email for consistent lookups
+			await sql`
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_lower ON auth_users(LOWER(email))
+			`
+		})
 	}
 
 	async createUser(params: {
@@ -128,26 +144,31 @@ export class PostgresUserStore implements UserStore {
 		name: string
 	}): Promise<AuthDevice> {
 		await this.ready
+		const now = Date.now()
+		// INSERT-or-ignore first, then read: the owner check sees whichever
+		// registration won, even when two users race for the same id.
+		await this.sql`
+			INSERT INTO auth_devices (id, user_id, public_key, name, revoked, created_at, last_seen_at)
+			VALUES (${params.id}, ${params.userId}, ${params.publicKey}, ${params.name}, FALSE, ${now}, ${now})
+			ON CONFLICT (id) DO NOTHING
+		`
 		const existingRows = (await this.sql`
 			SELECT * FROM auth_devices WHERE id = ${params.id}
 		`) as unknown as DeviceRow[]
+		const existing = existingRows[0]
 
-		if (existingRows.length > 0 && !existingRows[0]?.revoked) {
-			return rowToDevice(existingRows[0] as DeviceRow)
+		if (existing && existing.user_id !== params.userId) {
+			throw new DeviceOwnershipError(params.id)
+		}
+		if (existing && !existing.revoked) {
+			return rowToDevice(existing)
 		}
 
-		const now = Date.now()
-
-		if (existingRows.length > 0) {
-			// Re-activate previously revoked device
+		if (existing) {
+			// Re-activate the owner's previously revoked device
 			await this.sql`
 				UPDATE auth_devices SET revoked = FALSE, public_key = ${params.publicKey}, name = ${params.name}, last_seen_at = ${now}
-				WHERE id = ${params.id}
-			`
-		} else {
-			await this.sql`
-				INSERT INTO auth_devices (id, user_id, public_key, name, revoked, created_at, last_seen_at)
-				VALUES (${params.id}, ${params.userId}, ${params.publicKey}, ${params.name}, FALSE, ${now}, ${now})
+				WHERE id = ${params.id} AND user_id = ${params.userId}
 			`
 		}
 
@@ -157,7 +178,7 @@ export class PostgresUserStore implements UserStore {
 			publicKey: params.publicKey,
 			name: params.name,
 			revoked: false,
-			createdAt: existingRows.length > 0 ? Number(existingRows[0]?.created_at) : now,
+			createdAt: existing ? Number(existing.created_at) : now,
 			lastSeenAt: now,
 		}
 	}

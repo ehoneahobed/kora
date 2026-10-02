@@ -74,6 +74,12 @@ const TX_ID_KEY = '__kora_tx_id__'
 const MUTATION_NAME_KEY = '__kora_mutation__'
 
 /**
+ * Internal key used to embed a scope-entry insert's per-field versions (RT-27) in the
+ * data JSON column, so a later fold of the record's log places each field correctly.
+ */
+const FIELD_VERSIONS_KEY = '__kora_field_versions__'
+
+/**
  * Serialize an Operation to a row for the operations log table.
  *
  * @param op - The operation to serialize
@@ -93,6 +99,9 @@ export function serializeOperation(op: Operation): OperationRow {
 		}
 		if (op.mutationName !== undefined) {
 			dataPayload[MUTATION_NAME_KEY] = op.mutationName
+		}
+		if (op.fieldVersions !== undefined) {
+			dataPayload[FIELD_VERSIONS_KEY] = op.fieldVersions
 		}
 	} else if (hasMetadata) {
 		// For delete operations (data is null), we still need to store metadata
@@ -130,6 +139,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 	let atomicOps: Record<string, unknown> | undefined
 	let transactionId: string | undefined
 	let mutationName: string | undefined
+	let fieldVersions: Operation['fieldVersions']
 
 	if (row.data) {
 		const parsed = JSON.parse(row.data) as Record<string, unknown>
@@ -143,8 +153,17 @@ export function deserializeOperation(row: OperationRow): Operation {
 		if (MUTATION_NAME_KEY in parsed) {
 			mutationName = parsed[MUTATION_NAME_KEY] as string
 		}
+		if (FIELD_VERSIONS_KEY in parsed) {
+			fieldVersions = parsed[FIELD_VERSIONS_KEY] as Operation['fieldVersions']
+		}
 		// Remove metadata keys from data
-		const { [ATOMIC_OPS_KEY]: _a, [TX_ID_KEY]: _t, [MUTATION_NAME_KEY]: _m, ...rest } = parsed
+		const {
+			[ATOMIC_OPS_KEY]: _a,
+			[TX_ID_KEY]: _t,
+			[MUTATION_NAME_KEY]: _m,
+			[FIELD_VERSIONS_KEY]: _f,
+			...rest
+		} = parsed
 		data = Object.keys(rest).length > 0 ? rest : null
 	}
 
@@ -165,6 +184,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 		...(atomicOps !== undefined ? { atomicOps: atomicOps as Operation['atomicOps'] } : {}),
 		...(transactionId !== undefined ? { transactionId } : {}),
 		...(mutationName !== undefined ? { mutationName } : {}),
+		...(fieldVersions !== undefined ? { fieldVersions } : {}),
 	}
 }
 

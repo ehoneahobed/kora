@@ -11,8 +11,13 @@ import {
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { type RoutePredicate, evaluateRoutePredicate } from '../apply/route-predicate'
 import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
-import type { ScopeMap } from '../scopes/server-scope-filter'
-import { operationMatchesScopes } from '../scopes/server-scope-filter'
+import { authorizeOperationReferences } from '../scopes/reference-authorization'
+import type { ScopeMap, UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+import {
+	authorizeUplinkWrite,
+	recordMatchesScopes,
+	splitScopeForQuery,
+} from '../scopes/server-scope-filter'
 import type {
 	CollectionQueryOptions,
 	ConditionalApplyInput,
@@ -140,23 +145,35 @@ export interface ProductionHttpRouteContext {
 /**
  * Returns true when a materialized record satisfies the scope declared for its
  * collection. A collection absent from the scope map is treated as out of scope
- * (hidden), mirroring `operationMatchesScopes` on the write path.
+ * (hidden). Uses the same predicate matcher as the sync path, so `$in` works here too.
  */
 function recordMatchesScope(
 	collection: string,
 	record: MaterializedRecord,
 	scope: ScopeMap,
 ): boolean {
-	const collectionScope = scope[collection]
-	if (!collectionScope) {
-		return false
+	return recordMatchesScopes(collection, record, scope)
+}
+
+/**
+ * Read a record as stored, including a soft-deleted one, for authorization. Returns
+ * null when it was never written (or the store cannot read the collection).
+ */
+async function readStoredRecord(
+	store: ServerStore,
+	collection: string,
+	id: string,
+): Promise<MaterializedRecord | null> {
+	try {
+		const rows = await store.queryCollection(collection, {
+			where: { id },
+			includeDeleted: true,
+			limit: 1,
+		})
+		return rows[0] ?? null
+	} catch {
+		return null
 	}
-	for (const [field, expected] of Object.entries(collectionScope)) {
-		if (record[field] !== expected) {
-			return false
-		}
-	}
-	return true
 }
 
 /** Picks only the given keys from a record (used to capture previousData). */
@@ -274,6 +291,19 @@ async function buildRouteOperation(
 	)
 }
 
+/** Deterministic key for a scope map (sorted keys at every level). */
+function stableScopeKey(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableScopeKey).join(',')}]`
+	if (value && typeof value === 'object') {
+		const record = value as Record<string, unknown>
+		return `{${Object.keys(record)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableScopeKey(record[key])}`)
+			.join(',')}}`
+	}
+	return JSON.stringify(value) ?? 'undefined'
+}
+
 /** Internal error carrying a stable code for route-context failures. */
 class RouteMutationError extends Error {
 	constructor(
@@ -297,6 +327,25 @@ export function createRouteContext(
 	server: KoraSyncServer,
 	store: ServerStore,
 ): ProductionHttpRouteContext {
+	// Reference authorization for a scoped route write (RT-11, RT-13). The route's
+	// scope is both what it may write and what it may read; blob claims are keyed by
+	// the scope, since a route has no device or session of its own.
+	function authorizeRouteReferences(
+		op: Operation,
+		stored: MaterializedRecord | null,
+		scope: ScopeMap | undefined,
+		readRow: (collection: string, id: string) => Promise<MaterializedRecord | null>,
+	): Promise<UplinkAuthorizationResult> {
+		if (!scope) return Promise.resolve({ allowed: true })
+		return authorizeOperationReferences(op, stored, {
+			schema: store.getSchema(),
+			downlinkScopes: scope,
+			readRow,
+			blobs: server.getBlobAccessIndex(),
+			blobOwner: `kora:route:${stableScopeKey(scope)}`,
+		})
+	}
+
 	// Promise chain that serializes apply() so sequence allocation + apply is
 	// atomic per mutation, even under concurrent in-flight requests.
 	let mutationTail: Promise<unknown> = Promise.resolve()
@@ -341,14 +390,30 @@ export function createRouteContext(
 			throw error
 		}
 
-		if (scope && !operationMatchesScopes(op, scope)) {
+		// The same rule as sync uploads: the stored row (including a soft-deleted one)
+		// must be in scope, and so must the record after the write. A scoped route
+		// therefore cannot edit, delete, take over or same-id-overwrite a record that
+		// belongs to someone else.
+		const stored = scope ? await readStoredRecord(store, op.collection, op.recordId) : null
+		let decision = authorizeUplinkWrite(op, stored, scope)
+		// A scoped route may only point at parents and blob content inside its scope
+		// (RT-11, RT-13), exactly like a sync session.
+		if (decision.allowed) {
+			decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
+				readStoredRecord(store, collection, id),
+			)
+		}
+		if (!decision.allowed) {
 			return {
 				ok: false,
 				rejection: {
 					ok: false,
-					code: 'SCOPE_VIOLATION',
-					message: `Mutation on "${mutation.collection}" is outside the provided scope.`,
-					retriable: isRetriableRejection('SCOPE_VIOLATION'),
+					code: decision.code,
+					message:
+						decision.code === 'SCOPE_VIOLATION'
+							? `Mutation on "${mutation.collection}" is outside the provided scope. ${decision.message}`
+							: decision.message,
+					retriable: isRetriableRejection(decision.code),
 				},
 			}
 		}
@@ -357,8 +422,23 @@ export function createRouteContext(
 	}
 
 	// Apply a prepared operation and read back the resulting record.
-	async function commitOperation(op: Operation, collection: string): Promise<RouteApplyResult> {
-		const result = await server.applyLocalOperation(op)
+	async function commitOperation(
+		op: Operation,
+		collection: string,
+		scope: ScopeMap | undefined,
+	): Promise<RouteApplyResult> {
+		// Scoped writes are re-authorized by the store inside its apply critical section,
+		// against the row as it is at commit time.
+		const result = await server.applyLocalOperation(
+			op,
+			scope
+				? {
+						authorize: (stored) => authorizeUplinkWrite(op, stored, scope),
+						// A scoped route's delete may only cascade inside its scope (RT-10).
+						authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, scope),
+					}
+				: {},
+		)
 		if (result.result !== 'applied') {
 			const code = result.rejection?.code ?? 'NOT_APPLIED'
 			return {
@@ -388,7 +468,7 @@ export function createRouteContext(
 		if (!prepared.ok) {
 			return prepared.rejection
 		}
-		return commitOperation(prepared.op, mutation.collection)
+		return commitOperation(prepared.op, mutation.collection, scope)
 	}
 
 	// Cross-instance conditional apply, delegating admission and atomicity to the
@@ -444,12 +524,28 @@ export function createRouteContext(
 							useLockedCurrent ? { record: current } : undefined,
 							context.clock,
 						)
-						// Validate scope inside the locked transaction. Throwing here rolls
-						// the transaction back, so a violation in any mutation applies nothing.
-						if (scope && !operationMatchesScopes(op, scope)) {
+						// Validate inside the locked transaction against the stored row read
+						// through the store's transaction when it offers one. Throwing here
+						// rolls the transaction back, so a violation applies nothing.
+						const stored = scope
+							? context.readStoredRow
+								? await context.readStoredRow(op.collection, op.recordId)
+								: await readStoredRecord(store, op.collection, op.recordId)
+							: null
+						let decision = authorizeUplinkWrite(op, stored, scope)
+						if (decision.allowed) {
+							decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
+								context.readStoredRow
+									? context.readStoredRow(collection, id)
+									: readStoredRecord(store, collection, id),
+							)
+						}
+						if (!decision.allowed) {
 							throw new RouteMutationError(
-								'SCOPE_VIOLATION',
-								`Mutation on "${mutation.collection}" is outside the provided scope.`,
+								decision.code,
+								decision.code === 'SCOPE_VIOLATION'
+									? `Mutation on "${mutation.collection}" is outside the provided scope. ${decision.message}`
+									: decision.message,
 							)
 						}
 						ops.push(op)
@@ -578,7 +674,7 @@ export function createRouteContext(
 				const operations: Operation[] = []
 				const records: (MaterializedRecord | null)[] = []
 				for (const { op, collection } of prepared) {
-					const result = await commitOperation(op, collection)
+					const result = await commitOperation(op, collection, options?.scope)
 					if (!result.ok) {
 						return {
 							ok: false,
@@ -597,11 +693,39 @@ export function createRouteContext(
 
 		async query(collection, options): Promise<MaterializedRecord[]> {
 			const { scope, ...queryOptions } = options ?? {}
-			const records = await store.queryCollection(collection, queryOptions)
 			if (!scope) {
-				return records
+				return store.queryCollection(collection, queryOptions)
 			}
-			return records.filter((record) => recordMatchesScope(collection, record, scope))
+			const collectionScope = scope[collection]
+			if (!collectionScope) {
+				return []
+			}
+			// Push equality scope predicates into the store query so limit/offset apply
+			// to in-scope records only. A caller filter that contradicts the scope can
+			// match nothing.
+			const { equality, hasNonEquality } = splitScopeForQuery(collectionScope)
+			const callerWhere = queryOptions.where ?? {}
+			for (const [field, value] of Object.entries(equality)) {
+				if (field in callerWhere && !Object.is(callerWhere[field], value)) {
+					return []
+				}
+			}
+			const where = { ...callerWhere, ...equality }
+			const scopedWhere = Object.keys(where).length > 0 ? { where } : {}
+			if (!hasNonEquality) {
+				const records = await store.queryCollection(collection, {
+					...queryOptions,
+					...scopedWhere,
+				})
+				return records.filter((record) => recordMatchesScope(collection, record, scope))
+			}
+			// `$in` predicates cannot be pushed into the store's exact-match filter: fetch
+			// without pagination, filter by the full scope, then apply offset and limit.
+			const { limit, offset, ...unpaged } = queryOptions
+			const records = await store.queryCollection(collection, { ...unpaged, ...scopedWhere })
+			const inScope = records.filter((record) => recordMatchesScope(collection, record, scope))
+			const start = offset ?? 0
+			return limit === undefined ? inScope.slice(start) : inScope.slice(start, start + limit)
 		},
 
 		async findById(collection, id, options): Promise<MaterializedRecord | null> {

@@ -1,18 +1,29 @@
-import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import { generateUUIDv7 } from '@korajs/core'
+import type {
+	HLCTimestamp,
+	Operation,
+	RecordFieldVersions,
+	SchemaDefinition,
+	VersionVector,
+} from '@korajs/core'
+import { HybridLogicalClock, generateUUIDv7, replayFieldVersionsForRecord } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
 	deserializeFieldValue,
 	replayOperationsForRecord,
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 /**
  * In-memory server store for testing and quick prototyping.
@@ -35,6 +46,15 @@ export class MemoryServerStore implements ServerStore {
 	private readonly deliverySeqByOpId = new Map<string, number>()
 	private deliverySeqCounter = 0
 	private schema: SchemaDefinition | null = null
+
+	/** Node id -> the authenticated principal that claimed it (see claimNode). */
+	private readonly nodeOwners = new Map<string, string>()
+	/** Operation id -> scope snapshot captured at apply time (RT-14). */
+	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
+	/** Fields the current snapshots were captured with (RT-20). */
+	private snapshotFingerprint: string | null = null
+	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
+	private readonly blobOwners = new Map<string, Set<string>>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -70,15 +90,38 @@ export class MemoryServerStore implements ServerStore {
 
 		// Backfill from existing operations
 		this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot (RT-20).
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		if (fingerprint !== this.snapshotFingerprint) {
+			this.scopeSnapshots.clear()
+			this.snapshotFingerprint = fingerprint
+		}
+		this.backfillScopeSnapshots()
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 
 		// Content-addressed dedup: same id = same content
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'
 		}
+
+		// Authorization re-check against the row as stored right now. Everything from
+		// here to the write is synchronous, so no other writer can interleave.
+		if (options?.authorize) {
+			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId))
+			if (!decision.allowed) {
+				throw new UplinkAuthorizationError(decision.code, decision.message, {
+					operationId: op.id,
+					collection: op.collection,
+					recordId: op.recordId,
+				})
+			}
+		}
+
+		const materialized = this.schema?.collections[op.collection] !== undefined
+		const pre = materialized ? this.scopeValuesBefore(op.collection, op.recordId) : null
 
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
@@ -94,11 +137,124 @@ export class MemoryServerStore implements ServerStore {
 		}
 
 		// Dual-write: update materialized records if schema is set
-		if (this.schema?.collections[op.collection]) {
+		if (materialized) {
 			this.rebuildMaterializedRecord(op.collection, op.recordId)
+			// The record's scope values around this write, from the store's own rows.
+			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
+			this.scopeSnapshots.set(op.id, {
+				pre,
+				post: scopeValuesOf(this.schema, op.collection, op.recordId, row),
+			})
 		}
 
 		return 'applied'
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (const id of operationIds) {
+			const snapshot = this.scopeSnapshots.get(id)
+			if (snapshot) result.set(id, snapshot)
+		}
+		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		let latest: HLCTimestamp | null = null
+		for (const op of this.operations) {
+			if (op.collection !== collection || op.recordId !== recordId) continue
+			if (latest === null || HybridLogicalClock.compare(op.timestamp, latest) > 0) {
+				latest = op.timestamp
+			}
+		}
+		return latest
+	}
+
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		const ops = this.operations
+			.filter((op) => op.collection === collection && op.recordId === recordId)
+			.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
+		return replayFieldVersionsForRecord(ops)
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		let owners = this.blobOwners.get(hash)
+		if (!owners) {
+			owners = new Set()
+			this.blobOwners.set(hash, owners)
+		}
+		owners.add(owner)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		return new Map(hashes.map((hash) => [hash, [...(this.blobOwners.get(hash) ?? [])]]))
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		const owners = this.blobOwners.get(hash)
+		if (owners && owners.size > 0) return owners.has(owner)
+		this.blobOwners.set(hash, new Set([owner]))
+		return true
+	}
+
+	/** Scope values of a live record before a write; null when absent or deleted. */
+	private scopeValuesBefore(collection: string, recordId: string): Record<string, unknown> | null {
+		const row = this.materializedRecords.get(collection)?.get(recordId)
+		if (!row || row._deleted === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, row)
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a store without
+	 * them, or a replace-mode backup import), replaying each record in commit order.
+	 */
+	private backfillScopeSnapshots(): void {
+		const schema = this.schema
+		if (!schema) return
+		const byRecord = new Map<string, Operation[]>()
+		for (const op of this.operations) {
+			if (!schema.collections[op.collection]) continue
+			const key = `${op.collection}:::${op.recordId}`
+			let list = byRecord.get(key)
+			if (!list) {
+				list = []
+				byRecord.set(key, list)
+			}
+			list.push(op)
+		}
+		for (const ops of byRecord.values()) {
+			if (ops.every((op) => this.scopeSnapshots.has(op.id))) continue
+			const first = ops[0] as Operation
+			const replayed = replayScopeSnapshots(
+				schema,
+				first.collection,
+				first.recordId,
+				ops.map((op) => ({
+					id: op.id,
+					type: op.type,
+					data: op.data,
+					atomicOps: op.atomicOps ?? null,
+					timestamp: op.timestamp,
+				})),
+			)
+			for (const [id, snapshot] of replayed) {
+				if (!this.scopeSnapshots.has(id)) this.scopeSnapshots.set(id, snapshot)
+			}
+		}
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
@@ -133,7 +289,11 @@ export class MemoryServerStore implements ServerStore {
 		for (const op of this.operations) {
 			const deliverySequence = this.deliverySeqByOpId.get(op.id) ?? 0
 			if (deliverySequence > afterDeliverySequence) {
-				result.push({ operation: op, deliverySequence })
+				result.push({
+					operation: op,
+					deliverySequence,
+					scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+				})
 				if (result.length >= limit) break
 			}
 		}
@@ -291,6 +451,73 @@ export class MemoryServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		const owner = this.nodeOwners.get(nodeId)
+		if (owner === undefined) {
+			// History without a claim predates node claims: its writer is unknown, so
+			// nobody adopts it until an admin releases it (RT-5).
+			if ((this.versionVector.get(nodeId) ?? 0) > 0) return false
+			this.nodeOwners.set(nodeId, userId)
+			return true
+		}
+		if (owner === RELEASED_NODE_OWNER) {
+			this.nodeOwners.set(nodeId, userId)
+			return true
+		}
+		return owner === userId
+	}
+
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		return this.nodeOwners.get(nodeId) ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		if (this.nodeOwners.get(nodeId) !== expectedOwner) return false
+		this.nodeOwners.set(nodeId, newOwner)
+		return true
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		const known = this.nodeOwners.has(nodeId) || (this.versionVector.get(nodeId) ?? 0) > 0
+		if (!known) return false
+		this.nodeOwners.set(nodeId, RELEASED_NODE_OWNER)
+		return true
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private readStoredRow(collection: string, recordId: string): MaterializedRecord | null {
+		if (this.schema?.collections[collection]) {
+			const record = this.materializedRecords.get(collection)?.get(recordId)
+			if (!record) return null
+			const stored: MaterializedRecord = { ...record, id: recordId }
+			stored._deleted = undefined
+			return stored
+		}
+		const recordOps = this.operations
+			.filter((o) => o.collection === collection && o.recordId === recordId)
+			.sort((a, b) => compareTimestamps(a, b))
+		if (recordOps.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			recordOps
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({ type: o.type, data: o.data, atomicOps: o.atomicOps ?? null })),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
+	}
+
 	/**
 	 * Wipes all in-memory state. For tests and E2E isolation only.
 	 */
@@ -300,6 +527,9 @@ export class MemoryServerStore implements ServerStore {
 		this.operationIndex.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
+		this.nodeOwners.clear()
+		this.scopeSnapshots.clear()
+		this.blobOwners.clear()
 		this.schema = null
 	}
 
@@ -332,6 +562,7 @@ export class MemoryServerStore implements ServerStore {
 		this.versionVector.clear()
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
+		this.scopeSnapshots.clear()
 
 		for (const [nid, seq] of versionVector) {
 			this.versionVector.set(nid, seq)
@@ -349,6 +580,7 @@ export class MemoryServerStore implements ServerStore {
 				this.rebuildMaterializedRecord(op.collection, op.recordId)
 			}
 		}
+		this.backfillScopeSnapshots()
 
 		return { operationsRestored: operations.length, success: true }
 	}
@@ -397,6 +629,7 @@ export class MemoryServerStore implements ServerStore {
 			type: op.type,
 			data: op.data,
 			atomicOps: op.atomicOps ?? null,
+			previousData: op.previousData ?? null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -522,4 +755,15 @@ export class MemoryServerStore implements ServerStore {
 			)
 		}
 	}
+}
+
+function compareTimestamps(a: Operation, b: Operation): number {
+	if (a.timestamp.wallTime !== b.timestamp.wallTime)
+		return a.timestamp.wallTime - b.timestamp.wallTime
+	if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
+	return a.timestamp.nodeId < b.timestamp.nodeId
+		? -1
+		: a.timestamp.nodeId > b.timestamp.nodeId
+			? 1
+			: 0
 }

@@ -7,6 +7,7 @@ export type {
 	RejectedOperation,
 	RejectedOperationStorage,
 	SyncStatePersistence,
+	SyncAuthRequest,
 	SyncConfig,
 	SyncEncryptionConfig,
 	SyncScopeContext,
@@ -31,6 +32,7 @@ export {
 
 // === Scope Filtering ===
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
+export type { ScopeSnapshotOptions } from './scopes/scope-snapshot'
 export {
 	dedupeQuerySubsets,
 	querySubsetContains,
@@ -107,7 +109,10 @@ export type {
 export type { HttpLongPollingTransportOptions } from './transport/http-long-polling-transport'
 
 export { WebSocketTransport } from './transport/websocket-transport'
-export { HttpLongPollingTransport } from './transport/http-long-polling-transport'
+export {
+	HTTP_SYNC_SESSION_HEADER,
+	HttpLongPollingTransport,
+} from './transport/http-long-polling-transport'
 
 export type { ChaosConfig } from './transport/chaos-transport'
 

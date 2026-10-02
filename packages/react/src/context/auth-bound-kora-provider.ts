@@ -10,6 +10,13 @@ export interface AuthBoundKoraProviderProps {
 		session: Extract<AuthSyncState, { state: 'authenticated' }>,
 	) => KoraAppLike & { close(): Promise<void> }
 	signedOut?: ReactNode
+	/**
+	 * Rendered instead of the app while the session is locked (offline longer
+	 * than the auth client's `maxOfflineGraceMs`, or the device clock moved
+	 * backwards). The app and its local data stay open underneath; nothing is
+	 * wiped. Defaults to `signedOut`.
+	 */
+	locked?: ReactNode
 	fallback?: ReactNode
 	error?: (context: AuthBoundKoraErrorContext) => ReactNode
 	children?: ReactNode
@@ -83,6 +90,7 @@ export function AuthBoundKoraProvider({
 	authClient,
 	createApp,
 	signedOut = null,
+	locked,
 	fallback = null,
 	error: renderError,
 	children,
@@ -188,6 +196,9 @@ export function AuthBoundKoraProvider({
 		)
 	}
 	if (state.state === 'signed-out' || state.state === 'anonymous') return signedOut
+	// Authenticated-offline sessions (token: null) mount the user's own local
+	// database like fresh ones; only a locked session is hidden behind `locked`.
+	if (state.state === 'authenticated' && state.locked) return locked ?? signedOut
 	if (!app) return fallback
 	return createElement(KoraProvider, { app, fallback }, children)
 }

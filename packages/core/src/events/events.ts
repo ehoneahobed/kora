@@ -66,6 +66,17 @@ export type KoraEvent =
 			source: 'handshake' | 'server-reject'
 	  }
 	| {
+			/**
+			 * The server refused this device's node id (`NODE_ID_CLAIMED`, RT-21), so the
+			 * device moved to a fresh node id and re-queued its unsynced writes under it.
+			 */
+			type: 'sync:node-id-rotated'
+			previousNodeId: string
+			nodeId: string
+			/** Unsynced operations re-authored under the new node id. */
+			reenqueuedCount: number
+	  }
+	| {
 			type: 'sync:clock-rebase'
 			/** Number of unsynced operations that were re-stamped. */
 			rebasedCount: number
@@ -203,6 +214,21 @@ export type KoraEvent =
 			from: 'opfs' | 'sqlite-wasm'
 			to: 'indexeddb'
 			reason: 'lock-conflict' | 'timeout' | 'unsupported'
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING. The store could not obtain durable storage when it opened or when
+			 * this tab was promoted to storage leader, so it is running on a
+			 * non-persistent in-memory database. Writes are refused with
+			 * `StorageDurabilityError` (unless the app opted into non-durable storage)
+			 * instead of being accepted and lost on reload. Apps should show a blocking
+			 * state, for example asking the user to close other tabs and reload.
+			 */
+			type: 'store:durability-lost'
+			dbName: string
+			phase: 'open' | 'promotion'
+			reason: 'lock-conflict' | 'timeout' | 'unsupported' | 'open-failed'
 			message: string
 	  }
 	| {

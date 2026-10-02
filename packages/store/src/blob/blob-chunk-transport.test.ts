@@ -106,4 +106,48 @@ describe('blob chunk transport (request/response over a message port)', () => {
 			}),
 		).rejects.toThrow('could not supply chunk')
 	})
+
+	test('a throttled answer is retried after a back-off instead of failing (RT-24)', async () => {
+		const pair = createChunkPortPair()
+		const chunk = new Uint8Array([7, 7, 7])
+		let requests = 0
+		pair.a.onMessage((message) => {
+			if (message.type !== 'blob-chunk-request') return
+			requests += 1
+			pair.a.send(
+				requests < 3
+					? {
+							type: 'blob-chunk-response',
+							requestId: message.requestId,
+							bytes: null,
+							throttled: true,
+							retryAfterMs: 1,
+						}
+					: { type: 'blob-chunk-response', requestId: message.requestId, bytes: chunk },
+			)
+		})
+		const provider = createRemoteChunkProvider(pair.b, { minThrottleDelayMs: 1 })
+		expect(await provider.getChunk('h')).toEqual(chunk)
+		expect(requests).toBe(3)
+		expect(provider.pendingCount()).toBe(0)
+	})
+
+	test('a request throttled past the wait budget fails', async () => {
+		const pair = createChunkPortPair()
+		pair.a.onMessage((message) => {
+			if (message.type !== 'blob-chunk-request') return
+			pair.a.send({
+				type: 'blob-chunk-response',
+				requestId: message.requestId,
+				bytes: null,
+				throttled: true,
+				retryAfterMs: 50,
+			})
+		})
+		const provider = createRemoteChunkProvider(pair.b, {
+			minThrottleDelayMs: 1,
+			maxThrottleWaitMs: 10,
+		})
+		await expect(provider.getChunk('h')).rejects.toThrow('throttled')
+	})
 })

@@ -28,7 +28,9 @@
     "test:pre-release:core": "pnpm lint && pnpm build && pnpm test && pnpm test:release-gate",
     "dev:full-stack": "pnpm --filter kora-full-stack dev",
     "verify:full-stack": "pnpm --filter kora-full-stack verify",
-    "docs:dev": "pnpm --filter kora-docs dev"
+    "docs:dev": "pnpm --filter kora-docs dev",
+    "remediation": "node scripts/remediation/check.mjs",
+    "remediation:all": "node scripts/remediation/check.mjs --all"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

@@ -78,8 +78,12 @@ export interface UseMutationResultBase<TData, TArgs extends unknown[]> {
  * Created by `createKoraAuthSync()` in `@korajs/auth`.
  */
 export interface AuthSyncBinding {
-	/** Returns the access token for sync handshake (empty string when signed out). */
-	auth: () => Promise<{ token: string }>
+	/**
+	 * Returns the access token for sync handshake (empty string when signed out).
+	 * Called with `{ forceRefresh: true }` after the server ended the session with
+	 * `AUTH_EXPIRED` / `AUTH_REVOKED`: refresh instead of returning the cached token.
+	 */
+	auth: (options?: { forceRefresh?: boolean }) => Promise<{ token: string }>
 	/** Resolve whether sync may currently open a transport. Tokens are never used as readiness signals. */
 	resolveSyncState?: () => Promise<AuthSyncState>
 	/** Builds a scope map from the current token and schema. */
@@ -100,4 +104,22 @@ export type AuthSyncState =
 	| { state: 'loading' }
 	| { state: 'signed-out'; mayConnectAnonymously: false }
 	| { state: 'anonymous'; mayConnectAnonymously: true }
-	| { state: 'authenticated'; userId: string; token: string }
+	| {
+			state: 'authenticated'
+			userId: string
+			/**
+			 * Fresh access token, or null while authenticated-offline: the identity
+			 * is known from stored credentials but no fresh token can be minted now.
+			 * The local store opens either way; a sync transport waits for a token.
+			 */
+			token: string | null
+			/** Device id of the stored credentials, when known. */
+			deviceId?: string
+			/** True while the session is authenticated-offline (or locked). */
+			offline?: boolean
+			/**
+			 * True when the offline grace period ran out or the device clock moved
+			 * backwards. The UI should lock; local data is never wiped.
+			 */
+			locked?: boolean
+	  }

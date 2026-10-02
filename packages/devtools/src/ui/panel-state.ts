@@ -202,6 +202,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `sync suspended (${event.reason})`
 		case 'sync:clock-skew':
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
+		case 'sync:node-id-rotated':
+			return `node id rotated (${event.reenqueuedCount} ops re-queued)`
 		case 'sync:clock-rebase':
 			return `clock rebase ${event.rebasedCount} ops (${Math.round(event.maxSkewMs / 1000)}s ahead)`
 		case 'sync:schema-mismatch':
@@ -258,6 +260,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `store fallback ${event.from} → ${event.to}`
 		case 'store:opfs-unavailable':
 			return `store OPFS unavailable (${event.reason}), running in memory`
+		case 'store:durability-lost':
+			return `store durability lost (${event.reason} during ${event.phase}), writes refused`
 		case 'store:db-name-collision':
 			return `store db-name collision ${event.dbName}`
 		case 'replay:completed':

@@ -3,7 +3,9 @@ import {
 	type CreateKoraAuthServerOptions,
 	createKoraAuthServer,
 	createPostgresOAuthStores,
+	createPostgresUserStore,
 	createSqliteOAuthStores,
+	createSqliteUserStore,
 	googleProvider,
 } from '@korajs/auth/server'
 import {
@@ -108,8 +110,14 @@ async function createAuth() {
 	}
 
 	const oauth = await createOAuthConfig()
+	// Users and token revocations persist in the same database (the user store's
+	// revocation store is used automatically), so sign-outs survive restarts.
+	const userStore = process.env.DATABASE_URL
+		? await createPostgresUserStore({ connectionString: process.env.DATABASE_URL })
+		: await createSqliteUserStore({ filename: process.env.KORA_AUTH_DB || './.kora/kora-auth.db' })
 	return createKoraAuthServer({
 		jwtSecret: process.env.KORA_AUTH_SECRET,
+		userStore,
 		...(oauth ? { oauth } : {}),
 	})
 }

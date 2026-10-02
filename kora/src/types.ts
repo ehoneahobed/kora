@@ -71,6 +71,13 @@ export interface StoreOptions {
 	sharedWorkerUrl?: string | URL
 	/** Max wait for a worker RPC (e.g. `open`). Defaults to 30000ms. */
 	workerResponseTimeoutMs?: number
+	/**
+	 * Accept writes when no durable browser storage can be obtained (the store runs
+	 * in memory and loses local writes on reload). Defaults to false: Kora emits the
+	 * blocking `store:durability-lost` event and refuses writes with
+	 * `StorageDurabilityError` instead.
+	 */
+	allowNonDurable?: boolean
 }
 
 export interface StoreInfo {
@@ -96,8 +103,12 @@ export interface SyncOptions {
 	url: string
 	/** Transport type. Defaults to 'websocket'. */
 	transport?: 'websocket' | 'http'
-	/** Auth provider function. Called before each connection attempt. */
-	auth?: () => Promise<{ token: string }>
+	/**
+	 * Auth provider function. Called before each connection attempt, with
+	 * `{ forceRefresh: true }` after the server ended a session because its
+	 * credential expired or was revoked (return a freshly refreshed token then).
+	 */
+	auth?: (options?: { forceRefresh?: boolean }) => Promise<{ token: string }>
 	/**
 	 * Pre-built auth binding from `createKoraAuthSync({ authClient, schema })`.
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.

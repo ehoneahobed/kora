@@ -1,13 +1,16 @@
 import {
 	CausalTracker,
 	HybridLogicalClock,
+	KoraError,
 	createVersionVector,
+	expandFieldVersionedOperations,
 	generateUUIDv7,
 	migrationStepsToSQL,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
+	HLCTimestamp,
 	KoraEventEmitter,
 	MigrationStep,
 	Operation,
@@ -23,6 +26,8 @@ import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import {
+	type FieldVersions,
+	effectiveFieldVersion,
 	fieldVersionsForFields,
 	parseFieldVersions,
 	resolvePerFieldLww,
@@ -50,6 +55,8 @@ import {
 import { SubscriptionManager } from '../subscription/subscription-manager'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
+import type { NodeRotationResult } from '../sync/rotate-node-id'
+import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import {
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
@@ -57,10 +64,12 @@ import {
 	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
+	loadNodeToken,
 	mergeVersionVectors,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
+	saveNodeToken,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import { TransactionSequenceAllocator } from '../transaction/transaction-sequence'
@@ -309,7 +318,9 @@ export class Store implements OperationLog {
 
 		// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
 		if (this.clock) {
-			this.clock.receive(op.timestamp)
+			// A scope entry's newest field version can be later than its timestamp (the
+			// record's creation, RT-27): the clock must move past every version it carries.
+			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
 		}
 
 		// Materialization may use overridden data/timestamp (authoritative merge
@@ -343,6 +354,16 @@ export class Store implements OperationLog {
 				// Append-only: the caller (after folding the record's log) determined
 				// this op does not change the authoritative row. Persist it for future
 				// folds but leave the row untouched. Fall through to op-log insert + VV.
+			} else if (
+				op.type === 'insert' &&
+				op.data &&
+				op.fieldVersions &&
+				!options?.materializeData &&
+				!options?.forceMaterialize &&
+				!options?.materializeTimestamp
+			) {
+				// Server scope-entry insert (RT-27): every field carries its own version.
+				await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
 			} else if (op.type === 'insert' && materializeSource) {
 				const serializedData = serializeRecord(materializeSource, definition.fields)
 				const existing = await tx.query<RawCollectionRow>(
@@ -374,6 +395,47 @@ export class Store implements OperationLog {
 					// inside this same transaction. Per-field LWW makes the result
 					// identical to what an in-order device computed.
 					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+				} else if (
+					row._deleted === 1 &&
+					(
+						await tx.query<{ record_id: string }>(
+							'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+					).length > 0
+				) {
+					// The row is hidden by a scope retraction (a view change, not a domain
+					// delete) and the record is entering the scope again, typically through
+					// a server scope-entry insert (RT-19). Show it again and merge per field,
+					// exactly like an insert collision on a live row: fields this device
+					// holds newer versions of are kept.
+					const { winners, merged } = resolvePerFieldLww(
+						parseFieldVersions(row._field_versions),
+						Object.keys(serializedData),
+						remoteVersion,
+						typeof row._version === 'string' ? row._version : undefined,
+					)
+					const fieldChanges: Record<string, unknown> = {
+						_deleted: 0,
+						_field_versions: serializeFieldVersions(merged),
+					}
+					for (const field of winners) {
+						fieldChanges[field] = serializedData[field]
+					}
+					// `_created_at` is left alone: the record was created long before it
+					// re-entered this device's view.
+					const reactivate = buildFieldFastForwardUpdateQuery(
+						collection,
+						op.recordId,
+						fieldChanges,
+						remoteVersion,
+						wallTime,
+					)
+					await tx.execute(reactivate.sql, reactivate.params)
+					await tx.execute(
+						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
 				} else if (row._deleted === 1) {
 					// Insert vs tombstone: a strictly newer insert resurrects the record
 					// with its full field set; an older one is stale (delete wins).
@@ -606,6 +668,110 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Materialize a server scope-entry insert (RT-19) whose fields each carry their
+	 * own version (RT-27). The entry restates the record's current server values; a
+	 * single whole-row stamp would let a field the server last wrote long ago
+	 * overwrite this device's newer unsynced edit of it, after which the device's own
+	 * operation uploads and wins on the server (divergence). So every field is resolved
+	 * on its own, by last-write-wins against this row's `_field_versions`:
+	 *
+	 * - no row: inserted with each field stamped at its own version, `_created_at`
+	 *   at the record's creation (the entry's `timestamp`), then any orphaned
+	 *   updates/deletes are folded in as for any insert;
+	 * - live row, or a row hidden by a scope retraction: per-field LWW (a retracted
+	 *   row is shown again; `_created_at` is kept);
+	 * - domain tombstone: revived only when the entry's newest field version is
+	 *   newer than the tombstone, then per-field LWW.
+	 *
+	 * Deterministic and idempotent: the outcome depends only on the stored and
+	 * incoming per-field versions, and a re-applied entry wins no field.
+	 */
+	private async applyFieldVersionedInsert(
+		tx: Transaction,
+		op: Operation,
+		definition: NonNullable<SchemaDefinition['collections'][string]>,
+		data: Record<string, unknown>,
+		checkGuard: (row: RawCollectionRow | undefined) => void,
+	): Promise<void> {
+		const collection = op.collection
+		const serialized = serializeRecord(data, definition.fields)
+		const versions = op.fieldVersions ?? {}
+		const latest = newestFieldVersion(op)
+		const latestVersion = serializeRowVersion(latest)
+		const incoming: FieldVersions = {}
+		for (const field of Object.keys(serialized)) {
+			// A field without its own version (renamed by a schema transform) falls back
+			// to the entry's newest version: the single-stamp rule of RT-19.
+			const version = versions[field]
+			incoming[field] = version ? serializeRowVersion(version) : latestVersion
+		}
+
+		const rows = await tx.query<RawCollectionRow>(
+			`SELECT _updated_at, _version, _field_versions, _deleted FROM ${quoteIdent(collection)} WHERE id = ?`,
+			[op.recordId],
+		)
+		const row = rows[0]
+		checkGuard(row)
+
+		if (!row) {
+			const record: Record<string, unknown> = {
+				id: op.recordId,
+				...serialized,
+				_created_at: op.timestamp.wallTime,
+				_updated_at: latest.wallTime,
+				_version: latestVersion,
+				_field_versions: serializeFieldVersions(incoming),
+			}
+			const insertQuery = buildInsertQuery(collection, record)
+			await tx.execute(insertQuery.sql, insertQuery.params)
+			await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+			return
+		}
+
+		let retracted = false
+		if (row._deleted === 1) {
+			retracted =
+				(
+					await tx.query<{ record_id: string }>(
+						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
+				).length > 0
+			// A domain delete newer than everything the entry carries still wins.
+			if (!retracted && !isIncomingNewerThanRow(latest, row)) return
+		}
+
+		const current = parseFieldVersions(row._field_versions)
+		const rowVersion = typeof row._version === 'string' ? row._version : undefined
+		const merged: FieldVersions = { ...current }
+		const changes: Record<string, unknown> = {}
+		for (const [field, version] of Object.entries(incoming)) {
+			if (version > effectiveFieldVersion(current, field, rowVersion)) {
+				changes[field] = serialized[field]
+				merged[field] = version
+			}
+		}
+		if (row._deleted === 1) {
+			changes._deleted = 0
+		}
+		changes._field_versions = serializeFieldVersions(merged)
+		const update = buildFieldFastForwardUpdateQuery(
+			collection,
+			op.recordId,
+			changes,
+			latestVersion,
+			latest.wallTime,
+		)
+		await tx.execute(update.sql, update.params)
+		if (retracted) {
+			await tx.execute(
+				'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+				[collection, op.recordId],
+			)
+		}
+	}
+
+	/**
 	 * Materialize update/delete operations that were logged for a record BEFORE
 	 * its insert arrived (reordered delivery). Runs inside the insert's write
 	 * transaction, folding each orphan in timestamp order through the exact
@@ -694,9 +860,8 @@ export class Store implements OperationLog {
 			}
 		}
 		if (atomicFields.size > 0) {
-			const ordered = [insertOp, ...orphans].sort((a, b) =>
-				HybridLogicalClock.compare(a.timestamp, b.timestamp),
-			)
+			// A scope-entry insert expands into its per-field writes (RT-27).
+			const ordered = expandFieldVersionedOperations([insertOp, ...orphans])
 			const folded = replayOperationsForRecord(ordered)
 			if (folded) {
 				const composed: Record<string, unknown> = {}
@@ -965,6 +1130,22 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Load the per-device node token the sync server issued for this node id (RT-12).
+	 */
+	async loadNodeToken(): Promise<string | null> {
+		this.ensureOpen()
+		return loadNodeToken(this.adapter)
+	}
+
+	/**
+	 * Persist the per-device node token next to the node id.
+	 */
+	async saveNodeToken(token: string): Promise<void> {
+		this.ensureOpen()
+		await saveNodeToken(this.adapter, token)
+	}
+
+	/**
 	 * Load persisted delta cursor for resuming paginated initial sync.
 	 */
 	async loadDeltaCursor(): Promise<string | null> {
@@ -1036,6 +1217,65 @@ export class Store implements OperationLog {
 	 * No data-change notifications are emitted: materialized values are
 	 * unchanged, only version stamps move.
 	 */
+	/**
+	 * Move this device to a fresh node id, re-authoring its never-acknowledged
+	 * operations under it (RT-21). Used when the sync server refuses the current node
+	 * id (`NODE_ID_CLAIMED`): the device keeps every local write and uploads it under
+	 * the new id. Acknowledged history stays under the old id. Persisted atomically;
+	 * later writes use the new id.
+	 *
+	 * @param unsyncedOpIds - Ids of this node's operations the server never acknowledged
+	 * @returns The new node id and the rewritten operations (for the outbound queue)
+	 * @throws {KoraError} When the node id is pinned (`StoreConfig.nodeId`, or per-tab isolation)
+	 */
+	async rotateNodeId(unsyncedOpIds: string[]): Promise<NodeRotationResult> {
+		this.ensureOpen()
+		if (this.configNodeId || this.isolation === 'per-tab') {
+			throw new KoraError(
+				'This store uses a pinned node id, so it cannot move to a fresh one after the sync server refused it.',
+				'NODE_ID_PINNED',
+				{
+					nodeId: this.nodeId,
+					fix: 'Remove StoreConfig.nodeId, or give the device a node id no other device uses.',
+				},
+			)
+		}
+		const oldNodeId = this.nodeId
+		const oldClock = this.clock
+		const result = await rotateUnsyncedOperationsInLog(
+			this.adapter,
+			this.schema,
+			unsyncedOpIds,
+			oldNodeId,
+			generateUUIDv7(),
+		)
+		this.nodeId = result.nodeId
+		const clock = new HybridLogicalClock(this.nodeId)
+		if (oldClock) {
+			const last = oldClock.now()
+			clock.advanceTo({ ...last, nodeId: this.nodeId })
+			const offset = oldClock.getReferenceOffset()
+			if (offset !== null) clock.setReferenceOffset(offset)
+		}
+		this.clock = clock
+		this.causalTracker = new CausalTracker()
+		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
+		this.sequenceNumber = result.operations.length
+		this.versionVector = await this.loadVersionVector()
+		this.relationEnforcer = this.relationEnforcer
+			? new RelationEnforcer({
+					schema: this.schema,
+					adapter: this.adapter,
+					clock,
+					nodeId: this.nodeId,
+				})
+			: null
+		for (const collection of this.collections.values()) {
+			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
+		}
+		return result
+	}
+
 	async rebaseUnsyncedOperations(
 		unsyncedOpIds: string[],
 		correctedNowMs: number,
@@ -1175,6 +1415,7 @@ export class Store implements OperationLog {
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
 			localMutationHandler: this.localMutationHandler,
+			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
 		})
 	}
 
@@ -1439,4 +1680,16 @@ export interface CollectionAccessor {
 	update(id: string, data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
 	delete(id: string): Promise<void>
 	where(conditions: Record<string, unknown>): QueryBuilder
+}
+
+/**
+ * The newest HLC an operation carries: its timestamp, or for a scope-entry insert
+ * (RT-27) the greatest of its timestamp and every per-field version.
+ */
+function newestFieldVersion(op: Operation): HLCTimestamp {
+	let newest = op.timestamp
+	for (const version of Object.values(op.fieldVersions ?? {})) {
+		if (HybridLogicalClock.compare(version, newest) > 0) newest = version
+	}
+	return newest
 }

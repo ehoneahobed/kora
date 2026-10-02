@@ -170,8 +170,15 @@ export async function verifyRegistrationResponse(params: {
 	expectedChallenge: string
 	expectedOrigin: string
 	expectedRpId: string
+	/**
+	 * Require the User Verified (UV) flag. Kora's options request
+	 * `userVerification: 'required'`, so the response must honour it.
+	 * @default true
+	 */
+	requireUserVerification?: boolean
 }): Promise<RegistrationVerificationResult> {
 	const { credential, expectedChallenge, expectedOrigin, expectedRpId } = params
+	const requireUserVerification = params.requireUserVerification ?? true
 
 	// Step 1: Decode and verify clientDataJSON
 	const clientDataBytes = fromBase64Url(credential.clientDataJSON)
@@ -254,6 +261,13 @@ export async function verifyRegistrationResponse(params: {
 		throw new PasskeyVerificationError(
 			'User Present flag is not set in authenticator data. ' +
 				'The authenticator did not confirm user presence.',
+		)
+	}
+
+	// Bit 2: User Verified (UV) - required unless explicitly relaxed (AUTH-14)
+	if (requireUserVerification && (flags & 0x04) === 0) {
+		throw new PasskeyVerificationError(
+			'User Verified flag is not set in authenticator data, but user verification is required.',
 		)
 	}
 
@@ -440,6 +454,12 @@ export async function verifyAuthenticationResponse(params: {
 	expectedRpId: string
 	publicKey: string
 	previousSignCount: number
+	/**
+	 * Require the User Verified (UV) flag. Kora's options request
+	 * `userVerification: 'required'`, so the assertion must honour it.
+	 * @default true
+	 */
+	requireUserVerification?: boolean
 }): Promise<AuthenticationVerificationResult> {
 	const {
 		assertion,
@@ -507,6 +527,13 @@ export async function verifyAuthenticationResponse(params: {
 	// Bit 0: User Present (UP) - must be set
 	if ((flags & 0x01) === 0) {
 		throw new PasskeyVerificationError('User Present flag is not set in authenticator data.')
+	}
+
+	// Bit 2: User Verified (UV) - required unless explicitly relaxed (AUTH-14)
+	if ((params.requireUserVerification ?? true) && (flags & 0x04) === 0) {
+		throw new PasskeyVerificationError(
+			'User Verified flag is not set in authenticator data, but user verification is required.',
+		)
 	}
 
 	// Parse sign count (bytes 33-36, big-endian uint32)

@@ -83,6 +83,11 @@ const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
 /**
  * Valid state transitions for the sync engine state machine.
  */
+/** Server error codes that end a session because its credential expired or was revoked. */
+function isCredentialEndingCode(code: string): boolean {
+	return code === 'AUTH_EXPIRED' || code === 'AUTH_REVOKED'
+}
+
 const VALID_TRANSITIONS: Record<SyncState, SyncState[]> = {
 	disconnected: ['connecting'],
 	connecting: ['handshaking', 'error', 'disconnected'],
@@ -148,6 +153,9 @@ export interface SyncDiagnostics {
 
 let nextMessageId = 0
 let nextQuerySubsetId = 0
+
+/** Rejection code for a local operation the uplink scope refuses (recorded client-side). */
+const OUT_OF_UPLINK_SCOPE = 'OUT_OF_UPLINK_SCOPE'
 function generateMessageId(): string {
 	return `msg-${Date.now()}-${nextMessageId++}`
 }
@@ -210,6 +218,14 @@ export class SyncEngine {
 	private readonly syncState: SyncStatePersistence | null
 
 	private remoteVector: VersionVector = new Map()
+	/** Runs before each outbound operation batch is sent (see setOutboundPreparer). */
+	private outboundPreparer: ((operations: Operation[]) => Promise<void>) | null = null
+	/**
+	 * Per-device node token the server issued at this node id's first anonymous claim
+	 * (RT-12). Presented in every handshake; persisted next to the node id when the
+	 * sync-state persistence supports it, otherwise kept for this engine's lifetime.
+	 */
+	private nodeToken: string | null = null
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -226,8 +242,15 @@ export class SyncEngine {
 	private clockBlocked = false
 	private clockSkewMs: number | null = null
 	private blobStorageEnabled = false
+	private blobPossessionProof = false
 	private suspensionReason: string | null = null
 	private authRejected = false
+	/**
+	 * Set when the server ended the session with AUTH_EXPIRED or AUTH_REVOKED. The
+	 * next connect asks the auth callback for a refreshed token (never the cached
+	 * one the server just refused) and is cleared by an accepted handshake.
+	 */
+	private credentialRefreshRequired = false
 	private serverFrontier: number | null = null
 	private hasInFlightDeliveryBatch = false
 	private blockedFailure: import('../types').ActiveApplyFailure | null = null
@@ -235,6 +258,8 @@ export class SyncEngine {
 	private startPromise: Promise<void> | null = null
 	private stopPromise: Promise<void> | null = null
 	private reconnectPromise: Promise<void> | null = null
+	/** A node-id rotation started by NODE_ID_CLAIMED; the next connect waits for it (RT-21). */
+	private nodeRotation: Promise<void> | null = null
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -335,10 +360,14 @@ export class SyncEngine {
 			onSend: (
 				message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
 			) => {
-				// Blob transfer is only meaningful once the connection reaches steady
-				// state. A request dropped here is safe: the puller times out and
-				// retries, and blob transfer is resumable.
-				if (this.state !== 'streaming') {
+				// Blob transfer needs an accepted handshake. Pushes may also go out while
+				// syncing, so the bytes behind a handshake-delta operation reach the server
+				// before the operation does (RT-11). A request dropped here is safe: the
+				// puller times out and retries, and blob transfer is resumable.
+				const live =
+					this.state === 'streaming' ||
+					(this.state === 'syncing' && message.type === 'blob-chunk-push')
+				if (!live) {
 					return
 				}
 				this.transport.send(message)
@@ -376,6 +405,9 @@ export class SyncEngine {
 		if (this.stopPromise) {
 			await this.stopPromise
 		}
+		if (this.nodeRotation) {
+			await this.nodeRotation
+		}
 		if (this.state === 'streaming') return
 		if (this.state !== 'disconnected') {
 			await this.stop()
@@ -400,6 +432,9 @@ export class SyncEngine {
 		await this.outboundQueue.initialize()
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
+			if (this.nodeToken === null && this.syncState.loadNodeToken) {
+				this.nodeToken = await this.syncState.loadNodeToken()
+			}
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
 			}
@@ -435,8 +470,24 @@ export class SyncEngine {
 		this.transitionTo('connecting')
 
 		try {
-			const authToken = this.config.auth ? (await this.config.auth()).token : undefined
+			const forceRefresh = this.credentialRefreshRequired
+			const authToken = this.config.auth
+				? (await (forceRefresh ? this.config.auth({ forceRefresh: true }) : this.config.auth()))
+						.token
+				: undefined
 			if (this.state !== 'connecting') return
+			if (forceRefresh && !authToken) {
+				// The refresh did not produce a token yet (offline, auth server down).
+				// Handshaking with an empty or stale token would be refused as AUTH_FAILED
+				// and suspend sync for good; fail this attempt so reconnection retries.
+				throw new SyncError(
+					'Waiting for refreshed credentials before reconnecting: the server ended the previous session because its credential expired or was revoked.',
+					{
+						code: 'AUTH_REFRESH_PENDING',
+						fix: 'Sync reconnects automatically once the auth client can refresh its token. If the user was signed out, sign in again.',
+					},
+				)
+			}
 
 			await this.transport.connect(this.config.url, { authToken })
 			if (this.state !== 'connecting') {
@@ -466,6 +517,7 @@ export class SyncEngine {
 				// that understands it drives server->client sync from delivery sequences; an
 				// older server ignores it and falls back to the version-vector delta.
 				lastDeliverySequence: this.deliveryWatermark,
+				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -523,11 +575,19 @@ export class SyncEngine {
 	 * Push a local operation to the outbound queue.
 	 * If streaming, flushes immediately.
 	 *
-	 * Operations outside the configured sync scope are silently skipped
-	 * because they should remain local-only and not be sent to the server.
+	 * Uploads are judged against the UPLINK scope only. Query subsets narrow what
+	 * this client downloads, never what it uploads: an edit that moves a record out
+	 * of a reactive query's view must still reach the server (SYNC-1).
+	 *
+	 * Operations on collections that do not sync at all stay local-only by design.
+	 * An operation on a synced collection that falls outside the uplink scope would
+	 * be refused by the server, so it is recorded in the rejected store and
+	 * surfaced as `sync:operation-rejected` (code `OUT_OF_UPLINK_SCOPE`) rather than
+	 * kept as a silent local fork.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
-		if (!(await this.operationAllowedForSync(op))) {
+		if (!(await this.operationAllowedForUpload(op))) {
+			await this.recordOutOfUplinkScope(op)
 			return
 		}
 
@@ -1024,14 +1084,44 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Upload a blob chunk (or manifest) to the server for central persistence.
-	 * A no-op unless connected and the server advertised blob storage.
+	 * Whether the connected server (peer-relay mode, no central storage) asks for the
+	 * bytes behind blob references as proof of possession (RT-23). The server verifies
+	 * and drops them; the app uploads exactly as for central storage.
+	 */
+	isBlobPossessionProofRequested(): boolean {
+		return this.blobPossessionProof
+	}
+
+	/**
+	 * Upload a blob chunk (or manifest) to the server, for central persistence or as
+	 * proof of possession. A no-op unless the handshake was accepted (syncing or
+	 * streaming) and the server advertised blob storage or asked for proofs.
 	 */
 	uploadBlobChunk(hash: string, bytes: Uint8Array): void {
-		if (this.state !== 'streaming' || !this.blobStorageEnabled) {
+		if (
+			(this.state !== 'streaming' && this.state !== 'syncing') ||
+			!(this.blobStorageEnabled || this.blobPossessionProof)
+		) {
 			return
 		}
 		this.blobChunkChannel.send({ type: 'blob-chunk-push', hash, bytes })
+	}
+
+	/**
+	 * Register work that must reach the server before each outbound operation batch,
+	 * on the same connection (messages are processed in order). Used to upload the
+	 * bytes behind blob references first: the server only accepts a reference to
+	 * content the writer can read or has uploaded (RT-11). Errors are ignored; the
+	 * batch is sent regardless.
+	 *
+	 * @param preparer - Called with the operations about to be sent; null to remove
+	 * @returns A function that removes this preparer
+	 */
+	setOutboundPreparer(preparer: ((operations: Operation[]) => Promise<void>) | null): () => void {
+		this.outboundPreparer = preparer
+		return () => {
+			if (this.outboundPreparer === preparer) this.outboundPreparer = null
+		}
 	}
 
 	// --- Private methods ---
@@ -1039,6 +1129,12 @@ export class SyncEngine {
 	private messageChain: Promise<void> = Promise.resolve()
 
 	private enqueueMessage(message: SyncMessage): void {
+		// The server sends a credential-ending error and closes the socket right away.
+		// The close is handled synchronously (and may start a reconnect) before this
+		// queued message is processed, so record the need to refresh now (AUTH-11).
+		if (message.type === 'error' && isCredentialEndingCode(message.code)) {
+			this.credentialRefreshRequired = true
+		}
 		this.messageChain = this.messageChain
 			.then(() => this.handleMessageAsync(message))
 			.catch((error) => this.handleMessageFailure(error))
@@ -1114,6 +1210,7 @@ export class SyncEngine {
 		if (this.state !== 'handshaking') return
 
 		this.blobStorageEnabled = msg.blobStorageEnabled === true
+		this.blobPossessionProof = msg.blobPossessionProof === true
 
 		if (typeof msg.serverTime === 'number') {
 			this.evaluateClockSkew(msg.serverTime)
@@ -1123,6 +1220,10 @@ export class SyncEngine {
 				void this.transport.disconnect()
 				return
 			}
+		}
+
+		if (msg.accepted) {
+			this.credentialRefreshRequired = false
 		}
 
 		if (!msg.accepted) {
@@ -1151,6 +1252,24 @@ export class SyncEngine {
 			})
 			this.transitionTo('disconnected')
 			return
+		}
+
+		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
+			this.nodeToken = msg.nodeToken
+			await this.syncState?.saveNodeToken?.(msg.nodeToken)
+			// The claim stays provisional until the server knows the token is saved:
+			// confirm it now, so a lost response never locks this device out (RT-21).
+			// Without persistence the token lives for this engine only; confirming would
+			// tie the node to a secret the next process does not have, so don't.
+			if (this.syncState?.saveNodeToken) {
+				this.transport.send({
+					type: 'acknowledgment',
+					messageId: generateMessageId(),
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+					nodeToken: msg.nodeToken,
+				})
+			}
 		}
 
 		this.remoteVector = wireToVersionVector(msg.versionVector)
@@ -1215,6 +1334,45 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Move this device to a fresh node id after the server refused the current one
+	 * (RT-21). Every unsynced own operation (queued, or in the log above the server's
+	 * acknowledged position) is re-authored under the new id and re-queued, so no
+	 * write is lost. Without store support the engine stays refused and reports it.
+	 */
+	private async rotateNodeIdentity(): Promise<void> {
+		const rotate = this.store.rotateNodeId?.bind(this.store)
+		if (!rotate) {
+			this.emitter?.emit({ type: 'sync:suspended', reason: 'node-id-claimed' })
+			return
+		}
+		const previousNodeId = this.store.getNodeId()
+		try {
+			const ids = new Set(this.outboundQueue.getAll().map((op) => op.id))
+			if (this.syncState) {
+				const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
+				for (const op of unsynced) if (op.nodeId === previousNodeId) ids.add(op.id)
+			}
+			const result = await rotate([...ids])
+			await this.outboundQueue.replaceAll(result.operations)
+			this.nodeToken = null
+			await this.refreshPendingCount()
+			this.emitter?.emit({
+				type: 'sync:node-id-rotated',
+				previousNodeId,
+				nodeId: result.nodeId,
+				reenqueuedCount: result.operations.length,
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Node id rotation failed',
+				code: 'NODE_ROTATION_FAILED',
+			})
+		}
+	}
+
+	/**
 	 * Re-stamps queued (never-acknowledged) operations whose timestamps are far
 	 * enough in the future that the server would reject them, using the server's
 	 * own handshake time as the trusted "now". This is the automatic recovery
@@ -1269,9 +1427,9 @@ export class SyncEngine {
 
 	private async sendDelta(): Promise<void> {
 		const localVector = this.store.getVersionVector()
-		const allMissingOps = await this.collectDelta(localVector, this.remoteVector)
+		const allMissingOps = await this.collectDelta(localVector, this.uploadBaseVector())
 
-		const missingOps = await this.filterAllowedForSync(allMissingOps)
+		const missingOps = await this.filterAllowedForUpload(allMissingOps)
 
 		this.deltaSentOpIds = missingOps.map((op) => op.id)
 
@@ -1305,6 +1463,13 @@ export class SyncEngine {
 			const start = i * this.batchSize
 			const batchOps = sorted.slice(start, start + this.batchSize)
 			const batchCursor = createDeltaCursorFromBatch(batchOps, i)
+			if (this.outboundPreparer) {
+				try {
+					await this.outboundPreparer(batchOps)
+				} catch {
+					// Best effort: the server decides on the operations themselves.
+				}
+			}
 
 			// Encrypt data fields before serialization if E2E encryption is enabled
 			const opsToSerialize = this.encryptor ? await this.encryptor.encryptBatch(batchOps) : batchOps
@@ -1347,19 +1512,24 @@ export class SyncEngine {
 		void this.checkDeltaComplete()
 	}
 
+	/**
+	 * Local operations the server has not seen. Only this node's own operations are
+	 * uploaded: operations relayed from other nodes reached this client through the
+	 * server, so re-uploading them is redundant and would be refused once the server
+	 * binds nodeId to the session (W3 step 1b).
+	 */
 	private async collectDelta(
 		localVector: VersionVector,
 		remoteVector: VersionVector,
 	): Promise<Operation[]> {
-		const missing: Operation[] = []
-		for (const [nodeId, localSeq] of localVector) {
-			const remoteSeq = remoteVector.get(nodeId) ?? 0
-			if (localSeq > remoteSeq) {
-				const ops = await this.store.getOperationRange(nodeId, remoteSeq + 1, localSeq)
-				missing.push(...ops)
-			}
+		const localNodeId = this.store.getNodeId()
+		const localSeq = localVector.get(localNodeId) ?? 0
+		const remoteSeq = remoteVector.get(localNodeId) ?? 0
+		if (localSeq <= remoteSeq) {
+			return []
 		}
-		return missing
+		const ops = await this.store.getOperationRange(localNodeId, remoteSeq + 1, localSeq)
+		return ops.filter((op) => op.nodeId === localNodeId)
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -1406,7 +1576,11 @@ export class SyncEngine {
 			? await this.encryptor.decryptBatch(deserialized)
 			: deserialized
 
-		const inScopeOps = await this.filterAllowedForSync(operations)
+		// Inbound filtering still uses the combined predicate; removing it is SYNC-2 (W4).
+		// It is judged per operation, in apply order: a partial update that does not
+		// restate the scope field is judged on the record as materialized by the earlier
+		// operations of the same batch (its insert, or a scope-entry insert, RT-19).
+		const inScopeOps: Operation[] = []
 
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		const transforms = this.config.operationTransforms ?? []
@@ -1427,7 +1601,11 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 
 		// Apply each in-scope operation; per-op failures must not block batch ACK
-		for (const op of inScopeOps) {
+		for (const op of operations) {
+			if ((await this.filterAllowedForSync([op])).length === 0) {
+				continue
+			}
+			inScopeOps.push(op)
 			const transformed =
 				transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
 			if (transformed === null) {
@@ -1634,7 +1812,28 @@ export class SyncEngine {
 			this.currentBatchRequiresPartialAck = false
 			this.currentBatchRequiresRetryBackoff = false
 		}
-		this.transitionTo('error')
+		// The server usually closes the socket right after an error, so the close may
+		// already have moved the engine to disconnected. The error still carries
+		// meaning (auth rejection, clock block, credential refresh): record it either way.
+		const live = this.state !== 'disconnected'
+		if (live) {
+			this.transitionTo('error')
+		}
+		if (isCredentialEndingCode(msg.code)) {
+			// The server ended this session because its credential expired or was
+			// revoked (AUTH-11). Not fatal and not a sign-out: refresh, then reconnect.
+			// A truly revoked device is refused at the next handshake (AUTH_FAILED), or
+			// its refresh is rejected and the auth client signs it out.
+			this.credentialRefreshRequired = true
+		}
+		if (msg.code === 'NODE_ID_CLAIMED' && !this.nodeRotation) {
+			// Another device holds this node id (for example the node token issued at the
+			// first claim was lost). Move to a fresh node id with every unsynced write;
+			// the next connect uses it (RT-21).
+			this.nodeRotation = this.rotateNodeIdentity().finally(() => {
+				this.nodeRotation = null
+			})
+		}
 		if (msg.code === 'AUTH_FAILED' || msg.code === 'DEVICE_REVOKED') {
 			this.authRejected = true
 			this.suspensionReason = msg.code === 'DEVICE_REVOKED' ? 'device-revoked' : 'auth-rejected'
@@ -1652,11 +1851,15 @@ export class SyncEngine {
 				severity: 'fast-blocked',
 				source: 'server-reject',
 			})
-			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			if (live) {
+				this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			}
 			return
 		}
-		this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
-		this.transitionTo('disconnected')
+		if (live) {
+			this.emitter?.emit({ type: 'sync:disconnected', reason: msg.message })
+			this.transitionTo('disconnected')
+		}
 	}
 
 	/**
@@ -1811,16 +2014,61 @@ export class SyncEngine {
 		if (!this.syncState) {
 			return this.remoteVector
 		}
-		return this.syncState.mergeServerVectors(this.lastAckedServerVector, this.remoteVector)
+		const merged = this.syncState.mergeServerVectors(
+			this.lastAckedServerVector,
+			this.withoutOwnNode(this.remoteVector),
+		)
+		const own = this.ownAcknowledgedSequence()
+		const localNodeId = this.store.getNodeId()
+		if (own > 0) merged.set(localNodeId, own)
+		else merged.delete(localNodeId)
+		return merged
+	}
+
+	/**
+	 * How far the server holds THIS device's own operations, as far as the device can
+	 * trust it (RT-12). The server-advertised entry for the own node is never trusted
+	 * above what the server actually acknowledged: a forged high sequence (another
+	 * client that uploaded under this node id) would otherwise make the device treat
+	 * its unsynced writes as already uploaded and never send them. Bounded by
+	 * min(serverVector[self], last acknowledged own sequence); a lower server value
+	 * (a restored backup) is honoured so the device re-uploads what the server lost.
+	 *
+	 * Without sync-state persistence the acknowledged sequence is not tracked, and the
+	 * server's value is used as before; that mode re-enqueues the device's whole own
+	 * history from the op log on every start, so a forged value cannot hide a write.
+	 */
+	private ownAcknowledgedSequence(): number {
+		const localNodeId = this.store.getNodeId()
+		const remote = this.remoteVector.get(localNodeId)
+		if (!this.syncState) return remote ?? 0
+		const acked = this.lastAckedServerVector.get(localNodeId) ?? 0
+		return remote === undefined ? acked : Math.min(remote, acked)
+	}
+
+	/** The server vector the handshake upload is computed against (own entry bounded, RT-12). */
+	private uploadBaseVector(): VersionVector {
+		const base = new Map(this.remoteVector)
+		const own = this.ownAcknowledgedSequence()
+		base.set(this.store.getNodeId(), own)
+		return base
+	}
+
+	private withoutOwnNode(vector: VersionVector): VersionVector {
+		const copy = new Map(vector)
+		copy.delete(this.store.getNodeId())
+		return copy
 	}
 
 	private async persistLastAckedServerVector(vector: VersionVector): Promise<void> {
 		if (!this.syncState) {
 			return
 		}
+		// The own-node entry is only ever advanced by acknowledgments of this device's
+		// uploads (advanceLastAckedForLocalNode), never by what a handshake advertises.
 		this.lastAckedServerVector = this.syncState.mergeServerVectors(
 			this.lastAckedServerVector,
-			vector,
+			this.withoutOwnNode(vector),
 		)
 		await this.syncState.saveLastAckedServerVector(this.lastAckedServerVector)
 	}
@@ -1863,15 +2111,16 @@ export class SyncEngine {
 	 * Hydrate the outbound queue from unsynced ops in the op log (deduped by operation id).
 	 */
 	private async reconcileOutboundFromOpLog(): Promise<void> {
+		const localNodeId = this.store.getNodeId()
 		if (this.syncState) {
 			const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
-			for (const op of unsynced) {
+			const own = unsynced.filter((op) => op.nodeId === localNodeId)
+			for (const op of await this.filterAllowedForUpload(own)) {
 				await this.outboundQueue.enqueue(op)
 			}
 			return
 		}
 
-		const localNodeId = this.store.getNodeId()
 		const localVector = this.store.getVersionVector()
 		const localSeq = localVector.get(localNodeId) ?? 0
 		if (localSeq === 0) {
@@ -1879,7 +2128,7 @@ export class SyncEngine {
 		}
 
 		const ops = await this.store.getOperationRange(localNodeId, 1, localSeq)
-		const inScope = await this.filterAllowedForSync(ops)
+		const inScope = await this.filterAllowedForUpload(ops)
 		for (const op of inScope) {
 			await this.outboundQueue.enqueue(op)
 		}
@@ -1897,6 +2146,26 @@ export class SyncEngine {
 		this.currentBatchRequiresPartialAck = false
 		this.currentBatchRequiresRetryBackoff = false
 
+		const preparer = this.outboundPreparer
+		if (preparer) {
+			// Let the app send what the server needs BEFORE these operations (blob bytes,
+			// so the server sees proof of possession before the reference, RT-11). A
+			// batch returned to the queue meanwhile (disconnect) is not sent here.
+			void preparer(batch.operations)
+				.catch(() => {
+					// Best effort: the server decides on the operations themselves.
+				})
+				.then(() => {
+					if (this.currentBatch !== batch || this.state !== 'streaming') return
+					this.sendTakenBatch(batch)
+				})
+			return
+		}
+		this.sendTakenBatch(batch)
+	}
+
+	/** Encode and send a batch already taken from the outbound queue. */
+	private sendTakenBatch(batch: OutboundBatch): void {
 		if (this.encryptor) {
 			// Encryption is async — encrypt then send. Errors return the batch to the queue.
 			this.encryptor.encryptBatch(batch.operations).then(
@@ -2061,6 +2330,67 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Upload predicate: the UPLINK scope only, never query subsets (SYNC-1). Query
+	 * subsets describe what this client wants to download; the server authorizes
+	 * uploads independently of the client's downloaded view.
+	 */
+	private async operationAllowedForUpload(op: Operation): Promise<boolean> {
+		// Fast path: the bare operation already carries the scope fields.
+		if (this.matchesScopeAndSubsets(op, undefined, 'upload')) {
+			return true
+		}
+		// A partial update or delete may not restate the scope fields. Backfill the
+		// record's current fields before deciding, so an in-scope edit to an
+		// unrelated field is never dropped.
+		const fullRecord = await this.readRecordForBackfill(op)
+		if (!fullRecord) {
+			return false
+		}
+		return this.matchesScopeAndSubsets(op, fullRecord, 'upload')
+	}
+
+	/**
+	 * Record a local operation that the uplink scope refuses, so it is visible to
+	 * the app instead of silently diverging from the server. Operations on
+	 * collections that are not synced in either direction are local-only by design
+	 * and are not recorded.
+	 *
+	 * Interim (S1): the durable "out of uplink scope at creation" bookkeeping and the
+	 * contiguous acknowledged prefix come with W3 step 2.
+	 */
+	private async recordOutOfUplinkScope(op: Operation): Promise<void> {
+		const uplink = this.activeUplinkScope
+		if (!uplink) return
+		const syncsCollection =
+			uplink[op.collection] !== undefined || this.activeScope?.[op.collection] !== undefined
+		if (!syncsCollection) return
+
+		const message = `Operation on "${op.collection}" record "${op.recordId}" is outside this client's upload scope and was not sent to the server. The local change is not synced; roll it back or move the record back into scope.`
+		await this.rejectedStorage.record({
+			operationId: op.id,
+			collection: op.collection,
+			recordId: op.recordId,
+			code: OUT_OF_UPLINK_SCOPE,
+			message,
+			retriable: false,
+			rejectedAt: Date.now(),
+		})
+		this.emitter?.emit({
+			type: 'sync:operation-rejected',
+			operationId: op.id,
+			collection: op.collection,
+			recordId: op.recordId,
+			code: OUT_OF_UPLINK_SCOPE,
+			message,
+			retriable: false,
+		})
+	}
+
+	/**
+	 * Inbound predicate (unchanged): uplink scope plus query subsets. Judging
+	 * delivered operations against the uplink scope is SYNC-2, fixed in W4.
+	 */
 	private async operationAllowedForSync(op: Operation): Promise<boolean> {
 		// Fast path: the bare operation already carries the scope / subset fields
 		// (inserts, or an op that restates them). No record read needed.
@@ -2069,8 +2399,7 @@ export class SyncEngine {
 		}
 		// It failed on the bare op. That may be a genuine out-of-scope op, OR a partial
 		// update / delete that simply does not restate the scope / subset field. Backfill
-		// the record's current fields and re-check before dropping it, so we never fail
-		// to sync an in-scope edit just because it changed an unrelated field.
+		// the record's current fields and re-check before dropping it.
 		const fullRecord = await this.readRecordForBackfill(op)
 		if (!fullRecord) {
 			return false
@@ -2078,16 +2407,31 @@ export class SyncEngine {
 		return this.matchesScopeAndSubsets(op, fullRecord)
 	}
 
+	/**
+	 * The uplink scope always applies. Query subsets apply only to the inbound
+	 * direction: they describe what this client downloads, never what it may
+	 * upload (SYNC-1).
+	 */
 	private matchesScopeAndSubsets(
 		op: Operation,
 		fullRecord?: Record<string, unknown> | null,
+		direction: 'inbound' | 'upload' = 'inbound',
 	): boolean {
-		if (!operationMatchesScope(op, this.activeUplinkScope, fullRecord)) {
+		// A client judging its own local view may trust previousData: this is not a
+		// cross-tenant visibility decision (the server judges those on its own rows).
+		if (
+			!operationMatchesScope(op, this.activeUplinkScope, fullRecord, { includePreviousData: true })
+		) {
 			return false
+		}
+		if (direction === 'upload') {
+			return true
 		}
 		return (
 			this.hasDirectionalScopes ||
-			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord)
+			operationMatchesQuerySubsets(op, this.getActiveQuerySubsets(), fullRecord, {
+				includePreviousData: true,
+			})
 		)
 	}
 
@@ -2100,6 +2444,16 @@ export class SyncEngine {
 		} catch {
 			return null
 		}
+	}
+
+	private async filterAllowedForUpload(ops: Operation[]): Promise<Operation[]> {
+		const allowed: Operation[] = []
+		for (const op of ops) {
+			if (await this.operationAllowedForUpload(op)) {
+				allowed.push(op)
+			}
+		}
+		return allowed
 	}
 
 	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {

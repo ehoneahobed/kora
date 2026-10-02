@@ -6,6 +6,12 @@ export const DEFAULT_MAX_OPERATION_BYTES = 256 * 1024
 /** Default maximum operations accepted per client session per minute. */
 export const DEFAULT_MAX_OPS_PER_MINUTE = 600
 
+/** Default blob chunk requests accepted per client session per minute (RT-24). */
+export const DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE = 6000
+
+/** Default largest operation batch a session accepts in one message. */
+export const DEFAULT_MAX_OPS_PER_BATCH = 1000
+
 /**
  * Approximate UTF-8 byte length of an operation payload for rate/size guards.
  */
@@ -44,7 +50,14 @@ export class SessionRateLimiter {
 	private windowStartMs = Date.now()
 	private count = 0
 
-	constructor(private readonly maxOpsPerMinute: number = DEFAULT_MAX_OPS_PER_MINUTE) {}
+	/**
+	 * @param maxOpsPerMinute - Units allowed per window
+	 * @param windowMs - Window length (one minute; shorter only in tests)
+	 */
+	constructor(
+		private readonly maxOpsPerMinute: number = DEFAULT_MAX_OPS_PER_MINUTE,
+		private readonly windowMs: number = 60_000,
+	) {}
 
 	get limit(): number {
 		return this.maxOpsPerMinute
@@ -53,12 +66,17 @@ export class SessionRateLimiter {
 	/** Record N operations and return false when the limit is exceeded. */
 	allow(count = 1): boolean {
 		const now = Date.now()
-		if (now - this.windowStartMs >= 60_000) {
+		if (now - this.windowStartMs >= this.windowMs) {
 			this.windowStartMs = now
 			this.count = 0
 		}
 		this.count += count
 		return this.count <= this.maxOpsPerMinute
+	}
+
+	/** Milliseconds until the current window resets (when a refused unit may retry). */
+	retryAfterMs(): number {
+		return Math.max(0, this.windowStartMs + this.windowMs - Date.now())
 	}
 
 	reset(): void {

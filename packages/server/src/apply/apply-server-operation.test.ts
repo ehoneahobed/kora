@@ -1,6 +1,7 @@
 import { defineSchema, t } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import type { Operation, SchemaDefinition } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
+import { authorizeUplinkWrite } from '../scopes/server-scope-filter'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { applyServerOperation } from './apply-server-operation'
 
@@ -147,6 +148,84 @@ describe('applyServerOperation', () => {
 		expect(await store.findRecord('todos', 'todo-1')).toBeNull()
 		expect(await store.getOperationCount()).toBe(4)
 
+		await store.close()
+	})
+})
+
+describe('untrusted deletes: side effects authorized, restrict generic (RT-10)', () => {
+	async function seeded(target: SchemaDefinition, owner: string) {
+		const store = new MemoryServerStore('server-test')
+		await store.setSchema(target)
+		await store.applyRemoteOperation(
+			makeOp({ id: 'p', collection: 'projects', recordId: 'proj-1', data: { name: 'mine' } }),
+		)
+		await store.applyRemoteOperation(
+			makeOp({
+				id: 't',
+				collection: 'todos',
+				recordId: 'todo-of-other',
+				data: { title: owner, projectId: 'proj-1' },
+				sequenceNumber: 2,
+			}),
+		)
+		return store
+	}
+	const del = () =>
+		makeOp({
+			id: 'del',
+			type: 'delete',
+			collection: 'projects',
+			recordId: 'proj-1',
+			data: null,
+			sequenceNumber: 3,
+		})
+	// The writer may touch projects freely but only its own todos (title === 'me').
+	const scopes = { projects: {}, todos: { title: 'me' } }
+
+	test('a cascade into a record outside the writer scope refuses the whole delete', async () => {
+		const store = await seeded(cascadeSchema, 'someone-else')
+		const op = del()
+		const result = await applyServerOperation(store, op, undefined, {
+			authorize: (stored) => authorizeUplinkWrite(op, stored, scopes),
+			authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, scopes),
+		})
+		expect(result.rejection?.code).toBe('RESTRICTED')
+		expect(result.rejection?.message).not.toContain('todo-of-other')
+		expect(await store.findRecord('projects', 'proj-1')).not.toBeNull()
+		expect(await store.findRecord('todos', 'todo-of-other')).not.toBeNull()
+		await store.close()
+	})
+
+	test('a cascade inside the writer scope still applies', async () => {
+		const store = await seeded(cascadeSchema, 'me')
+		const op = del()
+		const result = await applyServerOperation(store, op, undefined, {
+			authorize: (stored) => authorizeUplinkWrite(op, stored, scopes),
+			authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, scopes),
+		})
+		expect(result.result).toBe('applied')
+		expect(result.appliedOperations).toHaveLength(2)
+		await store.close()
+	})
+
+	test('an untrusted restrict refusal is the generic RESTRICTED (no ids or counts)', async () => {
+		const store = await seeded(schema, 'someone-else')
+		const op = del()
+		const result = await applyServerOperation(store, op, undefined, {
+			authorize: (stored) => authorizeUplinkWrite(op, stored, scopes),
+		})
+		expect(result.rejection).toEqual({
+			code: 'RESTRICTED',
+			message: expect.not.stringContaining('todo-of-other'),
+			retriable: false,
+		})
+		await store.close()
+	})
+
+	test('a trusted (server) delete keeps the REFERENTIAL_INTEGRITY code', async () => {
+		const store = await seeded(schema, 'someone-else')
+		const result = await applyServerOperation(store, del())
+		expect(result.rejection?.code).toBe('REFERENTIAL_INTEGRITY')
 		await store.close()
 	})
 })

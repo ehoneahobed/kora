@@ -1,4 +1,9 @@
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
+
+// Reproduction suites (tests/repro) assert the CORRECT behaviour of known, tracked defects and
+// fail until each fix lands. They are run and enforced by scripts/remediation/check.mjs, which
+// sets KORA_REPRO=1, and are excluded from the normal `pnpm test` run so CI stays meaningful.
+const includeRepro = process.env.KORA_REPRO === '1'
 
 export default defineConfig({
 	test: {
@@ -13,6 +18,9 @@ export default defineConfig({
 			exclude: ['node_modules', 'dist', '**/*.test.ts', 'tests/fixtures/**'],
 		},
 		environment: 'node',
+		exclude: includeRepro
+			? configDefaults.exclude
+			: [...configDefaults.exclude, '**/tests/repro/**'],
 		passWithNoTests: true,
 		// Cap each package's own worker pool. Vitest's default (unset) maxForks
 		// is the machine's CPU count, fine for one package running alone, but

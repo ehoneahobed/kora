@@ -81,20 +81,30 @@ describe('WebSocketTransport', () => {
 			expect(transport.isConnected()).toBe(true)
 		})
 
-		test('appends auth token as query parameter', async () => {
+		// SEC-8: the token travels in the handshake message only. These two tests used
+		// to assert the opposite (token appended to the URL, where proxies log it).
+		test('does not put the auth token in the URL by default', async () => {
 			const { factory, lastInstance } = createMockWSFactory()
 			const transport = new WebSocketTransport({ WebSocketImpl: factory })
 
 			await transport.connect('ws://test-server', { authToken: 'my-token' })
-			expect(lastInstance()?.url).toBe('ws://test-server?token=my-token')
+			expect(lastInstance()?.url).toBe('ws://test-server')
 		})
 
-		test('appends auth token with & when URL has existing params', async () => {
+		test('keeps existing URL params untouched and adds no token by default', async () => {
 			const { factory, lastInstance } = createMockWSFactory()
 			const transport = new WebSocketTransport({ WebSocketImpl: factory })
 
 			await transport.connect('ws://test-server?foo=bar', { authToken: 'my-token' })
-			expect(lastInstance()?.url).toBe('ws://test-server?foo=bar&token=my-token')
+			expect(lastInstance()?.url).toBe('ws://test-server?foo=bar')
+		})
+
+		test('appends the auth token as a query parameter only with tokenInUrl', async () => {
+			const { factory, lastInstance } = createMockWSFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory, tokenInUrl: true })
+
+			await transport.connect('ws://test-server?foo=bar', { authToken: 'my token' })
+			expect(lastInstance()?.url).toBe('ws://test-server?foo=bar&token=my%20token')
 		})
 
 		test('rejects on connection error', async () => {

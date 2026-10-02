@@ -2,6 +2,7 @@ import type {
 	AtomicOp,
 	HLCTimestamp,
 	Operation,
+	RecordFieldVersions,
 	SchemaDefinition,
 	TimeSource,
 	VersionVector,
@@ -11,6 +12,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
 	deserializeFieldValue,
@@ -19,14 +21,25 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { type FieldVersionRow, foldFieldVersionRows } from './record-field-versions'
+import {
+	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	parseScopeSnapshot,
+	replayScopeSnapshots,
+	scopeSnapshotFingerprint,
+	scopeValuesOf,
+} from './scope-snapshot'
 import type {
+	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	ConditionalApplyInput,
 	ConditionalApplyResult,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
+import { RELEASED_NODE_OWNER } from './server-store'
 
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
@@ -124,9 +137,27 @@ export class PostgresServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot: drop them
+		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
+		// (or a concurrent instance) only repeats the idempotent rebuild.
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		const metaRows = (await this.db.execute(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
+		)) as unknown as { value: string }[]
+		const stored = metaRows[0]?.value
+		if (stored !== fingerprint) {
+			await this.db.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
+		}
+		await this.backfillScopeSnapshots()
+		if (stored !== fingerprint) {
+			await this.db.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+		}
 	}
 
-	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
+	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 		await this.ready
 
@@ -147,6 +178,29 @@ export class PostgresServerStore implements ServerStore {
 			// Assign the delivery sequence in commit order (see nextDeliverySeq). A rare
 			// concurrent duplicate insert below no-ops and simply leaves a harmless gap.
 			const deliverySeq = await this.nextDeliverySeq(tx)
+
+			// Authorization re-check against the committed row. nextDeliverySeq above
+			// holds the delivery_counter row lock until this transaction ends, and every
+			// append on every instance (including conditional applies) takes that lock,
+			// so every earlier write is committed and visible to this READ COMMITTED
+			// read, and no later write can commit before this one. Throwing rolls back.
+			if (options?.authorize) {
+				const stored = await this.readStoredRow(tx, op.collection, op.recordId)
+				const decision = options.authorize(stored)
+				if (!decision.allowed) {
+					throw new UplinkAuthorizationError(decision.code, decision.message, {
+						operationId: op.id,
+						collection: op.collection,
+						recordId: op.recordId,
+					})
+				}
+			}
+
+			const materialized = this.schema?.collections[op.collection] !== undefined
+			const pre = materialized
+				? await this.readScopeValues(tx, op.collection, op.recordId, false)
+				: null
+
 			const row = this.serializeOperation(op, now, deliverySeq)
 
 			// Insert operation with dedup
@@ -169,8 +223,9 @@ export class PostgresServerStore implements ServerStore {
 				})
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema?.collections[op.collection]) {
+			if (materialized) {
 				await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+				await this.writeScopeSnapshot(tx, op, pre)
 			}
 		})
 
@@ -206,6 +261,12 @@ export class PostgresServerStore implements ServerStore {
 			// hashtextextended maps the key to the bigint pg_advisory_xact_lock expects;
 			// the lock releases automatically when the transaction ends.
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`)
+			// Also take the delivery-counter row lock now (every append takes it until
+			// commit), so the reads below, including the authorization reads of the
+			// built operations, see every earlier commit and no append can commit
+			// between them and this transaction's writes. Lock order (advisory, then
+			// counter) matches every other path, so this cannot deadlock.
+			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 
 			// Idempotency: if the key record already exists (from an earlier attempt),
 			// this set is already committed. Checked under the lock so a retry racing a
@@ -246,10 +307,17 @@ export class PostgresServerStore implements ServerStore {
 				clock.advanceTo(latest)
 			}
 
-			const ops = await input.buildOperations(current, { clock })
+			const ops = await input.buildOperations(current, {
+				clock,
+				readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
+			})
 			const now = Date.now()
 			for (const op of ops) {
 				const deliverySeq = await this.nextDeliverySeq(tx)
+				const materialized = this.schema?.collections[op.collection] !== undefined
+				const pre = materialized
+					? await this.readScopeValues(tx, op.collection, op.recordId, false)
+					: null
 				const row = this.serializeOperation(op, now, deliverySeq)
 				await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
 				await tx
@@ -262,8 +330,9 @@ export class PostgresServerStore implements ServerStore {
 							lastSeenAt: sql`${now}`,
 						},
 					})
-				if (this.schema?.collections[op.collection]) {
+				if (materialized) {
 					await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+					await this.writeScopeSnapshot(tx, op, pre)
 				}
 			}
 			return { admitted: true, idempotent: false, applied: ops }
@@ -326,7 +395,202 @@ export class PostgresServerStore implements ServerStore {
 		return rows.map((row) => ({
 			operation: this.deserializeOperation(row),
 			deliverySequence: row.deliverySeq ?? 0,
+			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 		}))
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (let i = 0; i < operationIds.length; i += 500) {
+			const ids = operationIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
+					ids.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { id: string; scope_snapshot: string | null }[]
+			for (const row of rows) {
+				const snapshot = parseScopeSnapshot(row.scope_snapshot)
+				if (snapshot) result.set(row.id, snapshot)
+			}
+		}
+		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		await this.ready
+		// COLLATE "C" so the node-id tie-break is the same byte order as HLC.compare.
+		const rows = (await this.db.execute(
+			sql`SELECT wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}
+				ORDER BY wall_time DESC, logical DESC, timestamp_node_id COLLATE "C" DESC LIMIT 1`,
+		)) as unknown as { wall_time: number | string; logical: number; timestamp_node_id: string }[]
+		const row = rows[0]
+		return row
+			? {
+					wallTime: Number(row.wall_time),
+					logical: Number(row.logical),
+					nodeId: row.timestamp_node_id,
+				}
+			: null
+	}
+
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT type, data, wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}`,
+		)) as unknown as FieldVersionRow[]
+		return foldFieldVersionRows(rows)
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`INSERT INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})
+				ON CONFLICT (hash, owner) DO NOTHING`,
+		)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
+		for (let i = 0; i < hashes.length; i += 500) {
+			const slice = hashes.slice(i, i + 500)
+			if (slice.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
+					slice.map((hash) => sql`${hash}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { hash: string; owner: string }[]
+			for (const row of rows) result.get(row.hash)?.push(row.owner)
+		}
+		return result
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		// A transaction-scoped advisory lock per hash makes "insert when nobody owns it"
+		// atomic across instances (two concurrent first claims cannot both win).
+		return this.db.transaction(async (tx) => {
+			await tx.execute(
+				sql`SELECT pg_advisory_xact_lock(hashtextextended(${`kora:blob:${hash}`}, 0))`,
+			)
+			await tx.execute(
+				sql`INSERT INTO blob_owners (hash, owner, created_at)
+					SELECT ${hash}, ${owner}, ${Date.now()}
+					WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${hash})
+					ON CONFLICT (hash, owner) DO NOTHING`,
+			)
+			const rows = (await tx.execute(
+				sql`SELECT 1 AS one FROM blob_owners WHERE hash = ${hash} AND owner = ${owner} LIMIT 1`,
+			)) as unknown as unknown[]
+			return rows.length > 0
+		})
+	}
+
+	/**
+	 * Scope values of a record as stored, for an operation's scope snapshot. With
+	 * `includeDeleted` false a soft-deleted row counts as absent; with true it keeps
+	 * its last values (a delete's post-image).
+	 */
+	private async readScopeValues(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+		includeDeleted: boolean,
+	): Promise<Record<string, unknown> | null> {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return null
+		const rows = (await txOrDb.execute(
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+		)) as unknown as Record<string, unknown>[]
+		const row = rows[0]
+		if (!row) return null
+		if (!includeDeleted && Number(row._deleted) === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, this.deserializeRow(row, collectionDef))
+	}
+
+	/** Persist the scope snapshot of a just-applied operation (RT-14). */
+	private async writeScopeSnapshot(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		pre: Record<string, unknown> | null,
+	): Promise<void> {
+		const snapshot: OperationScopeSnapshot = {
+			pre,
+			post: await this.readScopeValues(tx, op.collection, op.recordId, true),
+		}
+		await tx.execute(
+			sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
+		)
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a database written
+	 * before snapshots existed), replaying each affected record in commit order.
+	 */
+	private async backfillScopeSnapshots(): Promise<void> {
+		const schema = this.schema
+		if (!schema) return
+		const pending = (await this.db.execute(
+			sql`SELECT DISTINCT collection, record_id FROM operations WHERE scope_snapshot IS NULL`,
+		)) as unknown as { collection: string; record_id: string }[]
+		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
+		for (const target of targets) {
+			const rows = await this.db
+				.select()
+				.from(pgOperations)
+				.where(
+					and(
+						eq(pgOperations.collection, target.collection),
+						eq(pgOperations.recordId, target.record_id),
+					),
+				)
+				.orderBy(asc(pgOperations.deliverySeq))
+			const replayed = replayScopeSnapshots(
+				schema,
+				target.collection,
+				target.record_id,
+				rows.map((row) => {
+					const op = this.deserializeOperation(row)
+					return {
+						id: op.id,
+						type: op.type,
+						data: op.data,
+						atomicOps: op.atomicOps ?? null,
+						timestamp: op.timestamp,
+					}
+				}),
+			)
+			for (const row of rows) {
+				if (row.scopeSnapshot !== null) continue
+				const snapshot = replayed.get(row.id)
+				if (!snapshot) continue
+				// Only fill a still-empty column: a concurrent apply's own snapshot wins.
+				await this.db.execute(
+					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)}
+						WHERE id = ${row.id} AND scope_snapshot IS NULL`,
+				)
+			}
+		}
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -478,6 +742,7 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (id) DO UPDATE SET value = ${deliverySeq}`,
 			)
 		})
+		await this.backfillScopeSnapshots()
 
 		// Rebuild in-memory version vector
 		this.versionVector.clear()
@@ -516,7 +781,8 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				desc(pgOperations.wallTime),
 				desc(pgOperations.logical),
-				desc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), like HLC.compare.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" DESC`,
 			)
 			.limit(1)
 
@@ -525,6 +791,118 @@ export class PostgresServerStore implements ServerStore {
 			return null
 		}
 		return { wallTime: row.wallTime, logical: row.logical, nodeId: row.timestampNodeId }
+	}
+
+	async claimNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		if (userId === RELEASED_NODE_OWNER) return false
+		const now = Date.now()
+		// Each statement is atomic on the node_claims primary key. A fresh claim is
+		// only created for a node without history: history with no claim predates
+		// node claims, so its writer is unknown (RT-5).
+		await this.db.execute(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				SELECT ${nodeId}, ${userId}, ${now}
+				WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})
+				ON CONFLICT (node_id) DO NOTHING`,
+		)
+		// An admin-released node is taken over by its next claimant (one winner).
+		await this.db.execute(
+			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
+				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
+		)
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id === userId
+	}
+
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		// One statement, atomic on the row: concurrent re-issues have one winner.
+		const rows = (await this.db.execute(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)) as unknown as { node_id: string }[]
+		return rows.length > 0
+	}
+
+	async releaseNodeClaim(nodeId: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		const known = (await this.db.execute(
+			sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
+				OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+		)) as unknown as { one: number }[]
+		if (known.length === 0) return false
+		await this.db.execute(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = EXCLUDED.user_id, claimed_at = EXCLUDED.claimed_at`,
+		)
+		return true
+	}
+
+	/**
+	 * The record as currently stored, including a soft-deleted one (whose last field
+	 * values are kept), or null when it was never written. Without a materialized
+	 * table, the last known values are replayed from the operation log.
+	 */
+	private async readStoredRow(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRecord | null> {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const rows = (await txOrDb.execute(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+			)) as unknown as Record<string, unknown>[]
+			const row = rows[0]
+			return row ? this.deserializeRow(row, collectionDef) : null
+		}
+		const ops = await txOrDb
+			.select({
+				type: pgOperations.type,
+				data: pgOperations.data,
+				atomicOps: pgOperations.atomicOps,
+			})
+			.from(pgOperations)
+			.where(and(eq(pgOperations.collection, collection), eq(pgOperations.recordId, recordId)))
+			.orderBy(
+				asc(pgOperations.wallTime),
+				asc(pgOperations.logical),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
+			)
+		if (ops.length === 0) return null
+		const lastKnown = replayOperationsForRecord(
+			ops
+				.filter((o) => o.type !== 'delete')
+				.map((o) => ({
+					type: o.type,
+					data: o.data !== null ? JSON.parse(o.data) : null,
+					atomicOps:
+						o.atomicOps != null ? (JSON.parse(o.atomicOps) as Record<string, AtomicOp>) : null,
+				})),
+		)
+		return { ...(lastKnown ?? {}), id: recordId }
 	}
 
 	/**
@@ -545,6 +923,7 @@ export class PostgresServerStore implements ServerStore {
 				type: pgOperations.type,
 				data: pgOperations.data,
 				atomicOps: pgOperations.atomicOps,
+				previousData: pgOperations.previousData,
 				wallTime: pgOperations.wallTime,
 			})
 			.from(pgOperations)
@@ -554,7 +933,9 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
-				asc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
 			)
 
 		// Replay to get current state
@@ -563,6 +944,7 @@ export class PostgresServerStore implements ServerStore {
 			data: op.data !== null ? JSON.parse(op.data) : null,
 			atomicOps:
 				op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+			previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 		}))
 		const recordData = replayOperationsForRecord(parsedOps)
 
@@ -656,6 +1038,7 @@ export class PostgresServerStore implements ServerStore {
 				type: pgOperations.type,
 				data: pgOperations.data,
 				atomicOps: pgOperations.atomicOps,
+				previousData: pgOperations.previousData,
 				wallTime: pgOperations.wallTime,
 			})
 			.from(pgOperations)
@@ -664,7 +1047,9 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
-				asc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
 			)
 
 		if (allOps.length === 0) return
@@ -689,6 +1074,7 @@ export class PostgresServerStore implements ServerStore {
 				data: op.data !== null ? JSON.parse(op.data) : null,
 				atomicOps:
 					op.atomicOps != null ? (JSON.parse(op.atomicOps) as Record<string, AtomicOp>) : null,
+				previousData: op.previousData !== null ? JSON.parse(op.previousData) : null,
 			}))
 			const recordData = replayOperationsForRecord(parsedOps)
 
@@ -890,6 +1276,20 @@ export class PostgresServerStore implements ServerStore {
 			// delivery watermark.
 			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS delivery_seq BIGINT`)
 
+			// Backward-compatible migration: the per-operation scope snapshot (RT-14).
+			// Rows written before it are backfilled from the log when the schema is set.
+			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS scope_snapshot TEXT`)
+
+			// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS blob_owners (
+					hash TEXT NOT NULL,
+					owner TEXT NOT NULL,
+					created_at BIGINT NOT NULL,
+					PRIMARY KEY (hash, owner)
+				)
+			`)
+
 			await tx.execute(
 				sql`CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)`,
 			)
@@ -902,6 +1302,23 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
 			)
+
+			// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_server_meta (
+					key TEXT PRIMARY KEY,
+					value TEXT NOT NULL
+				)
+			`)
+
+			// Node id -> principal binding (see claimNode). One row per device node id.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS node_claims (
+					node_id TEXT PRIMARY KEY,
+					user_id TEXT NOT NULL,
+					claimed_at BIGINT NOT NULL
+				)
+			`)
 
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS sync_state (

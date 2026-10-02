@@ -1,0 +1,76 @@
+name: remediation
+
+# Enforces the remediation tracker (remediation/tracker.json) against the reproduction suites.
+# A problem marked "fixed" whose repro tests fail, a broken guard, or an unmapped failing repro
+# test fails this job. Open problems are expected to fail their repro tests and do not.
+# See remediation/README.md.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  remediation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: kora
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      KORA_PG_TEST_URL: postgres://postgres:kora@localhost:5432/postgres
+      LMS_OPS: '20000'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+
+      - name: Resolve Chromium path
+        run: echo "PW_CHROMIUM_PATH=$(cd e2e && node -e "import('@playwright/test').then(m => console.log(m.chromium.executablePath()))")" >> "$GITHUB_ENV"
+
+      - name: Run remediation checker (node, Postgres, real Chromium, type probes)
+        run: node scripts/remediation/check.mjs --all
+
+      - name: Publish status
+        if: always()
+        run: cat remediation/STATUS.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remediation-status
+          path: remediation/STATUS.md

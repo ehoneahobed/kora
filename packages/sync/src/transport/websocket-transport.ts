@@ -39,6 +39,13 @@ export interface WebSocketTransportOptions {
 	WebSocketImpl?: WebSocketConstructor
 	/** Connection timeout in ms. Defaults to 10000 (10s). */
 	connectTimeout?: number
+	/**
+	 * Also append the auth token to the connection URL as `?token=`. Off by
+	 * default: the token already travels in the handshake message, and URLs are
+	 * recorded by reverse proxies, load balancers and access logs. Enable only for an
+	 * intermediary that authenticates the WebSocket upgrade by query parameter.
+	 */
+	tokenInUrl?: boolean
 }
 
 // WebSocket readyState constants
@@ -55,10 +62,12 @@ export class WebSocketTransport implements SyncTransport {
 	private readonly serializer: MessageSerializer
 	private readonly WebSocketImpl: WebSocketConstructor
 	private readonly connectTimeout: number
+	private readonly tokenInUrl: boolean
 
 	constructor(options?: WebSocketTransportOptions) {
 		this.serializer = options?.serializer ?? new JsonMessageSerializer()
 		this.connectTimeout = options?.connectTimeout ?? 10000
+		this.tokenInUrl = options?.tokenInUrl ?? false
 
 		if (options?.WebSocketImpl) {
 			this.WebSocketImpl = options.WebSocketImpl
@@ -111,10 +120,12 @@ export class WebSocketTransport implements SyncTransport {
 			}, this.connectTimeout)
 
 			try {
-				// Append auth token as query param if provided
-				const connectUrl = options?.authToken
-					? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(options.authToken)}`
-					: url
+				// The token is NOT put in the URL by default (it is sent in the handshake);
+				// see WebSocketTransportOptions.tokenInUrl for the explicit opt-in.
+				const connectUrl =
+					this.tokenInUrl && options?.authToken
+						? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(options.authToken)}`
+						: url
 
 				const ws = new this.WebSocketImpl(connectUrl)
 				this.ws = ws

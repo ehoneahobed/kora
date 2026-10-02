@@ -36,6 +36,7 @@ export {
 	PersistenceError,
 	QueryError,
 	RecordNotFoundError,
+	StorageDurabilityError,
 	StoreNotOpenError,
 	WorkerInitError,
 	WorkerTimeoutError,
@@ -51,6 +52,7 @@ export {
 
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
+export type { NodeRotationResult } from './sync/rotate-node-id'
 
 // === Sync state helpers ===
 export {
@@ -209,4 +211,5 @@ export {
 	type ChunkRequestMessage,
 	type ChunkResponseMessage,
 	type RemoteChunkProvider,
+	type RemoteChunkProviderOptions,
 } from './blob/blob-chunk-transport'

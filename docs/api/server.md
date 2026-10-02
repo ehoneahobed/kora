@@ -223,7 +223,8 @@ Main server class.
 - `start(): Promise<void>`: starts WebSocket server mode.
 - `stop(): Promise<void>`: gracefully stops server and sessions.
 - `handleConnection(transport): string`: attach a server transport manually.
-- `handleHttpRequest(request): Promise<HttpSyncResponse>`: HTTP sync endpoint handler.
+- `handleHttpRequest(request): Promise<HttpSyncResponse>`: HTTP long-poll sync endpoint handler. Map `method`, `body`, `contentType`, `ifNoneMatch`, the `Authorization` header (`authorization`) and the `x-kora-session` header (`sessionId`) from every request. The handshake POST (no session id) opens a session and the 202 carries a server-issued, 256-bit session id in its `x-kora-session` header (expose it to browsers with `Access-Control-Expose-Headers` if the endpoint is cross-origin). With an auth provider, every request is authenticated and must resolve to the same user and device as the session (401/403 otherwise); unknown or expired ids get 404. Sessions idle for `httpSessionIdleTimeoutMs` (default 2 minutes) are closed.
+- `releaseNodeClaim(nodeId): Promise<boolean>`: admin release of a device node id; the next principal to handshake with it claims it (needed for node ids with history written before beta.13).
 - `getStatus(): Promise<ServerStatus>`: returns runtime status.
 - `getConnectionCount(): number`: returns active connection count.
 

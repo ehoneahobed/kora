@@ -234,6 +234,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			severity: 'fast-blocked',
 			source: 'handshake',
 		},
+		'sync:node-id-rotated': {
+			type: 'sync:node-id-rotated',
+			previousNodeId: 'node-old',
+			nodeId: 'node-new',
+			reenqueuedCount: 2,
+		},
 		'sync:clock-rebase': {
 			type: 'sync:clock-rebase',
 			rebasedCount: 3,
@@ -348,6 +354,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			dbName: 'kora-db',
 			reason: 'lock-conflict',
 			message: 'OPFS unavailable, running in memory',
+		},
+		'store:durability-lost': {
+			type: 'store:durability-lost',
+			dbName: 'kora-db',
+			phase: 'promotion',
+			reason: 'lock-conflict',
+			message: 'No durable storage; writes are refused',
 		},
 		'store:db-name-collision': {
 			type: 'store:db-name-collision',

@@ -104,8 +104,17 @@ export {
 export type { AtomicOpSentinel } from './operations/atomic-ops'
 
 // === Record materialization (shared client/server atomic-aware replay) ===
-export { replayOperationsForRecord } from './operations/replay-record'
-export type { ReplayOperation } from './operations/replay-record'
+export {
+	expandFieldVersionedOperations,
+	mergeArraySet,
+	replayFieldVersionsForRecord,
+	replayOperationsForRecord,
+} from './operations/replay-record'
+export type {
+	RecordFieldVersions,
+	ReplayOperation,
+	VersionedReplayOperation,
+} from './operations/replay-record'
 
 // === Binary op-data encoding ===
 export {
@@ -158,6 +167,7 @@ export type { OperationLog } from './version-vector/version-vector'
 // === Scopes ===
 export { buildScopeMap } from './scopes/build-scope-map'
 export type { ScopeMap } from './scopes/build-scope-map'
+export { SCOPE_CLAIMS_KEY, claimScopes, getScopeClaims } from './scopes/scope-grant'
 export {
 	collectSchemaScopeFields,
 	extractScopeValuesFromClaims,

@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import {
+	type SqliteRevocationDatabase,
+	SqliteTokenRevocationStore,
+} from '../../tokens/sqlite-token-revocation-store'
+import type { TokenRevocationStore } from '../../tokens/token-manager'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
-import { DuplicateEmailError } from './user-store'
+import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
 /**
  * Row shape returned by better-sqlite3 for the auth_users table.
@@ -63,11 +68,22 @@ interface SqliteDatabase {
  */
 export class SqliteUserStore implements UserStore {
 	private readonly db: SqliteDatabase
+	private revocationStore: SqliteTokenRevocationStore | null = null
 
 	constructor(db: SqliteDatabase) {
 		this.db = db
 		this.db.pragma('journal_mode = WAL')
 		this.ensureTables()
+	}
+
+	/** Token revocations stored in the same SQLite database as the users. */
+	getTokenRevocationStore(): TokenRevocationStore {
+		if (!this.revocationStore) {
+			this.revocationStore = new SqliteTokenRevocationStore(
+				this.db as unknown as SqliteRevocationDatabase,
+			)
+		}
+		return this.revocationStore
 	}
 
 	private ensureTables(): void {
@@ -146,31 +162,35 @@ export class SqliteUserStore implements UserStore {
 		publicKey: string
 		name: string
 	}): Promise<AuthDevice> {
+		const now = Date.now()
+		// INSERT-or-ignore first, then read: the owner check sees whichever
+		// registration won, even when two users race for the same id.
+		this.db
+			.prepare(`
+			INSERT INTO auth_devices (id, user_id, public_key, name, revoked, created_at, last_seen_at)
+			VALUES (?, ?, ?, ?, 0, ?, ?)
+			ON CONFLICT(id) DO NOTHING
+		`)
+			.run(params.id, params.userId, params.publicKey, params.name, now, now)
 		const existing = this.db.prepare('SELECT * FROM auth_devices WHERE id = ?').get(params.id) as
 			| DeviceRow
 			| undefined
 
+		if (existing && existing.user_id !== params.userId) {
+			throw new DeviceOwnershipError(params.id)
+		}
 		if (existing && !existing.revoked) {
 			return rowToDevice(existing)
 		}
 
-		const now = Date.now()
-
 		if (existing) {
-			// Re-activate previously revoked device
+			// Re-activate the owner's previously revoked device
 			this.db
 				.prepare(`
 				UPDATE auth_devices SET revoked = 0, public_key = ?, name = ?, last_seen_at = ?
-				WHERE id = ?
+				WHERE id = ? AND user_id = ?
 			`)
-				.run(params.publicKey, params.name, now, params.id)
-		} else {
-			this.db
-				.prepare(`
-				INSERT INTO auth_devices (id, user_id, public_key, name, revoked, created_at, last_seen_at)
-				VALUES (?, ?, ?, ?, 0, ?, ?)
-			`)
-				.run(params.id, params.userId, params.publicKey, params.name, now, now)
+				.run(params.publicKey, params.name, now, params.id, params.userId)
 		}
 
 		return {

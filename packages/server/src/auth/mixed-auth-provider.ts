@@ -12,7 +12,9 @@ export interface MixedAuthProviderOptions {
 	primary: AuthProvider
 
 	/**
-	 * Scopes to apply to anonymous connections.
+	 * Scopes to apply to anonymous connections. This is the complete anonymous
+	 * grant: anonymous sessions can sync exactly these collections, and the
+	 * client handshake can only narrow them, never add one.
 	 * Each key is a collection name; the value is a filter object
 	 * (use `{}` for unrestricted access to that collection).
 	 *
@@ -38,10 +40,10 @@ export interface MixedAuthProviderOptions {
 /**
  * Auth provider that supports both authenticated and anonymous connections.
  *
- * When a client connects with a valid token, the primary auth provider
- * handles authentication normally. When a client connects without a token
- * (or with an invalid one), the connection is accepted as anonymous with
- * restricted sync scopes.
+ * When a client connects with a token, the primary auth provider decides:
+ * a valid token authenticates normally and an invalid, expired or revoked one
+ * is rejected (the client refreshes and reconnects). Only a client that sends
+ * no token at all is accepted as anonymous, with exactly `anonymousScopes`.
  *
  * This is the recommended pattern for apps that need public data access
  * alongside authenticated users — for example, a form builder where
@@ -86,20 +88,40 @@ export class MixedAuthProvider implements AuthProvider {
 		this.primary = options.primary
 		this.anonymousScopes = options.anonymousScopes
 		this.anonymousPrefix = options.anonymousPrefix ?? 'anon'
+		// Forward the primary provider's revocation feed, so wrapping it does not
+		// silently stop revoked sessions from being terminated (AUTH-11).
+		const primary = this.primary
+		if (primary.onRevoke) {
+			this.onRevoke = (listener) => primary.onRevoke?.(listener) ?? (() => {})
+		}
 	}
 
-	async authenticate(token: string): Promise<AuthContext> {
-		// Try authenticated path first when a token is provided
+	/** The primary provider's revocation feed, when it has one. */
+	onRevoke?: AuthProvider['onRevoke']
+
+	async authenticate(token: string): Promise<AuthContext | null> {
+		// A presented credential is either valid or rejected. It is never silently
+		// downgraded to anonymous: an expired or revoked token from a signed-in
+		// user must make the client refresh, not sync that user's local writes
+		// against the anonymous grant.
 		if (token) {
-			const ctx = await this.primary.authenticate(token)
-			if (ctx) return ctx
+			return this.primary.authenticate(token)
 		}
 
 		// Fall back to scoped anonymous access
 		this.anonymousCounter++
 		return {
 			userId: `${this.anonymousPrefix}-${Date.now()}-${this.anonymousCounter}`,
-			scopes: this.anonymousScopes,
+			// The userId above is per connection, so node-id claims must not be keyed by
+			// it (a reconnecting anonymous device would be locked out of its own node).
+			anonymous: true,
+			// A fresh copy per session: the grant must not be shared mutable state.
+			scopes: Object.fromEntries(
+				Object.entries(this.anonymousScopes).map(([collection, predicate]) => [
+					collection,
+					{ ...predicate },
+				]),
+			),
 		}
 	}
 }

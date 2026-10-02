@@ -265,8 +265,9 @@ const transport = new WebSocketTransport(options?: WebSocketTransportOptions)
 | `serializer` | `MessageSerializer` | No | `JsonMessageSerializer` |
 | `WebSocketImpl` | `WebSocketConstructor` | No | `globalThis.WebSocket` |
 | `connectTimeout` | `number` (ms) | No | `10000` |
+| `tokenInUrl` | `boolean` | No | `false` |
 
-Auth tokens are appended as a `?token=` query parameter on the connection URL.
+The auth token is sent in the sync handshake message, never in the connection URL, because URLs are recorded by reverse proxies, load balancers and access logs. Set `tokenInUrl: true` only if an intermediary must authenticate the WebSocket upgrade by a `?token=` query parameter.
 
 ```typescript
 import { WebSocketTransport } from '@korajs/sync'
@@ -283,6 +284,8 @@ await transport.connect('wss://my-server.com/kora', {
 ### `HttpLongPollingTransport`
 
 HTTP long-polling fallback with automatic WebSocket upgrade. If `preferWebSocket` is `true` (the default), the transport attempts a WebSocket connection first and falls back to long-polling on failure.
+
+Over long-polling, the handshake POST opens a server-side session and the server returns a session id in the `x-kora-session` response header (`HTTP_SYNC_SESSION_HEADER`). Polling starts once the id is known; every later request carries it plus the `Authorization: Bearer` credential, and POSTs are sent one at a time in order. A 401, 403, 404 or 410 closes the transport so the sync engine reconnects from scratch.
 
 ```typescript
 const transport = new HttpLongPollingTransport(options?: HttpLongPollingTransportOptions)
@@ -742,6 +745,11 @@ pending writes for the record are quarantined as `SCOPE_RETRACTED`. Scope narrow
 outside the new map before view completion; widening backfills the current authoritative row. This
 is reconnect-dependent: a device that never reconnects cannot be remotely erased. Blob bytes become
 reclaimable after normal garbage collection once no live row references them.
+
+With the default `scopeExit: 'retain'`, a record that leaves the scope stays in the local view as
+the last copy the device had; it is no longer updated. A record that ENTERS the scope (for example
+transferred to this user) arrives as a server-built scope-entry insert carrying its current values
+(node `kora:scope-entry`), followed by the operation that moved it; earlier history is not sent.
 
 Permanent per-operation rejections—including `SCOPE_VIOLATION`—leave the outbound queue, enter the
 durable rejected-operation store, and are never uploaded again automatically. The server advances

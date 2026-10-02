@@ -54,6 +54,27 @@ export class AdapterError extends KoraError {
 }
 
 /**
+ * Thrown when a write reaches a storage adapter that could not obtain durable
+ * storage (it opened, or was promoted to leader, on a non-persistent in-memory
+ * database). Kora refuses such writes instead of accepting data that would be
+ * lost on reload. Reads still work.
+ *
+ * Fix: close other tabs or apps using the same origin's OPFS storage and reopen,
+ * or opt in explicitly with `allowNonDurable: true` if in-memory storage is
+ * acceptable for this app.
+ */
+export class StorageDurabilityError extends KoraError {
+	constructor(dbName: string, phase: 'open' | 'promotion', reason: string) {
+		super(
+			`Database "${dbName}" has no durable storage (${reason} during ${phase}); writes are refused so they are not silently lost on reload. Close other tabs or apps using this origin's storage and reload, or set allowNonDurable: true to accept in-memory storage.`,
+			'STORAGE_DURABILITY_LOST',
+			{ dbName, phase, reason },
+		)
+		this.name = 'StorageDurabilityError'
+	}
+}
+
+/**
  * Thrown when an operation is attempted on a store that has not been opened.
  */
 export class StoreNotOpenError extends KoraError {

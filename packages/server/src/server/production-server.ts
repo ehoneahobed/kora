@@ -2,8 +2,9 @@ import type { BlobRef } from '@korajs/core'
 import type { ServerStore } from '../store/server-store'
 import { WsServerTransport } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
-import { KoraSyncServer } from './kora-sync-server'
+import { DEFAULT_MAX_MESSAGE_BYTES, KoraSyncServer } from './kora-sync-server'
 import type { ProductionHttpRouteContext } from './route-context'
+import { type TrustProxySetting, resolveClientIp } from './trust-proxy'
 
 /**
  * Configuration for the production server that serves both
@@ -43,6 +44,14 @@ export interface ProductionServerConfig {
 	 * backupToken.
 	 */
 	operationalAuth?: ProductionOperationalAuth
+	/**
+	 * Reverse proxies trusted to report the client address in `X-Forwarded-For`,
+	 * which becomes `request.ip` (the key `@korajs/auth` rate-limits sign-in by).
+	 * A hop count (`1` for a single load balancer in front) or a list of trusted
+	 * proxy IPs / CIDR ranges. When unset, the header is ignored and `request.ip`
+	 * is the socket address, so a client cannot pick its own rate-limit bucket.
+	 */
+	trustProxy?: TrustProxySetting
 }
 
 export interface ProductionOperationalAuth {
@@ -86,7 +95,10 @@ export interface ProductionHttpRoute {
  * A production server handle returned by createProductionServer.
  */
 export interface ProductionServer {
-	/** Start listening. Returns the URL the server is available at. */
+	/**
+	 * Start listening. Returns the URL the server is available at, with the port it
+	 * actually bound (pass `port: 0` to let the OS pick a free one).
+	 */
 	start(): Promise<string>
 	/** Stop the server gracefully. */
 	stop(): Promise<void>
@@ -318,11 +330,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	}
 
 	function getClientIp(req: import('node:http').IncomingMessage): string | undefined {
-		const forwarded = req.headers['x-forwarded-for']
-		if (typeof forwarded === 'string' && forwarded.length > 0) {
-			return forwarded.split(',')[0]?.trim()
-		}
-		return req.socket.remoteAddress
+		return resolveClientIp(
+			req.socket.remoteAddress,
+			req.headers['x-forwarded-for'],
+			config.trustProxy,
+		)
 	}
 
 	function getQuery(url: URL): Record<string, string | string[] | undefined> {
@@ -584,7 +596,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				createReadStream(filePath).pipe(res)
 			}
 
-			const wss = new WebSocketServer({ noServer: true })
+			const wss = new WebSocketServer({
+				noServer: true,
+				maxPayload: config.syncOptions?.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
+			})
 
 			httpServer.on('upgrade', (req, socket, head) => {
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
@@ -605,7 +620,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				httpServer?.once('error', onError)
 				httpServer?.listen(port, '0.0.0.0', () => {
 					httpServer?.off('error', onError)
-					resolve(`http://localhost:${port}`)
+					// Report the bound port, so `port: 0` (an OS-assigned free port, as tests
+					// running in parallel use) resolves to a reachable URL.
+					const address = httpServer?.address()
+					const bound = address && typeof address === 'object' ? address.port : port
+					resolve(`http://localhost:${bound}`)
 				})
 			})
 		},

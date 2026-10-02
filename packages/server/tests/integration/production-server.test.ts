@@ -5,10 +5,9 @@ import { MemoryServerStore } from '../../src/store/memory-server-store'
 
 describe('createProductionServer operational auth', () => {
 	test('keeps health public and protects operational endpoints when tokens are configured', async () => {
-		const port = 39217
 		const server = createProductionServer({
 			store: new MemoryServerStore('server-1'),
-			port,
+			port: 0,
 			operationalAuth: {
 				adminToken: 'admin-secret',
 				metricsToken: 'metrics-secret',
@@ -16,10 +15,8 @@ describe('createProductionServer operational auth', () => {
 			},
 		})
 
-		await server.start()
+		const baseUrl = await server.start()
 		try {
-			const baseUrl = `http://localhost:${port}`
-
 			const health = await fetch(`${baseUrl}/health`)
 			expect(health.status).toBe(200)
 
@@ -54,11 +51,11 @@ describe('createProductionServer operational auth', () => {
 	test('uses credentialless COEP by default and allows explicit override', async () => {
 		const defaultServer = createProductionServer({
 			store: new MemoryServerStore('server-coep-default'),
-			port: 39223,
+			port: 0,
 		})
-		await defaultServer.start()
+		const defaultUrl = await defaultServer.start()
 		try {
-			const response = await fetch('http://localhost:39223/health')
+			const response = await fetch(`${defaultUrl}/health`)
 			expect(response.headers.get('Cross-Origin-Embedder-Policy')).toBe('credentialless')
 		} finally {
 			await defaultServer.stop()
@@ -66,12 +63,12 @@ describe('createProductionServer operational auth', () => {
 
 		const strictServer = createProductionServer({
 			store: new MemoryServerStore('server-coep-strict'),
-			port: 39224,
+			port: 0,
 			crossOriginEmbedderPolicy: 'require-corp',
 		})
-		await strictServer.start()
+		const strictUrl = await strictServer.start()
 		try {
-			const response = await fetch('http://localhost:39224/health')
+			const response = await fetch(`${strictUrl}/health`)
 			expect(response.headers.get('Cross-Origin-Embedder-Policy')).toBe('require-corp')
 		} finally {
 			await strictServer.stop()
@@ -79,10 +76,9 @@ describe('createProductionServer operational auth', () => {
 	})
 
 	test('mounts custom HTTP routes before static file serving', async () => {
-		const port = 39218
 		const server = createProductionServer({
 			store: new MemoryServerStore('server-1'),
-			port,
+			port: 0,
 			httpRoutes: [
 				{
 					path: '/auth',
@@ -102,9 +98,9 @@ describe('createProductionServer operational auth', () => {
 			],
 		})
 
-		await server.start()
+		const baseUrl = await server.start()
 		try {
-			const response = await fetch(`http://localhost:${port}/auth/signin?next=/dashboard`, {
+			const response = await fetch(`${baseUrl}/auth/signin?next=/dashboard`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ email: 'alice@example.com' }),
@@ -122,7 +118,7 @@ describe('createProductionServer operational auth', () => {
 			expect(body.body.email).toBe('alice@example.com')
 			expect(body.query.next).toBe('/dashboard')
 
-			const nonMatch = await fetch(`http://localhost:${port}/authentication/signin`)
+			const nonMatch = await fetch(`${baseUrl}/authentication/signin`)
 			expect(nonMatch.status).toBe(404)
 		} finally {
 			await server.stop()
@@ -139,10 +135,9 @@ describe('createProductionServer operational auth', () => {
 	// This proves the fix: any handler that throws returns a clean 500, and
 	// the server keeps serving requests afterward instead of going down.
 	test('a throwing httpRoutes handler returns 500 instead of crashing the server', async () => {
-		const port = 39220
 		const server = createProductionServer({
 			store: new MemoryServerStore('server-1'),
-			port,
+			port: 0,
 			httpRoutes: [
 				{
 					path: '/echo',
@@ -156,10 +151,8 @@ describe('createProductionServer operational auth', () => {
 			],
 		})
 
-		await server.start()
+		const baseUrl = await server.start()
 		try {
-			const baseUrl = `http://localhost:${port}`
-
 			// No body at all — request.body is undefined, `.length` throws inside
 			// the handler with the pre-fix code.
 			const crashing = await fetch(`${baseUrl}/echo`, { method: 'POST' })
@@ -188,10 +181,9 @@ describe('createProductionServer operational auth', () => {
 	// Node versions/environments, so httpRoutes handlers (and @korajs/auth's
 	// signup/signin built on top of them) silently never see the real body.
 	test('reads the full POST body for httpRoutes handlers', async () => {
-		const port = 39221
 		const server = createProductionServer({
 			store: new MemoryServerStore('server-1'),
-			port,
+			port: 0,
 			httpRoutes: [
 				{
 					path: '/echo',
@@ -202,9 +194,9 @@ describe('createProductionServer operational auth', () => {
 			],
 		})
 
-		await server.start()
+		const baseUrl = await server.start()
 		try {
-			const response = await fetch(`http://localhost:${port}/echo`, {
+			const response = await fetch(`${baseUrl}/echo`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ hello: 'world' }),
