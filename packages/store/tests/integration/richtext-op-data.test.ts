@@ -49,7 +49,10 @@ async function deriveId(op: Operation): Promise<string> {
 		schemaVersion: op.schemaVersion,
 		...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
 	}
-	return computeOperationId(input, HybridLogicalClock.serialize(op.timestamp))
+	// The operation's own hash version (2 since protocol v2 covers every semantic field).
+	return op.hashVersion === 2
+		? computeOperationId({ ...input, timestamp: op.timestamp }, 2)
+		: computeOperationId(input, HybridLogicalClock.serialize(op.timestamp))
 }
 
 function toByteArray(value: unknown): number[] {

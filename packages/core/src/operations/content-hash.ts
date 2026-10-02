@@ -5,7 +5,7 @@ import { bytesToBase64 } from './op-data-binary'
 /**
  * Content-hash versions for operation ids.
  *
- * - **1** (default until protocol v2 is wired): hashes type, collection, recordId,
+ * - **1** (Kora <= beta.13): hashes type, collection, recordId,
  *   data, timestamp, nodeId and atomicOps. previousData, sequenceNumber,
  *   causalDeps and schemaVersion are NOT covered (CORE-1).
  * - **2**: additionally hashes previousData, sequenceNumber, causalDeps (as a
@@ -14,8 +14,8 @@ import { bytesToBase64 } from './op-data-binary'
  */
 export type OperationHashVersion = 1 | 2
 
-/** Hash version new operations get until protocol v2 flips it to 2 (Stage B). */
-export const DEFAULT_OPERATION_HASH_VERSION: OperationHashVersion = 1
+/** Hash version new operations get: 2 since protocol v2 (beta.14). */
+export const DEFAULT_OPERATION_HASH_VERSION: OperationHashVersion = 2
 
 /** The operation fields a content hash can cover. */
 export interface HashableOperation {

@@ -9,19 +9,32 @@ Kora supports end-to-end encryption for sync. When enabled, operation data is en
 
 ## What Gets Encrypted
 
-Only the `data` and `previousData` fields of each operation are encrypted. Metadata stays in cleartext:
+Since protocol v2 (beta.14) an operation's `data`, `previousData` and atomic ops (`increment` amounts and similar) travel only as ciphertext, inside the operation's encryption envelope (`op.encrypted`). On the wire `data` is `null`, or holds only the cleartext scope fields you list (see below). Metadata stays in cleartext:
 
-| Encrypted | Not Encrypted |
+| Encrypted (in `op.encrypted`) | Not Encrypted |
 |-----------|---------------|
 | `data` (field values) | `id` (operation ID) |
 | `previousData` (previous field values) | `nodeId` (device ID) |
-| | `collection` (collection name) |
+| `atomicOps` (atomic intents) | `collection`, `recordId`, `type` |
 | | `timestamp` (HLC timestamp) |
-| | `sequenceNumber` |
-| | `causalDeps` (dependency IDs) |
-| | `type` (insert/update/delete) |
+| | `sequenceNumber`, `causalDeps`, `schemaVersion` |
+| | fields listed in `cleartextFields` |
 
-This design is intentional. The server needs metadata to route operations, deduplicate by content-addressed ID, enforce causal ordering, and compute version vector deltas. But the actual user data -- the field values your application writes -- is opaque to the server.
+The server needs metadata to route operations, deduplicate by content-addressed ID, enforce causal ordering, and compute deltas. A schema-aware server stores an encrypted operation opaquely: it never validates, transforms or reads its fields.
+
+### Cleartext scope fields
+
+A server can only evaluate sync scopes on values it can read. List the scope keys per collection; they travel in cleartext beside the envelope (and stay inside the ciphertext as well, which is the authoritative copy):
+
+```typescript
+encryption: {
+  enabled: true,
+  key: passphrase,
+  cleartextFields: { todos: ['ownerId'] },
+}
+```
+
+Values listed here are visible to the server. List only scope keys.
 
 ## Enabling Encryption
 
@@ -84,25 +97,29 @@ When a key is first derived, a random 32-byte salt is generated. This salt must 
 
 ## Encryption Algorithm
 
-Each field encryption uses AES-256-GCM with a fresh random 12-byte initialization vector (IV). This is the NIST-recommended configuration (SP 800-38D). Key properties:
+Each envelope member (`data`, `previousData`, `atomicOps`) is encrypted with AES-256-GCM and a fresh random 12-byte IV (NIST SP 800-38D). `data` and `previousData` are sealed even when they are `null`, so a delete is authenticated too.
 
-- **Authenticated encryption**: AES-GCM provides both confidentiality and integrity. Tampered ciphertext is detected and rejected during decryption.
-- **Unique IVs**: Every field encryption generates a new random IV. Encrypting the same data twice produces different ciphertext.
-- **Per-field encryption**: `data` and `previousData` are encrypted independently, each with their own IV.
+**Binding (ENC-3).** Every ciphertext is authenticated with AES-GCM additional data: the canonical JSON of `(nodeId, collection, recordId, type, timestamp, sequenceNumber, field, keyVersion, hashVersion)`. A ciphertext moved to another operation, record or member, or an envelope whose metadata was rewritten, fails authentication and the operation is quarantined (`DECRYPT_FAILED`). The operation id is the version-2 content hash of the **plaintext**; the receiving client verifies it after decryption, which covers `causalDeps` and `schemaVersion` as well (`INVALID_OPERATION_ID`).
 
-The encrypted payload stored on the wire looks like this:
+The envelope (protocol v2) looks like this on the wire:
 
 ```json
 {
-  "__kora_e2e_encrypted": true,
-  "v": 1,
-  "iv": "base64-encoded-12-byte-iv",
-  "ct": "base64-encoded-ciphertext",
-  "alg": "aes-256-gcm"
+  "data": null,
+  "hashVersion": 2,
+  "encrypted": {
+    "v": 2,
+    "alg": "aes-256-gcm",
+    "keyId": "k1-3fa9c1d2e4b5a6f7",
+    "keyVersion": 1,
+    "data": { "iv": "base64-12-byte-iv", "ct": "base64-ciphertext-and-tag" },
+    "previousData": { "iv": "...", "ct": "..." },
+    "atomicOps": { "iv": "...", "ct": "..." }
+  }
 }
 ```
 
-The `v` field identifies the key version, enabling key rotation.
+`keyVersion` selects the key (rotation). `keyId` names the key material (a fingerprint of the key-derivation salt, never the key), so a device holding different material reports `KEY_ID_MISMATCH` instead of a bare authentication failure.
 
 ## Key Rotation
 
@@ -152,13 +169,17 @@ encryptor.addKey(newKey)
 // Now encrypts with version 2, can still decrypt version 1
 ```
 
-## Backward Compatibility
+## Plaintext and Older Payloads
 
-The encryption system handles mixed plaintext and encrypted operations gracefully. If a field value does not contain the encrypted marker (`__kora_e2e_encrypted`), it passes through decryption unchanged. This means:
+With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.13, not bound to their operation) are refused the same way.
 
-- You can enable encryption on an existing app. Old unencrypted operations remain readable.
-- During a transition period, some operations may be encrypted and others not.
-- The system never fails on unencrypted data -- it simply passes through.
+To migrate an existing plaintext app to encryption, open a migration window:
+
+```typescript
+encryption: { enabled: true, key: passphrase, allowPlaintextMigration: true }
+```
+
+During the window, plaintext operations are applied as before. Close it once every device has upgraded and re-synced. A server can enforce the same rule for uploads with `createKoraServer({ encryption: { required: true } })` (`PLAINTEXT_REJECTED`, with the same `allowPlaintextMigration` escape hatch).
 
 ## Performance Considerations
 
@@ -227,3 +248,6 @@ With this setup:
 - **Server cannot query encrypted fields**: Since the server sees only ciphertext, server-side filtering or indexing of encrypted field values is not possible. Sync scoping works on metadata (collection names, scope fields in cleartext) rather than encrypted content.
 - **Key loss is data loss**: If all devices lose the encryption key and no backup exists, encrypted operations cannot be recovered. There is no server-side recovery mechanism -- this is inherent to end-to-end encryption.
 - **All clients must share keys**: Every device that needs to decrypt operations must have the correct key version registered. Key distribution is the application's responsibility.
+- **Key material is per device until Phase 4 (ENC-1)**: `createApp` derives the key with a random salt per process, so two devices with the same passphrase do not yet derive the same key. Decryption then fails with `KEY_ID_MISMATCH` (the envelope's `keyId` names the material) and the operation is quarantined, not lost. Until shared key material ships, construct the encryptor with a shared salt (`SyncEncryptor.create(config, salt)`) or `SyncEncryptor.fromKeys`.
+- **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
+- **Server stores must persist the envelope**: the in-memory server store keeps `op.encrypted`; check your server version's release notes before running encrypted sync on the SQLite or Postgres store.

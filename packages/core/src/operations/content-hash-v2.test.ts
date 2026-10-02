@@ -26,13 +26,16 @@ const hashable: HashableOperation = {
 }
 
 describe('content hash versions', () => {
-	test('version 1 stays the default and is unchanged', async () => {
-		expect(DEFAULT_OPERATION_HASH_VERSION).toBe(1)
+	test('version 2 is the default (protocol v2); version 1 is unchanged', async () => {
+		expect(DEFAULT_OPERATION_HASH_VERSION).toBe(2)
 		const legacy = await computeOperationId(input, HybridLogicalClock.serialize(hashable.timestamp))
 		expect(await computeOperationId(hashable, 1)).toBe(legacy)
 		const op = await createOperation(input, new HybridLogicalClock('node-a'))
-		expect(op.hashVersion).toBeUndefined()
+		expect(op.hashVersion).toBe(2)
 		expect(await verifyOperationId(op)).toBe(true)
+		const v1 = await createOperation(input, new HybridLogicalClock('node-a'), { hashVersion: 1 })
+		expect(v1.hashVersion).toBeUndefined()
+		expect(await verifyOperationId(v1)).toBe(true)
 	})
 
 	test('version 2 differs from version 1 and is deterministic', async () => {

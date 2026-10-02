@@ -1,11 +1,11 @@
-import { HybridLogicalClock, quoteIdent } from '@korajs/core'
-import type { Operation, OperationInput, SchemaDefinition } from '@korajs/core'
-import { computeOperationId } from '@korajs/core/internal'
+import { quoteIdent } from '@korajs/core'
+import type { Operation, SchemaDefinition } from '@korajs/core'
 import { parseFieldVersions, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
+import { rehashOperation } from './rehash-operation'
 import { NODE_TOKEN_META_KEY } from './sync-state'
 
 /** Result of {@link rotateUnsyncedOperationsInLog}. */
@@ -74,25 +74,20 @@ export async function rotateUnsyncedOperationsInLog(
 			const op = rotated[i]
 			if (!op) continue
 			const timestamp = { ...op.timestamp, nodeId: newNodeId }
-			const input: OperationInput = {
+			// Deps among the rotated set are remapped BEFORE hashing: a version-2 id covers
+			// causalDeps, and sequence order is causal order, so every dep is already
+			// mapped. Deps on acknowledged operations keep their ids.
+			const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+			const moved: Operation = {
+				...op,
 				nodeId: newNodeId,
-				type: op.type,
-				collection: op.collection,
-				recordId: op.recordId,
-				data: op.data,
-				previousData: op.previousData,
+				timestamp,
 				sequenceNumber: i + 1,
-				causalDeps: op.causalDeps,
-				schemaVersion: op.schemaVersion,
-				...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
+				causalDeps,
 			}
-			const id = await computeOperationId(input, HybridLogicalClock.serialize(timestamp))
+			const id = await rehashOperation(moved)
 			idMapping[op.id] = id
-			rewritten.push({ ...op, id, nodeId: newNodeId, timestamp, sequenceNumber: i + 1 })
-		}
-		// Remap causal deps among the rotated set (deps on acknowledged ops keep their ids).
-		for (const op of rewritten) {
-			op.causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+			rewritten.push({ ...moved, id })
 		}
 
 		for (let i = 0; i < rotated.length; i++) {

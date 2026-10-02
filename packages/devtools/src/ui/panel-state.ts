@@ -210,6 +210,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `clock rebase ${event.rebasedCount} ops (${Math.round(event.maxSkewMs / 1000)}s ahead)`
 		case 'sync:schema-mismatch':
 			return `schema mismatch client ${event.clientSchemaVersion} server ${event.serverSchemaVersion}`
+		case 'sync:protocol-deprecated':
+			return `protocol v${event.clientProtocolVersion} deprecated (node ${event.nodeId})`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
 		case 'sync:apply-blocked':

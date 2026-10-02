@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { HybridLogicalClock, createOperation, defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
+import { computeOperationId } from '@korajs/core/internal'
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { buildInsertQuery } from '../query/sql-builder'
@@ -57,6 +58,8 @@ async function op(
 			...fields,
 		},
 		new HybridLogicalClock(nodeId),
+		// beta.12 wrote version-1 ids (the sequence number is not hashed).
+		{ hashVersion: 1 },
 	)
 }
 
@@ -84,11 +87,19 @@ async function createBeta12Database(
 	const store = new Store({ schema, adapter: new BetterSqlite3Adapter(path), nodeId: 'node-1' })
 	await store.open()
 	const a = await store.collection('todos').insert({ title: 'a' }) // seq 1
-	const [aOp] = await store.getAllOperations()
+	const [aV2] = await store.getAllOperations()
 	await store.close()
 
 	const raw = new BetterSqlite3Adapter(path)
 	await raw.open(schema)
+	// Rewrite the store-made operation as beta.12 wrote it: a version-1 id.
+	let aOp: Operation | undefined
+	if (aV2) {
+		const { hashVersion: _v2, ...legacy } = aV2
+		aOp = { ...legacy, id: await computeOperationId(aV2, 1) }
+		await raw.execute('DELETE FROM _kora_ops_todos WHERE id = ?', [aV2.id])
+		await writeRaw(raw, aOp)
+	}
 	await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
 	await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('projects')}"`)
 	if (!options.keepRepairFlag) {

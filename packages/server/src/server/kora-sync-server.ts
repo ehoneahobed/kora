@@ -200,6 +200,10 @@ export class KoraSyncServer {
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
+	private readonly authoritativeNodeIds: string[] | undefined
+	private readonly encryptionPolicy:
+		| { required: boolean; allowPlaintextMigration?: boolean }
+		| undefined
 	private readonly handshakeTimeoutMs: number | undefined
 	private readonly maxBufferedBytes: number
 	private readonly deliveryHighWaterBytes: number | undefined
@@ -344,6 +348,10 @@ export class KoraSyncServer {
 			'appHeartbeatIntervalMs',
 			config.appHeartbeatIntervalMs ?? DEFAULT_APP_HEARTBEAT_INTERVAL_MS,
 		)
+		this.authoritativeNodeIds = config.authoritativeNodeIds
+			? [...config.authoritativeNodeIds]
+			: undefined
+		this.encryptionPolicy = config.encryption ? { ...config.encryption } : undefined
 		this.handshakeTimeoutMs =
 			config.handshakeTimeoutMs === undefined
 				? undefined
@@ -1275,6 +1283,8 @@ export class KoraSyncServer {
 			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
 			rateLimiterFor: (nodeId, principal) => this.rateLimiterFor(nodeId, principal),
 			appHeartbeatIntervalMs: this.appHeartbeatIntervalMs,
+			...(this.authoritativeNodeIds ? { authoritativeNodeIds: this.authoritativeNodeIds } : {}),
+			...(this.encryptionPolicy ? { encryption: this.encryptionPolicy } : {}),
 			...(this.handshakeTimeoutMs !== undefined
 				? { handshakeTimeoutMs: this.handshakeTimeoutMs }
 				: {}),

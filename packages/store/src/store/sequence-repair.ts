@@ -1,5 +1,6 @@
 import { quoteIdent } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
+import { renumberOperationRow } from '../sync/rehash-operation'
 import type { OperationRow, StorageAdapter, Transaction } from '../types'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 
@@ -223,16 +224,16 @@ async function repairDuplicates(
 		if (!row) continue
 		if (loser.node_id === nodeId) {
 			const newSeq = await allocateNextSequenceInTransaction(tx, nodeId)
+			const moved = await renumberOperationRow(tx, loser.collection, row, newSeq)
 			await insertConflictRow(
 				tx,
 				loser.collection,
 				row,
 				'duplicate-sequence',
-				loser.id,
+				moved.id,
 				newSeq,
 				now,
 			)
-			await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [newSeq, loser.id])
 			result.resequenced++
 		} else {
 			await insertConflictRow(tx, loser.collection, row, 'duplicate-sequence', null, null, now)

@@ -103,7 +103,7 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.raiseSequenceFloor(nodeId, floor)
 	}
 
-	/** Renumber an operation refused with SEQUENCE_CONFLICT, keeping its id (RT-35). */
+	/** Renumber an operation refused with SEQUENCE_CONFLICT (RT-35); a version-2 op is re-hashed. */
 	resequenceOperation(
 		operationId: string,
 		nodeId: string,

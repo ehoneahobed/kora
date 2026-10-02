@@ -5,7 +5,7 @@
 import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema, t, verifyOperationId } from '@korajs/core'
 import type { KoraEvent } from '@korajs/core'
 import { KoraSyncServer, MemoryServerStore, TokenAuthProvider } from '@korajs/server'
 import type { ServerTransport } from '@korajs/server'
@@ -93,7 +93,16 @@ describe('RT-35: a write made offline after losing the log tail', () => {
 		const stored = serverOps.filter((op) => op.recordId === offline.id)
 		expect(stored).toHaveLength(1)
 		expect(stored[0]?.sequenceNumber).toBeGreaterThan(2)
-		expect(stored[0]?.id).toBe(offlineOp?.id)
+		// Protocol v2: the id covers the sequence number (CORE-1), so the renumbered op is
+		// re-hashed. Same write, new id; the server verified it before storing it.
+		expect(stored[0]?.id).not.toBe(offlineOp?.id)
+		expect(stored[0]?.data).toEqual(offlineOp?.data)
+		expect(stored[0] && (await verifyOperationId(stored[0]))).toBe(true)
+		expect(
+			(await d2.store.getOperationRange(d2.getNodeId(), 1, 50)).some(
+				(op) => op.id === stored[0]?.id,
+			),
+		).toBe(true)
 		expect(await d2.collection('notes').findById(lost.id)).not.toBeNull()
 		expect(await d2.getRejectedOperations()).toEqual([])
 		expect(

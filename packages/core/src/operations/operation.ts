@@ -10,8 +10,8 @@ import {
 /** Options for {@link createOperation}. */
 export interface CreateOperationOptions {
 	/**
-	 * Content-hash version of the new operation's id. Defaults to 1 until protocol
-	 * v2 is wired; 2 commits the id to every semantic field (CORE-1).
+	 * Content-hash version of the new operation's id. Defaults to 2 (protocol v2),
+	 * which commits the id to every semantic field (CORE-1); 1 is the legacy hash.
 	 */
 	hashVersion?: OperationHashVersion
 }
@@ -22,7 +22,7 @@ export interface CreateOperationOptions {
  *
  * @param input - The operation parameters (without id, which is computed)
  * @param clock - The HLC clock to generate the timestamp
- * @param options - Optional hash version (default 1)
+ * @param options - Optional hash version (default 2)
  * @returns A frozen Operation with a content-addressed id
  *
  * @example

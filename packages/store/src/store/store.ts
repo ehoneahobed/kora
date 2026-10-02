@@ -81,6 +81,7 @@ import {
 } from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
+import { renumberOperationRow } from '../sync/rehash-operation'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
@@ -98,12 +99,14 @@ import {
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
 	loadAllDeliveryWatermarks,
+	loadAuthoritativeNodeIds,
 	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
 	loadNodeToken,
 	mergeVersionVectors,
 	nodeTokenKey,
+	saveAuthoritativeNodeIds,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
@@ -1347,6 +1350,21 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Load the node ids the sync server named authoritative (protocol v2), or null when
+	 * no protocol-2 server ever answered.
+	 */
+	async loadAuthoritativeNodeIds(): Promise<string[] | null> {
+		this.ensureOpen()
+		return loadAuthoritativeNodeIds(this.adapter)
+	}
+
+	/** Persist the node ids the sync server named authoritative (protocol v2). */
+	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
+		this.ensureOpen()
+		await saveAuthoritativeNodeIds(this.adapter, nodeIds)
+	}
+
+	/**
 	 * Load persisted delta cursor for resuming paginated initial sync.
 	 */
 	async loadDeltaCursor(): Promise<string | null> {
@@ -1755,10 +1773,11 @@ export class Store implements OperationLog {
 	/**
 	 * Give one of a local node's operations a fresh sequence number above `floor`
 	 * (RT-35): the server refused it with `SEQUENCE_CONFLICT` because it holds another
-	 * operation of this node under that number (one this device lost). The operation
-	 * keeps its id and content (protocol v1 does not hash the sequence number), exactly
-	 * like the W6 sequence repair, and the old identity is recorded in
-	 * `_kora_seq_conflicts`.
+	 * operation of this node under that number (one this device lost). A version-1
+	 * operation keeps its id (its hash does not cover the sequence number), exactly like
+	 * the W6 sequence repair; a version-2 operation (protocol v2) is re-hashed under the
+	 * new number, so the returned operation can carry a new id. The old identity is
+	 * recorded in `_kora_seq_conflicts`.
 	 *
 	 * @returns The renumbered operation, or null when it is not in the log
 	 */
@@ -1784,20 +1803,19 @@ export class Store implements OperationLog {
 					[nodeId, floor],
 				)
 				const sequence = await allocateNextSequenceInTransaction(tx, nodeId)
+				// A version-2 id covers the sequence number (CORE-1): such an operation is
+				// re-hashed under the new number (the server never stored it).
+				const moved = await renumberOperationRow(tx, collection, row, sequence)
 				await insertConflictRow(
 					tx,
 					collection,
 					row,
 					'server-sequence-conflict',
-					row.id,
+					moved.id,
 					sequence,
 					Date.now(),
 				)
-				await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [sequence, row.id])
-				found.op = deserializeOperationWithCollection(
-					{ ...row, sequence_number: sequence },
-					collection,
-				)
+				found.op = moved
 				return
 			}
 		})

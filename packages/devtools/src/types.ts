@@ -30,6 +30,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:local-node': 'sync',
 	'sync:clock-rebase': 'sync',
 	'sync:schema-mismatch': 'sync',
+	'sync:protocol-deprecated': 'sync',
 	'sync:apply-failed': 'sync',
 	'sync:apply-blocked': 'sync',
 	'sync:apply-retrying': 'sync',

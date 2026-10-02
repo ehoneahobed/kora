@@ -43,6 +43,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '../protocol/messages'
+import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from '../protocol/protocol-version'
 import { isSchemaMismatchReject } from '../protocol/schema-version'
 import {
 	NegotiatedMessageSerializer,
@@ -80,6 +81,7 @@ import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
 import type { SyncStore } from './sync-store'
+import { verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
@@ -313,6 +315,14 @@ export class SyncEngine {
 	 * sync-state persistence supports it, otherwise kept for this engine's lifetime.
 	 */
 	private nodeToken: string | null = null
+	/**
+	 * Node ids the server named authoritative in its last accepted handshake response
+	 * (protocol v2). Null until a protocol-2 server answered in this engine's lifetime;
+	 * loaded from persistence on start. See {@link SyncEngine.getAuthoritativeNodeIds}.
+	 */
+	private authoritativeNodeIds: string[] | null = null
+	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
+	private serverProtocolVersion = 1
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -676,6 +686,9 @@ export class SyncEngine {
 			if (this.nodeToken === null && this.syncState.loadNodeToken) {
 				this.nodeToken = await this.syncState.loadNodeToken(this.currentNodeId())
 			}
+			if (this.authoritativeNodeIds === null && this.syncState.loadAuthoritativeNodeIds) {
+				this.authoritativeNodeIds = await this.syncState.loadAuthoritativeNodeIds()
+			}
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
 			}
@@ -794,6 +807,8 @@ export class SyncEngine {
 				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
 				// (node, sequence) uniqueness against this client (RT-37).
 				sequenceReservation: true,
+				// Protocol v2: hash-version-2 ids, the encryption envelope v2 (D2).
+				protocolVersion: SYNC_PROTOCOL_VERSION,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -966,6 +981,21 @@ export class SyncEngine {
 	/**
 	 * Get the current developer-facing sync status.
 	 */
+	/**
+	 * Node ids the sync server named authoritative (protocol v2): operations from these
+	 * nodes are server-authored and are the only ones that may carry `fieldVersions` or
+	 * `foldState`. Null until a protocol-2 server answered (or one answered in an earlier
+	 * session and the list was persisted).
+	 */
+	getAuthoritativeNodeIds(): readonly string[] | null {
+		return this.authoritativeNodeIds
+	}
+
+	/** Protocol version of the server in the current (or last) session; 1 before any. */
+	getServerProtocolVersion(): number {
+		return this.serverProtocolVersion
+	}
+
 	getStatus(): SyncStatusInfo {
 		const pendingOperations = this.computePendingCount()
 		const base = {
@@ -1781,6 +1811,13 @@ export class SyncEngine {
 					nodeToken: msg.nodeToken,
 				})
 			}
+		}
+
+		this.serverProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		if (Array.isArray(msg.authoritativeNodeIds)) {
+			const ids = msg.authoritativeNodeIds.filter((id): id is string => typeof id === 'string')
+			this.authoritativeNodeIds = ids
+			await this.syncState?.saveAuthoritativeNodeIds?.(ids)
 		}
 
 		this.remoteVector = wireToVersionVector(msg.versionVector)
@@ -2701,6 +2738,16 @@ export class SyncEngine {
 			}
 		}
 
+		// Content-addressed id check (CORE-1, protocol v2), on the plaintext and before
+		// any transform. A forged or altered operation is kept in quarantine, never
+		// applied; it never verifies later, so the replay leaves it there.
+		const integrity = await verifyInboundOperation(op, {
+			encrypted: delivered.encrypted !== undefined,
+		})
+		if (!integrity.ok) {
+			return quarantine(delivered, integrity.code, integrity.message, 'rejected', false, null)
+		}
+
 		// A far-future timestamp is never applied: adopting it would make every later
 		// local edit lose to it until real time caught up (SYNC-7). The HLC also refuses
 		// it once warm; this check covers a cold clock and does not depend on the store.
@@ -2885,6 +2932,9 @@ export class SyncEngine {
 			} catch {
 				return false
 			}
+		}
+		if (!(await verifyInboundOperation(op, { encrypted: stored.encrypted !== undefined })).ok) {
+			return false
 		}
 		const reference = Date.now() + (this.clockSkewMs ?? 0)
 		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) return false
