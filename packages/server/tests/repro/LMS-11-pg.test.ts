@@ -7,6 +7,7 @@ import {
 	type ScopeMap,
 	missingScopeFields,
 	operationMatchesScopes,
+	recordMatchesScopes,
 } from '../../src/scopes/server-scope-filter'
 import { ClientSession } from '../../src/session/client-session'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
@@ -245,8 +246,30 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 				`  pushdown plan: ${plan.map((p) => p['QUERY PLAN']).join(' | ')}`,
 			].join('\n'),
 		)
-		// The cheaper strategies must agree with HEAD on what is visible (retain policy).
-		expect(batchedSent).toBe(sentinelRetain.ops)
-		expect(proposedSent).toBe(sentinelRetain.ops)
+		// Since RT-14 HEAD judges each operation on the scope values the record had when the
+		// operation was applied (its stored scope snapshot), not on the current row: updates
+		// written while a record was in scope are delivered even if it left the scope
+		// later, and nothing written before it entered the scope is. The two cheaper
+		// strategies above emulate the previous current-row rule, so they agree with each
+		// other, and HEAD agrees with a reference count over the stored snapshots.
+		let cursorRef = 0
+		let snapshotVisible = 0
+		for (;;) {
+			const chunk = await store.getOperationsAfterDelivery(cursorRef, 2000)
+			const last = chunk[chunk.length - 1]
+			if (!last) break
+			cursorRef = last.deliverySequence
+			for (const { operation, scopeSnapshot } of chunk) {
+				const post = scopeSnapshot?.post
+				if (
+					post &&
+					recordMatchesScopes(operation.collection, { ...post, id: operation.recordId }, scopes)
+				)
+					snapshotVisible++
+			}
+			if (chunk.length < 2000) break
+		}
+		expect(sentinelRetain.ops).toBe(snapshotVisible)
+		expect(batchedSent).toBe(proposedSent)
 	}, 1_800_000)
 })

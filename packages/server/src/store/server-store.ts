@@ -86,7 +86,35 @@ export interface ConditionalApplyResult {
 export interface DeliveredOperation {
 	operation: Operation
 	deliverySequence: number
+	/**
+	 * The record's scope-relevant values around this operation, captured from the
+	 * server's own rows when it was applied (RT-14, RT-15). Absent (or null) for
+	 * operations stored before snapshots existed that could not be backfilled.
+	 */
+	scopeSnapshot?: OperationScopeSnapshot | null
 }
+
+/**
+ * Scope-relevant field values of a record, captured by the store from its own rows
+ * when an operation is applied (never from the writer's `previousData`). Download
+ * visibility of a historical operation is judged on `post`, so a later ownership
+ * transfer does not disclose the record's earlier history to the new owner (RT-14),
+ * and a scope exit is judged from `pre` to `post` (RT-15).
+ *
+ * Only scalar fields (string, number, boolean, enum, timestamp) and `id` are kept:
+ * scope predicates compare with `Object.is`, so other kinds can never match. A
+ * string longer than {@link MAX_SCOPE_SNAPSHOT_STRING_LENGTH} is left out (fails
+ * closed for a scope on such a field) so a snapshot never copies large text.
+ */
+export interface OperationScopeSnapshot {
+	/** Values before the operation; null when the record did not exist or was deleted. */
+	pre: Record<string, unknown> | null
+	/** Values after it; a delete keeps the record's last values; null when unknown. */
+	post: Record<string, unknown> | null
+}
+
+/** Longest string value copied into an {@link OperationScopeSnapshot}. */
+export const MAX_SCOPE_SNAPSHOT_STRING_LENGTH = 512
 
 /**
  * Options for querying a materialized collection table.
@@ -160,6 +188,25 @@ export interface ServerStore extends SyncStore {
 	 * a claim or history to release, false when it was unknown.
 	 */
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
+	/**
+	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
+	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server
+	 * keeps ownership in memory (lost on restart, not shared between instances).
+	 */
+	recordBlobOwner?(hash: string, owner: string): Promise<void>
+	/** The owners recorded for each hash (an empty list for unowned hashes). */
+	getBlobOwners?(hashes: string[]): Promise<Map<string, string[]>>
+	/**
+	 * Atomically make `owner` the first owner of a hash nobody owns yet. Returns true
+	 * when `owner` owns the hash afterwards (newly, or already), false when someone
+	 * else does. Must be atomic per hash across server instances.
+	 */
+	claimBlobIfUnowned?(hash: string, owner: string): Promise<boolean>
+	/**
+	 * The scope snapshots captured when the given operations were applied (RT-14).
+	 * Operations without one are absent from the result.
+	 */
+	getOperationScopeSnapshots?(operationIds: string[]): Promise<Map<string, OperationScopeSnapshot>>
 	/** Close the store and release resources */
 	close(): Promise<void>
 

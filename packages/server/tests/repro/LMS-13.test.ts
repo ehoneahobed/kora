@@ -30,9 +30,12 @@ beforeAll(async () => {
 	writeFileSync(join(dir, 'assets', 'sqlite3-opfs-async-proxy.js'), 'self.onmessage=()=>{}')
 	writeFileSync(join(dir, 'sw.js'), 'self.addEventListener("fetch",()=>{})')
 	writeFileSync(join(dir, 'manifest.webmanifest'), '{"name":"lms"}')
-	const port = 43_000 + Math.floor(Math.random() * 1_000)
-	const server = createProductionServer({ store: new MemoryServerStore('s'), port, staticDir: dir })
-	await server.start()
+	const server = createProductionServer({
+		store: new MemoryServerStore('s'),
+		port: 0,
+		staticDir: dir,
+	})
+	const port = Number(new URL(await server.start()).port)
 	base = `http://127.0.0.1:${port}`
 	stop = () => server.stop()
 })

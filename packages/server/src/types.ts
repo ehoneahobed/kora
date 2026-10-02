@@ -189,6 +189,14 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerBatch?: number
 	/**
+	 * How often every live session's credential is re-validated with the auth
+	 * provider, in milliseconds (RT-18). A revocation persisted by another server
+	 * instance ends the session here within this interval. Defaults to 30 seconds; 0
+	 * disables it (sessions then end only through this process's `onRevoke` feed,
+	 * `terminateSessions`, or credential expiry).
+	 */
+	sessionRevalidationIntervalMs?: number
+	/**
 	 * How long an HTTP long-poll session may go without any request before the server
 	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
 	 */

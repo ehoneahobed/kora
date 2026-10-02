@@ -8,11 +8,13 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
 import { RELEASED_NODE_OWNER } from './server-store'
@@ -41,6 +43,10 @@ export class MemoryServerStore implements ServerStore {
 
 	/** Node id -> the authenticated principal that claimed it (see claimNode). */
 	private readonly nodeOwners = new Map<string, string>()
+	/** Operation id -> scope snapshot captured at apply time (RT-14). */
+	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
+	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
+	private readonly blobOwners = new Map<string, Set<string>>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -76,6 +82,7 @@ export class MemoryServerStore implements ServerStore {
 
 		// Backfill from existing operations
 		this.backfillAllCollections()
+		this.backfillScopeSnapshots()
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -99,6 +106,9 @@ export class MemoryServerStore implements ServerStore {
 			}
 		}
 
+		const materialized = this.schema?.collections[op.collection] !== undefined
+		const pre = materialized ? this.scopeValuesBefore(op.collection, op.recordId) : null
+
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
 
@@ -113,11 +123,98 @@ export class MemoryServerStore implements ServerStore {
 		}
 
 		// Dual-write: update materialized records if schema is set
-		if (this.schema?.collections[op.collection]) {
+		if (materialized) {
 			this.rebuildMaterializedRecord(op.collection, op.recordId)
+			// The record's scope values around this write, from the store's own rows.
+			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
+			this.scopeSnapshots.set(op.id, {
+				pre,
+				post: scopeValuesOf(this.schema, op.collection, op.recordId, row),
+			})
 		}
 
 		return 'applied'
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (const id of operationIds) {
+			const snapshot = this.scopeSnapshots.get(id)
+			if (snapshot) result.set(id, snapshot)
+		}
+		return result
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		let owners = this.blobOwners.get(hash)
+		if (!owners) {
+			owners = new Set()
+			this.blobOwners.set(hash, owners)
+		}
+		owners.add(owner)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		return new Map(hashes.map((hash) => [hash, [...(this.blobOwners.get(hash) ?? [])]]))
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		const owners = this.blobOwners.get(hash)
+		if (owners && owners.size > 0) return owners.has(owner)
+		this.blobOwners.set(hash, new Set([owner]))
+		return true
+	}
+
+	/** Scope values of a live record before a write; null when absent or deleted. */
+	private scopeValuesBefore(collection: string, recordId: string): Record<string, unknown> | null {
+		const row = this.materializedRecords.get(collection)?.get(recordId)
+		if (!row || row._deleted === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, row)
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a store without
+	 * them, or a replace-mode backup import), replaying each record in commit order.
+	 */
+	private backfillScopeSnapshots(): void {
+		const schema = this.schema
+		if (!schema) return
+		const byRecord = new Map<string, Operation[]>()
+		for (const op of this.operations) {
+			if (!schema.collections[op.collection]) continue
+			const key = `${op.collection}:::${op.recordId}`
+			let list = byRecord.get(key)
+			if (!list) {
+				list = []
+				byRecord.set(key, list)
+			}
+			list.push(op)
+		}
+		for (const ops of byRecord.values()) {
+			if (ops.every((op) => this.scopeSnapshots.has(op.id))) continue
+			const first = ops[0] as Operation
+			const replayed = replayScopeSnapshots(
+				schema,
+				first.collection,
+				first.recordId,
+				ops.map((op) => ({
+					id: op.id,
+					type: op.type,
+					data: op.data,
+					atomicOps: op.atomicOps ?? null,
+					timestamp: op.timestamp,
+				})),
+			)
+			for (const [id, snapshot] of replayed) {
+				if (!this.scopeSnapshots.has(id)) this.scopeSnapshots.set(id, snapshot)
+			}
+		}
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
@@ -152,7 +249,11 @@ export class MemoryServerStore implements ServerStore {
 		for (const op of this.operations) {
 			const deliverySequence = this.deliverySeqByOpId.get(op.id) ?? 0
 			if (deliverySequence > afterDeliverySequence) {
-				result.push({ operation: op, deliverySequence })
+				result.push({
+					operation: op,
+					deliverySequence,
+					scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+				})
 				if (result.length >= limit) break
 			}
 		}
@@ -371,6 +472,8 @@ export class MemoryServerStore implements ServerStore {
 		this.versionVector.clear()
 		this.materializedRecords.clear()
 		this.nodeOwners.clear()
+		this.scopeSnapshots.clear()
+		this.blobOwners.clear()
 		this.schema = null
 	}
 
@@ -403,6 +506,7 @@ export class MemoryServerStore implements ServerStore {
 		this.versionVector.clear()
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
+		this.scopeSnapshots.clear()
 
 		for (const [nid, seq] of versionVector) {
 			this.versionVector.set(nid, seq)
@@ -420,6 +524,7 @@ export class MemoryServerStore implements ServerStore {
 				this.rebuildMaterializedRecord(op.collection, op.recordId)
 			}
 		}
+		this.backfillScopeSnapshots()
 
 		return { operationsRestored: operations.length, success: true }
 	}

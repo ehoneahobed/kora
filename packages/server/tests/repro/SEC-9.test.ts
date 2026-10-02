@@ -16,10 +16,9 @@ import { SqliteServerStore } from '../../src/store/sqlite-server-store'
 
 describe('SEC-9', () => {
 	test('(a) request.ip is not taken from a spoofed X-Forwarded-For when no trusted proxy is configured', async () => {
-		const port = 39391
 		const server = createProductionServer({
 			store: new MemoryServerStore('server-1'),
-			port,
+			port: 0,
 			httpRoutes: [
 				{
 					path: '/whoami',
@@ -29,9 +28,9 @@ describe('SEC-9', () => {
 				},
 			],
 		})
-		await server.start()
+		const base = await server.start()
 		try {
-			const res = await fetch(`http://localhost:${port}/whoami`, {
+			const res = await fetch(`${base}/whoami`, {
 				headers: { 'X-Forwarded-For': '203.0.113.77' },
 			})
 			const body = (await res.json()) as { ip?: string }

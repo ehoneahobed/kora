@@ -20,6 +20,7 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { parseScopeSnapshot, replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -27,6 +28,7 @@ import type {
 	ConditionalApplyResult,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
 import { RELEASED_NODE_OWNER } from './server-store'
@@ -127,6 +129,7 @@ export class PostgresServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		await this.backfillScopeSnapshots()
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -168,6 +171,11 @@ export class PostgresServerStore implements ServerStore {
 				}
 			}
 
+			const materialized = this.schema?.collections[op.collection] !== undefined
+			const pre = materialized
+				? await this.readScopeValues(tx, op.collection, op.recordId, false)
+				: null
+
 			const row = this.serializeOperation(op, now, deliverySeq)
 
 			// Insert operation with dedup
@@ -190,8 +198,9 @@ export class PostgresServerStore implements ServerStore {
 				})
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema?.collections[op.collection]) {
+			if (materialized) {
 				await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+				await this.writeScopeSnapshot(tx, op, pre)
 			}
 		})
 
@@ -280,6 +289,10 @@ export class PostgresServerStore implements ServerStore {
 			const now = Date.now()
 			for (const op of ops) {
 				const deliverySeq = await this.nextDeliverySeq(tx)
+				const materialized = this.schema?.collections[op.collection] !== undefined
+				const pre = materialized
+					? await this.readScopeValues(tx, op.collection, op.recordId, false)
+					: null
 				const row = this.serializeOperation(op, now, deliverySeq)
 				await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
 				await tx
@@ -292,8 +305,9 @@ export class PostgresServerStore implements ServerStore {
 							lastSeenAt: sql`${now}`,
 						},
 					})
-				if (this.schema?.collections[op.collection]) {
+				if (materialized) {
 					await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+					await this.writeScopeSnapshot(tx, op, pre)
 				}
 			}
 			return { admitted: true, idempotent: false, applied: ops }
@@ -356,7 +370,167 @@ export class PostgresServerStore implements ServerStore {
 		return rows.map((row) => ({
 			operation: this.deserializeOperation(row),
 			deliverySequence: row.deliverySeq ?? 0,
+			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 		}))
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (let i = 0; i < operationIds.length; i += 500) {
+			const ids = operationIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
+					ids.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { id: string; scope_snapshot: string | null }[]
+			for (const row of rows) {
+				const snapshot = parseScopeSnapshot(row.scope_snapshot)
+				if (snapshot) result.set(row.id, snapshot)
+			}
+		}
+		return result
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`INSERT INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})
+				ON CONFLICT (hash, owner) DO NOTHING`,
+		)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
+		for (let i = 0; i < hashes.length; i += 500) {
+			const slice = hashes.slice(i, i + 500)
+			if (slice.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
+					slice.map((hash) => sql`${hash}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { hash: string; owner: string }[]
+			for (const row of rows) result.get(row.hash)?.push(row.owner)
+		}
+		return result
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		// A transaction-scoped advisory lock per hash makes "insert when nobody owns it"
+		// atomic across instances (two concurrent first claims cannot both win).
+		return this.db.transaction(async (tx) => {
+			await tx.execute(
+				sql`SELECT pg_advisory_xact_lock(hashtextextended(${`kora:blob:${hash}`}, 0))`,
+			)
+			await tx.execute(
+				sql`INSERT INTO blob_owners (hash, owner, created_at)
+					SELECT ${hash}, ${owner}, ${Date.now()}
+					WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${hash})
+					ON CONFLICT (hash, owner) DO NOTHING`,
+			)
+			const rows = (await tx.execute(
+				sql`SELECT 1 AS one FROM blob_owners WHERE hash = ${hash} AND owner = ${owner} LIMIT 1`,
+			)) as unknown as unknown[]
+			return rows.length > 0
+		})
+	}
+
+	/**
+	 * Scope values of a record as stored, for an operation's scope snapshot. With
+	 * `includeDeleted` false a soft-deleted row counts as absent; with true it keeps
+	 * its last values (a delete's post-image).
+	 */
+	private async readScopeValues(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+		includeDeleted: boolean,
+	): Promise<Record<string, unknown> | null> {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return null
+		const rows = (await txOrDb.execute(
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+		)) as unknown as Record<string, unknown>[]
+		const row = rows[0]
+		if (!row) return null
+		if (!includeDeleted && Number(row._deleted) === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, this.deserializeRow(row, collectionDef))
+	}
+
+	/** Persist the scope snapshot of a just-applied operation (RT-14). */
+	private async writeScopeSnapshot(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		pre: Record<string, unknown> | null,
+	): Promise<void> {
+		const snapshot: OperationScopeSnapshot = {
+			pre,
+			post: await this.readScopeValues(tx, op.collection, op.recordId, true),
+		}
+		await tx.execute(
+			sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
+		)
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a database written
+	 * before snapshots existed), replaying each affected record in commit order.
+	 */
+	private async backfillScopeSnapshots(): Promise<void> {
+		const schema = this.schema
+		if (!schema) return
+		const pending = (await this.db.execute(
+			sql`SELECT DISTINCT collection, record_id FROM operations WHERE scope_snapshot IS NULL`,
+		)) as unknown as { collection: string; record_id: string }[]
+		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
+		for (const target of targets) {
+			const rows = await this.db
+				.select()
+				.from(pgOperations)
+				.where(
+					and(
+						eq(pgOperations.collection, target.collection),
+						eq(pgOperations.recordId, target.record_id),
+					),
+				)
+				.orderBy(asc(pgOperations.deliverySeq))
+			const replayed = replayScopeSnapshots(
+				schema,
+				target.collection,
+				target.record_id,
+				rows.map((row) => {
+					const op = this.deserializeOperation(row)
+					return {
+						id: op.id,
+						type: op.type,
+						data: op.data,
+						atomicOps: op.atomicOps ?? null,
+						timestamp: op.timestamp,
+					}
+				}),
+			)
+			for (const row of rows) {
+				if (row.scopeSnapshot !== null) continue
+				const snapshot = replayed.get(row.id)
+				if (!snapshot) continue
+				// Only fill a still-empty column: a concurrent apply's own snapshot wins.
+				await this.db.execute(
+					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)}
+						WHERE id = ${row.id} AND scope_snapshot IS NULL`,
+				)
+			}
+		}
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -508,6 +682,7 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (id) DO UPDATE SET value = ${deliverySeq}`,
 			)
 		})
+		await this.backfillScopeSnapshots()
 
 		// Rebuild in-memory version vector
 		this.versionVector.clear()
@@ -1009,6 +1184,20 @@ export class PostgresServerStore implements ServerStore {
 			// Backward-compatible migration: add the delivery_seq column for the gap-free
 			// delivery watermark.
 			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS delivery_seq BIGINT`)
+
+			// Backward-compatible migration: the per-operation scope snapshot (RT-14).
+			// Rows written before it are backfilled from the log when the schema is set.
+			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS scope_snapshot TEXT`)
+
+			// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS blob_owners (
+					hash TEXT NOT NULL,
+					owner TEXT NOT NULL,
+					created_at BIGINT NOT NULL,
+					PRIMARY KEY (hash, owner)
+				)
+			`)
 
 			await tx.execute(
 				sql`CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)`,

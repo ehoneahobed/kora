@@ -47,9 +47,16 @@ describe('RT-5: node-id claims', () => {
 		const harness = await createHarness(schema, auth)
 		const first = await harness.login('', 'kiosk-node')
 		expect(accepted(first.messages)).toBe(true)
+		// Since RT-12 the anonymous claim is bound to the node token issued at the first
+		// claim, which the device stores next to its node id and presents again.
+		const response = first.messages.find((m) => m.type === 'handshake-response') as
+			| { nodeToken?: string }
+			| undefined
 		first.client.disconnect()
 		await tick()
-		const second = await harness.login('', 'kiosk-node')
+		const second = await harness.login('', 'kiosk-node', {
+			nodeToken: response?.nodeToken,
+		} as Partial<SyncMessage>)
 		expect(errorCode(second.messages)).toBeNull()
 		expect(accepted(second.messages)).toBe(true)
 	})

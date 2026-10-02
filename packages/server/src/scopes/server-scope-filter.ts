@@ -96,23 +96,25 @@ export function operationMatchesScopes(
 	return recordMatchesScopePredicates(buildScopeSnapshot(op, fullRecord), collectionScope)
 }
 
-/** True when an update moved a previously visible record outside the scope. */
-export function operationExitsScopes(
+/**
+ * True when an update moved a previously visible record outside the scope, judged
+ * on the scope values the store captured from its own rows before and after the
+ * write (RT-15). The writer's `previousData` is never consulted: it is unverified,
+ * so it could inject retractions for its own records into another tenant's stream.
+ *
+ * @param op - The operation (only updates can exit a scope)
+ * @param snapshot - The scope values captured when the operation was applied
+ * @param scopes - The session's download scope
+ */
+export function snapshotExitsScopes(
 	op: Operation,
+	snapshot: { pre: Record<string, unknown> | null; post: Record<string, unknown> | null },
 	scopes: ScopeMap | undefined,
-	resultingRecord?: Record<string, unknown> | null,
 ): boolean {
-	if (!scopes || op.type !== 'update' || !op.previousData) return false
-	if (operationMatchesScopes(op, scopes, resultingRecord)) return false
-	const previousSnapshot = {
-		...(resultingRecord ?? {}),
-		...(op.data ?? {}),
-		...op.previousData,
-	}
-	return operationMatchesScopes(
-		{ ...op, type: 'insert', data: previousSnapshot, previousData: null },
-		scopes,
-		previousSnapshot,
+	if (!scopes || op.type !== 'update' || !snapshot.pre || !snapshot.post) return false
+	return (
+		recordMatchesScopes(op.collection, { ...snapshot.pre, id: op.recordId }, scopes) &&
+		!recordMatchesScopes(op.collection, { ...snapshot.post, id: op.recordId }, scopes)
 	)
 }
 

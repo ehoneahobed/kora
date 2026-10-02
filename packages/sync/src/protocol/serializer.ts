@@ -379,6 +379,8 @@ interface ProtoEnvelope {
 	acceptedUplinkScopesJson?: string
 	retractionsJson?: string
 	scopeExitPolicy?: string
+	/** Field 39: per-device node token (handshake and handshake-response, RT-12). */
+	nodeToken?: string
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -399,6 +401,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 					? { lastDeliverySequence: message.lastDeliverySequence }
 					: {}),
 				scopeExitPolicy: message.scopeExitPolicy,
+				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
 			}
 		case 'handshake-response':
 			return {
@@ -427,6 +430,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				acceptedUplinkScopesJson: message.acceptedUplinkScopes
 					? JSON.stringify(message.acceptedUplinkScopes)
 					: undefined,
+				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
 			}
 		case 'operation-batch':
 			return {
@@ -530,6 +534,7 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.scopeExitPolicy === 'retain' || envelope.scopeExitPolicy === 'retract'
 					? { scopeExitPolicy: envelope.scopeExitPolicy }
 					: {}),
+				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
 			}
 		case 'handshake-response':
 			return {
@@ -564,6 +569,7 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.acceptedUplinkScopesJson
 					? { acceptedUplinkScopes: JSON.parse(envelope.acceptedUplinkScopesJson) }
 					: {}),
+				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
 			}
 		case 'operation-batch':
 			return {
@@ -827,6 +833,7 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 		writer.uint32(290).string(envelope.acceptedUplinkScopesJson)
 	if (envelope.retractionsJson) writer.uint32(298).string(envelope.retractionsJson)
 	if (envelope.scopeExitPolicy) writer.uint32(306).string(envelope.scopeExitPolicy)
+	if (envelope.nodeToken) writer.uint32(314).string(envelope.nodeToken)
 	return writer.finish()
 }
 
@@ -953,6 +960,9 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 38:
 				envelope.scopeExitPolicy = reader.string()
+				break
+			case 39:
+				envelope.nodeToken = reader.string()
 				break
 			default:
 				reader.skipType(tag & 7)

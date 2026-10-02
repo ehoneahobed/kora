@@ -992,12 +992,24 @@ describe('ClientSession', () => {
 			sendHandshake(client, { authToken: 'ok', scopeExitPolicy: 'retract' })
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
+			// The pre-image comes from the server's own row (RT-15), never from the
+			// writer's previousData, so the record must exist on the server first.
+			await store.applyRemoteOperation(
+				createTestOp({
+					id: 'publish-1',
+					type: 'insert',
+					recordId: 'announcement-1',
+					data: { status: 'published', title: 'News' },
+				}),
+			)
 			const archived = createTestOp({
 				id: 'archive-1',
 				type: 'update',
 				recordId: 'announcement-1',
 				data: { status: 'archived' },
 				previousData: { status: 'published', title: 'News' },
+				timestamp: { wallTime: 1001, logical: 0, nodeId: 'client-1' },
+				sequenceNumber: 2,
 			})
 			await store.applyRemoteOperation(archived)
 			session.relayOperations([archived])

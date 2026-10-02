@@ -14,11 +14,13 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { parseScopeSnapshot, replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
 import { RELEASED_NODE_OWNER } from './server-store'
@@ -93,6 +95,7 @@ export class SqliteServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		this.backfillScopeSnapshots()
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -125,6 +128,9 @@ export class SqliteServerStore implements ServerStore {
 				}
 			}
 
+			const materialized = this.schema?.collections[op.collection] !== undefined
+			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
+
 			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
 			tx.insert(operations).values(row).run()
 
@@ -145,8 +151,16 @@ export class SqliteServerStore implements ServerStore {
 				.run()
 
 			// Dual-write: update materialized collection table if schema is set
-			if (this.schema?.collections[op.collection]) {
+			if (materialized) {
 				this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+				// The record's scope values around this write, from the store's own rows.
+				const snapshot: OperationScopeSnapshot = {
+					pre,
+					post: this.readScopeValues(tx, op.collection, op.recordId, true),
+				}
+				tx.run(
+					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
+				)
 			}
 
 			return 'applied' as const
@@ -198,7 +212,144 @@ export class SqliteServerStore implements ServerStore {
 		return rows.map((row) => ({
 			operation: this.deserializeOperation(row),
 			deliverySequence: row.deliverySeq ?? 0,
+			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 		}))
+	}
+
+	async getOperationScopeSnapshots(
+		operationIds: string[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		this.assertOpen()
+		const result = new Map<string, OperationScopeSnapshot>()
+		for (let i = 0; i < operationIds.length; i += 500) {
+			const ids = operationIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const rows = this.db.all<{ id: string; scope_snapshot: string | null }>(
+				sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
+					ids.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) {
+				const snapshot = parseScopeSnapshot(row.scope_snapshot)
+				if (snapshot) result.set(row.id, snapshot)
+			}
+		}
+		return result
+	}
+
+	async recordBlobOwner(hash: string, owner: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})`,
+		)
+	}
+
+	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
+		this.assertOpen()
+		const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
+		for (let i = 0; i < hashes.length; i += 500) {
+			const slice = hashes.slice(i, i + 500)
+			if (slice.length === 0) continue
+			const rows = this.db.all<{ hash: string; owner: string }>(
+				sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
+					slice.map((hash) => sql`${hash}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) result.get(row.hash)?.push(row.owner)
+		}
+		return result
+	}
+
+	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
+		this.assertOpen()
+		// better-sqlite3 runs both statements synchronously under SQLite's writer lock,
+		// so no other claim interleaves (and the file lock covers other processes).
+		this.db.run(
+			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at)
+				SELECT ${hash}, ${owner}, ${Date.now()}
+				WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${hash})`,
+		)
+		const rows = this.db.all<{ one: number }>(
+			sql`SELECT 1 AS one FROM blob_owners WHERE hash = ${hash} AND owner = ${owner} LIMIT 1`,
+		)
+		return rows.length > 0
+	}
+
+	/**
+	 * Scope values of a record as stored, for an operation's scope snapshot. With
+	 * `includeDeleted` false a soft-deleted row counts as absent (the pre-image of a
+	 * write to a deleted record); with true it keeps its last values (a delete's
+	 * post-image).
+	 */
+	private readScopeValues(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		includeDeleted: boolean,
+	): Record<string, unknown> | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return null
+		const rows = txOrDb.all<Record<string, unknown>>(
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+		)
+		const row = rows[0]
+		if (!row) return null
+		if (!includeDeleted && Number(row._deleted) === 1) return null
+		return scopeValuesOf(this.schema, collection, recordId, this.deserializeRow(row, collectionDef))
+	}
+
+	/**
+	 * Rebuild missing scope snapshots from the log (migration from a database written
+	 * before snapshots existed), replaying each affected record in commit order.
+	 */
+	private backfillScopeSnapshots(): void {
+		const schema = this.schema
+		if (!schema) return
+		const pending = this.db.all<{ collection: string; record_id: string }>(
+			sql`SELECT DISTINCT collection, record_id FROM operations WHERE scope_snapshot IS NULL`,
+		)
+		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
+		if (targets.length === 0) return
+		this.db.transaction((tx) => {
+			for (const target of targets) {
+				const rows = tx
+					.select()
+					.from(operations)
+					.where(
+						and(
+							eq(operations.collection, target.collection),
+							eq(operations.recordId, target.record_id),
+						),
+					)
+					.orderBy(asc(operations.deliverySeq))
+					.all()
+				const replayed = replayScopeSnapshots(
+					schema,
+					target.collection,
+					target.record_id,
+					rows.map((row) => {
+						const op = this.deserializeOperation(row)
+						return {
+							id: op.id,
+							type: op.type,
+							data: op.data,
+							atomicOps: op.atomicOps ?? null,
+							timestamp: op.timestamp,
+						}
+					}),
+				)
+				for (const row of rows) {
+					if (row.scopeSnapshot !== null) continue
+					const snapshot = replayed.get(row.id)
+					if (!snapshot) continue
+					tx.run(
+						sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${row.id}`,
+					)
+				}
+			}
+		})
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -408,6 +559,7 @@ export class SqliteServerStore implements ServerStore {
 			}
 			tx.update(deliveryCounter).set({ value: deliverySeq }).where(eq(deliveryCounter.id, 1)).run()
 		})
+		this.backfillScopeSnapshots()
 
 		return { operationsRestored: ops.length, success: true }
 	}
@@ -777,8 +929,30 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Backward-compatible migration: the per-operation scope snapshot (RT-14). Rows
+		// written before it are backfilled from the log when the schema is set.
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN scope_snapshot TEXT`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
+		`)
+
+		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS blob_owners (
+				hash TEXT NOT NULL,
+				owner TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (hash, owner)
+			)
 		`)
 
 		// Node id -> principal binding (see claimNode). One row per device node id.
