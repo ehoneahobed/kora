@@ -972,7 +972,11 @@ export class Store implements OperationLog {
 		}
 		const report = await this.scanLog('full')
 		const mode: RematerializationMode =
-			report.quarantined.length > 0 ? 'kept' : report.clean ? 'log' : 'snapshot+log'
+			report.quarantined.length > 0
+				? 'kept'
+				: report.clean && report.compactedAt === null
+					? 'log'
+					: 'snapshot+log'
 		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode)
 		await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_CURRENT)
 		this.foldActive = true

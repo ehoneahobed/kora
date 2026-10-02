@@ -13,6 +13,11 @@ import { mergeField } from './field-merger'
 /**
  * Three-tier merge engine for resolving concurrent operations.
  *
+ * @deprecated W7 (beta.14): records are materialized by the per-field CRDT fold in
+ * `@korajs/core` (`mergeOp` / `foldRecord`), which produces the MergeTraces. This
+ * pairwise engine only backs `experimental.legacyMerge` for one beta and is
+ * removed afterwards. Constraint and referential checks stay in this package.
+ *
  * Tier 1: Auto-merge per field kind (LWW, add-wins set, CRDT)
  * Tier 3: Custom resolvers override Tier 1 for specific fields
  * Tier 2: Constraint validation against the candidate merged state
