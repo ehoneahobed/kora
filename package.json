@@ -6,7 +6,7 @@
     "build": "turbo run build",
     "dev": "turbo run dev",
     "test": "turbo run test --concurrency=6",
-    "benchmark:gates": "pnpm --filter @korajs/store test:benchmarks && pnpm --filter @korajs/merge test:benchmarks && pnpm --filter @korajs/sync test:benchmarks",
+    "benchmark:gates": "pnpm --filter @korajs/core test:benchmarks && pnpm --filter @korajs/store test:benchmarks && pnpm --filter @korajs/merge test:benchmarks && pnpm --filter @korajs/sync test:benchmarks",
     "chaos:nightly": "pnpm --filter @korajs/sync test:chaos && pnpm test:invariants:nightly",
     "test:invariants:nightly": "KORA_CHAOS_SEEDS=11,23,37,163,277,401,557,691,829,947,1117 pnpm --filter @korajs/test test -- tests/no-silent-loss-invariants.test.ts",
     "test:chaos:real-path": "pnpm --filter @korajs/test test -- tests/chaos-real-path.test.ts",
