@@ -16,7 +16,25 @@ export type MigrationStep =
 			transform: (record: Record<string, unknown>) => Record<string, unknown>
 			/** Reverse transform for rollback. If not provided, backfill is not safely reversible. */
 			reverseTransform?: (record: Record<string, unknown>) => Record<string, unknown>
+			/**
+			 * Rewrite rows on this device only, without writing operations (so nothing
+			 * syncs). Default false: every changed record is written through the normal
+			 * local write path as an update operation (mutation name `migration:v<N>`).
+			 */
+			localOnly?: boolean
 	  }
+
+/** Options for {@link MigrationBuilder.backfill}. */
+export interface BackfillOptions {
+	/** Reverse transform for rollback support. */
+	reverseTransform?: (record: Record<string, unknown>) => Record<string, unknown>
+	/**
+	 * Rewrite rows on this device only, without operations, so the change never syncs.
+	 * Use it for device-local derived data. Default false: backfilled values are written
+	 * as update operations and sync like any other write.
+	 */
+	localOnly?: boolean
+}
 
 /**
  * A completed migration definition containing ordered steps and optional rollback steps.
@@ -189,21 +207,38 @@ export class MigrationBuilder implements MigrationDefinition {
 
 	/**
 	 * Backfill records in a collection using a transform function.
-	 * The transform receives each record and returns the fields to update.
-	 * Runs after structural changes (addField, renameField, etc.).
+	 * The transform receives each live record (typed values, as the app reads them) and
+	 * returns the fields to change. Runs after structural changes (addField, renameField,
+	 * etc.), in the same transaction as them and the schema version write.
+	 *
+	 * Changed records are written as update operations (mutation name `migration:v<N>`)
+	 * through the normal local write path, so backfilled values sync. Pass
+	 * `{ localOnly: true }` for device-local data that must not sync.
 	 *
 	 * @param collection - The collection name
 	 * @param transform - Forward transform function
-	 * @param reverseTransform - Optional reverse transform for rollback support
+	 * @param reverseOrOptions - Reverse transform for rollback support, or options
 	 */
 	backfill(
 		collection: string,
 		transform: (record: Record<string, unknown>) => Record<string, unknown>,
-		reverseTransform?: (record: Record<string, unknown>) => Record<string, unknown>,
+		reverseOrOptions?:
+			| ((record: Record<string, unknown>) => Record<string, unknown>)
+			| BackfillOptions,
 	): MigrationBuilder {
+		const options: BackfillOptions =
+			typeof reverseOrOptions === 'function'
+				? { reverseTransform: reverseOrOptions }
+				: (reverseOrOptions ?? {})
 		return new MigrationBuilder([
 			...this.steps,
-			{ type: 'backfill', collection, transform, reverseTransform },
+			{
+				type: 'backfill',
+				collection,
+				transform,
+				...(options.reverseTransform ? { reverseTransform: options.reverseTransform } : {}),
+				...(options.localOnly ? { localOnly: true } : {}),
+			},
 		])
 	}
 

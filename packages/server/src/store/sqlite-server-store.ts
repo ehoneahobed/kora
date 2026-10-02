@@ -15,6 +15,14 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
+	SERVER_LOG_INTEGRITY_META_KEY,
+	SERVER_LOG_QUARANTINE_DDL,
+	type ServerLogIntegrityReport,
+	type ServerOperationRow,
+	checkServerOperationRow,
+	quarantineRowJson,
+} from './log-integrity'
+import {
 	deserializeFieldValue,
 	generateAllCollectionDDL,
 	replayOperationsForRecord,
@@ -109,6 +117,12 @@ export class SqliteServerStore implements ServerStore {
 	private closed = false
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
 	private sequenceEpoch = 0
+	private logIntegrity: ServerLogIntegrityReport = {
+		checkedRows: 0,
+		quarantined: [],
+		ran: false,
+		totalQuarantined: 0,
+	}
 
 	constructor(db: BetterSQLite3Database, nodeId?: string) {
 		this.db = db
@@ -1348,6 +1362,73 @@ export class SqliteServerStore implements ServerStore {
 		this.backfillDeliverySequence()
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		this.backfillSequencePairs()
+		this.logIntegrity = this.scanLogIntegrityOnce()
+	}
+
+	/**
+	 * The startup log-integrity scan's result (W8 step 0): rows that could not be read
+	 * back into an operation are moved to `operations_quarantine` once per database,
+	 * before any fold reads them.
+	 */
+	getLogIntegrityReport(): ServerLogIntegrityReport {
+		return { ...this.logIntegrity, quarantined: [...this.logIntegrity.quarantined] }
+	}
+
+	private scanLogIntegrityOnce(): ServerLogIntegrityReport {
+		this.db.run(sql.raw(SERVER_LOG_QUARANTINE_DDL))
+		const report: ServerLogIntegrityReport = {
+			checkedRows: 0,
+			quarantined: [],
+			ran: false,
+			totalQuarantined: 0,
+		}
+		const done = this.db.all<{ value: string }>(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${SERVER_LOG_INTEGRITY_META_KEY}`,
+		)
+		if (done.length === 0) {
+			report.ran = true
+			const bad: Array<{
+				rowid: number
+				row: ServerOperationRow
+				problem: string
+				detail: string
+			}> = []
+			let after = 0
+			for (;;) {
+				const page = this.db.all<ServerOperationRow & { __rowid: number }>(
+					sql`SELECT rowid AS __rowid, id, node_id, type, collection, record_id, data, previous_data, atomic_ops, wall_time, logical, timestamp_node_id, sequence_number, causal_deps, schema_version FROM operations WHERE rowid > ${after} ORDER BY rowid LIMIT 1000`,
+				)
+				for (const { __rowid, ...row } of page) {
+					report.checkedRows++
+					const verdict = checkServerOperationRow(row)
+					if (verdict) bad.push({ rowid: __rowid, row, ...verdict })
+				}
+				if (page.length < 1000) break
+				after = page[page.length - 1]?.__rowid ?? after
+			}
+			const now = Date.now()
+			this.db.transaction((tx) => {
+				for (const entry of bad) {
+					const id = typeof entry.row.id === 'string' ? entry.row.id : `rowid:${entry.rowid}`
+					tx.run(
+						sql`INSERT OR REPLACE INTO operations_quarantine (id, problem, detail, row_json, quarantined_at) VALUES (${id}, ${entry.problem}, ${entry.detail}, ${quarantineRowJson(entry.row)}, ${now})`,
+					)
+					tx.run(sql`DELETE FROM operations WHERE rowid = ${entry.rowid}`)
+					report.quarantined.push({ operationId: id, problem: entry.problem, detail: entry.detail })
+				}
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_LOG_INTEGRITY_META_KEY}, ${String(now)})`,
+				)
+			})
+			if (bad.length > 0) {
+				console.warn(
+					`[kora] Log integrity: ${bad.length} unreadable operation row(s) moved to operations_quarantine.`,
+				)
+			}
+		}
+		const total = this.db.all<{ n: number }>(sql`SELECT COUNT(*) AS n FROM operations_quarantine`)
+		report.totalQuarantined = Number(total[0]?.n ?? 0)
+		return report
 	}
 
 	/**

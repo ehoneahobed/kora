@@ -140,18 +140,31 @@ export { pluralize, singularize } from './query/pluralize'
 
 // === Backup/Restore ===
 export {
+	BACKUP_VERSION,
+	BackupFormatError,
+	convertBackupV1,
 	exportBackup,
 	readBackupManifest,
 	restoreBackup,
 	verifyBackupChecksum,
 } from './backup'
 export type {
+	ConvertBackupV1Options,
 	BackupManifest,
 	BackupOptions,
 	BackupProgress,
 	RestoreOptions,
 	RestoreResult,
 } from './backup'
+
+// === Log integrity (W8 step 0) ===
+export { LOG_QUARANTINE_TABLE } from './log-integrity/log-integrity'
+export type {
+	LogIntegrityReport,
+	LogIntegrityRow,
+	LogRowProblem,
+	LogSequenceGap,
+} from './log-integrity/log-integrity'
 
 // === Audit export ===
 export {

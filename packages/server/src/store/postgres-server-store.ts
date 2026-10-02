@@ -15,6 +15,14 @@ import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
+	SERVER_LOG_INTEGRITY_META_KEY,
+	SERVER_LOG_QUARANTINE_DDL,
+	type ServerLogIntegrityReport,
+	type ServerOperationRow,
+	checkServerOperationRow,
+	quarantineRowJson,
+} from './log-integrity'
+import {
 	deserializeFieldValue,
 	generateAllCollectionDDL,
 	replayOperationsForRecord,
@@ -116,6 +124,12 @@ export class PostgresServerStore implements ServerStore {
 	private sequenceCounter: number | null = null
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
 	private sequenceEpoch = 0
+	private logIntegrity: ServerLogIntegrityReport = {
+		checkedRows: 0,
+		quarantined: [],
+		ran: false,
+		totalQuarantined: 0,
+	}
 	/**
 	 * Time source for HLC timestamps on server-originated operations. Injectable so a
 	 * test can freeze wall-clock time and prove the conditional-apply ordering holds
@@ -1514,6 +1528,7 @@ export class PostgresServerStore implements ServerStore {
 
 	private async initialize(): Promise<void> {
 		await this.ensureTables()
+		this.logIntegrity = await this.scanLogIntegrityOnce()
 
 		// Hydrate in-memory version vector cache
 		const rows = await this.db
@@ -1526,6 +1541,72 @@ export class PostgresServerStore implements ServerStore {
 		for (const row of rows) {
 			this.versionVector.set(row.nodeId, row.maxSequenceNumber)
 		}
+	}
+
+	/**
+	 * The startup log-integrity scan's result (W8 step 0): rows that could not be read
+	 * back into an operation are moved to `operations_quarantine` once per database,
+	 * before any fold reads them.
+	 */
+	async getLogIntegrityReport(): Promise<ServerLogIntegrityReport> {
+		await this.ready
+		return { ...this.logIntegrity, quarantined: [...this.logIntegrity.quarantined] }
+	}
+
+	/**
+	 * One-time scan under the setup advisory lock (concurrent starts run it once). Keyset
+	 * pages by id, so a large log is read in bounded chunks; like the delivery-sequence
+	 * backfill it runs on the first start of this release only.
+	 */
+	private async scanLogIntegrityOnce(): Promise<ServerLogIntegrityReport> {
+		const report: ServerLogIntegrityReport = {
+			checkedRows: 0,
+			quarantined: [],
+			ran: false,
+			totalQuarantined: 0,
+		}
+		await this.db.transaction(async (tx) => {
+			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:log-integrity', 0))`)
+			await tx.execute(sql.raw(SERVER_LOG_QUARANTINE_DDL))
+			const done = (await tx.execute(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${SERVER_LOG_INTEGRITY_META_KEY}`,
+			)) as unknown as { value: string }[]
+			if (done.length > 0) return
+			report.ran = true
+			const now = Date.now()
+			let after = ''
+			for (;;) {
+				const page = (await tx.execute(
+					sql`SELECT id, node_id, type, collection, record_id, data, previous_data, atomic_ops, wall_time, logical, timestamp_node_id, sequence_number, causal_deps, schema_version FROM operations WHERE id > ${after} ORDER BY id LIMIT 2000`,
+				)) as unknown as ServerOperationRow[]
+				for (const row of page) {
+					report.checkedRows++
+					const verdict = checkServerOperationRow(row)
+					if (!verdict) continue
+					const id = String(row.id)
+					await tx.execute(
+						sql`INSERT INTO operations_quarantine (id, problem, detail, row_json, quarantined_at) VALUES (${id}, ${verdict.problem}, ${verdict.detail}, ${quarantineRowJson(row)}, ${now}) ON CONFLICT (id) DO NOTHING`,
+					)
+					await tx.execute(sql`DELETE FROM operations WHERE id = ${id}`)
+					report.quarantined.push({ operationId: id, ...verdict })
+				}
+				if (page.length < 2000) break
+				after = String(page[page.length - 1]?.id ?? after)
+			}
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SERVER_LOG_INTEGRITY_META_KEY}, ${String(now)}) ON CONFLICT (key) DO NOTHING`,
+			)
+		})
+		if (report.quarantined.length > 0) {
+			console.warn(
+				`[kora] Log integrity: ${report.quarantined.length} unreadable operation row(s) moved to operations_quarantine.`,
+			)
+		}
+		const total = (await this.db.execute(
+			sql`SELECT COUNT(*) AS n FROM operations_quarantine`,
+		)) as unknown as { n: string | number }[]
+		report.totalQuarantined = Number(total[0]?.n ?? 0)
+		return report
 	}
 
 	private async ensureTables(): Promise<void> {

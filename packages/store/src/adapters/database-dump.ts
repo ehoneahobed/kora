@@ -9,6 +9,12 @@ import { PersistenceError } from '../errors'
 export interface DatabaseDump {
 	tables: Array<{
 		name: string
+		/**
+		 * The table's `CREATE TABLE` statement (from `sqlite_master`), so a restore can
+		 * recreate a table the target database does not have yet with its constraints.
+		 * Absent in dumps written before it was recorded.
+		 */
+		sql?: string
 		columns: string[]
 		rows: Array<Record<string, unknown>>
 	}>
@@ -38,15 +44,20 @@ export function ensureSafeIdentifier(identifier: string): string {
  * consistent snapshot.
  */
 export async function exportDump(query: QueryFn): Promise<DatabaseDump> {
-	const tableRows = await query<{ name: string }>(
-		"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+	const tableRows = await query<{ name: string; sql: string | null }>(
+		"SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
 	)
 	const tables: DatabaseDump['tables'] = []
 	for (const tableRow of tableRows) {
 		const tableName = ensureSafeIdentifier(tableRow.name)
 		const columns = await query<{ name: string }>(`PRAGMA table_info(${quoteIdent(tableName)})`)
 		const rows = await query<Record<string, unknown>>(`SELECT * FROM ${quoteIdent(tableName)}`)
-		tables.push({ name: tableName, columns: columns.map((column) => column.name), rows })
+		tables.push({
+			name: tableName,
+			...(typeof tableRow.sql === 'string' ? { sql: tableRow.sql } : {}),
+			columns: columns.map((column) => column.name),
+			rows,
+		})
 	}
 	return { tables }
 }
@@ -55,17 +66,25 @@ export async function exportDump(query: QueryFn): Promise<DatabaseDump> {
  * Statements that replace the contents of each dumped table with the dump's
  * rows. Run them inside one transaction so a failure leaves the target as it was.
  *
- * @param createMissingTables - Also create untyped tables first (for scratch
- *   databases that have no schema, such as the unsynced-data check before a delete).
+ * A table the target does not have yet (the store creates some of its bookkeeping
+ * tables after the schema DDL) is created first from the dump's recorded `CREATE TABLE`
+ * statement, constraints included. A dump written before statements were recorded
+ * creates it untyped, so its rows are still restored.
+ *
+ * @param createMissingTables - Kept for callers that restore into scratch databases
+ *   with no schema; missing tables are always created now.
  */
 export function restoreDumpStatements(
 	dump: DatabaseDump,
-	createMissingTables = false,
+	_createMissingTables = true,
 ): DumpStatement[] {
 	const statements: DumpStatement[] = []
 	for (const table of dump.tables) {
 		const name = quoteIdent(ensureSafeIdentifier(table.name))
-		if (createMissingTables) {
+		const create = createTableIfNotExists(table.name, table.sql)
+		if (create) {
+			statements.push({ sql: create })
+		} else {
 			const columns = table.columns.map((column) => quoteIdent(ensureSafeIdentifier(column)))
 			if (columns.length === 0) continue
 			statements.push({ sql: `CREATE TABLE IF NOT EXISTS ${name} (${columns.join(', ')})` })
@@ -86,4 +105,17 @@ export function restoreDumpStatements(
 		}
 	}
 	return statements
+}
+
+/**
+ * The recorded `CREATE TABLE` statement made idempotent, or null when there is none or
+ * it is not a single plain `CREATE TABLE` of exactly this table (dump data is untrusted).
+ */
+function createTableIfNotExists(tableName: string, sql: string | undefined): string | null {
+	if (typeof sql !== 'string' || sql.includes(';')) return null
+	const match = /^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?("?)([A-Za-z0-9_]+)\1\s*\(/i.exec(
+		sql,
+	)
+	if (!match || match[2] !== tableName) return null
+	return `CREATE TABLE IF NOT EXISTS ${quoteIdent(tableName)} ${sql.slice(match[0].length - 1)}`
 }

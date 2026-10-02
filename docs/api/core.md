@@ -647,7 +647,7 @@ const migration = migrate()
 | `.renameField(collection, from, to)` | Rename a field. |
 | `.addIndex(collection, field)` | Add an index on a field. |
 | `.removeIndex(collection, field)` | Remove an index. |
-| `.backfill(collection, transform)` | Apply a transform function to all existing records. |
+| `.backfill(collection, transform, reverseOrOptions?)` | Apply a transform to every live record (typed values). Changed records are written as update operations (`migration:v<N>`) that sync; `{ localOnly: true }` rewrites rows on this device only. Third argument: a reverse transform, or `{ reverseTransform?, localOnly? }`. |
 
 ### .build()
 

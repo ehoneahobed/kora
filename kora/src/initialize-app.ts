@@ -29,6 +29,8 @@ import type { AuthSyncBinding, KoraConfig } from './types'
 /** Result of opening the local store and optionally constructing a sync engine. */
 export interface InitializeAppResult {
 	store: Store
+	/** The local apply pipeline; its `applyRemote` is the path backups replay through. */
+	applyPipeline: ApplyPipeline
 	syncEngine: SyncEngine | null
 	unsubscribeSync: (() => void) | null
 	unsubscribeAudit: (() => void) | null
@@ -240,6 +242,7 @@ export async function initializeApp(
 
 	return {
 		store,
+		applyPipeline,
 		syncEngine,
 		unsubscribeSync,
 		unsubscribeAudit,

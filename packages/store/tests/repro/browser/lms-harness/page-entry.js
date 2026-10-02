@@ -73,6 +73,7 @@ window.H = {
 			workerUrl: '/kora-worker.js',
 			emitter,
 			workerResponseTimeoutMs: opts.timeoutMs ?? 30000,
+			...(opts.debounceMs !== undefined ? { persistenceDebounceMs: opts.debounceMs } : {}),
 		})
 		adapters.set(key, a)
 		try {
@@ -107,6 +108,21 @@ window.H = {
 				error: String(e?.message ?? e),
 				name: e?.name,
 			}
+		}
+	},
+	async exec(key, sql, params) {
+		try {
+			await adapters.get(key).execute(sql, params)
+			return { ok: true }
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e) }
+		}
+	},
+	async rows(key, sql) {
+		try {
+			return { ok: true, rows: await adapters.get(key).query(sql) }
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e) }
 		}
 	},
 	async titles(key) {

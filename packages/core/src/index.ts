@@ -186,7 +186,11 @@ export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence
 export type { OperationTransform } from './migration/operation-transform'
 export { applyOperationTransforms } from './migration/apply-operation-transforms'
 export { MigrationBuilder, RollbackBuilder, migrate } from './migrations/migration-builder'
-export type { MigrationDefinition, MigrationStep } from './migrations/migration-builder'
+export type {
+	BackfillOptions,
+	MigrationDefinition,
+	MigrationStep,
+} from './migrations/migration-builder'
 export { migrationStepsToSQL, rollbackStepsToSQL } from './migrations/migration-sql'
 export {
 	MigrationRollbackError,

@@ -135,6 +135,17 @@ export interface SyncOptions {
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
 	 */
 	authClient?: AuthSyncBinding
+	/**
+	 * What happens to writes made on a database that never synced, before the app knew
+	 * who was signed in (they cannot be attributed to a user, RT-50):
+	 *
+	 * - `'hold'` (default): they are held, reported in `status.heldNodes` with reason
+	 *   `unassigned`, until the app calls `app.sync.assignHeld` or `app.sync.discardHeld`.
+	 * - `'assign-to-first-user'`: they are assigned to the first user the sync server
+	 *   accepts a session for on this device, and upload as that user. Use it for
+	 *   single-user apps, where those writes can only be that user's.
+	 */
+	unassignedWrites?: 'hold' | 'assign-to-first-user'
 	/** Controls whether reactive queries affect the replicated view. Defaults to `reactive`. */
 	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
 	/** Remove records from the local active view when server authorization retracts them. */

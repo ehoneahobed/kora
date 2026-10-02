@@ -1119,14 +1119,14 @@
    "severity": "P0",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 1). Backup format version 2 (BACKUP_VERSION 2): canonical Operation NDJSON in HLC order (incl. atomicOps, transactionId, mutationName, fieldVersions, and ops kept only in _kora_seq_conflicts), raw rows incl. tombstones (bytes base64-tagged), version vector, terminal rejections; no _kora_meta at all. Read inside one transaction. Import parses and verifies every op through the canonical serializer (BackupFormatError). Merge mode: every op through the remote-apply path (app.importBackup passes the ApplyPipeline sync uses), vector by MAX, terminal markers added, node_id/node tokens/local nodes/principal bindings/watermarks/acked prefixes never imported. Replace mode (backup/restore.ts): one transaction wipes the target collections and loads ops + rows, keeps node id, tokens, local node registry, principal bindings, acked prefixes; own counters never move backwards; unacknowledged writes of an accepted node are always re-applied on top, other unsynced own writes when keepUnsyncedWrites (default true at store level; app.importBackup defaults it to whether sync is configured and refuses false with sync); a never-accepted node whose writes are dropped restarts its counter after the highest restored number (contiguous); delivery watermarks reset to 0, delta cursor dropped; dropped ops leave the outbound queue. Then Store.reloadFromDisk() (node id, vector, sequence counter, clock advanced past the newest logged timestamp, fresh causal tracker, every subscription invalidated). app.importBackup pauses sync for a replace and resumes it. Version-1 files are refused with BACKUP_FORMAT_OUTDATED; convertBackupV1(data, { dropUnrecoverable }) converts them (drops meta, recovers misread timestamps, decodes bytes). Breaking: restoreBackup(adapter, ...) is deprecated and now opens a temporary Store on the adapter (closing it). Tests: store backup/backup.test.ts, kora import-backup.test.ts. Docs: guide/backup-restore.md. Server backups (server-backup.ts) already used canonical Operation JSON and are unchanged."
   },
   {
    "id": "STORE-6",
@@ -1134,14 +1134,17 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-6.test.ts"
+    },
+    {
+     "browser": "STORE-6"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 2). Only the storage leader restores an IndexedDB snapshot, and only into a worker database no snapshot was restored into yet (a connection-local TEMP marker, never dumped). A browser leader restores inside its own worker right after the open and BEFORE the worker serves other tabs (SqliteWasmAdapter onLeaderWorkerOpened), on first open and on promotion, in one transaction; a follower never restores, and a failed restore fails the open/promotion instead of serving a partial database. Before the fix a promoted follower also started from an EMPTY worker database (the real-browser check showed it). Tests: store indexeddb-adapter.test.ts (STORE-6 block), real-Chromium LMS-5-6-7.browser.mjs scenario STORE-6 (two tabs, IndexedDB fallback, leader writes, follower opens, promotion, reload)."
   },
   {
    "id": "STORE-7",
@@ -1149,14 +1152,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 3). IndexedDbPersistenceScheduler.flushNow waits for an in-flight snapshot and then writes again while any scheduled write is not covered by a successful snapshot (generation counters = dirty flag); a failed snapshot ends the loop (reported via onError; flushBarrier/ensureDurable still rejects). The snapshot dump is read inside one transaction (no torn snapshot). The RT-35 ensureDurable contract is unchanged. Tests: indexeddb-persistence-scheduler.test.ts (STORE-7 tests)."
   },
   {
    "id": "STORE-8",
@@ -1239,14 +1242,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-13.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4). New packages/store/src/migrations/run-migrations.ts: each schema version runs in ONE transaction (structural DDL, every backfill, the schema_version write); a throwing backfill or a crash leaves nothing of that version, versions already committed are not repeated. Backfills write update operations through the single local write path (writeUpdateInTx: in-tx sequence reservation, per-field stamps, previousData) with mutationName migration:v<N>, so they sync; core migrate().backfill(collection, transform, { localOnly: true }) rewrites rows only. Store.open now loads the node id and clock before migrations. Unchanged values write nothing; fields outside the schema fail the version (MIGRATION_UNKNOWN_FIELD). Tests: store migration.test.ts (STORE-13 block), core migration-builder.test.ts. Docs: guide/schema-design.md, api/core.md."
   },
   {
    "id": "STORE-14",
@@ -1296,14 +1299,14 @@
    "severity": "P2",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4): backfill transforms receive deserializeRecord(row) (typed booleans, arrays, objects); returned values go through validateRecord + serializeRecord on the write path. Tests: store migration.test.ts."
   },
   {
    "id": "NEW-STORE-2",
@@ -1482,6 +1485,21 @@
    "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
    "pr": null,
    "notes": ""
+  },
+  {
+   "id": "NEW-STORE-12",
+   "title": "No log-integrity check: rows damaged by beta.12 backup restore (JSON timestamps read as wallTime NaN/null) or unreadable rows are folded as-is, and compaction gaps are invisible; W7 re-materialization would bake the damage in",
+   "severity": "P0",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-STORE-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W8 step 0 (prerequisite for W7, plan section 3 dependency rules). Acceptance test kora/tests/repro/NEW-STORE-12.test.ts (fails before the fix: getAllOperations throws on the unreadable row and the restored row reads wallTime NaN). FIXED (store): new packages/store/src/log-integrity module. Every Store.open runs a quick scan (SQL prefilter, suspects checked in JS) before anything reads or folds the log: a row must round-trip through deserializeOperation/serializeOperation; a JSON-encoded timestamp (one beta.12 restore, or a nested restore-export-restore) is repaired in place; anything unrecoverable moves to _kora_log_quarantine (kept verbatim, never deleted) and store:log-integrity is emitted. Store.verifyLogIntegrity({ mode, repair }) runs the full scan and returns a LogIntegrityReport (clean, repaired, newlyQuarantined, quarantined, gaps in this database own nodes below their highest stored sequence, compactedAt). W7 re-materialization must refuse unless report.clean. Remote-node gaps are not reported (scoped sync delivers partial logs). Tests: store log-integrity.test.ts. Server half: packages/server/src/store/log-integrity.ts (checkServerOperationRow); the SQLite and Postgres stores run a one-time startup scan (meta key log_integrity_scan_v1; Postgres under an advisory lock, keyset pages) that moves unreadable rows (malformed JSON, out-of-range HLC, bad type/sequence) to operations_quarantine verbatim and logs a warning; getLogIntegrityReport() returns the result. Typed server columns rule out the beta.12 null-wallTime damage, so there is nothing to repair in place. Tests: server log-integrity.test.ts (Postgres case gated by KORA_PG_TEST_URL, not run in this environment)."
   },
   {
    "id": "MERGE-1",
@@ -1726,6 +1744,21 @@
    ],
    "pr": null,
    "notes": ""
+  },
+  {
+   "id": "NEW-DX-4",
+   "title": "Single-user apps cannot opt out of holding writes made before sign-in (RT-50 unassigned): every app must call app.sync.assignHeld itself",
+   "severity": "P3",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-DX-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 DX item (user decision pending; the recommended default implemented). New createApp option sync.unassignedWrites: hold | assign-to-first-user (default hold, RT-50 behavior unchanged). assign-to-first-user (kora/src/unassigned-writes.ts, wired in sync-lifecycle): on sync:connected (a session the server ACCEPTED for the signed-in user) every held node with reason unassigned is assigned via engine.assignHeld and the engine reconnects so they upload as that user; other-user nodes are never touched, a refused user never gets a session so never gets them; once assigned (and bound by the server) a later user is never offered them. Invalid values are rejected by createApp. Acceptance test packages/test/tests/repro/NEW-DX-4.test.ts (real server, both policies); unit tests kora unassigned-writes.test.ts. Docs: guide/authentication.md, guide/sync-configuration.md."
   },
   {
    "id": "NEW-TEST-1",

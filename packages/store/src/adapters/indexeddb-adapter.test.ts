@@ -322,3 +322,76 @@ describe('IDB persistence helpers', () => {
 		expect(loaded).toBeNull()
 	})
 })
+
+describe('IndexedDbAdapter snapshot restore ownership (STORE-6)', () => {
+	const DB = 'test-idb-restore-owner'
+	afterEach(async () => {
+		await deleteFromIndexedDB(DB).catch(() => {})
+	})
+
+	/** One worker shared by two adapters, like a leader tab and a follower relaying to it. */
+	class SharedWorker extends MockWorkerBridge {
+		private opened = false
+		override async send(
+			request: Parameters<MockWorkerBridge['send']>[0],
+		): ReturnType<MockWorkerBridge['send']> {
+			if (request.type === 'open' && this.opened) return { id: request.id, type: 'success' }
+			if (request.type === 'open') this.opened = true
+			if (request.type === 'export') {
+				return { id: request.id, type: 'error', message: 'no export', code: 'EXPORT_NOT_SUPPORTED' }
+			}
+			if (request.type === 'close') return { id: request.id, type: 'success' }
+			return super.send(request)
+		}
+	}
+
+	const insert = (a: IndexedDbAdapter, id: string) =>
+		a.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			[id, id, 0, 1, 1],
+		)
+
+	test('a second adapter on a live worker database never restores over it', async () => {
+		const worker = new SharedWorker()
+		const a = new IndexedDbAdapter({ bridge: worker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		await insert(a, 'one')
+		await a.flushPersistence()
+		await insert(a, 'two')
+		const b = new IndexedDbAdapter({ bridge: worker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		const rows = await b.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+		expect(rows.map((r) => r.id)).toEqual(['one', 'two'])
+	})
+
+	test('a fresh worker database is restored from the JSON dump, and the marker is not dumped', async () => {
+		const first = new IndexedDbAdapter({ bridge: new SharedWorker(), dbName: DB })
+		await first.open(minimalSchema)
+		await insert(first, 'kept')
+		await first.close()
+		const dump = await loadDumpFromIndexedDB<{ tables: Array<{ name: string }> }>(DB)
+		expect(dump?.tables.some((t) => t.name.includes('restored'))).toBe(false)
+
+		const second = new IndexedDbAdapter({ bridge: new SharedWorker(), dbName: DB })
+		await second.open(minimalSchema)
+		const rows = await second.query<{ id: string }>('SELECT id FROM todos')
+		expect(rows.map((r) => r.id)).toEqual(['kept'])
+		await second.close()
+	})
+
+	test('a dump that cannot be restored fails the open instead of serving a partial database', async () => {
+		const first = new IndexedDbAdapter({ bridge: new SharedWorker(), dbName: DB })
+		await first.open(minimalSchema)
+		await insert(first, 'kept')
+		await first.close()
+		const dump = await loadDumpFromIndexedDB<{
+			tables: Array<{ name: string; columns: string[]; rows: Array<Record<string, unknown>> }>
+		}>(DB)
+		const todos = dump?.tables.find((t) => t.name === 'todos')
+		// A row that violates NOT NULL: the restore fails after earlier statements ran.
+		todos?.rows.push({ id: null, title: 'bad' })
+		await persistence.saveDumpToIndexedDB(DB, dump)
+		const second = new IndexedDbAdapter({ bridge: new SharedWorker(), dbName: DB })
+		await expect(second.open(minimalSchema)).rejects.toThrow()
+	})
+})

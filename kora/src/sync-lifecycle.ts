@@ -4,6 +4,7 @@ import { AuthSyncCoordinator } from './auth-sync-coordinator'
 import type { InitializeAppResult } from './initialize-app'
 import { type SyncStatusBridge, createSyncStatusBridge } from './sync-status-bridge'
 import type { KoraConfig } from './types'
+import { wireUnassignedWritesPolicy } from './unassigned-writes'
 
 /** Mutable sync runtime state owned by {@link createApp}. */
 export interface SyncRuntimeState {
@@ -49,6 +50,12 @@ export function wireSyncLifecycleAfterReady(
 	}
 
 	const syncEngine = state.syncEngine
+	wireUnassignedWritesPolicy(
+		config,
+		emitter,
+		() => state.syncEngine,
+		() => state.intentionalDisconnect,
+	)
 	// The backoff resets only after a session has stayed up (streaming) for a while,
 	// and a session that drops sooner keeps backing off (SYNC-8).
 	syncEngine.onStateChange((engineState) => {

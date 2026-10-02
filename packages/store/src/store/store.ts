@@ -5,14 +5,12 @@ import {
 	createVersionVector,
 	expandFieldVersionedOperations,
 	generateUUIDv7,
-	migrationStepsToSQL,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
 	HLCTimestamp,
 	KoraEventEmitter,
-	MigrationStep,
 	Operation,
 	OperationLog,
 	SchemaDefinition,
@@ -26,6 +24,11 @@ import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import {
+	LOG_QUARANTINE_TABLE,
+	type LogIntegrityReport,
+	scanLogIntegrity,
+} from '../log-integrity/log-integrity'
+import {
 	type FieldVersions,
 	effectiveFieldVersion,
 	fieldVersionsForFields,
@@ -34,6 +37,7 @@ import {
 	serializeFieldVersions,
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
+import { runSchemaMigrations } from '../migrations/run-migrations'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -231,19 +235,20 @@ export class Store implements OperationLog {
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
-		// Run schema migrations if needed
-		await this.runMigrationsIfNeeded()
-
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
+		// Every node id this database authors under is registered (RT-38, RT-40).
+		await registerLocalNode(this.adapter, this.nodeId)
+
+		// Log integrity first (W8 step 0): repair rows an earlier release damaged and
+		// quarantine the unrecoverable ones, before anything reads or folds the log.
+		await this.scanLog('quick')
 
 		// (node_id, sequence_number) is unique in the operation log: repair any
 		// duplicates an earlier version wrote, then enforce it with an index (W6).
 		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
-		// Every node id this database authors under is registered (RT-38, RT-40), and the
-		// terminal rejections an earlier release kept only in the app's list become
+		// The terminal rejections an earlier release kept only in the app's list become
 		// durable markers (RT-36).
-		await registerLocalNode(this.adapter, this.nodeId)
 		await seedTerminalRejectionsOnce(this.adapter)
 		if (this.isolation === 'per-tab' && !this.configNodeId) {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
@@ -252,6 +257,16 @@ export class Store implements OperationLog {
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
+
+		// Run schema migrations if needed. Backfills write operations through the local
+		// write path, so the node id and clock must exist first (STORE-13).
+		try {
+			await this.runMigrationsIfNeeded()
+		} catch (error) {
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = null
+			throw error
+		}
 
 		// Initialize sequence manager
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
@@ -301,6 +316,49 @@ export class Store implements OperationLog {
 			this.releaseNodeLock?.()
 			this.releaseNodeLock = null
 		}
+	}
+
+	/**
+	 * Check the operation log (W8 step 0): every row must round-trip through the
+	 * canonical operation serializer. Rows an earlier release damaged in a recoverable
+	 * way (a JSON-encoded timestamp written by a beta.12 backup restore) are repaired;
+	 * unrecoverable rows move to the quarantine table, where no fold reads them. Also
+	 * reports sequence gaps in this database's own nodes (compaction, a lost tail).
+	 *
+	 * The store runs a quick variant (SQL prefilter) on every open. Rebuilding state from
+	 * the log must only run on a `clean` report.
+	 *
+	 * @param options - `repair: false` only reports; `mode: 'quick'` checks only the rows
+	 *   a SQL prefilter flags (default `'full'`: every row)
+	 * @returns The integrity report; emits `store:log-integrity` when rows changed
+	 */
+	async verifyLogIntegrity(options?: {
+		repair?: boolean
+		mode?: 'full' | 'quick'
+	}): Promise<LogIntegrityReport> {
+		this.ensureOpen()
+		return this.scanLog(options?.mode ?? 'full', options?.repair ?? true)
+	}
+
+	private async scanLog(mode: 'full' | 'quick', repair = true): Promise<LogIntegrityReport> {
+		const localNodeIds = (await listLocalNodes(this.adapter)).map((node) => node.nodeId)
+		const report = await scanLogIntegrity(this.adapter, this.schema, {
+			mode,
+			repair,
+			localNodeIds,
+		})
+		if (repair && (report.repaired.length > 0 || report.newlyQuarantined.length > 0)) {
+			this.emitter?.emit({
+				type: 'store:log-integrity',
+				dbName: this.dbName,
+				repaired: report.repaired.length,
+				quarantined: report.newlyQuarantined.length,
+				gaps: report.gaps.length,
+				clean: report.clean,
+				message: `Operation log of "${this.dbName}": ${report.repaired.length} row(s) repaired, ${report.newlyQuarantined.length} row(s) quarantined (${LOG_QUARANTINE_TABLE}).`,
+			})
+		}
+		return report
 	}
 
 	/**
@@ -2014,16 +2072,125 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Restore data from a backup binary.
+	 * Restore data from a backup binary (format version 2, STORE-5).
+	 *
+	 * - `merge: true`: every backup operation is applied through the remote-apply path
+	 *   (deduplicated by id, merged per field), the version vector advances by MAX, and
+	 *   nothing of the exporting device's identity or sync state is imported.
+	 * - Replace (default): the data is replaced by the backup's while this device keeps
+	 *   its node id, local nodes and principal bindings, its own sequence counters never
+	 *   move backwards, and unsynced own writes are kept (see
+	 *   `RestoreOptions.keepUnsyncedWrites`). Then {@link reloadFromDisk} runs.
+	 *
+	 * A version-1 file is refused (`errorCode: 'BACKUP_FORMAT_OUTDATED'`); convert it with
+	 * `convertBackupV1`.
 	 *
 	 * @param data - The backup data
-	 * @param options - Restore options (merge, collections, onProgress)
+	 * @param options - Restore options (merge, collections, keepUnsyncedWrites, onProgress)
+	 * @param internal - `applyOperation`: the app's remote-apply path (defaults to
+	 *   {@link applyRemoteOperation}); `createApp` passes the merge-aware pipeline sync uses
 	 * @returns Result of the restore operation
 	 */
-	async importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult> {
+	async importBackup(
+		data: Uint8Array,
+		options?: RestoreOptions,
+		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
+	): Promise<RestoreResult> {
 		this.ensureOpen()
-		const { restoreBackup: doRestore } = await import('../backup/backup')
-		return doRestore(this.adapter, this.schema, data, options)
+		const started = Date.now()
+		const onProgress = options?.onProgress ?? (() => {})
+		const { BackupFormatError, parseBackup } = await import('../backup/backup')
+		const { restoreMerge, restoreReplace } = await import('../backup/restore')
+		onProgress({ phase: 'verifying', progress: 0, message: 'Verifying backup' })
+		let parsed: Awaited<ReturnType<typeof parseBackup>>
+		try {
+			parsed = await parseBackup(
+				data,
+				options?.collections ? { collections: options.collections } : undefined,
+			)
+		} catch (error) {
+			if (!(error instanceof BackupFormatError)) throw error
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: error.message,
+				errorCode: error.code,
+				duration: Date.now() - started,
+			}
+		}
+		if (parsed.manifest.schemaVersion > this.schema.version) {
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: `The backup was written by schema version ${parsed.manifest.schemaVersion}; this app runs version ${this.schema.version}. Update the app before restoring it.`,
+				errorCode: 'BACKUP_SCHEMA_NEWER',
+				duration: Date.now() - started,
+			}
+		}
+		onProgress({ phase: 'restoring', progress: 0.3, message: 'Restoring' })
+		const host = {
+			adapter: this.adapter,
+			schema: this.schema,
+			applyOperation:
+				internal?.applyOperation ?? ((op: Operation) => this.applyRemoteOperation(op)),
+			listLocalNodes: () => listLocalNodes(this.adapter),
+		}
+		const counts = options?.merge
+			? await restoreMerge(host, parsed, options.collections !== undefined)
+			: await restoreReplace(host, parsed, {
+					collections: options?.collections ?? null,
+					keepUnsyncedWrites: options?.keepUnsyncedWrites ?? true,
+				})
+		await this.reloadFromDisk()
+		onProgress({ phase: 'restoring', progress: 1, message: 'Done' })
+		return {
+			operationsRestored: counts.operationsRestored,
+			recordsRestored: counts.recordsRestored,
+			...(options?.merge ? {} : { unsyncedWritesKept: counts.unsyncedWritesKept }),
+			success: true,
+			duration: Date.now() - started,
+		}
+	}
+
+	/**
+	 * Re-read this store's state from the database after it changed underneath it (a
+	 * backup restore): the node id, version vector and own sequence counter, the clock
+	 * (advanced past every timestamp in the log), and a fresh causal tracker. Every live
+	 * query re-runs. The local node registry and terminal rejections are always read
+	 * from the database, so they need no reload.
+	 */
+	async reloadFromDisk(): Promise<void> {
+		this.ensureOpen()
+		let nodeId = this.nodeId
+		if (!this.configNodeId && this.isolation !== 'per-tab') {
+			const rows = await this.adapter.query<MetaRow>(
+				"SELECT value FROM _kora_meta WHERE key = 'node_id'",
+			)
+			nodeId = rows[0]?.value ?? this.nodeId
+		}
+		await this.rebindToNode(nodeId)
+		const newest = await this.loadNewestLogTimestamp()
+		if (newest && this.clock) {
+			this.clock.advanceTo({ ...newest, nodeId: this.nodeId })
+		}
+		for (const collection of Object.keys(this.schema.collections)) {
+			this.subscriptionManager.invalidate(collection)
+		}
+	}
+
+	/** The greatest HLC timestamp in the operation log (canonical strings sort by HLC). */
+	private async loadNewestLogTimestamp(): Promise<HLCTimestamp | null> {
+		let newest: string | null = null
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ t: string | null }>(
+				`SELECT MAX(timestamp) AS t FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			const value = rows[0]?.t ?? null
+			if (value !== null && (newest === null || value > newest)) newest = value
+		}
+		return newest === null ? null : HybridLogicalClock.deserialize(newest)
 	}
 
 	/**
@@ -2068,108 +2235,25 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Check the stored schema version and run any pending migrations.
-	 * Migrations are applied in version order within a transaction.
+	 * Run pending schema migrations (STORE-13, NEW-STORE-1): one transaction per version
+	 * (DDL, backfills, `schema_version`); backfills write operations through the local
+	 * write path so they sync, unless declared `localOnly`.
 	 */
 	private async runMigrationsIfNeeded(): Promise<void> {
-		const storedVersion = await this.getStoredSchemaVersion()
-		const targetVersion = this.schema.version
-
-		if (storedVersion >= targetVersion) {
-			// Already up to date (or first run with version 1)
-			if (storedVersion === 0) {
-				// First open — store the initial version
-				await this.adapter.execute(
-					"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-					[String(targetVersion)],
-				)
-			}
-			return
-		}
-
-		// Run each migration in order from storedVersion+1 to targetVersion
-		const migrations = this.schema.migrations ?? {}
-		for (let v = storedVersion + 1; v <= targetVersion; v++) {
-			const migration = migrations[v]
-			if (!migration) continue
-
-			// Generate SQL from structural steps
-			const sqlStatements = migrationStepsToSQL(migration.steps)
-
-			// Execute structural changes individually, tolerating "duplicate column" errors
-			// because generateSQL already emits --kora:safe-alter ALTER TABLE statements
-			// for the current schema's columns (run via generateFullDDL in adapter.open()).
-			for (const sql of sqlStatements) {
-				try {
-					await this.adapter.execute(sql)
-				} catch (e) {
-					const msg = (e as Error).message || ''
-					if (!msg.includes('duplicate column name')) {
-						throw e
-					}
-					// Column already exists (added by safe-alter in generateSQL) — safe to skip
-				}
-			}
-
-			// Run backfills in a transaction
-			const backfillSteps = migration.steps.filter(
-				(s): s is Extract<MigrationStep, { type: 'backfill' }> => s.type === 'backfill',
-			)
-			for (const step of backfillSteps) {
-				await this.runBackfill(step.collection, step.transform)
-			}
-		}
-
-		// Update stored schema version
-		await this.adapter.execute(
-			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-			[String(targetVersion)],
-		)
-	}
-
-	/**
-	 * Get the stored schema version from _kora_meta. Returns 0 if not set.
-	 */
-	private async getStoredSchemaVersion(): Promise<number> {
-		const rows = await this.adapter.query<MetaRow>(
-			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
-		)
-		return rows[0] ? Number(rows[0].value) : 0
-	}
-
-	/**
-	 * Run a backfill transform on all records in a collection.
-	 * Reads all rows, applies the transform, and updates changed fields.
-	 */
-	private async runBackfill(
-		collection: string,
-		transform: (record: Record<string, unknown>) => Record<string, unknown>,
-	): Promise<void> {
-		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
-		)
-
-		await this.adapter.transaction(async (tx) => {
-			for (const row of rows) {
-				const updates = transform(row as Record<string, unknown>)
-				const fields = Object.keys(updates)
-				if (fields.length === 0) continue
-
-				const setClauses = fields.map((f) => `${quoteIdent(f)} = ?`).join(', ')
-				const values = fields.map((f) => {
-					const val = updates[f]
-					// Serialize booleans to 0/1 for SQLite
-					if (typeof val === 'boolean') return val ? 1 : 0
-					// Serialize arrays/objects to JSON
-					if (Array.isArray(val) || (typeof val === 'object' && val !== null)) {
-						return JSON.stringify(val)
-					}
-					return val
-				})
-				values.push(row.id)
-
-				await tx.execute(`UPDATE ${quoteIdent(collection)} SET ${setClauses} WHERE id = ?`, values)
-			}
+		const clock = this.clock
+		if (!clock) throw new StoreNotOpenError()
+		await runSchemaMigrations({
+			adapter: this.adapter,
+			schema: this.schema,
+			env: {
+				schema: this.schema,
+				clock,
+				nodeId: this.nodeId,
+				relationEnforcer: null,
+				...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			},
+			causalTracker: this.causalTracker,
+			onOperation: (operation) => this.publishLocalOperation(operation.collection, operation),
 		})
 	}
 

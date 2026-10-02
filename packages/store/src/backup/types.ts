@@ -2,11 +2,14 @@
  * Manifest embedded in every backup file.
  */
 export interface BackupManifest {
-	/** Backup format version */
-	version: 1
+	/** Backup format version (2 since STORE-5; version 1 files need `convertBackupV1`) */
+	version: number
 	/** When the backup was created (epoch ms) */
 	createdAt: number
-	/** Node ID of the originating device */
+	/**
+	 * Node ID of the originating device. Informational only: a restore never copies a
+	 * device identity into the importing database.
+	 */
 	nodeId: string
 	/** Schema version at backup time */
 	schemaVersion: number
@@ -16,6 +19,10 @@ export interface BackupManifest {
 	collections: string[]
 	/** Whether materialized records are included */
 	includesRecords: boolean
+	/** Whether the records include deleted rows (tombstones). False for converted v1 files. */
+	includesTombstones?: boolean
+	/** Set on a file produced by `convertBackupV1`. */
+	convertedFrom?: number
 	/** SHA-256 hex checksum of all content sections */
 	checksum: string
 }
@@ -42,6 +49,13 @@ export interface RestoreResult {
 	success: boolean
 	/** Error message if failed */
 	error?: string
+	/** Error code if failed (`BACKUP_FORMAT_OUTDATED`, `BACKUP_CHECKSUM_MISMATCH`, ...) */
+	errorCode?: string
+	/**
+	 * Replace mode: this device's own writes the sync server had not acknowledged,
+	 * re-applied on top of the restored data (see `RestoreOptions.keepUnsyncedWrites`).
+	 */
+	unsyncedWritesKept?: number
 	/** Duration in ms */
 	duration: number
 }
@@ -67,8 +81,19 @@ export interface RestoreOptions {
 	/** Progress callback */
 	onProgress?: (progress: BackupProgress) => void
 	/**
-	 * If true, merge operations with existing data (replay through applyRemoteOperation).
-	 * If false, clear and replace all data (default: false).
+	 * If true, merge the backup into the existing data: every operation is applied like
+	 * one received from sync (deduplicated by id, merged per field), the version vector
+	 * advances by MAX, and nothing of the exporting device's identity or sync state is
+	 * imported. If false (default), replace the local data with the backup's.
 	 */
 	merge?: boolean
+	/**
+	 * Replace mode only: keep this device's own writes that the sync server has not
+	 * acknowledged, re-applied on top of the backup, so a restore never discards writes
+	 * that exist nowhere else. Writes of a node the server has accepted are always kept
+	 * (they are in flight). Default: true for `store.importBackup`; `app.importBackup`
+	 * defaults it to whether sync is configured, so a local-only app gets an exact
+	 * replace.
+	 */
+	keepUnsyncedWrites?: boolean
 }
