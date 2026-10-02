@@ -1426,6 +1426,17 @@ export class KoraSyncServer {
 		return this.sessions.size
 	}
 
+	/**
+	 * Node ids whose operations win `merge('server-authoritative')` fields in the fold
+	 * (W7): the store's own node id, which authors every server-originated operation
+	 * (side effects, constraint corrections, route writes), plus any extras the store
+	 * was configured with. Advertised to clients in the handshake so they fold with the
+	 * same authority as the server.
+	 */
+	get authoritativeNodeIds(): string[] {
+		return this.store.getAuthoritativeNodeIds?.() ?? [this.store.getNodeId()]
+	}
+
 	// --- Private ---
 
 	/**

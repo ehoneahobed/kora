@@ -6,9 +6,9 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 
-// Re-exported so existing server-internal imports keep working; the implementation
-// now lives in @korajs/core so the client apply pipeline and the server materialize
-// records through the exact same atomic-aware fold.
+// Legacy comparison only (W7 Stage B2): the server stores no longer materialize with
+// the pre-fold replay. Every store merges operations into a per-record fold state
+// (see ./record-fold.ts). Kept so tests can compare the old and new results.
 export { replayOperationsForRecord }
 export type { ReplayOperation }
 

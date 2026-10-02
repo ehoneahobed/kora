@@ -68,6 +68,14 @@ async function projectCandidateRecord(
 		return null
 	}
 
+	// W7: the record exactly as the fold would materialize it after the operation (a
+	// write that loses last-write-wins, an array delta, a counter...). Null when the
+	// record would not be live, which nothing can violate.
+	if (store.previewOperation) {
+		const preview = await store.previewOperation(op)
+		return preview ? { ...preview, id: op.recordId } : null
+	}
+
 	const existing = await store.findRecord(op.collection, op.recordId)
 	const base = existing ? { ...existing } : {}
 

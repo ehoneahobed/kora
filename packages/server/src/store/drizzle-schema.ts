@@ -39,6 +39,9 @@ export const operations = sqliteTable(
 		// before the column existed. The partial unique index NODE_SEQ_UNIQUE_INDEX covers
 		// only flagged rows (RT-37; see server-store.ts).
 		seqUnique: integer('seq_unique').notNull().default(0),
+		// Content-hash version of `id` (CORE-1). Null for v1 rows and rows written before
+		// the column existed.
+		hashVersion: integer('hash_version'),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_node_seq').on(table.nodeId, table.sequenceNumber),

@@ -1,4 +1,5 @@
 import type {
+	FoldState,
 	HLCTimestamp,
 	HybridLogicalClock,
 	Operation,
@@ -512,6 +513,28 @@ export interface ServerStore extends SyncStore {
 	 * operation carries them so a receiver resolves every field on its own.
 	 */
 	getRecordFieldVersions?(collection: string, recordId: string): Promise<RecordFieldVersions | null>
+	/**
+	 * The record's fold state (W7): the per-field CRDT state its row is projected from.
+	 * Null when the record has no operations or its collection is not materialized. A
+	 * scope-entry operation carries it (filtered to the fields the receiver may see) so
+	 * the receiver merges richtext, counter and resolver fields exactly (RT-29).
+	 */
+	getRecordFoldState?(collection: string, recordId: string): Promise<FoldState | null>
+	/** Every stored operation of one record, in delivery (commit) order. */
+	getRecordOperations?(collection: string, recordId: string): Promise<Operation[]>
+	/**
+	 * The record's row as it would be after merging `op` into its fold state, with
+	 * nothing written: the candidate a Tier-2 constraint check judges at ingest. Null
+	 * when the record would not be live (deleted, or never inserted).
+	 */
+	previewOperation?(op: Operation): Promise<MaterializedRecord | null>
+	/**
+	 * Node ids whose operations win `merge('server-authoritative')` fields in the fold:
+	 * this store's own node id (every server-originated operation is authored by it)
+	 * plus any configured extras. The sync server advertises them in the handshake so
+	 * clients fold with the same authority.
+	 */
+	getAuthoritativeNodeIds?(): string[]
 	/** Close the store and release resources */
 	close(): Promise<void>
 

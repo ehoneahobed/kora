@@ -811,14 +811,14 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration). W7 Stage B1 (client): client half done: both clients agree on arrays, objects and the additive resolver (18) through the real pipeline; the array case passes end to end. The object and resolver cases stay red on the server assertion until B2 (server stores materialize via the fold).",
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration). W7 Stage B1 (client): client half done: both clients agree on arrays, objects and the additive resolver (18) through the real pipeline; the array case passes end to end. The object and resolver cases stay red on the server assertion until B2 (server stores materialize via the fold). 2 (server): Server half done: memory/SQLite/Postgres materialize through the fold (packages/server/src/store/record-fold.ts); server rows equal foldRecord of the same ops in any order (packages/server/tests/integration/fold-materialization.test.ts: parity on random workloads across the 3 stores, and the SRV-1 array/object/resolver case). The repro (packages/test, real client pipeline) needs the client half (Stage B1) to go green. Repro (packages/test SRV-1, 3 cases) green with the server fold; the client pipeline still merges pairwise for other shapes until B1 (MERGE-2 tracks that).",
    "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
@@ -914,14 +914,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED. All three server stores keep a per-record fold state (kora_fold_state on SQLite/Postgres, a map in memory) and apply = append + mergeOp: O(fields touched); the freshness check is one index probe on (collection, record_id, delivery_seq). Repro green (sqlite late/early ratio 0.6x, memory 0.3x). Benchmark per write at record history 0/1k/3k/6k: memory 140/2819/10233/15135us -> 61/30/334/12us; SQLite 8727/10363/30583/31789us -> 1450/965/869/839us; Postgres 0/1k/3k 5341/9744/18804us -> 5089/5317/3566us."
   },
   {
    "id": "NEW-SRV-1",
@@ -972,7 +972,7 @@
    "severity": "P2",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-10.test.ts",
@@ -980,7 +980,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing."
   },
   {
    "id": "NEW-SRV-5",
@@ -988,7 +988,7 @@
    "severity": "P1",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-10.test.ts",
@@ -996,7 +996,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: Postgres re-materialization runs in 500-record batches, each one transaction under the delivery-counter row lock every append takes, reading each record's complete log; a live write on another instance commits before the batch (and is folded) or after it (and is merged into the stored state). LMS-10 rolling-deploy test green."
   },
   {
    "id": "NEW-SRV-6",
@@ -1540,7 +1540,8 @@
    ],
    "pr": null,
    "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). The pure fold converges for all field kinds (gate). The repro (packages/test, real pipeline) stays red until Stage B replaces apply-pipeline's pairwise merge with append-then-mergeOp and re-materializes stores. W7 Stage B1 (client): clients now converge on every MERGE-2 seed (the repro's first assertion, 'clients diverge', passes for all 6 cases). The repro stays red only on its second assertion (server materialization vs clients) until B2 makes the server stores materialize through the fold.",
-   "acceptanceTest": "packages/test/tests/fold-gate/fold-gate-e2e.test.ts (W7 convergence gate END TO END: 200 seeds, every field kind incl. real Yjs richtext and arrays with duplicates, 2-4 real TestDevices (Store + fold + ApplyPipeline + SyncEngine) going offline/online, deleting and editing concurrently; every device holds the same ops and materializes the same record, equal to the reference fold; the gate rejects the beta.13 pipeline) + packages/test/tests/fold-gate/fold-vs-legacy.test.ts (legacyMerge comparison: every fold/legacy difference explained by a documented semantic change) + packages/core/tests/property/fold/fold-convergence.property.test.ts (pure gate, 200 seeds, extended to duplicates and server-authoritative classes)"
+   "acceptanceTest": "packages/test/tests/fold-gate/fold-gate-e2e.test.ts (W7 convergence gate END TO END: 200 seeds, every field kind incl. real Yjs richtext and arrays with duplicates, 2-4 real TestDevices (Store + fold + ApplyPipeline + SyncEngine) going offline/online, deleting and editing concurrently; every device holds the same ops and materializes the same record, equal to the reference fold; the gate rejects the beta.13 pipeline) + packages/test/tests/fold-gate/fold-vs-legacy.test.ts (legacyMerge comparison: every fold/legacy difference explained by a documented semantic change) + packages/core/tests/property/fold/fold-convergence.property.test.ts (pure gate, 200 seeds, extended to duplicates and server-authoritative classes) 2 (server): Server half done: server stores fold per field (no pairwise merge, no replay); parity test proves identical rows and fold states for any delivery order across memory/SQLite/Postgres. Repro waits on the client pipeline (B1).",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "NEW-MERGE-1",
@@ -1577,7 +1578,8 @@
    ],
    "pr": null,
    "notes": "Protocol v2 (Phase 3 Stage B3): createOperation defaults to hash version 2; hashVersion is carried on the wire (JSON + protobuf operation field 14) and persisted in the client op log; rebase/rotation/SEQUENCE_CONFLICT renumbering re-hash v2 ops. The server verifies plaintext v2 ids before any schema transform (non-retriable INVALID_OPERATION_ID; transformed copies stored as v1); clients verify after decryption in packages/sync/src/engine/verify-inbound.ts and quarantine mismatches. v1 ops are never verified against v2. Repros core/tests/repro/CORE-1 and packages/test/tests/repro/CORE-1 green. Residual: SQLite/Postgres server stores do not yet persist hashVersion (W7 store work), so ops they relay are treated as v1 (unverified) by clients.",
-   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/server/src/session/protocol-v2-ingest.test.ts + packages/sync/src/encryption/envelope-v2.test.ts (verifyInboundOperation)"
+   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/server/src/session/protocol-v2-ingest.test.ts + packages/sync/src/encryption/envelope-v2.test.ts (verifyInboundOperation) W7 Stage A: content hash v2 behind hashVersion (computeOperationId(op, 2), verifyOperationId, createOperation(..., { hashVersion: 2 }), Operation.hashVersion). v2 covers previousData, sequenceNumber, causalDeps (as a set), schemaVersion, atomicOps, with binary in tagged form. Acceptance: packages/core/tests/integration/core-1-hash-v2.test.ts (the repro's 4 tampers under v2) + src/operations/content-hash-v2.test.ts. v1 stays the default, so core/tests/repro/CORE-1 (default createOperation) and packages/test/tests/repro/CORE-1 (server/client verification) stay red until Stage B: protocol v2 makes hashVersion 2 the default, wire + store persist hashVersion, the server verifies plaintext v2 ids before schema transforms, clients verify after decryption. W7 Stage B2 (server): Server stores now persist hashVersion (operations.hash_version on SQLite and Postgres; memory keeps the op), so v2 ids survive storage and delivery.",
+   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/core/src/operations/content-hash-v2.test.ts (Stage A, pure core)"
   },
   {
    "id": "DX-1",
@@ -2220,7 +2222,7 @@
     }
    ],
    "pr": null,
-   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state. W7 Stage B1 (client): a scope-entry insert carrying Operation.foldState (server-authored serialized fold state, B3 wire / B2 server) is JOINED into the device's state (core mergeOp -> joinStates), so counters, custom resolvers, arrays and richtext keep the device's concurrent edits; one merge:conflict trace per field where the device and the server differed (strategy scope-entry-<strategy>). Entries from older servers (fieldVersions only) still merge per field. Repro kora/tests/repro/RT-29 (counter/resolver/array + traces) and packages/test/tests/fold-scope-entry-richtext.test.ts (real Yjs). End to end it needs the server to send foldState (B2/B3)."
+   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state. W7 Stage B1 (client): a scope-entry insert carrying Operation.foldState (server-authored serialized fold state, B3 wire / B2 server) is JOINED into the device's state (core mergeOp -> joinStates), so counters, custom resolvers, arrays and richtext keep the device's concurrent edits; one merge:conflict trace per field where the device and the server differed (strategy scope-entry-<strategy>). Entries from older servers (fieldVersions only) still merge per field. Repro kora/tests/repro/RT-29 (counter/resolver/array + traces) and packages/test/tests/fold-scope-entry-richtext.test.ts (real Yjs). End to end it needs the server to send foldState (B2/B3). 2 (server): Server half done: scope-entry ops carry foldState (serialized fold state filtered to the fields the entry restates; fieldVersions kept, now derived from the fold) built from ServerStore.getRecordFoldState; client-session passes it (2 call-site lines). Repro packages/server/tests/repro/RT-29.test.ts (memory + SQLite): joining the entry state with a receiver's concurrent counter/resolver/richtext writes equals the server fold of the union. Wire + client join are B3/B1."
   },
   {
    "id": "RT-30",

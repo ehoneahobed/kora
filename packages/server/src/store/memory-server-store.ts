@@ -1,19 +1,25 @@
 import type {
+	FoldState,
 	HLCTimestamp,
 	Operation,
 	RecordFieldVersions,
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, generateUUIDv7, replayFieldVersionsForRecord } from '@korajs/core'
+import { HybridLogicalClock, generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import { validateFieldName } from './materialization'
 import {
-	deserializeFieldValue,
-	replayOperationsForRecord,
-	serializeFieldValue,
-	validateFieldName,
-} from './materialization'
+	EMPTY_FOLD_SCHEMA,
+	REFOLD_REQUIRED,
+	type ServerFoldOptions,
+	foldFieldVersions,
+	mergeIntoFoldState,
+	projectFoldState,
+	refoldRecord,
+	serverFoldOptions,
+} from './record-fold'
 import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
@@ -56,6 +62,20 @@ function sequenceKey(nodeId: string, sequenceNumber: number): string {
 	return `${nodeId}\u0000${String(sequenceNumber)}`
 }
 
+/** Key of a record in {@link MemoryServerStore}'s per-record indexes. */
+function recordKey(collection: string, recordId: string): string {
+	return `${collection}\u0000${recordId}`
+}
+
+/** Options for {@link MemoryServerStore}. */
+export interface MemoryServerStoreOptions {
+	/**
+	 * Node ids, besides this store's own, whose operations win
+	 * `merge('server-authoritative')` fields (for example other server instances).
+	 */
+	authoritativeNodeIds?: string[]
+}
+
 /**
  * In-memory server store for testing and quick prototyping.
  * Not suitable for production — data does not survive process restart.
@@ -96,6 +116,12 @@ export class MemoryServerStore implements ServerStore {
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
+	/** Fold state per materialized record (W7): rows are projected from it. */
+	private readonly foldStates = new Map<string, FoldState>()
+	/** Every operation of a record, in store (delivery) order. */
+	private readonly recordOps = new Map<string, Operation[]>()
+	private readonly authoritativeNodeIds: string[]
+	private readonly foldOptions: ServerFoldOptions
 
 	private closed = false
 	/**
@@ -105,8 +131,14 @@ export class MemoryServerStore implements ServerStore {
 	 */
 	private sequenceEpoch = 0
 
-	constructor(nodeId?: string) {
+	constructor(nodeId?: string, options: MemoryServerStoreOptions = {}) {
 		this.nodeId = nodeId ?? generateUUIDv7()
+		this.authoritativeNodeIds = [...new Set([this.nodeId, ...(options.authoritativeNodeIds ?? [])])]
+		this.foldOptions = serverFoldOptions(this.authoritativeNodeIds)
+	}
+
+	getAuthoritativeNodeIds(): string[] {
+		return [...this.authoritativeNodeIds]
 	}
 
 	getVersionVector(): VersionVector {
@@ -180,6 +212,7 @@ export class MemoryServerStore implements ServerStore {
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
 		this.addSequenceHolder(op)
+		this.addRecordOp(op)
 
 		// Assign the next delivery sequence in commit order (single-process: no race).
 		this.deliverySeqCounter += 1
@@ -193,7 +226,7 @@ export class MemoryServerStore implements ServerStore {
 
 		// Dual-write: update materialized records if schema is set
 		if (materialized) {
-			this.rebuildMaterializedRecord(op.collection, op.recordId)
+			this.mergeIntoRecord(op)
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
 			this.scopeSnapshots.set(op.id, {
@@ -301,8 +334,7 @@ export class MemoryServerStore implements ServerStore {
 	): Promise<HLCTimestamp | null> {
 		this.assertOpen()
 		let latest: HLCTimestamp | null = null
-		for (const op of this.operations) {
-			if (op.collection !== collection || op.recordId !== recordId) continue
+		for (const op of this.recordOps.get(recordKey(collection, recordId)) ?? []) {
 			if (latest === null || HybridLogicalClock.compare(op.timestamp, latest) > 0) {
 				latest = op.timestamp
 			}
@@ -315,10 +347,55 @@ export class MemoryServerStore implements ServerStore {
 		recordId: string,
 	): Promise<RecordFieldVersions | null> {
 		this.assertOpen()
-		const ops = this.operations
-			.filter((op) => op.collection === collection && op.recordId === recordId)
-			.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
-		return replayFieldVersionsForRecord(ops)
+		return foldFieldVersions(this.readFoldState(collection, recordId))
+	}
+
+	async getRecordFoldState(collection: string, recordId: string): Promise<FoldState | null> {
+		this.assertOpen()
+		return this.readFoldState(collection, recordId)
+	}
+
+	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
+		this.assertOpen()
+		return [...(this.recordOps.get(recordKey(collection, recordId)) ?? [])]
+	}
+
+	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
+		this.assertOpen()
+		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
+		const current = this.readFoldState(op.collection, op.recordId)
+		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
+		const state =
+			merged === REFOLD_REQUIRED
+				? refoldRecord(
+						[...(this.recordOps.get(recordKey(op.collection, op.recordId)) ?? []), op],
+						schema,
+						this.foldOptions,
+					)
+				: merged
+		const row = state ? projectFoldState(state, this.foldOptions) : null
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
+	}
+
+	/**
+	 * The record's fold state: the stored one for a materialized collection, else
+	 * folded from the record's operations (a collection outside the schema).
+	 */
+	private readFoldState(collection: string, recordId: string): FoldState | null {
+		const key = recordKey(collection, recordId)
+		const stored = this.foldStates.get(key)
+		if (stored) return stored
+		const ops = this.recordOps.get(key)
+		if (!ops || ops.length === 0) return null
+		return refoldRecord(ops, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
+	}
+
+	private addRecordOp(op: Operation): void {
+		const key = recordKey(op.collection, op.recordId)
+		const list = this.recordOps.get(key)
+		if (list) list.push(op)
+		else this.recordOps.set(key, [op])
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -358,31 +435,16 @@ export class MemoryServerStore implements ServerStore {
 	private backfillScopeSnapshots(): void {
 		const schema = this.schema
 		if (!schema) return
-		const byRecord = new Map<string, Operation[]>()
-		for (const op of this.operations) {
-			if (!schema.collections[op.collection]) continue
-			const key = `${op.collection}:::${op.recordId}`
-			let list = byRecord.get(key)
-			if (!list) {
-				list = []
-				byRecord.set(key, list)
-			}
-			list.push(op)
-		}
-		for (const ops of byRecord.values()) {
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (!first || !schema.collections[first.collection]) continue
 			if (ops.every((op) => this.scopeSnapshots.has(op.id))) continue
-			const first = ops[0] as Operation
 			const replayed = replayScopeSnapshots(
 				schema,
 				first.collection,
 				first.recordId,
-				ops.map((op) => ({
-					id: op.id,
-					type: op.type,
-					data: op.data,
-					atomicOps: op.atomicOps ?? null,
-					timestamp: op.timestamp,
-				})),
+				ops,
+				this.foldOptions,
 			)
 			for (const [id, snapshot] of replayed) {
 				if (!this.scopeSnapshots.has(id)) this.scopeSnapshots.set(id, snapshot)
@@ -476,7 +538,7 @@ export class MemoryServerStore implements ServerStore {
 		const result = new Map<string, MaterializedRecord>()
 		for (const id of ids) {
 			const record = records?.get(id)
-			if (record) result.set(id, record)
+			if (record) result.set(id, { ...record })
 		}
 		return result
 	}
@@ -553,6 +615,8 @@ export class MemoryServerStore implements ServerStore {
 			}
 			if ('_created_at' in r) clean._created_at = r._created_at
 			if ('_updated_at' in r) clean._updated_at = r._updated_at
+			// A soft-deleted row (returned only with includeDeleted) says so.
+			if (r._deleted === 1) clean._deleted = 1
 			return clean
 		})
 	}
@@ -675,16 +739,11 @@ export class MemoryServerStore implements ServerStore {
 			stored._deleted = undefined
 			return stored
 		}
-		const recordOps = this.operations
-			.filter((o) => o.collection === collection && o.recordId === recordId)
-			.sort((a, b) => compareTimestamps(a, b))
+		const recordOps = this.recordOps.get(recordKey(collection, recordId)) ?? []
 		if (recordOps.length === 0) return null
-		const lastKnown = replayOperationsForRecord(
-			recordOps
-				.filter((o) => o.type !== 'delete')
-				.map((o) => ({ type: o.type, data: o.data, atomicOps: o.atomicOps ?? null })),
-		)
-		return { ...(lastKnown ?? {}), id: recordId }
+		const state = refoldRecord(recordOps, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
+		const lastKnown = state ? projectFoldState(state, this.foldOptions) : null
+		return { ...(lastKnown?.values ?? {}), id: recordId }
 	}
 
 	/**
@@ -699,6 +758,8 @@ export class MemoryServerStore implements ServerStore {
 		this.resolutions.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
+		this.foldStates.clear()
+		this.recordOps.clear()
 		this.nodeOwners.clear()
 		this.scopeSnapshots.clear()
 		this.blobOwners.clear()
@@ -733,6 +794,9 @@ export class MemoryServerStore implements ServerStore {
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
 		this.scopeSnapshots.clear()
+		this.foldStates.clear()
+		this.recordOps.clear()
+		for (const collectionMap of this.materializedRecords.values()) collectionMap.clear()
 
 		for (const [nid, seq] of versionVector) {
 			this.versionVector.set(nid, seq)
@@ -742,15 +806,13 @@ export class MemoryServerStore implements ServerStore {
 			this.operations.push(op)
 			this.operationIndex.set(op.id, op)
 			this.addSequenceHolder(op)
+			this.addRecordOp(op)
 			// Re-assign delivery sequence in backup order (the order ops were shipped).
 			this.deliverySeqCounter += 1
 			this.deliverySeqByOpId.set(op.id, this.deliverySeqCounter)
-
-			// Update materialized records if schema is set
-			if (this.schema?.collections[op.collection]) {
-				this.rebuildMaterializedRecord(op.collection, op.recordId)
-			}
 		}
+		// Re-materialize every restored record through the fold, once per record.
+		this.backfillAllCollections()
 		// Resolutions past a node's restored log describe operations decided after the
 		// backup: advertising them would hide stored operations the restore lost (RT-45),
 		// so they go and the devices re-upload that tail.
@@ -776,88 +838,68 @@ export class MemoryServerStore implements ServerStore {
 	// Materialization internals
 	// ---------------------------------------------------------------------------
 
-	private rebuildMaterializedRecord(collection: string, recordId: string): void {
-		const collectionDef = this.schema?.collections[collection]
-		if (!collectionDef) return
+	/**
+	 * Merge one just-appended operation into its record's fold state and project the
+	 * row: O(fields the operation touches), independent of the record's history
+	 * (SRV-7). Falls back to a full re-fold only when the stored state cannot take the
+	 * operation (a field's fold kind changed with the schema).
+	 */
+	private mergeIntoRecord(op: Operation): void {
+		const schema = this.schema
+		if (!schema?.collections[op.collection]) return
+		const key = recordKey(op.collection, op.recordId)
+		const merged = mergeIntoFoldState(
+			this.foldStates.get(key) ?? null,
+			[op],
+			schema,
+			this.foldOptions,
+		)
+		const state =
+			merged === REFOLD_REQUIRED
+				? refoldRecord(this.recordOps.get(key) ?? [op], schema, this.foldOptions)
+				: merged
+		this.writeRecord(op.collection, op.recordId, state)
+	}
 
-		// Get or create collection map
+	/** Persist a record's fold state and project it onto its materialized row. */
+	private writeRecord(collection: string, recordId: string, state: FoldState | null): void {
+		const key = recordKey(collection, recordId)
 		let collectionMap = this.materializedRecords.get(collection)
 		if (!collectionMap) {
 			collectionMap = new Map()
 			this.materializedRecords.set(collection, collectionMap)
 		}
-
-		// Get all ops for this record in HLC total order (wallTime, logical, nodeId)
-		// so atomic composition and LWW converge like the merge engine.
-		const recordOps = this.operations
-			.filter((op) => op.collection === collection && op.recordId === recordId)
-			.sort((a, b) => {
-				if (a.timestamp.wallTime !== b.timestamp.wallTime)
-					return a.timestamp.wallTime - b.timestamp.wallTime
-				if (a.timestamp.logical !== b.timestamp.logical)
-					return a.timestamp.logical - b.timestamp.logical
-				return a.timestamp.nodeId < b.timestamp.nodeId
-					? -1
-					: a.timestamp.nodeId > b.timestamp.nodeId
-						? 1
-						: 0
-			})
-
-		const parsedOps = recordOps.map((op) => ({
-			type: op.type,
-			data: op.data,
-			atomicOps: op.atomicOps ?? null,
-			previousData: op.previousData ?? null,
-		}))
-		const recordData = replayOperationsForRecord(parsedOps)
-
-		if (recordData) {
-			const createdAt =
-				recordOps.length > 0 ? (recordOps[0] as Operation).timestamp.wallTime : Date.now()
-			const updatedAt =
-				recordOps.length > 0
-					? (recordOps[recordOps.length - 1] as Operation).timestamp.wallTime
-					: Date.now()
-
-			const materialized: MaterializedRecord = {
-				id: recordId,
-				...recordData,
-				_created_at: createdAt,
-				_updated_at: updatedAt,
-				_deleted: 0,
-			}
-			collectionMap.set(recordId, materialized)
-		} else {
-			// Record was deleted
+		if (state) this.foldStates.set(key, state)
+		else this.foldStates.delete(key)
+		const row = state ? projectFoldState(state, this.foldOptions) : null
+		if (!row) {
+			// Never inserted (an update with no merged insert): no visible row. A row an
+			// earlier materialization produced for it is hidden, never resurrected.
 			const existing = collectionMap.get(recordId)
-			if (existing) {
-				existing._deleted = 1
-				existing._updated_at = Date.now()
-			} else {
-				collectionMap.set(recordId, {
-					id: recordId,
-					_deleted: 1,
-					_created_at: Date.now(),
-					_updated_at: Date.now(),
-				})
-			}
+			if (existing) existing._deleted = 1
+			return
 		}
+		collectionMap.set(recordId, {
+			id: recordId,
+			...row.values,
+			_created_at: row.createdAt,
+			_updated_at: row.updatedAt,
+			_deleted: row.deleted ? 1 : 0,
+		})
 	}
 
+	/** Re-fold every record of every materialized collection (schema set, backup restore). */
 	private backfillAllCollections(): void {
-		if (!this.schema) return
-
-		// Get all unique (collection, recordId) pairs
-		const recordKeys = new Set<string>()
-		for (const op of this.operations) {
-			if (this.schema.collections[op.collection]) {
-				recordKeys.add(`${op.collection}:::${op.recordId}`)
-			}
-		}
-
-		for (const key of recordKeys) {
-			const [collection, recordId] = key.split(':::') as [string, string]
-			this.rebuildMaterializedRecord(collection, recordId)
+		const schema = this.schema
+		if (!schema) return
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (!first || !schema.collections[first.collection]) continue
+			this.writeRecord(
+				first.collection,
+				first.recordId,
+				refoldRecord(ops, schema, this.foldOptions),
+			)
 		}
 	}
 
@@ -866,45 +908,15 @@ export class MemoryServerStore implements ServerStore {
 	// ---------------------------------------------------------------------------
 
 	private materializeFromOps(collection: string): MaterializedRecord[] {
-		const collectionOps = this.operations
-			.filter((op) => op.collection === collection)
-			.sort((a, b) => {
-				if (a.timestamp.wallTime !== b.timestamp.wallTime)
-					return a.timestamp.wallTime - b.timestamp.wallTime
-				if (a.timestamp.logical !== b.timestamp.logical)
-					return a.timestamp.logical - b.timestamp.logical
-				return a.sequenceNumber - b.sequenceNumber
-			})
-
-		const records = new Map<string, Record<string, unknown>>()
-		const deleted = new Set<string>()
-
-		for (const op of collectionOps) {
-			switch (op.type) {
-				case 'insert':
-					if (op.data) {
-						records.set(op.recordId, { id: op.recordId, ...op.data })
-						deleted.delete(op.recordId)
-					}
-					break
-				case 'update':
-					if (op.data) {
-						const existing = records.get(op.recordId) ?? { id: op.recordId }
-						records.set(op.recordId, { ...existing, ...op.data })
-						deleted.delete(op.recordId)
-					}
-					break
-				case 'delete':
-					deleted.add(op.recordId)
-					break
-			}
+		const records: MaterializedRecord[] = []
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (!first || first.collection !== collection) continue
+			const state = refoldRecord(ops, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
+			const row = state ? projectFoldState(state, this.foldOptions) : null
+			if (row && !row.deleted) records.push({ id: first.recordId, ...row.values })
 		}
-
-		for (const id of deleted) {
-			records.delete(id)
-		}
-
-		return Array.from(records.values()) as MaterializedRecord[]
+		return records
 	}
 
 	// ---------------------------------------------------------------------------
@@ -933,15 +945,4 @@ export class MemoryServerStore implements ServerStore {
 			)
 		}
 	}
-}
-
-function compareTimestamps(a: Operation, b: Operation): number {
-	if (a.timestamp.wallTime !== b.timestamp.wallTime)
-		return a.timestamp.wallTime - b.timestamp.wallTime
-	if (a.timestamp.logical !== b.timestamp.logical) return a.timestamp.logical - b.timestamp.logical
-	return a.timestamp.nodeId < b.timestamp.nodeId
-		? -1
-		: a.timestamp.nodeId > b.timestamp.nodeId
-			? 1
-			: 0
 }
