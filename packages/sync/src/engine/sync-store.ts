@@ -69,6 +69,14 @@ export interface SyncStore {
 	readRecordFields?(collection: string, recordId: string): Promise<Record<string, unknown> | null>
 
 	/**
+	 * Optional: whether the local schema defines this collection. Lets the engine tell a
+	 * merge-decided `'skipped'` (the record is settled, nothing to keep) from a skip
+	 * because the collection is unknown (the operation must be quarantined and replayed
+	 * after a schema upgrade). Without it every `'skipped'` result is quarantined.
+	 */
+	hasCollection?(collection: string): boolean
+
+	/**
 	 * Remove a record from this client's materialized authorization view without
 	 * writing a domain delete to the replicated operation log.
 	 */

@@ -113,9 +113,12 @@ describe('LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQL
 		net.auth.set('s', { userId: 's', scopes: { courses: { id: { $in: [a.id] } } } })
 		const s = await net.device('s', 's', (engine: SyncEngine) => {
 			const e = engine as unknown as {
-				filterAllowedForSync: (ops: Operation[]) => Promise<Operation[]>
+				filterAllowedForSync?: (ops: Operation[]) => Promise<Operation[]>
 			}
-			const orig = e.filterAllowedForSync.bind(engine)
+			// Once the split shipped (SYNC-2) the engine has no inbound filter to bypass.
+			const original = e.filterAllowedForSync
+			if (!original) return
+			const orig = original.bind(engine)
 			e.filterAllowedForSync = async (ops) =>
 				new Error().stack?.includes('handleOperationBatch') ? ops : orig(ops)
 		})

@@ -113,7 +113,7 @@ describe('ENC-2: decrypt failure handled as a transport close', () => {
 
 		await appA.close()
 		await appB.close()
-		await server.close()
+		await server.stop()
 		rmSync(dir, { recursive: true, force: true })
 	}, 20000)
 })

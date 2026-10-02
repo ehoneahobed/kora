@@ -190,7 +190,9 @@ export function createApp<const S extends SchemaInput>(
 				unsubscribeLocalOperations = null
 			}
 			if (syncState.syncEngine) {
-				await syncState.syncEngine.stop()
+				// destroy(), not stop(): every engine timer is cleared even when the session
+				// already ended, and nothing the engine scheduled runs after close (SYNC-10).
+				await syncState.syncEngine.destroy()
 				syncState.syncEngine = null
 			}
 			queryStoreCache.clear()

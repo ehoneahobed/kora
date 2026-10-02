@@ -4,6 +4,7 @@
 // === Types ===
 export type {
 	QueueStorage,
+	QuarantinedOperation,
 	RejectedOperation,
 	RejectedOperationStorage,
 	SyncStatePersistence,

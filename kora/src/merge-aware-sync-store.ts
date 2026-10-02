@@ -57,6 +57,11 @@ export class MergeAwareSyncStore implements SyncStore {
 		return snapshot ? snapshot.record : null
 	}
 
+	/** Whether the local schema defines this collection (unknown ones are quarantined). */
+	hasCollection(collection: string): boolean {
+		return this.store.getSchema().collections[collection] !== undefined
+	}
+
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
 		return this.pipeline.applyRemote(op)
 	}

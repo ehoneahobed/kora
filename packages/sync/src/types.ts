@@ -247,6 +247,50 @@ export interface SyncStatePersistence {
 	 */
 	loadNodeToken?(): Promise<string | null>
 	saveNodeToken?(token: string): Promise<void>
+	/**
+	 * The contiguous acknowledged prefix of this device's own operations (W3): the highest
+	 * sequence s such that every own operation with sequence <= s is stored on the server,
+	 * terminally rejected and recorded, or was never upload-eligible. Keyed by node id, so
+	 * a rotated node starts from 0. Returns null when nothing was ever recorded under this
+	 * contract (a device upgrading from a release that persisted a max, not a prefix): the
+	 * engine then re-uploads the device's own history once, from 0; the server dedups by id.
+	 * Optional: without it the engine trusts the own entry of the last acked server vector.
+	 */
+	loadOwnAckedThrough?(nodeId: string): Promise<number | null>
+	saveOwnAckedThrough?(nodeId: string, sequence: number): Promise<void>
+	/**
+	 * Durable inbound quarantine (W4): delivered operations the client deliberately did
+	 * not apply (unknown collection, transform unavailable, deferred or rejected apply,
+	 * far-future timestamp, undecryptable payload). When `watermark` is given, the rows and
+	 * the delivery watermark advance MUST be written in one transaction, so the watermark
+	 * never passes an operation that is neither applied nor recorded here. Optional: a
+	 * persistence layer without it keeps the old behaviour (the watermark stalls instead).
+	 */
+	saveQuarantine?(
+		entries: QuarantinedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void>
+	/** Every quarantined operation, oldest delivery first. */
+	loadQuarantine?(): Promise<QuarantinedOperation[]>
+	/** Remove quarantined operations once applied (replay) or reconciled. */
+	removeQuarantine?(operationIds: string[]): Promise<void>
+}
+
+/**
+ * A delivered operation the client deliberately did not apply, kept durably so it is
+ * never silently lost and can be replayed (on start, after a schema upgrade, or on demand).
+ */
+export interface QuarantinedOperation {
+	/** The operation as delivered (still encrypted when decryption failed). */
+	operation: Operation
+	/** Delivery sequence of the batch that carried it, or null for a legacy batch. */
+	deliverySequence: number | null
+	/** Machine-readable reason (for example `APPLY_SKIPPED`, `REMOTE_CLOCK_DRIFT`). */
+	code: string
+	/** Human-readable explanation. */
+	message: string
+	/** Wall-clock time (ms) it was quarantined. Display only. */
+	quarantinedAt: number
 }
 
 /**
@@ -262,6 +306,15 @@ export interface QueueStorage {
 	dequeue(ids: string[]): Promise<void>
 	/** Return number of operations in storage */
 	count(): Promise<number>
+	/**
+	 * Record that these queued operations were put on the wire at least once. A sent
+	 * operation may already be stored on the server (its ack can be lost), so it must
+	 * never be re-stamped by a clock rebase (W3 step 4). Optional: without it the flag
+	 * lives for the engine's lifetime only.
+	 */
+	markSent?(ops: Operation[]): Promise<void>
+	/** Ids of queued operations recorded by {@link markSent}. */
+	loadSentIds?(): Promise<string[]>
 }
 
 /**

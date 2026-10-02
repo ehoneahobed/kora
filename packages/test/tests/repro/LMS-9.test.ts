@@ -17,19 +17,29 @@ const schema = defineSchema({
 	},
 })
 
-/** The LMS #9 patch, verbatim, applied to one engine instance. */
+/**
+ * The LMS #9 patch, verbatim, applied to one engine instance. After the SYNC-1/SYNC-2
+ * split the engine's upload predicate is `matchesUplinkScope` and the `hasDirectionalScopes`
+ * flag is gone; the flag was true for every server-scoped session (the server sends
+ * `acceptedUplinkScopes` for legacy `scopes` too), so it is emulated as "the server
+ * accepted an uplink scope". The patch's harm on OUTBOUND stays pinned below.
+ */
 function lmsPatch(engine: SyncEngine) {
 	const e = engine as unknown as {
-		matchesScopeAndSubsets: (o: Operation, f?: Record<string, unknown> | null) => boolean
-		hasDirectionalScopes: boolean
+		matchesScopeAndSubsets?: (o: Operation, f?: Record<string, unknown> | null) => boolean
+		matchesUplinkScope?: (o: Operation, f?: Record<string, unknown> | null) => boolean
+		hasDirectionalScopes?: boolean
 		activeUplinkScope: Record<string, Record<string, unknown>> | undefined
 		getActiveQuerySubsets: () => never
 	}
-	e.matchesScopeAndSubsets = (op, fullRecord) => {
-		if (e.hasDirectionalScopes) return true
+	const directional = () => e.hasDirectionalScopes ?? e.activeUplinkScope !== undefined
+	const patched = (op: Operation, fullRecord?: Record<string, unknown> | null) => {
+		if (directional()) return true
 		if (!operationMatchesScope(op, e.activeUplinkScope, fullRecord)) return false
 		return operationMatchesQuerySubsets(op, e.getActiveQuerySubsets(), fullRecord)
 	}
+	if (e.matchesUplinkScope) e.matchesUplinkScope = patched
+	else e.matchesScopeAndSubsets = patched
 }
 
 /**
@@ -40,9 +50,12 @@ function lmsPatch(engine: SyncEngine) {
  */
 function splitPatch(engine: SyncEngine) {
 	const e = engine as unknown as {
-		filterAllowedForSync: (ops: Operation[]) => Promise<Operation[]>
+		filterAllowedForSync?: (ops: Operation[]) => Promise<Operation[]>
 	}
-	const orig = e.filterAllowedForSync.bind(engine)
+	// Once the split shipped (SYNC-2) the engine has no inbound filter to bypass.
+	const original = e.filterAllowedForSync
+	if (!original) return
+	const orig = original.bind(engine)
 	e.filterAllowedForSync = async (ops) =>
 		new Error().stack?.includes('handleOperationBatch') ? ops : orig(ops)
 }
@@ -260,9 +273,13 @@ describe('LMS-9 patch side effects on OUTBOUND', () => {
 
 	test('hasDirectionalScopes is true for a legacy `scopes` session', async () => {
 		const { ta } = await taDevice(false)
-		expect((ta.engine as unknown as { hasDirectionalScopes: boolean }).hasDirectionalScopes).toBe(
-			true,
-		)
+		// The flag was removed with the SYNC-2 split (nothing filters inbound any more);
+		// the structural fact it pinned is that a legacy session carries an uplink scope.
+		const e = ta.engine as unknown as {
+			hasDirectionalScopes?: boolean
+			activeUplinkScope?: Record<string, unknown>
+		}
+		expect(e.hasDirectionalScopes ?? e.activeUplinkScope !== undefined).toBe(true)
 	})
 
 	test('[fails today] an edit to a downlink-visible but non-uploadable record must not be silently kept local-only', async () => {

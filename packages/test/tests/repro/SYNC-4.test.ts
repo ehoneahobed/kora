@@ -34,7 +34,9 @@ describe('SYNC-4: handshake-delta ops treated as acked before the server acks', 
 			// Offline write, delivered via the handshake delta on first connect.
 			const flaky = await a.collection('todos').insert({ title: 'flaky' })
 			await a.sync()
-			expect(flakyAttempts).toBe(1) // server rejected it retriably
+			// The server rejected it retriably at least once (a fixed client may already have
+			// retried it within this sync, so the count is not pinned to exactly 1).
+			expect(flakyAttempts).toBeGreaterThanOrEqual(1)
 
 			// A later write accepted while streaming raises the server vector past it.
 			const later = await a.collection('todos').insert({ title: 'later' })

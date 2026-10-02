@@ -146,7 +146,7 @@ export async function saveDeltaCursor(
  * The `_kora_meta` key for a view's delivery watermark. The default (empty) signature
  * uses the bare key for backward compatibility; other views suffix the signature.
  */
-function deliveryWatermarkKey(signature: string): string {
+export function deliveryWatermarkKey(signature: string): string {
 	return signature === ''
 		? DELIVERY_WATERMARK_META_KEY
 		: `${DELIVERY_WATERMARK_META_KEY}:${signature}`

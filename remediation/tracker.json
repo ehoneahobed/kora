@@ -521,7 +521,7 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-2.test.ts"
@@ -536,7 +536,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Inbound delivery batches are no longer filtered client-side (W4 step 1): the engine applies what the server delivered; anything deliberately not applied goes to the durable quarantine."
   },
   {
    "id": "SYNC-3",
@@ -544,14 +544,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Durable inbound quarantine _kora_unapplied_ops written in the same transaction as the watermark advance; unknown collection, transform-to-null, rejected/deferred apply are quarantined and replayed on start (after a schema upgrade)."
   },
   {
    "id": "SYNC-4",
@@ -559,14 +559,14 @@
    "severity": "P1",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Every sent batch (delta and streaming) is tracked by message id; an ack resolves only its batch; no early dequeue of delta ops; contiguous own-op prefix (localAckedThrough) replaces the max-merged ack."
   },
   {
    "id": "SYNC-5",
@@ -574,14 +574,14 @@
    "severity": "P2",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Engine side: every engine-initiated end of session (message failure, transport error, server error, rejected handshake, stop while already disconnected) calls transport.disconnect(). Transport-side generation guard remains with the network engineer."
   },
   {
    "id": "SYNC-6",
@@ -589,14 +589,14 @@
    "severity": "P3",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "OutboundQueue.acknowledge releases ids from the seen set."
   },
   {
    "id": "SYNC-7",
@@ -604,14 +604,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Client part: far-future delivered ops (and RemoteClockDriftError/InvalidTimestampError) are quarantined, never applied or adopted into the HLC; later ops flow. Server ingest validation of every path is the server half."
   },
   {
    "id": "SYNC-8",
@@ -649,14 +649,14 @@
    "severity": "P3",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "stopInternal clears every timer before any early return; SyncEngine.destroy() used by app.close(); async send continuations check the batch belongs to the live session and catch send errors."
   },
   {
    "id": "SYNC-11",
@@ -664,14 +664,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-11.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Each handshake reports the watermark of the REQUESTED view; an accepted scope that differs switches to that view (switchDeliveryView), and NEW-SYNC-1 makes the server restart from 0 harmless. Handshake syncScope stays the configured scope: echoing the accepted scope would pin $in narrowing and hide later grant widening. Residual (server): it restarts the stream from 0 on every reconnect when accepted != requested; it should compare against the scope it last resolved for the node."
   },
   {
    "id": "NEW-SYNC-1",
@@ -679,14 +679,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-SYNC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Duplicate delivery batches still run initial-sync bookkeeping (isFinal completes the handshake); a batch straddling the watermark is applied whole and advances to its max."
   },
   {
    "id": "NEW-SYNC-2",
@@ -709,7 +709,7 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-8.test.ts",
@@ -721,7 +721,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed by the SYNC-2 change: no client-side inbound filtering of delivered ops, so an id-scoped downlink insert is applied."
   },
   {
    "id": "NEW-SYNC-4",
@@ -764,14 +764,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "ENC-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Per-op decrypt inside the apply path; a failure quarantines the op (DECRYPT_FAILED) with sync:apply-failed, the session is kept."
   },
   {
    "id": "ENC-3",
@@ -2150,11 +2150,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "Write a repro when the workstream starts.",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-28.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan §6). Investigate in Phase 2."
+   "notes": "Pending count is the queue plus the unscanned own tail, from the client's own acks (never min with the stale handshake vector); the engine notifies status bridges on ack/streaming so waitForSettled resolves promptly. Repro kora/tests/repro/RT-28.test.ts (both cases failed on the baseline engine)."
   },
   {
    "id": "RT-29",

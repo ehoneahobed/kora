@@ -2,7 +2,12 @@ import type { Operation, VersionVector } from '@korajs/core'
 import { mergeVersionVectors } from '@korajs/store'
 import type { Store } from '@korajs/store'
 import { decodeDeltaCursor, encodeDeltaCursor, operationMatchesScope } from '@korajs/sync'
-import type { DeltaCursor, SyncScopeMap, SyncStatePersistence } from '@korajs/sync'
+import type {
+	DeltaCursor,
+	QuarantinedOperation,
+	SyncScopeMap,
+	SyncStatePersistence,
+} from '@korajs/sync'
 
 /**
  * Persists and queries sync acknowledgment state via the local Store.
@@ -65,5 +70,29 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 
 	async saveNodeToken(token: string): Promise<void> {
 		await this.store.saveNodeToken(token)
+	}
+
+	loadOwnAckedThrough(nodeId: string): Promise<number | null> {
+		return this.store.loadOwnAckedThrough(nodeId)
+	}
+
+	async saveOwnAckedThrough(nodeId: string, sequence: number): Promise<void> {
+		await this.store.saveOwnAckedThrough(nodeId, sequence)
+	}
+
+	/** Quarantine rows and the watermark advance commit in one store transaction (W4). */
+	async saveQuarantine(
+		entries: QuarantinedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void> {
+		await this.store.saveInboundQuarantine(entries, watermark)
+	}
+
+	loadQuarantine(): Promise<QuarantinedOperation[]> {
+		return this.store.loadInboundQuarantine()
+	}
+
+	async removeQuarantine(operationIds: string[]): Promise<void> {
+		await this.store.removeInboundQuarantine(operationIds)
 	}
 }
