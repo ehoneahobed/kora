@@ -36,6 +36,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:opfs-unavailable',
 	'store:durability-lost',
 	'store:db-name-collision',
+	'store:storage-blocked',
+	'store:storage-migrated',
 	'replay:completed',
 	'query:subscribed',
 	'query:invalidated',

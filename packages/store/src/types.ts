@@ -31,6 +31,8 @@ export interface StorageOpenState {
 	mode: 'opfs' | 'indexeddb' | 'memory' | 'native' | 'unknown'
 	/** Present when a primary storage mode degraded during open. */
 	fallbackReason?: StorageFallbackReason
+	/** OPFS pool that owns the database file (one pool per database), when known. */
+	poolName?: string
 }
 
 /**

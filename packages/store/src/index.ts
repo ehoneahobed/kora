@@ -31,13 +31,19 @@ export type {
 // === Errors ===
 export {
 	AdapterError,
+	BridgeTerminatedError,
+	LeaderUnresponsiveError,
 	NoLeaderError,
 	OptimisticLockError,
 	PersistenceError,
 	QueryError,
 	RecordNotFoundError,
+	RequestAbortedError,
+	StorageBackendMismatchError,
 	StorageDurabilityError,
+	StorageInUseError,
 	StoreNotOpenError,
+	UnsyncedDataError,
 	WorkerInitError,
 	WorkerTimeoutError,
 } from './errors'

@@ -56,7 +56,9 @@ describe('LMS-7 follower liveness', () => {
 		)
 		// Let the first probe (t=PROBE_MS) succeed, then hang the leader.
 		await new Promise((r) => setTimeout(r, PROBE_MS * 2 + 100))
-		expect(leader.pings()).toBe(1)
+		// The leader was alive and answering before it hung (the follower's watchdog
+		// may have pinged more than once by now; it keeps probing while requests wait).
+		expect(leader.pings()).toBeGreaterThanOrEqual(1)
 		leader.hang()
 
 		const { error } = await pending

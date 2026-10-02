@@ -264,6 +264,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `store durability lost (${event.reason} during ${event.phase}), writes refused`
 		case 'store:db-name-collision':
 			return `store db-name collision ${event.dbName}`
+		case 'store:storage-blocked':
+			return `store ${event.resource} ${event.state === 'waiting' ? 'blocked by another holder' : 'unblocked'}`
+		case 'store:storage-migrated':
+			return `store migrated ${event.from} → ${event.to}`
 		case 'replay:completed':
 			return `replay ${event.operationsApplied} ops`
 	}

@@ -233,6 +233,35 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * BLOCKING while `state` is `waiting`. Another holder (a previous storage
+			 * owner still shutting down, or a tab running an older Kora that does not
+			 * take part in the ownership protocol) has the database's OPFS storage, so
+			 * the open waits instead of falling back to non-durable storage. Apps
+			 * should show a "close other tabs of this app" state; `resolved` follows
+			 * when the wait ends.
+			 */
+			type: 'store:storage-blocked'
+			dbName: string
+			/** `pool`: the database's own pool; `legacy-pool`: the pre-W8a shared pool. */
+			resource: 'pool' | 'legacy-pool'
+			state: 'waiting' | 'resolved'
+			waitedMs?: number
+			message: string
+	  }
+	| {
+			/**
+			 * Informational. The database's data was moved between storage locations
+			 * explicitly (the pre-W8a shared OPFS pool to the database's own pool, or
+			 * between OPFS and IndexedDB), so there is still exactly one copy.
+			 */
+			type: 'store:storage-migrated'
+			dbName: string
+			from: 'legacy-opfs-pool' | 'opfs' | 'indexeddb'
+			to: 'opfs' | 'indexeddb'
+			message: string
+	  }
+	| {
+			/**
 			 * Another runtime on this origin was already using this database name, so
 			 * this runtime attached to it as a follower and now SHARES that one
 			 * database. That is intended for multiple tabs of the SAME app; it is a bug

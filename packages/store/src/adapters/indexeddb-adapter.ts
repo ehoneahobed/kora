@@ -1,7 +1,7 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
-import { AdapterError, PersistenceError } from '../errors'
+import { AdapterError, PersistenceError, StorageBackendMismatchError } from '../errors'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
+import { type DatabaseDump, exportDump, restoreDumpStatements } from './database-dump'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
@@ -13,14 +13,7 @@ import {
 	saveDumpToIndexedDB,
 	saveToIndexedDB,
 } from './sqlite-wasm-persistence'
-
-interface DatabaseDump {
-	tables: Array<{
-		name: string
-		columns: string[]
-		rows: Array<Record<string, unknown>>
-	}>
-}
+import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
 
 /**
  * Options for creating an IndexedDbAdapter.
@@ -76,10 +69,15 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private readonly emitter: KoraEventEmitter | undefined
 	private readonly scheduler: IndexedDbPersistenceScheduler
 	private storageOpenState: StorageOpenState | null = null
+	private readonly options: IndexedDbAdapterOptions
+	/** True in browsers (a real worker), where the backend choice is recorded. */
+	private readonly usesRealWorker: boolean
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
+		this.options = options
 		this.dbName = options.dbName ?? 'kora-db'
 		this.emitter = options.emitter
+		this.usesRealWorker = !options.bridge && options.workerUrl !== undefined
 		this.inner = new SqliteWasmAdapter({
 			bridge: options.bridge,
 			workerUrl: options.workerUrl,
@@ -87,8 +85,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 			workerResponseTimeoutMs: options.workerResponseTimeoutMs,
 			// The inner SQLite database is in memory by design: this adapter makes it
 			// durable by persisting snapshots to IndexedDB, so the inner adapter must
-			// not refuse writes as non-durable.
+			// not refuse writes as non-durable, and must never touch OPFS (which would
+			// create a second, disjoint copy of the data).
 			allowNonDurable: true,
+			storage: 'memory',
+			skipBackendRecord: true,
 		})
 		this.scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: options.persistenceDebounceMs,
@@ -98,20 +99,94 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
+		// The backend choice is recorded per database. If OPFS holds the
+		// authoritative copy, carry it over explicitly before this session starts,
+		// so OPFS and IndexedDB never hold two disjoint copies (NEW-STORE-5).
+		const tracksBackend = this.usesRealWorker && isManifestAvailable()
+		const recorded = tracksBackend ? await readManifestRecord(this.dbName).catch(() => null) : null
+		const carried = recorded?.backend === 'opfs' ? await this.readOpfsCopy(schema) : null
+
 		await this.inner.open(schema)
 		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
+
+		if (carried) {
+			await this.applyDump(carried)
+			await this.scheduler.flushNow()
+			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' })
+			this.emitter?.emit({
+				type: 'store:storage-migrated',
+				dbName: this.dbName,
+				from: 'opfs',
+				to: 'indexeddb',
+				message: `Database "${this.dbName}" moved from OPFS into IndexedDB because OPFS is not usable in this session.`,
+			})
+			return
+		}
 
 		const persisted = await loadFromIndexedDB(this.dbName)
 		if (!persisted) {
 			await this.restoreFromDumpFallback()
-			return
+		} else {
+			try {
+				await this.inner.importDatabase(persisted)
+			} catch {
+				await this.restoreFromDumpFallback()
+			}
 		}
+		if (tracksBackend) {
+			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' }).catch((error: unknown) =>
+				console.warn(`[kora] Could not record the storage backend of "${this.dbName}":`, error),
+			)
+		}
+	}
 
+	/**
+	 * Read the OPFS copy of this database through a short-lived SQLite WASM
+	 * adapter (as leader, or as a follower of a tab that has it open). Refuses
+	 * loudly when OPFS cannot be read, instead of starting an empty copy.
+	 */
+	private async readOpfsCopy(schema: SchemaDefinition): Promise<DatabaseDump> {
+		const reader = new SqliteWasmAdapter({
+			dbName: this.dbName,
+			workerUrl: this.options.workerUrl,
+			workerResponseTimeoutMs: this.options.workerResponseTimeoutMs,
+			skipBackendRecord: true,
+			releaseOnFreeze: false,
+		})
 		try {
-			await this.inner.importDatabase(persisted)
-		} catch {
-			await this.restoreFromDumpFallback()
+			await reader.open(schema)
+			if (reader.getStorageOpenState()?.persistent !== true) {
+				throw new StorageBackendMismatchError(
+					this.dbName,
+					'OPFS',
+					'IndexedDB',
+					`OPFS reported ${reader.getStorageOpenState()?.fallbackReason ?? 'no durable storage'}`,
+				)
+			}
+			let dump: DatabaseDump = { tables: [] }
+			await reader.transaction(async (tx) => {
+				dump = await exportDump((sql, params) => tx.query(sql, params))
+			})
+			return dump
+		} catch (error) {
+			if (error instanceof StorageBackendMismatchError) throw error
+			throw new StorageBackendMismatchError(
+				this.dbName,
+				'OPFS',
+				'IndexedDB',
+				error instanceof Error ? error.message : String(error),
+			)
+		} finally {
+			await reader.close().catch(() => undefined)
 		}
+	}
+
+	private async applyDump(dump: DatabaseDump): Promise<void> {
+		await this.inner.transaction(async (tx) => {
+			for (const statement of restoreDumpStatements(dump)) {
+				await tx.execute(statement.sql, statement.params)
+			}
+		})
 	}
 
 	async close(): Promise<void> {
@@ -190,68 +265,14 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private async restoreFromDumpFallback(): Promise<void> {
 		const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
 		if (!dump) return
-
-		for (const table of dump.tables) {
-			const name = ensureSafeIdentifier(table.name)
-			await this.inner.execute(`DELETE FROM ${quoteIdent(name)}`)
-
-			if (table.rows.length === 0) continue
-
-			for (const row of table.rows) {
-				const columns = table.columns.filter((column) =>
-					Object.prototype.hasOwnProperty.call(row, column),
-				)
-				if (columns.length === 0) continue
-
-				const placeholders = columns.map(() => '?').join(', ')
-				const quotedColumns = columns
-					.map((column) => quoteIdent(ensureSafeIdentifier(column)))
-					.join(', ')
-				const values = columns.map((column) => row[column])
-
-				await this.inner.execute(
-					`INSERT INTO ${quoteIdent(name)} (${quotedColumns}) VALUES (${placeholders})`,
-					values,
-				)
-			}
+		for (const statement of restoreDumpStatements(dump)) {
+			await this.inner.execute(statement.sql, statement.params)
 		}
 	}
 
 	private async exportDump(): Promise<DatabaseDump> {
-		const tableRows = await this.inner.query<{ name: string }>(
-			"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-		)
-
-		const tables: DatabaseDump['tables'] = []
-		for (const tableRow of tableRows) {
-			const tableName = ensureSafeIdentifier(tableRow.name)
-			const columns = await this.inner.query<{ name: string }>(
-				`PRAGMA table_info(${quoteIdent(tableName)})`,
-			)
-			const columnNames = columns.map((column) => column.name)
-			const rows = await this.inner.query<Record<string, unknown>>(
-				`SELECT * FROM ${quoteIdent(tableName)}`,
-			)
-
-			tables.push({
-				name: tableName,
-				columns: columnNames,
-				rows,
-			})
-		}
-
-		return { tables }
+		return exportDump((sql, params) => this.inner.query(sql, params))
 	}
-}
-
-function ensureSafeIdentifier(identifier: string): string {
-	if (!/^[a-zA-Z0-9_]+$/.test(identifier)) {
-		throw new PersistenceError(`Unsafe SQL identifier: ${identifier}`, {
-			code: 'UNSAFE_IDENTIFIER',
-			identifier,
-		})
-	}
-	return identifier
 }
 
 function isUnsupportedWorkerExport(error: unknown): boolean {

@@ -3,123 +3,37 @@
  * Reusable SQLite WASM core, decoupled from any specific worker global.
  *
  * The dedicated worker ({@link file://./sqlite-wasm-worker.ts}) wires one core to
- * `self.onmessage`/`self.postMessage`.
- *
- * The WASM module and the OPFS SyncAccessHandle pool are cached at module scope
- * and shared across every core in the same worker: the pool holds
- * multiple database files keyed by filename, so installing it once and opening
- * each database within it avoids the single-writer conflict that installing the
- * pool twice in one scope would cause.
+ * `self.onmessage`/`self.postMessage`. Each worker serves exactly one database
+ * and owns that database's OPFS SyncAccessHandle pool (one pool per database,
+ * W8a). Pool ownership, the pool Web Lock and the beta.12 legacy-pool migration
+ * live in {@link file://./opfs-pool-ownership.ts}.
  *
  * This file cannot be unit-tested in Node (no WASM/OPFS); it is exercised through
- * the browser E2E suite.
+ * the real-browser suite.
  */
 
-import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
+import { opfsPoolLockName, opfsPoolNameFor, opfsPoolPath } from './opfs-names'
+import {
+	type BlockingReporter,
+	type OpfsPool,
+	PoolUnavailableError,
+	type Sqlite3Api,
+	type SqliteDb,
+	ensurePoolCapacity,
+	holdExclusiveLock,
+	installPool,
+	migrateFromLegacyPool,
+	opfsSahSupported,
+	pausePool,
+} from './opfs-pool-ownership'
+import type { WorkerRequest, WorkerResponse, WorkerStatusEvent } from './sqlite-wasm-channel'
 
-interface SqliteDb {
-	exec(opts: {
-		sql: string
-		bind?: unknown[]
-		returnValue?: string
-		rowMode?: string
-		callback?: (row: Record<string, unknown>) => void
-	}): void
-	close(): void
-	deserialize?: (data: Uint8Array) => void
-}
+/** Minimum gap between progress heartbeats sent from inside a long statement. */
+const PROGRESS_HEARTBEAT_MS = 500
+/** SQLite VM instructions between progress-handler callbacks. */
+const PROGRESS_HANDLER_OPS = 20_000
 
-interface OpfsPool {
-	OpfsSAHPoolDb: new (filename: string) => SqliteDb
-	/** Number of files currently stored in the pool (each occupies one slot). */
-	getFileCount?: () => number
-	/** Grow the pool to at least `min` slots; existing files are untouched. */
-	reserveMinimumCapacity?: (min: number) => Promise<number>
-}
-
-interface Sqlite3Api {
-	oo1: { DB: new (opts: { filename: string }) => SqliteDb }
-	installOpfsSAHPoolVfs?: (opts: { name: string }) => Promise<OpfsPool>
-	capi?: { sqlite3_deserialize?: unknown }
-}
-
-/** OPFS SAH pool name. Shared across all databases on the origin (the pool holds
- * multiple db files keyed by filename), so it must NOT be namespaced per database
- * or existing persisted data would be orphaned. */
-const OPFS_POOL_NAME = 'kora-opfs'
-
-/**
- * Free slots kept beyond the database being opened. Every open needs one slot for
- * the database file and one transient slot for its rollback journal during each
- * write transaction; the headroom covers other databases' journals in the pool.
- */
-const OPFS_POOL_HEADROOM = 2
-
-/**
- * Make sure the shared pool has room for the database about to be opened (and its
- * journal) before opening it. Without this, the 6th per-user database on an
- * origin exhausts the default 6-slot pool and every database in it, including
- * already-open ones, fails to commit (NEW-STORE-7). Slots are empty pre-allocated
- * files, so reserving them is cheap; files are never evicted.
- */
-async function ensurePoolCapacity(pool: OpfsPool): Promise<void> {
-	if (
-		typeof pool.getFileCount !== 'function' ||
-		typeof pool.reserveMinimumCapacity !== 'function'
-	) {
-		return
-	}
-	await pool.reserveMinimumCapacity(pool.getFileCount() + 2 + OPFS_POOL_HEADROOM)
-}
-
-/** Headless browsers and some profiles hang on OPFS VFS install; fall back to memory. */
-const OPFS_INIT_TIMEOUT_MS = 10_000
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined
-	try {
-		return await Promise.race([
-			promise,
-			new Promise<T>((_, reject) => {
-				timer = setTimeout(
-					() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
-					timeoutMs,
-				)
-			}),
-		])
-	} finally {
-		if (timer !== undefined) clearTimeout(timer)
-	}
-}
-
-function opfsDatabaseFilename(dbName: string): string {
-	const base = dbName.replace(/[^a-zA-Z0-9._-]/g, '_')
-	return base.endsWith('.db') ? base : `${base}.db`
-}
-
-/**
- * Classify why the OPFS SyncAccessHandle pool could not be installed, so the
- * fallback to in-memory is explainable rather than silent.
- */
-function classifyOpfsFailure(error: unknown): 'lock-conflict' | 'timeout' | 'unsupported' {
-	const message = error instanceof Error ? error.message : String(error)
-	if (/timed out|timeout/i.test(message)) {
-		return 'timeout'
-	}
-	if (
-		/lock|already|in use|in-use|NoModificationAllowed|acquire|SyncAccessHandle|being created/i.test(
-			message,
-		)
-	) {
-		return 'lock-conflict'
-	}
-	return 'unsupported'
-}
-
-// Scope-global caches shared by every core in this worker.
 let sqlite3Promise: Promise<Sqlite3Api> | null = null
-let opfsPoolPromise: Promise<OpfsPool | null> | null = null
-let opfsFallbackReason: 'lock-conflict' | 'timeout' | 'unsupported' | undefined
 
 async function loadSqlite3(): Promise<Sqlite3Api> {
 	const sqlite3InitModule = (await import('@sqlite.org/sqlite-wasm')).default
@@ -138,7 +52,20 @@ async function loadSqlite3(): Promise<Sqlite3Api> {
 	const initFn = sqlite3InitModule as unknown as (
 		opts?: Record<string, unknown>,
 	) => Promise<unknown>
-	return (await withTimeout(initFn(initOptions), 60_000, 'SQLite3 module init')) as Sqlite3Api
+	let timer: ReturnType<typeof setTimeout> | undefined
+	try {
+		return (await Promise.race([
+			initFn(initOptions),
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error('SQLite3 module init timed out after 60000ms')),
+					60_000,
+				)
+			}),
+		])) as Sqlite3Api
+	} finally {
+		if (timer !== undefined) clearTimeout(timer)
+	}
 }
 
 function getSqlite3(): Promise<Sqlite3Api> {
@@ -148,28 +75,15 @@ function getSqlite3(): Promise<Sqlite3Api> {
 	return sqlite3Promise
 }
 
-async function installOpfsPool(sqlite3: Sqlite3Api): Promise<OpfsPool | null> {
-	if (!sqlite3.installOpfsSAHPoolVfs) {
-		opfsFallbackReason = 'unsupported'
-		return null
-	}
-	try {
-		return await withTimeout(
-			sqlite3.installOpfsSAHPoolVfs({ name: OPFS_POOL_NAME }),
-			OPFS_INIT_TIMEOUT_MS,
-			'OPFS VFS install',
-		)
-	} catch (error) {
-		opfsFallbackReason = classifyOpfsFailure(error)
-		return null
-	}
-}
-
-function getOpfsPool(sqlite3: Sqlite3Api): Promise<OpfsPool | null> {
-	if (!opfsPoolPromise) {
-		opfsPoolPromise = installOpfsPool(sqlite3)
-	}
-	return opfsPoolPromise
+/** Options for {@link createSqliteWasmCore}. */
+export interface SqliteWasmCoreOptions {
+	/** Posts unsolicited status (blocking state) to the tab that owns this worker. */
+	postEvent?: (event: WorkerStatusEvent) => void
+	/**
+	 * Called from inside long-running statements (sqlite progress handler) so the
+	 * worker can keep announcing liveness to follower tabs while it is busy.
+	 */
+	onProgress?: () => void
 }
 
 /** Handle to a single database, dispatching the worker protocol for it. */
@@ -182,51 +96,211 @@ export interface SqliteWasmCore {
  * each request; the caller routes it back through the dedicated worker's
  * `postMessage`.
  */
-export function createSqliteWasmCore(): SqliteWasmCore {
+export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): SqliteWasmCore {
 	let db: SqliteDb | null = null
 	let sqlite3Api: Sqlite3Api | null = null
 	let persistent = false
+	let fallbackReason: 'timeout' | 'unsupported' | 'lock-conflict' | undefined
+	let pool: OpfsPool | null = null
+	let poolName: string | null = null
+	let releasePoolLock: (() => void) | null = null
+	let openInfo: { created: boolean; migratedFromLegacy: boolean } = {
+		created: false,
+		migratedFromLegacy: false,
+	}
+	let lastProgressBeat = 0
+
+	function reporterFor(resource: 'pool' | 'legacy-pool', name: string): BlockingReporter {
+		return {
+			blocked: () => options.postEvent?.({ kind: 'storage-blocked', resource, poolName: name }),
+			unblocked: (waitedMs) =>
+				options.postEvent?.({ kind: 'storage-unblocked', resource, poolName: name, waitedMs }),
+		}
+	}
+
+	/** Close the database and give the pool back: handles first, then the lock. */
+	async function releaseStorage(mode: 'pause' | 'remove'): Promise<void> {
+		if (db) {
+			detachProgressHandler(db)
+			try {
+				db.close()
+			} finally {
+				db = null
+			}
+		}
+		if (pool) {
+			if (mode === 'remove') {
+				await pool.removeVfs()
+			} else {
+				pausePool(pool)
+			}
+			pool = null
+		}
+		releasePoolLock?.()
+		releasePoolLock = null
+	}
+
+	function attachProgressHandler(target: SqliteDb): void {
+		const register = sqlite3Api?.capi?.sqlite3_progress_handler
+		if (!options.onProgress || typeof register !== 'function' || !target.pointer) return
+		register(
+			target.pointer,
+			PROGRESS_HANDLER_OPS,
+			() => {
+				const now = Date.now()
+				if (now - lastProgressBeat >= PROGRESS_HEARTBEAT_MS) {
+					lastProgressBeat = now
+					options.onProgress?.()
+				}
+				return 0
+			},
+			0,
+		)
+	}
+
+	function detachProgressHandler(target: SqliteDb): void {
+		const register = sqlite3Api?.capi?.sqlite3_progress_handler
+		if (typeof register !== 'function' || !target.pointer) return
+		try {
+			register(target.pointer, 0, 0, 0)
+		} catch {
+			// Closing the database releases the handler binding anyway.
+		}
+	}
+
+	async function openOpfs(
+		sqlite3: Sqlite3Api,
+		dbName: string,
+		mustExist: boolean,
+	): Promise<WorkerResponse | null> {
+		const name = opfsPoolNameFor(dbName)
+		const path = opfsPoolPath(dbName)
+		poolName = name
+		releasePoolLock = await holdExclusiveLock(opfsPoolLockName(name), reporterFor('pool', name))
+		pool = await installPool(sqlite3, name, reporterFor('pool', name))
+
+		let migratedFromLegacy = false
+		if (!pool.getFileNames().includes(path)) {
+			migratedFromLegacy = await migrateFromLegacyPool(
+				sqlite3,
+				pool,
+				path,
+				reporterFor('legacy-pool', name),
+			)
+		}
+		const existedBefore = pool.getFileNames().includes(path)
+		if (!existedBefore && mustExist) {
+			// Do not leave behind the empty pool this probe just created.
+			await releaseStorage(pool.getFileCount() === 0 ? 'remove' : 'pause')
+			return { id: 0, type: 'error', message: `Database file ${path} not found`, code: 'NOT_FOUND' }
+		}
+		await ensurePoolCapacity(pool)
+		try {
+			db = new pool.OpfsSAHPoolDb(path)
+		} catch (error) {
+			if (!existedBefore) pool.unlink(path)
+			throw error
+		}
+		persistent = true
+		openInfo = { created: !existedBefore, migratedFromLegacy }
+		return null
+	}
 
 	async function open(
 		id: number,
 		ddlStatements: string[],
-		dbName?: string,
+		dbName: string,
+		storage: 'opfs' | 'memory',
+		mustExist: boolean,
 	): Promise<WorkerResponse> {
-		try {
-			// Re-run idempotent DDL on the existing handle rather than opening the
-			// database a second time.
-			if (db) {
+		// Re-run idempotent DDL on the existing handle rather than opening the
+		// database a second time (a follower's open lands here on the leader).
+		if (db) {
+			try {
 				applyDdl(db, ddlStatements)
 				return { id, type: 'success', data: buildOpenData() }
+			} catch (error) {
+				return { id, type: 'error', message: (error as Error).message, code: 'INIT_ERROR' }
 			}
+		}
 
+		let createdPath: string | null = null
+		try {
 			const sqlite3 = await getSqlite3()
 			sqlite3Api = sqlite3
-			const pool = await getOpfsPool(sqlite3)
-
-			if (pool) {
-				await ensurePoolCapacity(pool)
-				db = new pool.OpfsSAHPoolDb(opfsDatabaseFilename(dbName ?? 'kora-db'))
-				persistent = true
+			if (storage === 'opfs' && opfsSahSupported(sqlite3)) {
+				try {
+					const early = await openOpfs(sqlite3, dbName, mustExist)
+					if (early) return { ...early, id }
+					if (openInfo.created) createdPath = opfsPoolPath(dbName)
+				} catch (error) {
+					if (!(error instanceof PoolUnavailableError) || error.reason === 'lock-conflict') {
+						throw error
+					}
+					// Only an unsupported or hung OPFS selects memory here; the adapter
+					// then reports it (and refuses writes unless the app opted in).
+					await releaseStorage('pause')
+					fallbackReason = error.reason
+				}
 			} else {
+				fallbackReason = 'unsupported'
+			}
+			if (!db) {
 				db = new sqlite3.oo1.DB({ filename: ':memory:' })
 				persistent = false
 			}
 
 			db.exec({ sql: 'PRAGMA journal_mode = WAL' })
 			db.exec({ sql: 'PRAGMA foreign_keys = ON' })
-
 			applyDdl(db, ddlStatements)
+			attachProgressHandler(db)
 			return { id, type: 'success', data: buildOpenData() }
 		} catch (error) {
-			return { id, type: 'error', message: (error as Error).message, code: 'INIT_ERROR' }
+			// A failed open removes only the file this open created (never existing
+			// or migrated data) and gives the pool and its lock back (NEW-STORE-8).
+			const currentPool = pool
+			if (db) {
+				try {
+					db.close()
+				} catch {
+					// Already failing; the original error is what matters.
+				}
+				db = null
+			}
+			if (createdPath && currentPool) {
+				try {
+					currentPool.unlink(createdPath)
+					currentPool.unlink(`${createdPath}-journal`)
+				} catch {
+					// Best effort: an empty leftover slot is harmless.
+				}
+			}
+			try {
+				await releaseStorage('pause')
+			} catch {
+				// The worker is about to be terminated by the adapter anyway.
+			}
+			const reason = error instanceof PoolUnavailableError ? error.reason : undefined
+			return {
+				id,
+				type: 'error',
+				message: (error as Error).message,
+				code: 'INIT_ERROR',
+				context: {
+					...(reason ? { reason } : {}),
+					...(createdPath ? { removedCreatedFile: createdPath } : {}),
+				},
+			}
 		}
 	}
 
-	function buildOpenData(): { persistent: boolean; fallbackReason?: string } {
+	function buildOpenData(): Record<string, unknown> {
 		return {
 			persistent,
-			...(persistent ? {} : { fallbackReason: opfsFallbackReason ?? 'unsupported' }),
+			...(persistent ? {} : { fallbackReason: fallbackReason ?? 'unsupported' }),
+			...(poolName && persistent ? { poolName } : {}),
+			created: openInfo.created,
+			migratedFromLegacy: openInfo.migratedFromLegacy,
 		}
 	}
 
@@ -279,12 +353,13 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 		}
 	}
 
-	function close(id: number): WorkerResponse {
-		if (db) {
-			db.close()
-			db = null
+	async function close(id: number, mode: 'pause' | 'remove'): Promise<WorkerResponse> {
+		try {
+			await releaseStorage(mode)
+			return { id, type: 'success' }
+		} catch (error) {
+			return { id, type: 'error', message: (error as Error).message, code: 'CLOSE_ERROR' }
 		}
-		return { id, type: 'success' }
 	}
 
 	function migrate(id: number, statements: string[]): WorkerResponse {
@@ -305,10 +380,9 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 		if (!db) {
 			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
 		}
-		const dbWithDeserialize = db as SqliteDb & { deserialize?: (bytes: Uint8Array) => void }
-		if (typeof dbWithDeserialize.deserialize === 'function') {
+		if (typeof db.deserialize === 'function') {
 			try {
-				dbWithDeserialize.deserialize(data)
+				db.deserialize(data)
 				return { id, type: 'success' }
 			} catch (error) {
 				return { id, type: 'error', message: (error as Error).message, code: 'IMPORT_ERROR' }
@@ -335,9 +409,17 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 		try {
 			switch (request.type) {
 				case 'open':
-					return await open(request.id, request.ddlStatements, request.dbName)
+					return await open(
+						request.id,
+						request.ddlStatements,
+						request.dbName ?? 'kora-db',
+						request.storage ?? 'opfs',
+						request.mustExist === true,
+					)
 				case 'close':
-					return close(request.id)
+					return await close(request.id, 'pause')
+				case 'destroy':
+					return await close(request.id, 'remove')
 				case 'execute':
 					return execute(request.id, request.sql, request.params)
 				case 'query':
@@ -359,6 +441,9 @@ export function createSqliteWasmCore(): SqliteWasmCore {
 						message: 'Export not yet supported in browser worker',
 						code: 'EXPORT_NOT_SUPPORTED',
 					}
+				case 'serve':
+					// Handled by the worker entry, which owns the BroadcastChannel.
+					return { id: request.id, type: 'success' }
 				default:
 					return {
 						id: (request as WorkerRequest).id,

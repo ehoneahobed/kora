@@ -1,23 +1,46 @@
 /**
  * Multi-tab SQLite storage coordination via `navigator.locks` and `BroadcastChannel`.
  *
- * One tab holds the exclusive `kora-leader-${dbName}` lock and owns the SQLite worker.
- * Other tabs send worker RPC over a named broadcast channel.
+ * One tab holds the exclusive `kora-leader-${dbName}` lock and owns the SQLite
+ * worker. Other tabs send worker RPC over a named broadcast channel. In browsers
+ * the leader's WORKER answers that channel itself ({@link startWorkerRpcRelay}),
+ * so a hung leader main thread never blocks other tabs, and it pushes heartbeats
+ * (also from inside long statements) that followers use to detect a hung or
+ * frozen leader (NEW-STORE-9).
  */
 
-import type { WorkerBridge, WorkerRequest, WorkerResponse } from '../adapters/sqlite-wasm-channel'
-import { NoLeaderError, WorkerTimeoutError } from '../errors'
+import { leaderLockName, storageChannelName } from '../adapters/opfs-names'
+import type {
+	WorkerBridge,
+	WorkerRequest,
+	WorkerResponse,
+	WorkerSendOptions,
+} from '../adapters/sqlite-wasm-channel'
+import {
+	BridgeTerminatedError,
+	LeaderUnresponsiveError,
+	NoLeaderError,
+	RequestAbortedError,
+	WorkerTimeoutError,
+} from '../errors'
 
 const RPC_REQUEST = 'kora-worker-request'
 const RPC_RESPONSE = 'kora-worker-response'
 const CLIENT_LEAVE = 'kora-client-leave'
 const LEADER_PING = 'kora-leader-ping'
 const LEADER_PONG = 'kora-leader-pong'
+const LEADER_HEARTBEAT = 'kora-leader-heartbeat'
 
-/** Default delay before a stalled follower RPC probes the leader for liveness. */
-const DEFAULT_LIVENESS_PROBE_MS = 2000
+/** Default interval between leader heartbeats and follower watchdog ticks. */
+export const DEFAULT_HEARTBEAT_MS = 1000
+/** Missed heartbeat intervals after which a follower gives up on a leader it heard. */
+const MISSED_BEATS_UNRESPONSIVE = 3
+/** Silent intervals after which a follower that never heard a leader gives up. */
+const MISSED_BEATS_ABSENT = 2
 /** Default idle budget for a client that owns an open transaction span. */
 const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 10_000
+/** Completed follower responses remembered for de-duplicating retried requests. */
+const DEDUP_CAPACITY = 512
 
 interface RpcRequestMessage {
 	type: typeof RPC_REQUEST
@@ -37,6 +60,20 @@ interface ClientLeaveMessage {
 	clientId: string
 }
 
+interface HeartbeatMessage {
+	type: typeof LEADER_HEARTBEAT
+	epoch: string
+	source: 'main' | 'worker'
+}
+
+type ChannelMessage =
+	| RpcRequestMessage
+	| RpcResponseMessage
+	| ClientLeaveMessage
+	| HeartbeatMessage
+	| { type: typeof LEADER_PING }
+	| { type: typeof LEADER_PONG }
+
 interface ReclaimingWorkerBridge extends WorkerBridge {
 	reclaimClient(clientId: string, reason: string): void
 }
@@ -46,8 +83,9 @@ export type TabStorageRole = 'leader' | 'follower'
 export interface AcquireTabStorageOptions {
 	/**
 	 * Invoked when a follower is promoted to leader because the previous leader
-	 * released the lock (its tab closed or crashed). The adapter uses this to
-	 * rebuild its bridge as a leader. Never fires for a tab that started as leader.
+	 * released the lock (its tab closed, crashed, or suspended itself on freeze).
+	 * The adapter uses this to rebuild its bridge as a leader. Never fires for a
+	 * tab that started as leader.
 	 */
 	onPromote?: () => void
 }
@@ -57,13 +95,11 @@ export interface TabStorageSession {
 	channelName: string
 	/** Leader only: release the navigator lock when closing the database. */
 	releaseLock?: () => Promise<void>
-	/** Leader only: stop the broadcast RPC relay. */
+	/** Leader only: stop the broadcast RPC relay or heartbeat. */
 	stopRelay?: () => void
 	/**
-	 * Follower only: resolves when this tab has been promoted to leader (the old
-	 * leader released the lock). The adapter awaits nothing here directly; it reacts
-	 * via {@link AcquireTabStorageOptions.onPromote}. Present so callers can cancel
-	 * the promotion watch on close.
+	 * Follower only: cancels the queued lock request (or, once promoted, releases
+	 * the lock this tab won). Present so callers can tear the session down.
 	 */
 	cancelPromotionWatch?: () => void
 }
@@ -85,18 +121,18 @@ export function isMultiTabStorageSupported(): boolean {
  * Without lock APIs, every instance is treated as leader (single-tab / Node).
  *
  * A follower additionally queues a blocking request for the same lock. When the
- * current leader releases it (its tab closed or crashed), the browser grants the
- * lock to this follower and {@link AcquireTabStorageOptions.onPromote} fires so the
- * adapter can rebuild itself as the new leader. This is the automatic failover
- * path; a leader that is merely throttled (backgrounded but alive) keeps the lock,
- * and followers stay resilient through the liveness probe on the RPC bridge.
+ * current leader releases it (its tab closed, crashed, or suspended on freeze),
+ * the browser grants the lock to this follower and
+ * {@link AcquireTabStorageOptions.onPromote} fires so the adapter can rebuild
+ * itself as the new leader. Kora never uses the Web Locks `steal` option: a
+ * frozen leader's worker would still hold the OPFS file handles.
  */
 export async function acquireTabStorageSession(
 	dbName: string,
 	options?: AcquireTabStorageOptions,
 ): Promise<TabStorageSession> {
-	const channelName = `kora-storage-${dbName}`
-	const lockName = `kora-leader-${dbName}`
+	const channelName = storageChannelName(dbName)
+	const lockName = leaderLockName(dbName)
 
 	if (!isMultiTabStorageSupported()) {
 		return { role: 'leader', channelName }
@@ -168,17 +204,69 @@ function startFollowerSession(
 }
 
 /**
- * Leader tab: forward follower RPC to the real worker bridge.
+ * Answers follower RPC with a bounded response cache keyed by request id, so a
+ * follower that retries a request it lost track of (leader looked unresponsive,
+ * caller aborted) gets the original response instead of a second application.
  */
-export function startLeaderRpcRelay(channelName: string, bridge: WorkerBridge): () => void {
-	const channel = new BroadcastChannel(channelName)
+function createRequestDeduper(): {
+	run(requestId: string, start: () => Promise<WorkerResponse>): Promise<WorkerResponse> | null
+} {
+	const inflight = new Map<string, Promise<WorkerResponse>>()
+	const completed = new Map<string, WorkerResponse>()
+	return {
+		run(requestId, start) {
+			const done = completed.get(requestId)
+			if (done) return Promise.resolve(done)
+			// Already running: the original response is broadcast when it lands.
+			if (inflight.has(requestId)) return null
+			const promise = start().then((response) => {
+				inflight.delete(requestId)
+				completed.set(requestId, response)
+				if (completed.size > DEDUP_CAPACITY) {
+					const oldest = completed.keys().next().value
+					if (oldest !== undefined) completed.delete(oldest)
+				}
+				return response
+			})
+			inflight.set(requestId, promise)
+			return promise
+		},
+	}
+}
 
-	const onMessage = (
-		event: MessageEvent<RpcRequestMessage | ClientLeaveMessage | { type: typeof LEADER_PING }>,
-	): void => {
+/** Options for the leader-side relays. */
+export interface LeaderRelayOptions {
+	/** Heartbeat interval; 0 disables heartbeats. */
+	heartbeatMs?: number
+}
+
+/** Handle returned by {@link startWorkerRpcRelay}. */
+export interface WorkerRpcRelay {
+	/** Push a heartbeat now (called from inside long statements). */
+	beat(): void
+	stop(): void
+}
+
+function serveChannel(
+	channel: BroadcastChannel,
+	bridge: WorkerBridge,
+	source: 'main' | 'worker',
+	heartbeatMs: number,
+): WorkerRpcRelay {
+	const epoch = createClientId()
+	const dedup = createRequestDeduper()
+	const beat = (): void => {
+		const message: HeartbeatMessage = { type: LEADER_HEARTBEAT, epoch, source }
+		channel.postMessage(message)
+	}
+	const respond = (requestId: string, response: WorkerResponse): void => {
+		const msg: RpcResponseMessage = { type: RPC_RESPONSE, requestId, response }
+		channel.postMessage(msg)
+	}
+
+	const onMessage = (event: MessageEvent<ChannelMessage>): void => {
 		const data = event.data
-		// Answer liveness probes immediately, without touching the worker, so a
-		// follower can distinguish a slow-but-alive leader from an absent one.
+		// Answer liveness probes immediately, without touching the database.
 		if (data?.type === LEADER_PING) {
 			channel.postMessage({ type: LEADER_PONG })
 			return
@@ -192,42 +280,91 @@ export function startLeaderRpcRelay(channelName: string, bridge: WorkerBridge): 
 		if (data?.type !== RPC_REQUEST) {
 			return
 		}
+		if (
+			data.request.type === 'close' ||
+			data.request.type === 'destroy' ||
+			data.request.type === 'serve'
+		) {
+			// Only the owning tab may close or remove the database; a follower
+			// leaving just stops sending requests.
+			respond(data.requestId, { id: data.request.id, type: 'success' })
+			return
+		}
 
-		void bridge
-			.send(data.request, data.clientId)
-			.then((response) => {
-				const msg: RpcResponseMessage = {
-					type: RPC_RESPONSE,
-					requestId: data.requestId,
-					response,
-				}
-				channel.postMessage(msg)
-			})
-			.catch((error: unknown) => {
-				const message = error instanceof Error ? error.message : 'Worker RPC failed'
-				const msg: RpcResponseMessage = {
-					type: RPC_RESPONSE,
-					requestId: data.requestId,
-					response: {
-						id: data.request.id,
-						type: 'error',
-						message,
-						code: 'LEADER_RPC_ERROR',
-					},
-				}
-				channel.postMessage(msg)
-			})
+		const pending = dedup.run(data.requestId, () =>
+			bridge.send(data.request, data.clientId).catch(
+				(error: unknown): WorkerResponse => ({
+					id: data.request.id,
+					type: 'error',
+					message: error instanceof Error ? error.message : 'Worker RPC failed',
+					code: 'LEADER_RPC_ERROR',
+				}),
+			),
+		)
+		void pending?.then((response) => respond(data.requestId, response))
 	}
 
 	channel.addEventListener('message', onMessage)
-	return () => {
-		channel.removeEventListener('message', onMessage)
-		channel.close()
+	const interval = heartbeatMs > 0 ? setInterval(beat, heartbeatMs) : undefined
+	if (heartbeatMs > 0) beat()
+	return {
+		beat,
+		stop: () => {
+			if (interval !== undefined) clearInterval(interval)
+			channel.removeEventListener('message', onMessage)
+			channel.close()
+		},
 	}
 }
 
 /**
+ * Leader main thread: forward follower RPC to the worker bridge. Used where the
+ * worker cannot host the relay itself (Node tests, custom bridges). Heartbeats
+ * are off by default here; pass `heartbeatMs` to enable them.
+ */
+export function startLeaderRpcRelay(
+	channelName: string,
+	bridge: WorkerBridge,
+	options: LeaderRelayOptions = {},
+): () => void {
+	return serveChannel(new BroadcastChannel(channelName), bridge, 'main', options.heartbeatMs ?? 0)
+		.stop
+}
+
+/**
+ * Leader WORKER: answer follower RPC, pings and heartbeats from inside the
+ * dedicated SQLite worker, through the worker's transaction serializer. The
+ * leader tab's main thread is not on this path, so a hung or busy main thread
+ * does not stall other tabs (NEW-STORE-9).
+ */
+export function startWorkerRpcRelay(
+	channelName: string,
+	bridge: WorkerBridge,
+	options: LeaderRelayOptions = {},
+): WorkerRpcRelay {
+	return serveChannel(
+		new BroadcastChannel(channelName),
+		bridge,
+		'worker',
+		options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
+	)
+}
+
+interface PendingFollowerRequest {
+	type: string
+	resolve: (r: WorkerResponse) => void
+	reject: (e: Error) => void
+}
+
+/**
  * Follower tab: proxy {@link WorkerBridge} over BroadcastChannel to the leader.
+ *
+ * A single watchdog runs while requests are pending. Any message from the leader
+ * (heartbeat, pong, response) is a sign of life; when the leader goes quiet the
+ * watchdog pings it, and after {@link MISSED_BEATS_UNRESPONSIVE} silent intervals
+ * it fails every pending request with a typed, retriable
+ * {@link LeaderUnresponsiveError} (or {@link NoLeaderError} if no leader was
+ * heard at all) instead of waiting out the full RPC timeout.
  */
 export class FollowerBroadcastBridge implements WorkerBridge {
 	private readonly channel: BroadcastChannel
@@ -235,23 +372,35 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 	private readonly onPageHide = (): void => {
 		this.leaveLeader()
 	}
-	private readonly pending = new Map<
-		string,
-		{ resolve: (r: WorkerResponse) => void; reject: (e: Error) => void }
-	>()
+	private readonly pending = new Map<string, PendingFollowerRequest>()
 	private readonly timeoutMs: number
-	private readonly livenessProbeMs: number
+	private readonly heartbeatMs: number
 	private terminated = false
+	private lastHeardAt = 0
+	private heardSinceWatch = false
+	private watchdog: ReturnType<typeof setInterval> | undefined
 
-	constructor(channelName: string, timeoutMs = 30000, livenessProbeMs = DEFAULT_LIVENESS_PROBE_MS) {
+	/**
+	 * @param channelName - Storage channel of the database
+	 * @param timeoutMs - Hard ceiling per request (default 30s)
+	 * @param heartbeatMs - Expected leader heartbeat interval, also the watchdog tick
+	 */
+	constructor(channelName: string, timeoutMs = 30000, heartbeatMs = DEFAULT_HEARTBEAT_MS) {
 		this.timeoutMs = timeoutMs
-		this.livenessProbeMs = Math.min(livenessProbeMs, timeoutMs)
+		this.heartbeatMs = Math.max(10, Math.min(heartbeatMs, timeoutMs))
 		this.channel = new BroadcastChannel(channelName)
 		if (typeof addEventListener === 'function') {
 			addEventListener('pagehide', this.onPageHide)
 		}
-		this.channel.addEventListener('message', (event: MessageEvent<RpcResponseMessage>) => {
+		this.channel.addEventListener('message', (event: MessageEvent<ChannelMessage>) => {
 			const data = event.data
+			if (
+				data?.type === LEADER_HEARTBEAT ||
+				data?.type === LEADER_PONG ||
+				data?.type === RPC_RESPONSE
+			) {
+				this.markHeard()
+			}
 			if (data?.type !== RPC_RESPONSE) {
 				return
 			}
@@ -267,7 +416,7 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 	 * Readiness handshake: resolves `true` as soon as a live leader answers a ping,
 	 * or `false` if none answers within the budget. The adapter calls this before
 	 * its first RPC so a follower created before a leader relay is live retries the
-	 * handshake instead of firing into the void and waiting out the full timeout.
+	 * handshake instead of firing into the void.
 	 */
 	async waitForLeader(timeoutMs = 3000, attempts = 3): Promise<boolean> {
 		const perAttempt = Math.max(50, Math.floor(timeoutMs / Math.max(1, attempts)))
@@ -307,7 +456,11 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 		})
 	}
 
-	async send(request: WorkerRequest): Promise<WorkerResponse> {
+	async send(
+		request: WorkerRequest,
+		_clientId?: string,
+		options: WorkerSendOptions = {},
+	): Promise<WorkerResponse> {
 		if (this.terminated) {
 			return {
 				id: request.id,
@@ -317,42 +470,44 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			}
 		}
 
-		const requestId = createClientId()
+		const requestId = request.requestId ?? createClientId()
+		const signal = options.signal
+		if (signal?.aborted) {
+			throw new RequestAbortedError(request.type, requestId)
+		}
 		const msg: RpcRequestMessage = {
 			type: RPC_REQUEST,
 			requestId,
 			clientId: this.clientId,
-			request,
+			request: { ...request, requestId },
 		}
+		const timeoutMs = options.timeoutMs ?? this.timeoutMs
 
 		return new Promise<WorkerResponse>((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined
+			const onAbort = (): void => {
+				settle(() => reject(new RequestAbortedError(request.type, requestId)))
+			}
 			const settle = (fn: () => void): void => {
-				clearTimeout(timer)
-				clearTimeout(probe)
+				if (timer !== undefined) clearTimeout(timer)
+				signal?.removeEventListener('abort', onAbort)
 				this.pending.delete(requestId)
+				this.stopWatchdogIfIdle()
 				fn()
 			}
-
-			const timer = setTimeout(() => {
-				settle(() => reject(new WorkerTimeoutError(`follower-rpc:${request.type}`, this.timeoutMs)))
-			}, this.timeoutMs)
-
-			// Liveness watchdog: if the request stalls, probe the leader. A confirmed
-			// absent leader fails fast (NoLeaderError) instead of waiting out the full
-			// timeout; a slow-but-alive leader keeps its remaining time.
-			const probe = setTimeout(() => {
-				void this.pingLeader(this.livenessProbeMs).then((alive) => {
-					if (!alive && this.pending.has(requestId)) {
-						settle(() => reject(new NoLeaderError(`follower-rpc:${request.type}`)))
-					}
-				})
-			}, this.livenessProbeMs)
+			if (Number.isFinite(timeoutMs)) {
+				timer = setTimeout(() => {
+					settle(() => reject(new WorkerTimeoutError(`follower-rpc:${request.type}`, timeoutMs)))
+				}, timeoutMs)
+			}
+			signal?.addEventListener('abort', onAbort, { once: true })
 
 			this.pending.set(requestId, {
+				type: request.type,
 				resolve: (response) => settle(() => resolve(response)),
 				reject: (error) => settle(() => reject(error)),
 			})
-
+			this.startWatchdog()
 			this.channel.postMessage(msg)
 		})
 	}
@@ -367,10 +522,61 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			removeEventListener('pagehide', this.onPageHide)
 		}
 		this.channel.close()
-		for (const [, entry] of this.pending) {
-			entry.reject(new Error('Follower bridge terminated'))
+		for (const [, entry] of [...this.pending]) {
+			entry.reject(new BridgeTerminatedError(entry.type, 'follower bridge terminated'))
 		}
 		this.pending.clear()
+		this.stopWatchdog()
+	}
+
+	private markHeard(): void {
+		this.lastHeardAt = Date.now()
+		this.heardSinceWatch = true
+	}
+
+	private startWatchdog(): void {
+		if (this.watchdog !== undefined) return
+		// A recent beat means a leader is known to exist; otherwise the silence
+		// clock starts now.
+		const now = Date.now()
+		this.heardSinceWatch = now - this.lastHeardAt < this.heartbeatMs * 2
+		if (!this.heardSinceWatch) this.lastHeardAt = now
+		this.watchdog = setInterval(() => this.checkLiveness(), this.heartbeatMs)
+	}
+
+	private stopWatchdogIfIdle(): void {
+		if (this.pending.size === 0) this.stopWatchdog()
+	}
+
+	private stopWatchdog(): void {
+		if (this.watchdog !== undefined) {
+			clearInterval(this.watchdog)
+			this.watchdog = undefined
+		}
+	}
+
+	private checkLiveness(): void {
+		if (this.pending.size === 0) {
+			this.stopWatchdog()
+			return
+		}
+		const silentMs = Date.now() - this.lastHeardAt
+		const heard = this.heardSinceWatch
+		const limit = this.heartbeatMs * (heard ? MISSED_BEATS_UNRESPONSIVE : MISSED_BEATS_ABSENT)
+		if (silentMs >= limit) {
+			for (const [requestId, entry] of [...this.pending]) {
+				entry.reject(
+					heard
+						? new LeaderUnresponsiveError(`follower-rpc:${entry.type}`, silentMs, requestId)
+						: new NoLeaderError(`follower-rpc:${entry.type}`),
+				)
+			}
+			return
+		}
+		if (silentMs >= this.heartbeatMs) {
+			// Pull a sign of life from leaders that do not push heartbeats.
+			this.channel.postMessage({ type: LEADER_PING })
+		}
 	}
 
 	private leaveLeader(): void {
@@ -456,7 +662,7 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		this.inner.terminate()
 		const pending = this.queue.splice(0)
 		for (const entry of pending) {
-			entry.reject(new Error('Worker terminated'))
+			entry.reject(new BridgeTerminatedError(entry.request.type, 'worker terminated'))
 		}
 	}
 
