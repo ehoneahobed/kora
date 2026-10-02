@@ -134,6 +134,10 @@ describe.each(kinds)('server-authoritative field through the %s store', (kind) =
 			]) {
 				expect(view).toMatchObject({ status: 'final' })
 			}
+			// Route writes are content-hashed (version 2) and verify on every device.
+			for (const device of [a, b]) {
+				expect(await device.getSyncEngine()?.getQuarantinedOperations()).toEqual([])
+			}
 		} finally {
 			await network?.close()
 			rmSync(dir, { recursive: true, force: true })
