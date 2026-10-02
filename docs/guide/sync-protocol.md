@@ -54,7 +54,13 @@ A protocol-1 client is accepted for beta.14 only: the server logs
 Version-1 operations stored before beta.14 keep `hashVersion: 1` (absent) and are never
 verified against version-2 rules. Local rewrites before an op is shared (clock rebase,
 node rotation, `SEQUENCE_CONFLICT` renumbering, legacy sequence repair) re-hash a
-version-2 op with its own version, remapping causal deps first.
+version-2 op with its own version, remapping causal deps first. A renumbered
+version-2 op gets a new id: never-sent later operations naming it in `causalDeps` are
+rewritten (and re-hashed, transitively) in the same transaction; operations already
+sent keep their ids and resolve the old id through `_kora_seq_conflicts.reemitted_as`
+(used by `replayTo`). The legacy sequence repair never renumbers a version-2 op when
+the other half of the pair is version 1 (that one keeps its id, which the server
+deduplicates).
 
 ## Protobuf field numbers
 

@@ -93,6 +93,8 @@ export interface TestDeviceOptions {
 	legacyMerge?: boolean
 	/** Encrypt sync traffic end to end (protocol v2 envelope). */
 	encryption?: TestDeviceEncryption
+	/** Upload batch size of the sync engine (default: the engine's). */
+	batchSize?: number
 }
 
 type TransportPairFactory = TestDeviceOptions['createTransportPair']
@@ -177,6 +179,7 @@ export class TestDevice {
 	private readonly schema: SchemaDefinition
 	private readonly server: TestDeviceServer
 	private readonly encryption: TestDeviceEncryption | undefined
+	private readonly batchSize: number | undefined
 	private encryptor: SyncEncryptor | null = null
 	private readonly mergeEngine: MergeEngine
 	private readonly createTransportPair: TestDeviceOptions['createTransportPair']
@@ -208,6 +211,7 @@ export class TestDevice {
 		this.principal = options.principal
 		this.reconnectable = options.reconnectable === true
 		this.encryption = options.encryption
+		this.batchSize = options.batchSize
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -303,6 +307,7 @@ export class TestDevice {
 					? { principal: async () => (this.principal ? this.principal() : null) }
 					: {}),
 				...(this.encryption ? { encryption: this.encryption.config } : {}),
+				...(this.batchSize !== undefined ? { batchSize: this.batchSize } : {}),
 			},
 			emitter: this.emitter,
 			...(this.encryptor ? { encryptor: this.encryptor } : {}),

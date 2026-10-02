@@ -193,8 +193,10 @@ describe('Store sequence recovery (RT-35)', () => {
 		const [op] = await s.getOperationRange(node, 1, 1)
 		if (!op) throw new Error('missing op')
 		expect(op.hashVersion).toBe(2)
-		const renumbered = await s.resequenceOperation(op.id, node, 6)
-		if (!renumbered) throw new Error('not renumbered')
+		const result = await s.resequenceOperation(op.id, node, 6)
+		if (!result) throw new Error('not renumbered')
+		const renumbered = result.operation
+		expect(result.idMapping).toEqual({ [op.id]: renumbered.id })
 		// A version-2 id covers the sequence number (CORE-1): new number, new id, still valid.
 		expect(renumbered.sequenceNumber).toBe(7)
 		expect(renumbered.id).not.toBe(op.id)
@@ -213,6 +215,53 @@ describe('Store sequence recovery (RT-35)', () => {
 			{ reason: 'server-sequence-conflict', new_sequence_number: 7, reemitted_as: renumbered.id },
 		])
 		expect(await s.resequenceOperation('missing', node, 1)).toBeNull()
+	})
+
+	test('resequenceOperation rewrites never-sent dependents transitively (v2 causalDeps)', async () => {
+		const { store: s } = await openStore()
+		const node = s.getNodeId()
+		const row = await s.collection('todos').insert({ title: 'one' })
+		await s.collection('todos').update(String(row.id), { title: 'two' })
+		await s.collection('todos').update(String(row.id), { title: 'three' })
+		const [a, b, c] = await s.getOperationRange(node, 1, 3)
+		if (!a || !b || !c) throw new Error('missing ops')
+		expect(b.causalDeps).toContain(a.id)
+		expect(c.causalDeps).toContain(b.id)
+		// b and c were never sent; a collided on the server.
+		const result = await s.resequenceOperation(a.id, node, 3, [b.id, c.id])
+		if (!result) throw new Error('not renumbered')
+		const [b2, c2] = result.dependents
+		if (!b2 || !c2) throw new Error('dependents not rewritten')
+		expect(b2.causalDeps).toContain(result.operation.id)
+		expect(b2.causalDeps).not.toContain(a.id)
+		expect(c2.causalDeps).toContain(b2.id)
+		expect(b2.id).not.toBe(b.id)
+		expect(c2.id).not.toBe(c.id)
+		expect([b2.sequenceNumber, c2.sequenceNumber]).toEqual([2, 3])
+		expect(result.idMapping).toEqual({
+			[a.id]: result.operation.id,
+			[b.id]: b2.id,
+			[c.id]: c2.id,
+		})
+		for (const rewritten of [result.operation, b2, c2]) {
+			expect(await verifyOperationId(rewritten)).toBe(true)
+		}
+		const logIds = (await s.getOperationRange(node, 1, 10)).map((o) => o.id).sort()
+		expect(logIds).toEqual([result.operation.id, b2.id, c2.id].sort())
+		// The record still folds to the same value.
+		expect(await s.collection('todos').findById(String(row.id))).toMatchObject({ title: 'three' })
+	})
+
+	test('resequenceOperation never rewrites a dependent that may have been sent', async () => {
+		const { store: s } = await openStore()
+		const node = s.getNodeId()
+		const row = await s.collection('todos').insert({ title: 'one' })
+		await s.collection('todos').update(String(row.id), { title: 'two' })
+		const [a, b] = await s.getOperationRange(node, 1, 2)
+		if (!a || !b) throw new Error('missing ops')
+		const result = await s.resequenceOperation(a.id, node, 2, [])
+		expect(result?.dependents).toEqual([])
+		expect((await s.getOperationRange(node, 2, 2))[0]?.id).toBe(b.id)
 	})
 
 	test('switchNodeId moves back to a registered node and refuses an unknown one', async () => {

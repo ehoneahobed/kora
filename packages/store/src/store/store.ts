@@ -94,7 +94,8 @@ import {
 } from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
-import { renumberOperationRow } from '../sync/rehash-operation'
+import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
+import type { ResequenceResult } from '../sync/rehash-operation'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
@@ -145,6 +146,7 @@ import { dropLegacyIndexes } from './legacy-indexes'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
+	SEQ_CONFLICTS_TABLE,
 	insertConflictRow,
 	isOperationLogged,
 	loadRetainedConflictRows,
@@ -1426,7 +1428,11 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		const start = Date.now()
 		const allOps = await this.getAllOperations()
-		const snapshot = buildReplaySnapshot(this.schema, allOps, operationId)
+		const aliasRows = await this.adapter.query<{ id: string; reemitted_as: string }>(
+			`SELECT id, reemitted_as FROM ${SEQ_CONFLICTS_TABLE} WHERE reemitted_as IS NOT NULL AND reemitted_as <> id`,
+		)
+		const aliases = new Map(aliasRows.map((row) => [row.id, row.reemitted_as]))
+		const snapshot = buildReplaySnapshot(this.schema, allOps, operationId, aliases)
 
 		if (this.emitter) {
 			this.emitter.emit({
@@ -2060,20 +2066,31 @@ export class Store implements OperationLog {
 	 * operation of this node under that number (one this device lost). A version-1
 	 * operation keeps its id (its hash does not cover the sequence number), exactly like
 	 * the W6 sequence repair; a version-2 operation (protocol v2) is re-hashed under the
-	 * new number, so the returned operation can carry a new id. The old identity is
-	 * recorded in `_kora_seq_conflicts`.
+	 * new number, so it carries a new id. The old identity is recorded in
+	 * `_kora_seq_conflicts` (`reemitted_as`).
 	 *
-	 * @returns The renumbered operation, or null when it is not in the log
+	 * A new id would leave later operations naming the old one in `causalDeps`: those in
+	 * `rewritableDependents` (operations the server never stored: never sent) are
+	 * rewritten to name the new id, and re-hashed, transitively, in the same
+	 * transaction. Dependents already sent keep their ids (the server may hold them);
+	 * their dep resolves through the `_kora_seq_conflicts` record. Every touched record
+	 * is re-folded (fold stamps carry operation ids).
+	 *
+	 * @param rewritableDependents - Ids of this node's operations that were never sent
+	 * @returns The renumbered operation and the rewritten dependents, or null when the
+	 *   operation is not in the log
 	 */
 	async resequenceOperation(
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null> {
+		rewritableDependents: readonly string[] = [],
+	): Promise<ResequenceResult | null> {
 		this.ensureOpen()
-		const found: { op: Operation | null } = { op: null }
+		const found: { result: ResequenceResult | null } = { result: null }
+		const collections = Object.keys(this.schema.collections)
 		await this.adapter.transaction(async (tx) => {
-			for (const collection of Object.keys(this.schema.collections)) {
+			for (const collection of collections) {
 				const table = quoteIdent(`_kora_ops_${collection}`)
 				const rows = await tx.query<OperationRow>(
 					`SELECT * FROM ${table} WHERE id = ? AND node_id = ?`,
@@ -2099,12 +2116,24 @@ export class Store implements OperationLog {
 					sequence,
 					Date.now(),
 				)
-				found.op = moved
+				const idMapping: Record<string, string> = moved.id !== row.id ? { [row.id]: moved.id } : {}
+				const rewritable = new Set(rewritableDependents)
+				rewritable.delete(row.id)
+				const dependents =
+					moved.id !== row.id
+						? await rewriteDependentsInTx(tx, collections, nodeId, idMapping, rewritable)
+						: []
+				found.result = { operation: moved, dependents, idMapping }
 				return
 			}
 		})
-		if (found.op) this.recordOperationSequence(found.op)
-		return found.op
+		const result = found.result
+		if (!result) return null
+		this.recordOperationSequence(result.operation)
+		if (Object.keys(result.idMapping).length > 0) {
+			await this.refoldRecordsOf([result.operation.id, ...result.dependents.map((op) => op.id)])
+		}
+		return result
 	}
 
 	/**

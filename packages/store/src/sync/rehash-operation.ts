@@ -5,6 +5,16 @@ import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import type { OperationRow, Transaction } from '../types'
 
+/** Result of `Store.resequenceOperation` (RT-35 renumbering). */
+export interface ResequenceResult {
+	/** The renumbered operation (a version-2 one under a new id). */
+	operation: Operation
+	/** Never-sent dependents rewritten to name the new id (re-hashed), in sequence order. */
+	dependents: Operation[]
+	/** Old id -> new id, for the operation and every re-hashed dependent. */
+	idMapping: Record<string, string>
+}
+
 /**
  * The content-addressed id of an operation whose stamp, node, sequence or causal deps
  * were rewritten locally before it was ever shared (clock rebase, node rotation,
@@ -62,11 +72,70 @@ export async function renumberOperationRow(
 	}
 	const id = await rehashOperation(renumbered)
 	const moved: Operation = { ...renumbered, id }
-	await tx.execute(`DELETE FROM ${table} WHERE id = ?`, [row.id])
+	await replaceOperationRow(tx, collection, row.id, moved)
+	return moved
+}
+
+async function replaceOperationRow(
+	tx: Transaction,
+	collection: string,
+	oldId: string,
+	next: Operation,
+): Promise<void> {
+	await tx.execute(`DELETE FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE id = ?`, [oldId])
 	const insert = buildInsertQuery(
 		`_kora_ops_${collection}`,
-		serializeOperation(moved) as unknown as Record<string, unknown>,
+		serializeOperation(next) as unknown as Record<string, unknown>,
 	)
 	await tx.execute(insert.sql, insert.params)
-	return moved
+}
+
+/**
+ * After operations were re-hashed under new ids (`idMapping`, old id -> new id), make
+ * the local operations that name an old id in `causalDeps` name the new one, inside
+ * `tx`. Only operations in `rewritable` are touched: those the server never stored
+ * (never sent). Each rewritten operation covers its causalDeps in its id (version 2),
+ * so it is re-hashed too and its own dependents follow, transitively, in sequence
+ * order (sequence order is authoring order, so a dependency is always rewritten before
+ * its dependents). A version-1 operation keeps its id (its hash does not cover
+ * causalDeps) but still gets the new dep. `idMapping` is extended in place.
+ *
+ * An operation outside `rewritable` (already sent: the server may hold it under its
+ * id) is never rewritten; its dep on an old id resolves through `_kora_seq_conflicts`
+ * (`reemitted_as`) on this device.
+ *
+ * @returns The rewritten operations, in sequence order
+ */
+export async function rewriteDependentsInTx(
+	tx: Transaction,
+	collections: readonly string[],
+	nodeId: string,
+	idMapping: Record<string, string>,
+	rewritable: ReadonlySet<string>,
+): Promise<Operation[]> {
+	if (rewritable.size === 0) return []
+	const candidates: Array<{ collection: string; row: OperationRow; op: Operation }> = []
+	for (const collection of collections) {
+		const rows = await tx.query<OperationRow>(
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE node_id = ?`,
+			[nodeId],
+		)
+		for (const row of rows) {
+			if (!rewritable.has(row.id)) continue
+			candidates.push({ collection, row, op: deserializeOperationWithCollection(row, collection) })
+		}
+	}
+	candidates.sort((a, b) => a.op.sequenceNumber - b.op.sequenceNumber)
+	const rewritten: Operation[] = []
+	for (const { collection, row, op } of candidates) {
+		if (!op.causalDeps.some((dep) => idMapping[dep] !== undefined)) continue
+		const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+		const updated: Operation = { ...op, causalDeps }
+		const id = op.hashVersion === 2 ? await rehashOperation(updated) : op.id
+		const next: Operation = { ...updated, id }
+		await replaceOperationRow(tx, collection, row.id, next)
+		if (id !== op.id) idMapping[op.id] = id
+		rewritten.push(next)
+	}
+	return rewritten
 }
