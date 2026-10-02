@@ -218,7 +218,9 @@ describe.skipIf(!PG_URL)('ingest integrity: postgres', () => {
 			`SELECT column_name, data_type FROM information_schema.columns
 			 WHERE table_schema = '${PG_SCHEMA}' AND column_name IN ('sequence_number', 'max_sequence_number')`,
 		)) as Array<{ column_name: string; data_type: string }>
-		expect(types.map((row) => row.data_type)).toEqual(['bigint', 'bigint'])
+		// operations, sync_state, and the RT-43/RT-48 operation_resolutions and
+		// sequence_pairs tables.
+		expect(types.map((row) => row.data_type)).toEqual(['bigint', 'bigint', 'bigint', 'bigint'])
 	})
 
 	test('an INTEGER log from an older release is widened on startup', async () => {

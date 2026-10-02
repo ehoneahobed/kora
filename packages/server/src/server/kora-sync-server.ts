@@ -18,7 +18,13 @@ import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
-import { DEFAULT_MAX_OPS_PER_MINUTE, SessionRateLimiter } from '../session/session-operation-limits'
+import {
+	CombinedRateLimiter,
+	DEFAULT_MAX_OPS_PER_MINUTE,
+	DEFAULT_USER_BUDGET_MULTIPLIER,
+	type IngestRateLimiter,
+	SessionRateLimiter,
+} from '../session/session-operation-limits'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
@@ -54,6 +60,34 @@ export const DEFAULT_APP_HEARTBEAT_INTERVAL_MS = 25_000
 const MAX_TRACKED_RATE_LIMITERS = 100_000
 /** Window of the per-node ingest rate limiter. */
 const RATE_LIMIT_WINDOW_MS = 60_000
+
+/**
+ * The limiter tracked under `key` in `map`, created on first use. Re-inserted on every
+ * use so the map's insertion order is least-recently-used order, and bounded by
+ * {@link MAX_TRACKED_RATE_LIMITERS}.
+ */
+function trackedLimiter(
+	map: Map<string, { limiter: SessionRateLimiter; lastUsedAtMs: number }>,
+	key: string,
+	perMinute: number,
+): SessionRateLimiter {
+	const now = Date.now()
+	const existing = map.get(key)
+	if (existing) {
+		existing.lastUsedAtMs = now
+		map.delete(key)
+		map.set(key, existing)
+		return existing.limiter
+	}
+	const limiter = new SessionRateLimiter(perMinute, RATE_LIMIT_WINDOW_MS)
+	map.set(key, { limiter, lastUsedAtMs: now })
+	while (map.size > MAX_TRACKED_RATE_LIMITERS) {
+		const oldest = map.keys().next().value
+		if (oldest === undefined) break
+		map.delete(oldest)
+	}
+	return limiter
+}
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_HOST = '0.0.0.0'
@@ -158,6 +192,8 @@ export class KoraSyncServer {
 		| null
 	private readonly maxOperationBytes: number | undefined
 	private readonly maxOpsPerMinute: number | undefined
+	/** Per-principal ingest budget per minute; 0 when disabled. */
+	private readonly maxOpsPerMinutePerUser: number
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
@@ -174,6 +210,14 @@ export class KoraSyncServer {
 	 * dropped by the background tick; insertion order doubles as LRU order.
 	 */
 	private readonly rateLimiters = new Map<
+		string,
+		{ limiter: SessionRateLimiter; lastUsedAtMs: number }
+	>()
+	/**
+	 * Ingest budgets by authenticated principal, shared by every node of that user, so
+	 * minting node ids does not multiply the per-node budget. Expired like the node map.
+	 */
+	private readonly userRateLimiters = new Map<
 		string,
 		{ limiter: SessionRateLimiter; lastUsedAtMs: number }
 	>()
@@ -310,6 +354,17 @@ export class KoraSyncServer {
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
+		if (
+			config.maxOpsPerMinutePerUser !== undefined &&
+			(!Number.isSafeInteger(config.maxOpsPerMinutePerUser) || config.maxOpsPerMinutePerUser < 0)
+		) {
+			throw new Error(
+				`maxOpsPerMinutePerUser must be a non-negative integer (0 disables the per-user budget), got ${String(config.maxOpsPerMinutePerUser)}.`,
+			)
+		}
+		this.maxOpsPerMinutePerUser =
+			config.maxOpsPerMinutePerUser ??
+			(config.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE) * DEFAULT_USER_BUDGET_MULTIPLIER
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
 		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
@@ -549,27 +604,15 @@ export class KoraSyncServer {
 	 * The ingest rate limiter of a device node, created on first use and shared by
 	 * every session of that node, so reconnecting does not buy a fresh budget (SRV-6).
 	 */
-	private rateLimiterFor(nodeId: string): SessionRateLimiter {
-		const now = Date.now()
-		const existing = this.rateLimiters.get(nodeId)
-		if (existing) {
-			existing.lastUsedAtMs = now
-			// Re-insert to keep the map in least-recently-used order.
-			this.rateLimiters.delete(nodeId)
-			this.rateLimiters.set(nodeId, existing)
-			return existing.limiter
-		}
-		const limiter = new SessionRateLimiter(
+	private rateLimiterFor(nodeId: string, principal: string | null): IngestRateLimiter {
+		const node = trackedLimiter(
+			this.rateLimiters,
+			nodeId,
 			this.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE,
-			RATE_LIMIT_WINDOW_MS,
 		)
-		this.rateLimiters.set(nodeId, { limiter, lastUsedAtMs: now })
-		while (this.rateLimiters.size > MAX_TRACKED_RATE_LIMITERS) {
-			const oldest = this.rateLimiters.keys().next().value
-			if (oldest === undefined) break
-			this.rateLimiters.delete(oldest)
-		}
-		return limiter
+		if (principal === null || this.maxOpsPerMinutePerUser === 0) return node
+		const user = trackedLimiter(this.userRateLimiters, principal, this.maxOpsPerMinutePerUser)
+		return new CombinedRateLimiter(node, user)
 	}
 
 	/**
@@ -586,6 +629,11 @@ export class KoraSyncServer {
 		const cutoff = now - 2 * RATE_LIMIT_WINDOW_MS
 		for (const [nodeId, entry] of this.rateLimiters) {
 			if (entry.lastUsedAtMs <= cutoff && !live.has(nodeId)) this.rateLimiters.delete(nodeId)
+		}
+		// A user budget is touched at every handshake of its nodes; one idle past two
+		// windows would be full again anyway. A live session keeps its own reference.
+		for (const [principal, entry] of this.userRateLimiters) {
+			if (entry.lastUsedAtMs <= cutoff) this.userRateLimiters.delete(principal)
 		}
 	}
 
@@ -886,6 +934,7 @@ export class KoraSyncServer {
 		}
 		this.orphanedRelaysByNode.clear()
 		this.rateLimiters.clear()
+		this.userRateLimiters.clear()
 		this.revocationUnsubscribe?.()
 		this.revocationUnsubscribe = null
 
@@ -1224,7 +1273,7 @@ export class KoraSyncServer {
 				? { anonymousClaimTtlMs: this.anonymousClaimTtlMs }
 				: {}),
 			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
-			rateLimiterFor: (nodeId) => this.rateLimiterFor(nodeId),
+			rateLimiterFor: (nodeId, principal) => this.rateLimiterFor(nodeId, principal),
 			appHeartbeatIntervalMs: this.appHeartbeatIntervalMs,
 			...(this.handshakeTimeoutMs !== undefined
 				? { handshakeTimeoutMs: this.handshakeTimeoutMs }

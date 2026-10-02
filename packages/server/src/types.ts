@@ -232,6 +232,15 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerMinute?: number
 	/**
+	 * Maximum operations accepted per authenticated principal per minute, across all of
+	 * its device nodes, on top of the per-node `maxOpsPerMinute`. Without it a user could
+	 * multiply the per-node budget by minting node ids. Keyed by the provider's user id;
+	 * anonymous and unauthenticated sessions (no stable principal) have only the per-node
+	 * budget. Defaults to 4 x `maxOpsPerMinute` (2400), so one busy device never meets it
+	 * and a user's devices share it. `0` disables the per-user budget.
+	 */
+	maxOpsPerMinutePerUser?: number
+	/**
 	 * Largest operation batch accepted from a client in one message. A larger batch is
 	 * refused whole with `BATCH_TOO_LARGE` before the server decodes it or reads the
 	 * store, so one message cannot buy unbounded work. Defaults to 1000 (the client

@@ -135,7 +135,9 @@ describe('ClientSession', () => {
 			expect(response?.type).toBe('handshake-response')
 			if (response?.type === 'handshake-response') {
 				expect(response.accepted).toBe(true)
-				expect(response.versionVector).toEqual({ 'node-a': 5 })
+				// The session's own node is always advertised, 0 when the server holds none
+				// of its operations (RT-45).
+				expect(response.versionVector).toEqual({ 'node-a': 5, 'client-1': 0 })
 				expect(response.nodeId).toBe('server-1')
 				expect(response.selectedWireFormat).toBe('protobuf')
 			}

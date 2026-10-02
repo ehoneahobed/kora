@@ -53,9 +53,25 @@ export function validateOperationSize(
 }
 
 /**
+ * Default per-principal ingest budget as a multiple of the per-node budget: a user's
+ * devices share it, and one device (bounded by its node budget) never meets it.
+ */
+export const DEFAULT_USER_BUDGET_MULTIPLIER = 4
+
+/** What a session charges uploaded operations to. */
+export interface IngestRateLimiter {
+	/** Units allowed per window (the tightest applicable budget). */
+	readonly limit: number
+	/** Charge `count` units; false when a budget is exceeded (the units are refused). */
+	allow(count?: number): boolean
+	/** Milliseconds until a refused unit may be retried. */
+	retryAfterMs(): number
+}
+
+/**
  * Simple sliding-window rate limiter for per-session operation ingest.
  */
-export class SessionRateLimiter {
+export class SessionRateLimiter implements IngestRateLimiter {
 	private windowStartMs = Date.now()
 	private count = 0
 
@@ -83,6 +99,13 @@ export class SessionRateLimiter {
 		return this.count <= this.maxOpsPerMinute
 	}
 
+	/** True when `count` more units fit in the current window (charges nothing). */
+	wouldAllow(count = 1): boolean {
+		const now = Date.now()
+		const used = now - this.windowStartMs >= this.windowMs ? 0 : this.count
+		return used + count <= this.maxOpsPerMinute
+	}
+
 	/** Milliseconds until the current window resets (when a refused unit may retry). */
 	retryAfterMs(): number {
 		return Math.max(0, this.windowStartMs + this.windowMs - Date.now())
@@ -91,5 +114,37 @@ export class SessionRateLimiter {
 	reset(): void {
 		this.windowStartMs = Date.now()
 		this.count = 0
+	}
+}
+
+/**
+ * A device node's ingest budget combined with its principal's (one user, many nodes).
+ * A refusal by the user budget spends none of the node's, and a node over its own
+ * budget spends none of the user's, so one runaway node cannot drain its siblings'
+ * shared budget beyond its own per-node limit (per-node fairness holds).
+ */
+export class CombinedRateLimiter implements IngestRateLimiter {
+	constructor(
+		private readonly node: SessionRateLimiter,
+		private readonly user: SessionRateLimiter,
+	) {}
+
+	get limit(): number {
+		return Math.min(this.node.limit, this.user.limit)
+	}
+
+	allow(count = 1): boolean {
+		if (!this.user.wouldAllow(count)) {
+			// Refused by the shared budget: the node keeps its units for later.
+			return false
+		}
+		if (!this.node.allow(count)) return false
+		return this.user.allow(count)
+	}
+
+	retryAfterMs(): number {
+		const blockers = [this.node, this.user].filter((limiter) => !limiter.wouldAllow(1))
+		if (blockers.length === 0) return 0
+		return Math.max(...blockers.map((limiter) => limiter.retryAfterMs()))
 	}
 }

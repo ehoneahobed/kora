@@ -34,13 +34,17 @@ import type {
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationResolution,
+	OperationResolutionOutcome,
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
 import {
+	MAX_RESOLUTION_MESSAGE_LENGTH,
 	NODE_SEQ_UNIQUE_INDEX,
 	RELEASED_NODE_OWNER,
 	SEQUENCE_ENFORCEMENT_EPOCH_KEY,
+	SEQUENCE_PAIRS_BACKFILLED_KEY,
 	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
 	SequenceConflictError,
 	type SequenceHolderVerdict,
@@ -48,6 +52,37 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+
+/** Index every (node, sequence) the log holds more than once (RT-48). */
+const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
+	SELECT node_id, sequence_number FROM operations
+	GROUP BY node_id, sequence_number HAVING COUNT(*) > 1`
+
+/** Drop resolutions above their node's restored log (see importBackup). */
+const PRUNE_RESOLUTIONS_PAST_LOG_SQL = `DELETE FROM operation_resolutions
+	WHERE sequence_number > COALESCE(
+		(SELECT max_sequence_number FROM sync_state WHERE sync_state.node_id = operation_resolutions.node_id),
+		0)`
+
+interface ResolutionRow {
+	op_id: string
+	node_id: string
+	sequence_number: number | string
+	outcome: string
+	code: string | null
+	message: string | null
+}
+
+function resolutionFromRow(row: ResolutionRow): OperationResolution {
+	return {
+		operationId: row.op_id,
+		nodeId: row.node_id,
+		sequenceNumber: Number(row.sequence_number),
+		outcome: row.outcome as OperationResolutionOutcome,
+		code: row.code,
+		message: row.message,
+	}
+}
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -198,6 +233,12 @@ export class SqliteServerStore implements ServerStore {
 				decision.verdict === 'free',
 			)
 			tx.insert(operations).values(row).run()
+			// A legacy pair: index its sequence so version-vector clients get both (RT-48).
+			if (decision.verdict === 'legacy') {
+				tx.run(
+					sql`INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number) VALUES (${op.nodeId}, ${op.sequenceNumber})`,
+				)
+			}
 
 			// Advance version vector: upsert with MAX to ensure monotonic progress
 			tx.insert(syncState)
@@ -470,6 +511,62 @@ export class SqliteServerStore implements ServerStore {
 		return rows.map((row) => row.node_id)
 	}
 
+	async getSequencePairOperations(nodeId: string, throughSequence: number): Promise<Operation[]> {
+		this.assertOpen()
+		const rows = this.db
+			.select()
+			.from(operations)
+			.where(
+				and(
+					eq(operations.nodeId, nodeId),
+					sql`${operations.sequenceNumber} IN (SELECT sequence_number FROM sequence_pairs WHERE node_id = ${nodeId} AND sequence_number <= ${throughSequence})`,
+				),
+			)
+			.orderBy(asc(operations.sequenceNumber), asc(operations.deliverySeq))
+			.all()
+		return rows.map((row) => this.deserializeOperation(row))
+	}
+
+	async recordOperationResolution(resolution: OperationResolution): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR IGNORE INTO operation_resolutions
+				(op_id, node_id, sequence_number, outcome, code, message, resolved_at)
+				VALUES (${resolution.operationId}, ${resolution.nodeId}, ${resolution.sequenceNumber},
+					${resolution.outcome}, ${resolution.code},
+					${resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null}, ${Date.now()})`,
+		)
+	}
+
+	async findOperationResolutions(
+		nodeId: string,
+		ids: string[],
+	): Promise<Map<string, OperationResolution>> {
+		this.assertOpen()
+		const found = new Map<string, OperationResolution>()
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500)
+			if (chunk.length === 0) continue
+			const rows = this.db.all<ResolutionRow>(
+				sql`SELECT op_id, node_id, sequence_number, outcome, code, message FROM operation_resolutions
+					WHERE node_id = ${nodeId} AND op_id IN (${sql.join(
+						chunk.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+			)
+			for (const row of rows) found.set(row.op_id, resolutionFromRow(row))
+		}
+		return found
+	}
+
+	async getResolvedThrough(nodeId: string): Promise<number> {
+		this.assertOpen()
+		const rows = this.db.all<{ m: number | string | null }>(
+			sql`SELECT MAX(sequence_number) AS m FROM operation_resolutions WHERE node_id = ${nodeId}`,
+		)
+		return Number(rows[0]?.m ?? 0)
+	}
+
 	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
 		this.assertOpen()
 		const found = new Map<string, StoredOperationKey>()
@@ -734,6 +831,12 @@ export class SqliteServerStore implements ServerStore {
 				tx.insert(operations).values(row).run()
 			}
 			tx.update(deliveryCounter).set({ value: deliverySeq }).where(eq(deliveryCounter.id, 1)).run()
+			// The restored log's legacy pairs (RT-48), and only the resolutions it covers:
+			// one past a node's restored log was decided after the backup, and advertising
+			// it would hide stored operations the restore lost (RT-45).
+			tx.run(sql.raw('DELETE FROM sequence_pairs'))
+			tx.run(sql.raw(BACKFILL_SEQUENCE_PAIRS_SQL))
+			tx.run(sql.raw(PRUNE_RESOLUTIONS_PAST_LOG_SQL))
 			// The restored log is a snapshot that may hold legacy duplicate sequences: it
 			// all sits at or below the new epoch, and enforcement resumes above it.
 			tx.run(
@@ -1204,8 +1307,52 @@ export class SqliteServerStore implements ServerStore {
 			)
 		`)
 
+		// How uploaded operations were resolved without being stored under their sequence
+		// (validator `ignore`, terminal refusal, renumbered duplicate; RT-43, RT-47).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS operation_resolutions (
+				op_id TEXT PRIMARY KEY,
+				node_id TEXT NOT NULL,
+				sequence_number INTEGER NOT NULL,
+				outcome TEXT NOT NULL,
+				code TEXT,
+				message TEXT,
+				resolved_at INTEGER NOT NULL
+			)
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_resolutions_node_seq
+			ON operation_resolutions (node_id, sequence_number)
+		`)
+		// (node, sequence) held by more than one operation: legacy pairs (RT-48).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS sequence_pairs (
+				node_id TEXT NOT NULL,
+				sequence_number INTEGER NOT NULL,
+				PRIMARY KEY (node_id, sequence_number)
+			)
+		`)
+
 		this.backfillDeliverySequence()
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
+		this.backfillSequencePairs()
+	}
+
+	/**
+	 * Index the legacy pairs already in the log once (history written before the
+	 * `sequence_pairs` table existed); appends maintain it from then on.
+	 */
+	private backfillSequencePairs(): void {
+		this.db.transaction((tx) => {
+			const done = tx.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_PAIRS_BACKFILLED_KEY}`,
+			)
+			if (done.length > 0) return
+			tx.run(sql.raw(BACKFILL_SEQUENCE_PAIRS_SQL))
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SEQUENCE_PAIRS_BACKFILLED_KEY}, '1')`,
+			)
+		})
 	}
 
 	/**
