@@ -75,6 +75,14 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		await this.store.saveNodeToken(token, nodeId)
 	}
 
+	loadAuthoritativeNodeIds(): Promise<string[] | null> {
+		return this.store.loadAuthoritativeNodeIds()
+	}
+
+	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
+		await this.store.saveAuthoritativeNodeIds(nodeIds)
+	}
+
 	loadOwnAckedThrough(nodeId: string): Promise<number | null> {
 		return this.store.loadOwnAckedThrough(nodeId)
 	}

@@ -98,12 +98,14 @@ import {
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
 	loadAllDeliveryWatermarks,
+	loadAuthoritativeNodeIds,
 	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
 	loadNodeToken,
 	mergeVersionVectors,
 	nodeTokenKey,
+	saveAuthoritativeNodeIds,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
@@ -1344,6 +1346,21 @@ export class Store implements OperationLog {
 	async saveNodeToken(token: string, nodeId?: string): Promise<void> {
 		this.ensureOpen()
 		await saveNodeToken(this.adapter, token, nodeId ?? this.nodeId)
+	}
+
+	/**
+	 * Load the node ids the sync server named authoritative (protocol v2), or null when
+	 * no protocol-2 server ever answered.
+	 */
+	async loadAuthoritativeNodeIds(): Promise<string[] | null> {
+		this.ensureOpen()
+		return loadAuthoritativeNodeIds(this.adapter)
+	}
+
+	/** Persist the node ids the sync server named authoritative (protocol v2). */
+	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
+		this.ensureOpen()
+		await saveAuthoritativeNodeIds(this.adapter, nodeIds)
 	}
 
 	/**

@@ -25,6 +25,7 @@ describe('getEventCategory', () => {
 			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',
 			'sync:schema-mismatch': 'sync',
+			'sync:protocol-deprecated': 'sync',
 			'sync:apply-failed': 'sync',
 			'sync:operation-rejected': 'sync',
 			'sync:sent': 'sync',

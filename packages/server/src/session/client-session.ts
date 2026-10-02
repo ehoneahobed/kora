@@ -7,7 +7,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { applyOperationTransforms } from '@korajs/core'
-import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
+import { SyncError, generateUUIDv7, hashBlob, verifyOperationId } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
 	AwarenessUpdateMessage,
@@ -24,10 +24,16 @@ import type {
 import { decodeBlobChunkBytes } from '@korajs/sync'
 import {
 	type DeltaCursor,
+	INVALID_OPERATION_ID,
+	LEGACY_SYNC_PROTOCOL_VERSION,
 	NegotiatedMessageSerializer,
+	PLAINTEXT_REJECTED,
+	PROTOCOL_V1_DEPRECATED,
 	SCHEMA_MISMATCH_PREFIX,
+	SYNC_PROTOCOL_VERSION,
 	type SyncQuerySubset,
 	createDeltaCursorFromBatch,
+	declaredProtocolVersion,
 	decodeDeltaCursor,
 	dedupeQuerySubsets,
 	encodeDeltaCursor,
@@ -79,7 +85,7 @@ import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
-import { buildScopeEntryOperation } from './scope-entry'
+import { SCOPE_ENTRY_NODE_ID, buildScopeEntryOperation } from './scope-entry'
 import {
 	BATCH_LOOKUP_RATE_COST,
 	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
@@ -482,6 +488,21 @@ export interface ClientSessionOptions {
 	 * interval so it can declare the connection dead after missing two. 0 disables it.
 	 */
 	appHeartbeatIntervalMs?: number
+	/**
+	 * Node ids whose operations this server authors (protocol v2). Sent to clients in
+	 * the handshake response (`authoritativeNodeIds`); only operations from these nodes
+	 * may carry server-authored metadata (`fieldVersions`, `foldState`). Defaults to the
+	 * store's node id and the reserved scope-entry node.
+	 */
+	authoritativeNodeIds?: readonly string[]
+	/**
+	 * End-to-end encryption policy (protocol v2, ENC-3). With `required`, every uploaded
+	 * data-bearing operation must carry the encryption envelope; a plaintext one is
+	 * refused non-retriably (`PLAINTEXT_REJECTED`), unless `allowPlaintextMigration` is
+	 * set for a migration window. Without it, the server stores whatever it receives
+	 * (envelope operations always opaquely).
+	 */
+	encryption?: { required: boolean; allowPlaintextMigration?: boolean }
 }
 
 /**
@@ -664,6 +685,12 @@ export class ClientSession {
 	private sequenceReservation = false
 	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
 	private legacySequencePairs = 0
+	/** Protocol version the client declared in its handshake (1 when absent). */
+	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
+	private readonly authoritativeNodeIds: readonly string[] | null
+	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
+	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
+	private invalidOperationIds = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -698,6 +725,13 @@ export class ClientSession {
 		this.onOrphanedRelays = options.onOrphanedRelays ?? null
 		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
+		this.authoritativeNodeIds = options.authoritativeNodeIds
+			? [...options.authoritativeNodeIds]
+			: null
+		this.encryptionPolicy = {
+			required: options.encryption?.required === true,
+			allowPlaintextMigration: options.encryption?.allowPlaintextMigration === true,
+		}
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
 		this.blobRateLimiter = new SessionRateLimiter(
@@ -1730,6 +1764,7 @@ export class ClientSession {
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 		this.sequenceReservation = msg.sequenceReservation === true
+		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -2034,11 +2069,14 @@ export class ClientSession {
 				: {}),
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
+			protocolVersion: SYNC_PROTOCOL_VERSION,
+			authoritativeNodeIds: this.serverAuthoritativeNodeIds(),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
+		if (this.clientProtocolVersion < SYNC_PROTOCOL_VERSION) this.warnLegacyProtocol(msg.nodeId)
 
 		// The ingest rate limit follows the node across reconnects (SRV-6): the node id
 		// is bound to this principal by now (claimed when auth is configured).
@@ -2261,11 +2299,16 @@ export class ClientSession {
 			)
 			return
 		}
-		// Per-field versions are server-authored only (scope-entry operations, RT-27). A
-		// device never sends them; one that does would forge field precedence on its
-		// peers, so they are dropped before anything else sees the operation.
+		// Per-field versions and fold state are server-authored only (scope-entry
+		// operations, RT-27, W7). A device never sends them; one that does would forge
+		// field precedence on its peers, so they are dropped before anything else sees
+		// the operation.
 		const operations = msg.operations.map((s) => {
-			const { fieldVersions: _forged, ...op } = this.serializer.decodeOperation(s)
+			const {
+				fieldVersions: _forged,
+				foldState: _forgedFold,
+				...op
+			} = this.serializer.decodeOperation(s)
 			return op
 		})
 		const applied: Operation[] = []
@@ -2427,6 +2470,20 @@ export class ClientSession {
 				continue
 			}
 
+			// Content-hash verification (CORE-1, protocol v2) runs on the operation exactly
+			// as uploaded, BEFORE any schema transform (which rewrites data) and before any
+			// validator or store sees it. Only plaintext version-2 ids are verified here: an
+			// envelope's id covers the plaintext, which only the clients can check (they do,
+			// after decryption), and a version-1 id never covered every field.
+			const integrity = await this.checkUploadIntegrity(op)
+			if (integrity !== null) {
+				if (integrity.code === INVALID_OPERATION_ID) this.invalidOperationIds += 1
+				await this.refuseTerminally(op, integrity.code, integrity.message)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
 			const serverOp = this.transformForServerSchema(op)
 			if (serverOp === null) {
 				await this.refuseTerminally(
@@ -2582,7 +2639,94 @@ export class ClientSession {
 		if (op.schemaVersion === this.schemaVersion) {
 			return op
 		}
-		return applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
+		// An envelope operation is opaque to the server (NEW-ENC-1): its data cannot be
+		// transformed here. It is stored as uploaded; clients transform after decryption.
+		if (op.encrypted !== undefined) {
+			return op
+		}
+		const transformed = applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
+		if (transformed === null || transformed === op) return transformed
+		// The transform rewrote the content under the original id, so the id is no
+		// longer the content hash of what is stored. The original was verified above;
+		// the stored copy declares hash version 1 (never verified against version-2
+		// rules), so receivers do not quarantine a server-transformed operation.
+		const { hashVersion: _rewritten, ...rest } = transformed
+		return rest
+	}
+
+	/**
+	 * Integrity checks on an uploaded operation before anything else judges it:
+	 * - a version-2 plaintext id must be the content hash (`INVALID_OPERATION_ID`);
+	 * - an unknown declared hash version is refused the same way;
+	 * - with required encryption, a data-bearing plaintext operation is refused
+	 *   (`PLAINTEXT_REJECTED`) unless the plaintext migration window is open.
+	 *
+	 * @returns null when the operation passes, or the refusal
+	 */
+	private async checkUploadIntegrity(
+		op: Operation,
+	): Promise<{ code: string; message: string } | null> {
+		const declared = op.hashVersion
+		if (declared !== undefined && declared !== 1 && declared !== 2) {
+			return {
+				code: INVALID_OPERATION_ID,
+				message: `Operation "${op.id}" declares unknown content-hash version ${String(declared)}. Upgrade the server or the client so both speak the same protocol version.`,
+			}
+		}
+		if (op.encrypted === undefined) {
+			if (
+				this.encryptionPolicy.required &&
+				!this.encryptionPolicy.allowPlaintextMigration &&
+				(op.data !== null || op.previousData !== null)
+			) {
+				return {
+					code: PLAINTEXT_REJECTED,
+					message: `Operation "${op.id}" is plaintext but this server requires end-to-end encryption. Enable sync encryption on the client, or open a plaintext migration window (encryption.allowPlaintextMigration) on the server.`,
+				}
+			}
+			if (declared === 2 && !(await verifyOperationId(op))) {
+				return {
+					code: INVALID_OPERATION_ID,
+					message: `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`,
+				}
+			}
+		}
+		return null
+	}
+
+	/** Node ids this server authors operations under (protocol v2 handshake response). */
+	private serverAuthoritativeNodeIds(): string[] {
+		if (this.authoritativeNodeIds !== null) return [...this.authoritativeNodeIds]
+		return [...new Set([this.store.getNodeId(), SCOPE_ENTRY_NODE_ID])]
+	}
+
+	/**
+	 * A protocol-1 client (Kora <= beta.13) is served for one release (beta.14) with a
+	 * deprecation warning: its operation ids are version-1 hashes and its encrypted
+	 * payloads have no envelope binding.
+	 */
+	private warnLegacyProtocol(nodeId: string): void {
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.13) are accepted in beta.14 only and will be refused by the next release. Upgrade the client.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.protocol_deprecated',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				code: PROTOCOL_V1_DEPRECATED,
+				clientProtocolVersion: this.clientProtocolVersion,
+				serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+				message,
+			},
+		})
+		this.emitter?.emit({
+			type: 'sync:protocol-deprecated',
+			nodeId,
+			clientProtocolVersion: this.clientProtocolVersion,
+			serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+			message,
+		})
 	}
 
 	/** The in-scope operations a version-vector client is missing (not yet sent). */

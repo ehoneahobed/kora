@@ -6,6 +6,7 @@ export const LAST_ACKED_SERVER_VECTOR_META_KEY = 'last_acked_server_vector'
 export const DELTA_CURSOR_META_KEY = 'delta_cursor'
 export const DELIVERY_WATERMARK_META_KEY = 'delivery_watermark'
 export const NODE_TOKEN_META_KEY = 'sync_node_token'
+export const AUTHORITATIVE_NODE_IDS_META_KEY = 'sync_authoritative_node_ids'
 
 /**
  * Serialize a version vector for `_kora_meta` storage.
@@ -239,4 +240,39 @@ export async function loadAllDeliveryWatermarks(
 		}
 	}
 	return result
+}
+
+/**
+ * Persist the node ids the sync server named authoritative (protocol v2): their
+ * operations are server-authored. Stored as a JSON array in `_kora_meta`.
+ */
+export async function saveAuthoritativeNodeIds(
+	adapter: StorageAdapter,
+	nodeIds: string[],
+): Promise<void> {
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		AUTHORITATIVE_NODE_IDS_META_KEY,
+		JSON.stringify(nodeIds),
+	])
+}
+
+/**
+ * Load the persisted authoritative node ids, or null when no protocol-2 server ever
+ * answered (or the stored value is unreadable).
+ */
+export async function loadAuthoritativeNodeIds(adapter: StorageAdapter): Promise<string[] | null> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		AUTHORITATIVE_NODE_IDS_META_KEY,
+	])
+	const raw = rows[0]?.value
+	if (raw === undefined) return null
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		if (Array.isArray(parsed) && parsed.every((id) => typeof id === 'string')) {
+			return parsed as string[]
+		}
+	} catch {
+		// Unreadable: treated as never received; the next handshake rewrites it.
+	}
+	return null
 }

@@ -174,6 +174,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			supportedMax: 2,
 			reason: 'Client schema v1 is below server minimum v2',
 		},
+		'sync:protocol-deprecated': {
+			type: 'sync:protocol-deprecated',
+			nodeId: 'node-a',
+			clientProtocolVersion: 1,
+			serverProtocolVersion: 2,
+			message: 'Upgrade the client.',
+		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
 		'sync:suspended': { type: 'sync:suspended', reason: 'auth-required' },
 		'sync:apply-blocked': {

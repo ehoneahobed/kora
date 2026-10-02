@@ -10,6 +10,8 @@ export type {
 	Constraint,
 	CustomResolver,
 	BlobRef,
+	EncryptedEnvelopeField,
+	EncryptedOperationEnvelope,
 	FieldDescriptor,
 	FieldKind,
 	SecretMode,
