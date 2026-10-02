@@ -1,4 +1,6 @@
 import type { Operation } from '@korajs/core'
+import { assertBackupOperationsIngestible } from '../apply/ingest-validation'
+import { SequenceConflictError } from './server-store'
 
 /**
  * Server-side backup format: same portable section-based format as the client.
@@ -170,5 +172,38 @@ export function parseServerBackup(data: Uint8Array): {
 		}
 	}
 
+	// Every ingest path validates against server time (SYNC-7): a backup whose
+	// operations are far-future or malformed is refused whole, before anything changes.
+	assertBackupOperationsIngestible(operations)
+
 	return { operations, versionVector }
+}
+
+/**
+ * Merge-mode restore shared by the built-in stores: apply every backup operation
+ * through the store's normal append (dedup by id). An operation refused for a
+ * sequence conflict (another operation holds its node and sequence, W3 step 4) is
+ * counted, not thrown, so the rest of the backup still restores; the result is then
+ * `success: false` and the conflicts are logged, never silently dropped.
+ */
+export async function mergeBackupOperations(
+	operations: Operation[],
+	apply: (op: Operation) => Promise<string>,
+): Promise<{ operationsRestored: number; success: boolean }> {
+	let restored = 0
+	const conflicts: string[] = []
+	for (const op of operations) {
+		try {
+			if ((await apply(op)) === 'applied') restored++
+		} catch (error) {
+			if (!(error instanceof SequenceConflictError)) throw error
+			conflicts.push(op.id)
+		}
+	}
+	if (conflicts.length > 0) {
+		console.warn(
+			`[kora] Backup merge: ${String(conflicts.length)} operation(s) were not restored because another operation already holds their node and sequence number (SEQUENCE_CONFLICT). First: ${conflicts.slice(0, 5).join(', ')}`,
+		)
+	}
+	return { operationsRestored: restored, success: conflicts.length === 0 }
 }

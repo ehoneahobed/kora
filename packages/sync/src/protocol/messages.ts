@@ -55,6 +55,16 @@ export interface HandshakeMessage {
 	 * cursor for the server->client direction. Optional, so old servers ignore it.
 	 */
 	lastDeliverySequence?: number
+	/**
+	 * SYNC-11: canonical key (`scopeViewKey`) of the downlink scope the server accepted at
+	 * this client's last handshake, when it differs from `syncScope`. A server that
+	 * resolves a scope with the same key resumes the delivery stream from
+	 * `acceptedScopeWatermark` instead of restarting it from 0. Optional; old servers
+	 * ignore it.
+	 */
+	acceptedScopeKey?: string
+	/** The client's delivery watermark for the view named by `acceptedScopeKey`. */
+	acceptedScopeWatermark?: number
 	/** Opt in to client-local removal when records leave the accepted downlink view. */
 	scopeExitPolicy?: 'retain' | 'retract'
 	/**
@@ -64,6 +74,35 @@ export interface HandshakeMessage {
 	 * over (RT-12). Stored by the client next to its node id; never sent elsewhere.
 	 */
 	nodeToken?: string
+	/**
+	 * Set by a client transport that understands `heartbeat` messages (LMS #12). Only
+	 * then does the server send them, so an older client never receives a message type
+	 * it cannot decode. Old servers ignore it.
+	 */
+	supportsHeartbeat?: boolean
+	/**
+	 * Capability (RT-37): this client reserves each operation's sequence number inside
+	 * the same local transaction that writes the operation, so it never puts two
+	 * different operations under one `(nodeId, sequenceNumber)`. Only for such a client
+	 * does the server refuse a second, different operation under a held sequence
+	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.13, which could give
+	 * two concurrent transactions one number) is served as legacy: such a pair is
+	 * stored, both operations are delivered, and a warning is logged. Old servers
+	 * ignore it. Protobuf field 45.
+	 */
+	sequenceReservation?: boolean
+}
+
+/**
+ * Application-level liveness message (LMS #12). A server sends it every
+ * `HandshakeResponseMessage.heartbeatIntervalMs` to a client that set
+ * `HandshakeMessage.supportsHeartbeat`. Browsers cannot see WebSocket ping frames, so
+ * this is how a client notices a half-open connection: no inbound traffic for about
+ * two intervals means the connection is dead. Carries no data; never acknowledged.
+ */
+export interface HeartbeatMessage {
+	type: 'heartbeat'
+	messageId: string
 }
 
 /**
@@ -119,6 +158,11 @@ export interface HandshakeResponseMessage {
 	 * their hash, records possession, and drops them (RT-23).
 	 */
 	blobPossessionProof?: boolean
+	/**
+	 * Interval of the server's `heartbeat` messages, in ms, present when the client set
+	 * `supportsHeartbeat` and the server sends them (LMS #12).
+	 */
+	heartbeatIntervalMs?: number
 }
 
 /**
@@ -338,6 +382,7 @@ export type SyncMessage =
 	| BlobChunkRequestMessage
 	| BlobChunkResponseMessage
 	| BlobChunkPushMessage
+	| HeartbeatMessage
 
 // --- Type Guards ---
 
@@ -371,6 +416,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isBlobChunkResponseMessage(value)
 		case 'blob-chunk-push':
 			return isBlobChunkPushMessage(value)
+		case 'heartbeat':
+			return true
 		default:
 			return false
 	}

@@ -288,6 +288,28 @@ function buildCollection(name: string, input: CollectionInput): CollectionDefini
 		stateMachine = { ...input.stateMachine }
 	}
 
+	// Field-level `t.enum(...).transitions({...})` (NEW-STORE-3) is the documented
+	// shorthand for a state machine on that field, with the default 'reject' mode.
+	// With exactly one such field and no collection-level definition, it becomes
+	// the collection's state machine, so every layer that reads `stateMachine`
+	// (local writes, transactions, merge) sees it. Local writes also enforce every
+	// field-level transition map directly, so a collection may declare several.
+	if (!stateMachine) {
+		const transitionFields = Object.entries(fields).filter(
+			([, descriptor]) => descriptor.kind === 'enum' && descriptor.transitions,
+		)
+		const only = transitionFields.length === 1 ? transitionFields[0] : undefined
+		if (only?.[1].transitions) {
+			const derived: StateMachineInput = {
+				field: only[0],
+				transitions: { ...only[1].transitions },
+				onInvalidTransition: 'reject',
+			}
+			validateStateMachineDefinition(name, derived, fields)
+			stateMachine = derived
+		}
+	}
+
 	return { fields, indexes, constraints, resolvers, scope, stateMachine }
 }
 

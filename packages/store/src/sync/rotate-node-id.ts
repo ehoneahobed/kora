@@ -31,9 +31,9 @@ export interface NodeRotationResult {
  * shared, so no replica holds their old ids.
  *
  * Materialized rows are re-stamped so per-field LWW keeps comparing against the
- * rewritten timestamps; the version vector gets the new node's sequence, and the old
- * node's entry drops to its highest remaining (acknowledged) operation. Everything is
- * written in one transaction.
+ * rewritten timestamps; the version vector gets the new node's sequence (MAX with the
+ * stored value) and the old node's entry is never lowered (W6). Everything, the scan
+ * of the rotated operations included, runs in one transaction.
  *
  * @param adapter - The store's adapter
  * @param schema - The store schema (collections to scan)
@@ -49,52 +49,52 @@ export async function rotateUnsyncedOperationsInLog(
 	newNodeId: string,
 ): Promise<NodeRotationResult> {
 	const rotateIds = new Set(unsyncedOpIds)
-	const rotated: Operation[] = []
-	let maxRemainingOldSeq = 0
-	for (const collectionName of Object.keys(schema.collections)) {
-		const rows = await adapter.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} WHERE node_id = ?`,
-			[oldNodeId],
-		)
-		for (const row of rows) {
-			if (rotateIds.has(row.id)) {
-				rotated.push(deserializeOperationWithCollection(row, collectionName))
-			} else if (row.sequence_number > maxRemainingOldSeq) {
-				maxRemainingOldSeq = row.sequence_number
-			}
-		}
-	}
-	// Original authoring order: sequence numbers are allocated in causal order.
-	rotated.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
-
 	const idMapping: Record<string, string> = {}
 	const rewritten: Operation[] = []
-	for (let i = 0; i < rotated.length; i++) {
-		const op = rotated[i]
-		if (!op) continue
-		const timestamp = { ...op.timestamp, nodeId: newNodeId }
-		const input: OperationInput = {
-			nodeId: newNodeId,
-			type: op.type,
-			collection: op.collection,
-			recordId: op.recordId,
-			data: op.data,
-			previousData: op.previousData,
-			sequenceNumber: i + 1,
-			causalDeps: op.causalDeps,
-			schemaVersion: op.schemaVersion,
-			...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
-		}
-		const id = await computeOperationId(input, HybridLogicalClock.serialize(timestamp))
-		idMapping[op.id] = id
-		rewritten.push({ ...op, id, nodeId: newNodeId, timestamp, sequenceNumber: i + 1 })
-	}
-	// Remap causal deps among the rotated set (deps on acknowledged ops keep their ids).
-	for (const op of rewritten) {
-		op.causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
-	}
 
+	// One transaction from the scan to the last write (W6): the rotated set is read in
+	// the transaction that rewrites it, so nothing committed in between is missed.
 	await adapter.transaction(async (tx) => {
+		const rotated: Operation[] = []
+		for (const collectionName of Object.keys(schema.collections)) {
+			const rows = await tx.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)} WHERE node_id = ?`,
+				[oldNodeId],
+			)
+			for (const row of rows) {
+				if (rotateIds.has(row.id)) {
+					rotated.push(deserializeOperationWithCollection(row, collectionName))
+				}
+			}
+		}
+		// Original authoring order: sequence numbers are allocated in causal order.
+		rotated.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+
+		for (let i = 0; i < rotated.length; i++) {
+			const op = rotated[i]
+			if (!op) continue
+			const timestamp = { ...op.timestamp, nodeId: newNodeId }
+			const input: OperationInput = {
+				nodeId: newNodeId,
+				type: op.type,
+				collection: op.collection,
+				recordId: op.recordId,
+				data: op.data,
+				previousData: op.previousData,
+				sequenceNumber: i + 1,
+				causalDeps: op.causalDeps,
+				schemaVersion: op.schemaVersion,
+				...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
+			}
+			const id = await computeOperationId(input, HybridLogicalClock.serialize(timestamp))
+			idMapping[op.id] = id
+			rewritten.push({ ...op, id, nodeId: newNodeId, timestamp, sequenceNumber: i + 1 })
+		}
+		// Remap causal deps among the rotated set (deps on acknowledged ops keep their ids).
+		for (const op of rewritten) {
+			op.causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+		}
+
 		for (let i = 0; i < rotated.length; i++) {
 			const oldOp = rotated[i]
 			const newOp = rewritten[i]
@@ -139,18 +139,20 @@ export async function rotateUnsyncedOperationsInLog(
 		])
 		// The node token belonged to the refused node id.
 		await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
-		await tx.execute(
-			'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-			[newNodeId, rewritten.length],
-		)
-		if (maxRemainingOldSeq > 0) {
+		// The new node's counter covers the rewritten operations: MAX with the stored
+		// value, in this transaction, like every sequence reservation (W6).
+		if (rewritten.length > 0) {
 			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
-				[oldNodeId, maxRemainingOldSeq],
+				`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+				[newNodeId, rewritten.length],
 			)
-		} else {
-			await tx.execute('DELETE FROM _kora_version_vector WHERE node_id = ?', [oldNodeId])
 		}
+		// The old node's counter is left as it is, never lowered: a rotated operation
+		// may have reached the server unacknowledged, and a writer still on the old id
+		// (another tab) must not reuse its number for different content. The numbers the
+		// rotated operations held become holes in the old node's log, which upload
+		// tracking treats as resolved.
 	})
 
 	return { nodeId: newNodeId, operations: rewritten, idMapping }

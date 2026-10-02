@@ -17,6 +17,10 @@ export default mergeConfig(
 			name: '@korajs/test',
 			root: __dirname,
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+			// Multi-device convergence tests run whole simulated fleets; the timeout is a hang
+			// guard only (the tests use deterministic clocks and mock transports), so it must not
+			// trip on a loaded CI machine. Several took ~4.5s against the 5s default.
+			testTimeout: 30_000,
 		},
 	}),
 )

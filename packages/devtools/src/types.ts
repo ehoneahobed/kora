@@ -27,6 +27,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:suspended': 'sync',
 	'sync:clock-skew': 'sync',
 	'sync:node-id-rotated': 'sync',
+	'sync:local-node': 'sync',
 	'sync:clock-rebase': 'sync',
 	'sync:schema-mismatch': 'sync',
 	'sync:apply-failed': 'sync',
@@ -48,6 +49,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:initial-sync-progress': 'sync',
 	'sync:delivery-gap': 'sync',
 	'sync:delivery-stalled': 'sync',
+	'sync:durability-degraded': 'connection',
+	'sync:durability-restored': 'connection',
 	'awareness:updated': 'sync',
 	'state-machine:transition': 'operation',
 	'state-machine:rejected': 'operation',
@@ -57,6 +60,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:opfs-unavailable': 'connection',
 	'store:durability-lost': 'connection',
 	'store:db-name-collision': 'connection',
+	'store:storage-blocked': 'connection',
+	'store:storage-migrated': 'connection',
 	'replay:completed': 'operation',
 }
 

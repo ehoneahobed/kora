@@ -8,6 +8,8 @@ import {
 	type UplinkAuthorizationResult,
 } from '../scopes/server-scope-filter'
 import type { ApplyRemoteOptions, MaterializedRecord, ServerStore } from '../store/server-store'
+import { SEQUENCE_CONFLICT_CODE, SequenceConflictError } from '../store/server-store'
+import { validateIngestedOperation } from './ingest-validation'
 import { type OperationRejection, isRetriableRejection } from './rejection-taxonomy'
 import {
 	createServerSideEffectOperation,
@@ -59,6 +61,15 @@ export interface ApplyServerOperationOptions {
 	 * alone also switches restrict refusals to the generic form.
 	 */
 	authorizeSideEffect?: SideEffectAuthorizer
+	/**
+	 * The writer is a legacy client that does not reserve sequence numbers (RT-37): a
+	 * different operation under a held `(nodeId, sequenceNumber)` is stored as a legacy
+	 * pair instead of being refused with `SEQUENCE_CONFLICT`. Applies to the primary
+	 * operation only; server-originated side effects are always enforced.
+	 */
+	legacySequenceWriter?: boolean
+	/** See `ApplyRemoteOptions.onLegacySequencePair`; for the primary operation. */
+	onLegacySequencePair?: ApplyRemoteOptions['onLegacySequencePair']
 }
 
 /**
@@ -77,6 +88,17 @@ export async function applyServerOperation(
 	relationLookup?: ReturnType<typeof buildMergeRelationLookup>,
 	options: ApplyServerOperationOptions = {},
 ): Promise<ApplyServerOperationResult> {
+	// Every ingest path (sync, route kora.apply, applyLocalOperation) validates the
+	// timestamp against server time and the sequence number (SYNC-7, SRV-4).
+	const ingest = validateIngestedOperation(op)
+	if (!ingest.valid) {
+		return {
+			result: 'skipped',
+			appliedOperations: [],
+			rejection: { code: ingest.code, message: ingest.message, retriable: false },
+		}
+	}
+
 	const schema = store.getSchema()
 	const lookup = relationLookup ?? (schema ? buildMergeRelationLookup(schema) : new Map())
 
@@ -230,13 +252,24 @@ function applyPrimary(
 	op: Operation,
 	options: ApplyServerOperationOptions,
 ): ReturnType<ServerStore['applyRemoteOperation']> {
-	return options.authorize
-		? store.applyRemoteOperation(op, { authorize: options.authorize })
+	const storeOptions: ApplyRemoteOptions = {
+		...(options.authorize ? { authorize: options.authorize } : {}),
+		...(options.legacySequenceWriter ? { legacySequenceWriter: true } : {}),
+		...(options.onLegacySequencePair ? { onLegacySequencePair: options.onLegacySequencePair } : {}),
+	}
+	return Object.keys(storeOptions).length > 0
+		? store.applyRemoteOperation(op, storeOptions)
 		: store.applyRemoteOperation(op)
 }
 
-/** Map an in-store authorization refusal to a structured, non-retriable rejection. */
+/**
+ * Map an in-store refusal to a structured, non-retriable rejection: an authorization
+ * refusal, or a sequence conflict (another operation holds the node and sequence).
+ */
 function authorizationRejection(error: unknown): OperationRejection | null {
+	if (error instanceof SequenceConflictError) {
+		return { code: SEQUENCE_CONFLICT_CODE, message: error.message, retriable: false }
+	}
 	if (!(error instanceof UplinkAuthorizationError)) return null
 	return { code: error.rejectionCode, message: error.message, retriable: false }
 }

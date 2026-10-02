@@ -5,6 +5,14 @@ import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
 import { PostgresServerStore } from './postgres-server-store'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 /**
  * Real-Postgres proof that atomic-op intent persists through the operation log and is
  * composed during materialization. Requires a running Postgres; set KORA_PG_TEST_URL
@@ -52,7 +60,7 @@ describe.skipIf(!PG_URL)('Postgres atomic-op materialization', () => {
 			data: { count: 0 },
 			previousData: null,
 			timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
-			sequenceNumber: 1,
+			sequenceNumber: nextFixtureSequence(),
 			causalDeps: [],
 			schemaVersion: 1,
 			...overrides,
@@ -72,6 +80,7 @@ describe.skipIf(!PG_URL)('Postgres atomic-op materialization', () => {
 				previousData: { count: 0 },
 				atomicOps: { count: { type: 'increment', value: delta } },
 				timestamp: { wallTime: wall, logical: 0, nodeId: node },
+				sequenceNumber: 1,
 			})
 		await store.applyRemoteOperation(increment('a', 'node-a', 1001, 5))
 		await store.applyRemoteOperation(increment('b', 'node-b', 1002, 3))

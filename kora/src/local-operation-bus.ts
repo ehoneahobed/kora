@@ -15,8 +15,11 @@ interface LocalOperationMessage {
  * The storage leader/follower path makes all tabs read and write one durable
  * database. A write committed in tab A, however, only invalidates tab A's in-memory
  * subscriptions unless the other tabs are told that a committed operation exists.
- * This bus carries that notification. Receivers do not reapply the operation; they
- * only ask their Store to advance in-memory watermarks and refetch affected queries.
+ * This bus carries that notification for local writes (`operation:created`) AND
+ * for remote operations applied by sync (`operation:applied`): a tab that is not
+ * syncing still sees what the syncing tab received (STORE-10). Receivers do not
+ * reapply the operation; they only ask their Store to advance in-memory
+ * watermarks and refetch affected queries.
  */
 export function wireLocalOperationBus(
 	dbName: string,
@@ -43,17 +46,16 @@ export function wireLocalOperationBus(
 	}
 
 	channel.addEventListener('message', onMessage)
-	const unsubscribe = emitter.on('operation:created', (event) => {
-		const message: LocalOperationMessage = {
-			type: MESSAGE_TYPE,
-			originId,
-			operation: event.operation,
-		}
+	const broadcast = (operation: Operation): void => {
+		const message: LocalOperationMessage = { type: MESSAGE_TYPE, originId, operation }
 		channel.postMessage(message)
-	})
+	}
+	const unsubscribeCreated = emitter.on('operation:created', (event) => broadcast(event.operation))
+	const unsubscribeApplied = emitter.on('operation:applied', (event) => broadcast(event.operation))
 
 	return () => {
-		unsubscribe()
+		unsubscribeCreated()
+		unsubscribeApplied()
 		channel.removeEventListener('message', onMessage)
 		channel.close()
 	}

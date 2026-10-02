@@ -92,8 +92,50 @@ export interface KoraSyncServerConfig {
 	serializer?: MessageSerializer
 	/** Event emitter for DevTools integration */
 	emitter?: KoraEventEmitter
-	/** Maximum concurrent client connections. 0 = unlimited. Defaults to 0. */
+	/**
+	 * Maximum concurrent client connections (sessions, including ones still
+	 * handshaking). A connection over the limit gets a retriable `MAX_CONNECTIONS` error
+	 * and is closed. 0 = unlimited. Defaults to 10,000.
+	 */
 	maxConnections?: number
+	/**
+	 * Interval between WebSocket pings, in ms (SRV-6, LMS #12). A connection that
+	 * leaves two pings in a row unanswered is terminated, which ends its session.
+	 * Applies to the standalone server and `createProductionServer`. Defaults to 25
+	 * seconds; 0 disables probing.
+	 */
+	heartbeatIntervalMs?: number
+	/**
+	 * Interval of the application-level `heartbeat` message sent to clients that
+	 * advertise support for it (browsers cannot see WebSocket pings), in ms. A client
+	 * that hears nothing for about 2.5 intervals reconnects. Defaults to 25 seconds; 0
+	 * disables it.
+	 */
+	appHeartbeatIntervalMs?: number
+	/**
+	 * Time a new connection has to send its handshake, in ms. Defaults to 10 seconds;
+	 * 0 disables the deadline.
+	 */
+	handshakeTimeoutMs?: number
+	/**
+	 * Bytes that may wait unsent for one client (WebSocket send buffer, or the queue of
+	 * an HTTP long-poll client that stopped polling) before it is disconnected as a slow
+	 * consumer. Defaults to 32 MiB; 0 disables the ceiling. The delivery stream pauses
+	 * well before this (`deliveryHighWaterBytes`).
+	 */
+	maxBufferedBytes?: number
+	/**
+	 * Queued outbound bytes above which a client's delivery stream pauses until the
+	 * client drains them (backpressure). Defaults to 1 MiB.
+	 */
+	deliveryHighWaterBytes?: number
+	/**
+	 * WebSocket permessage-deflate compression. `true` (the default) compresses messages
+	 * of 1 KiB or more without keeping a compression context between messages, which
+	 * cuts sync payloads several-fold on 2G/3G links at a bounded memory cost per
+	 * connection. `false` disables it; an object is passed to `ws` as is.
+	 */
+	perMessageDeflate?: boolean | Record<string, unknown>
 	/** Maximum operations per sync batch. Defaults to 100. */
 	batchSize?: number
 	/**
@@ -183,11 +225,21 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOperationBytes?: number
 	/**
-	 * Maximum operations accepted per connected client per minute (sliding window).
-	 * Operations beyond the limit are rejected until the window resets. Defaults to
-	 * 600. Set once here to enforce one rate cap across every connected client.
+	 * Maximum operations accepted per device node per minute (fixed window). The budget
+	 * belongs to the node id (bound to its principal when auth is configured), not to
+	 * the connection, so reconnecting does not reset it (SRV-6). Operations beyond the
+	 * limit get a retriable `RATE_LIMIT` until the window resets. Defaults to 600.
 	 */
 	maxOpsPerMinute?: number
+	/**
+	 * Maximum operations accepted per authenticated principal per minute, across all of
+	 * its device nodes, on top of the per-node `maxOpsPerMinute`. Without it a user could
+	 * multiply the per-node budget by minting node ids. Keyed by the provider's user id;
+	 * anonymous and unauthenticated sessions (no stable principal) have only the per-node
+	 * budget. Defaults to 4 x `maxOpsPerMinute` (2400), so one busy device never meets it
+	 * and a user's devices share it. `0` disables the per-user budget.
+	 */
+	maxOpsPerMinutePerUser?: number
 	/**
 	 * Largest operation batch accepted from a client in one message. A larger batch is
 	 * refused whole with `BATCH_TOO_LARGE` before the server decodes it or reads the

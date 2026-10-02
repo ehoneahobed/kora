@@ -1,35 +1,28 @@
-import type {
-	CausalTracker,
-	CollectionDefinition,
-	HybridLogicalClock,
-	SchemaDefinition,
-	SecretKeyProvider,
-} from '@korajs/core'
+import type { CausalTracker, CollectionDefinition } from '@korajs/core'
 import type { MutationCallback } from '../collection/collection'
-import type { RelationEnforcer } from '../relations/relation-enforcer'
 import type { StorageAdapter } from '../types'
+import type { WriteEnv } from './write-context'
 
 /**
  * Shared context for executing local collection mutations.
+ *
+ * Extends the {@link WriteEnv} of the single local write path with the target
+ * collection and the post-commit plumbing. There is deliberately no way to
+ * allocate a sequence number outside a write transaction: every local operation
+ * reserves its number inside the transaction that persists it (W6).
  */
-export interface LocalMutationContext {
+export interface LocalMutationContext extends WriteEnv {
 	readonly collection: string
 	readonly definition: CollectionDefinition
-	readonly schema: SchemaDefinition
 	readonly adapter: StorageAdapter
-	readonly clock: HybridLogicalClock
-	readonly nodeId: string
-	readonly allocateSequenceNumber: () => Promise<number>
+	/** Called once per committed operation, after the storage transaction commits. */
 	readonly onMutation: MutationCallback
-	readonly relationEnforcer: RelationEnforcer | null
 	readonly causalTracker: CausalTracker | null
-	readonly inTransaction: boolean
 	/** Additional parent op ids (e.g. referential cascade from a delete). */
 	readonly extraCausalDeps?: string[]
 	/**
-	 * Supplies the key used to encrypt `encrypted` secret fields at write time, so
-	 * plaintext never enters the operation log. Null/absent for apps with no
-	 * secret fields (or with only `hashed` secrets, which need no key).
+	 * Called when a write transaction fails, before the error propagates (the
+	 * store maps out-of-space errors to `store:quota-exceeded`).
 	 */
-	readonly secretKeyProvider?: SecretKeyProvider
+	readonly onStorageError?: (error: unknown) => void
 }

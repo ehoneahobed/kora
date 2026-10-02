@@ -57,6 +57,19 @@ export interface ActiveApplyFailure {
 	retryCount: number
 }
 
+/** Why a local node's unsynced writes are held (RT-38, RT-50). */
+export type HeldReason = 'other-user' | 'unassigned'
+
+/** A local node whose unsynced writes are held (see {@link SyncStatusInfo.heldNodes}). */
+export interface HeldNodeInfo {
+	nodeId: string
+	/** Unsynced writes the node holds. */
+	operationCount: number
+	reason: HeldReason
+	/** The user the node is bound to, or null when nobody knows (unassigned). */
+	principal: string | null
+}
+
 /**
  * Sync status information exposed to developers.
  */
@@ -77,6 +90,30 @@ export interface SyncStatusInfo {
 	lastSuccessfulPull: number | null
 	/** Number of merge conflicts encountered during this session */
 	conflicts: number
+	/**
+	 * Unsynced writes of another user who shared this local database (RT-38): the server
+	 * refused their node for the signed-in principal, so they wait, not counted in
+	 * `pendingOperations`, until that user signs in again on this device. Use
+	 * `store.namespaceByAuthUser` to give each user their own database instead.
+	 */
+	heldOperations?: number
+	/**
+	 * The local nodes whose unsynced writes are held (RT-38, RT-50), with how many each
+	 * holds and why: `other-user` (they belong to another user, or the server refused
+	 * the node for the signed-in one: they upload when their user signs in) or
+	 * `unassigned` (written before the app knew who was signed in, on a node that never
+	 * synced: nobody can tell whose they are, so the app decides with
+	 * `app.sync.assignHeld` or `app.sync.discardHeld`). As of the last session start.
+	 */
+	heldNodes?: HeldNodeInfo[]
+	/**
+	 * `degraded` when this device's local database could not be made durable several times
+	 * in a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads continue so the
+	 * server keeps a durable copy, and a later reload recovers its writes from the server;
+	 * writes made while offline in this state may be lost if the page closes. Show the user
+	 * a warning (free up storage, stay online). `durable` otherwise.
+	 */
+	localDurability?: 'durable' | 'degraded'
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
 	inFlightUploadOperations?: number
@@ -140,6 +177,15 @@ export interface SyncConfig {
 	 * cached one the server just refused.
 	 */
 	auth?: (options?: SyncAuthRequest) => Promise<{ token: string }>
+	/**
+	 * The signed-in user whose writes this device makes (RT-42): a user id, or null /
+	 * undefined when nobody is known to be signed in. Called before each session. With
+	 * it, the engine binds the store's node to that user (the store moves to the user's
+	 * own node when another user's is in use) and never uploads, or adopts, a node that
+	 * belongs to another user: those writes wait for their user (`heldOperations`).
+	 * `createApp` derives it from `sync.authClient`.
+	 */
+	principal?: () => Promise<string | null | undefined>
 	/** Auth readiness gate. A suspended result prevents transport creation and retries. */
 	authState?: () => Promise<{
 		state: 'loading' | 'signed-out' | 'anonymous' | 'authenticated'
@@ -245,8 +291,157 @@ export interface SyncStatePersistence {
 	 * claim (RT-12), stored next to the node id so the device can reconnect with it.
 	 * Optional: without it the token lives only as long as the sync engine.
 	 */
-	loadNodeToken?(): Promise<string | null>
-	saveNodeToken?(token: string): Promise<void>
+	loadNodeToken?(nodeId?: string): Promise<string | null>
+	/**
+	 * `nodeId` names the node the token was issued for: a database that authors under
+	 * several node ids (a rotated identity, per-tab isolation) keeps one token per node.
+	 */
+	saveNodeToken?(token: string, nodeId?: string): Promise<void>
+	/**
+	 * The contiguous acknowledged prefix of this device's own operations (W3): the highest
+	 * sequence s such that every own operation with sequence <= s is stored on the server,
+	 * terminally rejected and recorded, or was never upload-eligible. Keyed by node id, so
+	 * a rotated node starts from 0. Returns null when nothing was ever recorded under this
+	 * contract (a device upgrading from a release that persisted a max, not a prefix): the
+	 * engine then re-uploads the device's own history once, from 0; the server dedups by id.
+	 * Optional: without it the engine trusts the own entry of the last acked server vector.
+	 */
+	loadOwnAckedThrough?(nodeId: string): Promise<number | null>
+	saveOwnAckedThrough?(nodeId: string, sequence: number): Promise<void>
+	/**
+	 * Durable inbound quarantine (W4): delivered operations the client deliberately did
+	 * not apply (unknown collection, transform unavailable, deferred or rejected apply,
+	 * far-future timestamp, undecryptable payload). When `watermark` is given, the rows and
+	 * the delivery watermark advance MUST be written in one transaction, so the watermark
+	 * never passes an operation that is neither applied nor recorded here. Optional: a
+	 * persistence layer without it keeps the old behaviour (the watermark stalls instead).
+	 */
+	saveQuarantine?(
+		entries: QuarantinedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void>
+	/** Every quarantined operation, oldest delivery first. */
+	loadQuarantine?(): Promise<QuarantinedOperation[]>
+	/** Remove quarantined operations once applied (replay) or reconciled. */
+	removeQuarantine?(operationIds: string[]): Promise<void>
+	/**
+	 * The downlink scope the server last accepted for this device (SYNC-11). The next
+	 * handshake reports its canonical key and that view's delivery watermark next to the
+	 * requested view's, so a server that resolves the same scope again resumes the
+	 * stream instead of restarting it from 0. Never sent as the requested scope.
+	 * Optional; without it every handshake with a server-chosen scope rescans from 0.
+	 */
+	loadAcceptedDownlinkScope?(): Promise<SyncScopeMap | null>
+	saveAcceptedDownlinkScope?(scope: SyncScopeMap | null): Promise<void>
+	/**
+	 * Durable terminal-rejection markers (RT-36): operations the server refused with a
+	 * non-retriable rejection. Never cleared (unlike the app's rejected list), so a
+	 * rescan of the device's own history never submits a refused operation again.
+	 * Optional: without them the engine remembers refusals for its own lifetime only.
+	 */
+	recordTerminalRejections?(entries: TerminalRejectionRecord[]): Promise<void>
+	/** Which of these operation ids carry a terminal-rejection marker. */
+	findTerminalRejections?(operationIds: string[]): Promise<Set<string>>
+	/**
+	 * The node ids this database authored operations under (RT-38, RT-40), with what the
+	 * sync server said about each. Optional: without it the engine tracks only the
+	 * current node and keeps the pre-Phase-2 behaviour for refused nodes.
+	 */
+	listLocalNodes?(): Promise<LocalNodeInfo[]>
+	/** Record an accepted handshake as `nodeId`; starts a new refusal cycle. */
+	markLocalNodeAccepted?(nodeId: string): Promise<void>
+	/** Record that the server refused `nodeId`; `held` holds its unsynced writes. */
+	markLocalNodeRefused?(nodeId: string, held: boolean): Promise<void>
+	/**
+	 * A handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound node
+	 * (or replace a guessed binding) from the server's answer.
+	 */
+	confirmLocalNodePrincipal?(nodeId: string, principal: string): Promise<void>
+	/**
+	 * The server refused `nodeId` for `principal` (RT-50): clear a guessed binding, and
+	 * remember that an unbound node is not theirs.
+	 */
+	recordLocalNodeRefusedFor?(nodeId: string, principal: string): Promise<void>
+	/**
+	 * Assign a held, unbound node's writes to `principal` (RT-50, the app's decision).
+	 * @returns false when the node is not unbound, or was refused for `principal`
+	 */
+	assignLocalNodePrincipal?(nodeId: string, principal: string): Promise<boolean>
+	/** Forget a non-current local node whatever it holds (its held writes were discarded). */
+	dropLocalNode?(nodeId: string): Promise<void>
+	/** The current refusal cycle (count of accepted handshakes). */
+	loadAcceptedCycle?(): Promise<number>
+	/** Forget a non-current local node with nothing left to upload (bounds the registry). */
+	forgetLocalNode?(nodeId: string): Promise<void>
+	/**
+	 * Which adoptions of other local nodes are parked (RT-46), and an upload-progress
+	 * counter. Optional: without it the schedule lives for the engine's lifetime.
+	 */
+	loadAdoptionSchedule?(): Promise<AdoptionScheduleInfo>
+	saveAdoptionSchedule?(schedule: AdoptionScheduleInfo): Promise<void>
+}
+
+/**
+ * Upload scheduling across a database's local nodes (RT-46). A node whose adoption made
+ * no progress is parked: it is retried once anything else uploaded (`progress` moved past
+ * `progressMark`) or after its backoff (`untilMs`).
+ */
+export interface AdoptionScheduleInfo {
+	progress: number
+	parked: Record<
+		string,
+		{ progressMark: number; untilMs: number; count: number; parkedAtMs: number }
+	>
+}
+
+/** A terminally rejected operation, as recorded in the durable markers (RT-36). */
+export interface TerminalRejectionRecord {
+	operationId: string
+	nodeId: string | null
+	sequenceNumber: number | null
+	code: string
+	rejectedAt: number
+}
+
+/** A node id this database authored operations under (RT-38, RT-40). */
+export interface LocalNodeInfo {
+	nodeId: string
+	/** A handshake as this node was accepted at least once. */
+	accepted: boolean
+	/** Refused after acceptance: its unsynced writes belong to a principal not signed in. */
+	held: boolean
+	/** Refusal cycle in which the server last refused it, or null. */
+	refusedCycle: number | null
+	/**
+	 * The user the node's writes belong to (RT-42), or null when unknown. A node bound to
+	 * another user than the signed-in one is never uploaded or adopted.
+	 */
+	principal?: string | null
+	/**
+	 * How `principal` was learned (RT-50): `fresh` (bound before its first write),
+	 * `server` (an accepted handshake), `app` (assigned by the app: a guess the server can
+	 * overrule), or null (unbound, or a guess by an earlier release).
+	 */
+	binding?: 'fresh' | 'server' | 'app' | null
+	/** Users the server refused this unbound node for (RT-50): never tried for them again. */
+	refusedPrincipals?: string[]
+}
+
+/**
+ * A delivered operation the client deliberately did not apply, kept durably so it is
+ * never silently lost and can be replayed (on start, after a schema upgrade, or on demand).
+ */
+export interface QuarantinedOperation {
+	/** The operation as delivered (still encrypted when decryption failed). */
+	operation: Operation
+	/** Delivery sequence of the batch that carried it, or null for a legacy batch. */
+	deliverySequence: number | null
+	/** Machine-readable reason (for example `APPLY_SKIPPED`, `REMOTE_CLOCK_DRIFT`). */
+	code: string
+	/** Human-readable explanation. */
+	message: string
+	/** Wall-clock time (ms) it was quarantined. Display only. */
+	quarantinedAt: number
 }
 
 /**
@@ -262,6 +457,15 @@ export interface QueueStorage {
 	dequeue(ids: string[]): Promise<void>
 	/** Return number of operations in storage */
 	count(): Promise<number>
+	/**
+	 * Record that these queued operations were put on the wire at least once. A sent
+	 * operation may already be stored on the server (its ack can be lost), so it must
+	 * never be re-stamped by a clock rebase (W3 step 4). Optional: without it the flag
+	 * lives for the engine's lifetime only.
+	 */
+	markSent?(ops: Operation[]): Promise<void>
+	/** Ids of queued operations recorded by {@link markSent}. */
+	loadSentIds?(): Promise<string[]>
 }
 
 /**

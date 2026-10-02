@@ -6,9 +6,6 @@ export type {
 	ApplyRemoteOptions,
 	ApplyResult,
 	LocalMutationHandler,
-	TransactionBufferedEntry,
-	TransactionCommitBatch,
-	TransactionCommitResult,
 	MaterializedRowSnapshot,
 	RowVersionState,
 	CollectionRecord,
@@ -31,13 +28,19 @@ export type {
 // === Errors ===
 export {
 	AdapterError,
+	BridgeTerminatedError,
+	LeaderUnresponsiveError,
 	NoLeaderError,
 	OptimisticLockError,
 	PersistenceError,
 	QueryError,
 	RecordNotFoundError,
+	RequestAbortedError,
+	StorageBackendMismatchError,
 	StorageDurabilityError,
+	StorageInUseError,
 	StoreNotOpenError,
+	UnsyncedDataError,
 	WorkerInitError,
 	WorkerTimeoutError,
 } from './errors'
@@ -53,6 +56,14 @@ export {
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
+export type { UnappliedOperation } from './sync/sync-durability'
+export type {
+	AdoptionSchedule,
+	LocalNodeRecord,
+	ParkedAdoption,
+	TerminalRejection,
+} from './sync/local-sync-records'
+export type { PrincipalBinding } from './store/store'
 
 // === Sync state helpers ===
 export {

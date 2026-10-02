@@ -50,12 +50,14 @@ test('a relay dropped by a lossy transport is retransmitted and recovered (no lo
 
 	// The first update (delivered to B) is dropped once.
 	await a.collection('items').update(id, { tag: 'DROP_ONCE' })
-	// A later update follows it. The delivery stream resumes from B's last acknowledged
-	// position, so this next push re-includes the dropped update: B recovers it as soon as
-	// the next operation flows, with no lost op and without needing a reconnect. It never
-	// forms a torn version-vector gap (it applies the two updates in order).
+	// A later update follows it. Live pushes chain from the server's send cursor (SRV-3),
+	// so B sees a gap and stalls rather than applying out of order. The server's
+	// retransmit (on its timer; triggered here deterministically) re-sends from B's last
+	// acknowledged position: B recovers the dropped update with no lost op and without a
+	// reconnect, applying the two updates in order (never a torn version-vector gap).
 	await a.collection('items').update(id, { title: 'later' })
 	await a.sync()
+	network.server.retransmitPendingRelays(0)
 	await b.sync()
 
 	const after = await rec(b, id)

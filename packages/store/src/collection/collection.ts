@@ -38,12 +38,12 @@ export class Collection {
 		private readonly adapter: StorageAdapter,
 		private clock: HybridLogicalClock,
 		private nodeId: string,
-		private readonly allocateSequenceNumber: () => Promise<number>,
 		private readonly onMutation: MutationCallback,
 		private relationEnforcer: RelationEnforcer | null,
 		private mutationHandler: LocalMutationHandler | null,
 		private causalTracker: CausalTracker | null,
 		private readonly secretKeyProvider?: SecretKeyProvider,
+		private readonly onStorageError?: (error: unknown) => void,
 	) {}
 
 	/**
@@ -72,12 +72,11 @@ export class Collection {
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			allocateSequenceNumber: this.allocateSequenceNumber,
 			onMutation: this.onMutation,
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
-			inTransaction: false,
-			secretKeyProvider: this.secretKeyProvider,
+			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(this.onStorageError ? { onStorageError: this.onStorageError } : {}),
 		}
 	}
 

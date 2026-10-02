@@ -17,7 +17,16 @@ interface QueuedMessage {
 	etag: string
 	contentType: string
 	payload: string | Uint8Array
+	/** Approximate size of `payload` in bytes. */
+	bytes: number
 }
+
+/**
+ * Default ceiling on bytes queued for an HTTP long-poll client that is not polling
+ * (32 MiB). Past it the session is closed instead of growing server memory without
+ * bound; the client resumes from its delivery watermark on its next handshake.
+ */
+export const DEFAULT_HTTP_MAX_QUEUED_BYTES = 32 * 1024 * 1024
 
 /**
  * Server-side transport for HTTP long-polling clients.
@@ -35,9 +44,17 @@ export class HttpServerTransport implements ServerTransport {
 	private connected = true
 	private nextSequence = 1
 	private readonly queue: QueuedMessage[] = []
+	private queuedBytes = 0
+	private readonly maxQueuedBytes: number
 
-	constructor(serializer: MessageSerializer) {
+	/**
+	 * @param serializer - Message serializer
+	 * @param options - `maxQueuedBytes`: close the session once this many bytes wait
+	 *   unpolled (default 32 MiB; 0 disables the ceiling)
+	 */
+	constructor(serializer: MessageSerializer, options: { maxQueuedBytes?: number } = {}) {
 		this.serializer = serializer
+		this.maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_HTTP_MAX_QUEUED_BYTES
 	}
 
 	send(message: import('@korajs/sync').SyncMessage): void {
@@ -45,11 +62,24 @@ export class HttpServerTransport implements ServerTransport {
 
 		const encoded = this.serializer.encode(message)
 		const isBinary = encoded instanceof Uint8Array
+		// UTF-16 length is a cheap upper-bound proxy for the UTF-8 size of JSON text.
+		const bytes = isBinary ? encoded.byteLength : encoded.length
 		this.queue.push({
 			etag: this.makeEtag(this.nextSequence++),
 			contentType: isBinary ? 'application/x-protobuf' : 'application/json',
 			payload: encoded,
+			bytes,
 		})
+		this.queuedBytes += bytes
+		if (this.maxQueuedBytes > 0 && this.queuedBytes > this.maxQueuedBytes) {
+			// The client stopped polling: end the session rather than buffer without bound.
+			this.close(1001, 'http session queue overflow')
+		}
+	}
+
+	/** Bytes queued for the client and not yet polled (delivery-stream backpressure). */
+	bufferedAmount(): number {
+		return this.queuedBytes
 	}
 
 	onMessage(handler: ServerMessageHandler): void {
@@ -72,6 +102,7 @@ export class HttpServerTransport implements ServerTransport {
 		if (!this.connected) return
 		this.connected = false
 		this.queue.length = 0
+		this.queuedBytes = 0
 		this.closeHandler?.(code, reason)
 	}
 
@@ -106,6 +137,7 @@ export class HttpServerTransport implements ServerTransport {
 		}
 
 		this.queue.shift()
+		this.queuedBytes = Math.max(0, this.queuedBytes - next.bytes)
 		return {
 			status: 200,
 			body: next.payload,

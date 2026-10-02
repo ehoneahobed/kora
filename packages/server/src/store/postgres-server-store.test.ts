@@ -42,11 +42,13 @@ function createFakeDrizzleDb(): unknown {
 		insert: (..._args: unknown[]) => chainable(),
 		execute: async () => [],
 		transaction: async (fn: (tx: unknown) => Promise<void>) => {
-			const tx = {
+			const tx: Record<string, unknown> = {
 				select: (..._args: unknown[]) => chainable(),
 				insert: (..._args: unknown[]) => chainable(),
 				execute: async () => [],
 			}
+			// Nested transactions (savepoints) run against the same fake.
+			tx.transaction = async (nested: (inner: unknown) => Promise<void>) => nested(tx)
 			await fn(tx)
 		},
 	}

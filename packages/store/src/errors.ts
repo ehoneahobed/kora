@@ -115,13 +115,106 @@ export class WorkerTimeoutError extends KoraError {
  * leader instead of waiting out the full RPC timeout.
  */
 export class NoLeaderError extends KoraError {
-	constructor(operation: string) {
-		super(
-			`No live leader tab is answering multi-tab storage RPC for operation "${operation}"`,
-			'NO_LEADER',
-			{ operation },
-		)
+	constructor(
+		operation: string,
+		message = `No live leader tab is answering multi-tab storage RPC for operation "${operation}"`,
+		code = 'NO_LEADER',
+		context: Record<string, unknown> = {},
+	) {
+		super(message, code, { operation, ...context })
 		this.name = 'NoLeaderError'
+	}
+}
+
+/**
+ * Thrown to a follower tab's pending storage requests when the leader tab that
+ * was answering stopped sending heartbeats (hung, frozen, or suspended). The
+ * request may or may not have been applied: retry it with the same `requestId`
+ * (in the error context) and the leader de-duplicates it. Retriable.
+ */
+export class LeaderUnresponsiveError extends NoLeaderError {
+	constructor(operation: string, silentMs: number, requestId: string) {
+		super(
+			operation,
+			`The leader tab stopped responding (no heartbeat for ${silentMs}ms) during "${operation}". The request may or may not have been applied; retry it with the same requestId and the leader de-duplicates it.`,
+			'LEADER_UNRESPONSIVE',
+			{ silentMs, requestId, retriable: true },
+		)
+		this.name = 'LeaderUnresponsiveError'
+	}
+}
+
+/**
+ * Thrown to pending storage requests when their bridge was torn down, typically
+ * because this tab was just promoted to leader or the leader handed over.
+ * Retriable: the next attempt goes to the new leader.
+ */
+export class BridgeTerminatedError extends KoraError {
+	constructor(operation: string, reason: string) {
+		super(
+			`Storage request "${operation}" was interrupted (${reason}); retry it against the new storage leader.`,
+			'BRIDGE_TERMINATED',
+			{ operation, reason, retriable: true },
+		)
+		this.name = 'BridgeTerminatedError'
+	}
+}
+
+/** Thrown when a storage request is cancelled through its `AbortSignal`. */
+export class RequestAbortedError extends KoraError {
+	constructor(operation: string, requestId: string) {
+		super(
+			`Storage request "${operation}" was aborted by the caller. A write may already have reached the leader; retry with the same requestId to stay idempotent.`,
+			'REQUEST_ABORTED',
+			{ operation, requestId },
+		)
+		this.name = 'RequestAbortedError'
+	}
+}
+
+/**
+ * Thrown by `deleteDatabase()` when the database is open in some tab or worker
+ * on this origin. Close it everywhere (or call `app.close()`) and retry.
+ */
+export class StorageInUseError extends KoraError {
+	constructor(dbName: string) {
+		super(
+			`Database "${dbName}" is open in a tab on this origin; close it before deleting it.`,
+			'STORAGE_IN_USE',
+			{ dbName },
+		)
+		this.name = 'StorageInUseError'
+	}
+}
+
+/**
+ * Thrown by `deleteDatabase()` when the database still holds operations that
+ * never reached the server. Sync first, or pass `{ force: true }` to discard them.
+ */
+export class UnsyncedDataError extends KoraError {
+	constructor(dbName: string) {
+		super(
+			`Database "${dbName}" has unsynced operations; deleting it would lose them. Sync first, or pass { force: true } to discard them deliberately.`,
+			'UNSYNCED_DATA',
+			{ dbName },
+		)
+		this.name = 'UnsyncedDataError'
+	}
+}
+
+/**
+ * Thrown when a database's data lives in a storage backend this runtime cannot
+ * read (for example it was written to OPFS, and OPFS is unavailable now). Kora
+ * refuses to start an empty, disjoint copy rather than hide the existing data.
+ */
+export class StorageBackendMismatchError extends KoraError {
+	constructor(dbName: string, recorded: string, requested: string, reason: string) {
+		super(
+			`Database "${dbName}" is stored in ${recorded}, but this session can only use ${requested} (${reason}). Kora will not start a separate empty copy; reload in a browser profile where ${recorded} is available.`,
+			'STORAGE_BACKEND_MISMATCH',
+			{ dbName, recorded, requested, reason },
+		)
+		this.name = 'StorageBackendMismatchError'
 	}
 }
 

@@ -36,6 +36,14 @@ function makeOp(id: string, seq: number, nodeId = 'node-1', deps: string[] = [])
 	}
 }
 
+/**
+ * Let an upload's awaits run (sent flag, durability barrier, RT-35) before asserting on
+ * the wire: no timer is involved, so one macrotask turn drains them.
+ */
+async function settleUpload(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 function createMockStore(overrides?: Partial<SyncStore>): SyncStore {
 	const operations: Operation[] = []
 	const versionVector: VersionVector = new Map()
@@ -174,13 +182,15 @@ function setupServerResponder(
 			}
 		} else if (msg.type === 'operation-batch') {
 			if (options?.acknowledgeOperations === false) return
-			// Acknowledge operation batches
+			// Acknowledge operation batches the way the server does: "processed through"
+			// the last operation's sequence number (0 means nothing was processed).
 			const batch = msg as OperationBatchMessage
+			const last = batch.operations[batch.operations.length - 1]
 			const ack: AcknowledgmentMessage = {
 				type: 'acknowledgment',
 				messageId: `ack-${batch.messageId}`,
 				acknowledgedMessageId: batch.messageId,
-				lastSequenceNumber: 0,
+				lastSequenceNumber: last?.sequenceNumber ?? 0,
 			}
 			server.send(ack)
 		}
@@ -392,7 +402,10 @@ describe('SyncEngine timestamp rebase', () => {
 			idMapping: { 'old-1': 'new-1', 'old-2': 'new-2' },
 			rebasedCount: 2,
 		}))
-		const store = createMockStore({ rebaseUnsyncedOperations: rebaseSpy })
+		const store = createMockStore({
+			getNodeId: () => 'node-1',
+			rebaseUnsyncedOperations: rebaseSpy,
+		})
 		setupServerResponder(server, { serverTime: now })
 		const emitter = createMockEmitter()
 		const engine = new SyncEngine({
@@ -457,6 +470,7 @@ describe('SyncEngine timestamp rebase', () => {
 		const { client, server } = createMemoryTransportPair()
 		const now = Date.now()
 		const store = createMockStore({
+			getNodeId: () => 'node-1',
 			rebaseUnsyncedOperations: vi.fn(async () => {
 				throw new Error('disk full')
 			}),
@@ -1158,7 +1172,7 @@ describe('SyncEngine streaming', () => {
 
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test' },
 		})
 
@@ -1170,6 +1184,7 @@ describe('SyncEngine streaming', () => {
 		client.clearSentMessages()
 
 		await engine.pushOperation(makeOp('new-op', 10))
+		await settleUpload()
 
 		// Should have sent the op
 		const sent = client.getSentMessages()
@@ -1538,7 +1553,7 @@ describe('SyncEngine scope', () => {
 		const scopeMap = { todos: { userId: 'user-1' } }
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test', scopeMap },
 		})
 
@@ -1554,6 +1569,7 @@ describe('SyncEngine scope', () => {
 			data: { userId: 'user-1', title: 'Test' },
 		}
 		await engine.pushOperation(inScopeOp)
+		await settleUpload()
 
 		const sent = client.getSentMessages()
 		const opBatch = sent.find((m) => m.type === 'operation-batch') as
@@ -1563,7 +1579,11 @@ describe('SyncEngine scope', () => {
 		expect(opBatch?.operations).toHaveLength(1)
 	})
 
-	test('incoming operations outside scope are filtered out (defense in depth)', async () => {
+	// Inverted for SYNC-2: this test encoded the bug. The client judged delivered operations
+	// against its own scope and silently dropped them (a reader with a read-only downlink
+	// lost every announcement, and the watermark moved past them). The server enforces the
+	// downlink scope; the client applies what it delivered.
+	test('applies every delivered operation; the server, not the client, enforces scope (SYNC-2)', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const applyFn = vi.fn(async (_op: Operation) => 'applied' as const)
 		const store = createMockStore({ applyRemoteOperation: applyFn })
@@ -1631,10 +1651,10 @@ describe('SyncEngine scope', () => {
 
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
-		// Only the in-scope op should be applied
+		// Both are applied: nothing delivered is silently dropped.
 		const appliedOps = applyFn.mock.calls.map((call) => (call[0] as Operation).id)
 		expect(appliedOps).toContain('in')
-		expect(appliedOps).not.toContain('out')
+		expect(appliedOps).toContain('out')
 	})
 
 	test('applies authorization retractions and acknowledges only after local removal', async () => {
@@ -1814,7 +1834,7 @@ describe('SyncEngine scope', () => {
 
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test', scopeMap: { todos: { userId: 'user-1' } } },
 		})
 
@@ -1830,6 +1850,7 @@ describe('SyncEngine scope', () => {
 
 		client.clearSentMessages()
 		await engine.pushOperation(user2Op)
+		await settleUpload()
 		let sent = client.getSentMessages()
 		expect(sent.filter((m) => m.type === 'operation-batch')).toHaveLength(0)
 
@@ -1838,6 +1859,7 @@ describe('SyncEngine scope', () => {
 
 		// Now user-2 op should be sent
 		await engine.pushOperation(user2Op)
+		await settleUpload()
 		sent = client.getSentMessages()
 		expect(sent.filter((m) => m.type === 'operation-batch')).toHaveLength(1)
 	})
@@ -1848,7 +1870,7 @@ describe('SyncEngine scope', () => {
 
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test' },
 			// No scopeMap — all ops should pass through
 		})
@@ -1859,6 +1881,7 @@ describe('SyncEngine scope', () => {
 
 		client.clearSentMessages()
 		await engine.pushOperation(makeOp('any-op', 10))
+		await settleUpload()
 
 		const sent = client.getSentMessages()
 		const opBatch = sent.find((m) => m.type === 'operation-batch') as
@@ -1924,7 +1947,7 @@ describe('SyncEngine enhanced status', () => {
 
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test' },
 		})
 
@@ -2397,7 +2420,7 @@ describe('SyncEngine operation rejection', () => {
 		const emitter = createMockEmitter()
 		const engine = new SyncEngine({
 			transport: client,
-			store: createMockStore(),
+			store: createMockStore({ getNodeId: () => 'node-1' }),
 			config: { url: 'ws://test' },
 			emitter,
 		})

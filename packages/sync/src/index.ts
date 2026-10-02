@@ -4,6 +4,7 @@
 // === Types ===
 export type {
 	QueueStorage,
+	QuarantinedOperation,
 	RejectedOperation,
 	RejectedOperationStorage,
 	SyncStatePersistence,
@@ -20,6 +21,11 @@ export type {
 	SyncSettlementResult,
 	ActiveApplyFailure,
 	DeltaCursor,
+	LocalNodeInfo,
+	HeldNodeInfo,
+	HeldReason,
+	AdoptionScheduleInfo,
+	TerminalRejectionRecord,
 } from './types'
 
 export {
@@ -56,6 +62,7 @@ export type {
 	AcknowledgmentMessage,
 	ErrorMessage,
 	HandshakeMessage,
+	HeartbeatMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	OperationRejectedMessage,

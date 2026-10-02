@@ -1,5 +1,16 @@
 import { describe, expect, test } from 'vitest'
-import { KeyDerivationError, deriveKey, deriveVersionedKey, generateSalt } from './key-derivation'
+import {
+	DEFAULT_PBKDF2_ITERATIONS,
+	KeyDerivationError,
+	deriveKey,
+	deriveVersionedKey,
+	generateSalt,
+} from './key-derivation'
+
+// Behaviour tests use a low iteration count: 600,000 PBKDF2 rounds take seconds on a
+// loaded CI machine and made these tests time out (a timing dependency, CLAUDE.md
+// anti-pattern 9). The production default is pinned by its own test below.
+const TEST_ITERATIONS = 1_000
 
 describe('generateSalt', () => {
 	test('returns a 32-byte Uint8Array', () => {
@@ -18,7 +29,7 @@ describe('generateSalt', () => {
 
 describe('deriveKey', () => {
 	test('derives a CryptoKey from a passphrase', async () => {
-		const { key, salt } = await deriveKey('test-passphrase')
+		const { key, salt } = await deriveKey('test-passphrase', undefined, TEST_ITERATIONS)
 		expect(key).toBeDefined()
 		expect(key.type).toBe('secret')
 		expect(key.algorithm).toMatchObject({ name: 'AES-GCM', length: 256 })
@@ -30,8 +41,8 @@ describe('deriveKey', () => {
 
 	test('same passphrase and salt produce the same key', async () => {
 		const salt = generateSalt()
-		const { key: key1 } = await deriveKey('deterministic-test', salt)
-		const { key: key2 } = await deriveKey('deterministic-test', salt)
+		const { key: key1 } = await deriveKey('deterministic-test', salt, TEST_ITERATIONS)
+		const { key: key2 } = await deriveKey('deterministic-test', salt, TEST_ITERATIONS)
 
 		// Export both keys to compare raw bytes
 		const raw1 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', key1))
@@ -41,8 +52,8 @@ describe('deriveKey', () => {
 
 	test('different passphrases produce different keys', async () => {
 		const salt = generateSalt()
-		const { key: key1 } = await deriveKey('passphrase-one', salt)
-		const { key: key2 } = await deriveKey('passphrase-two', salt)
+		const { key: key1 } = await deriveKey('passphrase-one', salt, TEST_ITERATIONS)
+		const { key: key2 } = await deriveKey('passphrase-two', salt, TEST_ITERATIONS)
 
 		const raw1 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', key1))
 		const raw2 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', key2))
@@ -52,8 +63,8 @@ describe('deriveKey', () => {
 	test('different salts produce different keys', async () => {
 		const salt1 = generateSalt()
 		const salt2 = generateSalt()
-		const { key: key1 } = await deriveKey('same-passphrase', salt1)
-		const { key: key2 } = await deriveKey('same-passphrase', salt2)
+		const { key: key1 } = await deriveKey('same-passphrase', salt1, TEST_ITERATIONS)
+		const { key: key2 } = await deriveKey('same-passphrase', salt2, TEST_ITERATIONS)
 
 		const raw1 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', key1))
 		const raw2 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', key2))
@@ -61,13 +72,13 @@ describe('deriveKey', () => {
 	})
 
 	test('throws KeyDerivationError for empty passphrase', async () => {
-		await expect(deriveKey('')).rejects.toThrow(KeyDerivationError)
-		await expect(deriveKey('')).rejects.toThrow('must not be empty')
+		await expect(deriveKey('', undefined, TEST_ITERATIONS)).rejects.toThrow(KeyDerivationError)
+		await expect(deriveKey('', undefined, TEST_ITERATIONS)).rejects.toThrow('must not be empty')
 	})
 
 	test('generates a random salt when none is provided', async () => {
-		const result1 = await deriveKey('some-passphrase')
-		const result2 = await deriveKey('some-passphrase')
+		const result1 = await deriveKey('some-passphrase', undefined, TEST_ITERATIONS)
+		const result2 = await deriveKey('some-passphrase', undefined, TEST_ITERATIONS)
 		// Salts should differ since none was provided
 		expect(result1.salt).not.toEqual(result2.salt)
 	})
@@ -75,7 +86,7 @@ describe('deriveKey', () => {
 
 describe('deriveVersionedKey', () => {
 	test('creates a versioned key with the specified version', async () => {
-		const vk = await deriveVersionedKey('my-passphrase', 1)
+		const vk = await deriveVersionedKey('my-passphrase', 1, undefined, TEST_ITERATIONS)
 		expect(vk.version).toBe(1)
 		expect(vk.key).toBeDefined()
 		expect(vk.key.type).toBe('secret')
@@ -84,8 +95,8 @@ describe('deriveVersionedKey', () => {
 
 	test('respects the provided salt', async () => {
 		const salt = generateSalt()
-		const vk1 = await deriveVersionedKey('test', 1, salt)
-		const vk2 = await deriveVersionedKey('test', 1, salt)
+		const vk1 = await deriveVersionedKey('test', 1, salt, TEST_ITERATIONS)
+		const vk2 = await deriveVersionedKey('test', 1, salt, TEST_ITERATIONS)
 
 		const raw1 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', vk1.key))
 		const raw2 = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', vk2.key))
@@ -93,21 +104,44 @@ describe('deriveVersionedKey', () => {
 	})
 
 	test('throws for version 0', async () => {
-		await expect(deriveVersionedKey('test', 0)).rejects.toThrow(KeyDerivationError)
-		await expect(deriveVersionedKey('test', 0)).rejects.toThrow('positive integer')
+		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
+		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			'positive integer',
+		)
 	})
 
 	test('throws for negative version', async () => {
-		await expect(deriveVersionedKey('test', -1)).rejects.toThrow(KeyDerivationError)
+		await expect(deriveVersionedKey('test', -1, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
 	})
 
 	test('throws for non-integer version', async () => {
-		await expect(deriveVersionedKey('test', 1.5)).rejects.toThrow(KeyDerivationError)
+		await expect(deriveVersionedKey('test', 1.5, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
 	})
 
 	test('supports high version numbers for key rotation', async () => {
-		const vk = await deriveVersionedKey('rotated-key', 42)
+		const vk = await deriveVersionedKey('rotated-key', 42, undefined, TEST_ITERATIONS)
 		expect(vk.version).toBe(42)
 		expect(vk.key.type).toBe('secret')
 	})
+})
+
+describe('production iteration count', () => {
+	test('defaults to the OWASP minimum of 600,000 iterations', () => {
+		expect(DEFAULT_PBKDF2_ITERATIONS).toBe(600_000)
+	})
+
+	test('a key derived with the default count differs from one with a lower count', async () => {
+		const salt = generateSalt()
+		const { key: strong } = await deriveKey('pinned', salt)
+		const { key: weak } = await deriveKey('pinned', salt, TEST_ITERATIONS)
+		const rawStrong = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', strong))
+		const rawWeak = new Uint8Array(await globalThis.crypto.subtle.exportKey('raw', weak))
+		expect(rawStrong).not.toEqual(rawWeak)
+	}, 60_000)
 })

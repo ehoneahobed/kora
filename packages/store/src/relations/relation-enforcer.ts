@@ -1,9 +1,8 @@
-import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
-import { KoraError, createOperation, quoteIdent } from '@korajs/core'
-import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
-import { serializeOperation, serializeRecord } from '../serialization/serializer'
-import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
-import type { StorageAdapter, Transaction } from '../types'
+import type { Operation, SchemaDefinition } from '@korajs/core'
+import { KoraError, quoteIdent } from '@korajs/core'
+import type { WriteEnv, WriteScope } from '../mutations/write-context'
+import { writeDeleteInTx, writeUpdateInTx } from '../mutations/write-ops'
+import type { Transaction } from '../types'
 import type { IncomingRelation } from './relation-lookup'
 import { buildRelationLookup, getIncomingRelations } from './relation-lookup'
 
@@ -40,9 +39,6 @@ export class ReferentialIntegrityError extends KoraError {
  */
 export interface RelationEnforcerConfig {
 	schema: SchemaDefinition
-	adapter: StorageAdapter
-	clock: HybridLogicalClock
-	nodeId: string
 }
 
 /**
@@ -66,55 +62,45 @@ export interface EnforcementResult {
  * - **restrict**: Throws a ReferentialIntegrityError if any references exist
  * - **no-action**: Does nothing (the foreign key is left dangling)
  *
- * The enforcer operates within a provided transaction to ensure atomicity.
- * All generated operations (cascaded deletes, set-null updates) share a
- * causal dependency chain through the original delete operation.
+ * The enforcer runs inside the delete's write transaction and writes every side
+ * effect through the single local write path (`writeDeleteInTx` /
+ * `writeUpdateInTx`), so cascaded operations reserve their sequence numbers in
+ * the same contiguous block as the parent and carry per-field version stamps
+ * (STORE-2, STORE-3). Every generated operation depends causally on the delete
+ * that caused it.
  *
  * @example
  * ```typescript
- * const enforcer = new RelationEnforcer({
- *   schema, adapter, clock, nodeId,
- *   allocateSequenceNumber: async () => ++seq,
- * })
- * const result = await enforcer.enforceDelete(
- *   'projects', 'proj-1', tx, ['delete-op-id']
- * )
+ * const enforcer = new RelationEnforcer({ schema })
+ * // inside a write transaction, after building the parent delete operation:
+ * const result = await enforcer.enforceDelete('projects', 'proj-1', scope, env, deleteOp.id)
  * // result.operations contains any cascaded delete/update ops
  * ```
  */
 export class RelationEnforcer {
 	private readonly lookup: Map<string, IncomingRelation[]>
-	private readonly schema: SchemaDefinition
-	private readonly adapter: StorageAdapter
-	private readonly clock: HybridLogicalClock
-	private readonly nodeId: string
 
 	constructor(config: RelationEnforcerConfig) {
-		this.schema = config.schema
-		this.adapter = config.adapter
-		this.clock = config.clock
-		this.nodeId = config.nodeId
 		this.lookup = buildRelationLookup(config.schema)
 	}
 
 	/**
-	 * Enforce referential integrity after deleting a record.
-	 *
-	 * Must be called within a transaction. The transaction handle is used
-	 * for all cascaded writes to ensure atomicity.
+	 * Enforce referential integrity for a record being deleted.
 	 *
 	 * @param collection - The collection the deleted record belongs to
 	 * @param recordId - The ID of the deleted record
-	 * @param tx - The active transaction handle
-	 * @param causalDeps - Causal dependencies for generated operations
+	 * @param scope - The active write scope (transaction + causal scope)
+	 * @param env - The write environment of the delete
+	 * @param parentOpId - Id of the delete operation; every side effect depends on it
 	 * @returns All additional operations created as side effects
 	 * @throws {ReferentialIntegrityError} If a 'restrict' policy is violated
 	 */
 	async enforceDelete(
 		collection: string,
 		recordId: string,
-		tx: Transaction,
-		causalDeps: string[],
+		scope: WriteScope,
+		env: WriteEnv,
+		parentOpId: string,
 	): Promise<EnforcementResult> {
 		const incomingRelations = getIncomingRelations(this.lookup, collection)
 		if (incomingRelations.length === 0) {
@@ -130,7 +116,7 @@ export class RelationEnforcer {
 		)
 
 		for (const incoming of sortedRelations) {
-			const ops = await this.enforceRelation(incoming, recordId, tx, causalDeps)
+			const ops = await this.enforceRelation(incoming, recordId, scope, env, parentOpId)
 			allOperations.push(...ops)
 		}
 
@@ -143,151 +129,69 @@ export class RelationEnforcer {
 	private async enforceRelation(
 		incoming: IncomingRelation,
 		deletedRecordId: string,
-		tx: Transaction,
-		causalDeps: string[],
+		scope: WriteScope,
+		env: WriteEnv,
+		parentOpId: string,
 	): Promise<Operation[]> {
 		switch (incoming.onDelete) {
 			case 'cascade':
-				return this.enforceCascade(incoming, deletedRecordId, tx, causalDeps)
+				return this.enforceCascade(incoming, deletedRecordId, scope, env, parentOpId)
 			case 'set-null':
-				return this.enforceSetNull(incoming, deletedRecordId, tx, causalDeps)
+				return this.enforceSetNull(incoming, deletedRecordId, scope, env, parentOpId)
 			case 'restrict':
-				return this.enforceRestrict(incoming, deletedRecordId, tx)
+				return this.enforceRestrict(incoming, deletedRecordId, scope.tx)
 			case 'no-action':
 				return []
 		}
 	}
 
 	/**
-	 * Cascade: delete all records in the source collection that reference
-	 * the deleted record, then recursively cascade those deletes.
+	 * Cascade: delete every live record that references the deleted record. Each
+	 * cascaded delete runs the full delete path, so it recurses into its own
+	 * referencing records.
 	 */
 	private async enforceCascade(
 		incoming: IncomingRelation,
 		deletedRecordId: string,
-		tx: Transaction,
-		causalDeps: string[],
+		scope: WriteScope,
+		env: WriteEnv,
+		parentOpId: string,
 	): Promise<Operation[]> {
-		const { sourceCollection, foreignKeyField } = incoming
-
-		// Find all non-deleted records that reference the deleted record
-		const referencingRows = await tx.query<{ id: string }>(
-			`SELECT id FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
-			[deletedRecordId],
-		)
-
-		if (referencingRows.length === 0) {
-			return []
-		}
-
+		const referencingIds = await this.findReferencing(incoming, deletedRecordId, scope.tx)
 		const operations: Operation[] = []
-
-		for (const row of referencingRows) {
-			const now = Date.now()
-			const sequenceNumber = await allocateNextSequenceInTransaction(tx, this.nodeId)
-
-			const operation = await createOperation(
-				{
-					nodeId: this.nodeId,
-					type: 'delete',
-					collection: sourceCollection,
-					recordId: row.id,
-					data: null,
-					previousData: null,
-					sequenceNumber,
-					causalDeps: [...causalDeps],
-					schemaVersion: this.schema.version,
-				},
-				this.clock,
-			)
-
-			const deleteQuery = buildSoftDeleteQuery(sourceCollection, row.id, now)
-			await tx.execute(deleteQuery.sql, deleteQuery.params)
-
-			const opInsert = buildInsertQuery(
-				`_kora_ops_${sourceCollection}`,
-				serializeOperation(operation) as unknown as Record<string, unknown>,
-			)
-			await tx.execute(opInsert.sql, opInsert.params)
-
-			operations.push(operation)
-
-			// Recursively cascade: this deleted record might also be referenced
-			const cascadeResult = await this.enforceDelete(sourceCollection, row.id, tx, [operation.id])
-			operations.push(...cascadeResult.operations)
+		for (const id of referencingIds) {
+			const result = await writeDeleteInTx(env, scope, incoming.sourceCollection, id, {
+				extraCausalDeps: [parentOpId],
+			})
+			if (result.operation) operations.push(result.operation)
+			operations.push(...result.sideEffects)
 		}
-
 		return operations
 	}
 
 	/**
-	 * Set-null: update all referencing records to set the foreign key to null.
+	 * Set-null: set the foreign key to null on every live referencing record.
 	 */
 	private async enforceSetNull(
 		incoming: IncomingRelation,
 		deletedRecordId: string,
-		tx: Transaction,
-		causalDeps: string[],
+		scope: WriteScope,
+		env: WriteEnv,
+		parentOpId: string,
 	): Promise<Operation[]> {
-		const { sourceCollection, foreignKeyField } = incoming
-		const collectionDef = this.schema.collections[sourceCollection]
-		if (!collectionDef) {
-			return []
-		}
-
-		// Find all non-deleted records that reference the deleted record
-		const referencingRows = await tx.query<{ id: string }>(
-			`SELECT id FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
-			[deletedRecordId],
-		)
-
-		if (referencingRows.length === 0) {
-			return []
-		}
-
+		const referencingIds = await this.findReferencing(incoming, deletedRecordId, scope.tx)
 		const operations: Operation[] = []
-
-		for (const row of referencingRows) {
-			const now = Date.now()
-			const sequenceNumber = await allocateNextSequenceInTransaction(tx, this.nodeId)
-
-			const updateData: Record<string, unknown> = { [foreignKeyField]: null }
-			const previousData: Record<string, unknown> = { [foreignKeyField]: deletedRecordId }
-
-			const operation = await createOperation(
-				{
-					nodeId: this.nodeId,
-					type: 'update',
-					collection: sourceCollection,
-					recordId: row.id,
-					data: { ...updateData },
-					previousData,
-					sequenceNumber,
-					causalDeps: [...causalDeps],
-					schemaVersion: this.schema.version,
-				},
-				this.clock,
+		for (const id of referencingIds) {
+			const result = await writeUpdateInTx(
+				env,
+				scope,
+				incoming.sourceCollection,
+				id,
+				{ [incoming.foreignKeyField]: null },
+				[parentOpId],
 			)
-
-			// Update the record's foreign key to null
-			const serializedChanges = serializeRecord(updateData, collectionDef.fields)
-			const updateQuery = buildUpdateQuery(sourceCollection, row.id, {
-				...serializedChanges,
-				_updated_at: now,
-			})
-			await tx.execute(updateQuery.sql, updateQuery.params)
-
-			// Persist the operation
-			const opRow = serializeOperation(operation)
-			const opInsert = buildInsertQuery(
-				`_kora_ops_${sourceCollection}`,
-				opRow as unknown as Record<string, unknown>,
-			)
-			await tx.execute(opInsert.sql, opInsert.params)
-
-			operations.push(operation)
+			if (result.operation) operations.push(result.operation)
 		}
-
 		return operations
 	}
 
@@ -308,10 +212,8 @@ export class RelationEnforcer {
 		const count = countRows[0]?.cnt ?? 0
 
 		if (count > 0) {
-			// Determine the target collection from the relation lookup
-			const targetCollection = incoming.relation.to
 			throw new ReferentialIntegrityError(
-				targetCollection,
+				incoming.relation.to,
 				deletedRecordId,
 				sourceCollection,
 				relationName,
@@ -320,6 +222,19 @@ export class RelationEnforcer {
 		}
 
 		return []
+	}
+
+	/** Ids of live records referencing `deletedRecordId`, in id order (deterministic). */
+	private async findReferencing(
+		incoming: IncomingRelation,
+		deletedRecordId: string,
+		tx: Transaction,
+	): Promise<string[]> {
+		const rows = await tx.query<{ id: string }>(
+			`SELECT id FROM ${quoteIdent(incoming.sourceCollection)} WHERE ${quoteIdent(incoming.foreignKeyField)} = ? AND _deleted = 0 ORDER BY id`,
+			[deletedRecordId],
+		)
+		return rows.map((row) => row.id)
 	}
 
 	/**

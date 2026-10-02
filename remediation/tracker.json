@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -521,7 +521,7 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-2.test.ts"
@@ -536,7 +536,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Inbound delivery batches are no longer filtered client-side (W4 step 1): the engine applies what the server delivered; anything deliberately not applied goes to the durable quarantine."
   },
   {
    "id": "SYNC-3",
@@ -544,14 +544,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Durable inbound quarantine _kora_unapplied_ops written in the same transaction as the watermark advance; unknown collection, transform-to-null, rejected/deferred apply are quarantined and replayed on start (after a schema upgrade)."
   },
   {
    "id": "SYNC-4",
@@ -559,14 +559,14 @@
    "severity": "P1",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Every sent batch (delta and streaming) is tracked by message id; an ack resolves only its batch; no early dequeue of delta ops; contiguous own-op prefix (localAckedThrough) replaces the max-merged ack. Server half of W3 step 4 landed in Phase 2: all three stores refuse a second, different op under an existing (nodeId, sequenceNumber) with a non-retriable SEQUENCE_CONFLICT (unique index where the existing log allows it). Caution until W3 step 5 (single upload leader) lands: tabs sharing one nodeId with per-tab sequence counters (STORE-10) now get the colliding op rejected instead of stored twice."
   },
   {
    "id": "SYNC-5",
@@ -574,14 +574,14 @@
    "severity": "P2",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Engine side: every engine-initiated end of session (message failure, transport error, server error, rejected handshake, stop while already disconnected) calls transport.disconnect(). Transport-side generation guard remains with the network engineer. Phase 2 (W5 step 1, transport half): WebSocketTransport.connect closes and detaches any previous socket, and every socket callback is bound to its generation, so a superseded socket can neither sever nor feed the live session; disconnect() invalidates the generation. The repro passes on this half alone. The engine half (engine-initiated moves to disconnected call transport.disconnect()) is the engine owner's and still to land. Tests: sync/src/transport/websocket-liveness.test.ts."
   },
   {
    "id": "SYNC-6",
@@ -589,14 +589,14 @@
    "severity": "P3",
    "workstream": "W3",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "OutboundQueue.acknowledge releases ids from the seen set."
   },
   {
    "id": "SYNC-7",
@@ -604,14 +604,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Client part: far-future delivered ops (and RemoteClockDriftError/InvalidTimestampError) are quarantined, never applied or adopted into the HLC; later ops flow. Server ingest validation of every path is the server half. Phase 2 server part landed: every ingest path validates timestamps against server time (applyServerOperation covers sync, route kora.apply and applyLocalOperation; conditional route ops are checked inside the locked build; backup import refuses a backup holding a far-future or malformed op, whole, with BackupValidationError -> 400 from /__kora/backup/import). The repro still fails by design: it writes the far-future op straight into the store (bypassing ingest), and the client quarantine (W4 step 2) is the engine owner's."
   },
   {
    "id": "SYNC-8",
@@ -619,14 +619,14 @@
    "severity": "P2",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W5 step 2): a reconnect attempt succeeds only when the engine reaches streaming (sync-lifecycle waits on the new SyncEngine.onStateChange hook, the one engine change, flagged to the engine owner); the ReconnectionManager attempt counter persists across runs and resets only after the connection stayed streaming for stableAfterMs (10 s, reportConnected/reportDisconnected); reset() no longer clears stopped. Tests: sync/src/engine/reconnection-backoff.test.ts."
   },
   {
    "id": "SYNC-9",
@@ -649,14 +649,14 @@
    "severity": "P3",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "stopInternal clears every timer before any early return; SyncEngine.destroy() used by app.close(); async send continuations check the batch belongs to the live session and catch send errors."
   },
   {
    "id": "SYNC-11",
@@ -664,14 +664,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-11.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Each handshake reports the watermark of the REQUESTED view; an accepted scope that differs switches to that view (switchDeliveryView), and NEW-SYNC-1 makes the server restart from 0 harmless. Handshake syncScope stays the configured scope: echoing the accepted scope would pin $in narrowing and hide later grant widening. Residual (server): it restarts the stream from 0 on every reconnect when accepted != requested; it should compare against the scope it last resolved for the node."
   },
   {
    "id": "NEW-SYNC-1",
@@ -679,14 +679,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-SYNC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Duplicate delivery batches still run initial-sync bookkeeping (isFinal completes the handshake); a batch straddling the watermark is applied whole and advances to its max."
   },
   {
    "id": "NEW-SYNC-2",
@@ -694,14 +694,14 @@
    "severity": "P3",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-SYNC-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W5 step 2): a disconnect while an attempt is in flight calls ReconnectionManager.requestRetry() (pendingRetry), which makes that attempt count as failed so the loop retries with backoff; success also requires reaching streaming (SYNC-8)."
   },
   {
    "id": "NEW-SYNC-3",
@@ -709,7 +709,7 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-8.test.ts",
@@ -721,7 +721,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed by the SYNC-2 change: no client-side inbound filtering of delivered ops, so an id-scoped downlink insert is applied."
   },
   {
    "id": "NEW-SYNC-4",
@@ -764,14 +764,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "ENC-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Per-op decrypt inside the apply path; a failure quarantines the op (DECRYPT_FAILED) with sync:apply-failed, the session is kept."
   },
   {
    "id": "ENC-3",
@@ -839,14 +839,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W4 step 5): ClientSession keeps lastSentDeliverySeq; live pushes chain from it (base = lastSent) and carry only new operations. The stream rewinds to lastAcked only on a retransmit timeout: an RFC 6298-style RTO from per-batch ack round trips (Karn: no samples from re-sent ranges; floor 1 s, initial 2 s), doubled per re-send and kept until a fresh sample, capped at 5 min; the delivery poll is a safety net with the same window. No client gap report exists yet (engine side), so a dropped batch is recovered after the RTO. Measured with the repro: initial-sync write amplification 2.00x -> 1.00x, steady writes at 20 ms RTT 2.34x -> 1.00x. Unit tests: session/delivery-cursor-liveness.test.ts."
   },
   {
    "id": "SRV-4",
@@ -854,14 +854,14 @@
    "severity": "P2",
    "workstream": "W10a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W10 step 1): PostgresServerStore.applyRemoteOperation takes the delivery-counter lock first, then INSERT ... ON CONFLICT (id) DO NOTHING RETURNING; a duplicate rolls back (no delivery seq burned, no cascade). New ServerStore.readVersionVector() reads sync_state; sessions use it at handshake and for the legacy delta (repro test 1 now awaits readVersionVector(): the synchronous getVersionVector() can only reflect the instance's own writes). sequence_number and max_sequence_number migrate to BIGINT once at startup (information_schema-guarded ALTER, under the ensure-tables advisory lock; rewrites the table under an exclusive lock, so expect a pause proportional to log size on first start). sequenceNumber is validated as a safe positive integer on every ingest path (INVALID_SEQUENCE_NUMBER). Tests: store/ingest-integrity.test.ts (Postgres part with KORA_PG_TEST_URL)."
   },
   {
    "id": "SRV-5",
@@ -869,14 +869,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 2 (W4 step 6): the delivery stream is filtered and sent per scan chunk (batchSize*5) with a one-batch lookahead for isFinal, so a stream holds at most one chunk plus two batches; the handshake stream runs on the delivery chain after the response (acks and uploads keep flowing) and pauses while the transport reports more than deliveryHighWaterBytes (1 MiB) queued. MemoryServerStore seeks by binary search. LMS #11: records the visibility decisions need are prefetched once per chunk and collection (new optional ServerStore.findRecordsByIds: Postgres/SQLite IN (...), memory map). The handshake vector of a delivery client is the full vector when unscoped and, when scoped, the nodes a metadata pre-pass finds visible (RT-7 kept; the client still needs those entries for its pending count). Repro: 5000 ops scanned before the first send -> 500."
   },
   {
    "id": "SRV-6",
@@ -884,7 +884,7 @@
    "severity": "P1",
    "workstream": "W5",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-6.test.ts"
@@ -896,10 +896,14 @@
     {
      "file": "LMS-12.test.ts",
      "title": "must be reaped after inactivity"
+    },
+    {
+     "file": "LMS-12.test.ts",
+     "title": "is not re-scanned from its unacked watermark"
     }
    ],
    "pr": null,
-   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat."
+   "notes": "RT-2/RT-6 closed the HTTP idle-expiry facet (httpSessionIdleTimeoutMs) and the scope-rejected-ops-bypass-rate-limit facet; SRV-6.test.ts now opens HTTP sessions with a handshake POST (clientId no longer exists). Remaining: rate limit reset by reconnect, route body caps, WS heartbeat. Phase 2 (W5 step 4, W10 step 2, LMS #12): WsServerTransport pings every heartbeatIntervalMs (default 25 s) and terminates after 2 unanswered pings (Kora close path), for the standalone server and createProductionServer (new KoraSyncServer.handleWebSocket); slow-consumer ceiling maxBufferedBytes (32 MiB) on WS and HTTP queues; handshake deadline (handshakeTimeoutMs, default 10 s); application heartbeat message for clients that advertise supportsHeartbeat (client transport closes after 2.5 silent intervals); ingest rate limiter keyed by node id across reconnects (server-level map, TTL 2 windows, LRU 100k); default maxConnections 10,000; route bodies capped at 1 MiB (413, maxRequestBodyBytes), backup import at 256 MiB; permessage-deflate on by default (threshold 1 KiB, no context takeover; perMessageDeflate option). Stuck deliveries back off instead of being re-pushed forever (see SRV-3). LMS-12: the HEAD-cost observation is inverted (ghost re-scans now <= 5 in 1 s at a 50 ms poll; was ~18); the ping and half-open tests send a handshake first, since a connection that never handshakes is now closed by the 10 s deadline. Tests: transport/transport-liveness.test.ts, session/delivery-cursor-liveness.test.ts, tests/integration/server-limits.test.ts."
   },
   {
    "id": "SRV-7",
@@ -934,11 +938,14 @@
    "severity": "P3",
    "workstream": "W10a",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-SRV-2.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed with SRV-4 (atomic dedup inside the append transaction). Repro: tests/repro/NEW-SRV-2.test.ts (Postgres): 10/10 rounds cascaded twice before, 0/10 after."
   },
   {
    "id": "NEW-SRV-3",
@@ -1042,7 +1049,7 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-1.test.ts"
@@ -1054,7 +1061,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
+   "notes": "W6: one local write path. Transaction entries are buffered as intent and written at commit inside the commit's storage transaction through the same builders as single-record writes (mutations/write-ops.ts); every sequence number is reserved through that transaction (UPSERT ... RETURNING) and each op is built only after its number is reserved. TransactionSequenceAllocator and the out-of-transaction allocator are removed; remote applies write the vector with MAX. A repair migration re-sequences beta.12 duplicates and a UNIQUE (node_id, sequence_number) index is created on every op table. Earlier: S1 counter stopgap: ApplyPipeline.commitTransaction writes _kora_version_vector as MAX(existing, highest own seq in batch) inside the commit transaction, so later writes no longer reuse sequence numbers or look synced. Concurrent app.transaction calls can still share sequence numbers (repro 'two concurrent app.transaction calls' still fails) until W6 block reservation."
   },
   {
    "id": "STORE-2",
@@ -1062,14 +1069,14 @@
    "severity": "P0",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: cascades/set-null are written by RelationEnforcer through writeDeleteInTx/writeUpdateInTx inside the commit, after the parent, so they take the next numbers of the same contiguous block. ApplyPipeline.commitTransaction and build-side-effect-entry are removed; the merge-package referential check runs as LocalMutationHandler.beforeLocalDelete inside the transaction (traces + restrict)."
   },
   {
    "id": "STORE-3",
@@ -1077,14 +1084,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: transaction inserts/updates, set-null cascades and deletes go through the shared builders, which stamp _field_versions per field (stampFieldVersions: field -> HLC register, monotonic) and _version."
   },
   {
    "id": "STORE-4",
@@ -1157,14 +1164,14 @@
    "severity": "P2",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "BetterSqlite3Adapter and SqliteWasmAdapter execute/query (and export/import) take the transaction mutex; transaction-internal calls use the tx handle. The repro reader test now awaits the read after the gate opens (it previously deadlocked by awaiting a read inside the transaction it waits for)."
   },
   {
    "id": "STORE-9",
@@ -1172,14 +1179,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: writeUpdateInTx reads the row through the write transaction, so atomic ops and previousData resolve against committed state; transactions are serialized, so concurrent increments compose on both the single-record and the transaction path."
   },
   {
    "id": "STORE-10",
@@ -1187,14 +1194,14 @@
    "severity": "P2",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-10.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: a duplicate apply still records the sequence in the in-memory vector and notifies subscriptions; Store emits operation:applied after remote applies and the local-operation bus relays it to other tabs."
   },
   {
    "id": "STORE-11",
@@ -1262,14 +1269,14 @@
    "severity": "P3",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-15.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: dedup inside the apply transaction (op log + retained conflicts), in-memory vector updated only after commit on every path, collision-free index names idx_<len>_<collection>_<field> (legacy indexes dropped on open once replaced), SQLITE_FULL/quota errors on any write path emit store:quota-exceeded (Store.reportStorageError)."
   },
   {
    "id": "STORE-16",
@@ -1304,14 +1311,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: writeUpdateInTx validates the state machine against the row read inside the commit transaction for every local update, including app.transaction / app.mutation (also checked early at the call site)."
   },
   {
    "id": "NEW-STORE-3",
@@ -1319,14 +1326,14 @@
    "severity": "P1",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W6: defineSchema derives the collection stateMachine (mode reject) from an enum field with .transitions(); a collection-level stateMachine on the same field wins; transitions on a second field are a schema error."
   },
   {
    "id": "NEW-STORE-4",
@@ -1349,17 +1356,20 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-5b"
     },
     {
      "browser": "LMS-5c"
+    },
+    {
+     "browser": "LMS-MIG"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W8a step 1: one OPFS SAH pool per database (opfsPoolNameFor), held by the worker under the Web Lock kora-opfs-pool:<pool> for its whole life; contention waits (store:storage-blocked), never falls back. Bounded install retry with forceReinitIfPreviouslyFailed only after every pool handle probes free. Backend choice recorded per database in the kora-manifest IndexedDB store; OPFS<->IndexedDB switches migrate explicitly (LMS-5c). Legacy kora-opfs pool: each DB is moved into its own pool on first open (quick_check before and after, legacy copy removed only after the verified import, legacy pool removed after its last DB); a live beta.12 holder blocks with store:storage-blocked. Real Chromium: LMS-5b, LMS-5c, LMS-MIG (beta.12 frozen worker fixture) pass."
   },
   {
    "id": "NEW-STORE-6",
@@ -1367,7 +1377,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-5f"
@@ -1379,7 +1389,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: SqliteWasmAdapter open() and promoteToLeader() that end non-durable (or a failed promotion re-open) emit the blocking store:durability-lost event and refuse writes with StorageDurabilityError unless allowNonDurable is set (createApp: store.allowNonDurable; its OPFS probe defers only the open check because it falls back to IndexedDB itself). Real Chromium LMS-5f: blocking check passes; 'write accepted by promoted follower is durable' still fails by design (the write is refused, not made durable) until W8a per-database pools."
+   "notes": "S1 interim plus W8a step 2: per-database pools and pool-lock waiting make the promoted leader durable (LMS-5f both checks pass in real Chromium); any remaining non-durable open/promotion/resume emits store:durability-lost and refuses writes unless allowNonDurable. IndexedDB only where OPFS SAH is unsupported, with the backend recorded and migrated explicitly."
   },
   {
    "id": "NEW-STORE-7",
@@ -1387,10 +1397,13 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-6a"
+    },
+    {
+     "browser": "NEW-STORE-7"
     }
    ],
    "stopgap": {
@@ -1399,7 +1412,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: the SQLite WASM worker calls pool.reserveMinimumCapacity(fileCount + 2 + headroom 2) before every OPFS SAH pool open. Real Chromium LMS-6a both checks pass (8 per-user DBs durable; user #1 still writes). No eviction. Manifest, listDatabases/deleteDatabase and per-database pools remain W8a."
+   "notes": "S1 interim (reserveMinimumCapacity) plus W8a step 3: per-database pools, Kora-owned manifest (kora-manifest IndexedDB), listLocalDatabases()/deleteLocalDatabase() in @korajs/store/sqlite-wasm and app.storage.listDatabases()/deleteDatabase(name, {force}) in korajs. Delete refuses while the DB is open in any tab (StorageInUseError) and while it has unsynced operations (UnsyncedDataError, check injected from the kora layer). No automatic eviction. Real Chromium: LMS-6a and NEW-STORE-7 pass."
   },
   {
    "id": "NEW-STORE-8",
@@ -1407,14 +1420,17 @@
    "severity": "P1",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-6c"
+    },
+    {
+     "browser": "NEW-STORE-8"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "A failed open removes only the file that open created (never existing or migrated data), pauses the pool and releases its Web Lock in the worker; the adapter then terminates the worker and releases the leader lock or queued promotion request. Real Chromium: LMS-6c and NEW-STORE-8 pass."
   },
   {
    "id": "NEW-STORE-9",
@@ -1422,17 +1438,23 @@
    "severity": "P2",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-7.test.ts"
     },
     {
      "browser": "LMS-7b"
+    },
+    {
+     "browser": "LMS-7c"
+    },
+    {
+     "browser": "LMS-7d"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Follower RPC is served by the leader WORKER over BroadcastChannel (a hung leader main thread no longer blocks followers); the worker pushes heartbeats, also from inside long statements via the sqlite progress handler. Followers run one watchdog while requests are pending and fail them with LeaderUnresponsiveError (retriable, carries requestId) after missed beats. Requests carry request ids (leader dedup cache) and accept an AbortSignal. On freeze/pagehide the leader terminates its worker then releases the leader lock (no steal); followers withdraw their queued lock request; both rejoin on resume/pageshow. Real Chromium: LMS-7b, LMS-7c (dispatched lifecycle events; headless cannot freeze), LMS-7d pass. Real Android freeze still to run."
   },
   {
    "id": "NEW-STORE-10",
@@ -1440,11 +1462,14 @@
    "severity": "P2",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "browser": "NEW-STORE-10"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "close(): the worker closes the database, pauses the pool and releases the pool Web Lock, the adapter terminates the worker, and only then releases the leader lock. The next leader additionally waits on the pool lock and probes the handles. Real Chromium NEW-STORE-10: lock sampling shows no overlap; 8 rapid hand-offs all durable."
   },
   {
    "id": "NEW-STORE-11",
@@ -1476,7 +1501,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -2132,11 +2157,14 @@
    "severity": "P2",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "Write a repro when the workstream starts.",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-28.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan \u00a76). Investigate in Phase 2."
+   "notes": "Pending count is the queue plus the unscanned own tail, from the client's own acks (never min with the stale handshake vector); the engine notifies status bridges on ack/streaming so waitForSettled resolves promptly. Repro kora/tests/repro/RT-28.test.ts (both cases failed on the baseline engine)."
   },
   {
    "id": "RT-29",
@@ -2161,6 +2189,348 @@
    "acceptance": "Write a repro when the workstream starts.",
    "pr": null,
    "notes": "Found during RT-27 Postgres verification."
+  },
+  {
+   "id": "RT-31",
+   "title": "Upgrade re-upload / renumbered own ops re-judged by today's authorization and validators: non-retriable rejection for ops the server already stores",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-31.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 seam (W3 upgrade re-upload x server ingest). handleOperationBatch authorized, timestamp/size-checked and ran validateOperation before learning the op was stored; isStoredOperation looked up by (node, seq) only, so an op renumbered by the client sequence repair (same id, new seq) was not recognised either. Fixed: optional ServerStore.findStoredOperations(ids) -> Map<id,{nodeId,sequenceNumber}> (memory, SQLite, Postgres; one chunked IN read per batch, after the first rate-limit charge). An own-node op whose id is stored under this node is acked as a duplicate before any other check (any sequence). Foreign ops keep NODE_ID_MISMATCH unless the exact (node, seq, id) is stored (echo). Stores without the method fall back to a per-op (node, seq) lookup. Repro packages/test/tests/repro/RT-31.test.ts; unit tests in packages/server/src/session/session-hardening.test.ts."
+  },
+  {
+   "id": "RT-32",
+   "title": "Legacy duplicate (node, seq) from beta.12: the op the client repair keeps is refused SEQUENCE_CONFLICT when the server holds the other half",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-32.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 seam (W6 sequence repair x SRV-4 SEQUENCE_CONFLICT). Fixed with a server sequence-enforcement epoch: on the first start of this release each SQL store records MAX(delivery_seq) in kora_server_meta.sequence_enforcement_epoch (memory store: 0). SEQUENCE_CONFLICT is raised only when a holder of the (node, seq) was stored after the epoch; a legacy-only holder is accepted and stored with a console warning (as beta.12 did). The conditional full unique index is replaced by a partial unique index idx_node_seq_unique_after_epoch ON operations(node_id, sequence_number) WHERE delivery_seq > epoch, which always exists. Replace-mode backup import moves the epoch to the restored log's end. Postgres insertOperationRow now checks every holder (re-applying one op of a legacy pair was a false conflict with LIMIT 1). Store tests: packages/server/src/store/sequence-enforcement-epoch.test.ts (SQLite, Postgres via KORA_PG_TEST_URL, memory). E2E repro packages/test/tests/repro/RT-32.test.ts."
+  },
+  {
+   "id": "RT-33",
+   "title": "SYNC-11 server half: an auth-scoped client's reconnect restarts the delivery stream from 0 (full rescan and resend every reconnect)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-33.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "The client reports the watermark of its REQUESTED scope; when the server resolves a different scope it could not trust it and restarted at 0 on every reconnect. Fixed: the client persists the downlink scope the server last accepted (SyncStatePersistence load/saveAcceptedDownlinkScope, restored) and its handshake additionally sends acceptedScopeKey (scopeViewKey: canonical JSON of the normalized scope map, packages/sync/src/scopes/scope-view-key.ts, shared by client and server) and acceptedScopeWatermark (that view's own watermark). New optional protocol fields, JSON and protobuf 43/44. The server computes scopeViewKey of the scope it resolves now and resumes from acceptedScopeWatermark when the keys match, else starts the view from 0 (a widened grant delivers the newly visible records). The accepted scope is never sent as the requested scope. A grant equal (by key) to the request keeps the requested view on the client. Repro packages/test/tests/repro/RT-33.test.ts (resume counts sent ops and scan cursors; widened grant). The handshake node pre-scan for scoped clients stays (beta.13 clients count pending from the handshake vector; kora compact uses peer entries); it now starts at the resumed watermark."
+  },
+  {
+   "id": "RT-34",
+   "title": "Node rotation lowers or deletes the old node's version-vector entry and writes the vector outside the W6 discipline (scan before the transaction, INSERT OR REPLACE)",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [],
+   "pr": null,
+   "acceptanceTest": "packages/store/src/sync/rotate-node-id.test.ts (3 tests failed before the fix: old entry lowered to the highest remaining op, deleted when every op rotated, and a counter advanced by another writer after the pre-transaction scan overwritten)",
+   "notes": "Phase 2 seam (W6 x RT-21). rotateUnsyncedOperationsInLog scanned the old node's ops before its transaction and wrote _kora_version_vector with INSERT OR REPLACE: the old node's counter dropped to its highest remaining op (or was deleted), so a rotated op that reached the server unacknowledged could have its number reused by a writer still on the old id (another tab): SEQUENCE_CONFLICT on the server. Fixed: the scan, rewrite and vector writes run in one transaction; the new node's entry is an UPSERT with MAX(stored, new); the old node's entry is never lowered (rotated numbers become holes, which upload tracking resolves). Store.rotateNodeId takes its counter from the persisted vector. A grep found no other vector write outside the discipline except backup restore (STORE-5, Phase 3, untouched)."
+  },
+  {
+   "id": "RT-35",
+   "title": "Op uploaded and acked before it is durable locally (IndexedDB 500 ms snapshot debounce): after losing the tail the next write reuses the sequence (non-retriable SEQUENCE_CONFLICT, never synced) and the lost op is never re-delivered to its author (permanent divergence)",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-35.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Locations: store/src/adapters/indexeddb-adapter.ts:95 (debounced snapshot; flushPersistence has no caller in sync); sync/src/engine/sync-engine.ts:1541 (only a LOWER advertised own entry is acted on; the local counter is never raised to the server's); server/src/session/client-session.ts:2010, 2649-2657 (own ops excluded from a resumed stream); server/src/apply/apply-server-operation.ts:256 (SEQUENCE_CONFLICT terminal). Same outcome after restoring an older local copy (OS/Electron backup). Required fix: flush the IndexedDB snapshot before an op is marked sent; at handshake raise the local counter above an advertised own entry (MAX, in a transaction) and have the server re-send own ops above the client's own vector entry regardless of watermark; treat SEQUENCE_CONFLICT against the device's own lost op as recoverable (fetch the holder, renumber the new write). Repro simulates the lost tail by restoring a VACUUM INTO snapshot. FIXED (client, branch worktree-agent-ac713ddaf488cccee): upload batches are flagged sent (persisted) and the store durability barrier (StorageAdapter.ensureDurable; IndexedDB generation-tracked snapshot barrier) is awaited before the wire; handshake raises the persisted counter past an advertised own entry (in-tx MAX), resets delivery to a full resync (own ops included) and reconnects; SEQUENCE_CONFLICT on an own upload renumbers it (same id) above the server entry and resyncs. Client advertises handshake sequenceReservation: true. Server-side targeted resend of own ops above the client vector not done (client full resync instead)."
+  },
+  {
+   "id": "RT-36",
+   "title": "Own-log rescan (upgrade re-upload, server-advertised lower prefix) resubmits ops the server terminally rejected: a refused write is re-judged and applied later",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-36.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2807-2840 scanOwnLog enqueues every own op not queued and inside the uplink scope, never consulting the rejected store; the prefix restarts at 0 on upgrade (2680) or is lowered by lowerOwnPrefixLocked. Repro: a withdrawal refused (INSUFFICIENT_FUNDS, non-retriable) is applied after the upgrade re-upload once the balance allows it. Required fix: persist terminal rejections as resolved per op id in a durable marker the app cannot clear, and skip them in scanOwnLog and rotation; optionally the server remembers refused ids and answers a resubmission with the original rejection. Fix RT-37 first (beta.13 SEQUENCE_CONFLICT losses are currently only rescued by this bug). FIXED (client): durable _kora_terminal_rejections markers (app cannot clear), written before the prefix passes the op; scanOwnLog and RT-21 re-authoring skip them; seeded once from _kora_sync_rejected excluding SEQUENCE_CONFLICT/NODE_ID_MISMATCH/OUT_OF_UPLINK_SCOPE so beta.13 SEQUENCE_CONFLICT writes still re-upload (and are renumbered if refused again)."
+  },
+  {
+   "id": "RT-37",
+   "title": "Mixed versions: beta.13 clients still create duplicate (node, seq) pairs (concurrent app.transaction); the Phase 2 server refuses the second op with non-retriable SEQUENCE_CONFLICT for every pair created after the server upgrade, and the beta.13 engine drops the write",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-37.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Verified end to end with the real beta.13 build (33bca46, scratch harness): two concurrent app.transaction inserts share seq 1; synced to this branch's server, the second is recorded rejected SEQUENCE_CONFLICT and never stored. Location: server/src/store/server-store.ts:63-76 judgeSequenceHolders (conflict when any holder is after the epoch); server/src/apply/apply-server-operation.ts:252-258. Also on Postgres (KORA_REPRO_STORE=postgres); during a rolling upgrade a beta.13 instance's insert of such a pair hits idx_node_seq_unique_after_epoch. Required fix: enforce SEQUENCE_CONFLICT only for clients that advertise the W6 sequence guarantee (new handshake capability); for older clients store the pair as a legacy pair with a warning (beta.13 server behaviour) or answer retriably; document upgrade order. Repro drives the beta.13 upload at protocol level. Fixed (server + protocol): new optional handshake capability HandshakeMessage.sequenceReservation?: boolean (JSON; protobuf envelope field 45, bool), set by clients that reserve sequence numbers in-transaction. ClientSession reads it at handshake; a session without it is a legacy sequence client (isLegacySequenceClient()) and applies with ApplyRemoteOptions.legacySequenceWriter: judgeSequenceHolders then never refuses a held sequence for that writer: the second op is stored as a legacy pair (own delivery sequence, so the delivery stream, live relay and getOperationRange version-vector path deliver both), with a console warning, a structured log event session.legacy_sequence_pair and onLegacySequencePair/getLegacySequencePairCount(). Capable clients and server-originated ops still get SEQUENCE_CONFLICT. Index redesign (SQLite + Postgres): new column operations.seq_unique INTEGER NOT NULL DEFAULT 0, set to 1 only when the row was the sole holder of its (node, seq) at insert; the partial unique index is now idx_node_seq_unique_sole ON operations(node_id, sequence_number) WHERE seq_unique = 1 (idx_node_seq_unique and idx_node_seq_unique_after_epoch are dropped at startup; flagged duplicates from outside writes are unflagged before the index is recreated). A legacy pair is never in the index, and an older instance's insert during a rolling upgrade (column default 0) never hits it; two concurrent sole inserts still collide. Replace-mode backup rows are inserted unflagged. Memory store keeps every holder per (node, seq). Upgrade order: servers first, then clients; a client is only held to SEQUENCE_CONFLICT once it advertises the capability. Tests: packages/sync/src/protocol/sequence-reservation-wire.test.ts; packages/server/src/store/sequence-enforcement-epoch.test.ts (legacy writer contract on memory, SQLite, Postgres); packages/server/tests/integration/legacy-sequence-and-ingest-budget.test.ts (session level, memory/SQLite/Postgres)."
+  },
+  {
+   "id": "RT-38",
+   "title": "Node rotation (RT-21) uploads the previous user's unsynced writes on the next user's session when users share one local database (no namespaceByAuthUser): authorized, validated and attributed as the new user; sent-but-unacked ops are stored twice",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-38.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:1582-1640 rotateNodeIdentity re-queues every own op above the prefix regardless of who wrote it; NODE_ID_CLAIMED is exactly what a second user on the same database receives. Repro: Alice's offline note is submitted with ctx.auth.userId = bob. A rotated op that was sent but not acknowledged keeps its old copy on the server and gains a re-authored copy (atomic increments double). Required fix: bind unsynced ops to the principal that wrote them; on NODE_ID_CLAIMED for a different principal hold the other user's ops (surface them; upload when that user signs in) or require namespaceByAuthUser with auth; never rotate ops flagged sent. FIXED (client): uploads bound to the session node; on NODE_ID_CLAIMED for a previously accepted node its unsynced writes are held (status.heldOperations) and the device switches to a held node untried in this refusal cycle or a fresh one; never-accepted nodes keep RT-21 re-authoring minus ops flagged sent (the double-store cause). namespaceByAuthUser default unchanged (see report)."
+  },
+  {
+   "id": "RT-39",
+   "title": "Upgrade re-upload charged op by op to the ingest rate limit (600/min) although every op is a stored duplicate: RATE_LIMIT ends the session every minute and new writes wait behind the whole history",
+   "severity": "P2",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-39.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: server/src/session/client-session.ts:2236-2251 (rate limiter charged before the stored-id lookup); RATE_LIMIT is a session error (engine disconnects and backs off, downloads interrupted); the outbound queue is HLC-ordered so new writes follow the old history. Repro: 1,500-op history, server restarted with default limits, a fresh write is not on the server after 5 reconnects and RATE_LIMIT was sent. Required fix: look up stored ids first (batch already capped) and do not charge stored duplicates (or use a separate larger budget); make RATE_LIMIT a per-batch retriable throttle with retryAfterMs instead of a session error; upload new writes ahead of the re-upload backlog. Fixed (server): handleOperationBatch charges one rate-limit unit per batch for the stored-id lookup (BATCH_LOOKUP_RATE_COST, credited against the first charged op, so N new ops still cost N), then acks operations the lookup finds stored (own op under this node, or exact (node, seq, id) echo) as duplicates with no per-op charge. Every other op is charged before any store work as before (RT-6). The ingest limiter is keyed per device node (KoraSyncServer.rateLimiterFor), so one node's re-upload never throttles another node of the same user (test added). RATE_LIMIT text now includes the retry delay. Not done here (client engine / ErrorMessage, other owners): RATE_LIMIT is still a connection-level error message (retriable: true) rather than a per-batch throttle with a retryAfterMs field, and new writes are not reordered ahead of a re-upload backlog. Tests: packages/server/tests/integration/legacy-sequence-and-ingest-budget.test.ts; repro packages/test/tests/repro/RT-39.test.ts green. Follow-up (Phase 2 round 2, not attacked by the red team): the per-node limiter could be multiplied by minting node ids, so KoraSyncServer now layers a per-principal budget (maxOpsPerMinutePerUser, default 4 x maxOpsPerMinute, 0 disables; user map with the same TTL/LRU bounds as the node map) on the per-node one via CombinedRateLimiter: a refusal by the user budget spends none of the node budget, and a node over its own budget spends none of the user budget, so per-node fairness and the per-batch lookup cost are unchanged. Anonymous and NoAuth sessions have no stable principal and keep only the per-node budget. Tests: session-operation-limits.test.ts, operation-resolutions.test.ts (per-user ingest budget)."
+  },
+  {
+   "id": "RT-40",
+   "title": "per-tab isolation: a closed tab's unsynced writes (own node id, shared database) are never uploaded by later tabs and never counted pending",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-40.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: sync/src/engine/sync-engine.ts:2680-2700 and 2761-2800 (own tracking bound to store.getNodeId()); store/src/store/tab-node-id.ts (sessionStorage node per tab). Required fix: persist the set of node ids this database authored with a prefix per node; a starting engine adopts orphaned per-tab nodes under a Web Lock and uploads their unacknowledged ops (server side: node-claim handover for those nodes under auth). FIXED (client): local node registry + per-tab Web Lock; a starting engine adopts a local node with unsynced writes and a free lock, runs a session as that node (original ids), then reconnects; other local nodes count as pending."
+  },
+  {
+   "id": "RT-41",
+   "title": "app.storage.deleteDatabase() unsynced check counts only _kora_sync_queue rows; own ops above own_acked_through that are not queued (upgrade re-upload pending, op committed before an un-awaited pushOperation persisted, closed per-tab tab) are deleted",
+   "severity": "P2",
+   "workstream": "W8a",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-41.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: kora/src/storage-accessor.ts:15-36 hasUnsyncedOperations. Required fix: unsynced = queue rows OR any own op (any local node id) above its own_acked_through OR a node with no recorded prefix; keep the local-only branch. FIXED: deleteDatabase unsynced check = queue OR any local node own op above its prefix (no prefix: from 0) minus terminal rejections (store/internal hasUnsyncedOwnOperations)."
+  },
+  {
+   "id": "RT-42",
+   "title": "Unsynced writes are bound to a node, not to the principal that wrote them: a write made after a user switch but before the next accepted handshake is held for the previous user and later uploaded as that user; a never-accepted node's writes are uploaded as whoever handshakes first",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-42.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Residual of RT-38. Locations: sync/src/engine/sync-engine.ts:1717 holdNodeAndSwitch (holds EVERY unsynced op of the refused node, including the new user's own writes authored under it before the refusal), 1759 reauthorUnsentAndRotate and 1536 recordNodeAccepted (a node's owner is learned only at the first accepted handshake), 3200 chooseSessionNode (adopts a never-accepted per-tab node under the current principal). Repro 1: Alice synced on NA; Bob signs in and writes before his first handshake; NA is refused and held: Bob's write is held while he is signed in (heldOperations>0) and is submitted with ctx.auth.userId = alice when Alice signs back in. Repro 2: a database that never synced: Alice's offline writes are uploaded on Bob's session. Required fix: bind each write to the principal known locally at write time (the auth layer knows who is signed in): rotate or switch the node id when the signed-in principal changes, BEFORE the next write (not on NODE_ID_CLAIMED), record the principal per local node, and never upload a node's writes on another principal's session; or make namespaceByAuthUser the default when auth is configured. Repro packages/test/tests/repro/RT-42.test.ts. FIXED (client, auth-aware apps): local writes are bound to the signed-in user. Store.bindPrincipal(user) (new _kora_local_nodes.principal column, added in place by ALTER TABLE on open) moves the store to that user's own node, or a fresh one, BEFORE the next write; createApp calls it at start and on every auth change of sync.authClient (AuthSyncCoordinator -> SyncEngine.refreshPrincipal(), which ends the previous user's session first). The engine (SyncConfig.principal) never uploads, adopts or rotates into a node bound to another user: its writes are reported in status.heldOperations and upload as their owner when they sign in again. Pinned node ids (auth dev claim) cannot move: another user suspends sync (reason node-owned-by-another-user). per-tab: the tab moves to a fresh per-tab node. The repro now models an auth-aware device (TestDevice principal + authChanged()); a client never told who is signed in cannot tell users apart (documented residual, docs/guide/authentication.md). namespaceByAuthUser default unchanged (false): switching it on would hide the shared database's data without a migration; principal binding gives per-user node isolation without it. Writes issued before the auth binding reports a sign-in (same tick) are still authored under the previous user's node and held for them (documented; AuthBoundKoraProvider avoids it). Tests: packages/store/src/store/principal-binding.test.ts, sync local-nodes.test.ts (RT-42 block), kora auth-sync-coordinator.test.ts + create-app.test.ts, packages/test/tests/phase2-node-fairness.test.ts."
+  },
+  {
+   "id": "RT-43",
+   "title": "An acknowledged own op the server does not store under its sequence (validator action ignore; W6-renumbered op stored under its old number) at the tail makes every handshake look like a restored server: the tail is re-uploaded and re-validated on every reconnect",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-43.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: sync/src/engine/sync-engine.ts:1634 (advertisedOwn < ownAckedThrough lowers the prefix on every handshake); the server's handshake vector is MAX(stored sequence) per node (server/src/session/client-session.ts:1942-1986), and client-session.ts:2425-2429 acknowledges an ignored op without storing anything. Repro: the newest own op is ignored by validateOperation (out-of-band handling, e.g. send an invoice): after 5 reconnects the validator has seen it 6 times; its out-of-band effect repeats. Same shape for a W6 sequence-repaired op whose stored copy keeps the old number (free duplicate re-upload each reconnect). Ends only when the device writes something newer. Required fix: the server must advertise per node the highest sequence it has RESOLVED (stored, ignored, or terminally refused), e.g. a per-node acknowledged-through column, not MAX(stored); or the client must confirm a lower advertisement by id (ask which of its ops above X the server holds) before lowering the prefix, and lower it at most once per server incarnation. Repro packages/test/tests/repro/RT-43.test.ts. Fixed (server): the handshake's own-node entry is max(stored max, highest RESOLVED sequence) for the node. ClientSession durably records (awaited before the answer) an op the validator ignored ('ignored'), a terminal non-retriable refusal ('refused', excluding SEQUENCE_CONFLICT, which the client renumbers and resubmits under the same id), and an own op acked as a duplicate of a copy stored under another sequence ('stored-elsewhere'); retriable rejections are never resolutions. A resubmitted ignored/stored-elsewhere id is acknowledged as a duplicate without re-running the validator. Store schema: new tables operation_resolutions(op_id PK, node_id, sequence_number, outcome ignored|refused|stored-elsewhere, code, message, resolved_at; index (node_id, sequence_number)) and sequence_pairs(node_id, sequence_number PK) on SQLite and Postgres (created at startup, IF NOT EXISTS; pairs backfilled once from the log, flag sequence_pairs_backfilled in kora_server_meta); memory store keeps both in maps. A replace-mode importBackup rebuilds sequence_pairs and drops resolutions above each node's restored log (they would hide stored ops the restore lost). Tests: packages/server/tests/integration/operation-resolutions.test.ts (memory, SQLite, Postgres); repro packages/test/tests/repro/RT-43.test.ts green."
+  },
+  {
+   "id": "RT-44",
+   "title": "Cloned database (one node id on two live devices) is never detected: each copy's writes are own operations for the other (never delivered on a resumed stream or live relay), and every sequence collision costs a renumber plus a full resync from 0",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-44.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: server/src/session/client-session.ts:2703-2711 (own-node ops skipped above ownOperationsIncludedThrough), sync/src/engine/sync-engine.ts:3383 recoverSequenceConflict (renumber + resetDeliveryForFullResync per collision), 1609-1625 (handshake raise + full resync). Repro: copy of a synced database opened as a second device; 3 writes on each while both are connected: the original never sees 2 of the copy's writes until a reconnect; 4 history-behind recoveries (each a full resync) for 6 writes. Converges after reconnects with no loss (verified). Required fix: detect a clone (the server sees two live sessions of one node, or a SEQUENCE_CONFLICT whose holder is not in the device's log yet was uploaded after the device's last handshake) and move one copy to a fresh node id (RT-21 re-authoring of its unsynced ops); at minimum rate-limit full resyncs. Repro packages/test/tests/repro/RT-44.test.ts. FIXED (client): a SEQUENCE_CONFLICT for an own write whose sequence is above the session's handshake own entry means the holder was stored during this session by another live copy of the database: the copy moves to a fresh node id (rotateUnsent: the refused write, certainly not stored, and every never-sent one are re-authored; sent-unacked ones stay under the old node), ends the session and resyncs from 0 (sync:local-node clone-detected, no history-behind). The old node is forgotten when nothing of this copy waits under it. Fallback for stores that cannot rotate (pinned ids): recovery full resyncs are rate-limited to one per 60 s per engine (deferred to the next session start). A clone that collides only at or below the handshake entry (both copies wrote while offline) is first handled as RT-35 (renumber + resync) and detected at its next live collision. Tests: sync local-nodes.test.ts (RT-44 blocks)."
+  },
+  {
+   "id": "RT-45",
+   "title": "Server restored from an older backup: a device whose node has no operation in the backup never re-uploads the operations the server lost (absent own vector entry read as \"no information\"); they exist only on devices",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-45.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: sync/src/engine/sync-engine.ts:1634 `advertisedOwn !== undefined && advertisedOwn < this.ownAckedThrough`: the handshake vector omits a node the server holds nothing of (client-session.ts:1975-1977 filters serverVector), so advertisedOwn is undefined and the prefix is never lowered. Repro: devices a and b; backup taken when only a had written; then 3 increments each; server restored: a re-uploads its 3 (once), b never does: server count 6 instead of 66, serverOps 4 instead of 7; both devices show 66 and pendingOperations 0 (deleteDatabase would call b synced). New devices never receive b's writes. Required fix: the server always includes the session's own node in the handshake vector (0 when absent), and the client treats an absent own entry as 0 (lowering to 0 is safe: the server dedups by id). Combine with the RT-43 fix (resolved-through, not MAX(stored)). Repro packages/test/tests/repro/RT-45.test.ts. Fixed (server half): the handshake response always carries the session's own node, 0 when the server holds nothing of it (and the resolved-through value of RT-43 otherwise); only the own node is added, so RT-7 holds. The repro passes with the server half alone: the engine already lowers its prefix for any advertised own entry below its acknowledged prefix, and 0 is now advertised. The client half (an ABSENT own entry read as 0, for servers that omit it, e.g. beta.13) is owned by the client-engine fix and is defence in depth. Tests: operation-resolutions.test.ts (own node always advertised, RT-7 not echoed; replace import prunes resolutions past the restored log); client-session.test.ts handshake expectation updated; repro packages/test/tests/repro/RT-45.test.ts green. IXED (client half; repro green with the client alone): the engine reads an ABSENT own entry in the handshake vector as 0 (the server names the session's node whenever it holds an op of it), lowers the acknowledged prefix and re-uploads (sync:local-node server-behind); the server dedups by id. The server half (always include the session's node, 0 when absent) is owned by the server workstream and is complementary. Until RT-43's server fix lands, a node whose ops the server only ignored (never stored) is absent and gets re-uploaded at each handshake (RT-43 class). Tests: sync own-node-bound.test.ts (own=0, absent, fresh device); no-silent-loss.test.ts upgrade-recovery mock now advertises what it stores."
+  },
+  {
+   "id": "RT-46",
+   "title": "Per-tab adoption (RT-40) is head-of-line blocking: a session adopts one orphaned node and uploads nothing else until all its writes are acknowledged; one retriably rejected adopted write stalls the live tab's own uploads and every other orphan node, forever (cross-node parent/child deadlock)",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-46.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:3200 chooseSessionNode (adopts the first eligible node in registry order on every start), 3175 isSessionOperation / takeBatch (only the session node uploads), 3422 maybeEndSessionForNodeWork (adoption ends only when the adopted prefix reaches its counter). Repro: two closed per-tab tabs, the OLDER node holds a task whose parent project is on the NEWER node; the app validator defers a child until its parent is on the server (retriable: true). The remaining tab adopts the older node forever: after 6 reconnects NOTHING is on the server (not the parent, not the child, not the open tab's own write). Control without the deferral: all three sync. Same stall with any persistent retriable rejection (throwing validator, RATE_LIMIT) of an adopted write. Required fix: upload the live tab's own writes and other nodes' writes alongside an adoption (one session per node, or multiplex by bounded time slices), give up an adoption that makes no progress and move on round-robin, and order adoption by causal dependencies across local nodes (a cross-node causalDep must upload first). Repro packages/test/tests/repro/RT-46.test.ts. FIXED (client): local nodes take turns, one session each (the server confines uploads to the session node). chooseSessionNode skips a parked adoption (its last session ended with a batch the server did not process, e.g. a retriable deferral) until the database's upload-progress counter moved or its backoff (30 s doubling, max 1 h) ran out, orders adoptions by cross-node causal deps (a node whose unsynced ops name another local node's unsynced op goes after it; cycles broken in registry order), and an adopted node that stalls is parked and its session ended at once (sync:local-node adoption-parked). The own node's session yields once its own uploads made progress and a deferred node became worth retrying (causal parent uploaded, or parked >= 30 s and progress moved). Schedule persisted in _kora_meta sync_adoption_schedule_v1 (SyncStatePersistence.load/saveAdoptionSchedule, in memory otherwise). Residual: a session-level error (not a per-op rejection) recurring on an adopted node's batch is not parked. Tests: sync local-nodes.test.ts (RT-46 block), packages/test/tests/phase2-node-fairness.test.ts (3 closed tabs + open tab, one write deferred forever)."
+  },
+  {
+   "id": "RT-47",
+   "title": "RT-36 residual: the terminal-rejection marker is client-only and not covered by any durability barrier; a device that loses the tail of its database after a rejection (IndexedDB 500 ms window, restored copy) resubmits the refused op, and the server applies it",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-47.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:2780-2785 (recordTerminalRejections on a non-retriable rejection; no durability barrier before the outcome is acted on), store/src/sync/local-sync-records.ts:111; server keeps no record of refused ids (server/src/session/client-session.ts sendOperationRejected). Repro: the device database is snapshotted while the server judges the upload (sent flag durable, rejection not yet received), the refusal (INSUFFICIENT_FUNDS) is recorded, the snapshot is restored, the balance recovers: the withdrawal is applied. Required fix: the server remembers refused operation ids (with the original code) and answers a resubmission with the original rejection (the optional half of the RT-36 fix); client side, flush the marker durably (ensureDurable) before acting on the rejection. Repro packages/test/tests/repro/RT-47.test.ts. Fixed (server): a terminal refusal is recorded (code, message) in operation_resolutions before the rejection is sent; a later upload of the same id under the session's own node is answered from the table with the original rejection (retriable false) before authorization, validators or any store work, and charged nothing beyond the batch lookup unit. Lookups are keyed by the session's own (claimed) node id, so another device or tenant reusing the id is judged normally and learns nothing (not an oracle). Not done here (client engine, other owner): flushing the client-side marker durably before acting on the rejection. Store schema: new tables operation_resolutions(op_id PK, node_id, sequence_number, outcome ignored|refused|stored-elsewhere, code, message, resolved_at; index (node_id, sequence_number)) and sequence_pairs(node_id, sequence_number PK) on SQLite and Postgres (created at startup, IF NOT EXISTS; pairs backfilled once from the log, flag sequence_pairs_backfilled in kora_server_meta); memory store keeps both in maps. A replace-mode importBackup rebuilds sequence_pairs and drops resolutions above each node's restored log (they would hide stored ops the restore lost). Tests: operation-resolutions.test.ts (original rejection replayed, validator not re-run; cross-node id reuse judged normally; retriable and SEQUENCE_CONFLICT not remembered); repro packages/test/tests/repro/RT-47.test.ts green."
+  },
+  {
+   "id": "RT-48",
+   "title": "The second op of an RT-37 legacy pair never reaches a version-vector client that already holds the first (getOperationRange starts above the client's entry); mixed fleets diverge on vector clients",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-48.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: server/src/session/client-session.ts:2517 collectDeltaOperations (range clientSeq + 1 .. serverSeq per node). Repro (memory, SQLite and Postgres 16): a beta.13 writer uploads X@1; a vector client receives it and disconnects; the writer's concurrent transaction Y@1 is stored as a legacy pair; the vector client reconnects with {writer: 1} and receives nothing. The live relay covers only a connected peer; the delivery stream (watermark clients) is fine. The beta.13 server had the same gap; RT-37 keeps creating such pairs for every beta.13 writer. Required fix: the vector delta also sends ops stored as the non-sole holder of a (node, seq) at or below the client's entry that were stored after the client's last session (track per-node pair delivery sequences), or force vector clients to a full resync when the server stored a legacy pair for a node they track; document that vector clients must upgrade. Repro packages/server/tests/repro/RT-48.test.ts. Fixed (server): stores index legacy pairs in sequence_pairs at append (verdict 'legacy') and by a one-time backfill of the existing log; collectDeltaOperations sends, for every node a version-vector client reports, the members of each pair at or below min(client entry, server entry) ahead of the range above the entry. The client dedups by id; pairs come only from legacy writers, so the resend per handshake is small (it repeats at every handshake of a vector client: such clients should upgrade). New store method ServerStore.getSequencePairOperations (optional). Pairs written by an older server instance sharing the database during a rolling upgrade are not indexed until the next replace import. Tests: operation-resolutions.test.ts (pair index at append and after import; session delivery); repro packages/server/tests/repro/RT-48.test.ts green on memory, SQLite and Postgres 16."
+  },
+  {
+   "id": "RT-49",
+   "title": "A permanent local persistence failure (IndexedDB quota exceeded) makes the RT-35 durability barrier stop every upload while the app keeps writing in memory: writes the reachable server could have kept are lost on reload",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-49.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:2074-2093 sendUpload (barrier failure returns the batch and retries forever, UPLOAD_NOT_DURABLE), 1926-1932 (initial delta); store/src/adapters/indexeddb-persistence-scheduler.ts flushBarrier. Repro: the store's ensureDurable rejects (QuotaExceededError) after the first sync; a new write never reaches the reachable server after 3 reconnects. Since RT-35, a device that loses its tail recovers it from the server (handshake raise + full resync, renumber on SEQUENCE_CONFLICT), so uploading a non-durable op is no longer what loses data; withholding it is. Required fix: treat a persistently failing barrier (N attempts or T seconds, or a quota error) as degraded mode: upload anyway (the RT-35 recovery covers the reuse), surface a sync status error (store not durable) so the app can warn the user, and keep the barrier for transient failures. Repro packages/test/tests/repro/RT-49.test.ts. FIXED (client): the durability barrier before an upload is bounded: after 3 consecutive failures the engine uploads anyway (degraded mode: status.localDurability = 'degraded', sync:durability-degraded and store:persistence-error DURABILITY_DEGRADED once); transient failures still postpone (UPLOAD_NOT_DURABLE). The barrier is still attempted before every upload and its first success restores (sync:durability-restored). RT-35 recovery restores a lost tail after reload. Tests: sync local-nodes.test.ts (RT-49 tests)."
+  },
+  {
+   "id": "RT-50",
+   "title": "Store.bindPrincipal binds an UNBOUND node to the first user who signs in, without asking who owns it: on every database created before the RT-42 fix, the first sign-in after the upgrade adopts another user's node (their unsynced writes stranded forever, or uploaded as the wrong user)",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-50.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Locations: store/src/store/store.ts:1547 (bindPrincipal: owner === null -> setLocalNodePrincipal(current node, principal)); kora/src/initialize-app.ts:152 (bind at start); sync/src/engine/sync-engine.ts:1868 holdNodeAndSwitch (NODE_ID_CLAIMED never corrects the local binding of the refused node). All pre-fix nodes have principal NULL. (1) Shared device, Bob left unsynced writes on his node NB, Alice signs in first after the upgrade: NB is bound to Alice locally, the server refuses it for Alice (claimed by Bob) so it is held; when Bob signs in NB belongs to another principal locally, so it is never uploaded or adopted: stranded forever (heldOperations 1). (2) A pre-upgrade database that never synced (Alice wrote offline): the first user to sign in after the upgrade (Bob) gets Alice's node and her writes are uploaded as Bob, so the RT-42 never-synced case is still open for existing databases. Required fix: never bind an unbound node that has unsynced writes by inference; learn its owner from the server (bind at the first ACCEPTED handshake as the session principal; on NODE_ID_CLAIMED clear an inferred binding instead of keeping it), and hold an unbound never-synced node with writes for an explicit app decision (surface it) instead of giving it to the first user. Record whether a binding is inferred or confirmed. Repro packages/test/tests/repro/RT-50.test.ts (two tests). FIXED (store, sync, kora): Store.bindPrincipal never guesses the owner of an unbound node. An unbound node with no history (no write, never accepted) is bound in place (binding 'fresh'); one with history keeps no owner and the store moves to the user's own node (or a fresh one); a pinned unbound node stays in use unbound until the server decides. _kora_local_nodes gains binding ('fresh' | 'server' | 'app') and refused_principals. The engine learns owners from the server: an unbound node accepted before is adopted once per signed-in user; an accepted handshake binds it (confirmLocalNodePrincipal, 'server'); NODE_ID_CLAIMED records the user as refused for it and clears a guessed ('app' or legacy) binding, without holding it for good (markLocalNodeRefused held=false for unbound nodes). A never-synced unbound node with writes is held as 'unassigned' (status.heldNodes, heldOperations) until the app calls app.sync.assignHeld(nodeId, 'current-user') or app.sync.discardHeld(nodeId) (writes stay local, terminal marker HELD_DISCARDED). Rotation carries the binding to the re-authored node. Tests: store principal-binding.test.ts (RT-50 tests), sync local-nodes.test.ts (RT-50), packages/test/tests/phase2-held-writes.test.ts, kora sync-control.test.ts. Documented in docs/guide/authentication.md, sync-configuration.md, api/sync.md."
+  },
+  {
+   "id": "RT-51",
+   "title": "A 'stored-elsewhere' resolution acknowledges an upload the server does not store: after a replace-mode backup import the record outlives its stored copy and every re-upload of that id is acked and dropped",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-51.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Locations: server/src/session/client-session.ts:2324 (any resolution hit for an id the batch lookup did NOT find stored is acked as a duplicate; for 'stored-elsewhere' that claim was just disproved by the lookup); server/src/store/{memory-server-store.ts:37, sqlite-server-store.ts:62, postgres-server-store.ts:73} (replace import prunes only resolutions ABOVE the restored node max, whatever their outcome). Sequence: ops 1..11 stored, backup; X stored at 12 (W6 renumber); a stale copy of X re-submitted at 5 (restored device copy) -> 'stored-elsewhere' at 5; replace import of the backup (X gone, resolution at 5 <= 11 kept); the device re-uploads X -> acked, never stored, no replica receives it. Fails on memory, SQLite and Postgres 16. Narrow (needs a renumber, a stale resubmission and a restore), but it is a silent ack-without-store. Required fix: treat a 'stored-elsewhere' hit for an id the lookup did not find as stale (judge the op normally, and delete the record); on replace import drop every 'stored-elsewhere' resolution whose id is not in the restored log. Also consider exporting resolutions in backups (today a migrated server forgets every refusal, RT-47 protection lost). Repro packages/server/tests/repro/RT-51.test.ts. FIXED (server): a stored-elsewhere resolution hit for an id the batch lookup did not find stored is stale: the session deletes it (new optional ServerStore.deleteOperationResolution, memory/SQLite/Postgres) and judges the op normally, recording its real outcome. Replace-mode import also drops stored-elsewhere resolutions whose op id is not in the restored log. Tests: server tests/integration/operation-resolutions.test.ts (RT-51 store and session tests, memory/SQLite/Postgres 16). Residual: backups still do not carry operation_resolutions (a migrated server forgets refusals, RT-47)."
+  },
+  {
+   "id": "RT-52",
+   "title": "RT-42 residual is much wider than 'the same instant': AuthSyncCoordinator queues a user switch behind any in-flight auth reconnect (credential fetch + up to 10 s connect), and every write the new user makes meanwhile is authored under the previous user's node and uploaded as that user",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-52.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Cross-principal. Locations: kora/src/auth-sync-coordinator.ts:66 scheduleReconnect (a change during a run only sets pending), :90 run (refreshPrincipal, then engine.reconnect() which awaits stop/start); sync/src/engine/sync-engine.ts:639 (start binds the principal BEFORE the credential fetch and transport.connect at :714, so a session can also hand-shake a node bound to the previous user with the next user's token). Repro: Alice's token refresh starts a reconnect on a slow network; Bob signs in (binding reports it) and writes; the write is authored under Alice's node and later submitted as Alice. docs/guide/authentication.md says only writes 'in the same instant as a sign-in' are affected. Required fix: apply the principal binding synchronously on every auth event, outside the serialized reconnect (bind the store first, then queue the reconnect), and re-check the principal against the session node's owner after the credential fetch, before the handshake. At least document the real window. Repro packages/test/tests/repro/RT-52.test.ts. FIXED (sync, kora): AuthSyncCoordinator.scheduleReconnect binds the store at once on every auth event via SyncEngine.bindSignedInUser(), outside the serialized reconnect (a live session keeps running as the previous user's node and uploads only that node's writes). SyncEngine.start() re-resolves the principal after the credential fetch and transport connect, before the handshake; if it changed it disconnects and starts over (at most 2 restarts, then PRINCIPAL_CHANGED). The session's principal (sessionPrincipal) is what an accepted handshake binds. Store bindings are serialized (withPrincipalLock). Tests: sync local-nodes.test.ts (RT-52), kora auth-sync-coordinator.test.ts, packages/test/tests/phase2-held-writes.test.ts (RT-52). Residual: a write in the same tick as the auth event, before the async binding completes, is still authored under the previous user's node (documented)."
+  },
+  {
+   "id": "RT-53",
+   "title": "A parked adoption (RT-46) is retried only at a session start or after the open tab's own uploads progress: an idle connected tab never retries a closed tab's deferred writes, however long ago the park expired",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-53.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Liveness. Locations: sync/src/engine/sync-engine.ts:3927 maybeYieldToDeferredNode (requires sessionAcked > 0 and is only reached from maybeEndSessionForNodeWork after an ack, :3892); :3665 parkAdoption (untilMs is never armed as a timer). A closed tab's write deferred once (retriable) is parked for 30 s; the open tab reconnects as its own node and stays connected and idle (dashboard, kiosk, tab left open): the write is never retried while the connection holds (reported as pending, but it lives only on this device). Required fix: arm a timer for the earliest parked untilMs (and for causal deferrals) that ends an idle own-node session, or upload parked nodes on a side session; keep the bound of one retry per backoff. Repro packages/test/tests/repro/RT-53.test.ts (36 s real wait). FIXED (sync): an own-node session arms a timer for the earliest parked adoption's untilMs; when it fires on an idle session (nothing queued or in flight) the engine reconnects and the next session adopts the node; a busy session hands over when its uploads drain (an expired park is due without own progress). One retry per backoff kept. Timer cleared with the session. TestDevice gains an opt-in reconnectable transport; the repro runs on fake timers (Date + setTimeout, advancing with real time) instead of a 36 s wait. Tests: sync local-nodes.test.ts (RT-53)."
   }
  ],
  "rejectedProposalPins": {

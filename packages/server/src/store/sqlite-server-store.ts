@@ -34,10 +34,60 @@ import type {
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationResolution,
+	OperationResolutionOutcome,
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER } from './server-store'
+import {
+	MAX_RESOLUTION_MESSAGE_LENGTH,
+	NODE_SEQ_UNIQUE_INDEX,
+	RELEASED_NODE_OWNER,
+	SEQUENCE_ENFORCEMENT_EPOCH_KEY,
+	SEQUENCE_PAIRS_BACKFILLED_KEY,
+	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
+	SequenceConflictError,
+	type SequenceHolderVerdict,
+	judgeSequenceHolders,
+	reportLegacyPair,
+} from './server-store'
+import type { StoredOperationKey } from './server-store'
+
+/** Index every (node, sequence) the log holds more than once (RT-48). */
+const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
+	SELECT node_id, sequence_number FROM operations
+	GROUP BY node_id, sequence_number HAVING COUNT(*) > 1`
+
+/**
+ * Drop resolutions above their node's restored log, and every `stored-elsewhere`
+ * resolution whose operation the restored log does not hold (RT-51; see importBackup).
+ */
+const PRUNE_RESOLUTIONS_PAST_LOG_SQL = `DELETE FROM operation_resolutions
+	WHERE sequence_number > COALESCE(
+		(SELECT max_sequence_number FROM sync_state WHERE sync_state.node_id = operation_resolutions.node_id),
+		0)
+	OR (outcome = 'stored-elsewhere'
+		AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.id = operation_resolutions.op_id))`
+
+interface ResolutionRow {
+	op_id: string
+	node_id: string
+	sequence_number: number | string
+	outcome: string
+	code: string | null
+	message: string | null
+}
+
+function resolutionFromRow(row: ResolutionRow): OperationResolution {
+	return {
+		operationId: row.op_id,
+		nodeId: row.node_id,
+		sequenceNumber: Number(row.sequence_number),
+		outcome: row.outcome as OperationResolutionOutcome,
+		code: row.code,
+		message: row.message,
+	}
+}
 
 // better-sqlite3 is a native CJS addon that cannot be loaded via ESM import().
 // createRequire provides a CJS require() that works in both ESM and CJS contexts.
@@ -57,6 +107,8 @@ export class SqliteServerStore implements ServerStore {
 	private readonly db: BetterSQLite3Database
 	private schema: SchemaDefinition | null = null
 	private closed = false
+	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
+	private sequenceEpoch = 0
 
 	constructor(db: BetterSQLite3Database, nodeId?: string) {
 		this.db = db
@@ -132,6 +184,7 @@ export class SqliteServerStore implements ServerStore {
 
 		const now = Date.now()
 
+		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
 		// Use a transaction for atomicity: insert op + update version vector + materialize
 		const result = this.db.transaction((tx) => {
 			// Content-addressed dedup: check before assigning a delivery sequence so a
@@ -142,6 +195,24 @@ export class SqliteServerStore implements ServerStore {
 			if (existing.length > 0) {
 				return 'duplicate' as const
 			}
+			// A different operation under the same (node, sequence) is refused (W3 step 4)
+			// when it was stored under enforcement and the writer reserves its sequences;
+			// a legacy holder (stored before the epoch) or a legacy writer (RT-37) is
+			// accepted, as beta.12 did. Inside the write transaction so no concurrent
+			// writer can slip one in.
+			const holders = tx.all<{ id: string; delivery_seq: number | null }>(
+				sql`SELECT id, delivery_seq FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber}`,
+			)
+			const decision = judgeSequenceHolders(
+				op,
+				holders.map((row) => ({ id: row.id, deliverySequence: Number(row.delivery_seq ?? 0) })),
+				this.sequenceEpoch,
+				{ legacySequenceWriter: options?.legacySequenceWriter === true },
+			)
+			if (decision.verdict === 'conflict') {
+				throw new SequenceConflictError(op, decision.holderId)
+			}
+			sequenceDecision = decision
 
 			// Authorization re-check inside the write transaction: better-sqlite3 runs
 			// it synchronously under SQLite's single writer lock, so the row it sees is
@@ -160,8 +231,19 @@ export class SqliteServerStore implements ServerStore {
 			const materialized = this.schema?.collections[op.collection] !== undefined
 			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
 
-			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
+			const row = this.serializeOperation(
+				op,
+				now,
+				this.nextDeliverySeq(tx),
+				decision.verdict === 'free',
+			)
 			tx.insert(operations).values(row).run()
+			// A legacy pair: index its sequence so version-vector clients get both (RT-48).
+			if (decision.verdict === 'legacy') {
+				tx.run(
+					sql`INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number) VALUES (${op.nodeId}, ${op.sequenceNumber})`,
+				)
+			}
 
 			// Advance version vector: upsert with MAX to ensure monotonic progress
 			tx.insert(syncState)
@@ -195,6 +277,7 @@ export class SqliteServerStore implements ServerStore {
 			return 'applied' as const
 		})
 
+		if (result === 'applied') reportLegacyPair(op, sequenceDecision, options)
 		return result
 	}
 
@@ -425,6 +508,127 @@ export class SqliteServerStore implements ServerStore {
 		return this.materializeFromOpsLog(collection)
 	}
 
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		const rows = this.db.all<{ node_id: string }>(
+			sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
+		)
+		return rows.map((row) => row.node_id)
+	}
+
+	async getSequencePairOperations(nodeId: string, throughSequence: number): Promise<Operation[]> {
+		this.assertOpen()
+		const rows = this.db
+			.select()
+			.from(operations)
+			.where(
+				and(
+					eq(operations.nodeId, nodeId),
+					sql`${operations.sequenceNumber} IN (SELECT sequence_number FROM sequence_pairs WHERE node_id = ${nodeId} AND sequence_number <= ${throughSequence})`,
+				),
+			)
+			.orderBy(asc(operations.sequenceNumber), asc(operations.deliverySeq))
+			.all()
+		return rows.map((row) => this.deserializeOperation(row))
+	}
+
+	async recordOperationResolution(resolution: OperationResolution): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR IGNORE INTO operation_resolutions
+				(op_id, node_id, sequence_number, outcome, code, message, resolved_at)
+				VALUES (${resolution.operationId}, ${resolution.nodeId}, ${resolution.sequenceNumber},
+					${resolution.outcome}, ${resolution.code},
+					${resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null}, ${Date.now()})`,
+		)
+	}
+
+	async findOperationResolutions(
+		nodeId: string,
+		ids: string[],
+	): Promise<Map<string, OperationResolution>> {
+		this.assertOpen()
+		const found = new Map<string, OperationResolution>()
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500)
+			if (chunk.length === 0) continue
+			const rows = this.db.all<ResolutionRow>(
+				sql`SELECT op_id, node_id, sequence_number, outcome, code, message FROM operation_resolutions
+					WHERE node_id = ${nodeId} AND op_id IN (${sql.join(
+						chunk.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+			)
+			for (const row of rows) found.set(row.op_id, resolutionFromRow(row))
+		}
+		return found
+	}
+
+	async deleteOperationResolution(nodeId: string, operationId: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`DELETE FROM operation_resolutions WHERE node_id = ${nodeId} AND op_id = ${operationId}`,
+		)
+	}
+
+	async getResolvedThrough(nodeId: string): Promise<number> {
+		this.assertOpen()
+		const rows = this.db.all<{ m: number | string | null }>(
+			sql`SELECT MAX(sequence_number) AS m FROM operation_resolutions WHERE node_id = ${nodeId}`,
+		)
+		return Number(rows[0]?.m ?? 0)
+	}
+
+	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
+		this.assertOpen()
+		const found = new Map<string, StoredOperationKey>()
+		// Chunked to stay far below SQLite's bound-parameter limit.
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500)
+			if (chunk.length === 0) continue
+			const rows = this.db.all<{ id: string; node_id: string; sequence_number: number | string }>(
+				sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) {
+				found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+			}
+		}
+		return found
+	}
+
+	async findRecordsByIds(
+		collection: string,
+		ids: string[],
+	): Promise<Map<string, MaterializedRecord>> {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
+		const result = new Map<string, MaterializedRecord>()
+		// Chunked to stay far below SQLite's bound-parameter limit.
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500)
+			if (chunk.length === 0) continue
+			const rows = this.db.all<Record<string, unknown>>(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+			for (const row of rows) {
+				const record = this.deserializeRow(row, collectionDef)
+				result.set(record.id, record)
+			}
+		}
+		return result
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
@@ -608,20 +812,19 @@ export class SqliteServerStore implements ServerStore {
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
-		const { parseServerBackup } = await import('./server-backup')
+		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
 		const { operations: ops, versionVector } = parseServerBackup(data)
 
 		if (merge) {
-			let restored = 0
-			for (const op of ops) {
-				const result = await this.applyRemoteOperation(op)
-				if (result === 'applied') restored++
-			}
-			return { operationsRestored: restored, success: true }
+			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
+			return merged
 		}
 
 		// Replace mode: DROP and recreate
 		this.db.transaction((tx) => {
+			// Restored rows are inserted unflagged (`seq_unique = 0`): they may hold legacy
+			// duplicate sequences, and they sit at or below the new epoch, so they stay
+			// outside the partial unique index and are judged by the append check.
 			tx.run(sql.raw('DELETE FROM operations'))
 			tx.run(sql.raw('DELETE FROM sync_state'))
 			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
@@ -640,7 +843,19 @@ export class SqliteServerStore implements ServerStore {
 				tx.insert(operations).values(row).run()
 			}
 			tx.update(deliveryCounter).set({ value: deliverySeq }).where(eq(deliveryCounter.id, 1)).run()
+			// The restored log's legacy pairs (RT-48), and only the resolutions it covers:
+			// one past a node's restored log was decided after the backup, and advertising
+			// it would hide stored operations the restore lost (RT-45).
+			tx.run(sql.raw('DELETE FROM sequence_pairs'))
+			tx.run(sql.raw(BACKFILL_SEQUENCE_PAIRS_SQL))
+			tx.run(sql.raw(PRUNE_RESOLUTIONS_PAST_LOG_SQL))
+			// The restored log is a snapshot that may hold legacy duplicate sequences: it
+			// all sits at or below the new epoch, and enforcement resumes above it.
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, ${String(deliverySeq)})`,
+			)
 		})
+		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		this.backfillScopeSnapshots()
 
 		return { operationsRestored: ops.length, success: true }
@@ -1023,10 +1238,22 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Backward-compatible migration (RT-37): the sole-holder flag behind the partial
+		// unique index. Existing rows read 0 (outside the index; the append check still
+		// judges them as holders).
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN seq_unique INTEGER NOT NULL DEFAULT 0`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
 		`)
-
 		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 		this.db.run(sql`
 			CREATE TABLE IF NOT EXISTS blob_owners (
@@ -1092,7 +1319,108 @@ export class SqliteServerStore implements ServerStore {
 			)
 		`)
 
+		// How uploaded operations were resolved without being stored under their sequence
+		// (validator `ignore`, terminal refusal, renumbered duplicate; RT-43, RT-47).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS operation_resolutions (
+				op_id TEXT PRIMARY KEY,
+				node_id TEXT NOT NULL,
+				sequence_number INTEGER NOT NULL,
+				outcome TEXT NOT NULL,
+				code TEXT,
+				message TEXT,
+				resolved_at INTEGER NOT NULL
+			)
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_resolutions_node_seq
+			ON operation_resolutions (node_id, sequence_number)
+		`)
+		// (node, sequence) held by more than one operation: legacy pairs (RT-48).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS sequence_pairs (
+				node_id TEXT NOT NULL,
+				sequence_number INTEGER NOT NULL,
+				PRIMARY KEY (node_id, sequence_number)
+			)
+		`)
+
 		this.backfillDeliverySequence()
+		this.sequenceEpoch = this.ensureSequenceEnforcement()
+		this.backfillSequencePairs()
+	}
+
+	/**
+	 * Index the legacy pairs already in the log once (history written before the
+	 * `sequence_pairs` table existed); appends maintain it from then on.
+	 */
+	private backfillSequencePairs(): void {
+		this.db.transaction((tx) => {
+			const done = tx.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_PAIRS_BACKFILLED_KEY}`,
+			)
+			if (done.length > 0) return
+			tx.run(sql.raw(BACKFILL_SEQUENCE_PAIRS_SQL))
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SEQUENCE_PAIRS_BACKFILLED_KEY}, '1')`,
+			)
+		})
+	}
+
+	/**
+	 * Record the sequence-enforcement epoch on the first start of this release (the log's
+	 * highest delivery sequence then; see {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}) and
+	 * back the append check with the partial unique index over sole-holder rows
+	 * ({@link NODE_SEQ_UNIQUE_INDEX}), which therefore always exists: a legacy duplicate
+	 * pair is stored unflagged. Replaces the earlier indexes (a full one, created only
+	 * when the log had no duplicates, and one over the rows past the epoch, which a
+	 * legacy client's pair would violate). Runs in one write transaction, so stores
+	 * sharing a file agree on the epoch.
+	 */
+	private ensureSequenceEnforcement(): number {
+		return this.db.transaction((tx) => {
+			tx.run(
+				sql`INSERT OR IGNORE INTO kora_server_meta (key, value)
+					SELECT ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, CAST(COALESCE(MAX(delivery_seq), 0) AS TEXT) FROM operations`,
+			)
+			const stored = tx.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}`,
+			)[0]?.value
+			// Absent only if the row could not be written: enforce everything (epoch 0).
+			const epoch = stored === undefined ? 0 : Number(stored)
+			if (!Number.isSafeInteger(epoch) || epoch < 0) {
+				throw new Error(
+					`kora_server_meta.${SEQUENCE_ENFORCEMENT_EPOCH_KEY} holds "${String(stored)}", not a delivery sequence. Restore it from a backup or delete the row to re-derive it.`,
+				)
+			}
+			for (const superseded of SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES) {
+				tx.run(sql.raw(`DROP INDEX IF EXISTS ${superseded}`))
+			}
+			// A row is flagged only when nothing held its sequence at insert, so flagged
+			// duplicates can come only from outside writes (a manual edit, an older release
+			// writing into this file). Before (re)creating the index, unflag them: they stay
+			// stored and judged by the append check, and the index creation cannot fail.
+			const indexed = tx.all<{ name: string }>(
+				sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ${NODE_SEQ_UNIQUE_INDEX}`,
+			)
+			if (indexed.length === 0) {
+				tx.run(sql`
+					UPDATE operations SET seq_unique = 0
+					WHERE seq_unique = 1 AND EXISTS (
+						SELECT 1 FROM operations other
+						WHERE other.node_id = operations.node_id
+							AND other.sequence_number = operations.sequence_number
+							AND other.id <> operations.id
+					)
+				`)
+			}
+			tx.run(
+				sql.raw(
+					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE seq_unique = 1`,
+				),
+			)
+			return epoch
+		})
 	}
 
 	/**
@@ -1151,10 +1479,16 @@ export class SqliteServerStore implements ServerStore {
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
+	/**
+	 * @param soleHolder - Nothing else held the (node, sequence) at insert: the row is
+	 *   flagged `seq_unique` and covered by {@link NODE_SEQ_UNIQUE_INDEX}. False for a
+	 *   legacy pair's second operation and for restored backup rows.
+	 */
 	private serializeOperation(
 		op: Operation,
 		receivedAt: number,
 		deliverySeq: number,
+		soleHolder = false,
 	): typeof operations.$inferInsert {
 		return {
 			id: op.id,
@@ -1174,6 +1508,7 @@ export class SqliteServerStore implements ServerStore {
 			schemaVersion: op.schemaVersion,
 			receivedAt,
 			deliverySeq,
+			seqUnique: soleHolder ? 1 : 0,
 		}
 	}
 

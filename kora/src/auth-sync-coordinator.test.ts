@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest'
-import { AuthSyncCoordinator, transportAuthState } from './auth-sync-coordinator'
+import { AuthSyncCoordinator, authPrincipal, transportAuthState } from './auth-sync-coordinator'
 import type { AuthSyncBinding } from './types'
 
 function createMockEngine() {
@@ -46,6 +46,27 @@ describe('AuthSyncCoordinator', () => {
 		})
 
 		expect(maxConcurrentAuth).toBe(1)
+	})
+
+	test('binds the store on every auth event, even while a reconnect is in flight (RT-52)', async () => {
+		const engine = { ...createMockEngine(), bindSignedInUser: vi.fn(async () => {}) }
+		let release: (() => void) | null = null
+		engine.reconnect = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve
+				}),
+		)
+		const coordinator = new AuthSyncCoordinator(() => engine as never, createBinding())
+		coordinator.scheduleReconnect()
+		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalledTimes(1))
+		coordinator.scheduleReconnect()
+		// Bound at once, not after the in-flight reconnect.
+		expect(engine.bindSignedInUser).toHaveBeenCalledTimes(2)
+		expect(engine.reconnect).toHaveBeenCalledTimes(1)
+		;(release as (() => void) | null)?.()
+		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalledTimes(2))
+		;(release as (() => void) | null)?.()
 	})
 
 	test('stops sync when token is empty', async () => {
@@ -109,5 +130,45 @@ describe('transportAuthState (authenticated-offline)', () => {
 		token = 'fresh'
 		coordinator.scheduleReconnect()
 		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalledTimes(1))
+	})
+})
+
+describe('authPrincipal (RT-42)', () => {
+	test('reads the signed-in user from the sync state, null when signed out, unknown while loading', async () => {
+		let state: Awaited<ReturnType<NonNullable<AuthSyncBinding['resolveSyncState']>>> = {
+			state: 'authenticated',
+			userId: 'alice',
+			token: null,
+			offline: true,
+		}
+		const principal = authPrincipal(createBinding({ resolveSyncState: async () => state }))
+		expect(await principal?.()).toBe('alice')
+		state = { state: 'signed-out', mayConnectAnonymously: false }
+		expect(await principal?.()).toBeNull()
+		state = { state: 'loading' }
+		expect(await principal?.()).toBeUndefined()
+	})
+
+	test('falls back to resolveUserId, and is absent without a way to tell', async () => {
+		expect(await authPrincipal(createBinding({ resolveUserId: async () => 'bob' }))?.()).toBe('bob')
+		expect(authPrincipal(createBinding())).toBeUndefined()
+		expect(authPrincipal(null)).toBeUndefined()
+	})
+
+	test('an auth change rebinds the principal before reconnecting', async () => {
+		const calls: string[] = []
+		const engine = {
+			...createMockEngine(),
+			refreshPrincipal: vi.fn(async () => {
+				calls.push('refreshPrincipal')
+			}),
+			reconnect: vi.fn(async () => {
+				calls.push('reconnect')
+			}),
+		}
+		const coordinator = new AuthSyncCoordinator(() => engine as never, createBinding())
+		coordinator.scheduleReconnect()
+		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalled())
+		expect(calls).toEqual(['refreshPrincipal', 'reconnect'])
 	})
 })

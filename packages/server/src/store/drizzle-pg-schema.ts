@@ -24,7 +24,8 @@ export const pgOperations = pgTable(
 		wallTime: bigint('wall_time', { mode: 'number' }).notNull(),
 		logical: integer('logical').notNull(),
 		timestampNodeId: text('timestamp_node_id').notNull(),
-		sequenceNumber: integer('sequence_number').notNull(),
+		// BIGINT (SRV-4): a node's sequence numbers are only bounded by Number.MAX_SAFE_INTEGER.
+		sequenceNumber: bigint('sequence_number', { mode: 'number' }).notNull(),
 		causalDeps: text('causal_deps').notNull().default('[]'), // JSON array of op IDs
 		schemaVersion: integer('schema_version').notNull(),
 		receivedAt: bigint('received_at', { mode: 'number' }).notNull(),
@@ -36,6 +37,11 @@ export const pgOperations = pgTable(
 		// JSON { pre, post }: the record's scope values around this operation, captured
 		// from the server's own rows at apply time (RT-14).
 		scopeSnapshot: text('scope_snapshot'),
+		// 1 when this row was the sole holder of its (node_id, sequence_number) when stored;
+		// 0 for the second operation of a legacy duplicate pair and for rows written
+		// before the column existed. The partial unique index NODE_SEQ_UNIQUE_INDEX covers
+		// only flagged rows (RT-37; see server-store.ts).
+		seqUnique: integer('seq_unique').notNull().default(0),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_pg_node_seq').on(table.nodeId, table.sequenceNumber),
@@ -47,6 +53,6 @@ export const pgOperations = pgTable(
 
 export const pgSyncState = pgTable('sync_state', {
 	nodeId: text('node_id').primaryKey(),
-	maxSequenceNumber: integer('max_sequence_number').notNull(),
+	maxSequenceNumber: bigint('max_sequence_number', { mode: 'number' }).notNull(),
 	lastSeenAt: bigint('last_seen_at', { mode: 'number' }).notNull(),
 })

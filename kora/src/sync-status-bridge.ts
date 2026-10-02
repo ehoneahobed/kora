@@ -16,13 +16,20 @@ export interface SyncStatusBridge {
  */
 export function createSyncStatusBridge(
 	emitter: KoraEventEmitter,
-	getSyncEngine: () => { getStatus(): SyncStatusInfo } | null,
+	getSyncEngine: () => {
+		getStatus(): SyncStatusInfo
+		onStatusChange?(listener: () => void): () => void
+	} | null,
 ): SyncStatusBridge {
 	const controller = createSyncStatusController({
 		getSyncEngine,
 		subscribeSyncStatus: null,
 		events: emitter,
 	})
+	// Some status changes have no event (an upload ack lowering the pending count, the
+	// move to streaming). Without this, a waiter such as waitForSettled only saw them at
+	// the next unrelated event, seconds later or never (RT-28).
+	let unsubscribeEngine = getSyncEngine()?.onStatusChange?.(() => controller.refresh()) ?? null
 
 	return {
 		get status() {
@@ -34,6 +41,10 @@ export function createSyncStatusBridge(
 			})
 		},
 		refresh: () => controller.refresh(),
-		destroy: () => controller.destroy(),
+		destroy: () => {
+			unsubscribeEngine?.()
+			unsubscribeEngine = null
+			controller.destroy()
+		},
 	}
 }

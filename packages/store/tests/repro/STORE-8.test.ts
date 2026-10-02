@@ -60,9 +60,14 @@ describe('STORE-8 execute/query isolation from open transactions', () => {
 			})
 			.catch(() => {})
 		await reached
-		const seen = await adapter.query<{ id: string }>('SELECT id FROM todos')
+		// The read is issued while the transaction is open. It must not observe the
+		// uncommitted row; with the fix it waits for the transaction to settle (one
+		// connection has no separate snapshot), so it is awaited after the gate opens.
+		const seenPromise = adapter.query<{ id: string }>('SELECT id FROM todos')
+		await new Promise((r) => setTimeout(r, 10))
 		resume()
 		await tx
+		const seen = await seenPromise
 		expect(seen).toEqual([])
 	})
 })

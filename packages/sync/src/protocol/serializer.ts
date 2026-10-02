@@ -431,6 +431,11 @@ interface ProtoEnvelope {
 	/** Fields 41-42: a throttled blob-chunk-response and its retry delay (RT-24). */
 	throttled?: boolean
 	retryAfterMs?: number
+	/** Fields 43-44: the accepted view a handshake resumes (SYNC-11). */
+	acceptedScopeKey?: string
+	acceptedScopeWatermark?: number
+	/** Field 45: the handshake's sequence-reservation capability (RT-37). */
+	sequenceReservation?: boolean
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -450,8 +455,17 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: message.lastDeliverySequence }
 					: {}),
+				...(message.acceptedScopeKey !== undefined
+					? { acceptedScopeKey: message.acceptedScopeKey }
+					: {}),
+				...(message.acceptedScopeWatermark !== undefined
+					? { acceptedScopeWatermark: message.acceptedScopeWatermark }
+					: {}),
 				scopeExitPolicy: message.scopeExitPolicy,
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
+				...(message.sequenceReservation !== undefined
+					? { sequenceReservation: message.sequenceReservation }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -566,6 +580,8 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				hash: message.hash,
 				chunkBytes: message.bytes,
 			}
+		case 'heartbeat':
+			return { type: message.type, messageId: message.messageId }
 	}
 }
 
@@ -587,10 +603,19 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.lastDeliverySequence !== undefined
 					? { lastDeliverySequence: envelope.lastDeliverySequence }
 					: {}),
+				...(envelope.acceptedScopeKey !== undefined
+					? { acceptedScopeKey: envelope.acceptedScopeKey }
+					: {}),
+				...(envelope.acceptedScopeWatermark !== undefined
+					? { acceptedScopeWatermark: envelope.acceptedScopeWatermark }
+					: {}),
 				...(envelope.scopeExitPolicy === 'retain' || envelope.scopeExitPolicy === 'retract'
 					? { scopeExitPolicy: envelope.scopeExitPolicy }
 					: {}),
 				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
+				...(envelope.sequenceReservation !== undefined
+					? { sequenceReservation: envelope.sequenceReservation }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -698,6 +723,8 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				hash: envelope.hash ?? '',
 				bytes: envelope.chunkBytes ?? '',
 			}
+		case 'heartbeat':
+			return { type: 'heartbeat', messageId: envelope.messageId }
 		default:
 			throw new SyncError('Failed to decode sync message: unknown protobuf type', {
 				type: envelope.type,
@@ -915,6 +942,13 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 		writer.uint32(320).bool(envelope.blobPossessionProof)
 	if (envelope.throttled) writer.uint32(328).bool(envelope.throttled)
 	if (envelope.retryAfterMs !== undefined) writer.uint32(336).int64(envelope.retryAfterMs)
+	if (envelope.acceptedScopeKey !== undefined) writer.uint32(346).string(envelope.acceptedScopeKey)
+	if (envelope.acceptedScopeWatermark !== undefined)
+		writer.uint32(352).int64(envelope.acceptedScopeWatermark)
+	// Field 45 (bool, wiretype 0): 45 << 3 = 360. Written whenever set (false included),
+	// so a client that explicitly opts out is told apart from one that predates it.
+	if (envelope.sequenceReservation !== undefined)
+		writer.uint32(360).bool(envelope.sequenceReservation)
 	return writer.finish()
 }
 
@@ -1053,6 +1087,15 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 42:
 				envelope.retryAfterMs = longToNumber(reader.int64())
+				break
+			case 43:
+				envelope.acceptedScopeKey = reader.string()
+				break
+			case 44:
+				envelope.acceptedScopeWatermark = longToNumber(reader.int64())
+				break
+			case 45:
+				envelope.sequenceReservation = reader.bool()
 				break
 			default:
 				reader.skipType(tag & 7)

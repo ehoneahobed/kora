@@ -89,26 +89,33 @@ describe('Sync performance gates', () => {
 		expect(elapsedMs).toBeLessThan(INCREMENTAL_SYNC_LIMIT_MS)
 	}, 20_000)
 
-	test('version vector delta computation for 100 nodes under target', async () => {
+	// The upload delta is this device's own operations above its acknowledged prefix (W3):
+	// relayed operations of the other 100 nodes are never part of it. The gate times
+	// building that set (log read, eligibility, queueing) with 100 peers in the log.
+	test('upload delta computation with 100 peer nodes in the log under target', async () => {
 		const operations: Operation[] = []
 		for (let node = 0; node < 100; node++) {
 			operations.push(...createTestOperations(10, `node-${node}`))
 		}
+		operations.push(...createTestOperations(100, 'bench-node'))
 
 		const store = createMockSyncStore({ nodeId: 'bench-node', initialOps: operations })
 		const { client } = createMemoryTransportPair()
 		const engine = new SyncEngine({ transport: client, store, config: { url: 'ws://bench' } })
-
-		const localVector = store.getVersionVector()
-		const remoteVector: VersionVector = new Map(
-			Array.from(localVector.entries(), ([nodeId, sequence]) => [nodeId, sequence - 1]),
-		)
+		const internals = engine as unknown as {
+			loadOwnTracking(): Promise<void>
+			reconcileOutboundFromOpLog(): Promise<void>
+		}
+		await engine.getOutboundQueue().initialize()
+		await internals.loadOwnTracking()
 
 		const startNs = process.hrtime.bigint()
-		const missing = await collectDelta(engine, localVector, remoteVector)
+		await internals.reconcileOutboundFromOpLog()
 		const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000
 
-		expect(missing.length).toBe(100)
+		const queued = engine.getOutboundQueue().getAll()
+		expect(queued).toHaveLength(100)
+		expect(queued.every((op) => op.nodeId === 'bench-node')).toBe(true)
 		expect(elapsedMs).toBeLessThan(VERSION_VECTOR_DELTA_LIMIT_MS)
 	})
 })
@@ -196,16 +203,4 @@ async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
 
 		await new Promise((resolve) => setTimeout(resolve, 5))
 	}
-}
-
-async function collectDelta(
-	engine: SyncEngine,
-	localVector: VersionVector,
-	remoteVector: VersionVector,
-): Promise<Operation[]> {
-	const implementation = engine as unknown as {
-		collectDelta(local: VersionVector, remote: VersionVector): Promise<Operation[]>
-	}
-
-	return implementation.collectDelta(localVector, remoteVector)
 }

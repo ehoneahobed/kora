@@ -75,6 +75,54 @@ export type KoraEvent =
 			nodeId: string
 			/** Unsynced operations re-authored under the new node id. */
 			reenqueuedCount: number
+			/**
+			 * Unsynced operations left under the previous node id, held for the principal
+			 * that owns it (RT-38): they upload when that user signs in again on this device.
+			 */
+			heldCount?: number
+	  }
+	| {
+			/**
+			 * Sync bookkeeping of one of this database's own node ids (Phase 2):
+			 * - `history-behind`: the server holds more of this node's operations than the
+			 *   device (its log lost a tail, RT-35); the counter was raised past them and a
+			 *   full resync fetches them back.
+			 * - `adoption-started` / `adoption-completed` / `adoption-refused`: the engine
+			 *   uploads the unsynced writes of a node no live tab uses (RT-40).
+			 * - `held`: the server refused this node for the signed-in principal; its unsynced
+			 *   writes wait for the principal that owns it (RT-38).
+			 * - `server-behind`: the server holds fewer of this node's operations than the
+			 *   device had acknowledged (a server restored from a backup, RT-45); the device
+			 *   re-uploads them from the server's position.
+			 * - `adoption-parked`: an adopted node made no upload progress for a whole session
+			 *   (for example a write the server keeps deferring); the next session tries the
+			 *   other nodes first (RT-46).
+			 * - `clone-detected`: another live copy of this database uses the same node id
+			 *   (copied app data, a restored image); this copy moved to a fresh node id (RT-44).
+			 * - `principal-switched`: the signed-in user changed; local writes from now on are
+			 *   authored under that user's own node (RT-42).
+			 * - `held-assigned` / `held-discarded`: the app assigned a held node's writes to
+			 *   the signed-in user, or discarded them from sync (RT-50).
+			 */
+			type: 'sync:local-node'
+			nodeId: string
+			action:
+				| 'history-behind'
+				| 'server-behind'
+				| 'adoption-started'
+				| 'adoption-completed'
+				| 'adoption-refused'
+				| 'adoption-parked'
+				| 'held'
+				| 'clone-detected'
+				| 'principal-switched'
+				| 'held-assigned'
+				| 'held-discarded'
+			/** For `history-behind` / `server-behind`: the device's sequence and the server's. */
+			localSequence?: number
+			serverSequence?: number
+			/** Unsynced operations concerned, when known. */
+			operationCount?: number
 	  }
 	| {
 			type: 'sync:clock-rebase'
@@ -181,6 +229,19 @@ export type KoraEvent =
 			code: string
 	  }
 	| {
+			/**
+			 * The local database could not be made durable before an upload several times in
+			 * a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads no longer wait
+			 * for it, so the server holds the only durable copy of new writes (a reload
+			 * recovers them from it) until `sync:durability-restored`. Writes are still
+			 * accepted; warn the user (free up storage, stay online).
+			 */
+			type: 'sync:durability-degraded'
+			message: string
+			failedAttempts: number
+	  }
+	| { type: 'sync:durability-restored' }
+	| {
 			type: 'store:quota-exceeded'
 			dbName: string
 			message: string
@@ -229,6 +290,35 @@ export type KoraEvent =
 			dbName: string
 			phase: 'open' | 'promotion'
 			reason: 'lock-conflict' | 'timeout' | 'unsupported' | 'open-failed'
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING while `state` is `waiting`. Another holder (a previous storage
+			 * owner still shutting down, or a tab running an older Kora that does not
+			 * take part in the ownership protocol) has the database's OPFS storage, so
+			 * the open waits instead of falling back to non-durable storage. Apps
+			 * should show a "close other tabs of this app" state; `resolved` follows
+			 * when the wait ends.
+			 */
+			type: 'store:storage-blocked'
+			dbName: string
+			/** `pool`: the database's own pool; `legacy-pool`: the pre-W8a shared pool. */
+			resource: 'pool' | 'legacy-pool'
+			state: 'waiting' | 'resolved'
+			waitedMs?: number
+			message: string
+	  }
+	| {
+			/**
+			 * Informational. The database's data was moved between storage locations
+			 * explicitly (the pre-W8a shared OPFS pool to the database's own pool, or
+			 * between OPFS and IndexedDB), so there is still exactly one copy.
+			 */
+			type: 'store:storage-migrated'
+			dbName: string
+			from: 'legacy-opfs-pool' | 'opfs' | 'indexeddb'
+			to: 'opfs' | 'indexeddb'
 			message: string
 	  }
 	| {

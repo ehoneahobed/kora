@@ -35,6 +35,7 @@ import {
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import type { LocalMutationContext } from '../mutations/types'
+import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -53,11 +54,43 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { SubscriptionManager } from '../subscription/subscription-manager'
+import {
+	type AdoptionSchedule,
+	type LocalNodeRecord,
+	type TerminalRejection,
+	assignLocalNodePrincipal,
+	confirmLocalNodePrincipal,
+	dropLocalNode,
+	findTerminalRejections,
+	forgetLocalNode,
+	listLocalNodes,
+	loadAcceptedCycle,
+	loadAdoptionSchedule,
+	markLocalNodeAccepted,
+	markLocalNodeRefused,
+	recordLocalNodeRefusedFor,
+	recordTerminalRejections,
+	registerLocalNode,
+	saveAdoptionSchedule,
+	seedTerminalRejectionsOnce,
+	setLocalNodePrincipal,
+} from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
+import type { UnappliedOperation } from '../sync/sync-durability'
 import {
+	loadAcceptedDownlinkScope,
+	loadOwnAckedThrough,
+	loadUnappliedOperations,
+	removeUnappliedOperations,
+	saveAcceptedDownlinkScope,
+	saveOwnAckedThrough,
+	saveUnappliedOperations,
+} from '../sync/sync-durability'
+import {
+	NODE_TOKEN_META_KEY,
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
 	loadAllDeliveryWatermarks,
@@ -66,13 +99,13 @@ import {
 	loadLastAckedServerVector,
 	loadNodeToken,
 	mergeVersionVectors,
+	nodeTokenKey,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
 	saveNodeToken,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
-import { TransactionSequenceAllocator } from '../transaction/transaction-sequence'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -88,7 +121,16 @@ import type {
 	Transaction,
 	VersionVectorRow,
 } from '../types'
-import { allocateNextSequenceNumber } from './sequence-allocator'
+import { dropLegacyIndexes } from './legacy-indexes'
+import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import { allocateNextSequenceInTransaction } from './sequence-allocator'
+import {
+	insertConflictRow,
+	isOperationLogged,
+	loadRetainedConflictRows,
+	repairSequenceUniqueness,
+} from './sequence-repair'
+import { savePerTabNodeId } from './tab-node-id'
 import { resolvePerTabNodeId } from './tab-node-id'
 
 /**
@@ -105,6 +147,40 @@ import { resolvePerTabNodeId } from './tab-node-id'
  * await store.close()
  * ```
  */
+/**
+ * Make `nodeId` the database's node id (`_kora_meta.node_id`). The unkeyed legacy node
+ * token belongs to the node id it replaces, so it moves to that node's own key first:
+ * it must never be presented as the new node's token.
+ */
+async function moveDatabaseNodeId(tx: Transaction, nodeId: string): Promise<void> {
+	const meta = await tx.query<MetaRow>("SELECT value FROM _kora_meta WHERE key = 'node_id'")
+	const previous = meta[0]?.value
+	if (previous === nodeId) return
+	const legacy = await tx.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		NODE_TOKEN_META_KEY,
+	])
+	if (legacy[0] && previous) {
+		await tx.execute('INSERT OR IGNORE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			nodeTokenKey(previous),
+			legacy[0].value,
+		])
+	}
+	await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
+	await tx.execute("INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)", [nodeId])
+}
+
+/** Result of {@link Store.bindPrincipal} (RT-42). */
+export interface PrincipalBinding {
+	/** The node id local writes use from now on. */
+	nodeId: string
+	/** The node id in use before the call. */
+	previousNodeId: string
+	/** The store moved to another node id. */
+	switched: boolean
+	/** The node id is pinned and belongs to another user: nothing may upload it now. */
+	conflict: boolean
+}
+
 export class Store implements OperationLog {
 	private opened = false
 	private nodeId = ''
@@ -125,6 +201,8 @@ export class Store implements OperationLog {
 	private relationEnforcer: RelationEnforcer | null = null
 	private causalTracker: CausalTracker | null = null
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
+	/** Releases the per-tab node lock (RT-40); null when none is held. */
+	private releaseNodeLock: (() => void) | null = null
 
 	constructor(config: StoreConfig) {
 		this.schema = config.schema
@@ -150,11 +228,28 @@ export class Store implements OperationLog {
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
 
+		// Indexes named under the old, colliding scheme are replaced (STORE-15).
+		await dropLegacyIndexes(this.adapter, this.schema)
+
 		// Run schema migrations if needed
 		await this.runMigrationsIfNeeded()
 
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
+
+		// (node_id, sequence_number) is unique in the operation log: repair any
+		// duplicates an earlier version wrote, then enforce it with an index (W6).
+		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
+		// Every node id this database authors under is registered (RT-38, RT-40), and the
+		// terminal rejections an earlier release kept only in the app's list become
+		// durable markers (RT-36).
+		await registerLocalNode(this.adapter, this.nodeId)
+		await seedTerminalRejectionsOnce(this.adapter)
+		if (this.isolation === 'per-tab' && !this.configNodeId) {
+			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
+			// writes only after this tab is gone (RT-40).
+			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId))
+		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
 
@@ -169,14 +264,7 @@ export class Store implements OperationLog {
 		// The enforcer is shared across all Collection instances so that
 		// cascading deletes can cross collection boundaries.
 		const hasRelations = Object.keys(this.schema.relations).length > 0
-		this.relationEnforcer = hasRelations
-			? new RelationEnforcer({
-					schema: this.schema,
-					adapter: this.adapter,
-					clock: this.clock,
-					nodeId: this.nodeId,
-				})
-			: null
+		this.relationEnforcer = hasRelations ? new RelationEnforcer({ schema: this.schema }) : null
 
 		// Create collection instances
 		for (const [name, definition] of Object.entries(this.schema.collections)) {
@@ -187,18 +275,12 @@ export class Store implements OperationLog {
 				this.adapter,
 				this.clock,
 				this.nodeId,
-				() => this.allocateSequenceNumber(),
-				(collectionName, operation) => {
-					this.recordOperationSequence(operation)
-					this.subscriptionManager.notify(collectionName, operation)
-					if (this.emitter) {
-						this.emitter.emit({ type: 'operation:created', operation })
-					}
-				},
+				(collectionName, operation) => this.publishLocalOperation(collectionName, operation),
 				this.relationEnforcer,
 				this.localMutationHandler,
 				this.causalTracker,
 				this.secretKeyProvider,
+				(error) => this.reportStorageError(error),
 			)
 			this.collections.set(name, col)
 		}
@@ -213,7 +295,12 @@ export class Store implements OperationLog {
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
-		await this.adapter.close()
+		try {
+			await this.adapter.close()
+		} finally {
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = null
+		}
 	}
 
 	/**
@@ -291,38 +378,6 @@ export class Store implements OperationLog {
 			return 'skipped'
 		}
 
-		// Check for duplicate (content-addressed dedup)
-		const existing = await this.adapter.query<{ id: string }>(
-			`SELECT id FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE id = ?`,
-			[op.id],
-		)
-		if (existing.length > 0) {
-			const retracted = await this.adapter.query<{ record_id: string }>(
-				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-				[collection, op.recordId],
-			)
-			if (retracted.length > 0) {
-				await this.adapter.transaction(async (tx) => {
-					await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
-						op.recordId,
-					])
-					await tx.execute(
-						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-						[collection, op.recordId],
-					)
-				})
-				this.subscriptionManager.invalidate(collection)
-			}
-			return 'duplicate'
-		}
-
-		// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
-		if (this.clock) {
-			// A scope entry's newest field version can be later than its timestamp (the
-			// record's creation, RT-27): the clock must move past every version it carries.
-			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
-		}
-
 		// Materialization may use overridden data/timestamp (authoritative merge
 		// results), but the LOG below always stores the canonical operation:
 		// operations are immutable and content-addressed, so merged values must
@@ -331,284 +386,365 @@ export class Store implements OperationLog {
 		const remoteVersion = serializeRowVersion(materializeTimestamp)
 		const wallTime = materializeTimestamp.wallTime
 		const materializeSource = options?.materializeData ?? op.data
+		// Duration is reported to DevTools only; it never orders anything.
+		const startedAt = Date.now()
+		const outcome = { duplicate: false, revived: false }
 
 		// Apply the operation to the data table (LWW-guarded; op log always appended below)
-		await this.adapter.transaction(async (tx) => {
-			// Optimistic-concurrency guard: if the caller computed its data from a
-			// snapshot, verify the row hasn't changed since. Throwing rolls the
-			// whole transaction back (nothing written, op NOT logged) so the caller
-			// can recompute against fresh state and retry.
-			const checkGuard = (row: RawCollectionRow | undefined): void => {
-				const guard = options?.guardRowState
-				if (!guard) {
-					return
-				}
-				const version = typeof row?._version === 'string' ? row._version : null
-				const fieldVersions = typeof row?._field_versions === 'string' ? row._field_versions : null
-				if (version !== guard.version || fieldVersions !== guard.fieldVersions) {
-					throw new OptimisticLockError(collection, op.recordId)
-				}
-			}
-
-			if (options?.logOnly) {
-				// Append-only: the caller (after folding the record's log) determined
-				// this op does not change the authoritative row. Persist it for future
-				// folds but leave the row untouched. Fall through to op-log insert + VV.
-			} else if (
-				op.type === 'insert' &&
-				op.data &&
-				op.fieldVersions &&
-				!options?.materializeData &&
-				!options?.forceMaterialize &&
-				!options?.materializeTimestamp
-			) {
-				// Server scope-entry insert (RT-27): every field carries its own version.
-				await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
-			} else if (op.type === 'insert' && materializeSource) {
-				const serializedData = serializeRecord(materializeSource, definition.fields)
-				const existing = await tx.query<RawCollectionRow>(
-					`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
-					[op.recordId],
-				)
-				const row = existing[0]
-				checkGuard(row)
-
-				if (!row) {
-					const record: Record<string, unknown> = {
-						id: op.recordId,
-						...serializedData,
-						_created_at: wallTime,
-						_updated_at: wallTime,
-						_version: remoteVersion,
-						// Stamp every inserted field so per-field LWW has a real baseline.
-						_field_versions: serializeFieldVersions(
-							fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
-						),
-					}
-					const insertQuery = buildInsertQuery(collection, record)
-					await tx.execute(insertQuery.sql, insertQuery.params)
-
-					// Catch up on operations delivered BEFORE this insert (transports may
-					// reorder): any update/delete already logged for this record was
-					// applied while no row existed, so it never materialized. The row is
-					// a fold of the log — fold the orphans now, in timestamp order,
-					// inside this same transaction. Per-field LWW makes the result
-					// identical to what an in-order device computed.
-					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
-				} else if (
-					row._deleted === 1 &&
-					(
-						await tx.query<{ record_id: string }>(
-							'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-							[collection, op.recordId],
-						)
-					).length > 0
-				) {
-					// The row is hidden by a scope retraction (a view change, not a domain
-					// delete) and the record is entering the scope again, typically through
-					// a server scope-entry insert (RT-19). Show it again and merge per field,
-					// exactly like an insert collision on a live row: fields this device
-					// holds newer versions of are kept.
-					const { winners, merged } = resolvePerFieldLww(
-						parseFieldVersions(row._field_versions),
-						Object.keys(serializedData),
-						remoteVersion,
-						typeof row._version === 'string' ? row._version : undefined,
-					)
-					const fieldChanges: Record<string, unknown> = {
-						_deleted: 0,
-						_field_versions: serializeFieldVersions(merged),
-					}
-					for (const field of winners) {
-						fieldChanges[field] = serializedData[field]
-					}
-					// `_created_at` is left alone: the record was created long before it
-					// re-entered this device's view.
-					const reactivate = buildFieldFastForwardUpdateQuery(
-						collection,
-						op.recordId,
-						fieldChanges,
-						remoteVersion,
-						wallTime,
-					)
-					await tx.execute(reactivate.sql, reactivate.params)
-					await tx.execute(
-						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+		try {
+			await this.adapter.transaction(async (tx) => {
+				// Content-addressed dedup INSIDE the write transaction: two concurrent
+				// deliveries of one operation serialize here, and the second sees the
+				// first's row instead of failing on the primary key (STORE-15).
+				if (await isOperationLogged(tx, collection, op.id)) {
+					outcome.duplicate = true
+					const retracted = await tx.query<{ record_id: string }>(
+						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 						[collection, op.recordId],
 					)
-				} else if (row._deleted === 1) {
-					// Insert vs tombstone: a strictly newer insert resurrects the record
-					// with its full field set; an older one is stale (delete wins).
-					if (isIncomingNewerThanRow(materializeTimestamp, row)) {
-						const fieldChanges: Record<string, unknown> = {
+					if (retracted.length > 0) {
+						await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
+							op.recordId,
+						])
+						await tx.execute(
+							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+						outcome.revived = true
+					}
+					return
+				}
+
+				// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
+				if (this.clock) {
+					// A scope entry's newest field version can be later than its timestamp (the
+					// record's creation, RT-27): the clock must move past every version it carries.
+					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+				}
+
+				// Optimistic-concurrency guard: if the caller computed its data from a
+				// snapshot, verify the row hasn't changed since. Throwing rolls the
+				// whole transaction back (nothing written, op NOT logged) so the caller
+				// can recompute against fresh state and retry.
+				const checkGuard = (row: RawCollectionRow | undefined): void => {
+					const guard = options?.guardRowState
+					if (!guard) {
+						return
+					}
+					const version = typeof row?._version === 'string' ? row._version : null
+					const fieldVersions =
+						typeof row?._field_versions === 'string' ? row._field_versions : null
+					if (version !== guard.version || fieldVersions !== guard.fieldVersions) {
+						throw new OptimisticLockError(collection, op.recordId)
+					}
+				}
+
+				if (options?.logOnly) {
+					// Append-only: the caller (after folding the record's log) determined
+					// this op does not change the authoritative row. Persist it for future
+					// folds but leave the row untouched. Fall through to op-log insert + VV.
+				} else if (
+					op.type === 'insert' &&
+					op.data &&
+					op.fieldVersions &&
+					!options?.materializeData &&
+					!options?.forceMaterialize &&
+					!options?.materializeTimestamp
+				) {
+					// Server scope-entry insert (RT-27): every field carries its own version.
+					await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
+				} else if (op.type === 'insert' && materializeSource) {
+					const serializedData = serializeRecord(materializeSource, definition.fields)
+					const existing = await tx.query<RawCollectionRow>(
+						`SELECT _updated_at, _version, _field_versions, _deleted FROM ${collection} WHERE id = ?`,
+						[op.recordId],
+					)
+					const row = existing[0]
+					checkGuard(row)
+
+					if (!row) {
+						const record: Record<string, unknown> = {
+							id: op.recordId,
 							...serializedData,
-							_deleted: 0,
+							_created_at: wallTime,
+							_updated_at: wallTime,
+							_version: remoteVersion,
+							// Stamp every inserted field so per-field LWW has a real baseline.
 							_field_versions: serializeFieldVersions(
 								fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
 							),
 						}
-						const upsert = buildFieldFastForwardUpdateQuery(
+						const insertQuery = buildInsertQuery(collection, record)
+						await tx.execute(insertQuery.sql, insertQuery.params)
+
+						// Catch up on operations delivered BEFORE this insert (transports may
+						// reorder): any update/delete already logged for this record was
+						// applied while no row existed, so it never materialized. The row is
+						// a fold of the log — fold the orphans now, in timestamp order,
+						// inside this same transaction. Per-field LWW makes the result
+						// identical to what an in-order device computed.
+						await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+					} else if (
+						row._deleted === 1 &&
+						(
+							await tx.query<{ record_id: string }>(
+								'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+								[collection, op.recordId],
+							)
+						).length > 0
+					) {
+						// The row is hidden by a scope retraction (a view change, not a domain
+						// delete) and the record is entering the scope again, typically through
+						// a server scope-entry insert (RT-19). Show it again and merge per field,
+						// exactly like an insert collision on a live row: fields this device
+						// holds newer versions of are kept.
+						const { winners, merged } = resolvePerFieldLww(
+							parseFieldVersions(row._field_versions),
+							Object.keys(serializedData),
+							remoteVersion,
+							typeof row._version === 'string' ? row._version : undefined,
+						)
+						const fieldChanges: Record<string, unknown> = {
+							_deleted: 0,
+							_field_versions: serializeFieldVersions(merged),
+						}
+						for (const field of winners) {
+							fieldChanges[field] = serializedData[field]
+						}
+						// `_created_at` is left alone: the record was created long before it
+						// re-entered this device's view.
+						const reactivate = buildFieldFastForwardUpdateQuery(
 							collection,
 							op.recordId,
 							fieldChanges,
+							remoteVersion,
+							wallTime,
+						)
+						await tx.execute(reactivate.sql, reactivate.params)
+						await tx.execute(
+							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+					} else if (row._deleted === 1) {
+						// Insert vs tombstone: a strictly newer insert resurrects the record
+						// with its full field set; an older one is stale (delete wins).
+						if (isIncomingNewerThanRow(materializeTimestamp, row)) {
+							const fieldChanges: Record<string, unknown> = {
+								...serializedData,
+								_deleted: 0,
+								_field_versions: serializeFieldVersions(
+									fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
+								),
+							}
+							const upsert = buildFieldFastForwardUpdateQuery(
+								collection,
+								op.recordId,
+								fieldChanges,
+								remoteVersion,
+								wallTime,
+								{ maxCreatedAt: wallTime },
+							)
+							await tx.execute(upsert.sql, upsert.params)
+						}
+					} else {
+						// Insert collision on a LIVE row (relayed insert racing a local one,
+						// or an insert-vs-insert merge). A plain INSERT would violate the
+						// primary key; resolve per-field instead, exactly like an update, so
+						// every node converges no matter which insert (or interleaved
+						// update) it saw first. `_created_at` converges to the max insert
+						// wall time seen, applied even when every field loses.
+						const currentVersions = parseFieldVersions(row._field_versions)
+						const rowVersion = typeof row._version === 'string' ? row._version : undefined
+						const fieldChanges: Record<string, unknown> = {}
+						let fieldVersionsJson: string
+						if (options?.forceMaterialize) {
+							// Authoritative merged insert: every field is written.
+							const merged = { ...currentVersions }
+							for (const field of Object.keys(serializedData)) {
+								fieldChanges[field] = serializedData[field]
+								merged[field] = remoteVersion
+							}
+							fieldVersionsJson = serializeFieldVersions(merged)
+						} else {
+							const { winners, merged } = resolvePerFieldLww(
+								currentVersions,
+								Object.keys(serializedData),
+								remoteVersion,
+								rowVersion,
+							)
+							for (const field of winners) {
+								fieldChanges[field] = serializedData[field]
+							}
+							fieldVersionsJson = serializeFieldVersions(merged)
+						}
+						const upsert = buildFieldFastForwardUpdateQuery(
+							collection,
+							op.recordId,
+							{ ...fieldChanges, _field_versions: fieldVersionsJson },
 							remoteVersion,
 							wallTime,
 							{ maxCreatedAt: wallTime },
 						)
 						await tx.execute(upsert.sql, upsert.params)
 					}
-				} else {
-					// Insert collision on a LIVE row (relayed insert racing a local one,
-					// or an insert-vs-insert merge). A plain INSERT would violate the
-					// primary key; resolve per-field instead, exactly like an update, so
-					// every node converges no matter which insert (or interleaved
-					// update) it saw first. `_created_at` converges to the max insert
-					// wall time seen, applied even when every field loses.
-					const currentVersions = parseFieldVersions(row._field_versions)
-					const rowVersion = typeof row._version === 'string' ? row._version : undefined
-					const fieldChanges: Record<string, unknown> = {}
-					let fieldVersionsJson: string
-					if (options?.forceMaterialize) {
-						// Authoritative merged insert: every field is written.
-						const merged = { ...currentVersions }
-						for (const field of Object.keys(serializedData)) {
-							fieldChanges[field] = serializedData[field]
-							merged[field] = remoteVersion
-						}
-						fieldVersionsJson = serializeFieldVersions(merged)
-					} else {
-						const { winners, merged } = resolvePerFieldLww(
-							currentVersions,
-							Object.keys(serializedData),
-							remoteVersion,
-							rowVersion,
-						)
-						for (const field of winners) {
-							fieldChanges[field] = serializedData[field]
-						}
-						fieldVersionsJson = serializeFieldVersions(merged)
-					}
-					const upsert = buildFieldFastForwardUpdateQuery(
-						collection,
-						op.recordId,
-						{ ...fieldChanges, _field_versions: fieldVersionsJson },
-						remoteVersion,
-						wallTime,
-						{ maxCreatedAt: wallTime },
+				} else if (op.type === 'update' && materializeSource) {
+					const serializedChanges = serializeRecord(materializeSource, definition.fields)
+					const changedFields = Object.keys(serializedChanges)
+
+					// Read the current per-field versions INSIDE the transaction so the
+					// resolve-then-write is atomic with respect to any concurrent local
+					// mutation — this is what prevents a relayed remote op from clobbering
+					// a newer local edit that lands between the read and the write.
+					const currentRows = await tx.query<RawCollectionRow>(
+						`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
+						[op.recordId],
 					)
-					await tx.execute(upsert.sql, upsert.params)
-				}
-			} else if (op.type === 'update' && materializeSource) {
-				const serializedChanges = serializeRecord(materializeSource, definition.fields)
-				const changedFields = Object.keys(serializedChanges)
+					const currentRow = currentRows[0]
+					checkGuard(currentRow)
 
-				// Read the current per-field versions INSIDE the transaction so the
-				// resolve-then-write is atomic with respect to any concurrent local
-				// mutation — this is what prevents a relayed remote op from clobbering
-				// a newer local edit that lands between the read and the write.
-				const currentRows = await tx.query<RawCollectionRow>(
-					`SELECT _version, _field_versions FROM ${quoteIdent(collection)} WHERE id = ?`,
-					[op.recordId],
-				)
-				const currentRow = currentRows[0]
-				checkGuard(currentRow)
+					if (currentRow) {
+						const currentVersions = parseFieldVersions(currentRow._field_versions)
+						const rowVersion =
+							typeof currentRow._version === 'string' ? currentRow._version : undefined
 
-				if (currentRow) {
-					const currentVersions = parseFieldVersions(currentRow._field_versions)
-					const rowVersion =
-						typeof currentRow._version === 'string' ? currentRow._version : undefined
-
-					if (options?.forceMaterialize) {
-						// Authoritative merged result (richtext / add-wins-set / constraint
-						// resolution computed by the merge engine): write every changed
-						// field and stamp its per-field version to this op's version, while
-						// advancing the row watermark monotonically.
-						const merged = { ...currentVersions }
-						for (const field of changedFields) {
-							merged[field] = remoteVersion
-						}
-						const fieldChanges: Record<string, unknown> = {
-							...serializedChanges,
-							_field_versions: serializeFieldVersions(merged),
-						}
-						if (options?.reactivateIfDeleted) {
-							fieldChanges._deleted = 0
-						}
-						const forceQuery = buildFieldFastForwardUpdateQuery(
-							collection,
-							op.recordId,
-							fieldChanges,
-							remoteVersion,
-							wallTime,
-						)
-						await tx.execute(forceQuery.sql, forceQuery.params)
-					} else {
-						// Deterministic field-level LWW: write only the fields this op
-						// wins (strictly newer than the field's stored version). Same
-						// result on every node regardless of arrival order.
-						const { winners, merged } = resolvePerFieldLww(
-							currentVersions,
-							changedFields,
-							remoteVersion,
-							rowVersion,
-						)
-						if (winners.length > 0 || options?.reactivateIfDeleted) {
-							const winningChanges: Record<string, unknown> = {
+						if (options?.forceMaterialize) {
+							// Authoritative merged result (richtext / add-wins-set / constraint
+							// resolution computed by the merge engine): write every changed
+							// field and stamp its per-field version to this op's version, while
+							// advancing the row watermark monotonically.
+							const merged = { ...currentVersions }
+							for (const field of changedFields) {
+								merged[field] = remoteVersion
+							}
+							const fieldChanges: Record<string, unknown> = {
+								...serializedChanges,
 								_field_versions: serializeFieldVersions(merged),
 							}
-							for (const field of winners) {
-								winningChanges[field] = serializedChanges[field]
-							}
 							if (options?.reactivateIfDeleted) {
-								winningChanges._deleted = 0
+								fieldChanges._deleted = 0
 							}
 							const forceQuery = buildFieldFastForwardUpdateQuery(
 								collection,
 								op.recordId,
-								winningChanges,
+								fieldChanges,
 								remoteVersion,
 								wallTime,
 							)
 							await tx.execute(forceQuery.sql, forceQuery.params)
+						} else {
+							// Deterministic field-level LWW: write only the fields this op
+							// wins (strictly newer than the field's stored version). Same
+							// result on every node regardless of arrival order.
+							const { winners, merged } = resolvePerFieldLww(
+								currentVersions,
+								changedFields,
+								remoteVersion,
+								rowVersion,
+							)
+							if (winners.length > 0 || options?.reactivateIfDeleted) {
+								const winningChanges: Record<string, unknown> = {
+									_field_versions: serializeFieldVersions(merged),
+								}
+								for (const field of winners) {
+									winningChanges[field] = serializedChanges[field]
+								}
+								if (options?.reactivateIfDeleted) {
+									winningChanges._deleted = 0
+								}
+								const forceQuery = buildFieldFastForwardUpdateQuery(
+									collection,
+									op.recordId,
+									winningChanges,
+									remoteVersion,
+									wallTime,
+								)
+								await tx.execute(forceQuery.sql, forceQuery.params)
+							}
 						}
 					}
+					// currentRow absent: nothing materialized to update (insert not yet
+					// applied, or hard-absent). The op is still appended to the log below;
+					// the pipeline handles tombstone reactivation separately.
+				} else if (op.type === 'delete') {
+					const deleteQuery = buildLwwSoftDeleteQuery(
+						collection,
+						op.recordId,
+						wallTime,
+						remoteVersion,
+					)
+					await tx.execute(deleteQuery.sql, deleteQuery.params)
 				}
-				// currentRow absent: nothing materialized to update (insert not yet
-				// applied, or hard-absent). The op is still appended to the log below;
-				// the pipeline handles tombstone reactivation separately.
-			} else if (op.type === 'delete') {
-				const deleteQuery = buildLwwSoftDeleteQuery(
-					collection,
-					op.recordId,
-					wallTime,
-					remoteVersion,
-				)
-				await tx.execute(deleteQuery.sql, deleteQuery.params)
-			}
 
-			// Persist the operation
-			const opRow = serializeOperation(op)
-			const opInsert = buildInsertQuery(
-				`_kora_ops_${collection}`,
-				opRow as unknown as Record<string, unknown>,
-			)
-			await tx.execute(opInsert.sql, opInsert.params)
+				// Persist the operation
+				await this.appendRemoteOperationRow(tx, op)
 
-			// Update version vector
-			const currentSeq = this.versionVector.get(op.nodeId) ?? 0
-			if (op.sequenceNumber > currentSeq) {
-				this.versionVector.set(op.nodeId, op.sequenceNumber)
+				// Version vector: MAX with the stored value, never a value computed outside
+				// this transaction (another tab may have advanced it). The in-memory
+				// vector is updated only after commit.
 				await tx.execute(
-					'INSERT OR REPLACE INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)',
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
 					[op.nodeId, op.sequenceNumber],
 				)
+			})
+		} catch (error) {
+			this.reportStorageError(error)
+			throw error
+		}
+
+		// Committed. A duplicate still advances this runtime's vector and refreshes
+		// its queries: another tab sharing the database may have applied the
+		// operation first, and this tab must not stay blind to it (STORE-10).
+		this.recordOperationSequence(op)
+		if (outcome.duplicate) {
+			if (outcome.revived) {
+				this.subscriptionManager.invalidate(collection)
+			} else {
+				this.subscriptionManager.notify(collection, op)
 			}
+			return 'duplicate'
+		}
+
+		this.subscriptionManager.notify(collection, op)
+		this.emitter?.emit({
+			type: 'operation:applied',
+			operation: op,
+			duration: Date.now() - startedAt,
 		})
 
-		// Notify subscriptions
-		this.subscriptionManager.notify(collection, op)
-
 		return 'applied'
+	}
+
+	/**
+	 * Append a remote operation to the log. If another operation of the same node
+	 * already holds its sequence number (a beta.12 device could produce such
+	 * pairs), the log keeps the existing row and this one is recorded in the
+	 * sequence-conflicts table, where dedup and record folds still see it.
+	 */
+	private async appendRemoteOperationRow(tx: Transaction, op: Operation): Promise<void> {
+		const table = quoteIdent(`_kora_ops_${op.collection}`)
+		const holder = await tx.query<{ id: string }>(
+			`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
+			[op.nodeId, op.sequenceNumber],
+		)
+		const opRow = serializeOperation(op)
+		if (holder.length > 0) {
+			await insertConflictRow(
+				tx,
+				op.collection,
+				opRow,
+				'remote-sequence-conflict',
+				null,
+				null,
+				Date.now(),
+			)
+			return
+		}
+		const opInsert = buildInsertQuery(
+			`_kora_ops_${op.collection}`,
+			opRow as unknown as Record<string, unknown>,
+		)
+		await tx.execute(opInsert.sql, opInsert.params)
 	}
 
 	/**
@@ -789,10 +925,18 @@ export class Store implements OperationLog {
 		recordId: string,
 		insertOp: Operation,
 	): Promise<void> {
-		const orphanRows = await tx.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND type IN ('update', 'delete')`,
-			[recordId],
-		)
+		const orphanRows = [
+			...(await tx.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND type IN ('update', 'delete')`,
+				[recordId],
+			)),
+			...(await loadRetainedConflictRows(
+				(sql, params) => tx.query(sql, params),
+				collection,
+				recordId,
+				['update', 'delete'],
+			)),
+		]
 		if (orphanRows.length === 0) {
 			return
 		}
@@ -1022,17 +1166,19 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Build mutation context for a collection (used by ApplyPipeline side effects).
+	 * Build the local write context for a collection: everything the single local
+	 * write path needs (used by Collection writes and by ApplyPipeline).
 	 */
 	createMutationContext(
 		collection: string,
-		options?: { inTransaction?: boolean; extraCausalDeps?: string[] },
+		options?: { extraCausalDeps?: string[] },
 	): LocalMutationContext {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
 		if (!definition || !this.clock) {
 			throw new StoreNotOpenError()
 		}
+		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		return {
 			collection,
 			definition,
@@ -1040,19 +1186,16 @@ export class Store implements OperationLog {
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			allocateSequenceNumber: () => this.allocateSequenceNumber(),
-			onMutation: (collectionName, operation) => {
-				this.recordOperationSequence(operation)
-				this.subscriptionManager.notify(collectionName, operation)
-				if (this.emitter) {
-					this.emitter.emit({ type: 'operation:created', operation })
-				}
-			},
+			onMutation: (collectionName, operation) =>
+				this.publishLocalOperation(collectionName, operation),
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
-			inTransaction: options?.inTransaction ?? false,
-			extraCausalDeps: options?.extraCausalDeps,
-			secretKeyProvider: this.secretKeyProvider,
+			...(options?.extraCausalDeps ? { extraCausalDeps: options.extraCausalDeps } : {}),
+			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(beforeLocalDelete
+				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
+				: {}),
+			onStorageError: (error) => this.reportStorageError(error),
 		}
 	}
 
@@ -1132,17 +1275,17 @@ export class Store implements OperationLog {
 	/**
 	 * Load the per-device node token the sync server issued for this node id (RT-12).
 	 */
-	async loadNodeToken(): Promise<string | null> {
+	async loadNodeToken(nodeId?: string): Promise<string | null> {
 		this.ensureOpen()
-		return loadNodeToken(this.adapter)
+		return loadNodeToken(this.adapter, nodeId ?? this.nodeId)
 	}
 
 	/**
-	 * Persist the per-device node token next to the node id.
+	 * Persist the per-device node token under its node id (the current one by default).
 	 */
-	async saveNodeToken(token: string): Promise<void> {
+	async saveNodeToken(token: string, nodeId?: string): Promise<void> {
 		this.ensureOpen()
-		await saveNodeToken(this.adapter, token)
+		await saveNodeToken(this.adapter, token, nodeId ?? this.nodeId)
 	}
 
 	/**
@@ -1195,6 +1338,61 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Record delivered operations the sync engine deliberately did not apply (inbound
+	 * quarantine, W4) and, when given, advance a view's delivery watermark in the same
+	 * transaction, so the watermark never passes an operation that is neither applied nor
+	 * recorded.
+	 */
+	async saveInboundQuarantine(
+		entries: UnappliedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void> {
+		this.ensureOpen()
+		await saveUnappliedOperations(this.adapter, entries, watermark)
+	}
+
+	/** Every quarantined inbound operation, oldest delivery first. */
+	async loadInboundQuarantine(): Promise<UnappliedOperation[]> {
+		this.ensureOpen()
+		return loadUnappliedOperations(this.adapter)
+	}
+
+	/** Remove quarantined inbound operations (applied on replay, or reconciled). */
+	async removeInboundQuarantine(operationIds: string[]): Promise<void> {
+		this.ensureOpen()
+		await removeUnappliedOperations(this.adapter, operationIds)
+	}
+
+	/**
+	 * The contiguous acknowledged prefix of this device's own operations for a node id,
+	 * or null when none was recorded under that contract (W3).
+	 */
+	async loadOwnAckedThrough(nodeId: string): Promise<number | null> {
+		this.ensureOpen()
+		return loadOwnAckedThrough(this.adapter, nodeId)
+	}
+
+	/** Persist the contiguous acknowledged own-operation prefix for a node id. */
+	async saveOwnAckedThrough(nodeId: string, sequence: number): Promise<void> {
+		this.ensureOpen()
+		await saveOwnAckedThrough(this.adapter, nodeId, sequence)
+	}
+
+	/** The downlink scope the sync server last accepted (null when none). */
+	async loadAcceptedDownlinkScope(): Promise<Record<string, Record<string, unknown>> | null> {
+		this.ensureOpen()
+		return loadAcceptedDownlinkScope(this.adapter)
+	}
+
+	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	async saveAcceptedDownlinkScope(
+		scope: Record<string, Record<string, unknown>> | null,
+	): Promise<void> {
+		this.ensureOpen()
+		await saveAcceptedDownlinkScope(this.adapter, scope)
+	}
+
+	/**
 	 * Local operations not yet reflected on the server version vector.
 	 */
 	async getUnsyncedOperations(serverVector: VersionVector): Promise<Operation[]> {
@@ -1242,6 +1440,9 @@ export class Store implements OperationLog {
 		}
 		const oldNodeId = this.nodeId
 		const oldClock = this.clock
+		const oldBinding = (await listLocalNodes(this.adapter)).find(
+			(node) => node.nodeId === oldNodeId,
+		)
 		const result = await rotateUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
@@ -1249,6 +1450,17 @@ export class Store implements OperationLog {
 			oldNodeId,
 			generateUUIDv7(),
 		)
+		await registerLocalNode(this.adapter, result.nodeId)
+		// The re-authored writes keep their author (RT-50): the fresh node carries the old
+		// node's binding, so they are never held as unassigned or given to another user.
+		if (oldBinding?.principal) {
+			await setLocalNodePrincipal(
+				this.adapter,
+				result.nodeId,
+				oldBinding.principal,
+				oldBinding.binding ?? 'app',
+			)
+		}
 		this.nodeId = result.nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
 		if (oldClock) {
@@ -1260,20 +1472,349 @@ export class Store implements OperationLog {
 		this.clock = clock
 		this.causalTracker = new CausalTracker()
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
-		this.sequenceNumber = result.operations.length
 		this.versionVector = await this.loadVersionVector()
-		this.relationEnforcer = this.relationEnforcer
-			? new RelationEnforcer({
-					schema: this.schema,
-					adapter: this.adapter,
-					clock,
-					nodeId: this.nodeId,
-				})
-			: null
+		// The persisted counter (MAX with the stored value, W6), not a local count.
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? result.operations.length
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
 		return result
+	}
+
+	/**
+	 * Move this database back to a node id it authored under before (RT-38): after the
+	 * sync server refused the current node, the device tries a node a returning user
+	 * owns. Nothing is rewritten; later writes use `nodeId`.
+	 *
+	 * @throws {KoraError} When the node id is pinned, or `nodeId` is not a local node
+	 */
+	async switchNodeId(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (this.configNodeId || this.isolation === 'per-tab') {
+			throw new KoraError(
+				'This store uses a pinned node id, so it cannot switch to another one.',
+				'NODE_ID_PINNED',
+				{ nodeId: this.nodeId },
+			)
+		}
+		if (nodeId === this.nodeId) return
+		const known = (await listLocalNodes(this.adapter)).some((node) => node.nodeId === nodeId)
+		if (!known) {
+			throw new KoraError(
+				`Node id "${nodeId}" was never used by this database, so the store cannot switch to it.`,
+				'NODE_ID_UNKNOWN',
+				{ nodeId },
+			)
+		}
+		await this.adapter.transaction((tx) => moveDatabaseNodeId(tx, nodeId))
+		await this.rebindToNode(nodeId)
+	}
+
+	/** Point the clock, sequence counter and collections at `nodeId` (already persisted). */
+	private async rebindToNode(nodeId: string): Promise<void> {
+		const oldClock = this.clock
+		this.nodeId = nodeId
+		const clock = new HybridLogicalClock(this.nodeId)
+		if (oldClock) {
+			const last = oldClock.now()
+			clock.advanceTo({ ...last, nodeId: this.nodeId })
+			const offset = oldClock.getReferenceOffset()
+			if (offset !== null) clock.setReferenceOffset(offset)
+		}
+		this.clock = clock
+		this.causalTracker = new CausalTracker()
+		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
+		this.versionVector = await this.loadVersionVector()
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? 0
+		for (const collection of this.collections.values()) {
+			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
+		}
+	}
+
+	/**
+	 * Bind this database's writes to the signed-in user (RT-42). Call it whenever the
+	 * signed-in user is known or changes, BEFORE the next local write (`createApp` does
+	 * so at start and on every auth change of `sync.authClient`).
+	 *
+	 * - The current node belongs to `principal`: nothing changes.
+	 * - The current node is unbound and has no history (no write, never synced): it is
+	 *   bound to `principal` (every write under it from now on is theirs).
+	 * - The current node is unbound but has history (a database from before RT-42, or
+	 *   writes made while nobody was signed in): its owner is NOT guessed (RT-50). The
+	 *   store moves to `principal`'s own node, and the old node's owner is learned from
+	 *   the sync server (the first accepted handshake as it binds it; a refusal rules
+	 *   that user out). A node that never synced cannot be attributed by anyone: its
+	 *   unsynced writes are held for the app to assign or discard (`app.sync.assignHeld`,
+	 *   `app.sync.discardHeld`).
+	 * - It belongs to another user: the store moves to `principal`'s own local node (the
+	 *   most recent one, not held), or to a fresh node bound to `principal`. Nothing is
+	 *   rewritten: the other user's unsynced writes stay under their node, and sync never
+	 *   uploads them on this user's session (they count as `heldOperations`).
+	 *
+	 * A pinned node id (`StoreConfig.nodeId`, such as an auth device id) cannot move:
+	 * `conflict` is then true when it belongs to another user, and sync refuses to
+	 * upload it under `principal`; an unbound pinned node with history stays unbound
+	 * until the server accepts it for a user. Under `per-tab` isolation the tab moves to
+	 * a fresh per-tab node.
+	 *
+	 * @param principal - The signed-in user id
+	 * @returns The node now in use and whether it changed
+	 */
+	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		this.ensureOpen()
+		const previousNodeId = this.nodeId
+		const nodes = await listLocalNodes(this.adapter)
+		const current = nodes.find((node) => node.nodeId === this.nodeId)
+		const owner = current?.principal ?? null
+		if (owner === principal) {
+			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+		}
+		if (owner === null) {
+			const written = (await this.loadVersionVector()).get(this.nodeId) ?? 0
+			if (written === 0 && !(current?.accepted ?? false)) {
+				await setLocalNodePrincipal(this.adapter, this.nodeId, principal, 'fresh')
+				return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+			}
+			if (this.configNodeId) {
+				// Cannot move: the server decides whose it is at the first handshake.
+				return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+			}
+		} else if (this.configNodeId) {
+			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: true }
+		}
+		if (this.isolation === 'per-tab') {
+			// A per-tab node belongs to its tab; another user in this tab gets a fresh one.
+			const fresh = generateUUIDv7()
+			await registerLocalNode(this.adapter, fresh)
+			await setLocalNodePrincipal(this.adapter, fresh, principal, 'fresh')
+			savePerTabNodeId(this.dbName, fresh)
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, fresh))
+			await this.rebindToNode(fresh)
+			return { nodeId: fresh, previousNodeId, switched: true, conflict: false }
+		}
+		const own = nodes
+			.filter((node) => node.principal === principal && !node.held)
+			.sort((a, b) => b.createdAt - a.createdAt)[0]
+		if (own) {
+			await this.switchNodeId(own.nodeId)
+			return { nodeId: own.nodeId, previousNodeId, switched: true, conflict: false }
+		}
+		const fresh = generateUUIDv7()
+		await this.adapter.transaction((tx) => moveDatabaseNodeId(tx, fresh))
+		await registerLocalNode(this.adapter, fresh)
+		await setLocalNodePrincipal(this.adapter, fresh, principal, 'fresh')
+		await this.rebindToNode(fresh)
+		return { nodeId: fresh, previousNodeId, switched: true, conflict: false }
+	}
+
+	/**
+	 * A sync handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound
+	 * node (or replace a guessed binding) from the server's answer.
+	 */
+	async confirmNodePrincipal(nodeId: string, principal: string): Promise<void> {
+		this.ensureOpen()
+		await confirmLocalNodePrincipal(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * The sync server refused `nodeId` for `principal` (RT-50): clear a guessed binding,
+	 * and remember that an unbound node is not theirs.
+	 */
+	async recordNodeRefusedFor(nodeId: string, principal: string): Promise<void> {
+		this.ensureOpen()
+		await recordLocalNodeRefusedFor(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * Assign a held, unbound local node's writes to `principal` (RT-50): an explicit app
+	 * decision for writes nobody can attribute (a database that never synced).
+	 *
+	 * @returns false when the node is unknown, the store's own, already bound, or was
+	 *   refused for `principal` by the server
+	 */
+	async assignNodePrincipal(nodeId: string, principal: string): Promise<boolean> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return false
+		return assignLocalNodePrincipal(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * Forget a local node other than the store's own whatever it still holds (RT-50: the
+	 * app discarded its held writes, which were marked never to upload first).
+	 */
+	async dropLocalNode(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await dropLocalNode(this.adapter, nodeId)
+	}
+
+	/** The adoption schedule of this database's local nodes (RT-46). */
+	async loadAdoptionSchedule(): Promise<AdoptionSchedule> {
+		this.ensureOpen()
+		return loadAdoptionSchedule(this.adapter)
+	}
+
+	/** Persist the adoption schedule (RT-46). */
+	async saveAdoptionSchedule(schedule: AdoptionSchedule): Promise<void> {
+		this.ensureOpen()
+		await saveAdoptionSchedule(this.adapter, schedule)
+	}
+
+	/**
+	 * Raise a local node's sequence counter to at least `floor`, in a transaction (the
+	 * same MAX every reservation uses, W6), so the next write never reuses a number the
+	 * server already holds (RT-35: the device lost the tail of its log, for example on a
+	 * reload inside the IndexedDB snapshot window or after restoring an older copy).
+	 *
+	 * @returns Whether the counter moved
+	 */
+	async raiseSequenceFloor(nodeId: string, floor: number): Promise<boolean> {
+		this.ensureOpen()
+		let raised = false
+		await this.adapter.transaction(async (tx) => {
+			const rows = await tx.query<VersionVectorRow>(
+				'SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?',
+				[nodeId],
+			)
+			const current = rows[0]?.sequence_number ?? 0
+			if (floor <= current) return
+			await tx.execute(
+				`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+				[nodeId, floor],
+			)
+			raised = true
+		})
+		if (raised) {
+			const previous = this.versionVector.get(nodeId) ?? 0
+			this.versionVector.set(nodeId, Math.max(previous, floor))
+			if (nodeId === this.nodeId) this.sequenceNumber = Math.max(this.sequenceNumber, floor)
+		}
+		return raised
+	}
+
+	/**
+	 * Give one of a local node's operations a fresh sequence number above `floor`
+	 * (RT-35): the server refused it with `SEQUENCE_CONFLICT` because it holds another
+	 * operation of this node under that number (one this device lost). The operation
+	 * keeps its id and content (protocol v1 does not hash the sequence number), exactly
+	 * like the W6 sequence repair, and the old identity is recorded in
+	 * `_kora_seq_conflicts`.
+	 *
+	 * @returns The renumbered operation, or null when it is not in the log
+	 */
+	async resequenceOperation(
+		operationId: string,
+		nodeId: string,
+		floor: number,
+	): Promise<Operation | null> {
+		this.ensureOpen()
+		const found: { op: Operation | null } = { op: null }
+		await this.adapter.transaction(async (tx) => {
+			for (const collection of Object.keys(this.schema.collections)) {
+				const table = quoteIdent(`_kora_ops_${collection}`)
+				const rows = await tx.query<OperationRow>(
+					`SELECT * FROM ${table} WHERE id = ? AND node_id = ?`,
+					[operationId, nodeId],
+				)
+				const row = rows[0]
+				if (!row) continue
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[nodeId, floor],
+				)
+				const sequence = await allocateNextSequenceInTransaction(tx, nodeId)
+				await insertConflictRow(
+					tx,
+					collection,
+					row,
+					'server-sequence-conflict',
+					row.id,
+					sequence,
+					Date.now(),
+				)
+				await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [sequence, row.id])
+				found.op = deserializeOperationWithCollection(
+					{ ...row, sequence_number: sequence },
+					collection,
+				)
+				return
+			}
+		})
+		if (found.op) this.recordOperationSequence(found.op)
+		return found.op
+	}
+
+	/**
+	 * Durability barrier (RT-35): resolves once every write committed so far is durable
+	 * on this device. Sync awaits it before an operation leaves the device.
+	 */
+	async ensureDurable(): Promise<void> {
+		this.ensureOpen()
+		await this.adapter.ensureDurable?.()
+	}
+
+	/** Record operations the server refused for good (RT-36). Never cleared. */
+	async recordTerminalRejections(entries: TerminalRejection[]): Promise<void> {
+		this.ensureOpen()
+		await recordTerminalRejections(this.adapter, entries)
+	}
+
+	/** Which of these operation ids the server refused for good (RT-36). */
+	async findTerminalRejections(operationIds: string[]): Promise<Set<string>> {
+		this.ensureOpen()
+		return findTerminalRejections(this.adapter, operationIds)
+	}
+
+	/** Every node id this database authored operations under (RT-38, RT-40). */
+	async listLocalNodes(): Promise<LocalNodeRecord[]> {
+		this.ensureOpen()
+		return listLocalNodes(this.adapter)
+	}
+
+	/** Forget a drained local node other than this store's own (RT-40). */
+	async forgetLocalNode(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await forgetLocalNode(this.adapter, nodeId)
+	}
+
+	/** The current refusal cycle: the count of accepted sync handshakes (RT-38). */
+	async loadAcceptedCycle(): Promise<number> {
+		this.ensureOpen()
+		return loadAcceptedCycle(this.adapter)
+	}
+
+	/** Record an accepted sync handshake as `nodeId` (RT-38). */
+	async markLocalNodeAccepted(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		await markLocalNodeAccepted(this.adapter, nodeId)
+	}
+
+	/** Record that the sync server refused `nodeId`; `held` holds its writes (RT-38). */
+	async markLocalNodeRefused(nodeId: string, held: boolean): Promise<void> {
+		this.ensureOpen()
+		await markLocalNodeRefused(this.adapter, nodeId, held)
+	}
+
+	/**
+	 * Take over another local node's unsynced writes (RT-40): resolves to a release
+	 * function when no live tab uses `nodeId` (its lock is free), or null when one does.
+	 * Without Web Locks (Node, old browsers) the node is assumed free.
+	 */
+	async claimLocalNode(nodeId: string): Promise<(() => void) | null> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return null
+		return tryAcquireNodeLock(nodeLockName(this.dbName, nodeId))
+	}
+
+	/** Whether a live tab holds `nodeId` (per-tab isolation, RT-40). */
+	async isLocalNodeLive(nodeId: string): Promise<boolean> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return true
+		return isNodeLockHeld(nodeLockName(this.dbName, nodeId))
 	}
 
 	async rebaseUnsyncedOperations(
@@ -1368,10 +1909,19 @@ export class Store implements OperationLog {
 	 */
 	async getOperationsForRecord(collection: string, recordId: string): Promise<Operation[]> {
 		this.ensureOpen()
-		const rows = await this.adapter.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
-			[recordId],
-		)
+		const rows = [
+			...(await this.adapter.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
+				[recordId],
+			)),
+			// Other nodes' operations kept only in the sequence-conflicts table still
+			// belong to the record's history.
+			...(await loadRetainedConflictRows(
+				(sql, params) => this.adapter.query(sql, params),
+				collection,
+				recordId,
+			)),
+		]
 		const ops = rows.map((row) => deserializeOperationWithCollection(row, collection))
 		ops.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
 		return ops
@@ -1406,16 +1956,19 @@ export class Store implements OperationLog {
 		if (!this.clock) {
 			throw new StoreNotOpenError()
 		}
+		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		return new TransactionContext({
 			schema: this.schema,
 			adapter: this.adapter,
 			clock: this.clock,
 			nodeId: this.nodeId,
-			sequenceAllocator: new TransactionSequenceAllocator(this.adapter, this.nodeId),
 			relationEnforcer: this.relationEnforcer,
 			causalTracker: this.causalTracker,
-			localMutationHandler: this.localMutationHandler,
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(beforeLocalDelete
+				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
+				: {}),
+			onStorageError: (error) => this.reportStorageError(error),
 		})
 	}
 
@@ -1431,28 +1984,20 @@ export class Store implements OperationLog {
 	 */
 	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
 		const tx = this.createTransaction()
-		this.causalTracker?.beginTransaction()
 		try {
 			await fn(tx)
-			const { operations } = await tx.commit()
-
-			this.causalTracker?.clearTransaction()
-
-			// Notify subscriptions and emit events after commit
-			for (const op of operations) {
-				this.recordOperationSequence(op)
-				this.subscriptionManager.notify(op.collection, op)
-				if (this.emitter) {
-					this.emitter.emit({ type: 'operation:created', operation: op })
-				}
-			}
-
-			return operations
 		} catch (error) {
 			tx.rollback()
-			this.causalTracker?.clearTransaction()
 			throw error
 		}
+		const { operations } = await tx.commit()
+
+		// Notify subscriptions and emit events after commit
+		for (const op of operations) {
+			this.publishLocalOperation(op.collection, op)
+		}
+
+		return operations
 	}
 
 	/**
@@ -1501,11 +2046,25 @@ export class Store implements OperationLog {
 		}
 	}
 
-	private async allocateSequenceNumber(): Promise<number> {
-		const seq = await allocateNextSequenceNumber(this.adapter, this.nodeId)
-		this.sequenceNumber = seq
-		this.versionVector.set(this.nodeId, seq)
-		return seq
+	/** Post-commit publication of a committed local operation. */
+	private publishLocalOperation(collection: string, operation: Operation): void {
+		this.recordOperationSequence(operation)
+		this.subscriptionManager.notify(collection, operation)
+		this.emitter?.emit({ type: 'operation:created', operation })
+	}
+
+	/**
+	 * Map an out-of-space storage failure to `store:quota-exceeded` (STORE-15).
+	 * The error itself still propagates to the caller; this only makes the
+	 * condition observable on every adapter, not just IndexedDB.
+	 */
+	private reportStorageError(error: unknown): void {
+		if (!isStorageFullError(error)) return
+		this.emitter?.emit({
+			type: 'store:quota-exceeded',
+			dbName: this.dbName,
+			message: error instanceof Error ? error.message : String(error),
+		})
 	}
 
 	/**

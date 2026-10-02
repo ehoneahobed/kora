@@ -68,7 +68,9 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 			timestamp: { wallTime: Date.now(), logical: 0, nodeId: 'vv-node' },
 		})
 		expect(await a.applyRemoteOperation(op)).toBe('applied')
-		expect(b.getVersionVector().get('vv-node')).toBe(1)
+		// The shared vector is read from the database; the synchronous getVersionVector()
+		// can only reflect the instance's own writes (SRV-4 fix: readVersionVector()).
+		expect((await b.readVersionVector()).get('vv-node')).toBe(1)
 	})
 
 	test('legacy (version-vector) client handshaking on instance B receives an op written via A', async () => {

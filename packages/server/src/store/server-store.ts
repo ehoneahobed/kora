@@ -4,9 +4,188 @@ import type {
 	Operation,
 	RecordFieldVersions,
 	SchemaDefinition,
+	VersionVector,
 } from '@korajs/core'
+import { KoraError } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+
+/** Rejection code for a second, different operation under an existing (node, sequence). */
+export const SEQUENCE_CONFLICT_CODE = 'SEQUENCE_CONFLICT'
+
+/**
+ * Thrown by a store when an operation claims a `(nodeId, sequenceNumber)` that an
+ * operation with a DIFFERENT id already holds (W3 step 4). A node's sequence numbers
+ * identify its writes: accepting a second operation under the same number would make
+ * one of them invisible to every version-vector delta and to the client's contiguous
+ * acknowledged prefix. Nothing was written. Not retriable: the same bytes always fail.
+ */
+export class SequenceConflictError extends KoraError {
+	constructor(
+		readonly operation: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+		readonly existingOperationId: string,
+	) {
+		super(
+			`Operation "${operation.id}" claims sequence ${String(operation.sequenceNumber)} of node "${operation.nodeId}", which operation "${existingOperationId}" already holds. A node may never reuse a sequence number for different content.`,
+			SEQUENCE_CONFLICT_CODE,
+			{
+				operationId: operation.id,
+				nodeId: operation.nodeId,
+				sequenceNumber: operation.sequenceNumber,
+				existingOperationId,
+			},
+		)
+		this.name = 'SequenceConflictError'
+	}
+}
+
+/**
+ * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
+ * sequence in the log when this release first opened the store. Operations stored at
+ * or below it were accepted by a release that allowed a node to reuse a sequence
+ * number (beta.12 STORE-1/2); a newly uploaded operation that shares a (node,
+ * sequence) only with such legacy operations is accepted as before (the client's
+ * sequence repair may keep the OTHER op of a legacy duplicate pair at that number).
+ * Above it, a writer that reserves its sequence numbers (see
+ * {@link ApplyRemoteOptions.legacySequenceWriter}) is refused a held sequence.
+ */
+export const SEQUENCE_ENFORCEMENT_EPOCH_KEY = 'sequence_enforcement_epoch'
+
+/**
+ * `kora_server_meta` key set once the legacy pairs already in the log were indexed in
+ * `sequence_pairs` (RT-48); appends maintain the index from then on.
+ */
+export const SEQUENCE_PAIRS_BACKFILLED_KEY = 'sequence_pairs_backfilled'
+
+/**
+ * Name of the partial unique index over (node_id, sequence_number) of the rows that
+ * were the sole holder of their sequence when stored (`seq_unique = 1`, RT-37).
+ *
+ * Design: a row is flagged when nothing else held its (node, sequence) at insert, and
+ * a row stored as the second of a pair (a legacy duplicate: a pre-epoch holder, or an
+ * upload from a client without the `sequenceReservation` capability) is not. So the
+ * index can never be violated by an accepted legacy pair, yet two concurrent sole
+ * inserts of one (node, sequence) (the race between server instances it backs) still
+ * collide. Rows written by a release without the column (older instances during a
+ * rolling upgrade, or history) default to 0 and sit outside it; the append check, run
+ * under the store's write lock, judges them as holders.
+ */
+export const NODE_SEQ_UNIQUE_INDEX = 'idx_node_seq_unique_sole'
+
+/** Earlier unique indexes over (node_id, sequence_number), dropped at startup. */
+export const SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES = [
+	'idx_node_seq_unique',
+	'idx_node_seq_unique_after_epoch',
+] as const
+
+/** Outcome of {@link judgeSequenceHolders}. */
+export type SequenceHolderVerdict =
+	/** No other operation holds the sequence: stored as its sole holder (indexed). */
+	| { verdict: 'free' }
+	/** Shares the sequence with `holderIds`, accepted: stored as a legacy pair. */
+	| { verdict: 'legacy'; holderIds: string[]; legacyWriter: boolean }
+	/** Refused: `holderId` holds the sequence under enforcement. */
+	| { verdict: 'conflict'; holderId: string }
+
+/**
+ * Decide an append against the operations already holding its (node, sequence):
+ * `'conflict'` when any of them was stored after the enforcement epoch and the writer
+ * reserves its sequence numbers; `'legacy'` (accepted, with a warning) when all of
+ * them predate the epoch, or when the writer is a legacy client (RT-37: Kora <=
+ * beta.13 could give two concurrent transactions one number, and refusing the second
+ * would drop a write the user made); `'free'` when there are none. Holders with the
+ * operation's own id are the caller's duplicate case.
+ */
+export function judgeSequenceHolders(
+	op: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+	holders: ReadonlyArray<{ id: string; deliverySequence: number }>,
+	epoch: number,
+	writer: { legacySequenceWriter?: boolean } = {},
+): SequenceHolderVerdict {
+	const others = holders.filter((holder) => holder.id !== op.id)
+	if (others.length === 0) return { verdict: 'free' }
+	const enforced = others.find((holder) => holder.deliverySequence > epoch)
+	const holderIds = others.map((holder) => holder.id)
+	const list = holderIds.map((id) => `"${id}"`).join(', ')
+	if (enforced) {
+		if (writer.legacySequenceWriter !== true) {
+			return { verdict: 'conflict', holderId: enforced.id }
+		}
+		console.warn(
+			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.13), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
+		)
+		return { verdict: 'legacy', holderIds, legacyWriter: true }
+	}
+	console.warn(
+		`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list} stored before sequence enforcement (a duplicate written by Kora <= beta.12). Accepted and stored, as that release did.`,
+	)
+	return { verdict: 'legacy', holderIds, legacyWriter: false }
+}
+
+/** A stored legacy pair, reported to {@link ApplyRemoteOptions.onLegacySequencePair}. */
+export interface LegacySequencePair {
+	operationId: string
+	nodeId: string
+	sequenceNumber: number
+	/** The operations that already held the sequence. */
+	holderIds: string[]
+	/** True when accepted because the writer is a legacy client (not a pre-epoch holder). */
+	legacyWriter: boolean
+}
+
+/**
+ * Tell the caller of an append that it committed a legacy pair (see
+ * {@link ApplyRemoteOptions.onLegacySequencePair}). Called by the built-in stores
+ * after the write committed.
+ */
+export function reportLegacyPair(
+	op: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+	decision: SequenceHolderVerdict,
+	options: Pick<ApplyRemoteOptions, 'onLegacySequencePair'> | undefined,
+): void {
+	if (decision.verdict !== 'legacy' || !options?.onLegacySequencePair) return
+	options.onLegacySequencePair({
+		operationId: op.id,
+		nodeId: op.nodeId,
+		sequenceNumber: op.sequenceNumber,
+		holderIds: decision.holderIds,
+		legacyWriter: decision.legacyWriter,
+	})
+}
+
+/**
+ * How the server resolved an uploaded operation it did NOT store under the submitted
+ * (node, sequence) (RT-43, RT-47):
+ * - `'ignored'`: the validator answered `ignore` (handled out of band, nothing stored);
+ * - `'refused'`: a terminal (non-retriable) rejection; the same id is answered with the
+ *   original rejection forever after;
+ * - `'stored-elsewhere'`: the id is stored under another sequence of the same node (a
+ *   client sequence repair renumbered it), acknowledged as a duplicate.
+ * A retriable rejection, and a `SEQUENCE_CONFLICT` (the client renumbers and resubmits
+ * under the same id), are never resolutions.
+ */
+export type OperationResolutionOutcome = 'ignored' | 'refused' | 'stored-elsewhere'
+
+/** A durable record of how an uploaded operation was resolved without being stored. */
+export interface OperationResolution {
+	operationId: string
+	nodeId: string
+	sequenceNumber: number
+	outcome: OperationResolutionOutcome
+	/** Rejection code, for `'refused'`. */
+	code: string | null
+	/** Rejection message, for `'refused'`. */
+	message: string | null
+}
+
+/** Longest rejection message kept in an {@link OperationResolution}. */
+export const MAX_RESOLUTION_MESSAGE_LENGTH = 1024
+
+/** Where a stored operation sits in its node's sequence space. */
+export interface StoredOperationKey {
+	nodeId: string
+	sequenceNumber: number
+}
 
 /**
  * Owner recorded for a node id an admin released (see `ServerStore.releaseNodeClaim`):
@@ -159,6 +338,20 @@ export interface ApplyRemoteOptions {
 	 * server instance) could otherwise slip in.
 	 */
 	authorize?: (storedRow: MaterializedRecord | null) => UplinkAuthorizationResult
+	/**
+	 * The writer does not reserve its sequence numbers inside the write transaction
+	 * (a client that did not advertise the `sequenceReservation` handshake capability,
+	 * Kora <= beta.13; RT-37). A different operation already holding the
+	 * `(nodeId, sequenceNumber)` then does not refuse this one: both are stored as a
+	 * legacy pair (each keeps its own delivery sequence, so both are delivered) instead
+	 * of throwing {@link SequenceConflictError}. Default false: enforce.
+	 */
+	legacySequenceWriter?: boolean
+	/**
+	 * Called once the operation was committed as the second holder of its sequence (a
+	 * legacy pair), for logging and diagnostics. Never called for a refused write.
+	 */
+	onLegacySequencePair?: (pair: LegacySequencePair) => void
 }
 
 /**
@@ -171,8 +364,88 @@ export interface ServerStore extends SyncStore {
 	 * `options.authorize`, the authorization is re-checked atomically with the write
 	 * (see {@link ApplyRemoteOptions}). Stores written before this option existed
 	 * may ignore it; callers always pre-check as well.
+	 *
+	 * Built-in stores throw {@link SequenceConflictError} when a different operation
+	 * already holds the operation's `(nodeId, sequenceNumber)` under enforcement
+	 * (unless `options.legacySequenceWriter`, see {@link judgeSequenceHolders}), and return
+	 * `'duplicate'` (writing nothing) for an operation id already stored, decided
+	 * atomically with the write.
 	 */
 	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
+
+	/**
+	 * The version vector as committed in the shared database, read fresh (SRV-4). A
+	 * store shared by several server instances must implement it: its synchronous
+	 * {@link SyncStore.getVersionVector} can only reflect this instance's own writes.
+	 * Optional; callers fall back to `getVersionVector()`.
+	 */
+	readVersionVector?(): Promise<VersionVector>
+
+	/**
+	 * Several records of one collection by id, as stored (soft-deleted ones included),
+	 * in one read: `id = ANY(...)` on Postgres, chunked `IN (...)` on SQLite (LMS #11).
+	 * Ids with no row are absent from the result. Optional; the delivery stream falls
+	 * back to one lookup per operation without it.
+	 */
+	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
+
+	/**
+	 * Which of `ids` the operation log already holds, with the node and sequence each is
+	 * stored under, in one read per batch (chunked `IN (...)`). The sync session asks before any other per-operation check, so a
+	 * device re-uploading history the server already stores (the one-time upgrade
+	 * re-upload, or an op the client's sequence repair renumbered under its original
+	 * id) is acknowledged as a duplicate instead of being re-judged by today's
+	 * authorization and validators. Optional; sessions fall back to a per-operation
+	 * (node, sequence) lookup without it.
+	 */
+	findStoredOperations?(ids: string[]): Promise<Map<string, StoredOperationKey>>
+
+	/**
+	 * Durably record how an uploaded operation was resolved without being stored under
+	 * its sequence (RT-43, RT-47; see {@link OperationResolution}). Idempotent per
+	 * operation id: the first resolution wins. The session awaits it BEFORE answering the
+	 * client, so a client never acts on a resolution the server could forget. Optional
+	 * for custom stores: without it an ignored tail op may be re-validated at reconnect
+	 * and a refused id re-judged on resubmission.
+	 */
+	recordOperationResolution?(resolution: OperationResolution): Promise<void>
+
+	/**
+	 * The resolutions recorded for `ids` under `nodeId` (ids resolved under another node
+	 * are absent: the answer never crosses devices or tenants).
+	 */
+	findOperationResolutions?(
+		nodeId: string,
+		ids: string[],
+	): Promise<Map<string, OperationResolution>>
+
+	/** The highest sequence number of `nodeId` with a recorded resolution (0 when none). */
+	getResolvedThrough?(nodeId: string): Promise<number>
+
+	/**
+	 * Forget the resolution recorded for `operationId` under `nodeId` (no-op when none).
+	 * The session calls it for a stale `stored-elsewhere` record: one whose id the batch
+	 * lookup did not find stored (RT-51). The operation is then judged normally, and its
+	 * real outcome is recorded in place of the stale one. Optional for custom stores:
+	 * without it the stale record is ignored but kept.
+	 */
+	deleteOperationResolution?(nodeId: string, operationId: string): Promise<void>
+
+	/**
+	 * Every operation of `nodeId` at or below `throughSequence` that shares its sequence
+	 * with another stored operation (a legacy pair, RT-37), ordered by sequence then
+	 * delivery. A version-vector client reporting `throughSequence` for the node may hold
+	 * only one of a pair, and a range read above its entry can never return the other
+	 * (RT-48). Optional; without it such clients miss the second op of a pair.
+	 */
+	getSequencePairOperations?(nodeId: string, throughSequence: number): Promise<Operation[]>
+
+	/**
+	 * The distinct node ids of the operations with `deliverySequence >
+	 * afterDeliverySequence`. Optional; lets a handshake stop judging which nodes a
+	 * scoped client will hear from as soon as every candidate was found visible.
+	 */
+	getNodeIdsAfterDelivery?(afterDeliverySequence: number): Promise<string[]>
 
 	/**
 	 * Bind a client node id to the authenticated principal that first used it.

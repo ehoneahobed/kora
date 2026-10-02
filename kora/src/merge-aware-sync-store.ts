@@ -57,6 +57,11 @@ export class MergeAwareSyncStore implements SyncStore {
 		return snapshot ? snapshot.record : null
 	}
 
+	/** Whether the local schema defines this collection (unknown ones are quarantined). */
+	hasCollection(collection: string): boolean {
+		return this.store.getSchema().collections[collection] !== undefined
+	}
+
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
 		return this.pipeline.applyRemote(op)
 	}
@@ -77,6 +82,39 @@ export class MergeAwareSyncStore implements SyncStore {
 	 */
 	async rotateNodeId(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }> {
 		return this.store.rotateNodeId(ids)
+	}
+
+	/** Move back to a node id this database used before (RT-38). */
+	bindPrincipal(principal: string): ReturnType<Store['bindPrincipal']> {
+		return this.store.bindPrincipal(principal)
+	}
+
+	async switchNodeId(nodeId: string): Promise<void> {
+		await this.store.switchNodeId(nodeId)
+	}
+
+	/** Durability barrier before an upload (RT-35). */
+	async ensureDurable(): Promise<void> {
+		await this.store.ensureDurable()
+	}
+
+	/** Raise a local node's sequence counter past numbers the server holds (RT-35). */
+	raiseSequenceFloor(nodeId: string, floor: number): Promise<boolean> {
+		return this.store.raiseSequenceFloor(nodeId, floor)
+	}
+
+	/** Renumber an operation refused with SEQUENCE_CONFLICT, keeping its id (RT-35). */
+	resequenceOperation(
+		operationId: string,
+		nodeId: string,
+		floor: number,
+	): Promise<Operation | null> {
+		return this.store.resequenceOperation(operationId, nodeId, floor)
+	}
+
+	/** Take over a closed tab's node id (RT-40). */
+	claimLocalNode(nodeId: string): Promise<(() => void) | null> {
+		return this.store.claimLocalNode(nodeId)
 	}
 
 	/**

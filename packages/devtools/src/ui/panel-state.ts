@@ -204,6 +204,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
 		case 'sync:node-id-rotated':
 			return `node id rotated (${event.reenqueuedCount} ops re-queued)`
+		case 'sync:local-node':
+			return `local node ${event.nodeId} ${event.action}`
 		case 'sync:clock-rebase':
 			return `clock rebase ${event.rebasedCount} ops (${Math.round(event.maxSkewMs / 1000)}s ahead)`
 		case 'sync:schema-mismatch':
@@ -246,6 +248,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `delivery gap expected ${event.expectedBase} received ${event.receivedBase}`
 		case 'sync:delivery-stalled':
 			return `delivery unacknowledged ${event.watermark} → ${event.outstandingMaxDeliverySequence} (${event.repeatCount} repeats)`
+		case 'sync:durability-degraded':
+			return `local durability degraded after ${event.failedAttempts} failed barriers: ${event.message}`
+		case 'sync:durability-restored':
+			return 'local durability restored'
 		case 'awareness:updated':
 			return `awareness ${event.states.size} peers`
 		case 'state-machine:transition':
@@ -264,6 +270,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `store durability lost (${event.reason} during ${event.phase}), writes refused`
 		case 'store:db-name-collision':
 			return `store db-name collision ${event.dbName}`
+		case 'store:storage-blocked':
+			return `store ${event.resource} ${event.state === 'waiting' ? 'blocked by another holder' : 'unblocked'}`
+		case 'store:storage-migrated':
+			return `store migrated ${event.from} → ${event.to}`
 		case 'replay:completed':
 			return `replay ${event.operationsApplied} ops`
 	}

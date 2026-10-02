@@ -161,6 +161,39 @@ describe('SqliteWasmAdapter', () => {
 		})
 	})
 
+	describe('isolation from open transactions (STORE-8)', () => {
+		const ins =
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)'
+
+		test('a non-transactional write issued mid-transaction survives its rollback', async () => {
+			let reached: () => void = () => {}
+			const midTx = new Promise<void>((r) => {
+				reached = r
+			})
+			let resume: () => void = () => {}
+			const gate = new Promise<void>((r) => {
+				resume = r
+			})
+			const tx = adapter
+				.transaction(async (t) => {
+					await t.execute(ins, ['tx-row', 'tx', 0, 1, 1])
+					reached()
+					await gate
+					throw new Error('validation failure')
+				})
+				.catch(() => undefined)
+			await midTx
+			const independent = adapter.execute(ins, ['independent', 'x', 0, 1, 1])
+			const read = adapter.query<{ id: string }>('SELECT id FROM todos')
+			resume()
+			await Promise.all([tx, independent])
+			// The read waited for the transaction: it never saw the rolled-back row.
+			expect((await read).map((r) => r.id)).toEqual(['independent'])
+			const rows = await adapter.query<{ id: string }>('SELECT id FROM todos')
+			expect(rows.map((r) => r.id)).toEqual(['independent'])
+		})
+	})
+
 	describe('close', () => {
 		test('can close and is safe to close twice', async () => {
 			await adapter.close()

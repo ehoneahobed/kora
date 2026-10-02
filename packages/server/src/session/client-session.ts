@@ -4,6 +4,7 @@ import type {
 	OperationTransform,
 	RecordFieldVersions,
 	SchemaDefinition,
+	VersionVector,
 } from '@korajs/core'
 import { applyOperationTransforms } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
@@ -36,7 +37,8 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import { applyServerOperation } from '../apply/apply-server-operation'
+import { scopeViewKey } from '@korajs/sync/internal'
+import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
@@ -65,25 +67,54 @@ import {
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type {
 	DeliveredOperation,
+	LegacySequencePair,
 	MaterializedRecord,
+	OperationResolution,
+	OperationResolutionOutcome,
 	OperationScopeSnapshot,
 	ServerStore,
+	StoredOperationKey,
 } from '../store/server-store'
+import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
+	BATCH_LOOKUP_RATE_COST,
 	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
+	type IngestRateLimiter,
 	SessionRateLimiter,
 	validateOperationSize,
 } from './session-operation-limits'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+/** Default time a connection has to send its handshake before it is closed (SRV-6). */
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
+/**
+ * Default outbound bytes queued on the socket above which the delivery stream pauses
+ * until the client drains it (SRV-5/SRV-6 backpressure): 1 MiB.
+ */
+export const DEFAULT_DELIVERY_HIGH_WATER_BYTES = 1024 * 1024
+/** How often a paused delivery stream re-checks the transport's queued bytes. */
+const DELIVERY_DRAIN_POLL_MS = 25
+/**
+ * Longest wait between re-sends of an unacknowledged delivery (the stale window
+ * doubles on every re-send without progress, LMS #12): five minutes.
+ */
+export const MAX_DELIVERY_RETRANSMIT_BACKOFF_MS = 5 * 60_000
+/** Delivery retransmit timeout before any round trip was measured. */
+const INITIAL_DELIVERY_RTO_MS = 2_000
+/** Floor of the measured delivery retransmit timeout. */
+const MIN_DELIVERY_RTO_MS = 1_000
+/** Ceiling of the measured delivery retransmit timeout (before backoff). */
+const MAX_DELIVERY_RTO_MS = 60_000
+/** Unacknowledged batches remembered for round-trip samples. */
+const MAX_TRACKED_UNACKED_BATCHES = 4096
 /** setTimeout's largest delay; longer credential lifetimes are re-armed in steps. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 /** Revocations remembered for a session whose handshake has not resolved its principal. */
@@ -425,6 +456,32 @@ export interface ClientSessionOptions {
 	 * A provisional anonymous claim is never re-issued away from a connected device.
 	 */
 	isNodeLive?: (nodeId: string, exceptSessionId: string) => boolean
+	/**
+	 * Time a new connection has to deliver its handshake, in ms (SRV-6). A connection
+	 * that sends none is closed with `HANDSHAKE_TIMEOUT`. Defaults to 10 seconds; 0
+	 * disables the deadline.
+	 */
+	handshakeTimeoutMs?: number
+	/**
+	 * Queued outbound bytes above which the delivery stream pauses until the client
+	 * drains its socket (transports that report `bufferedAmount`). Defaults to 1 MiB.
+	 */
+	deliveryHighWaterBytes?: number
+	/**
+	 * The ingest rate limiter for a node, shared across that node's sessions so a
+	 * reconnect does not reset it (SRV-6). Called once the handshake binds the node,
+	 * with the authenticated principal's user id (null for anonymous and
+	 * unauthenticated sessions) so a per-user budget can be layered on top: a user
+	 * minting node ids must not multiply the per-node budget.
+	 * Without it the session keeps a private limiter.
+	 */
+	rateLimiterFor?: (nodeId: string, principal: string | null) => IngestRateLimiter
+	/**
+	 * Interval of the application-level heartbeat sent to clients that advertised
+	 * support for it, in ms (LMS #12). The handshake response tells the client the
+	 * interval so it can declare the connection dead after missing two. 0 disables it.
+	 */
+	appHeartbeatIntervalMs?: number
 }
 
 /**
@@ -481,28 +538,72 @@ export class ClientSession {
 	private clientDeliveryWatermark: number | null = null
 	/**
 	 * The highest delivery sequence this client has ACKNOWLEDGED (its confirmed
-	 * watermark, as reported in acks). Incremental streaming pushes resume from here, not
-	 * from the highest sequence sent, so a dropped or unapplied batch is always
-	 * re-included by the next push (which re-scans from the acknowledged position). This
-	 * is what makes streaming recovery independent of any bounded retransmit buffer: there
-	 * is no sent-but-unacked window that a buffer eviction could strand. Seeded from the
-	 * client's reported watermark at handshake.
+	 * watermark, as reported in acks). A retransmission rewinds the send cursor to here,
+	 * so a dropped or unapplied batch is always re-included by a re-scan from the
+	 * acknowledged position: recovery never depends on a bounded retransmit buffer.
+	 * Seeded from the client's reported watermark at handshake.
 	 */
 	private lastAckedDeliverySeq = 0
 	/**
-	 * Timestamp of the last delivery-stream send attempt. Periodic retransmission uses
-	 * this as its stale window so a slow client does not receive duplicate full-stream
-	 * batches every server tick while the first batch is still being applied.
+	 * The delivery send cursor (SRV-3): the max of the last batch sent. Live pushes
+	 * chain from it (base = lastSent), so each operation goes out once per retransmit
+	 * epoch instead of the whole unacknowledged backlog on every write. Invariant:
+	 * lastAcked <= lastSent. It rewinds to lastAcked only when the outstanding delivery
+	 * went unacknowledged for the (backed-off) stale window.
 	 */
-	private lastDeliveryPushAttemptAtMs = 0
-	private outstandingDelivery: {
-		base: number
-		max: number
-		sentAtMs: number
-		repeatCount: number
-	} | null = null
-	/** Serializes incremental delivery pushes so their batches never interleave. */
+	private lastSentDeliverySeq = 0
+	/** The highest batch max ever sent to this client (acks are capped by it). */
+	private highestSentDeliverySeq = 0
+	/**
+	 * Own-node operations at or below this delivery sequence are streamed to this
+	 * client; above it they are skipped (it uploaded them itself). Set at handshake: a
+	 * full resync (watermark 0) recovers the client's own history up to the frontier
+	 * at that moment; a resume excludes all of them.
+	 */
+	private ownOperationsIncludedThrough = 0
+	/** When the delivery last made progress (an ack advanced, or a fresh send/rewind). */
+	private lastDeliveryProgressAtMs = 0
+	/** Consecutive rewinds without acknowledgment progress (drives the backoff, LMS #12). */
+	private deliveryRewinds = 0
+	/**
+	 * Sent, not yet acknowledged delivery batches in send order (their max and send
+	 * time), for round-trip samples. `resent` marks a re-sent range, which yields no
+	 * sample (Karn's rule: its ack cannot be matched to one transmission).
+	 */
+	private readonly unackedBatches: Array<{ max: number; sentAtMs: number; resent: boolean }> = []
+	private smoothedRttMs: number | null = null
+	private rttVarianceMs = 0
+	/**
+	 * Retransmit timeout of the delivery stream (RFC 6298 style: smoothed round trip
+	 * plus four deviations, floored). An outstanding delivery with no acknowledgment
+	 * progress for this long (doubled per consecutive re-send) is re-sent from the
+	 * acknowledged position. Round trips include the client's apply time, so a slow
+	 * device earns a longer timeout instead of spurious re-sends.
+	 */
+	private retransmitTimeoutMs = INITIAL_DELIVERY_RTO_MS
+	private retransmitTimer: ReturnType<typeof setTimeout> | null = null
+	/** A delivery push is queued but not started: further wake-ups coalesce into it. */
+	private deliveryPushQueued = false
+	/** Serializes delivery pushes so their batches never interleave. */
 	private deliveryPushChain: Promise<void> = Promise.resolve()
+	/**
+	 * Records prefetched for the delivery chunk being filtered (LMS #11: one batched
+	 * lookup per collection per chunk instead of one query per operation). Keyed
+	 * `collection\u0000id`; null marks a record known to be absent. Only set while a
+	 * chunk is filtered.
+	 */
+	private recordLookupCache: Map<string, MaterializedRecord | null> | null = null
+	private readonly deliveryHighWaterBytes: number
+	private readonly handshakeTimeoutMs: number
+	private handshakeTimer: ReturnType<typeof setTimeout> | null = null
+	private handshakeReceived = false
+	private readonly rateLimiterFor:
+		| ((nodeId: string, principal: string | null) => IngestRateLimiter)
+		| null
+	private readonly appHeartbeatIntervalMs: number
+	private appHeartbeatTimer: ReturnType<typeof setInterval> | null = null
+	/** Last time anything was sent to the client (a heartbeat is skipped when recent). */
+	private lastClientSendAtMs = 0
 
 	/**
 	 * Relay batches sent to this client but not yet acknowledged, keyed by messageId.
@@ -545,7 +646,7 @@ export class ClientSession {
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
-	private readonly rateLimiter: SessionRateLimiter
+	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
 	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
@@ -554,6 +655,15 @@ export class ClientSession {
 	private rejectedBatches = 0
 	/** Blob chunk requests answered "not held" because the session was over budget (RT-17). */
 	private rateLimitedBlobRequests = 0
+	/**
+	 * The client advertised the `sequenceReservation` handshake capability (RT-37): it
+	 * reserves sequence numbers in-transaction, so a second operation under a held
+	 * (node, sequence) is refused with SEQUENCE_CONFLICT. False for a legacy client
+	 * (Kora <= beta.13), whose duplicate pairs are stored instead.
+	 */
+	private sequenceReservation = false
+	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
+	private legacySequencePairs = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -601,12 +711,32 @@ export class ClientSession {
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
+		this.deliveryHighWaterBytes =
+			options.deliveryHighWaterBytes ?? DEFAULT_DELIVERY_HIGH_WATER_BYTES
+		this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
+		this.rateLimiterFor = options.rateLimiterFor ?? null
+		this.appHeartbeatIntervalMs = options.appHeartbeatIntervalMs ?? 0
 	}
 
 	/**
 	 * Start handling messages from the client transport.
 	 */
 	start(): void {
+		// A connection that never handshakes would hold a session (and a connection
+		// slot) forever (SRV-6): close it once the deadline passes.
+		if (this.handshakeTimeoutMs > 0) {
+			this.handshakeTimer = setTimeout(() => {
+				this.handshakeTimer = null
+				if (this.handshakeReceived || this.state === 'closed') return
+				this.sendError(
+					'HANDSHAKE_TIMEOUT',
+					`No handshake within ${String(this.handshakeTimeoutMs)} ms of connecting.`,
+					true,
+				)
+				this.close('handshake timeout')
+			}, this.handshakeTimeoutMs)
+			;(this.handshakeTimer as { unref?: () => void }).unref?.()
+		}
 		this.transport.onMessage((msg) => this.enqueueMessage(msg))
 		this.transport.onClose((_code, _reason) => this.handleTransportClose())
 		this.transport.onError((_err) => {
@@ -629,7 +759,7 @@ export class ClientSession {
 		// the fan-out are only a wake-up: the push pulls everything in scope after the send
 		// cursor from the delivery log, which is the authoritative, contiguous order.
 		if (this.clientDeliveryWatermark !== null) {
-			this.pushDeliveryStream()
+			this.pushDeliveryStream('continue')
 			return
 		}
 		if (operations.length === 0) return
@@ -639,59 +769,42 @@ export class ClientSession {
 	}
 
 	/**
-	 * Push newly-available in-scope operations to a delivery-watermark client, resuming
-	 * from the highest delivery sequence already sent. Pushes are serialized so their
-	 * batches never interleave (which would break the base/max chain).
+	 * Push newly-available in-scope operations to a delivery-watermark client, chained
+	 * from the send cursor (SRV-3): only what was not sent yet goes out. `rewind`
+	 * first moves the cursor back to the acknowledged position (a retransmission), and
+	 * `initial` is the handshake stream (it always ends in a final batch, even an empty
+	 * one, so the client completes initial sync). Pushes are serialized so their batches
+	 * never interleave (which would break the base/max chain); wake-ups that arrive
+	 * while one is queued coalesce into it.
 	 */
-	private pushDeliveryStream(options: { trackStall?: boolean } = {}): void {
+	private pushDeliveryStream(mode: 'continue' | 'rewind' | 'initial' = 'continue'): void {
+		if (mode === 'continue') {
+			if (this.deliveryPushQueued) return
+			this.deliveryPushQueued = true
+		}
 		this.deliveryPushChain = this.deliveryPushChain.then(async () => {
+			if (mode === 'continue') this.deliveryPushQueued = false
 			if (this.state !== 'streaming' || !this.transport.isConnected()) return
 			try {
-				const previous = this.outstandingDelivery
-				if (options.trackStall && previous && previous.max > this.lastAckedDeliverySeq) {
-					previous.repeatCount += 1
-					if (previous.repeatCount >= 3) {
-						this.emitter?.emit({
-							type: 'sync:delivery-stalled',
-							sessionId: this.sessionId,
-							watermark: this.lastAckedDeliverySeq,
-							outstandingMaxDeliverySequence: previous.max,
-							repeatCount: previous.repeatCount,
-							reason: 'unacknowledged-delivery',
-						})
-					}
+				if (mode === 'rewind' && this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
+					this.lastSentDeliverySeq = this.lastAckedDeliverySeq
+					this.lastDeliveryProgressAtMs = Date.now()
+					// Earlier transmissions can no longer be matched to their acks (Karn).
+					this.unackedBatches.length = 0
 				}
-				this.lastDeliveryPushAttemptAtMs = Date.now()
-				// Resume from the client's last acknowledged sequence, not the last sent, so a
-				// dropped or unapplied batch is re-included here. Exclude the client's own
-				// operations during streaming; it already has them.
-				const result = await this.sendDeliveryStream(
-					this.lastAckedDeliverySeq,
-					false,
-					this.clientNodeId ?? undefined,
-				)
-				if (result.sent && result.maxScanned > this.lastAckedDeliverySeq) {
-					if (
-						!this.outstandingDelivery ||
-						this.outstandingDelivery.base !== this.lastAckedDeliverySeq ||
-						this.outstandingDelivery.max !== result.maxScanned
-					) {
-						this.outstandingDelivery = {
-							base: this.lastAckedDeliverySeq,
-							max: result.maxScanned,
-							sentAtMs: Date.now(),
-							repeatCount: 0,
-						}
-					} else {
-						this.outstandingDelivery.sentAtMs = Date.now()
-					}
-				} else if (result.maxScanned <= this.lastAckedDeliverySeq) {
-					this.outstandingDelivery = null
-				}
-			} catch {
-				// A failed push (e.g. a transient store read error) must not reject the chain
-				// and stall all future pushes. The next push, or a reconnect resend from the
-				// client's watermark, recovers anything this push did not deliver.
+				await this.streamDelivery(this.lastSentDeliverySeq, mode === 'initial')
+			} catch (error) {
+				// A failed push (for example a transient store read error) must not reject the
+				// chain and stall every future push. What it did not send stays above the send
+				// cursor, so the next wake-up (a relay or the delivery poll) sends it.
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.delivery_push_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+				})
 			}
 		})
 	}
@@ -744,10 +857,17 @@ export class ClientSession {
 	 * Retransmit relay batches this client has not acknowledged within `staleMs`.
 	 * Called on a periodic tick by the server (and directly by tests). Redelivering an
 	 * already-applied op is harmless: the client dedups by content-addressed id.
+	 *
+	 * For a delivery-watermark client it re-sends an outstanding (sent, unacknowledged)
+	 * delivery from the acknowledged position, under the same backed-off window as the
+	 * retransmit timer; `staleMs` 0 re-sends at once (a deterministic trigger for tests).
 	 */
 	retransmitPendingRelays(staleMs = 0): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark !== null) {
+			if (this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
+				this.pushDeliveryStreamIfSupported(staleMs, { serverFrontier: this.lastSentDeliverySeq })
+			}
 			return
 		}
 		if (this.pendingRelays.size === 0) return
@@ -761,9 +881,14 @@ export class ClientSession {
 
 	/**
 	 * Wake the durable delivery stream for clients that negotiated delivery
-	 * watermarks. This is used both for dropped watermark batches and for operations
-	 * appended by another server/store instance: the session always scans from its
-	 * own acknowledged cursor and applies its visibility filter before sending.
+	 * watermarks: for operations appended by another server/store instance (sent from
+	 * the send cursor), and for a delivery that went unacknowledged (re-sent from the
+	 * acknowledged position once it made no progress for `staleMs`, backed off while it
+	 * stays stuck). `staleMs` 0 re-sends at once.
+	 *
+	 * @param staleMs - Base stale window before an unacknowledged delivery is re-sent
+	 * @param options - `serverFrontier`: the store's max delivery sequence, when known;
+	 *   `trackStall`: emit `sync:delivery-stalled` after repeated re-sends
 	 */
 	pushDeliveryStreamIfSupported(
 		staleMs = 0,
@@ -771,17 +896,193 @@ export class ClientSession {
 	): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark === null) return
-		if (
-			options.serverFrontier !== undefined &&
-			options.serverFrontier <= this.lastAckedDeliverySeq
+		const frontier = options.serverFrontier
+		if (frontier !== undefined && frontier <= this.lastAckedDeliverySeq) {
+			// Everything is acknowledged: nothing to send or re-send.
+			this.deliveryRewinds = 0
+			return
+		}
+		if (frontier !== undefined && frontier > this.lastSentDeliverySeq) {
+			// New operations (possibly committed through another instance): send them.
+			this.pushDeliveryStream('continue')
+			return
+		}
+		if (this.lastSentDeliverySeq <= this.lastAckedDeliverySeq) {
+			// Nothing outstanding. Without a known frontier, look for anything new.
+			if (frontier === undefined) this.pushDeliveryStream('continue')
+			return
+		}
+		// Everything is sent but not all acknowledged. The retransmit timer normally
+		// handles this; the poll is a safety net with the same rule: re-send from the
+		// acknowledged position only once the delivery made no progress for the window
+		// (backed off while it stays stuck), so a client that cannot apply (or a
+		// half-open socket) is not re-sent its backlog forever (LMS #12).
+		if (this.transportBufferedAmount() > 0) return // still draining what was sent
+		const window =
+			staleMs <= 0
+				? 0
+				: Math.max(
+						this.retransmitWindowMs(),
+						Math.min(
+							staleMs * 2 ** Math.min(this.deliveryRewinds, 16),
+							MAX_DELIVERY_RETRANSMIT_BACKOFF_MS,
+						),
+					)
+		if (Date.now() - this.lastDeliveryProgressAtMs < window) return
+		this.rewindDelivery(options.trackStall === true)
+	}
+
+	/** Book-keeping for one sent delivery batch ending at `max`. */
+	private recordDeliverySent(max: number): void {
+		const now = Date.now()
+		if (max <= this.lastAckedDeliverySeq) return
+		if (this.lastSentDeliverySeq <= this.lastAckedDeliverySeq) {
+			// A new outstanding delivery: its retransmit window starts now.
+			this.lastDeliveryProgressAtMs = now
+		}
+		const resent = max <= this.highestSentDeliverySeq
+		if (max > this.lastSentDeliverySeq) this.lastSentDeliverySeq = max
+		if (max > this.highestSentDeliverySeq) this.highestSentDeliverySeq = max
+		this.unackedBatches.push({ max, sentAtMs: now, resent })
+		if (this.unackedBatches.length > MAX_TRACKED_UNACKED_BATCHES) this.unackedBatches.shift()
+		this.armRetransmitTimer()
+	}
+
+	/**
+	 * A delivery acknowledgment: advance the confirmed watermark (a retransmission
+	 * rewinds to it), take a round-trip sample, and reset the backoff. The watermark
+	 * never passes what was sent: a client cannot acknowledge what it never received.
+	 */
+	private noteDeliveryAcked(deliverySequence: number): void {
+		const acked = Math.min(deliverySequence, this.highestSentDeliverySeq)
+		if (acked <= this.lastAckedDeliverySeq) return
+		const now = Date.now()
+		this.lastAckedDeliverySeq = acked
+		this.lastDeliveryProgressAtMs = now
+		this.deliveryRewinds = 0
+		// An ack of a batch sent before a rewind: the re-send skips what it covers.
+		if (this.lastSentDeliverySeq < acked) this.lastSentDeliverySeq = acked
+		let sample: number | null = null
+		while (this.unackedBatches.length > 0) {
+			const first = this.unackedBatches[0]
+			if (!first || first.max > acked) break
+			this.unackedBatches.shift()
+			sample = first.resent ? null : now - first.sentAtMs
+		}
+		if (sample !== null) this.recordRoundTrip(sample)
+		this.armRetransmitTimer()
+	}
+
+	/** Fold one round-trip sample into the retransmit timeout (RFC 6298). */
+	private recordRoundTrip(sampleMs: number): void {
+		const sample = Math.max(0, sampleMs)
+		if (this.smoothedRttMs === null) {
+			this.smoothedRttMs = sample
+			this.rttVarianceMs = sample / 2
+		} else {
+			this.rttVarianceMs = 0.75 * this.rttVarianceMs + 0.25 * Math.abs(this.smoothedRttMs - sample)
+			this.smoothedRttMs = 0.875 * this.smoothedRttMs + 0.125 * sample
+		}
+		this.retransmitTimeoutMs = Math.min(
+			MAX_DELIVERY_RTO_MS,
+			Math.max(MIN_DELIVERY_RTO_MS, this.smoothedRttMs + 4 * this.rttVarianceMs),
+		)
+	}
+
+	/**
+	 * The current retransmit window: the timeout, which each re-send doubled (up to
+	 * five minutes) and which only a fresh round-trip sample brings back down.
+	 */
+	private retransmitWindowMs(): number {
+		return Math.min(this.retransmitTimeoutMs, MAX_DELIVERY_RETRANSMIT_BACKOFF_MS)
+	}
+
+	/**
+	 * (Re)arm the retransmit timer for the outstanding delivery: it fires once no
+	 * acknowledgment progress was made for the retransmit window.
+	 */
+	private armRetransmitTimer(): void {
+		if (this.retransmitTimer !== null) {
+			clearTimeout(this.retransmitTimer)
+			this.retransmitTimer = null
+		}
+		if (this.state === 'closed' || this.lastSentDeliverySeq <= this.lastAckedDeliverySeq) return
+		const due = this.lastDeliveryProgressAtMs + this.retransmitWindowMs() - Date.now()
+		this.retransmitTimer = setTimeout(
+			() => {
+				this.retransmitTimer = null
+				this.onRetransmitTimeout()
+			},
+			Math.max(0, due),
+		)
+		;(this.retransmitTimer as { unref?: () => void }).unref?.()
+	}
+
+	/**
+	 * No acknowledgment progress for the retransmit window: re-send from the
+	 * acknowledged position (the batch was dropped, or the client could not apply it),
+	 * unless the socket is still draining what was sent.
+	 */
+	private onRetransmitTimeout(): void {
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.lastSentDeliverySeq <= this.lastAckedDeliverySeq) return
+		if (Date.now() - this.lastDeliveryProgressAtMs < this.retransmitWindowMs()) {
+			this.armRetransmitTimer()
+			return
+		}
+		if (this.transportBufferedAmount() > 0) {
+			// Still writing to a slow link: that is not a loss. Look again later.
+			this.lastDeliveryProgressAtMs = Date.now()
+			this.armRetransmitTimer()
+			return
+		}
+		this.rewindDelivery(true)
+	}
+
+	/** Re-send the outstanding delivery from the acknowledged position. */
+	private rewindDelivery(trackStall: boolean): void {
+		this.deliveryRewinds += 1
+		// Exponential backoff that survives acknowledgment progress until a fresh
+		// round-trip sample (RFC 6298 5.5-5.7): acks of re-sent batches give no sample.
+		this.retransmitTimeoutMs = Math.min(
+			this.retransmitTimeoutMs * 2,
+			MAX_DELIVERY_RETRANSMIT_BACKOFF_MS,
+		)
+		if (trackStall && this.deliveryRewinds >= 3) {
+			this.emitter?.emit({
+				type: 'sync:delivery-stalled',
+				sessionId: this.sessionId,
+				watermark: this.lastAckedDeliverySeq,
+				outstandingMaxDeliverySequence: this.lastSentDeliverySeq,
+				repeatCount: this.deliveryRewinds,
+				reason: 'unacknowledged-delivery',
+			})
+		}
+		this.pushDeliveryStream('rewind')
+	}
+
+	/** Bytes queued on the transport and not yet written to the network (0 if unknown). */
+	private transportBufferedAmount(): number {
+		const amount = this.transport.bufferedAmount?.()
+		return typeof amount === 'number' && Number.isFinite(amount) ? amount : 0
+	}
+
+	/**
+	 * Wait until the transport's queued bytes drop to the high-water mark (SRV-5
+	 * backpressure), so a slow client never makes the server buffer the whole stream
+	 * in socket memory. Resolves early when the session closes.
+	 */
+	private async waitForSendWindow(): Promise<void> {
+		while (
+			this.state !== 'closed' &&
+			this.transport.isConnected() &&
+			this.transportBufferedAmount() > this.deliveryHighWaterBytes
 		) {
-			this.outstandingDelivery = null
-			return
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, DELIVERY_DRAIN_POLL_MS)
+				;(timer as { unref?: () => void }).unref?.()
+			})
 		}
-		if (staleMs > 0 && Date.now() - this.lastDeliveryPushAttemptAtMs < staleMs) {
-			return
-		}
-		this.pushDeliveryStream({ trackStall: options.trackStall })
 	}
 
 	/**
@@ -808,7 +1109,7 @@ export class ClientSession {
 	close(reason?: string): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
-		this.clearExpiryTimer()
+		this.clearSessionTimers()
 		this.flushOrphanedRelays()
 
 		if (this.transport.isConnected()) {
@@ -922,6 +1223,40 @@ export class ClientSession {
 		)
 	}
 
+	/** Clear every timer this session owns (expiry, handshake deadline, heartbeat). */
+	private clearSessionTimers(): void {
+		this.clearExpiryTimer()
+		if (this.handshakeTimer !== null) {
+			clearTimeout(this.handshakeTimer)
+			this.handshakeTimer = null
+		}
+		if (this.appHeartbeatTimer !== null) {
+			clearInterval(this.appHeartbeatTimer)
+			this.appHeartbeatTimer = null
+		}
+		if (this.retransmitTimer !== null) {
+			clearTimeout(this.retransmitTimer)
+			this.retransmitTimer = null
+		}
+	}
+
+	/**
+	 * Start the application-level heartbeat for a client that advertised support for it
+	 * (LMS #12): a `heartbeat` message whenever nothing else was sent for an interval,
+	 * so the client can detect a dead connection it cannot see (browsers never surface
+	 * WebSocket pings).
+	 */
+	private startAppHeartbeat(): void {
+		if (this.appHeartbeatIntervalMs <= 0 || this.appHeartbeatTimer !== null) return
+		const interval = this.appHeartbeatIntervalMs
+		this.appHeartbeatTimer = setInterval(() => {
+			if (this.state === 'closed') return
+			if (Date.now() - this.lastClientSendAtMs < interval / 2) return
+			this.sendToClient({ type: 'heartbeat', messageId: generateUUIDv7() })
+		}, interval)
+		;(this.appHeartbeatTimer as { unref?: () => void }).unref?.()
+	}
+
 	/**
 	 * Arm the expiry timer from `AuthContext.expiresAt`. Returns false when the
 	 * credential has already expired (the caller refuses the handshake).
@@ -1004,6 +1339,21 @@ export class ClientSession {
 	}
 
 	/**
+	 * True when the client did not advertise the `sequenceReservation` capability
+	 * (RT-37): a legacy client (Kora <= beta.13) that may give two operations one
+	 * sequence number. Such a pair is stored and delivered, never refused with
+	 * SEQUENCE_CONFLICT. Meaningful once the handshake was accepted.
+	 */
+	isLegacySequenceClient(): boolean {
+		return !this.sequenceReservation
+	}
+
+	/** Legacy duplicate (node, sequence) pairs this session stored (RT-37). */
+	getLegacySequencePairCount(): number {
+		return this.legacySequencePairs
+	}
+
+	/**
 	 * True when a stored record is inside this session's download scope, so a side
 	 * channel (for example a Yjs doc update) about it may be delivered here. A record
 	 * not stored yet is judged by its id alone.
@@ -1052,6 +1402,7 @@ export class ClientSession {
 		}
 		try {
 			this.transport.send(message)
+			this.lastClientSendAtMs = Date.now()
 			return true
 		} catch {
 			return false
@@ -1059,6 +1410,14 @@ export class ClientSession {
 	}
 
 	private enqueueMessage(message: SyncMessage): void {
+		if (message.type === 'handshake' && !this.handshakeReceived) {
+			// The deadline covers the handshake's arrival, not its (possibly slow) auth.
+			this.handshakeReceived = true
+			if (this.handshakeTimer !== null) {
+				clearTimeout(this.handshakeTimer)
+				this.handshakeTimer = null
+			}
+		}
 		this.messageChain = this.messageChain
 			.then(() => this.handleMessageAsync(message))
 			.catch((error) => this.handleMessageFailure(error))
@@ -1092,19 +1451,14 @@ export class ClientSession {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
 				if (message.deliverySequence !== undefined) {
-					// Advance the confirmed watermark; the next streaming push resumes here.
-					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
-					if (
-						this.outstandingDelivery &&
-						this.lastAckedDeliverySeq >= this.outstandingDelivery.max
-					) {
-						this.outstandingDelivery = null
-					} else if (this.outstandingDelivery) {
-						this.outstandingDelivery.repeatCount = 0
-					}
+					// Advance the confirmed watermark (a retransmission rewinds to it). It never
+					// passes the send cursor: a client cannot acknowledge what was not sent.
+					this.noteDeliveryAcked(message.deliverySequence)
 				}
 				break
 			case 'error':
+			case 'heartbeat':
+				// A client liveness probe needs no answer: receiving it is the point.
 				break
 			case 'awareness-update':
 				this.handleAwarenessUpdate(message)
@@ -1375,6 +1729,7 @@ export class ClientSession {
 
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
+		this.sequenceReservation = msg.sequenceReservation === true
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -1522,16 +1877,25 @@ export class ClientSession {
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
 		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
 		// A delivery watermark is valid only for the exact server-visible view that
-		// earned it. When the server resolves a different scope than the client sent
-		// (common with server-auth scopes, promotions, or invite acceptance), the client
-		// cannot have keyed its local watermark by that authoritative view before this
-		// handshake. Reset to a full scoped backfill instead of trusting a cursor that may
-		// have advanced over previously hidden operations.
+		// earned it. `lastDeliverySequence` belongs to the scope the client REQUESTED.
+		// When the server resolves a different scope (server-auth scopes, promotions,
+		// invite acceptance), it resumes from the watermark the client reports for the
+		// accepted scope it last streamed under, if that scope has the same canonical key
+		// as the one resolved now (SYNC-11). Otherwise the resolved view is new to the
+		// client (for example a widened grant): a full scoped backfill from 0, never a
+		// cursor that may have advanced over operations hidden from its earlier view.
 		if (
 			this.clientDeliveryWatermark !== null &&
 			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes)
 		) {
-			this.clientDeliveryWatermark = 0
+			const acceptedWatermark = msg.acceptedScopeWatermark
+			const resumable =
+				typeof msg.acceptedScopeKey === 'string' &&
+				typeof acceptedWatermark === 'number' &&
+				Number.isSafeInteger(acceptedWatermark) &&
+				acceptedWatermark >= 0 &&
+				msg.acceptedScopeKey === scopeViewKey(this.authContext?.downlinkScopes)
+			this.clientDeliveryWatermark = resumable ? acceptedWatermark : 0
 		}
 
 		// Only read the server's delivery frontier when the client actually uses the
@@ -1551,7 +1915,6 @@ export class ClientSession {
 			}
 		}
 
-		const serverVector = this.store.getVersionVector()
 		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
 		this.setSerializerWireFormat(selectedWireFormat)
 
@@ -1582,36 +1945,58 @@ export class ClientSession {
 			return
 		}
 
-		// Collect the server->client stream before answering, so the response can describe
-		// exactly the nodes this client will hear from. A client that reports a delivery
-		// watermark gets the gap-free delivery stream (resumed from that watermark); an
-		// older client gets the version-vector delta. Both hold only in-scope operations.
+		// The version vector as committed in the store, shared by every server instance
+		// (SRV-4), not this instance's cache.
+		const serverVector = await this.readServerVector()
 		const clientVector = wireToVersionVector(msg.versionVector)
-		const excludeOwn =
-			this.clientDeliveryWatermark !== null && this.clientDeliveryWatermark > 0
-				? (this.clientNodeId ?? undefined)
-				: undefined
-		const deliveryPlan =
-			this.clientDeliveryWatermark !== null
-				? await this.collectDeliveryStream(this.clientDeliveryWatermark, excludeOwn)
-				: null
-		const deltaPlan = deliveryPlan === null ? await this.collectDeltaOperations(clientVector) : []
+		// A client that reports a delivery watermark gets the gap-free delivery stream,
+		// streamed after the response (SRV-5: never collected whole). An older client gets
+		// the version-vector delta, collected before answering. Both hold only in-scope
+		// operations.
+		const deltaPlan =
+			this.clientDeliveryWatermark === null ? await this.collectDeltaOperations(clientVector) : []
 
 		// Only reveal vector entries for the client's own node and the nodes whose in-scope
 		// operations it is about to receive. The full vector would leak every device id and
 		// write count across tenants, and echoing the nodes the client names in its own
 		// vector would make the handshake a write-count oracle for any device id (RT-7).
-		// The client only reads its own entry (pending count and upload delta).
+		// The client merges these entries so the operations it receives are not counted
+		// as its own pending uploads. A delivery-stream client's stream is not collected
+		// in advance (SRV-5): an unscoped session may see every operation, so it gets the
+		// whole vector; a scoped one gets the nodes a metadata pre-pass finds visible.
+		// Clients of this release count pending from their own acks (RT-28) and would not
+		// need the pre-pass, but beta.13 clients count every node ahead of this vector as
+		// pending (and `kora compact` uses the persisted peer entries), so it stays. It
+		// starts at the resumed watermark (SYNC-11), so a reconnect scans only new ops.
 		const visibleNodes = new Set<string>([msg.nodeId])
-		const plannedOps = deliveryPlan
-			? deliveryPlan.deliverable.filter((item) => !item.retraction).map((item) => item.operation)
-			: deltaPlan
-		for (const op of plannedOps) {
+		for (const op of deltaPlan) {
 			visibleNodes.add(op.nodeId)
+		}
+		const unscoped = (this.authContext?.downlinkScopes ?? this.authContext?.scopes) === undefined
+		if (this.clientDeliveryWatermark !== null) {
+			if (unscoped) {
+				for (const nodeId of serverVector.keys()) visibleNodes.add(nodeId)
+			} else {
+				for (const nodeId of await this.collectVisibleNodeIds(this.clientDeliveryWatermark)) {
+					visibleNodes.add(nodeId)
+				}
+			}
 		}
 		const visibleServerVector = new Map(
 			[...serverVector].filter(([nodeId]) => visibleNodes.has(nodeId)),
 		)
+		// The session's own node is ALWAYS advertised, 0 when the server holds nothing of
+		// it (RT-45): a device must learn that the server lost its operations (restored
+		// from an older backup) to upload them again. The entry is the highest sequence
+		// the server has RESOLVED for the node (stored, validator-ignored, terminally
+		// refused, or stored under another number; RT-43), so an operation the server
+		// decided without storing is never read as lost and re-submitted at every
+		// reconnect. It names only the client's own node, so it discloses nothing (RT-7).
+		visibleServerVector.set(
+			msg.nodeId,
+			Math.max(serverVector.get(msg.nodeId) ?? 0, await this.resolvedThrough(msg.nodeId)),
+		)
+		const heartbeat = msg.supportsHeartbeat === true && this.appHeartbeatIntervalMs > 0
 
 		// Send handshake response with the visible version vector and accepted scope
 		const response: SyncMessage = {
@@ -1648,28 +2033,49 @@ export class ClientSession {
 				? { acceptedUplinkScopes: this.authContext.uplinkScopes }
 				: {}),
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
+			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
 
-		// Transition to syncing and send the collected server->client stream. Resuming
-		// from a non-zero watermark excludes the client's own operations (it already holds
-		// its history); a full resync (watermark 0) includes them so it recovers everything.
-		this.state = 'syncing'
-		if (this.clientDeliveryWatermark !== null && deliveryPlan !== null) {
-			this.lastAckedDeliverySeq = this.clientDeliveryWatermark
-			this.lastDeliveryPushAttemptAtMs = Date.now()
-			this.sendCollectedDeliveryStream(deliveryPlan, this.clientDeliveryWatermark, true)
-		} else {
-			this.sendCollectedDelta(deltaPlan)
+		// The ingest rate limit follows the node across reconnects (SRV-6): the node id
+		// is bound to this principal by now (claimed when auth is configured).
+		if (this.rateLimiterFor) {
+			const principal =
+				this.principal &&
+				this.principal.anonymous !== true &&
+				!(this.auth instanceof NoAuthProvider)
+					? this.principal.userId
+					: null
+			this.rateLimiter = this.rateLimiterFor(msg.nodeId, principal)
 		}
 
-		// Transition to streaming after delta is sent
-		if (this.state !== 'syncing') return
-		this.state = 'streaming'
+		if (this.clientDeliveryWatermark !== null) {
+			// Resuming from a non-zero watermark excludes the client's own operations (it
+			// already holds its history); a full resync (watermark 0) includes those
+			// committed so far, so it recovers everything.
+			const watermark = this.clientDeliveryWatermark
+			this.lastAckedDeliverySeq = watermark
+			this.lastSentDeliverySeq = watermark
+			this.highestSentDeliverySeq = watermark
+			this.ownOperationsIncludedThrough = watermark === 0 ? serverMaxDelivery : 0
+			this.lastDeliveryProgressAtMs = Date.now()
+			this.deliveryRewinds = 0
+			// The stream runs on the delivery chain, so this session keeps processing the
+			// client's acknowledgments and uploads while it streams (with backpressure).
+			this.state = 'streaming'
+			this.pushDeliveryStream('initial')
+		} else {
+			this.state = 'syncing'
+			this.sendCollectedDelta(deltaPlan)
+			// Transition to streaming after delta is sent
+			if (this.state !== 'syncing') return
+			this.state = 'streaming'
+		}
 		this.onReady?.(this.sessionId)
+		if (heartbeat) this.startAppHeartbeat()
 
 		// Redeliver any relays buffered while this client's node id was disconnected
 		// (dropped just before a prior reconnect). relayOperations re-filters them by
@@ -1680,11 +2086,69 @@ export class ClientSession {
 				this.relayOperations(buffered)
 			}
 		}
-		// A delivery-watermark client needs no explicit drain here: an operation committed
-		// during the handshake-scan-to-streaming window is picked up by the next streaming
-		// push (or the retransmit tick), which resumes from the client's acknowledged
-		// position. Draining here would re-scan from the not-yet-advanced acknowledged
-		// position and re-send the whole handshake stream.
+		// A delivery-watermark client needs no explicit drain here: the initial stream
+		// scans to the end of the log, and anything committed after its last scan is
+		// above the send cursor, where the next relay wake-up or delivery poll sends it.
+	}
+
+	/**
+	 * The nodes whose operations after `fromDeliverySeq` this scoped session will
+	 * receive, for the handshake vector (RT-7). Scans the delivery log without holding
+	 * it (memory is O(nodes)), and judges each node only until one of its operations is
+	 * visible, so most operations cost one scope comparison and no record read.
+	 */
+	private async collectVisibleNodeIds(fromDeliverySeq: number): Promise<Set<string>> {
+		const visible = new Set<string>()
+		// With the candidate list, the scan stops as soon as every candidate is known
+		// visible (typically after a few chunks); only nodes that never become visible
+		// (other tenants' devices) make it read to the end.
+		let pending: Set<string> | null = null
+		if (this.store.getNodeIdsAfterDelivery) {
+			try {
+				pending = new Set(await this.store.getNodeIdsAfterDelivery(fromDeliverySeq))
+			} catch {
+				pending = null
+			}
+		}
+		const scanChunk = Math.max(this.batchSize, 1) * 20
+		let cursor = fromDeliverySeq
+		while (this.state !== 'closed' && (pending === null || pending.size > 0)) {
+			const chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
+			const last = chunk[chunk.length - 1]
+			if (last === undefined) break
+			for (const delivered of chunk) {
+				const op = delivered.operation
+				if (visible.has(op.nodeId)) continue
+				if (await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null)) {
+					visible.add(op.nodeId)
+					pending?.delete(op.nodeId)
+				}
+			}
+			cursor = last.deliverySequence
+			if (chunk.length < scanChunk) break
+		}
+		return visible
+	}
+
+	/**
+	 * The version vector as committed in the store (SRV-4). A store shared by several
+	 * instances reads it fresh; others serve their own (complete) vector.
+	 */
+	private async readServerVector(): Promise<VersionVector> {
+		if (this.store.readVersionVector) {
+			try {
+				return await this.store.readVersionVector()
+			} catch (error) {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.version_vector_read_failed',
+					sessionId: this.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+		}
+		return this.store.getVersionVector()
 	}
 
 	/**
@@ -1810,22 +2274,79 @@ export class ClientSession {
 		let uniqueOperations = 0
 		let duplicateOperations = 0
 		let rejectedOperations = 0
+		// Which of the batch's ids the server already holds, read once per batch and
+		// before any other per-operation check. A device re-uploading its history (the
+		// one-time upgrade re-upload, or an op its sequence repair renumbered under the
+		// same id) must get a duplicate ack, never a rejection from today's authorization
+		// or validators for an operation the server already accepted (RT-31).
+		//
+		// Rate limiting (RT-6, RT-39): the lookup is charged once per batch
+		// (BATCH_LOOKUP_RATE_COST; the batch size is already capped), and an operation
+		// the lookup finds stored costs nothing more: acknowledging it writes nothing and
+		// reads nothing else. Every other operation is charged before anything touches
+		// the store for it. So a device's upgrade re-upload of thousands of stored
+		// operations is not cut off by RATE_LIMIT, while lookups still cost per batch.
+		let stored: Map<string, StoredOperationKey> = new Map()
+		let resolved: Map<string, OperationResolution> = new Map()
+		let lookupCredit = 0
+		if (operations.length > 0) {
+			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
+				lookupCredit = BATCH_LOOKUP_RATE_COST
+				stored = await this.findStoredOperations(operations)
+				resolved = await this.findResolutions(operations, stored)
+			} else {
+				this.rateLimitedOperations += operations.length
+				this.sendRateLimited()
+				canAdvanceAck = false
+			}
+		}
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
 				continue
 			}
 
+			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
+			if (this.isStoredDuplicate(op, stored)) {
+				await this.noteStoredElsewhere(op, stored)
+				duplicateOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
+			// Already resolved for this device without being stored (RT-43, RT-47): the
+			// original answer again, free of charge, and never a second judgement. A refused
+			// operation stays refused even when the device lost its rejection marker (a
+			// restored copy): re-running authorization and validators against today's state
+			// could apply a write the server refused. An ignored one is not handed to the
+			// validator again (its out-of-band effect must not repeat).
+			const resolution = resolved.get(op.id)
+			if (resolution) {
+				if (resolution.outcome === 'refused') {
+					this.sendOperationRejected(
+						op,
+						resolution.code ?? RESTRICTED_REJECTION_CODE,
+						resolution.message ?? 'This operation was refused earlier.',
+						false,
+					)
+					rejectedOperations += 1
+				} else {
+					duplicateOperations += 1
+				}
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
 			// Charge the rate limiter before anything that touches the store (RT-6): a
 			// refused operation (foreign node, out of scope) still costs a store read, so
-			// it must count against the budget like an accepted one.
-			if (!this.rateLimiter.allow(1)) {
+			// it must count against the budget like an accepted one. The batch's lookup
+			// unit pays for its first such operation, so a batch of N new operations costs
+			// N, exactly as before, and a batch of stored duplicates costs one.
+			if (lookupCredit > 0) {
+				lookupCredit -= 1
+			} else if (!this.rateLimiter.allow(1)) {
 				this.rateLimitedOperations += 1
-				this.sendError(
-					'RATE_LIMIT',
-					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
-					true,
-				)
+				this.sendRateLimited()
 				canAdvanceAck = false
 				continue
 			}
@@ -1839,7 +2360,7 @@ export class ClientSession {
 				// delivered (its delta is computed against the handshake-time vector). That
 				// op is already stored under its id, so accepting it as a duplicate writes
 				// nothing and cannot advance any vector: treat it exactly like a duplicate.
-				if (await this.isStoredOperation(op)) {
+				if (await this.isStoredOperation(op, stored)) {
 					duplicateOperations += 1
 					acknowledgedThrough = op.sequenceNumber
 					continue
@@ -1854,15 +2375,31 @@ export class ClientSession {
 				continue
 			}
 
+			// This device's own operation, already stored under its id (content-addressed,
+			// so the same write): nothing to judge or write again. It was authorized and
+			// validated when first accepted; re-judging it now could refuse a write the
+			// server holds and make the device roll it back.
+			// The (node, sequence) may differ from the stored one: the client's sequence
+			// repair renumbers a legacy duplicate and keeps its id.
+			// A custom store without the batch lookup is asked per op by (node, sequence).
+			if (
+				stored.get(op.id)?.nodeId === op.nodeId ||
+				(!this.store.findStoredOperations && (await this.isStoredOperation(op, stored)))
+			) {
+				await this.noteStoredElsewhere(op, stored)
+				duplicateOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
 			const authorization = await this.authorizeClientOperation(op)
 			if (!authorization.allowed) {
-				this.sendOperationRejected(
+				await this.refuseTerminally(
 					op,
 					authorization.code,
 					authorization.code === 'SCOPE_VIOLATION'
 						? `${authorization.message} Refresh scopes before creating or explicitly resubmitting an authorized operation.`
 						: authorization.message,
-					false,
 				)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -1892,11 +2429,10 @@ export class ClientSession {
 
 			const serverOp = this.transformForServerSchema(op)
 			if (serverOp === null) {
-				this.sendOperationRejected(
+				await this.refuseTerminally(
 					op,
 					'SCHEMA_TRANSFORM_UNAVAILABLE',
 					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
-					false,
 				)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -1928,7 +2464,11 @@ export class ClientSession {
 				}
 				if (decision.action === 'reject') {
 					const retriable = decision.retriable ?? isRetriableRejection(decision.code)
-					this.sendOperationRejected(serverOp, decision.code, decision.message, retriable)
+					if (retriable) {
+						this.sendOperationRejected(serverOp, decision.code, decision.message, true)
+					} else {
+						await this.refuseTerminally(serverOp, decision.code, decision.message)
+					}
 					rejectedOperations += 1
 					if (retriable) {
 						canAdvanceAck = false
@@ -1940,6 +2480,10 @@ export class ClientSession {
 				if (decision.action === 'ignore') {
 					// The server took responsibility out of band; do not materialize the
 					// raw op and do not reject. The batch ack lets the client drop it.
+					// Recorded first, durably: the handshake then counts its sequence as
+					// resolved, and a resubmission is acknowledged without being handed to
+					// the validator again (RT-43).
+					await this.recordResolution(op, 'ignored', null, null)
 					acknowledgedThrough = op.sequenceNumber
 					continue
 				}
@@ -1950,7 +2494,7 @@ export class ClientSession {
 			// what this writer may read (RT-11, RT-13).
 			const references = await this.authorizeReferences(serverOp)
 			if (!references.allowed) {
-				this.sendOperationRejected(serverOp, references.code, references.message, false)
+				await this.refuseTerminally(serverOp, references.code, references.message)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -1964,14 +2508,31 @@ export class ClientSession {
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
 				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
+				// A client without the sequence-reservation capability may legitimately
+				// produce two operations under one sequence: store the pair (RT-37).
+				legacySequenceWriter: !this.sequenceReservation,
+				onLegacySequencePair: (pair) => this.recordLegacySequencePair(pair),
 			})
 			if (applyResult.rejection) {
-				this.sendOperationRejected(
-					serverOp,
-					applyResult.rejection.code,
-					applyResult.rejection.message,
-					applyResult.rejection.retriable,
-				)
+				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
+				// resubmits it under the same id, so it is never remembered as refused.
+				if (
+					applyResult.rejection.retriable ||
+					applyResult.rejection.code === SEQUENCE_CONFLICT_CODE
+				) {
+					this.sendOperationRejected(
+						serverOp,
+						applyResult.rejection.code,
+						applyResult.rejection.message,
+						applyResult.rejection.retriable,
+					)
+				} else {
+					await this.refuseTerminally(
+						serverOp,
+						applyResult.rejection.code,
+						applyResult.rejection.message,
+					)
+				}
 				rejectedOperations += 1
 				if (applyResult.rejection.retriable) {
 					canAdvanceAck = false
@@ -2026,13 +2587,25 @@ export class ClientSession {
 
 	/** The in-scope operations a version-vector client is missing (not yet sent). */
 	private async collectDeltaOperations(clientVector: Map<string, number>): Promise<Operation[]> {
-		const serverVector = this.store.getVersionVector()
+		const serverVector = await this.readServerVector()
 		const missing: Operation[] = []
 
 		for (const [nodeId, serverSeq] of serverVector) {
 			const clientSeq = clientVector.get(nodeId) ?? 0
-			if (serverSeq > clientSeq) {
-				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
+			// A legacy pair (two operations under one (node, sequence), RT-37) at or below
+			// the client's entry: the client may hold only one of them, and the range read
+			// below starts above its entry, so both are sent again (RT-48). The client
+			// dedups by id; pairs are few (legacy writers only), so the resend is small.
+			const pairs =
+				clientSeq > 0 && this.store.getSequencePairOperations
+					? await this.store.getSequencePairOperations(nodeId, Math.min(clientSeq, serverSeq))
+					: []
+			if (serverSeq > clientSeq || pairs.length > 0) {
+				const range =
+					serverSeq > clientSeq
+						? await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
+						: []
+				const ops = [...pairs, ...range]
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
 					const snapshot = snapshots.get(op.id) ?? null
@@ -2105,58 +2678,125 @@ export class ClientSession {
 	}
 
 	/**
-	 * Send the gap-free server->client delivery stream, resuming just after
+	 * Stream the gap-free server->client delivery stream, resuming just after
 	 * `fromDeliverySeq`. Operations are scanned in server delivery-sequence order
 	 * (commit order), scope-filtered for this session, and sent in batches that chain:
 	 * each batch's `baseDeliverySequence` equals the previous batch's
 	 * `maxDeliverySequence` (the first batch bases on `fromDeliverySeq`). The client
 	 * applies a batch only when its watermark equals the base and advances the
 	 * watermark to the max, so a dropped batch stalls the watermark and is recovered by
-	 * the next handshake resend. Because delivery-sequence order respects causal order
-	 * (a dependency is always committed, and thus sequenced, before its dependent), no
-	 * topological sort is needed and the client never defers on a missing dependency
-	 * that is itself in this stream.
+	 * a re-send from the acknowledged position. Because delivery-sequence order respects
+	 * causal order (a dependency is always committed, and thus sequenced, before its
+	 * dependent), no topological sort is needed.
 	 *
-	 * The final batch advances the watermark to the highest delivery sequence scanned,
-	 * not merely the last in-scope one, so an out-of-scope tail is not re-scanned on the
-	 * next reconnect. Returns the number of operations actually sent.
+	 * Batches go out as each scan chunk is filtered (SRV-5): the server holds at most
+	 * one scan chunk plus two batches per stream, never the whole backlog, and the
+	 * first batch reaches the client after one chunk. One full batch is held back so
+	 * the stream's last batch can be marked `isFinal` (one-batch lookahead). The final
+	 * batch carries the highest sequence scanned, not merely the last in-scope one, so
+	 * an out-of-scope tail is not re-scanned. Every sent batch advances the send cursor
+	 * ({@link lastSentDeliverySeq}). Between batches the stream waits for the client to
+	 * drain its socket (backpressure).
+	 *
+	 * @param fromDeliverySeq - The chain base: the client's watermark or the send cursor
+	 * @param finalizeWhenEmpty - Send an empty final batch even when nothing new was
+	 *   scanned (the handshake stream, so the client completes initial sync)
 	 */
-	private async sendDeliveryStream(
+	private async streamDelivery(
 		fromDeliverySeq: number,
 		finalizeWhenEmpty: boolean,
-		excludeNodeId?: string,
-	): Promise<{ sentOperations: number; maxScanned: number; sent: boolean }> {
-		const collected = await this.collectDeliveryStream(fromDeliverySeq, excludeNodeId)
-		return this.sendCollectedDeliveryStream(collected, fromDeliverySeq, finalizeWhenEmpty)
-	}
-
-	/** Scan the delivery log after `fromDeliverySeq` and keep what this session may see. */
-	private async collectDeliveryStream(
-		fromDeliverySeq: number,
-		excludeNodeId?: string,
-	): Promise<CollectedDeliveryStream> {
-		const scanChunk = Math.max(this.batchSize, 1) * 5
+	): Promise<{ sentOperations: number; maxScanned: number }> {
+		const batchSize = Math.max(this.batchSize, 1)
+		const scanChunk = batchSize * 5
 		let scanCursor = fromDeliverySeq
 		let maxScanned = fromDeliverySeq
-		const deliverable: DeliverableOperation[] = []
+		let base = fromDeliverySeq
+		let batchIndex = 0
+		let sentOperations = 0
+		let pending: DeliverableOperation[] = []
+		let held: DeliverableOperation[] | null = null
 
-		while (true) {
+		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
+		const send = async (slice: DeliverableOperation[], isFinal: boolean): Promise<void> => {
+			const last = slice[slice.length - 1]
+			const lastSeq = last ? last.deliverySequence : base
+			// The final batch carries the max scanned sequence (>= lastSeq) so the client
+			// skips past any out-of-scope operations above the last in-scope one.
+			const max = isFinal ? Math.max(maxScanned, lastSeq) : lastSeq
+			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
+			batchIndex += 1
+			base = max
+			sentOperations += slice.filter((item) => !item.retraction).length
+			this.recordDeliverySent(max)
+			await this.waitForSendWindow()
+		}
+
+		while (live()) {
 			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
 			const last = chunk[chunk.length - 1]
 			if (last === undefined) break
+			const deliverable = await this.filterDeliveryChunk(chunk)
+			pending.push(...deliverable)
+			// Cut full batches. A batch never ends on a scope entry: the entry and the
+			// operation that triggered it share one delivery sequence, and a batch max of
+			// that sequence would claim the trigger was delivered too. (The trigger always
+			// follows its entry in the same chunk, so the extension stays in `pending`.)
+			while (pending.length >= batchSize && live()) {
+				let end = batchSize
+				while (end < pending.length && pending[end - 1]?.scopeEntry === true) end += 1
+				if (pending[end - 1]?.scopeEntry === true) break
+				const slice = pending.slice(0, end)
+				pending = pending.slice(end)
+				if (held) await send(held, false)
+				held = slice
+			}
 			scanCursor = last.deliverySequence
-			// maxScanned counts every operation scanned, including any excluded (own or
-			// out-of-scope) ones, so the batch max advances the client's watermark past
-			// them even though they are not sent.
+			// maxScanned counts every operation scanned, including excluded (own or
+			// out-of-scope) ones, so the final max advances the watermark past them.
 			maxScanned = scanCursor
-			for (const delivered of chunk) {
-				// Skip the client's own operations during streaming: it already holds them,
-				// so echoing them back is pure waste. They are still counted in maxScanned,
-				// and a full resync (fromDeliverySeq 0) passes no excludeNodeId, so a client
-				// that lost its local store still recovers its own history.
-				if (excludeNodeId !== undefined && delivered.operation.nodeId === excludeNodeId) {
-					continue
-				}
+			if (chunk.length < scanChunk) break
+		}
+		if (!live()) return { sentOperations, maxScanned }
+
+		if (held && pending.length > 0) {
+			await send(held, false)
+			await send(pending, true)
+		} else if (held) {
+			await send(held, true)
+		} else if (pending.length > 0) {
+			await send(pending, true)
+		} else if (finalizeWhenEmpty || maxScanned > fromDeliverySeq) {
+			// Nothing in scope after the cursor. On a handshake, a single empty final batch
+			// lets the client advance past an out-of-scope tail and complete initial sync;
+			// during streaming it advances the watermark past newly scanned out-of-scope
+			// operations. With nothing scanned at all, a live push sends nothing.
+			await send([], true)
+		}
+		return { sentOperations, maxScanned }
+	}
+
+	/**
+	 * Filter one scan chunk of the delivery log down to what this session receives:
+	 * visible operations (each preceded by its scope-entry insert, RT-19) and
+	 * retractions. The records the decisions need are fetched for the whole chunk at
+	 * once (LMS #11), one batched read per collection instead of one query per op.
+	 */
+	private async filterDeliveryChunk(chunk: DeliveredOperation[]): Promise<DeliverableOperation[]> {
+		const deliverable: DeliverableOperation[] = []
+		const clientNodeId = this.clientNodeId
+		const candidates = chunk.filter(
+			(delivered) =>
+				// The client's own operations are skipped above the inclusion point: it
+				// uploaded them itself. A full resync still recovers its own history.
+				!(
+					clientNodeId !== null &&
+					delivered.operation.nodeId === clientNodeId &&
+					delivered.deliverySequence > this.ownOperationsIncludedThrough
+				),
+		)
+		this.recordLookupCache = await this.prefetchRecordsFor(candidates)
+		try {
+			for (const delivered of candidates) {
 				const snapshot = delivered.scopeSnapshot ?? null
 				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
 					// The scope-entry shares the trigger's delivery sequence and precedes it,
@@ -2174,60 +2814,57 @@ export class ClientSession {
 					deliverable.push({ ...delivered, retraction: true })
 				}
 			}
-			if (chunk.length < scanChunk) break
+		} finally {
+			this.recordLookupCache = null
 		}
-		return { deliverable, maxScanned }
+		return deliverable
 	}
 
-	/** Send a collected delivery stream as chained base -> max batches. */
-	private sendCollectedDeliveryStream(
-		collected: CollectedDeliveryStream,
-		fromDeliverySeq: number,
-		finalizeWhenEmpty: boolean,
-	): { sentOperations: number; maxScanned: number; sent: boolean } {
-		const { deliverable, maxScanned } = collected
-		if (deliverable.length === 0) {
-			// Nothing in scope after the cursor. On a handshake resume, send a single empty
-			// final batch so the client advances past an out-of-scope tail and completes
-			// initial sync. During streaming, send nothing (an empty batch every relay tick
-			// would be pure noise); a reconnect re-scans the small tail if needed.
-			let sent = false
-			if (finalizeWhenEmpty || maxScanned > fromDeliverySeq) {
-				sent = this.sendDeliveryBatch([], fromDeliverySeq, maxScanned, 0, true)
+	/**
+	 * Read, in one batched query per collection, every record the visibility decisions
+	 * for these operations may look up, when the store supports batched reads. Returns
+	 * null (per-operation lookups) otherwise. Over-fetching is harmless: the chunk
+	 * bounds it.
+	 */
+	private async prefetchRecordsFor(
+		delivered: DeliveredOperation[],
+	): Promise<Map<string, MaterializedRecord | null> | null> {
+		const store = this.store
+		if (!store.findRecordsByIds || delivered.length === 0) return null
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const subsets = this.syncQuerySubsets.length > 0
+		const idsByCollection = new Map<string, Set<string>>()
+		for (const { operation: op, scopeSnapshot } of delivered) {
+			const snapshot = scopeSnapshot ?? null
+			const needsRecord =
+				subsets ||
+				(snapshot?.post
+					? snapshotLacksScopeFields(op.collection, { pre: null, post: snapshot.post }, scopes)
+					: missingScopeFields(op, scopes).length > 0) ||
+				(snapshot !== null &&
+					scopes !== undefined &&
+					(snapshotLacksScopeFields(op.collection, snapshot, scopes) ||
+						(op.type === 'update' && snapshotEntersScopes(op, snapshot, scopes))))
+			if (!needsRecord) continue
+			let ids = idsByCollection.get(op.collection)
+			if (!ids) {
+				ids = new Set()
+				idsByCollection.set(op.collection, ids)
 			}
-			return { sentOperations: 0, maxScanned, sent }
+			ids.add(op.recordId)
 		}
-
-		// Chunk into batches. A batch never ends on a scope entry: the entry and the
-		// operation that triggered it share one delivery sequence, and a batch max of
-		// that sequence would claim the trigger was delivered too.
-		const slices: DeliverableOperation[][] = []
-		let start = 0
-		while (start < deliverable.length) {
-			let end = Math.min(start + Math.max(this.batchSize, 1), deliverable.length)
-			while (end < deliverable.length && deliverable[end - 1]?.scopeEntry === true) end += 1
-			slices.push(deliverable.slice(start, end))
-			start = end
+		if (idsByCollection.size === 0) return null
+		const cache = new Map<string, MaterializedRecord | null>()
+		try {
+			for (const [collection, ids] of idsByCollection) {
+				const rows = await store.findRecordsByIds(collection, [...ids])
+				for (const id of ids) cache.set(recordCacheKey(collection, id), rows.get(id) ?? null)
+			}
+		} catch {
+			// A failed batched read falls back to per-operation lookups.
+			return null
 		}
-		const totalBatches = slices.length
-		let base = fromDeliverySeq
-		for (let i = 0; i < totalBatches; i++) {
-			const slice = slices[i] ?? []
-			const lastInSlice = slice[slice.length - 1]
-			if (lastInSlice === undefined) continue
-			const isFinal = i === totalBatches - 1
-			const lastSeq = lastInSlice.deliverySequence
-			// The final batch carries the max scanned sequence (>= lastSeq) so the client
-			// skips past any out-of-scope operations above the last in-scope one.
-			const max = isFinal ? Math.max(maxScanned, lastSeq) : lastSeq
-			this.sendDeliveryBatch(slice, base, max, i, isFinal)
-			base = max
-		}
-		return {
-			sentOperations: deliverable.filter((item) => !item.retraction).length,
-			maxScanned,
-			sent: true,
-		}
+		return cache
 	}
 
 	/** Build, track, and send one chained delivery-stream batch. */
@@ -2338,8 +2975,165 @@ export class ClientSession {
 		return operationMatchesQuerySubsets(op, subsets, fullRecord)
 	}
 
-	/** True when the store already holds exactly this operation (same node, sequence and id). */
-	private async isStoredOperation(op: Operation): Promise<boolean> {
+	/**
+	 * Where the store already holds each of `operations` (by id), in one store read.
+	 * Null when the store cannot answer by id (a custom store without
+	 * `findStoredOperations`, or the read failed): callers then fall back to a
+	 * per-operation (node, sequence) lookup and the store's own dedup at apply.
+	 */
+	private async findStoredOperations(
+		operations: Operation[],
+	): Promise<Map<string, StoredOperationKey>> {
+		if (!this.store.findStoredOperations) return new Map()
+		try {
+			return await this.store.findStoredOperations(operations.map((op) => op.id))
+		} catch (error) {
+			console.warn(
+				`[kora] findStoredOperations failed; judging the batch without it: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
+		}
+	}
+
+	/**
+	 * True when the batch lookup alone shows `op` is already stored and may be
+	 * acknowledged as a duplicate with no further store work (RT-31, RT-39): this
+	 * device's own operation stored under its node (its sequence repair may have
+	 * renumbered it, keeping the id), or any other operation stored under exactly its
+	 * (node, sequence, id), such as one the server itself delivered and the client
+	 * echoed back. Never true for a store without the batch lookup.
+	 */
+	private isStoredDuplicate(op: Operation, batch: Map<string, StoredOperationKey>): boolean {
+		const known = batch.get(op.id)
+		if (!known || known.nodeId !== op.nodeId) return false
+		const own = op.nodeId === this.clientNodeId && op.timestamp.nodeId === op.nodeId
+		return own || known.sequenceNumber === op.sequenceNumber
+	}
+
+	/**
+	 * The recorded resolutions of the batch's own-node operations that the lookup did
+	 * not find stored (RT-43, RT-47). Asked only for this session's own node, so the
+	 * answer never reveals another device's (or tenant's) refusals.
+	 */
+	private async findResolutions(
+		operations: Operation[],
+		stored: Map<string, StoredOperationKey>,
+	): Promise<Map<string, OperationResolution>> {
+		const nodeId = this.clientNodeId
+		if (!this.store.findOperationResolutions || nodeId === null) return new Map()
+		const ids = operations
+			.filter((op) => op.nodeId === nodeId && op.timestamp.nodeId === nodeId && !stored.has(op.id))
+			.map((op) => op.id)
+		if (ids.length === 0) return new Map()
+		let found: Map<string, OperationResolution>
+		try {
+			found = await this.store.findOperationResolutions(nodeId, ids)
+		} catch (error) {
+			console.warn(
+				`[kora] findOperationResolutions failed; judging the batch without it: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
+		}
+		// Only ids the lookup did NOT find stored are asked for, so a `stored-elsewhere`
+		// hit here is stale: it claims a stored copy the lookup has just disproved (the
+		// copy was lost by a restore, RT-51). Acking on it would drop the operation, so it
+		// is forgotten and the operation is judged normally (its real outcome is then
+		// recorded in its place).
+		for (const [id, resolution] of found) {
+			if (resolution.outcome !== 'stored-elsewhere') continue
+			found.delete(id)
+			await this.store.deleteOperationResolution?.(nodeId, id)
+		}
+		return found
+	}
+
+	/** The highest resolved sequence of `nodeId` (0 without the store method or on error). */
+	private async resolvedThrough(nodeId: string): Promise<number> {
+		if (!this.store.getResolvedThrough) return 0
+		try {
+			return await this.store.getResolvedThrough(nodeId)
+		} catch (error) {
+			console.warn(
+				`[kora] getResolvedThrough failed; advertising the stored maximum: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return 0
+		}
+	}
+
+	/**
+	 * Durably record how this session's own operation was resolved without being stored
+	 * under its sequence. Awaited before the answer is sent: a failure propagates (the
+	 * batch fails and is not acknowledged), so the client never acts on a resolution the
+	 * server could forget.
+	 */
+	private async recordResolution(
+		op: Operation,
+		outcome: OperationResolutionOutcome,
+		code: string | null,
+		message: string | null,
+	): Promise<void> {
+		if (!this.store.recordOperationResolution || op.nodeId !== this.clientNodeId) return
+		await this.store.recordOperationResolution({
+			operationId: op.id,
+			nodeId: op.nodeId,
+			sequenceNumber: op.sequenceNumber,
+			outcome,
+			code,
+			message,
+		})
+	}
+
+	/**
+	 * Refuse an operation for good (non-retriable): remember the refusal (RT-47), then
+	 * tell the client. A resubmission of the same id is answered with this rejection
+	 * without being judged again.
+	 */
+	private async refuseTerminally(op: Operation, code: string, message: string): Promise<void> {
+		await this.recordResolution(op, 'refused', code, message)
+		this.sendOperationRejected(op, code, message, false)
+	}
+
+	/**
+	 * An own operation acknowledged as a duplicate of the copy stored under ANOTHER
+	 * sequence (the client's sequence repair renumbered it, keeping its id): record the
+	 * submitted sequence as resolved, so the handshake does not read it as lost (RT-43).
+	 */
+	private async noteStoredElsewhere(
+		op: Operation,
+		stored: Map<string, StoredOperationKey>,
+	): Promise<void> {
+		const known = stored.get(op.id)
+		if (
+			!known ||
+			known.nodeId !== op.nodeId ||
+			known.sequenceNumber === op.sequenceNumber ||
+			op.nodeId !== this.clientNodeId
+		) {
+			return
+		}
+		await this.recordResolution(op, 'stored-elsewhere', null, null)
+	}
+
+	/** Refuse the rest of a batch for the per-minute ingest budget (retriable). */
+	private sendRateLimited(): void {
+		this.sendError(
+			'RATE_LIMIT',
+			`Session exceeded operation rate limit (${String(this.rateLimiter.limit)} ops/min for this device; a signed-in user's devices also share a per-user budget); retry in ${String(this.rateLimiter.retryAfterMs())} ms`,
+			true,
+		)
+	}
+
+	/**
+	 * True when the store already holds exactly this operation (same node, sequence and
+	 * id). Answered from the batch lookup when the store supports it.
+	 */
+	private async isStoredOperation(
+		op: Operation,
+		batch: Map<string, StoredOperationKey>,
+	): Promise<boolean> {
+		const known = batch.get(op.id)
+		if (known) return known.nodeId === op.nodeId && known.sequenceNumber === op.sequenceNumber
+		if (this.store.findStoredOperations) return false
 		try {
 			const stored = await this.store.getOperationRange(
 				op.nodeId,
@@ -2455,6 +3249,8 @@ export class ClientSession {
 		collection: string,
 		recordId: string,
 	): Promise<MaterializedRecord | undefined> {
+		const cached = this.recordLookupCache?.get(recordCacheKey(collection, recordId))
+		if (cached !== undefined) return cached ?? undefined
 		try {
 			const rows = await this.store.queryCollection(collection, {
 				where: { id: recordId },
@@ -2495,6 +3291,27 @@ export class ClientSession {
 			return
 		}
 		this.onYjsDocUpdate(this.sessionId, msg, stored)
+	}
+
+	/** A legacy client's duplicate pair was stored (RT-37): count it and log it. */
+	private recordLegacySequencePair(pair: LegacySequencePair): void {
+		this.legacySequencePairs += 1
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.legacy_sequence_pair',
+			sessionId: this.sessionId,
+			nodeId: pair.nodeId,
+			details: {
+				operationId: pair.operationId,
+				sequenceNumber: pair.sequenceNumber,
+				holderIds: pair.holderIds,
+				legacyWriter: pair.legacyWriter,
+				message: pair.legacyWriter
+					? 'A client without the sequenceReservation capability (Kora <= beta.13) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
+					: 'An operation shares its sequence number with one stored before sequence enforcement (Kora <= beta.12). Both are stored.',
+			},
+		})
 	}
 
 	private sendError(code: string, message: string, retriable: boolean): void {
@@ -2542,17 +3359,16 @@ export class ClientSession {
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
-		this.clearExpiryTimer()
+		this.clearSessionTimers()
 		this.flushOrphanedRelays()
 		this.emitter?.emit({ type: 'sync:disconnected', reason: 'transport closed' })
 		this.onClose?.(this.sessionId)
 	}
 }
 
-/** Delivery-log operations collected for one session, before they are batched. */
-interface CollectedDeliveryStream {
-	deliverable: DeliverableOperation[]
-	maxScanned: number
+/** Key of a record in the delivery chunk's prefetch cache. */
+function recordCacheKey(collection: string, recordId: string): string {
+	return `${collection}\u0000${recordId}`
 }
 
 /**

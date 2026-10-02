@@ -37,6 +37,8 @@ export type {
 export { executeInsert } from './mutations/execute-insert'
 export { executeUpdate } from './mutations/execute-update'
 export { executeDelete } from './mutations/execute-delete'
-export { resolveCausalDeps } from './mutations/resolve-causal-deps'
 export type { ExecuteDeleteOptions } from './mutations/execute-delete'
 export type { LocalMutationContext } from './mutations/types'
+
+export { hasUnsyncedOwnOperations } from './sync/local-sync-records'
+export type { DatabaseQuery } from './sync/local-sync-records'

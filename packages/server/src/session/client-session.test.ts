@@ -9,6 +9,14 @@ import { createServerTransportPair } from '../transport/memory-server-transport'
 import type { AuthContext, AuthProvider } from '../types'
 import { ClientSession } from './client-session'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 const guardrailSchema = defineSchema({
 	version: 1,
 	collections: {
@@ -46,7 +54,7 @@ function createTestOp(overrides: Partial<Operation> = {}): Operation {
 		data: { title: 'test' },
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'client-1' },
-		sequenceNumber: 1,
+		sequenceNumber: nextFixtureSequence(),
 		causalDeps: [],
 		schemaVersion: 1,
 		...overrides,
@@ -127,7 +135,9 @@ describe('ClientSession', () => {
 			expect(response?.type).toBe('handshake-response')
 			if (response?.type === 'handshake-response') {
 				expect(response.accepted).toBe(true)
-				expect(response.versionVector).toEqual({ 'node-a': 5 })
+				// The session's own node is always advertised, 0 when the server holds none
+				// of its operations (RT-45).
+				expect(response.versionVector).toEqual({ 'node-a': 5, 'client-1': 0 })
 				expect(response.nodeId).toBe('server-1')
 				expect(response.selectedWireFormat).toBe('protobuf')
 			}

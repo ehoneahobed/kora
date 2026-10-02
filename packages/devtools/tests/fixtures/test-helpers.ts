@@ -240,6 +240,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			nodeId: 'node-new',
 			reenqueuedCount: 2,
 		},
+		'sync:local-node': {
+			type: 'sync:local-node',
+			nodeId: 'node-a',
+			action: 'history-behind',
+			localSequence: 1,
+			serverSequence: 2,
+		},
 		'sync:clock-rebase': {
 			type: 'sync:clock-rebase',
 			rebasedCount: 3,
@@ -313,6 +320,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			repeatCount: 3,
 			reason: 'unacknowledged-delivery',
 		},
+		'sync:durability-degraded': {
+			type: 'sync:durability-degraded',
+			message: 'QuotaExceededError',
+			failedAttempts: 3,
+		},
+		'sync:durability-restored': { type: 'sync:durability-restored' },
 		'awareness:updated': { type: 'awareness:updated', states: new Map() },
 		'state-machine:transition': {
 			type: 'state-machine:transition',
@@ -366,6 +379,20 @@ export function createSampleEvent<T extends KoraEventType>(
 			type: 'store:db-name-collision',
 			dbName: 'kora-db',
 			message: 'Another runtime is already using this database name',
+		},
+		'store:storage-blocked': {
+			type: 'store:storage-blocked',
+			dbName: 'kora-db',
+			resource: 'pool',
+			state: 'waiting',
+			message: 'Waiting for another holder of the OPFS pool',
+		},
+		'store:storage-migrated': {
+			type: 'store:storage-migrated',
+			dbName: 'kora-db',
+			from: 'legacy-opfs-pool',
+			to: 'opfs',
+			message: 'Moved to its own OPFS pool',
 		},
 		'replay:completed': {
 			type: 'replay:completed',

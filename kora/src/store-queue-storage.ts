@@ -9,7 +9,7 @@ interface SyncQueueRow {
 	payload: string
 }
 
-type QueuePayload = OperationRow & { _collection: string }
+type QueuePayload = OperationRow & { _collection: string; _sent?: 1 }
 
 /**
  * Persists the outbound sync queue in `_kora_sync_queue` via the local StorageAdapter.
@@ -31,6 +31,37 @@ export class StoreQueueStorage implements QueueStorage {
 			'INSERT OR REPLACE INTO _kora_sync_queue (id, payload) VALUES (?, ?)',
 			[op.id, JSON.stringify(payload)],
 		)
+	}
+
+	/**
+	 * Flag queued operations as sent (W3 step 4: a sent op is never re-stamped by a clock
+	 * rebase). An UPDATE, never an insert: an op acknowledged meanwhile stays dequeued.
+	 */
+	async markSent(ops: Operation[]): Promise<void> {
+		for (const op of ops) {
+			const payload: QueuePayload = {
+				...serializeOperation(op),
+				_collection: op.collection,
+				_sent: 1,
+			}
+			await this.adapter.execute('UPDATE _kora_sync_queue SET payload = ? WHERE id = ?', [
+				JSON.stringify(payload),
+				op.id,
+			])
+		}
+	}
+
+	async loadSentIds(): Promise<string[]> {
+		const rows = await this.adapter.query<SyncQueueRow>('SELECT id, payload FROM _kora_sync_queue')
+		const ids: string[] = []
+		for (const row of rows) {
+			try {
+				if ((JSON.parse(row.payload) as QueuePayload)._sent === 1) ids.push(row.id)
+			} catch {
+				// An unreadable row is not reported as sent; load() surfaces the error.
+			}
+		}
+		return ids
 	}
 
 	async dequeue(ids: string[]): Promise<void> {
