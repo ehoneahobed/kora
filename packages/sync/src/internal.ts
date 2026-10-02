@@ -8,3 +8,4 @@ export {
 	matchesScopePredicate,
 	recordMatchesScopePredicates,
 } from './scopes/scope-snapshot'
+export { scopeViewKey } from './scopes/scope-view-key'

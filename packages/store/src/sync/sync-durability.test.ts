@@ -4,9 +4,11 @@ import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import type { StorageAdapter, Transaction } from '../types'
 import {
+	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
 	loadUnappliedOperations,
 	removeUnappliedOperations,
+	saveAcceptedDownlinkScope,
 	saveOwnAckedThrough,
 	saveUnappliedOperations,
 } from './sync-durability'
@@ -100,13 +102,23 @@ describe('inbound quarantine (_kora_unapplied_ops)', () => {
 	})
 })
 
-describe('own acknowledged prefix', () => {
+describe('own acknowledged prefix and accepted scope', () => {
 	test('the prefix is keyed by node id; an unknown node or a fresh database reads null', async () => {
 		const adapter = await openAdapter()
 		expect(await loadOwnAckedThrough(adapter, 'n1')).toBeNull()
 		await saveOwnAckedThrough(adapter, 'n1', 12)
 		expect(await loadOwnAckedThrough(adapter, 'n1')).toBe(12)
 		expect(await loadOwnAckedThrough(adapter, 'n2')).toBeNull()
+		await adapter.close()
+	})
+
+	test('the accepted downlink scope round-trips and clears', async () => {
+		const adapter = await openAdapter()
+		expect(await loadAcceptedDownlinkScope(adapter)).toBeNull()
+		await saveAcceptedDownlinkScope(adapter, { todos: { orgId: 'o1' } })
+		expect(await loadAcceptedDownlinkScope(adapter)).toEqual({ todos: { orgId: 'o1' } })
+		await saveAcceptedDownlinkScope(adapter, null)
+		expect(await loadAcceptedDownlinkScope(adapter)).toBeNull()
 		await adapter.close()
 	})
 })

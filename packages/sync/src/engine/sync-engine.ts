@@ -57,6 +57,7 @@ import {
 	querySubsetContains,
 } from '../scopes/query-subset'
 import { operationMatchesScope } from '../scopes/scope-filter'
+import { scopeViewKey } from '../scopes/scope-view-key'
 import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
 import {
@@ -341,6 +342,13 @@ export class SyncEngine {
 	private activeScope: SyncScopeMap | undefined
 	/** Server-authoritative upload authorization, separate from the downloaded view. */
 	private activeUplinkScope: SyncScopeMap | undefined
+	/**
+	 * The downlink scope the server accepted at the last handshake that named one
+	 * (SYNC-11), persisted. The next handshake reports its key and that view's watermark
+	 * so the server can resume the stream of an unchanged grant. Never sent as the
+	 * requested scope: a later-widened grant must not be narrowed to it.
+	 */
+	private lastAcceptedScope: SyncScopeMap | null = null
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -522,6 +530,9 @@ export class SyncEngine {
 				this.deliverySignatureWatermarks.set('', await this.syncState.loadDeliveryWatermark(''))
 			}
 			this.deliveryWatermark = this.deliverySignatureWatermarks.get(this.deliverySignature()) ?? 0
+			if (this.syncState.loadAcceptedDownlinkScope) {
+				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
+			}
 			// Bound a set that predates the retention cap (older clients persisted views
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
@@ -595,6 +606,9 @@ export class SyncEngine {
 				// that understands it drives server->client sync from delivery sequences; an
 				// older server ignores it and falls back to the version-vector delta.
 				lastDeliverySequence: this.deliveryWatermark,
+				// The accepted view this client last streamed under, with its own watermark
+				// (SYNC-11): a server that resolves the same scope again resumes from it.
+				...this.acceptedViewHandshakeFields(),
 				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 			}
 			this.transport.send(handshake)
@@ -1065,14 +1079,54 @@ export class SyncEngine {
 	 * its own last position.
 	 */
 	private deliverySignature(): string {
+		return this.deliverySignatureFor(this.activeScope)
+	}
+
+	/** The view signature {@link deliverySignature} gives under `scope` and today's subsets. */
+	private deliverySignatureFor(scope: SyncScopeMap | undefined): string {
 		const subsets = this.getActiveQuerySubsets()
-		if (!this.activeScope && subsets.length === 0) {
+		if (!scope && subsets.length === 0) {
 			return '' // the default, unfiltered view (maps to the legacy watermark key)
 		}
 		const normalizedSubsets = subsets
 			.map((s) => `${s.collection}:${stableStringify(s.where)}`)
 			.sort()
-		return stableStringify({ scope: this.activeScope ?? null, subsets: normalizedSubsets })
+		return stableStringify({ scope: scope ?? null, subsets: normalizedSubsets })
+	}
+
+	/**
+	 * Handshake fields naming the accepted view this client last streamed under (SYNC-11):
+	 * its canonical scope key and its delivery watermark. Omitted when no scope was ever
+	 * accepted, or when it equals the requested scope (the requested watermark covers it).
+	 */
+	private acceptedViewHandshakeFields(): {
+		acceptedScopeKey?: string
+		acceptedScopeWatermark?: number
+	} {
+		const accepted = this.lastAcceptedScope
+		if (accepted === null) return {}
+		const key = scopeViewKey(accepted)
+		if (key === scopeViewKey(this.activeScope)) return {}
+		const watermark = this.deliverySignatureWatermarks.get(this.deliverySignatureFor(accepted))
+		if (watermark === undefined) return {}
+		return { acceptedScopeKey: key, acceptedScopeWatermark: watermark }
+	}
+
+	/** Persist the downlink scope the server accepted at this handshake (null: none). */
+	private rememberAcceptedScope(accepted: SyncScopeMap | null): void {
+		if (scopeViewKey(accepted) === scopeViewKey(this.lastAcceptedScope)) return
+		this.lastAcceptedScope = accepted
+		if (this.syncState?.saveAcceptedDownlinkScope) {
+			this.syncState.saveAcceptedDownlinkScope(accepted).catch((error: unknown) => {
+				// Losing it only costs a rescan from 0 at the next handshake.
+				this.emitter?.emit({
+					type: 'store:persistence-error',
+					dbName: 'kora-oplog',
+					message: error instanceof Error ? error.message : 'Saving the accepted scope failed',
+					code: 'ACCEPTED_SCOPE_SAVE_FAILED',
+				})
+			})
+		}
 	}
 
 	/**
@@ -1445,11 +1499,15 @@ export class SyncEngine {
 		// can tell the duplicates in it from operations this client never saw.
 		const previousSignature = this.deliverySignature()
 		const acceptedDownlink = msg.acceptedDownlinkScopes ?? msg.acceptedScope
-		if (acceptedDownlink) {
+		// A grant equal to the request (by canonical key) keeps the requested view: the
+		// server resumed from the requested view's watermark, and a re-ordered copy of the
+		// same scope must not switch to a differently keyed watermark.
+		if (acceptedDownlink && scopeViewKey(acceptedDownlink) !== scopeViewKey(this.activeScope)) {
 			this.activeScope = acceptedDownlink
 		}
 		this.activeUplinkScope = msg.acceptedUplinkScopes ?? msg.acceptedScope ?? this.activeScope
 		this.switchDeliveryView(previousSignature)
+		this.rememberAcceptedScope(acceptedDownlink ?? null)
 
 		// If our watermark is ahead of the server's frontier, the server's log was rolled
 		// back (for example a backup restore reset the delivery sequence). Reset to a full

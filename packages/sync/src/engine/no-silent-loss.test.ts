@@ -8,6 +8,7 @@ import type {
 	SyncMessage,
 } from '../protocol/messages'
 import { JsonMessageSerializer } from '../protocol/serializer'
+import { scopeViewKey } from '../scopes/scope-view-key'
 import { type MemoryTransport, createMemoryTransportPair } from '../transport/memory-transport'
 import type { QuarantinedOperation, SyncStatePersistence } from '../types'
 import { MemoryQueueStorage } from './memory-queue-storage'
@@ -596,6 +597,13 @@ describe('delivery view across handshakes (SYNC-11)', () => {
 		// The second handshake reports the REQUESTED view's watermark, never the accepted
 		// view's: a server that now served the requested scope would resume from it.
 		expect(handshakes[1]?.lastDeliverySequence).toBe(0)
+		// Next to it, the accepted view it last streamed under and that view's own
+		// watermark (SYNC-11 server half), so a server resolving the same scope resumes.
+		// The accepted scope is never sent as the requested one.
+		expect(handshakes[0]?.acceptedScopeKey).toBeUndefined()
+		expect(handshakes[1]?.acceptedScopeKey).toBe(scopeViewKey(accepted))
+		expect(handshakes[1]?.acceptedScopeWatermark).toBe(4)
+		expect(handshakes[1]?.syncScope).toBeUndefined()
 		// The restarted stream is a duplicate of the accepted view: no wedge.
 		expect(engine.getState()).toBe('streaming')
 		expect(engine.getStatus().deliveryWatermark).toBe(4)

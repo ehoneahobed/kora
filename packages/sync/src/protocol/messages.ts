@@ -55,6 +55,16 @@ export interface HandshakeMessage {
 	 * cursor for the server->client direction. Optional, so old servers ignore it.
 	 */
 	lastDeliverySequence?: number
+	/**
+	 * SYNC-11: canonical key (`scopeViewKey`) of the downlink scope the server accepted at
+	 * this client's last handshake, when it differs from `syncScope`. A server that
+	 * resolves a scope with the same key resumes the delivery stream from
+	 * `acceptedScopeWatermark` instead of restarting it from 0. Optional; old servers
+	 * ignore it.
+	 */
+	acceptedScopeKey?: string
+	/** The client's delivery watermark for the view named by `acceptedScopeKey`. */
+	acceptedScopeWatermark?: number
 	/** Opt in to client-local removal when records leave the accepted downlink view. */
 	scopeExitPolicy?: 'retain' | 'retract'
 	/**

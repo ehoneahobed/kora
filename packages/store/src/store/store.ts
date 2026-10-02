@@ -60,9 +60,11 @@ import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
 import {
+	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
 	loadUnappliedOperations,
 	removeUnappliedOperations,
+	saveAcceptedDownlinkScope,
 	saveOwnAckedThrough,
 	saveUnappliedOperations,
 } from '../sync/sync-durability'
@@ -1299,6 +1301,20 @@ export class Store implements OperationLog {
 		await saveOwnAckedThrough(this.adapter, nodeId, sequence)
 	}
 
+	/** The downlink scope the sync server last accepted (null when none). */
+	async loadAcceptedDownlinkScope(): Promise<Record<string, Record<string, unknown>> | null> {
+		this.ensureOpen()
+		return loadAcceptedDownlinkScope(this.adapter)
+	}
+
+	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	async saveAcceptedDownlinkScope(
+		scope: Record<string, Record<string, unknown>> | null,
+	): Promise<void> {
+		this.ensureOpen()
+		await saveAcceptedDownlinkScope(this.adapter, scope)
+	}
+
 	/**
 	 * Local operations not yet reflected on the server version vector.
 	 */
@@ -1365,8 +1381,9 @@ export class Store implements OperationLog {
 		this.clock = clock
 		this.causalTracker = new CausalTracker()
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
-		this.sequenceNumber = result.operations.length
 		this.versionVector = await this.loadVersionVector()
+		// The persisted counter (MAX with the stored value, W6), not a local count.
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? result.operations.length
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}

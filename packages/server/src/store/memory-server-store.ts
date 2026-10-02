@@ -23,7 +23,8 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER, SequenceConflictError } from './server-store'
+import { RELEASED_NODE_OWNER, SequenceConflictError, judgeSequenceHolders } from './server-store'
+import type { StoredOperationKey } from './server-store'
 
 /** Key of a node's sequence number in {@link MemoryServerStore}'s sequence index. */
 function sequenceKey(nodeId: string, sequenceNumber: number): string {
@@ -67,6 +68,12 @@ export class MemoryServerStore implements ServerStore {
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
 
 	private closed = false
+	/**
+	 * Sequence-enforcement epoch (see SEQUENCE_ENFORCEMENT_EPOCH_KEY). A memory store
+	 * starts empty under this release, so 0: every holder was stored under enforcement.
+	 * A replace-mode backup import moves it to the restored log's end.
+	 */
+	private sequenceEpoch = 0
 
 	constructor(nodeId?: string) {
 		this.nodeId = nodeId ?? generateUUIDv7()
@@ -116,7 +123,12 @@ export class MemoryServerStore implements ServerStore {
 		// A different operation under the same (node, sequence) is refused (W3 step 4).
 		const holder = this.operationIdBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber))
 		if (holder !== undefined && holder !== op.id) {
-			throw new SequenceConflictError(op, holder)
+			const decision = judgeSequenceHolders(
+				op,
+				[{ id: holder, deliverySequence: this.deliverySeqByOpId.get(holder) ?? 1 }],
+				this.sequenceEpoch,
+			)
+			if (decision.verdict === 'conflict') throw new SequenceConflictError(op, holder)
 		}
 
 		// Authorization re-check against the row as stored right now. Everything from
@@ -161,6 +173,16 @@ export class MemoryServerStore implements ServerStore {
 		}
 
 		return 'applied'
+	}
+
+	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
+		this.assertOpen()
+		const found = new Map<string, StoredOperationKey>()
+		for (const id of ids) {
+			const op = this.operationIndex.get(id)
+			if (op) found.set(id, { nodeId: op.nodeId, sequenceNumber: op.sequenceNumber })
+		}
+		return found
 	}
 
 	async getOperationScopeSnapshots(
@@ -628,6 +650,9 @@ export class MemoryServerStore implements ServerStore {
 				this.rebuildMaterializedRecord(op.collection, op.recordId)
 			}
 		}
+		// The restored snapshot may hold legacy duplicate sequences; enforcement resumes
+		// above it.
+		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
 
 		return { operationsRestored: operations.length, success: true }

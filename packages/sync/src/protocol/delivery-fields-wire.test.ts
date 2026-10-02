@@ -29,6 +29,34 @@ describe('delivery watermark wire round-trip', () => {
 			}
 		})
 
+		test(`handshake accepted-view key and watermark survive ${format} (SYNC-11)`, () => {
+			const serializer = new NegotiatedMessageSerializer(format)
+			const message: SyncMessage = {
+				type: 'handshake',
+				messageId: 'm1',
+				nodeId: 'n1',
+				versionVector: {},
+				schemaVersion: 1,
+				lastDeliverySequence: 0,
+				acceptedScopeKey: '{"todos":{"owner":"alice"}}',
+				acceptedScopeWatermark: 2 ** 40,
+			}
+			const decoded = serializer.decode(serializer.encode(message))
+			expect(decoded.type).toBe('handshake')
+			if (decoded.type === 'handshake') {
+				expect(decoded.acceptedScopeKey).toBe('{"todos":{"owner":"alice"}}')
+				expect(decoded.acceptedScopeWatermark).toBe(2 ** 40)
+			}
+			const {
+				acceptedScopeKey: _key,
+				acceptedScopeWatermark: _watermark,
+				...plain
+			} = message as Extract<SyncMessage, { type: 'handshake' }>
+			const decodedPlain = serializer.decode(serializer.encode(plain))
+			expect(decodedPlain).not.toHaveProperty('acceptedScopeKey')
+			expect(decodedPlain).not.toHaveProperty('acceptedScopeWatermark')
+		})
+
 		test(`operation-batch base/max delivery sequence survives ${format}`, () => {
 			const serializer = new NegotiatedMessageSerializer(format)
 			const message: SyncMessage = {

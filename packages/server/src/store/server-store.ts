@@ -40,6 +40,48 @@ export class SequenceConflictError extends KoraError {
 }
 
 /**
+ * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
+ * sequence in the log when this release first opened the store. Operations stored at
+ * or below it were accepted by a release that allowed a node to reuse a sequence
+ * number (beta.12 STORE-1/2); a newly uploaded operation that shares a (node,
+ * sequence) only with such legacy operations is accepted as before (the client's
+ * sequence repair may keep the OTHER op of a legacy duplicate pair at that number).
+ * Uniqueness is enforced among operations stored after the epoch, by the check in
+ * every append and by a partial unique index over `delivery_seq > epoch`.
+ */
+export const SEQUENCE_ENFORCEMENT_EPOCH_KEY = 'sequence_enforcement_epoch'
+
+/** Name of the partial unique index over (node_id, sequence_number) past the epoch. */
+export const NODE_SEQ_UNIQUE_INDEX = 'idx_node_seq_unique_after_epoch'
+
+/**
+ * Decide an append against the operations already holding its (node, sequence):
+ * `'conflict'` when any of them was stored after the enforcement epoch, `'legacy'` when
+ * all of them predate it (accepted, with a warning), `'free'` when there are none.
+ * Holders with the operation's own id are the caller's duplicate case.
+ */
+export function judgeSequenceHolders(
+	op: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+	holders: ReadonlyArray<{ id: string; deliverySequence: number }>,
+	epoch: number,
+): { verdict: 'free' | 'legacy' } | { verdict: 'conflict'; holderId: string } {
+	const others = holders.filter((holder) => holder.id !== op.id)
+	const enforced = others.find((holder) => holder.deliverySequence > epoch)
+	if (enforced) return { verdict: 'conflict', holderId: enforced.id }
+	if (others.length === 0) return { verdict: 'free' }
+	console.warn(
+		`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${others.map((holder) => `"${holder.id}"`).join(', ')} stored before sequence enforcement (a duplicate written by Kora <= beta.12). Accepted and stored, as that release did.`,
+	)
+	return { verdict: 'legacy' }
+}
+
+/** Where a stored operation sits in its node's sequence space. */
+export interface StoredOperationKey {
+	nodeId: string
+	sequenceNumber: number
+}
+
+/**
  * Owner recorded for a node id an admin released (see `ServerStore.releaseNodeClaim`):
  * the next principal to claim the node takes it over. Never a valid principal id.
  */
@@ -225,6 +267,17 @@ export interface ServerStore extends SyncStore {
 	 * back to one lookup per operation without it.
 	 */
 	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
+
+	/**
+	 * Which of `ids` the operation log already holds, with the node and sequence each is
+	 * stored under, in one read per batch (chunked `IN (...)`). The sync session asks before any other per-operation check, so a
+	 * device re-uploading history the server already stores (the one-time upgrade
+	 * re-upload, or an op the client's sequence repair renumbered under its original
+	 * id) is acknowledged as a duplicate instead of being re-judged by today's
+	 * authorization and validators. Optional; sessions fall back to a per-operation
+	 * (node, sequence) lookup without it.
+	 */
+	findStoredOperations?(ids: string[]): Promise<Map<string, StoredOperationKey>>
 
 	/**
 	 * The distinct node ids of the operations with `deliverySequence >

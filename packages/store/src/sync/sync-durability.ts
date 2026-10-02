@@ -4,6 +4,8 @@ import { deliveryWatermarkKey } from './sync-state'
 
 /** `_kora_meta` key of this device's contiguous acknowledged own-operation prefix (W3). */
 export const OWN_ACKED_THROUGH_META_KEY = 'own_acked_through'
+/** `_kora_meta` key of the downlink scope the sync server last accepted (SYNC-11). */
+export const ACCEPTED_DOWNLINK_SCOPE_META_KEY = 'accepted_downlink_scope'
 
 /**
  * Durable inbound quarantine (W4): delivered operations the client deliberately did not
@@ -149,5 +151,41 @@ export async function saveOwnAckedThrough(
 	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 		OWN_ACKED_THROUGH_META_KEY,
 		JSON.stringify({ nodeId, sequence }),
+	])
+}
+
+/** Load the downlink scope the sync server last accepted (null when none). */
+export async function loadAcceptedDownlinkScope(
+	adapter: StorageAdapter,
+): Promise<Record<string, Record<string, unknown>> | null> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		ACCEPTED_DOWNLINK_SCOPE_META_KEY,
+	])
+	const value = rows[0]?.value
+	if (value === undefined || value === null) return null
+	try {
+		const parsed = JSON.parse(value) as unknown
+		return parsed !== null && typeof parsed === 'object'
+			? (parsed as Record<string, Record<string, unknown>>)
+			: null
+	} catch {
+		return null
+	}
+}
+
+/** Persist (or clear) the downlink scope the sync server last accepted. */
+export async function saveAcceptedDownlinkScope(
+	adapter: StorageAdapter,
+	scope: Record<string, Record<string, unknown>> | null,
+): Promise<void> {
+	if (scope === null) {
+		await adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
+			ACCEPTED_DOWNLINK_SCOPE_META_KEY,
+		])
+		return
+	}
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		ACCEPTED_DOWNLINK_SCOPE_META_KEY,
+		JSON.stringify(scope),
 	])
 }

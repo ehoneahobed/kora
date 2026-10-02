@@ -95,4 +95,12 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	async removeQuarantine(operationIds: string[]): Promise<void> {
 		await this.store.removeInboundQuarantine(operationIds)
 	}
+
+	loadAcceptedDownlinkScope(): Promise<SyncScopeMap | null> {
+		return this.store.loadAcceptedDownlinkScope()
+	}
+
+	async saveAcceptedDownlinkScope(scope: SyncScopeMap | null): Promise<void> {
+		await this.store.saveAcceptedDownlinkScope(scope)
+	}
 }
