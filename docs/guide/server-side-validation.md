@@ -63,9 +63,13 @@ where resubmitting the identical operation might later succeed.
 
 A rejected operation is not silently lost and not retried forever. On the client,
 Kora diverts it out of the pending outbound queue into a durable rejected store
-and emits a `sync:operation-rejected` event. The submitter's own optimistic local
-write is left in place; the framework surfaces the rejection rather than deciding
-for you whether to roll it back or let the user edit and resubmit.
+and emits a `sync:operation-rejected` event. Since beta.14 the submitter's record
+is re-folded without the refused operation, so its view matches the server and every
+other device (an inserted record that was refused disappears; a refused edit is
+undone, while concurrent accepted edits stay). The operation itself is kept in the
+rejected store and the local log, so the app can show the reason and let the user
+edit and resubmit. (Writes you discard from a held node with `discardHeld` are not
+rolled back: they only stop uploading.)
 
 ```typescript
 const app = createApp({ schema, sync: { url } })
@@ -76,16 +80,15 @@ app.sync?.subscribeStatus(() => {}) // status also reflects the drop in pending 
 // Or read the durable list (survives a page refresh) and reconcile.
 const rejected = await app.sync?.getRejectedOperations()
 for (const r of rejected ?? []) {
-  // Roll the optimistic write back, or show the reason and let the user retry.
-  await app[r.collection].delete(r.recordId)
+  // The write is already undone locally: show the reason and let the user retry.
+  showRejection(r.collection, r.recordId, r.message)
   await app.sync?.clearRejectedOperations([r.operationId])
 }
 ```
 
 Convergence holds because the authoritative state is defined purely by accepted
 operations. Every device that syncs from the server agrees, without the rejected
-op. The submitter is the only place the rejected write exists, and it is told, so
-it can reconcile instead of diverging silently.
+op, and so does the submitter once the rejection arrives.
 
 ## The quarantine pattern (anonymous submissions)
 

@@ -442,6 +442,61 @@ describe('richtext', () => {
 		const base = insert(1, { body: new Uint8Array([1, 2]) })
 		expect(fold([base])?.body).toEqual(update1)
 	})
+
+	test('richtextSubsumes prunes contained updates without changing any materialization', () => {
+		// Model: an update is a set of bytes; content = union; a ⊆ b by bytes.
+		const setMerger = (updates: Uint8Array[]): Uint8Array =>
+			new Uint8Array([...new Set(updates.flatMap((u) => [...u]))].sort((x, y) => x - y))
+		const subsumes = (a: Uint8Array, b: Uint8Array): boolean => [...a].every((x) => b.includes(x))
+		const enc = (...bytes: number[]) => ({
+			$koraBytes: Buffer.from(new Uint8Array(bytes)).toString('base64'),
+		})
+		let rng = 7
+		const next = () => {
+			rng = (rng * 1103515245 + 12345) % 2147483648
+			return rng / 2147483648
+		}
+		for (let round = 0; round < 60; round++) {
+			const ops: Operation[] = [insert(1, { body: enc(1) })]
+			let local = [1]
+			for (let i = 0; i < 6; i++) {
+				const r = next()
+				if (r < 0.1) {
+					ops.push(update(2 + i, { body: 'plain' }, { body: enc(...local) }, `n${i}`))
+					continue
+				}
+				// Snapshots grow (a device's edits), sometimes from an older view (concurrent).
+				local = r < 0.6 ? [...local, 10 + i] : [1, 20 + i]
+				ops.push(update(2 + i, { body: enc(...local) }, { body: enc(1) }, `n${i}`))
+			}
+			// Content, not encoding: a single live update materializes as its own bytes.
+			const content = (body: unknown): unknown =>
+				body !== null && typeof body === 'object' && '$koraBytes' in body
+					? [
+							...setMerger([
+								new Uint8Array(
+									Buffer.from(String((body as { $koraBytes: string }).$koraBytes), 'base64'),
+								),
+							]),
+						]
+					: body
+			const plain = foldRecord(ops, schema).state as FoldState
+			const expected = content(materialize(plain, { richtext: setMerger })?.body)
+			const states = [ops, [...ops].reverse(), [...ops].sort(() => next() - 0.5)].map((order) => {
+				let state = createFoldState('tickets', 'r1')
+				for (const op of order)
+					state = mergeOp(state, op, schema, { richtextSubsumes: subsumes }).state
+				return state
+			})
+			for (const state of states) {
+				expect(content(materialize(state, { richtext: setMerger })?.body)).toEqual(expected)
+				expect(serializeFoldState(state)).toBe(serializeFoldState(states[0] as FoldState))
+				const kept = state.f.body?.k === 'rt' ? Object.keys(state.f.body.u).length : 0
+				const all = plain.f.body?.k === 'rt' ? Object.keys(plain.f.body.u).length : 0
+				expect(kept).toBeLessThanOrEqual(all)
+			}
+		}
+	})
 })
 
 describe('delete vs write', () => {

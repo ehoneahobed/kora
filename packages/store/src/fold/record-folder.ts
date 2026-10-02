@@ -8,9 +8,10 @@ import {
 	type MergeTrace,
 	type Operation,
 	type SchemaDefinition,
+	base64ToBytes,
 	createFoldState,
 	deserializeFoldState,
-	getFoldFieldVersions,
+	getFoldFieldVersionStrings,
 	isFoldStateLive,
 	joinStates,
 	materialize,
@@ -36,6 +37,11 @@ export const FOLD_STATE_TABLE = '_kora_fold_state'
 export const FOLD_BASE_TABLE = '_kora_fold_base'
 /** Per-node sequence prefix removed by compaction: ids at or below it are duplicates. */
 export const COMPACTED_THROUGH_TABLE = '_kora_compacted_through'
+/**
+ * Terminal-rejection codes the fold does NOT exclude: the user discarded a held
+ * node's writes (they stay in the local database; only their upload stops).
+ */
+const KEPT_REJECTION_CODES: readonly string[] = ['HELD_DISCARDED']
 /** `_kora_meta` key recording how the rows of this database are materialized. */
 export const FOLD_MATERIALIZATION_META_KEY = 'fold_materialization'
 /** `_kora_meta` key holding the authoritative node ids (JSON array) the states were folded with. */
@@ -62,6 +68,20 @@ export function mergeYjsUpdates(updates: Uint8Array[]): Uint8Array {
 	const doc = new Y.Doc()
 	for (const update of updates) Y.applyUpdate(doc, update)
 	return Y.encodeStateAsUpdate(doc)
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+	return true
+}
+
+/**
+ * Whether Yjs update `a` adds nothing to update `b` (the fold's richtext space
+ * bound): the canonical encoding of `b` alone equals that of `a` and `b` merged.
+ */
+export function yjsSubsumes(a: Uint8Array, b: Uint8Array): boolean {
+	return sameBytes(mergeYjsUpdates([b]), mergeYjsUpdates([a, b]))
 }
 
 /**
@@ -114,6 +134,7 @@ export class RecordFolder {
 	options(traces: FoldOptions['traces'] = 'none'): FoldOptions {
 		return {
 			richtext: mergeYjsUpdates,
+			richtextSubsumes: yjsSubsumes,
 			traces,
 			...(this.authoritative.size > 0 ? { authoritativeNodeIds: this.authoritative } : {}),
 		}
@@ -142,7 +163,11 @@ export class RecordFolder {
 		op: Operation,
 		mode: 'local' | 'remote',
 	): Promise<FoldApplyOutcome> {
-		const prior = await this.loadOrRebuild(tx, op.collection, op.recordId, op.id)
+		// A local insert has a fresh UUIDv7 record id: no state, log or row precedes it.
+		const fresh = mode === 'local' && op.type === 'insert'
+		const prior = fresh
+			? { state: createFoldState(op.collection, op.recordId), rebuilt: false }
+			: await this.loadOrRebuild(tx, op.collection, op.recordId, op.id)
 		const result = mergeOp(
 			prior.state,
 			op,
@@ -159,7 +184,10 @@ export class RecordFolder {
 			prior.rebuilt || revived || op.foldState !== undefined
 				? 'all'
 				: new Set(Object.keys(op.data ?? {}))
-		await this.materializeRow(tx, result.state, fields, { clearRetraction: scopeEntry })
+		await this.materializeRow(tx, result.state, fields, {
+			clearRetraction: scopeEntry,
+			...(fresh ? { absent: true } : {}),
+		})
 		return { changed: result.changed, traces: await this.toMergeTraces(tx, result.traces) }
 	}
 
@@ -233,15 +261,20 @@ export class RecordFolder {
 		return rows.map((row) => deserializeOperationWithCollection(row, collection))
 	}
 
-	/** Which of `ids` carry a terminal rejection marker. */
+	/**
+	 * Which of `ids` the fold leaves out: operations with a terminal-rejection marker
+	 * from the server (or quarantined by a scope retraction, which the server never
+	 * receives). Writes the user chose to discard from a held node are NOT left out:
+	 * discarding stops the upload, it is not a rollback.
+	 */
 	async loadTerminalRejections(tx: Transaction, ids: readonly string[]): Promise<Set<string>> {
 		const found = new Set<string>()
 		const CHUNK = 500
 		for (let i = 0; i < ids.length; i += CHUNK) {
 			const chunk = ids.slice(i, i + CHUNK)
 			const rows = await tx.query<{ operation_id: string }>(
-				`SELECT operation_id FROM ${TERMINAL_REJECTIONS_TABLE} WHERE operation_id IN (${chunk.map(() => '?').join(', ')})`,
-				chunk,
+				`SELECT operation_id FROM ${TERMINAL_REJECTIONS_TABLE} WHERE code NOT IN (${KEPT_REJECTION_CODES.map(() => '?').join(', ')}) AND operation_id IN (${chunk.map(() => '?').join(', ')})`,
+				[...KEPT_REJECTION_CODES, ...chunk],
 			)
 			for (const row of rows) found.add(row.operation_id)
 		}
@@ -264,14 +297,14 @@ export class RecordFolder {
 	async saveState(tx: Transaction, state: FoldState): Promise<void> {
 		await tx.execute(
 			`INSERT OR REPLACE INTO ${FOLD_STATE_TABLE} (collection, record_id, state) VALUES (?, ?, ?)`,
-			[state.c, state.r, serializeFoldState(state)],
+			[state.c, state.r, persistedForm(state)],
 		)
 	}
 
 	async saveBase(tx: Transaction, state: FoldState): Promise<void> {
 		await tx.execute(
 			`INSERT OR REPLACE INTO ${FOLD_BASE_TABLE} (collection, record_id, state) VALUES (?, ?, ?)`,
-			[state.c, state.r, serializeFoldState(state)],
+			[state.c, state.r, persistedForm(state)],
 		)
 	}
 
@@ -299,16 +332,17 @@ export class RecordFolder {
 		tx: Transaction,
 		state: FoldState,
 		fields: MaterializeFields,
-		options: { clearRetraction: boolean },
+		options: { clearRetraction: boolean; absent?: boolean },
 	): Promise<void> {
 		const collection = state.c
 		const definition = this.schema.collections[collection]
 		if (!definition) return
 		const table = quoteIdent(collection)
-		const rows = await tx.query<RawCollectionRow>(
-			`SELECT id, _deleted FROM ${table} WHERE id = ?`,
-			[state.r],
-		)
+		const rows = options.absent
+			? []
+			: await tx.query<RawCollectionRow>(`SELECT id, _deleted FROM ${table} WHERE id = ?`, [
+					state.r,
+				])
 		const existing = rows[0]
 		if (state.cr === null || state.u === null) {
 			if (existing && existing._deleted !== 1) {
@@ -318,15 +352,10 @@ export class RecordFolder {
 		}
 		const asLive: FoldState = { ...state, d: null }
 		const values = materialize(asLive, { richtext: mergeYjsUpdates }) ?? {}
-		const versions = getFoldFieldVersions(asLive)
 		const latest = HybridLogicalClock.deserialize(state.u.t)
 		const created = HybridLogicalClock.deserialize(state.cr.t)
 		// Sorted keys: replicas holding the same state write byte-identical columns.
-		const fieldVersions: Record<string, string> = {}
-		for (const field of Object.keys(versions?.fields ?? {}).sort()) {
-			const version = versions?.fields[field]
-			if (version) fieldVersions[field] = HybridLogicalClock.serialize(version)
-		}
+		const fieldVersions = getFoldFieldVersionStrings(state)
 		let deleted = isDeadState(state) ? 1 : 0
 		if (existing && deleted === 0) {
 			const retracted = await tx.query<{ record_id: string }>(
@@ -352,11 +381,23 @@ export class RecordFolder {
 				? []
 				: known.filter((field) => field in state.f && (fields === 'all' || fields.has(field)))
 		const fieldValues: Record<string, unknown> = {}
-		for (const field of writable) fieldValues[field] = values[field] ?? null
+		for (const field of writable) {
+			const value = values[field] ?? null
+			// A richtext field with a single live update materializes as that update's
+			// own bytes; re-encode it so every replica stores the same canonical bytes,
+			// however its state happens to be split into updates.
+			fieldValues[field] =
+				definition.fields[field]?.kind === 'richtext' &&
+				value !== null &&
+				typeof value === 'object' &&
+				'$koraBytes' in value
+					? mergeYjsUpdates([base64ToBytes(String((value as { $koraBytes: string }).$koraBytes))])
+					: value
+		}
 		const serialized = serializeRecord(fieldValues, definition.fields)
 		const meta: Record<string, unknown> = {
 			_updated_at: latest.wallTime,
-			_version: HybridLogicalClock.serialize(latest),
+			_version: state.u.t,
 			_field_versions: JSON.stringify(fieldVersions),
 			_deleted: deleted,
 		}
@@ -395,8 +436,22 @@ export class RecordFolder {
 		const stored = await this.loadState(tx, collection, recordId)
 		if (stored !== null) return { state: stored, rebuilt: false }
 		const hasRow = await this.hasStateRow(tx, collection, recordId)
-		const ops = await this.loadRecordOperations(tx, collection, recordId)
-		if (!hasRow && ops.every((op) => op.id === appendedId)) {
+		const others = await tx.query<{ n: number }>(
+			`SELECT COUNT(*) AS n FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ? AND id != ?`,
+			[recordId, appendedId],
+		)
+		const retained = await loadRetainedConflictRows(
+			(sql, params) => tx.query(sql, params),
+			collection,
+			recordId,
+		)
+		const hasBase = (await this.loadBase(tx, collection, recordId)) !== null
+		if (
+			!hasRow &&
+			!hasBase &&
+			(others[0]?.n ?? 0) === 0 &&
+			retained.every((row) => row.id === appendedId)
+		) {
 			// A new record: nothing to rebuild.
 			return { state: createFoldState(collection, recordId), rebuilt: false }
 		}
@@ -456,6 +511,16 @@ export class RecordFolder {
 }
 
 /** No insert merged yet, or the newest delete is later than the newest write. */
+/**
+ * The stored form of a fold state: plain JSON, read back by `deserializeFoldState`.
+ * The canonical form (`serializeFoldState`, sorted keys) is for comparing and
+ * exchanging states; a local row only needs to round-trip, and plain JSON is several
+ * times cheaper on the write path.
+ */
+function persistedForm(state: FoldState): string {
+	return JSON.stringify(state)
+}
+
 function isDeadState(state: FoldState): boolean {
 	return !isFoldStateLive(state)
 }

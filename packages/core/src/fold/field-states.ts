@@ -16,6 +16,7 @@ import type {
 	RegisterFieldState,
 	ResolverFieldState,
 	RichtextFieldState,
+	RichtextSubsumes,
 	RichtextUpdateMerger,
 	Stamp,
 } from './types'
@@ -615,7 +616,11 @@ function decodeRichtext(value: unknown): { reset: unknown } | { update: string }
 	}
 }
 
-function applyRichtext(state: RichtextFieldState, write: FieldWrite): FieldApplyResult {
+function applyRichtext(
+	state: RichtextFieldState,
+	write: FieldWrite,
+	subsumes: RichtextSubsumes | undefined,
+): FieldApplyResult {
 	const decoded = decodeRichtext(write.v)
 	if ('reset' in decoded) {
 		if (state.reset !== null && compareStamps(write.s, state.reset.s) <= 0) {
@@ -630,10 +635,29 @@ function applyRichtext(state: RichtextFieldState, write: FieldWrite): FieldApply
 	if (current !== undefined && compareStamps(write.s, current) <= 0) {
 		return { state, changed: false }
 	}
-	return {
-		state: { k: 'rt', reset: state.reset, u: { ...state.u, [decoded.update]: write.s } },
-		changed: true,
+	if (subsumes === undefined) {
+		return {
+			state: { k: 'rt', reset: state.reset, u: { ...state.u, [decoded.update]: write.s } },
+			changed: true,
+		}
 	}
+	// Keep only maximal updates: one whose content another update contains AND whose
+	// stamp is not later is redundant (every materialization, before or after any
+	// reset, is unchanged without it). The maximal elements of this partial order are
+	// a function of the update set, so pruning commutes with merging.
+	const incoming = base64ToBytes(decoded.update)
+	const u: Record<string, Stamp> = {}
+	for (const [update, stamp] of Object.entries(state.u)) {
+		if (update === decoded.update) continue
+		const bytes = base64ToBytes(update)
+		if (compareStamps(write.s, stamp) <= 0 && subsumes(incoming, bytes)) {
+			return { state, changed: false }
+		}
+		if (compareStamps(stamp, write.s) <= 0 && subsumes(bytes, incoming)) continue
+		u[update] = stamp
+	}
+	u[decoded.update] = write.s
+	return { state: { k: 'rt', reset: state.reset, u }, changed: true }
 }
 
 function materializeRichtext(
@@ -667,11 +691,15 @@ function materializeRichtext(
 /**
  * Apply one write to a field state. Commutative, associative and idempotent per
  * kind: the resulting state depends only on the set of writes applied.
+ *
+ * @param subsumes - Richtext only: prunes updates another update contains
+ *   ({@link FoldOptions.richtextSubsumes})
  */
 export function applyFieldWrite(
 	state: FieldState,
 	write: FieldWrite,
 	plan: FieldPlan,
+	subsumes?: RichtextSubsumes,
 ): FieldApplyResult {
 	switch (state.k) {
 		case 'reg':
@@ -688,7 +716,7 @@ export function applyFieldWrite(
 		case 'min':
 			return applyExtremum(state, write)
 		case 'rt':
-			return applyRichtext(state, write)
+			return applyRichtext(state, write, subsumes)
 	}
 }
 

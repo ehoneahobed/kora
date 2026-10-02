@@ -63,3 +63,10 @@ disagree permanently in beta.13.
   `ApplyRemoteOptions` (`guardRowState`, `materializeData`, `materializeTimestamp`,
   `forceMaterialize`, `logOnly`, `reactivateIfDeleted`) only apply under
   `materialization: 'legacy'`.
+- **A refused write is undone on its author.** `sync:operation-rejected` / the rejected
+  store still explain it, but the record no longer shows it (a refused insert disappears).
+  Own writes quarantined by a scope retraction are left out too. Writes discarded from a
+  held node (`discardHeld`) are NOT undone: they only stop uploading.
+- **Richtext state is bounded**: a Yjs update another update of the field contains (and
+  is not newer) is dropped from the field's fold state; richtext columns hold the
+  canonical encoding of the merged document, byte-identical across devices.

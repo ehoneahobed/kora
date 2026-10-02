@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Database as BetterSqlite3Database } from 'better-sqlite3'
+import type BetterSqlite3 from 'better-sqlite3'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 
 type BetterSqlite3Constructor = (filename: string) => BetterSqlite3Database
@@ -116,11 +117,29 @@ export class MockWorkerBridge implements WorkerBridge {
 		return { id, type: 'success' }
 	}
 
+	private statementCache: {
+		db: BetterSqlite3Database
+		statements: Map<string, BetterSqlite3.Statement>
+	} | null = null
+
+	/** Prepared statements cached per open database (as the real adapters reuse work). */
+	private statement(db: BetterSqlite3Database, sql: string): BetterSqlite3.Statement {
+		if (this.statementCache?.db !== db) this.statementCache = { db, statements: new Map() }
+		const statements = this.statementCache.statements
+		let prepared = statements.get(sql)
+		if (!prepared) {
+			prepared = db.prepare(sql)
+			if (statements.size >= 256) statements.clear()
+			statements.set(sql, prepared)
+		}
+		return prepared
+	}
+
 	private handleExecute(id: number, sql: string, params?: unknown[]): WorkerResponse {
 		if (!this.db) {
 			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
 		}
-		this.db.prepare(sql).run(...(params ?? []))
+		this.statement(this.db, sql).run(...(params ?? []))
 		return { id, type: 'success' }
 	}
 
@@ -128,7 +147,7 @@ export class MockWorkerBridge implements WorkerBridge {
 		if (!this.db) {
 			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
 		}
-		const rows = this.db.prepare(sql).all(...(params ?? []))
+		const rows = this.statement(this.db, sql).all(...(params ?? []))
 		return { id, type: 'success', data: rows }
 	}
 

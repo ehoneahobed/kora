@@ -128,6 +128,7 @@ export {
 	FOLD_RECORD_TRACE_FIELD,
 	createFoldState,
 	foldRecord,
+	getFoldFieldVersionStrings,
 	getFoldFieldVersions,
 	isFoldStateLive,
 	joinStates,
@@ -160,6 +161,7 @@ export type {
 	RegisterFieldState,
 	ResolverFieldState,
 	RichtextFieldState,
+	RichtextSubsumes,
 	RichtextUpdateMerger,
 	Stamp,
 } from './fold/types'

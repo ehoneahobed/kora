@@ -208,6 +208,9 @@ export interface FoldState {
 /** Merges the opaque Yjs updates of a richtext field into one update. */
 export type RichtextUpdateMerger = (updates: Uint8Array[]) => Uint8Array
 
+/** True when update `a`'s content is contained in update `b`'s (a adds nothing to b). */
+export type RichtextSubsumes = (a: Uint8Array, b: Uint8Array) => boolean
+
 /** Which merge traces {@link mergeOp} emits. */
 export type FoldTraceMode = 'conflicts' | 'all' | 'none'
 
@@ -224,6 +227,15 @@ export interface FoldOptions {
 	 * Core has no Yjs dependency, so it cannot supply one itself.
 	 */
 	richtext?: RichtextUpdateMerger
+	/**
+	 * Optional richtext space bound: when given, an update whose content another
+	 * update of the field contains, and whose stamp is not later, is dropped (it can
+	 * never change a materialization). Devices persist a full Yjs snapshot per edit,
+	 * so without it a field's state keeps every snapshot. Materializations are the
+	 * same with or without it; every replica of one database must use the same setting
+	 * for its serialized states to be byte-identical.
+	 */
+	richtextSubsumes?: RichtextSubsumes
 	/** Which traces to emit. Default `'conflicts'`. */
 	traces?: FoldTraceMode
 	/**

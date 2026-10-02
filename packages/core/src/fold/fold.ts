@@ -408,7 +408,12 @@ export function mergeOp(
 		const tracing = mode !== 'none'
 		const prior = tracing ? safeMaterializeField(existing, field, options) : undefined
 		const priorStamp = existing ? fieldStamp(existing) : null
-		const result = applyFieldWrite(existing ?? emptyField(plan), write, plan)
+		const result = applyFieldWrite(
+			existing ?? emptyField(plan),
+			write,
+			plan,
+			options.richtextSubsumes,
+		)
 		if (result.changed) {
 			if (fields === state.f) fields = { ...state.f }
 			fields[field] = result.state
@@ -558,6 +563,20 @@ export function joinStates(a: FoldState, b: FoldState, schema: SchemaDefinition)
 		u: maxStamp(a.u, b.u),
 		f: fields,
 	}
+}
+
+/**
+ * Each field's newest affecting write as a serialized HLC (`HybridLogicalClock.
+ * serialize`), regardless of liveness: the `_field_versions` column of a stored row,
+ * without a deserialize/serialize round trip. Keys in sorted order.
+ */
+export function getFoldFieldVersionStrings(state: FoldState): Record<string, string> {
+	const out: Record<string, string> = {}
+	for (const field of Object.keys(state.f).sort()) {
+		const stamp = fieldStamp(state.f[field] as FieldState)
+		if (stamp !== null) out[field] = stamp.t
+	}
+	return out
 }
 
 /**
