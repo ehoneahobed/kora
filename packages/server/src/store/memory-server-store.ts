@@ -20,16 +20,28 @@ import type {
 	CollectionQueryOptions,
 	DeliveredOperation,
 	MaterializedRecord,
+	OperationResolution,
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
 import {
+	MAX_RESOLUTION_MESSAGE_LENGTH,
 	RELEASED_NODE_OWNER,
 	SequenceConflictError,
 	judgeSequenceHolders,
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+
+/** Drop resolutions above their node's entry in `vector` (absent: every one). */
+function pruneResolutionsPastLog(
+	resolutions: Map<string, OperationResolution>,
+	vector: ReadonlyMap<string, number>,
+): void {
+	for (const [id, resolution] of resolutions) {
+		if (resolution.sequenceNumber > (vector.get(resolution.nodeId) ?? 0)) resolutions.delete(id)
+	}
+}
 
 /** Key of a node's sequence number in {@link MemoryServerStore}'s sequence index. */
 function sequenceKey(nodeId: string, sequenceNumber: number): string {
@@ -50,6 +62,10 @@ export class MemoryServerStore implements ServerStore {
 	/** (nodeId, sequenceNumber) -> the id of the operation holding it (W3 step 4). */
 	/** (node, sequence) -> ids holding it, in store order (several only for a legacy pair). */
 	private readonly operationIdsBySequence = new Map<string, string[]>()
+	/** Node -> sequences held by more than one operation (legacy pairs, RT-48). */
+	private readonly pairSequencesByNode = new Map<string, Set<number>>()
+	/** Operation id -> how it was resolved without being stored (RT-43, RT-47). */
+	private readonly resolutions = new Map<string, OperationResolution>()
 	private readonly versionVector: Map<string, number> = new Map()
 	/**
 	 * Server-assigned delivery sequence per operation id. Single-process, so a plain
@@ -185,8 +201,63 @@ export class MemoryServerStore implements ServerStore {
 	private addSequenceHolder(op: Operation): void {
 		const key = sequenceKey(op.nodeId, op.sequenceNumber)
 		const ids = this.operationIdsBySequence.get(key)
-		if (ids) ids.push(op.id)
-		else this.operationIdsBySequence.set(key, [op.id])
+		if (ids) {
+			ids.push(op.id)
+			let pairs = this.pairSequencesByNode.get(op.nodeId)
+			if (!pairs) {
+				pairs = new Set()
+				this.pairSequencesByNode.set(op.nodeId, pairs)
+			}
+			pairs.add(op.sequenceNumber)
+		} else this.operationIdsBySequence.set(key, [op.id])
+	}
+
+	async getSequencePairOperations(nodeId: string, throughSequence: number): Promise<Operation[]> {
+		this.assertOpen()
+		const sequences = [...(this.pairSequencesByNode.get(nodeId) ?? [])]
+			.filter((seq) => seq <= throughSequence)
+			.sort((a, b) => a - b)
+		const result: Operation[] = []
+		for (const seq of sequences) {
+			for (const id of this.operationIdsBySequence.get(sequenceKey(nodeId, seq)) ?? []) {
+				const op = this.operationIndex.get(id)
+				if (op) result.push(op)
+			}
+		}
+		return result
+	}
+
+	async recordOperationResolution(resolution: OperationResolution): Promise<void> {
+		this.assertOpen()
+		if (this.resolutions.has(resolution.operationId)) return
+		this.resolutions.set(resolution.operationId, {
+			...resolution,
+			message: resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null,
+		})
+	}
+
+	async findOperationResolutions(
+		nodeId: string,
+		ids: string[],
+	): Promise<Map<string, OperationResolution>> {
+		this.assertOpen()
+		const found = new Map<string, OperationResolution>()
+		for (const id of ids) {
+			const resolution = this.resolutions.get(id)
+			if (resolution && resolution.nodeId === nodeId) found.set(id, { ...resolution })
+		}
+		return found
+	}
+
+	async getResolvedThrough(nodeId: string): Promise<number> {
+		this.assertOpen()
+		let max = 0
+		for (const resolution of this.resolutions.values()) {
+			if (resolution.nodeId === nodeId && resolution.sequenceNumber > max) {
+				max = resolution.sequenceNumber
+			}
+		}
+		return max
 	}
 
 	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
@@ -611,6 +682,8 @@ export class MemoryServerStore implements ServerStore {
 		this.operations.length = 0
 		this.operationIndex.clear()
 		this.operationIdsBySequence.clear()
+		this.pairSequencesByNode.clear()
+		this.resolutions.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
 		this.nodeOwners.clear()
@@ -642,6 +715,7 @@ export class MemoryServerStore implements ServerStore {
 		this.operations.length = 0
 		this.operationIndex.clear()
 		this.operationIdsBySequence.clear()
+		this.pairSequencesByNode.clear()
 		this.versionVector.clear()
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
@@ -664,6 +738,10 @@ export class MemoryServerStore implements ServerStore {
 				this.rebuildMaterializedRecord(op.collection, op.recordId)
 			}
 		}
+		// Resolutions past a node's restored log describe operations decided after the
+		// backup: advertising them would hide stored operations the restore lost (RT-45),
+		// so they go and the devices re-upload that tail.
+		pruneResolutionsPastLog(this.resolutions, this.versionVector)
 		// The restored snapshot may hold legacy duplicate sequences; enforcement resumes
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter

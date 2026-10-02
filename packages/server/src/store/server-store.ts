@@ -52,6 +52,12 @@ export class SequenceConflictError extends KoraError {
 export const SEQUENCE_ENFORCEMENT_EPOCH_KEY = 'sequence_enforcement_epoch'
 
 /**
+ * `kora_server_meta` key set once the legacy pairs already in the log were indexed in
+ * `sequence_pairs` (RT-48); appends maintain the index from then on.
+ */
+export const SEQUENCE_PAIRS_BACKFILLED_KEY = 'sequence_pairs_backfilled'
+
+/**
  * Name of the partial unique index over (node_id, sequence_number) of the rows that
  * were the sole holder of their sequence when stored (`seq_unique = 1`, RT-37).
  *
@@ -146,6 +152,34 @@ export function reportLegacyPair(
 		legacyWriter: decision.legacyWriter,
 	})
 }
+
+/**
+ * How the server resolved an uploaded operation it did NOT store under the submitted
+ * (node, sequence) (RT-43, RT-47):
+ * - `'ignored'`: the validator answered `ignore` (handled out of band, nothing stored);
+ * - `'refused'`: a terminal (non-retriable) rejection; the same id is answered with the
+ *   original rejection forever after;
+ * - `'stored-elsewhere'`: the id is stored under another sequence of the same node (a
+ *   client sequence repair renumbered it), acknowledged as a duplicate.
+ * A retriable rejection, and a `SEQUENCE_CONFLICT` (the client renumbers and resubmits
+ * under the same id), are never resolutions.
+ */
+export type OperationResolutionOutcome = 'ignored' | 'refused' | 'stored-elsewhere'
+
+/** A durable record of how an uploaded operation was resolved without being stored. */
+export interface OperationResolution {
+	operationId: string
+	nodeId: string
+	sequenceNumber: number
+	outcome: OperationResolutionOutcome
+	/** Rejection code, for `'refused'`. */
+	code: string | null
+	/** Rejection message, for `'refused'`. */
+	message: string | null
+}
+
+/** Longest rejection message kept in an {@link OperationResolution}. */
+export const MAX_RESOLUTION_MESSAGE_LENGTH = 1024
 
 /** Where a stored operation sits in its node's sequence space. */
 export interface StoredOperationKey {
@@ -365,6 +399,37 @@ export interface ServerStore extends SyncStore {
 	 * (node, sequence) lookup without it.
 	 */
 	findStoredOperations?(ids: string[]): Promise<Map<string, StoredOperationKey>>
+
+	/**
+	 * Durably record how an uploaded operation was resolved without being stored under
+	 * its sequence (RT-43, RT-47; see {@link OperationResolution}). Idempotent per
+	 * operation id: the first resolution wins. The session awaits it BEFORE answering the
+	 * client, so a client never acts on a resolution the server could forget. Optional
+	 * for custom stores: without it an ignored tail op may be re-validated at reconnect
+	 * and a refused id re-judged on resubmission.
+	 */
+	recordOperationResolution?(resolution: OperationResolution): Promise<void>
+
+	/**
+	 * The resolutions recorded for `ids` under `nodeId` (ids resolved under another node
+	 * are absent: the answer never crosses devices or tenants).
+	 */
+	findOperationResolutions?(
+		nodeId: string,
+		ids: string[],
+	): Promise<Map<string, OperationResolution>>
+
+	/** The highest sequence number of `nodeId` with a recorded resolution (0 when none). */
+	getResolvedThrough?(nodeId: string): Promise<number>
+
+	/**
+	 * Every operation of `nodeId` at or below `throughSequence` that shares its sequence
+	 * with another stored operation (a legacy pair, RT-37), ordered by sequence then
+	 * delivery. A version-vector client reporting `throughSequence` for the node may hold
+	 * only one of a pair, and a range read above its entry can never return the other
+	 * (RT-48). Optional; without it such clients miss the second op of a pair.
+	 */
+	getSequencePairOperations?(nodeId: string, throughSequence: number): Promise<Operation[]>
 
 	/**
 	 * The distinct node ids of the operations with `deliverySequence >

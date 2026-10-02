@@ -38,7 +38,7 @@ import {
 	wireToVersionVector,
 } from '@korajs/sync'
 import { scopeViewKey } from '@korajs/sync/internal'
-import { applyServerOperation } from '../apply/apply-server-operation'
+import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
@@ -69,10 +69,13 @@ import type {
 	DeliveredOperation,
 	LegacySequencePair,
 	MaterializedRecord,
+	OperationResolution,
+	OperationResolutionOutcome,
 	OperationScopeSnapshot,
 	ServerStore,
 	StoredOperationKey,
 } from '../store/server-store'
+import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
@@ -83,6 +86,7 @@ import {
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
+	type IngestRateLimiter,
 	SessionRateLimiter,
 	validateOperationSize,
 } from './session-operation-limits'
@@ -465,10 +469,13 @@ export interface ClientSessionOptions {
 	deliveryHighWaterBytes?: number
 	/**
 	 * The ingest rate limiter for a node, shared across that node's sessions so a
-	 * reconnect does not reset it (SRV-6). Called once the handshake binds the node.
+	 * reconnect does not reset it (SRV-6). Called once the handshake binds the node,
+	 * with the authenticated principal's user id (null for anonymous and
+	 * unauthenticated sessions) so a per-user budget can be layered on top: a user
+	 * minting node ids must not multiply the per-node budget.
 	 * Without it the session keeps a private limiter.
 	 */
-	rateLimiterFor?: (nodeId: string) => SessionRateLimiter
+	rateLimiterFor?: (nodeId: string, principal: string | null) => IngestRateLimiter
 	/**
 	 * Interval of the application-level heartbeat sent to clients that advertised
 	 * support for it, in ms (LMS #12). The handshake response tells the client the
@@ -590,7 +597,9 @@ export class ClientSession {
 	private readonly handshakeTimeoutMs: number
 	private handshakeTimer: ReturnType<typeof setTimeout> | null = null
 	private handshakeReceived = false
-	private readonly rateLimiterFor: ((nodeId: string) => SessionRateLimiter) | null
+	private readonly rateLimiterFor:
+		| ((nodeId: string, principal: string | null) => IngestRateLimiter)
+		| null
 	private readonly appHeartbeatIntervalMs: number
 	private appHeartbeatTimer: ReturnType<typeof setInterval> | null = null
 	/** Last time anything was sent to the client (a heartbeat is skipped when recent). */
@@ -637,7 +646,7 @@ export class ClientSession {
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
-	private rateLimiter: SessionRateLimiter
+	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
 	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
@@ -1976,6 +1985,17 @@ export class ClientSession {
 		const visibleServerVector = new Map(
 			[...serverVector].filter(([nodeId]) => visibleNodes.has(nodeId)),
 		)
+		// The session's own node is ALWAYS advertised, 0 when the server holds nothing of
+		// it (RT-45): a device must learn that the server lost its operations (restored
+		// from an older backup) to upload them again. The entry is the highest sequence
+		// the server has RESOLVED for the node (stored, validator-ignored, terminally
+		// refused, or stored under another number; RT-43), so an operation the server
+		// decided without storing is never read as lost and re-submitted at every
+		// reconnect. It names only the client's own node, so it discloses nothing (RT-7).
+		visibleServerVector.set(
+			msg.nodeId,
+			Math.max(serverVector.get(msg.nodeId) ?? 0, await this.resolvedThrough(msg.nodeId)),
+		)
 		const heartbeat = msg.supportsHeartbeat === true && this.appHeartbeatIntervalMs > 0
 
 		// Send handshake response with the visible version vector and accepted scope
@@ -2023,7 +2043,13 @@ export class ClientSession {
 		// The ingest rate limit follows the node across reconnects (SRV-6): the node id
 		// is bound to this principal by now (claimed when auth is configured).
 		if (this.rateLimiterFor) {
-			this.rateLimiter = this.rateLimiterFor(msg.nodeId)
+			const principal =
+				this.principal &&
+				this.principal.anonymous !== true &&
+				!(this.auth instanceof NoAuthProvider)
+					? this.principal.userId
+					: null
+			this.rateLimiter = this.rateLimiterFor(msg.nodeId, principal)
 		}
 
 		if (this.clientDeliveryWatermark !== null) {
@@ -2261,11 +2287,13 @@ export class ClientSession {
 		// the store for it. So a device's upgrade re-upload of thousands of stored
 		// operations is not cut off by RATE_LIMIT, while lookups still cost per batch.
 		let stored: Map<string, StoredOperationKey> = new Map()
+		let resolved: Map<string, OperationResolution> = new Map()
 		let lookupCredit = 0
 		if (operations.length > 0) {
 			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
 				lookupCredit = BATCH_LOOKUP_RATE_COST
 				stored = await this.findStoredOperations(operations)
+				resolved = await this.findResolutions(operations, stored)
 			} else {
 				this.rateLimitedOperations += operations.length
 				this.sendRateLimited()
@@ -2280,7 +2308,31 @@ export class ClientSession {
 
 			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
 			if (this.isStoredDuplicate(op, stored)) {
+				await this.noteStoredElsewhere(op, stored)
 				duplicateOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
+			// Already resolved for this device without being stored (RT-43, RT-47): the
+			// original answer again, free of charge, and never a second judgement. A refused
+			// operation stays refused even when the device lost its rejection marker (a
+			// restored copy): re-running authorization and validators against today's state
+			// could apply a write the server refused. An ignored one is not handed to the
+			// validator again (its out-of-band effect must not repeat).
+			const resolution = resolved.get(op.id)
+			if (resolution) {
+				if (resolution.outcome === 'refused') {
+					this.sendOperationRejected(
+						op,
+						resolution.code ?? RESTRICTED_REJECTION_CODE,
+						resolution.message ?? 'This operation was refused earlier.',
+						false,
+					)
+					rejectedOperations += 1
+				} else {
+					duplicateOperations += 1
+				}
 				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
@@ -2334,6 +2386,7 @@ export class ClientSession {
 				stored.get(op.id)?.nodeId === op.nodeId ||
 				(!this.store.findStoredOperations && (await this.isStoredOperation(op, stored)))
 			) {
+				await this.noteStoredElsewhere(op, stored)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2341,13 +2394,12 @@ export class ClientSession {
 
 			const authorization = await this.authorizeClientOperation(op)
 			if (!authorization.allowed) {
-				this.sendOperationRejected(
+				await this.refuseTerminally(
 					op,
 					authorization.code,
 					authorization.code === 'SCOPE_VIOLATION'
 						? `${authorization.message} Refresh scopes before creating or explicitly resubmitting an authorized operation.`
 						: authorization.message,
-					false,
 				)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -2377,11 +2429,10 @@ export class ClientSession {
 
 			const serverOp = this.transformForServerSchema(op)
 			if (serverOp === null) {
-				this.sendOperationRejected(
+				await this.refuseTerminally(
 					op,
 					'SCHEMA_TRANSFORM_UNAVAILABLE',
 					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
-					false,
 				)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -2413,7 +2464,11 @@ export class ClientSession {
 				}
 				if (decision.action === 'reject') {
 					const retriable = decision.retriable ?? isRetriableRejection(decision.code)
-					this.sendOperationRejected(serverOp, decision.code, decision.message, retriable)
+					if (retriable) {
+						this.sendOperationRejected(serverOp, decision.code, decision.message, true)
+					} else {
+						await this.refuseTerminally(serverOp, decision.code, decision.message)
+					}
 					rejectedOperations += 1
 					if (retriable) {
 						canAdvanceAck = false
@@ -2425,6 +2480,10 @@ export class ClientSession {
 				if (decision.action === 'ignore') {
 					// The server took responsibility out of band; do not materialize the
 					// raw op and do not reject. The batch ack lets the client drop it.
+					// Recorded first, durably: the handshake then counts its sequence as
+					// resolved, and a resubmission is acknowledged without being handed to
+					// the validator again (RT-43).
+					await this.recordResolution(op, 'ignored', null, null)
 					acknowledgedThrough = op.sequenceNumber
 					continue
 				}
@@ -2435,7 +2494,7 @@ export class ClientSession {
 			// what this writer may read (RT-11, RT-13).
 			const references = await this.authorizeReferences(serverOp)
 			if (!references.allowed) {
-				this.sendOperationRejected(serverOp, references.code, references.message, false)
+				await this.refuseTerminally(serverOp, references.code, references.message)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2455,12 +2514,25 @@ export class ClientSession {
 				onLegacySequencePair: (pair) => this.recordLegacySequencePair(pair),
 			})
 			if (applyResult.rejection) {
-				this.sendOperationRejected(
-					serverOp,
-					applyResult.rejection.code,
-					applyResult.rejection.message,
-					applyResult.rejection.retriable,
-				)
+				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
+				// resubmits it under the same id, so it is never remembered as refused.
+				if (
+					applyResult.rejection.retriable ||
+					applyResult.rejection.code === SEQUENCE_CONFLICT_CODE
+				) {
+					this.sendOperationRejected(
+						serverOp,
+						applyResult.rejection.code,
+						applyResult.rejection.message,
+						applyResult.rejection.retriable,
+					)
+				} else {
+					await this.refuseTerminally(
+						serverOp,
+						applyResult.rejection.code,
+						applyResult.rejection.message,
+					)
+				}
 				rejectedOperations += 1
 				if (applyResult.rejection.retriable) {
 					canAdvanceAck = false
@@ -2520,8 +2592,20 @@ export class ClientSession {
 
 		for (const [nodeId, serverSeq] of serverVector) {
 			const clientSeq = clientVector.get(nodeId) ?? 0
-			if (serverSeq > clientSeq) {
-				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
+			// A legacy pair (two operations under one (node, sequence), RT-37) at or below
+			// the client's entry: the client may hold only one of them, and the range read
+			// below starts above its entry, so both are sent again (RT-48). The client
+			// dedups by id; pairs are few (legacy writers only), so the resend is small.
+			const pairs =
+				clientSeq > 0 && this.store.getSequencePairOperations
+					? await this.store.getSequencePairOperations(nodeId, Math.min(clientSeq, serverSeq))
+					: []
+			if (serverSeq > clientSeq || pairs.length > 0) {
+				const range =
+					serverSeq > clientSeq
+						? await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
+						: []
+				const ops = [...pairs, ...range]
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
 					const snapshot = snapshots.get(op.id) ?? null
@@ -2926,11 +3010,103 @@ export class ClientSession {
 		return own || known.sequenceNumber === op.sequenceNumber
 	}
 
+	/**
+	 * The recorded resolutions of the batch's own-node operations that the lookup did
+	 * not find stored (RT-43, RT-47). Asked only for this session's own node, so the
+	 * answer never reveals another device's (or tenant's) refusals.
+	 */
+	private async findResolutions(
+		operations: Operation[],
+		stored: Map<string, StoredOperationKey>,
+	): Promise<Map<string, OperationResolution>> {
+		const nodeId = this.clientNodeId
+		if (!this.store.findOperationResolutions || nodeId === null) return new Map()
+		const ids = operations
+			.filter((op) => op.nodeId === nodeId && op.timestamp.nodeId === nodeId && !stored.has(op.id))
+			.map((op) => op.id)
+		if (ids.length === 0) return new Map()
+		try {
+			return await this.store.findOperationResolutions(nodeId, ids)
+		} catch (error) {
+			console.warn(
+				`[kora] findOperationResolutions failed; judging the batch without it: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
+		}
+	}
+
+	/** The highest resolved sequence of `nodeId` (0 without the store method or on error). */
+	private async resolvedThrough(nodeId: string): Promise<number> {
+		if (!this.store.getResolvedThrough) return 0
+		try {
+			return await this.store.getResolvedThrough(nodeId)
+		} catch (error) {
+			console.warn(
+				`[kora] getResolvedThrough failed; advertising the stored maximum: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return 0
+		}
+	}
+
+	/**
+	 * Durably record how this session's own operation was resolved without being stored
+	 * under its sequence. Awaited before the answer is sent: a failure propagates (the
+	 * batch fails and is not acknowledged), so the client never acts on a resolution the
+	 * server could forget.
+	 */
+	private async recordResolution(
+		op: Operation,
+		outcome: OperationResolutionOutcome,
+		code: string | null,
+		message: string | null,
+	): Promise<void> {
+		if (!this.store.recordOperationResolution || op.nodeId !== this.clientNodeId) return
+		await this.store.recordOperationResolution({
+			operationId: op.id,
+			nodeId: op.nodeId,
+			sequenceNumber: op.sequenceNumber,
+			outcome,
+			code,
+			message,
+		})
+	}
+
+	/**
+	 * Refuse an operation for good (non-retriable): remember the refusal (RT-47), then
+	 * tell the client. A resubmission of the same id is answered with this rejection
+	 * without being judged again.
+	 */
+	private async refuseTerminally(op: Operation, code: string, message: string): Promise<void> {
+		await this.recordResolution(op, 'refused', code, message)
+		this.sendOperationRejected(op, code, message, false)
+	}
+
+	/**
+	 * An own operation acknowledged as a duplicate of the copy stored under ANOTHER
+	 * sequence (the client's sequence repair renumbered it, keeping its id): record the
+	 * submitted sequence as resolved, so the handshake does not read it as lost (RT-43).
+	 */
+	private async noteStoredElsewhere(
+		op: Operation,
+		stored: Map<string, StoredOperationKey>,
+	): Promise<void> {
+		const known = stored.get(op.id)
+		if (
+			!known ||
+			known.nodeId !== op.nodeId ||
+			known.sequenceNumber === op.sequenceNumber ||
+			op.nodeId !== this.clientNodeId
+		) {
+			return
+		}
+		await this.recordResolution(op, 'stored-elsewhere', null, null)
+	}
+
 	/** Refuse the rest of a batch for the per-minute ingest budget (retriable). */
 	private sendRateLimited(): void {
 		this.sendError(
 			'RATE_LIMIT',
-			`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min); retry in ${String(this.rateLimiter.retryAfterMs())} ms`,
+			`Session exceeded operation rate limit (${String(this.rateLimiter.limit)} ops/min for this device; a signed-in user's devices also share a per-user budget); retry in ${String(this.rateLimiter.retryAfterMs())} ms`,
 			true,
 		)
 	}
