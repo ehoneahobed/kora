@@ -1401,3 +1401,33 @@ The host waits for initial auth restoration, removes the old provider tree, clos
 app, and only then creates the next user's app. A refresh or scope change for the same user
 keeps the app and store. `app.storeInfo()` exposes the active database identity and durability
 without providing access to any other user's data. `app.close()` remains the teardown boundary.
+
+## Writes belong to the signed-in user
+
+With `sync.authClient`, Kora binds every local write to the user who is signed in when it is
+made, even when several users share one local database (`namespaceByAuthUser` off, the default):
+
+- At start, and on every auth change the binding reports, the store moves to that user's own
+  sync node (creating one the first time), before the next local write.
+- A node that belongs to another user is never uploaded, adopted or re-authored on this user's
+  session. Its unsynced writes wait for their user and are reported in
+  `useSyncStatus().heldOperations`, not in `pendingOperations`. They upload, as that user, when
+  they sign in again on this device.
+- A database that never synced does not hand one user's offline writes to the next user.
+
+What this does not cover:
+
+- Writes issued in the same instant as a sign-in, before the auth binding reports the new user,
+  are still authored under the previous user's node (and wait for that user). Use
+  `AuthBoundKoraProvider`, which creates the app only after auth resolves, when this matters.
+- A node id pinned by the auth device id (`resolveNodeId`) cannot move: if another user signs
+  in on an app created for a different user, sync is suspended with reason
+  `node-owned-by-another-user` instead of uploading. Recreate the app for the new user.
+- Apps that pass only a `sync.auth` token function do not tell Kora who is signed in, so Kora
+  cannot tell two users' unsynced writes apart. The server still refuses another user's node,
+  and those writes are held for the user who first synced it.
+
+`namespaceByAuthUser` stays off by default. Turning it on gives each user a separate local
+database, which also keeps their rows apart on the device; turning it on for an existing app
+makes the data in the shared database invisible until it is migrated, so it is not enabled
+implicitly.
