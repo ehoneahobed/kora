@@ -18,6 +18,7 @@ export type {
 	ServerStore,
 	MaterializedRecord,
 	CollectionQueryOptions,
+	StoredOperationKey,
 } from './store/server-store'
 export type { TrustProxySetting } from './server/trust-proxy'
 

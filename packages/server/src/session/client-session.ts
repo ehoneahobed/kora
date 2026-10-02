@@ -69,6 +69,7 @@ import type {
 	MaterializedRecord,
 	OperationScopeSnapshot,
 	ServerStore,
+	StoredOperationKey,
 } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
@@ -2206,6 +2207,13 @@ export class ClientSession {
 		let uniqueOperations = 0
 		let duplicateOperations = 0
 		let rejectedOperations = 0
+		// Which of the batch's ids the server already holds, read once per batch (after
+		// the first operation is charged to the rate limiter) and before any other
+		// per-operation check. A device re-uploading its history (the one-time upgrade
+		// re-upload, or an op its sequence repair renumbered under the same id) must get
+		// a duplicate ack, never a rejection from today's authorization or validators
+		// for an operation the server already accepted (RT-31).
+		let stored: Map<string, StoredOperationKey> | null = null
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
@@ -2226,6 +2234,8 @@ export class ClientSession {
 				continue
 			}
 
+			if (stored === null) stored = await this.findStoredOperations(operations)
+
 			// A session may only upload its own device's operations. A foreign nodeId
 			// would let one peer advance another device's version-vector entry and make
 			// that device skip uploading its real writes. The ack does not advance over a
@@ -2235,7 +2245,7 @@ export class ClientSession {
 				// delivered (its delta is computed against the handshake-time vector). That
 				// op is already stored under its id, so accepting it as a duplicate writes
 				// nothing and cannot advance any vector: treat it exactly like a duplicate.
-				if (await this.isStoredOperation(op)) {
+				if (await this.isStoredOperation(op, stored)) {
 					duplicateOperations += 1
 					acknowledgedThrough = op.sequenceNumber
 					continue
@@ -2247,6 +2257,22 @@ export class ClientSession {
 					false,
 				)
 				rejectedOperations += 1
+				continue
+			}
+
+			// This device's own operation, already stored under its id (content-addressed,
+			// so the same write): nothing to judge or write again. It was authorized and
+			// validated when first accepted; re-judging it now could refuse a write the
+			// server holds and make the device roll it back.
+			// The (node, sequence) may differ from the stored one: the client's sequence
+			// repair renumbers a legacy duplicate and keeps its id.
+			// A custom store without the batch lookup is asked per op by (node, sequence).
+			if (
+				stored.get(op.id)?.nodeId === op.nodeId ||
+				(!this.store.findStoredOperations && (await this.isStoredOperation(op, stored)))
+			) {
+				duplicateOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -2798,8 +2824,37 @@ export class ClientSession {
 		return operationMatchesQuerySubsets(op, subsets, fullRecord)
 	}
 
-	/** True when the store already holds exactly this operation (same node, sequence and id). */
-	private async isStoredOperation(op: Operation): Promise<boolean> {
+	/**
+	 * Where the store already holds each of `operations` (by id), in one store read.
+	 * Null when the store cannot answer by id (a custom store without
+	 * `findStoredOperations`, or the read failed): callers then fall back to a
+	 * per-operation (node, sequence) lookup and the store's own dedup at apply.
+	 */
+	private async findStoredOperations(
+		operations: Operation[],
+	): Promise<Map<string, StoredOperationKey>> {
+		if (!this.store.findStoredOperations) return new Map()
+		try {
+			return await this.store.findStoredOperations(operations.map((op) => op.id))
+		} catch (error) {
+			console.warn(
+				`[kora] findStoredOperations failed; judging the batch without it: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
+		}
+	}
+
+	/**
+	 * True when the store already holds exactly this operation (same node, sequence and
+	 * id). Answered from the batch lookup when the store supports it.
+	 */
+	private async isStoredOperation(
+		op: Operation,
+		batch: Map<string, StoredOperationKey>,
+	): Promise<boolean> {
+		const known = batch.get(op.id)
+		if (known) return known.nodeId === op.nodeId && known.sequenceNumber === op.sequenceNumber
+		if (this.store.findStoredOperations) return false
 		try {
 			const stored = await this.store.getOperationRange(
 				op.nodeId,

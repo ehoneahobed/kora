@@ -39,7 +39,14 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER, SequenceConflictError } from './server-store'
+import {
+	NODE_SEQ_UNIQUE_INDEX,
+	RELEASED_NODE_OWNER,
+	SEQUENCE_ENFORCEMENT_EPOCH_KEY,
+	SequenceConflictError,
+	judgeSequenceHolders,
+} from './server-store'
+import type { StoredOperationKey } from './server-store'
 
 /** Thrown inside an append transaction to roll it back when the operation is a duplicate. */
 class DuplicateOperationRollback extends Error {
@@ -84,6 +91,8 @@ export class PostgresServerStore implements ServerStore {
 	 * null after a backup import so it re-seeds from the restored version vector.
 	 */
 	private sequenceCounter: number | null = null
+	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
+	private sequenceEpoch = 0
 	/**
 	 * Time source for HLC timestamps on server-originated operations. Injectable so a
 	 * test can freeze wall-clock time and prove the conditional-apply ordering holds
@@ -269,8 +278,9 @@ export class PostgresServerStore implements ServerStore {
 	 * Insert one operation row inside an append transaction that already holds the
 	 * delivery-counter lock. Returns false (writing nothing) when an operation with the
 	 * same id is stored; throws {@link SequenceConflictError} when a DIFFERENT
-	 * operation holds its (node, sequence) (W3 step 4). The unique index on
-	 * (node_id, sequence_number) backs the check where the existing log allowed it.
+	 * operation stored after the sequence-enforcement epoch holds its (node, sequence)
+	 * (W3 step 4); a legacy holder is accepted. The partial unique index over rows past
+	 * the epoch backs the check.
 	 */
 	private async insertOperationRow(
 		tx: PostgresJsDatabase,
@@ -279,12 +289,19 @@ export class PostgresServerStore implements ServerStore {
 		deliverySeq: number,
 	): Promise<boolean> {
 		const holders = (await tx.execute(
-			sql`SELECT id FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber} LIMIT 1`,
-		)) as unknown as { id: string }[]
-		const holder = holders[0]
-		if (holder !== undefined && holder.id !== op.id) {
-			throw new SequenceConflictError(op, holder.id)
+			sql`SELECT id, delivery_seq FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber}`,
+		)) as unknown as { id: string; delivery_seq: string | number | null }[]
+		// Already stored (a legacy pair may hold the sequence twice: check every holder).
+		if (holders.some((row) => row.id === op.id)) return false
+		const decision = judgeSequenceHolders(
+			op,
+			holders.map((row) => ({ id: row.id, deliverySequence: Number(row.delivery_seq ?? 0) })),
+			this.sequenceEpoch,
+		)
+		if (decision.verdict === 'conflict') {
+			throw new SequenceConflictError(op, decision.holderId)
 		}
+		const holder = holders[0]
 		try {
 			const inserted = await tx
 				.insert(pgOperations)
@@ -691,6 +708,27 @@ export class PostgresServerStore implements ServerStore {
 		return rows.map((row) => row.node_id)
 	}
 
+	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
+		this.assertOpen()
+		await this.ready
+		const found = new Map<string, StoredOperationKey>()
+		// One statement per 1000 ids, well below the bind-parameter limit.
+		for (let i = 0; i < ids.length; i += 1000) {
+			const chunk = ids.slice(i, i + 1000)
+			if (chunk.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { id: string; node_id: string; sequence_number: number | string }[]
+			for (const row of rows) {
+				found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+			}
+		}
+		return found
+	}
+
 	async findRecordsByIds(
 		collection: string,
 		ids: string[],
@@ -830,7 +868,10 @@ export class PostgresServerStore implements ServerStore {
 		}
 
 		const now = Date.now()
-		await this.db.transaction(async (tx) => {
+		const restoredMax = await this.db.transaction(async (tx) => {
+			// Restored rows are inserted as they are (a legacy log may reuse a sequence);
+			// the partial index is rebuilt below for the new epoch.
+			await tx.execute(sql.raw(`DROP INDEX IF EXISTS ${NODE_SEQ_UNIQUE_INDEX}`))
 			await tx.delete(pgOperations)
 			await tx.delete(pgSyncState)
 
@@ -853,7 +894,20 @@ export class PostgresServerStore implements ServerStore {
 				sql`INSERT INTO delivery_counter (id, value) VALUES (1, ${deliverySeq})
 					ON CONFLICT (id) DO UPDATE SET value = ${deliverySeq}`,
 			)
+			// The restored snapshot sits at or below the new epoch (see
+			// SEQUENCE_ENFORCEMENT_EPOCH_KEY); enforcement resumes above it.
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, ${String(deliverySeq)})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+			await tx.execute(
+				sql.raw(
+					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE delivery_seq > ${String(deliverySeq)}`,
+				),
+			)
+			return deliverySeq
 		})
+		this.sequenceEpoch = restoredMax
 		await this.backfillScopeSnapshots()
 
 		// Rebuild in-memory version vector
@@ -1458,24 +1512,6 @@ export class PostgresServerStore implements ServerStore {
 				)
 			}
 
-			// One operation per (node, sequence) (W3 step 4), enforced by the database where
-			// the existing log allows it. A log written by an older release may already hold
-			// two operations under one sequence: the index is then skipped (in a savepoint,
-			// so the setup transaction survives) and the check inside every append guards
-			// new writes alone.
-			try {
-				await tx.transaction(async (savepoint) => {
-					await savepoint.execute(
-						sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_node_seq_unique ON operations (node_id, sequence_number)`,
-					)
-				})
-			} catch (error) {
-				if (!isUniqueViolation(error)) throw error
-				console.warn(
-					'[kora] The operation log holds operations that share a (node, sequence) pair, so the unique index idx_node_seq_unique was not created. New conflicting writes are still refused (SEQUENCE_CONFLICT).',
-				)
-			}
-
 			// Counter row that assigns delivery sequences in commit order. Every append
 			// does `UPDATE ... value = value + 1 RETURNING value` inside its transaction,
 			// which holds an exclusive row lock until commit. So a later assigner cannot
@@ -1510,6 +1546,47 @@ export class PostgresServerStore implements ServerStore {
 				ON CONFLICT (id) DO UPDATE
 					SET value = GREATEST(delivery_counter.value, EXCLUDED.value)
 			`)
+
+			// Sequence enforcement (W3 step 4): record the epoch on the first start of this
+			// release (the log's highest delivery sequence then; see
+			// SEQUENCE_ENFORCEMENT_EPOCH_KEY), then enforce one operation per (node,
+			// sequence) among the rows stored after it with a partial unique index, which
+			// therefore always exists: legacy duplicates sit at or below the epoch. It
+			// replaces the earlier full index, created only when the log had none.
+			await tx.execute(sql`
+				INSERT INTO kora_server_meta (key, value)
+				SELECT ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, COALESCE(MAX(delivery_seq), 0)::text FROM operations
+				ON CONFLICT (key) DO NOTHING
+			`)
+			const epochRows = (await tx.execute(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}`,
+			)) as unknown as { value: string }[]
+			const epoch = Number(epochRows[0]?.value)
+			if (!Number.isSafeInteger(epoch) || epoch < 0) {
+				throw new Error(
+					`kora_server_meta.${SEQUENCE_ENFORCEMENT_EPOCH_KEY} holds "${String(epochRows[0]?.value)}", not a delivery sequence. Restore it from a backup or delete the row to re-derive it.`,
+				)
+			}
+			this.sequenceEpoch = epoch
+			await tx.execute(sql`DROP INDEX IF EXISTS idx_node_seq_unique`)
+			try {
+				// In a savepoint, so the setup transaction survives a failure. The epoch is a
+				// validated integer, inlined because an index predicate takes no parameter.
+				await tx.transaction(async (savepoint) => {
+					await savepoint.execute(
+						sql.raw(
+							`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE delivery_seq > ${String(epoch)}`,
+						),
+					)
+				})
+			} catch (error) {
+				// Only possible when an older release wrote a duplicate after the epoch (a
+				// rolling upgrade): the append check still refuses new ones.
+				if (!isUniqueViolation(error)) throw error
+				console.warn(
+					`[kora] Operations stored after the sequence-enforcement epoch share a (node, sequence) pair, so ${NODE_SEQ_UNIQUE_INDEX} was not created; the next start retries. New conflicting writes are still refused (SEQUENCE_CONFLICT).`,
+				)
+			}
 		})
 	}
 

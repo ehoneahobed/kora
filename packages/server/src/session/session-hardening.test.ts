@@ -160,6 +160,54 @@ describe('ClientSession node binding (SEC-3, server half)', () => {
 		expect(store.getVersionVector().get('other-device')).toBe(stored.sequenceNumber)
 	})
 
+	test('own ops the server already stores are acked as duplicates before any other check (RT-31)', async () => {
+		const { login, store } = await setup()
+		const c = await login('bob', 'bob-node')
+		// Stored earlier, inside Bob's scope at the time.
+		const first = op('bob-node', { data: { title: 't', userId: 'bob' } })
+		const second = op('bob-node', { data: { title: 't', userId: 'bob' } })
+		await store.applyRemoteOperation(first)
+		await store.applyRemoteOperation(second)
+		const lookup = vi.spyOn(store, 'findStoredOperations')
+		// The device re-uploads: `first` unchanged, `second` renumbered by the client's
+		// sequence repair (same id, new sequence), plus a write that would be refused
+		// today (out of Bob's scope) but is already stored.
+		const outOfScope = op('bob-node', { data: { title: 't', userId: 'alice' } })
+		await store.applyRemoteOperation(outOfScope)
+		const renumbered = { ...second, sequenceNumber: outOfScope.sequenceNumber + 5 }
+		c.client.send(batch([first, outOfScope, renumbered], 'reupload'))
+		await vi.waitFor(() => expect(c.messages.some((m) => m.type === 'acknowledgment')).toBe(true))
+		expect(c.messages.some((m) => m.type === 'operation-rejected')).toBe(false)
+		const ack = c.messages.find((m) => m.type === 'acknowledgment')
+		expect(ack?.type === 'acknowledgment' ? ack.lastSequenceNumber : null).toBe(
+			renumbered.sequenceNumber,
+		)
+		expect(lookup).toHaveBeenCalledTimes(1)
+		expect(await store.getOperationCount()).toBe(3)
+	})
+
+	test('a stored id claimed under this node by an op of another node is not a duplicate', async () => {
+		const { login, store } = await setup()
+		const foreign = op('other-device')
+		await store.applyRemoteOperation(foreign)
+		const c = await login('bob', 'bob-node')
+		c.client.send(
+			batch(
+				[
+					{
+						...foreign,
+						nodeId: 'bob-node',
+						timestamp: { ...foreign.timestamp, nodeId: 'bob-node' },
+					},
+				],
+				'stolen-id',
+			),
+		)
+		await vi.waitFor(() => expect(c.messages.some((m) => m.type === 'acknowledgment')).toBe(true))
+		// Judged like any new op (the store then dedups the id): never acked unexamined.
+		expect(await store.getOperationCount()).toBe(1)
+	})
+
 	test('an op whose timestamp names another node is rejected', async () => {
 		const { login, store } = await setup()
 		const c = await login('bob', 'bob-node')

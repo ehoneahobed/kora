@@ -2189,6 +2189,36 @@
    "acceptance": "Write a repro when the workstream starts.",
    "pr": null,
    "notes": "Found during RT-27 Postgres verification."
+  },
+  {
+   "id": "RT-31",
+   "title": "Upgrade re-upload / renumbered own ops re-judged by today's authorization and validators: non-retriable rejection for ops the server already stores",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-31.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 seam (W3 upgrade re-upload x server ingest). handleOperationBatch authorized, timestamp/size-checked and ran validateOperation before learning the op was stored; isStoredOperation looked up by (node, seq) only, so an op renumbered by the client sequence repair (same id, new seq) was not recognised either. Fixed: optional ServerStore.findStoredOperations(ids) -> Map<id,{nodeId,sequenceNumber}> (memory, SQLite, Postgres; one chunked IN read per batch, after the first rate-limit charge). An own-node op whose id is stored under this node is acked as a duplicate before any other check (any sequence). Foreign ops keep NODE_ID_MISMATCH unless the exact (node, seq, id) is stored (echo). Stores without the method fall back to a per-op (node, seq) lookup. Repro packages/test/tests/repro/RT-31.test.ts; unit tests in packages/server/src/session/session-hardening.test.ts."
+  },
+  {
+   "id": "RT-32",
+   "title": "Legacy duplicate (node, seq) from beta.12: the op the client repair keeps is refused SEQUENCE_CONFLICT when the server holds the other half",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-32.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 seam (W6 sequence repair x SRV-4 SEQUENCE_CONFLICT). Fixed with a server sequence-enforcement epoch: on the first start of this release each SQL store records MAX(delivery_seq) in kora_server_meta.sequence_enforcement_epoch (memory store: 0). SEQUENCE_CONFLICT is raised only when a holder of the (node, seq) was stored after the epoch; a legacy-only holder is accepted and stored with a console warning (as beta.12 did). The conditional full unique index is replaced by a partial unique index idx_node_seq_unique_after_epoch ON operations(node_id, sequence_number) WHERE delivery_seq > epoch, which always exists. Replace-mode backup import moves the epoch to the restored log's end. Postgres insertOperationRow now checks every holder (re-applying one op of a legacy pair was a false conflict with LIMIT 1). Store tests: packages/server/src/store/sequence-enforcement-epoch.test.ts (SQLite, Postgres via KORA_PG_TEST_URL, memory). E2E repro packages/test/tests/repro/RT-32.test.ts."
   }
  ],
  "rejectedProposalPins": {
