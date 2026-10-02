@@ -2,6 +2,7 @@ import type {
 	AtomicOp,
 	HLCTimestamp,
 	Operation,
+	RecordFieldVersions,
 	SchemaDefinition,
 	TimeSource,
 	VersionVector,
@@ -20,6 +21,7 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { type FieldVersionRow, foldFieldVersionRows } from './record-field-versions'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	parseScopeSnapshot,
@@ -442,6 +444,19 @@ export class PostgresServerStore implements ServerStore {
 			: null
 	}
 
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT type, data, wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}`,
+		)) as unknown as FieldVersionRow[]
+		return foldFieldVersionRows(rows)
+	}
+
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
 		this.assertOpen()
 		await this.ready
@@ -766,7 +781,8 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				desc(pgOperations.wallTime),
 				desc(pgOperations.logical),
-				desc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), like HLC.compare.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" DESC`,
 			)
 			.limit(1)
 
@@ -871,7 +887,9 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
-				asc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
 			)
 		if (ops.length === 0) return null
 		const lastKnown = replayOperationsForRecord(
@@ -915,7 +933,9 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
-				asc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
 			)
 
 		// Replay to get current state
@@ -1027,7 +1047,9 @@ export class PostgresServerStore implements ServerStore {
 			.orderBy(
 				asc(pgOperations.wallTime),
 				asc(pgOperations.logical),
-				asc(pgOperations.timestampNodeId),
+				// Byte order (COLLATE "C"), never the database collation: ties on node id
+				// must break exactly like HLC.compare on every replica.
+				sql`${pgOperations.timestampNodeId} COLLATE "C" ASC`,
 			)
 
 		if (allOps.length === 0) return

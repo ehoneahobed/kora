@@ -2,6 +2,7 @@ import type {
 	KoraEventEmitter,
 	Operation,
 	OperationTransform,
+	RecordFieldVersions,
 	SchemaDefinition,
 } from '@korajs/core'
 import { applyOperationTransforms } from '@korajs/core'
@@ -1796,7 +1797,13 @@ export class ClientSession {
 			)
 			return
 		}
-		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
+		// Per-field versions are server-authored only (scope-entry operations, RT-27). A
+		// device never sends them; one that does would forge field precedence on its
+		// peers, so they are dropped before anything else sees the operation.
+		const operations = msg.operations.map((s) => {
+			const { fieldVersions: _forged, ...op } = this.serializer.decodeOperation(s)
+			return op
+		})
 		const applied: Operation[] = []
 		let acknowledgedThrough = 0
 		let canAdvanceAck = true
@@ -2411,8 +2418,16 @@ export class ClientSession {
 		if (!current || current._deleted === 1 || current._deleted === true) return null
 		if (!snapshotEntersScopes(op, snapshot, scopes, current)) return null
 		if (!recordMatchesScopes(op.collection, { ...current, id: op.recordId }, scopes)) return null
-		let timestamp = op.timestamp
-		if (this.store.getRecordLatestTimestamp) {
+		let fieldVersions: RecordFieldVersions | null = null
+		if (this.store.getRecordFieldVersions) {
+			try {
+				fieldVersions = await this.store.getRecordFieldVersions(op.collection, op.recordId)
+			} catch {
+				// Fall back to a single whole-row stamp below.
+			}
+		}
+		let timestamp = fieldVersions?.latest ?? op.timestamp
+		if (!fieldVersions && this.store.getRecordLatestTimestamp) {
 			try {
 				timestamp =
 					(await this.store.getRecordLatestTimestamp(op.collection, op.recordId)) ?? timestamp
@@ -2425,6 +2440,7 @@ export class ClientSession {
 			row: current,
 			schema,
 			timestamp,
+			fieldVersions,
 			schemaVersion: this.schemaVersion,
 		})
 	}

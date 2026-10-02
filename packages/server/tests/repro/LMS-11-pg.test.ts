@@ -89,6 +89,8 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 		firstBatchMs: number
 		queries: number
 		ops: number
+		/** Server-synthesized scope-entry inserts among `ops` (RT-19). */
+		entries: number
 		retractions: number
 		bytes: number
 	}> {
@@ -131,6 +133,10 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 			firstBatchMs: firstBatchAt - t0,
 			queries,
 			ops: b.reduce((n, x) => n + x.operations.length, 0),
+			entries: b.reduce(
+				(n, x) => n + x.operations.filter((op) => op.nodeId === 'kora:scope-entry').length,
+				0,
+			),
 			retractions: b.reduce((n, x) => n + (x.retractions?.length ?? 0), 0),
 			bytes: b.reduce((n, x) => n + JSON.stringify(x).length, 0),
 		}
@@ -252,8 +258,12 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 		// later, and nothing written before it entered the scope is. The two cheaper
 		// strategies above emulate the previous current-row rule, so they agree with each
 		// other, and HEAD agrees with a reference count over the stored snapshots.
+		// Since RT-19 an update that moves a record INTO the scope is preceded by one
+		// server-built scope-entry insert, sent only while the record is still live and
+		// in scope: those are counted separately.
 		let cursorRef = 0
 		let snapshotVisible = 0
+		let expectedEntries = 0
 		for (;;) {
 			const chunk = await store.getOperationsAfterDelivery(cursorRef, 2000)
 			const last = chunk[chunk.length - 1]
@@ -261,15 +271,21 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 			cursorRef = last.deliverySequence
 			for (const { operation, scopeSnapshot } of chunk) {
 				const post = scopeSnapshot?.post
-				if (
-					post &&
-					recordMatchesScopes(operation.collection, { ...post, id: operation.recordId }, scopes)
-				)
+				const visible = (values: Record<string, unknown> | null | undefined): boolean =>
+					!!values &&
+					recordMatchesScopes(operation.collection, { ...values, id: operation.recordId }, scopes)
+				if (visible(post)) {
 					snapshotVisible++
+					if (operation.type === 'update' && scopeSnapshot?.pre && !visible(scopeSnapshot.pre)) {
+						const current = await store.findRecord(operation.collection, operation.recordId)
+						if (current && visible(current)) expectedEntries++
+					}
+				}
 			}
 			if (chunk.length < 2000) break
 		}
-		expect(sentinelRetain.ops).toBe(snapshotVisible)
+		expect(sentinelRetain.entries).toBe(expectedEntries)
+		expect(sentinelRetain.ops - sentinelRetain.entries).toBe(snapshotVisible)
 		expect(batchedSent).toBe(proposedSent)
 	}, 1_800_000)
 })

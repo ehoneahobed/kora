@@ -1,4 +1,5 @@
-import type { AtomicOp } from '../types'
+import { HybridLogicalClock } from '../clock/hlc'
+import type { AtomicOp, HLCTimestamp, Operation } from '../types'
 import { applyAtomicOp } from './atomic-ops'
 import { canonicalize } from './content-hash'
 
@@ -168,4 +169,116 @@ export function replayOperationsForRecord(ops: ReplayOperation[]): Record<string
 	}
 
 	return deleted ? null : record
+}
+
+/** A {@link ReplayOperation} with the HLC timestamp it was written at. */
+export interface VersionedReplayOperation {
+	type: string
+	data: Record<string, unknown> | null
+	timestamp: HLCTimestamp
+}
+
+/** Per-field versions of a live record, as folded by {@link replayFieldVersionsForRecord}. */
+export interface RecordFieldVersions {
+	/** Field name -> HLC of the write that produced the field's current value. */
+	fields: Record<string, HLCTimestamp>
+	/** The record's first operation (its creation; the server's `_created_at`). */
+	created: HLCTimestamp
+	/** The record's newest operation. */
+	latest: HLCTimestamp
+}
+
+/**
+ * Fold the per-field versions of one record, mirroring {@link replayOperationsForRecord}
+ * exactly (RT-27): an insert resets the field set and stamps every field it carries,
+ * an update stamps the fields it writes (composed atomic and array writes included:
+ * the field's version is its last writer's), a delete hides the record until a later
+ * write revives it. Operations MUST be pre-sorted in HLC total order.
+ *
+ * @param ops - The record's operations in HLC order
+ * @returns The live record's field versions, or null when it is deleted or absent
+ */
+export function replayFieldVersionsForRecord(
+	ops: readonly VersionedReplayOperation[],
+): RecordFieldVersions | null {
+	let fields: Record<string, HLCTimestamp> | null = null
+	let deleted = false
+	const first = ops[0]
+	const last = ops[ops.length - 1]
+	if (!first || !last) return null
+	for (const op of ops) {
+		switch (op.type) {
+			case 'insert':
+				if (op.data) {
+					fields = {}
+					for (const field of Object.keys(op.data)) fields[field] = { ...op.timestamp }
+					deleted = false
+				}
+				break
+			case 'update':
+				if (op.data) {
+					const next: Record<string, HLCTimestamp> = { ...(fields ?? {}) }
+					for (const field of Object.keys(op.data)) next[field] = { ...op.timestamp }
+					fields = next
+					deleted = false
+				}
+				break
+			case 'delete':
+				deleted = true
+				break
+		}
+	}
+	if (deleted || fields === null) return null
+	return { fields, created: { ...first.timestamp }, latest: { ...last.timestamp } }
+}
+
+/**
+ * Expand operations for a record fold (RT-27). A scope-entry insert carrying
+ * per-field versions restates the record's CURRENT values, each produced at its own
+ * version; folding it as one insert at a single timestamp would misplace every field
+ * relative to the receiver's own writes. It is expanded into an insert at its
+ * `timestamp` (the record's creation) followed by one update per newer field version,
+ * so a fold in HLC order puts each field exactly where its writer did. Other
+ * operations pass through unchanged. The result is sorted in HLC total order (stable,
+ * so an expansion keeps insert-before-update on equal timestamps).
+ *
+ * @param ops - Operations of one record, in any order
+ * @returns The operations to fold, in HLC order
+ */
+export function expandFieldVersionedOperations(ops: readonly Operation[]): Operation[] {
+	const expanded: Operation[] = []
+	for (const op of ops) {
+		if (op.type !== 'insert' || !op.fieldVersions || !op.data) {
+			expanded.push(op)
+			continue
+		}
+		const { fieldVersions, ...base } = op
+		expanded.push(base)
+		const groups = new Map<string, { timestamp: HLCTimestamp; data: Record<string, unknown> }>()
+		// A field without its own version falls back to the entry's newest one.
+		let newest = op.timestamp
+		for (const v of Object.values(fieldVersions)) {
+			if (HybridLogicalClock.compare(v, newest) > 0) newest = v
+		}
+		for (const [field, value] of Object.entries(op.data)) {
+			const version = fieldVersions[field] ?? newest
+			if (HybridLogicalClock.compare(version, op.timestamp) <= 0) continue
+			const key = `${version.wallTime}:${version.logical}:${version.nodeId}`
+			const group = groups.get(key) ?? { timestamp: version, data: {} }
+			group.data[field] = value
+			groups.set(key, group)
+		}
+		let index = 0
+		for (const group of groups.values()) {
+			expanded.push({
+				...base,
+				id: `${op.id}#field-version-${index++}`,
+				type: 'update',
+				data: group.data,
+				previousData: null,
+				timestamp: { ...group.timestamp },
+			})
+		}
+	}
+	return expanded.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
 }

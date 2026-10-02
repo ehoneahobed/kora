@@ -1,5 +1,5 @@
 import { SyncError } from '@korajs/core'
-import type { Operation, VersionVector } from '@korajs/core'
+import type { HLCTimestamp, Operation, VersionVector } from '@korajs/core'
 // protobufjs/minimal is CJS — named ESM imports fail in some runtimes (tsx, Node ESM).
 // Use a default import for the runtime values and type aliases for annotations.
 // The explicit .js extension is required: protobufjs has no "exports" map, so
@@ -203,6 +203,9 @@ export class JsonMessageSerializer implements MessageSerializer {
 			...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
 			...(op.transactionId !== undefined ? { transactionId: op.transactionId } : {}),
 			...(op.mutationName !== undefined ? { mutationName: op.mutationName } : {}),
+			...(op.fieldVersions !== undefined
+				? { fieldVersions: copyFieldVersions(op.fieldVersions) }
+				: {}),
 		}
 	}
 
@@ -228,8 +231,50 @@ export class JsonMessageSerializer implements MessageSerializer {
 				? { transactionId: serialized.transactionId }
 				: {}),
 			...(serialized.mutationName !== undefined ? { mutationName: serialized.mutationName } : {}),
+			...withFieldVersions(serialized.fieldVersions),
 		}
 	}
+}
+
+/**
+ * Validate wire per-field versions (RT-27): a map of field name to a well-formed HLC
+ * timestamp. Anything else (from an untrusted peer) yields undefined: the operation
+ * is then applied with its single timestamp, never with a malformed version.
+ *
+ * @param raw - The decoded `fieldVersions` value
+ * @returns A fresh validated copy, or undefined
+ */
+export function normalizeFieldVersions(raw: unknown): Record<string, HLCTimestamp> | undefined {
+	if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+	const result: Record<string, HLCTimestamp> = {}
+	for (const [field, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (value === null || typeof value !== 'object') return undefined
+		const ts = value as Record<string, unknown>
+		if (
+			typeof ts.wallTime !== 'number' ||
+			!Number.isFinite(ts.wallTime) ||
+			typeof ts.logical !== 'number' ||
+			!Number.isFinite(ts.logical) ||
+			typeof ts.nodeId !== 'string'
+		) {
+			return undefined
+		}
+		result[field] = { wallTime: ts.wallTime, logical: ts.logical, nodeId: ts.nodeId }
+	}
+	return result
+}
+
+function copyFieldVersions(versions: Record<string, HLCTimestamp>): Record<string, HLCTimestamp> {
+	const copy: Record<string, HLCTimestamp> = {}
+	for (const [field, ts] of Object.entries(versions)) {
+		copy[field] = { wallTime: ts.wallTime, logical: ts.logical, nodeId: ts.nodeId }
+	}
+	return copy
+}
+
+function withFieldVersions(raw: unknown): { fieldVersions?: Record<string, HLCTimestamp> } {
+	const fieldVersions = raw === undefined ? undefined : normalizeFieldVersions(raw)
+	return fieldVersions !== undefined ? { fieldVersions } : {}
 }
 
 /**
@@ -675,6 +720,9 @@ function serializeProtoOperation(operation: SerializedOperation): ProtoOperation
 		if (operation.mutationName !== undefined) {
 			dataPayload.__kora_mutation__ = operation.mutationName
 		}
+		if (operation.fieldVersions !== undefined) {
+			dataPayload.__kora_field_versions__ = operation.fieldVersions
+		}
 		dataJson = JSON.stringify(dataPayload)
 	} else if (hasMetadata) {
 		// For delete operations (data is null), still need to carry metadata
@@ -710,6 +758,7 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 	let atomicOps: Record<string, unknown> | undefined
 	let transactionId: string | undefined
 	let mutationName: string | undefined
+	let fieldVersions: Record<string, HLCTimestamp> | undefined
 
 	if (operation.hasData || operation.dataJson.length > 0) {
 		const parsed = JSON.parse(operation.dataJson) as Record<string, unknown>
@@ -722,7 +771,16 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 		if ('__kora_mutation__' in parsed) {
 			mutationName = parsed.__kora_mutation__ as string
 		}
-		const { __kora_atomic_ops__: _a, __kora_tx_id__: _t, __kora_mutation__: _m, ...rest } = parsed
+		if ('__kora_field_versions__' in parsed) {
+			fieldVersions = normalizeFieldVersions(parsed.__kora_field_versions__)
+		}
+		const {
+			__kora_atomic_ops__: _a,
+			__kora_tx_id__: _t,
+			__kora_mutation__: _m,
+			__kora_field_versions__: _f,
+			...rest
+		} = parsed
 		data = operation.hasData && Object.keys(rest).length > 0 ? rest : null
 	}
 
@@ -749,6 +807,7 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 			: {}),
 		...(transactionId !== undefined ? { transactionId } : {}),
 		...(mutationName !== undefined ? { mutationName } : {}),
+		...(fieldVersions !== undefined ? { fieldVersions } : {}),
 	}
 }
 

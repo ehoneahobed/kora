@@ -18,8 +18,7 @@ import type { Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
-import { MemoryServerStore } from '../../src/store/memory-server-store'
-import { createHarness, makeOp } from './rt-fixture'
+import { createHarness, createReproStore, makeOp } from './rt-fixture'
 
 const v1 = defineSchema({
 	version: 1,
@@ -47,7 +46,7 @@ function deliveredIds(messages: SyncMessage[]): string[] {
 
 describe('RT-20: scope-field migration keeps history visible', () => {
 	test('v1 -> v2 adds an orgId scope: a fresh device sees the full history', async () => {
-		const store = new MemoryServerStore('server-1')
+		const store = await createReproStore()
 		await store.setSchema(v1)
 		const insert = makeOp('legacy-node', 1, {
 			collection: 'todos',
@@ -94,7 +93,7 @@ describe('RT-20: scope-field migration keeps history visible', () => {
 
 	test('snapshots are recomputed when the captured fields change (history judged per op)', async () => {
 		// Clients ahead of the server already wrote orgId before the server schema had it.
-		const store = new MemoryServerStore('server-1')
+		const store = await createReproStore()
 		await store.setSchema(v1)
 		const insert = makeOp('client-node', 1, {
 			collection: 'todos',

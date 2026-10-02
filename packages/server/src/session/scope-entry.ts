@@ -1,4 +1,4 @@
-import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
+import type { HLCTimestamp, Operation, RecordFieldVersions, SchemaDefinition } from '@korajs/core'
 import { hashBlob } from '@korajs/core'
 import type { MaterializedRecord } from '../store/server-store'
 
@@ -23,11 +23,19 @@ export interface ScopeEntryInput {
 	/** The server schema (decides which row columns are record fields). */
 	schema: SchemaDefinition
 	/**
-	 * The record's newest stored HLC timestamp (its latest field write). The entry
-	 * carries it so that, under per-field last-write-wins, it never overrides a field
-	 * a client wrote more recently.
+	 * The record's newest stored HLC timestamp (its latest field write). Used as the
+	 * entry's timestamp only when per-field versions are unavailable (a custom store
+	 * without {@link ScopeEntryInput.fieldVersions}): a whole-row stamp is then the
+	 * best the server can do.
 	 */
 	timestamp: HLCTimestamp
+	/**
+	 * Per-field versions folded from the record's stored operations (RT-27). When
+	 * present, the entry carries each field's own version and is stamped with the
+	 * record's creation time, so a receiver resolves every field by last-write-wins
+	 * against its own version of that field and keeps any newer local edit.
+	 */
+	fieldVersions?: RecordFieldVersions | null
 	/** Server schema version stamped on the entry. */
 	schemaVersion: number
 }
@@ -49,9 +57,13 @@ export interface ScopeEntryInput {
  *   (content-addressed dedup).
  * - **System node.** {@link SCOPE_ENTRY_NODE_ID}, sequence 0, no causal deps: it
  *   never enters a client's version vector or upload delta.
- * - **Never newer than the record.** Its timestamp is the record's newest HLC, so
- *   per-field LWW keeps any field a client wrote later; on a client that already
- *   holds the record (a stale retained copy) it merges like an insert collision.
+ * - **Per-field versions (RT-27).** Every field carries the version of the write
+ *   that produced its current value, and the entry's timestamp is the record's
+ *   creation, so a receiver resolves each field by last-write-wins against its own
+ *   version of it: a device's newer unsynced edit of a field the server last wrote
+ *   long ago is kept (it uploads and wins on the server too), and `createdAt` is the
+ *   record's real creation time. Without versions (a custom store) the entry falls
+ *   back to one stamp, the record's newest HLC.
  *
  * @param input - Trigger, current row, schema and the record's newest timestamp
  * @returns The synthesized insert
@@ -60,11 +72,18 @@ export async function buildScopeEntryOperation(input: ScopeEntryInput): Promise<
 	const { trigger, row, schema } = input
 	const definition = schema.collections[trigger.collection]
 	const data: Record<string, unknown> = {}
+	const versioned = input.fieldVersions ?? null
+	const fieldVersions: Record<string, HLCTimestamp> = {}
 	for (const field of Object.keys(definition?.fields ?? {})) {
 		if (!(field in row)) continue
 		const value = row[field]
 		if (value === undefined) continue
 		data[field] = toWireValue(value)
+		if (versioned) {
+			// A column no operation ever wrote (a later schema default) is as old as
+			// the record itself.
+			fieldVersions[field] = { ...(versioned.fields[field] ?? versioned.created) }
+		}
 	}
 	const id = await hashBlob(
 		new TextEncoder().encode(
@@ -79,10 +98,11 @@ export async function buildScopeEntryOperation(input: ScopeEntryInput): Promise<
 		recordId: trigger.recordId,
 		data,
 		previousData: null,
-		timestamp: { ...input.timestamp },
+		timestamp: versioned ? { ...versioned.created } : { ...input.timestamp },
 		sequenceNumber: 0,
 		causalDeps: [],
 		schemaVersion: input.schemaVersion,
+		...(versioned ? { fieldVersions } : {}),
 	}
 }
 

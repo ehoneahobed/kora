@@ -3,6 +3,7 @@ import type {
 	AtomicOp,
 	HLCTimestamp,
 	Operation,
+	RecordFieldVersions,
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
@@ -20,6 +21,7 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
+import { type FieldVersionRow, foldFieldVersionRows } from './record-field-versions'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	parseScopeSnapshot,
@@ -283,6 +285,18 @@ export class SqliteServerStore implements ServerStore {
 					nodeId: row.timestamp_node_id,
 				}
 			: null
+	}
+
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		const rows = this.db.all<FieldVersionRow>(
+			sql`SELECT type, data, wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}`,
+		)
+		return foldFieldVersionRows(rows)
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
