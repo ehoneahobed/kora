@@ -7,12 +7,15 @@ import {
 	materialize,
 	serializeFoldState,
 	t,
+	verifyOperationId,
 } from '@korajs/core'
+import { verifyInboundOperation } from '@korajs/sync/internal'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
 import { applyServerOperation } from '../apply/apply-server-operation'
 import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
+import { buildScopeEntryOperation } from '../session/scope-entry'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { PostgresServerStore } from '../store/postgres-server-store'
 import { serverFoldOptions } from '../store/record-fold'
@@ -385,4 +388,95 @@ test('fold-state serialization of a corrected record is identical on every repli
 	)
 	expect(states[0]).toBe(states[1])
 	expect(await memory.findRecord('tags', 'tag-y')).toBeNull()
+})
+
+describe('every server-authored operation verifies (or is exempt) on a client (Phase 3 seam 2)', () => {
+	/**
+	 * A server-authored operation whose id is not a content hash (a derived side-effect
+	 * or correction id, a scope entry) must not declare a hash version: a client would
+	 * verify it and quarantine it (INVALID_OPERATION_ID). One whose id IS a content
+	 * hash (a route write) must verify.
+	 */
+	async function expectClientAccepts(ops: Operation[]): Promise<void> {
+		for (const authored of ops) {
+			const verdict = await verifyInboundOperation(authored, { encrypted: false })
+			expect(verdict.ok, `${authored.mutationName ?? authored.type} ${authored.id}`).toBe(true)
+			if (authored.hashVersion === 2) {
+				expect(await verifyOperationId(authored)).toBe(true)
+			} else {
+				expect(authored.hashVersion).toBeUndefined()
+				// Derived: not the content hash under version 2 either.
+				expect(await verifyOperationId({ ...authored, hashVersion: 2 })).toBe(false)
+			}
+		}
+	}
+
+	const serverAuthored = async (store: ServerStore): Promise<Operation[]> =>
+		(await log(store)).filter((o) => o.nodeId === store.getNodeId())
+
+	test('side effects, late-child and set-null corrections, restrict revive, unique undo', async () => {
+		const collected: Operation[] = []
+		for (const onDelete of ['cascade', 'set-null', 'restrict'] as const) {
+			const store = new MemoryServerStore('server')
+			await store.setSchema(relationSchema(onDelete))
+			await store.applyRemoteOperation(op('a', 1000, 'projects', 'p1', { data: { name: 'P' } }))
+			await store.applyRemoteOperation(
+				op('a', 1100, 'todos', 't0', { data: { title: 'x', projectId: 'p1' } }),
+			)
+			if (onDelete === 'restrict') {
+				await store.applyRemoteOperation(op('a', 1001, 'projects', 'p2', { data: { name: 'Q' } }))
+				const child = op('b', 1500, 'todos', 't1', { data: { title: 'x', projectId: 'p2' } })
+				const del = op('a', 2000, 'projects', 'p2', { type: 'delete', data: null })
+				await store.applyRemoteOperation(child)
+				await store.applyRemoteOperation(del)
+				await enforceCrossRecordRules(store, del, () => nextServerSequenceNumber(store))
+			} else {
+				// Side effects of the delete on the existing child, then a correction for a
+				// child written later under the deleted parent.
+				await applyServerOperation(
+					store,
+					op('a', 2000, 'projects', 'p1', { type: 'delete', data: null }),
+				)
+				await applyServerOperation(
+					store,
+					op('b', 3000, 'todos', 't1', { data: { title: 'late', projectId: 'p1' } }),
+				)
+			}
+			collected.push(...(await serverAuthored(store)))
+			await store.close()
+		}
+		for (const onConflict of ['first-write-wins', 'last-write-wins'] as const) {
+			const store = new MemoryServerStore('server')
+			await store.setSchema(uniqueSchema(onConflict))
+			await store.applyRemoteOperation(op('dev-a', 1000, 'tags', 'tag-a', { data: { name: 'a' } }))
+			await store.applyRemoteOperation(op('dev-b', 1001, 'tags', 'tag-b', { data: { name: 'b' } }))
+			const rename = op('dev-b', 5000, 'tags', 'tag-b', {
+				type: 'update',
+				data: { name: 'a' },
+				previousData: { name: 'b' },
+			})
+			await store.applyRemoteOperation(rename)
+			await enforceCrossRecordRules(store, rename, () => nextServerSequenceNumber(store))
+			collected.push(...(await serverAuthored(store)))
+			await store.close()
+		}
+		const kinds = collected.map((o) => `${o.type}:${o.mutationName ?? ''}`)
+		expect(kinds.some((k) => k === 'delete:kora:side-effect:cascade')).toBe(true)
+		expect(kinds.some((k) => k === 'update:kora:side-effect:set-null')).toBe(true)
+		expect(kinds.filter((k) => k.includes('kora:correction:')).length).toBeGreaterThanOrEqual(4)
+		await expectClientAccepts(collected)
+	})
+
+	test('a scope entry (reserved system node) is exempt', async () => {
+		const trigger = op('a', 1000, 'projects', 'p1', { data: { name: 'P' }, hashVersion: 2 })
+		const entry = await buildScopeEntryOperation({
+			trigger,
+			row: { id: 'p1', name: 'P' },
+			schema: relationSchema('cascade'),
+			timestamp: trigger.timestamp,
+			schemaVersion: 1,
+		})
+		expect(entry.hashVersion).toBeUndefined()
+		expect((await verifyInboundOperation(entry, { encrypted: false })).ok).toBe(true)
+	})
 })

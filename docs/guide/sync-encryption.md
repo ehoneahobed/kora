@@ -171,7 +171,7 @@ encryptor.addKey(newKey)
 
 ## Plaintext and Older Payloads
 
-With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.13, not bound to their operation) are refused the same way.
+With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. One exception: the server's own operations (from a node the handshake names authoritative: cascades and set-nulls of a deleted parent, constraint corrections, route writes) are accepted in plaintext when they touch only the collection's `cleartextFields` (a delete carries no fields). The server holds no key, so it cannot seal them, and they carry nothing the server cannot already read. A server write to a sealed field is still refused. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.13, not bound to their operation) are refused the same way.
 
 To migrate an existing plaintext app to encryption, open a migration window:
 
@@ -250,4 +250,5 @@ With this setup:
 - **All clients must share keys**: Every device that needs to decrypt operations must have the correct key version registered. Key distribution is the application's responsibility.
 - **Key material is per device until Phase 4 (ENC-1)**: `createApp` derives the key with a random salt per process, so two devices with the same passphrase do not yet derive the same key. Decryption then fails with `KEY_ID_MISMATCH` (the envelope's `keyId` names the material) and the operation is quarantined, not lost. Until shared key material ships, construct the encryptor with a shared salt (`SyncEncryptor.create(config, salt)`) or `SyncEncryptor.fromKeys`.
 - **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
-- **Server stores must persist the envelope**: the in-memory server store keeps `op.encrypted`; check your server version's release notes before running encrypted sync on the SQLite or Postgres store.
+- **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (beta.14 or later on the server).
+- **Server-side rules see only cleartext fields**: cascades and set-nulls run on the server only when the relation's field is listed in `cleartextFields`; otherwise each device cascades for itself. A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.

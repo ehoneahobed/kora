@@ -44,8 +44,6 @@ export const COMPACTED_THROUGH_TABLE = '_kora_compacted_through'
 const KEPT_REJECTION_CODES: readonly string[] = ['HELD_DISCARDED']
 /** `_kora_meta` key recording how the rows of this database are materialized. */
 export const FOLD_MATERIALIZATION_META_KEY = 'fold_materialization'
-/** `_kora_meta` key holding the authoritative node ids (JSON array) the states were folded with. */
-export const AUTHORITATIVE_NODES_META_KEY = 'fold_authoritative_nodes'
 /** Value of {@link FOLD_MATERIALIZATION_META_KEY} once rows are materializations of the current fold. */
 export const FOLD_MATERIALIZATION_CURRENT = `fold-v${FOLD_STATE_VERSION}`
 /** Value of {@link FOLD_MATERIALIZATION_META_KEY} while the legacy (beta.13) paths write rows. */

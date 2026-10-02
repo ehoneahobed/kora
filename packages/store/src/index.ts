@@ -60,6 +60,7 @@ export type { RematerializationMode } from './fold/rematerialize'
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
+export type { ResequenceResult } from './sync/rehash-operation'
 export type { UnappliedOperation } from './sync/sync-durability'
 export type {
 	AdoptionSchedule,

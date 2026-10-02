@@ -86,16 +86,24 @@ export interface SyncStore {
 	raiseSequenceFloor?(nodeId: string, floor: number): Promise<boolean>
 
 	/**
-	 * Optional: give a local operation a fresh sequence number above `floor`, keeping its
-	 * id (RT-35: the server refused it with `SEQUENCE_CONFLICT` because it holds another
-	 * operation of this node, lost locally, under that number).
-	 * @returns The renumbered operation, or null when it is not in the log
+	 * Optional: give a local operation a fresh sequence number above `floor` (RT-35: the
+	 * server refused it with `SEQUENCE_CONFLICT` because it holds another operation of
+	 * this node, lost locally, under that number). A version-2 operation is re-hashed
+	 * under a new id; its never-sent dependents (`rewritableDependents`) are rewritten
+	 * to name the new id, transitively.
+	 * @returns The renumbered operation, the rewritten dependents and the id mapping,
+	 *   or null when it is not in the log
 	 */
 	resequenceOperation?(
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null>
+		rewritableDependents?: readonly string[],
+	): Promise<{
+		operation: Operation
+		dependents: Operation[]
+		idMapping: Record<string, string>
+	} | null>
 
 	/**
 	 * Optional: take over another local node id's unsynced writes (RT-40). Resolves to a

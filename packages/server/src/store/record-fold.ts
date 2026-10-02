@@ -37,14 +37,11 @@ import type {
 import { mergeRichtext } from '@korajs/merge'
 
 /**
- * Fold options as the server passes them. `authoritativeNodeIds` lists the node ids
+ * Fold options as the server passes them. `authoritativeNodeIds` holds the node ids
  * whose operations win `merge('server-authoritative')` fields (the server's own node
- * ids). Declared here as well as in core's `FoldOptions` so this module compiles
- * against a core that predates the option; the fold ignores unknown options.
+ * ids); it is exactly the list the handshake advertises to clients.
  */
-export interface ServerFoldOptions extends FoldOptions {
-	authoritativeNodeIds?: readonly string[]
-}
+export type ServerFoldOptions = FoldOptions
 
 /**
  * `kora_server_meta` key holding {@link foldPlanFingerprint} of the schema the stored
@@ -103,7 +100,7 @@ export function serverFoldOptions(authoritativeNodeIds: readonly string[]): Serv
 	return {
 		richtext: mergeRichtextUpdatesForServer,
 		traces: 'none',
-		authoritativeNodeIds: [...authoritativeNodeIds],
+		authoritativeNodeIds: new Set(authoritativeNodeIds),
 	}
 }
 

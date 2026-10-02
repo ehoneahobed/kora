@@ -298,4 +298,54 @@ describe('sequence uniqueness repair (W6)', () => {
 			await store.close()
 		}
 	})
+
+	test('a version-2 op keeps its id and number; the version-1 half of the pair is renumbered (seam 4)', async () => {
+		const path = nextDbPath()
+		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(path), nodeId: 'node-1' })
+		await store.open()
+		await store.collection('todos').insert({ title: 'beta.14 write' }) // seq 1, version 2
+		const [v2] = await store.getAllOperations()
+		await store.close()
+		if (!v2) throw new Error('missing op')
+		expect(v2.hashVersion).toBe(2)
+
+		// An older Kora reopened the database and wrote a version-1 op under seq 1, whose
+		// id sorts BEFORE the version-2 one (so an id-only tie-break would renumber v2).
+		const raw = new BetterSqlite3Adapter(path)
+		await raw.open(schema)
+		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
+		let v1: Operation | null = null
+		for (let i = 0; i < 200 && v1 === null; i++) {
+			const candidate = await op('node-1', {
+				type: 'insert',
+				collection: 'todos',
+				recordId: `old-${i}`,
+				data: { title: 'beta.13 write', n: 0 },
+				sequenceNumber: 1,
+			})
+			if (candidate.id < v2.id) v1 = candidate
+		}
+		if (!v1) throw new Error('no smaller id found')
+		await writeRaw(raw, v1)
+		await raw.close()
+
+		const reopened = new Store({
+			schema,
+			adapter: new BetterSqlite3Adapter(path),
+			nodeId: 'node-1',
+		})
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await reopened.open()
+		try {
+			const ops = await reopened.getAllOperations()
+			const keptV2 = ops.find((o) => o.id === v2.id)
+			const movedV1 = ops.find((o) => o.id === v1?.id)
+			// Neither id changed: a server that stored either deduplicates it.
+			expect(keptV2?.sequenceNumber).toBe(1)
+			expect(movedV1?.sequenceNumber).toBe(2)
+			expect(ops).toHaveLength(2)
+		} finally {
+			await reopened.close()
+		}
+	})
 })

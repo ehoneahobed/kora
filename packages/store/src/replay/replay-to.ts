@@ -38,8 +38,16 @@ type ReplayMemoryState = Map<string, Map<string, MutableReplayRecord>>
 
 /**
  * Collect the target operation and all causal ancestors present in `allOps`.
+ *
+ * @param aliases - Old operation id -> the id it was re-emitted under (a renumbered
+ *   version-2 operation, `_kora_seq_conflicts.reemitted_as`). A dependent the server
+ *   already stored keeps naming the old id; the alias resolves it.
  */
-export function collectCausalClosure(allOps: Operation[], targetOperationId: string): Operation[] {
+export function collectCausalClosure(
+	allOps: Operation[],
+	targetOperationId: string,
+	aliases: ReadonlyMap<string, string> = new Map(),
+): Operation[] {
 	const opMap = new Map<string, Operation>()
 	for (const op of allOps) {
 		opMap.set(op.id, op)
@@ -68,7 +76,12 @@ export function collectCausalClosure(allOps: Operation[], targetOperationId: str
 		if (!op) {
 			continue
 		}
-		for (const depId of op.causalDeps) {
+		for (const dep of op.causalDeps) {
+			let depId = dep
+			// Follow re-emissions (a renumbered op may itself have been renumbered again).
+			for (let hops = 0; !opMap.has(depId) && aliases.has(depId) && hops < 8; hops++) {
+				depId = aliases.get(depId) ?? depId
+			}
 			if (opMap.has(depId)) {
 				stack.push(depId)
 			}
@@ -87,8 +100,9 @@ export function buildReplaySnapshot(
 	schema: SchemaDefinition,
 	allOps: Operation[],
 	targetOperationId: string,
+	aliases: ReadonlyMap<string, string> = new Map(),
 ): ReplaySnapshot {
-	const operationsApplied = collectCausalClosure(allOps, targetOperationId)
+	const operationsApplied = collectCausalClosure(allOps, targetOperationId, aliases)
 	const targetOperation = operationsApplied.find((op) => op.id === targetOperationId)
 	if (!targetOperation) {
 		throw new OperationError(`Operation "${targetOperationId}" not found after causal sort`, {

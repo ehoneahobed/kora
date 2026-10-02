@@ -980,7 +980,8 @@
     }
    ],
    "pr": null,
-   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing."
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing.",
+   "acceptanceTest": "packages/server/tests/repro/LMS-10.test.ts 'benchmark:' (a warm restart re-materializes nothing; with LMS_OPS=20000 its key is a baseline observation, so the checker does not map it as a repro) + packages/server/tests/integration/fold-materialization.test.ts"
   },
   {
    "id": "NEW-SRV-5",
@@ -1532,15 +1533,14 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "MERGE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). The pure fold converges for all field kinds (gate). The repro (packages/test, real pipeline) stays red until Stage B replaces apply-pipeline's pairwise merge with append-then-mergeOp and re-materializes stores. W7 Stage B1 (client): clients now converge on every MERGE-2 seed (the repro's first assertion, 'clients diverge', passes for all 6 cases). The repro stays red only on its second assertion (server materialization vs clients) until B2 makes the server stores materialize through the fold.",
-   "acceptanceTest": "packages/test/tests/fold-gate/fold-gate-e2e.test.ts (W7 convergence gate END TO END: 200 seeds, every field kind incl. real Yjs richtext and arrays with duplicates, 2-4 real TestDevices (Store + fold + ApplyPipeline + SyncEngine) going offline/online, deleting and editing concurrently; every device holds the same ops and materializes the same record, equal to the reference fold; the gate rejects the beta.13 pipeline) + packages/test/tests/fold-gate/fold-vs-legacy.test.ts (legacyMerge comparison: every fold/legacy difference explained by a documented semantic change) + packages/core/tests/property/fold/fold-convergence.property.test.ts (pure gate, 200 seeds, extended to duplicates and server-authoritative classes) 2 (server): Server half done: server stores fold per field (no pairwise merge, no replay); parity test proves identical rows and fold states for any delivery order across memory/SQLite/Postgres. Repro waits on the client pipeline (B1).",
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). The pure fold converges for all field kinds (gate). The repro (packages/test, real pipeline) stays red until Stage B replaces apply-pipeline's pairwise merge with append-then-mergeOp and re-materializes stores. W7 Stage B1 (client): clients now converge on every MERGE-2 seed (the repro's first assertion, 'clients diverge', passes for all 6 cases). The repro stays red only on its second assertion (server materialization vs clients) until B2 makes the server stores materialize through the fold. Phase 3 seam review (2026-10-02): all 6 repro cases green with the client fold (B1) and the server fold (B2) merged; marked fixed.",
    "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
@@ -1578,7 +1578,6 @@
    ],
    "pr": null,
    "notes": "Protocol v2 (Phase 3 Stage B3): createOperation defaults to hash version 2; hashVersion is carried on the wire (JSON + protobuf operation field 14) and persisted in the client op log; rebase/rotation/SEQUENCE_CONFLICT renumbering re-hash v2 ops. The server verifies plaintext v2 ids before any schema transform (non-retriable INVALID_OPERATION_ID; transformed copies stored as v1); clients verify after decryption in packages/sync/src/engine/verify-inbound.ts and quarantine mismatches. v1 ops are never verified against v2. Repros core/tests/repro/CORE-1 and packages/test/tests/repro/CORE-1 green. Residual: SQLite/Postgres server stores do not yet persist hashVersion (W7 store work), so ops they relay are treated as v1 (unverified) by clients.",
-   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/server/src/session/protocol-v2-ingest.test.ts + packages/sync/src/encryption/envelope-v2.test.ts (verifyInboundOperation) W7 Stage A: content hash v2 behind hashVersion (computeOperationId(op, 2), verifyOperationId, createOperation(..., { hashVersion: 2 }), Operation.hashVersion). v2 covers previousData, sequenceNumber, causalDeps (as a set), schemaVersion, atomicOps, with binary in tagged form. Acceptance: packages/core/tests/integration/core-1-hash-v2.test.ts (the repro's 4 tampers under v2) + src/operations/content-hash-v2.test.ts. v1 stays the default, so core/tests/repro/CORE-1 (default createOperation) and packages/test/tests/repro/CORE-1 (server/client verification) stay red until Stage B: protocol v2 makes hashVersion 2 the default, wire + store persist hashVersion, the server verifies plaintext v2 ids before schema transforms, clients verify after decryption. W7 Stage B2 (server): Server stores now persist hashVersion (operations.hash_version on SQLite and Postgres; memory keeps the op), so v2 ids survive storage and delivery.",
    "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/core/src/operations/content-hash-v2.test.ts (Stage A, pure core)"
   },
   {
@@ -2577,6 +2576,109 @@
    ],
    "pr": null,
    "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Liveness. Locations: sync/src/engine/sync-engine.ts:3927 maybeYieldToDeferredNode (requires sessionAcked > 0 and is only reached from maybeEndSessionForNodeWork after an ack, :3892); :3665 parkAdoption (untilMs is never armed as a timer). A closed tab's write deferred once (retriable) is parked for 30 s; the open tab reconnects as its own node and stays connected and idle (dashboard, kiosk, tab left open): the write is never retried while the connection holds (reported as pending, but it lives only on this device). Required fix: arm a timer for the earliest parked untilMs (and for causal deferrals) that ends an idle own-node session, or upload parked nodes on a side session; keep the bound of one retry per backoff. Repro packages/test/tests/repro/RT-53.test.ts (36 s real wait). FIXED (sync): an own-node session arms a timer for the earliest parked adoption's untilMs; when it fires on an idle session (nothing queued or in flight) the engine reconnects and the next session adopts the node; a busy session hands over when its uploads drain (an expired park is due without own progress). One retry per backoff kept. Timer cleared with the session. TestDevice gains an opt-in reconnectable transport; the repro runs on fake timers (Date + setTimeout, advancing with real time) instead of a 36 s wait. Tests: sync local-nodes.test.ts (RT-53)."
+  },
+  {
+   "id": "RT-54",
+   "title": "Merged server fold passed authoritativeNodeIds as an array where the core fold calls Set.has (every server-authored write to a merge('server-authoritative') field throws), and the handshake's authoritativeNodeIds came from a second source (a KoraSyncServerConfig option defaulting to [store node, 'kora:scope-entry']) instead of the list the stores fold with",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-54.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Also build breakage of the merge: Operation.foldState declared twice (core), two Store.loadAuthoritativeNodeIds under two meta keys (store), KoraSyncServer.authoritativeNodeIds declared as field and getter (server). Fixed: ServerFoldOptions = FoldOptions with a Set; one persisted list (sync_authoritative_node_ids) feeds the client fold and the sync engine; KoraSyncServer.authoritativeNodeIds = ServerStore.getAuthoritativeNodeIds() (store node id, which authors route writes, side effects and corrections, plus configured extras) is what every session advertises; the separate server option is removed. Repro packages/test/tests/repro/RT-54.test.ts (= tests/server-authoritative-convergence.test.ts: a server-authoritative field converges identically on server and devices through memory, SQLite and Postgres stores; handshake list == stores list)."
+  },
+  {
+   "id": "RT-55",
+   "title": "A scope retraction quarantines (and since W7 B1 excludes from the fold) an own write already on the wire; the server stores it, so the device diverges from every other replica (RT-27 retract case regressed)",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-27.test.ts",
+     "title": "a device regaining scope after a retraction keeps its newer offline edit"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Location: sync/src/engine/outbound-queue.ts rejectRecord took in-flight (sent) operations; sync-engine applyScopeRetraction recorded them as terminal SCOPE_RETRACTED, which B1 excludes from the fold. Fixed: rejectRecord never takes an operation already put on the wire; its ack (stored) or rejection resolves it. Unit test sync outbound-queue.test.ts."
+  },
+  {
+   "id": "RT-56",
+   "title": "SQLite and Postgres server stores drop the protocol v2 encryption envelope: a relayed encrypted op has no ciphertext and every receiving device quarantines it (encrypted sync through a SQL store never works)",
+   "severity": "P0",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-56.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: operations.encrypted (JSON, verbatim) on SQLite and Postgres next to hash_version (both migrate with ADD COLUMN), deserialized back onto op.encrypted; an unreadable envelope column throws so the startup integrity scan quarantines the row. Repro packages/test/tests/repro/RT-56.test.ts (= tests/encryption-server-stores.test.ts: two encrypted devices through memory, SQLite and Postgres stores; stored ops keep envelope and hashVersion 2, verify after decryption, the server never materializes sealed values, nothing quarantined)."
+  },
+  {
+   "id": "RT-57",
+   "title": "Encrypted devices quarantine every server-authored plaintext operation (cascades, set-nulls, constraint corrections, route writes) as PLAINTEXT_REJECTED: the server has no key, so its side effects never reach encrypted devices",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-57.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: the sync engine accepts a plaintext operation from a node the handshake named authoritative when it touches only the collection's cleartextFields (SyncEncryptor.isCleartextOnly; a delete carries no fields); a server write to a sealed field is still refused. Scope entries (kora:scope-entry) restate sealed fields as null and stay refused under encryption (documented limitation). Repro RT-57.test.ts (the cascade step of the encrypted e2e); unit tests sync-encryptor.test.ts."
+  },
+  {
+   "id": "RT-58",
+   "title": "Server fold ignores envelope operations with data null (no cleartext field): a sealed insert never creates the record and a sealed update does not count against a delete, so the server's record existence (scopes, cascades, cross-record rules) disagrees with the devices",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [],
+   "pr": null,
+   "acceptanceTest": "packages/core/src/fold/fold.test.ts (sealed envelope operations: insert creates the record, a later sealed update revives, cleartext fields fold) + packages/test/tests/encryption-server-stores.test.ts (sealed-only collection)",
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed in core mergeOp: an operation carrying op.encrypted with data null sets the record's creation stamp (insert) and write stamp; sealed values are never materialized."
+  },
+  {
+   "id": "RT-59",
+   "title": "Renumbering a version-2 op (SEQUENCE_CONFLICT, RT-35) gives it a new id but leaves later ops naming the old id in causalDeps; the W6 legacy repair could re-hash a server-stored version-2 op, which would then be stored a second time (atomic increments applied twice)",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-59.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: Store.resequenceOperation rewrites never-sent dependents (re-hashed, transitively) in the same transaction and returns them; the engine passes its unsent queued ops and swaps them in the queue and own-ack tracking; already-sent dependents keep their ids and replayTo resolves the old id through _kora_seq_conflicts.reemitted_as; the W6 repair renumbers the version-1 half of a mixed pair (id kept, deduplicated by the server). Invariant review (RT-31/32/35/36/43/44) in the seam report. Repro RT-59.test.ts (= tests/renumber-v2-chain.test.ts: 3-op chain insert + 2 increments, first op renumbered, dependents unsent and already stored); unit tests store local-sync-records.test.ts, sequence-repair.test.ts."
+  },
+  {
+   "id": "RT-60",
+   "title": "A device applying a remote delete cascades with operations stamped at its own current time: if it applies the delete after another device's later edit or re-point of the child, its cascade erases that edit on every replica (the server's own copy, stamped right after the delete, would not)",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-60.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. B1 residual (client cascades of remote deletes vs server/ cascades). Fixed: kora apply-pipeline stamps a remote delete's side effects with a clock seeded at the delete's HLC (next logical ticks on this node), like timestampAfter on the server; Store.createMutationContext accepts a clock. All copies are idempotent in effect and a later write wins everywhere. Repro RT-60.test.ts (= tests/client-cascade-convergence.test.ts, 3 devices, cascade and set-null)."
   }
  ],
  "rejectedProposalPins": {

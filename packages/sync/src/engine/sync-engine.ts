@@ -2731,7 +2731,7 @@ export class SyncEngine {
 		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
 		// corrupted payload) is quarantined; the session and every other operation go on.
 		let op = delivered
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(delivered)) {
 			try {
 				op = await this.encryptor.decryptOperation(delivered)
 			} catch (error) {
@@ -2931,10 +2931,24 @@ export class SyncEngine {
 		return released.length
 	}
 
+	/**
+	 * Under end-to-end encryption, a plaintext operation authored by the server (a node
+	 * the handshake named authoritative: cascades, set-nulls, constraint corrections,
+	 * route writes) that touches only the collection's cleartext fields is accepted
+	 * without an envelope: the server holds no key, so it cannot seal its own writes, and
+	 * such an operation carries nothing the server cannot already read. Any sealed field
+	 * (or an operation from any other node) still has to arrive sealed.
+	 */
+	private isServerAuthoredCleartext(op: Operation): boolean {
+		if (!this.encryptor || op.encrypted !== undefined) return false
+		if (!this.authoritativeNodeIds?.includes(op.nodeId)) return false
+		return this.encryptor.isCleartextOnly(op)
+	}
+
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
 	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
 		let op = stored
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(stored)) {
 			try {
 				op = await this.encryptor.decryptOperation(stored)
 			} catch {
@@ -4160,7 +4174,18 @@ export class SyncEngine {
 		const resequence = this.store.resequenceOperation?.bind(this.store)
 		if (!op || op.nodeId !== node || !resequence) return false
 		const floor = Math.max(this.remoteVector.get(node) ?? 0, op.sequenceNumber)
-		const renumbered = await resequence(op.id, node, floor)
+		// A version-2 op is re-hashed under a new id; queued operations of this node that
+		// were never put on the wire (the server cannot hold them) and name it in their
+		// causalDeps are rewritten with it (seam 4).
+		const unsentDependents = this.outboundQueue
+			.getAll()
+			.filter(
+				(queued) =>
+					queued.nodeId === node && queued.id !== op.id && !this.outboundQueue.wasSent(queued.id),
+			)
+			.map((queued) => queued.id)
+		const resequenced = await resequence(op.id, node, floor, unsentDependents)
+		const renumbered = resequenced?.operation ?? null
 		await this.withOwnTracking(async () => {
 			// Out of its batch, so the batch's ack cannot resolve it under the old number.
 			await this.outboundQueue.reject(op.id)
@@ -4169,6 +4194,21 @@ export class SyncEngine {
 			if (renumbered) {
 				await this.outboundQueue.enqueue(renumbered)
 				this.trackOwnOperation(renumbered, true)
+			}
+			if (resequenced && resequenced.dependents.length > 0) {
+				const previousId = new Map<string, string>()
+				for (const [oldId, newId] of Object.entries(resequenced.idMapping)) {
+					previousId.set(newId, oldId)
+				}
+				const oldIds = resequenced.dependents.map((dep) => previousId.get(dep.id) ?? dep.id)
+				await this.outboundQueue.replace(oldIds, resequenced.dependents)
+				// Same sequence, new id: the tracked id moves with it, or the prefix would
+				// wait forever for the old one.
+				for (const dependent of resequenced.dependents) {
+					const oldId = previousId.get(dependent.id)
+					if (oldId) this.ownUnresolved.get(dependent.sequenceNumber)?.delete(oldId)
+					this.trackOwnOperation(dependent, true)
+				}
 			}
 			await this.advanceOwnPrefixLocked()
 		})

@@ -29,7 +29,7 @@ The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2),
 | `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora <= beta.13). |
 | `handshake` | `sequenceReservation` | Always `true` from a protocol-2 client. |
 | `handshake-response` | `protocolVersion` | `2`. Absent: a beta.13-era server. |
-| `handshake-response` | `authoritativeNodeIds` | Node ids whose operations the server authors: the store's node id and `kora:scope-entry` by default (`KoraSyncServerConfig.authoritativeNodeIds` overrides). The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`); only operations from these nodes may carry `fieldVersions` / `foldState`. |
+| `handshake-response` | `authoritativeNodeIds` | Exactly the node ids the server stores fold with (`ServerStore.getAuthoritativeNodeIds()`: the store's node id, which authors route writes, side effects and constraint corrections, plus the store's configured `authoritativeNodeIds` extras; `KoraSyncServer.authoritativeNodeIds`). Their writes win `merge('server-authoritative')` fields on every replica. The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`, one meta key shared with the store's fold) and re-folds affected records when they change. Under end-to-end encryption, a plaintext operation from these nodes touching only cleartext fields is accepted. `kora:scope-entry` is not listed: scope entries carry the server's fold state and are joined, not folded as writes. |
 
 A protocol-1 client is accepted for beta.14 only: the server logs
 `session.protocol_deprecated` (warn) and emits `sync:protocol-deprecated`.
@@ -38,9 +38,9 @@ A protocol-1 client is accepted for beta.14 only: the server logs
 
 | Field | Type | Hashed | Notes |
 |---|---|---|---|
-| `hashVersion` | `1 \| 2` | domain tag of v2 | Absent means 1. Persisted by the client store (op row) and the memory server store; the SQLite/Postgres server stores persist it with the W7 store work (until then they relay ops as version 1). |
+| `hashVersion` | `1 \| 2` | domain tag of v2 | Absent means 1. Persisted by the client store (op row) and every server store (`operations.hash_version`). Operations whose id is not a content hash (server side effects and constraint corrections, `server/` derived ids; scope entries) never declare it. |
 | `foldState` | `string` | no | Server-authored (scope entries). Stripped by the server from every device upload, like `fieldVersions`. |
-| `encrypted` | `EncryptedOperationEnvelope` | no | `{ v: 2, alg, keyId, keyVersion, data, previousData, atomicOps? }`; each member `{ iv, ct }`. `data` is then `null` or the cleartext scope fields; `previousData`/`atomicOps` are absent. The id is the v2 hash of the plaintext. |
+| `encrypted` | `EncryptedOperationEnvelope` | no | `{ v: 2, alg, keyId, keyVersion, data, previousData, atomicOps? }`; each member `{ iv, ct }`. `data` is then `null` or the cleartext scope fields; `previousData`/`atomicOps` are absent. The id is the v2 hash of the plaintext. Every server store keeps it verbatim (`operations.encrypted`, JSON) and relays it; the server fold folds only the cleartext fields, and an envelope with `data: null` still creates the record (insert) and counts as a write against deletes. |
 
 ## Verification
 
@@ -54,7 +54,13 @@ A protocol-1 client is accepted for beta.14 only: the server logs
 Version-1 operations stored before beta.14 keep `hashVersion: 1` (absent) and are never
 verified against version-2 rules. Local rewrites before an op is shared (clock rebase,
 node rotation, `SEQUENCE_CONFLICT` renumbering, legacy sequence repair) re-hash a
-version-2 op with its own version, remapping causal deps first.
+version-2 op with its own version, remapping causal deps first. A renumbered
+version-2 op gets a new id: never-sent later operations naming it in `causalDeps` are
+rewritten (and re-hashed, transitively) in the same transaction; operations already
+sent keep their ids and resolve the old id through `_kora_seq_conflicts.reemitted_as`
+(used by `replayTo`). The legacy sequence repair never renumbers a version-2 op when
+the other half of the pair is version 1 (that one keeps its id, which the server
+deduplicates).
 
 ## Protobuf field numbers
 

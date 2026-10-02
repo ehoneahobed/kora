@@ -45,6 +45,8 @@ export const pgOperations = pgTable(
 		// Content-hash version of `id` (CORE-1). Null for v1 rows and rows written before
 		// the column existed.
 		hashVersion: integer('hash_version'),
+		// Protocol v2 encryption envelope (JSON), stored opaquely. Null for plaintext.
+		encrypted: text('encrypted'),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_pg_node_seq').on(table.nodeId, table.sequenceNumber),

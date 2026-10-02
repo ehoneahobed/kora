@@ -200,7 +200,6 @@ export class KoraSyncServer {
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
-	private readonly authoritativeNodeIds: string[] | undefined
 	private readonly encryptionPolicy:
 		| { required: boolean; allowPlaintextMigration?: boolean }
 		| undefined
@@ -348,9 +347,6 @@ export class KoraSyncServer {
 			'appHeartbeatIntervalMs',
 			config.appHeartbeatIntervalMs ?? DEFAULT_APP_HEARTBEAT_INTERVAL_MS,
 		)
-		this.authoritativeNodeIds = config.authoritativeNodeIds
-			? [...config.authoritativeNodeIds]
-			: undefined
 		this.encryptionPolicy = config.encryption ? { ...config.encryption } : undefined
 		this.handshakeTimeoutMs =
 			config.handshakeTimeoutMs === undefined
@@ -1283,7 +1279,7 @@ export class KoraSyncServer {
 			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
 			rateLimiterFor: (nodeId, principal) => this.rateLimiterFor(nodeId, principal),
 			appHeartbeatIntervalMs: this.appHeartbeatIntervalMs,
-			...(this.authoritativeNodeIds ? { authoritativeNodeIds: this.authoritativeNodeIds } : {}),
+			authoritativeNodeIds: this.authoritativeNodeIds,
 			...(this.encryptionPolicy ? { encryption: this.encryptionPolicy } : {}),
 			...(this.handshakeTimeoutMs !== undefined
 				? { handshakeTimeoutMs: this.handshakeTimeoutMs }
@@ -1430,8 +1426,9 @@ export class KoraSyncServer {
 	 * Node ids whose operations win `merge('server-authoritative')` fields in the fold
 	 * (W7): the store's own node id, which authors every server-originated operation
 	 * (side effects, constraint corrections, route writes), plus any extras the store
-	 * was configured with. Advertised to clients in the handshake so they fold with the
-	 * same authority as the server.
+	 * was configured with (`authoritativeNodeIds` store option). This is the one source
+	 * of truth: every session advertises exactly this list in the handshake, so clients
+	 * fold with the same authority as the server's stores.
 	 */
 	get authoritativeNodeIds(): string[] {
 		return this.store.getAuthoritativeNodeIds?.() ?? [this.store.getNodeId()]

@@ -25,8 +25,15 @@ orders writes by HLC stamps compared in JavaScript, never by a database collatio
 
 Server fold options: the Yjs richtext merger, no traces, and
 `authoritativeNodeIds` = the store's node id plus configured extras
-(`KoraSyncServer.authoritativeNodeIds`, for the handshake). Stores persist
-`hash_version` (CORE-1) with each operation.
+(`ServerStore.getAuthoritativeNodeIds()`). `KoraSyncServer.authoritativeNodeIds`
+returns that list and every session advertises exactly it in the handshake (one
+source of truth; there is no separate server option). Stores persist `hash_version`
+(CORE-1) and the encryption envelope (`encrypted`, protocol v2) with each operation.
+
+Envelope operations (end-to-end encryption) are folded like any other, over their
+cleartext scope fields only; sealed members are never materialized. An envelope with
+`data: null` creates its record (insert) and counts as a write against deletes, so the
+server's record existence agrees with the devices'.
 
 ## Re-materialization migration
 
@@ -55,10 +62,16 @@ node). Every instance, session or retry that generates the same effect produces 
 same id, and the log stores it once. A causally later write (re-pointing the child)
 still wins over it.
 
-Clients may derive ids for their own copies, but MUST NOT use the `server/` rule
-namespace: a client copy has different content (node, clock, sequence), so it must be
-a different operation. Both are stored; under the fold they are idempotent in effect
-(two deletes, two writes of null).
+A device that applies a REMOTE delete still cascades locally (its view stays
+consistent offline, and with end-to-end encryption a sealed reference is visible only
+to devices). Its copy is an ordinary operation of its own node (content-hashed, its own
+sequence), never in the `server/` rule namespace, but it is stamped the same way as the
+server's: right after the delete (the delete's HLC, next logical ticks, the device's
+node), not with the device's current time. Both copies are stored; under the fold they
+are idempotent in effect (two deletes, two writes of null), and a write to the child
+that is later than the delete wins over every copy, whenever each device applied the
+delete (seam 5; stamped with "now", a late-applying device's copy used to erase such a
+write on every replica).
 
 ## Cross-record rules (unique, capacity, referential)
 

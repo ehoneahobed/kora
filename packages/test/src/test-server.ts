@@ -1,14 +1,27 @@
 import type { BlobRef, Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
 import { MemoryServerStore } from '@korajs/server'
 import { KoraSyncServer } from '@korajs/server'
-import type { OperationValidator, ServerTransport } from '@korajs/server'
+import type {
+	KoraSyncServerConfig,
+	OperationValidator,
+	ServerStore,
+	ServerTransport,
+} from '@korajs/server'
 import { type ContentAddressedBlobStore, createMemoryServerBlobStore } from '@korajs/store'
 
 /**
  * In-memory test server wrapping KoraSyncServer with MemoryServerStore.
  * Handles client connections via memory transports.
  */
-export interface TestServerOptions {
+export interface TestServerOptions<S extends ServerStore = MemoryServerStore> {
+	/**
+	 * The server store (SQLite, Postgres, a memory store with options). Defaults to a
+	 * fresh {@link MemoryServerStore}. Await {@link TestServer.ready} before use: the
+	 * schema is set asynchronously.
+	 */
+	store?: S
+	/** End-to-end encryption policy of the sync server (protocol v2). */
+	encryption?: KoraSyncServerConfig['encryption']
 	/** Handshake schema version advertised by the server. Defaults to `schema.version`. */
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake. */
@@ -21,14 +34,17 @@ export interface TestServerOptions {
 	validateOperation?: OperationValidator
 }
 
-export class TestServer {
-	readonly store: MemoryServerStore
+export class TestServer<S extends ServerStore = MemoryServerStore> {
+	readonly store: S
+	/** Resolves once the store has the schema (needed before a SQL store is used). */
+	readonly ready: Promise<void>
 	/** The server's central blob store, present when `blobStorage` was enabled. */
 	readonly blobStore: ContentAddressedBlobStore | null
 	private readonly syncServer: KoraSyncServer
 
-	constructor(schema: SchemaDefinition, options?: TestServerOptions) {
-		this.store = new MemoryServerStore()
+	constructor(schema: SchemaDefinition, options?: TestServerOptions<S>) {
+		// Without a store option S is its default, MemoryServerStore.
+		this.store = options?.store ?? (new MemoryServerStore() as ServerStore as S)
 		const schemaVersion = options?.schemaVersion ?? schema.version
 		const blob = options?.blobStorage ? createMemoryServerBlobStore() : null
 		this.blobStore = blob?.store ?? null
@@ -42,8 +58,10 @@ export class TestServer {
 			...(options?.operationTransforms ? { operationTransforms: options.operationTransforms } : {}),
 			...(blob ? blob.callbacks : {}),
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
+			...(options?.encryption ? { encryption: options.encryption } : {}),
 		})
-		void this.store.setSchema(schema)
+		this.ready = this.store.setSchema(schema)
+		this.ready.catch(() => {})
 	}
 
 	/**
@@ -58,7 +76,22 @@ export class TestServer {
 	 * Get all operations stored on the server.
 	 */
 	getAllOperations(): Operation[] {
+		if (!(this.store instanceof MemoryServerStore)) {
+			throw new Error(
+				'TestServer.getAllOperations() reads the memory store synchronously; use store.getOperationsAfterDelivery() with a SQL store',
+			)
+		}
 		return this.store.getAllOperations()
+	}
+
+	/** The trusted server-side write API (route context): writes authored by the server node. */
+	getKoraContext(): ReturnType<KoraSyncServer['getKoraContext']> {
+		return this.syncServer.getKoraContext()
+	}
+
+	/** The node ids the server's stores fold with and advertise in the handshake. */
+	get authoritativeNodeIds(): string[] {
+		return this.syncServer.authoritativeNodeIds
 	}
 
 	/**

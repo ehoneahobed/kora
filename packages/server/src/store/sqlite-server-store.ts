@@ -15,6 +15,7 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
+import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	SERVER_LOG_QUARANTINE_DDL,
@@ -1438,6 +1439,17 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Encryption envelope of the operation (protocol v2), stored opaquely (JSON).
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN encrypted TEXT`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
 		`)
@@ -1794,12 +1806,14 @@ export class SqliteServerStore implements ServerStore {
 			deliverySeq,
 			seqUnique: soleHolder ? 1 : 0,
 			hashVersion: op.hashVersion ?? null,
+			encrypted: envelopeColumn(op),
 		}
 	}
 
 	private deserializeOperation(row: typeof operations.$inferSelect): Operation {
 		const atomicOps =
 			row.atomicOps != null ? (JSON.parse(row.atomicOps) as Record<string, AtomicOp>) : undefined
+		const encrypted = parseEnvelopeColumn(row.encrypted)
 		return {
 			id: row.id,
 			nodeId: row.nodeId,
@@ -1818,6 +1832,7 @@ export class SqliteServerStore implements ServerStore {
 			schemaVersion: row.schemaVersion,
 			...(atomicOps ? { atomicOps } : {}),
 			...(row.hashVersion === 1 || row.hashVersion === 2 ? { hashVersion: row.hashVersion } : {}),
+			...(encrypted !== undefined ? { encrypted } : {}),
 		}
 	}
 

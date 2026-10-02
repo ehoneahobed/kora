@@ -1,6 +1,6 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
-import type { Store } from '@korajs/store'
+import type { ResequenceResult, Store } from '@korajs/store'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
 
@@ -113,8 +113,9 @@ export class MergeAwareSyncStore implements SyncStore {
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null> {
-		return this.store.resequenceOperation(operationId, nodeId, floor)
+		rewritableDependents?: readonly string[],
+	): Promise<ResequenceResult | null> {
+		return this.store.resequenceOperation(operationId, nodeId, floor, rewritableDependents)
 	}
 
 	/** Take over a closed tab's node id (RT-40). */

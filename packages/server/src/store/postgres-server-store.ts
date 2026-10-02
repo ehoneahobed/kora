@@ -15,6 +15,7 @@ import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-or
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
+import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	SERVER_LOG_QUARANTINE_DDL,
@@ -1974,6 +1975,9 @@ export class PostgresServerStore implements ServerStore {
 			// Content-hash version of the stored id (CORE-1, protocol v2). Null means 1.
 			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS hash_version INTEGER`)
 
+			// Encryption envelope of the operation (protocol v2), stored opaquely (JSON).
+			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS encrypted TEXT`)
+
 			// Per-record fold state (W7): the materialized row is projected from it.
 			// `covered_seq` / `covered_op_id`: the delivery sequence and id of the record's
 			// newest operation merged into it (the state covers every operation up to it).
@@ -2254,12 +2258,14 @@ export class PostgresServerStore implements ServerStore {
 			deliverySeq,
 			seqUnique: soleHolder ? 1 : 0,
 			hashVersion: op.hashVersion ?? null,
+			encrypted: envelopeColumn(op),
 		}
 	}
 
 	private deserializeOperation(row: typeof pgOperations.$inferSelect): Operation {
 		const atomicOps =
 			row.atomicOps != null ? (JSON.parse(row.atomicOps) as Record<string, AtomicOp>) : undefined
+		const encrypted = parseEnvelopeColumn(row.encrypted)
 		return {
 			id: row.id,
 			nodeId: row.nodeId,
@@ -2278,6 +2284,7 @@ export class PostgresServerStore implements ServerStore {
 			schemaVersion: row.schemaVersion,
 			...(atomicOps ? { atomicOps } : {}),
 			...(row.hashVersion === 1 || row.hashVersion === 2 ? { hashVersion: row.hashVersion } : {}),
+			...(encrypted !== undefined ? { encrypted } : {}),
 		}
 	}
 

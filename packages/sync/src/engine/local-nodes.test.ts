@@ -364,7 +364,7 @@ describe('RT-35: own history behind the server', () => {
 		const renumbered: Operation = { ...original, sequenceNumber: 6 }
 		const resequence = vi.fn(async () => {
 			log[1] = renumbered
-			return renumbered
+			return { operation: renumbered, dependents: [], idMapping: {} }
 		})
 		const store = fakeStore(log, { resequenceOperation: resequence })
 		const p = persistence()
@@ -385,7 +385,7 @@ describe('RT-35: own history behind the server', () => {
 		})
 		await engine.start()
 		await tick()
-		expect(resequence).toHaveBeenCalledWith(original.id, NODE, 5)
+		expect(resequence).toHaveBeenCalledWith(original.id, NODE, 5, [])
 		expect(await engine.getRejectedOperations()).toEqual([])
 		expect(p.recorded).toEqual([])
 		// The session ended to resync from 0; the next one uploads the renumbered write.
@@ -771,7 +771,7 @@ describe('RT-44: recovery full resyncs are rate-limited', () => {
 			if (!current) return null
 			const renumbered = { ...current, sequenceNumber: current.sequenceNumber + 10 }
 			log[index] = renumbered
-			return renumbered
+			return { operation: renumbered, dependents: [], idMapping: {} }
 		})
 		const p = persistence()
 		p.prefixes.set(NODE, 1)
