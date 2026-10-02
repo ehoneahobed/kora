@@ -121,3 +121,32 @@ export function resolvePerFieldLww(
 	}
 	return { winners, merged }
 }
+
+/**
+ * Stamp `fields` with `version` on top of a stored `_field_versions` value and
+ * return the serialized column. This is the one per-field stamp every local
+ * write uses (insert, update, transaction entries, cascades), so every field a
+ * device writes carries the HLC of the operation that wrote it.
+ *
+ * Stamps only move forward: a field already holding a newer version keeps it.
+ * The map is keyed by field name with one HLC register per field, the shape the
+ * per-field fold (W7) builds on.
+ *
+ * @param currentRaw - The stored `_field_versions` column (or null for a new row)
+ * @param fields - Field names this write sets
+ * @param version - The writing operation's serialized HLC version
+ */
+export function stampFieldVersions(
+	currentRaw: unknown,
+	fields: Iterable<string>,
+	version: string,
+): string {
+	const versions = parseFieldVersions(currentRaw)
+	for (const field of fields) {
+		const existing = versions[field]
+		if (existing === undefined || existing < version) {
+			versions[field] = version
+		}
+	}
+	return serializeFieldVersions(versions)
+}

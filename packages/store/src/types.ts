@@ -65,37 +65,23 @@ export interface StorageAdapter {
 }
 
 /**
- * Buffered SQL + operation produced during a transaction (before commit).
+ * Routes local mutations through a unified apply pipeline (korajs ApplyPipeline).
+ *
+ * Every local write — including each entry of an `app.transaction` commit — is
+ * built and persisted by the store's single local write path; the handler adds
+ * pipeline behaviour around it.
  */
-export interface TransactionBufferedEntry {
-	operation: Operation
-	commands: Array<{ sql: string; params: unknown[] }>
-	collection: string
-}
-
-/**
- * Batch passed to {@link LocalMutationHandler.commitTransaction} on commit.
- */
-export interface TransactionCommitBatch {
-	entries: TransactionBufferedEntry[]
-	transactionId: string
-	mutationName?: string
-}
-
-export interface TransactionCommitResult {
-	operations: Operation[]
-	affectedCollections: Set<string>
-}
-
 export interface LocalMutationHandler {
 	insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord>
 	update(collection: string, id: string, data: Record<string, unknown>): Promise<CollectionRecord>
 	delete(collection: string, id: string): Promise<void>
 	/**
-	 * Commit a buffered transaction through the unified apply pipeline.
-	 * When omitted, the store uses the built-in SQL commit path.
+	 * Called inside the write transaction for every local delete (single-record,
+	 * transactional and cascaded), after the delete operation is built and before
+	 * referential side effects run. Reads must go through `tx`. Throwing aborts
+	 * the whole write.
 	 */
-	commitTransaction?(batch: TransactionCommitBatch): Promise<TransactionCommitResult>
+	beforeLocalDelete?(operation: Operation, tx: Transaction): Promise<void>
 }
 
 export type StoreIsolation = 'shared' | 'per-tab'

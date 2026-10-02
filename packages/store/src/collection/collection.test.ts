@@ -10,7 +10,6 @@ import { Collection } from './collection'
 describe('Collection', () => {
 	let adapter: BetterSqlite3Adapter
 	let clock: HybridLogicalClock
-	let seq: number
 	const nodeId = 'test-node-1'
 	const mutations: Array<{ collection: string; operation: Operation }> = []
 
@@ -24,7 +23,6 @@ describe('Collection', () => {
 			adapter,
 			clock,
 			nodeId,
-			async () => ++seq,
 			(col, op) => mutations.push({ collection: col, operation: op }),
 			null,
 			null,
@@ -35,7 +33,6 @@ describe('Collection', () => {
 	beforeEach(async () => {
 		adapter = await createTestAdapter()
 		clock = new HybridLogicalClock(nodeId)
-		seq = 0
 		mutations.length = 0
 	})
 

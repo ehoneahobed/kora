@@ -116,11 +116,35 @@ export function validateUpdateStateMachine(
 	currentRecord: Record<string, unknown>,
 	updateData: Record<string, unknown>,
 ): Record<string, unknown> {
+	let result = updateData
 	const stateMachine = collectionDef.stateMachine
-	if (stateMachine === undefined) {
-		return updateData
+	if (stateMachine !== undefined) {
+		result = applyStateMachine(collectionName, recordId, stateMachine, currentRecord, result)
 	}
+	// Field-level `t.enum(...).transitions()` maps are state machines too, in the
+	// default 'reject' mode (NEW-STORE-3). A collection-level machine on the same
+	// field takes precedence.
+	for (const [field, descriptor] of Object.entries(collectionDef.fields)) {
+		if (descriptor.kind !== 'enum' || !descriptor.transitions) continue
+		if (stateMachine?.field === field) continue
+		result = applyStateMachine(
+			collectionName,
+			recordId,
+			{ field, transitions: descriptor.transitions, onInvalidTransition: 'reject' },
+			currentRecord,
+			result,
+		)
+	}
+	return result
+}
 
+function applyStateMachine(
+	collectionName: string,
+	recordId: string,
+	stateMachine: StateMachineDefinition,
+	currentRecord: Record<string, unknown>,
+	updateData: Record<string, unknown>,
+): Record<string, unknown> {
 	const stateField = stateMachine.field
 	if (!(stateField in updateData)) {
 		// State field not being changed -- no validation needed

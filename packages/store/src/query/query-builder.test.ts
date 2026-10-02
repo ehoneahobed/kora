@@ -13,14 +13,12 @@ describe('QueryBuilder', () => {
 	let clock: HybridLogicalClock
 	let subManager: SubscriptionManager
 	let collection: Collection
-	let seq: number
 	const nodeId = 'test-node-1'
 
 	beforeEach(async () => {
 		adapter = await createTestAdapter()
 		clock = new HybridLogicalClock(nodeId)
 		subManager = new SubscriptionManager()
-		seq = 0
 
 		const def = minimalSchema.collections.todos
 		if (!def) throw new Error('Missing todos')
@@ -31,7 +29,6 @@ describe('QueryBuilder', () => {
 			adapter,
 			clock,
 			nodeId,
-			async () => ++seq,
 			(col, op) => subManager.notify(col, op),
 			null,
 			null,

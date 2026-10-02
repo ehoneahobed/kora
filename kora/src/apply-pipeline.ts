@@ -8,8 +8,8 @@ import type {
 import {
 	HybridLogicalClock,
 	KoraError,
-	createOperation,
 	expandFieldVersionedOperations,
+	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
@@ -22,18 +22,17 @@ import type {
 	LocalMutationHandler,
 	RowVersionState,
 	Store,
-	TransactionCommitBatch,
-	TransactionCommitResult,
+	Transaction,
 } from '@korajs/store'
 import { OptimisticLockError, richtextStatesEqual } from '@korajs/store'
 import {
+	deserializeRecord,
 	executeDelete,
 	executeInsert,
 	executeUpdate,
-	resolveCausalDeps,
 } from '@korajs/store/internal'
+import type { RawCollectionRow } from '@korajs/store/internal'
 import type { ApplyResult } from '@korajs/sync'
-import { buildSideEffectEntry } from './build-side-effect-entry'
 
 /**
  * Whether the operation originated locally or arrived from sync.
@@ -94,32 +93,29 @@ export class ApplyPipeline implements LocalMutationHandler {
 	}
 
 	/**
-	 * Local delete with merge-package referential integrity (same rules as remote delete).
+	 * Local delete. The store builds and persists the delete, its referential
+	 * side effects (cascade / set-null, recursively) and their sequence numbers in
+	 * one write transaction; {@link beforeLocalDelete} adds the merge-package
+	 * referential checks and their DevTools traces inside that transaction.
 	 */
 	async delete(collection: string, id: string): Promise<void> {
-		const ctx = this.deps.store.createMutationContext(collection)
-		const causalDeps = resolveCausalDeps(ctx)
-		const operation = await createOperation(
-			{
-				nodeId: ctx.nodeId,
-				type: 'delete',
-				collection,
-				recordId: id,
-				data: null,
-				previousData: null,
-				sequenceNumber: await ctx.allocateSequenceNumber(),
-				causalDeps,
-				schemaVersion: ctx.schema.version,
-			},
-			ctx.clock,
-		)
-		ctx.causalTracker?.afterOperation(collection, operation.id, ctx.inTransaction)
+		await executeDelete(this.deps.store.createMutationContext(collection), id)
+	}
 
-		const refCtx = createReferentialMergeContext(this.deps.store)
+	/**
+	 * Referential integrity for a local delete, run inside the delete's write
+	 * transaction (single-record, `app.transaction` entries and cascades alike):
+	 * emits the referential merge traces and refuses a delete a `restrict` relation
+	 * forbids. The side effects themselves are written by the store's relation
+	 * enforcer through the single local write path, so they share the commit's
+	 * sequence block (STORE-2).
+	 */
+	async beforeLocalDelete(operation: Operation, tx: Transaction): Promise<void> {
+		const schema = this.deps.store.getSchema()
 		const check = await checkReferentialIntegrityOnDelete(
 			operation,
-			this.deps.store.getSchema(),
-			refCtx,
+			schema,
+			createTransactionalReferentialContext(schema, tx),
 			this.relationLookupMap,
 		)
 
@@ -129,116 +125,11 @@ export class ApplyPipeline implements LocalMutationHandler {
 
 		if (!check.allowed) {
 			throw new KoraError(
-				`Cannot delete record "${id}" from "${collection}": referential restrict policy violated`,
+				`Cannot delete record "${operation.recordId}" from "${operation.collection}": referential restrict policy violated`,
 				'REFERENTIAL_INTEGRITY',
-				{ collection, recordId: id },
+				{ collection: operation.collection, recordId: operation.recordId },
 			)
 		}
-
-		await executeDelete(ctx, id, {
-			skipReferentialEnforcement: true,
-			operation,
-		})
-
-		if (check.sideEffectOps.length > 0) {
-			await applySideEffectOps(this.deps.store, check.sideEffectOps, operation.id)
-		}
-	}
-
-	/**
-	 * Commit a buffered transaction: merge-package delete enforcement, causal ordering, single DB txn.
-	 */
-	async commitTransaction(batch: TransactionCommitBatch): Promise<TransactionCommitResult> {
-		const store = this.deps.store
-		const supplemental: TransactionCommitBatch['entries'] = []
-
-		for (const entry of batch.entries) {
-			if (entry.operation.type !== 'delete') {
-				continue
-			}
-			const refCtx = createReferentialMergeContext(store)
-			const check = await checkReferentialIntegrityOnDelete(
-				entry.operation,
-				store.getSchema(),
-				refCtx,
-				this.relationLookupMap,
-			)
-
-			for (const trace of check.traces) {
-				this.deps.emitter?.emit({ type: 'merge:conflict', trace })
-			}
-
-			if (!check.allowed) {
-				throw new KoraError(
-					`Cannot delete record "${entry.operation.recordId}" from "${entry.collection}": referential restrict policy violated`,
-					'REFERENTIAL_INTEGRITY',
-					{ collection: entry.collection, recordId: entry.operation.recordId },
-				)
-			}
-
-			for (const effect of check.sideEffectOps) {
-				const ctx = store.createMutationContext(effect.collection, { inTransaction: true })
-				supplemental.push(
-					await buildSideEffectEntry(
-						ctx,
-						effect,
-						entry.operation.id,
-						batch.transactionId,
-						batch.mutationName,
-					),
-				)
-			}
-		}
-
-		const allEntries = [...batch.entries, ...supplemental]
-		const sortedOps = topologicalSort(allEntries.map((e) => e.operation))
-		const commandsByOpId = new Map(allEntries.map((e) => [e.operation.id, e.commands] as const))
-
-		const ctx = store.createMutationContext(
-			batch.entries[0]?.collection ?? Object.keys(store.getSchema().collections)[0] ?? 'todos',
-			{ inTransaction: true },
-		)
-
-		// Highest own sequence number in this batch (buffered entries + side effects).
-		let highestOwnSeq = 0
-		for (const op of sortedOps) {
-			if (op.nodeId === ctx.nodeId && op.sequenceNumber > highestOwnSeq) {
-				highestOwnSeq = op.sequenceNumber
-			}
-		}
-
-		await ctx.adapter.transaction(async (tx) => {
-			for (const op of sortedOps) {
-				const commands = commandsByOpId.get(op.id)
-				if (!commands) {
-					continue
-				}
-				for (const cmd of commands) {
-					await tx.execute(cmd.sql, cmd.params)
-				}
-			}
-			// STORE-1 stopgap: persist the sequence counter inside the commit, and never
-			// lower it. Without this the next single-record write re-allocates a
-			// sequence number this transaction already used, so the server's ack of the
-			// transaction makes that later write look synced and it is never uploaded.
-			// MAX(existing, batch) also undoes any side-effect command that wrote an
-			// older value. Concurrent transactions can still collide on the same numbers
-			// until W6 reserves a block inside the transaction.
-			if (highestOwnSeq > 0) {
-				await tx.execute(
-					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
-     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
-					[ctx.nodeId, highestOwnSeq],
-				)
-			}
-		})
-
-		const affectedCollections = new Set<string>()
-		for (const entry of allEntries) {
-			affectedCollections.add(entry.collection)
-		}
-
-		return { operations: sortedOps, affectedCollections }
 	}
 
 	async applyRemote(op: Operation): Promise<ApplyResult> {
@@ -788,6 +679,36 @@ function createConstraintContext(store: Store): ConstraintContext {
 		},
 		async countRecords(collection: string, where: Record<string, unknown>) {
 			return store.collection(collection).where(where).count()
+		},
+	}
+}
+
+/**
+ * Referential lookups for a local delete, read through the delete's own write
+ * transaction so they see exactly the rows the transaction commits against.
+ */
+function createTransactionalReferentialContext(
+	schema: SchemaDefinition,
+	tx: Transaction,
+): ReferentialMergeContext {
+	return {
+		async queryRecords(collection: string, where: Record<string, unknown>) {
+			const definition = schema.collections[collection]
+			if (!definition) return []
+			const fields = Object.keys(where)
+			const clause = fields.map((field) => `${quoteIdent(field)} = ?`).join(' AND ')
+			const rows = await tx.query<RawCollectionRow>(
+				`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0${clause ? ` AND ${clause}` : ''}`,
+				fields.map((field) => where[field]),
+			)
+			return rows.map((row) => deserializeRecord(row, definition.fields) as Record<string, unknown>)
+		},
+		async recordExists(collection: string, recordId: string) {
+			const rows = await tx.query<{ id: string }>(
+				`SELECT id FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
+				[recordId],
+			)
+			return rows.length > 0
 		},
 	}
 }

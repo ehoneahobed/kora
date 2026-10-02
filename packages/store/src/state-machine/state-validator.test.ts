@@ -1,4 +1,5 @@
 import type { CollectionDefinition, StateMachineDefinition } from '@korajs/core'
+import { defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import {
 	InvalidStateTransitionError,
@@ -216,5 +217,46 @@ describe('validateUpdateStateMachine', () => {
 			{ status: 'shipped' },
 		)
 		expect(result).toEqual({})
+	})
+})
+
+describe('field-level transitions (NEW-STORE-3)', () => {
+	const schema = defineSchema({
+		version: 1,
+		collections: {
+			orders: {
+				fields: {
+					status: t
+						.enum(['draft', 'submitted', 'delivered'])
+						.transitions({ draft: ['submitted'], submitted: ['delivered'], delivered: [] }),
+					payment: t.enum(['open', 'paid']).transitions({ open: ['paid'], paid: [] }),
+				},
+			},
+		},
+	})
+	const orders = schema.collections.orders as CollectionDefinition
+
+	test('every field-level transition map is enforced in reject mode', () => {
+		const current = { status: 'draft', payment: 'open' }
+		expect(() =>
+			validateUpdateStateMachine('orders', 'o1', orders, current, { status: 'delivered' }),
+		).toThrow(InvalidStateTransitionError)
+		expect(() =>
+			validateUpdateStateMachine(
+				'orders',
+				'o1',
+				orders,
+				{ status: 'draft', payment: 'paid' },
+				{
+					payment: 'open',
+				},
+			),
+		).toThrow(InvalidStateTransitionError)
+		expect(
+			validateUpdateStateMachine('orders', 'o1', orders, current, {
+				status: 'submitted',
+				payment: 'paid',
+			}),
+		).toEqual({ status: 'submitted', payment: 'paid' })
 	})
 })
