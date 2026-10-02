@@ -311,6 +311,30 @@ export interface SyncControl {
 	getRejectedOperations(): Promise<import('@korajs/sync').RejectedOperation[]>
 	/** Forget rejected operations by id once the app has reconciled them. */
 	clearRejectedOperations(operationIds: string[]): Promise<void>
+	/**
+	 * Local nodes whose unsynced writes are held (RT-38, RT-50), with why: `other-user`
+	 * (they upload when their user signs in on this device) or `unassigned` (written
+	 * before the app knew who was signed in, on a database that never synced: nobody can
+	 * tell whose they are). Empty when sync is not configured.
+	 */
+	getHeldOperations(): Promise<import('@korajs/sync').HeldNodeInfo[]>
+	/**
+	 * Assign a node's `unassigned` held writes to the signed-in user: they upload on
+	 * that user's sessions from now on (a reconnect starts at once when connected). Only
+	 * the app knows whose they are (for example a single-user device, or after asking).
+	 *
+	 * @throws {SyncError} `HELD_ASSIGN_NO_USER` when nobody is signed in;
+	 *   `HELD_NODE_NOT_ASSIGNABLE` when the node holds no unassigned writes
+	 */
+	assignHeld(nodeId: string, to: 'current-user'): Promise<void>
+	/**
+	 * Never upload a node's `unassigned` held writes. They are not rolled back: they stay
+	 * in this device's local database only.
+	 *
+	 * @returns How many writes were discarded from sync
+	 * @throws {SyncError} `HELD_NODE_NOT_DISCARDABLE` when the node holds no unassigned writes
+	 */
+	discardHeld(nodeId: string): Promise<number>
 }
 
 /**

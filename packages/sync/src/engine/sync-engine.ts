@@ -62,6 +62,8 @@ import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
 import {
 	type AdoptionScheduleInfo,
+	type HeldNodeInfo,
+	type HeldReason,
 	type LocalNodeInfo,
 	MemoryRejectedOperationStorage,
 	type QuarantinedOperation,
@@ -114,6 +116,10 @@ const DURABILITY_FAILURES_BEFORE_DEGRADED = 3
  */
 const ADOPTION_PARK_BASE_MS = 30_000
 const ADOPTION_PARK_MAX_MS = 60 * 60_000
+/** Terminal marker of held writes the app discarded from sync (RT-50). */
+const HELD_DISCARDED_CODE = 'HELD_DISCARDED'
+/** Times one start() begins again because the signed-in user changed while connecting (RT-52). */
+const MAX_PRINCIPAL_RESTARTS = 2
 /**
  * A live session of this tab's own node ends to retry a parked adoption (that other
  * uploads may have unblocked) at most this soon after it was parked, so a node the
@@ -396,6 +402,8 @@ export class SyncEngine {
 	private otherNodesPending = 0
 	/** Unsynced, unqueued operations of held nodes (RT-38), reported separately. */
 	private heldPending = 0
+	/** Held local nodes as of the last session start (RT-50), for status.heldNodes. */
+	private heldNodeInfos: HeldNodeInfo[] = []
 	/**
 	 * The server holds operations of this node that the device lost (RT-35): the delivery
 	 * watermark was reset so the next session resyncs from 0, which fetches them back.
@@ -407,6 +415,14 @@ export class SyncEngine {
 	 * (nobody signed in) or undefined (the app does not tell the engine).
 	 */
 	private principal: string | null | undefined = undefined
+	/**
+	 * The user whose credential the current session's handshake carried (RT-50, RT-52):
+	 * re-read after the credential fetch, so an accepted handshake binds a node to the
+	 * user the server accepted it for, never to a user who signed out meanwhile.
+	 */
+	private sessionPrincipal: string | null | undefined = undefined
+	/** Serializes store bindings to the signed-in user (RT-52). */
+	private principalChain: Promise<void> = Promise.resolve()
 	/** Adoption schedule kept in memory when the persistence layer has none (RT-46). */
 	private memorySchedule: AdoptionScheduleInfo = { progress: 0, parked: {} }
 	/** The schedule had parked adoptions when last read or written (RT-46). */
@@ -585,7 +601,7 @@ export class SyncEngine {
 		return this.startPromise
 	}
 
-	private async startInternal(): Promise<void> {
+	private async startInternal(principalRestarts = 0): Promise<void> {
 		if (this.stopPromise) {
 			await this.stopPromise
 		}
@@ -636,7 +652,10 @@ export class SyncEngine {
 			this.lastFullResyncAt = Date.now()
 			await this.resetDeliveryForFullResync()
 		}
-		if (!(await this.applyPrincipal())) return
+		if (!(await this.withPrincipalLock(() => this.applyPrincipal()))) return
+		// The user this session's node was chosen for (RT-52): re-checked after the
+		// credential fetch, before the handshake.
+		const boundPrincipal = this.principal
 		await this.chooseSessionNode()
 		{
 			const sessionNode = this.currentNodeId()
@@ -717,6 +736,26 @@ export class SyncEngine {
 				this.ensureDisconnected()
 				return
 			}
+			// RT-52: the signed-in user may have changed while the credential was fetched
+			// or the transport connected (up to the connect timeout). The node was chosen
+			// for the previous user and the credential may be the next one's: never
+			// handshake that pair. Start over (the store is rebound to the current user).
+			const principalNow = await this.resolvePrincipal()
+			if (this.config.principal && principalNow !== boundPrincipal) {
+				await this.transport.disconnect()
+				this.ensureDisconnected()
+				if (principalRestarts >= MAX_PRINCIPAL_RESTARTS) {
+					throw new SyncError(
+						'The signed-in user kept changing while sync was connecting; this attempt was abandoned so no write is uploaded as the wrong user.',
+						{
+							code: 'PRINCIPAL_CHANGED',
+							fix: 'Sync retries automatically once the signed-in user is stable.',
+						},
+					)
+				}
+				return this.startInternal(principalRestarts + 1)
+			}
+			this.sessionPrincipal = principalNow
 			this.sessionEpoch++
 			this.transitionTo('handshaking')
 
@@ -926,6 +965,7 @@ export class SyncEngine {
 			lastSuccessfulPull: this.lastSuccessfulPull,
 			conflicts: this.conflictCount,
 			heldOperations: this.computeHeldCount(),
+			heldNodes: this.heldNodeInfos.map((node) => ({ ...node })),
 			localDurability: this.durabilityDegraded ? ('degraded' as const) : ('durable' as const),
 			clockSkewMs: this.clockSkewMs,
 			inFlightUploadOperations: this.inFlightUploadCount(),
@@ -1136,7 +1176,45 @@ export class SyncEngine {
 		if (next === this.principal) return
 		if (this.nodeRotation) await this.nodeRotation
 		if (this.state !== 'disconnected') await this.stop()
-		await this.applyPrincipal()
+		await this.withPrincipalLock(() => this.applyPrincipal())
+	}
+
+	/**
+	 * Bind the store to the user the app reports NOW (RT-52), without ending or waiting
+	 * for any session: call it on every auth event, before queueing the reconnect that
+	 * follows. Writes made from then on are authored under that user's node, even while
+	 * an earlier reconnect is still fetching a credential or connecting; that attempt
+	 * notices the change before its handshake and starts over. A live session keeps
+	 * running as the previous user's node and uploads only that node's writes, until the
+	 * queued reconnect replaces it.
+	 */
+	async bindSignedInUser(): Promise<void> {
+		if (!this.config.principal || !this.store.bindPrincipal) return
+		await this.withPrincipalLock(async () => {
+			const next = await this.resolvePrincipal()
+			if (next === this.principal) return
+			await this.applyPrincipal({ keepSession: this.state !== 'disconnected' })
+		})
+	}
+
+	/** The signed-in user as `config.principal` reports it (undefined when it throws). */
+	private async resolvePrincipal(): Promise<string | null | undefined> {
+		if (!this.config.principal) return undefined
+		try {
+			return await this.config.principal()
+		} catch {
+			return undefined
+		}
+	}
+
+	/** Run `fn` after every earlier principal binding (one store binding at a time). */
+	private withPrincipalLock<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.principalChain.then(fn, fn)
+		this.principalChain = run.then(
+			() => undefined,
+			() => undefined,
+		)
+		return run
 	}
 
 	/**
@@ -1145,15 +1223,11 @@ export class SyncEngine {
 	 * @returns false when sync must stay suspended: the store's node id is pinned and
 	 *   belongs to another user, so nothing on this database may upload as this user.
 	 */
-	private async applyPrincipal(): Promise<boolean> {
+	private async applyPrincipal(options: { keepSession?: boolean } = {}): Promise<boolean> {
 		if (!this.config.principal) return true
-		let principal: string | null | undefined
-		try {
-			principal = await this.config.principal()
-		} catch {
-			// Unknown: no binding is changed, and no bound node is judged against it.
-			principal = undefined
-		}
+		// Unknown (undefined, or the resolver threw): no binding is changed, and no bound
+		// node is judged against it.
+		const principal = await this.resolvePrincipal()
 		this.principal = principal
 		if (!principal || !this.store.bindPrincipal) return true
 		const binding = await this.store.bindPrincipal(principal)
@@ -1168,7 +1242,10 @@ export class SyncEngine {
 				nodeId: binding.nodeId,
 				action: 'principal-switched',
 			})
-			await this.afterIdentityChange()
+			// A live session stays the previous user's node until it is replaced: only
+			// that node's writes upload on it (RT-52). The next session starts from the
+			// store's new node.
+			if (!options.keepSession) await this.afterIdentityChange()
 		}
 		return true
 	}
@@ -1837,8 +1914,20 @@ export class SyncEngine {
 		const storeNode = this.store.getNodeId()
 		this.returnAllInFlightUploads()
 		try {
+			// The server says the node is not the signed-in user's (RT-50): a guessed
+			// binding was wrong, and an unbound node is never tried for them again.
+			const principal = this.sessionPrincipal
+			if (typeof principal === 'string') {
+				await this.syncState?.recordLocalNodeRefusedFor?.(refused, principal)
+			}
 			if (refused !== storeNode) {
-				await this.syncState?.markLocalNodeRefused?.(refused, true)
+				const node = (await this.syncState?.listLocalNodes?.())?.find(
+					(entry) => entry.nodeId === refused,
+				)
+				// An unbound node (learning its owner) is not held for good: another user's
+				// session may still be accepted for it.
+				const unbound = node !== undefined && (node.principal ?? null) === null
+				await this.syncState?.markLocalNodeRefused?.(refused, !unbound)
 				this.heldNodeIds.add(refused)
 				this.endAdoption()
 				this.emitter?.emit({ type: 'sync:local-node', nodeId: refused, action: 'adoption-refused' })
@@ -1889,6 +1978,8 @@ export class SyncEngine {
 					node.nodeId !== refused &&
 					node.held &&
 					!this.belongsToAnotherPrincipal(node) &&
+					// An unbound node is never handed to the signed-in user (RT-50).
+					!(typeof this.principal === 'string' && (node.principal ?? null) === null) &&
 					(node.refusedCycle === null || node.refusedCycle < cycle),
 			)
 			if (candidate) {
@@ -2990,6 +3081,122 @@ export class SyncEngine {
 		})
 	}
 
+	/**
+	 * The local nodes whose unsynced writes are held now (RT-38, RT-50), for the user the
+	 * app reports as signed in. See {@link SyncStatusInfo.heldNodes}.
+	 */
+	async getHeldNodes(): Promise<HeldNodeInfo[]> {
+		const nodes = (await this.syncState?.listLocalNodes?.()) ?? []
+		const principal = this.config.principal ? await this.resolvePrincipal() : this.principal
+		const storeNode = this.store.getNodeId()
+		const held: HeldNodeInfo[] = []
+		for (const node of nodes) {
+			if (node.nodeId === storeNode) continue
+			const reason = this.holdReason(node, principal)
+			if (!reason) continue
+			const unsynced = await this.countUnsyncedOfNode(node.nodeId)
+			if (unsynced.count === 0) continue
+			held.push({
+				nodeId: node.nodeId,
+				operationCount: unsynced.count,
+				reason,
+				principal: node.principal ?? null,
+			})
+		}
+		return held
+	}
+
+	/**
+	 * Assign the `unassigned` held writes of `nodeId` to the signed-in user (RT-50): writes
+	 * made on this device before the app knew who was signed in, on a node that never
+	 * synced. Only the app can know whose they are (for example, a single-user device).
+	 * They upload on the user's next session (the server then binds the node to them).
+	 *
+	 * @throws {SyncError} `HELD_ASSIGN_NO_USER` when nobody is signed in;
+	 *   `HELD_NODE_NOT_ASSIGNABLE` when `nodeId` is not an unassigned held node (it belongs
+	 *   to a user, or the server refused it for this one)
+	 */
+	async assignHeld(nodeId: string): Promise<void> {
+		const principal = await this.resolvePrincipal()
+		if (typeof principal !== 'string') {
+			throw new SyncError('Held writes can only be assigned to a signed-in user.', {
+				code: 'HELD_ASSIGN_NO_USER',
+				nodeId,
+				fix: 'Call assignHeld after the user signed in.',
+			})
+		}
+		const node = (await this.syncState?.listLocalNodes?.())?.find(
+			(entry) => entry.nodeId === nodeId,
+		)
+		const assigned =
+			node !== undefined &&
+			nodeId !== this.store.getNodeId() &&
+			this.holdReason(node, principal) === 'unassigned' &&
+			((await this.syncState?.assignLocalNodePrincipal?.(nodeId, principal)) ?? false)
+		if (!assigned) {
+			throw new SyncError(
+				`Node "${nodeId}" holds no unassigned writes: only writes nobody can attribute can be assigned.`,
+				{
+					code: 'HELD_NODE_NOT_ASSIGNABLE',
+					nodeId,
+					fix: 'Pick a node from status.heldNodes whose reason is "unassigned".',
+				},
+			)
+		}
+		this.emitter?.emit({ type: 'sync:local-node', nodeId, action: 'held-assigned' })
+		this.heldNodeInfos = this.heldNodeInfos.filter((entry) => entry.nodeId !== nodeId)
+		this.notifyStatusChange()
+	}
+
+	/**
+	 * Discard the `unassigned` held writes of `nodeId` from sync (RT-50): they are never
+	 * uploaded. They are NOT rolled back: they stay in this device's local database, and
+	 * count as synced from now on (`deleteDatabase` no longer protects them). Writes held
+	 * for another user (`other-user`) cannot be discarded by this user.
+	 *
+	 * @returns How many writes were discarded
+	 * @throws {SyncError} `HELD_NODE_NOT_DISCARDABLE` when `nodeId` is not an unassigned
+	 *   held node
+	 */
+	async discardHeld(nodeId: string): Promise<number> {
+		const principal = this.config.principal ? await this.resolvePrincipal() : this.principal
+		const node = (await this.syncState?.listLocalNodes?.())?.find(
+			(entry) => entry.nodeId === nodeId,
+		)
+		if (
+			!node ||
+			nodeId === this.store.getNodeId() ||
+			this.holdReason(node, principal) !== 'unassigned'
+		) {
+			throw new SyncError(
+				`Node "${nodeId}" holds no unassigned writes: only writes nobody can attribute can be discarded.`,
+				{
+					code: 'HELD_NODE_NOT_DISCARDABLE',
+					nodeId,
+					fix: 'Pick a node from status.heldNodes whose reason is "unassigned".',
+				},
+			)
+		}
+		const unsynced = await this.countUnsyncedOfNode(nodeId)
+		const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
+		const ops = (await this.store.getOperationRange(nodeId, 1, localSeq)).filter((op) =>
+			unsynced.ids.has(op.id),
+		)
+		await this.recordTerminalRejections(ops, HELD_DISCARDED_CODE)
+		await this.outboundQueue.removeByIds(ops.map((op) => op.id))
+		await this.syncState?.dropLocalNode?.(nodeId)
+		this.heldNodeInfos = this.heldNodeInfos.filter((entry) => entry.nodeId !== nodeId)
+		this.emitter?.emit({
+			type: 'sync:local-node',
+			nodeId,
+			action: 'held-discarded',
+			operationCount: ops.length,
+		})
+		await this.refreshPendingCount()
+		this.notifyStatusChange()
+		return ops.length
+	}
+
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
 		if (msg.retriable) {
 			// The op stays in its batch; the batch's ack stops short of it and returns it
@@ -3456,6 +3663,7 @@ export class SyncEngine {
 		this.otherNodesPending = 0
 		this.heldPending = 0
 		this.heldNodeIds = new Set()
+		this.heldNodeInfos = []
 		this.localNodeIds = new Set([storeNode])
 		this.deferredAdoptions = []
 		const syncState = this.syncState
@@ -3485,17 +3693,23 @@ export class SyncEngine {
 		const candidates: Candidate[] = []
 		for (const node of nodes) {
 			if (node.nodeId === storeNode) continue
-			// Held for its principal (RT-38), or bound to another user (RT-42): it is never
-			// uploaded on this user's session.
-			const held = node.held || this.belongsToAnotherPrincipal(node)
-			if (held) this.heldNodeIds.add(node.nodeId)
+			// Held for its principal (RT-38), bound to another user (RT-42), refused for
+			// this one or never attributed (RT-50): it is never uploaded on this session.
+			const heldReason = this.holdReason(node)
+			if (heldReason) this.heldNodeIds.add(node.nodeId)
 			const unsynced = await this.countUnsyncedOfNode(node.nodeId)
 			if (unsynced.count === 0) {
 				if (!node.held) await this.forgetDrainedNode(node.nodeId)
 				continue
 			}
-			if (held) {
+			if (heldReason) {
 				this.heldPending += unsynced.notQueued
+				this.heldNodeInfos.push({
+					nodeId: node.nodeId,
+					operationCount: unsynced.count,
+					reason: heldReason,
+					principal: node.principal ?? null,
+				})
 				continue
 			}
 			const refusedThisCycle = node.refusedCycle !== null && node.refusedCycle >= cycle
@@ -3578,6 +3792,35 @@ export class SyncEngine {
 			// While adopting, the store's own unsynced tail is not tracked by this session.
 			this.otherNodesPending += own.notQueued
 		}
+	}
+
+	/**
+	 * Why a local node other than the store's own must not upload on this session, or
+	 * null when it may (RT-38, RT-42, RT-50):
+	 *
+	 * - Bound to another user than the signed-in one (or refused after acceptance,
+	 *   RT-38): `other-user`.
+	 * - Unbound (its owner was never recorded, RT-50) while a user is signed in: its
+	 *   owner is learned from the server, never guessed. If it was accepted before, the
+	 *   server holds a claim on it: it is tried (adopted) on this user's session unless
+	 *   the server already refused it for them, and an accepted handshake binds it to
+	 *   them. If it never synced nobody can tell whose its writes are: `unassigned`,
+	 *   held until the app assigns or discards them.
+	 */
+	private holdReason(
+		node: LocalNodeInfo,
+		principal: string | null | undefined = this.principal,
+	): HeldReason | null {
+		const owner = node.principal ?? null
+		if (this.config.principal && typeof principal === 'string') {
+			if (owner !== null) return owner !== principal || node.held ? 'other-user' : null
+			if (!node.accepted) return 'unassigned'
+			if ((node.refusedPrincipals ?? []).includes(principal)) return 'other-user'
+			return null
+		}
+		if (node.held) return 'other-user'
+		if (this.config.principal && principal === null && owner !== null) return 'other-user'
+		return null
 	}
 
 	/** A node bound to another user than the signed-in one (RT-42). */
@@ -3702,12 +3945,19 @@ export class SyncEngine {
 		release?.()
 	}
 
-	/** Record an accepted handshake as `nodeId` (RT-38), durably when supported. */
+	/**
+	 * Record an accepted handshake as `nodeId` (RT-38), durably when supported. The server
+	 * accepted it for the session's user, so an unbound node is now theirs (RT-50).
+	 */
 	private async recordNodeAccepted(nodeId: string): Promise<void> {
 		this.memoryAcceptedNodes.add(nodeId)
 		this.heldNodeIds.delete(nodeId)
 		try {
 			await this.syncState?.markLocalNodeAccepted?.(nodeId)
+			const principal = this.sessionPrincipal
+			if (this.config.principal && typeof principal === 'string') {
+				await this.syncState?.confirmLocalNodePrincipal?.(nodeId, principal)
+			}
 		} catch (error) {
 			this.emitter?.emit({
 				type: 'store:persistence-error',

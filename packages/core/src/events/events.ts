@@ -101,6 +101,8 @@ export type KoraEvent =
 			 *   (copied app data, a restored image); this copy moved to a fresh node id (RT-44).
 			 * - `principal-switched`: the signed-in user changed; local writes from now on are
 			 *   authored under that user's own node (RT-42).
+			 * - `held-assigned` / `held-discarded`: the app assigned a held node's writes to
+			 *   the signed-in user, or discarded them from sync (RT-50).
 			 */
 			type: 'sync:local-node'
 			nodeId: string
@@ -114,6 +116,8 @@ export type KoraEvent =
 				| 'held'
 				| 'clone-detected'
 				| 'principal-switched'
+				| 'held-assigned'
+				| 'held-discarded'
 			/** For `history-behind` / `server-behind`: the device's sequence and the server's. */
 			localSequence?: number
 			serverSequence?: number

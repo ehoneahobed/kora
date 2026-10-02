@@ -68,6 +68,18 @@ export class AuthSyncCoordinator {
 			return
 		}
 
+		// Bind the store to the user the binding reports NOW, outside the serialized
+		// reconnect (RT-52): a run already in flight can take as long as a credential
+		// fetch plus the transport's connect timeout, and every write made meanwhile must be
+		// authored under the new user's node. The run notices the change before its
+		// handshake and starts over.
+		const engine = this.getEngine()
+		void engine?.bindSignedInUser?.().catch((error: unknown) => {
+			console.warn(
+				`[kora] binding local writes to the signed-in user failed: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		})
+
 		if (this.inFlight) {
 			this.pending = true
 			return

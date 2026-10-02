@@ -48,6 +48,27 @@ describe('AuthSyncCoordinator', () => {
 		expect(maxConcurrentAuth).toBe(1)
 	})
 
+	test('binds the store on every auth event, even while a reconnect is in flight (RT-52)', async () => {
+		const engine = { ...createMockEngine(), bindSignedInUser: vi.fn(async () => {}) }
+		let release: (() => void) | null = null
+		engine.reconnect = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve
+				}),
+		)
+		const coordinator = new AuthSyncCoordinator(() => engine as never, createBinding())
+		coordinator.scheduleReconnect()
+		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalledTimes(1))
+		coordinator.scheduleReconnect()
+		// Bound at once, not after the in-flight reconnect.
+		expect(engine.bindSignedInUser).toHaveBeenCalledTimes(2)
+		expect(engine.reconnect).toHaveBeenCalledTimes(1)
+		;(release as (() => void) | null)?.()
+		await vi.waitFor(() => expect(engine.reconnect).toHaveBeenCalledTimes(2))
+		;(release as (() => void) | null)?.()
+	})
+
 	test('stops sync when token is empty', async () => {
 		const engine = createMockEngine()
 		const coordinator = new AuthSyncCoordinator(

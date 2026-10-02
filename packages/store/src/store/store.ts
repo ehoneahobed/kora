@@ -58,6 +58,9 @@ import {
 	type AdoptionSchedule,
 	type LocalNodeRecord,
 	type TerminalRejection,
+	assignLocalNodePrincipal,
+	confirmLocalNodePrincipal,
+	dropLocalNode,
 	findTerminalRejections,
 	forgetLocalNode,
 	listLocalNodes,
@@ -65,6 +68,7 @@ import {
 	loadAdoptionSchedule,
 	markLocalNodeAccepted,
 	markLocalNodeRefused,
+	recordLocalNodeRefusedFor,
 	recordTerminalRejections,
 	registerLocalNode,
 	saveAdoptionSchedule,
@@ -1436,6 +1440,9 @@ export class Store implements OperationLog {
 		}
 		const oldNodeId = this.nodeId
 		const oldClock = this.clock
+		const oldBinding = (await listLocalNodes(this.adapter)).find(
+			(node) => node.nodeId === oldNodeId,
+		)
 		const result = await rotateUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
@@ -1444,6 +1451,16 @@ export class Store implements OperationLog {
 			generateUUIDv7(),
 		)
 		await registerLocalNode(this.adapter, result.nodeId)
+		// The re-authored writes keep their author (RT-50): the fresh node carries the old
+		// node's binding, so they are never held as unassigned or given to another user.
+		if (oldBinding?.principal) {
+			await setLocalNodePrincipal(
+				this.adapter,
+				result.nodeId,
+				oldBinding.principal,
+				oldBinding.binding ?? 'app',
+			)
+		}
 		this.nodeId = result.nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
 		if (oldClock) {
@@ -1519,9 +1536,16 @@ export class Store implements OperationLog {
 	 * signed-in user is known or changes, BEFORE the next local write (`createApp` does
 	 * so at start and on every auth change of `sync.authClient`).
 	 *
-	 * - The current node is unbound: it is bound to `principal` (its writes so far were
-	 *   made while nobody else was known to be signed in).
 	 * - The current node belongs to `principal`: nothing changes.
+	 * - The current node is unbound and has no history (no write, never synced): it is
+	 *   bound to `principal` (every write under it from now on is theirs).
+	 * - The current node is unbound but has history (a database from before RT-42, or
+	 *   writes made while nobody was signed in): its owner is NOT guessed (RT-50). The
+	 *   store moves to `principal`'s own node, and the old node's owner is learned from
+	 *   the sync server (the first accepted handshake as it binds it; a refusal rules
+	 *   that user out). A node that never synced cannot be attributed by anyone: its
+	 *   unsynced writes are held for the app to assign or discard (`app.sync.assignHeld`,
+	 *   `app.sync.discardHeld`).
 	 * - It belongs to another user: the store moves to `principal`'s own local node (the
 	 *   most recent one, not held), or to a fresh node bound to `principal`. Nothing is
 	 *   rewritten: the other user's unsynced writes stay under their node, and sync never
@@ -1529,8 +1553,9 @@ export class Store implements OperationLog {
 	 *
 	 * A pinned node id (`StoreConfig.nodeId`, such as an auth device id) cannot move:
 	 * `conflict` is then true when it belongs to another user, and sync refuses to
-	 * upload it under `principal`. Under `per-tab` isolation the tab moves to a fresh
-	 * per-tab node.
+	 * upload it under `principal`; an unbound pinned node with history stays unbound
+	 * until the server accepts it for a user. Under `per-tab` isolation the tab moves to
+	 * a fresh per-tab node.
 	 *
 	 * @param principal - The signed-in user id
 	 * @returns The node now in use and whether it changed
@@ -1545,17 +1570,23 @@ export class Store implements OperationLog {
 			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
 		}
 		if (owner === null) {
-			await setLocalNodePrincipal(this.adapter, this.nodeId, principal)
-			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
-		}
-		if (this.configNodeId) {
+			const written = (await this.loadVersionVector()).get(this.nodeId) ?? 0
+			if (written === 0 && !(current?.accepted ?? false)) {
+				await setLocalNodePrincipal(this.adapter, this.nodeId, principal, 'fresh')
+				return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+			}
+			if (this.configNodeId) {
+				// Cannot move: the server decides whose it is at the first handshake.
+				return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: false }
+			}
+		} else if (this.configNodeId) {
 			return { nodeId: this.nodeId, previousNodeId, switched: false, conflict: true }
 		}
 		if (this.isolation === 'per-tab') {
 			// A per-tab node belongs to its tab; another user in this tab gets a fresh one.
 			const fresh = generateUUIDv7()
 			await registerLocalNode(this.adapter, fresh)
-			await setLocalNodePrincipal(this.adapter, fresh, principal)
+			await setLocalNodePrincipal(this.adapter, fresh, principal, 'fresh')
 			savePerTabNodeId(this.dbName, fresh)
 			this.releaseNodeLock?.()
 			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, fresh))
@@ -1572,9 +1603,50 @@ export class Store implements OperationLog {
 		const fresh = generateUUIDv7()
 		await this.adapter.transaction((tx) => moveDatabaseNodeId(tx, fresh))
 		await registerLocalNode(this.adapter, fresh)
-		await setLocalNodePrincipal(this.adapter, fresh, principal)
+		await setLocalNodePrincipal(this.adapter, fresh, principal, 'fresh')
 		await this.rebindToNode(fresh)
 		return { nodeId: fresh, previousNodeId, switched: true, conflict: false }
+	}
+
+	/**
+	 * A sync handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound
+	 * node (or replace a guessed binding) from the server's answer.
+	 */
+	async confirmNodePrincipal(nodeId: string, principal: string): Promise<void> {
+		this.ensureOpen()
+		await confirmLocalNodePrincipal(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * The sync server refused `nodeId` for `principal` (RT-50): clear a guessed binding,
+	 * and remember that an unbound node is not theirs.
+	 */
+	async recordNodeRefusedFor(nodeId: string, principal: string): Promise<void> {
+		this.ensureOpen()
+		await recordLocalNodeRefusedFor(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * Assign a held, unbound local node's writes to `principal` (RT-50): an explicit app
+	 * decision for writes nobody can attribute (a database that never synced).
+	 *
+	 * @returns false when the node is unknown, the store's own, already bound, or was
+	 *   refused for `principal` by the server
+	 */
+	async assignNodePrincipal(nodeId: string, principal: string): Promise<boolean> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return false
+		return assignLocalNodePrincipal(this.adapter, nodeId, principal)
+	}
+
+	/**
+	 * Forget a local node other than the store's own whatever it still holds (RT-50: the
+	 * app discarded its held writes, which were marked never to upload first).
+	 */
+	async dropLocalNode(nodeId: string): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await dropLocalNode(this.adapter, nodeId)
 	}
 
 	/** The adoption schedule of this database's local nodes (RT-46). */

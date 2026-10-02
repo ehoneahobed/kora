@@ -60,8 +60,27 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   accepted INTEGER NOT NULL DEFAULT 0,
   held INTEGER NOT NULL DEFAULT 0,
   refused_cycle INTEGER,
-  principal TEXT
+  principal TEXT,
+  binding TEXT,
+  refused_principals TEXT
 )`
+
+/**
+ * How a local node's {@link LocalNodeRecord.principal} was learned (RT-50):
+ *
+ * - `fresh`: the node had no writes when it was bound to the signed-in user, so every
+ *   write under it was made by that user.
+ * - `server`: a sync handshake as the node was accepted for that user (the server's node
+ *   claims are authoritative).
+ * - `app`: the app assigned a held node to the signed-in user
+ *   (`app.sync.assignHeld`). A guess: cleared if the server refuses the node for them.
+ */
+export type LocalNodeBinding = 'fresh' | 'server' | 'app'
+
+const LOCAL_NODE_BINDINGS: readonly LocalNodeBinding[] = ['fresh', 'server', 'app']
+
+/** At most this many principals are remembered as refused for one node (RT-50). */
+const MAX_REFUSED_PRINCIPALS = 32
 
 /** Meta key: per-node adoption schedule (parked adoptions, upload progress; RT-46). */
 export const ADOPTION_SCHEDULE_META_KEY = 'sync_adoption_schedule_v1'
@@ -100,6 +119,17 @@ export interface LocalNodeRecord {
 	 * never used for, uploaded under, or adopted by another user's session.
 	 */
 	principal: string | null
+	/**
+	 * How {@link principal} was learned (RT-50), or null when unbound, or bound by a release
+	 * that did not record it (treated as a guess).
+	 */
+	binding: LocalNodeBinding | null
+	/**
+	 * Users the server refused this UNBOUND node for (`NODE_ID_CLAIMED`, RT-50): it is
+	 * not theirs, so it is never tried again on their sessions. An unbound node that was
+	 * accepted before belongs to whichever user the server accepts it for.
+	 */
+	refusedPrincipals: string[]
 }
 
 interface LocalNodeRow {
@@ -109,6 +139,8 @@ interface LocalNodeRow {
 	held: number
 	refused_cycle: number | null
 	principal: string | null
+	binding: string | null
+	refused_principals: string | null
 }
 
 /** A parked adoption (RT-46): the node made no upload progress in its last session. */
@@ -143,9 +175,12 @@ export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Prom
 	await adapter.execute(LOCAL_NODES_DDL)
 	if (migratedAdapters.has(adapter)) return
 	// A table created by an earlier release lacks the principal column (RT-42).
+	// ... and the binding columns (RT-50).
 	const columns = await adapter.query<{ name: string }>(`PRAGMA table_info(${LOCAL_NODES_TABLE})`)
-	if (!columns.some((column) => column.name === 'principal')) {
-		await adapter.execute(`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN principal TEXT`)
+	for (const column of ['principal', 'binding', 'refused_principals']) {
+		if (!columns.some((existing) => existing.name === column)) {
+			await adapter.execute(`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN ${column} TEXT`)
+		}
 	}
 	migratedAdapters.add(adapter)
 }
@@ -227,6 +262,24 @@ function rowToRecord(row: LocalNodeRow): LocalNodeRecord {
 		held: Number(row.held) === 1,
 		refusedCycle: row.refused_cycle === null ? null : Number(row.refused_cycle),
 		principal: typeof row.principal === 'string' ? row.principal : null,
+		binding:
+			typeof row.principal === 'string' &&
+			LOCAL_NODE_BINDINGS.includes(row.binding as LocalNodeBinding)
+				? (row.binding as LocalNodeBinding)
+				: null,
+		refusedPrincipals: parsePrincipalList(row.refused_principals),
+	}
+}
+
+function parsePrincipalList(value: string | null): string[] {
+	if (typeof value !== 'string' || value.length === 0) return []
+	try {
+		const parsed: unknown = JSON.parse(value)
+		return Array.isArray(parsed)
+			? parsed.filter((entry): entry is string => typeof entry === 'string')
+			: []
+	} catch {
+		return []
 	}
 }
 
@@ -289,7 +342,7 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 /** Every registered local node, oldest first. */
 export async function listLocalNodes(adapter: StorageAdapter): Promise<LocalNodeRecord[]> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
 	)
 	return rows.map(rowToRecord)
 }
@@ -359,19 +412,120 @@ export async function forgetLocalNode(adapter: StorageAdapter, nodeId: string): 
 }
 
 /**
- * Bind a local node to the signed-in user whose writes it carries (RT-42). The node is
- * registered if it is not yet.
+ * Bind a local node to the signed-in user whose writes it carries (RT-42), recording how
+ * that was learned (RT-50). The node is registered if it is not yet.
  */
 export async function setLocalNodePrincipal(
 	adapter: StorageAdapter,
 	nodeId: string,
 	principal: string,
+	binding: LocalNodeBinding,
 ): Promise<void> {
 	await ensureLocalSyncRecordTables(adapter)
 	await adapter.execute(
-		`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, principal) VALUES (?, ?, 0, 0, NULL, ?)
-       ON CONFLICT(node_id) DO UPDATE SET principal = excluded.principal`,
-		[nodeId, Date.now(), principal],
+		`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, principal, binding) VALUES (?, ?, 0, 0, NULL, ?, ?)
+       ON CONFLICT(node_id) DO UPDATE SET principal = excluded.principal, binding = excluded.binding`,
+		[nodeId, Date.now(), principal, binding],
+	)
+}
+
+/** A binding that is only a guess: cleared when the server refuses the node (RT-50). */
+function isGuessedBinding(node: LocalNodeRecord): boolean {
+	return node.principal !== null && (node.binding === null || node.binding === 'app')
+}
+
+async function findLocalNode(
+	adapter: StorageAdapter | Transaction,
+	nodeId: string,
+): Promise<LocalNodeRecord | null> {
+	const rows = await adapter.query<LocalNodeRow>(
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		[nodeId],
+	)
+	const row = rows[0]
+	return row ? rowToRecord(row) : null
+}
+
+/**
+ * A sync handshake as `nodeId` was accepted for `principal` (RT-50): the server's node
+ * claims say the node is theirs. Binds an unbound node, or replaces a guessed binding,
+ * as `server`. A node bound from evidence (`fresh` or `server`) to another user keeps
+ * its binding: the engine never runs such a session.
+ */
+export async function confirmLocalNodePrincipal(
+	adapter: StorageAdapter,
+	nodeId: string,
+	principal: string,
+): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.transaction(async (tx) => {
+		const node = await findLocalNode(tx, nodeId)
+		if (node && node.principal !== null && node.principal !== principal && !isGuessedBinding(node))
+			return
+		await tx.execute(
+			`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, principal, binding) VALUES (?, ?, 0, 0, NULL, ?, 'server')
+       ON CONFLICT(node_id) DO UPDATE SET principal = excluded.principal, binding = 'server', refused_principals = NULL`,
+			[nodeId, Date.now(), principal],
+		)
+	})
+}
+
+/**
+ * The server refused `nodeId` for `principal` (`NODE_ID_CLAIMED`, RT-50): another user
+ * owns it. A guessed binding is cleared (it was wrong), and an unbound node remembers
+ * that it is not `principal`'s, so it is tried on another user's session instead.
+ */
+export async function recordLocalNodeRefusedFor(
+	adapter: StorageAdapter,
+	nodeId: string,
+	principal: string,
+): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.transaction(async (tx) => {
+		const node = await findLocalNode(tx, nodeId)
+		if (!node) return
+		if (node.principal !== null && !isGuessedBinding(node)) return
+		const refused = node.refusedPrincipals.filter((entry) => entry !== principal)
+		refused.push(principal)
+		await tx.execute(
+			`UPDATE ${LOCAL_NODES_TABLE} SET principal = NULL, binding = NULL, refused_principals = ? WHERE node_id = ?`,
+			[JSON.stringify(refused.slice(-MAX_REFUSED_PRINCIPALS)), nodeId],
+		)
+	})
+}
+
+/**
+ * The app assigned a held, unbound local node to `principal` (RT-50,
+ * `app.sync.assignHeld`): its writes upload on their sessions from now on. A guess, so
+ * a later refusal by the server clears it again.
+ *
+ * @returns false when the node is unknown, already bound, or was refused for `principal`
+ */
+export async function assignLocalNodePrincipal(
+	adapter: StorageAdapter,
+	nodeId: string,
+	principal: string,
+): Promise<boolean> {
+	await ensureLocalSyncRecordTables(adapter)
+	let assigned = false
+	await adapter.transaction(async (tx) => {
+		const node = await findLocalNode(tx, nodeId)
+		if (!node || node.principal !== null || node.refusedPrincipals.includes(principal)) return
+		await tx.execute(
+			`UPDATE ${LOCAL_NODES_TABLE} SET principal = ?, binding = 'app', held = 0, refused_cycle = NULL WHERE node_id = ?`,
+			[principal, nodeId],
+		)
+		assigned = true
+	})
+	return assigned
+}
+
+/** Forget a local node whatever its state (its writes were discarded by the app, RT-50). */
+export async function dropLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.execute(
+		`DELETE FROM ${LOCAL_NODES_TABLE} WHERE node_id = ? AND node_id NOT IN (SELECT value FROM _kora_meta WHERE key = 'node_id')`,
+		[nodeId],
 	)
 }
 

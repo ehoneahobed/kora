@@ -806,3 +806,185 @@ describe('RT-44: recovery full resyncs are rate-limited', () => {
 		await engine.stop()
 	})
 })
+
+describe('RT-50: the owner of an unbound node is learned from the server', () => {
+	function bindAs(nodeId: string) {
+		return vi.fn(async () => ({ nodeId, previousNodeId: nodeId, switched: false, conflict: false }))
+	}
+
+	test('a never-synced unbound node is held as unassigned, never adopted', async () => {
+		const p = persistence({
+			nodes: [
+				nodeInfo(NODE, { principal: 'bob' }),
+				nodeInfo('orphan', { accepted: false, principal: null }),
+			],
+		})
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1, 'orphan')], {
+				claimLocalNode: vi.fn(async () => () => {}),
+				bindPrincipal: bindAs(NODE),
+			}),
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+		expect(engine.getStatus()).toMatchObject({
+			pendingOperations: 0,
+			heldOperations: 1,
+			heldNodes: [{ nodeId: 'orphan', operationCount: 1, reason: 'unassigned', principal: null }],
+		})
+		await engine.stop()
+	})
+
+	test('an unbound node accepted before is tried, and an accepted handshake binds it', async () => {
+		const confirmed: Array<[string, string]> = []
+		const p = persistence({
+			nodes: [nodeInfo(NODE, { principal: 'bob' }), nodeInfo('legacy', { principal: null })],
+		})
+		p.state.confirmLocalNodePrincipal = async (nodeId, principal) => {
+			confirmed.push([nodeId, principal])
+		}
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1, 'legacy')], {
+				claimLocalNode: vi.fn(async () => () => {}),
+				bindPrincipal: bindAs(NODE),
+			}),
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual(['legacy'])
+		expect(confirmed).toEqual([['legacy', 'bob']])
+		expect(srv.uploaded).toEqual([op(1, 'legacy').id])
+		await engine.stop()
+	})
+
+	test('an unbound node the server refused for this user is held for its owner', async () => {
+		const p = persistence({
+			nodes: [
+				nodeInfo(NODE, { principal: 'bob' }),
+				nodeInfo('legacy', { principal: null, refusedPrincipals: ['bob'] }),
+			],
+		})
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1, 'legacy')], {
+				claimLocalNode: vi.fn(async () => () => {}),
+				bindPrincipal: bindAs(NODE),
+			}),
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+		expect(engine.getStatus().heldNodes).toEqual([
+			{ nodeId: 'legacy', operationCount: 1, reason: 'other-user', principal: null },
+		])
+		await engine.stop()
+	})
+
+	test('NODE_ID_CLAIMED for an adopted unbound node rules this user out, not held for good', async () => {
+		const refusedFor: Array<[string, string]> = []
+		const marked: Array<[string, boolean]> = []
+		const p = persistence({
+			nodes: [nodeInfo(NODE, { principal: 'bob' }), nodeInfo('legacy', { principal: null })],
+		})
+		p.state.recordLocalNodeRefusedFor = async (nodeId, principal) => {
+			refusedFor.push([nodeId, principal])
+		}
+		p.state.markLocalNodeRefused = async (nodeId, held) => {
+			marked.push([nodeId, held])
+		}
+		const { client, server } = createMemoryTransportPair()
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			server.send({
+				type: 'error',
+				messageId: 'claimed',
+				code: 'NODE_ID_CLAIMED',
+				message: 'another user owns this node',
+				retriable: false,
+			} as SyncMessage)
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1, 'legacy')], {
+				claimLocalNode: vi.fn(async () => () => {}),
+				bindPrincipal: bindAs(NODE),
+			}),
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start().catch(() => {})
+		await tick()
+		await tick()
+		expect(refusedFor).toEqual([['legacy', 'bob']])
+		expect(marked).toEqual([['legacy', false]])
+		await engine.stop()
+	})
+})
+
+describe('RT-52: the signed-in user changes while a session is connecting', () => {
+	test('the handshake never pairs the previous user node with the next credential', async () => {
+		let user = 'alice'
+		const bindPrincipal = vi.fn(async (principal: string) => ({
+			nodeId: `${principal}-node`,
+			previousNodeId: NODE,
+			switched: false,
+			conflict: false,
+		}))
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const gate: { release: (() => void) | null } = { release: null }
+		let slow = true
+		const connect = client.connect.bind(client)
+		client.connect = async (url, options) => {
+			if (slow) {
+				slow = false
+				await new Promise<void>((resolve) => {
+					gate.release = resolve
+				})
+			}
+			return connect(url, options)
+		}
+		const confirmed: string[] = []
+		const p = persistence()
+		p.state.confirmLocalNodePrincipal = async (_nodeId, principal) => {
+			confirmed.push(principal)
+		}
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], { bindPrincipal }),
+			syncState: p.state,
+			config: {
+				url: 'ws://t',
+				principal: async () => user,
+				auth: async () => ({ token: user }),
+			},
+		})
+		const started = engine.start()
+		await tick()
+		// Bob signs in while the transport is still connecting with Alice's credential.
+		user = 'bob'
+		await engine.bindSignedInUser()
+		expect(bindPrincipal).toHaveBeenLastCalledWith('bob')
+		gate.release?.()
+		await started
+		await tick()
+		expect(srv.handshakes.map((h) => h.authToken)).toEqual(['bob'])
+		expect(confirmed).toEqual(['bob'])
+		await engine.stop()
+	})
+})

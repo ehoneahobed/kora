@@ -1,3 +1,4 @@
+import { SyncError } from '@korajs/core'
 import type { RejectedOperation, SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
 import type { SyncRuntimeState } from './sync-lifecycle'
@@ -153,6 +154,46 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 			if (state.syncEngine) {
 				await state.syncEngine.clearRejectedOperations(operationIds)
 			}
+		},
+		async getHeldOperations() {
+			await ready
+			return state.syncEngine ? state.syncEngine.getHeldNodes() : []
+		},
+		async assignHeld(nodeId: string, to: 'current-user'): Promise<void> {
+			await ready
+			if (to !== 'current-user') {
+				throw new SyncError(`assignHeld only supports 'current-user', got "${String(to)}".`, {
+					code: 'HELD_ASSIGN_TARGET',
+					nodeId,
+				})
+			}
+			const engine = state.syncEngine
+			if (!engine) {
+				throw new SyncError('Sync is not running, so held writes cannot be assigned.', {
+					code: 'HELD_ASSIGN_NO_SYNC',
+					nodeId,
+				})
+			}
+			await engine.assignHeld(nodeId)
+			// The writes upload on a session as their node: start one now when connected.
+			const phase = engine.getStatus().phase
+			if (phase !== 'offline' && phase !== 'suspended' && !state.intentionalDisconnect) {
+				await engine.reconnect()
+			}
+			state.syncStatusBridge?.refresh()
+		},
+		async discardHeld(nodeId: string): Promise<number> {
+			await ready
+			const engine = state.syncEngine
+			if (!engine) {
+				throw new SyncError('Sync is not running, so held writes cannot be discarded.', {
+					code: 'HELD_DISCARD_NO_SYNC',
+					nodeId,
+				})
+			}
+			const discarded = await engine.discardHeld(nodeId)
+			state.syncStatusBridge?.refresh()
+			return discarded
 		},
 		exportDiagnostics() {
 			if (state.syncEngine) {

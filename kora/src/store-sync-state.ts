@@ -119,13 +119,37 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	/** The node ids this database authored under (RT-38, RT-40). */
 	async listLocalNodes(): Promise<LocalNodeInfo[]> {
 		const nodes = await this.store.listLocalNodes()
-		return nodes.map(({ nodeId, accepted, held, refusedCycle, principal }) => ({
-			nodeId,
-			accepted,
-			held,
-			refusedCycle,
-			principal,
-		}))
+		return nodes.map(
+			({ nodeId, accepted, held, refusedCycle, principal, binding, refusedPrincipals }) => ({
+				nodeId,
+				accepted,
+				held,
+				refusedCycle,
+				principal,
+				binding,
+				refusedPrincipals,
+			}),
+		)
+	}
+
+	/** An accepted handshake binds the node to the session's user (RT-50). */
+	async confirmLocalNodePrincipal(nodeId: string, principal: string): Promise<void> {
+		await this.store.confirmNodePrincipal(nodeId, principal)
+	}
+
+	/** The server refused the node for this user (RT-50). */
+	async recordLocalNodeRefusedFor(nodeId: string, principal: string): Promise<void> {
+		await this.store.recordNodeRefusedFor(nodeId, principal)
+	}
+
+	/** The app assigned a held node's writes to this user (RT-50). */
+	assignLocalNodePrincipal(nodeId: string, principal: string): Promise<boolean> {
+		return this.store.assignNodePrincipal(nodeId, principal)
+	}
+
+	/** Forget a local node whose held writes were discarded (RT-50). */
+	async dropLocalNode(nodeId: string): Promise<void> {
+		await this.store.dropLocalNode(nodeId)
 	}
 
 	/** Parked adoptions and the upload-progress counter (RT-46). */

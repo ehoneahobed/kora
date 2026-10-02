@@ -1414,12 +1414,38 @@ made, even when several users share one local database (`namespaceByAuthUser` of
   `useSyncStatus().heldOperations`, not in `pendingOperations`. They upload, as that user, when
   they sign in again on this device.
 - A database that never synced does not hand one user's offline writes to the next user.
+- A node whose owner was never recorded (a database created before this release, or writes
+  made while nobody was signed in) is never given to whoever signs in first. Kora learns its
+  owner from the sync server instead:
+  - If the node synced before, the server holds a claim on it. Kora tries it once on each
+    signed-in user's session: the user the server accepts it for owns it from then on, and its
+    writes upload as them; a user the server refuses is never tried again for it.
+  - If the node never synced, nobody can tell whose its writes are. They are held, reported in
+    `status.heldNodes` with reason `unassigned`, until the app decides:
+
+    ```typescript
+    for (const node of await app.sync.getHeldOperations()) {
+      if (node.reason !== 'unassigned') continue
+      // A single-user device, or after asking the user:
+      await app.sync.assignHeld(node.nodeId, 'current-user')
+      // Or never upload them (they stay in this device's local database only):
+      // await app.sync.discardHeld(node.nodeId)
+    }
+    ```
+
+    Only `unassigned` writes can be assigned or discarded; writes held for another user
+    (reason `other-user`) wait for that user.
+- The binding moves to the new user as soon as the auth binding reports the change, even while
+  an earlier reconnect is still fetching a credential or connecting. That attempt re-checks the
+  signed-in user before its handshake and starts over if it changed, so a node is never
+  presented with another user's credential.
 
 What this does not cover:
 
-- Writes issued in the same instant as a sign-in, before the auth binding reports the new user,
-  are still authored under the previous user's node (and wait for that user). Use
-  `AuthBoundKoraProvider`, which creates the app only after auth resolves, when this matters.
+- Writes issued in the same instant as a sign-in, before the auth binding reports the new user
+  and the store has moved to their node (one local database round trip), are still authored
+  under the previous user's node (and wait for that user). Use `AuthBoundKoraProvider`, which
+  creates the app only after auth resolves, when this matters.
 - A node id pinned by the auth device id (`resolveNodeId`) cannot move: if another user signs
   in on an app created for a different user, sync is suspended with reason
   `node-owned-by-another-user` instead of uploading. Recreate the app for the new user.
