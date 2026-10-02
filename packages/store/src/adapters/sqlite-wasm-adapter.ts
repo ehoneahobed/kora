@@ -130,6 +130,16 @@ export interface SqliteWasmAdapterOptions {
 	 * inner database and its one-shot OPFS reader manage the manifest themselves).
 	 */
 	skipBackendRecord?: boolean
+
+	/**
+	 * @internal Used by the IndexedDB adapter (STORE-6): runs in one transaction on this
+	 * tab's OWN worker right after it opened the database as storage leader (first open
+	 * or promotion), before the worker serves any other tab. The IndexedDB adapter
+	 * restores its persisted snapshot here, so a snapshot is only ever restored into a
+	 * freshly created worker database and never over a leader's live one. Throwing fails
+	 * the open (or the promotion, which then refuses writes).
+	 */
+	onLeaderWorkerOpened?: (tx: Transaction) => Promise<void>
 }
 
 interface Gate {
@@ -198,6 +208,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly skipBackendRecord: boolean
 	/** Set when this adapter lost (or never had) durable storage; writes are refused. */
 	private durabilityLoss: { phase: 'open' | 'promotion'; reason: string } | null = null
+	private readonly onLeaderWorkerOpened: ((tx: Transaction) => Promise<void>) | undefined
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
@@ -212,6 +223,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.releaseOnFreeze = options.releaseOnFreeze ?? true
 		this.storage = options.storage ?? 'opfs'
 		this.skipBackendRecord = options.skipBackendRecord ?? false
+		this.onLeaderWorkerOpened = options.onLeaderWorkerOpened
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
@@ -305,10 +317,29 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		worker: WebWorkerBridge,
 		ddlStatements: string[],
 	): Promise<WorkerSuccessResponse> {
-		const pending = this.checkedOpen(worker, ddlStatements)
-		// Posted after the open so follower requests queue behind it in the worker.
+		const hook = this.onLeaderWorkerOpened
+		if (!hook) {
+			const pending = this.checkedOpen(worker, ddlStatements)
+			// Posted after the open so follower requests queue behind it in the worker.
+			worker.post({ id: 0, type: 'serve', channelName: this.tabSession?.channelName ?? '' })
+			return pending
+		}
+		const response = await this.checkedOpen(worker, ddlStatements)
+		// The hook (snapshot restore, STORE-6) runs before the worker serves other tabs,
+		// so no follower ever reads or writes the database before it holds its data.
+		await runWorkerTransaction(worker, hook)
 		worker.post({ id: 0, type: 'serve', channelName: this.tabSession?.channelName ?? '' })
-		return pending
+		return response
+	}
+
+	/**
+	 * Whether this runtime owns the database's worker: the storage leader in a browser,
+	 * or any adapter with an injected bridge (tests, Node). A follower tab relays every
+	 * request to the leader's worker (STORE-6).
+	 */
+	isLeader(): boolean {
+		if (this.injectedBridge) return true
+		return this.tabSession?.role === 'leader'
 	}
 
 	private async checkedOpen(
@@ -946,6 +977,42 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		if (response.type === 'error') {
 			throw new AdapterError(`${description} failed: ${response.message}`)
 		}
+	}
+}
+
+/**
+ * Run `fn` in one transaction sent straight to `worker`, bypassing the adapter's mutex
+ * and leadership gate (the caller is the leader opening its own worker).
+ */
+async function runWorkerTransaction(
+	worker: WorkerBridge,
+	fn: (tx: Transaction) => Promise<void>,
+): Promise<void> {
+	const send = async (request: WorkerRequest, what: string): Promise<WorkerResponse> => {
+		const response = await worker.send(request)
+		if (response.type === 'error') {
+			throw new AdapterError(`${what} failed: ${response.message}`, {
+				code: response.code,
+				...(request.type === 'execute' || request.type === 'query' ? { sql: request.sql } : {}),
+			})
+		}
+		return response
+	}
+	await send({ id: 0, type: 'begin' }, 'BEGIN')
+	try {
+		await fn({
+			execute: async (sql, params) => {
+				await send({ id: 0, type: 'execute', sql, params }, 'Leader open execute')
+			},
+			query: async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
+				const response = await send({ id: 0, type: 'query', sql, params }, 'Leader open query')
+				return ((response as WorkerSuccessResponse).data as T[]) ?? []
+			},
+		})
+		await send({ id: 0, type: 'commit' }, 'COMMIT')
+	} catch (error) {
+		await worker.send({ id: 0, type: 'rollback' }).catch(() => undefined)
+		throw error
 	}
 }
 

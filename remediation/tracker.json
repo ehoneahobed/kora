@@ -1134,14 +1134,17 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-6.test.ts"
+    },
+    {
+     "browser": "STORE-6"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 2). Only the storage leader restores an IndexedDB snapshot, and only into a worker database no snapshot was restored into yet (a connection-local TEMP marker, never dumped). A browser leader restores inside its own worker right after the open and BEFORE the worker serves other tabs (SqliteWasmAdapter onLeaderWorkerOpened), on first open and on promotion, in one transaction; a follower never restores, and a failed restore fails the open/promotion instead of serving a partial database. Before the fix a promoted follower also started from an EMPTY worker database (the real-browser check showed it). Tests: store indexeddb-adapter.test.ts (STORE-6 block), real-Chromium LMS-5-6-7.browser.mjs scenario STORE-6 (two tabs, IndexedDB fallback, leader writes, follower opens, promotion, reload)."
   },
   {
    "id": "STORE-7",
@@ -1149,14 +1152,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 3). IndexedDbPersistenceScheduler.flushNow waits for an in-flight snapshot and then writes again while any scheduled write is not covered by a successful snapshot (generation counters = dirty flag); a failed snapshot ends the loop (reported via onError; flushBarrier/ensureDurable still rejects). The snapshot dump is read inside one transaction (no torn snapshot). The RT-35 ensureDurable contract is unchanged. Tests: indexeddb-persistence-scheduler.test.ts (STORE-7 tests)."
   },
   {
    "id": "STORE-8",

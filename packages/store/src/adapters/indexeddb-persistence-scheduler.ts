@@ -64,23 +64,42 @@ export class IndexedDbPersistenceScheduler {
 		}, this.debounceMs)
 	}
 
-	/** Cancel any pending debounce and persist immediately. */
+	/**
+	 * Cancel any pending debounce and persist immediately. Resolves only when a snapshot
+	 * taken after every write scheduled so far was written (STORE-7): a snapshot already in
+	 * flight may predate the latest writes, so the call waits for it and then writes again
+	 * while anything is still dirty. A failed snapshot ends the loop (the failure is
+	 * reported through `onError`; {@link flushBarrier} is the variant that rejects).
+	 */
 	async flushNow(): Promise<void> {
 		if (this.disposed) return
 		if (this.timer !== null) {
 			clearTimeout(this.timer)
 			this.timer = null
 		}
-		if (this.inFlight) {
-			await this.inFlight
-			return
+		// With nothing in flight, "persist immediately" writes one snapshot even when no
+		// write was scheduled (callers use it to force the first snapshot).
+		let mustRun = this.inFlight === null
+		for (;;) {
+			if (this.inFlight) {
+				await this.inFlight
+				continue
+			}
+			if (!mustRun && this.persistedGeneration >= this.scheduledGeneration) return
+			mustRun = false
+			this.inFlight = this.runFlush()
+			try {
+				await this.inFlight
+			} finally {
+				this.inFlight = null
+			}
+			if (this.lastFlushError !== null) return
 		}
-		this.inFlight = this.runFlush()
-		try {
-			await this.inFlight
-		} finally {
-			this.inFlight = null
-		}
+	}
+
+	/** Whether a write was scheduled that no successful snapshot covers yet. */
+	isDirty(): boolean {
+		return this.persistedGeneration < this.scheduledGeneration
 	}
 
 	/**

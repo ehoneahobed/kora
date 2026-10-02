@@ -73,6 +73,7 @@ window.H = {
 			workerUrl: '/kora-worker.js',
 			emitter,
 			workerResponseTimeoutMs: opts.timeoutMs ?? 30000,
+			...(opts.debounceMs !== undefined ? { persistenceDebounceMs: opts.debounceMs } : {}),
 		})
 		adapters.set(key, a)
 		try {
