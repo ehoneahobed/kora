@@ -8,9 +8,9 @@ import {
 import { deserializeFoldState, serializeFoldState } from '../../../src/fold/serialize'
 import type { FoldState } from '../../../src/fold/types'
 import type { Operation, SchemaDefinition } from '../../../src/types'
-import { type FoldUnderTest, fakeRichtextMerger } from './harness'
+import { type FoldUnderTest, GATE_AUTHORITATIVE_NODES, fakeRichtextMerger } from './harness'
 
-const options = { richtext: fakeRichtextMerger }
+const options = { richtext: fakeRichtextMerger, authoritativeNodeIds: GATE_AUTHORITATIVE_NODES }
 
 function foldState(ops: readonly Operation[], schema: SchemaDefinition): FoldState {
 	return foldRecord(ops, schema, options).state ?? createFoldState('items', 'rec-1')

@@ -9,8 +9,10 @@ import {
 	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
+	FoldState,
 	HLCTimestamp,
 	KoraEventEmitter,
+	MergeTrace,
 	Operation,
 	OperationLog,
 	SchemaDefinition,
@@ -23,6 +25,18 @@ import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
+import { compactFoldedLog } from '../fold/compact-folded-log'
+import {
+	AUTHORITATIVE_NODES_META_KEY,
+	FOLD_MATERIALIZATION_CURRENT,
+	FOLD_MATERIALIZATION_LEGACY,
+	FOLD_MATERIALIZATION_META_KEY,
+	FOLD_STATE_TABLE,
+	FOLD_TABLES_DDL,
+	RecordFolder,
+	isCompacted,
+} from '../fold/record-folder'
+import { type RematerializationMode, rematerializeDatabase } from '../fold/rematerialize'
 import {
 	LOG_QUARANTINE_TABLE,
 	type LogIntegrityReport,
@@ -210,8 +224,16 @@ export class Store implements OperationLog {
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
 	/** Releases the per-tab node lock (RT-40); null when none is held. */
 	private releaseNodeLock: (() => void) | null = null
+	/** How rows are materialized ({@link StoreConfig.materialization}). */
+	private readonly materialization: 'fold' | 'legacy'
+	/** The W7 record fold; null under legacy materialization. */
+	private readonly folder: RecordFolder | null
+	/** True once every row of the database is a materialization of its fold state. */
+	private foldActive = false
 
 	constructor(config: StoreConfig) {
+		this.materialization = config.materialization ?? 'fold'
+		this.folder = this.materialization === 'fold' ? new RecordFolder(config.schema) : null
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.configNodeId = config.nodeId
@@ -234,6 +256,8 @@ export class Store implements OperationLog {
 		await this.adapter.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
+		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
+		this.foldActive = false
 
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
@@ -261,10 +285,20 @@ export class Store implements OperationLog {
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
 
+		// The fold is active for writes as soon as the database's rows are known to be
+		// fold materializations (W7); a pre-W7 database is re-materialized after its
+		// schema migrations, whose backfills then write the legacy way.
+		if (this.folder) {
+			this.folder.setAuthoritativeNodeIds(await this.loadAuthoritativeNodeIds())
+			this.foldActive =
+				(await this.readMeta(FOLD_MATERIALIZATION_META_KEY)) === FOLD_MATERIALIZATION_CURRENT
+		}
+
 		// Run schema migrations if needed. Backfills write operations through the local
 		// write path, so the node id and clock must exist first (STORE-13).
 		try {
 			await this.runMigrationsIfNeeded()
+			await this.ensureMaterialization()
 		} catch (error) {
 			this.releaseNodeLock?.()
 			this.releaseNodeLock = null
@@ -299,6 +333,7 @@ export class Store implements OperationLog {
 				this.causalTracker,
 				this.secretKeyProvider,
 				(error) => this.reportStorageError(error),
+				() => this.activeFold(),
 			)
 			this.collections.set(name, col)
 		}
@@ -437,6 +472,10 @@ export class Store implements OperationLog {
 		const definition = this.schema.collections[collection]
 		if (!definition) {
 			return 'skipped'
+		}
+		const fold = this.activeFold()
+		if (fold) {
+			return this.applyRemoteFolded(op, fold, options)
 		}
 
 		// Materialization may use overridden data/timestamp (authoritative merge
@@ -774,6 +813,252 @@ export class Store implements OperationLog {
 		})
 
 		return 'applied'
+	}
+
+	/**
+	 * W7 remote apply: append the operation, then merge it into its record's fold
+	 * state, which re-materializes the row, all in one write transaction. There is no
+	 * read-decide-write race to guard: the state is read and written inside the
+	 * transaction, and the merge does not depend on the order operations arrive in.
+	 */
+	private async applyRemoteFolded(
+		op: Operation,
+		fold: RecordFolder,
+		options: ApplyRemoteOptions | undefined,
+	): Promise<ApplyResult> {
+		const collection = op.collection
+		const startedAt = Date.now()
+		const outcome = { duplicate: false, revived: false, traces: [] as MergeTrace[] }
+		try {
+			await this.adapter.transaction(async (tx) => {
+				if ((await isOperationLogged(tx, collection, op.id)) || (await isCompacted(tx, op))) {
+					outcome.duplicate = true
+					const retracted = await tx.query<{ record_id: string }>(
+						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
+					if (retracted.length > 0) {
+						// The record re-enters the scope: show it again with every field of
+						// its state (writes merged while it was hidden included).
+						const state = await fold.loadState(tx, collection, op.recordId)
+						if (state) {
+							await fold.materializeRow(tx, state, 'all', { clearRetraction: true })
+						} else {
+							await tx.execute(
+								'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+								[collection, op.recordId],
+							)
+						}
+						outcome.revived = true
+					}
+					return
+				}
+				if (this.clock) {
+					// A scope entry's newest field version can be later than its timestamp (the
+					// record's creation, RT-27): the clock must move past every version it carries.
+					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+				}
+				await this.appendRemoteOperationRow(tx, op)
+				const applied = await fold.applyInTx(tx, op, 'remote')
+				outcome.traces = applied.traces
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[op.nodeId, op.sequenceNumber],
+				)
+			})
+		} catch (error) {
+			this.reportStorageError(error)
+			throw error
+		}
+
+		this.recordOperationSequence(op)
+		if (outcome.duplicate) {
+			if (outcome.revived) {
+				this.subscriptionManager.invalidate(collection)
+			} else {
+				this.subscriptionManager.notify(collection, op)
+			}
+			return 'duplicate'
+		}
+		this.subscriptionManager.notify(collection, op)
+		this.emitMergeTraces(op, outcome.traces)
+		options?.onMergeTraces?.(outcome.traces)
+		this.emitter?.emit({
+			type: 'operation:applied',
+			operation: op,
+			duration: Date.now() - startedAt,
+		})
+		return 'applied'
+	}
+
+	/** DevTools: every fold decision that was a conflict, plus one completion per merge. */
+	private emitMergeTraces(op: Operation, traces: MergeTrace[]): void {
+		if (!this.emitter || traces.length === 0) return
+		const first = traces[0] as MergeTrace
+		this.emitter.emit({ type: 'merge:started', operationA: first.operationA, operationB: op })
+		for (const trace of traces) this.emitter.emit({ type: 'merge:conflict', trace })
+		this.emitter.emit({ type: 'merge:completed', trace: first })
+	}
+
+	/** The record fold, once the database's rows are fold materializations. */
+	private activeFold(): RecordFolder | undefined {
+		return this.foldActive && this.folder ? this.folder : undefined
+	}
+
+	/**
+	 * The record's W7 fold state (null under legacy materialization or when the
+	 * record has none). For DevTools, tests and the server-comparison harness.
+	 */
+	async getFoldState(collection: string, recordId: string): Promise<FoldState | null> {
+		this.ensureOpen()
+		const fold = this.activeFold()
+		if (!fold) return null
+		let state: FoldState | null = null
+		await this.adapter.transaction(async (tx) => {
+			state = await fold.loadState(tx, collection, recordId)
+		})
+		return state
+	}
+
+	/** Whether rows are materialized by the W7 fold (false under `materialization: 'legacy'`). */
+	isFoldMaterialized(): boolean {
+		return this.activeFold() !== undefined
+	}
+
+	private async readMeta(key: string): Promise<string | null> {
+		const rows = await this.adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+			key,
+		])
+		return rows[0]?.value ?? null
+	}
+
+	private async writeMeta(key: string, value: string): Promise<void> {
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			key,
+			value,
+		])
+	}
+
+	private async loadAuthoritativeNodeIds(): Promise<string[]> {
+		const raw = await this.readMeta(AUTHORITATIVE_NODES_META_KEY)
+		if (raw === null) return []
+		try {
+			const parsed = JSON.parse(raw) as unknown
+			return Array.isArray(parsed)
+				? parsed.filter((id): id is string => typeof id === 'string')
+				: []
+		} catch {
+			return []
+		}
+	}
+
+	/**
+	 * Make every row a materialization of its record's fold state (W7), once per
+	 * database and fold-state version. Runs after the W8 log-integrity scan: a
+	 * clean log is rebuilt with the fold; an incomplete (compacted) log rebuilds on
+	 * top of the rows as base snapshots; a log with quarantined rows is never
+	 * rebuilt from (rows are kept and become base snapshots), and
+	 * `store:rematerialized` reports which happened.
+	 */
+	private async ensureMaterialization(): Promise<void> {
+		const current = await this.readMeta(FOLD_MATERIALIZATION_META_KEY)
+		if (!this.folder) {
+			if (current !== FOLD_MATERIALIZATION_LEGACY) {
+				await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_LEGACY)
+			}
+			return
+		}
+		if (current === FOLD_MATERIALIZATION_CURRENT) {
+			this.foldActive = true
+			return
+		}
+		const report = await this.scanLog('full')
+		const mode: RematerializationMode =
+			report.quarantined.length > 0
+				? 'kept'
+				: report.clean && report.compactedAt === null
+					? 'log'
+					: 'snapshot+log'
+		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode)
+		await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_CURRENT)
+		this.foldActive = true
+		if (result.records > 0) {
+			this.emitter?.emit({
+				type: 'store:rematerialized',
+				dbName: this.dbName,
+				mode: result.mode,
+				records: result.records,
+				changedRows: result.changedRows,
+				message:
+					result.mode === 'kept'
+						? `Operation log of "${this.dbName}" has quarantined rows: ${result.records} record(s) kept as they were (base snapshots); nothing was rebuilt from the log.`
+						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
+			})
+		}
+	}
+
+	/**
+	 * Node ids whose writes win `merge('server-authoritative')` fields (the server's,
+	 * from the sync handshake). Persisted; when the set changes, records of
+	 * collections with such fields are re-folded so every replica agrees.
+	 *
+	 * @param nodeIds - The server's authoritative node ids
+	 */
+	async setAuthoritativeNodeIds(nodeIds: readonly string[]): Promise<void> {
+		this.ensureOpen()
+		const folder = this.folder
+		if (!folder) return
+		const next = [...new Set(nodeIds)].sort()
+		const previous = [...folder.getAuthoritativeNodeIds()].sort()
+		if (JSON.stringify(next) === JSON.stringify(previous)) return
+		folder.setAuthoritativeNodeIds(next)
+		await this.writeMeta(AUTHORITATIVE_NODES_META_KEY, JSON.stringify(next))
+		const fold = this.activeFold()
+		if (!fold) return
+		for (const collection of Object.keys(this.schema.collections)) {
+			if (!fold.hasAuthoritativeFields(collection)) continue
+			const ids = await this.adapter.query<{ record_id: string }>(
+				`SELECT record_id FROM ${FOLD_STATE_TABLE} WHERE collection = ?`,
+				[collection],
+			)
+			await this.adapter.transaction(async (tx) => {
+				for (const { record_id } of ids) await fold.refoldInTx(tx, collection, record_id)
+			})
+			this.subscriptionManager.invalidate(collection)
+		}
+	}
+
+	/**
+	 * Re-fold the records of these operations from base + log (W7 exclusion: an
+	 * operation with a terminal-rejection marker is left out).
+	 */
+	private async refoldRecordsOf(operationIds: readonly string[]): Promise<void> {
+		const fold = this.activeFold()
+		if (!fold || operationIds.length === 0) return
+		const touched = new Map<string, Set<string>>()
+		for (const collection of Object.keys(this.schema.collections)) {
+			const table = quoteIdent(`_kora_ops_${collection}`)
+			for (let i = 0; i < operationIds.length; i += 500) {
+				const chunk = operationIds.slice(i, i + 500)
+				const rows = await this.adapter.query<{ record_id: string }>(
+					`SELECT DISTINCT record_id FROM ${table} WHERE id IN (${chunk.map(() => '?').join(', ')})`,
+					chunk,
+				)
+				for (const row of rows) {
+					const set = touched.get(collection) ?? new Set<string>()
+					set.add(row.record_id)
+					touched.set(collection, set)
+				}
+			}
+		}
+		if (touched.size === 0) return
+		await this.adapter.transaction(async (tx) => {
+			for (const [collection, records] of touched) {
+				for (const recordId of records) await fold.refoldInTx(tx, collection, recordId)
+			}
+		})
+		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
 	}
 
 	/**
@@ -1240,7 +1525,9 @@ export class Store implements OperationLog {
 			throw new StoreNotOpenError()
 		}
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
+		const fold = this.activeFold()
 		return {
+			...(fold ? { fold } : {}),
 			collection,
 			definition,
 			schema: this.schema,
@@ -1554,6 +1841,9 @@ export class Store implements OperationLog {
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
+		// The re-authored operations have new ids: their records' fold states still name
+		// the old ones, so they are re-folded from the log.
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
 		return result
 	}
 
@@ -1836,6 +2126,9 @@ export class Store implements OperationLog {
 	async recordTerminalRejections(entries: TerminalRejection[]): Promise<void> {
 		this.ensureOpen()
 		await recordTerminalRejections(this.adapter, entries)
+		// The server never stored these operations: re-fold their records without them,
+		// so this device converges to the server's state (W7 step 2).
+		await this.refoldRecordsOf(entries.map((entry) => entry.operationId))
 	}
 
 	/** Which of these operation ids the server refused for good (RT-36). */
@@ -1907,6 +2200,8 @@ export class Store implements OperationLog {
 		if (result.newMaxTimestamp && this.clock) {
 			this.clock.advanceTo(result.newMaxTimestamp)
 		}
+		// Re-stamped operations order differently: re-fold their records.
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
 		return result
 	}
 
@@ -1919,16 +2214,25 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Compact the local operation log using materialized rows as the baseline.
-	 * Only removes ops the server has acknowledged (per {@link CompactionStrategy}).
+	 * Compact the local operation log. Only removes ops the server has acknowledged
+	 * (per {@link CompactionStrategy}). With the W7 fold (STORE-14), the effect of the
+	 * removed operations is first joined into each record's base fold state, so a
+	 * re-fold (rejection exclusion, a later re-materialization) and the merge of a
+	 * late operation stay exact; delete, atomic and custom-resolver operations are
+	 * kept, and a re-delivered compacted id is a duplicate by its node's compacted
+	 * prefix.
 	 */
 	async compact(strategy: CompactionStrategy): Promise<CompactionResult> {
 		this.ensureOpen()
+		const fold = this.activeFold()
 		if (strategy.mode === 'never') {
 			return compactOperationLog(this.adapter, this.schema, strategy, createVersionVector())
 		}
 
 		const serverVector = strategy.serverVector ?? (await loadLastAckedServerVector(this.adapter))
+		if (fold) {
+			return compactFoldedLog(this.adapter, this.schema, fold, strategy, serverVector)
+		}
 		return compactOperationLog(this.adapter, this.schema, strategy, serverVector)
 	}
 
@@ -2033,7 +2337,9 @@ export class Store implements OperationLog {
 			throw new StoreNotOpenError()
 		}
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
+		const fold = this.activeFold()
 		return new TransactionContext({
+			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,
 			clock: this.clock,
@@ -2161,6 +2467,14 @@ export class Store implements OperationLog {
 					collections: options?.collections ?? null,
 					keepUnsyncedWrites: options?.keepUnsyncedWrites ?? true,
 				})
+		if (!options?.merge && this.folder) {
+			// Restored rows and log replace what the fold states described: rebuild them.
+			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
+				FOLD_MATERIALIZATION_META_KEY,
+			])
+			this.foldActive = false
+			await this.ensureMaterialization()
+		}
 		await this.reloadFromDisk()
 		onProgress({ phase: 'restoring', progress: 1, message: 'Done' })
 		return {
@@ -2260,10 +2574,12 @@ export class Store implements OperationLog {
 	private async runMigrationsIfNeeded(): Promise<void> {
 		const clock = this.clock
 		if (!clock) throw new StoreNotOpenError()
+		const fold = this.activeFold()
 		await runSchemaMigrations({
 			adapter: this.adapter,
 			schema: this.schema,
 			env: {
+				...(fold ? { fold } : {}),
 				schema: this.schema,
 				clock,
 				nodeId: this.nodeId,

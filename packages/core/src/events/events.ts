@@ -276,6 +276,22 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * The database was re-materialized with the W7 per-field fold (once, on the
+			 * first open with fold-state version N, or after a replace-mode restore).
+			 * `mode`: `'log'` rebuilt every record from its clean log (repairing
+			 * pre-W7 divergence); `'snapshot+log'` used each row as a base snapshot
+			 * because the log was compacted or has gaps; `'kept'` left every row as it
+			 * was because the log has quarantined rows (never rebuilt from).
+			 */
+			type: 'store:rematerialized'
+			dbName: string
+			mode: 'log' | 'snapshot+log' | 'kept'
+			records: number
+			changedRows: number
+			message: string
+	  }
+	| {
+			/**
 			 * OPFS persistence was unavailable, so the store fell back to a
 			 * NON-PERSISTENT in-memory database. Anything written this session is lost
 			 * on reload. This is emitted instead of failing silently so the condition

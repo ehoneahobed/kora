@@ -14,6 +14,8 @@ export interface FieldPlan {
 	tier: 1 | 3
 	/** Secret field: values are redacted from traces. */
 	secret: boolean
+	/** `merge('server-authoritative')`: writes of authoritative nodes win (class 1 stamps). */
+	authoritative?: boolean
 }
 
 const LWW_PLAN: FieldPlan = {
@@ -38,7 +40,8 @@ const LWW_PLAN: FieldPlan = {
  * | array (default or `merge('union')`) | 'set' (LWW element set) |
  * | object / json | 'map' (per-top-level-key LWW) |
  * | richtext | 'rt' (Yjs updates + string reset register) |
- * | everything else, `merge('lww')`, `merge('server-authoritative')` | 'reg' |
+ * | `merge('server-authoritative')` | 'reg' with authority-classed stamps |
+ * | everything else, `merge('lww')` | 'reg' |
  *
  * A field that is not in the schema (an older schema version's field, or an
  * unknown collection) folds as a last-write-wins register.
@@ -75,10 +78,15 @@ export function planField(collection: CollectionDefinition | undefined, field: s
 		case 'lww':
 			return { ...LWW_PLAN, secret }
 		case 'server-authoritative':
-			// The fold cannot know which replica is "the server" from an operation, so
-			// it resolves by last-write-wins; authority is enforced by the server
-			// rejecting or correcting client writes with ordinary (later) operations.
-			return { ...LWW_PLAN, strategy: 'schema-server-authoritative', secret }
+			// A register whose writes from authoritative nodes (FoldOptions.
+			// authoritativeNodeIds: the server's node ids) beat every other write,
+			// whatever their HLC. Within a class, last write wins.
+			return {
+				...LWW_PLAN,
+				strategy: 'schema-server-authoritative',
+				secret,
+				authoritative: true,
+			}
 		default:
 			break
 	}

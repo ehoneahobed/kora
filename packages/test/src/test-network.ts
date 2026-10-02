@@ -32,6 +32,8 @@ export interface TestNetworkOptions {
 	blobStorage?: boolean
 	/** Adjudicate untrusted client operations on the server before materialization. */
 	validateOperation?: import('@korajs/server').OperationValidator
+	/** Devices use the beta.13 pairwise pipeline (`experimental.legacyMerge`). */
+	legacyMerge?: boolean
 }
 
 /**
@@ -108,6 +110,7 @@ export async function createTestNetwork(
 				return options?.wrapTransport ? options.wrapTransport(base) : base
 			},
 			tmpDir,
+			...(options?.legacyMerge ? { legacyMerge: true } : {}),
 		})
 		await device.open()
 		devices.push(device)

@@ -70,6 +70,11 @@ export interface TestDeviceOptions {
 	 * (a closed pair stays closed until the next {@link TestDevice.sync}).
 	 */
 	reconnectable?: boolean
+	/**
+	 * Run the device on the beta.13 pairwise pipeline (`experimental.legacyMerge`)
+	 * instead of the W7 fold. Used by the comparison harness.
+	 */
+	legacyMerge?: boolean
 }
 
 type TransportPairFactory = TestDeviceOptions['createTransportPair']
@@ -190,6 +195,7 @@ export class TestDevice {
 			schema: options.schema,
 			adapter: this.adapter,
 			emitter: this.emitter,
+			materialization: options.legacyMerge === true ? 'legacy' : 'fold',
 		})
 	}
 

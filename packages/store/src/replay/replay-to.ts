@@ -1,6 +1,13 @@
-import { OperationError } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	OperationError,
+	foldRecord,
+	isFoldStateLive,
+	materialize,
+} from '@korajs/core'
 import type { CollectionDefinition, Operation, SchemaDefinition } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
+import { mergeYjsUpdates } from '../fold/record-folder'
 import { decodeRichtextFieldsFromOpData } from '../serialization/op-data-encoding'
 import type { CollectionRecord } from '../types'
 
@@ -89,10 +96,7 @@ export function buildReplaySnapshot(
 		})
 	}
 
-	const memory: ReplayMemoryState = new Map()
-	for (const op of operationsApplied) {
-		applyOperationToMemory(memory, op, schema)
-	}
+	const memory = foldIntoMemory(operationsApplied, schema)
 
 	const collections = materializeCollections(schema, memory)
 
@@ -115,80 +119,43 @@ export function buildReplaySnapshot(
 	}
 }
 
-function applyOperationToMemory(
-	state: ReplayMemoryState,
-	op: Operation,
-	schema: SchemaDefinition,
-): void {
-	const definition = schema.collections[op.collection]
-	if (!definition) {
-		return
+/**
+ * Fold every record of the causal cut with the W7 fold, exactly as the live store
+ * materializes it (the cut may hold concurrent branches: the fold, not the
+ * application order, decides).
+ */
+function foldIntoMemory(ops: readonly Operation[], schema: SchemaDefinition): ReplayMemoryState {
+	const byRecord = new Map<string, Operation[]>()
+	for (const op of ops) {
+		if (!schema.collections[op.collection]) continue
+		const key = `${op.collection}\u0000${op.recordId}`
+		const list = byRecord.get(key) ?? []
+		list.push(op)
+		byRecord.set(key, list)
 	}
-
-	let colMap = state.get(op.collection)
-	if (!colMap) {
-		colMap = new Map()
-		state.set(op.collection, colMap)
+	const state: ReplayMemoryState = new Map()
+	for (const recordOps of byRecord.values()) {
+		const first = recordOps[0] as Operation
+		const definition = schema.collections[first.collection] as CollectionDefinition
+		const folded = foldRecord(recordOps, schema, { richtext: mergeYjsUpdates }).state
+		if (folded === null || folded.cr === null || folded.u === null) continue
+		const values = materialize({ ...folded, d: null }, { richtext: mergeYjsUpdates }) ?? {}
+		let colMap = state.get(first.collection)
+		if (!colMap) {
+			colMap = new Map()
+			state.set(first.collection, colMap)
+		}
+		colMap.set(first.recordId, {
+			id: first.recordId,
+			// The fold materializes op-data form (tagged binary); snapshots expose
+			// record-shaped values (Uint8Array / string).
+			fields: decodeRichtextFieldsFromOpData(values, definition.fields),
+			deleted: !isFoldStateLive(folded),
+			createdAt: HybridLogicalClock.deserialize(folded.cr.t).wallTime,
+			updatedAt: HybridLogicalClock.deserialize(folded.u.t).wallTime,
+		})
 	}
-
-	const wallTime = op.timestamp.wallTime
-
-	switch (op.type) {
-		case 'insert': {
-			if (!op.data) {
-				return
-			}
-			colMap.set(op.recordId, {
-				id: op.recordId,
-				// op.data stores binary richtext as tagged JSON; snapshots must
-				// expose record-shaped values (Uint8Array/string).
-				fields: decodeRichtextFieldsFromOpData(op.data, definition.fields),
-				deleted: false,
-				createdAt: wallTime,
-				updatedAt: wallTime,
-			})
-			break
-		}
-		case 'update': {
-			if (!op.data) {
-				return
-			}
-			const decodedData = decodeRichtextFieldsFromOpData(op.data, definition.fields)
-			const existing = colMap.get(op.recordId)
-			if (existing && !existing.deleted) {
-				existing.fields = { ...existing.fields, ...decodedData }
-				existing.updatedAt = wallTime
-				break
-			}
-			if (existing?.deleted) {
-				return
-			}
-			colMap.set(op.recordId, {
-				id: op.recordId,
-				fields: decodedData,
-				deleted: false,
-				createdAt: wallTime,
-				updatedAt: wallTime,
-			})
-			break
-		}
-		case 'delete': {
-			const existing = colMap.get(op.recordId)
-			if (existing) {
-				existing.deleted = true
-				existing.updatedAt = wallTime
-				return
-			}
-			colMap.set(op.recordId, {
-				id: op.recordId,
-				fields: {},
-				deleted: true,
-				createdAt: wallTime,
-				updatedAt: wallTime,
-			})
-			break
-		}
-	}
+	return state
 }
 
 function materializeCollections(

@@ -68,6 +68,14 @@ export interface Operation {
 	 */
 	fieldVersions?: Record<string, HLCTimestamp>
 	/**
+	 * Server-authored serialized fold state (`serializeFoldState`) of the record,
+	 * carried on scope-entry inserts instead of `fieldVersions` (W7). A receiver joins
+	 * it into its own state (`joinStates`), so every field kind (richtext, counters,
+	 * resolvers, element sets) enters with its full merge state. Not part of the
+	 * content hash; never uploaded by devices.
+	 */
+	foldState?: string
+	/**
 	 * Content-hash version of `id` (CORE-1). Absent means 1: the id covers type,
 	 * collection, recordId, data, timestamp, nodeId and atomicOps. 2: it also
 	 * covers previousData, sequenceNumber, causalDeps and schemaVersion. Verify

@@ -9,11 +9,12 @@ const FIELD_KINDS = new Set(['reg', 'set', 'map', 'ctr', 'max', 'min', 'res', 'r
  * the server stores' fold-record rows, backups, compaction snapshots).
  *
  * The output is canonical JSON (sorted keys), so two replicas holding the same
- * operations write byte-identical strings. Format, version 1:
+ * operations write byte-identical strings. Format, version 2 (version 1, Stage A,
+ * keyed array elements by value only and is refused: such a state is re-folded):
  *
  * ```
  * {
- *   "v": 1,                      // format version
+ *   "v": 2,                      // format version
  *   "c": "todos", "r": "<id>",   // collection, record id
  *   "cr": Stamp|null,            // oldest insert (creation)
  *   "w":  Stamp|null,            // newest insert/update
@@ -21,16 +22,16 @@ const FIELD_KINDS = new Set(['reg', 'set', 'map', 'ctr', 'max', 'min', 'res', 'r
  *   "u":  Stamp|null,            // newest operation of any type
  *   "f": { "<field>": FieldState }
  * }
- * Stamp      = { "t": "<HLC serialized>", "o": "<op id>" }
+ * Stamp      = { "t": "<HLC serialized>", "o": "<op id>", "c"?: 1 }  // c: authority class
  * FieldState =
  *   { "k":"reg", "e":[{ "s":Stamp, "v":value, "a"?:AtomicOp }], "val":value }
  *   { "k":"set", "ao":bool, "sh":{ "s":Stamp, "arr":bool, "v"?:value }|null, "clr":Stamp|null,
- *     "el":{ "<canonical JSON>":{ "v":value, "a":Stamp|null, "f":{ "s":Stamp, "i":n }|null, "r":Stamp|null } } }
+ *     "el":{ "<canonical JSON>#<k>":{ "v":value, "n":k, "a":Stamp|null, "f":{ "s":Stamp, "i":n }|null, "r":Stamp|null } } }
  *   { "k":"map", "sh":{ "s":Stamp, "obj":bool, "v"?:value }|null, "clr":Stamp|null,
  *     "keys":{ "<key>":{ "s":Stamp, "del":bool, "v"?:value } } }
  *   { "k":"ctr", "base":{ "s":Stamp, "v":value }|null, "d":[{ "s":Stamp, "n":number }], "val":value }
  *   { "k":"max"|"min", "best":{ "s":Stamp, "v":number }|null, "reg":{ "s":Stamp, "v":value }|null }
- *   { "k":"res", "e":[{ "s":Stamp, "v":value, "b"?:value }], "val":value, "err"?:string }
+ *   { "k":"res", "e":[{ "s":Stamp, "v":value, "b"?:value, "z"?:1 }], "val":value, "err"?:string }
  *   { "k":"rt", "reset":{ "s":Stamp, "v":value }|null, "u":{ "<base64 Yjs update>":Stamp } }
  * ```
  *

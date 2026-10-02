@@ -200,7 +200,14 @@ const ostamp = (op: Operation): OStamp => ({
 	o: op.id,
 })
 
+/**
+ * The node whose writes are authoritative for `merge('server-authoritative')`
+ * fields in every gate scenario (it plays the server).
+ */
+export const GATE_AUTHORITATIVE_NODES: ReadonlySet<string> = new Set(['node-1'])
+
 interface OWrite {
+	node: string
 	s: OStamp
 	insert: boolean
 	v: unknown
@@ -234,14 +241,22 @@ function fieldWrites(sorted: Operation[], field: string): OWrite[] {
 		const v = normalize(op.data[field])
 		const a = op.atomicOps?.[field]
 		if (op.type === 'insert') {
-			out.push({ s: ostamp(op), insert: true, v, prev: undefined, hasPrev: false, a })
+			out.push({
+				node: op.nodeId,
+				s: ostamp(op),
+				insert: true,
+				v,
+				prev: undefined,
+				hasPrev: false,
+				a,
+			})
 			continue
 		}
 		const hasPrev =
 			op.previousData !== null && field in op.previousData && op.previousData[field] !== undefined
 		const prev = hasPrev ? normalize(op.previousData?.[field]) : undefined
 		if (!a && hasPrev && canonicalize(prev) === canonicalize(v)) continue
-		out.push({ s: ostamp(op), insert: false, v, prev, hasPrev, a })
+		out.push({ node: op.nodeId, s: ostamp(op), insert: false, v, prev, hasPrev, a })
 	}
 	return out
 }
@@ -311,26 +326,45 @@ function oracleField(
 		}
 		case 'set':
 		case 'set-ao': {
+			// Occurrence-indexed multiset: the identity of an element is (value, k), the
+			// k-th copy of the value. Writes are applied in stamp order, so the last
+			// add/remove of an occurrence is its newest.
 			const ao = kind === 'set-ao'
 			const el = new Map<
 				string,
 				{ v: unknown; a: OStamp | null; f: { s: OStamp; i: number } | null; r: OStamp | null }
 			>()
-			const get = (x: unknown) => {
-				const key = canonicalize(x)
+			const get = (x: unknown, k: number) => {
+				const key = `${canonicalize(normalize(x))}#${k}`
 				let e = el.get(key)
 				if (!e) {
-					e = { v: JSON.parse(key), a: null, f: null, r: null }
+					e = { v: JSON.parse(canonicalize(normalize(x))), a: null, f: null, r: null }
 					el.set(key, e)
 				}
 				return e
 			}
+			const occurrences = (items: unknown[]) => {
+				const counts = new Map<string, number>()
+				return items.map((x) => {
+					const c = canonicalize(normalize(x))
+					const k = counts.get(c) ?? 0
+					counts.set(c, k + 1)
+					return { x, c, k }
+				})
+			}
+			const countOf = (items: unknown[], c: string) =>
+				items.filter((x) => canonicalize(normalize(x)) === c).length
 			let shape: { arr: boolean; v: unknown } | null = null
 			let clr: OStamp | null = null
 			for (const w of writes) {
-				if (w.a && (w.a.type === 'append' || w.a.type === 'remove')) {
+				const prevArr = !w.insert && Array.isArray(w.prev) ? (w.prev as unknown[]) : null
+				if (
+					w.a &&
+					(w.a.type === 'append' || w.a.type === 'remove') &&
+					(prevArr === null || !Array.isArray(w.v))
+				) {
 					shape = { arr: true, v: undefined }
-					const e = get(normalize(w.a.value))
+					const e = get(w.a.value, 0)
 					if (w.a.type === 'append') {
 						e.a = w.s
 						if (!e.f) e.f = { s: w.s, i: 0 }
@@ -343,17 +377,17 @@ function oracleField(
 					continue
 				}
 				shape = { arr: true, v: undefined }
-				const prevArr = !w.insert && Array.isArray(w.prev) ? (w.prev as unknown[]) : null
-				const prevKeys = new Set(prevArr ? prevArr.map((x) => canonicalize(x)) : [])
-				const nextKeys = new Set((w.v as unknown[]).map((x) => canonicalize(x)))
-				;(w.v as unknown[]).forEach((x, i) => {
-					if (prevKeys.has(canonicalize(x))) return
-					const e = get(x)
+				const next = w.v as unknown[]
+				occurrences(next).forEach(({ x, c, k }, i) => {
+					if (k < (prevArr ? countOf(prevArr, c) : 0)) return
+					const e = get(x, k)
 					e.a = w.s
 					if (!e.f) e.f = { s: w.s, i }
 				})
 				if (prevArr && !ao) {
-					for (const x of prevArr) if (!nextKeys.has(canonicalize(x))) get(x).r = w.s
+					for (const { x, c, k } of occurrences(prevArr)) {
+						if (k >= countOf(next, c)) get(x, k).r = w.s
+					}
 				}
 			}
 			if (!shape) return undefined
@@ -430,6 +464,7 @@ export function oracleMaterialize(
 	ops: readonly Operation[],
 	schema: SchemaDefinition,
 	merger: (u: Uint8Array[]) => Uint8Array = fakeRichtextMerger,
+	authoritative: ReadonlySet<string> = GATE_AUTHORITATIVE_NODES,
 ): Record<string, unknown> | null {
 	const unique = new Map<string, Operation>()
 	for (const op of ops) unique.set(op.id, op)
@@ -451,12 +486,17 @@ export function oracleMaterialize(
 	const out: Record<string, unknown> = {}
 	for (const field of [...fields].sort()) {
 		const kind = oracleKind(collection?.fields[field], collection, field)
-		const value = oracleField(
-			kind,
-			fieldWrites(sorted, field),
-			collection?.resolvers[field],
-			merger,
-		)
+		let writes = fieldWrites(sorted, field)
+		if (
+			authoritative.size > 0 &&
+			!collection?.resolvers[field] &&
+			collection?.fields[field]?.mergeStrategy === 'server-authoritative'
+		) {
+			// Authoritative writes order after every other write: (class, HLC, op id).
+			const cls = (w: OWrite) => (authoritative.has(w.node) ? 1 : 0)
+			writes = [...writes].sort((a, b) => cls(a) - cls(b) || ocmp(a.s, b.s))
+		}
+		const value = oracleField(kind, writes, collection?.resolvers[field], merger)
 		if (value !== undefined) out[field] = value
 	}
 	return out
@@ -539,7 +579,8 @@ function randomValue(rng: Rng, field: GateField, current: unknown): { v: unknown
 			if (chance(rng, 0.5) && base.length > 0) base.splice(int(rng, 0, base.length - 1), 1)
 			if (chance(rng, 0.7)) {
 				const tag = pick(rng, TAGS)
-				if (!base.includes(tag)) base.push(tag)
+				// Duplicates are data: arrays are multisets.
+				if (!base.includes(tag) || chance(rng, 0.3)) base.push(tag)
 			}
 			if (chance(rng, 0.15)) base.reverse()
 			return { v: base }
@@ -552,7 +593,7 @@ function randomValue(rng: Rng, field: GateField, current: unknown): { v: unknown
 			const base = Array.isArray(current) ? [...(current as unknown[])] : []
 			if (chance(rng, 0.5) && base.length > 0) base.splice(int(rng, 0, base.length - 1), 1)
 			const n = int(rng, 1, 4)
-			if (!base.includes(n)) base.push(n)
+			if (!base.includes(n) || chance(rng, 0.3)) base.push(n)
 			return { v: base }
 		}
 		case 'meta': {

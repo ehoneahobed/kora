@@ -7,6 +7,7 @@ import type {
 	SecretKeyProvider,
 } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
+import type { RecordFolder } from '../fold/record-folder'
 import { executeDelete } from '../mutations/execute-delete'
 import { executeInsert } from '../mutations/execute-insert'
 import { executeUpdate } from '../mutations/execute-update'
@@ -44,6 +45,7 @@ export class Collection {
 		private causalTracker: CausalTracker | null,
 		private readonly secretKeyProvider?: SecretKeyProvider,
 		private readonly onStorageError?: (error: unknown) => void,
+		private readonly fold?: () => RecordFolder | undefined,
 	) {}
 
 	/**
@@ -65,7 +67,9 @@ export class Collection {
 	}
 
 	private mutationContext(): LocalMutationContext {
+		const fold = this.fold?.()
 		return {
+			...(fold ? { fold } : {}),
 			collection: this.name,
 			definition: this.definition,
 			schema: this.schema,

@@ -53,6 +53,10 @@ export {
 	computeAckCompactionWatermark,
 } from './compaction/compact-operation-log'
 
+// === W7 record fold (client materialization) ===
+export { mergeYjsUpdates } from './fold/record-folder'
+export type { RematerializationMode } from './fold/rematerialize'
+
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'

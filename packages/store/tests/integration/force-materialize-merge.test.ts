@@ -33,7 +33,8 @@ describe('Integration: forceMaterialize bypasses the LWW version tie', () => {
 
 	beforeEach(async () => {
 		adapter = new BetterSqlite3Adapter(':memory:')
-		store = new Store({ schema, adapter, nodeId: 'node-a' })
+		// forceMaterialize is an option of the legacy (beta.13) apply path.
+		store = new Store({ schema, adapter, nodeId: 'node-a', materialization: 'legacy' })
 		await store.open()
 	})
 

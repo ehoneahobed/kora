@@ -66,6 +66,11 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.pipeline.applyRemote(op)
 	}
 
+	/** W7: the server's authoritative node ids (handshake), persisted by the store. */
+	async setAuthoritativeNodeIds(nodeIds: readonly string[]): Promise<void> {
+		await this.store.setAuthoritativeNodeIds(nodeIds)
+	}
+
 	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
 		return this.store.applyScopeRetraction(collection, recordId)
 	}

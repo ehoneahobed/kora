@@ -3,12 +3,16 @@ import type { HLCTimestamp } from '../types'
 import type { Stamp } from './types'
 
 /**
- * Total order on stamps: serialized HLC (which sorts exactly like
+ * Total order on stamps: authority class (only `merge('server-authoritative')`
+ * fields carry one), then serialized HLC (which sorts exactly like
  * `HybridLogicalClock.compare`), then operation id.
  *
  * @returns Negative if a < b, positive if a > b, 0 if equal
  */
 export function compareStamps(a: Stamp, b: Stamp): number {
+	const ca = a.c ?? 0
+	const cb = b.c ?? 0
+	if (ca !== cb) return ca - cb
 	if (a.t !== b.t) return a.t < b.t ? -1 : 1
 	if (a.o !== b.o) return a.o < b.o ? -1 : 1
 	return 0
