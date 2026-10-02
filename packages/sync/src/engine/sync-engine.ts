@@ -1602,7 +1602,7 @@ export class SyncEngine {
 
 		// Apply each in-scope operation; per-op failures must not block batch ACK
 		for (const op of operations) {
-			if (!(await this.operationAllowedForSync(op))) {
+			if ((await this.filterAllowedForSync([op])).length === 0) {
 				continue
 			}
 			inScopeOps.push(op)
@@ -2450,6 +2450,16 @@ export class SyncEngine {
 		const allowed: Operation[] = []
 		for (const op of ops) {
 			if (await this.operationAllowedForUpload(op)) {
+				allowed.push(op)
+			}
+		}
+		return allowed
+	}
+
+	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {
+		const allowed: Operation[] = []
+		for (const op of ops) {
+			if (await this.operationAllowedForSync(op)) {
 				allowed.push(op)
 			}
 		}
