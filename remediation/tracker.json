@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1476,7 +1476,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -2125,6 +2125,42 @@
    ],
    "pr": null,
    "notes": "Follow-up to RT-19 (remediation/evidence/redteam-phase1-round3.md). The synthesized scope-entry insert was stamped with the record's newest HLC for every field; under per-field LWW it beat a device's unsynced edit (t5) of a field the server last wrote earlier (t1) whenever any other field was newer (t7), after which the device's own op uploaded and won on the server: device and server diverged. Fixed: Operation gains optional fieldVersions (field -> HLC; server-authored only, not in the content hash). The server folds them from the record's stored operations exactly like the materialization (core replayFieldVersionsForRecord; new optional ServerStore.getRecordFieldVersions on memory/SQLite/Postgres, ordered in JS by HLC.compare); the entry carries them, and its timestamp is the record's first operation (server _created_at), so a fresh device's createdAt is the real creation time. Fields no op wrote get the creation version. Wire: JSON field + protobuf __kora_field_versions__ in the data JSON (static and dynamic serializers), validated on decode; the server strips fieldVersions from device-uploaded ops. Client: the apply pipeline routes an entry with fieldVersions straight to the store, which resolves each field by LWW against _field_versions (absent row: per-field stamps + orphan fold; live or scope-retracted row: per-field LWW; domain tombstone: revived only when the newest field version is newer), never a whole-row stamp; the clock receives the newest version; the client op log persists fieldVersions and record folds expand an entry into insert@creation + per-version updates (core expandFieldVersionedOperations). Stores without getRecordFieldVersions fall back to the RT-19 single stamp. Residual: richtext and atomic (counter) fields resolve by plain LWW in the entry path (a device's unsynced richtext/atomic edit older than the server's latest write to that field is overwritten locally while its op still merges on the server). Found while running the round-3 code on Postgres (none of it had run there): (1) the Postgres store ordered node-id ties by the database collation when folding a record (materialization, backfill, latest-timestamp), so under a linguistic collation (en_US/ICU: node-a < node-Z) the server row diverged from HLC.compare used by clients, memory and SQLite; now COLLATE \"C\" (postgres-round3.test.ts forces an ICU column collation); (2) LMS-11-pg counted RT-19 scope entries as unexplained extra ops; its reference now counts entries separately. The rt-fixture / scoped-network harnesses run on Postgres with KORA_REPRO_STORE=postgres."
+  },
+  {
+   "id": "RT-28",
+   "title": "Ops made while offline stay counted as pending after the server has them (status accuracy)",
+   "severity": "P2",
+   "workstream": "W4",
+   "phase": 2,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan \u00a76). Investigate in Phase 2."
+  },
+  {
+   "id": "RT-29",
+   "title": "Scope entry: richtext and counter fields resolved by plain LWW; renamed fields lose versions; no MergeTrace",
+   "severity": "P3",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state."
+  },
+  {
+   "id": "RT-30",
+   "title": "Live-Postgres parity tests fail under vitest with DATABASE_URL (dynamic import of postgres)",
+   "severity": "P3",
+   "workstream": "W10",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "acceptance": "Write a repro when the workstream starts.",
+   "pr": null,
+   "notes": "Found during RT-27 Postgres verification."
   }
  ],
  "rejectedProposalPins": {
