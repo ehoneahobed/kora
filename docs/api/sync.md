@@ -674,6 +674,8 @@ Additional methods:
 
 Decoding is format-agnostic: string payloads are decoded as JSON, binary payloads attempt protobuf first then fall back to JSON.
 
+Protocol v2 (beta.14) fields (`protocolVersion`, `authoritativeNodeIds`, operation `hashVersion`, `foldState`, `encrypted`), their protobuf field numbers and the verification rules are documented in the [protocol v2 reference](../guide/sync-protocol.md).
+
 ### Utility Functions
 
 - **`versionVectorToWire(vector: VersionVector): Record<string, number>`** -- Convert a `Map<string, number>` version vector to a plain object for wire transmission.

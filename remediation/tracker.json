@@ -779,14 +779,15 @@
    "severity": "P2",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "ENC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Protocol v2 envelope (Phase 3 Stage B3): ciphertext in op.encrypted (v2, alg, keyId, keyVersion, per-member {iv, ct}); AES-GCM AAD = canonical(nodeId, collection, recordId, type, timestamp, sequenceNumber, field, keyVersion, hashVersion); data and previousData sealed even when null; plaintext and protocol-1 payloads refused unless allowPlaintextMigration; the v2 id over the plaintext is verified after decryption. Repro sync/tests/repro/ENC-3 green.",
+   "acceptanceTest": "packages/sync/src/encryption/envelope-v2.test.ts"
   },
   {
    "id": "NEW-ENC-1",
@@ -794,14 +795,15 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-ENC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Protocol v2 envelope (Phase 3 Stage B3): data is null (or the listed cleartextFields), so a schema-aware server's shape validation passes; envelope ops are stored opaquely and never schema-transformed by the server. Repro kora/tests/repro/NEW-ENC-1 green (memory store). Residual: the SQLite/Postgres server stores must persist op.encrypted (W7 store work) before encrypted sync runs on them.",
+   "acceptanceTest": "packages/server/src/session/protocol-v2-ingest.test.ts (NEW-ENC-1 case)"
   },
   {
    "id": "SRV-1",
@@ -1566,15 +1568,15 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "CORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "W7 Stage A: content hash v2 behind hashVersion (computeOperationId(op, 2), verifyOperationId, createOperation(..., { hashVersion: 2 }), Operation.hashVersion). v2 covers previousData, sequenceNumber, causalDeps (as a set), schemaVersion, atomicOps, with binary in tagged form. Acceptance: packages/core/tests/integration/core-1-hash-v2.test.ts (the repro's 4 tampers under v2) + src/operations/content-hash-v2.test.ts. v1 stays the default, so core/tests/repro/CORE-1 (default createOperation) and packages/test/tests/repro/CORE-1 (server/client verification) stay red until Stage B: protocol v2 makes hashVersion 2 the default, wire + store persist hashVersion, the server verifies plaintext v2 ids before schema transforms, clients verify after decryption.",
-   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/core/src/operations/content-hash-v2.test.ts (Stage A, pure core)"
+   "notes": "Protocol v2 (Phase 3 Stage B3): createOperation defaults to hash version 2; hashVersion is carried on the wire (JSON + protobuf operation field 14) and persisted in the client op log; rebase/rotation/SEQUENCE_CONFLICT renumbering re-hash v2 ops. The server verifies plaintext v2 ids before any schema transform (non-retriable INVALID_OPERATION_ID; transformed copies stored as v1); clients verify after decryption in packages/sync/src/engine/verify-inbound.ts and quarantine mismatches. v1 ops are never verified against v2. Repros core/tests/repro/CORE-1 and packages/test/tests/repro/CORE-1 green. Residual: SQLite/Postgres server stores do not yet persist hashVersion (W7 store work), so ops they relay are treated as v1 (unverified) by clients.",
+   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/server/src/session/protocol-v2-ingest.test.ts + packages/sync/src/encryption/envelope-v2.test.ts (verifyInboundOperation)"
   },
   {
    "id": "DX-1",

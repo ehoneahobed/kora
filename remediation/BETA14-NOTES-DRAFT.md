@@ -1,0 +1,12 @@
+# Kora beta.14 release notes (draft)
+
+## Protocol v2
+
+- Protocol v2: one wire bump (decision D2) carrying the content-hash v2 ids, the encryption envelope v2 and the sequence-reservation rule. Handshakes carry `protocolVersion: 2`; see `docs/guide/sync-protocol.md` for fields, protobuf numbers (envelope 46-47, operation 14-16) and the compatibility matrix.
+- Protocol v2 (CORE-1): new operations get content-hash version 2 ids (covering previousData, sequenceNumber, causalDeps and schemaVersion). `hashVersion` travels on the wire and is persisted in the client op log. The server refuses a plaintext v2 op whose id is not its content hash (`INVALID_OPERATION_ID`, non-retriable) before any schema transform; clients verify after decryption and quarantine mismatches (`sync:apply-failed`). Version-1 ops stored before beta.14 are never judged by v2 rules.
+- Protocol v2 (ENC-3, NEW-ENC-1): encrypted operations use envelope v2 (`op.encrypted`, `data: null` or listed `cleartextFields`), with AES-GCM additional data binding each ciphertext to its operation, record, member and key version. Schema-aware servers store encrypted ops opaquely (the beta.12/13 `SCHEMA_VALIDATION_ERROR` on every encrypted op is gone). With encryption enabled, plaintext and protocol-1 encrypted payloads are refused unless `allowPlaintextMigration` is set. Breaking: beta.13 encrypted payloads are not readable by beta.14 (they were not readable across devices before either, ENC-1).
+- Protocol v2: the envelope names its key material (`keyId`), so devices with different key material fail with a diagnosable `KEY_ID_MISMATCH`. Shared key distribution (ENC-1) is still open (Phase 4).
+- Protocol v2: protocol-1 (beta.13) clients are accepted by beta.14 servers with a deprecation warning (`session.protocol_deprecated`, `sync:protocol-deprecated`) and will be refused by the next release. A beta.14 client also syncs plaintext through a beta.13 server, but encrypted sync requires a beta.14 server.
+- Protocol v2: handshake responses name the server's authoritative node ids (`authoritativeNodeIds`, persisted by the client); only their operations may carry server-authored `fieldVersions`/`foldState`, which the server strips from device uploads.
+- Protocol v2: new server options `authoritativeNodeIds` and `encryption: { required, allowPlaintextMigration }` (`PLAINTEXT_REJECTED`).
+- Protocol v2: a SEQUENCE_CONFLICT renumbering (and a clock rebase or node rotation) of a version-2 op re-hashes it, so the renumbered op carries a new id.

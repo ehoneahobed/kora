@@ -137,6 +137,21 @@ function parseJsonColumn(raw: unknown): Record<string, unknown> | null {
 	}
 }
 
+/**
+ * The op log embeds operation metadata in the data JSON under `__kora_*__` keys
+ * (atomic ops, transaction id, mutation name, field versions, hash version). They are
+ * not field values: Studio shows the data the operation wrote.
+ */
+function stripOpMetadata(data: Record<string, unknown> | null): Record<string, unknown> | null {
+	if (data === null) return null
+	const fields: Record<string, unknown> = {}
+	for (const [key, value] of Object.entries(data)) {
+		if (key.startsWith('__kora_') && key.endsWith('__')) continue
+		fields[key] = value
+	}
+	return Object.keys(fields).length > 0 ? fields : null
+}
+
 function parseJsonArrayColumn(raw: unknown): string[] {
 	if (typeof raw !== 'string' || raw.length === 0) {
 		return []
@@ -441,7 +456,7 @@ export class StudioDbReader {
 			nodeId: String(row.node_id),
 			type: String(row.type),
 			recordId: String(row.record_id),
-			data: parseJsonColumn(row.data),
+			data: stripOpMetadata(parseJsonColumn(row.data)),
 			previousData: parseJsonColumn(row.previous_data),
 			timestamp: parseVersionStamp(row.timestamp),
 			sequenceNumber: Number(row.sequence_number),
