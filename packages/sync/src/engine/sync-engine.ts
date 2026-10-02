@@ -85,8 +85,11 @@ const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
  * How many own sequence numbers the engine reads from the op log at a time when it
  * (re)builds the upload set. Bounds memory during the one-time upgrade re-upload of a
  * device's whole history: the next chunk is read only once the previous one is resolved.
+ * Large on purpose: an engine without sync-state persistence re-reads its history on
+ * every start, and against a legacy (version-vector) server a relay of a later chunk
+ * that overtakes a dropped earlier one leaves a vector gap on peers.
  */
-const OWN_LOG_SCAN_CHUNK = 500
+const OWN_LOG_SCAN_CHUNK = 2000
 /**
  * A delivered operation stamped further than this ahead of the trusted reference time
  * is quarantined instead of applied (SYNC-7). Matches the HLC's own refusal threshold.
