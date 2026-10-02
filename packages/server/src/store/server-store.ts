@@ -189,6 +189,18 @@ export interface ServerStore extends SyncStore {
 	 */
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
 	/**
+	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
+	 * Optional; anonymous provisional claims need it together with
+	 * {@link replaceNodeClaim}.
+	 */
+	getNodeClaimOwner?(nodeId: string): Promise<string | null>
+	/**
+	 * Atomically replace the owner of a node claim, only if it is still
+	 * `expectedOwner` (compare-and-set, RT-21). Returns true when replaced. Used to
+	 * confirm or re-issue an anonymous device's provisional claim; never creates one.
+	 */
+	replaceNodeClaim?(nodeId: string, expectedOwner: string, newOwner: string): Promise<boolean>
+	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server
 	 * keeps ownership in memory (lost on restart, not shared between instances).

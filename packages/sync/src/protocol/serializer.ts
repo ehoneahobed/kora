@@ -379,8 +379,13 @@ interface ProtoEnvelope {
 	acceptedUplinkScopesJson?: string
 	retractionsJson?: string
 	scopeExitPolicy?: string
-	/** Field 39: per-device node token (handshake and handshake-response, RT-12). */
+	/** Field 39: per-device node token (handshake, handshake-response, RT-12; acknowledgment, RT-21). */
 	nodeToken?: string
+	/** Field 40: peer-relay server asks for blob possession proofs (handshake-response, RT-23). */
+	blobPossessionProof?: boolean
+	/** Fields 41-42: a throttled blob-chunk-response and its retry delay (RT-24). */
+	throttled?: boolean
+	retryAfterMs?: number
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -431,6 +436,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 					? JSON.stringify(message.acceptedUplinkScopes)
 					: undefined,
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
+				...(message.blobPossessionProof !== undefined
+					? { blobPossessionProof: message.blobPossessionProof }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -456,6 +464,7 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.deliverySequence !== undefined
 					? { deliverySequence: message.deliverySequence }
 					: {}),
+				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
 			}
 		case 'error':
 			return {
@@ -502,6 +511,8 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				requestId: message.requestId,
 				hasBytes: message.bytes !== null,
 				...(message.bytes !== null ? { chunkBytes: message.bytes } : {}),
+				...(message.throttled ? { throttled: true } : {}),
+				...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 			}
 		case 'blob-chunk-push':
 			return {
@@ -570,6 +581,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 					? { acceptedUplinkScopes: JSON.parse(envelope.acceptedUplinkScopesJson) }
 					: {}),
 				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
+				...(envelope.blobPossessionProof !== undefined
+					? { blobPossessionProof: envelope.blobPossessionProof }
+					: {}),
 			}
 		case 'operation-batch':
 			return {
@@ -595,6 +609,7 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.deliverySequence !== undefined
 					? { deliverySequence: envelope.deliverySequence }
 					: {}),
+				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
 			}
 		case 'error':
 			return {
@@ -628,6 +643,8 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				messageId: envelope.messageId,
 				requestId: envelope.requestId ?? '',
 				bytes: envelope.hasBytes ? (envelope.chunkBytes ?? '') : null,
+				...(envelope.throttled ? { throttled: true } : {}),
+				...(envelope.retryAfterMs !== undefined ? { retryAfterMs: envelope.retryAfterMs } : {}),
 			}
 		case 'blob-chunk-push':
 			return {
@@ -834,6 +851,11 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.retractionsJson) writer.uint32(298).string(envelope.retractionsJson)
 	if (envelope.scopeExitPolicy) writer.uint32(306).string(envelope.scopeExitPolicy)
 	if (envelope.nodeToken) writer.uint32(314).string(envelope.nodeToken)
+	// Field 40 (bool, wiretype 0): 40 << 3 = 320. Fields 41-42: 328, 336.
+	if (envelope.blobPossessionProof !== undefined)
+		writer.uint32(320).bool(envelope.blobPossessionProof)
+	if (envelope.throttled) writer.uint32(328).bool(envelope.throttled)
+	if (envelope.retryAfterMs !== undefined) writer.uint32(336).int64(envelope.retryAfterMs)
 	return writer.finish()
 }
 
@@ -963,6 +985,15 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 39:
 				envelope.nodeToken = reader.string()
+				break
+			case 40:
+				envelope.blobPossessionProof = reader.bool()
+				break
+			case 41:
+				envelope.throttled = reader.bool()
+				break
+			case 42:
+				envelope.retryAfterMs = longToNumber(reader.int64())
 				break
 			default:
 				reader.skipType(tag & 7)

@@ -802,6 +802,30 @@ export class PostgresServerStore implements ServerStore {
 		return rows[0]?.user_id === userId
 	}
 
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		// One statement, atomic on the row: concurrent re-issues have one winner.
+		const rows = (await this.db.execute(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)) as unknown as { node_id: string }[]
+		return rows.length > 0
+	}
+
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
 		this.assertOpen()
 		await this.ready

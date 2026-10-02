@@ -73,6 +73,7 @@ import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
+	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
@@ -103,6 +104,45 @@ export const RESERVED_PRINCIPAL_PREFIX = 'kora:'
 
 /** Prefix of the node-claim owner of an anonymous device: `kora:anon-node:<sha256(token)>`. */
 const ANONYMOUS_NODE_OWNER_PREFIX = 'kora:anon-node:'
+/**
+ * Prefix of a PROVISIONAL anonymous claim (RT-21):
+ * `kora:anon-pending:<sha256(token)>:<expiresAtMs>`. It becomes the confirmed
+ * `kora:anon-node:<sha256(token)>` once the device proves it saved the token.
+ */
+const ANONYMOUS_PENDING_OWNER_PREFIX = 'kora:anon-pending:'
+/** Default time an unconfirmed provisional claim stays re-issuable: 24 hours. */
+export const DEFAULT_ANONYMOUS_CLAIM_TTL_MS = 24 * 60 * 60 * 1000
+
+function pendingOwner(tokenHash: string, expiresAtMs: number): string {
+	return `${ANONYMOUS_PENDING_OWNER_PREFIX}${tokenHash}:${String(expiresAtMs)}`
+}
+
+function parsePendingOwner(
+	owner: string | null,
+): { tokenHash: string; expiresAtMs: number } | null {
+	if (owner === null || !owner.startsWith(ANONYMOUS_PENDING_OWNER_PREFIX)) return null
+	const rest = owner.slice(ANONYMOUS_PENDING_OWNER_PREFIX.length)
+	const separator = rest.lastIndexOf(':')
+	if (separator <= 0) return null
+	const expiresAtMs = Number(rest.slice(separator + 1))
+	if (!Number.isFinite(expiresAtMs)) return null
+	return { tokenHash: rest.slice(0, separator), expiresAtMs }
+}
+
+/** Outcome of an anonymous device's node claim at handshake (RT-12, RT-21). */
+type AnonymousClaimOutcome =
+	| {
+			ok: true
+			/** The claim owner now recorded for the node. */
+			owner: string
+			/** The device key (`kora:anon-node:<hash>`), stable across confirmation. */
+			deviceKey: string
+			/** A token to hand the device in the response, when one was (re-)issued. */
+			issuedToken: string | null
+			/** Set while the claim is provisional: what confirmation replaces it with. */
+			pending: { owner: string; token: string; confirmedOwner: string } | null
+	  }
+	| { ok: false }
 /** Longest node token a client may present. */
 const MAX_NODE_TOKEN_LENGTH = 256
 /** Bytes of randomness in a server-issued node token (256 bits). */
@@ -122,7 +162,11 @@ function generateNodeToken(): string {
  * stored, so the claims table never holds a usable secret.
  */
 async function anonymousNodeOwner(nodeToken: string): Promise<string> {
-	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await hashBlob(new TextEncoder().encode(nodeToken))}`
+	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await nodeTokenHash(nodeToken)}`
+}
+
+async function nodeTokenHash(nodeToken: string): Promise<string> {
+	return hashBlob(new TextEncoder().encode(nodeToken))
 }
 
 /**
@@ -346,6 +390,13 @@ export interface ClientSessionOptions {
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
 	maxOpsPerMinute?: number
 	/**
+	 * Blob chunk requests accepted per minute, separate from the operation budget
+	 * (RT-24). Defaults to 6000.
+	 */
+	maxBlobRequestsPerMinute?: number
+	/** Length of the blob request window in ms. One minute; shorter only in tests. */
+	blobRequestWindowMs?: number
+	/**
 	 * Largest operation batch accepted in one message. A larger batch is refused whole
 	 * (`BATCH_TOO_LARGE`) before it is decoded or the store is read. Defaults to 1000.
 	 */
@@ -364,6 +415,15 @@ export interface ClientSessionOptions {
 	 * references are not checked at ingest.
 	 */
 	blobAccess?: BlobAccessIndex
+	/** See `KoraSyncServerConfig.allowLegacyAnonymousClaims` (RT-21). Defaults to true. */
+	allowLegacyAnonymousClaims?: boolean
+	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
+	anonymousClaimTtlMs?: number
+	/**
+	 * True when another live session (not `exceptSessionId`) is connected as `nodeId`.
+	 * A provisional anonymous claim is never re-issued away from a connected device.
+	 */
+	isNodeLive?: (nodeId: string, exceptSessionId: string) => boolean
 }
 
 /**
@@ -398,6 +458,11 @@ export class ClientSession {
 	private issuedNodeToken: string | null = null
 	/** The node-claim owner this session holds its node id under (userId, or an anonymous device key). */
 	private nodeOwnerKey: string | null = null
+	/** A provisional anonymous claim awaiting the device's confirmation (RT-21). */
+	private pendingNodeClaim: { owner: string; token: string; confirmedOwner: string } | null = null
+	private readonly allowLegacyAnonymousClaims: boolean
+	private readonly anonymousClaimTtlMs: number
+	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
 	private credential: string | null = null
 	/** The scope the client asked for at handshake, kept to re-resolve scopes (RT-26). */
@@ -480,6 +545,8 @@ export class ClientSession {
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
 	private readonly rateLimiter: SessionRateLimiter
+	/** Separate budget for blob chunk requests (RT-24). */
+	private readonly blobRateLimiter: SessionRateLimiter
 	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
 	private rateLimitedOperations = 0
 	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
@@ -522,10 +589,17 @@ export class ClientSession {
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.blobRateLimiter = new SessionRateLimiter(
+			options.maxBlobRequestsPerMinute ?? DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
+			options.blobRequestWindowMs ?? 60_000,
+		)
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
+		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
+		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
+		this.isNodeLive = options.isNodeLive ?? null
 	}
 
 	/**
@@ -1013,6 +1087,9 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
+				if (typeof message.nodeToken === 'string') {
+					await this.confirmNodeClaim(message.nodeToken)
+				}
 				if (message.deliverySequence !== undefined) {
 					// Advance the confirmed watermark; the next streaming push resumes here.
 					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
@@ -1036,16 +1113,19 @@ export class ClientSession {
 				break
 			case 'blob-chunk-request':
 				// Every request costs access checks and possibly a central-store read, so it
-				// is charged to the same per-session budget as operations (RT-17). Over
-				// budget it is answered "not held" rather than with an error, so a client
-				// pulling a large blob backs off and retries instead of being disconnected.
-				if (!this.rateLimiter.allow(1)) {
+				// is rate-limited (RT-17), on its own budget: a large blob is one request per
+				// chunk and must not starve (or be starved by) operation sync (RT-24). Over
+				// budget the answer is a retriable "throttled", never "not held", so the
+				// client backs off and retries instead of failing the transfer.
+				if (!this.blobRateLimiter.allow(1)) {
 					this.rateLimitedBlobRequests += 1
 					this.sendToClient({
 						type: 'blob-chunk-response',
 						messageId: `blob-resp-${message.requestId}`,
 						requestId: message.requestId,
 						bytes: null,
+						throttled: true,
+						retryAfterMs: this.blobRateLimiter.retryAfterMs(),
 					})
 					break
 				}
@@ -1066,7 +1146,10 @@ export class ClientSession {
 	 * mislabeled upload is rejected rather than served later as trusted content.
 	 */
 	private async handleBlobChunkPush(message: BlobChunkPushMessage): Promise<void> {
-		if (!this.persistBlobChunk) {
+		// Without central persistence a push is still accepted as proof of possession
+		// (RT-23): the bytes are verified and the pusher recorded as an owner, then
+		// dropped. Without either, there is nothing to do with the bytes.
+		if (!this.persistBlobChunk && !this.blobAccess) {
 			return
 		}
 		const bytes = decodeBlobChunkBytes(message.bytes)
@@ -1093,7 +1176,7 @@ export class ClientSession {
 			// Reject a mismatched upload rather than persisting untrusted bytes.
 			return
 		}
-		const owner = this.blobOwnerKey()
+		const owner = this.getBlobOwnerKey()
 		const scopes = this.referenceScopes()
 		// A manifest may only list chunks the pusher may reference itself (RT-11), so a
 		// crafted manifest cannot make another tenant's chunk reachable.
@@ -1110,9 +1193,107 @@ export class ClientSession {
 			return
 		}
 		this.blobBytesPushed += bytes.byteLength
-		await this.persistBlobChunk(message.hash, bytes)
+		if (this.persistBlobChunk) {
+			await this.persistBlobChunk(message.hash, bytes)
+		}
 		// Pushing the bytes proves possession: the session may reference this hash.
 		await this.blobAccess?.recordPush(message.hash, bytes, owner)
+	}
+
+	/**
+	 * Claim (or re-claim) a node id for an anonymous device (RT-12, RT-21).
+	 *
+	 * A device presenting a token holds the node when the claim is (or can become)
+	 * `kora:anon-node:<hash(token)>`: its confirmed claim, a fresh claim, or its own
+	 * provisional claim, which presenting the token confirms.
+	 *
+	 * A device presenting no token gets a fresh token and a PROVISIONAL claim, which it
+	 * confirms by acknowledging the response with the token once saved (or by
+	 * presenting it next time). Until then the claim may be re-issued to a device that
+	 * again presents no token (the response was lost in transit), but only while no
+	 * session is connected as that node and before the claim expires. Legacy claims
+	 * (expired provisional ones, and nodes of the pre-release shared anonymous owner)
+	 * are re-issued only with `allowLegacyAnonymousClaims`, with a deprecation warning.
+	 */
+	private async claimAnonymousNode(
+		nodeId: string,
+		presentedToken: string | null,
+	): Promise<AnonymousClaimOutcome> {
+		const store = this.store
+		if (!store.claimNode) return { ok: false }
+		if (presentedToken !== null) {
+			const hash = await nodeTokenHash(presentedToken)
+			const confirmed = `${ANONYMOUS_NODE_OWNER_PREFIX}${hash}`
+			const base = { deviceKey: confirmed, issuedToken: null, pending: null }
+			if (await store.claimNode(nodeId, confirmed)) return { ok: true, owner: confirmed, ...base }
+			const current = (await store.getNodeClaimOwner?.(nodeId)) ?? null
+			const pending = parsePendingOwner(current)
+			if (
+				current !== null &&
+				pending?.tokenHash === hash &&
+				(await store.replaceNodeClaim?.(nodeId, current, confirmed)) === true
+			) {
+				return { ok: true, owner: confirmed, ...base }
+			}
+			return { ok: false }
+		}
+
+		const token = generateNodeToken()
+		const hash = await nodeTokenHash(token)
+		const confirmedOwner = `${ANONYMOUS_NODE_OWNER_PREFIX}${hash}`
+		const owner = pendingOwner(hash, Date.now() + this.anonymousClaimTtlMs)
+		const issued = {
+			ok: true as const,
+			owner,
+			deviceKey: confirmedOwner,
+			issuedToken: token,
+			pending: { owner, token, confirmedOwner },
+		}
+		if (await store.claimNode(nodeId, owner)) return issued
+		if (!store.getNodeClaimOwner || !store.replaceNodeClaim) return { ok: false }
+		const current = await store.getNodeClaimOwner(nodeId)
+		if (current === null) return { ok: false }
+		const pending = parsePendingOwner(current)
+		let legacy = false
+		if (pending) {
+			// Never take a provisional claim away from a device that is connected now.
+			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
+			if (pending.expiresAtMs <= Date.now()) {
+				if (!this.allowLegacyAnonymousClaims) return { ok: false }
+				legacy = true
+			}
+		} else if (current === ANONYMOUS_NODE_OWNER) {
+			if (!this.allowLegacyAnonymousClaims) return { ok: false }
+			legacy = true
+		} else {
+			return { ok: false }
+		}
+		if (!(await store.replaceNodeClaim(nodeId, current, owner))) return { ok: false }
+		if (legacy) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.legacy_anonymous_claim',
+				sessionId: this.sessionId,
+				nodeId,
+				details: {
+					message:
+						'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+				},
+			})
+		}
+		return issued
+	}
+
+	/**
+	 * The device proved it saved the node token issued by this handshake: make the
+	 * provisional claim permanent (RT-21). A mismatched token is ignored.
+	 */
+	private async confirmNodeClaim(token: string): Promise<void> {
+		const pending = this.pendingNodeClaim
+		if (!pending || token !== pending.token || !this.clientNodeId) return
+		this.pendingNodeClaim = null
+		await this.store.replaceNodeClaim?.(this.clientNodeId, pending.owner, pending.confirmedOwner)
 	}
 
 	/**
@@ -1130,7 +1311,7 @@ export class ClientSession {
 	 * Stable blob-ownership key of this session's principal: the user id, or for an
 	 * anonymous device its node-claim owner (never shared by two anonymous devices).
 	 */
-	private blobOwnerKey(): string {
+	getBlobOwnerKey(): string {
 		if (this.principal?.anonymous === true) {
 			return this.nodeOwnerKey ?? `kora:node:${this.clientNodeId ?? this.sessionId}`
 		}
@@ -1144,7 +1325,7 @@ export class ClientSession {
 	 */
 	getBlobPartitionKey(): string {
 		const key = this.getScopePartitionKey()
-		return this.principal?.anonymous === true ? `${this.blobOwnerKey()}|${key}` : key
+		return this.principal?.anonymous === true ? `${this.getBlobOwnerKey()}|${key}` : key
 	}
 
 	/** Authorize foreign-key targets and blob references of an untrusted write. */
@@ -1162,7 +1343,7 @@ export class ClientSession {
 			readRow: async (collection, recordId) =>
 				(await this.lookupRecordFields(collection, recordId)) ?? null,
 			...(this.blobAccess ? { blobs: this.blobAccess } : {}),
-			blobOwner: this.blobOwnerKey(),
+			blobOwner: this.getBlobOwnerKey(),
 		})
 	}
 
@@ -1194,6 +1375,18 @@ export class ClientSession {
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 
+		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
+		// operations use `kora:scope-entry`, RT-19); no device may use one.
+		if (typeof msg.nodeId !== 'string' || msg.nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				`Node id "${String(msg.nodeId)}" is in the reserved "${RESERVED_PRINCIPAL_PREFIX}" namespace. Use a generated device node id.`,
+				false,
+			)
+			this.close('reserved node id')
+			return
+		}
+
 		// Authenticate if provider is configured
 		if (this.auth) {
 			const token = msg.authToken ?? ''
@@ -1222,7 +1415,7 @@ export class ClientSession {
 			// handshake presenting it may use the node again. NoAuthProvider has no
 			// identity at all.
 			if (this.store.claimNode && !(this.auth instanceof NoAuthProvider)) {
-				let owner = context.userId
+				let claimed: boolean
 				if (context.anonymous === true) {
 					const presented =
 						typeof msg.nodeToken === 'string' &&
@@ -1230,12 +1423,18 @@ export class ClientSession {
 						msg.nodeToken.length <= MAX_NODE_TOKEN_LENGTH
 							? msg.nodeToken
 							: null
-					const nodeToken = presented ?? generateNodeToken()
-					if (presented === null) this.issuedNodeToken = nodeToken
-					owner = await anonymousNodeOwner(nodeToken)
+					const outcome = await this.claimAnonymousNode(msg.nodeId, presented)
+					claimed = outcome.ok
+					if (outcome.ok) {
+						this.nodeOwnerKey = outcome.deviceKey
+						this.issuedNodeToken = outcome.issuedToken
+						this.pendingNodeClaim = outcome.pending
+					}
+				} else {
+					this.nodeOwnerKey = context.userId
+					claimed = await this.store.claimNode(msg.nodeId, context.userId)
 				}
-				this.nodeOwnerKey = owner
-				if (!(await this.store.claimNode(msg.nodeId, owner))) {
+				if (!claimed) {
 					this.issuedNodeToken = null
 					this.sendError(
 						'NODE_ID_CLAIMED',
@@ -1430,6 +1629,12 @@ export class ClientSession {
 			// Advertise central blob storage so the client uploads the bytes behind
 			// its blob fields, keeping them available after the author goes offline.
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
+			// Peer-relay mode: ask the client to push the bytes behind a blob reference
+			// anyway, so the server can verify possession (and then drop them) before
+			// accepting the reference (RT-23).
+			...(!this.persistBlobChunk && this.blobAccess && this.referenceScopes() !== undefined
+				? { blobPossessionProof: true }
+				: {}),
 			// Confirm the accepted scope so the client knows what data will be synced.
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.downlinkScopes

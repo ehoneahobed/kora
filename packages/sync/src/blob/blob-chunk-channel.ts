@@ -15,7 +15,14 @@ import type {
  */
 export type BlobChunkChannelMessage =
 	| { type: 'blob-chunk-request'; requestId: string; hash: string }
-	| { type: 'blob-chunk-response'; requestId: string; bytes: Uint8Array | null }
+	| {
+			type: 'blob-chunk-response'
+			requestId: string
+			bytes: Uint8Array | null
+			/** The server refused the request for rate; retry after `retryAfterMs` (RT-24). */
+			throttled?: boolean
+			retryAfterMs?: number
+	  }
 	| { type: 'blob-chunk-push'; hash: string; bytes: Uint8Array }
 
 /** Encode chunk bytes to a base64 string for the JSON wire. */
@@ -100,6 +107,8 @@ export class BlobChunkChannel {
 			messageId: generateUUIDv7(),
 			requestId: message.requestId,
 			bytes: message.bytes === null ? null : encodeBlobChunkBytes(message.bytes),
+			...(message.throttled ? { throttled: true } : {}),
+			...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 		})
 	}
 
@@ -137,6 +146,8 @@ export class BlobChunkChannel {
 							type: 'blob-chunk-response',
 							requestId: message.requestId,
 							bytes: message.bytes === null ? null : decodeBlobChunkBytes(message.bytes),
+							...(message.throttled ? { throttled: true } : {}),
+							...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 						}
 		for (const handler of this.handlers) {
 			handler(decoded)

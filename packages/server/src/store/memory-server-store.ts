@@ -452,6 +452,22 @@ export class MemoryServerStore implements ServerStore {
 		return owner === userId
 	}
 
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		return this.nodeOwners.get(nodeId) ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		if (this.nodeOwners.get(nodeId) !== expectedOwner) return false
+		this.nodeOwners.set(nodeId, newOwner)
+		return true
+	}
+
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
 		this.assertOpen()
 		const known = this.nodeOwners.has(nodeId) || (this.versionVector.get(nodeId) ?? 0) > 0

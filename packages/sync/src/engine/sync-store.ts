@@ -44,6 +44,13 @@ export interface SyncStore {
 	 * @param ids - Operation ids that are candidates for re-stamping
 	 * @param correctedNowMs - Trusted "now" (server time at handshake) in ms
 	 */
+	/**
+	 * Optional: move the device to a fresh node id, re-authoring the given unsynced
+	 * operations under it (RT-21). Called after the server refused the node id
+	 * (`NODE_ID_CLAIMED`). Returns the new node id and the rewritten operations.
+	 */
+	rotateNodeId?(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }>
+
 	rebaseUnsyncedOperations?(
 		ids: string[],
 		correctedNowMs: number,

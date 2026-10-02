@@ -501,6 +501,27 @@ export class SqliteServerStore implements ServerStore {
 		return rows[0]?.user_id === userId
 	}
 
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		const rows = this.db.all<{ node_id: string }>(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)
+		return rows.length > 0
+	}
+
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
 		this.assertOpen()
 		const known = this.db.all<{ one: number }>(

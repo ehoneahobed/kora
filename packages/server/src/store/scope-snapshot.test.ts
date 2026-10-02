@@ -49,7 +49,7 @@ function history(): Operation[] {
 }
 
 describe('scopeValuesOf', () => {
-	test('keeps id and scalar fields, never arrays or over-long strings', () => {
+	test('keeps id and scalar fields, never arrays; over-long strings are recorded as null', () => {
 		const values = scopeValuesOf(schema, 'todos', 'todo-1', {
 			id: 'ignored',
 			title: 'x'.repeat(MAX_SCOPE_SNAPSHOT_STRING_LENGTH + 1),
@@ -57,7 +57,9 @@ describe('scopeValuesOf', () => {
 			done: true,
 			tags: ['a'],
 		})
-		expect(values).toEqual({ id: 'todo-1', owner: 'bob', done: true })
+		// null keeps the field present, so a scope on it fails closed instead of falling
+		// back to the current row (RT-20).
+		expect(values).toEqual({ id: 'todo-1', title: null, owner: 'bob', done: true })
 		expect(scopeValuesOf(schema, 'todos', 'todo-1', null)).toBeNull()
 		expect(scopeValuesOf(schema, 'nope', 'todo-1', { id: 'x' })).toBeNull()
 	})

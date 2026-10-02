@@ -114,6 +114,8 @@ export class KoraSyncServer {
 		| null
 	private readonly maxOperationBytes: number | undefined
 	private readonly maxOpsPerMinute: number | undefined
+	private readonly allowLegacyAnonymousClaims: boolean | undefined
+	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
@@ -208,7 +210,7 @@ export class KoraSyncServer {
 		this.blobChunkRelay = new BlobChunkRelay(
 			config.resolveBlobChunk,
 			{
-				canReadFromStore: (requesterId, hash) => this.sessionReferencesBlob(requesterId, hash),
+				canReadFromStore: (requesterId, hash) => this.sessionMayReadStoredBlob(requesterId, hash),
 				canForward: (requesterId, targetId, hash) =>
 					this.mayForwardBlobRequest(requesterId, targetId, hash),
 				observeVerifiedBytes: (hash, bytes) => this.blobAccess.observeVerifiedBytes(hash, bytes),
@@ -234,6 +236,8 @@ export class KoraSyncServer {
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
+		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
+		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
 			config.maxOpsPerBatch !== undefined &&
 			(!Number.isInteger(config.maxOpsPerBatch) || config.maxOpsPerBatch < 1)
@@ -1068,11 +1072,21 @@ export class KoraSyncServer {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			...(this.maxOpsPerMinute !== undefined ? { maxOpsPerMinute: this.maxOpsPerMinute } : {}),
+			...(this.blobLimits.maxRequestsPerMinute !== undefined
+				? { maxBlobRequestsPerMinute: this.blobLimits.maxRequestsPerMinute }
+				: {}),
 			...(this.maxOpsPerBatch !== undefined ? { maxOpsPerBatch: this.maxOpsPerBatch } : {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),
 			blobAccess: this.blobAccess,
+			...(this.allowLegacyAnonymousClaims !== undefined
+				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
+				: {}),
+			...(this.anonymousClaimTtlMs !== undefined
+				? { anonymousClaimTtlMs: this.anonymousClaimTtlMs }
+				: {}),
+			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
@@ -1217,6 +1231,26 @@ export class KoraSyncServer {
 	private async sessionReferencesBlob(sessionId: string, hash: string): Promise<boolean> {
 		const session = this.sessions.get(sessionId)
 		if (!session || !session.isStreaming()) return false
+		return this.blobAccess.isReferenced(session.getDownlinkScopes(), hash)
+	}
+
+	/** True when a session other than `exceptSessionId` is connected as `nodeId`. */
+	private isNodeLive(nodeId: string, exceptSessionId: string): boolean {
+		for (const [sessionId, session] of this.sessions) {
+			if (sessionId === exceptSessionId) continue
+			if (session.getState() !== 'closed' && session.getClientNodeId() === nodeId) return true
+		}
+		return false
+	}
+
+	/**
+	 * Central-store read policy (RT-1, RT-25): the session owns the hash (it pushed
+	 * the bytes) or a live record inside its download scope references it.
+	 */
+	private async sessionMayReadStoredBlob(sessionId: string, hash: string): Promise<boolean> {
+		const session = this.sessions.get(sessionId)
+		if (!session || !session.isStreaming()) return false
+		if (await this.blobAccess.isOwnedBy(hash, session.getBlobOwnerKey())) return true
 		return this.blobAccess.isReferenced(session.getDownlinkScopes(), hash)
 	}
 

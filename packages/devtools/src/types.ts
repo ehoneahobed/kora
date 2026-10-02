@@ -26,6 +26,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:auth-failed': 'sync',
 	'sync:suspended': 'sync',
 	'sync:clock-skew': 'sync',
+	'sync:node-id-rotated': 'sync',
 	'sync:clock-rebase': 'sync',
 	'sync:schema-mismatch': 'sync',
 	'sync:apply-failed': 'sync',

@@ -234,6 +234,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			severity: 'fast-blocked',
 			source: 'handshake',
 		},
+		'sync:node-id-rotated': {
+			type: 'sync:node-id-rotated',
+			previousNodeId: 'node-old',
+			nodeId: 'node-new',
+			reenqueuedCount: 2,
+		},
 		'sync:clock-rebase': {
 			type: 'sync:clock-rebase',
 			rebasedCount: 3,

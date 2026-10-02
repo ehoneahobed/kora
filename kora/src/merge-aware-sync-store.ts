@@ -72,6 +72,14 @@ export class MergeAwareSyncStore implements SyncStore {
 	}
 
 	/**
+	 * Delegates node-id rotation to the store (RT-21): the server refused this
+	 * device's node id, so unsynced writes move to a fresh one.
+	 */
+	async rotateNodeId(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }> {
+		return this.store.rotateNodeId(ids)
+	}
+
+	/**
 	 * Delegates timestamp rebase to the store so the sync engine can re-stamp
 	 * never-acknowledged operations after a fast device clock is corrected.
 	 */

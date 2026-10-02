@@ -52,8 +52,10 @@ export interface BlobReferenceRequest {
  * **A content hash is not a secret.** Hashes of well-known content can be computed
  * by anyone, and they travel in records, manifests and logs. So knowing a hash never
  * grants access: a write may reference a hash only when the writer can already read
- * a record that references it, has proven possession of the bytes (pushed them), or
- * is the first to present a hash nobody references, owns or stores (a new blob).
+ * a record that references it, or has proven possession of the bytes (pushed them).
+ * Only in peer-relay mode (no central store, so nothing can be pre-claimed and then
+ * read back from the server) may the first writer of a hash nobody references or
+ * owns claim it by reference alone.
  *
  * A hash is referenced in a scope when a live (not deleted) record in scope has a
  * blob field whose `BlobRef.manifestHash` (or, for a bare reference without a
@@ -153,8 +155,19 @@ export class BlobAccessIndex {
 		if (owners.includes(owner)) return true
 		if (owners.length > 0) return false
 		if (scopes !== undefined && (await this.isReferenced(undefined, hash))) return false
-		if (await this.heldCentrally(hash)) return false
+		// With a central store a bare reference never claims a hash (RT-25): the writer
+		// must push the bytes first (the client's outbound preparer does), so a guessed
+		// hash cannot be pre-claimed to read content another tenant uploads later, and
+		// the answer is the same whether or not someone else holds the content.
+		if (this.resolveBlobChunk) return false
 		return this.claim(hash, owner)
+	}
+
+	/** True when `owner` pushed (or first claimed) the bytes behind `hash`. */
+	async isOwnedBy(hash: string, owner: string): Promise<boolean> {
+		if (!HEX_HASH.test(hash)) return false
+		const owners = (await this.ownersOf([hash])).get(hash) ?? []
+		return owners.includes(owner)
 	}
 
 	/**
@@ -306,16 +319,6 @@ export class BlobAccessIndex {
 			if (bytes === null) continue
 			if ((await hashBlob(bytes)) !== manifestHash) continue
 			this.observeVerifiedBytes(manifestHash, bytes)
-		}
-	}
-
-	private async heldCentrally(hash: string): Promise<boolean> {
-		if (!this.resolveBlobChunk) return false
-		try {
-			return (await this.resolveBlobChunk(hash)) !== null
-		} catch {
-			// Unknown: fail closed.
-			return true
 		}
 	}
 

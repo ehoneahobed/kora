@@ -36,15 +36,33 @@ export class Collection {
 		private readonly definition: CollectionDefinition,
 		private readonly schema: SchemaDefinition,
 		private readonly adapter: StorageAdapter,
-		private readonly clock: HybridLogicalClock,
-		private readonly nodeId: string,
+		private clock: HybridLogicalClock,
+		private nodeId: string,
 		private readonly allocateSequenceNumber: () => Promise<number>,
 		private readonly onMutation: MutationCallback,
-		private readonly relationEnforcer: RelationEnforcer | null,
+		private relationEnforcer: RelationEnforcer | null,
 		private mutationHandler: LocalMutationHandler | null,
-		private readonly causalTracker: CausalTracker | null,
+		private causalTracker: CausalTracker | null,
 		private readonly secretKeyProvider?: SecretKeyProvider,
 	) {}
+
+	/**
+	 * Point this collection at the store's new device identity after a node-id
+	 * rotation (RT-21). Internal: called by the owning Store only.
+	 *
+	 * @internal
+	 */
+	rebindNode(
+		clock: HybridLogicalClock,
+		nodeId: string,
+		relationEnforcer: RelationEnforcer | null,
+		causalTracker: CausalTracker | null,
+	): void {
+		this.clock = clock
+		this.nodeId = nodeId
+		this.relationEnforcer = relationEnforcer
+		this.causalTracker = causalTracker
+	}
 
 	private mutationContext(): LocalMutationContext {
 		return {
