@@ -2731,7 +2731,7 @@ export class SyncEngine {
 		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
 		// corrupted payload) is quarantined; the session and every other operation go on.
 		let op = delivered
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(delivered)) {
 			try {
 				op = await this.encryptor.decryptOperation(delivered)
 			} catch (error) {
@@ -2931,10 +2931,24 @@ export class SyncEngine {
 		return released.length
 	}
 
+	/**
+	 * Under end-to-end encryption, a plaintext operation authored by the server (a node
+	 * the handshake named authoritative: cascades, set-nulls, constraint corrections,
+	 * route writes) that touches only the collection's cleartext fields is accepted
+	 * without an envelope: the server holds no key, so it cannot seal its own writes, and
+	 * such an operation carries nothing the server cannot already read. Any sealed field
+	 * (or an operation from any other node) still has to arrive sealed.
+	 */
+	private isServerAuthoredCleartext(op: Operation): boolean {
+		if (!this.encryptor || op.encrypted !== undefined) return false
+		if (!this.authoritativeNodeIds?.includes(op.nodeId)) return false
+		return this.encryptor.isCleartextOnly(op)
+	}
+
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
 	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
 		let op = stored
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(stored)) {
 			try {
 				op = await this.encryptor.decryptOperation(stored)
 			} catch {

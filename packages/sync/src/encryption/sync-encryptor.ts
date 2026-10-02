@@ -327,6 +327,31 @@ export class SyncEncryptor {
 		return isEncryptedPayload(field)
 	}
 
+	/**
+	 * Whether a plaintext operation touches only data the server can already read: its
+	 * `data` (and, except for a delete, its `previousData`) names only the collection's
+	 * cleartext scope fields, and it has no atomic ops. The sync engine accepts such an
+	 * operation from a server-authored node (a cascade, a set-null of a cleartext
+	 * reference, a constraint correction of a cleartext field) under end-to-end
+	 * encryption: the server cannot seal it (it has no key), and it reveals or forges
+	 * nothing the server does not already hold in cleartext. Any sealed field makes it
+	 * false, so the operation is refused as plaintext.
+	 *
+	 * @param operation - A delivered operation without an envelope
+	 */
+	isCleartextOnly(operation: Operation): boolean {
+		if (operation.encrypted !== undefined) return false
+		if (operation.atomicOps !== undefined && Object.keys(operation.atomicOps).length > 0) {
+			return false
+		}
+		const allowed = new Set(this.cleartextFields[operation.collection] ?? [])
+		const within = (value: Record<string, unknown> | null): boolean =>
+			value === null || Object.keys(value).every((field) => allowed.has(field))
+		if (!within(operation.data)) return false
+		// A delete's previousData is informational: the fold never reads it.
+		return operation.type === 'delete' || within(operation.previousData)
+	}
+
 	/** Whether an operation carries an envelope v2. */
 	static isEncryptedOperation(operation: { encrypted?: unknown }): boolean {
 		return operation.encrypted !== undefined && operation.encrypted !== null

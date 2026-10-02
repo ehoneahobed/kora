@@ -642,3 +642,57 @@ describe('edge cases', () => {
 		expect(decrypted.data).toEqual(op.data)
 	})
 })
+
+describe('isCleartextOnly (server-authored plaintext under encryption)', () => {
+	async function withCleartext(): Promise<SyncEncryptor> {
+		return SyncEncryptor.create(
+			{ enabled: true, key: 'k', cleartextFields: { todos: ['ownerId', 'projectId'] } },
+			undefined,
+			TEST_KDF_ITERATIONS,
+		)
+	}
+
+	test('a delete (whatever its previousData) and a cleartext-only write qualify', async () => {
+		const encryptor = await withCleartext()
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({ type: 'delete', data: null, previousData: { title: null, ownerId: 'u' } }),
+			),
+		).toBe(true)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({
+					type: 'update',
+					data: { projectId: null },
+					previousData: { projectId: 'p' },
+				}),
+			),
+		).toBe(true)
+	})
+
+	test('a sealed field, atomic ops, an envelope or an unknown collection do not', async () => {
+		const encryptor = await withCleartext()
+		expect(encryptor.isCleartextOnly(makeOperation({ type: 'update', data: { title: 'x' } }))).toBe(
+			false,
+		)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({ type: 'update', data: { ownerId: 'u' }, previousData: { title: 'x' } }),
+			),
+		).toBe(false)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({
+					type: 'update',
+					data: { ownerId: 'u' },
+					atomicOps: { ownerId: { type: 'max', value: 1 } },
+				}),
+			),
+		).toBe(false)
+		const sealed = await encryptor.encryptOperation(makeOperation({ data: { ownerId: 'u' } }))
+		expect(encryptor.isCleartextOnly(sealed)).toBe(false)
+		expect(
+			encryptor.isCleartextOnly(makeOperation({ collection: 'other', data: { ownerId: 'u' } })),
+		).toBe(false)
+	})
+})

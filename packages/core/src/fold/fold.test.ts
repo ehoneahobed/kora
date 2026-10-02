@@ -531,6 +531,41 @@ describe('delete vs write', () => {
 	})
 })
 
+describe('sealed envelope operations (server fold, protocol v2)', () => {
+	const envelope = {
+		v: 2 as const,
+		alg: 'aes-256-gcm' as const,
+		keyId: 'k',
+		keyVersion: 1,
+		data: { iv: 'i', ct: 'c' },
+		previousData: { iv: 'i', ct: 'c' },
+	}
+	const sealed = (o: Operation): Operation => ({ ...o, data: null, encrypted: envelope })
+
+	test('a sealed insert creates the record without values', () => {
+		expect(foldBothOrders([sealed(insert(1, { title: 'x' }))])).toEqual({})
+	})
+
+	test('a sealed update later than a delete revives the record, an older one does not', () => {
+		const base = sealed(insert(1, { title: 'x' }))
+		expect(foldBothOrders([base, del(2), sealed(update(3, { qty: 2 }, { qty: 1 }, 'b'))])).toEqual(
+			{},
+		)
+		expect(
+			foldBothOrders([base, sealed(update(2, { qty: 2 }, { qty: 1 }, 'b')), del(3)]),
+		).toBeNull()
+	})
+
+	test('cleartext scope fields of an envelope fold; sealed members never do', () => {
+		const base = { ...insert(1, { title: 'x', qty: 1 }), data: { title: 'x' }, encrypted: envelope }
+		expect(foldBothOrders([base])).toEqual({ title: 'x' })
+	})
+
+	test('a plaintext operation with data null changes nothing but its stamp', () => {
+		expect(fold([insert(1, { title: 'x' }), del(2), op({ type: 'update', wall: 3 })])).toBeNull()
+	})
+})
+
 describe('insert onto an existing row', () => {
 	test('merges per field: newer fields win, older inserts never reset', () => {
 		const a = insert(1, { title: 'a', qty: 1 }, 'a')

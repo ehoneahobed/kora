@@ -388,7 +388,17 @@ export function mergeOp(
 		}
 		return { state: changed ? next : state, traces, changed }
 	}
-	if (op.data === null) return { state: changed ? next : state, traces, changed }
+	if (op.data === null) {
+		// An envelope operation (protocol v2) whose every field is sealed: the server
+		// cannot read its values, but the write happened. It creates the record (an
+		// insert) and counts as a write against deletes, so the server's record
+		// existence agrees with the devices' (which fold the decrypted operation).
+		if (op.encrypted !== undefined) {
+			if (op.type === 'insert') setRecordStamp('cr', minStamp(state.cr, stamp))
+			setRecordStamp('w', maxStamp(state.w, stamp))
+		}
+		return { state: changed ? next : state, traces, changed }
+	}
 
 	if (op.type === 'insert') setRecordStamp('cr', minStamp(state.cr, stamp))
 	setRecordStamp('w', maxStamp(state.w, stamp))
