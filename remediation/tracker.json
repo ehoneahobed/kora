@@ -809,14 +809,15 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "SRV-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Array case now agrees (S1 interim: replayOperationsForRecord uses mergeArraySet against previousData). Object and custom-resolver cases remain for W7."
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration).",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "SRV-2",
@@ -1519,7 +1520,8 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open. W7 Stage A: arrays fold as an LWW element set in @korajs/core (fold/field-states.ts); fold.test.ts 'MERGE-1' passes in both orders. Stays mitigated until Stage B wires the fold into the client store and server stores and retires addWinsSet/mergeArraySet.",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "MERGE-2",
@@ -1527,14 +1529,15 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "MERGE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). The pure fold converges for all field kinds (gate). The repro (packages/test, real pipeline) stays red until Stage B replaces apply-pipeline's pairwise merge with append-then-mergeOp and re-materializes stores.",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "NEW-MERGE-1",
@@ -1554,7 +1557,8 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7."
+   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7. W7 Stage A: the fold treats an unchanged restated field as no write (all kinds); fold.test.ts 'NEW-MERGE-1' passes. Stays mitigated until Stage B replaces the pairwise apply path.",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "CORE-1",
@@ -1562,14 +1566,15 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "file": "CORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage A: content hash v2 behind hashVersion (computeOperationId(op, 2), verifyOperationId, createOperation(..., { hashVersion: 2 }), Operation.hashVersion). v2 covers previousData, sequenceNumber, causalDeps (as a set), schemaVersion, atomicOps, with binary in tagged form. Acceptance: packages/core/tests/integration/core-1-hash-v2.test.ts (the repro's 4 tampers under v2) + src/operations/content-hash-v2.test.ts. v1 stays the default, so core/tests/repro/CORE-1 (default createOperation) and packages/test/tests/repro/CORE-1 (server/client verification) stay red until Stage B: protocol v2 makes hashVersion 2 the default, wire + store persist hashVersion, the server verifies plaintext v2 ids before schema transforms, clients verify after decryption.",
+   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/core/src/operations/content-hash-v2.test.ts (Stage A, pure core)"
   },
   {
    "id": "DX-1",

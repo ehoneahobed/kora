@@ -67,6 +67,14 @@ export interface Operation {
 	 * `timestamp` is then the record's creation time. Not part of the content hash.
 	 */
 	fieldVersions?: Record<string, HLCTimestamp>
+	/**
+	 * Content-hash version of `id` (CORE-1). Absent means 1: the id covers type,
+	 * collection, recordId, data, timestamp, nodeId and atomicOps. 2: it also
+	 * covers previousData, sequenceNumber, causalDeps and schemaVersion. Verify
+	 * with `verifyOperationId`. Not yet carried over the wire or persisted by the
+	 * store (protocol v2 wires it).
+	 */
+	hashVersion?: 1 | 2
 }
 
 /**

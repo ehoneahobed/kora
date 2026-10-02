@@ -9,11 +9,9 @@ export default mergeConfig(
 	shared,
 	defineConfig({
 		test: {
-			name: '@korajs/core',
+			name: '@korajs/core/benchmarks',
 			root: __dirname,
-			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
-			// Performance gates run via `pnpm test:benchmarks`, not default `pnpm test`.
-			exclude: ['src/benchmarks/**', ...(shared.test?.exclude ?? [])],
+			include: ['src/benchmarks/**/*.test.ts'],
 		},
 	}),
 )

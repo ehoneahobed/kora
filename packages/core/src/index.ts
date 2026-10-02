@@ -90,8 +90,15 @@ export type { ApplyFailureReason, ApplyResult } from './operations/apply-result'
 export {
 	createOperation,
 	isValidOperation,
+	verifyOperationId,
 	verifyOperationIntegrity,
 } from './operations/operation'
+export type { CreateOperationOptions } from './operations/operation'
+export {
+	DEFAULT_OPERATION_HASH_VERSION,
+	computeOperationId,
+} from './operations/content-hash'
+export type { HashableOperation, OperationHashVersion } from './operations/content-hash'
 
 // === Atomic Operations ===
 export {
@@ -115,6 +122,46 @@ export type {
 	ReplayOperation,
 	VersionedReplayOperation,
 } from './operations/replay-record'
+
+// === Record fold: one deterministic per-field CRDT merge (W7) ===
+export {
+	FOLD_RECORD_TRACE_FIELD,
+	createFoldState,
+	foldRecord,
+	getFoldFieldVersions,
+	isFoldStateLive,
+	joinStates,
+	materialize,
+	mergeOp,
+} from './fold/fold'
+export { deserializeFoldState, serializeFoldState } from './fold/serialize'
+export { toMergeTrace } from './fold/trace'
+export { deriveSideEffectOpId } from './fold/side-effect-id'
+export { FoldConfigurationError, FoldStateError } from './fold/errors'
+export { FOLD_STATE_VERSION } from './fold/types'
+export type {
+	CounterFieldState,
+	ElementSetFieldState,
+	ElementState,
+	ExtremumFieldState,
+	FieldLogEntry,
+	FieldState,
+	FoldFieldKind,
+	FoldFieldVersions,
+	FoldOptions,
+	FoldRecordResult,
+	FoldState,
+	FoldTrace,
+	FoldTraceMode,
+	KeyMapFieldState,
+	KeyState,
+	MergeOpResult,
+	RegisterFieldState,
+	ResolverFieldState,
+	RichtextFieldState,
+	RichtextUpdateMerger,
+	Stamp,
+} from './fold/types'
 
 // === Binary op-data encoding ===
 export {
