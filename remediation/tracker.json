@@ -2110,6 +2110,21 @@
    ],
    "pr": null,
    "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: revalidateCredential re-resolves the session's scopes (computeSessionScopes, shared with the handshake, using the handshake's syncScope) and ends a session whose downlink or uplink scope changed, or no longer resolves, with retriable SCOPE_CHANGED. Documented in docs/guide/production-server.md."
+  },
+  {
+   "id": "RT-27",
+   "title": "Scope-entry insert carries one whole-row timestamp: overwrites a device's newer unsynced edit of an older field, then client and server diverge (and createdAt = latest edit)",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-27.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Follow-up to RT-19 (remediation/evidence/redteam-phase1-round3.md). The synthesized scope-entry insert is stamped with the record's newest HLC for every field. Under per-field LWW it beats a device's unsynced edit (t5) of a field the server last wrote earlier (t1) whenever another field is newer (t7); the device's own op then uploads and wins on the server, so device and server diverge. A fresh device's createdAt is also the latest edit time. Fix: carry per-field versions on the entry and apply it field by field against _field_versions."
   }
  ],
  "rejectedProposalPins": {
