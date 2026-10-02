@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1472,7 +1472,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1983,6 +1983,126 @@
    ],
    "pr": null,
    "notes": "Phase 1 red-team round 2 (remediation/evidence/redteam-phase1-round2.md). Fixed: KoraSyncServer re-validates every live session credential with its auth provider every sessionRevalidationIntervalMs (default 30 s, 0 disables; also driven by the delivery poll tick) and on demand via revalidateSessions(); a refused credential or a different principal ends the session with retriable AUTH_REVOKED (AUTH_EXPIRED when past expiry); provider errors end nothing. Two-instance tests: shared in-memory user store, two SQLite handles on one file, two Postgres pools on one database (packages/auth/tests/repro/RT-18.test.ts). Not done: Postgres LISTEN/NOTIFY push (optional). Found while testing: PostgresUserStore cold-start DDL races when two instances start at once (type already exists)."
+  },
+  {
+   "id": "RT-19",
+   "title": "Record moving into scope never appears for the new owner (only the scope-changing update is delivered)",
+   "severity": "P0",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-19.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-20",
+   "title": "Schema migration adding/renaming a scope field: scope snapshots not recomputed, history hidden from fresh devices",
+   "severity": "P1",
+   "workstream": "W4",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-20.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-21",
+   "title": "Anonymous device locked out permanently if node token is lost; legacy anonymous clients refused",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-21.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-22",
+   "title": "FK target authorized against downlink only: children of uplink-only parents rejected (forms/surveys)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-22.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-23",
+   "title": "Peer-relay mode (no central blob store): identical content in a second tenant permanently rejected",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-23.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-24",
+   "title": "Blob downloads share the op rate budget; \"not held\" treated as hard failure; large blobs fail",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-24.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-25",
+   "title": "Content-hash existence oracle; pre-claimed hash lets claimer read bytes another tenant uploads later",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-25.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+  },
+  {
+   "id": "RT-26",
+   "title": "Session revalidation checks identity only; scope/role changes apply at token expiry (document or compare scopes)",
+   "severity": "P3",
+   "workstream": "W2",
+   "phase": 1,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-26.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
   }
  ],
  "rejectedProposalPins": {
