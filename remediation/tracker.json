@@ -2351,6 +2351,126 @@
    ],
    "pr": null,
    "notes": "Phase 2 red-team review 2026-10-02 (remediation/evidence/redteam-phase2.md). Location: kora/src/storage-accessor.ts:15-36 hasUnsyncedOperations. Required fix: unsynced = queue rows OR any own op (any local node id) above its own_acked_through OR a node with no recorded prefix; keep the local-only branch. FIXED: deleteDatabase unsynced check = queue OR any local node own op above its prefix (no prefix: from 0) minus terminal rejections (store/internal hasUnsyncedOwnOperations)."
+  },
+  {
+   "id": "RT-42",
+   "title": "Unsynced writes are bound to a node, not to the principal that wrote them: a write made after a user switch but before the next accepted handshake is held for the previous user and later uploaded as that user; a never-accepted node's writes are uploaded as whoever handshakes first",
+   "severity": "P2",
+   "workstream": "W1",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-42.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Residual of RT-38. Locations: sync/src/engine/sync-engine.ts:1717 holdNodeAndSwitch (holds EVERY unsynced op of the refused node, including the new user's own writes authored under it before the refusal), 1759 reauthorUnsentAndRotate and 1536 recordNodeAccepted (a node's owner is learned only at the first accepted handshake), 3200 chooseSessionNode (adopts a never-accepted per-tab node under the current principal). Repro 1: Alice synced on NA; Bob signs in and writes before his first handshake; NA is refused and held: Bob's write is held while he is signed in (heldOperations>0) and is submitted with ctx.auth.userId = alice when Alice signs back in. Repro 2: a database that never synced: Alice's offline writes are uploaded on Bob's session. Required fix: bind each write to the principal known locally at write time (the auth layer knows who is signed in): rotate or switch the node id when the signed-in principal changes, BEFORE the next write (not on NODE_ID_CLAIMED), record the principal per local node, and never upload a node's writes on another principal's session; or make namespaceByAuthUser the default when auth is configured. Repro packages/test/tests/repro/RT-42.test.ts."
+  },
+  {
+   "id": "RT-43",
+   "title": "An acknowledged own op the server does not store under its sequence (validator action ignore; W6-renumbered op stored under its old number) at the tail makes every handshake look like a restored server: the tail is re-uploaded and re-validated on every reconnect",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-43.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: sync/src/engine/sync-engine.ts:1634 (advertisedOwn < ownAckedThrough lowers the prefix on every handshake); the server's handshake vector is MAX(stored sequence) per node (server/src/session/client-session.ts:1942-1986), and client-session.ts:2425-2429 acknowledges an ignored op without storing anything. Repro: the newest own op is ignored by validateOperation (out-of-band handling, e.g. send an invoice): after 5 reconnects the validator has seen it 6 times; its out-of-band effect repeats. Same shape for a W6 sequence-repaired op whose stored copy keeps the old number (free duplicate re-upload each reconnect). Ends only when the device writes something newer. Required fix: the server must advertise per node the highest sequence it has RESOLVED (stored, ignored, or terminally refused), e.g. a per-node acknowledged-through column, not MAX(stored); or the client must confirm a lower advertisement by id (ask which of its ops above X the server holds) before lowering the prefix, and lower it at most once per server incarnation. Repro packages/test/tests/repro/RT-43.test.ts."
+  },
+  {
+   "id": "RT-44",
+   "title": "Cloned database (one node id on two live devices) is never detected: each copy's writes are own operations for the other (never delivered on a resumed stream or live relay), and every sequence collision costs a renumber plus a full resync from 0",
+   "severity": "P3",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-44.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: server/src/session/client-session.ts:2703-2711 (own-node ops skipped above ownOperationsIncludedThrough), sync/src/engine/sync-engine.ts:3383 recoverSequenceConflict (renumber + resetDeliveryForFullResync per collision), 1609-1625 (handshake raise + full resync). Repro: copy of a synced database opened as a second device; 3 writes on each while both are connected: the original never sees 2 of the copy's writes until a reconnect; 4 history-behind recoveries (each a full resync) for 6 writes. Converges after reconnects with no loss (verified). Required fix: detect a clone (the server sees two live sessions of one node, or a SEQUENCE_CONFLICT whose holder is not in the device's log yet was uploaded after the device's last handshake) and move one copy to a fresh node id (RT-21 re-authoring of its unsynced ops); at minimum rate-limit full resyncs. Repro packages/test/tests/repro/RT-44.test.ts."
+  },
+  {
+   "id": "RT-45",
+   "title": "Server restored from an older backup: a device whose node has no operation in the backup never re-uploads the operations the server lost (absent own vector entry read as \"no information\"); they exist only on devices",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-45.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: sync/src/engine/sync-engine.ts:1634 `advertisedOwn !== undefined && advertisedOwn < this.ownAckedThrough`: the handshake vector omits a node the server holds nothing of (client-session.ts:1975-1977 filters serverVector), so advertisedOwn is undefined and the prefix is never lowered. Repro: devices a and b; backup taken when only a had written; then 3 increments each; server restored: a re-uploads its 3 (once), b never does: server count 6 instead of 66, serverOps 4 instead of 7; both devices show 66 and pendingOperations 0 (deleteDatabase would call b synced). New devices never receive b's writes. Required fix: the server always includes the session's own node in the handshake vector (0 when absent), and the client treats an absent own entry as 0 (lowering to 0 is safe: the server dedups by id). Combine with the RT-43 fix (resolved-through, not MAX(stored)). Repro packages/test/tests/repro/RT-45.test.ts."
+  },
+  {
+   "id": "RT-46",
+   "title": "Per-tab adoption (RT-40) is head-of-line blocking: a session adopts one orphaned node and uploads nothing else until all its writes are acknowledged; one retriably rejected adopted write stalls the live tab's own uploads and every other orphan node, forever (cross-node parent/child deadlock)",
+   "severity": "P1",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-46.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:3200 chooseSessionNode (adopts the first eligible node in registry order on every start), 3175 isSessionOperation / takeBatch (only the session node uploads), 3422 maybeEndSessionForNodeWork (adoption ends only when the adopted prefix reaches its counter). Repro: two closed per-tab tabs, the OLDER node holds a task whose parent project is on the NEWER node; the app validator defers a child until its parent is on the server (retriable: true). The remaining tab adopts the older node forever: after 6 reconnects NOTHING is on the server (not the parent, not the child, not the open tab's own write). Control without the deferral: all three sync. Same stall with any persistent retriable rejection (throwing validator, RATE_LIMIT) of an adopted write. Required fix: upload the live tab's own writes and other nodes' writes alongside an adoption (one session per node, or multiplex by bounded time slices), give up an adoption that makes no progress and move on round-robin, and order adoption by causal dependencies across local nodes (a cross-node causalDep must upload first). Repro packages/test/tests/repro/RT-46.test.ts."
+  },
+  {
+   "id": "RT-47",
+   "title": "RT-36 residual: the terminal-rejection marker is client-only and not covered by any durability barrier; a device that loses the tail of its database after a rejection (IndexedDB 500 ms window, restored copy) resubmits the refused op, and the server applies it",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-47.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:2780-2785 (recordTerminalRejections on a non-retriable rejection; no durability barrier before the outcome is acted on), store/src/sync/local-sync-records.ts:111; server keeps no record of refused ids (server/src/session/client-session.ts sendOperationRejected). Repro: the device database is snapshotted while the server judges the upload (sent flag durable, rejection not yet received), the refusal (INSUFFICIENT_FUNDS) is recorded, the snapshot is restored, the balance recovers: the withdrawal is applied. Required fix: the server remembers refused operation ids (with the original code) and answers a resubmission with the original rejection (the optional half of the RT-36 fix); client side, flush the marker durably (ensureDurable) before acting on the rejection. Repro packages/test/tests/repro/RT-47.test.ts."
+  },
+  {
+   "id": "RT-48",
+   "title": "The second op of an RT-37 legacy pair never reaches a version-vector client that already holds the first (getOperationRange starts above the client's entry); mixed fleets diverge on vector clients",
+   "severity": "P3",
+   "workstream": "W5",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-48.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Location: server/src/session/client-session.ts:2517 collectDeltaOperations (range clientSeq + 1 .. serverSeq per node). Repro (memory, SQLite and Postgres 16): a beta.13 writer uploads X@1; a vector client receives it and disconnects; the writer's concurrent transaction Y@1 is stored as a legacy pair; the vector client reconnects with {writer: 1} and receives nothing. The live relay covers only a connected peer; the delivery stream (watermark clients) is fine. The beta.13 server had the same gap; RT-37 keeps creating such pairs for every beta.13 writer. Required fix: the vector delta also sends ops stored as the non-sole holder of a (node, seq) at or below the client's entry that were stored after the client's last session (track per-node pair delivery sequences), or force vector clients to a full resync when the server stored a legacy pair for a node they track; document that vector clients must upgrade. Repro packages/server/tests/repro/RT-48.test.ts."
+  },
+  {
+   "id": "RT-49",
+   "title": "A permanent local persistence failure (IndexedDB quota exceeded) makes the RT-35 durability barrier stop every upload while the app keeps writing in memory: writes the reachable server could have kept are lost on reload",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 2,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-49.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 2 red-team review round 2, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 2). Locations: sync/src/engine/sync-engine.ts:2074-2093 sendUpload (barrier failure returns the batch and retries forever, UPLOAD_NOT_DURABLE), 1926-1932 (initial delta); store/src/adapters/indexeddb-persistence-scheduler.ts flushBarrier. Repro: the store's ensureDurable rejects (QuotaExceededError) after the first sync; a new write never reaches the reachable server after 3 reconnects. Since RT-35, a device that loses its tail recovers it from the server (handshake raise + full resync, renumber on SEQUENCE_CONFLICT), so uploading a non-durable op is no longer what loses data; withholding it is. Required fix: treat a persistently failing barrier (N attempts or T seconds, or a quota error) as degraded mode: upload anyway (the RT-35 recovery covers the reuse), surface a sync status error (store not durable) so the app can warn the user, and keep the barrier for transient failures. Repro packages/test/tests/repro/RT-49.test.ts."
   }
  ],
  "rejectedProposalPins": {
