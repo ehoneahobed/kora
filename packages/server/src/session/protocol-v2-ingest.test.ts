@@ -49,6 +49,7 @@ async function note(
 async function setup(
 	extra: Partial<KoraSyncServerConfig> = {},
 	schema: SchemaDefinition = schemaV1,
+	storeAuthoritativeNodeIds?: string[],
 ): Promise<{
 	store: MemoryServerStore
 	login: (
@@ -56,7 +57,10 @@ async function setup(
 		handshake?: Record<string, unknown>,
 	) => Promise<{ send: (m: SyncMessage) => void; messages: SyncMessage[] }>
 }> {
-	const store = new MemoryServerStore('server-1')
+	const store = new MemoryServerStore(
+		'server-1',
+		storeAuthoritativeNodeIds ? { authoritativeNodeIds: storeAuthoritativeNodeIds } : undefined,
+	)
 	await store.setSchema(schema)
 	const server = new KoraSyncServer({ store, ...extra })
 	const login = async (nodeId: string, handshake: Record<string, unknown> = {}) => {
@@ -103,14 +107,16 @@ describe('protocol v2 handshake', () => {
 		const response = c.messages.find((m) => m.type === 'handshake-response')
 		if (response?.type !== 'handshake-response') throw new Error('no response')
 		expect(response.protocolVersion).toBe(2)
-		expect(response.authoritativeNodeIds).toEqual(['server-1', 'kora:scope-entry'])
+		expect(response.authoritativeNodeIds).toEqual(['server-1'])
 	})
 
-	test('configured authoritative node ids are sent as given', async () => {
-		const { login } = await setup({ authoritativeNodeIds: ['srv-a', 'srv-b'] })
+	test('the handshake sends exactly the node ids the store folds with', async () => {
+		const { login, store } = await setup({}, schemaV1, ['srv-a', 'srv-b'])
+		expect(store.getAuthoritativeNodeIds()).toEqual(['server-1', 'srv-a', 'srv-b'])
 		const c = await login('dev-a')
 		const response = c.messages.find((m) => m.type === 'handshake-response')
 		expect(response?.type === 'handshake-response' && response.authoritativeNodeIds).toEqual([
+			'server-1',
 			'srv-a',
 			'srv-b',
 		])

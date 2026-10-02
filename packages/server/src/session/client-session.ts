@@ -85,7 +85,7 @@ import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
-import { SCOPE_ENTRY_NODE_ID, buildScopeEntryOperation } from './scope-entry'
+import { buildScopeEntryOperation } from './scope-entry'
 import {
 	BATCH_LOOKUP_RATE_COST,
 	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
@@ -492,7 +492,9 @@ export interface ClientSessionOptions {
 	 * Node ids whose operations this server authors (protocol v2). Sent to clients in
 	 * the handshake response (`authoritativeNodeIds`); only operations from these nodes
 	 * may carry server-authored metadata (`fieldVersions`, `foldState`). Defaults to the
-	 * store's node id and the reserved scope-entry node.
+	 * ids the store folds with (`ServerStore.getAuthoritativeNodeIds`), which is what
+	 * `KoraSyncServer` always passes. Scope-entry operations (`kora:scope-entry`) are not
+	 * listed: they carry the server's fold state and are joined, never folded as writes.
 	 */
 	authoritativeNodeIds?: readonly string[]
 	/**
@@ -2697,7 +2699,9 @@ export class ClientSession {
 	/** Node ids this server authors operations under (protocol v2 handshake response). */
 	private serverAuthoritativeNodeIds(): string[] {
 		if (this.authoritativeNodeIds !== null) return [...this.authoritativeNodeIds]
-		return [...new Set([this.store.getNodeId(), SCOPE_ENTRY_NODE_ID])]
+		// Exactly the ids the server stores fold with (seam 3): a client that folded with
+		// a different set would resolve `merge('server-authoritative')` differently.
+		return this.store.getAuthoritativeNodeIds?.() ?? [this.store.getNodeId()]
 	}
 
 	/**

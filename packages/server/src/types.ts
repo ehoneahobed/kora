@@ -113,13 +113,6 @@ export interface KoraSyncServerConfig {
 	 */
 	appHeartbeatIntervalMs?: number
 	/**
-	 * Node ids whose operations this server authors (protocol v2). Sent to every client
-	 * in the handshake response; only operations from these nodes may carry
-	 * server-authored metadata (`fieldVersions`, `foldState`). Defaults to the store's
-	 * node id and the reserved scope-entry node (`kora:scope-entry`).
-	 */
-	authoritativeNodeIds?: string[]
-	/**
 	 * End-to-end encryption policy (protocol v2, ENC-3). With `required: true` an
 	 * uploaded plaintext operation that carries data is refused non-retriably
 	 * (`PLAINTEXT_REJECTED`), unless `allowPlaintextMigration` opens a migration window.

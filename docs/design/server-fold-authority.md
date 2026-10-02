@@ -25,8 +25,15 @@ orders writes by HLC stamps compared in JavaScript, never by a database collatio
 
 Server fold options: the Yjs richtext merger, no traces, and
 `authoritativeNodeIds` = the store's node id plus configured extras
-(`KoraSyncServer.authoritativeNodeIds`, for the handshake). Stores persist
-`hash_version` (CORE-1) with each operation.
+(`ServerStore.getAuthoritativeNodeIds()`). `KoraSyncServer.authoritativeNodeIds`
+returns that list and every session advertises exactly it in the handshake (one
+source of truth; there is no separate server option). Stores persist `hash_version`
+(CORE-1) and the encryption envelope (`encrypted`, protocol v2) with each operation.
+
+Envelope operations (end-to-end encryption) are folded like any other, over their
+cleartext scope fields only; sealed members are never materialized. An envelope with
+`data: null` creates its record (insert) and counts as a write against deletes, so the
+server's record existence agrees with the devices'.
 
 ## Re-materialization migration
 
