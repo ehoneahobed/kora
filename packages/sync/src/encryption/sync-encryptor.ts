@@ -1,8 +1,16 @@
 import { SyncError } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import type {
+	AtomicOp,
+	EncryptedEnvelopeField,
+	EncryptedOperationEnvelope,
+	HLCTimestamp,
+	Operation,
+	OperationType,
+} from '@korajs/core'
+import { canonicalize } from '@korajs/core/internal'
 import type { SerializedOperation } from '../protocol/messages'
 import { deriveVersionedKey } from './key-derivation'
-import type { EncryptedPayload, SyncEncryptionConfig, VersionedKey } from './types'
+import type { SyncEncryptionConfig, VersionedKey } from './types'
 
 /**
  * Thrown when encryption of operation data fails.
@@ -28,35 +36,65 @@ export class DecryptionError extends SyncError {
 /** AES-GCM initialization vector length in bytes (96 bits). NIST recommended. */
 const IV_LENGTH = 12
 
-/** Marker field to identify encrypted payloads during deserialization. */
-const ENCRYPTED_MARKER = '__kora_e2e_encrypted' as const
+/** Marker of the protocol-1 in-`data` payload (no integrity binding; no longer accepted). */
+const LEGACY_ENCRYPTED_MARKER = '__kora_e2e_encrypted' as const
+
+/** The members of an operation the envelope protects. */
+type EnvelopeMember = 'data' | 'previousData' | 'atomicOps'
 
 /**
- * Encrypts and decrypts operation `data` and `previousData` fields for
- * end-to-end encryption in the sync layer.
+ * The operation shape the encryptor works on: a domain {@link Operation} or its wire
+ * form {@link SerializedOperation} (same fields).
+ */
+interface EncryptableOperation {
+	id: string
+	nodeId: string
+	type: OperationType
+	collection: string
+	recordId: string
+	data: Record<string, unknown> | null
+	previousData: Record<string, unknown> | null
+	timestamp: HLCTimestamp
+	sequenceNumber: number
+	schemaVersion: number
+	atomicOps?: Record<string, AtomicOp>
+	hashVersion?: 1 | 2
+	encrypted?: EncryptedOperationEnvelope
+}
+
+/**
+ * End-to-end encryption of operations, envelope v2 (protocol v2; ENC-3, NEW-ENC-1).
  *
- * **Design principles:**
- * - Only `data` and `previousData` are encrypted. Metadata (id, nodeId,
- *   collection, timestamps, causalDeps, etc.) stays in cleartext so the
- *   server can route, deduplicate, and order operations.
- * - Each field encryption uses a unique random IV (12 bytes for AES-GCM),
- *   ensuring that encrypting the same data twice produces different ciphertext.
- * - Key rotation is supported via versioned keys. The key version is embedded
- *   in the {@link EncryptedPayload} so the decryptor can select the correct key.
- * - Unencrypted fields pass through during decryption (backward compatibility).
+ * **Envelope.** The plaintext `data`, `previousData` and `atomicOps` move into
+ * `op.encrypted` ({@link EncryptedOperationEnvelope}: alg, keyId, keyVersion and one
+ * AES-256-GCM ciphertext per member). On the wire `data` is null, or holds only the
+ * collection's documented cleartext scope fields (`cleartextFields`), so a schema-aware
+ * server stores the operation opaquely and can still evaluate scopes. Metadata (id,
+ * nodeId, collection, recordId, timestamp, sequence, causalDeps, schemaVersion) stays in
+ * cleartext so the server can route, deduplicate and order.
+ *
+ * **Binding (ENC-3).** Every ciphertext is authenticated with AES-GCM additional data
+ * canonical(nodeId, collection, recordId, type, timestamp, sequenceNumber, field,
+ * keyVersion, hashVersion): a ciphertext moved to another operation, record or member,
+ * or an envelope whose metadata was rewritten, fails authentication. `data` and
+ * `previousData` are always encrypted, even when null, so a delete is authenticated too.
+ * The operation id (the version-2 content hash of the PLAINTEXT) is verified after
+ * decryption by the sync engine (`verify-inbound.ts`).
+ *
+ * **Plaintext.** With encryption enabled an operation without an envelope is refused
+ * (a server must not be able to inject unauthenticated writes), unless the config opens
+ * a migration window (`allowPlaintextMigration`). Protocol-1 payloads (ciphertext inside
+ * `data`, no binding) are refused the same way.
+ *
+ * **Key id.** The envelope names its key material (`keyId`, a fingerprint of the
+ * key-derivation salt), so a device holding different material (ENC-1, Phase 4) reports
+ * a diagnosable mismatch rather than a bare authentication failure.
  *
  * @example
  * ```typescript
- * const encryptor = await SyncEncryptor.create({
- *   enabled: true,
- *   key: 'user-passphrase'
- * })
- *
- * // Encrypt before sending
- * const encrypted = await encryptor.encryptOperation(operation)
- *
- * // Decrypt after receiving
- * const decrypted = await encryptor.decryptOperation(encrypted)
+ * const encryptor = await SyncEncryptor.create({ enabled: true, key: 'user-passphrase' })
+ * const sealed = await encryptor.encryptOperation(operation)
+ * const opened = await encryptor.decryptOperation(sealed)
  * ```
  */
 export class SyncEncryptor {
@@ -67,10 +105,20 @@ export class SyncEncryptor {
 	private readonly keys: Map<number, VersionedKey>
 	/** The current key version used for encryption. */
 	private currentVersion: number
+	/** Fingerprint of each key version's material (cached). */
+	private readonly keyIds = new Map<number, Promise<string>>()
+	private readonly cleartextFields: Readonly<Record<string, readonly string[]>>
+	private readonly allowPlaintextMigration: boolean
 
-	private constructor(keys: Map<number, VersionedKey>, currentVersion: number) {
+	private constructor(
+		keys: Map<number, VersionedKey>,
+		currentVersion: number,
+		options: EncryptorOptions = {},
+	) {
 		this.keys = keys
 		this.currentVersion = currentVersion
+		this.cleartextFields = options.cleartextFields ?? {}
+		this.allowPlaintextMigration = options.allowPlaintextMigration === true
 	}
 
 	/**
@@ -80,8 +128,9 @@ export class SyncEncryptor {
 	 * derivation is async because it uses the Web Crypto API.
 	 *
 	 * @param config - Encryption configuration with passphrase
-	 * @param salt - Optional salt for deterministic key derivation (mainly for testing).
-	 *              If omitted, a random salt is generated.
+	 * @param salt - Optional salt for deterministic key derivation.
+	 *              If omitted, a random salt is generated (ENC-1: shared key
+	 *              material across devices is Phase 4 work).
 	 * @param iterations - Optional PBKDF2 iteration count. Defaults to the
 	 *              production-strength value. Lower it only in tests.
 	 * @returns A configured SyncEncryptor instance
@@ -113,7 +162,10 @@ export class SyncEncryptor {
 		const keys = new Map<number, VersionedKey>()
 		keys.set(1, versionedKey)
 
-		return new SyncEncryptor(keys, 1)
+		return new SyncEncryptor(keys, 1, {
+			...(config.cleartextFields ? { cleartextFields: config.cleartextFields } : {}),
+			...(config.allowPlaintextMigration ? { allowPlaintextMigration: true } : {}),
+		})
 	}
 
 	/**
@@ -123,10 +175,11 @@ export class SyncEncryptor {
 	 * or when you have already derived the keys externally.
 	 *
 	 * @param versionedKeys - Array of versioned keys. The highest version is used for encryption.
+	 * @param options - Cleartext scope fields and the plaintext migration window
 	 * @returns A configured SyncEncryptor instance
 	 * @throws {EncryptionError} If no keys are provided
 	 */
-	static fromKeys(versionedKeys: VersionedKey[]): SyncEncryptor {
+	static fromKeys(versionedKeys: VersionedKey[], options: EncryptorOptions = {}): SyncEncryptor {
 		if (versionedKeys.length === 0) {
 			throw new EncryptionError('At least one versioned key must be provided.')
 		}
@@ -141,7 +194,7 @@ export class SyncEncryptor {
 			}
 		}
 
-		return new SyncEncryptor(keys, maxVersion)
+		return new SyncEncryptor(keys, maxVersion, options)
 	}
 
 	/**
@@ -176,100 +229,72 @@ export class SyncEncryptor {
 	}
 
 	/**
-	 * Encrypt an operation's `data` and `previousData` fields.
+	 * The key id written into envelopes for a key version: a fingerprint of its
+	 * key-derivation salt (never the key itself).
 	 *
-	 * Returns a new Operation with encrypted field values. The original
-	 * operation is not mutated (operations are immutable).
+	 * @param version - Key version (defaults to the current one)
+	 */
+	async getKeyId(version: number = this.currentVersion): Promise<string> {
+		const key = this.keys.get(version)
+		if (!key) {
+			throw new EncryptionError(`Encryption key version ${version} not found.`, { version })
+		}
+		let cached = this.keyIds.get(version)
+		if (!cached) {
+			cached = keyFingerprint(key.salt)
+			this.keyIds.set(version, cached)
+		}
+		return cached
+	}
+
+	/**
+	 * Seal an operation into an envelope v2.
 	 *
-	 * Fields that are null (e.g., delete operations) remain null.
+	 * Returns a new operation (operations are immutable): `encrypted` holds the
+	 * ciphertexts, `data` is null or the collection's cleartext scope fields, and
+	 * `previousData`/`atomicOps` are removed. An operation that already carries an
+	 * envelope is returned unchanged.
 	 *
-	 * @param operation - The operation to encrypt
-	 * @returns A new operation with encrypted data fields
+	 * @param operation - The plaintext operation
+	 * @returns The sealed operation
 	 * @throws {EncryptionError} If encryption fails
 	 */
 	async encryptOperation(operation: Operation): Promise<Operation> {
-		const [encryptedData, encryptedPreviousData] = await Promise.all([
-			this.encryptField(operation.data, operation.id, 'data'),
-			this.encryptField(operation.previousData, operation.id, 'previousData'),
-		])
-
-		return {
-			...operation,
-			data: encryptedData,
-			previousData: encryptedPreviousData,
-		}
+		return this.seal(operation)
 	}
 
 	/**
-	 * Decrypt an operation's `data` and `previousData` fields.
+	 * Open an envelope v2 and restore the plaintext `data`, `previousData` and
+	 * `atomicOps`. The returned operation has no `encrypted` member.
 	 *
-	 * Returns a new Operation with the original field values restored.
-	 * The original operation is not mutated.
-	 *
-	 * If a field is null or not encrypted (no marker), it passes through unchanged.
-	 * This enables mixed plaintext/encrypted operations during migration.
-	 *
-	 * @param operation - The operation to decrypt
-	 * @returns A new operation with decrypted data fields
-	 * @throws {DecryptionError} If decryption fails (wrong key, tampered data, unsupported version)
+	 * @param operation - The sealed operation
+	 * @returns The plaintext operation (its id is NOT verified here; the caller does)
+	 * @throws {DecryptionError} On a plaintext operation (unless the migration window
+	 *   is open), a protocol-1 payload, an unknown key, a key-id mismatch, or a
+	 *   ciphertext that fails authentication (tampered, transplanted, wrong key)
 	 */
 	async decryptOperation(operation: Operation): Promise<Operation> {
-		const [decryptedData, decryptedPreviousData] = await Promise.all([
-			this.decryptField(operation.data, operation.id, 'data'),
-			this.decryptField(operation.previousData, operation.id, 'previousData'),
-		])
-
-		return {
-			...operation,
-			data: decryptedData,
-			previousData: decryptedPreviousData,
-		}
+		return this.open(operation)
 	}
 
 	/**
-	 * Encrypt a serialized operation's `data` and `previousData` fields.
-	 *
-	 * Same as {@link encryptOperation} but works with the wire-format
-	 * {@link SerializedOperation} type used by the serializer.
+	 * Same as {@link encryptOperation} for the wire form.
 	 *
 	 * @param serialized - The serialized operation to encrypt
-	 * @returns A new serialized operation with encrypted data fields
-	 * @throws {EncryptionError} If encryption fails
+	 * @returns The sealed serialized operation
 	 */
 	async encryptSerializedOperation(serialized: SerializedOperation): Promise<SerializedOperation> {
-		const [encryptedData, encryptedPreviousData] = await Promise.all([
-			this.encryptField(serialized.data, serialized.id, 'data'),
-			this.encryptField(serialized.previousData, serialized.id, 'previousData'),
-		])
-
-		return {
-			...serialized,
-			data: encryptedData,
-			previousData: encryptedPreviousData,
-		}
+		return this.seal(serialized)
 	}
 
 	/**
-	 * Decrypt a serialized operation's `data` and `previousData` fields.
-	 *
-	 * Same as {@link decryptOperation} but works with the wire-format
-	 * {@link SerializedOperation} type used by the serializer.
+	 * Same as {@link decryptOperation} for the wire form.
 	 *
 	 * @param serialized - The serialized operation to decrypt
-	 * @returns A new serialized operation with decrypted data fields
-	 * @throws {DecryptionError} If decryption fails
+	 * @returns The plaintext serialized operation
 	 */
 	async decryptSerializedOperation(serialized: SerializedOperation): Promise<SerializedOperation> {
-		const [decryptedData, decryptedPreviousData] = await Promise.all([
-			this.decryptField(serialized.data, serialized.id, 'data'),
-			this.decryptField(serialized.previousData, serialized.id, 'previousData'),
-		])
-
-		return {
-			...serialized,
-			data: decryptedData,
-			previousData: decryptedPreviousData,
-		}
+		return this.open(serialized)
 	}
 
 	/**
@@ -293,159 +318,283 @@ export class SyncEncryptor {
 	}
 
 	/**
-	 * Check if a field value contains an encrypted payload.
+	 * Check if an operation `data` field holds a protocol-1 encrypted payload (the
+	 * pre-envelope format, refused since protocol v2).
 	 *
 	 * @param field - An operation's `data` or `previousData` field
-	 * @returns true if the field contains an encrypted payload
 	 */
 	static isEncryptedPayload(field: Record<string, unknown> | null): boolean {
 		return isEncryptedPayload(field)
 	}
 
+	/** Whether an operation carries an envelope v2. */
+	static isEncryptedOperation(operation: { encrypted?: unknown }): boolean {
+		return operation.encrypted !== undefined && operation.encrypted !== null
+	}
+
 	// --- Private helpers ---
 
-	private async encryptField(
-		field: Record<string, unknown> | null,
-		operationId: string,
-		fieldName: string,
-	): Promise<Record<string, unknown> | null> {
-		if (field === null) {
-			return null
+	private async seal<T extends EncryptableOperation>(operation: T): Promise<T> {
+		if (operation.encrypted !== undefined) return operation
+		const keyVersion = this.currentVersion
+		const key = this.keys.get(keyVersion)
+		if (!key) {
+			throw new EncryptionError(`Current encryption key version ${keyVersion} not found.`, {
+				operationId: operation.id,
+			})
 		}
+		const keyId = await this.getKeyId(keyVersion)
+		const hasAtomicOps =
+			operation.atomicOps !== undefined && Object.keys(operation.atomicOps).length > 0
+		const [data, previousData, atomicOps] = await Promise.all([
+			this.encryptMember(operation, 'data', operation.data, key, keyVersion),
+			this.encryptMember(operation, 'previousData', operation.previousData, key, keyVersion),
+			hasAtomicOps
+				? this.encryptMember(operation, 'atomicOps', operation.atomicOps ?? null, key, keyVersion)
+				: Promise.resolve(null),
+		])
+		const envelope: EncryptedOperationEnvelope = {
+			v: 2,
+			alg: 'aes-256-gcm',
+			keyId,
+			keyVersion,
+			data,
+			previousData,
+			...(atomicOps !== null ? { atomicOps } : {}),
+		}
+		const { atomicOps: _plainAtomic, ...rest } = operation
+		return {
+			...rest,
+			data: this.cleartextScope(operation),
+			previousData: null,
+			encrypted: envelope,
+		} as T
+	}
 
-		const currentKey = this.keys.get(this.currentVersion)
-		if (!currentKey) {
-			throw new EncryptionError(
-				`Current encryption key version ${this.currentVersion} not found.`,
-				{ operationId, fieldName },
+	private async open<T extends EncryptableOperation>(operation: T): Promise<T> {
+		const envelope = operation.encrypted
+		if (envelope === undefined || envelope === null) {
+			if (isEncryptedPayload(operation.data) || isEncryptedPayload(operation.previousData)) {
+				throw new DecryptionError(
+					`Operation ${operation.id} carries a protocol-1 encrypted payload (ciphertext inside data, not bound to the operation). Protocol v2 accepts only the encryption envelope; re-sync from an upgraded client.`,
+					{ operationId: operation.id, code: 'LEGACY_ENCRYPTED_PAYLOAD' },
+				)
+			}
+			if (this.allowPlaintextMigration) return operation
+			throw new DecryptionError(
+				`Operation ${operation.id} is not encrypted, but end-to-end encryption is enabled: a plaintext operation could have been written by anyone who can reach the sync server. It is refused. During a migration from plaintext sync, set encryption.allowPlaintextMigration.`,
+				{ operationId: operation.id, code: 'PLAINTEXT_REJECTED' },
 			)
 		}
+		if (envelope.v !== 2 || envelope.alg !== 'aes-256-gcm') {
+			throw new DecryptionError(
+				`Unsupported encryption envelope (v${String(envelope.v)}, ${String(envelope.alg)}) on operation ${operation.id}. Update @korajs/sync.`,
+				{ operationId: operation.id },
+			)
+		}
+		const key = this.keys.get(envelope.keyVersion)
+		if (!key) {
+			throw new DecryptionError(
+				`No encryption key available for version ${envelope.keyVersion} (key id ${envelope.keyId}). This operation was encrypted with a key that is not registered. If you rotated keys, ensure all previous key versions are provided.`,
+				{
+					operationId: operation.id,
+					keyVersion: envelope.keyVersion,
+					keyId: envelope.keyId,
+					availableVersions: [...this.keys.keys()],
+				},
+			)
+		}
+		const localKeyId = await this.getKeyId(envelope.keyVersion)
+		if (localKeyId !== envelope.keyId) {
+			throw new DecryptionError(
+				`Operation ${operation.id} was encrypted with key material "${envelope.keyId}" (version ${envelope.keyVersion}), but this device holds "${localKeyId}". The devices derived different keys: they need the same passphrase AND the same key-derivation salt.`,
+				{
+					operationId: operation.id,
+					code: 'KEY_ID_MISMATCH',
+					keyId: envelope.keyId,
+					localKeyId,
+					keyVersion: envelope.keyVersion,
+				},
+			)
+		}
+		if (envelope.data === null || envelope.previousData === null) {
+			throw new DecryptionError(
+				`Operation ${operation.id} has an incomplete encryption envelope (data and previousData must both be sealed).`,
+				{ operationId: operation.id },
+			)
+		}
+		const [data, previousData, atomicOps] = await Promise.all([
+			this.decryptMember(operation, 'data', envelope.data, key, envelope.keyVersion),
+			this.decryptMember(
+				operation,
+				'previousData',
+				envelope.previousData,
+				key,
+				envelope.keyVersion,
+			),
+			envelope.atomicOps
+				? this.decryptMember(operation, 'atomicOps', envelope.atomicOps, key, envelope.keyVersion)
+				: Promise.resolve(null),
+		])
+		const { encrypted: _sealed, atomicOps: _unsealedAtomic, ...rest } = operation
+		return {
+			...rest,
+			data,
+			previousData,
+			...(atomicOps !== null ? { atomicOps: atomicOps as Record<string, AtomicOp> } : {}),
+		} as T
+	}
 
+	/** The collection's documented cleartext scope fields, or null when none. */
+	private cleartextScope(operation: EncryptableOperation): Record<string, unknown> | null {
+		const fields = this.cleartextFields[operation.collection]
+		if (!fields || fields.length === 0 || operation.data === null) return null
+		const scope: Record<string, unknown> = {}
+		for (const field of fields) {
+			if (field in operation.data) scope[field] = operation.data[field]
+		}
+		return Object.keys(scope).length > 0 ? scope : null
+	}
+
+	private async encryptMember(
+		operation: EncryptableOperation,
+		member: EnvelopeMember,
+		value: Record<string, unknown> | null,
+		key: VersionedKey,
+		keyVersion: number,
+	): Promise<EncryptedEnvelopeField> {
 		try {
-			const plaintext = new TextEncoder().encode(JSON.stringify(field))
-
-			// Generate a fresh random IV for each field encryption.
-			// AES-GCM with a 96-bit IV is the recommended configuration per NIST SP 800-38D.
+			const plaintext = new TextEncoder().encode(JSON.stringify(value))
+			// A fresh random IV per member encryption (NIST SP 800-38D, 96-bit IV).
 			const iv = globalThis.crypto.getRandomValues(new Uint8Array(IV_LENGTH))
-
-			const ciphertextBuffer = await globalThis.crypto.subtle.encrypt(
-				{ name: 'AES-GCM', iv: iv as unknown as ArrayBuffer },
-				currentKey.key,
+			const ciphertext = await globalThis.crypto.subtle.encrypt(
+				{
+					name: 'AES-GCM',
+					iv: iv as unknown as ArrayBuffer,
+					additionalData: additionalData(operation, member, keyVersion) as unknown as ArrayBuffer,
+				},
+				key.key,
 				plaintext as unknown as ArrayBuffer,
 			)
-
-			const payload: EncryptedPayload = {
-				v: this.currentVersion,
-				iv: toBase64(iv),
-				ct: toBase64(new Uint8Array(ciphertextBuffer)),
-				alg: 'aes-256-gcm',
-			}
-
-			// Wrap in an object with the encrypted marker so we can detect it later
-			return {
-				[ENCRYPTED_MARKER]: true,
-				...payload,
-			}
+			return { iv: toBase64(iv), ct: toBase64(new Uint8Array(ciphertext)) }
 		} catch (cause) {
-			if (cause instanceof EncryptionError) {
-				throw cause
-			}
 			throw new EncryptionError(
-				`Failed to encrypt operation ${fieldName} field. Ensure the encryption key is valid and crypto.subtle is available.`,
+				`Failed to encrypt operation ${member}. Ensure the encryption key is valid and crypto.subtle is available.`,
 				{
-					operationId,
-					fieldName,
+					operationId: operation.id,
+					fieldName: member,
 					cause: cause instanceof Error ? cause.message : String(cause),
 				},
 			)
 		}
 	}
 
-	private async decryptField(
-		field: Record<string, unknown> | null,
-		operationId: string,
-		fieldName: string,
+	private async decryptMember(
+		operation: EncryptableOperation,
+		member: EnvelopeMember,
+		sealed: EncryptedEnvelopeField,
+		key: VersionedKey,
+		keyVersion: number,
 	): Promise<Record<string, unknown> | null> {
-		if (field === null) {
-			return null
-		}
-
-		// Pass through unencrypted fields (backward compatibility / mixed mode)
-		if (!isEncryptedPayload(field)) {
-			return field
-		}
-
-		const payload = field as unknown as EncryptedPayload & { [ENCRYPTED_MARKER]: true }
-
-		const keyVersion = payload.v
-		const key = this.keys.get(keyVersion)
-
-		if (!key) {
-			throw new DecryptionError(
-				`No encryption key available for version ${keyVersion}. This operation was encrypted with a key that is not registered. If you rotated keys, ensure all previous key versions are provided.`,
-				{ operationId, fieldName, keyVersion, availableVersions: [...this.keys.keys()] },
-			)
-		}
-
-		if (payload.alg !== 'aes-256-gcm') {
-			throw new DecryptionError(
-				`Unsupported encryption algorithm: "${payload.alg}". Only "aes-256-gcm" is supported. Update your @korajs/sync package.`,
-				{ operationId, fieldName, algorithm: payload.alg },
-			)
-		}
-
+		let parsed: unknown
 		try {
-			const iv = fromBase64(payload.iv)
-			const ciphertext = fromBase64(payload.ct)
-
-			const plaintextBuffer = await globalThis.crypto.subtle.decrypt(
-				{ name: 'AES-GCM', iv: iv as unknown as ArrayBuffer },
-				key.key,
-				ciphertext as unknown as ArrayBuffer,
-			)
-
-			const json = new TextDecoder().decode(plaintextBuffer)
-			const parsed: unknown = JSON.parse(json)
-
-			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-				throw new DecryptionError(`Decrypted ${fieldName} is not a valid record object.`, {
-					operationId,
-					fieldName,
-				})
-			}
-
-			return parsed as Record<string, unknown>
-		} catch (cause) {
-			if (cause instanceof DecryptionError) {
-				throw cause
-			}
-			throw new DecryptionError(
-				`Failed to decrypt operation ${fieldName} field. This may indicate a wrong encryption key, tampered ciphertext, or corrupted data.`,
+			const plaintext = await globalThis.crypto.subtle.decrypt(
 				{
-					operationId,
-					fieldName,
+					name: 'AES-GCM',
+					iv: fromBase64(sealed.iv) as unknown as ArrayBuffer,
+					additionalData: additionalData(operation, member, keyVersion) as unknown as ArrayBuffer,
+				},
+				key.key,
+				fromBase64(sealed.ct) as unknown as ArrayBuffer,
+			)
+			parsed = JSON.parse(new TextDecoder().decode(plaintext))
+		} catch (cause) {
+			throw new DecryptionError(
+				`Failed to decrypt operation ${member}: the ciphertext does not authenticate against this operation. It was tampered with, moved from another operation, record or field, or encrypted with a different key.`,
+				{
+					operationId: operation.id,
+					fieldName: member,
 					keyVersion,
 					cause: cause instanceof Error ? cause.message : String(cause),
 				},
 			)
 		}
+		if (parsed === null) return null
+		if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+			throw new DecryptionError(`Decrypted ${member} is not a valid record object.`, {
+				operationId: operation.id,
+				fieldName: member,
+			})
+		}
+		return parsed as Record<string, unknown>
 	}
+}
+
+/** Options of {@link SyncEncryptor.fromKeys}. */
+export interface EncryptorOptions {
+	/** Per collection, the data fields kept in cleartext beside the envelope (for scopes). */
+	cleartextFields?: Readonly<Record<string, readonly string[]>>
+	/** Accept plaintext (envelope-less) inbound operations during a migration window. */
+	allowPlaintextMigration?: boolean
+}
+
+/**
+ * AES-GCM additional authenticated data of one envelope member (ENC-3): canonical
+ * JSON of (nodeId, collection, recordId, type, timestamp, sequenceNumber, field,
+ * keyVersion, hashVersion). The declared hash version is bound too, so an envelope's
+ * id cannot be downgraded to the weaker version-1 hash in transit.
+ */
+function additionalData(
+	operation: EncryptableOperation,
+	member: EnvelopeMember,
+	keyVersion: number,
+): Uint8Array {
+	return new TextEncoder().encode(
+		canonicalize({
+			nodeId: operation.nodeId,
+			collection: operation.collection,
+			recordId: operation.recordId,
+			type: operation.type,
+			timestamp: {
+				wallTime: operation.timestamp.wallTime,
+				logical: operation.timestamp.logical,
+				nodeId: operation.timestamp.nodeId,
+			},
+			sequenceNumber: operation.sequenceNumber,
+			field: member,
+			keyVersion,
+			hashVersion: operation.hashVersion ?? 1,
+		}),
+	)
+}
+
+/** First 16 hex chars of SHA-256("kora-key-id" || salt): names key material, reveals nothing. */
+async function keyFingerprint(salt: Uint8Array): Promise<string> {
+	const prefix = new TextEncoder().encode('kora-key-id\u0000')
+	const input = new Uint8Array(prefix.length + salt.length)
+	input.set(prefix, 0)
+	input.set(salt, prefix.length)
+	const digest = new Uint8Array(
+		await globalThis.crypto.subtle.digest('SHA-256', input as unknown as ArrayBuffer),
+	)
+	return `k1-${Array.from(digest.slice(0, 8), (b) => b.toString(16).padStart(2, '0')).join('')}`
 }
 
 // --- Utility functions ---
 
 /**
- * Check if a field value contains an encrypted payload.
+ * Check if a field value contains a protocol-1 encrypted payload (ciphertext inside
+ * `data`). Protocol v2 refuses such payloads; the envelope lives in `op.encrypted`.
  *
  * @param field - An operation's `data` or `previousData` field
- * @returns true if the field contains an encrypted payload
+ * @returns true if the field contains a protocol-1 encrypted payload
  */
 export function isEncryptedPayload(field: Record<string, unknown> | null): boolean {
 	if (field === null || typeof field !== 'object') {
 		return false
 	}
 	return (
-		field[ENCRYPTED_MARKER] === true &&
+		field[LEGACY_ENCRYPTED_MARKER] === true &&
 		typeof field.v === 'number' &&
 		typeof field.iv === 'string' &&
 		typeof field.ct === 'string' &&
@@ -455,10 +604,6 @@ export function isEncryptedPayload(field: Record<string, unknown> | null): boole
 
 // --- Base64 helpers ---
 
-/**
- * Encode a Uint8Array to a base64 string.
- * Uses standard base64 (not URL-safe) for compatibility with JSON serialization.
- */
 function toBase64(bytes: Uint8Array): string {
 	let binary = ''
 	for (let i = 0; i < bytes.length; i++) {
@@ -467,9 +612,6 @@ function toBase64(bytes: Uint8Array): string {
 	return btoa(binary)
 }
 
-/**
- * Decode a base64 string to a Uint8Array.
- */
 function fromBase64(str: string): Uint8Array {
 	const binary = atob(str)
 	const bytes = new Uint8Array(binary.length)

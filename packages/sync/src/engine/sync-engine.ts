@@ -81,6 +81,7 @@ import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
 import type { SyncStore } from './sync-store'
+import { verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
@@ -2737,6 +2738,16 @@ export class SyncEngine {
 			}
 		}
 
+		// Content-addressed id check (CORE-1, protocol v2), on the plaintext and before
+		// any transform. A forged or altered operation is kept in quarantine, never
+		// applied; it never verifies later, so the replay leaves it there.
+		const integrity = await verifyInboundOperation(op, {
+			encrypted: delivered.encrypted !== undefined,
+		})
+		if (!integrity.ok) {
+			return quarantine(delivered, integrity.code, integrity.message, 'rejected', false, null)
+		}
+
 		// A far-future timestamp is never applied: adopting it would make every later
 		// local edit lose to it until real time caught up (SYNC-7). The HLC also refuses
 		// it once warm; this check covers a cold clock and does not depend on the store.
@@ -2921,6 +2932,9 @@ export class SyncEngine {
 			} catch {
 				return false
 			}
+		}
+		if (!(await verifyInboundOperation(op, { encrypted: stored.encrypted !== undefined })).ok) {
+			return false
 		}
 		const reference = Date.now() + (this.clockSkewMs ?? 0)
 		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) return false

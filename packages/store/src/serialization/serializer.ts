@@ -80,13 +80,21 @@ const MUTATION_NAME_KEY = '__kora_mutation__'
 const FIELD_VERSIONS_KEY = '__kora_field_versions__'
 
 /**
+ * Internal key used to embed the operation's content-hash version (CORE-1, protocol
+ * v2) in the data JSON column. Absent means version 1. Kept in the row so id
+ * verification and re-hashing (rebase, rotation, resequence) use the right version.
+ */
+const HASH_VERSION_KEY = '__kora_hash_version__'
+
+/**
  * Serialize an Operation to a row for the operations log table.
  *
  * @param op - The operation to serialize
  * @returns An OperationRow suitable for SQL INSERT
  */
 export function serializeOperation(op: Operation): OperationRow {
-	const hasMetadata = op.transactionId !== undefined || op.mutationName !== undefined
+	const hasMetadata =
+		op.transactionId !== undefined || op.mutationName !== undefined || op.hashVersion !== undefined
 	let dataPayload: Record<string, unknown> | null = null
 	if (op.data) {
 		// Embed metadata in the data JSON when present
@@ -103,6 +111,9 @@ export function serializeOperation(op: Operation): OperationRow {
 		if (op.fieldVersions !== undefined) {
 			dataPayload[FIELD_VERSIONS_KEY] = op.fieldVersions
 		}
+		if (op.hashVersion !== undefined) {
+			dataPayload[HASH_VERSION_KEY] = op.hashVersion
+		}
 	} else if (hasMetadata) {
 		// For delete operations (data is null), we still need to store metadata
 		dataPayload = {}
@@ -111,6 +122,9 @@ export function serializeOperation(op: Operation): OperationRow {
 		}
 		if (op.mutationName !== undefined) {
 			dataPayload[MUTATION_NAME_KEY] = op.mutationName
+		}
+		if (op.hashVersion !== undefined) {
+			dataPayload[HASH_VERSION_KEY] = op.hashVersion
 		}
 	}
 
@@ -140,6 +154,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 	let transactionId: string | undefined
 	let mutationName: string | undefined
 	let fieldVersions: Operation['fieldVersions']
+	let hashVersion: Operation['hashVersion']
 
 	if (row.data) {
 		const parsed = JSON.parse(row.data) as Record<string, unknown>
@@ -156,12 +171,16 @@ export function deserializeOperation(row: OperationRow): Operation {
 		if (FIELD_VERSIONS_KEY in parsed) {
 			fieldVersions = parsed[FIELD_VERSIONS_KEY] as Operation['fieldVersions']
 		}
+		if (HASH_VERSION_KEY in parsed) {
+			hashVersion = parsed[HASH_VERSION_KEY] as Operation['hashVersion']
+		}
 		// Remove metadata keys from data
 		const {
 			[ATOMIC_OPS_KEY]: _a,
 			[TX_ID_KEY]: _t,
 			[MUTATION_NAME_KEY]: _m,
 			[FIELD_VERSIONS_KEY]: _f,
+			[HASH_VERSION_KEY]: _h,
 			...rest
 		} = parsed
 		data = Object.keys(rest).length > 0 ? rest : null
@@ -185,6 +204,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 		...(transactionId !== undefined ? { transactionId } : {}),
 		...(mutationName !== undefined ? { mutationName } : {}),
 		...(fieldVersions !== undefined ? { fieldVersions } : {}),
+		...(hashVersion !== undefined ? { hashVersion } : {}),
 	}
 }
 

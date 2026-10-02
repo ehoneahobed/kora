@@ -1,4 +1,4 @@
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema, t, verifyOperationId } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
@@ -186,22 +186,32 @@ describe('Store sequence recovery (RT-35)', () => {
 		expect(ops.map((op) => op.sequenceNumber)).toEqual([1, 5])
 	})
 
-	test('resequenceOperation renumbers above the floor, keeps the id and records the old identity', async () => {
+	test('resequenceOperation renumbers a version-2 op above the floor under a re-hashed id', async () => {
 		const { store: s, adapter } = await openStore()
 		const node = s.getNodeId()
 		await s.collection('todos').insert({ title: 'one' })
 		const [op] = await s.getOperationRange(node, 1, 1)
 		if (!op) throw new Error('missing op')
+		expect(op.hashVersion).toBe(2)
 		const renumbered = await s.resequenceOperation(op.id, node, 6)
-		expect(renumbered?.id).toBe(op.id)
-		expect(renumbered?.sequenceNumber).toBe(7)
-		expect((await s.getOperationRange(node, 7, 7)).map((o) => o.id)).toEqual([op.id])
+		if (!renumbered) throw new Error('not renumbered')
+		// A version-2 id covers the sequence number (CORE-1): new number, new id, still valid.
+		expect(renumbered.sequenceNumber).toBe(7)
+		expect(renumbered.id).not.toBe(op.id)
+		expect(renumbered.hashVersion).toBe(2)
+		expect(await verifyOperationId(renumbered)).toBe(true)
+		expect((await s.getOperationRange(node, 7, 7)).map((o) => o.id)).toEqual([renumbered.id])
 		expect(await s.getOperationRange(node, 1, 1)).toEqual([])
-		const conflicts = await adapter.query<{ reason: string; new_sequence_number: number }>(
-			'SELECT reason, new_sequence_number FROM _kora_seq_conflicts WHERE id = ?',
-			[op.id],
-		)
-		expect(conflicts).toEqual([{ reason: 'server-sequence-conflict', new_sequence_number: 7 }])
+		const conflicts = await adapter.query<{
+			reason: string
+			new_sequence_number: number
+			reemitted_as: string
+		}>('SELECT reason, new_sequence_number, reemitted_as FROM _kora_seq_conflicts WHERE id = ?', [
+			op.id,
+		])
+		expect(conflicts).toEqual([
+			{ reason: 'server-sequence-conflict', new_sequence_number: 7, reemitted_as: renumbered.id },
+		])
 		expect(await s.resequenceOperation('missing', node, 1)).toBeNull()
 	})
 
