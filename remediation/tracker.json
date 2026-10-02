@@ -1242,14 +1242,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-13.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4). New packages/store/src/migrations/run-migrations.ts: each schema version runs in ONE transaction (structural DDL, every backfill, the schema_version write); a throwing backfill or a crash leaves nothing of that version, versions already committed are not repeated. Backfills write update operations through the single local write path (writeUpdateInTx: in-tx sequence reservation, per-field stamps, previousData) with mutationName migration:v<N>, so they sync; core migrate().backfill(collection, transform, { localOnly: true }) rewrites rows only. Store.open now loads the node id and clock before migrations. Unchanged values write nothing; fields outside the schema fail the version (MIGRATION_UNKNOWN_FIELD). Tests: store migration.test.ts (STORE-13 block), core migration-builder.test.ts. Docs: guide/schema-design.md, api/core.md."
   },
   {
    "id": "STORE-14",
@@ -1299,14 +1299,14 @@
    "severity": "P2",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4): backfill transforms receive deserializeRecord(row) (typed booleans, arrays, objects); returned values go through validateRecord + serializeRecord on the write path. Tests: store migration.test.ts."
   },
   {
    "id": "NEW-STORE-2",

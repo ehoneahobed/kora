@@ -5,14 +5,12 @@ import {
 	createVersionVector,
 	expandFieldVersionedOperations,
 	generateUUIDv7,
-	migrationStepsToSQL,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
 	HLCTimestamp,
 	KoraEventEmitter,
-	MigrationStep,
 	Operation,
 	OperationLog,
 	SchemaDefinition,
@@ -39,6 +37,7 @@ import {
 	serializeFieldVersions,
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
+import { runSchemaMigrations } from '../migrations/run-migrations'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -2127,108 +2126,25 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Check the stored schema version and run any pending migrations.
-	 * Migrations are applied in version order within a transaction.
+	 * Run pending schema migrations (STORE-13, NEW-STORE-1): one transaction per version
+	 * (DDL, backfills, `schema_version`); backfills write operations through the local
+	 * write path so they sync, unless declared `localOnly`.
 	 */
 	private async runMigrationsIfNeeded(): Promise<void> {
-		const storedVersion = await this.getStoredSchemaVersion()
-		const targetVersion = this.schema.version
-
-		if (storedVersion >= targetVersion) {
-			// Already up to date (or first run with version 1)
-			if (storedVersion === 0) {
-				// First open — store the initial version
-				await this.adapter.execute(
-					"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-					[String(targetVersion)],
-				)
-			}
-			return
-		}
-
-		// Run each migration in order from storedVersion+1 to targetVersion
-		const migrations = this.schema.migrations ?? {}
-		for (let v = storedVersion + 1; v <= targetVersion; v++) {
-			const migration = migrations[v]
-			if (!migration) continue
-
-			// Generate SQL from structural steps
-			const sqlStatements = migrationStepsToSQL(migration.steps)
-
-			// Execute structural changes individually, tolerating "duplicate column" errors
-			// because generateSQL already emits --kora:safe-alter ALTER TABLE statements
-			// for the current schema's columns (run via generateFullDDL in adapter.open()).
-			for (const sql of sqlStatements) {
-				try {
-					await this.adapter.execute(sql)
-				} catch (e) {
-					const msg = (e as Error).message || ''
-					if (!msg.includes('duplicate column name')) {
-						throw e
-					}
-					// Column already exists (added by safe-alter in generateSQL) — safe to skip
-				}
-			}
-
-			// Run backfills in a transaction
-			const backfillSteps = migration.steps.filter(
-				(s): s is Extract<MigrationStep, { type: 'backfill' }> => s.type === 'backfill',
-			)
-			for (const step of backfillSteps) {
-				await this.runBackfill(step.collection, step.transform)
-			}
-		}
-
-		// Update stored schema version
-		await this.adapter.execute(
-			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-			[String(targetVersion)],
-		)
-	}
-
-	/**
-	 * Get the stored schema version from _kora_meta. Returns 0 if not set.
-	 */
-	private async getStoredSchemaVersion(): Promise<number> {
-		const rows = await this.adapter.query<MetaRow>(
-			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
-		)
-		return rows[0] ? Number(rows[0].value) : 0
-	}
-
-	/**
-	 * Run a backfill transform on all records in a collection.
-	 * Reads all rows, applies the transform, and updates changed fields.
-	 */
-	private async runBackfill(
-		collection: string,
-		transform: (record: Record<string, unknown>) => Record<string, unknown>,
-	): Promise<void> {
-		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
-		)
-
-		await this.adapter.transaction(async (tx) => {
-			for (const row of rows) {
-				const updates = transform(row as Record<string, unknown>)
-				const fields = Object.keys(updates)
-				if (fields.length === 0) continue
-
-				const setClauses = fields.map((f) => `${quoteIdent(f)} = ?`).join(', ')
-				const values = fields.map((f) => {
-					const val = updates[f]
-					// Serialize booleans to 0/1 for SQLite
-					if (typeof val === 'boolean') return val ? 1 : 0
-					// Serialize arrays/objects to JSON
-					if (Array.isArray(val) || (typeof val === 'object' && val !== null)) {
-						return JSON.stringify(val)
-					}
-					return val
-				})
-				values.push(row.id)
-
-				await tx.execute(`UPDATE ${quoteIdent(collection)} SET ${setClauses} WHERE id = ?`, values)
-			}
+		const clock = this.clock
+		if (!clock) throw new StoreNotOpenError()
+		await runSchemaMigrations({
+			adapter: this.adapter,
+			schema: this.schema,
+			env: {
+				schema: this.schema,
+				clock,
+				nodeId: this.nodeId,
+				relationEnforcer: null,
+				...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			},
+			causalTracker: this.causalTracker,
+			onOperation: (operation) => this.publishLocalOperation(operation.collection, operation),
 		})
 	}
 

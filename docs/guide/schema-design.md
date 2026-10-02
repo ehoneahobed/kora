@@ -483,6 +483,34 @@ export default defineSchema({
 })
 ```
 
+How a version is applied when the app opens a database written by an older version:
+
+- **One transaction per version.** The version's structural changes, all of its backfills
+  and the stored schema version are committed together. If a backfill throws (or the app
+  crashes mid-migration) nothing of that version is applied, and the next open runs it
+  again from the start, so a non-idempotent backfill (such as `qty * 10`) never runs twice
+  on the same data. Versions that already committed are not repeated.
+- **Typed records.** The transform receives each live record as the app reads it
+  (booleans, arrays, objects, timestamps), and returns the fields to change. Returning the
+  record's own unchanged values (`{ ...record, priority }`) is fine: only changed fields
+  are written.
+- **Backfills sync.** Every changed record is written through the normal local write path
+  as an update operation with the mutation name `migration:v<N>`, so the backfilled values
+  reach the sync server and the user's other devices. A device that opens the new version
+  later receives them like any other update.
+- **Device-local data.** For values that must not sync (a local cache, a derived column),
+  declare the backfill local-only. It rewrites rows on this device without operations:
+
+  ```typescript
+  migrate().backfill('todos', (record) => ({ searchKey: String(record.title).toLowerCase() }), {
+    localOnly: true,
+  })
+  ```
+
+Backfill updates go through the same checks as any update (field validation, state
+machines). A backfill that would make a transition the collection's state machine
+rejects fails the migration; make such fixes local-only or adjust the state machine.
+
 ### Migration Rollbacks
 
 Kora can auto-generate rollback steps for most migration operations:
