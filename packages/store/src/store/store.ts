@@ -2072,16 +2072,125 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Restore data from a backup binary.
+	 * Restore data from a backup binary (format version 2, STORE-5).
+	 *
+	 * - `merge: true`: every backup operation is applied through the remote-apply path
+	 *   (deduplicated by id, merged per field), the version vector advances by MAX, and
+	 *   nothing of the exporting device's identity or sync state is imported.
+	 * - Replace (default): the data is replaced by the backup's while this device keeps
+	 *   its node id, local nodes and principal bindings, its own sequence counters never
+	 *   move backwards, and unsynced own writes are kept (see
+	 *   `RestoreOptions.keepUnsyncedWrites`). Then {@link reloadFromDisk} runs.
+	 *
+	 * A version-1 file is refused (`errorCode: 'BACKUP_FORMAT_OUTDATED'`); convert it with
+	 * `convertBackupV1`.
 	 *
 	 * @param data - The backup data
-	 * @param options - Restore options (merge, collections, onProgress)
+	 * @param options - Restore options (merge, collections, keepUnsyncedWrites, onProgress)
+	 * @param internal - `applyOperation`: the app's remote-apply path (defaults to
+	 *   {@link applyRemoteOperation}); `createApp` passes the merge-aware pipeline sync uses
 	 * @returns Result of the restore operation
 	 */
-	async importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult> {
+	async importBackup(
+		data: Uint8Array,
+		options?: RestoreOptions,
+		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
+	): Promise<RestoreResult> {
 		this.ensureOpen()
-		const { restoreBackup: doRestore } = await import('../backup/backup')
-		return doRestore(this.adapter, this.schema, data, options)
+		const started = Date.now()
+		const onProgress = options?.onProgress ?? (() => {})
+		const { BackupFormatError, parseBackup } = await import('../backup/backup')
+		const { restoreMerge, restoreReplace } = await import('../backup/restore')
+		onProgress({ phase: 'verifying', progress: 0, message: 'Verifying backup' })
+		let parsed: Awaited<ReturnType<typeof parseBackup>>
+		try {
+			parsed = await parseBackup(
+				data,
+				options?.collections ? { collections: options.collections } : undefined,
+			)
+		} catch (error) {
+			if (!(error instanceof BackupFormatError)) throw error
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: error.message,
+				errorCode: error.code,
+				duration: Date.now() - started,
+			}
+		}
+		if (parsed.manifest.schemaVersion > this.schema.version) {
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: `The backup was written by schema version ${parsed.manifest.schemaVersion}; this app runs version ${this.schema.version}. Update the app before restoring it.`,
+				errorCode: 'BACKUP_SCHEMA_NEWER',
+				duration: Date.now() - started,
+			}
+		}
+		onProgress({ phase: 'restoring', progress: 0.3, message: 'Restoring' })
+		const host = {
+			adapter: this.adapter,
+			schema: this.schema,
+			applyOperation:
+				internal?.applyOperation ?? ((op: Operation) => this.applyRemoteOperation(op)),
+			listLocalNodes: () => listLocalNodes(this.adapter),
+		}
+		const counts = options?.merge
+			? await restoreMerge(host, parsed, options.collections !== undefined)
+			: await restoreReplace(host, parsed, {
+					collections: options?.collections ?? null,
+					keepUnsyncedWrites: options?.keepUnsyncedWrites ?? true,
+				})
+		await this.reloadFromDisk()
+		onProgress({ phase: 'restoring', progress: 1, message: 'Done' })
+		return {
+			operationsRestored: counts.operationsRestored,
+			recordsRestored: counts.recordsRestored,
+			...(options?.merge ? {} : { unsyncedWritesKept: counts.unsyncedWritesKept }),
+			success: true,
+			duration: Date.now() - started,
+		}
+	}
+
+	/**
+	 * Re-read this store's state from the database after it changed underneath it (a
+	 * backup restore): the node id, version vector and own sequence counter, the clock
+	 * (advanced past every timestamp in the log), and a fresh causal tracker. Every live
+	 * query re-runs. The local node registry and terminal rejections are always read
+	 * from the database, so they need no reload.
+	 */
+	async reloadFromDisk(): Promise<void> {
+		this.ensureOpen()
+		let nodeId = this.nodeId
+		if (!this.configNodeId && this.isolation !== 'per-tab') {
+			const rows = await this.adapter.query<MetaRow>(
+				"SELECT value FROM _kora_meta WHERE key = 'node_id'",
+			)
+			nodeId = rows[0]?.value ?? this.nodeId
+		}
+		await this.rebindToNode(nodeId)
+		const newest = await this.loadNewestLogTimestamp()
+		if (newest && this.clock) {
+			this.clock.advanceTo({ ...newest, nodeId: this.nodeId })
+		}
+		for (const collection of Object.keys(this.schema.collections)) {
+			this.subscriptionManager.invalidate(collection)
+		}
+	}
+
+	/** The greatest HLC timestamp in the operation log (canonical strings sort by HLC). */
+	private async loadNewestLogTimestamp(): Promise<HLCTimestamp | null> {
+		let newest: string | null = null
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ t: string | null }>(
+				`SELECT MAX(timestamp) AS t FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			const value = rows[0]?.t ?? null
+			if (value !== null && (newest === null || value > newest)) newest = value
+		}
+		return newest === null ? null : HybridLogicalClock.deserialize(newest)
 	}
 
 	/**

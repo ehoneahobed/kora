@@ -1119,14 +1119,14 @@
    "severity": "P0",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 1). Backup format version 2 (BACKUP_VERSION 2): canonical Operation NDJSON in HLC order (incl. atomicOps, transactionId, mutationName, fieldVersions, and ops kept only in _kora_seq_conflicts), raw rows incl. tombstones (bytes base64-tagged), version vector, terminal rejections; no _kora_meta at all. Read inside one transaction. Import parses and verifies every op through the canonical serializer (BackupFormatError). Merge mode: every op through the remote-apply path (app.importBackup passes the ApplyPipeline sync uses), vector by MAX, terminal markers added, node_id/node tokens/local nodes/principal bindings/watermarks/acked prefixes never imported. Replace mode (backup/restore.ts): one transaction wipes the target collections and loads ops + rows, keeps node id, tokens, local node registry, principal bindings, acked prefixes; own counters never move backwards; unacknowledged writes of an accepted node are always re-applied on top, other unsynced own writes when keepUnsyncedWrites (default true at store level; app.importBackup defaults it to whether sync is configured and refuses false with sync); a never-accepted node whose writes are dropped restarts its counter after the highest restored number (contiguous); delivery watermarks reset to 0, delta cursor dropped; dropped ops leave the outbound queue. Then Store.reloadFromDisk() (node id, vector, sequence counter, clock advanced past the newest logged timestamp, fresh causal tracker, every subscription invalidated). app.importBackup pauses sync for a replace and resumes it. Version-1 files are refused with BACKUP_FORMAT_OUTDATED; convertBackupV1(data, { dropUnrecoverable }) converts them (drops meta, recovers misread timestamps, decodes bytes). Breaking: restoreBackup(adapter, ...) is deprecated and now opens a temporary Store on the adapter (closing it). Tests: store backup/backup.test.ts, kora import-backup.test.ts. Docs: guide/backup-restore.md. Server backups (server-backup.ts) already used canonical Operation JSON and are unchanged."
   },
   {
    "id": "STORE-6",

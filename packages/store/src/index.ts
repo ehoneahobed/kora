@@ -140,12 +140,16 @@ export { pluralize, singularize } from './query/pluralize'
 
 // === Backup/Restore ===
 export {
+	BACKUP_VERSION,
+	BackupFormatError,
+	convertBackupV1,
 	exportBackup,
 	readBackupManifest,
 	restoreBackup,
 	verifyBackupChecksum,
 } from './backup'
 export type {
+	ConvertBackupV1Options,
 	BackupManifest,
 	BackupOptions,
 	BackupProgress,

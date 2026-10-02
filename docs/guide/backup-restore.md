@@ -60,7 +60,54 @@ async function restoreBackup(file: File) {
 }
 ```
 
-Use `merge: true` when you want to import without deleting existing local data. Use `merge: false` when you want the backup to replace the local store.
+Use `merge: true` when you want to import without deleting existing local data. Use `merge: false` (the default) when you want the backup to replace the local store.
+
+A restore never copies the exporting device's identity. A backup holds the operation log
+(every operation in canonical form, deletions included), the materialized rows (deleted
+rows included), the version vector and the operations the sync server refused for good. It
+does not hold the device's node id, sync credentials or sync progress, so restoring a backup
+made on another device does not turn this device into a clone of it.
+
+- **Merge** (`merge: true`) applies every operation of the backup exactly like an
+  operation received from sync: duplicates are skipped by id, concurrent edits merge per
+  field, and the version vector only moves forward. Sync keeps running.
+- **Replace** (default) replaces the local data with the backup's. This device keeps its
+  node id, its sync credentials and the users its writes belong to, and its own sequence
+  numbers never move backwards. Sync is paused during the restore and resumes afterwards,
+  re-downloading everything in scope from the server. Live queries re-run with the restored
+  data.
+  - With sync configured, writes made on this device that the sync server has not
+    acknowledged are kept: they are applied again on top of the backup, so a restore never
+    discards writes that exist nowhere else (`result.unsyncedWritesKept` counts them).
+  - In a local-only app (no `sync`), replace is exact by default. Pass
+    `keepUnsyncedWrites: true` to keep the writes made since the backup was taken.
+
+The result reports failures instead of throwing for a file it cannot restore:
+`result.success` is false and `result.errorCode` says why (`BACKUP_CHECKSUM_MISMATCH`,
+`BACKUP_SCHEMA_NEWER` for a backup written by a newer schema version, or
+`BACKUP_FORMAT_OUTDATED`).
+
+### Backups made before beta.14
+
+Backups written by Kora 1.0.0-beta.13 and earlier use format version 1, whose restore
+corrupted operation timestamps and copied the exporting device's identity. They are refused
+with `errorCode: 'BACKUP_FORMAT_OUTDATED'`. Convert them once, then import the result:
+
+```typescript
+import { convertBackupV1 } from 'korajs'
+
+const converted = await convertBackupV1(oldBackup)
+await app.importBackup(converted)
+```
+
+`convertBackupV1` drops the device identity the old file carried and recovers timestamps a
+previous version-1 restore had damaged. If an operation cannot be recovered the conversion
+fails; pass `{ dropUnrecoverable: true }` to convert without it.
+
+A database already damaged by a version-1 restore is repaired when the app opens: the store
+checks its operation log on every open, rewrites timestamps it can recover, and moves rows it
+cannot read to a quarantine table (`store:log-integrity` reports both). Call
+`app.getStore().verifyLogIntegrity()` for a full report.
 
 ### Export Selected Collections
 

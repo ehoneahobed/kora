@@ -4,9 +4,11 @@ import { MergeEngine } from '@korajs/merge'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
+import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
 import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
+import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
@@ -52,6 +54,7 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	let store: Store | null = null
+	let applyPipeline: ApplyPipeline | null = null
 	let blobApi: BlobApi | null = null
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
@@ -81,6 +84,7 @@ export function createApp<const S extends SchemaInput>(
 
 	const ready = initializeApp(config, emitter, mergeEngine).then((init) => {
 		store = init.store
+		applyPipeline = init.applyPipeline
 		unsubscribeSync = init.unsubscribeSync
 		unsubscribeAudit = init.unsubscribeAudit
 		unsubscribeLocalOperations = init.unsubscribeLocalOperations
@@ -215,7 +219,7 @@ export function createApp<const S extends SchemaInput>(
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before importing backup.')
 			}
-			return store.importBackup(data, options)
+			return importBackupIntoApp(store, applyPipeline, config, syncState, data, options)
 		},
 		async replayTo(operationId) {
 			await ready

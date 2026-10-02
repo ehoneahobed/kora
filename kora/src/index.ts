@@ -80,6 +80,9 @@ export type {
 export { SequenceManager, Store } from '@korajs/store'
 export { TransactionContext } from '@korajs/store'
 export {
+	BACKUP_VERSION,
+	BackupFormatError,
+	convertBackupV1,
 	exportBackup,
 	readBackupManifest,
 	restoreBackup,
@@ -89,6 +92,7 @@ export type {
 	BackupManifest,
 	BackupOptions,
 	BackupProgress,
+	ConvertBackupV1Options,
 	CollectionAccessor,
 	CollectionRecord,
 	RestoreOptions,
