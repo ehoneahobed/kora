@@ -354,6 +354,15 @@ export function createSampleEvent<T extends KoraEventType>(
 			dbName: 'kora-db',
 			message: 'Quota exceeded',
 		},
+		'store:log-integrity': {
+			type: 'store:log-integrity',
+			dbName: 'kora-db',
+			repaired: 1,
+			quarantined: 0,
+			gaps: 0,
+			clean: true,
+			message: 'Operation log repaired',
+		},
 		'store:storage-fallback': {
 			type: 'store:storage-fallback',
 			dbName: 'kora-db',
