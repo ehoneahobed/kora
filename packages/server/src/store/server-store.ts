@@ -423,6 +423,15 @@ export interface ServerStore extends SyncStore {
 	getResolvedThrough?(nodeId: string): Promise<number>
 
 	/**
+	 * Forget the resolution recorded for `operationId` under `nodeId` (no-op when none).
+	 * The session calls it for a stale `stored-elsewhere` record: one whose id the batch
+	 * lookup did not find stored (RT-51). The operation is then judged normally, and its
+	 * real outcome is recorded in place of the stale one. Optional for custom stores:
+	 * without it the stale record is ignored but kept.
+	 */
+	deleteOperationResolution?(nodeId: string, operationId: string): Promise<void>
+
+	/**
 	 * Every operation of `nodeId` at or below `throughSequence` that shares its sequence
 	 * with another stored operation (a legacy pair, RT-37), ordered by sequence then
 	 * delivery. A version-vector client reporting `throughSequence` for the node may hold

@@ -58,11 +58,16 @@ const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_
 	SELECT node_id, sequence_number FROM operations
 	GROUP BY node_id, sequence_number HAVING COUNT(*) > 1`
 
-/** Drop resolutions above their node's restored log (see importBackup). */
+/**
+ * Drop resolutions above their node's restored log, and every `stored-elsewhere`
+ * resolution whose operation the restored log does not hold (RT-51; see importBackup).
+ */
 const PRUNE_RESOLUTIONS_PAST_LOG_SQL = `DELETE FROM operation_resolutions
 	WHERE sequence_number > COALESCE(
 		(SELECT max_sequence_number FROM sync_state WHERE sync_state.node_id = operation_resolutions.node_id),
-		0)`
+		0)
+	OR (outcome = 'stored-elsewhere'
+		AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.id = operation_resolutions.op_id))`
 
 interface ResolutionRow {
 	op_id: string
@@ -557,6 +562,13 @@ export class SqliteServerStore implements ServerStore {
 			for (const row of rows) found.set(row.op_id, resolutionFromRow(row))
 		}
 		return found
+	}
+
+	async deleteOperationResolution(nodeId: string, operationId: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`DELETE FROM operation_resolutions WHERE node_id = ${nodeId} AND op_id = ${operationId}`,
+		)
 	}
 
 	async getResolvedThrough(nodeId: string): Promise<number> {

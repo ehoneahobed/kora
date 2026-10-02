@@ -3025,14 +3025,26 @@ export class ClientSession {
 			.filter((op) => op.nodeId === nodeId && op.timestamp.nodeId === nodeId && !stored.has(op.id))
 			.map((op) => op.id)
 		if (ids.length === 0) return new Map()
+		let found: Map<string, OperationResolution>
 		try {
-			return await this.store.findOperationResolutions(nodeId, ids)
+			found = await this.store.findOperationResolutions(nodeId, ids)
 		} catch (error) {
 			console.warn(
 				`[kora] findOperationResolutions failed; judging the batch without it: ${error instanceof Error ? error.message : String(error)}`,
 			)
 			return new Map()
 		}
+		// Only ids the lookup did NOT find stored are asked for, so a `stored-elsewhere`
+		// hit here is stale: it claims a stored copy the lookup has just disproved (the
+		// copy was lost by a restore, RT-51). Acking on it would drop the operation, so it
+		// is forgotten and the operation is judged normally (its real outcome is then
+		// recorded in its place).
+		for (const [id, resolution] of found) {
+			if (resolution.outcome !== 'stored-elsewhere') continue
+			found.delete(id)
+			await this.store.deleteOperationResolution?.(nodeId, id)
+		}
+		return found
 	}
 
 	/** The highest resolved sequence of `nodeId` (0 without the store method or on error). */

@@ -40,15 +40,18 @@ async function open(
 	return { store, adapter }
 }
 
+async function nodeRecord(adapter: BetterSqlite3Adapter, nodeId: string) {
+	return (await listLocalNodes(adapter)).find((n) => n.nodeId === nodeId)
+}
+
 async function principalOf(adapter: BetterSqlite3Adapter, nodeId: string): Promise<string | null> {
 	return (await listLocalNodes(adapter)).find((n) => n.nodeId === nodeId)?.principal ?? null
 }
 
 describe('Store.bindPrincipal (RT-42)', () => {
-	test('an unbound node is bound to the first signed-in user, without moving', async () => {
+	test('an unbound node with no history is bound to the first signed-in user, without moving', async () => {
 		const { store, adapter } = await open()
 		const node = store.getNodeId()
-		await store.collection('todos').insert({ title: 'before anyone was known' })
 		const binding = await store.bindPrincipal('alice')
 		expect(binding).toEqual({
 			nodeId: node,
@@ -57,7 +60,99 @@ describe('Store.bindPrincipal (RT-42)', () => {
 			conflict: false,
 		})
 		expect(await principalOf(adapter, node)).toBe('alice')
+		expect((await nodeRecord(adapter, node))?.binding).toBe('fresh')
 		// Idempotent for the same user.
+		expect((await store.bindPrincipal('alice')).switched).toBe(false)
+	})
+
+	test('RT-50: an unbound node with writes is never given to the first signed-in user', async () => {
+		const { store, adapter } = await open()
+		const node = store.getNodeId()
+		await store.collection('todos').insert({ title: 'before anyone was known' })
+		const binding = await store.bindPrincipal('alice')
+		expect(binding.switched).toBe(true)
+		expect(binding.previousNodeId).toBe(node)
+		// The old node keeps no owner: the server (or the app) says whose it is.
+		expect(await principalOf(adapter, node)).toBeNull()
+		expect(await principalOf(adapter, store.getNodeId())).toBe('alice')
+		const write = await store.collection('todos').insert({ title: 'alice' })
+		const ops = await store.getOperationRange(store.getNodeId(), 1, 1)
+		expect(ops.map((op) => op.recordId)).toEqual([write.id])
+	})
+
+	test('RT-50: an unbound node that synced before is not guessed either', async () => {
+		const { store, adapter } = await open()
+		const node = store.getNodeId()
+		await store.markLocalNodeAccepted(node)
+		expect((await store.bindPrincipal('alice')).switched).toBe(true)
+		expect(await principalOf(adapter, node)).toBeNull()
+	})
+
+	test('RT-50: a pinned unbound node with history stays unbound and in use (the server decides)', async () => {
+		const { store, adapter } = await open({ nodeId: 'device-1' })
+		await store.collection('todos').insert({ title: 'before' })
+		expect(await store.bindPrincipal('alice')).toMatchObject({ switched: false, conflict: false })
+		expect(await principalOf(adapter, 'device-1')).toBeNull()
+		await store.confirmNodePrincipal('device-1', 'alice')
+		expect(await nodeRecord(adapter, 'device-1')).toMatchObject({
+			principal: 'alice',
+			binding: 'server',
+		})
+	})
+
+	test('RT-50: server answers bind, rule out and correct guesses; the app assigns and drops', async () => {
+		const { store, adapter } = await open()
+		const own = store.getNodeId()
+		await store.collection('todos').insert({ title: 'unattributed' })
+		await store.bindPrincipal('alice')
+
+		// Refused for alice: remembered, still unbound.
+		await store.recordNodeRefusedFor(own, 'alice')
+		expect(await nodeRecord(adapter, own)).toMatchObject({
+			principal: null,
+			refusedPrincipals: ['alice'],
+		})
+		// The app cannot assign it to a user the server refused it for.
+		expect(await store.assignNodePrincipal(own, 'alice')).toBe(false)
+		expect(await store.assignNodePrincipal(own, 'bob')).toBe(true)
+		expect(await nodeRecord(adapter, own)).toMatchObject({
+			principal: 'bob',
+			binding: 'app',
+			held: false,
+		})
+		// A guess the server overrules is cleared.
+		await store.recordNodeRefusedFor(own, 'bob')
+		expect(await nodeRecord(adapter, own)).toMatchObject({
+			principal: null,
+			refusedPrincipals: ['alice', 'bob'],
+		})
+		// An accepted handshake binds it.
+		await store.confirmNodePrincipal(own, 'carol')
+		expect(await nodeRecord(adapter, own)).toMatchObject({ principal: 'carol', binding: 'server' })
+		// Evidence-based bindings are never overwritten by another user's answer.
+		await store.confirmNodePrincipal(own, 'dave')
+		await store.recordNodeRefusedFor(own, 'carol')
+		expect(await nodeRecord(adapter, own)).toMatchObject({ principal: 'carol', binding: 'server' })
+		expect(await store.assignNodePrincipal(own, 'dave')).toBe(false)
+		// The store's own node can be neither assigned nor dropped.
+		expect(await store.assignNodePrincipal(store.getNodeId(), 'zed')).toBe(false)
+		await store.dropLocalNode(store.getNodeId())
+		expect(await nodeRecord(adapter, store.getNodeId())).toBeDefined()
+		await store.dropLocalNode(own)
+		expect(await nodeRecord(adapter, own)).toBeUndefined()
+	})
+
+	test('RT-50: re-authored writes keep their author after a rotation', async () => {
+		const { store, adapter } = await open()
+		await store.bindPrincipal('alice')
+		const write = await store.collection('todos').insert({ title: 'alice' })
+		const ops = await store.getOperationRange(store.getNodeId(), 1, 1)
+		const rotated = await store.rotateNodeId(ops.map((op) => op.id))
+		expect(rotated.operations.map((op) => op.recordId)).toEqual([write.id])
+		expect(await nodeRecord(adapter, rotated.nodeId)).toMatchObject({
+			principal: 'alice',
+			binding: 'fresh',
+		})
 		expect((await store.bindPrincipal('alice')).switched).toBe(false)
 	})
 
@@ -150,7 +245,7 @@ describe('Store.bindPrincipal (RT-42)', () => {
 })
 
 describe('local node registry migration and adoption schedule', () => {
-	test('a registry table from an earlier release gains the principal column', async () => {
+	test('a registry table from an earlier release gains the principal and binding columns', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
 		await adapter.open(schema)
 		await adapter.execute(`CREATE TABLE ${LOCAL_NODES_TABLE} (
@@ -172,6 +267,8 @@ describe('local node registry migration and adoption schedule', () => {
 				held: false,
 				refusedCycle: null,
 				principal: null,
+				binding: null,
+				refusedPrincipals: [],
 			},
 		])
 		await adapter.close()

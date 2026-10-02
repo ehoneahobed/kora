@@ -33,13 +33,21 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 
-/** Drop resolutions above their node's entry in `vector` (absent: every one). */
+/**
+ * Drop resolutions above their node's entry in `vector` (absent: every one), and every
+ * `stored-elsewhere` resolution whose operation is not in the restored log (RT-51).
+ */
 function pruneResolutionsPastLog(
 	resolutions: Map<string, OperationResolution>,
 	vector: ReadonlyMap<string, number>,
+	storedIds: ReadonlyMap<string, unknown>,
 ): void {
 	for (const [id, resolution] of resolutions) {
-		if (resolution.sequenceNumber > (vector.get(resolution.nodeId) ?? 0)) resolutions.delete(id)
+		if (resolution.sequenceNumber > (vector.get(resolution.nodeId) ?? 0)) {
+			resolutions.delete(id)
+		} else if (resolution.outcome === 'stored-elsewhere' && !storedIds.has(id)) {
+			resolutions.delete(id)
+		}
 	}
 }
 
@@ -247,6 +255,11 @@ export class MemoryServerStore implements ServerStore {
 			if (resolution && resolution.nodeId === nodeId) found.set(id, { ...resolution })
 		}
 		return found
+	}
+
+	async deleteOperationResolution(nodeId: string, operationId: string): Promise<void> {
+		this.assertOpen()
+		if (this.resolutions.get(operationId)?.nodeId === nodeId) this.resolutions.delete(operationId)
 	}
 
 	async getResolvedThrough(nodeId: string): Promise<number> {
@@ -741,7 +754,7 @@ export class MemoryServerStore implements ServerStore {
 		// Resolutions past a node's restored log describe operations decided after the
 		// backup: advertising them would hide stored operations the restore lost (RT-45),
 		// so they go and the devices re-upload that tail.
-		pruneResolutionsPastLog(this.resolutions, this.versionVector)
+		pruneResolutionsPastLog(this.resolutions, this.versionVector, this.operationIndex)
 		// The restored snapshot may hold legacy duplicate sequences; enforcement resumes
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter

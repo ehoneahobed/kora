@@ -111,3 +111,54 @@ describe('SyncControl.waitForSettled', () => {
 		expect(syncing.listeners.size).toBe(0)
 	})
 })
+
+describe('SyncControl held writes (RT-50)', () => {
+	function heldHarness(phase: 'streaming' | 'offline') {
+		const engine = {
+			getStatus: () => ({ ...OFFLINE_SYNC_STATUS, phase }),
+			getHeldNodes: vi.fn(async () => [
+				{ nodeId: 'n1', operationCount: 2, reason: 'unassigned' as const, principal: null },
+			]),
+			assignHeld: vi.fn(async () => {}),
+			discardHeld: vi.fn(async () => 2),
+			reconnect: vi.fn(async () => {}),
+		}
+		const state = {
+			syncEngine: engine as unknown as SyncEngine,
+			syncStatusBridge: { refresh: vi.fn() },
+		} as unknown as SyncRuntimeState
+		const control = createSyncControl({
+			config: {
+				schema: defineSchema({
+					version: 1,
+					collections: { todos: { fields: { title: t.string() } } },
+				}),
+				sync: { url: 'ws://test' },
+			},
+			ready: Promise.resolve(),
+			state,
+		})
+		if (!control) throw new Error('Expected sync control')
+		return { control, engine }
+	}
+
+	test('lists, assigns (reconnecting when connected) and discards held writes', async () => {
+		const { control, engine } = heldHarness('streaming')
+		expect(await control.getHeldOperations()).toEqual([
+			{ nodeId: 'n1', operationCount: 2, reason: 'unassigned', principal: null },
+		])
+		await control.assignHeld('n1', 'current-user')
+		expect(engine.assignHeld).toHaveBeenCalledWith('n1')
+		expect(engine.reconnect).toHaveBeenCalledTimes(1)
+		expect(await control.discardHeld('n1')).toBe(2)
+	})
+
+	test('assigning while offline does not start a session', async () => {
+		const { control, engine } = heldHarness('offline')
+		await control.assignHeld('n1', 'current-user')
+		expect(engine.reconnect).not.toHaveBeenCalled()
+		await expect(control.assignHeld('n1', 'someone' as 'current-user')).rejects.toMatchObject({
+			context: { code: 'HELD_ASSIGN_TARGET' },
+		})
+	})
+})

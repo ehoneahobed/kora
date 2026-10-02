@@ -33,7 +33,9 @@ const schema = defineSchema({
 	},
 })
 
-// Three seeds in the default suite; KORA_CHAOS_SEEDS widens the sample (nightly).
+// Three seeds in the default suite; KORA_CHAOS_SEEDS widens the sample. The nightly run
+// (`pnpm test:invariants:nightly`, part of `pnpm chaos:nightly`) uses a fixed list, so a
+// failure names a seed that can be replayed.
 const SEEDS = (process.env.KORA_CHAOS_SEEDS ?? '11,23,37').split(',').map(Number)
 const DEVICES = 3
 const ROUNDS = 5
@@ -51,7 +53,32 @@ function engineOf(device: TestDevice): EngineInternals | null {
 
 type Network = Awaited<ReturnType<typeof createTestNetwork>>
 
-async function checkInvariants(network: Network, label: string): Promise<void> {
+/**
+ * Remote deletes each device's apply pipeline judged against a local update (the merge
+ * decision behind a delete that is not in the log), by device. Recorded from the merge
+ * lifecycle events as they happen, so a later state of the record cannot hide them.
+ */
+type MergeJudged = Map<TestDevice, Set<string>>
+
+function recordMergeDecisions(network: Network): MergeJudged {
+	const judged: MergeJudged = new Map()
+	for (const device of network.devices) {
+		const ids = new Set<string>()
+		judged.set(device, ids)
+		device.emitter.on('merge:started', (event) => {
+			if (event.type === 'merge:started' && event.operationA.type === 'delete') {
+				ids.add(event.operationA.id)
+			}
+		})
+	}
+	return judged
+}
+
+async function checkInvariants(
+	network: Network,
+	judged: MergeJudged,
+	label: string,
+): Promise<void> {
 	const serverOps = await network.server.store.getOperationsAfterDelivery(0, 1_000_000)
 	const serverIds = new Set(serverOps.map((entry) => entry.operation.id))
 	for (const device of network.devices) {
@@ -85,16 +112,15 @@ async function checkInvariants(network: Network, label: string): Promise<void> {
 				op.sequenceNumber,
 				op.sequenceNumber,
 			)
-			// A remote delete that lost to a later local update is a merge decision (the
-			// record is settled and stays), not a dropped operation; the pipeline does not
-			// log it. Anything else must be in the log or the quarantine.
-			const mergeKeptRecord =
-				op.type === 'delete' &&
-				(await device.collection(op.collection).findById(op.recordId)) !== null
+			// A remote delete that lost to a later local update is a merge decision, not a
+			// dropped operation: the pipeline does not log it. It is recognised from the
+			// merge the pipeline ran for it (a delete it judged and did not log lost), not
+			// from the record's current state: a later delete of the same record removes
+			// the record the losing delete left in place (seed 1117).
+			// Anything else must be in the log or the quarantine.
+			const mergeLost = op.type === 'delete' && (judged.get(device)?.has(op.id) ?? false)
 			expect(
-				local.some((candidate) => candidate.id === op.id) ||
-					quarantined.has(op.id) ||
-					mergeKeptRecord,
+				local.some((candidate) => candidate.id === op.id) || quarantined.has(op.id) || mergeLost,
 				`${label}: ${device.name} watermark ${watermark} passed delivery ${entry.deliverySequence} (${op.id}) without applying or quarantining it (${op.type} ${op.collection}/${op.recordId})`,
 			).toBe(true)
 		}
@@ -122,12 +148,15 @@ describe('no silent loss: upload prefix, download watermark, convergence under c
 				},
 			})
 			close = () => network.close()
+			const judged = recordMergeDecisions(network)
 
 			for (let round = 0; round < ROUNDS; round++) {
 				for (const device of network.devices) {
 					const ops = 1 + Math.floor(rand() * 4)
 					for (let i = 0; i < ops; i++) {
-						const rows = await device.getState('todos')
+						// Pick by content, not by the random record ids, so a seed picks the same
+						// records run after run.
+						const rows = sortByContent(await device.getState('todos'))
 						const pick = rows[Math.floor(rand() * rows.length)]
 						const roll = rand()
 						if (!pick || roll < 0.4) {
@@ -149,7 +178,7 @@ describe('no silent loss: upload prefix, download watermark, convergence under c
 					if (rand() < 0.3) await device.disconnect()
 					await device.sync()
 				}
-				await checkInvariants(network, `seed ${seed} round ${round}`)
+				await checkInvariants(network, judged, `seed ${seed} round ${round}`)
 			}
 
 			// Heal: reconnect rounds until every device uploaded everything and converged.
@@ -158,7 +187,7 @@ describe('no silent loss: upload prefix, download watermark, convergence under c
 					await device.disconnect()
 					await device.sync()
 				}
-				await checkInvariants(network, `seed ${seed} heal ${round}`)
+				await checkInvariants(network, judged, `seed ${seed} heal ${round}`)
 				const settled = network.devices.every((device) => {
 					const engine = engineOf(device)
 					return (
@@ -194,4 +223,16 @@ function seededRandom(seed: number): () => number {
 		state = (state * 1103515245 + 12345) & 0x7fffffff
 		return state / 0x7fffffff
 	}
+}
+
+/** Rows in an order that does not depend on their (random) ids, as far as content allows. */
+function sortByContent(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+	const key = (row: Record<string, unknown>): string =>
+		`${String(row.title)}\u0000${String(row.done)}\u0000${String(row.rank).padStart(4, '0')}`
+	return [...rows].sort((a, b) => {
+		const ka = key(a)
+		const kb = key(b)
+		if (ka !== kb) return ka < kb ? -1 : 1
+		return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0
+	})
 }

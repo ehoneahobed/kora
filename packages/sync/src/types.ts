@@ -57,6 +57,19 @@ export interface ActiveApplyFailure {
 	retryCount: number
 }
 
+/** Why a local node's unsynced writes are held (RT-38, RT-50). */
+export type HeldReason = 'other-user' | 'unassigned'
+
+/** A local node whose unsynced writes are held (see {@link SyncStatusInfo.heldNodes}). */
+export interface HeldNodeInfo {
+	nodeId: string
+	/** Unsynced writes the node holds. */
+	operationCount: number
+	reason: HeldReason
+	/** The user the node is bound to, or null when nobody knows (unassigned). */
+	principal: string | null
+}
+
 /**
  * Sync status information exposed to developers.
  */
@@ -84,6 +97,15 @@ export interface SyncStatusInfo {
 	 * `store.namespaceByAuthUser` to give each user their own database instead.
 	 */
 	heldOperations?: number
+	/**
+	 * The local nodes whose unsynced writes are held (RT-38, RT-50), with how many each
+	 * holds and why: `other-user` (they belong to another user, or the server refused
+	 * the node for the signed-in one: they upload when their user signs in) or
+	 * `unassigned` (written before the app knew who was signed in, on a node that never
+	 * synced: nobody can tell whose they are, so the app decides with
+	 * `app.sync.assignHeld` or `app.sync.discardHeld`). As of the last session start.
+	 */
+	heldNodes?: HeldNodeInfo[]
 	/**
 	 * `degraded` when this device's local database could not be made durable several times
 	 * in a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads continue so the
@@ -330,6 +352,23 @@ export interface SyncStatePersistence {
 	markLocalNodeAccepted?(nodeId: string): Promise<void>
 	/** Record that the server refused `nodeId`; `held` holds its unsynced writes. */
 	markLocalNodeRefused?(nodeId: string, held: boolean): Promise<void>
+	/**
+	 * A handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound node
+	 * (or replace a guessed binding) from the server's answer.
+	 */
+	confirmLocalNodePrincipal?(nodeId: string, principal: string): Promise<void>
+	/**
+	 * The server refused `nodeId` for `principal` (RT-50): clear a guessed binding, and
+	 * remember that an unbound node is not theirs.
+	 */
+	recordLocalNodeRefusedFor?(nodeId: string, principal: string): Promise<void>
+	/**
+	 * Assign a held, unbound node's writes to `principal` (RT-50, the app's decision).
+	 * @returns false when the node is not unbound, or was refused for `principal`
+	 */
+	assignLocalNodePrincipal?(nodeId: string, principal: string): Promise<boolean>
+	/** Forget a non-current local node whatever it holds (its held writes were discarded). */
+	dropLocalNode?(nodeId: string): Promise<void>
 	/** The current refusal cycle (count of accepted handshakes). */
 	loadAcceptedCycle?(): Promise<number>
 	/** Forget a non-current local node with nothing left to upload (bounds the registry). */
@@ -378,6 +417,14 @@ export interface LocalNodeInfo {
 	 * another user than the signed-in one is never uploaded or adopted.
 	 */
 	principal?: string | null
+	/**
+	 * How `principal` was learned (RT-50): `fresh` (bound before its first write),
+	 * `server` (an accepted handshake), `app` (assigned by the app: a guess the server can
+	 * overrule), or null (unbound, or a guess by an earlier release).
+	 */
+	binding?: 'fresh' | 'server' | 'app' | null
+	/** Users the server refused this unbound node for (RT-50): never tried for them again. */
+	refusedPrincipals?: string[]
 }
 
 /**
