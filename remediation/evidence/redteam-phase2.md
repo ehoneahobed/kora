@@ -82,3 +82,76 @@ Method:
   - leader failover during an adoption;
   - IndexedDB fallback with several tabs (each tab has its own in-memory copy, a pre-existing W8a question);
   - the ingest limiter keyed per node, which an authenticated user can multiply by minting node ids (pre-existing, outside this round's mechanisms).
+
+## Round 3 (2026-10-02)
+
+Independent adversarial review of the round-2 fixes at 260c641. The mechanisms attacked:
+
+- **Server:**
+  - `operation_resolutions` and the resolved-through own entry;
+  - refused-id replay before auth and validators;
+  - `sequence_pairs` and legacy-pair delivery to version-vector clients;
+  - the own node always in the handshake;
+  - the per-user ingest budget;
+  - replace-import pruning.
+- **Client:**
+  - `server-behind` prefix lowering;
+  - degraded durability after 3 failed barriers;
+  - the per-tab adoption scheduler;
+  - `Store.bindPrincipal()` and held operations;
+  - clone detection.
+
+Every finding has a repro under `tests/repro/` that fails at 260c641, tracked as RT-50..RT-53 (status open, phase 2). **Nothing was found at P1 or above.**
+
+Method:
+- Executable repros against the real `KoraSyncServer`, `TestDevice` (real SQLite store and `SyncEngine`, auth-aware via `principal`) and the real `AuthSyncCoordinator`. The server store paths were driven through raw protocol sessions.
+- Postgres 16 (own instance, port 54399): RT-51 fails on memory, SQLite and Postgres.
+- `KORA_PG_TEST_URL=... LMS_OPS=20000 node scripts/remediation/check.mjs --all` (node, Postgres, real Chromium, tsc probes): no regression of RT-1..RT-49. Only the new, then-unmapped repros failed.
+- `pnpm chaos:nightly` and `pnpm test:release-gate` are green.
+- The no-silent-loss invariant suite with 8 extra seeds (`KORA_CHAOS_SEEDS=163,277,401,557,691,829,947,1117`): 7 are green. Seed 1117 fails in 2 of 3 runs on a checker false positive (see "What held up").
+
+| ID | Sev | Finding | Location | Required fix | Repro |
+|---|---|---|---|---|---|
+| RT-50 | P2 (cross-principal) | `bindPrincipal` binds an UNBOUND current node to whoever signs in first. Every database created before the RT-42 fix has only unbound nodes. Case 1, a shared laptop: Bob left an unsynced write on his node, and after the upgrade Alice signs in first. Bob's node is bound to Alice locally. The server refuses it for Alice (Bob claimed it), and nothing corrects the local binding. When Bob signs in, the node belongs to "another principal", so it is never uploaded or adopted. The write is stranded forever (`heldOperations` 1). Case 2, a pre-upgrade database that never synced: Alice's offline writes are uploaded as Bob, the first user to sign in after the upgrade. So RT-42's never-synced case is still open for existing databases. | `store/src/store/store.ts:1547` (`owner === null` branch); `kora/src/initialize-app.ts:152`; `sync/src/engine/sync-engine.ts:1868` (`holdNodeAndSwitch` keeps the local binding) | Do not infer the owner of an unbound node that has unsynced writes; learn it from the server. Bind at the first accepted handshake, and on `NODE_ID_CLAIMED` clear an inferred binding. Hold an unbound, never-synced node with writes until the app decides. Record whether each binding is inferred or confirmed. | `packages/test/tests/repro/RT-50.test.ts` |
+| RT-51 | P3 | A `stored-elsewhere` resolution acknowledges an upload the server does not store. The session looks up resolutions only for ids the batch lookup did NOT find stored, then acks any hit as a duplicate. For `stored-elsewhere`, the lookup has just disproved the claim. A replace-mode import prunes only resolutions above the restored maximum, so a record can outlive its stored copy. Sequence: X is stored at 12 (renumber); a stale copy of X is re-submitted at 5; a backup with ops 1..11 is restored. Every later upload of X is then acked and dropped. | `server/src/session/client-session.ts:2324`; prune in `memory-server-store.ts:37`, `sqlite-server-store.ts:62`, `postgres-server-store.ts:73` | A `stored-elsewhere` hit for an id the lookup did not find is stale: judge the op normally and delete the record. Replace import drops `stored-elsewhere` records whose id is not in the restored log. Consider exporting resolutions in backups: a migrated server forgets every refusal, and the RT-47 protection is lost. | `packages/server/tests/repro/RT-51.test.ts` |
+| RT-52 | P3 (cross-principal) | The RT-42 residual window is not "the same instant". While a run is in flight, `AuthSyncCoordinator` only marks a new auth change as `pending`. A run awaits `engine.reconnect()`, which means the credential fetch plus up to 10 s of `transport.connect`. A user switch during an in-flight token-refresh reconnect is applied only when that run ends. Every write the new user makes meanwhile is authored under the previous user's node and later submitted as that user. The engine also binds the principal before the credential fetch, so a session can hand-shake a node bound to the previous user with the next user's token. | `kora/src/auth-sync-coordinator.ts:66,90`; `sync/src/engine/sync-engine.ts:639,714` | Apply the store binding synchronously on every auth event, outside the serialized reconnect, then queue the reconnect. After the credential fetch and before the handshake, check the principal again against the session node's owner. At least, document the real window. | `packages/test/tests/repro/RT-52.test.ts` |
+| RT-53 | P3 (liveness) | A parked adoption is retried only when a session starts, or after the open tab's own uploads made progress (`sessionAcked > 0`). No timer ends an idle own-node session when the park expires. A closed tab's write that was deferred once (retriable) is never retried while the open tab stays connected and idle (a dashboard, a kiosk, a tab left open). The write counts as pending, but it exists only on this device for as long as the connection holds. | `sync/src/engine/sync-engine.ts:3927` (`maybeYieldToDeferredNode`), `3665` (`parkAdoption`: `untilMs` is never armed), `3892` | Arm a timer for the earliest parked `untilMs` (and for causal deferrals) that ends an idle own-node session, or serve parked nodes on a side session. Keep the bound of one retry per backoff. | `packages/test/tests/repro/RT-53.test.ts` |
+
+### What held up (round 3)
+
+- **Resolutions cannot make the server skip an op it never stored, apart from RT-51.**
+  - `ignored` and `refused` are recorded, and the write is awaited, before the answer is sent. Nothing is inserted for them, so a crash between the two leaves no half state.
+  - `stored-elsewhere` is recorded only after the stored copy was found.
+  - The resolved-through entry is used only in the handshake. The client never raises its acknowledged prefix from it; it raises only its sequence counter and runs one full resync. So a high resolution cannot hide a later unstored op. This holds even for a self-poisoned one, such as a refused op at seq 10^6 on the client's own node: that costs the device one counter raise and one full resync.
+  - Resolution lookups are keyed by the session's own claimed node, so there is no oracle across devices or tenants.
+  - The `op_id` primary key is global, so another node's row with the same id can pre-empt a record (`ON CONFLICT DO NOTHING`). That needs the victim's unstored op id, which is content-addressed and never disclosed. Keying the table by `(node_id, op_id)` would close the question.
+- **Refused-id replay is the documented contract.** The docs say "`retriable: false`: retrying the same bytes will always fail" (`docs/guide/production-server.md`, `docs/api/server.md`). A fixed cause is answered with a NEW operation; no client API resubmits the same id.
+  - Not documented: the server keeps refusals and validator `ignore` decisions forever. `operation_resolutions` therefore grows like the op log for apps that `ignore` high-volume writes. This needs a retention note, and backups do not carry the table.
+- **`server-behind`: no false positive found.** The own entry is `max(stored max, resolved)`, read from committed state on every store (Postgres advances `sync_state` in the append transaction). It is never scope-filtered, and acks are sent only after the store write. Retriable rejections never advance the ack.
+- **Clone detection does not duplicate stored ops.**
+  - Setup: a cloned database, where copy A re-uploads a history of 2,101 increments from prefix 0 (a simulated upgrade, with a scan window of 2,000). A's new write collides above its handshake entry.
+  - Result: clone detection fired and moved A to a fresh node. The counter stayed exactly 2,100 on both copies and on the server.
+  - Why it holds: the upload queue is in causal (HLC) order, and the scan runs ahead of every flush. So by the time the colliding write is on the wire, every older own op is already flagged sent.
+  - Cost 1: the abandoned node stays a local node of copy A, which adopts it and re-uploads the shared history once more, as duplicates.
+  - Cost 2: on pinned and per-tab stores, the rotation throws `NODE_ID_PINNED` (reported as `NODE_ROTATION_FAILED`); the next session renumbers instead.
+- **Degraded durability.**
+  - Setup: the quota fails, and uploads proceed after 3 failed barriers (`sync:durability-degraded`, `DURABILITY_DEGRADED`). The device then crashes back to its last durable snapshot and writes 4 ops offline, 3 of them reusing lost numbers.
+  - Result: one renumber per colliding write (3), with no storm and no duplicate. The server and peer counters are exact, and nothing is pending.
+- **Adoption scheduler.** No starvation was found beyond RT-53, and no unbounded loop:
+  - A parked node waits at most 1 h of backoff.
+  - Causal cycles are broken in registry order.
+  - A child whose parent is parked is adopted anyway, and parks again if it is deferred.
+- **Principal binding.**
+  - Post-fix databases behave correctly through sign-out, sign-in as another user and back, an offline switch, and the held-operations count (RT-42 repro, `phase2-node-fairness`). The exceptions are RT-50 (pre-fix databases) and RT-52 (in-flight reconnect).
+  - With `namespaceByAuthUser: true`, a user switch without recreating the app keeps the first user's database, and the binding moves it to the new user's node. Nothing is uploaded as the wrong user, but the app must be recreated per user (`AuthBoundKoraProvider`).
+- **Per-user ingest budget.** It is keyed by `userId`, like node claims, and `AuthContext` has no tenant notion, so the two are consistent. Anonymous principals get no user budget, so minting anonymous node ids still multiplies the per-node budget (pre-existing).
+- **Seed 1117 invariant failure: a checker false positive, not a product bug.**
+  - Device-0 held two updates that were later than another device's delete of the same record, so that delete lost the merge. By design, a losing delete is not logged.
+  - The checker's `mergeKeptRecord` accepts such a delete only while the record still exists.
+  - A second delete of the same record (delivery 42) then removed the record, so the earlier merge decision looked like a dropped op.
+  - The replicas converged.
+  - Fix the checker, for example by recognising the merge decision from the audit trace, so the nightly seeds stop being flaky.
+- **Not attacked:**
+  - leader failover during an adoption;
+  - IndexedDB fallback with several tabs;
+  - two live Postgres server instances, which were only reasoned from the code (one primary, and `sync_state` is written in the append transaction).
