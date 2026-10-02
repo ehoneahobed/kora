@@ -980,7 +980,8 @@
     }
    ],
    "pr": null,
-   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing."
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing.",
+   "acceptanceTest": "packages/server/tests/repro/LMS-10.test.ts 'benchmark:' (a warm restart re-materializes nothing; with LMS_OPS=20000 its key is a baseline observation, so the checker does not map it as a repro) + packages/server/tests/integration/fold-materialization.test.ts"
   },
   {
    "id": "NEW-SRV-5",
