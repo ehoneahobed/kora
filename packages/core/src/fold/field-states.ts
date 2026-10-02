@@ -198,6 +198,17 @@ function resolverFold(
 	return error === undefined ? { value } : { value, error }
 }
 
+/**
+ * Drop every entry older than the newest snapshot entry (`z`): a snapshot stands
+ * for the whole history before it, so the log always starts at the newest one.
+ */
+export function pruneResolverLog(entries: FieldLogEntry[]): FieldLogEntry[] {
+	for (let i = entries.length - 1; i > 0; i--) {
+		if ((entries[i] as FieldLogEntry).z === 1) return entries.slice(i)
+	}
+	return entries
+}
+
 function resolverState(
 	entries: FieldLogEntry[],
 	result: { value: unknown; error?: string },
@@ -214,6 +225,8 @@ function applyResolver(
 ): FieldApplyResult {
 	const index = insertionIndex(state.e, write.s)
 	if (index === -1) return { state, changed: false }
+	// Older than a snapshot entry: the snapshot already reflects it.
+	if (index === 0 && state.e[0]?.z === 1) return { state, changed: false }
 	const entry: FieldLogEntry = { s: write.s, v: write.v }
 	if (write.insert) entry.b = null
 	else if (write.hasPrev) entry.b = write.prev
@@ -254,21 +267,34 @@ function firstAddBefore(a: { s: Stamp; i: number } | null, b: { s: Stamp; i: num
 }
 
 interface ElementWriter {
-	add(value: unknown, stamp: Stamp, index: number): void
-	remove(value: unknown, stamp: Stamp): void
+	/** Add occurrence `occurrence` of `value`; `index` is its position in the written array. */
+	add(value: unknown, occurrence: number, stamp: Stamp, index: number): void
+	remove(value: unknown, occurrence: number, stamp: Stamp): void
 	/** The (copy-on-write) element map and whether any element changed. */
 	result(): { el: Record<string, ElementState>; changed: boolean }
+}
+
+/**
+ * Identity of one occurrence of an array element: the canonical JSON of the value
+ * plus its occurrence number (the k-th copy of that value, from 0). Canonical JSON
+ * never ends in `#<digits>`, so the key is unambiguous.
+ */
+export function elementKey(canonicalValue: string, occurrence: number): string {
+	return `${canonicalValue}#${occurrence}`
 }
 
 function elementWriter(base: Record<string, ElementState>): ElementWriter {
 	let el = base
 	let changed = false
-	const read = (value: unknown): [string, ElementState] => {
-		const key = canonicalKey(value)
+	const read = (value: unknown, occurrence: number): [string, ElementState] => {
+		const canonical = canonicalKey(value)
+		const key = elementKey(canonical, occurrence)
 		const existing = el[key]
 		return [
 			key,
-			existing ? { ...existing } : { v: JSON.parse(key) as unknown, a: null, f: null, r: null },
+			existing
+				? { ...existing }
+				: { v: JSON.parse(canonical) as unknown, n: occurrence, a: null, f: null, r: null },
 		]
 	}
 	const store = (key: string, element: ElementState): void => {
@@ -277,8 +303,8 @@ function elementWriter(base: Record<string, ElementState>): ElementWriter {
 		changed = true
 	}
 	return {
-		add(value, stamp, index) {
-			const [key, element] = read(value)
+		add(value, occurrence, stamp, index) {
+			const [key, element] = read(value, occurrence)
 			let touched = false
 			if (isAfter(stamp, element.a)) {
 				element.a = stamp
@@ -291,8 +317,8 @@ function elementWriter(base: Record<string, ElementState>): ElementWriter {
 			}
 			if (touched) store(key, element)
 		},
-		remove(value, stamp) {
-			const [key, element] = read(value)
+		remove(value, occurrence, stamp) {
+			const [key, element] = read(value, occurrence)
 			if (isAfter(stamp, element.r)) {
 				element.r = stamp
 				store(key, element)
@@ -300,6 +326,21 @@ function elementWriter(base: Record<string, ElementState>): ElementWriter {
 		},
 		result: () => ({ el, changed }),
 	}
+}
+
+/** Canonical value -> number of copies in `items`, and each item's occurrence number. */
+function countOccurrences(items: readonly unknown[]): {
+	counts: Map<string, number>
+	occurrences: Array<{ item: unknown; canonical: string; k: number }>
+} {
+	const counts = new Map<string, number>()
+	const occurrences = items.map((item) => {
+		const canonical = canonicalKey(item)
+		const k = counts.get(canonical) ?? 0
+		counts.set(canonical, k + 1)
+		return { item, canonical, k }
+	})
+	return { counts, occurrences }
 }
 
 function applyElementSet(state: ElementSetFieldState, write: FieldWrite): FieldApplyResult {
@@ -316,10 +357,15 @@ function applyElementSet(state: ElementSetFieldState, write: FieldWrite): FieldA
 		}
 	}
 	const atomic = write.a
-	if (atomic && (atomic.type === 'append' || atomic.type === 'remove')) {
+	const prev = !write.insert && Array.isArray(write.prev) ? (write.prev as unknown[]) : null
+	const atomicElement =
+		atomic !== undefined && (atomic.type === 'append' || atomic.type === 'remove')
+	if (atomicElement && (prev === null || !Array.isArray(write.v))) {
+		// An atomic element op without the writer's array base: append adds (and
+		// remove removes) the value's first occurrence.
 		setShape(true)
-		if (atomic.type === 'append') writer.add(atomic.value, write.s, 0)
-		else if (!state.ao) writer.remove(atomic.value, write.s)
+		if (atomic.type === 'append') writer.add(atomic.value, 0, write.s, 0)
+		else if (!state.ao) writer.remove(atomic.value, 0, write.s)
 	} else if (!Array.isArray(write.v)) {
 		setShape(false, write.v)
 		const nextClr = maxStamp(clr, write.s)
@@ -328,18 +374,18 @@ function applyElementSet(state: ElementSetFieldState, write: FieldWrite): FieldA
 			changed = true
 		}
 	} else {
+		// A multiset difference: the k-th copy of a value is added when the written
+		// array holds more than k copies and the writer's base held at most k, and
+		// removed in the opposite case. Duplicates are kept.
 		setShape(true)
-		const prev = !write.insert && Array.isArray(write.prev) ? (write.prev as unknown[]) : null
-		const prevKeys = new Set(prev ? prev.map((x) => canonicalKey(x)) : [])
-		const nextKeys = new Set<string>()
-		write.v.forEach((item, index) => {
-			const key = canonicalKey(item)
-			nextKeys.add(key)
-			if (!prevKeys.has(key)) writer.add(item, write.s, index)
+		const next = countOccurrences(write.v)
+		const before = prev ? countOccurrences(prev) : null
+		next.occurrences.forEach(({ item, canonical, k }, index) => {
+			if (k >= (before?.counts.get(canonical) ?? 0)) writer.add(item, k, write.s, index)
 		})
-		if (prev && !state.ao) {
-			for (const item of prev) {
-				if (!nextKeys.has(canonicalKey(item))) writer.remove(item, write.s)
+		if (before && !state.ao) {
+			for (const { item, canonical, k } of before.occurrences) {
+				if (k >= (next.counts.get(canonical) ?? 0)) writer.remove(item, k, write.s)
 			}
 		}
 	}
@@ -729,6 +775,7 @@ function joinElements(
 		}
 		out[key] = {
 			v: x.v,
+			n: x.n,
 			a: maxStamp(x.a, y.a),
 			f: y.f !== null && firstAddBefore(x.f, y.f) ? y.f : x.f,
 			r: maxStamp(x.r, y.r),
@@ -749,7 +796,7 @@ export function joinFieldStates(a: FieldState, b: FieldState, plan: FieldPlan): 
 			return { k: 'reg', e: entries, val: chainFold(entries) }
 		}
 		case 'res': {
-			const entries = mergeLogs(a.e, (b as ResolverFieldState).e)
+			const entries = pruneResolverLog(mergeLogs(a.e, (b as ResolverFieldState).e))
 			return resolverState(entries, resolverFold(plan, entries))
 		}
 		case 'set': {

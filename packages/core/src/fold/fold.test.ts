@@ -161,12 +161,38 @@ describe('arrays: LWW element set', () => {
 		expect(foldBothOrders([base, remove, readd, lateRemove])?.tags).toEqual([])
 	})
 
-	test('elements are a set: duplicates collapse, objects compare by canonical JSON', () => {
+	test('arrays are multisets: duplicates are kept, objects compare by canonical JSON', () => {
 		const base = insert(1, { tags: ['a', 'a', 'b'] })
-		expect(fold([base])?.tags).toEqual(['a', 'b'])
+		expect(fold([base])?.tags).toEqual(['a', 'a', 'b'])
 		const objs = insert(1, { doc: null, tags: [{ k: 1, j: 2 }] })
 		const restated = update(2, { tags: [{ j: 2, k: 1 }] }, { tags: [{ k: 1, j: 2 }] })
 		expect(fold([objs, restated])?.tags).toEqual([{ j: 2, k: 1 }])
+	})
+
+	test('duplicates merge per occurrence: removing one copy keeps the other', () => {
+		const base = insert(1, { tags: ['a', 'a', 'b'] })
+		// a removes one copy of 'a'; b concurrently adds a third copy and a 'c'.
+		const a = update(2, { tags: ['a', 'b'] }, { tags: ['a', 'a', 'b'] }, 'a')
+		const b = update(3, { tags: ['a', 'a', 'b', 'a', 'c'] }, { tags: ['a', 'a', 'b'] }, 'b')
+		// Occurrence #1 of 'a' is removed (newest add is the insert); #2 is new.
+		expect(foldBothOrders([base, a, b])?.tags).toEqual(['a', 'b', 'a', 'c'])
+		// Two writers appending the same value from the same base add the same
+		// occurrence: the copies coincide (documented limit of value-identified elements).
+		const c = update(4, { tags: ['a', 'a', 'b', 'x'] }, { tags: ['a', 'a', 'b'] }, 'c')
+		const d = update(4, { tags: ['a', 'a', 'b', 'x'] }, { tags: ['a', 'a', 'b'] }, 'd')
+		expect(foldBothOrders([base, c, d])?.tags).toEqual(['a', 'a', 'b', 'x'])
+	})
+
+	test('an atomic append of a value already present adds a copy', () => {
+		const base = insert(1, { tags: ['a'] })
+		const append = update(2, { tags: ['a', 'a'] }, { tags: ['a'] }, 'a', {
+			tags: { type: 'append', value: 'a' },
+		})
+		expect(foldBothOrders([base, append])?.tags).toEqual(['a', 'a'])
+		const removeAll = update(3, { tags: [] }, { tags: ['a', 'a'] }, 'b', {
+			tags: { type: 'remove', value: 'a' },
+		})
+		expect(foldBothOrders([base, append, removeAll])?.tags).toEqual([])
 	})
 
 	test('setting the array to null clears elements added before it', () => {
@@ -320,11 +346,41 @@ describe('scalars and atomic ops', () => {
 		expect(result?.least).toBe(1)
 	})
 
-	test('server-authoritative resolves by last write wins', () => {
+	test('server-authoritative without authoritative nodes resolves by last write wins', () => {
 		const base = insert(1, { owner: 'client' })
 		const server = update(3, { owner: 'server' }, { owner: 'client' }, 'srv')
 		const client = update(2, { owner: 'mine' }, { owner: 'client' }, 'a')
 		expect(foldBothOrders([base, server, client])?.owner).toBe('server')
+	})
+
+	test('server-authoritative: an authoritative write beats a later client write', () => {
+		const authoritativeNodeIds = new Set(['srv'])
+		const foldAuth = (ops: Operation[]) => {
+			const state = foldRecord(ops, schema, { authoritativeNodeIds }).state
+			return state === null ? null : materialize(state)
+		}
+		const base = insert(1, { owner: 'client', title: 't' })
+		const server = update(2, { owner: 'server' }, { owner: 'client' }, 'srv')
+		const client = update(9, { owner: 'mine', title: 'later' }, { owner: 'client', title: 't' })
+		for (const order of [
+			[base, server, client],
+			[client, server, base],
+			[server, base, client],
+		]) {
+			const result = foldAuth(order)
+			// The class decides the server-authoritative field only; other fields stay LWW.
+			expect(result?.owner).toBe('server')
+			expect(result?.title).toBe('later')
+		}
+		// Within the authoritative class, the later write wins.
+		const server2 = update(3, { owner: 'server-2' }, { owner: 'server' }, 'srv')
+		expect(foldAuth([base, client, server2, server])?.owner).toBe('server-2')
+		// Incremental merges agree with the from-scratch fold, in any order.
+		let state = createFoldState('tickets', 'r1')
+		for (const next of [server2, client, base, server]) {
+			state = mergeOp(state, next, schema, { authoritativeNodeIds }).state
+		}
+		expect(materialize(state)?.owner).toBe('server-2')
 	})
 })
 

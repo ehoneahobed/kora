@@ -135,6 +135,7 @@ export {
 	mergeOp,
 } from './fold/fold'
 export { deserializeFoldState, serializeFoldState } from './fold/serialize'
+export { createSnapshotState, type FoldSnapshotInput } from './fold/snapshot'
 export { toMergeTrace } from './fold/trace'
 export { deriveSideEffectOpId } from './fold/side-effect-id'
 export { FoldConfigurationError, FoldStateError } from './fold/errors'

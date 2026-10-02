@@ -16,11 +16,17 @@
  * - Scalars ('reg'): LWW register. With atomic ops, the chain since the newest
  *   plain write is kept: a same-type atomic chain composes (increments sum, max of
  *   maxes), any other write takes its resolved value.
- * - Arrays ('set'): LWW element set. Element identity = canonical JSON (sorted
- *   keys). adds = data − previousData, removes = previousData − data (an insert
- *   only adds). Present iff newest add > newest remove and > newest non-array
- *   write. Order: first add (stamp, then index in that write). Atomic append /
- *   remove add / remove one element. `merge('append-only')` ignores removals.
+ * - Arrays ('set'): occurrence-indexed LWW element multiset. Element identity =
+ *   (canonical JSON with sorted keys, occurrence k): the k-th copy of a value.
+ *   adds = data − previousData and removes = previousData − data as multisets
+ *   (an insert only adds). Present iff newest add > newest remove and > newest
+ *   non-array write. Order: first add (stamp, then index in that write). Atomic
+ *   append / remove are the same multiset difference against the writer's base
+ *   (without an array base: the value's first occurrence). `merge('append-only')`
+ *   ignores removals.
+ * - `merge('server-authoritative')` ('reg'): a register whose writes by
+ *   `FoldOptions.authoritativeNodeIds` (the server's node ids) carry class 1 and
+ *   beat every class-0 write regardless of HLC. Order: (class, HLC, op id).
  * - Objects / json ('map'): per-top-level-key LWW with removal markers; nested
  *   values are whole-value LWW per key. A non-object write (null, scalar, json
  *   array) replaces the whole value and clears keys written before it.
@@ -37,10 +43,12 @@
  *   newest delete. Insert onto an existing row merges per field.
  *
  * Semantic changes versus beta.12/13 (all deliberate; each was non-convergent):
- * 1. Arrays are sets of elements merged per element (pairwise add-wins-set gone):
- *    duplicates collapse; order is first-add order, not the writer's order; a
- *    removal beats an unchanged copy; for the same element the later edit wins;
- *    objects inside arrays compare by canonical JSON (key order ignored).
+ * 1. Arrays are multisets of elements merged per occurrence (pairwise
+ *    add-wins-set gone): duplicates are kept; order is first-add order, not the
+ *    writer's order; a removal beats an unchanged copy; for the same occurrence the
+ *    later edit wins; two writers that add the same value from the same base add
+ *    the same occurrence (one copy, not two); objects inside arrays compare by
+ *    canonical JSON (key order ignored).
  * 2. Objects merge per top-level key only; nested objects / arrays inside a key
  *    are whole-value LWW (the pairwise engine recursed and set-merged them).
  * 3. An update that restates a field unchanged no longer wins LWW for it (applies
@@ -50,14 +58,21 @@
  *    concurrent pair. Their output need not be commutative.
  * 5. Insert onto an existing row (or after a delete) merges per field; it no
  *    longer resets fields the insert does not carry (server replay used to).
- * 6. `merge('server-authoritative')` resolves by LWW: the fold cannot tell which
- *    replica is the server. Authority must come from server-side rejection or a
- *    later corrective write.
+ * 6. `merge('server-authoritative')`: a write by an authoritative node (the
+ *    server, `authoritativeNodeIds` from the handshake) beats any client write of
+ *    that field, even a later one; client writes among themselves, and server
+ *    writes among themselves, are LWW. With no authoritative node known it is LWW.
  * 7. `merge('counter' | 'max' | 'min' | 'append-only')` are folded over every
  *    write (they were pairwise formulas against one base).
- * 8. Atomic `append` on arrays no longer creates duplicates (set semantics).
+ * 8. Atomic `append` / `remove` on arrays are multiset differences against the
+ *    writer's base: appending a value already present adds a copy; `remove`
+ *    removes every copy the writer saw.
  * 9. An update to a record with no merged insert does not materialize a row (the
  *    client already behaved this way; the server replay materialized it).
+ * 10. A server scope-entry insert that carries the record's fold state
+ *    (`op.foldState`) is joined into the local state instead of merged as one
+ *    insert, so richtext, counters, resolvers and element sets enter with their
+ *    merge state (RT-29). Without it (older servers) `fieldVersions` still apply.
  * Delete vs update is unchanged: the later of the newest delete and the newest
  * write decides; a revived record shows every field's merged value.
  */
@@ -72,6 +87,7 @@ import {
 	joinFieldStates,
 	materializeField,
 } from './field-states'
+import { deserializeFoldState, serializeFoldState } from './serialize'
 import { compareStamps, isAfter, maxStamp, minStamp, stampOf, stampTimestamp } from './stamp'
 import {
 	FOLD_STATE_VERSION,
@@ -156,6 +172,46 @@ function fieldWriteStamp(op: Operation, field: string, opStamp: Stamp): Stamp {
 	if (version === undefined) return opStamp
 	const versioned = stampOf(version, op.id)
 	return compareStamps(versioned, opStamp) > 0 ? versioned : opStamp
+}
+
+/**
+ * A write to a `merge('server-authoritative')` field by an authoritative node
+ * gets authority class 1, which orders before the HLC (see {@link Stamp}).
+ */
+function classify(stamp: Stamp, op: Operation, plan: FieldPlan, options: FoldOptions): Stamp {
+	if (plan.authoritative && options.authoritativeNodeIds?.has(op.nodeId)) {
+		return { ...stamp, c: 1 }
+	}
+	return stamp
+}
+
+/**
+ * Merge a server scope-entry operation that carries the record's serialized fold
+ * state (`op.foldState`): a state-based join. Returns null when the carried state
+ * cannot be read (another format version): the caller then merges the operation's
+ * data like any insert (`fieldVersions` / whole-op stamp), as for an older server.
+ */
+function mergeCarriedState(
+	state: FoldState,
+	op: Operation,
+	schema: SchemaDefinition,
+): MergeOpResult | null {
+	let carried: FoldState
+	try {
+		carried = deserializeFoldState(op.foldState as string)
+	} catch (error) {
+		if (error instanceof FoldStateError) return null
+		throw error
+	}
+	if (carried.c !== state.c || carried.r !== state.r) {
+		throw new FoldStateError(
+			`Operation ${op.id} carries the fold state of ${carried.c}/${carried.r} but targets ${state.c}/${state.r}.`,
+			{ operationId: op.id, collection: op.collection, recordId: op.recordId },
+		)
+	}
+	const joined = joinStates(state, carried, schema)
+	const changed = serializeFoldState(joined) !== serializeFoldState(state)
+	return { state: changed ? joined : state, traces: [], changed }
 }
 
 /**
@@ -275,6 +331,10 @@ export function mergeOp(
 			{ operationId: op.id, collection: op.collection, recordId: op.recordId },
 		)
 	}
+	if (op.foldState !== undefined && op.type === 'insert') {
+		const carried = mergeCarriedState(state, op, schema)
+		if (carried !== null) return carried
+	}
 	const mode = options.traces ?? 'conflicts'
 	const traces: FoldTrace[] = []
 	const stamp = stampOf(op.timestamp, op.id)
@@ -304,10 +364,16 @@ export function mergeOp(
 	const collection = schema.collections[op.collection]
 	let fields = state.f
 	for (const [field, raw] of Object.entries(op.data)) {
-		const write = buildWrite(op, field, raw, fieldWriteStamp(op, field, stamp))
-		if (write === null) continue
+		if (raw === undefined) continue
 		const existing = fields[field]
 		const plan = fieldPlanFor(collection, field, existing, state)
+		const write = buildWrite(
+			op,
+			field,
+			raw,
+			classify(fieldWriteStamp(op, field, stamp), op, plan, options),
+		)
+		if (write === null) continue
 		const tracing = mode !== 'none'
 		const prior = tracing ? safeMaterializeField(existing, field, options) : undefined
 		const priorStamp = existing ? fieldStamp(existing) : null

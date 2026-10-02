@@ -6,7 +6,7 @@ import type { AtomicOp, HLCTimestamp, Operation } from '../types'
  * change to the on-disk shape. A reader that sees a different version must refuse
  * the state and re-fold the record from its operation log.
  */
-export const FOLD_STATE_VERSION = 1
+export const FOLD_STATE_VERSION = 2
 
 /**
  * A write's position in the record's total order: the operation's HLC timestamp
@@ -14,12 +14,18 @@ export const FOLD_STATE_VERSION = 1
  * `HybridLogicalClock.compare`), then the operation id as a tie-breaker. Two
  * distinct operations never share a stamp, even when a buggy or forged node reuses
  * an HLC, so every "latest wins" comparison in the fold is a strict total order.
+ *
+ * A write to a `merge('server-authoritative')` field by an authoritative node
+ * ({@link FoldOptions.authoritativeNodeIds}) carries class `c: 1`, which orders
+ * before the HLC: the order is lexicographic on (class, HLC, op id).
  */
 export interface Stamp {
 	/** `HybridLogicalClock.serialize(timestamp)` of the writing operation (or field version). */
 	t: string
 	/** Id of the writing operation. */
 	o: string
+	/** Authority class (1 = authoritative write). Absent means 0. */
+	c?: 1
 }
 
 /**
@@ -35,6 +41,11 @@ export interface FieldLogEntry {
 	a?: AtomicOp
 	/** For resolver fields: the writer's base (`previousData[field]`), null for inserts. */
 	b?: unknown
+	/**
+	 * Resolver fields only: a snapshot entry ({@link createSnapshotState}). It resets
+	 * the value without calling the resolver, and every older entry is pruned.
+	 */
+	z?: 1
 }
 
 /**
@@ -55,10 +66,12 @@ export interface RegisterFieldState {
 	val: unknown
 }
 
-/** One element of an {@link ElementSetFieldState}. */
+/** One element occurrence of an {@link ElementSetFieldState}. */
 export interface ElementState {
 	/** The element value (canonical JSON parsed back, so key order is normalized). */
 	v: unknown
+	/** Occurrence number: this is the n-th copy (from 0) of the value in the array. */
+	n: number
 	/** Newest add. */
 	a: Stamp | null
 	/** Oldest add plus the element's index in that write (its position in the array). */
@@ -213,6 +226,13 @@ export interface FoldOptions {
 	richtext?: RichtextUpdateMerger
 	/** Which traces to emit. Default `'conflicts'`. */
 	traces?: FoldTraceMode
+	/**
+	 * Node ids whose writes are authoritative for `merge('server-authoritative')`
+	 * fields (the server's node ids, learned at the sync handshake). Their writes beat
+	 * every non-authoritative write of such a field regardless of HLC; within a class
+	 * the later write wins. Every replica must fold with the same set.
+	 */
+	authoritativeNodeIds?: ReadonlySet<string>
 }
 
 /**
