@@ -484,6 +484,12 @@ export class SyncEngine {
 	private querySubsets = new Map<string, SyncQuerySubset>()
 	private staticQuerySubsets: SyncQuerySubset[] = []
 	private querySubsetReconnectTimer: ReturnType<typeof setTimeout> | null = null
+	/**
+	 * Fires when the earliest parked adoption's backoff runs out (RT-53): an idle session of
+	 * this tab's own node then hands over to it, so a closed tab's deferred writes are
+	 * retried even if this tab never writes or reconnects.
+	 */
+	private adoptionRetryTimer: ReturnType<typeof setTimeout> | null = null
 
 	/** Resume cursor for paginated initial sync (persisted across reconnects) */
 	private resumeDeltaCursor: DeltaCursor | null = null
@@ -855,6 +861,13 @@ export class SyncEngine {
 			clearTimeout(this.querySubsetReconnectTimer)
 			this.querySubsetReconnectTimer = null
 		}
+		this.clearAdoptionRetryTimer()
+	}
+
+	private clearAdoptionRetryTimer(): void {
+		if (!this.adoptionRetryTimer) return
+		clearTimeout(this.adoptionRetryTimer)
+		this.adoptionRetryTimer = null
 	}
 
 	/** Close the transport, logging nothing: it may already be closed. */
@@ -3311,7 +3324,52 @@ export class SyncEngine {
 
 		await this.refreshPendingCount()
 		this.notifyStatusChange()
-		await this.maybeEndSessionForNodeWork()
+		if (await this.maybeEndSessionForNodeWork()) return
+		this.armAdoptionRetryTimer()
+	}
+
+	/**
+	 * In a session of this tab's own node, arm a timer for the earliest parked adoption's
+	 * backoff expiry (RT-53). Without it a parked node is retried only at a session start
+	 * or after this tab's own uploads made progress, so an idle tab (a dashboard, a kiosk)
+	 * would never retry a closed tab's deferred writes while its connection holds.
+	 */
+	private armAdoptionRetryTimer(): void {
+		this.clearAdoptionRetryTimer()
+		if (this.destroyed || this.state !== 'streaming') return
+		if (this.currentNodeId() !== this.store.getNodeId()) return
+		let earliest = Number.POSITIVE_INFINITY
+		for (const deferred of this.deferredAdoptions) {
+			if (deferred.reason === 'parked') earliest = Math.min(earliest, deferred.untilMs)
+		}
+		if (!Number.isFinite(earliest)) return
+		const epoch = this.sessionEpoch
+		this.adoptionRetryTimer = setTimeout(
+			() => {
+				this.adoptionRetryTimer = null
+				void this.onAdoptionRetryTimer(epoch)
+			},
+			Math.max(0, earliest - Date.now()),
+		)
+	}
+
+	/**
+	 * A parked adoption's backoff ran out during this session (RT-53). An idle own-node
+	 * session hands over now: it reconnects, and the next session adopts the node (one
+	 * retry per backoff; a node deferred again is parked again for longer). A busy session
+	 * hands over when its uploads drain (maybeYieldToDeferredNode sees the expiry).
+	 */
+	private async onAdoptionRetryTimer(epoch: number): Promise<void> {
+		if (epoch !== this.sessionEpoch || this.destroyed) return
+		if (this.state !== 'streaming' || this.currentNodeId() !== this.store.getNodeId()) return
+		if (this.inFlightUploads.size > 0 || this.hasUploadable()) return
+		this.deferredAdoptions = []
+		try {
+			await this.reconnect()
+		} catch {
+			// The new session failed to start: the engine is disconnected, and the app's
+			// reconnection loop (or the next sync) takes over, adopting the node then.
+		}
 	}
 
 	// --- Own-operation upload tracking (W3: contiguous acknowledged prefix) ---
@@ -4176,14 +4234,18 @@ export class SyncEngine {
 	 */
 	private async maybeYieldToDeferredNode(): Promise<boolean> {
 		if (this.state !== 'streaming' || this.deferredAdoptions.length === 0) return false
-		if (this.sessionAcked === 0 || this.hasUploadable()) return false
+		if (this.hasUploadable()) return false
 		const now = Date.now()
 		const schedule = await this.loadSchedule()
+		// A park whose backoff ran out is due whatever this session did (RT-53: one retry
+		// per backoff). Anything else waits for this tab's own progress (RT-46).
+		const progressed = this.sessionAcked > 0
 		const ready = this.deferredAdoptions.some((deferred) =>
 			deferred.reason === 'causal'
-				? true
+				? progressed
 				: now >= deferred.untilMs ||
-					(schedule.progress > deferred.progressMark &&
+					(progressed &&
+						schedule.progress > deferred.progressMark &&
 						now - deferred.parkedAtMs >= ADOPTION_YIELD_MIN_MS),
 		)
 		if (!ready || this.state !== 'streaming' || this.inFlightUploads.size > 0) return false

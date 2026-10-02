@@ -12,6 +12,7 @@
  *
  * Asserts the CORRECT behaviour (fails today): the closed tab's write reaches the server
  * once its park expired, without waiting for a reconnect or a write in the open tab.
+ * The idle time runs on fake timers (Date and setTimeout), advanced past the backoff.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -23,7 +24,7 @@ import { createServerTransportPair } from '@korajs/server/internal'
 import { Store } from '@korajs/store'
 import type { StorageAdapter } from '@korajs/store'
 import type { SyncTransport } from '@korajs/sync'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { TestDevice } from '../../src/test-device'
 import { TestServer } from '../../src/test-server'
 
@@ -34,6 +35,7 @@ const schema = defineSchema({
 
 let cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => {
+	vi.useRealTimers()
 	for (const fn of cleanup.reverse()) await fn()
 	cleanup = []
 })
@@ -50,6 +52,8 @@ function perTabDevice(server: TestServer, dir: string): TestDevice {
 		server,
 		tmpDir: dir,
 		createTransportPair: pair,
+		// The engine may reconnect on its own, as over a real WebSocket.
+		reconnectable: true,
 	})
 	const internals = device as unknown as { store: Store; adapter: StorageAdapter }
 	internals.store = new Store({
@@ -91,19 +95,32 @@ describe('RT-53: a parked adoption is never retried by an idle connected tab', (
 		open.emitter.on('sync:local-node', (e: KoraEvent) => {
 			if (e.type === 'sync:local-node') actions.push(e.action)
 		})
+		// A controllable clock from here on (it also runs with real time, so the real
+		// SQLite store and the in-memory transports keep progressing): the 36 s of idle
+		// time below pass without waiting for them.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'], shouldAdvanceTime: true })
 		// First session adopts the closed tab's node; the server defers its write: parked.
 		await open.sync()
 		await open.disconnect()
 		// The reconnect (ReconnectionManager in an app) runs as the open tab's own node.
 		await open.sync()
 		expect(actions).toContain('adoption-parked')
+		// Still parked a moment later: the backoff is not over.
+		await vi.advanceTimersByTimeAsync(1_000)
+		expect({ onServer: server.getAllOperations().length, attempts }).toEqual({
+			onServer: 0,
+			attempts: 1,
+		})
 
 		// The open tab stays connected and idle past the 30 s park backoff.
-		await new Promise((resolve) => setTimeout(resolve, 36_000))
+		await vi.advanceTimersByTimeAsync(35_000)
+		// Let the handover session finish on the real store.
+		await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 10_000 })
+		await vi.waitFor(() => expect(server.getAllOperations().length).toBe(1), { timeout: 10_000 })
 
 		expect({
 			onServer: server.getAllOperations().map((op) => String(op.data?.body)),
 			attempts,
 		}).toEqual({ onServer: ['closed tab'], attempts: 2 })
-	}, 90_000)
+	}, 30_000)
 })

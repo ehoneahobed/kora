@@ -64,6 +64,79 @@ export interface TestDeviceOptions {
 	 * engine never uploads another user's node on this user's session.
 	 */
 	principal?: () => string | null
+	/**
+	 * Let the sync engine reconnect on its own, as over a real WebSocket: a `connect()`
+	 * after the session closed opens a new transport pair to the server. Off by default
+	 * (a closed pair stays closed until the next {@link TestDevice.sync}).
+	 */
+	reconnectable?: boolean
+}
+
+type TransportPairFactory = TestDeviceOptions['createTransportPair']
+
+/**
+ * A client transport that opens a fresh pair to the test server whenever it connects
+ * after its current pair closed (a real socket reconnecting). Handlers move with it.
+ */
+class ReconnectingClientTransport implements SyncTransport {
+	private messageHandler: Parameters<SyncTransport['onMessage']>[0] | null = null
+	private closeHandler: Parameters<SyncTransport['onClose']>[0] | null = null
+	private errorHandler: Parameters<SyncTransport['onError']>[0] | null = null
+	private connectedOnce = false
+
+	constructor(
+		private inner: SyncTransport,
+		private readonly createPair: TransportPairFactory,
+		private readonly server: TestServer,
+	) {}
+
+	async connect(url: string, options?: Parameters<SyncTransport['connect']>[1]): Promise<void> {
+		if (this.connectedOnce && !this.inner.isConnected()) {
+			const previous = this.inner
+			previous.onMessage(() => {})
+			previous.onClose(() => {})
+			previous.onError(() => {})
+			const { client, serverTransport } = this.createPair()
+			this.inner = client
+			this.wire()
+			this.server.handleConnection(serverTransport)
+		}
+		this.connectedOnce = true
+		await this.inner.connect(url, options)
+	}
+
+	disconnect(): Promise<void> {
+		return this.inner.disconnect()
+	}
+
+	send(message: Parameters<SyncTransport['send']>[0]): void {
+		this.inner.send(message)
+	}
+
+	onMessage(handler: Parameters<SyncTransport['onMessage']>[0]): void {
+		this.messageHandler = handler
+		this.wire()
+	}
+
+	onClose(handler: Parameters<SyncTransport['onClose']>[0]): void {
+		this.closeHandler = handler
+		this.wire()
+	}
+
+	onError(handler: Parameters<SyncTransport['onError']>[0]): void {
+		this.errorHandler = handler
+		this.wire()
+	}
+
+	isConnected(): boolean {
+		return this.inner.isConnected()
+	}
+
+	private wire(): void {
+		this.inner.onMessage((message) => this.messageHandler?.(message))
+		this.inner.onClose((reason) => this.closeHandler?.(reason))
+		this.inner.onError((error) => this.errorHandler?.(error))
+	}
 }
 
 /**
@@ -88,6 +161,7 @@ export class TestDevice {
 	private readonly operationTransforms: OperationTransform[]
 	private readonly scopeExit: 'retain' | 'retract' | undefined
 	private readonly principal: (() => string | null) | undefined
+	private readonly reconnectable: boolean
 
 	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
@@ -107,6 +181,7 @@ export class TestDevice {
 		this.operationTransforms = options.operationTransforms ?? []
 		this.scopeExit = options.scopeExit
 		this.principal = options.principal
+		this.reconnectable = options.reconnectable === true
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -166,7 +241,11 @@ export class TestDevice {
 		}
 
 		// Create a new transport pair and connect
-		const { client, serverTransport } = this.createTransportPair()
+		const created = this.createTransportPair()
+		const { serverTransport } = created
+		const client = this.reconnectable
+			? new ReconnectingClientTransport(created.client, this.createTransportPair, this.server)
+			: created.client
 		this.currentTransport = client
 
 		const conflictHandler: { fn?: () => void } = {}

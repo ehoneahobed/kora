@@ -988,3 +988,69 @@ describe('RT-52: the signed-in user changes while a session is connecting', () =
 		await engine.stop()
 	})
 })
+
+describe('RT-53: a parked adoption is retried when its backoff runs out', () => {
+	test('an idle own-node session hands over to the parked node once, at the expiry', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'], shouldAdvanceTime: true })
+		try {
+			const p = persistence({ nodes: [nodeInfo(NODE), nodeInfo('closed')] })
+			const now = Date.now()
+			await p.state.saveAdoptionSchedule?.({
+				progress: 0,
+				parked: {
+					closed: { progressMark: 0, untilMs: now + 30_000, count: 1, parkedAtMs: now },
+				},
+			})
+			const { client, server } = createMemoryTransportPair()
+			const srv = scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([op(1, 'closed')], { claimLocalNode: vi.fn(async () => () => {}) }),
+				syncState: p.state,
+				config: { url: 'ws://t' },
+			})
+			await engine.start()
+			await vi.advanceTimersByTimeAsync(100)
+			expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+			// Not before the backoff ends, and nothing written meanwhile.
+			await vi.advanceTimersByTimeAsync(20_000)
+			expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+			await vi.advanceTimersByTimeAsync(10_000)
+			await vi.waitFor(() => expect(srv.uploaded).toEqual([op(1, 'closed').id]))
+			expect(srv.handshakes.map((h) => h.nodeId).slice(0, 2)).toEqual([NODE, 'closed'])
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('no timer when nothing is parked, and none outlives the session', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'], shouldAdvanceTime: true })
+		try {
+			const p = persistence({ nodes: [nodeInfo(NODE), nodeInfo('closed')] })
+			const now = Date.now()
+			await p.state.saveAdoptionSchedule?.({
+				progress: 0,
+				parked: {
+					closed: { progressMark: 0, untilMs: now + 30_000, count: 1, parkedAtMs: now },
+				},
+			})
+			const { client, server } = createMemoryTransportPair()
+			const srv = scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([op(1, 'closed')], { claimLocalNode: vi.fn(async () => () => {}) }),
+				syncState: p.state,
+				config: { url: 'ws://t' },
+			})
+			await engine.start()
+			await vi.advanceTimersByTimeAsync(100)
+			await engine.stop()
+			await vi.advanceTimersByTimeAsync(40_000)
+			// The session ended before the expiry: its timer went with it.
+			expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+})
