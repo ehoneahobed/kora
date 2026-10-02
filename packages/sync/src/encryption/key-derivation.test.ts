@@ -104,16 +104,24 @@ describe('deriveVersionedKey', () => {
 	})
 
 	test('throws for version 0', async () => {
-		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow(KeyDerivationError)
-		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow('positive integer')
+		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
+		await expect(deriveVersionedKey('test', 0, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			'positive integer',
+		)
 	})
 
 	test('throws for negative version', async () => {
-		await expect(deriveVersionedKey('test', -1, undefined, TEST_ITERATIONS)).rejects.toThrow(KeyDerivationError)
+		await expect(deriveVersionedKey('test', -1, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
 	})
 
 	test('throws for non-integer version', async () => {
-		await expect(deriveVersionedKey('test', 1.5, undefined, TEST_ITERATIONS)).rejects.toThrow(KeyDerivationError)
+		await expect(deriveVersionedKey('test', 1.5, undefined, TEST_ITERATIONS)).rejects.toThrow(
+			KeyDerivationError,
+		)
 	})
 
 	test('supports high version numbers for key rotation', async () => {
