@@ -809,14 +809,14 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration). W7 Stage B2 (server): Server half done: memory/SQLite/Postgres materialize through the fold (packages/server/src/store/record-fold.ts); server rows equal foldRecord of the same ops in any order (packages/server/tests/integration/fold-materialization.test.ts: parity on random workloads across the 3 stores, and the SRV-1 array/object/resolver case). The repro (packages/test, real client pipeline) needs the client half (Stage B1) to go green.",
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration). W7 Stage B2 (server): Server half done: memory/SQLite/Postgres materialize through the fold (packages/server/src/store/record-fold.ts); server rows equal foldRecord of the same ops in any order (packages/server/tests/integration/fold-materialization.test.ts: parity on random workloads across the 3 stores, and the SRV-1 array/object/resolver case). The repro (packages/test, real client pipeline) needs the client half (Stage B1) to go green. Repro (packages/test SRV-1, 3 cases) green with the server fold; the client pipeline still merges pairwise for other shapes until B1 (MERGE-2 tracks that).",
    "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
