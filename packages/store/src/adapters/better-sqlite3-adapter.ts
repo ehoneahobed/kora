@@ -22,6 +22,7 @@ const STATEMENT_CACHE_SIZE = 256
 export class BetterSqlite3Adapter implements StorageAdapter {
 	private db: Database.Database | null = null
 	private readonly statements = new Map<string, Database.Statement>()
+	private statementsDb: Database.Database | null = null
 
 	/**
 	 * Serializes transactions. better-sqlite3 is synchronous, but our
@@ -195,6 +196,12 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 	 * itself when the schema changes.
 	 */
 	private statement(db: Database.Database, sql: string): Database.Statement {
+		// A re-open replaces the connection: statements belong to the one they were
+		// prepared on.
+		if (this.statementsDb !== db) {
+			this.statements.clear()
+			this.statementsDb = db
+		}
 		const cached = this.statements.get(sql)
 		if (cached) {
 			this.statements.delete(sql)
