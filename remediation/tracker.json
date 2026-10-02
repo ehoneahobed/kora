@@ -2234,6 +2234,18 @@
    ],
    "pr": null,
    "notes": "The client reports the watermark of its REQUESTED scope; when the server resolves a different scope it could not trust it and restarted at 0 on every reconnect. Fixed: the client persists the downlink scope the server last accepted (SyncStatePersistence load/saveAcceptedDownlinkScope, restored) and its handshake additionally sends acceptedScopeKey (scopeViewKey: canonical JSON of the normalized scope map, packages/sync/src/scopes/scope-view-key.ts, shared by client and server) and acceptedScopeWatermark (that view's own watermark). New optional protocol fields, JSON and protobuf 43/44. The server computes scopeViewKey of the scope it resolves now and resumes from acceptedScopeWatermark when the keys match, else starts the view from 0 (a widened grant delivers the newly visible records). The accepted scope is never sent as the requested scope. A grant equal (by key) to the request keeps the requested view on the client. Repro packages/test/tests/repro/RT-33.test.ts (resume counts sent ops and scan cursors; widened grant). The handshake node pre-scan for scoped clients stays (beta.13 clients count pending from the handshake vector; kora compact uses peer entries); it now starts at the resumed watermark."
+  },
+  {
+   "id": "RT-34",
+   "title": "Node rotation lowers or deletes the old node's version-vector entry and writes the vector outside the W6 discipline (scan before the transaction, INSERT OR REPLACE)",
+   "severity": "P2",
+   "workstream": "W6",
+   "phase": 2,
+   "status": "fixed",
+   "tests": [],
+   "pr": null,
+   "acceptanceTest": "packages/store/src/sync/rotate-node-id.test.ts (3 tests failed before the fix: old entry lowered to the highest remaining op, deleted when every op rotated, and a counter advanced by another writer after the pre-transaction scan overwritten)",
+   "notes": "Phase 2 seam (W6 x RT-21). rotateUnsyncedOperationsInLog scanned the old node's ops before its transaction and wrote _kora_version_vector with INSERT OR REPLACE: the old node's counter dropped to its highest remaining op (or was deleted), so a rotated op that reached the server unacknowledged could have its number reused by a writer still on the old id (another tab): SEQUENCE_CONFLICT on the server. Fixed: the scan, rewrite and vector writes run in one transaction; the new node's entry is an UPSERT with MAX(stored, new); the old node's entry is never lowered (rotated numbers become holes, which upload tracking resolves). Store.rotateNodeId takes its counter from the persisted vector. A grep found no other vector write outside the discipline except backup restore (STORE-5, Phase 3, untouched)."
   }
  ],
  "rejectedProposalPins": {

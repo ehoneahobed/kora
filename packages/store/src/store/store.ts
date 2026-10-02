@@ -1381,8 +1381,9 @@ export class Store implements OperationLog {
 		this.clock = clock
 		this.causalTracker = new CausalTracker()
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
-		this.sequenceNumber = result.operations.length
 		this.versionVector = await this.loadVersionVector()
+		// The persisted counter (MAX with the stored value, W6), not a local count.
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? result.operations.length
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
