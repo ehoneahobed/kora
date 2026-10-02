@@ -95,7 +95,10 @@ export interface ProductionHttpRoute {
  * A production server handle returned by createProductionServer.
  */
 export interface ProductionServer {
-	/** Start listening. Returns the URL the server is available at. */
+	/**
+	 * Start listening. Returns the URL the server is available at, with the port it
+	 * actually bound (pass `port: 0` to let the OS pick a free one).
+	 */
 	start(): Promise<string>
 	/** Stop the server gracefully. */
 	stop(): Promise<void>
@@ -617,7 +620,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				httpServer?.once('error', onError)
 				httpServer?.listen(port, '0.0.0.0', () => {
 					httpServer?.off('error', onError)
-					resolve(`http://localhost:${port}`)
+					// Report the bound port, so `port: 0` (an OS-assigned free port, as tests
+					// running in parallel use) resolves to a reachable URL.
+					const address = httpServer?.address()
+					const bound = address && typeof address === 'object' ? address.port : port
+					resolve(`http://localhost:${bound}`)
 				})
 			})
 		},

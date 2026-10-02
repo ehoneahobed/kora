@@ -154,18 +154,37 @@ describe('IndexedDbAdapter', () => {
 			persistenceDebounceMs: 500,
 		})
 		await coalesced.open(minimalSchema)
+		saveSpy.mockClear()
+		// The debounced flush writes one snapshot; count the flushes it starts.
+		const flushes = vi.spyOn(
+			coalesced as unknown as { writeSnapshot: () => Promise<void> },
+			'writeSnapshot',
+		)
 
-		for (let index = 0; index < 5; index++) {
-			await coalesced.execute(
-				'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
-				[`rec-${index}`, `Todo ${index}`, 0, 1000, 1000],
-			)
+		// Deterministic (CLAUDE.md anti-pattern 9, NEW-TEST-1): the debounce runs on a
+		// fake clock, so a slow machine cannot fire it between two executes. Only the
+		// timer functions are faked; fake-indexeddb keeps its own scheduling.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			for (let index = 0; index < 5; index++) {
+				await coalesced.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					[`rec-${index}`, `Todo ${index}`, 0, 1000, 1000],
+				)
+			}
+
+			expect(flushes).not.toHaveBeenCalled()
+			await vi.advanceTimersByTimeAsync(499)
+			expect(flushes).not.toHaveBeenCalled()
+			await vi.advanceTimersByTimeAsync(1)
+			expect(flushes).toHaveBeenCalledTimes(1)
+		} finally {
+			vi.useRealTimers()
 		}
 
-		expect(saveSpy).not.toHaveBeenCalled()
-		await new Promise<void>((resolve) => setTimeout(resolve, 550))
-		expect(saveSpy.mock.calls.length).toBeGreaterThanOrEqual(1)
-
+		// Let the one coalesced write finish; it reached IndexedDB.
+		await coalesced.flushPersistence()
+		expect(saveSpy).toHaveBeenCalled()
 		saveSpy.mockRestore()
 		await coalesced.close()
 		await deleteFromIndexedDB('coalesce-db').catch(() => {})

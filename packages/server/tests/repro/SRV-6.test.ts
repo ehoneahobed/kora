@@ -150,11 +150,10 @@ describe('SRV-6 server resource limits', () => {
 	})
 
 	test('custom route request bodies are size-capped', async () => {
-		const port = 39561
 		let receivedBytes = 0
 		const server = createProductionServer({
 			store: new MemoryServerStore('s4'),
-			port,
+			port: 0,
 			httpRoutes: [
 				{
 					path: '/auth',
@@ -165,10 +164,10 @@ describe('SRV-6 server resource limits', () => {
 				},
 			],
 		})
-		await server.start()
+		const base = await server.start()
 		try {
 			const big = JSON.stringify({ email: 'a@b.c', pad: 'x'.repeat(20 * 1024 * 1024) })
-			const res = await fetch(`http://localhost:${port}/auth/signin`, {
+			const res = await fetch(`${base}/auth/signin`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: big,

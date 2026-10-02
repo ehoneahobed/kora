@@ -62,12 +62,13 @@ function dispatcherRoute() {
 	}
 }
 
-async function startServer(port: number): Promise<{ stop: () => Promise<void>; base: string }> {
+async function startServer(): Promise<{ stop: () => Promise<void>; base: string }> {
 	const store = new MemoryServerStore('server-1')
 	await store.setSchema(schema)
-	const server = createProductionServer({ store, port, httpRoutes: [dispatcherRoute()] })
-	await server.start()
-	return { stop: () => server.stop(), base: `http://localhost:${port}` }
+	// Port 0: the OS picks a free port, so parallel test runs never collide.
+	const server = createProductionServer({ store, port: 0, httpRoutes: [dispatcherRoute()] })
+	const base = await server.start()
+	return { stop: () => server.stop(), base }
 }
 
 async function post(base: string, payload: unknown): Promise<{ status: number; body: unknown }> {
@@ -81,7 +82,7 @@ async function post(base: string, payload: unknown): Promise<{ status: number; b
 
 describe('httpRoutes request.kora context', () => {
 	test('apply insert is readable via findById and query', async () => {
-		const { stop, base } = await startServer(39230)
+		const { stop, base } = await startServer()
 		try {
 			const inserted = await post(base, {
 				action: 'apply',
@@ -104,7 +105,7 @@ describe('httpRoutes request.kora context', () => {
 	})
 
 	test('apply update changes materialized state, apply delete removes it', async () => {
-		const { stop, base } = await startServer(39231)
+		const { stop, base } = await startServer()
 		try {
 			const inserted = await post(base, {
 				action: 'apply',
@@ -135,7 +136,7 @@ describe('httpRoutes request.kora context', () => {
 	})
 
 	test('apply runs through the validated pipeline: unique constraint rejects a duplicate', async () => {
-		const { stop, base } = await startServer(39232)
+		const { stop, base } = await startServer()
 		try {
 			const first = await post(base, {
 				action: 'apply',
@@ -157,7 +158,7 @@ describe('httpRoutes request.kora context', () => {
 	})
 
 	test('scope rejects an out-of-scope mutation and allows an in-scope one', async () => {
-		const { stop, base } = await startServer(39233)
+		const { stop, base } = await startServer()
 		try {
 			const scope = { notes: { userId: 'u1' } }
 
@@ -181,7 +182,7 @@ describe('httpRoutes request.kora context', () => {
 	})
 
 	test('scope filters query results to the caller tenant', async () => {
-		const { stop, base } = await startServer(39234)
+		const { stop, base } = await startServer()
 		try {
 			await post(base, {
 				action: 'apply',

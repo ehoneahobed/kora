@@ -85,9 +85,8 @@ describe('LMS-12: liveness', () => {
 
 	test('the production server must probe an idle WebSocket (ping) within 35 s', async () => {
 		const store = new MemoryServerStore('srv')
-		const port = 41_000 + Math.floor(Math.random() * 1_000)
-		const prod = createProductionServer({ store, port, staticDir: '/nonexistent' })
-		await prod.start()
+		const prod = createProductionServer({ store, port: 0, staticDir: '/nonexistent' })
+		const port = Number(new URL(await prod.start()).port)
 		cleanups.push(() => prod.stop())
 		const ws = new WebSocket(`ws://127.0.0.1:${port}/kora-sync`)
 		cleanups.push(() => ws.terminate())
@@ -150,9 +149,8 @@ describe('LMS-12: liveness', () => {
 		// TCP proxy that silently stops forwarding: no FIN, no RST. The OS will not report
 		// this for minutes (retransmission timeout), so only an application probe can.
 		const store = new MemoryServerStore('srv')
-		const port = 42_000 + Math.floor(Math.random() * 1_000)
-		const prod = createProductionServer({ store, port, staticDir: '/nonexistent' })
-		await prod.start()
+		const prod = createProductionServer({ store, port: 0, staticDir: '/nonexistent' })
+		const port = Number(new URL(await prod.start()).port)
 		cleanups.push(() => prod.stop())
 		let blackhole = false
 		const sockets: Socket[] = []
