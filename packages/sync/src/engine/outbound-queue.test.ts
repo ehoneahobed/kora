@@ -306,6 +306,23 @@ describe('OutboundQueue: id release and sent flags (W3)', () => {
 		expect(reloaded.wasSent('op-1')).toBe(false)
 	})
 
+	test('rejectRecord (scope retraction) never takes an operation already on the wire', async () => {
+		const queue = new OutboundQueue(new MemoryQueueStorage())
+		await queue.initialize()
+		const sentOp = { ...makeOp('op-1', 1), recordId: 'r' }
+		const unsentOp = { ...makeOp('op-2', 2), recordId: 'r' }
+		await queue.enqueue(sentOp)
+		await queue.enqueue(unsentOp)
+		const batch = queue.takeBatch(1)
+		if (!batch) throw new Error('batch')
+		await queue.markSent(batch.batchId)
+		const removed = await queue.rejectRecord('todos', 'r')
+		// The sent one may be stored by the server: its ack or rejection resolves it.
+		expect(removed.map((op) => op.id)).toEqual(['op-2'])
+		expect(queue.has('op-1')).toBe(true)
+		expect(queue.getInFlight().map((op) => op.id)).toEqual(['op-1'])
+	})
+
 	test('replace swaps only the named queued operations', async () => {
 		const queue = new OutboundQueue(new MemoryQueueStorage())
 		await queue.initialize()

@@ -68,14 +68,6 @@ export interface Operation {
 	 */
 	fieldVersions?: Record<string, HLCTimestamp>
 	/**
-	 * Server-authored serialized fold state (`serializeFoldState`) of the record,
-	 * carried on scope-entry inserts instead of `fieldVersions` (W7). A receiver joins
-	 * it into its own state (`joinStates`), so every field kind (richtext, counters,
-	 * resolvers, element sets) enters with its full merge state. Not part of the
-	 * content hash; never uploaded by devices.
-	 */
-	foldState?: string
-	/**
 	 * Content-hash version of `id` (CORE-1). Absent means 1: the id covers type,
 	 * collection, recordId, data, timestamp, nodeId and atomicOps. 2: it also
 	 * covers previousData, sequenceNumber, causalDeps and schemaVersion. Verify
@@ -84,11 +76,14 @@ export interface Operation {
 	 */
 	hashVersion?: 1 | 2
 	/**
-	 * Serialized per-record fold state (W7), present only on server-authored scope-entry
+	 * Server-authored serialized fold state (`serializeFoldState`) of the record (W7),
+	 * carried on scope-entry inserts instead of `fieldVersions`, and present only on
 	 * operations from a node the handshake named authoritative
-	 * (`HandshakeResponseMessage.authoritativeNodeIds`). Opaque to the protocol layer.
-	 * Like `fieldVersions`, it is NOT part of the content hash, and the server strips it
-	 * from every device upload. Protobuf operation field 15.
+	 * (`HandshakeResponseMessage.authoritativeNodeIds`). A receiver joins it into its own
+	 * state (`joinStates`), so every field kind (richtext, counters, resolvers, element
+	 * sets) enters with its full merge state. Opaque to the protocol layer. NOT part of
+	 * the content hash; the server strips it from every device upload. Protobuf
+	 * operation field 15.
 	 */
 	foldState?: string
 	/**

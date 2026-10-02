@@ -27,7 +27,6 @@ import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import {
-	AUTHORITATIVE_NODES_META_KEY,
 	FOLD_MATERIALIZATION_CURRENT,
 	FOLD_MATERIALIZATION_LEGACY,
 	FOLD_MATERIALIZATION_META_KEY,
@@ -289,7 +288,7 @@ export class Store implements OperationLog {
 		// fold materializations (W7); a pre-W7 database is re-materialized after its
 		// schema migrations, whose backfills then write the legacy way.
 		if (this.folder) {
-			this.folder.setAuthoritativeNodeIds(await this.loadAuthoritativeNodeIds())
+			this.folder.setAuthoritativeNodeIds((await loadAuthoritativeNodeIds(this.adapter)) ?? [])
 			this.foldActive =
 				(await this.readMeta(FOLD_MATERIALIZATION_META_KEY)) === FOLD_MATERIALIZATION_CURRENT
 		}
@@ -940,19 +939,6 @@ export class Store implements OperationLog {
 		])
 	}
 
-	private async loadAuthoritativeNodeIds(): Promise<string[]> {
-		const raw = await this.readMeta(AUTHORITATIVE_NODES_META_KEY)
-		if (raw === null) return []
-		try {
-			const parsed = JSON.parse(raw) as unknown
-			return Array.isArray(parsed)
-				? parsed.filter((id): id is string => typeof id === 'string')
-				: []
-		} catch {
-			return []
-		}
-	}
-
 	/**
 	 * Make every row a materialization of its record's fold state (W7), once per
 	 * database and fold-state version. Runs after the W8 log-integrity scan: a
@@ -1007,13 +993,19 @@ export class Store implements OperationLog {
 	 */
 	async setAuthoritativeNodeIds(nodeIds: readonly string[]): Promise<void> {
 		this.ensureOpen()
-		const folder = this.folder
-		if (!folder) return
 		const next = [...new Set(nodeIds)].sort()
+		const folder = this.folder
+		if (!folder) {
+			await saveAuthoritativeNodeIds(this.adapter, next)
+			return
+		}
 		const previous = [...folder.getAuthoritativeNodeIds()].sort()
-		if (JSON.stringify(next) === JSON.stringify(previous)) return
+		const persisted = await loadAuthoritativeNodeIds(this.adapter)
+		if (JSON.stringify(next) === JSON.stringify(previous) && persisted !== null) return
 		folder.setAuthoritativeNodeIds(next)
-		await this.writeMeta(AUTHORITATIVE_NODES_META_KEY, JSON.stringify(next))
+		// One persisted list (`sync_authoritative_node_ids`) serves the fold and the
+		// sync engine's verification exemptions, so they can never disagree.
+		await saveAuthoritativeNodeIds(this.adapter, next)
 		const fold = this.activeFold()
 		if (!fold) return
 		for (const collection of Object.keys(this.schema.collections)) {
@@ -1645,10 +1637,12 @@ export class Store implements OperationLog {
 		return loadAuthoritativeNodeIds(this.adapter)
 	}
 
-	/** Persist the node ids the sync server named authoritative (protocol v2). */
+	/**
+	 * Persist the node ids the sync server named authoritative (protocol v2). Same as
+	 * {@link setAuthoritativeNodeIds}: the fold re-folds affected records on a change.
+	 */
 	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
-		this.ensureOpen()
-		await saveAuthoritativeNodeIds(this.adapter, nodeIds)
+		await this.setAuthoritativeNodeIds(nodeIds)
 	}
 
 	/**
