@@ -43,8 +43,11 @@ import {
 	NODE_SEQ_UNIQUE_INDEX,
 	RELEASED_NODE_OWNER,
 	SEQUENCE_ENFORCEMENT_EPOCH_KEY,
+	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
 	SequenceConflictError,
+	type SequenceHolderVerdict,
 	judgeSequenceHolders,
+	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 
@@ -192,6 +195,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 
 		const now = Date.now()
+		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
 
 		try {
 			await this.db.transaction(async (tx) => {
@@ -205,9 +209,11 @@ export class PostgresServerStore implements ServerStore {
 				// neither burns a delivery sequence nor runs any side effect (NEW-SRV-2).
 				const deliverySeq = await this.nextDeliverySeq(tx)
 
-				if (!(await this.insertOperationRow(tx, op, now, deliverySeq))) {
-					throw new DuplicateOperationRollback()
-				}
+				const inserted = await this.insertOperationRow(tx, op, now, deliverySeq, {
+					legacySequenceWriter: options?.legacySequenceWriter === true,
+				})
+				if (inserted === 'duplicate') throw new DuplicateOperationRollback()
+				sequenceDecision = inserted
 
 				// Authorization re-check against the committed row, under the same lock, so
 				// no write can commit between this read and this transaction's write.
@@ -249,6 +255,7 @@ export class PostgresServerStore implements ServerStore {
 			this.versionVector.set(op.nodeId, op.sequenceNumber)
 		}
 
+		reportLegacyPair(op, sequenceDecision, options)
 		return 'applied'
 	}
 
@@ -276,27 +283,31 @@ export class PostgresServerStore implements ServerStore {
 
 	/**
 	 * Insert one operation row inside an append transaction that already holds the
-	 * delivery-counter lock. Returns false (writing nothing) when an operation with the
-	 * same id is stored; throws {@link SequenceConflictError} when a DIFFERENT
+	 * delivery-counter lock. Returns `'duplicate'` (writing nothing) when an operation
+	 * with the same id is stored; throws {@link SequenceConflictError} when a DIFFERENT
 	 * operation stored after the sequence-enforcement epoch holds its (node, sequence)
-	 * (W3 step 4); a legacy holder is accepted. The partial unique index over rows past
-	 * the epoch backs the check.
+	 * and the writer reserves its sequences (W3 step 4); a legacy holder or a legacy
+	 * writer (RT-37) is accepted and the row is stored unflagged. Otherwise returns the
+	 * verdict the row was stored under. The partial unique index over sole-holder rows
+	 * backs the check against a writer that bypasses the counter lock.
 	 */
 	private async insertOperationRow(
 		tx: PostgresJsDatabase,
 		op: Operation,
 		now: number,
 		deliverySeq: number,
-	): Promise<boolean> {
+		writer: { legacySequenceWriter?: boolean } = {},
+	): Promise<Exclude<SequenceHolderVerdict, { verdict: 'conflict' }> | 'duplicate'> {
 		const holders = (await tx.execute(
 			sql`SELECT id, delivery_seq FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber}`,
 		)) as unknown as { id: string; delivery_seq: string | number | null }[]
 		// Already stored (a legacy pair may hold the sequence twice: check every holder).
-		if (holders.some((row) => row.id === op.id)) return false
+		if (holders.some((row) => row.id === op.id)) return 'duplicate'
 		const decision = judgeSequenceHolders(
 			op,
 			holders.map((row) => ({ id: row.id, deliverySequence: Number(row.delivery_seq ?? 0) })),
 			this.sequenceEpoch,
+			writer,
 		)
 		if (decision.verdict === 'conflict') {
 			throw new SequenceConflictError(op, decision.holderId)
@@ -305,10 +316,10 @@ export class PostgresServerStore implements ServerStore {
 		try {
 			const inserted = await tx
 				.insert(pgOperations)
-				.values(this.serializeOperation(op, now, deliverySeq))
+				.values(this.serializeOperation(op, now, deliverySeq, decision.verdict === 'free'))
 				.onConflictDoNothing({ target: pgOperations.id })
 				.returning({ id: pgOperations.id })
-			return inserted.length > 0
+			return inserted.length > 0 ? decision : 'duplicate'
 		} catch (error) {
 			if (isUniqueViolation(error)) {
 				throw new SequenceConflictError(op, holder?.id ?? '(unknown)')
@@ -421,7 +432,7 @@ export class PostgresServerStore implements ServerStore {
 					: null
 				// A built operation is new by construction (fresh id, reserved sequence); a
 				// duplicate would mean it is already committed, so it is not written twice.
-				if (!(await this.insertOperationRow(tx, op, now, deliverySeq))) continue
+				if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
 				await this.advanceSyncState(tx, op, now)
 				if (materialized) {
 					await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
@@ -869,9 +880,9 @@ export class PostgresServerStore implements ServerStore {
 
 		const now = Date.now()
 		const restoredMax = await this.db.transaction(async (tx) => {
-			// Restored rows are inserted as they are (a legacy log may reuse a sequence);
-			// the partial index is rebuilt below for the new epoch.
-			await tx.execute(sql.raw(`DROP INDEX IF EXISTS ${NODE_SEQ_UNIQUE_INDEX}`))
+			// Restored rows are inserted unflagged (`seq_unique = 0`: a legacy log may reuse
+			// a sequence), so they stay outside the partial unique index; they sit at or
+			// below the new epoch and the append check judges them as holders.
 			await tx.delete(pgOperations)
 			await tx.delete(pgSyncState)
 
@@ -899,11 +910,6 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, ${String(deliverySeq)})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			)
-			await tx.execute(
-				sql.raw(
-					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE delivery_seq > ${String(deliverySeq)}`,
-				),
 			)
 			return deliverySeq
 		})
@@ -1446,6 +1452,13 @@ export class PostgresServerStore implements ServerStore {
 			// Rows written before it are backfilled from the log when the schema is set.
 			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS scope_snapshot TEXT`)
 
+			// Backward-compatible migration (RT-37): the sole-holder flag behind the partial
+			// unique index. Existing rows (and rows an older instance writes during a rolling
+			// upgrade) read 0: outside the index, still judged as holders by the append check.
+			await tx.execute(
+				sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS seq_unique INTEGER NOT NULL DEFAULT 0`,
+			)
+
 			// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS blob_owners (
@@ -1549,10 +1562,11 @@ export class PostgresServerStore implements ServerStore {
 
 			// Sequence enforcement (W3 step 4): record the epoch on the first start of this
 			// release (the log's highest delivery sequence then; see
-			// SEQUENCE_ENFORCEMENT_EPOCH_KEY), then enforce one operation per (node,
-			// sequence) among the rows stored after it with a partial unique index, which
-			// therefore always exists: legacy duplicates sit at or below the epoch. It
-			// replaces the earlier full index, created only when the log had none.
+			// SEQUENCE_ENFORCEMENT_EPOCH_KEY), then back the append check with a partial
+			// unique index over sole-holder rows (NODE_SEQ_UNIQUE_INDEX), which therefore
+			// always exists: a legacy duplicate pair is stored unflagged. It replaces the
+			// earlier indexes (a full one, and one over the rows past the epoch, which a
+			// legacy client's pair and an older instance's insert would violate, RT-37).
 			await tx.execute(sql`
 				INSERT INTO kora_server_meta (key, value)
 				SELECT ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, COALESCE(MAX(delivery_seq), 0)::text FROM operations
@@ -1569,25 +1583,32 @@ export class PostgresServerStore implements ServerStore {
 				)
 			}
 			this.sequenceEpoch = epoch
-			await tx.execute(sql`DROP INDEX IF EXISTS idx_node_seq_unique`)
-			try {
-				// In a savepoint, so the setup transaction survives a failure. The epoch is a
-				// validated integer, inlined because an index predicate takes no parameter.
-				await tx.transaction(async (savepoint) => {
-					await savepoint.execute(
-						sql.raw(
-							`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE delivery_seq > ${String(epoch)}`,
-						),
-					)
-				})
-			} catch (error) {
-				// Only possible when an older release wrote a duplicate after the epoch (a
-				// rolling upgrade): the append check still refuses new ones.
-				if (!isUniqueViolation(error)) throw error
-				console.warn(
-					`[kora] Operations stored after the sequence-enforcement epoch share a (node, sequence) pair, so ${NODE_SEQ_UNIQUE_INDEX} was not created; the next start retries. New conflicting writes are still refused (SEQUENCE_CONFLICT).`,
-				)
+			for (const superseded of SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES) {
+				await tx.execute(sql.raw(`DROP INDEX IF EXISTS ${superseded}`))
 			}
+			// A row is flagged only when nothing held its sequence at insert, so flagged
+			// duplicates can come only from outside writes (a manual edit). Before
+			// (re)creating the index, unflag them: they stay stored and judged by the append
+			// check, and the index creation cannot fail.
+			const indexed = (await tx.execute(
+				sql`SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ${NODE_SEQ_UNIQUE_INDEX}`,
+			)) as unknown as unknown[]
+			if (indexed.length === 0) {
+				await tx.execute(sql`
+					UPDATE operations o SET seq_unique = 0
+					WHERE o.seq_unique = 1 AND EXISTS (
+						SELECT 1 FROM operations other
+						WHERE other.node_id = o.node_id
+							AND other.sequence_number = o.sequence_number
+							AND other.id <> o.id
+					)
+				`)
+			}
+			await tx.execute(
+				sql.raw(
+					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE seq_unique = 1`,
+				),
+			)
 		})
 	}
 
@@ -1619,10 +1640,16 @@ export class PostgresServerStore implements ServerStore {
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
+	/**
+	 * @param soleHolder - Nothing else held the (node, sequence) at insert: the row is
+	 *   flagged `seq_unique` and covered by {@link NODE_SEQ_UNIQUE_INDEX}. False for a
+	 *   legacy pair's second operation and for restored backup rows.
+	 */
 	private serializeOperation(
 		op: Operation,
 		receivedAt: number,
 		deliverySeq: number,
+		soleHolder = false,
 	): typeof pgOperations.$inferInsert {
 		return {
 			id: op.id,
@@ -1642,6 +1669,7 @@ export class PostgresServerStore implements ServerStore {
 			schemaVersion: op.schemaVersion,
 			receivedAt,
 			deliverySeq,
+			seqUnique: soleHolder ? 1 : 0,
 		}
 	}
 

@@ -80,6 +80,17 @@ export interface HandshakeMessage {
 	 * it cannot decode. Old servers ignore it.
 	 */
 	supportsHeartbeat?: boolean
+	/**
+	 * Capability (RT-37): this client reserves each operation's sequence number inside
+	 * the same local transaction that writes the operation, so it never puts two
+	 * different operations under one `(nodeId, sequenceNumber)`. Only for such a client
+	 * does the server refuse a second, different operation under a held sequence
+	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.13, which could give
+	 * two concurrent transactions one number) is served as legacy: such a pair is
+	 * stored, both operations are delivered, and a warning is logged. Old servers
+	 * ignore it. Protobuf field 45.
+	 */
+	sequenceReservation?: boolean
 }
 
 /**

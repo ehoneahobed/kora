@@ -41,8 +41,11 @@ import {
 	NODE_SEQ_UNIQUE_INDEX,
 	RELEASED_NODE_OWNER,
 	SEQUENCE_ENFORCEMENT_EPOCH_KEY,
+	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
 	SequenceConflictError,
+	type SequenceHolderVerdict,
 	judgeSequenceHolders,
+	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 
@@ -141,6 +144,7 @@ export class SqliteServerStore implements ServerStore {
 
 		const now = Date.now()
 
+		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
 		// Use a transaction for atomicity: insert op + update version vector + materialize
 		const result = this.db.transaction((tx) => {
 			// Content-addressed dedup: check before assigning a delivery sequence so a
@@ -152,9 +156,10 @@ export class SqliteServerStore implements ServerStore {
 				return 'duplicate' as const
 			}
 			// A different operation under the same (node, sequence) is refused (W3 step 4)
-			// when it was stored under enforcement; a legacy holder (stored before the
-			// epoch) is accepted, as beta.12 did. Inside the write transaction so no
-			// concurrent writer can slip one in.
+			// when it was stored under enforcement and the writer reserves its sequences;
+			// a legacy holder (stored before the epoch) or a legacy writer (RT-37) is
+			// accepted, as beta.12 did. Inside the write transaction so no concurrent
+			// writer can slip one in.
 			const holders = tx.all<{ id: string; delivery_seq: number | null }>(
 				sql`SELECT id, delivery_seq FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber}`,
 			)
@@ -162,10 +167,12 @@ export class SqliteServerStore implements ServerStore {
 				op,
 				holders.map((row) => ({ id: row.id, deliverySequence: Number(row.delivery_seq ?? 0) })),
 				this.sequenceEpoch,
+				{ legacySequenceWriter: options?.legacySequenceWriter === true },
 			)
 			if (decision.verdict === 'conflict') {
 				throw new SequenceConflictError(op, decision.holderId)
 			}
+			sequenceDecision = decision
 
 			// Authorization re-check inside the write transaction: better-sqlite3 runs
 			// it synchronously under SQLite's single writer lock, so the row it sees is
@@ -184,7 +191,12 @@ export class SqliteServerStore implements ServerStore {
 			const materialized = this.schema?.collections[op.collection] !== undefined
 			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
 
-			const row = this.serializeOperation(op, now, this.nextDeliverySeq(tx))
+			const row = this.serializeOperation(
+				op,
+				now,
+				this.nextDeliverySeq(tx),
+				decision.verdict === 'free',
+			)
 			tx.insert(operations).values(row).run()
 
 			// Advance version vector: upsert with MAX to ensure monotonic progress
@@ -219,6 +231,7 @@ export class SqliteServerStore implements ServerStore {
 			return 'applied' as const
 		})
 
+		if (result === 'applied') reportLegacyPair(op, sequenceDecision, options)
 		return result
 	}
 
@@ -700,9 +713,9 @@ export class SqliteServerStore implements ServerStore {
 
 		// Replace mode: DROP and recreate
 		this.db.transaction((tx) => {
-			// Restored rows are inserted as they are; the partial index is rebuilt for the
-			// new epoch below.
-			tx.run(sql.raw(`DROP INDEX IF EXISTS ${NODE_SEQ_UNIQUE_INDEX}`))
+			// Restored rows are inserted unflagged (`seq_unique = 0`): they may hold legacy
+			// duplicate sequences, and they sit at or below the new epoch, so they stay
+			// outside the partial unique index and are judged by the append check.
 			tx.run(sql.raw('DELETE FROM operations'))
 			tx.run(sql.raw('DELETE FROM sync_state'))
 			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
@@ -726,7 +739,6 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, ${String(deliverySeq)})`,
 			)
-			tx.run(sql.raw(`DROP INDEX IF EXISTS ${NODE_SEQ_UNIQUE_INDEX}`))
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		this.backfillScopeSnapshots()
@@ -1111,6 +1123,19 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// Backward-compatible migration (RT-37): the sole-holder flag behind the partial
+		// unique index. Existing rows read 0 (outside the index; the append check still
+		// judges them as holders).
+		try {
+			this.db.run(sql`ALTER TABLE operations ADD COLUMN seq_unique INTEGER NOT NULL DEFAULT 0`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)
 		`)
@@ -1186,14 +1211,15 @@ export class SqliteServerStore implements ServerStore {
 	/**
 	 * Record the sequence-enforcement epoch on the first start of this release (the log's
 	 * highest delivery sequence then; see {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}) and
-	 * enforce one operation per (node, sequence) among the rows stored after it with a
-	 * partial unique index, which therefore always exists: legacy duplicates sit at or
-	 * below the epoch, outside the index. Replaces the earlier full index, created only
-	 * when the log had no duplicates. Runs in one write transaction, so stores sharing a
-	 * file agree on the epoch.
+	 * back the append check with the partial unique index over sole-holder rows
+	 * ({@link NODE_SEQ_UNIQUE_INDEX}), which therefore always exists: a legacy duplicate
+	 * pair is stored unflagged. Replaces the earlier indexes (a full one, created only
+	 * when the log had no duplicates, and one over the rows past the epoch, which a
+	 * legacy client's pair would violate). Runs in one write transaction, so stores
+	 * sharing a file agree on the epoch.
 	 */
 	private ensureSequenceEnforcement(): number {
-		const epoch = this.db.transaction((tx) => {
+		return this.db.transaction((tx) => {
 			tx.run(
 				sql`INSERT OR IGNORE INTO kora_server_meta (key, value)
 					SELECT ${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, CAST(COALESCE(MAX(delivery_seq), 0) AS TEXT) FROM operations`,
@@ -1208,28 +1234,34 @@ export class SqliteServerStore implements ServerStore {
 					`kora_server_meta.${SEQUENCE_ENFORCEMENT_EPOCH_KEY} holds "${String(stored)}", not a delivery sequence. Restore it from a backup or delete the row to re-derive it.`,
 				)
 			}
-			tx.run(sql`DROP INDEX IF EXISTS idx_node_seq_unique`)
-			return epoch
-		})
-		try {
-			// The epoch is a validated integer, so it is safe to inline: SQLite does not
-			// accept a bound parameter in an index predicate.
-			this.db.run(
+			for (const superseded of SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES) {
+				tx.run(sql.raw(`DROP INDEX IF EXISTS ${superseded}`))
+			}
+			// A row is flagged only when nothing held its sequence at insert, so flagged
+			// duplicates can come only from outside writes (a manual edit, an older release
+			// writing into this file). Before (re)creating the index, unflag them: they stay
+			// stored and judged by the append check, and the index creation cannot fail.
+			const indexed = tx.all<{ name: string }>(
+				sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ${NODE_SEQ_UNIQUE_INDEX}`,
+			)
+			if (indexed.length === 0) {
+				tx.run(sql`
+					UPDATE operations SET seq_unique = 0
+					WHERE seq_unique = 1 AND EXISTS (
+						SELECT 1 FROM operations other
+						WHERE other.node_id = operations.node_id
+							AND other.sequence_number = operations.sequence_number
+							AND other.id <> operations.id
+					)
+				`)
+			}
+			tx.run(
 				sql.raw(
-					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE delivery_seq > ${String(epoch)}`,
+					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE seq_unique = 1`,
 				),
 			)
-		} catch (e) {
-			// Only possible when an older release wrote a duplicate after the epoch into a
-			// shared file (a rolling upgrade): the append check still refuses new ones.
-			const msg = e instanceof Error ? e.message : ''
-			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
-			if (!`${msg} ${causeMsg}`.includes('UNIQUE')) throw e
-			console.warn(
-				`[kora] Operations stored after the sequence-enforcement epoch share a (node, sequence) pair, so ${NODE_SEQ_UNIQUE_INDEX} was not created; the next start retries. New conflicting writes are still refused (SEQUENCE_CONFLICT).`,
-			)
-		}
-		return epoch
+			return epoch
+		})
 	}
 
 	/**
@@ -1288,10 +1320,16 @@ export class SqliteServerStore implements ServerStore {
 	// Operation serialization
 	// ---------------------------------------------------------------------------
 
+	/**
+	 * @param soleHolder - Nothing else held the (node, sequence) at insert: the row is
+	 *   flagged `seq_unique` and covered by {@link NODE_SEQ_UNIQUE_INDEX}. False for a
+	 *   legacy pair's second operation and for restored backup rows.
+	 */
 	private serializeOperation(
 		op: Operation,
 		receivedAt: number,
 		deliverySeq: number,
+		soleHolder = false,
 	): typeof operations.$inferInsert {
 		return {
 			id: op.id,
@@ -1311,6 +1349,7 @@ export class SqliteServerStore implements ServerStore {
 			schemaVersion: op.schemaVersion,
 			receivedAt,
 			deliverySeq,
+			seqUnique: soleHolder ? 1 : 0,
 		}
 	}
 

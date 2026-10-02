@@ -67,6 +67,7 @@ import {
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type {
 	DeliveredOperation,
+	LegacySequencePair,
 	MaterializedRecord,
 	OperationScopeSnapshot,
 	ServerStore,
@@ -77,6 +78,7 @@ import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
+	BATCH_LOOKUP_RATE_COST,
 	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
@@ -644,6 +646,15 @@ export class ClientSession {
 	private rejectedBatches = 0
 	/** Blob chunk requests answered "not held" because the session was over budget (RT-17). */
 	private rateLimitedBlobRequests = 0
+	/**
+	 * The client advertised the `sequenceReservation` handshake capability (RT-37): it
+	 * reserves sequence numbers in-transaction, so a second operation under a held
+	 * (node, sequence) is refused with SEQUENCE_CONFLICT. False for a legacy client
+	 * (Kora <= beta.13), whose duplicate pairs are stored instead.
+	 */
+	private sequenceReservation = false
+	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
+	private legacySequencePairs = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -1319,6 +1330,21 @@ export class ClientSession {
 	}
 
 	/**
+	 * True when the client did not advertise the `sequenceReservation` capability
+	 * (RT-37): a legacy client (Kora <= beta.13) that may give two operations one
+	 * sequence number. Such a pair is stored and delivered, never refused with
+	 * SEQUENCE_CONFLICT. Meaningful once the handshake was accepted.
+	 */
+	isLegacySequenceClient(): boolean {
+		return !this.sequenceReservation
+	}
+
+	/** Legacy duplicate (node, sequence) pairs this session stored (RT-37). */
+	getLegacySequencePairCount(): number {
+		return this.legacySequencePairs
+	}
+
+	/**
 	 * True when a stored record is inside this session's download scope, so a side
 	 * channel (for example a Yjs doc update) about it may be delivered here. A record
 	 * not stored yet is judged by its id alone.
@@ -1694,6 +1720,7 @@ export class ClientSession {
 
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
+		this.sequenceReservation = msg.sequenceReservation === true
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -2221,34 +2248,56 @@ export class ClientSession {
 		let uniqueOperations = 0
 		let duplicateOperations = 0
 		let rejectedOperations = 0
-		// Which of the batch's ids the server already holds, read once per batch (after
-		// the first operation is charged to the rate limiter) and before any other
-		// per-operation check. A device re-uploading its history (the one-time upgrade
-		// re-upload, or an op its sequence repair renumbered under the same id) must get
-		// a duplicate ack, never a rejection from today's authorization or validators
-		// for an operation the server already accepted (RT-31).
-		let stored: Map<string, StoredOperationKey> | null = null
+		// Which of the batch's ids the server already holds, read once per batch and
+		// before any other per-operation check. A device re-uploading its history (the
+		// one-time upgrade re-upload, or an op its sequence repair renumbered under the
+		// same id) must get a duplicate ack, never a rejection from today's authorization
+		// or validators for an operation the server already accepted (RT-31).
+		//
+		// Rate limiting (RT-6, RT-39): the lookup is charged once per batch
+		// (BATCH_LOOKUP_RATE_COST; the batch size is already capped), and an operation
+		// the lookup finds stored costs nothing more: acknowledging it writes nothing and
+		// reads nothing else. Every other operation is charged before anything touches
+		// the store for it. So a device's upgrade re-upload of thousands of stored
+		// operations is not cut off by RATE_LIMIT, while lookups still cost per batch.
+		let stored: Map<string, StoredOperationKey> = new Map()
+		let lookupCredit = 0
+		if (operations.length > 0) {
+			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
+				lookupCredit = BATCH_LOOKUP_RATE_COST
+				stored = await this.findStoredOperations(operations)
+			} else {
+				this.rateLimitedOperations += operations.length
+				this.sendRateLimited()
+				canAdvanceAck = false
+			}
+		}
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
 				continue
 			}
 
-			// Charge the rate limiter before anything that touches the store (RT-6): a
-			// refused operation (foreign node, out of scope) still costs a store read, so
-			// it must count against the budget like an accepted one.
-			if (!this.rateLimiter.allow(1)) {
-				this.rateLimitedOperations += 1
-				this.sendError(
-					'RATE_LIMIT',
-					`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min)`,
-					true,
-				)
-				canAdvanceAck = false
+			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
+			if (this.isStoredDuplicate(op, stored)) {
+				duplicateOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
-			if (stored === null) stored = await this.findStoredOperations(operations)
+			// Charge the rate limiter before anything that touches the store (RT-6): a
+			// refused operation (foreign node, out of scope) still costs a store read, so
+			// it must count against the budget like an accepted one. The batch's lookup
+			// unit pays for its first such operation, so a batch of N new operations costs
+			// N, exactly as before, and a batch of stored duplicates costs one.
+			if (lookupCredit > 0) {
+				lookupCredit -= 1
+			} else if (!this.rateLimiter.allow(1)) {
+				this.rateLimitedOperations += 1
+				this.sendRateLimited()
+				canAdvanceAck = false
+				continue
+			}
 
 			// A session may only upload its own device's operations. A foreign nodeId
 			// would let one peer advance another device's version-vector entry and make
@@ -2400,6 +2449,10 @@ export class ClientSession {
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
 				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
+				// A client without the sequence-reservation capability may legitimately
+				// produce two operations under one sequence: store the pair (RT-37).
+				legacySequenceWriter: !this.sequenceReservation,
+				onLegacySequencePair: (pair) => this.recordLegacySequencePair(pair),
 			})
 			if (applyResult.rejection) {
 				this.sendOperationRejected(
@@ -2859,6 +2912,30 @@ export class ClientSession {
 	}
 
 	/**
+	 * True when the batch lookup alone shows `op` is already stored and may be
+	 * acknowledged as a duplicate with no further store work (RT-31, RT-39): this
+	 * device's own operation stored under its node (its sequence repair may have
+	 * renumbered it, keeping the id), or any other operation stored under exactly its
+	 * (node, sequence, id), such as one the server itself delivered and the client
+	 * echoed back. Never true for a store without the batch lookup.
+	 */
+	private isStoredDuplicate(op: Operation, batch: Map<string, StoredOperationKey>): boolean {
+		const known = batch.get(op.id)
+		if (!known || known.nodeId !== op.nodeId) return false
+		const own = op.nodeId === this.clientNodeId && op.timestamp.nodeId === op.nodeId
+		return own || known.sequenceNumber === op.sequenceNumber
+	}
+
+	/** Refuse the rest of a batch for the per-minute ingest budget (retriable). */
+	private sendRateLimited(): void {
+		this.sendError(
+			'RATE_LIMIT',
+			`Session exceeded operation rate limit (${String(this.maxOpsPerMinute)} ops/min); retry in ${String(this.rateLimiter.retryAfterMs())} ms`,
+			true,
+		)
+	}
+
+	/**
 	 * True when the store already holds exactly this operation (same node, sequence and
 	 * id). Answered from the batch lookup when the store supports it.
 	 */
@@ -3026,6 +3103,27 @@ export class ClientSession {
 			return
 		}
 		this.onYjsDocUpdate(this.sessionId, msg, stored)
+	}
+
+	/** A legacy client's duplicate pair was stored (RT-37): count it and log it. */
+	private recordLegacySequencePair(pair: LegacySequencePair): void {
+		this.legacySequencePairs += 1
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.legacy_sequence_pair',
+			sessionId: this.sessionId,
+			nodeId: pair.nodeId,
+			details: {
+				operationId: pair.operationId,
+				sequenceNumber: pair.sequenceNumber,
+				holderIds: pair.holderIds,
+				legacyWriter: pair.legacyWriter,
+				message: pair.legacyWriter
+					? 'A client without the sequenceReservation capability (Kora <= beta.13) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
+					: 'An operation shares its sequence number with one stored before sequence enforcement (Kora <= beta.12). Both are stored.',
+			},
+		})
 	}
 
 	private sendError(code: string, message: string, retriable: boolean): void {

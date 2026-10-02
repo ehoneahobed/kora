@@ -61,6 +61,15 @@ export interface ApplyServerOperationOptions {
 	 * alone also switches restrict refusals to the generic form.
 	 */
 	authorizeSideEffect?: SideEffectAuthorizer
+	/**
+	 * The writer is a legacy client that does not reserve sequence numbers (RT-37): a
+	 * different operation under a held `(nodeId, sequenceNumber)` is stored as a legacy
+	 * pair instead of being refused with `SEQUENCE_CONFLICT`. Applies to the primary
+	 * operation only; server-originated side effects are always enforced.
+	 */
+	legacySequenceWriter?: boolean
+	/** See `ApplyRemoteOptions.onLegacySequencePair`; for the primary operation. */
+	onLegacySequencePair?: ApplyRemoteOptions['onLegacySequencePair']
 }
 
 /**
@@ -243,8 +252,13 @@ function applyPrimary(
 	op: Operation,
 	options: ApplyServerOperationOptions,
 ): ReturnType<ServerStore['applyRemoteOperation']> {
-	return options.authorize
-		? store.applyRemoteOperation(op, { authorize: options.authorize })
+	const storeOptions: ApplyRemoteOptions = {
+		...(options.authorize ? { authorize: options.authorize } : {}),
+		...(options.legacySequenceWriter ? { legacySequenceWriter: true } : {}),
+		...(options.onLegacySequencePair ? { onLegacySequencePair: options.onLegacySequencePair } : {}),
+	}
+	return Object.keys(storeOptions).length > 0
+		? store.applyRemoteOperation(op, storeOptions)
 		: store.applyRemoteOperation(op)
 }
 

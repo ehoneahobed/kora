@@ -46,33 +46,105 @@ export class SequenceConflictError extends KoraError {
  * number (beta.12 STORE-1/2); a newly uploaded operation that shares a (node,
  * sequence) only with such legacy operations is accepted as before (the client's
  * sequence repair may keep the OTHER op of a legacy duplicate pair at that number).
- * Uniqueness is enforced among operations stored after the epoch, by the check in
- * every append and by a partial unique index over `delivery_seq > epoch`.
+ * Above it, a writer that reserves its sequence numbers (see
+ * {@link ApplyRemoteOptions.legacySequenceWriter}) is refused a held sequence.
  */
 export const SEQUENCE_ENFORCEMENT_EPOCH_KEY = 'sequence_enforcement_epoch'
 
-/** Name of the partial unique index over (node_id, sequence_number) past the epoch. */
-export const NODE_SEQ_UNIQUE_INDEX = 'idx_node_seq_unique_after_epoch'
+/**
+ * Name of the partial unique index over (node_id, sequence_number) of the rows that
+ * were the sole holder of their sequence when stored (`seq_unique = 1`, RT-37).
+ *
+ * Design: a row is flagged when nothing else held its (node, sequence) at insert, and
+ * a row stored as the second of a pair (a legacy duplicate: a pre-epoch holder, or an
+ * upload from a client without the `sequenceReservation` capability) is not. So the
+ * index can never be violated by an accepted legacy pair, yet two concurrent sole
+ * inserts of one (node, sequence) (the race between server instances it backs) still
+ * collide. Rows written by a release without the column (older instances during a
+ * rolling upgrade, or history) default to 0 and sit outside it; the append check, run
+ * under the store's write lock, judges them as holders.
+ */
+export const NODE_SEQ_UNIQUE_INDEX = 'idx_node_seq_unique_sole'
+
+/** Earlier unique indexes over (node_id, sequence_number), dropped at startup. */
+export const SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES = [
+	'idx_node_seq_unique',
+	'idx_node_seq_unique_after_epoch',
+] as const
+
+/** Outcome of {@link judgeSequenceHolders}. */
+export type SequenceHolderVerdict =
+	/** No other operation holds the sequence: stored as its sole holder (indexed). */
+	| { verdict: 'free' }
+	/** Shares the sequence with `holderIds`, accepted: stored as a legacy pair. */
+	| { verdict: 'legacy'; holderIds: string[]; legacyWriter: boolean }
+	/** Refused: `holderId` holds the sequence under enforcement. */
+	| { verdict: 'conflict'; holderId: string }
 
 /**
  * Decide an append against the operations already holding its (node, sequence):
- * `'conflict'` when any of them was stored after the enforcement epoch, `'legacy'` when
- * all of them predate it (accepted, with a warning), `'free'` when there are none.
- * Holders with the operation's own id are the caller's duplicate case.
+ * `'conflict'` when any of them was stored after the enforcement epoch and the writer
+ * reserves its sequence numbers; `'legacy'` (accepted, with a warning) when all of
+ * them predate the epoch, or when the writer is a legacy client (RT-37: Kora <=
+ * beta.13 could give two concurrent transactions one number, and refusing the second
+ * would drop a write the user made); `'free'` when there are none. Holders with the
+ * operation's own id are the caller's duplicate case.
  */
 export function judgeSequenceHolders(
 	op: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
 	holders: ReadonlyArray<{ id: string; deliverySequence: number }>,
 	epoch: number,
-): { verdict: 'free' | 'legacy' } | { verdict: 'conflict'; holderId: string } {
+	writer: { legacySequenceWriter?: boolean } = {},
+): SequenceHolderVerdict {
 	const others = holders.filter((holder) => holder.id !== op.id)
-	const enforced = others.find((holder) => holder.deliverySequence > epoch)
-	if (enforced) return { verdict: 'conflict', holderId: enforced.id }
 	if (others.length === 0) return { verdict: 'free' }
+	const enforced = others.find((holder) => holder.deliverySequence > epoch)
+	const holderIds = others.map((holder) => holder.id)
+	const list = holderIds.map((id) => `"${id}"`).join(', ')
+	if (enforced) {
+		if (writer.legacySequenceWriter !== true) {
+			return { verdict: 'conflict', holderId: enforced.id }
+		}
+		console.warn(
+			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.13), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
+		)
+		return { verdict: 'legacy', holderIds, legacyWriter: true }
+	}
 	console.warn(
-		`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${others.map((holder) => `"${holder.id}"`).join(', ')} stored before sequence enforcement (a duplicate written by Kora <= beta.12). Accepted and stored, as that release did.`,
+		`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list} stored before sequence enforcement (a duplicate written by Kora <= beta.12). Accepted and stored, as that release did.`,
 	)
-	return { verdict: 'legacy' }
+	return { verdict: 'legacy', holderIds, legacyWriter: false }
+}
+
+/** A stored legacy pair, reported to {@link ApplyRemoteOptions.onLegacySequencePair}. */
+export interface LegacySequencePair {
+	operationId: string
+	nodeId: string
+	sequenceNumber: number
+	/** The operations that already held the sequence. */
+	holderIds: string[]
+	/** True when accepted because the writer is a legacy client (not a pre-epoch holder). */
+	legacyWriter: boolean
+}
+
+/**
+ * Tell the caller of an append that it committed a legacy pair (see
+ * {@link ApplyRemoteOptions.onLegacySequencePair}). Called by the built-in stores
+ * after the write committed.
+ */
+export function reportLegacyPair(
+	op: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+	decision: SequenceHolderVerdict,
+	options: Pick<ApplyRemoteOptions, 'onLegacySequencePair'> | undefined,
+): void {
+	if (decision.verdict !== 'legacy' || !options?.onLegacySequencePair) return
+	options.onLegacySequencePair({
+		operationId: op.id,
+		nodeId: op.nodeId,
+		sequenceNumber: op.sequenceNumber,
+		holderIds: decision.holderIds,
+		legacyWriter: decision.legacyWriter,
+	})
 }
 
 /** Where a stored operation sits in its node's sequence space. */
@@ -232,6 +304,20 @@ export interface ApplyRemoteOptions {
 	 * server instance) could otherwise slip in.
 	 */
 	authorize?: (storedRow: MaterializedRecord | null) => UplinkAuthorizationResult
+	/**
+	 * The writer does not reserve its sequence numbers inside the write transaction
+	 * (a client that did not advertise the `sequenceReservation` handshake capability,
+	 * Kora <= beta.13; RT-37). A different operation already holding the
+	 * `(nodeId, sequenceNumber)` then does not refuse this one: both are stored as a
+	 * legacy pair (each keeps its own delivery sequence, so both are delivered) instead
+	 * of throwing {@link SequenceConflictError}. Default false: enforce.
+	 */
+	legacySequenceWriter?: boolean
+	/**
+	 * Called once the operation was committed as the second holder of its sequence (a
+	 * legacy pair), for logging and diagnostics. Never called for a refused write.
+	 */
+	onLegacySequencePair?: (pair: LegacySequencePair) => void
 }
 
 /**
@@ -246,7 +332,8 @@ export interface ServerStore extends SyncStore {
 	 * may ignore it; callers always pre-check as well.
 	 *
 	 * Built-in stores throw {@link SequenceConflictError} when a different operation
-	 * already holds the operation's `(nodeId, sequenceNumber)`, and return
+	 * already holds the operation's `(nodeId, sequenceNumber)` under enforcement
+	 * (unless `options.legacySequenceWriter`, see {@link judgeSequenceHolders}), and return
 	 * `'duplicate'` (writing nothing) for an operation id already stored, decided
 	 * atomically with the write.
 	 */

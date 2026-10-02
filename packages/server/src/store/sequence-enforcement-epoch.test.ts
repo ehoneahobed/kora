@@ -127,7 +127,7 @@ function contract(getKind: () => Kind): void {
 		const store = await kind.open()
 		expect(await store.applyRemoteOperation(op(5))).toBe('applied')
 		await expect(store.applyRemoteOperation(op(5))).rejects.toBeInstanceOf(SequenceConflictError)
-		expect(await kind.indexPredicate()).toMatch(/delivery_seq\)? > \(?0/)
+		expect(await kind.indexPredicate()).toMatch(/seq_unique\)? = 1/)
 		await store.close()
 	})
 
@@ -152,8 +152,8 @@ function contract(getKind: () => Kind): void {
 			code: 'SEQUENCE_CONFLICT',
 			existingOperationId: kept.id,
 		})
-		// The partial index exists and starts above the legacy rows (epoch = 2).
-		expect(await kind.indexPredicate()).toMatch(/delivery_seq\)? > \(?2/)
+		// The partial index over sole-holder rows exists; the legacy pair is outside it.
+		expect(await kind.indexPredicate()).toMatch(/seq_unique\)? = 1/)
 		await store.close()
 	})
 
@@ -182,6 +182,105 @@ function contract(getKind: () => Kind): void {
 		expect(await kind.indexPredicate()).not.toBeNull()
 		await store.close()
 	})
+
+	legacyWriterContract(async () => {
+		const kind = getKind()
+		return { store: await kind.open(), kind }
+	})
+
+	test('RT-37: a legacy pair survives a restart (the index is recreated) and a replace-mode restore', async () => {
+		const kind = getKind()
+		const store = await kind.open()
+		const x = op(11)
+		const y = op(11)
+		await store.applyRemoteOperation(x)
+		expect(await store.applyRemoteOperation(y, { legacySequenceWriter: true })).toBe('applied')
+		await store.close()
+		await kind.exec(`DROP INDEX IF EXISTS ${NODE_SEQ_UNIQUE_INDEX}`)
+		const reopened = await kind.open()
+		expect(await kind.indexPredicate()).toMatch(/seq_unique\)? = 1/)
+		expect(await reopened.applyRemoteOperation(y)).toBe('duplicate')
+		// Enforcement still holds for a sequence-reserving writer.
+		await expect(reopened.applyRemoteOperation(op(11))).rejects.toBeInstanceOf(
+			SequenceConflictError,
+		)
+		const restored = await reopened.importBackup(await reopened.exportBackup(), false)
+		expect(restored.success).toBe(true)
+		expect((await reopened.getOperationRange('device-1', 11, 11)).map((o) => o.id).sort()).toEqual(
+			[x.id, y.id].sort(),
+		)
+		await reopened.close()
+	})
+
+	test('RT-37: an older instance writing a duplicate during a rolling upgrade does not hit the index', async () => {
+		const kind = getKind()
+		const store = await kind.open()
+		const x = op(12)
+		await store.applyRemoteOperation(x)
+		// What a beta.13 instance inserts: no seq_unique column in its INSERT (default 0).
+		await kind.exec(
+			`INSERT INTO operations (id, node_id, type, collection, record_id, data, previous_data, wall_time, logical, timestamp_node_id, sequence_number, causal_deps, schema_version, received_at, delivery_seq)
+			 VALUES ('beta13-dup', 'device-1', 'insert', 'todos', 'rec-b13', '{"title":"b"}', NULL, 1, 0, 'device-1', 12, '[]', 1, 1, 100000)`,
+		)
+		const ids = (await store.getOperationRange('device-1', 12, 12)).map((o) => o.id).sort()
+		expect(ids).toEqual(['beta13-dup', x.id].sort())
+		await store.close()
+	})
+}
+
+/**
+ * RT-37: a client that does not advertise the sequence-reservation capability (Kora
+ * <= beta.13) may put two different operations under one (node, sequence). Such a
+ * writer's second operation is stored as a legacy pair, never refused; a
+ * sequence-reserving writer is still refused, and both operations are delivered.
+ */
+function legacyWriterContract(open: () => Promise<{ store: ServerStore; kind?: Kind }>): void {
+	test('RT-37: a legacy writer stores the second op of a pair; both are delivered', async () => {
+		const { store, kind } = await open()
+		const x = op(21)
+		const y = op(21)
+		const pairs: unknown[] = []
+		expect(await store.applyRemoteOperation(x, { legacySequenceWriter: true })).toBe('applied')
+		expect(
+			await store.applyRemoteOperation(y, {
+				legacySequenceWriter: true,
+				onLegacySequencePair: (pair) => pairs.push(pair),
+			}),
+		).toBe('applied')
+		expect(pairs).toEqual([
+			{
+				operationId: y.id,
+				nodeId: 'device-1',
+				sequenceNumber: 21,
+				holderIds: [x.id],
+				legacyWriter: true,
+			},
+		])
+		// Re-uploads of either are duplicates (also from an upgraded, enforcing client).
+		expect(await store.applyRemoteOperation(x)).toBe('duplicate')
+		expect(await store.applyRemoteOperation(y, { legacySequenceWriter: true })).toBe('duplicate')
+		// Version-vector range path and delivery stream both carry the pair.
+		const range = (await store.getOperationRange('device-1', 21, 21)).map((o) => o.id)
+		expect(range.sort()).toEqual([x.id, y.id].sort())
+		const delivered = (await store.getOperationsAfterDelivery(0, 100)).map((d) => d.operation.id)
+		expect(delivered).toEqual(expect.arrayContaining([x.id, y.id]))
+		expect(store.getVersionVector().get('device-1')).toBe(21)
+		// A sequence-reserving writer is still refused at that sequence.
+		await expect(store.applyRemoteOperation(op(21))).rejects.toMatchObject({
+			code: 'SEQUENCE_CONFLICT',
+		})
+		// A third legacy op under it is kept too (no silent loss).
+		expect(await store.applyRemoteOperation(op(21), { legacySequenceWriter: true })).toBe('applied')
+		if (kind) expect(await kind.indexPredicate()).toMatch(/seq_unique\)? = 1/)
+		await store.close()
+	})
+
+	test('RT-37: without the flag the store enforces (default)', async () => {
+		const { store } = await open()
+		await store.applyRemoteOperation(op(22), { legacySequenceWriter: true })
+		await expect(store.applyRemoteOperation(op(22))).rejects.toBeInstanceOf(SequenceConflictError)
+		await store.close()
+	})
 }
 
 describe('sequence enforcement epoch: SQLite', () => {
@@ -206,6 +305,12 @@ describe.skipIf(!PG_URL)('sequence enforcement epoch: Postgres', () => {
 })
 
 describe('sequence enforcement epoch: memory', () => {
+	legacyWriterContract(async () => {
+		const store = new MemoryServerStore('server-1')
+		await store.setSchema(schema)
+		return { store }
+	})
+
 	test('epoch 0: every holder is enforced', async () => {
 		const store = new MemoryServerStore('server-1')
 		await store.setSchema(schema)

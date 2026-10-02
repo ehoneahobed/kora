@@ -37,6 +37,11 @@ export const pgOperations = pgTable(
 		// JSON { pre, post }: the record's scope values around this operation, captured
 		// from the server's own rows at apply time (RT-14).
 		scopeSnapshot: text('scope_snapshot'),
+		// 1 when this row was the sole holder of its (node_id, sequence_number) when stored;
+		// 0 for the second operation of a legacy duplicate pair and for rows written
+		// before the column existed. The partial unique index NODE_SEQ_UNIQUE_INDEX covers
+		// only flagged rows (RT-37; see server-store.ts).
+		seqUnique: integer('seq_unique').notNull().default(0),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_pg_node_seq').on(table.nodeId, table.sequenceNumber),
