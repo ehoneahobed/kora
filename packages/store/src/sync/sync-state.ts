@@ -97,19 +97,42 @@ export async function saveLastAckedServerVector(
 /**
  * Load the per-device node token the sync server issued for this node id (RT-12).
  */
-export async function loadNodeToken(adapter: StorageAdapter): Promise<string | null> {
+export async function loadNodeToken(
+	adapter: StorageAdapter,
+	nodeId?: string,
+): Promise<string | null> {
+	if (nodeId !== undefined) {
+		const own = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+			nodeTokenKey(nodeId),
+		])
+		if (own[0]) return own[0].value
+		// The legacy single key belongs to the database's node id (`_kora_meta.node_id`).
+		const meta = await adapter.query<MetaRow>("SELECT value FROM _kora_meta WHERE key = 'node_id'")
+		if (meta[0]?.value !== nodeId) return null
+	}
 	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
 		NODE_TOKEN_META_KEY,
 	])
 	return rows[0]?.value ?? null
 }
 
+/** `_kora_meta` key of one node id's token (RT-38/RT-40: a database may use several). */
+export function nodeTokenKey(nodeId: string): string {
+	return `${NODE_TOKEN_META_KEY}:${nodeId}`
+}
+
 /**
- * Persist the per-device node token next to the node id in `_kora_meta`.
+ * Persist the per-device node token next to the node id in `_kora_meta`. With a node
+ * id, the token is stored under that node's own key: a database that uses several node
+ * ids (a rotated identity, per-tab isolation) keeps each node's token.
  */
-export async function saveNodeToken(adapter: StorageAdapter, token: string): Promise<void> {
+export async function saveNodeToken(
+	adapter: StorageAdapter,
+	token: string,
+	nodeId?: string,
+): Promise<void> {
 	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
-		NODE_TOKEN_META_KEY,
+		nodeId === undefined ? NODE_TOKEN_META_KEY : nodeTokenKey(nodeId),
 		token,
 	])
 }

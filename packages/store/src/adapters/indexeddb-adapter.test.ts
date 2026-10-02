@@ -51,6 +51,34 @@ describe('IndexedDbAdapter', () => {
 		expect(data?.length).toBeGreaterThan(0)
 	})
 
+	test('ensureDurable persists every committed write before it resolves (RT-35)', async () => {
+		await adapter.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-durable', 'Durable', 0, 1000, 1000],
+		)
+		// Inside the debounce window nothing is on disk yet; the barrier writes it now.
+		expect(await loadFromIndexedDB(DB_NAME)).toBeNull()
+		await adapter.ensureDurable()
+		const reopened = new IndexedDbAdapter({ bridge: new MockWorkerBridge(), dbName: DB_NAME })
+		await reopened.open(minimalSchema)
+		const rows = await reopened.query<{ id: string }>('SELECT id FROM todos')
+		expect(rows.map((row) => row.id)).toEqual(['rec-durable'])
+		await reopened.close()
+	})
+
+	test('ensureDurable rejects when the snapshot cannot be written', async () => {
+		const save = vi
+			.spyOn(persistence, 'saveDumpToIndexedDB')
+			.mockRejectedValueOnce(new Error('quota exceeded'))
+		await adapter.execute(
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+			['rec-x', 'X', 0, 1000, 1000],
+		)
+		await expect(adapter.ensureDurable()).rejects.toThrow('quota exceeded')
+		save.mockRestore()
+		await expect(adapter.ensureDurable()).resolves.toBeUndefined()
+	})
+
 	test('close persists to IndexedDB', async () => {
 		await adapter.execute(
 			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',

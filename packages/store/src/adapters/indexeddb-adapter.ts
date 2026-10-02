@@ -226,6 +226,16 @@ export class IndexedDbAdapter implements StorageAdapter {
 		await this.scheduler.flushNow()
 	}
 
+	/**
+	 * Durability barrier (RT-35): resolves once every write committed before the call is
+	 * in a snapshot persisted to IndexedDB, and rejects when the snapshot cannot be
+	 * written. Sync calls it before an operation leaves the device, so the server never
+	 * holds an operation this device could lose on reload.
+	 */
+	async ensureDurable(): Promise<void> {
+		await this.scheduler.flushBarrier()
+	}
+
 	private async writeSnapshot(): Promise<void> {
 		const dump = await this.exportDump()
 		await saveDumpToIndexedDB(this.dbName, dump)

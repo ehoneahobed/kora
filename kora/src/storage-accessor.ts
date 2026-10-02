@@ -1,4 +1,5 @@
 import { KoraError, quoteIdent } from '@korajs/core'
+import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
 import type { KoraConfig, LocalDatabaseInfo, StorageApi } from './types'
 
 /** Read access to a database, as handed to the unsynced-data check. */
@@ -9,8 +10,12 @@ interface DatabaseReader {
 /**
  * Whether a local database still holds operations the server never
  * acknowledged. With sync configured that is the persisted outbound queue
- * (`_kora_sync_queue`); a local-only app never syncs, so any recorded operation
- * counts as unsynced and deleting the database would lose it.
+ * (`_kora_sync_queue`) plus, authoritatively, every own operation of any local node
+ * id above that node's contiguous acknowledged prefix that the server did not refuse
+ * for good (RT-41): such operations are often not queued (the one-time upgrade
+ * re-upload, an operation committed just before the tab died, a closed per-tab tab).
+ * A local-only app never syncs, so any recorded operation counts as unsynced and
+ * deleting the database would lose it.
  */
 export async function hasUnsyncedOperations(
 	db: DatabaseReader,
@@ -24,12 +29,13 @@ export async function hasUnsyncedOperations(
 		const rows = await db.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_sync_queue')
 		if ((rows[0]?.n ?? 0) > 0) return true
 	}
-	if (!syncConfigured) {
-		for (const name of names) {
-			if (!name.startsWith('_kora_ops_')) continue
-			const rows = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`)
-			if ((rows[0]?.n ?? 0) > 0) return true
-		}
+	if (syncConfigured) {
+		return hasUnsyncedOwnOperations(db)
+	}
+	for (const name of names) {
+		if (!name.startsWith('_kora_ops_')) continue
+		const rows = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`)
+		if ((rows[0]?.n ?? 0) > 0) return true
 	}
 	return false
 }

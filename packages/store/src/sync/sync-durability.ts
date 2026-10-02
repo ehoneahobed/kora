@@ -120,9 +120,32 @@ export async function removeUnappliedOperations(
 	)
 }
 
+/** `_kora_meta` key of a node's prefix when the legacy single key holds another node's. */
+export function ownAckedThroughKey(nodeId: string): string {
+	return `${OWN_ACKED_THROUGH_META_KEY}:${nodeId}`
+}
+
+function parseLegacyPrefix(value: string | undefined): { nodeId: string; sequence: number } | null {
+	if (value === undefined || value === null) return null
+	try {
+		const parsed = JSON.parse(value) as { nodeId?: unknown; sequence?: unknown }
+		if (typeof parsed.nodeId !== 'string') return null
+		const sequence =
+			typeof parsed.sequence === 'number' && parsed.sequence >= 0 ? parsed.sequence : null
+		return sequence === null ? null : { nodeId: parsed.nodeId, sequence }
+	} catch {
+		return null
+	}
+}
+
 /**
  * Load the acknowledged own-operation prefix for a node id. Null when none was ever
  * recorded for this node (an upgrade from a release that persisted a max instead).
+ *
+ * The first node a database tracks keeps the single legacy key (`own_acked_through`, as
+ * earlier releases wrote it); any other local node (a rotated node, another tab's node
+ * under per-tab isolation, RT-40) has its own key, so tracking one node never erases
+ * another node's prefix.
  */
 export async function loadOwnAckedThrough(
 	adapter: StorageAdapter,
@@ -131,15 +154,15 @@ export async function loadOwnAckedThrough(
 	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
 		OWN_ACKED_THROUGH_META_KEY,
 	])
-	const value = rows[0]?.value
+	const legacy = parseLegacyPrefix(rows[0]?.value)
+	if (legacy && legacy.nodeId === nodeId) return legacy.sequence
+	const own = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		ownAckedThroughKey(nodeId),
+	])
+	const value = own[0]?.value
 	if (value === undefined || value === null) return null
-	try {
-		const parsed = JSON.parse(value) as { nodeId?: unknown; sequence?: unknown }
-		if (parsed.nodeId !== nodeId) return null
-		return typeof parsed.sequence === 'number' && parsed.sequence >= 0 ? parsed.sequence : null
-	} catch {
-		return null
-	}
+	const sequence = Number(value)
+	return Number.isInteger(sequence) && sequence >= 0 ? sequence : null
 }
 
 /** Persist the acknowledged own-operation prefix for a node id. */
@@ -148,10 +171,23 @@ export async function saveOwnAckedThrough(
 	nodeId: string,
 	sequence: number,
 ): Promise<void> {
-	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
-		OWN_ACKED_THROUGH_META_KEY,
-		JSON.stringify({ nodeId, sequence }),
-	])
+	await adapter.transaction(async (tx) => {
+		const rows = await tx.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+			OWN_ACKED_THROUGH_META_KEY,
+		])
+		const legacy = parseLegacyPrefix(rows[0]?.value)
+		if (legacy === null || legacy.nodeId === nodeId) {
+			await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+				OWN_ACKED_THROUGH_META_KEY,
+				JSON.stringify({ nodeId, sequence }),
+			])
+			return
+		}
+		await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			ownAckedThroughKey(nodeId),
+			String(sequence),
+		])
+	})
 }
 
 /** Load the downlink scope the sync server last accepted (null when none). */

@@ -57,6 +57,7 @@ export {
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
 export type { UnappliedOperation } from './sync/sync-durability'
+export type { LocalNodeRecord, TerminalRejection } from './sync/local-sync-records'
 
 // === Sync state helpers ===
 export {
