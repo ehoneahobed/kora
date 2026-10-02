@@ -75,13 +75,12 @@ export function generateSQL(
 		`--kora:safe-alter\nALTER TABLE ${quoteIdent(collectionName)} ADD COLUMN _field_versions TEXT NOT NULL DEFAULT '{}'`,
 	)
 
-	// Create indexes. The index NAME stays unquoted (it is only ever created and
-	// dropped by this same construction, never referenced by a query), but the
-	// table and column in the ON clause are quoted so mixed-case / keyword names
-	// resolve correctly.
+	// Create indexes. Names come from collectionIndexName, which cannot collide
+	// across collections (STORE-15); table and column are quoted so mixed-case /
+	// keyword names resolve correctly.
 	for (const indexField of collection.indexes) {
 		statements.push(
-			`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${indexField} ON ${quoteIdent(collectionName)} (${quoteIdent(indexField)})`,
+			`CREATE INDEX IF NOT EXISTS ${quoteIdent(collectionIndexName(collectionName, indexField))} ON ${quoteIdent(collectionName)} (${quoteIdent(indexField)})`,
 		)
 	}
 
@@ -89,7 +88,7 @@ export function generateSQL(
 	for (const fkField of fkFields) {
 		if (!indexedFields.has(fkField)) {
 			statements.push(
-				`CREATE INDEX IF NOT EXISTS idx_${collectionName}_${fkField} ON ${quoteIdent(collectionName)} (${quoteIdent(fkField)})`,
+				`CREATE INDEX IF NOT EXISTS ${quoteIdent(collectionIndexName(collectionName, fkField))} ON ${quoteIdent(collectionName)} (${quoteIdent(fkField)})`,
 			)
 		}
 	}
@@ -118,6 +117,30 @@ export function generateSQL(
 	)
 
 	return statements
+}
+
+/**
+ * Name of the index on `field` of `collection`.
+ *
+ * The collection name's length is part of the name, so two (collection, field)
+ * pairs can never produce the same index name. The previous scheme,
+ * `idx_<collection>_<field>`, gave `a_b`.`c` and `a`.`b_c` the same name, and the
+ * second `CREATE INDEX IF NOT EXISTS` silently did nothing (STORE-15).
+ *
+ * @param collection - Collection (table) name
+ * @param field - Indexed field (column) name
+ * @returns A collision-free index name
+ */
+export function collectionIndexName(collection: string, field: string): string {
+	return `idx_${collection.length}_${collection}_${field}`
+}
+
+/**
+ * Name the pre-beta.13 scheme gave the index on `field` of `collection`. Only
+ * used to find and drop those indexes once their replacements exist.
+ */
+export function legacyCollectionIndexName(collection: string, field: string): string {
+	return `idx_${collection}_${field}`
 }
 
 /**

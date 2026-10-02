@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { FULL_SCHEMA, MINIMAL_SCHEMA } from '../../tests/fixtures/schemas'
 import { defineSchema } from './define'
-import { generateFullDDL, generateSQL } from './sql-gen'
+import { collectionIndexName, generateFullDDL, generateSQL } from './sql-gen'
 import { t } from './types'
 
 describe('generateSQL', () => {
@@ -56,9 +56,9 @@ describe('generateSQL', () => {
 		// Three schema-declared indexes plus the ops-table record_id index
 		// (record-scoped lookups run on every remote apply).
 		expect(indexStmts).toHaveLength(4)
-		expect(indexStmts[0]).toContain('idx_todos_assignee')
-		expect(indexStmts[1]).toContain('idx_todos_completed')
-		expect(indexStmts[2]).toContain('idx_todos_due_date')
+		expect(indexStmts[0]).toContain('idx_5_todos_assignee')
+		expect(indexStmts[1]).toContain('idx_5_todos_completed')
+		expect(indexStmts[2]).toContain('idx_5_todos_due_date')
 		expect(indexStmts[3]).toContain('idx_kora_ops_todos_record_id')
 	})
 
@@ -95,7 +95,7 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos, schema.relations)
 
 		// project_id is not in the explicit indexes array, so an auto-index should be created
-		const fkIndex = stmts.find((s) => s.includes('idx_todos_project_id'))
+		const fkIndex = stmts.find((s) => s.includes('idx_5_todos_project_id'))
 		expect(fkIndex).toBeDefined()
 		expect(fkIndex).toContain('ON "todos" ("project_id")')
 	})
@@ -134,7 +134,7 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('tasks', tasks, schema.relations)
 
 		// Count how many index statements reference user_id
-		const userIdIndexes = stmts.filter((s) => s.includes('idx_tasks_user_id'))
+		const userIdIndexes = stmts.filter((s) => s.includes('idx_5_tasks_user_id'))
 		expect(userIdIndexes).toHaveLength(1) // Only the explicit one, no duplicate
 	})
 })
@@ -164,5 +164,27 @@ describe('generateFullDDL', () => {
 		const todosIndex = stmts.findIndex((s) => s.includes('CREATE TABLE IF NOT EXISTS "todos"'))
 
 		expect(metaIndex).toBeLessThan(todosIndex)
+	})
+
+	test('index names never collide across collections (STORE-15)', () => {
+		const ab = generateSQL('a_b', {
+			fields: {},
+			indexes: ['c'],
+			constraints: [],
+			resolvers: {},
+			scope: [],
+		})
+		const a = generateSQL('a', {
+			fields: {},
+			indexes: ['b_c'],
+			constraints: [],
+			resolvers: {},
+			scope: [],
+		})
+		const name = (stmts: string[]) =>
+			stmts.find((s) => s.startsWith('CREATE INDEX') && !s.includes('_kora_ops_'))?.split(' ')[5]
+		expect(name(ab)).toBe('"idx_3_a_b_c"')
+		expect(name(a)).toBe('"idx_1_a_b_c"')
+		expect(collectionIndexName('a_b', 'c')).not.toBe(collectionIndexName('a', 'b_c'))
 	})
 })

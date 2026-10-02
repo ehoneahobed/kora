@@ -62,14 +62,14 @@ describe('migrationStepsToSQL', () => {
 		const steps = migrate().addIndex('products', 'category').steps
 		const sql = migrationStepsToSQL(steps)
 		expect(sql).toEqual([
-			'CREATE INDEX IF NOT EXISTS idx_products_category ON "products" ("category")',
+			'CREATE INDEX IF NOT EXISTS "idx_8_products_category" ON "products" ("category")',
 		])
 	})
 
 	test('removeIndex produces DROP INDEX IF EXISTS', () => {
 		const steps = migrate().removeIndex('products', 'category').steps
 		const sql = migrationStepsToSQL(steps)
-		expect(sql).toEqual(['DROP INDEX IF EXISTS idx_products_category'])
+		expect(sql).toEqual(['DROP INDEX IF EXISTS "idx_8_products_category"'])
 	})
 
 	test('backfill produces no SQL (handled at application layer)', () => {
@@ -90,7 +90,7 @@ describe('migrationStepsToSQL', () => {
 		expect(sql).toEqual([
 			'ALTER TABLE "products" ADD COLUMN "taxInclusive" INTEGER DEFAULT 0',
 			'ALTER TABLE "products" RENAME COLUMN "cost" TO "costPrice"',
-			'CREATE INDEX IF NOT EXISTS idx_products_costPrice ON "products" ("costPrice")',
+			'CREATE INDEX IF NOT EXISTS "idx_8_products_costPrice" ON "products" ("costPrice")',
 			'ALTER TABLE "products" DROP COLUMN "deprecated"',
 		])
 	})
@@ -149,14 +149,16 @@ describe('rollbackStepsToSQL', () => {
 		const migration = migrate().addIndex('todos', 'priority')
 
 		const sql = rollbackStepsToSQL(migration)
-		expect(sql).toEqual(['DROP INDEX IF EXISTS idx_todos_priority'])
+		expect(sql).toEqual(['DROP INDEX IF EXISTS "idx_5_todos_priority"'])
 	})
 
 	test('generates CREATE INDEX for removeIndex rollback', () => {
 		const migration = migrate().removeIndex('todos', 'priority')
 
 		const sql = rollbackStepsToSQL(migration)
-		expect(sql).toEqual(['CREATE INDEX IF NOT EXISTS idx_todos_priority ON "todos" ("priority")'])
+		expect(sql).toEqual([
+			'CREATE INDEX IF NOT EXISTS "idx_5_todos_priority" ON "todos" ("priority")',
+		])
 	})
 
 	test('skips backfill steps (handled at application layer)', () => {
@@ -179,7 +181,7 @@ describe('rollbackStepsToSQL', () => {
 		const sql = rollbackStepsToSQL(migration)
 		expect(sql).toEqual([
 			'ALTER TABLE "todos" RENAME COLUMN "title" TO "name"',
-			'DROP INDEX IF EXISTS idx_todos_priority',
+			'DROP INDEX IF EXISTS "idx_5_todos_priority"',
 			'ALTER TABLE "todos" DROP COLUMN "priority"',
 		])
 	})
@@ -194,7 +196,7 @@ describe('rollbackStepsToSQL', () => {
 
 		const sql = rollbackStepsToSQL(migration)
 		expect(sql).toEqual([
-			'DROP INDEX IF EXISTS idx_todos_priority',
+			'DROP INDEX IF EXISTS "idx_5_todos_priority"',
 			'ALTER TABLE "todos" DROP COLUMN "priority"',
 		])
 	})

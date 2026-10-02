@@ -1,4 +1,5 @@
 import { quoteIdent } from '../schema/quote-ident'
+import { collectionIndexName } from '../schema/sql-gen'
 import type { FieldDescriptor } from '../types'
 import type { MigrationDefinition, MigrationStep } from './migration-builder'
 import { generateRollbackSteps } from './migration-rollback'
@@ -37,11 +38,13 @@ export function migrationStepsToSQL(steps: readonly MigrationStep[]): string[] {
 				break
 			case 'addIndex':
 				statements.push(
-					`CREATE INDEX IF NOT EXISTS idx_${step.collection}_${step.field} ON ${quoteIdent(step.collection)} (${quoteIdent(step.field)})`,
+					`CREATE INDEX IF NOT EXISTS ${quoteIdent(collectionIndexName(step.collection, step.field))} ON ${quoteIdent(step.collection)} (${quoteIdent(step.field)})`,
 				)
 				break
 			case 'removeIndex':
-				statements.push(`DROP INDEX IF EXISTS idx_${step.collection}_${step.field}`)
+				statements.push(
+					`DROP INDEX IF EXISTS ${quoteIdent(collectionIndexName(step.collection, step.field))}`,
+				)
 				break
 			case 'backfill':
 				// Backfills are handled by the store at runtime, not via SQL.
@@ -70,7 +73,7 @@ export function migrationStepsToSQL(steps: readonly MigrationStep[]): string[] {
  *   .addIndex('todos', 'priority')
  *
  * const rollbackSQL = rollbackStepsToSQL(migration)
- * // ['DROP INDEX IF EXISTS idx_todos_priority',
+ * // ['DROP INDEX IF EXISTS "idx_5_todos_priority"',
  * //  'ALTER TABLE "todos" DROP COLUMN "priority"']
  * ```
  */
