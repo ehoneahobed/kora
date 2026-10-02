@@ -181,16 +181,18 @@ describe('RT-11: blob reference forging', () => {
 		const central = centralStore()
 		const harness = await createHarness(schema, auth, central.config)
 		const bob = await harness.login('bob-token', 'bob-node')
-		// The client's normal order: reference first, bytes uploaded after the op is sent.
+		// A brand-new blob: the client's outbound preparer pushes the bytes before the
+		// batch that references them. (With a central store, a reference sent BEFORE its
+		// bytes is refused since RT-25: a bare reference no longer claims a hash.)
 		const fresh = enc.encode('bob holiday photo')
 		const freshHash = await sha256Hex(fresh)
+		bob.send({ type: 'blob-chunk-push', messageId: 'p1', hash: freshHash, bytes: b64(fresh) })
 		const first = makeOp('bob-node', 1, {
 			collection: 'files',
 			recordId: 'bob-1',
 			data: { owner: 'bob', doc: { hash: freshHash, size: fresh.byteLength } },
 		})
 		bob.send(batch([first]))
-		bob.send({ type: 'blob-chunk-push', messageId: 'p1', hash: freshHash, bytes: b64(fresh) })
 		// Bytes pushed first, referenced second.
 		const pushed = enc.encode('bob tax return')
 		const pushedHash = await sha256Hex(pushed)

@@ -94,7 +94,8 @@ describe('anonymous node tokens (RT-12)', () => {
 		const token = tokenOf(first.messages) as string
 		const owners = (store as unknown as { nodeOwners: Map<string, string> }).nodeOwners
 		const owner = owners.get('kiosk') ?? ''
-		expect(owner.startsWith('kora:anon-node:')).toBe(true)
+		// Provisional until the device confirms it saved the token (RT-21); a hash either way.
+		expect(/^kora:anon-(node|pending):/.test(owner)).toBe(true)
 		expect(owner).not.toContain(token)
 	})
 
@@ -105,6 +106,75 @@ describe('anonymous node tokens (RT-12)', () => {
 		const result = await connect('t', 'n')
 		expect(accepted(result.messages)).toBe(false)
 		expect(errorCodes(result.messages)).toContain('AUTH_FAILED')
+	})
+})
+
+describe('provisional anonymous claims (RT-21)', () => {
+	const primary: AuthProvider = { authenticate: async () => null }
+	const mixed = () => new MixedAuthProvider({ primary, anonymousScopes: { notes: {} } })
+	const ownerOf = (store: MemoryServerStore, nodeId: string): string =>
+		(store as unknown as { nodeOwners: Map<string, string> }).nodeOwners.get(nodeId) ?? ''
+
+	test('acknowledging the response with the saved token confirms the claim', async () => {
+		const { connect, store } = await setup(mixed())
+		const first = await connect('', 'kiosk')
+		const response = first.messages.find((m) => m.type === 'handshake-response')
+		const token = tokenOf(first.messages) as string
+		expect(ownerOf(store, 'kiosk').startsWith('kora:anon-pending:')).toBe(true)
+		first.client.send({
+			type: 'acknowledgment',
+			messageId: 'ack',
+			acknowledgedMessageId: response?.messageId ?? '',
+			lastSequenceNumber: 0,
+			nodeToken: token,
+		} as SyncMessage)
+		await vi.waitFor(() => expect(ownerOf(store, 'kiosk').startsWith('kora:anon-node:')).toBe(true))
+		first.client.disconnect()
+		// Confirmed: a device without the token can no longer take it, even offline.
+		expect(errorCodes((await connect('', 'kiosk')).messages)).toContain('NODE_ID_CLAIMED')
+		expect(accepted((await connect('', 'kiosk', token)).messages)).toBe(true)
+	})
+
+	test('an unconfirmed claim is re-issued only when no session holds the node', async () => {
+		const { connect } = await setup(mixed())
+		const first = await connect('', 'kiosk')
+		expect(errorCodes((await connect('', 'kiosk')).messages)).toContain('NODE_ID_CLAIMED')
+		first.client.disconnect()
+		await vi.waitFor(async () => {
+			const retry = await connect('', 'kiosk')
+			expect(accepted(retry.messages)).toBe(true)
+			retry.client.disconnect()
+		})
+		// The first token is void after the re-issue.
+		const stale = await connect('', 'kiosk', tokenOf(first.messages))
+		expect(errorCodes(stale.messages)).toContain('NODE_ID_CLAIMED')
+	})
+
+	test('legacy claims need allowLegacyAnonymousClaims', async () => {
+		const strict = await setup(mixed(), {
+			allowLegacyAnonymousClaims: false,
+			anonymousClaimTtlMs: 1,
+		})
+		await strict.store.claimNode('old-kiosk', 'kora:anonymous')
+		expect(errorCodes((await strict.connect('', 'old-kiosk')).messages)).toContain(
+			'NODE_ID_CLAIMED',
+		)
+		// An expired, never-confirmed claim is legacy too.
+		const first = await strict.connect('', 'kiosk')
+		first.client.disconnect()
+		await new Promise((resolve) => setTimeout(resolve, 5))
+		expect(errorCodes((await strict.connect('', 'kiosk')).messages)).toContain('NODE_ID_CLAIMED')
+
+		const lenient = await setup(mixed())
+		await lenient.store.claimNode('old-kiosk', 'kora:anonymous')
+		expect(accepted((await lenient.connect('', 'old-kiosk')).messages)).toBe(true)
+	})
+
+	test('node ids in the reserved kora: namespace are refused', async () => {
+		const { connect } = await setup(mixed())
+		expect(errorCodes((await connect('', 'kora:scope-entry')).messages)).toContain(
+			'INVALID_NODE_ID',
+		)
 	})
 })
 

@@ -110,11 +110,15 @@ export function snapshotExitsScopes(
 	op: Operation,
 	snapshot: { pre: Record<string, unknown> | null; post: Record<string, unknown> | null },
 	scopes: ScopeMap | undefined,
+	current?: Record<string, unknown> | null,
 ): boolean {
 	if (!scopes || op.type !== 'update' || !snapshot.pre || !snapshot.post) return false
+	const pre = snapshotValuesWithFallback(op.collection, snapshot.pre, scopes, current)
+	const post = snapshotValuesWithFallback(op.collection, snapshot.post, scopes, current)
+	if (!pre || !post) return false
 	return (
-		recordMatchesScopes(op.collection, { ...snapshot.pre, id: op.recordId }, scopes) &&
-		!recordMatchesScopes(op.collection, { ...snapshot.post, id: op.recordId }, scopes)
+		recordMatchesScopes(op.collection, { ...pre, id: op.recordId }, scopes) &&
+		!recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)
 	)
 }
 
@@ -150,6 +154,82 @@ export function recordMatchesScopes(
 	const collectionScope = scopes[collection]
 	if (!collectionScope) return false
 	return recordMatchesScopePredicates(record, collectionScope)
+}
+
+/**
+ * One side of a scope snapshot, with every scope field the snapshot does not hold
+ * taken from the record's current row (RT-20). A snapshot captured before a schema
+ * change that added (or renamed) a scope field lacks that field entirely; judging it
+ * as "no value" would hide the record's whole history from every session. A field
+ * that IS present (including null, which an over-long string is recorded as) is
+ * kept, so a present-and-mismatched value still fails closed.
+ *
+ * @param collection - The record's collection
+ * @param values - The snapshot side (`pre` or `post`), or null
+ * @param scopes - The session's download scope
+ * @param current - The record's current stored row, when known
+ * @returns The values to judge, or null when `values` is null
+ */
+export function snapshotValuesWithFallback(
+	collection: string,
+	values: Record<string, unknown> | null,
+	scopes: ScopeMap | undefined,
+	current: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+	if (!values) return null
+	const predicate = scopes?.[collection]
+	if (!predicate) return values
+	let filled: Record<string, unknown> | null = null
+	for (const field of Object.keys(predicate)) {
+		if (field in values) continue
+		if (!current || !(field in current)) continue
+		filled ??= { ...values }
+		filled[field] = current[field]
+	}
+	return filled ?? values
+}
+
+/**
+ * True when one of the snapshot's scope fields is absent, so a caller must read the
+ * current row before judging it (see {@link snapshotValuesWithFallback}).
+ */
+export function snapshotLacksScopeFields(
+	collection: string,
+	snapshot: { pre: Record<string, unknown> | null; post: Record<string, unknown> | null },
+	scopes: ScopeMap | undefined,
+): boolean {
+	const predicate = scopes?.[collection]
+	if (!predicate) return false
+	const fields = Object.keys(predicate)
+	const lacks = (values: Record<string, unknown> | null): boolean =>
+		values !== null && fields.some((field) => !(field in values))
+	return lacks(snapshot.pre) || lacks(snapshot.post)
+}
+
+/**
+ * True when an operation moved an existing record INTO the scope: the store's own
+ * pre-image was out of scope and the post-image is in it (RT-19). Inserts (no
+ * pre-image) are not entries; they carry the whole record themselves.
+ *
+ * @param op - The operation
+ * @param snapshot - The scope values captured when it was applied
+ * @param scopes - The session's download scope
+ * @param current - The record's current row, for scope fields a legacy snapshot lacks
+ */
+export function snapshotEntersScopes(
+	op: Operation,
+	snapshot: { pre: Record<string, unknown> | null; post: Record<string, unknown> | null },
+	scopes: ScopeMap | undefined,
+	current?: Record<string, unknown> | null,
+): boolean {
+	if (!scopes || op.type !== 'update') return false
+	const pre = snapshotValuesWithFallback(op.collection, snapshot.pre, scopes, current)
+	const post = snapshotValuesWithFallback(op.collection, snapshot.post, scopes, current)
+	if (!pre || !post) return false
+	return (
+		!recordMatchesScopes(op.collection, { ...pre, id: op.recordId }, scopes) &&
+		recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)
+	)
 }
 
 /**

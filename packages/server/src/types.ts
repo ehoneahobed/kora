@@ -161,6 +161,13 @@ export interface KoraSyncServerConfig {
 		maxBytesPerSession?: number
 		maxPendingRequestsPerSession?: number
 		pendingRequestTtlMs?: number
+		/**
+		 * Blob chunk requests one session may make per minute, a budget separate from
+		 * `maxOpsPerMinute` (one request per chunk, so a large blob makes many). Over
+		 * it, a request is answered with a retriable `throttled` response the client
+		 * backs off on (RT-24). Defaults to 6000.
+		 */
+		maxRequestsPerMinute?: number
 	}
 	/**
 	 * Largest WebSocket message the standalone server (and `createProductionServer`)
@@ -188,6 +195,21 @@ export interface KoraSyncServerConfig {
 	 * sends batches of 100 by default).
 	 */
 	maxOpsPerBatch?: number
+	/**
+	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
+	 * nodes held by the pre-release shared anonymous owner, and provisional claims
+	 * that expired without the device ever confirming its node token (clients without
+	 * token support). Accepted with a deprecation warning and re-issued a token.
+	 * Defaults to `true` for 1.0.0-beta.13; the default flips to `false` in the next
+	 * release, after which such devices rotate to a fresh node id instead.
+	 */
+	allowLegacyAnonymousClaims?: boolean
+	/**
+	 * How long an anonymous device's provisional node claim may stay unconfirmed and
+	 * still be re-issued to a device that presents no token (a handshake response lost
+	 * in transit), in milliseconds (RT-21). Defaults to 24 hours.
+	 */
+	anonymousClaimTtlMs?: number
 	/**
 	 * How often every live session's credential is re-validated with the auth
 	 * provider, in milliseconds (RT-18). A revocation persisted by another server

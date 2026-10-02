@@ -20,7 +20,13 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import { parseScopeSnapshot, replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
+import {
+	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	parseScopeSnapshot,
+	replayScopeSnapshots,
+	scopeSnapshotFingerprint,
+	scopeValuesOf,
+} from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -129,7 +135,24 @@ export class PostgresServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot: drop them
+		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
+		// (or a concurrent instance) only repeats the idempotent rebuild.
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		const metaRows = (await this.db.execute(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
+		)) as unknown as { value: string }[]
+		const stored = metaRows[0]?.value
+		if (stored !== fingerprint) {
+			await this.db.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
+		}
 		await this.backfillScopeSnapshots()
+		if (stored !== fingerprint) {
+			await this.db.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+		}
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -395,6 +418,28 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		await this.ready
+		// COLLATE "C" so the node-id tie-break is the same byte order as HLC.compare.
+		const rows = (await this.db.execute(
+			sql`SELECT wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}
+				ORDER BY wall_time DESC, logical DESC, timestamp_node_id COLLATE "C" DESC LIMIT 1`,
+		)) as unknown as { wall_time: number | string; logical: number; timestamp_node_id: string }[]
+		const row = rows[0]
+		return row
+			? {
+					wallTime: Number(row.wall_time),
+					logical: Number(row.logical),
+					nodeId: row.timestamp_node_id,
+				}
+			: null
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -755,6 +800,30 @@ export class PostgresServerStore implements ServerStore {
 			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
 		)) as unknown as { user_id: string }[]
 		return rows[0]?.user_id === userId
+	}
+
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		// One statement, atomic on the row: concurrent re-issues have one winner.
+		const rows = (await this.db.execute(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)) as unknown as { node_id: string }[]
+		return rows.length > 0
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
@@ -1211,6 +1280,14 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
 			)
+
+			// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_server_meta (
+					key TEXT PRIMARY KEY,
+					value TEXT NOT NULL
+				)
+			`)
 
 			// Node id -> principal binding (see claimNode). One row per device node id.
 			await tx.execute(sql`

@@ -746,6 +746,11 @@ outside the new map before view completion; widening backfills the current autho
 is reconnect-dependent: a device that never reconnects cannot be remotely erased. Blob bytes become
 reclaimable after normal garbage collection once no live row references them.
 
+With the default `scopeExit: 'retain'`, a record that leaves the scope stays in the local view as
+the last copy the device had; it is no longer updated. A record that ENTERS the scope (for example
+transferred to this user) arrives as a server-built scope-entry insert carrying its current values
+(node `kora:scope-entry`), followed by the operation that moved it; earlier history is not sent.
+
 Permanent per-operation rejections—including `SCOPE_VIOLATION`—leave the outbound queue, enter the
 durable rejected-operation store, and are never uploaded again automatically. The server advances
 the acknowledgement through them so valid later offline writes are not blocked. If authorization

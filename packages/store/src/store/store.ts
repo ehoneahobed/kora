@@ -1,6 +1,7 @@
 import {
 	CausalTracker,
 	HybridLogicalClock,
+	KoraError,
 	createVersionVector,
 	generateUUIDv7,
 	migrationStepsToSQL,
@@ -50,6 +51,8 @@ import {
 import { SubscriptionManager } from '../subscription/subscription-manager'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
+import type { NodeRotationResult } from '../sync/rotate-node-id'
+import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import {
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
@@ -376,6 +379,47 @@ export class Store implements OperationLog {
 					// inside this same transaction. Per-field LWW makes the result
 					// identical to what an in-order device computed.
 					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+				} else if (
+					row._deleted === 1 &&
+					(
+						await tx.query<{ record_id: string }>(
+							'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+					).length > 0
+				) {
+					// The row is hidden by a scope retraction (a view change, not a domain
+					// delete) and the record is entering the scope again, typically through
+					// a server scope-entry insert (RT-19). Show it again and merge per field,
+					// exactly like an insert collision on a live row: fields this device
+					// holds newer versions of are kept.
+					const { winners, merged } = resolvePerFieldLww(
+						parseFieldVersions(row._field_versions),
+						Object.keys(serializedData),
+						remoteVersion,
+						typeof row._version === 'string' ? row._version : undefined,
+					)
+					const fieldChanges: Record<string, unknown> = {
+						_deleted: 0,
+						_field_versions: serializeFieldVersions(merged),
+					}
+					for (const field of winners) {
+						fieldChanges[field] = serializedData[field]
+					}
+					// `_created_at` is left alone: the record was created long before it
+					// re-entered this device's view.
+					const reactivate = buildFieldFastForwardUpdateQuery(
+						collection,
+						op.recordId,
+						fieldChanges,
+						remoteVersion,
+						wallTime,
+					)
+					await tx.execute(reactivate.sql, reactivate.params)
+					await tx.execute(
+						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
 				} else if (row._deleted === 1) {
 					// Insert vs tombstone: a strictly newer insert resurrects the record
 					// with its full field set; an older one is stale (delete wins).
@@ -1054,6 +1098,65 @@ export class Store implements OperationLog {
 	 * No data-change notifications are emitted: materialized values are
 	 * unchanged, only version stamps move.
 	 */
+	/**
+	 * Move this device to a fresh node id, re-authoring its never-acknowledged
+	 * operations under it (RT-21). Used when the sync server refuses the current node
+	 * id (`NODE_ID_CLAIMED`): the device keeps every local write and uploads it under
+	 * the new id. Acknowledged history stays under the old id. Persisted atomically;
+	 * later writes use the new id.
+	 *
+	 * @param unsyncedOpIds - Ids of this node's operations the server never acknowledged
+	 * @returns The new node id and the rewritten operations (for the outbound queue)
+	 * @throws {KoraError} When the node id is pinned (`StoreConfig.nodeId`, or per-tab isolation)
+	 */
+	async rotateNodeId(unsyncedOpIds: string[]): Promise<NodeRotationResult> {
+		this.ensureOpen()
+		if (this.configNodeId || this.isolation === 'per-tab') {
+			throw new KoraError(
+				'This store uses a pinned node id, so it cannot move to a fresh one after the sync server refused it.',
+				'NODE_ID_PINNED',
+				{
+					nodeId: this.nodeId,
+					fix: 'Remove StoreConfig.nodeId, or give the device a node id no other device uses.',
+				},
+			)
+		}
+		const oldNodeId = this.nodeId
+		const oldClock = this.clock
+		const result = await rotateUnsyncedOperationsInLog(
+			this.adapter,
+			this.schema,
+			unsyncedOpIds,
+			oldNodeId,
+			generateUUIDv7(),
+		)
+		this.nodeId = result.nodeId
+		const clock = new HybridLogicalClock(this.nodeId)
+		if (oldClock) {
+			const last = oldClock.now()
+			clock.advanceTo({ ...last, nodeId: this.nodeId })
+			const offset = oldClock.getReferenceOffset()
+			if (offset !== null) clock.setReferenceOffset(offset)
+		}
+		this.clock = clock
+		this.causalTracker = new CausalTracker()
+		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
+		this.sequenceNumber = result.operations.length
+		this.versionVector = await this.loadVersionVector()
+		this.relationEnforcer = this.relationEnforcer
+			? new RelationEnforcer({
+					schema: this.schema,
+					adapter: this.adapter,
+					clock,
+					nodeId: this.nodeId,
+				})
+			: null
+		for (const collection of this.collections.values()) {
+			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
+		}
+		return result
+	}
+
 	async rebaseUnsyncedOperations(
 		unsyncedOpIds: string[],
 		correctedNowMs: number,

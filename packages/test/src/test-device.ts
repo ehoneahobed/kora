@@ -56,6 +56,8 @@ export interface TestDeviceOptions {
 	syncSchemaVersion?: number
 	/** Transforms applied to inbound operations before local apply. */
 	operationTransforms?: OperationTransform[]
+	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
+	scopeExit?: 'retain' | 'retract'
 }
 
 /**
@@ -78,6 +80,7 @@ export class TestDevice {
 	private readonly dbPath: string
 	private readonly syncSchemaVersion: number
 	private readonly operationTransforms: OperationTransform[]
+	private readonly scopeExit: 'retain' | 'retract' | undefined
 
 	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
@@ -95,6 +98,7 @@ export class TestDevice {
 		this.dbPath = `${options.tmpDir}/test-device-${options.name}.db`
 		this.syncSchemaVersion = options.syncSchemaVersion ?? options.schema.version
 		this.operationTransforms = options.operationTransforms ?? []
+		this.scopeExit = options.scopeExit
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -155,6 +159,7 @@ export class TestDevice {
 				schemaVersion: this.syncSchemaVersion,
 				operationTransforms:
 					this.operationTransforms.length > 0 ? this.operationTransforms : undefined,
+				...(this.scopeExit ? { scopeExit: this.scopeExit } : {}),
 			},
 			emitter: this.emitter,
 		})

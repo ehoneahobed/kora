@@ -56,7 +56,10 @@ import {
 	normalizeScopeMap,
 	operationMatchesScopes,
 	recordMatchesScopes,
+	snapshotEntersScopes,
 	snapshotExitsScopes,
+	snapshotLacksScopeFields,
+	snapshotValuesWithFallback,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type {
@@ -68,7 +71,9 @@ import type {
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
+import { buildScopeEntryOperation } from './scope-entry'
 import {
+	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
 	DEFAULT_MAX_OPS_PER_MINUTE,
@@ -99,6 +104,45 @@ export const RESERVED_PRINCIPAL_PREFIX = 'kora:'
 
 /** Prefix of the node-claim owner of an anonymous device: `kora:anon-node:<sha256(token)>`. */
 const ANONYMOUS_NODE_OWNER_PREFIX = 'kora:anon-node:'
+/**
+ * Prefix of a PROVISIONAL anonymous claim (RT-21):
+ * `kora:anon-pending:<sha256(token)>:<expiresAtMs>`. It becomes the confirmed
+ * `kora:anon-node:<sha256(token)>` once the device proves it saved the token.
+ */
+const ANONYMOUS_PENDING_OWNER_PREFIX = 'kora:anon-pending:'
+/** Default time an unconfirmed provisional claim stays re-issuable: 24 hours. */
+export const DEFAULT_ANONYMOUS_CLAIM_TTL_MS = 24 * 60 * 60 * 1000
+
+function pendingOwner(tokenHash: string, expiresAtMs: number): string {
+	return `${ANONYMOUS_PENDING_OWNER_PREFIX}${tokenHash}:${String(expiresAtMs)}`
+}
+
+function parsePendingOwner(
+	owner: string | null,
+): { tokenHash: string; expiresAtMs: number } | null {
+	if (owner === null || !owner.startsWith(ANONYMOUS_PENDING_OWNER_PREFIX)) return null
+	const rest = owner.slice(ANONYMOUS_PENDING_OWNER_PREFIX.length)
+	const separator = rest.lastIndexOf(':')
+	if (separator <= 0) return null
+	const expiresAtMs = Number(rest.slice(separator + 1))
+	if (!Number.isFinite(expiresAtMs)) return null
+	return { tokenHash: rest.slice(0, separator), expiresAtMs }
+}
+
+/** Outcome of an anonymous device's node claim at handshake (RT-12, RT-21). */
+type AnonymousClaimOutcome =
+	| {
+			ok: true
+			/** The claim owner now recorded for the node. */
+			owner: string
+			/** The device key (`kora:anon-node:<hash>`), stable across confirmation. */
+			deviceKey: string
+			/** A token to hand the device in the response, when one was (re-)issued. */
+			issuedToken: string | null
+			/** Set while the claim is provisional: what confirmation replaces it with. */
+			pending: { owner: string; token: string; confirmedOwner: string } | null
+	  }
+	| { ok: false }
 /** Longest node token a client may present. */
 const MAX_NODE_TOKEN_LENGTH = 256
 /** Bytes of randomness in a server-issued node token (256 bits). */
@@ -118,11 +162,19 @@ function generateNodeToken(): string {
  * stored, so the claims table never holds a usable secret.
  */
 async function anonymousNodeOwner(nodeToken: string): Promise<string> {
-	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await hashBlob(new TextEncoder().encode(nodeToken))}`
+	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await nodeTokenHash(nodeToken)}`
 }
 
-/** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
-export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
+async function nodeTokenHash(nodeToken: string): Promise<string> {
+	return hashBlob(new TextEncoder().encode(nodeToken))
+}
+
+/**
+ * Session-ending error codes, all retriable. `AUTH_REVOKED` / `AUTH_EXPIRED`: the
+ * client refreshes its credential and re-handshakes. `SCOPE_CHANGED` (RT-26): the
+ * principal's grant changed; the client simply reconnects and gets the new scope.
+ */
+export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED' | 'SCOPE_CHANGED'
 
 /**
  * Same principal for re-validation: the same user and device, or both anonymous
@@ -338,6 +390,13 @@ export interface ClientSessionOptions {
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
 	maxOpsPerMinute?: number
 	/**
+	 * Blob chunk requests accepted per minute, separate from the operation budget
+	 * (RT-24). Defaults to 6000.
+	 */
+	maxBlobRequestsPerMinute?: number
+	/** Length of the blob request window in ms. One minute; shorter only in tests. */
+	blobRequestWindowMs?: number
+	/**
 	 * Largest operation batch accepted in one message. A larger batch is refused whole
 	 * (`BATCH_TOO_LARGE`) before it is decoded or the store is read. Defaults to 1000.
 	 */
@@ -356,6 +415,15 @@ export interface ClientSessionOptions {
 	 * references are not checked at ingest.
 	 */
 	blobAccess?: BlobAccessIndex
+	/** See `KoraSyncServerConfig.allowLegacyAnonymousClaims` (RT-21). Defaults to true. */
+	allowLegacyAnonymousClaims?: boolean
+	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
+	anonymousClaimTtlMs?: number
+	/**
+	 * True when another live session (not `exceptSessionId`) is connected as `nodeId`.
+	 * A provisional anonymous claim is never re-issued away from a connected device.
+	 */
+	isNodeLive?: (nodeId: string, exceptSessionId: string) => boolean
 }
 
 /**
@@ -390,8 +458,15 @@ export class ClientSession {
 	private issuedNodeToken: string | null = null
 	/** The node-claim owner this session holds its node id under (userId, or an anonymous device key). */
 	private nodeOwnerKey: string | null = null
+	/** A provisional anonymous claim awaiting the device's confirmation (RT-21). */
+	private pendingNodeClaim: { owner: string; token: string; confirmedOwner: string } | null = null
+	private readonly allowLegacyAnonymousClaims: boolean
+	private readonly anonymousClaimTtlMs: number
+	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
 	private credential: string | null = null
+	/** The scope the client asked for at handshake, kept to re-resolve scopes (RT-26). */
+	private handshakeScope: HandshakeMessage['syncScope'] = undefined
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	private resumeDeltaCursor: DeltaCursor | null = null
@@ -470,6 +545,8 @@ export class ClientSession {
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
 	private readonly rateLimiter: SessionRateLimiter
+	/** Separate budget for blob chunk requests (RT-24). */
+	private readonly blobRateLimiter: SessionRateLimiter
 	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
 	private rateLimitedOperations = 0
 	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
@@ -512,10 +589,17 @@ export class ClientSession {
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.blobRateLimiter = new SessionRateLimiter(
+			options.maxBlobRequestsPerMinute ?? DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
+			options.blobRequestWindowMs ?? 60_000,
+		)
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
+		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
+		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
+		this.isNodeLive = options.isNodeLive ?? null
 	}
 
 	/**
@@ -618,6 +702,9 @@ export class ClientSession {
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
 			if (await this.operationVisibleToClient(op, snapshot)) {
+				// A record entering the scope arrives whole, before the op that moved it (RT-19).
+				const entry = await this.scopeEntryFor(op, snapshot)
+				if (entry) visibleOperations.push(entry)
 				visibleOperations.push(op)
 			} else if (await this.scopeRetractionFor(op, snapshot)) {
 				retractions.push({ collection: op.collection, recordId: op.recordId })
@@ -773,10 +860,34 @@ export class ClientSession {
 		}
 		// The session may have closed (or re-authenticated) while the provider ran.
 		if (this.getState() === 'closed' || this.principal !== principal) return 'valid'
-		if (context && samePrincipal(principal, context)) return 'valid'
+		if (context && samePrincipal(principal, context)) {
+			// Same principal: the grant may still have changed (a role or team change).
+			// A session whose resolved scopes differ is ended so the client reconnects and
+			// is handed its new scope at handshake (RT-26).
+			if (this.scopesChangedFor(context)) {
+				this.terminate('SCOPE_CHANGED')
+				return 'terminated'
+			}
+			return 'valid'
+		}
 		const expired = principal.expiresAt !== undefined && Date.now() >= principal.expiresAt
 		this.terminate(expired ? 'AUTH_EXPIRED' : 'AUTH_REVOKED')
 		return 'terminated'
+	}
+
+	/**
+	 * True when `context` (a fresh authentication of this session's principal)
+	 * resolves to download or upload scopes other than the ones this session holds.
+	 * A grant that no longer resolves at all counts as changed.
+	 */
+	private scopesChangedFor(context: AuthContext): boolean {
+		if (this.state !== 'streaming' && this.state !== 'syncing') return false
+		const resolution = this.computeSessionScopes(context, this.handshakeScope)
+		if (!resolution.ok) return true
+		return (
+			!sameScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
+			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+		)
 	}
 
 	/**
@@ -797,9 +908,17 @@ export class ClientSession {
 		const message =
 			code === 'AUTH_EXPIRED'
 				? 'The credential for this sync session expired. Refresh it and reconnect.'
-				: 'The credential for this sync session was revoked. Refresh it and reconnect.'
+				: code === 'SCOPE_CHANGED'
+					? 'The sync scope granted to this session changed. Reconnect to receive the new scope.'
+					: 'The credential for this sync session was revoked. Refresh it and reconnect.'
 		this.sendError(code, message, true)
-		this.close(code === 'AUTH_EXPIRED' ? 'credential expired' : 'credential revoked')
+		this.close(
+			code === 'AUTH_EXPIRED'
+				? 'credential expired'
+				: code === 'SCOPE_CHANGED'
+					? 'sync scope changed'
+					: 'credential revoked',
+		)
 	}
 
 	/**
@@ -968,6 +1087,9 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
+				if (typeof message.nodeToken === 'string') {
+					await this.confirmNodeClaim(message.nodeToken)
+				}
 				if (message.deliverySequence !== undefined) {
 					// Advance the confirmed watermark; the next streaming push resumes here.
 					this.lastAckedDeliverySeq = Math.max(this.lastAckedDeliverySeq, message.deliverySequence)
@@ -991,16 +1113,19 @@ export class ClientSession {
 				break
 			case 'blob-chunk-request':
 				// Every request costs access checks and possibly a central-store read, so it
-				// is charged to the same per-session budget as operations (RT-17). Over
-				// budget it is answered "not held" rather than with an error, so a client
-				// pulling a large blob backs off and retries instead of being disconnected.
-				if (!this.rateLimiter.allow(1)) {
+				// is rate-limited (RT-17), on its own budget: a large blob is one request per
+				// chunk and must not starve (or be starved by) operation sync (RT-24). Over
+				// budget the answer is a retriable "throttled", never "not held", so the
+				// client backs off and retries instead of failing the transfer.
+				if (!this.blobRateLimiter.allow(1)) {
 					this.rateLimitedBlobRequests += 1
 					this.sendToClient({
 						type: 'blob-chunk-response',
 						messageId: `blob-resp-${message.requestId}`,
 						requestId: message.requestId,
 						bytes: null,
+						throttled: true,
+						retryAfterMs: this.blobRateLimiter.retryAfterMs(),
 					})
 					break
 				}
@@ -1021,7 +1146,10 @@ export class ClientSession {
 	 * mislabeled upload is rejected rather than served later as trusted content.
 	 */
 	private async handleBlobChunkPush(message: BlobChunkPushMessage): Promise<void> {
-		if (!this.persistBlobChunk) {
+		// Without central persistence a push is still accepted as proof of possession
+		// (RT-23): the bytes are verified and the pusher recorded as an owner, then
+		// dropped. Without either, there is nothing to do with the bytes.
+		if (!this.persistBlobChunk && !this.blobAccess) {
 			return
 		}
 		const bytes = decodeBlobChunkBytes(message.bytes)
@@ -1048,7 +1176,7 @@ export class ClientSession {
 			// Reject a mismatched upload rather than persisting untrusted bytes.
 			return
 		}
-		const owner = this.blobOwnerKey()
+		const owner = this.getBlobOwnerKey()
 		const scopes = this.referenceScopes()
 		// A manifest may only list chunks the pusher may reference itself (RT-11), so a
 		// crafted manifest cannot make another tenant's chunk reachable.
@@ -1065,9 +1193,107 @@ export class ClientSession {
 			return
 		}
 		this.blobBytesPushed += bytes.byteLength
-		await this.persistBlobChunk(message.hash, bytes)
+		if (this.persistBlobChunk) {
+			await this.persistBlobChunk(message.hash, bytes)
+		}
 		// Pushing the bytes proves possession: the session may reference this hash.
 		await this.blobAccess?.recordPush(message.hash, bytes, owner)
+	}
+
+	/**
+	 * Claim (or re-claim) a node id for an anonymous device (RT-12, RT-21).
+	 *
+	 * A device presenting a token holds the node when the claim is (or can become)
+	 * `kora:anon-node:<hash(token)>`: its confirmed claim, a fresh claim, or its own
+	 * provisional claim, which presenting the token confirms.
+	 *
+	 * A device presenting no token gets a fresh token and a PROVISIONAL claim, which it
+	 * confirms by acknowledging the response with the token once saved (or by
+	 * presenting it next time). Until then the claim may be re-issued to a device that
+	 * again presents no token (the response was lost in transit), but only while no
+	 * session is connected as that node and before the claim expires. Legacy claims
+	 * (expired provisional ones, and nodes of the pre-release shared anonymous owner)
+	 * are re-issued only with `allowLegacyAnonymousClaims`, with a deprecation warning.
+	 */
+	private async claimAnonymousNode(
+		nodeId: string,
+		presentedToken: string | null,
+	): Promise<AnonymousClaimOutcome> {
+		const store = this.store
+		if (!store.claimNode) return { ok: false }
+		if (presentedToken !== null) {
+			const hash = await nodeTokenHash(presentedToken)
+			const confirmed = `${ANONYMOUS_NODE_OWNER_PREFIX}${hash}`
+			const base = { deviceKey: confirmed, issuedToken: null, pending: null }
+			if (await store.claimNode(nodeId, confirmed)) return { ok: true, owner: confirmed, ...base }
+			const current = (await store.getNodeClaimOwner?.(nodeId)) ?? null
+			const pending = parsePendingOwner(current)
+			if (
+				current !== null &&
+				pending?.tokenHash === hash &&
+				(await store.replaceNodeClaim?.(nodeId, current, confirmed)) === true
+			) {
+				return { ok: true, owner: confirmed, ...base }
+			}
+			return { ok: false }
+		}
+
+		const token = generateNodeToken()
+		const hash = await nodeTokenHash(token)
+		const confirmedOwner = `${ANONYMOUS_NODE_OWNER_PREFIX}${hash}`
+		const owner = pendingOwner(hash, Date.now() + this.anonymousClaimTtlMs)
+		const issued = {
+			ok: true as const,
+			owner,
+			deviceKey: confirmedOwner,
+			issuedToken: token,
+			pending: { owner, token, confirmedOwner },
+		}
+		if (await store.claimNode(nodeId, owner)) return issued
+		if (!store.getNodeClaimOwner || !store.replaceNodeClaim) return { ok: false }
+		const current = await store.getNodeClaimOwner(nodeId)
+		if (current === null) return { ok: false }
+		const pending = parsePendingOwner(current)
+		let legacy = false
+		if (pending) {
+			// Never take a provisional claim away from a device that is connected now.
+			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
+			if (pending.expiresAtMs <= Date.now()) {
+				if (!this.allowLegacyAnonymousClaims) return { ok: false }
+				legacy = true
+			}
+		} else if (current === ANONYMOUS_NODE_OWNER) {
+			if (!this.allowLegacyAnonymousClaims) return { ok: false }
+			legacy = true
+		} else {
+			return { ok: false }
+		}
+		if (!(await store.replaceNodeClaim(nodeId, current, owner))) return { ok: false }
+		if (legacy) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.legacy_anonymous_claim',
+				sessionId: this.sessionId,
+				nodeId,
+				details: {
+					message:
+						'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+				},
+			})
+		}
+		return issued
+	}
+
+	/**
+	 * The device proved it saved the node token issued by this handshake: make the
+	 * provisional claim permanent (RT-21). A mismatched token is ignored.
+	 */
+	private async confirmNodeClaim(token: string): Promise<void> {
+		const pending = this.pendingNodeClaim
+		if (!pending || token !== pending.token || !this.clientNodeId) return
+		this.pendingNodeClaim = null
+		await this.store.replaceNodeClaim?.(this.clientNodeId, pending.owner, pending.confirmedOwner)
 	}
 
 	/**
@@ -1085,7 +1311,7 @@ export class ClientSession {
 	 * Stable blob-ownership key of this session's principal: the user id, or for an
 	 * anonymous device its node-claim owner (never shared by two anonymous devices).
 	 */
-	private blobOwnerKey(): string {
+	getBlobOwnerKey(): string {
 		if (this.principal?.anonymous === true) {
 			return this.nodeOwnerKey ?? `kora:node:${this.clientNodeId ?? this.sessionId}`
 		}
@@ -1099,7 +1325,7 @@ export class ClientSession {
 	 */
 	getBlobPartitionKey(): string {
 		const key = this.getScopePartitionKey()
-		return this.principal?.anonymous === true ? `${this.blobOwnerKey()}|${key}` : key
+		return this.principal?.anonymous === true ? `${this.getBlobOwnerKey()}|${key}` : key
 	}
 
 	/** Authorize foreign-key targets and blob references of an untrusted write. */
@@ -1113,10 +1339,11 @@ export class ClientSession {
 		return authorizeOperationReferences(op, stored, {
 			schema,
 			downlinkScopes: scopes,
+			uplinkScopes: this.uplinkScopes(),
 			readRow: async (collection, recordId) =>
 				(await this.lookupRecordFields(collection, recordId)) ?? null,
 			...(this.blobAccess ? { blobs: this.blobAccess } : {}),
-			blobOwner: this.blobOwnerKey(),
+			blobOwner: this.getBlobOwnerKey(),
 		})
 	}
 
@@ -1148,6 +1375,18 @@ export class ClientSession {
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 
+		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
+		// operations use `kora:scope-entry`, RT-19); no device may use one.
+		if (typeof msg.nodeId !== 'string' || msg.nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				`Node id "${String(msg.nodeId)}" is in the reserved "${RESERVED_PRINCIPAL_PREFIX}" namespace. Use a generated device node id.`,
+				false,
+			)
+			this.close('reserved node id')
+			return
+		}
+
 		// Authenticate if provider is configured
 		if (this.auth) {
 			const token = msg.authToken ?? ''
@@ -1176,7 +1415,7 @@ export class ClientSession {
 			// handshake presenting it may use the node again. NoAuthProvider has no
 			// identity at all.
 			if (this.store.claimNode && !(this.auth instanceof NoAuthProvider)) {
-				let owner = context.userId
+				let claimed: boolean
 				if (context.anonymous === true) {
 					const presented =
 						typeof msg.nodeToken === 'string' &&
@@ -1184,12 +1423,18 @@ export class ClientSession {
 						msg.nodeToken.length <= MAX_NODE_TOKEN_LENGTH
 							? msg.nodeToken
 							: null
-					const nodeToken = presented ?? generateNodeToken()
-					if (presented === null) this.issuedNodeToken = nodeToken
-					owner = await anonymousNodeOwner(nodeToken)
+					const outcome = await this.claimAnonymousNode(msg.nodeId, presented)
+					claimed = outcome.ok
+					if (outcome.ok) {
+						this.nodeOwnerKey = outcome.deviceKey
+						this.issuedNodeToken = outcome.issuedToken
+						this.pendingNodeClaim = outcome.pending
+					}
+				} else {
+					this.nodeOwnerKey = context.userId
+					claimed = await this.store.claimNode(msg.nodeId, context.userId)
 				}
-				this.nodeOwnerKey = owner
-				if (!(await this.store.claimNode(msg.nodeId, owner))) {
+				if (!claimed) {
 					this.issuedNodeToken = null
 					this.sendError(
 						'NODE_ID_CLAIMED',
@@ -1228,83 +1473,17 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
-		// Resolve download and upload authorization independently. The legacy `scopes`
-		// contract remains shorthand for both directions.
-		const directionalScopesConfigured =
-			this.authContext?.downlinkScopes !== undefined || this.authContext?.uplinkScopes !== undefined
-		const downlinkAuthScopes = directionalScopesConfigured
-			? (this.authContext?.downlinkScopes ?? this.authContext?.scopes ?? {})
-			: this.authContext?.scopes
-		const uplinkAuthScopes = directionalScopesConfigured
-			? (this.authContext?.uplinkScopes ?? this.authContext?.scopes ?? {})
-			: this.authContext?.scopes
-		// A real auth provider that grants nothing for a schema-scoped collection is
-		// refused, never handed the scope the client asked for (AUTH-1). A schemaless
-		// server has no scoped collections to protect, so it keeps the provider's
-		// (absent) grant as "unscoped" and the multi-tenant warning below.
-		const authenticated =
-			this.auth !== null &&
-			!(this.auth instanceof NoAuthProvider) &&
-			this.store.getSchema() !== null
-		let rawResolvedDownlinkScopes: ReturnType<typeof resolveSessionScopes>
-		let rawResolvedUplinkScopes: ReturnType<typeof resolveSessionScopes>
-		try {
-			rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
-				handshakeScope: msg.syncScope,
-				authScopes: downlinkAuthScopes,
-				authenticated,
-				onUnresolved: 'throw',
-			})
-			// A directional uplink grant goes through the same resolver as the downlink one
-			// (RT-16): verified `$claims` are bound to the schema, an unresolved binding
-			// denies the collection (fail closed; the session may still read), and the
-			// handshake can only narrow it, exactly as for a non-directional grant.
-			rawResolvedUplinkScopes = directionalScopesConfigured
-				? resolveSessionScopes(this.store.getSchema(), {
-						handshakeScope: msg.syncScope,
-						authScopes: uplinkAuthScopes,
-						authenticated,
-						onUnresolved: 'deny',
-					})
-				: rawResolvedDownlinkScopes
-		} catch (error) {
-			if (error instanceof InvalidScopePredicateError) {
-				this.sendError('INVALID_SCOPE_PREDICATE', error.message, false)
-				this.close('invalid scope predicate')
-				return
-			}
-			if (!(error instanceof ScopeRequiredError)) throw error
-			this.sendError('SCOPE_REQUIRED', error.message, false)
-			this.close('sync scope required')
+		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
+		if (!resolution.ok) {
+			this.sendError(resolution.code, resolution.message, false)
+			this.close(resolution.reason)
 			return
 		}
-		let resolvedDownlinkScopes: typeof rawResolvedDownlinkScopes
-		let resolvedUplinkScopes: typeof rawResolvedUplinkScopes
-		try {
-			resolvedDownlinkScopes = rawResolvedDownlinkScopes
-				? normalizeScopeMap(rawResolvedDownlinkScopes)
-				: directionalScopesConfigured
-					? {}
-					: undefined
-			resolvedUplinkScopes = rawResolvedUplinkScopes
-				? normalizeScopeMap(rawResolvedUplinkScopes)
-				: directionalScopesConfigured
-					? {}
-					: undefined
-		} catch (error) {
-			this.sendToClient({
-				type: 'error',
-				messageId: generateUUIDv7(),
-				code:
-					error instanceof InvalidScopePredicateError
-						? 'INVALID_SCOPE_PREDICATE'
-						: 'SCOPE_PREDICATE_LIMIT',
-				message: error instanceof Error ? error.message : 'Invalid scope predicate',
-				retriable: false,
-			})
-			this.close('invalid scope predicate')
-			return
-		}
+		this.handshakeScope = msg.syncScope
+		const resolvedDownlinkScopes = resolution.downlink
+		const resolvedUplinkScopes = resolution.uplink
+		const authenticated = resolution.authenticated
+		const downlinkAuthScopes = resolution.downlinkAuthScopes
 
 		if (resolvedDownlinkScopes || resolvedUplinkScopes) {
 			if (this.authContext) {
@@ -1450,6 +1629,12 @@ export class ClientSession {
 			// Advertise central blob storage so the client uploads the bytes behind
 			// its blob fields, keeping them available after the author goes offline.
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
+			// Peer-relay mode: ask the client to push the bytes behind a blob reference
+			// anyway, so the server can verify possession (and then drop them) before
+			// accepting the reference (RT-23).
+			...(!this.persistBlobChunk && this.blobAccess && this.referenceScopes() !== undefined
+				? { blobPossessionProof: true }
+				: {}),
 			// Confirm the accepted scope so the client knows what data will be synced.
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.downlinkScopes
@@ -1499,6 +1684,103 @@ export class ClientSession {
 		// push (or the retransmit tick), which resumes from the client's acknowledged
 		// position. Draining here would re-scan from the not-yet-advanced acknowledged
 		// position and re-send the whole handshake stream.
+	}
+
+	/**
+	 * Resolve this session's download and upload scopes from an auth context and the
+	 * scope the client asked for at handshake. Side-effect free, so revalidation can
+	 * recompute it and compare (RT-26). The legacy `scopes` contract remains shorthand
+	 * for both directions.
+	 */
+	private computeSessionScopes(
+		context: AuthContext | null,
+		handshakeScope: HandshakeMessage['syncScope'],
+	):
+		| {
+				ok: true
+				downlink: ScopeMap | undefined
+				uplink: ScopeMap | undefined
+				downlinkAuthScopes: ScopeMap | undefined
+				authenticated: boolean
+		  }
+		| { ok: false; code: string; message: string; reason: string } {
+		const directionalScopesConfigured =
+			context?.downlinkScopes !== undefined || context?.uplinkScopes !== undefined
+		const downlinkAuthScopes = directionalScopesConfigured
+			? (context?.downlinkScopes ?? context?.scopes ?? {})
+			: context?.scopes
+		const uplinkAuthScopes = directionalScopesConfigured
+			? (context?.uplinkScopes ?? context?.scopes ?? {})
+			: context?.scopes
+		// A real auth provider that grants nothing for a schema-scoped collection is
+		// refused, never handed the scope the client asked for (AUTH-1). A schemaless
+		// server has no scoped collections to protect, so it keeps the provider's
+		// (absent) grant as "unscoped" and the multi-tenant warning.
+		const authenticated =
+			this.auth !== null &&
+			!(this.auth instanceof NoAuthProvider) &&
+			this.store.getSchema() !== null
+		let rawDownlink: ReturnType<typeof resolveSessionScopes>
+		let rawUplink: ReturnType<typeof resolveSessionScopes>
+		try {
+			rawDownlink = resolveSessionScopes(this.store.getSchema(), {
+				handshakeScope,
+				authScopes: downlinkAuthScopes,
+				authenticated,
+				onUnresolved: 'throw',
+			})
+			// A directional uplink grant goes through the same resolver as the downlink one
+			// (RT-16): verified `$claims` are bound to the schema, an unresolved binding
+			// denies the collection (fail closed; the session may still read), and the
+			// handshake can only narrow it, exactly as for a non-directional grant.
+			rawUplink = directionalScopesConfigured
+				? resolveSessionScopes(this.store.getSchema(), {
+						handshakeScope,
+						authScopes: uplinkAuthScopes,
+						authenticated,
+						onUnresolved: 'deny',
+					})
+				: rawDownlink
+		} catch (error) {
+			if (error instanceof InvalidScopePredicateError) {
+				return {
+					ok: false,
+					code: 'INVALID_SCOPE_PREDICATE',
+					message: error.message,
+					reason: 'invalid scope predicate',
+				}
+			}
+			if (!(error instanceof ScopeRequiredError)) throw error
+			return {
+				ok: false,
+				code: 'SCOPE_REQUIRED',
+				message: error.message,
+				reason: 'sync scope required',
+			}
+		}
+		try {
+			const downlink = rawDownlink
+				? normalizeScopeMap(rawDownlink)
+				: directionalScopesConfigured
+					? {}
+					: undefined
+			const uplink = rawUplink
+				? normalizeScopeMap(rawUplink)
+				: directionalScopesConfigured
+					? {}
+					: undefined
+			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
+		} catch (error) {
+			return {
+				ok: false,
+				code:
+					error instanceof InvalidScopePredicateError
+						? 'INVALID_SCOPE_PREDICATE'
+						: 'SCOPE_PREDICATE_LIMIT',
+				message: error instanceof Error ? error.message : 'Invalid scope predicate',
+				reason: 'invalid scope predicate',
+			}
+		}
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -1746,7 +2028,10 @@ export class ClientSession {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
-					if (await this.operationVisibleToClient(op, snapshots.get(op.id) ?? null)) {
+					const snapshot = snapshots.get(op.id) ?? null
+					if (await this.operationVisibleToClient(op, snapshot)) {
+						const entry = await this.scopeEntryFor(op, snapshot)
+						if (entry) missing.push(entry)
 						missing.push(op)
 					}
 				}
@@ -1846,7 +2131,7 @@ export class ClientSession {
 		const scanChunk = Math.max(this.batchSize, 1) * 5
 		let scanCursor = fromDeliverySeq
 		let maxScanned = fromDeliverySeq
-		const deliverable: Array<DeliveredOperation & { retraction?: boolean }> = []
+		const deliverable: DeliverableOperation[] = []
 
 		while (true) {
 			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
@@ -1867,6 +2152,16 @@ export class ClientSession {
 				}
 				const snapshot = delivered.scopeSnapshot ?? null
 				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
+					// The scope-entry shares the trigger's delivery sequence and precedes it,
+					// so a resend from any watermark regenerates it (same id) with its trigger.
+					const entry = await this.scopeEntryFor(delivered.operation, snapshot)
+					if (entry) {
+						deliverable.push({
+							operation: entry,
+							deliverySequence: delivered.deliverySequence,
+							scopeEntry: true,
+						})
+					}
 					deliverable.push(delivered)
 				} else if (await this.scopeRetractionFor(delivered.operation, snapshot)) {
 					deliverable.push({ ...delivered, retraction: true })
@@ -1896,10 +2191,21 @@ export class ClientSession {
 			return { sentOperations: 0, maxScanned, sent }
 		}
 
-		const totalBatches = Math.ceil(deliverable.length / this.batchSize)
+		// Chunk into batches. A batch never ends on a scope entry: the entry and the
+		// operation that triggered it share one delivery sequence, and a batch max of
+		// that sequence would claim the trigger was delivered too.
+		const slices: DeliverableOperation[][] = []
+		let start = 0
+		while (start < deliverable.length) {
+			let end = Math.min(start + Math.max(this.batchSize, 1), deliverable.length)
+			while (end < deliverable.length && deliverable[end - 1]?.scopeEntry === true) end += 1
+			slices.push(deliverable.slice(start, end))
+			start = end
+		}
+		const totalBatches = slices.length
 		let base = fromDeliverySeq
 		for (let i = 0; i < totalBatches; i++) {
-			const slice = deliverable.slice(i * this.batchSize, (i + 1) * this.batchSize)
+			const slice = slices[i] ?? []
 			const lastInSlice = slice[slice.length - 1]
 			if (lastInSlice === undefined) continue
 			const isFinal = i === totalBatches - 1
@@ -1919,7 +2225,7 @@ export class ClientSession {
 
 	/** Build, track, and send one chained delivery-stream batch. */
 	private sendDeliveryBatch(
-		slice: Array<DeliveredOperation & { retraction?: boolean }>,
+		slice: DeliverableOperation[],
 		base: number,
 		max: number,
 		batchIndex: number,
@@ -1991,11 +2297,19 @@ export class ClientSession {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
 		if (snapshot?.post) {
-			if (!recordMatchesScopes(op.collection, { ...snapshot.post, id: op.recordId }, scopes)) {
+			// A snapshot captured before a scope field existed lacks it: judge that field
+			// on the current row instead of as "no value" (RT-20).
+			let current: MaterializedRecord | undefined
+			let post: Record<string, unknown> | null = snapshot.post
+			if (snapshotLacksScopeFields(op.collection, { pre: null, post }, scopes)) {
+				current = await this.lookupRecordFields(op.collection, op.recordId)
+				post = snapshotValuesWithFallback(op.collection, post, scopes, current)
+			}
+			if (!post || !recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)) {
 				return false
 			}
 			if (subsets.length === 0) return true
-			const current = await this.lookupRecordFields(op.collection, op.recordId)
+			current ??= await this.lookupRecordFields(op.collection, op.recordId)
 			return operationMatchesQuerySubsets(op, subsets, current)
 		}
 		// Visibility is judged on the server-materialized row plus op.data, never on the
@@ -2065,7 +2379,54 @@ export class ClientSession {
 		if (this.scopeExitPolicy !== 'retract') return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!scopes || !snapshot) return false
-		return snapshotExitsScopes(op, snapshot, scopes)
+		const current = snapshotLacksScopeFields(op.collection, snapshot, scopes)
+			? await this.lookupRecordFields(op.collection, op.recordId)
+			: undefined
+		return snapshotExitsScopes(op, snapshot, scopes, current)
+	}
+
+	/**
+	 * The scope-entry operation to send before `op` when `op` moved an existing record
+	 * into this session's download scope (RT-19), or null. Judged on the store's own
+	 * pre/post snapshot; built from the record's CURRENT row, and only while that row
+	 * is live and still inside the scope (a record that has since left again, or was
+	 * deleted, gets no entry: its later operations retract or delete it anyway).
+	 * Operations without a snapshot (legacy rows, custom stores) never produce one.
+	 */
+	private async scopeEntryFor(
+		op: Operation,
+		snapshot: OperationScopeSnapshot | null,
+	): Promise<Operation | null> {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const schema = this.store.getSchema()
+		if (!scopes || !snapshot || !schema || op.type !== 'update') return null
+		// Cheap pre-check on the snapshot alone; the row is read only for a candidate.
+		if (
+			!snapshotLacksScopeFields(op.collection, snapshot, scopes) &&
+			!snapshotEntersScopes(op, snapshot, scopes)
+		) {
+			return null
+		}
+		const current = await this.lookupRecordFields(op.collection, op.recordId)
+		if (!current || current._deleted === 1 || current._deleted === true) return null
+		if (!snapshotEntersScopes(op, snapshot, scopes, current)) return null
+		if (!recordMatchesScopes(op.collection, { ...current, id: op.recordId }, scopes)) return null
+		let timestamp = op.timestamp
+		if (this.store.getRecordLatestTimestamp) {
+			try {
+				timestamp =
+					(await this.store.getRecordLatestTimestamp(op.collection, op.recordId)) ?? timestamp
+			} catch {
+				// Fall back to the trigger's timestamp: still at or above every field it wrote.
+			}
+		}
+		return buildScopeEntryOperation({
+			trigger: op,
+			row: current,
+			schema,
+			timestamp,
+			schemaVersion: this.schemaVersion,
+		})
 	}
 
 	/**
@@ -2174,9 +2535,15 @@ export class ClientSession {
 
 /** Delivery-log operations collected for one session, before they are batched. */
 interface CollectedDeliveryStream {
-	deliverable: Array<DeliveredOperation & { retraction?: boolean }>
+	deliverable: DeliverableOperation[]
 	maxScanned: number
 }
+
+/**
+ * One item of a session's delivery stream: a stored operation, a retraction of its
+ * record, or a synthesized scope entry sharing the triggering operation's sequence.
+ */
+type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEntry?: boolean }
 
 function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
 	if (supportedWireFormats?.includes('protobuf')) {

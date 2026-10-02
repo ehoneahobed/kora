@@ -105,8 +105,18 @@ export interface HandshakeResponseMessage {
 	 * A per-device secret issued when this handshake made the first claim of the node
 	 * id for an anonymous principal (RT-12). The client stores it next to its node id
 	 * and presents it in every later handshake (`HandshakeMessage.nodeToken`).
+	 *
+	 * The claim stays provisional until the client proves it saved the token, by
+	 * presenting it in a later handshake or by echoing it in an acknowledgment of this
+	 * response (`AcknowledgmentMessage.nodeToken`) right after persisting it (RT-21).
 	 */
 	nodeToken?: string
+	/**
+	 * Peer-relay servers (no central blob storage) set this to ask the client to push
+	 * the bytes behind its blob references anyway: the server verifies them against
+	 * their hash, records possession, and drops them (RT-23).
+	 */
+	blobPossessionProof?: boolean
 }
 
 /**
@@ -161,6 +171,12 @@ export interface AcknowledgmentMessage {
 	 * stream batch. `lastSequenceNumber` stays for existing per-node behavior.
 	 */
 	deliverySequence?: number
+	/**
+	 * Claim confirmation (RT-21): the node token from a handshake response, echoed
+	 * once the client has persisted it, so the server makes the provisional claim of
+	 * the node id permanent. Sent with `acknowledgedMessageId` set to the response id.
+	 */
+	nodeToken?: string
 }
 
 /**
@@ -281,6 +297,13 @@ export interface BlobChunkResponseMessage {
 	requestId: string
 	/** Base64-encoded chunk bytes, or null when the responder does not hold the hash. */
 	bytes: string | null
+	/**
+	 * True when the server refused the request for rate (RT-24), not because the
+	 * chunk is missing: retry after `retryAfterMs`. Absent (or false) otherwise.
+	 */
+	throttled?: boolean
+	/** With `throttled`: milliseconds until the request may be retried. */
+	retryAfterMs?: number
 }
 
 /**

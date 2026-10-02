@@ -242,6 +242,7 @@ export class SyncEngine {
 	private clockBlocked = false
 	private clockSkewMs: number | null = null
 	private blobStorageEnabled = false
+	private blobPossessionProof = false
 	private suspensionReason: string | null = null
 	private authRejected = false
 	/**
@@ -257,6 +258,8 @@ export class SyncEngine {
 	private startPromise: Promise<void> | null = null
 	private stopPromise: Promise<void> | null = null
 	private reconnectPromise: Promise<void> | null = null
+	/** A node-id rotation started by NODE_ID_CLAIMED; the next connect waits for it (RT-21). */
+	private nodeRotation: Promise<void> | null = null
 
 	// Track delta exchange state
 	private deltaBatchesReceived = 0
@@ -401,6 +404,9 @@ export class SyncEngine {
 	private async startInternal(): Promise<void> {
 		if (this.stopPromise) {
 			await this.stopPromise
+		}
+		if (this.nodeRotation) {
+			await this.nodeRotation
 		}
 		if (this.state === 'streaming') return
 		if (this.state !== 'disconnected') {
@@ -1078,12 +1084,24 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Upload a blob chunk (or manifest) to the server for central persistence.
-	 * A no-op unless the handshake was accepted (syncing or streaming) and the server
-	 * advertised blob storage.
+	 * Whether the connected server (peer-relay mode, no central storage) asks for the
+	 * bytes behind blob references as proof of possession (RT-23). The server verifies
+	 * and drops them; the app uploads exactly as for central storage.
+	 */
+	isBlobPossessionProofRequested(): boolean {
+		return this.blobPossessionProof
+	}
+
+	/**
+	 * Upload a blob chunk (or manifest) to the server, for central persistence or as
+	 * proof of possession. A no-op unless the handshake was accepted (syncing or
+	 * streaming) and the server advertised blob storage or asked for proofs.
 	 */
 	uploadBlobChunk(hash: string, bytes: Uint8Array): void {
-		if ((this.state !== 'streaming' && this.state !== 'syncing') || !this.blobStorageEnabled) {
+		if (
+			(this.state !== 'streaming' && this.state !== 'syncing') ||
+			!(this.blobStorageEnabled || this.blobPossessionProof)
+		) {
 			return
 		}
 		this.blobChunkChannel.send({ type: 'blob-chunk-push', hash, bytes })
@@ -1192,6 +1210,7 @@ export class SyncEngine {
 		if (this.state !== 'handshaking') return
 
 		this.blobStorageEnabled = msg.blobStorageEnabled === true
+		this.blobPossessionProof = msg.blobPossessionProof === true
 
 		if (typeof msg.serverTime === 'number') {
 			this.evaluateClockSkew(msg.serverTime)
@@ -1238,6 +1257,19 @@ export class SyncEngine {
 		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
 			this.nodeToken = msg.nodeToken
 			await this.syncState?.saveNodeToken?.(msg.nodeToken)
+			// The claim stays provisional until the server knows the token is saved:
+			// confirm it now, so a lost response never locks this device out (RT-21).
+			// Without persistence the token lives for this engine only; confirming would
+			// tie the node to a secret the next process does not have, so don't.
+			if (this.syncState?.saveNodeToken) {
+				this.transport.send({
+					type: 'acknowledgment',
+					messageId: generateMessageId(),
+					acknowledgedMessageId: msg.messageId,
+					lastSequenceNumber: 0,
+					nodeToken: msg.nodeToken,
+				})
+			}
 		}
 
 		this.remoteVector = wireToVersionVector(msg.versionVector)
@@ -1299,6 +1331,45 @@ export class SyncEngine {
 
 		// Send our delta to the server
 		this.sendDelta()
+	}
+
+	/**
+	 * Move this device to a fresh node id after the server refused the current one
+	 * (RT-21). Every unsynced own operation (queued, or in the log above the server's
+	 * acknowledged position) is re-authored under the new id and re-queued, so no
+	 * write is lost. Without store support the engine stays refused and reports it.
+	 */
+	private async rotateNodeIdentity(): Promise<void> {
+		const rotate = this.store.rotateNodeId?.bind(this.store)
+		if (!rotate) {
+			this.emitter?.emit({ type: 'sync:suspended', reason: 'node-id-claimed' })
+			return
+		}
+		const previousNodeId = this.store.getNodeId()
+		try {
+			const ids = new Set(this.outboundQueue.getAll().map((op) => op.id))
+			if (this.syncState) {
+				const unsynced = await this.syncState.getUnsyncedOperations(this.getEffectiveServerVector())
+				for (const op of unsynced) if (op.nodeId === previousNodeId) ids.add(op.id)
+			}
+			const result = await rotate([...ids])
+			await this.outboundQueue.replaceAll(result.operations)
+			this.nodeToken = null
+			await this.refreshPendingCount()
+			this.emitter?.emit({
+				type: 'sync:node-id-rotated',
+				previousNodeId,
+				nodeId: result.nodeId,
+				reenqueuedCount: result.operations.length,
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Node id rotation failed',
+				code: 'NODE_ROTATION_FAILED',
+			})
+		}
 	}
 
 	/**
@@ -1506,7 +1577,10 @@ export class SyncEngine {
 			: deserialized
 
 		// Inbound filtering still uses the combined predicate; removing it is SYNC-2 (W4).
-		const inScopeOps = await this.filterAllowedForSync(operations)
+		// It is judged per operation, in apply order: a partial update that does not
+		// restate the scope field is judged on the record as materialized by the earlier
+		// operations of the same batch (its insert, or a scope-entry insert, RT-19).
+		const inScopeOps: Operation[] = []
 
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		const transforms = this.config.operationTransforms ?? []
@@ -1527,7 +1601,11 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 
 		// Apply each in-scope operation; per-op failures must not block batch ACK
-		for (const op of inScopeOps) {
+		for (const op of operations) {
+			if ((await this.filterAllowedForSync([op])).length === 0) {
+				continue
+			}
+			inScopeOps.push(op)
 			const transformed =
 				transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
 			if (transformed === null) {
@@ -1747,6 +1825,14 @@ export class SyncEngine {
 			// A truly revoked device is refused at the next handshake (AUTH_FAILED), or
 			// its refresh is rejected and the auth client signs it out.
 			this.credentialRefreshRequired = true
+		}
+		if (msg.code === 'NODE_ID_CLAIMED' && !this.nodeRotation) {
+			// Another device holds this node id (for example the node token issued at the
+			// first claim was lost). Move to a fresh node id with every unsynced write;
+			// the next connect uses it (RT-21).
+			this.nodeRotation = this.rotateNodeIdentity().finally(() => {
+				this.nodeRotation = null
+			})
 		}
 		if (msg.code === 'AUTH_FAILED' || msg.code === 'DEVICE_REVOKED') {
 			this.authRejected = true

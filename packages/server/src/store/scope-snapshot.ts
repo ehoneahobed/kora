@@ -28,11 +28,36 @@ export function scopeValuesOf(
 	for (const [name, field] of Object.entries(definition.fields)) {
 		if (!SNAPSHOT_KINDS.has(field.kind) || !(name in row)) continue
 		const value = row[name]
-		if (typeof value === 'string' && value.length > MAX_SCOPE_SNAPSHOT_STRING_LENGTH) continue
-		values[name] = value
+		// An over-long string is recorded as null: present (so the current-row fallback
+		// of RT-20 never applies to it) and never equal to a scope value (fails closed).
+		values[name] =
+			typeof value === 'string' && value.length > MAX_SCOPE_SNAPSHOT_STRING_LENGTH ? null : value
 	}
 	return values
 }
+
+/**
+ * Fingerprint of the fields scope snapshots capture under `schema` (every scalar
+ * field of every collection, with its kind). When it changes (a migration added,
+ * renamed or retyped a field), snapshots captured under the old schema no longer
+ * describe the records the way the new one would, so the store recomputes them all
+ * from the log (RT-20).
+ */
+export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
+	const parts: string[] = []
+	for (const collection of Object.keys(schema.collections).sort()) {
+		const fields = schema.collections[collection]?.fields ?? {}
+		const captured = Object.keys(fields)
+			.filter((name) => SNAPSHOT_KINDS.has(fields[name]?.kind ?? ''))
+			.sort()
+			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
+		parts.push(`${collection}(${captured.join(',')})`)
+	}
+	return `v1|${parts.join('|')}`
+}
+
+/** Meta key under which stores persist {@link scopeSnapshotFingerprint}. */
+export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
 
 /** Parse a persisted snapshot column; null for an absent or malformed value. */
 export function parseScopeSnapshot(raw: unknown): OperationScopeSnapshot | null {

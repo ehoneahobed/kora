@@ -1,5 +1,11 @@
 import { createRequire } from 'node:module'
-import type { AtomicOp, Operation, SchemaDefinition, VersionVector } from '@korajs/core'
+import type {
+	AtomicOp,
+	HLCTimestamp,
+	Operation,
+	SchemaDefinition,
+	VersionVector,
+} from '@korajs/core'
 import { generateUUIDv7, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
@@ -14,7 +20,13 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import { parseScopeSnapshot, replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
+import {
+	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	parseScopeSnapshot,
+	replayScopeSnapshots,
+	scopeSnapshotFingerprint,
+	scopeValuesOf,
+} from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -95,7 +107,22 @@ export class SqliteServerStore implements ServerStore {
 
 		// Backfill materialized tables from existing operations
 		await this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot: drop them
+		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
+		// mid-way only repeats the rebuild at the next start.
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		const stored = this.db.all<{ value: string }>(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
+		)[0]?.value
+		if (stored !== fingerprint) {
+			this.db.run(sql`UPDATE operations SET scope_snapshot = NULL`)
+		}
 		this.backfillScopeSnapshots()
+		if (stored !== fingerprint) {
+			this.db.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
+			)
+		}
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -236,6 +263,26 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ wall_time: number; logical: number; timestamp_node_id: string }>(
+			sql`SELECT wall_time, logical, timestamp_node_id FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId}
+				ORDER BY wall_time DESC, logical DESC, timestamp_node_id DESC LIMIT 1`,
+		)
+		const row = rows[0]
+		return row
+			? {
+					wallTime: Number(row.wall_time),
+					logical: Number(row.logical),
+					nodeId: row.timestamp_node_id,
+				}
+			: null
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -452,6 +499,27 @@ export class SqliteServerStore implements ServerStore {
 			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
 		)
 		return rows[0]?.user_id === userId
+	}
+
+	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id ?? null
+	}
+
+	async replaceNodeClaim(
+		nodeId: string,
+		expectedOwner: string,
+		newOwner: string,
+	): Promise<boolean> {
+		this.assertOpen()
+		const rows = this.db.all<{ node_id: string }>(
+			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+		)
+		return rows.length > 0
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
@@ -952,6 +1020,14 @@ export class SqliteServerStore implements ServerStore {
 				owner TEXT NOT NULL,
 				created_at INTEGER NOT NULL,
 				PRIMARY KEY (hash, owner)
+			)
+		`)
+
+		// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_server_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
 			)
 		`)
 

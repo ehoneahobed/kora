@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -729,7 +729,7 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-9.test.ts",
@@ -741,7 +741,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed alongside RT-19: the client's inbound scope filter is judged per operation in apply order, so a partial update delivered in the same batch as its insert is judged on the row the insert just materialized instead of being dropped (and skipped by the watermark). LMS-9 '[fails today] insert + partial update' and '...session stays up' pass."
   },
   {
    "id": "ENC-1",
@@ -824,14 +824,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed by RT-19 (server-built scope-entry insert; RT-14 forbids sending the earlier history the plan proposed). SRV-2.test.ts passes."
   },
   {
    "id": "SRV-3",
@@ -946,11 +946,15 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-19.test.ts",
+     "title": "NEW-SRV-3"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "Fixed by RT-19: the new owner materializes the record from the scope-entry insert and later edits apply on top (client folds any orphaned update when the insert lands). Acceptance: RT-19.test.ts \"NEW-SRV-3\"."
   },
   {
    "id": "NEW-SRV-4",
@@ -1472,7 +1476,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -1990,14 +1994,17 @@
    "severity": "P0",
    "workstream": "W4",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-19.test.ts"
+    },
+    {
+     "file": "RT-19-streams.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: when an operation moves an existing record into a session's download scope (store snapshot pre out, post in; scope fields a snapshot lacks judged on the current row), the server sends a synthesized scope-entry insert before the trigger on every path (delivery stream initial + live push, legacy version-vector delta, legacy relay). Built from the CURRENT materialized row (only while live and still in scope), id derived from (collection, recordId, trigger op id) (stable across paths and resends; delivery sequences are not available on the legacy paths), node 'kora:scope-entry', sequence 0, no deps, timestamp = record's newest HLC (new optional ServerStore.getRecordLatestTimestamp, memory/SQLite/Postgres) so it never overrides a newer client field. Delivery batches never end on an entry (entry and trigger share a delivery sequence). No pre-transfer history is sent (RT-14 tests unchanged). Client: inbound scope filter judged per op in apply order (a partial update in the same batch as its insert was dropped); an insert for a scope-retracted row reactivates it with per-field LWW. kora: node ids refused at handshake (INVALID_NODE_ID). Residual: on the new owner's devices createdAt is the entry's wall time (latest edit), not the original creation time; a device holding unsynced local edits to a stale retained copy can lose fields older than the record's newest server write (single op timestamp)."
   },
   {
    "id": "RT-20",
@@ -2005,14 +2012,14 @@
    "severity": "P1",
    "workstream": "W4",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-20.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: stores fingerprint the scalar fields scope snapshots capture (memory field; kora_server_meta table in SQLite/Postgres) and, when it changes at setSchema, null every snapshot and rebuild them from the log (fingerprint written last; idempotent). Visibility, exits and entries judge a scope field ABSENT from a snapshot on the record's current row; a present value (including null, which over-long strings are now recorded as) still fails closed. Migration: the first start on this build recomputes every snapshot once (fingerprint absent)."
   },
   {
    "id": "RT-21",
@@ -2020,14 +2027,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-21.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: anonymous claims are provisional (kora:anon-pending:<sha256(token)>:<expiresAt>) until the client acknowledges the handshake response with the saved token (AcknowledgmentMessage.nodeToken, protobuf field 39) or presents it at a later handshake (both confirm via CAS to kora:anon-node:<hash>). A provisional claim is re-issued to a token-less device when no live session (this instance) holds the node and it is younger than anonymousClaimTtlMs (default 24h). Expired provisional claims and legacy 'kora:anonymous' claims are re-issued only with allowLegacyAnonymousClaims (default true for beta.13, warns session.legacy_anonymous_claim). New optional store methods getNodeClaimOwner / replaceNodeClaim (memory/SQLite/Postgres). Client: NODE_ID_CLAIMED triggers Store.rotateNodeId (fresh UUIDv7 node, unsynced ops re-authored with seq 1..n, recomputed ids, remapped deps, re-stamped field versions, node token cleared, old node vector entry lowered), outbound queue replaced, event sync:node-id-rotated. Residual: an unconfirmed claim can be taken by any token-less anonymous device while its holder is disconnected (the holder then rotates; no data loss); liveness is per instance. A pinned StoreConfig.nodeId cannot rotate (NODE_ID_PINNED)."
   },
   {
    "id": "RT-22",
@@ -2035,14 +2042,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-22.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: authorizeOperationReferences accepts a foreign-key parent inside the writer's downlink OR uplink scope (ReferenceAuthorizationContext.uplinkScopes, passed by sync sessions). A parent in neither is still SCOPE_VIOLATION (RT-13 tests unchanged). Residual: with an uplink predicate wider than the downlink, existence of parent ids inside the uplink scope is observable via accept/refuse."
   },
   {
    "id": "RT-23",
@@ -2050,14 +2057,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-23.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: in peer-relay mode (no persistBlobChunk) the handshake response sets blobPossessionProof (protobuf field 40); the client upload coordinator pushes the bytes behind each reference; the session hash-verifies them, applies the size/quota and manifest checks, records the pusher in blob_owners and drops the bytes. Cross-tenant reads still refused (RT-1/RT-11 tests). Cost: each device uploads each blob once to the server even in P2P mode."
   },
   {
    "id": "RT-24",
@@ -2065,14 +2072,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-24.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: blob chunk requests use their own budget (blobLimits.maxRequestsPerMinute, default 6000/min) instead of maxOpsPerMinute; over budget the answer is a retriable {bytes:null, throttled:true, retryAfterMs} (protobuf fields 41-42), and createRemoteChunkProvider re-sends after max(minThrottleDelayMs, retryAfterMs) bounded by maxThrottleDelayMs until maxThrottleWaitMs (default 10 min)."
   },
   {
    "id": "RT-25",
@@ -2080,14 +2087,14 @@
    "severity": "P2",
    "workstream": "W1",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-25.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: with a central store (resolveBlobChunk) BlobAccessIndex.authorizeReference never claims an unowned hash; a reference is accepted only if the writer pushed the bytes or can already read a record referencing them. The store serves owners (BlobAccessIndex.isOwnedBy) or in-scope referencers. RT-11 guard test updated to push before referencing (the client's order since RT-11). Residual existence oracle (P2P bare-reference claims; non-constant timing) documented in docs/guide/production-server.md."
   },
   {
    "id": "RT-26",
@@ -2095,14 +2102,14 @@
    "severity": "P3",
    "workstream": "W2",
    "phase": 1,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-26.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Found by Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md)."
+   "notes": "Phase 1 red-team round 3 (remediation/evidence/redteam-phase1-round3.md). Fixed: revalidateCredential re-resolves the session's scopes (computeSessionScopes, shared with the handshake, using the handshake's syncScope) and ends a session whose downlink or uplink scope changed, or no longer resolves, with retriable SCOPE_CHANGED. Documented in docs/guide/production-server.md."
   }
  ],
  "rejectedProposalPins": {

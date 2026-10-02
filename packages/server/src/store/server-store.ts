@@ -1,4 +1,4 @@
-import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
+import type { HLCTimestamp, HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
@@ -189,6 +189,18 @@ export interface ServerStore extends SyncStore {
 	 */
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
 	/**
+	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
+	 * Optional; anonymous provisional claims need it together with
+	 * {@link replaceNodeClaim}.
+	 */
+	getNodeClaimOwner?(nodeId: string): Promise<string | null>
+	/**
+	 * Atomically replace the owner of a node claim, only if it is still
+	 * `expectedOwner` (compare-and-set, RT-21). Returns true when replaced. Used to
+	 * confirm or re-issue an anonymous device's provisional claim; never creates one.
+	 */
+	replaceNodeClaim?(nodeId: string, expectedOwner: string, newOwner: string): Promise<boolean>
+	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server
 	 * keeps ownership in memory (lost on restart, not shared between instances).
@@ -207,6 +219,12 @@ export interface ServerStore extends SyncStore {
 	 * Operations without one are absent from the result.
 	 */
 	getOperationScopeSnapshots?(operationIds: string[]): Promise<Map<string, OperationScopeSnapshot>>
+	/**
+	 * The greatest HLC timestamp among every stored operation of one record (its
+	 * newest field write), or null when the record has no operations (RT-19). A
+	 * scope-entry operation is stamped with it so it never overrides newer client data.
+	 */
+	getRecordLatestTimestamp?(collection: string, recordId: string): Promise<HLCTimestamp | null>
 	/** Close the store and release resources */
 	close(): Promise<void>
 

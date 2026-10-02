@@ -66,6 +66,17 @@ export type KoraEvent =
 			source: 'handshake' | 'server-reject'
 	  }
 	| {
+			/**
+			 * The server refused this device's node id (`NODE_ID_CLAIMED`, RT-21), so the
+			 * device moved to a fresh node id and re-queued its unsynced writes under it.
+			 */
+			type: 'sync:node-id-rotated'
+			previousNodeId: string
+			nodeId: string
+			/** Unsynced operations re-authored under the new node id. */
+			reenqueuedCount: number
+	  }
+	| {
 			type: 'sync:clock-rebase'
 			/** Number of unsynced operations that were re-stamped. */
 			rebasedCount: number

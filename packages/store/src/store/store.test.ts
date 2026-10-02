@@ -112,6 +112,68 @@ describe('Store', () => {
 			expect(await store.getOperationRange('test-node', 1, 100)).toEqual(before)
 		})
 
+		test('rotateNodeId re-authors unsynced operations under a fresh node id (RT-21)', async () => {
+			const unpinned = new Store({
+				schema: minimalSchema,
+				adapter: new BetterSqlite3Adapter(':memory:'),
+			})
+			await unpinned.open()
+			const col = unpinned.collection('todos')
+			const a = await col.insert({ title: 'a' })
+			await col.update(a.id, { title: 'a2' })
+			const before = unpinned.getNodeId()
+			const ops = await unpinned.getOperationRange(before, 1, 10)
+			expect(ops).toHaveLength(2)
+
+			const result = await unpinned.rotateNodeId(ops.map((op) => op.id))
+			expect(result.nodeId).not.toBe(before)
+			expect(unpinned.getNodeId()).toBe(result.nodeId)
+			expect(result.operations.map((op) => op.sequenceNumber)).toEqual([1, 2])
+			expect(result.operations.every((op) => op.timestamp.nodeId === result.nodeId)).toBe(true)
+			// The update's causal dep follows its insert to the new id.
+			expect(result.operations[1]?.causalDeps).toContain(result.operations[0]?.id)
+			expect(await unpinned.getOperationRange(before, 1, 10)).toEqual([])
+			expect(await unpinned.getOperationRange(result.nodeId, 1, 10)).toHaveLength(2)
+			expect((await col.findById(a.id))?.title).toBe('a2')
+			// New writes continue the new node's sequence.
+			await col.insert({ title: 'b' })
+			expect(unpinned.getVersionVector().get(result.nodeId)).toBe(3)
+			await unpinned.close()
+		})
+
+		test('rotateNodeId refuses a pinned node id', async () => {
+			await expect(store.rotateNodeId([])).rejects.toThrow('pinned node id')
+		})
+
+		test('an insert for a retracted row shows it again and merges per field (RT-19)', async () => {
+			const col = store.collection('todos')
+			const record = await col.insert({ title: 'Stale copy' })
+			await store.applyScopeRetraction('todos', record.id)
+
+			// A scope-entry insert stamped before the local write loses that field's LWW
+			// comparison only where this device is newer; here it is newer than the row.
+			const entry: Operation = {
+				id: 'scope-entry-test',
+				nodeId: 'kora:scope-entry',
+				type: 'insert',
+				collection: 'todos',
+				recordId: record.id,
+				data: { title: 'Current title', completed: true },
+				previousData: null,
+				timestamp: { wallTime: Date.now() + 1000, logical: 0, nodeId: 'remote' },
+				sequenceNumber: 0,
+				causalDeps: [],
+				schemaVersion: 1,
+			}
+			expect(await store.applyRemoteOperation(entry)).toBe('applied')
+			expect(await col.findById(record.id)).toMatchObject({
+				title: 'Current title',
+				completed: true,
+			})
+			// The system node never enters the version vector (sequence 0).
+			expect(store.getVersionVector().get('kora:scope-entry')).toBeUndefined()
+		})
+
 		test('where query', async () => {
 			const col = store.collection('todos')
 			await col.insert({ title: 'A', completed: true })

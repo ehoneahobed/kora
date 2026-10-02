@@ -59,7 +59,8 @@ async function uploadBlob(
  * is uploaded when its operation is finally pushed on reconnect. Each blob is
  * uploaded once per sync engine (deduplicated by manifest hash).
  *
- * A no-op unless the connected server advertised central blob storage.
+ * A no-op unless the connected server advertised central blob storage or asked for
+ * proofs of possession (peer-relay mode, RT-23).
  *
  * @returns An unsubscribe function.
  */
@@ -70,7 +71,9 @@ export function wireBlobUpload(
 ): () => void {
 	const uploaded = new Set<string>()
 	return syncEngine.setOutboundPreparer(async (operations) => {
-		if (!syncEngine.isBlobStorageEnabled()) {
+		// Central storage keeps the bytes; a peer-relay server only verifies them as
+		// proof of possession before it accepts the reference (RT-23).
+		if (!syncEngine.isBlobStorageEnabled() && !syncEngine.isBlobPossessionProofRequested()) {
 			return
 		}
 		for (const op of operations) {

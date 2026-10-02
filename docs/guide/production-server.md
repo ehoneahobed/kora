@@ -80,6 +80,13 @@ An operation over `maxOperationBytes` is rejected as a permanent
 yields a retriable `RATE_LIMIT` (the client should back off and resend). Both
 defaults (256 KiB and 600 ops/min) apply when you omit the knobs.
 
+Blob chunk requests have their own budget, `blobLimits.maxRequestsPerMinute`
+(default 6000 per client): a large blob is one request per chunk, so it must not
+compete with operation sync. A request over that budget is answered with a
+retriable `throttled` response carrying `retryAfterMs`; the Kora client waits and
+asks again instead of failing the download (`createRemoteChunkProvider` options
+`maxThrottleWaitMs`, `minThrottleDelayMs`, `maxThrottleDelayMs` bound the wait).
+
 ## Central blob storage and scheduled garbage collection
 
 When you want blob bytes to outlive the device that authored them, back the
@@ -130,17 +137,37 @@ treats knowing a hash as permission to read it:
 - A session can fetch blob bytes (from the central store or from a peer) only when a
   live record inside its own download scope references them.
 - A write may put a blob reference into a record only when the writer can already
-  read a record that references the same content, has uploaded the bytes itself
-  (proof of possession), or is the first to present content nobody references, owns
-  or stores. Otherwise the write is refused with `SCOPE_VIOLATION`. The Kora client
-  uploads a blob's bytes before the operation that references it, so this is
-  automatic with central storage.
+  read a record that references the same content, or has uploaded the bytes itself
+  (proof of possession). Otherwise the write is refused with `SCOPE_VIOLATION`. The
+  Kora client uploads a blob's bytes before the operation that references it, so
+  this is automatic.
+- With central storage, the store serves bytes only to a session that uploaded them
+  or whose download scope references them, and a bare reference never claims a hash
+  (RT-25): a writer cannot reference content it does not hold in the hope that
+  another tenant uploads it later.
 - A manifest may only list chunks its uploader may reference.
 
-Without central storage (peer-to-peer blob transfer), a device has no way to prove
-it holds content that another tenant already referenced first, so a write that
-references identical bytes another tenant uploaded earlier is refused. Enable central
-blob storage if tenants routinely share identical files.
+Without central storage (peer-to-peer blob transfer), the server still asks clients
+to push the bytes behind each reference (`blobPossessionProof` in the handshake
+response). It verifies them against their hash, records the pusher as an owner,
+and drops them (RT-23), so two tenants that hold identical files can both reference
+them. This costs one upload of each blob to the server per device; the bytes still
+travel between peers for reads. In this mode only, the first writer of a hash
+nobody references or owns may also claim it by reference alone (there is no stored
+copy to read back), for clients that cannot push.
+
+#### Residual: content-existence oracle
+
+Hash checks reveal a little. In peer-to-peer mode, whether a bare reference to a
+hash is accepted (unowned) or refused (someone else references or owns it) tells the
+writer whether *some* tenant holds that exact content. With central storage the
+answer is always "refused unless you pushed it or can already read it", so the
+reference check reveals nothing; response timing (a store lookup for owned hashes)
+is not constant-time. Nothing is readable through either signal: bytes and
+references never cross a scope. Treat the existence of a specific, guessable file (a known template,
+a public document) as observable by other tenants of the same server. Content an
+attacker cannot guess byte-for-byte (anything with private data in it) has an
+unguessable hash and is not exposed.
 
 ## Session re-validation across instances
 
@@ -151,6 +178,55 @@ its auth provider every `sessionRevalidationIntervalMs` (default 30 seconds, als
 driven by the delivery poll tick), and ends the ones whose credential is no longer
 accepted with a retriable `AUTH_REVOKED`. A provider error ends nothing; the next pass
 retries. Call `server.revalidateSessions()` to run a pass immediately.
+
+The same pass re-resolves each session's sync scopes from the fresh authentication.
+When a principal's download or upload scope changed (removed from a team, a role
+change), the session is ended with a retriable `SCOPE_CHANGED`; the client
+reconnects and is handed its new scope at handshake, so a narrowed grant takes
+effect within one revalidation interval rather than at token expiry (RT-26).
+
+## Records moving into a scope (scope entry)
+
+Each operation is delivered according to the scope values its record had right
+after that operation was applied (so a new owner never receives the history written
+while the record belonged to someone else). When an operation moves an existing
+record INTO a session's scope (an ownership transfer, a team change), the server
+sends that session a server-built **scope-entry** operation just before it: an
+`insert` carrying the record's current values, from the system node
+`kora:scope-entry` (sequence 0, deterministic id per triggering operation), stamped
+with the record's newest timestamp so it never overrides a field the client wrote
+more recently. Clients apply it like any insert (merging per field when they already
+hold a stale copy), so the new owner's devices, live or freshly signed in, see the
+complete record and can edit it.
+
+The previous owner's devices see the record leave: with `scopeExit: 'retract'` it is
+hidden from their view; with the default `'retain'` they keep the last copy they had
+(no longer updated). Node ids in the `kora:` namespace are reserved; a handshake
+using one is refused with `INVALID_NODE_ID`.
+
+Snapshots of each operation's scope values are captured with the schema in force
+when it was applied. When a migration adds, renames or retypes a field, the store
+recomputes every snapshot from the log at `setSchema` (it keeps a fingerprint of the
+captured fields), and a scope field a snapshot does not hold is judged on the
+record's current row, so adding a scope field never hides existing history.
+
+## Anonymous devices and node claims
+
+An anonymous device's node id is bound to a per-device token the server issues at
+the first claim. The claim is provisional until the device proves it saved the
+token: the Kora client acknowledges the handshake response with the token right
+after persisting it (or presents it at its next handshake). A provisional claim
+whose response was lost in transit is re-issued to the device when it reconnects
+without a token, as long as no session is connected as that node and the claim is
+younger than `anonymousClaimTtlMs` (default 24 hours). A device that is refused
+`NODE_ID_CLAIMED` anyway moves to a fresh node id and re-sends every unsynced write
+under it (event `sync:node-id-rotated`), so no write is lost.
+
+`allowLegacyAnonymousClaims` (default `true` in 1.0.0-beta.13, `false` from the next
+release) keeps clients without token support working: nodes held by the pre-release
+shared anonymous owner, and provisional claims that expired unconfirmed, are
+re-issued with a `session.legacy_anonymous_claim` warning in the log. Set it to
+`false` once every client is on beta.13 or later.
 
 ## Gap-free delivery and the delivery-sequence migration
 
