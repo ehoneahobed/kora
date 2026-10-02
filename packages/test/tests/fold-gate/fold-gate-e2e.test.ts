@@ -9,7 +9,10 @@
  *   - every device materializes the same record (byte for byte, richtext as text);
  *   - that record equals the from-scratch fold of the union of the logs (the
  *     persisted, incremental client pipeline == the reference fold).
- * The server's own materialization is compared in fold-gate-server.test.ts (B2).
+ * Two more sweeps (Phase 3 seams): with server-authored writes to the
+ * merge('server-authoritative') field (devices AND the server's own row must equal
+ * the reference fold, folded with the handshake's authoritative node ids), and the
+ * same end-to-end encrypted (no operation may be quarantined).
  *
  * KORA_FOLD_E2E_SEEDS / KORA_FOLD_E2E_SEED_BASE widen or move the sweep (nightly).
  */
@@ -43,6 +46,52 @@ describe('W7 convergence gate through real devices', () => {
 			const kinds = new Set(results.flatMap((result) => result.fields))
 			// Every field kind was exercised.
 			if (SEEDS >= 50) expect(kinds.size).toBe(15)
+			expect(failures.slice(0, 2)).toEqual([])
+		},
+		Math.max(300_000, SEEDS * 4_000),
+	)
+
+	test(
+		`${SEEDS} seeds with server-authoritative writes: devices AND the server converge to the reference fold`,
+		async () => {
+			const results = await runSeeds(SEED_BASE, SEEDS, PARALLEL, (seed) =>
+				runWorkload(seed, { serverWrites: true }),
+			)
+			const failures = results
+				.map((result) => {
+					const failure = failureOf(result)
+					if (failure) return failure
+					if (result.quarantined.length > 0) return `quarantined: ${result.quarantined.join('; ')}`
+					// The server folds the same operations (richtext compared on devices only).
+					const { body: _body, ...oracle } = result.oracle ?? {}
+					if (JSON.stringify(result.server) !== JSON.stringify(result.oracle ? oracle : null)) {
+						return `server != reference fold: seed=${result.seed} server=${JSON.stringify(result.server)} oracle=${JSON.stringify(oracle)}\n${result.log.join('\n')}`
+					}
+					return null
+				})
+				.filter((failure) => failure !== null)
+			const serverWrote = results.filter((r) =>
+				r.log.some((line) => line.startsWith('server auth=') && line.endsWith(' ok')),
+			)
+			expect(serverWrote.length).toBeGreaterThan(SEEDS / 2)
+			expect(failures.slice(0, 2)).toEqual([])
+		},
+		Math.max(300_000, SEEDS * 4_000),
+	)
+
+	test(
+		`${SEEDS} seeds end-to-end encrypted, with server-authoritative writes: devices converge`,
+		async () => {
+			const results = await runSeeds(SEED_BASE, SEEDS, PARALLEL, (seed) =>
+				runWorkload(seed, { encryption: true, serverWrites: true }),
+			)
+			const failures = results
+				.map((result) =>
+					result.quarantined.length > 0
+						? `seed=${result.seed} quarantined: ${result.quarantined.join('; ')}`
+						: failureOf(result),
+				)
+				.filter((failure) => failure !== null)
 			expect(failures.slice(0, 2)).toEqual([])
 		},
 		Math.max(300_000, SEEDS * 4_000),

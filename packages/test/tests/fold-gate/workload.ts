@@ -213,6 +213,8 @@ export interface WorkloadResult {
 	operations: import('@korajs/core').Operation[]
 	/** The schema of the run. */
 	schema: SchemaDefinition
+	/** Operations any device quarantined (undecryptable, unverifiable, ...). */
+	quarantined: string[]
 }
 
 /** Comparable form of a record: richtext as its text, no metadata. */
@@ -235,14 +237,43 @@ export function normalizeRecord(
  * @param seed - The seed
  * @param options - `legacyMerge` runs the devices on the beta.13 pipeline
  */
+export interface WorkloadOptions {
+	/** Devices run the beta.13 pairwise pipeline. */
+	legacyMerge?: boolean
+	/** Exactly these fields (default: a seeded subset). */
+	onlyFields?: readonly GateField[]
+	/**
+	 * Every device encrypts end to end (protocol v2 envelope, shared key material); the
+	 * server stores ciphertext and folds only the cleartext field (`auth`, so server
+	 * writes to it reach encrypted devices).
+	 */
+	encryption?: boolean
+	/**
+	 * The server writes the `merge('server-authoritative')` field (`auth`) through its
+	 * trusted route API at random steps; it is always in the schema then.
+	 */
+	serverWrites?: boolean
+}
+
+const GATE_ENCRYPTION = {
+	config: { enabled: true, key: 'fold gate passphrase', cleartextFields: { items: ['auth'] } },
+	salt: new Uint8Array(16).fill(3),
+	iterations: 1_000,
+}
+
 export async function runWorkload(
 	seed: number,
-	options: { legacyMerge?: boolean; onlyFields?: readonly GateField[] } = {},
+	options: WorkloadOptions = {},
 ): Promise<WorkloadResult> {
 	const rng = mulberry32(seed)
-	const fields = options.onlyFields
+	// A separate stream, so the device workload of a seed is the same with or without
+	// server writes.
+	const serverRng = mulberry32(seed ^ 0x5e4e)
+	const picked = options.onlyFields
 		? [...options.onlyFields]
 		: GATE_FIELDS.filter((field) => field === 'title' || chance(rng, 0.55))
+	const fields =
+		options.serverWrites && !picked.includes('auth') ? [...picked, 'auth' as const] : picked
 	const schema = buildSchema(fields)
 	const deviceCount = int(rng, 2, 4)
 	const log: string[] = []
@@ -251,6 +282,9 @@ export async function runWorkload(
 		network = await createTestNetwork(schema, {
 			devices: deviceCount,
 			...(options.legacyMerge ? { legacyMerge: true } : {}),
+			...(options.encryption
+				? { encryption: GATE_ENCRYPTION, serverEncryption: { required: true } }
+				: {}),
 		})
 		const devices = network.devices
 		const first = devices[0] as TestDevice
@@ -263,6 +297,13 @@ export async function runWorkload(
 
 		const steps = int(rng, 6, 14)
 		for (let step = 0; step < steps; step++) {
+			if (options.serverWrites && chance(serverRng, 0.3)) {
+				const value = `srv-${pick(serverRng, STRINGS)}`
+				const result = await network.server
+					.getKoraContext()
+					.apply({ collection: 'items', type: 'update', recordId: id, data: { auth: value } })
+				log.push(`server auth=${value} ${result.ok ? 'ok' : `refused ${JSON.stringify(result)}`}`)
+			}
 			const index = int(rng, 0, devices.length - 1)
 			const device = devices[index] as TestDevice
 			const roll = rng()
@@ -314,9 +355,19 @@ export async function runWorkload(
 			)
 			for (const op of ops) union.set(op.id, op)
 		}
-		const folded = foldRecord([...union.values()], schema, { richtext: mergeYjsUpdates }).state
+		const folded = foldRecord([...union.values()], schema, {
+			richtext: mergeYjsUpdates,
+			// The oracle folds with the authority the devices learned at the handshake.
+			authoritativeNodeIds: new Set(network.server.authoritativeNodeIds),
+		}).state
 		const oracleRaw = folded ? materialize(folded, { richtext: mergeYjsUpdates }) : null
 		const oracle = oracleRaw ? normalizeRecord(decodeOracle(oracleRaw), fields) : null
+		const quarantined: string[] = []
+		for (const device of devices) {
+			for (const entry of (await device.getSyncEngine()?.getQuarantinedOperations()) ?? []) {
+				quarantined.push(`${device.name}: ${entry.code} ${entry.message}`)
+			}
+		}
 		const serverRow = (await network.server.store.findRecord('items', id)) as Record<
 			string,
 			unknown
@@ -336,6 +387,7 @@ export async function runWorkload(
 			log,
 			operations: [...union.values()],
 			schema,
+			quarantined,
 		}
 	} finally {
 		await network?.close()
