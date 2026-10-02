@@ -79,9 +79,11 @@ describe('RT-32: a legacy duplicate sequence the server holds the other half of'
 		const r1 = await legacy.collection('todos').insert({ title: 'first' })
 		const r2 = await legacy.collection('todos').insert({ title: 'second' })
 		const nodeId = legacy.getNodeId()
-		const [opA, opB] = (await legacy.store.getAllOperations()).sort(
-			(x, y) => x.sequenceNumber - y.sequenceNumber,
-		)
+		// beta.12 wrote version-1 ids (protocol v2 made version 2 the default): the
+		// fixture's operations are legacy, so they carry no hash version.
+		const [opA, opB] = (await legacy.store.getAllOperations())
+			.map(({ hashVersion: _v2, ...op }) => op)
+			.sort((x, y) => x.sequenceNumber - y.sequenceNumber)
 		if (!opA || !opB) throw new Error('expected two operations')
 		const adapter = (legacy as unknown as { adapter: StorageAdapter }).adapter
 		const indexes = await adapter.query<{ name: string }>(
@@ -89,6 +91,9 @@ describe('RT-32: a legacy duplicate sequence the server holds the other half of'
 		)
 		for (const index of indexes) await adapter.execute(`DROP INDEX "${index.name}"`)
 		await adapter.execute("DELETE FROM _kora_meta WHERE key = 'seq_unique_repair_v1'")
+		await adapter.execute(
+			"UPDATE _kora_ops_todos SET data = json_remove(data, '$.__kora_hash_version__')",
+		)
 		await adapter.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [opB.id])
 		await adapter.execute('UPDATE _kora_version_vector SET sequence_number = 1 WHERE node_id = ?', [
 			nodeId,
