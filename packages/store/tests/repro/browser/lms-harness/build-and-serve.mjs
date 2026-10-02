@@ -38,6 +38,12 @@ export async function buildAndServe(outDir) {
 		entryPoints: [path.join(here, 'raw-worker-entry.js')],
 		outfile: path.join(outDir, 'raw-worker.js'),
 	})
+	// Frozen beta.12 worker: writes databases into the legacy origin-wide pool.
+	await esbuild.build({
+		...common,
+		entryPoints: [path.join(here, 'beta12-worker-entry.js')],
+		outfile: path.join(outDir, 'beta12-worker.js'),
+	})
 	await copyFile(
 		path.join(storeRoot, 'node_modules/@sqlite.org/sqlite-wasm/sqlite-wasm/jswasm/sqlite3.wasm'),
 		path.join(outDir, 'sqlite3.wasm'),

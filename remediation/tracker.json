@@ -221,7 +221,7 @@
     }
    ],
    "pr": null,
-   "notes": "W2 step 1. resolveSessionScopes is grant \u2229 handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
+   "notes": "W2 step 1. resolveSessionScopes is grant ∩ handshake (collection set = grant keys; $in narrowing only; empty grant = nothing visible); $claims grants bound to schema scopes, unresolved binding denied (SCOPE_REQUIRED warning / ScopeRequiredError). Kora providers (toSyncAuthProvider, KoraAuthProvider, TokenAuthProvider, ExternalJwtProvider, MixedAuthProvider) always return a server grant. ClientSession.handleHandshake passes authenticated (real provider, schema present) and onUnresolved:'throw': a custom provider with no grant (or an unresolved binding) on a schema-scoped collection is answered with non-retriable SCOPE_REQUIRED and closed, never given the handshake scope (session-termination.test.ts)."
   },
   {
    "id": "AUTH-2",
@@ -1157,14 +1157,14 @@
    "severity": "P2",
    "workstream": "W6",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "BetterSqlite3Adapter and SqliteWasmAdapter execute/query (and export/import) take the transaction mutex; transaction-internal calls use the tx handle. The repro reader test now awaits the read after the gate opens (it previously deadlocked by awaiting a read inside the transaction it waits for)."
   },
   {
    "id": "STORE-9",
@@ -1349,17 +1349,20 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-5b"
     },
     {
      "browser": "LMS-5c"
+    },
+    {
+     "browser": "LMS-MIG"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W8a step 1: one OPFS SAH pool per database (opfsPoolNameFor), held by the worker under the Web Lock kora-opfs-pool:<pool> for its whole life; contention waits (store:storage-blocked), never falls back. Bounded install retry with forceReinitIfPreviouslyFailed only after every pool handle probes free. Backend choice recorded per database in the kora-manifest IndexedDB store; OPFS<->IndexedDB switches migrate explicitly (LMS-5c). Legacy kora-opfs pool: each DB is moved into its own pool on first open (quick_check before and after, legacy copy removed only after the verified import, legacy pool removed after its last DB); a live beta.12 holder blocks with store:storage-blocked. Real Chromium: LMS-5b, LMS-5c, LMS-MIG (beta.12 frozen worker fixture) pass."
   },
   {
    "id": "NEW-STORE-6",
@@ -1367,7 +1370,7 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-5f"
@@ -1379,7 +1382,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: SqliteWasmAdapter open() and promoteToLeader() that end non-durable (or a failed promotion re-open) emit the blocking store:durability-lost event and refuse writes with StorageDurabilityError unless allowNonDurable is set (createApp: store.allowNonDurable; its OPFS probe defers only the open check because it falls back to IndexedDB itself). Real Chromium LMS-5f: blocking check passes; 'write accepted by promoted follower is durable' still fails by design (the write is refused, not made durable) until W8a per-database pools."
+   "notes": "S1 interim plus W8a step 2: per-database pools and pool-lock waiting make the promoted leader durable (LMS-5f both checks pass in real Chromium); any remaining non-durable open/promotion/resume emits store:durability-lost and refuses writes unless allowNonDurable. IndexedDB only where OPFS SAH is unsupported, with the backend recorded and migrated explicitly."
   },
   {
    "id": "NEW-STORE-7",
@@ -1387,10 +1390,13 @@
    "severity": "P0",
    "workstream": "W8a",
    "phase": 2,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-6a"
+    },
+    {
+     "browser": "NEW-STORE-7"
     }
    ],
    "stopgap": {
@@ -1399,7 +1405,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: the SQLite WASM worker calls pool.reserveMinimumCapacity(fileCount + 2 + headroom 2) before every OPFS SAH pool open. Real Chromium LMS-6a both checks pass (8 per-user DBs durable; user #1 still writes). No eviction. Manifest, listDatabases/deleteDatabase and per-database pools remain W8a."
+   "notes": "S1 interim (reserveMinimumCapacity) plus W8a step 3: per-database pools, Kora-owned manifest (kora-manifest IndexedDB), listLocalDatabases()/deleteLocalDatabase() in @korajs/store/sqlite-wasm and app.storage.listDatabases()/deleteDatabase(name, {force}) in korajs. Delete refuses while the DB is open in any tab (StorageInUseError) and while it has unsynced operations (UnsyncedDataError, check injected from the kora layer). No automatic eviction. Real Chromium: LMS-6a and NEW-STORE-7 pass."
   },
   {
    "id": "NEW-STORE-8",
@@ -1407,14 +1413,17 @@
    "severity": "P1",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "browser": "LMS-6c"
+    },
+    {
+     "browser": "NEW-STORE-8"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "A failed open removes only the file that open created (never existing or migrated data), pauses the pool and releases its Web Lock in the worker; the adapter then terminates the worker and releases the leader lock or queued promotion request. Real Chromium: LMS-6c and NEW-STORE-8 pass."
   },
   {
    "id": "NEW-STORE-9",
@@ -1422,17 +1431,23 @@
    "severity": "P2",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-7.test.ts"
     },
     {
      "browser": "LMS-7b"
+    },
+    {
+     "browser": "LMS-7c"
+    },
+    {
+     "browser": "LMS-7d"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Follower RPC is served by the leader WORKER over BroadcastChannel (a hung leader main thread no longer blocks followers); the worker pushes heartbeats, also from inside long statements via the sqlite progress handler. Followers run one watchdog while requests are pending and fail them with LeaderUnresponsiveError (retriable, carries requestId) after missed beats. Requests carry request ids (leader dedup cache) and accept an AbortSignal. On freeze/pagehide the leader terminates its worker then releases the leader lock (no steal); followers withdraw their queued lock request; both rejoin on resume/pageshow. Real Chromium: LMS-7b, LMS-7c (dispatched lifecycle events; headless cannot freeze), LMS-7d pass. Real Android freeze still to run."
   },
   {
    "id": "NEW-STORE-10",
@@ -1440,11 +1455,14 @@
    "severity": "P2",
    "workstream": "W8a",
    "phase": 2,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "browser": "NEW-STORE-10"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "close(): the worker closes the database, pauses the pool and releases the pool Web Lock, the adapter terminates the worker, and only then releases the leader lock. The next leader additionally waits on the pool lock and probes the handles. Real Chromium NEW-STORE-10: lock sampling shows no overlap; 8 rapid hand-offs all durable."
   },
   {
    "id": "NEW-STORE-11",
@@ -1476,7 +1494,7 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local \u2229 remote) \u222a (local \u2212 base) \u222a (remote \u2212 base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
   },
   {
    "id": "MERGE-2",
@@ -2136,7 +2154,7 @@
    "tests": [],
    "acceptance": "Write a repro when the workstream starts.",
    "pr": null,
-   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan \u00a76). Investigate in Phase 2."
+   "notes": "Seen in RT-27 harness; same family as the unverified waitForSettled observation (plan §6). Investigate in Phase 2."
   },
   {
    "id": "RT-29",
