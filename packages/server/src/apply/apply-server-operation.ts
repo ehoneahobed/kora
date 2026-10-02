@@ -1,6 +1,7 @@
 import type { Operation } from '@korajs/core'
 import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@korajs/merge'
 import type { ApplyResult } from '@korajs/sync'
+import { enforceCrossRecordRules } from '../constraints/constraint-authority'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
 import { createServerReferentialContext } from '../constraints/server-referential-context'
 import {
@@ -199,6 +200,7 @@ export async function applyServerOperation(
 				appliedOperations.push(sideOp)
 			}
 		}
+		appliedOperations.push(...(await enforceAfterCommit(store, op)))
 
 		return { result: 'applied', appliedOperations }
 	}
@@ -211,9 +213,24 @@ export async function applyServerOperation(
 		if (rejection) return { result: 'skipped', appliedOperations: [], rejection }
 		throw error
 	}
-	return {
-		result,
-		appliedOperations: result === 'applied' ? [op] : [],
+	if (result !== 'applied') return { result, appliedOperations: [] }
+	return { result, appliedOperations: [op, ...(await enforceAfterCommit(store, op))] }
+}
+
+/**
+ * Re-check the cross-record rules the committed `op` touched and store the server's
+ * corrections (W7 step 3; see `constraint-authority.ts`). A failure is logged, never
+ * thrown: the operation itself is committed, and the next write to the record (or a
+ * concurrent detector) re-checks.
+ */
+async function enforceAfterCommit(store: ServerStore, op: Operation): Promise<Operation[]> {
+	try {
+		return await enforceCrossRecordRules(store, op, () => nextServerSequenceNumber(store))
+	} catch (error) {
+		console.error(
+			`[kora] Cross-record rule check after operation "${op.id}" on ${op.collection}/${op.recordId} failed: ${error instanceof Error ? error.message : String(error)}`,
+		)
+		return []
 	}
 }
 

@@ -3220,6 +3220,10 @@ export class ClientSession {
 				// Fall back to a single whole-row stamp below.
 			}
 		}
+		// W7 / RT-29 (B2): the record's fold state rides on the entry (filtered to its fields).
+		const foldState = await this.store
+			.getRecordFoldState?.(op.collection, op.recordId)
+			.catch(() => null)
 		let timestamp = fieldVersions?.latest ?? op.timestamp
 		if (!fieldVersions && this.store.getRecordLatestTimestamp) {
 			try {
@@ -3235,6 +3239,7 @@ export class ClientSession {
 			schema,
 			timestamp,
 			fieldVersions,
+			foldState,
 			schemaVersion: this.schemaVersion,
 		})
 	}

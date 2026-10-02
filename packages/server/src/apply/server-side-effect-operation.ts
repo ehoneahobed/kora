@@ -1,10 +1,25 @@
-import { HybridLogicalClock, createOperation } from '@korajs/core'
+import { deriveSideEffectOpId } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import type { SideEffectOp } from '@korajs/merge'
+import { SERVER_RULE_PREFIX, timestampAfter } from '../constraints/constraint-authority'
 import type { ServerStore } from '../store/server-store'
 
 /**
- * Converts a merge-package referential side effect into a server-originated operation.
+ * Converts a merge-package referential side effect (cascade delete, set-null) of
+ * `parentOp` into a server-originated operation.
+ *
+ * Deterministic (W7 step 3): the id is `deriveSideEffectOpId(parent, rule, target)`
+ * with rule `server/relation:<relation>:<policy>`, and the timestamp is the parent's
+ * next HLC tick on the server's node, never the wall clock. Every server instance,
+ * session or retry that generates the effect of the same parent on the same record
+ * produces the same id, so the log stores it once. The `server/` rule namespace keeps
+ * it distinct from a copy a client derives for its own cascade (different node,
+ * clock and sequence): both are stored, and the fold makes them idempotent in effect
+ * (two deletes of a record, two writes of null).
+ *
+ * The timestamp sits immediately after the parent's, so a write that is causally
+ * later than the delete (for example re-pointing the child to another parent) still
+ * wins over the server's copy, exactly as it wins over the client's.
  */
 export async function createServerSideEffectOperation(
 	store: ServerStore,
@@ -14,23 +29,25 @@ export async function createServerSideEffectOperation(
 	sequenceNumber: number,
 ): Promise<Operation> {
 	const nodeId = store.getNodeId()
-	const clock = new HybridLogicalClock(nodeId)
-	clock.receive(parentOp.timestamp)
-
-	return createOperation(
-		{
-			nodeId,
-			type: effect.type === 'delete' ? 'delete' : 'update',
-			collection: effect.collection,
-			recordId: effect.recordId,
-			data: effect.data,
-			previousData: effect.previousData,
-			sequenceNumber,
-			causalDeps: [parentOp.id],
-			schemaVersion,
-		},
-		clock,
-	)
+	const policy = effect.type === 'delete' ? 'cascade' : 'set-null'
+	return {
+		id: await deriveSideEffectOpId(
+			parentOp.id,
+			`${SERVER_RULE_PREFIX}relation:${effect.relationName}:${policy}`,
+			effect.recordId,
+		),
+		nodeId,
+		type: effect.type === 'delete' ? 'delete' : 'update',
+		collection: effect.collection,
+		recordId: effect.recordId,
+		data: effect.data,
+		previousData: effect.previousData,
+		timestamp: timestampAfter(parentOp.timestamp, nodeId),
+		sequenceNumber,
+		causalDeps: [parentOp.id],
+		schemaVersion,
+		mutationName: `kora:side-effect:${policy}`,
+	}
 }
 
 /**

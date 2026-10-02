@@ -1,6 +1,24 @@
-import type { HLCTimestamp, Operation, RecordFieldVersions, SchemaDefinition } from '@korajs/core'
-import { hashBlob } from '@korajs/core'
+import type {
+	FoldState,
+	HLCTimestamp,
+	Operation,
+	RecordFieldVersions,
+	SchemaDefinition,
+} from '@korajs/core'
+import { getFoldFieldVersions, hashBlob } from '@korajs/core'
+import { filterFoldStateFields, serializeServerFoldState } from '../store/record-fold'
 import type { MaterializedRecord } from '../store/server-store'
+
+/**
+ * A scope-entry operation. `foldState` is server-authored (RT-29): the record's
+ * serialized fold state, restricted to the fields in `data`. A receiver that folds
+ * joins it into its own state instead of resolving each field by last-write-wins
+ * against `fieldVersions`, so richtext, counter, max/min, element-set, key-map and
+ * resolver fields merge exactly as on the server. `fieldVersions` stays for older
+ * clients. Declared here as well as on `Operation` (protocol v2) so this module
+ * compiles against a core that predates the field.
+ */
+export type ScopeEntryOperation = Operation & { foldState?: string }
 
 /**
  * Node id of server-synthesized scope-entry operations (RT-19). Reserved (`kora:`
@@ -36,6 +54,12 @@ export interface ScopeEntryInput {
 	 * against its own version of that field and keeps any newer local edit.
 	 */
 	fieldVersions?: RecordFieldVersions | null
+	/**
+	 * The record's fold state (W7, RT-29). When present the entry carries it, filtered
+	 * to the fields the entry restates, and per-field versions are derived from it when
+	 * `fieldVersions` is absent.
+	 */
+	foldState?: FoldState | null
 	/** Server schema version stamped on the entry. */
 	schemaVersion: number
 }
@@ -68,11 +92,15 @@ export interface ScopeEntryInput {
  * @param input - Trigger, current row, schema and the record's newest timestamp
  * @returns The synthesized insert
  */
-export async function buildScopeEntryOperation(input: ScopeEntryInput): Promise<Operation> {
+export async function buildScopeEntryOperation(
+	input: ScopeEntryInput,
+): Promise<ScopeEntryOperation> {
 	const { trigger, row, schema } = input
 	const definition = schema.collections[trigger.collection]
 	const data: Record<string, unknown> = {}
-	const versioned = input.fieldVersions ?? null
+	const foldState = input.foldState ?? null
+	const versioned =
+		input.fieldVersions ?? (foldState ? getFoldFieldVersions(foldState) : null) ?? null
 	const fieldVersions: Record<string, HLCTimestamp> = {}
 	for (const field of Object.keys(definition?.fields ?? {})) {
 		if (!(field in row)) continue
@@ -90,7 +118,7 @@ export async function buildScopeEntryOperation(input: ScopeEntryInput): Promise<
 			`scope-entry\u0000${trigger.collection}\u0000${trigger.recordId}\u0000${trigger.id}`,
 		),
 	)
-	return {
+	const entry: ScopeEntryOperation = {
 		id: `scope-entry-${id}`,
 		nodeId: SCOPE_ENTRY_NODE_ID,
 		type: 'insert',
@@ -103,7 +131,11 @@ export async function buildScopeEntryOperation(input: ScopeEntryInput): Promise<
 		causalDeps: [],
 		schemaVersion: input.schemaVersion,
 		...(versioned ? { fieldVersions } : {}),
+		...(foldState
+			? { foldState: serializeServerFoldState(filterFoldStateFields(foldState, Object.keys(data))) }
+			: {}),
 	}
+	return entry
 }
 
 /**
