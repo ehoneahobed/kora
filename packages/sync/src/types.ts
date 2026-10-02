@@ -155,6 +155,15 @@ export interface SyncConfig {
 	 * cached one the server just refused.
 	 */
 	auth?: (options?: SyncAuthRequest) => Promise<{ token: string }>
+	/**
+	 * The signed-in user whose writes this device makes (RT-42): a user id, or null /
+	 * undefined when nobody is known to be signed in. Called before each session. With
+	 * it, the engine binds the store's node to that user (the store moves to the user's
+	 * own node when another user's is in use) and never uploads, or adopts, a node that
+	 * belongs to another user: those writes wait for their user (`heldOperations`).
+	 * `createApp` derives it from `sync.authClient`.
+	 */
+	principal?: () => Promise<string | null | undefined>
 	/** Auth readiness gate. A suspended result prevents transport creation and retries. */
 	authState?: () => Promise<{
 		state: 'loading' | 'signed-out' | 'anonymous' | 'authenticated'
@@ -325,6 +334,25 @@ export interface SyncStatePersistence {
 	loadAcceptedCycle?(): Promise<number>
 	/** Forget a non-current local node with nothing left to upload (bounds the registry). */
 	forgetLocalNode?(nodeId: string): Promise<void>
+	/**
+	 * Which adoptions of other local nodes are parked (RT-46), and an upload-progress
+	 * counter. Optional: without it the schedule lives for the engine's lifetime.
+	 */
+	loadAdoptionSchedule?(): Promise<AdoptionScheduleInfo>
+	saveAdoptionSchedule?(schedule: AdoptionScheduleInfo): Promise<void>
+}
+
+/**
+ * Upload scheduling across a database's local nodes (RT-46). A node whose adoption made
+ * no progress is parked: it is retried once anything else uploaded (`progress` moved past
+ * `progressMark`) or after its backoff (`untilMs`).
+ */
+export interface AdoptionScheduleInfo {
+	progress: number
+	parked: Record<
+		string,
+		{ progressMark: number; untilMs: number; count: number; parkedAtMs: number }
+	>
 }
 
 /** A terminally rejected operation, as recorded in the durable markers (RT-36). */
@@ -345,6 +373,11 @@ export interface LocalNodeInfo {
 	held: boolean
 	/** Refusal cycle in which the server last refused it, or null. */
 	refusedCycle: number | null
+	/**
+	 * The user the node's writes belong to (RT-42), or null when unknown. A node bound to
+	 * another user than the signed-in one is never uploaded or adopted.
+	 */
+	principal?: string | null
 }
 
 /**

@@ -2,7 +2,12 @@ import type { KoraEvent, Operation, VersionVector } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
 import type { HandshakeMessage, OperationBatchMessage, SyncMessage } from '../protocol/messages'
 import { type MemoryTransport, createMemoryTransportPair } from '../transport/memory-transport'
-import type { LocalNodeInfo, SyncStatePersistence, TerminalRejectionRecord } from '../types'
+import type {
+	AdoptionScheduleInfo,
+	LocalNodeInfo,
+	SyncStatePersistence,
+	TerminalRejectionRecord,
+} from '../types'
 import { SyncEngine } from './sync-engine'
 import type { SyncStore } from './sync-store'
 
@@ -57,6 +62,7 @@ function persistence(options: { nodes?: LocalNodeInfo[]; terminal?: string[] } =
 	const terminal = new Set(options.terminal ?? [])
 	const recorded: TerminalRejectionRecord[] = []
 	const accepted: string[] = []
+	let schedule: AdoptionScheduleInfo = { progress: 0, parked: {} }
 	const state: SyncStatePersistence = {
 		loadLastAckedServerVector: async () => new Map(lastAcked),
 		saveLastAckedServerVector: async (v) => {
@@ -91,8 +97,12 @@ function persistence(options: { nodes?: LocalNodeInfo[]; terminal?: string[] } =
 		},
 		markLocalNodeRefused: async () => {},
 		loadAcceptedCycle: async () => 0,
+		loadAdoptionSchedule: async () => JSON.parse(JSON.stringify(schedule)),
+		saveAdoptionSchedule: async (next) => {
+			schedule = JSON.parse(JSON.stringify(next))
+		},
 	}
-	return { state, prefixes, watermarks, recorded, accepted }
+	return { state, prefixes, watermarks, recorded, accepted, schedule: () => schedule }
 }
 
 interface ServerScript {
@@ -526,6 +536,273 @@ describe('RT-38 / RT-40: uploads are bound to the session node', () => {
 		await tick()
 		expect(srv.handshakes[0]?.nodeId).toBe(NODE)
 		expect(engine.getStatus().pendingOperations).toBe(1)
+		await engine.stop()
+	})
+})
+
+function withDeps(base: Operation, deps: string[]): Operation {
+	return { ...base, causalDeps: deps }
+}
+
+function nodeInfo(nodeId: string, extra: Partial<LocalNodeInfo> = {}): LocalNodeInfo {
+	return { nodeId, accepted: true, held: false, refusedCycle: null, ...extra }
+}
+
+describe('RT-46: adoption never blocks the other nodes', () => {
+	test('an adoption the server keeps deferring is parked; the others and the own node go on', async () => {
+		const stuck = op(1, 'stuck')
+		const other = op(1, 'other')
+		const mine = op(1)
+		const p = persistence({ nodes: [nodeInfo(NODE), nodeInfo('stuck'), nodeInfo('other')] })
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server, {
+			reject: (o) =>
+				o.id === stuck.id ? { code: 'PARENT_NOT_YET_SYNCED', retriable: true } : null,
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([stuck, other, mine], { claimLocalNode: vi.fn(async () => () => {}) }),
+			syncState: p.state,
+			config: { url: 'ws://t', outboundRetryBaseDelayMs: 5 },
+			emitter: emitter as never,
+		})
+		for (let i = 0; i < 4; i++) {
+			await engine.start()
+			await tick()
+		}
+		// stuck (parked), other (completes, progress), stuck again (retried after that
+		// progress, parked again), then the own node: never blocked behind stuck.
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual(['stuck', 'other', 'stuck', NODE])
+		expect(srv.uploaded).toContain(other.id)
+		expect(srv.uploaded).toContain(mine.id)
+		expect(srv.uploaded.filter((id) => id === stuck.id)).toHaveLength(2)
+		expect(p.schedule().parked.stuck).toMatchObject({ count: 2 })
+		expect(
+			emitter.events.filter((e) => e.type === 'sync:local-node' && e.action === 'adoption-parked'),
+		).toHaveLength(2)
+		// The parked write is still reported, never dropped.
+		expect(engine.getStatus().pendingOperations).toBe(1)
+		await engine.stop()
+	})
+
+	test("a node whose writes depend on another local node's unsynced parent goes after it", async () => {
+		const parent = op(1, 'parent-node')
+		const child = withDeps(op(1, 'child-node'), [parent.id])
+		const p = persistence({
+			// The child's node is older: registry order alone would adopt it first.
+			nodes: [nodeInfo(NODE), nodeInfo('child-node'), nodeInfo('parent-node')],
+		})
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([parent, child], { claimLocalNode: vi.fn(async () => () => {}) }),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		for (let i = 0; i < 3; i++) {
+			await engine.start()
+			await tick()
+		}
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual(['parent-node', 'child-node', NODE])
+		expect(srv.uploaded).toEqual([parent.id, child.id])
+		await engine.stop()
+	})
+
+	test('the own session yields once its uploads unblock a node waiting for them', async () => {
+		const mine = op(1)
+		const waiting = withDeps(op(1, 'waiting'), [mine.id])
+		const p = persistence({ nodes: [nodeInfo(NODE), nodeInfo('waiting')] })
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([mine, waiting], { claimLocalNode: vi.fn(async () => () => {}) }),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+		expect(engine.getState()).toBe('disconnected')
+		await engine.start()
+		await tick()
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE, 'waiting'])
+		expect(srv.uploaded).toEqual([mine.id, waiting.id])
+	})
+})
+
+describe('RT-42: writes belong to the signed-in user', () => {
+	test("another user's node is never adopted; its writes are reported as held", async () => {
+		const p = persistence({
+			nodes: [nodeInfo(NODE, { principal: 'bob' }), nodeInfo('alice-node', { principal: 'alice' })],
+		})
+		const bindPrincipal = vi.fn(async () => ({
+			nodeId: NODE,
+			previousNodeId: NODE,
+			switched: false,
+			conflict: false,
+		}))
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1, 'alice-node')], {
+				claimLocalNode: vi.fn(async () => () => {}),
+				bindPrincipal,
+			}),
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start()
+		await tick()
+		expect(bindPrincipal).toHaveBeenCalledWith('bob')
+		expect(srv.handshakes.map((h) => h.nodeId)).toEqual([NODE])
+		expect(srv.uploaded).toEqual([])
+		expect(engine.getStatus()).toMatchObject({ pendingOperations: 0, heldOperations: 1 })
+		await engine.stop()
+	})
+
+	test('a user change ends the live session and binds before the next write', async () => {
+		let user = 'alice'
+		const bindPrincipal = vi.fn(async (principal: string) => ({
+			nodeId: `${principal}-node`,
+			previousNodeId: NODE,
+			switched: principal !== 'alice',
+			conflict: false,
+		}))
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], { bindPrincipal }),
+			config: { url: 'ws://t', principal: async () => user },
+			emitter: emitter as never,
+		})
+		await engine.start()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		// A token refresh of the same user keeps the session.
+		await engine.refreshPrincipal()
+		expect(engine.getState()).toBe('streaming')
+		user = 'bob'
+		await engine.refreshPrincipal()
+		expect(engine.getState()).toBe('disconnected')
+		expect(bindPrincipal).toHaveBeenLastCalledWith('bob')
+		expect(emitter.events).toContainEqual(
+			expect.objectContaining({ type: 'sync:local-node', action: 'principal-switched' }),
+		)
+	})
+
+	test('a pinned node of another user suspends sync instead of uploading it as this user', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([op(1)], {
+				bindPrincipal: vi.fn(async () => ({
+					nodeId: NODE,
+					previousNodeId: NODE,
+					switched: false,
+					conflict: true,
+				})),
+			}),
+			config: { url: 'ws://t', principal: async () => 'bob' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes).toEqual([])
+		expect(engine.getStatus()).toMatchObject({
+			status: 'auth-required',
+			reason: 'node-owned-by-another-user',
+		})
+	})
+})
+
+describe('RT-44: a cloned database moves to a fresh node id', () => {
+	test('a SEQUENCE_CONFLICT above the handshake entry rotates instead of renumbering', async () => {
+		const first = op(1)
+		const mine = op(2)
+		const rotated: Operation = { ...mine, id: 'rotated-2', nodeId: 'fresh-node', sequenceNumber: 1 }
+		const rotate = vi.fn(async () => ({ nodeId: 'fresh-node', operations: [rotated] }))
+		const resequence = vi.fn(async () => null)
+		const p = persistence()
+		p.prefixes.set(NODE, 1)
+		p.watermarks.set('', 9)
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server, {
+			ownSeq: 1,
+			reject: (o) => (o.id === mine.id ? { code: 'SEQUENCE_CONFLICT', retriable: false } : null),
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([first, mine], { rotateNodeId: rotate, resequenceOperation: resequence }),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+			emitter: emitter as never,
+		})
+		await engine.start()
+		await tick()
+		expect(srv.uploaded).toEqual([mine.id])
+		expect(rotate).toHaveBeenCalledWith([mine.id])
+		expect(resequence).not.toHaveBeenCalled()
+		expect(engine.getState()).toBe('disconnected')
+		// The next session resyncs from 0 to fetch what the other copy wrote.
+		expect(p.watermarks.get('')).toBe(0)
+		const actions = emitter.events.flatMap((e) => (e.type === 'sync:local-node' ? [e.action] : []))
+		expect(actions).toContain('clone-detected')
+		expect(actions).not.toContain('history-behind')
+		expect(await engine.getRejectedOperations()).toEqual([])
+		expect(
+			emitter.events.some((e) => e.type === 'sync:node-id-rotated' && e.nodeId === 'fresh-node'),
+		).toBe(true)
+	})
+})
+
+describe('RT-44: recovery full resyncs are rate-limited', () => {
+	test('a second SEQUENCE_CONFLICT recovery within the interval renumbers without a resync', async () => {
+		const log = [op(1), op(2), op(3)]
+		const resequence = vi.fn(async (id: string) => {
+			const index = log.findIndex((o) => o.id === id)
+			const current = log[index]
+			if (!current) return null
+			const renumbered = { ...current, sequenceNumber: current.sequenceNumber + 10 }
+			log[index] = renumbered
+			return renumbered
+		})
+		const p = persistence()
+		p.prefixes.set(NODE, 1)
+		p.watermarks.set('', 5)
+		const conflicted = new Set<string>()
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server, {
+			ownSeq: 9,
+			reject: (o) => {
+				// Each of the two writes collides once (the device lost what held 2 and 3).
+				if (conflicted.has(o.id) || (o as Operation).sequenceNumber > 9) return null
+				conflicted.add(o.id)
+				return { code: 'SEQUENCE_CONFLICT', retriable: false }
+			},
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore(log, { resequenceOperation: resequence }),
+			syncState: p.state,
+			config: { url: 'ws://t', batchSize: 1 },
+		})
+		await engine.start()
+		await tick()
+		expect(p.watermarks.get('')).toBe(0)
+		// The resync session ran; the watermark moved on again.
+		p.watermarks.set('', 7)
+		await engine.start()
+		await tick()
+		expect(resequence).toHaveBeenCalledTimes(2)
+		// Deferred: no second full resync inside the interval.
+		expect(p.watermarks.get('')).toBe(7)
 		await engine.stop()
 	})
 })

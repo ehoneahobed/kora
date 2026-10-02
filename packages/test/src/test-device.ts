@@ -58,6 +58,12 @@ export interface TestDeviceOptions {
 	operationTransforms?: OperationTransform[]
 	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
 	scopeExit?: 'retain' | 'retract'
+	/**
+	 * The signed-in user, as an auth-aware app knows it (RT-42). When set, the store binds
+	 * its node to that user at open and on {@link TestDevice.authChanged}, and the sync
+	 * engine never uploads another user's node on this user's session.
+	 */
+	principal?: () => string | null
 }
 
 /**
@@ -81,6 +87,7 @@ export class TestDevice {
 	private readonly syncSchemaVersion: number
 	private readonly operationTransforms: OperationTransform[]
 	private readonly scopeExit: 'retain' | 'retract' | undefined
+	private readonly principal: (() => string | null) | undefined
 
 	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
@@ -99,6 +106,7 @@ export class TestDevice {
 		this.syncSchemaVersion = options.syncSchemaVersion ?? options.schema.version
 		this.operationTransforms = options.operationTransforms ?? []
 		this.scopeExit = options.scopeExit
+		this.principal = options.principal
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -126,6 +134,23 @@ export class TestDevice {
 		// but the durable audit trail every real app has stays empty — a fidelity
 		// gap that hid from tests until Studio's Merges view made it visible.
 		this.unsubscribeAudit = wireAuditPersistence(this.store, this.emitter)
+		// Like createApp with an auth binding: the node is bound to the signed-in user
+		// before the first local write (RT-42).
+		const principal = this.principal?.()
+		if (principal) await this.store.bindPrincipal(principal)
+	}
+
+	/**
+	 * The signed-in user changed (RT-42), as an auth binding reports it: like createApp,
+	 * end the live session and bind the store to the new user before the next write.
+	 */
+	async authChanged(): Promise<void> {
+		if (this.syncEngine) {
+			await this.syncEngine.refreshPrincipal()
+			return
+		}
+		const principal = this.principal?.()
+		if (principal) await this.store.bindPrincipal(principal)
 	}
 
 	/**
@@ -160,6 +185,9 @@ export class TestDevice {
 				operationTransforms:
 					this.operationTransforms.length > 0 ? this.operationTransforms : undefined,
 				...(this.scopeExit ? { scopeExit: this.scopeExit } : {}),
+				...(this.principal
+					? { principal: async () => (this.principal ? this.principal() : null) }
+					: {}),
 			},
 			emitter: this.emitter,
 		})

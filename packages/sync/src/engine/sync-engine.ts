@@ -61,6 +61,7 @@ import { scopeViewKey } from '../scopes/scope-view-key'
 import type { SyncTransport } from '../transport/transport'
 import type { DeltaCursor } from '../types'
 import {
+	type AdoptionScheduleInfo,
 	type LocalNodeInfo,
 	MemoryRejectedOperationStorage,
 	type QuarantinedOperation,
@@ -106,6 +107,21 @@ const MAX_REMOTE_FUTURE_MS = 5 * 60_000
  * (handshake raise, full resync, renumber on SEQUENCE_CONFLICT) restores it after a reload.
  */
 const DURABILITY_FAILURES_BEFORE_DEGRADED = 3
+/**
+ * Backoff of a parked adoption (RT-46): an adopted node whose uploads the server keeps
+ * deferring is retried once anything else from this database uploaded, or after this
+ * delay (doubling per consecutive park, capped).
+ */
+const ADOPTION_PARK_BASE_MS = 30_000
+const ADOPTION_PARK_MAX_MS = 60 * 60_000
+/**
+ * A live session of this tab's own node ends to retry a parked adoption (that other
+ * uploads may have unblocked) at most this soon after it was parked, so a node the
+ * server defers for good costs at most one reconnect per interval (RT-46).
+ */
+const ADOPTION_YIELD_MIN_MS = 30_000
+/** Minimum time between two full resyncs triggered by SEQUENCE_CONFLICT recoveries (RT-44). */
+const FULL_RESYNC_MIN_INTERVAL_MS = 60_000
 /** Quarantine reason codes for inbound operations the client did not apply (W4). */
 const QUARANTINE_CODES = {
 	DECRYPT_FAILED: 'DECRYPT_FAILED',
@@ -122,6 +138,14 @@ interface InFlightUpload {
 	epoch: number
 	/** A retriable rejection hit this batch: back off before flushing again. */
 	retryBackoff: boolean
+}
+
+/** A local node's unsynced operations (see SyncEngine.countUnsyncedOfNode). */
+interface UnsyncedOfNode {
+	count: number
+	notQueued: number
+	ids: ReadonlySet<string>
+	deps: ReadonlySet<string>
 }
 
 /**
@@ -378,6 +402,40 @@ export class SyncEngine {
 	 * The session ends once its in-flight uploads are resolved.
 	 */
 	private ownRecoveryPending = false
+	/**
+	 * The signed-in user as resolved for the current session (RT-42): a user id, null
+	 * (nobody signed in) or undefined (the app does not tell the engine).
+	 */
+	private principal: string | null | undefined = undefined
+	/** Adoption schedule kept in memory when the persistence layer has none (RT-46). */
+	private memorySchedule: AdoptionScheduleInfo = { progress: 0, parked: {} }
+	/** The schedule had parked adoptions when last read or written (RT-46). */
+	private scheduleHasParked = false
+	/**
+	 * Local nodes with unsynced writes this session did not adopt (RT-46): parked (no
+	 * progress last time) or waiting for another local node's unsynced parent.
+	 */
+	private deferredAdoptions: Array<{
+		nodeId: string
+		reason: 'parked' | 'causal'
+		parkedAtMs: number
+		untilMs: number
+		progressMark: number
+	}> = []
+	/** Operations acknowledged in this session (RT-46: a yield needs progress). */
+	private sessionAcked = 0
+	/** An upload of the adopted node came back unprocessed in this session (RT-46). */
+	private adoptionStalled = false
+	/**
+	 * The session node's entry in this session's handshake vector (RT-44). The server held
+	 * nothing of the node above it then; a SEQUENCE_CONFLICT above it was caused by an
+	 * operation stored during this session by another live copy of this database.
+	 */
+	private handshakeOwnEntry = 0
+	/** When this engine last reset delivery for a SEQUENCE_CONFLICT recovery (RT-44). */
+	private lastFullResyncAt = Number.NEGATIVE_INFINITY
+	/** A recovery full resync was rate-limited; the next session start after the interval runs it. */
+	private fullResyncDeferred = false
 	/** Consecutive failed durability barriers before an upload (RT-49). */
 	private durabilityFailures = 0
 	/** Uploads proceed without local durability: the barrier failed persistently (RT-49). */
@@ -568,6 +626,17 @@ export class SyncEngine {
 		}
 		await this.outboundQueue.initialize()
 		this.ownRecoveryPending = false
+		this.sessionAcked = 0
+		this.adoptionStalled = false
+		if (
+			this.fullResyncDeferred &&
+			Date.now() - this.lastFullResyncAt >= FULL_RESYNC_MIN_INTERVAL_MS
+		) {
+			this.fullResyncDeferred = false
+			this.lastFullResyncAt = Date.now()
+			await this.resetDeliveryForFullResync()
+		}
+		if (!(await this.applyPrincipal())) return
 		await this.chooseSessionNode()
 		{
 			const sessionNode = this.currentNodeId()
@@ -1046,6 +1115,62 @@ export class SyncEngine {
 	notifyAuthChanged(): void {
 		this.authRejected = false
 		this.suspensionReason = null
+	}
+
+	/**
+	 * The signed-in user may have changed (RT-42): end the live session (it belongs to the
+	 * previous user), then bind the store to the user `config.principal` reports, so the
+	 * next local write is authored under that user's own node. Call it before the next
+	 * write after an auth change; `createApp` does so for `sync.authClient`. The next
+	 * `start()` connects as that user's node.
+	 */
+	async refreshPrincipal(): Promise<void> {
+		if (!this.config.principal || !this.store.bindPrincipal) return
+		let next: string | null | undefined
+		try {
+			next = await this.config.principal()
+		} catch {
+			return
+		}
+		// A token or scope refresh of the same user keeps the session.
+		if (next === this.principal) return
+		if (this.nodeRotation) await this.nodeRotation
+		if (this.state !== 'disconnected') await this.stop()
+		await this.applyPrincipal()
+	}
+
+	/**
+	 * Resolve the signed-in user and bind the store's node to them (RT-42).
+	 *
+	 * @returns false when sync must stay suspended: the store's node id is pinned and
+	 *   belongs to another user, so nothing on this database may upload as this user.
+	 */
+	private async applyPrincipal(): Promise<boolean> {
+		if (!this.config.principal) return true
+		let principal: string | null | undefined
+		try {
+			principal = await this.config.principal()
+		} catch {
+			// Unknown: no binding is changed, and no bound node is judged against it.
+			principal = undefined
+		}
+		this.principal = principal
+		if (!principal || !this.store.bindPrincipal) return true
+		const binding = await this.store.bindPrincipal(principal)
+		if (binding.conflict) {
+			this.suspensionReason = 'node-owned-by-another-user'
+			this.emitter?.emit({ type: 'sync:suspended', reason: this.suspensionReason })
+			return false
+		}
+		if (binding.switched) {
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: binding.nodeId,
+				action: 'principal-switched',
+			})
+			await this.afterIdentityChange()
+		}
+		return true
 	}
 
 	/**
@@ -1619,6 +1744,7 @@ export class SyncEngine {
 		// but the numbers it holds are taken: the counter moves past them before the next
 		// write, and a full resync fetches the operations back.
 		const advertisedOwn = this.remoteVector.get(sessionNode)
+		this.handshakeOwnEntry = advertisedOwn ?? 0
 		const localOwn = this.store.getVersionVector().get(sessionNode) ?? 0
 		// The persisted counter decides (raiseSequenceFloor reads it in a transaction): the
 		// in-memory vector of a tab sharing the node may simply lag another tab's writes.
@@ -1762,6 +1888,7 @@ export class SyncEngine {
 				(node) =>
 					node.nodeId !== refused &&
 					node.held &&
+					!this.belongsToAnotherPrincipal(node) &&
 					(node.refusedCycle === null || node.refusedCycle < cycle),
 			)
 			if (candidate) {
@@ -1771,6 +1898,7 @@ export class SyncEngine {
 		}
 		if (target === null) target = (await rotate([])).nodeId
 		await this.afterIdentityChange()
+		await this.bindFreshNode()
 		this.emitter?.emit({
 			type: 'sync:node-id-rotated',
 			previousNodeId: refused,
@@ -1786,37 +1914,73 @@ export class SyncEngine {
 		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
 	): Promise<void> {
 		await this.syncState?.markLocalNodeRefused?.(refused, false)
+		await this.rotateUnsent(refused, rotate)
+	}
+
+	/**
+	 * Move `nodeId`'s never-sent unsynced operations to a fresh node id (re-authored, so
+	 * they upload under it) and start using it. An operation flagged sent stays: it may
+	 * already be stored under `nodeId` (RT-38).
+	 *
+	 * @returns How many unsynced operations stayed under `nodeId` (sent, unacknowledged)
+	 */
+	private async rotateUnsent(
+		nodeId: string,
+		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+	): Promise<number> {
 		const queuedIds = this.outboundQueue
 			.getAll()
-			.filter((op) => op.nodeId === refused && !this.outboundQueue.wasSent(op.id))
+			.filter((op) => op.nodeId === nodeId && !this.outboundQueue.wasSent(op.id))
 			.map((op) => op.id)
 		const ids = new Set(queuedIds)
+		let staying = this.outboundQueue.countMatching(
+			(op) => op.nodeId === nodeId && this.outboundQueue.wasSent(op.id),
+		)
 		// Own operations above the acknowledged prefix that were never read into the
 		// queue (the unscanned tail) are unsynced too.
-		const localSeq = this.store.getVersionVector().get(refused) ?? 0
+		const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
 		if (localSeq > this.ownAckedThrough) {
-			const above = await this.store.getOperationRange(refused, this.ownAckedThrough + 1, localSeq)
+			const above = await this.store.getOperationRange(nodeId, this.ownAckedThrough + 1, localSeq)
 			const candidates = above.filter(
 				(op) =>
-					op.nodeId === refused &&
+					op.nodeId === nodeId &&
 					op.sequenceNumber > this.ownAckedThrough &&
 					!this.isOwnOperationResolved(op) &&
-					!this.outboundQueue.wasSent(op.id),
+					!this.outboundQueue.has(op.id),
 			)
 			const terminal = await this.findTerminalRejections(candidates.map((op) => op.id))
 			for (const op of candidates) {
-				if (!terminal.has(op.id)) ids.add(op.id)
+				if (terminal.has(op.id)) continue
+				if (this.outboundQueue.wasSent(op.id)) staying++
+				else ids.add(op.id)
 			}
 		}
 		const result = await rotate([...ids])
 		await this.outboundQueue.replace(queuedIds, result.operations)
 		await this.afterIdentityChange()
+		await this.bindFreshNode()
 		this.emitter?.emit({
 			type: 'sync:node-id-rotated',
-			previousNodeId: refused,
+			previousNodeId: nodeId,
 			nodeId: result.nodeId,
 			reenqueuedCount: result.operations.length,
 		})
+		return staying
+	}
+
+	/** A fresh node id belongs to the signed-in user, when the app says who that is (RT-42). */
+	private async bindFreshNode(): Promise<void> {
+		if (typeof this.principal !== 'string' || !this.store.bindPrincipal) return
+		try {
+			await this.store.bindPrincipal(this.principal)
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Binding the node to the user failed',
+				code: 'NODE_REGISTRY_FAILED',
+			})
+		}
 	}
 
 	/** The store moved to another node id: the next session starts from it. */
@@ -2681,8 +2845,18 @@ export class SyncEngine {
 			for (const op of acknowledged) this.markOwnResolved(op)
 			await this.advanceOwnPrefixLocked()
 		})
+		if (acknowledged.length > 0) {
+			this.sessionAcked += acknowledged.length
+			await this.recordUploadProgress(this.currentNodeId())
+		}
+		if (returned.length > 0 && this.currentNodeId() !== this.store.getNodeId()) {
+			// The server did not process part of an adopted node's batch (a retriable
+			// rejection): retrying it in this session would hold every other node's
+			// uploads behind it (RT-46). The session ends and the node is parked.
+			this.adoptionStalled = true
+		}
 		await this.refreshPendingCount()
-		if (this.maybeEndSessionForNodeWork()) return
+		if (await this.maybeEndSessionForNodeWork()) return
 
 		// Continue flushing if more ops in queue
 		const backoff = entry.retryBackoff || returned.length > 0
@@ -2922,14 +3096,15 @@ export class SyncEngine {
 		}
 
 		// Flush any queued operations accumulated during delta exchange. Delta batches
-		// still awaiting their acks stay in flight: only their acks resolve them.
-		if (this.hasUploadable()) {
+		// still awaiting their acks stay in flight: only their acks resolve them. A
+		// stalled adoption is not retried in this session (RT-46).
+		if (this.hasUploadable() && !this.adoptionStalled) {
 			this.flushQueue()
 		}
 
 		await this.refreshPendingCount()
 		this.notifyStatusChange()
-		this.maybeEndSessionForNodeWork()
+		await this.maybeEndSessionForNodeWork()
 	}
 
 	// --- Own-operation upload tracking (W3: contiguous acknowledged prefix) ---
@@ -3254,13 +3429,25 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Pick the node this session runs as (RT-40). A local node other than the store's own
-	 * that still has unsynced writes, is not held for another principal (RT-38), was not
-	 * refused in this refusal cycle, and is used by no live tab (its lock is free) is
-	 * adopted: the session runs as that node, uploads its writes with their original
-	 * identity (no re-authoring, so a write its tab sent before closing is deduplicated by
-	 * id), and ends once they are stored; the next session picks again. Also counts the
-	 * other local nodes' unsynced writes, so they are reported (pending, or held).
+	 * Pick the node this session runs as (RT-40, RT-46). A session uploads under one node
+	 * id (the server confines uploads to the session's node), so the database's local
+	 * nodes take turns, each for one session:
+	 *
+	 * - A local node other than the store's own that still has unsynced writes, is not
+	 *   held for another principal (RT-38) or bound to another user (RT-42), was not
+	 *   refused in this refusal cycle, and is used by no live tab (its lock is free) may
+	 *   be adopted: the session runs as that node and uploads its writes with their
+	 *   original identity, then ends; the next session picks again.
+	 * - Never one whose writes depend causally on another local node's unsynced writes:
+	 *   the parent's node goes first (a child is never uploaded before its parent).
+	 * - Never a parked one (its last adoption made no progress, for example the server
+	 *   kept deferring a write) until something else uploaded or its backoff ran out, so
+	 *   one stuck node never blocks the others or this tab's own writes.
+	 * - Otherwise the session runs as the store's own node; it yields to a deferred node
+	 *   once its own uploads made that node worth retrying (see maybeEndSessionForNodeWork).
+	 *
+	 * Also counts the other local nodes' unsynced writes, so they are reported (pending,
+	 * or held).
 	 */
 	private async chooseSessionNode(): Promise<void> {
 		this.endAdoption()
@@ -3270,6 +3457,7 @@ export class SyncEngine {
 		this.heldPending = 0
 		this.heldNodeIds = new Set()
 		this.localNodeIds = new Set([storeNode])
+		this.deferredAdoptions = []
 		const syncState = this.syncState
 		if (!syncState?.listLocalNodes) return
 		let nodes: LocalNodeInfo[]
@@ -3286,49 +3474,125 @@ export class SyncEngine {
 			})
 			return
 		}
+		const schedule = await this.loadSchedule()
+		const now = Date.now()
 		for (const node of nodes) this.localNodeIds.add(node.nodeId)
-		let adopted = false
+
+		interface Candidate {
+			nodeId: string
+			unsynced: UnsyncedOfNode
+		}
+		const candidates: Candidate[] = []
 		for (const node of nodes) {
 			if (node.nodeId === storeNode) continue
-			if (node.held) this.heldNodeIds.add(node.nodeId)
+			// Held for its principal (RT-38), or bound to another user (RT-42): it is never
+			// uploaded on this user's session.
+			const held = node.held || this.belongsToAnotherPrincipal(node)
+			if (held) this.heldNodeIds.add(node.nodeId)
 			const unsynced = await this.countUnsyncedOfNode(node.nodeId)
 			if (unsynced.count === 0) {
 				if (!node.held) await this.forgetDrainedNode(node.nodeId)
 				continue
 			}
-			if (node.held) {
+			if (held) {
 				this.heldPending += unsynced.notQueued
 				continue
 			}
 			const refusedThisCycle = node.refusedCycle !== null && node.refusedCycle >= cycle
-			if (!adopted && !refusedThisCycle && this.store.claimLocalNode) {
-				const release = await this.store.claimLocalNode(node.nodeId)
-				if (release) {
-					adopted = true
-					this.releaseAdoption = release
-					this.sessionNodeId = node.nodeId
-					this.emitter?.emit({
-						type: 'sync:local-node',
-						nodeId: node.nodeId,
-						action: 'adoption-started',
-						operationCount: unsynced.count,
-					})
-					continue
+			if (refusedThisCycle || !this.store.claimLocalNode) {
+				this.otherNodesPending += unsynced.notQueued
+				continue
+			}
+			candidates.push({ nodeId: node.nodeId, unsynced })
+		}
+		if (candidates.length === 0) return
+
+		// Unsynced operation ids per uploadable node, to order adoptions by causality.
+		const own = await this.countUnsyncedOfNode(storeNode)
+		const pendingIds = new Map<string, ReadonlySet<string>>([[storeNode, own.ids]])
+		for (const candidate of candidates) pendingIds.set(candidate.nodeId, candidate.unsynced.ids)
+		const dependsOnAnotherNode = (candidate: Candidate): boolean => {
+			for (const dep of candidate.unsynced.deps) {
+				for (const [nodeId, ids] of pendingIds) {
+					if (nodeId !== candidate.nodeId && ids.has(dep)) return true
 				}
 			}
-			this.otherNodesPending += unsynced.notQueued
+			return false
+		}
+
+		const eligible: Candidate[] = []
+		const causallyDeferred: Candidate[] = []
+		for (const candidate of candidates) {
+			const parked = schedule.parked[candidate.nodeId]
+			if (parked && schedule.progress <= parked.progressMark && now < parked.untilMs) {
+				this.deferredAdoptions.push({ nodeId: candidate.nodeId, reason: 'parked', ...parked })
+				continue
+			}
+			if (dependsOnAnotherNode(candidate)) {
+				causallyDeferred.push(candidate)
+				continue
+			}
+			eligible.push(candidate)
+		}
+		if (eligible.length === 0 && causallyDeferred.length > 0) {
+			// Every candidate waits for another one: a cycle among them (or the parent is
+			// parked). Break it in registry order unless one waits for this tab's own
+			// writes, which this session uploads first.
+			const breaker = causallyDeferred.find(
+				(candidate) => ![...candidate.unsynced.deps].some((dep) => own.ids.has(dep)),
+			)
+			if (breaker) {
+				causallyDeferred.splice(causallyDeferred.indexOf(breaker), 1)
+				eligible.push(breaker)
+			}
+		}
+		for (const candidate of causallyDeferred) {
+			this.deferredAdoptions.push({
+				nodeId: candidate.nodeId,
+				reason: 'causal',
+				parkedAtMs: now,
+				untilMs: now,
+				progressMark: schedule.progress,
+			})
+		}
+
+		let adopted: Candidate | null = null
+		for (const candidate of eligible) {
+			const release = await this.store.claimLocalNode?.(candidate.nodeId)
+			if (!release) continue
+			adopted = candidate
+			this.releaseAdoption = release
+			this.sessionNodeId = candidate.nodeId
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: candidate.nodeId,
+				action: 'adoption-started',
+				operationCount: candidate.unsynced.count,
+			})
+			break
+		}
+		for (const candidate of candidates) {
+			if (candidate !== adopted) this.otherNodesPending += candidate.unsynced.notQueued
 		}
 		if (adopted) {
 			// While adopting, the store's own unsynced tail is not tracked by this session.
-			this.otherNodesPending += (await this.countUnsyncedOfNode(storeNode)).notQueued
+			this.otherNodesPending += own.notQueued
 		}
+	}
+
+	/** A node bound to another user than the signed-in one (RT-42). */
+	private belongsToAnotherPrincipal(node: LocalNodeInfo): boolean {
+		if (!this.config.principal || this.principal === undefined) return false
+		const owner = node.principal ?? null
+		return owner !== null && owner !== this.principal
 	}
 
 	/**
 	 * A local node's own operations above its acknowledged prefix that are not
-	 * terminally rejected: `count` all of them, `notQueued` those not in the queue.
+	 * terminally rejected: `count` all of them, `notQueued` those not in the queue, their
+	 * `ids`, and the causal parents they name outside this set (`deps`).
 	 */
-	private async countUnsyncedOfNode(nodeId: string): Promise<{ count: number; notQueued: number }> {
+	private async countUnsyncedOfNode(nodeId: string): Promise<UnsyncedOfNode> {
 		const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
 		let prefix = 0
 		if (this.syncState?.loadOwnAckedThrough) {
@@ -3336,16 +3600,86 @@ export class SyncEngine {
 		} else {
 			prefix = this.lastAckedServerVector.get(nodeId) ?? 0
 		}
-		if (localSeq <= prefix) return { count: 0, notQueued: 0 }
+		const empty: UnsyncedOfNode = { count: 0, notQueued: 0, ids: new Set(), deps: new Set() }
+		if (localSeq <= prefix) return empty
 		const ops = (await this.store.getOperationRange(nodeId, prefix + 1, localSeq)).filter(
 			(op) => op.nodeId === nodeId && op.sequenceNumber > prefix,
 		)
 		const terminal = await this.findTerminalRejections(ops.map((op) => op.id))
 		const unsynced = ops.filter((op) => !terminal.has(op.id))
+		const ids = new Set(unsynced.map((op) => op.id))
+		const deps = new Set<string>()
+		for (const op of unsynced) {
+			for (const dep of op.causalDeps ?? []) if (!ids.has(dep)) deps.add(dep)
+		}
 		return {
 			count: unsynced.length,
 			notQueued: unsynced.filter((op) => !this.outboundQueue.has(op.id)).length,
+			ids,
+			deps,
 		}
+	}
+
+	/** The adoption schedule (RT-46), from persistence when it keeps one. */
+	private async loadSchedule(): Promise<AdoptionScheduleInfo> {
+		let schedule = this.memorySchedule
+		if (this.syncState?.loadAdoptionSchedule) {
+			try {
+				schedule = await this.syncState.loadAdoptionSchedule()
+			} catch {
+				// Unreadable: the in-memory copy decides (at worst an early retry).
+			}
+		}
+		this.scheduleHasParked = Object.keys(schedule.parked).length > 0
+		return { progress: schedule.progress, parked: { ...schedule.parked } }
+	}
+
+	private async saveSchedule(schedule: AdoptionScheduleInfo): Promise<void> {
+		this.memorySchedule = schedule
+		this.scheduleHasParked = Object.keys(schedule.parked).length > 0
+		try {
+			await this.syncState?.saveAdoptionSchedule?.(schedule)
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Saving the adoption schedule failed',
+				code: 'ADOPTION_SCHEDULE_FAILED',
+			})
+		}
+	}
+
+	/**
+	 * Operations of `nodeId` were stored (RT-46): a parked adoption may have waited for
+	 * them, so the progress counter moves; the node itself is no longer parked.
+	 */
+	private async recordUploadProgress(nodeId: string): Promise<void> {
+		if (!this.scheduleHasParked) return
+		const schedule = await this.loadSchedule()
+		schedule.progress += 1
+		delete schedule.parked[nodeId]
+		await this.saveSchedule(schedule)
+	}
+
+	/** Park the adopted node: it made no progress in this session (RT-46). */
+	private async parkAdoption(nodeId: string): Promise<void> {
+		const schedule = await this.loadSchedule()
+		const now = Date.now()
+		const count = (schedule.parked[nodeId]?.count ?? 0) + 1
+		const backoff = Math.min(ADOPTION_PARK_MAX_MS, ADOPTION_PARK_BASE_MS * 2 ** (count - 1))
+		schedule.parked[nodeId] = {
+			progressMark: schedule.progress,
+			untilMs: now + backoff,
+			count,
+			parkedAtMs: now,
+		}
+		await this.saveSchedule(schedule)
+		this.emitter?.emit({
+			type: 'sync:local-node',
+			nodeId,
+			action: 'adoption-parked',
+			operationCount: (await this.countUnsyncedOfNode(nodeId)).count,
+		})
 	}
 
 	/** Forget a drained, non-held local node no live tab uses (bounds the registry). */
@@ -3448,6 +3782,15 @@ export class SyncEngine {
 	private async recoverSequenceConflict(operationId: string): Promise<boolean> {
 		const node = this.currentNodeId()
 		const op = this.findQueuedOperation(operationId)
+		if (
+			op &&
+			op.nodeId === node &&
+			node === this.store.getNodeId() &&
+			op.sequenceNumber > this.handshakeOwnEntry &&
+			this.store.rotateNodeId
+		) {
+			return this.recoverFromClone(op)
+		}
 		const resequence = this.store.resequenceOperation?.bind(this.store)
 		if (!op || op.nodeId !== node || !resequence) return false
 		const floor = Math.max(this.remoteVector.get(node) ?? 0, op.sequenceNumber)
@@ -3470,21 +3813,83 @@ export class SyncEngine {
 			localSequence: op.sequenceNumber,
 			serverSequence: floor,
 		})
-		await this.resetDeliveryForFullResync()
-		this.ownRecoveryPending = true
+		// A full resync downloads the whole dataset again: at most one per interval
+		// (RT-44, a clone this store cannot move away from keeps colliding). A later
+		// one is deferred to the first session start after the interval.
+		if (Date.now() - this.lastFullResyncAt >= FULL_RESYNC_MIN_INTERVAL_MS) {
+			this.lastFullResyncAt = Date.now()
+			await this.resetDeliveryForFullResync()
+			this.ownRecoveryPending = true
+		} else {
+			this.fullResyncDeferred = true
+		}
 		await this.refreshPendingCount()
-		this.maybeEndSessionForNodeWork()
+		await this.maybeEndSessionForNodeWork()
 		return true
 	}
 
 	/**
-	 * End the session when it has done its node work and nothing is in flight: an own-
-	 * history recovery is pending (RT-35: reconnect to resync from 0), or an adopted node's
-	 * writes are all stored (RT-40: reconnect as the next node, or this tab's own).
+	 * A SEQUENCE_CONFLICT above this session's handshake entry (RT-44): the server held
+	 * nothing of this node above that entry when the session began, so the operation now
+	 * holding the number was stored during this session, and not by this session. Another
+	 * live copy of this database uses the same node id (app data copied to a new machine,
+	 * a restored image used alongside the original). Renumbering would only collide again,
+	 * and each copy's writes count as the other's own operations (never delivered on a
+	 * resumed stream), so this copy moves to a fresh node id: the refused write (refused,
+	 * so certainly not stored) and every never-sent one are re-authored under it, the
+	 * session ends, and the next one resyncs from 0 to fetch what the other copy wrote.
+	 */
+	private async recoverFromClone(op: Operation): Promise<boolean> {
+		const rotate = this.store.rotateNodeId?.bind(this.store)
+		if (!rotate) return false
+		const cloned = op.nodeId
+		this.emitter?.emit({
+			type: 'sync:local-node',
+			nodeId: cloned,
+			action: 'clone-detected',
+			localSequence: op.sequenceNumber,
+			serverSequence: this.handshakeOwnEntry,
+		})
+		// The session belongs to the cloned node: end it before the identity moves, so
+		// nothing of the new node is ever uploaded on it.
+		this.abandonSession(
+			'Another live copy of this database uses the same node id; moving this copy to a new one',
+		)
+		this.outboundQueue.clearSent([op.id])
+		try {
+			const staying = await this.rotateUnsent(cloned, rotate)
+			await this.resetDeliveryForFullResync()
+			if (staying === 0) {
+				// Nothing of this copy waits under the cloned node: stop tracking it, so
+				// the other copy's writes under it are never taken for unsynced ones.
+				await this.syncState?.forgetLocalNode?.(cloned)
+				this.localNodeIds.delete(cloned)
+			}
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Moving to a new node id failed',
+				code: 'NODE_ROTATION_FAILED',
+			})
+		}
+		await this.refreshPendingCount()
+		return true
+	}
+
+	/**
+	 * End the session when it has done its node work and nothing is in flight:
+	 * - an own-history recovery is pending (RT-35: reconnect to resync from 0);
+	 * - an adopted node's writes are all stored (RT-40: reconnect as the next node, or
+	 *   this tab's own);
+	 * - an adopted node stalled (RT-46: the server deferred part of it): it is parked and
+	 *   the next session serves another node;
+	 * - this tab's own uploads are drained, made progress, and a deferred node is now
+	 *   worth retrying (RT-46: its parent was among them, or its park has expired).
 	 *
 	 * @returns Whether the session was ended
 	 */
-	private maybeEndSessionForNodeWork(): boolean {
+	private async maybeEndSessionForNodeWork(): Promise<boolean> {
 		if (this.state !== 'streaming' && this.state !== 'syncing') return false
 		if (this.inFlightUploads.size > 0) return false
 		if (this.ownRecoveryPending) {
@@ -3493,13 +3898,49 @@ export class SyncEngine {
 			return true
 		}
 		const node = this.currentNodeId()
-		if (node === this.store.getNodeId() || this.state !== 'streaming') return false
+		if (node === this.store.getNodeId()) return this.maybeYieldToDeferredNode()
+		if (this.state !== 'streaming') return false
+		if (this.adoptionStalled) {
+			this.adoptionStalled = false
+			const epoch = this.sessionEpoch
+			await this.parkAdoption(node)
+			if (epoch !== this.sessionEpoch || this.currentNodeId() !== node) return true
+			this.endAdoption()
+			this.abandonSession('An adopted node made no upload progress; serving the other nodes first')
+			return true
+		}
 		if (this.hasUploadable()) return false
 		const localSeq = this.store.getVersionVector().get(node) ?? 0
 		if (this.ownTrackingNodeId !== node || this.ownAckedThrough < localSeq) return false
 		this.emitter?.emit({ type: 'sync:local-node', nodeId: node, action: 'adoption-completed' })
 		this.endAdoption()
 		this.abandonSession('Uploaded the unsynced writes of a closed tab; reconnecting')
+		return true
+	}
+
+	/**
+	 * This tab's own session: once its uploads are drained and it stored something, end
+	 * it when a node deferred at session start is worth retrying now (RT-46), so other
+	 * nodes' writes do not wait for an unrelated reconnect. Bounded: each yield needs new
+	 * own progress, and a parked node at most once per {@link ADOPTION_YIELD_MIN_MS}.
+	 */
+	private async maybeYieldToDeferredNode(): Promise<boolean> {
+		if (this.state !== 'streaming' || this.deferredAdoptions.length === 0) return false
+		if (this.sessionAcked === 0 || this.hasUploadable()) return false
+		const now = Date.now()
+		const schedule = await this.loadSchedule()
+		const ready = this.deferredAdoptions.some((deferred) =>
+			deferred.reason === 'causal'
+				? true
+				: now >= deferred.untilMs ||
+					(schedule.progress > deferred.progressMark &&
+						now - deferred.parkedAtMs >= ADOPTION_YIELD_MIN_MS),
+		)
+		if (!ready || this.state !== 'streaming' || this.inFlightUploads.size > 0) return false
+		this.deferredAdoptions = []
+		this.abandonSession(
+			"Uploaded this tab's writes; serving another local node that waited for them",
+		)
 		return true
 	}
 

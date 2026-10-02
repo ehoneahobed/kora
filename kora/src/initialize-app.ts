@@ -13,7 +13,7 @@ import { SyncEncryptor, SyncEngine } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { ApplyPipeline } from './apply-pipeline'
 import { wireAuditPersistence } from './audit-bridge'
-import { transportAuthState } from './auth-sync-coordinator'
+import { authPrincipal, transportAuthState } from './auth-sync-coordinator'
 import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
@@ -146,6 +146,15 @@ export async function initializeApp(
 		}
 	}
 
+	// Bind local writes to the signed-in user before the app can write (RT-42): a node
+	// that belongs to another user is never written under, uploaded or adopted for this
+	// user. Later user changes rebind through the auth binding's subscription.
+	const principal = config.sync ? authPrincipal(authBinding) : undefined
+	if (principal) {
+		const userId = await principal()
+		if (userId) await store.bindPrincipal(userId)
+	}
+
 	let recordConflict: (() => void) | undefined
 	const applyPipeline = new ApplyPipeline({
 		store,
@@ -189,6 +198,7 @@ export async function initializeApp(
 				transport: config.sync.transport,
 				auth: syncAuth,
 				authState: transportAuthState(authBinding),
+				...(principal ? { principal } : {}),
 				querySubsets: config.sync.querySubsets,
 				scopeExit: config.sync.scopeExit,
 				batchSize: config.sync.batchSize,

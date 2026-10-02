@@ -191,6 +191,43 @@ describe('createApp', () => {
 		})
 	})
 
+	test('binds local writes to the signed-in user of the auth binding (RT-42)', async () => {
+		const name = join(
+			tmpdir(),
+			`kora-principal-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		)
+		const createUserApp = (userId: string) =>
+			createApp({
+				schema,
+				store: { adapter: 'better-sqlite3', name },
+				sync: {
+					url: 'ws://localhost:65535/kora-sync',
+					autoConnect: false,
+					authClient: {
+						auth: async () => ({ token: '' }),
+						resolveSyncState: async () => ({ state: 'authenticated', userId, token: null }),
+					},
+				},
+			})
+		app = createUserApp('alice')
+		await app.ready
+		const aliceNode = app.sync?.exportDiagnostics().nodeId
+		await ((app as Record<string, unknown>).todos as CollectionAccessor).insert({ title: 'a' })
+		await app.close()
+
+		// Same shared database, another user: their writes get their own node.
+		app = createUserApp('bob')
+		await app.ready
+		const bobNode = app.sync?.exportDiagnostics().nodeId
+		expect(bobNode).toBeTruthy()
+		expect(bobNode).not.toBe(aliceNode)
+		await app.close()
+
+		app = createUserApp('alice')
+		await app.ready
+		expect(app.sync?.exportDiagnostics().nodeId).toBe(aliceNode)
+	})
+
 	test('emits operation:created events on mutations', async () => {
 		app = createApp({
 			schema,
