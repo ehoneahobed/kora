@@ -1,8 +1,13 @@
 import type { BlobRef } from '@korajs/core'
+import { BackupValidationError } from '../apply/ingest-validation'
 import type { ServerStore } from '../store/server-store'
-import { WsServerTransport } from '../transport/ws-server-transport'
+import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
-import { DEFAULT_MAX_MESSAGE_BYTES, KoraSyncServer } from './kora-sync-server'
+import {
+	DEFAULT_MAX_MESSAGE_BYTES,
+	KoraSyncServer,
+	resolvePerMessageDeflate,
+} from './kora-sync-server'
 import type { ProductionHttpRouteContext } from './route-context'
 import { type TrustProxySetting, resolveClientIp } from './trust-proxy'
 
@@ -52,7 +57,23 @@ export interface ProductionServerConfig {
 	 * is the socket address, so a client cannot pick its own rate-limit bucket.
 	 */
 	trustProxy?: TrustProxySetting
+	/**
+	 * Largest request body a custom HTTP route (`httpRoutes`) accepts, in bytes. A
+	 * larger body is refused with 413 before it is buffered (SRV-6), so an
+	 * unauthenticated client cannot make the server hold arbitrary amounts of memory.
+	 * Defaults to 1 MiB.
+	 */
+	maxRequestBodyBytes?: number
+	/**
+	 * Largest backup accepted by `/__kora/backup/import`, in bytes. Defaults to 256 MiB.
+	 */
+	maxBackupBytes?: number
 }
+
+/** Default largest custom-route request body: 1 MiB. */
+export const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+/** Default largest backup import body: 256 MiB. */
+export const DEFAULT_MAX_BACKUP_BYTES = 256 * 1024 * 1024
 
 export interface ProductionOperationalAuth {
 	/** Protects /__kora, /__kora/status, and /__kora/events. */
@@ -287,11 +308,42 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		return lines.join('\n')
 	}
 
-	function readBodyBuffer(req: import('node:http').IncomingMessage): Promise<Buffer> {
+	const maxRequestBodyBytes = config.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+	const maxBackupBytes = config.maxBackupBytes ?? DEFAULT_MAX_BACKUP_BYTES
+
+	/**
+	 * Read a request body of at most `limit` bytes. Resolves null when the body (or its
+	 * declared Content-Length) is larger: the caller answers 413, and nothing past the
+	 * limit is buffered (SRV-6).
+	 */
+	function readBodyBuffer(
+		req: import('node:http').IncomingMessage,
+		limit: number,
+	): Promise<Buffer | null> {
+		const declared = Number(req.headers['content-length'])
+		if (Number.isFinite(declared) && declared > limit) return Promise.resolve(null)
 		return new Promise((resolve) => {
 			const chunks: Buffer[] = []
-			req.on('data', (chunk: Buffer) => chunks.push(chunk))
-			req.on('end', () => resolve(Buffer.concat(chunks)))
+			let received = 0
+			let settled = false
+			const finish = (value: Buffer | null): void => {
+				if (settled) return
+				settled = true
+				resolve(value)
+			}
+			req.on('data', (chunk: Buffer) => {
+				if (settled) return
+				received += chunk.byteLength
+				if (received > limit) {
+					chunks.length = 0
+					// Stop reading; the caller replies 413 and then drops the connection.
+					req.pause()
+					finish(null)
+					return
+				}
+				chunks.push(chunk)
+			})
+			req.on('end', () => finish(Buffer.concat(chunks)))
 			// A raw http.IncomingMessage starts paused: attaching 'data'/'end'
 			// listeners alone does not put it in flowing mode. Without an
 			// explicit resume(), 'data' never fires, 'end' fires immediately with
@@ -305,17 +357,30 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 			// If the client disconnects mid-upload, `end` never fires; resolve
 			// with whatever arrived instead of leaving the request hung forever.
-			req.on('error', () => resolve(Buffer.concat(chunks)))
+			req.on('error', () => finish(Buffer.concat(chunks)))
 		})
 	}
 
-	async function readJsonBody(req: import('node:http').IncomingMessage): Promise<unknown> {
-		const buffer = await readBodyBuffer(req)
-		if (buffer.byteLength === 0) return undefined
+	/** Answer 413 and drop the connection once the response is written. */
+	function rejectTooLarge(
+		req: import('node:http').IncomingMessage,
+		res: import('node:http').ServerResponse,
+		limit: number,
+	): void {
+		res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' })
+		res.end(JSON.stringify({ error: 'Payload too large', maxBytes: limit }), () => req.destroy())
+	}
+
+	async function readJsonBody(
+		req: import('node:http').IncomingMessage,
+	): Promise<{ tooLarge: true } | { tooLarge: false; body: unknown }> {
+		const buffer = await readBodyBuffer(req, maxRequestBodyBytes)
+		if (buffer === null) return { tooLarge: true }
+		if (buffer.byteLength === 0) return { tooLarge: false, body: undefined }
 		try {
-			return JSON.parse(buffer.toString('utf8')) as unknown
+			return { tooLarge: false, body: JSON.parse(buffer.toString('utf8')) as unknown }
 		} catch {
-			return undefined
+			return { tooLarge: false, body: undefined }
 		}
 	}
 
@@ -525,7 +590,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						return
 					}
 					try {
-						const body = await readBodyBuffer(req)
+						const body = await readBodyBuffer(req, maxBackupBytes)
+						if (body === null) {
+							rejectTooLarge(req, res, maxBackupBytes)
+							return
+						}
 						const merge = url.searchParams.get('merge') === 'true'
 						const result = await config.store.importBackup(
 							new Uint8Array(body.buffer, body.byteOffset, body.byteLength),
@@ -534,8 +603,18 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' })
 						res.end(JSON.stringify(result))
 					} catch (error) {
-						res.writeHead(500, { 'Content-Type': 'application/json' })
-						res.end(JSON.stringify({ error: 'Restore failed', message: (error as Error).message }))
+						// A backup whose operations fail ingest validation (far-future
+						// timestamps, malformed sequence numbers) is the caller's input, not a
+						// server fault: 400 with the details (SYNC-7).
+						const invalid = error instanceof BackupValidationError
+						res.writeHead(invalid ? 400 : 500, { 'Content-Type': 'application/json' })
+						res.end(
+							JSON.stringify({
+								error: 'Restore failed',
+								message: (error as Error).message,
+								...(invalid ? { code: error.code, details: error.context } : {}),
+							}),
+						)
 					}
 					return
 				}
@@ -545,10 +624,15 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					matchesRoutePrefix(url.pathname, route.path),
 				)
 				if (customRoute) {
+					const parsed = await readJsonBody(req)
+					if (parsed.tooLarge) {
+						rejectTooLarge(req, res, maxRequestBodyBytes)
+						return
+					}
 					const result = await customRoute.handle({
 						method: req.method ?? 'GET',
 						path: url.pathname,
-						body: await readJsonBody(req),
+						body: parsed.body,
 						headers: req.headers,
 						query: getQuery(url),
 						ip: getClientIp(req),
@@ -599,14 +683,21 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			const wss = new WebSocketServer({
 				noServer: true,
 				maxPayload: config.syncOptions?.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
+				perMessageDeflate: resolvePerMessageDeflate(config.syncOptions?.perMessageDeflate),
 			})
 
 			httpServer.on('upgrade', (req, socket, head) => {
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
 				if (url.pathname === syncPath) {
 					wss.handleUpgrade(req, socket, head, (ws) => {
-						const transport = new WsServerTransport(ws)
-						syncServer.handleConnection(transport)
+						// The sync server builds the transport, so this path gets the same
+						// liveness probing, send-buffer ceiling and serializer as standalone.
+						try {
+							syncServer.handleWebSocket(ws as unknown as WsWebSocket)
+						} catch {
+							// Refused (for example the connection limit): handleConnection has
+							// already told the client and closed the socket.
+						}
 					})
 				} else {
 					socket.destroy()

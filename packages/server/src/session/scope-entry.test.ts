@@ -16,6 +16,14 @@ import { PostgresServerStore } from '../store/postgres-server-store'
 import { SqliteServerStore } from '../store/sqlite-server-store'
 import { SCOPE_ENTRY_NODE_ID, buildScopeEntryOperation, isScopeEntryOperation } from './scope-entry'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 const schema = defineSchema({
 	version: 3,
 	collections: {
@@ -33,7 +41,7 @@ function op(overrides: Partial<Operation>): Operation {
 		data: { owner: 'bob' },
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
-		sequenceNumber: 1,
+		sequenceNumber: nextFixtureSequence(),
 		causalDeps: [],
 		schemaVersion: 1,
 		...overrides,

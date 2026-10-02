@@ -18,10 +18,16 @@ import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { ClientSession } from '../session/client-session'
+import { DEFAULT_MAX_OPS_PER_MINUTE, SessionRateLimiter } from '../session/session-operation-limits'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
-import { WsServerTransport } from '../transport/ws-server-transport'
+import {
+	DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
+	DEFAULT_WS_MAX_BUFFERED_BYTES,
+	WsServerTransport,
+	type WsWebSocket,
+} from '../transport/ws-server-transport'
 import type {
 	AuthContext,
 	AuthProvider,
@@ -33,7 +39,21 @@ import type {
 } from '../types'
 import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
 
-const DEFAULT_MAX_CONNECTIONS = 0 // unlimited
+/**
+ * Default connection ceiling (SRV-6). Unlimited before beta.13; a bound keeps a flood
+ * of idle or half-open sockets from exhausting memory and file descriptors. 0 means
+ * unlimited.
+ */
+export const DEFAULT_MAX_CONNECTIONS = 10_000
+/** Default interval of the application-level heartbeat message (LMS #12). */
+export const DEFAULT_APP_HEARTBEAT_INTERVAL_MS = 25_000
+/**
+ * Upper bound on remembered per-node rate limiters. A flood of fresh node ids cannot
+ * grow the map past it; the least recently used entries go first.
+ */
+const MAX_TRACKED_RATE_LIMITERS = 100_000
+/** Window of the per-node ingest rate limiter. */
+const RATE_LIMIT_WINDOW_MS = 60_000
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_HOST = '0.0.0.0'
@@ -47,6 +67,29 @@ export const DEFAULT_SESSION_REVALIDATION_INTERVAL_MS = 30_000
 const HTTP_SESSION_ID_BYTES = 32
 /** Default largest WebSocket message accepted (the ws library default is 100 MiB). */
 export const DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
+
+/**
+ * The `ws` permessage-deflate setting for a `perMessageDeflate` config value (LMS #11).
+ * `true`/omitted: compress messages of 1 KiB or more with no compression context kept
+ * between messages (bounded memory per connection); `false`: off; an object: as is.
+ *
+ * @internal Shared by the standalone server and `createProductionServer`.
+ */
+export function resolvePerMessageDeflate(
+	option: boolean | Record<string, unknown> | undefined,
+): false | Record<string, unknown> {
+	if (option === false) return false
+	if (option === undefined || option === true) {
+		return {
+			threshold: 1024,
+			serverNoContextTakeover: true,
+			clientNoContextTakeover: true,
+			zlibDeflateOptions: { level: 6, memLevel: 8 },
+			concurrencyLimit: 10,
+		}
+	}
+	return option
+}
 
 /**
  * Minimal interface for a ws.WebSocketServer instance.
@@ -66,6 +109,7 @@ export type WsServerConstructor = new (options: {
 	host?: string
 	path?: string
 	maxPayload?: number
+	perMessageDeflate?: false | Record<string, unknown>
 }) => WsServerLike
 
 function validateIntervalOption(name: string, value: number): number {
@@ -118,6 +162,21 @@ export class KoraSyncServer {
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxMessageBytes: number
+	private readonly heartbeatIntervalMs: number
+	private readonly appHeartbeatIntervalMs: number
+	private readonly handshakeTimeoutMs: number | undefined
+	private readonly maxBufferedBytes: number
+	private readonly deliveryHighWaterBytes: number | undefined
+	private readonly perMessageDeflate: false | Record<string, unknown>
+	/**
+	 * Ingest rate limiters by device node id, shared by that node's sessions so a
+	 * reconnect does not reset the budget (SRV-6). Entries idle past the window are
+	 * dropped by the background tick; insertion order doubles as LRU order.
+	 */
+	private readonly rateLimiters = new Map<
+		string,
+		{ limiter: SessionRateLimiter; lastUsedAtMs: number }
+	>()
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
@@ -233,6 +292,21 @@ export class KoraSyncServer {
 			config.httpSessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS,
 		)
 		this.maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
+		this.heartbeatIntervalMs = validateIntervalOption(
+			'heartbeatIntervalMs',
+			config.heartbeatIntervalMs ?? DEFAULT_WS_HEARTBEAT_INTERVAL_MS,
+		)
+		this.appHeartbeatIntervalMs = validateIntervalOption(
+			'appHeartbeatIntervalMs',
+			config.appHeartbeatIntervalMs ?? DEFAULT_APP_HEARTBEAT_INTERVAL_MS,
+		)
+		this.handshakeTimeoutMs =
+			config.handshakeTimeoutMs === undefined
+				? undefined
+				: validateIntervalOption('handshakeTimeoutMs', config.handshakeTimeoutMs)
+		this.maxBufferedBytes = config.maxBufferedBytes ?? DEFAULT_WS_MAX_BUFFERED_BYTES
+		this.deliveryHighWaterBytes = config.deliveryHighWaterBytes
+		this.perMessageDeflate = resolvePerMessageDeflate(config.perMessageDeflate)
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
 		this.maxOpsPerMinute = config.maxOpsPerMinute
@@ -468,6 +542,51 @@ export class KoraSyncServer {
 		}
 		this.expireOrphanedRelays()
 		this.expireIdleHttpSessions()
+		this.expireIdleRateLimiters()
+	}
+
+	/**
+	 * The ingest rate limiter of a device node, created on first use and shared by
+	 * every session of that node, so reconnecting does not buy a fresh budget (SRV-6).
+	 */
+	private rateLimiterFor(nodeId: string): SessionRateLimiter {
+		const now = Date.now()
+		const existing = this.rateLimiters.get(nodeId)
+		if (existing) {
+			existing.lastUsedAtMs = now
+			// Re-insert to keep the map in least-recently-used order.
+			this.rateLimiters.delete(nodeId)
+			this.rateLimiters.set(nodeId, existing)
+			return existing.limiter
+		}
+		const limiter = new SessionRateLimiter(
+			this.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE,
+			RATE_LIMIT_WINDOW_MS,
+		)
+		this.rateLimiters.set(nodeId, { limiter, lastUsedAtMs: now })
+		while (this.rateLimiters.size > MAX_TRACKED_RATE_LIMITERS) {
+			const oldest = this.rateLimiters.keys().next().value
+			if (oldest === undefined) break
+			this.rateLimiters.delete(oldest)
+		}
+		return limiter
+	}
+
+	/**
+	 * Forget rate limiters of nodes with no live session whose window has long
+	 * passed: their budget would be full again anyway.
+	 */
+	private expireIdleRateLimiters(now = Date.now()): void {
+		if (this.rateLimiters.size === 0) return
+		const live = new Set<string>()
+		for (const session of this.sessions.values()) {
+			const nodeId = session.getClientNodeId()
+			if (nodeId !== null) live.add(nodeId)
+		}
+		const cutoff = now - 2 * RATE_LIMIT_WINDOW_MS
+		for (const [nodeId, entry] of this.rateLimiters) {
+			if (entry.lastUsedAtMs <= cutoff && !live.has(nodeId)) this.rateLimiters.delete(nodeId)
+		}
 	}
 
 	/** Close HTTP long-poll sessions that sent no request within the idle timeout. */
@@ -492,22 +611,20 @@ export class KoraSyncServer {
 		this.maybeRevalidateSessions()
 		try {
 			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
-			if (maxDeliverySequence <= this.lastObservedDeliverySequence) {
-				for (const session of this.sessions.values()) {
-					session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
-						trackStall: true,
-						serverFrontier: maxDeliverySequence,
-					})
-				}
-				return
+			if (maxDeliverySequence > this.lastObservedDeliverySequence) {
+				const previous = this.lastObservedDeliverySequence
+				this.lastObservedDeliverySequence = maxDeliverySequence
+				// Records may have changed through another instance: drop the blob access
+				// sets of the collections written since the last poll (RT-17).
+				await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
 			}
-			const previous = this.lastObservedDeliverySequence
-			this.lastObservedDeliverySequence = maxDeliverySequence
-			// Records may have changed through another instance: drop the blob access sets
-			// of the collections written since the last poll (RT-17).
-			await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
+			// Each session sends what is above its send cursor (operations committed
+			// through another instance), and re-sends an unacknowledged delivery only once
+			// it made no progress for the poll interval, backed off while it stays stuck
+			// (SRV-3, LMS #12: a stuck or ghost client is not re-sent its backlog forever).
 			for (const session of this.sessions.values()) {
-				session.pushDeliveryStreamIfSupported(0, {
+				session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
+					trackStall: true,
 					serverFrontier: maxDeliverySequence,
 				})
 			}
@@ -711,6 +828,7 @@ export class KoraSyncServer {
 				host: this.host,
 				path: this.path,
 				maxPayload: this.maxMessageBytes,
+				perMessageDeflate: this.perMessageDeflate,
 			})
 		} else {
 			// Dynamic import of ws — only needed in standalone mode
@@ -720,17 +838,17 @@ export class KoraSyncServer {
 				host: this.host,
 				path: this.path,
 				maxPayload: this.maxMessageBytes,
+				perMessageDeflate: this.perMessageDeflate,
 			})
 		}
 
 		this.wsServer.on('connection', (ws: unknown) => {
-			const transport = new WsServerTransport(
-				ws as import('../transport/ws-server-transport').WsWebSocket,
-				{
-					serializer: this.serializer,
-				},
-			)
-			this.handleConnection(transport)
+			try {
+				this.handleWebSocket(ws as WsWebSocket)
+			} catch {
+				// Refused (for example the connection limit): handleConnection already
+				// told the client and closed the socket.
+			}
 		})
 
 		this.running = true
@@ -767,6 +885,7 @@ export class KoraSyncServer {
 			this.sessionRevalidationTimer = null
 		}
 		this.orphanedRelaysByNode.clear()
+		this.rateLimiters.clear()
 		this.revocationUnsubscribe?.()
 		this.revocationUnsubscribe = null
 
@@ -902,6 +1021,24 @@ export class KoraSyncServer {
 			return false
 		}
 		return true
+	}
+
+	/**
+	 * Handle an accepted WebSocket (attach mode with `ws`): wraps it in a
+	 * {@link WsServerTransport} configured like the standalone server's (serializer,
+	 * ping/pong liveness probing, send-buffer ceiling) and starts a session.
+	 *
+	 * @param ws - A `ws` WebSocket from `WebSocketServer.handleUpgrade` or `connection`
+	 * @returns The session ID
+	 */
+	handleWebSocket(ws: WsWebSocket): string {
+		return this.handleConnection(
+			new WsServerTransport(ws, {
+				serializer: this.serializer,
+				heartbeatIntervalMs: this.heartbeatIntervalMs,
+				maxBufferedBytes: this.maxBufferedBytes,
+			}),
+		)
 	}
 
 	/**
@@ -1087,6 +1224,14 @@ export class KoraSyncServer {
 				? { anonymousClaimTtlMs: this.anonymousClaimTtlMs }
 				: {}),
 			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
+			rateLimiterFor: (nodeId) => this.rateLimiterFor(nodeId),
+			appHeartbeatIntervalMs: this.appHeartbeatIntervalMs,
+			...(this.handshakeTimeoutMs !== undefined
+				? { handshakeTimeoutMs: this.handshakeTimeoutMs }
+				: {}),
+			...(this.deliveryHighWaterBytes !== undefined
+				? { deliveryHighWaterBytes: this.deliveryHighWaterBytes }
+				: {}),
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
@@ -1354,7 +1499,9 @@ export class KoraSyncServer {
 
 	/** Open a new HTTP long-poll session bound to `principal`, under a fresh random id. */
 	private openHttpSession(principal: HttpPrincipal | null): HttpSessionEntry {
-		const transport = new HttpServerTransport(this.serializer)
+		const transport = new HttpServerTransport(this.serializer, {
+			maxQueuedBytes: this.maxBufferedBytes,
+		})
 		const sessionId = this.handleConnection(transport)
 		const entry: HttpSessionEntry = {
 			id: generateHttpSessionId(),

@@ -8,6 +8,7 @@ import {
 	resolveAtomicOp,
 	toAtomicOp,
 } from '@korajs/core'
+import { validateIngestedOperation } from '../apply/ingest-validation'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { type RoutePredicate, evaluateRoutePredicate } from '../apply/route-predicate'
 import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
@@ -524,6 +525,13 @@ export function createRouteContext(
 							useLockedCurrent ? { record: current } : undefined,
 							context.clock,
 						)
+						// The store-provided clock was advanced past the target's latest write;
+						// if that write is far-future (a log from a server with a wrong clock),
+						// so is this one. Refuse it rather than spread it (SYNC-7).
+						const ingest = validateIngestedOperation(op)
+						if (!ingest.valid) {
+							throw new RouteMutationError(ingest.code, ingest.message)
+						}
 						// Validate inside the locked transaction against the stored row read
 						// through the store's transaction when it offers one. Throwing here
 						// rolls the transaction back, so a violation applies nothing.

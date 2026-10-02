@@ -566,6 +566,8 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				hash: message.hash,
 				chunkBytes: message.bytes,
 			}
+		case 'heartbeat':
+			return { type: message.type, messageId: message.messageId }
 	}
 }
 
@@ -698,6 +700,8 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				hash: envelope.hash ?? '',
 				bytes: envelope.chunkBytes ?? '',
 			}
+		case 'heartbeat':
+			return { type: 'heartbeat', messageId: envelope.messageId }
 		default:
 			throw new SyncError('Failed to decode sync message: unknown protobuf type', {
 				type: envelope.type,

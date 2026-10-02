@@ -7,6 +7,14 @@ import { createServerTransportPair } from '../transport/memory-server-transport'
 import type { AuthProvider } from '../types'
 import { ClientSession } from './client-session'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 /**
  * Server-side delivery stream. A handshake that carries `lastDeliverySequence` makes the
  * session resume the gap-free server->client stream from that watermark instead of the
@@ -24,7 +32,7 @@ function op(id: string): Operation {
 		data: { title: id },
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
-		sequenceNumber: 1,
+		sequenceNumber: nextFixtureSequence(),
 		causalDeps: [],
 		schemaVersion: 1,
 	}

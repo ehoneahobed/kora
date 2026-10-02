@@ -11,6 +11,14 @@ import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
 import { SqliteServerStore, createSqliteServerStore } from './sqlite-server-store'
 
+// Each fixture operation takes its own sequence number by default: a node never reuses
+// one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
+let fixtureSequence = 1000
+function nextFixtureSequence(): number {
+	fixtureSequence += 1
+	return fixtureSequence
+}
+
 // better-sqlite3 is a native CJS addon; load it (and its drizzle adapter) through a
 // CJS require so this works in the ESM test runtime, matching the store's own loader.
 const esmRequire = createRequire(import.meta.url)
@@ -39,7 +47,7 @@ function op(overrides: Partial<Operation> = {}): Operation {
 		data: { title: 'test' },
 		previousData: null,
 		timestamp: { wallTime: 1000, logical: 0, nodeId: 'node-a' },
-		sequenceNumber: 1,
+		sequenceNumber: nextFixtureSequence(),
 		causalDeps: [],
 		schemaVersion: 1,
 		...overrides,

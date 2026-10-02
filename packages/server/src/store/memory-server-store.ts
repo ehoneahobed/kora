@@ -23,7 +23,12 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER } from './server-store'
+import { RELEASED_NODE_OWNER, SequenceConflictError } from './server-store'
+
+/** Key of a node's sequence number in {@link MemoryServerStore}'s sequence index. */
+function sequenceKey(nodeId: string, sequenceNumber: number): string {
+	return `${nodeId}\u0000${String(sequenceNumber)}`
+}
 
 /**
  * In-memory server store for testing and quick prototyping.
@@ -36,6 +41,8 @@ export class MemoryServerStore implements ServerStore {
 	private readonly nodeId: string
 	private readonly operations: Operation[] = []
 	private readonly operationIndex = new Map<string, Operation>()
+	/** (nodeId, sequenceNumber) -> the id of the operation holding it (W3 step 4). */
+	private readonly operationIdBySequence = new Map<string, string>()
 	private readonly versionVector: Map<string, number> = new Map()
 	/**
 	 * Server-assigned delivery sequence per operation id. Single-process, so a plain
@@ -106,6 +113,11 @@ export class MemoryServerStore implements ServerStore {
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'
 		}
+		// A different operation under the same (node, sequence) is refused (W3 step 4).
+		const holder = this.operationIdBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber))
+		if (holder !== undefined && holder !== op.id) {
+			throw new SequenceConflictError(op, holder)
+		}
 
 		// Authorization re-check against the row as stored right now. Everything from
 		// here to the write is synchronous, so no other writer can interleave.
@@ -125,6 +137,7 @@ export class MemoryServerStore implements ServerStore {
 
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
+		this.operationIdBySequence.set(sequenceKey(op.nodeId, op.sequenceNumber), op.id)
 
 		// Assign the next delivery sequence in commit order (single-process: no race).
 		this.deliverySeqCounter += 1
@@ -284,18 +297,29 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		const result: DeliveredOperation[] = []
 		if (limit <= 0) return result
-		// operations is in delivery order, so once entries exceed the cursor they all do;
-		// the guard on each entry keeps this correct even if that invariant ever weakens.
-		for (const op of this.operations) {
+		// `operations` is in delivery order (sequences increase along the array), so seek
+		// the first entry past the cursor by binary search instead of walking from the
+		// head on every chunk (SRV-5: a full scan was quadratic in the log size).
+		let low = 0
+		let high = this.operations.length
+		while (low < high) {
+			const mid = (low + high) >>> 1
+			const candidate = this.operations[mid]
+			const sequence = candidate ? (this.deliverySeqByOpId.get(candidate.id) ?? 0) : 0
+			if (sequence > afterDeliverySequence) high = mid
+			else low = mid + 1
+		}
+		for (let index = low; index < this.operations.length; index++) {
+			const op = this.operations[index] as Operation
 			const deliverySequence = this.deliverySeqByOpId.get(op.id) ?? 0
-			if (deliverySequence > afterDeliverySequence) {
-				result.push({
-					operation: op,
-					deliverySequence,
-					scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
-				})
-				if (result.length >= limit) break
-			}
+			// The guard keeps this correct even if the ordering invariant ever weakens.
+			if (deliverySequence <= afterDeliverySequence) continue
+			result.push({
+				operation: op,
+				deliverySequence,
+				scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+			})
+			if (result.length >= limit) break
 		}
 		return result
 	}
@@ -310,6 +334,31 @@ export class MemoryServerStore implements ServerStore {
 
 		// Fallback: replay operations
 		return this.materializeFromOps(collection)
+	}
+
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		const nodes = new Set<string>()
+		for (const op of this.operations) {
+			if ((this.deliverySeqByOpId.get(op.id) ?? 0) > afterDeliverySequence) nodes.add(op.nodeId)
+		}
+		return [...nodes]
+	}
+
+	async findRecordsByIds(
+		collection: string,
+		ids: string[],
+	): Promise<Map<string, MaterializedRecord>> {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const records = this.materializedRecords.get(collection)
+		const result = new Map<string, MaterializedRecord>()
+		for (const id of ids) {
+			const record = records?.get(id)
+			if (record) result.set(id, record)
+		}
+		return result
 	}
 
 	async queryCollection(
@@ -525,6 +574,7 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		this.operations.length = 0
 		this.operationIndex.clear()
+		this.operationIdBySequence.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
 		this.nodeOwners.clear()
@@ -544,21 +594,18 @@ export class MemoryServerStore implements ServerStore {
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
-		const { parseServerBackup } = await import('./server-backup')
+		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
 		const { operations, versionVector } = parseServerBackup(data)
 
 		if (merge) {
-			let restored = 0
-			for (const op of operations) {
-				const result = await this.applyRemoteOperation(op)
-				if (result === 'applied') restored++
-			}
-			return { operationsRestored: restored, success: true }
+			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
+			return merged
 		}
 
 		// Replace mode: clear and reload
 		this.operations.length = 0
 		this.operationIndex.clear()
+		this.operationIdBySequence.clear()
 		this.versionVector.clear()
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
@@ -571,6 +618,7 @@ export class MemoryServerStore implements ServerStore {
 		for (const op of operations) {
 			this.operations.push(op)
 			this.operationIndex.set(op.id, op)
+			this.operationIdBySequence.set(sequenceKey(op.nodeId, op.sequenceNumber), op.id)
 			// Re-assign delivery sequence in backup order (the order ops were shipped).
 			this.deliverySeqCounter += 1
 			this.deliverySeqByOpId.set(op.id, this.deliverySeqCounter)

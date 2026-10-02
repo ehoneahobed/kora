@@ -24,7 +24,8 @@ export const pgOperations = pgTable(
 		wallTime: bigint('wall_time', { mode: 'number' }).notNull(),
 		logical: integer('logical').notNull(),
 		timestampNodeId: text('timestamp_node_id').notNull(),
-		sequenceNumber: integer('sequence_number').notNull(),
+		// BIGINT (SRV-4): a node's sequence numbers are only bounded by Number.MAX_SAFE_INTEGER.
+		sequenceNumber: bigint('sequence_number', { mode: 'number' }).notNull(),
 		causalDeps: text('causal_deps').notNull().default('[]'), // JSON array of op IDs
 		schemaVersion: integer('schema_version').notNull(),
 		receivedAt: bigint('received_at', { mode: 'number' }).notNull(),
@@ -47,6 +48,6 @@ export const pgOperations = pgTable(
 
 export const pgSyncState = pgTable('sync_state', {
 	nodeId: text('node_id').primaryKey(),
-	maxSequenceNumber: integer('max_sequence_number').notNull(),
+	maxSequenceNumber: bigint('max_sequence_number', { mode: 'number' }).notNull(),
 	lastSeenAt: bigint('last_seen_at', { mode: 'number' }).notNull(),
 })

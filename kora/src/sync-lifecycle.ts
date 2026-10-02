@@ -49,6 +49,12 @@ export function wireSyncLifecycleAfterReady(
 	}
 
 	const syncEngine = state.syncEngine
+	// The backoff resets only after a session has stayed up (streaming) for a while,
+	// and a session that drops sooner keeps backing off (SYNC-8).
+	syncEngine.onStateChange((engineState) => {
+		if (engineState === 'streaming') state.reconnectionManager?.reportConnected()
+		else if (engineState === 'disconnected') state.reconnectionManager?.reportDisconnected()
+	})
 	state.connectionMonitor = new ConnectionMonitor()
 	state.reconnectionManager = new ReconnectionManager({
 		initialDelay: config.sync.reconnectInterval,
@@ -116,21 +122,26 @@ export function wireSyncLifecycleAfterReady(
 			if (state.intentionalDisconnect || syncEngine.isSchemaBlocked()) {
 				return
 			}
-			if (state.reconnectionManager?.isRunning()) {
+			// A disconnect while an attempt is in flight makes that attempt count as failed,
+			// so the running loop retries instead of exiting (NEW-SYNC-2).
+			if (state.reconnectionManager?.requestRetry()) {
 				return
 			}
 
 			syncEngine.setReconnecting(true)
-			state.reconnectionManager?.stop()
 			state.reconnectionManager
 				?.start(async () => {
 					try {
 						await syncEngine.start()
-						syncEngine.setReconnecting(false)
-						return true
 					} catch {
 						return false
 					}
+					// Success means the session reached streaming, not that the handshake was
+					// sent: a server that accepts and then drops sessions must not reset the
+					// backoff (SYNC-8).
+					const streaming = await waitForStreaming(syncEngine)
+					if (streaming) syncEngine.setReconnecting(false)
+					return streaming
 				})
 				.then(() => {
 					syncEngine.setReconnecting(false)
@@ -143,6 +154,31 @@ export function wireSyncLifecycleAfterReady(
 			// Errors surface via sync:disconnected / sync events; avoid unhandled rejection.
 		})
 	}
+}
+
+/**
+ * Resolve true once the engine reaches `streaming`, false as soon as it falls back to
+ * `disconnected` or `error` first. A slow initial sync (minutes on 2G) is not a
+ * failure: it resolves when that sync completes or the connection drops.
+ */
+function waitForStreaming(syncEngine: SyncEngine): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		const current = syncEngine.getState()
+		if (current === 'streaming') {
+			resolve(true)
+			return
+		}
+		if (current === 'disconnected' || current === 'error') {
+			resolve(false)
+			return
+		}
+		const unsubscribe = syncEngine.onStateChange((next) => {
+			if (next === 'streaming' || next === 'disconnected' || next === 'error') {
+				unsubscribe()
+				resolve(next === 'streaming')
+			}
+		})
+	})
 }
 
 /**

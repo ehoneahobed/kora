@@ -39,7 +39,28 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER } from './server-store'
+import { RELEASED_NODE_OWNER, SequenceConflictError } from './server-store'
+
+/** Thrown inside an append transaction to roll it back when the operation is a duplicate. */
+class DuplicateOperationRollback extends Error {
+	constructor() {
+		super('duplicate operation; append rolled back')
+		this.name = 'DuplicateOperationRollback'
+	}
+}
+
+/** Postgres unique_violation. */
+const PG_UNIQUE_VIOLATION = '23505'
+
+/** True when `error` (or its drizzle-wrapped cause) is a Postgres unique violation. */
+function isUniqueViolation(error: unknown): boolean {
+	const codeOf = (value: unknown): unknown =>
+		value && typeof value === 'object' && 'code' in value
+			? (value as { code: unknown }).code
+			: undefined
+	if (codeOf(error) === PG_UNIQUE_VIOLATION) return true
+	return error instanceof Error && codeOf(error.cause) === PG_UNIQUE_VIOLATION
+}
 
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
@@ -161,81 +182,144 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		// Content-addressed dedup check
-		const existing = await this.db
-			.select({ id: pgOperations.id })
-			.from(pgOperations)
-			.where(eq(pgOperations.id, op.id))
-			.limit(1)
-
-		if (existing.length > 0) {
-			return 'duplicate'
-		}
-
 		const now = Date.now()
 
-		await this.db.transaction(async (tx) => {
-			// Assign the delivery sequence in commit order (see nextDeliverySeq). A rare
-			// concurrent duplicate insert below no-ops and simply leaves a harmless gap.
-			const deliverySeq = await this.nextDeliverySeq(tx)
+		try {
+			await this.db.transaction(async (tx) => {
+				// Take the delivery-counter row lock first (see nextDeliverySeq). Every append
+				// on every instance, conditional applies included, takes it until commit, so
+				// from here on every earlier append is committed and visible to this READ
+				// COMMITTED transaction, and no later one can commit before it. That makes
+				// the dedup and sequence checks below atomic with the write across instances
+				// (SRV-4): a concurrent duplicate on another instance either committed first
+				// (and is seen here) or waits for this one. A duplicate rolls back, so it
+				// neither burns a delivery sequence nor runs any side effect (NEW-SRV-2).
+				const deliverySeq = await this.nextDeliverySeq(tx)
 
-			// Authorization re-check against the committed row. nextDeliverySeq above
-			// holds the delivery_counter row lock until this transaction ends, and every
-			// append on every instance (including conditional applies) takes that lock,
-			// so every earlier write is committed and visible to this READ COMMITTED
-			// read, and no later write can commit before this one. Throwing rolls back.
-			if (options?.authorize) {
-				const stored = await this.readStoredRow(tx, op.collection, op.recordId)
-				const decision = options.authorize(stored)
-				if (!decision.allowed) {
-					throw new UplinkAuthorizationError(decision.code, decision.message, {
-						operationId: op.id,
-						collection: op.collection,
-						recordId: op.recordId,
-					})
+				if (!(await this.insertOperationRow(tx, op, now, deliverySeq))) {
+					throw new DuplicateOperationRollback()
 				}
-			}
 
-			const materialized = this.schema?.collections[op.collection] !== undefined
-			const pre = materialized
-				? await this.readScopeValues(tx, op.collection, op.recordId, false)
-				: null
+				// Authorization re-check against the committed row, under the same lock, so
+				// no write can commit between this read and this transaction's write.
+				// Throwing rolls back, the operation row included.
+				if (options?.authorize) {
+					const stored = await this.readStoredRow(tx, op.collection, op.recordId)
+					const decision = options.authorize(stored)
+					if (!decision.allowed) {
+						throw new UplinkAuthorizationError(decision.code, decision.message, {
+							operationId: op.id,
+							collection: op.collection,
+							recordId: op.recordId,
+						})
+					}
+				}
 
-			const row = this.serializeOperation(op, now, deliverySeq)
+				const materialized = this.schema?.collections[op.collection] !== undefined
+				const pre = materialized
+					? await this.readScopeValues(tx, op.collection, op.recordId, false)
+					: null
 
-			// Insert operation with dedup
-			await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
+				await this.advanceSyncState(tx, op, now)
 
-			// Upsert version vector: advance max sequence number with GREATEST
-			await tx
-				.insert(pgSyncState)
-				.values({
-					nodeId: op.nodeId,
-					maxSequenceNumber: op.sequenceNumber,
-					lastSeenAt: now,
-				})
-				.onConflictDoUpdate({
-					target: pgSyncState.nodeId,
-					set: {
-						maxSequenceNumber: sql`GREATEST(${pgSyncState.maxSequenceNumber}, ${op.sequenceNumber})`,
-						lastSeenAt: sql`${now}`,
-					},
-				})
+				// Dual-write: update materialized collection table if schema is set
+				if (materialized) {
+					await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
+					await this.writeScopeSnapshot(tx, op, pre)
+				}
+			})
+		} catch (error) {
+			if (error instanceof DuplicateOperationRollback) return 'duplicate'
+			throw error
+		}
 
-			// Dual-write: update materialized collection table if schema is set
-			if (materialized) {
-				await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
-				await this.writeScopeSnapshot(tx, op, pre)
-			}
-		})
-
-		// Update in-memory version vector cache
+		// Keep this instance's cached vector current for its synchronous readers. The
+		// authoritative, cross-instance vector is readVersionVector().
 		const currentMax = this.versionVector.get(op.nodeId) ?? 0
 		if (op.sequenceNumber > currentMax) {
 			this.versionVector.set(op.nodeId, op.sequenceNumber)
 		}
 
 		return 'applied'
+	}
+
+	/**
+	 * The version vector as committed in `sync_state`, shared by every instance
+	 * (SRV-4). Also refreshes this instance's cache, which `getVersionVector()` serves.
+	 */
+	async readVersionVector(): Promise<VersionVector> {
+		this.assertOpen()
+		await this.ready
+		const rows = await this.db
+			.select({
+				nodeId: pgSyncState.nodeId,
+				maxSequenceNumber: pgSyncState.maxSequenceNumber,
+			})
+			.from(pgSyncState)
+		const vector: VersionVector = new Map()
+		for (const row of rows) {
+			const seq = Number(row.maxSequenceNumber)
+			vector.set(row.nodeId, seq)
+			if (seq > (this.versionVector.get(row.nodeId) ?? 0)) this.versionVector.set(row.nodeId, seq)
+		}
+		return vector
+	}
+
+	/**
+	 * Insert one operation row inside an append transaction that already holds the
+	 * delivery-counter lock. Returns false (writing nothing) when an operation with the
+	 * same id is stored; throws {@link SequenceConflictError} when a DIFFERENT
+	 * operation holds its (node, sequence) (W3 step 4). The unique index on
+	 * (node_id, sequence_number) backs the check where the existing log allowed it.
+	 */
+	private async insertOperationRow(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		now: number,
+		deliverySeq: number,
+	): Promise<boolean> {
+		const holders = (await tx.execute(
+			sql`SELECT id FROM operations WHERE node_id = ${op.nodeId} AND sequence_number = ${op.sequenceNumber} LIMIT 1`,
+		)) as unknown as { id: string }[]
+		const holder = holders[0]
+		if (holder !== undefined && holder.id !== op.id) {
+			throw new SequenceConflictError(op, holder.id)
+		}
+		try {
+			const inserted = await tx
+				.insert(pgOperations)
+				.values(this.serializeOperation(op, now, deliverySeq))
+				.onConflictDoNothing({ target: pgOperations.id })
+				.returning({ id: pgOperations.id })
+			return inserted.length > 0
+		} catch (error) {
+			if (isUniqueViolation(error)) {
+				throw new SequenceConflictError(op, holder?.id ?? '(unknown)')
+			}
+			throw error
+		}
+	}
+
+	/** Advance `sync_state` (the persisted version vector) for an appended operation. */
+	private async advanceSyncState(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		now: number,
+	): Promise<void> {
+		await tx
+			.insert(pgSyncState)
+			.values({
+				nodeId: op.nodeId,
+				maxSequenceNumber: op.sequenceNumber,
+				lastSeenAt: now,
+			})
+			.onConflictDoUpdate({
+				target: pgSyncState.nodeId,
+				set: {
+					maxSequenceNumber: sql`GREATEST(${pgSyncState.maxSequenceNumber}, ${op.sequenceNumber})`,
+					lastSeenAt: sql`${now}`,
+				},
+			})
 	}
 
 	/**
@@ -318,18 +402,10 @@ export class PostgresServerStore implements ServerStore {
 				const pre = materialized
 					? await this.readScopeValues(tx, op.collection, op.recordId, false)
 					: null
-				const row = this.serializeOperation(op, now, deliverySeq)
-				await tx.insert(pgOperations).values(row).onConflictDoNothing({ target: pgOperations.id })
-				await tx
-					.insert(pgSyncState)
-					.values({ nodeId: op.nodeId, maxSequenceNumber: op.sequenceNumber, lastSeenAt: now })
-					.onConflictDoUpdate({
-						target: pgSyncState.nodeId,
-						set: {
-							maxSequenceNumber: sql`GREATEST(${pgSyncState.maxSequenceNumber}, ${op.sequenceNumber})`,
-							lastSeenAt: sql`${now}`,
-						},
-					})
+				// A built operation is new by construction (fresh id, reserved sequence); a
+				// duplicate would mean it is already committed, so it is not written twice.
+				if (!(await this.insertOperationRow(tx, op, now, deliverySeq))) continue
+				await this.advanceSyncState(tx, op, now)
 				if (materialized) {
 					await this.rebuildMaterializedRecord(tx, op.collection, op.recordId)
 					await this.writeScopeSnapshot(tx, op, pre)
@@ -606,6 +682,46 @@ export class PostgresServerStore implements ServerStore {
 		return this.materializeFromOpsLog(collection)
 	}
 
+	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
+		)) as unknown as { node_id: string }[]
+		return rows.map((row) => row.node_id)
+	}
+
+	async findRecordsByIds(
+		collection: string,
+		ids: string[],
+	): Promise<Map<string, MaterializedRecord>> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
+		const result = new Map<string, MaterializedRecord>()
+		// One statement per 1000 ids (LMS #11), well below the bind-parameter limit.
+		for (let i = 0; i < ids.length; i += 1000) {
+			const chunk = ids.slice(i, i + 1000)
+			if (chunk.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as Record<string, unknown>[]
+			for (const row of rows) {
+				const record = this.deserializeRow(row, collectionDef)
+				result.set(record.id, record)
+			}
+		}
+		return result
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
@@ -702,19 +818,15 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const { parseServerBackup } = await import('./server-backup')
+		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
 		const { operations, versionVector } = parseServerBackup(data)
 
 		if (merge) {
-			let restored = 0
-			for (const op of operations) {
-				const result = await this.applyRemoteOperation(op)
-				if (result === 'applied') restored++
-			}
+			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
 			// Re-seed the sequence counter from the (possibly advanced) version vector,
 			// in case the merge restored operations on this node with higher numbers.
 			this.sequenceCounter = null
-			return { operationsRestored: restored, success: true }
+			return merged
 		}
 
 		const now = Date.now()
@@ -1260,7 +1372,7 @@ export class PostgresServerStore implements ServerStore {
 					wall_time BIGINT NOT NULL,
 					logical INTEGER NOT NULL,
 					timestamp_node_id TEXT NOT NULL,
-					sequence_number INTEGER NOT NULL,
+					sequence_number BIGINT NOT NULL,
 					causal_deps TEXT NOT NULL DEFAULT '[]',
 					schema_version INTEGER NOT NULL,
 					received_at BIGINT NOT NULL
@@ -1323,10 +1435,46 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS sync_state (
 					node_id TEXT PRIMARY KEY,
-					max_sequence_number INTEGER NOT NULL,
+					max_sequence_number BIGINT NOT NULL,
 					last_seen_at BIGINT NOT NULL
 				)
 			`)
+
+			// Migration (SRV-4): sequence numbers were INTEGER, so a node past 2^31-1 writes
+			// failed. Widen both columns once; the type check keeps restarts free (ALTER
+			// TYPE rewrites the table under an exclusive lock, so it must not repeat).
+			const narrowColumns = (await tx.execute(sql`
+				SELECT table_name, column_name FROM information_schema.columns
+				WHERE table_schema = current_schema() AND data_type = 'integer' AND (
+					(table_name = 'operations' AND column_name = 'sequence_number') OR
+					(table_name = 'sync_state' AND column_name = 'max_sequence_number')
+				)
+			`)) as unknown as { table_name: string; column_name: string }[]
+			for (const column of narrowColumns) {
+				await tx.execute(
+					sql.raw(
+						`ALTER TABLE ${quoteIdent(column.table_name)} ALTER COLUMN ${quoteIdent(column.column_name)} TYPE BIGINT`,
+					),
+				)
+			}
+
+			// One operation per (node, sequence) (W3 step 4), enforced by the database where
+			// the existing log allows it. A log written by an older release may already hold
+			// two operations under one sequence: the index is then skipped (in a savepoint,
+			// so the setup transaction survives) and the check inside every append guards
+			// new writes alone.
+			try {
+				await tx.transaction(async (savepoint) => {
+					await savepoint.execute(
+						sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_node_seq_unique ON operations (node_id, sequence_number)`,
+					)
+				})
+			} catch (error) {
+				if (!isUniqueViolation(error)) throw error
+				console.warn(
+					'[kora] The operation log holds operations that share a (node, sequence) pair, so the unique index idx_node_seq_unique was not created. New conflicting writes are still refused (SEQUENCE_CONFLICT).',
+				)
+			}
 
 			// Counter row that assigns delivery sequences in commit order. Every append
 			// does `UPDATE ... value = value + 1 RETURNING value` inside its transaction,

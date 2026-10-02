@@ -4,9 +4,40 @@ import type {
 	Operation,
 	RecordFieldVersions,
 	SchemaDefinition,
+	VersionVector,
 } from '@korajs/core'
+import { KoraError } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+
+/** Rejection code for a second, different operation under an existing (node, sequence). */
+export const SEQUENCE_CONFLICT_CODE = 'SEQUENCE_CONFLICT'
+
+/**
+ * Thrown by a store when an operation claims a `(nodeId, sequenceNumber)` that an
+ * operation with a DIFFERENT id already holds (W3 step 4). A node's sequence numbers
+ * identify its writes: accepting a second operation under the same number would make
+ * one of them invisible to every version-vector delta and to the client's contiguous
+ * acknowledged prefix. Nothing was written. Not retriable: the same bytes always fail.
+ */
+export class SequenceConflictError extends KoraError {
+	constructor(
+		readonly operation: Pick<Operation, 'id' | 'nodeId' | 'sequenceNumber'>,
+		readonly existingOperationId: string,
+	) {
+		super(
+			`Operation "${operation.id}" claims sequence ${String(operation.sequenceNumber)} of node "${operation.nodeId}", which operation "${existingOperationId}" already holds. A node may never reuse a sequence number for different content.`,
+			SEQUENCE_CONFLICT_CODE,
+			{
+				operationId: operation.id,
+				nodeId: operation.nodeId,
+				sequenceNumber: operation.sequenceNumber,
+				existingOperationId,
+			},
+		)
+		this.name = 'SequenceConflictError'
+	}
+}
 
 /**
  * Owner recorded for a node id an admin released (see `ServerStore.releaseNodeClaim`):
@@ -171,8 +202,36 @@ export interface ServerStore extends SyncStore {
 	 * `options.authorize`, the authorization is re-checked atomically with the write
 	 * (see {@link ApplyRemoteOptions}). Stores written before this option existed
 	 * may ignore it; callers always pre-check as well.
+	 *
+	 * Built-in stores throw {@link SequenceConflictError} when a different operation
+	 * already holds the operation's `(nodeId, sequenceNumber)`, and return
+	 * `'duplicate'` (writing nothing) for an operation id already stored, decided
+	 * atomically with the write.
 	 */
 	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
+
+	/**
+	 * The version vector as committed in the shared database, read fresh (SRV-4). A
+	 * store shared by several server instances must implement it: its synchronous
+	 * {@link SyncStore.getVersionVector} can only reflect this instance's own writes.
+	 * Optional; callers fall back to `getVersionVector()`.
+	 */
+	readVersionVector?(): Promise<VersionVector>
+
+	/**
+	 * Several records of one collection by id, as stored (soft-deleted ones included),
+	 * in one read: `id = ANY(...)` on Postgres, chunked `IN (...)` on SQLite (LMS #11).
+	 * Ids with no row are absent from the result. Optional; the delivery stream falls
+	 * back to one lookup per operation without it.
+	 */
+	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
+
+	/**
+	 * The distinct node ids of the operations with `deliverySequence >
+	 * afterDeliverySequence`. Optional; lets a handshake stop judging which nodes a
+	 * scoped client will hear from as soon as every candidate was found visible.
+	 */
+	getNodeIdsAfterDelivery?(afterDeliverySequence: number): Promise<string[]>
 
 	/**
 	 * Bind a client node id to the authenticated principal that first used it.

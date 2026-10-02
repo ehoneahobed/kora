@@ -14,6 +14,13 @@ export interface ReconnectionConfig {
 	maxAttempts?: number
 	/** Jitter factor (0-1). Random variation applied to delay. Defaults to 0.25. */
 	jitter?: number
+	/**
+	 * How long a connection must stay up (see {@link ReconnectionManager.reportConnected})
+	 * before the backoff resets to the initial delay, in ms (SYNC-8). A server that
+	 * accepts sessions and drops them right away therefore keeps backing off instead of
+	 * being retried at the initial interval forever. Defaults to 10000.
+	 */
+	stableAfterMs?: number
 	/** Injectable time source for deterministic testing. */
 	timeSource?: TimeSource
 	/** Injectable random source for deterministic jitter. Returns value in [0, 1). */
@@ -24,6 +31,10 @@ export interface ReconnectionConfig {
  * Manages reconnection attempts with exponential backoff and jitter.
  *
  * Formula: min(initialDelay * multiplier^attempt, maxDelay) * (1 + jitter * (random - 0.5) * 2)
+ *
+ * The attempt counter belongs to the manager, not to one `start()` run (SYNC-8): it
+ * keeps growing across runs and resets only once a connection stayed up for
+ * `stableAfterMs` ({@link reportConnected}), or on an explicit {@link reset}.
  */
 export class ReconnectionManager {
 	private readonly initialDelay: number
@@ -31,12 +42,16 @@ export class ReconnectionManager {
 	private readonly multiplier: number
 	private readonly maxAttempts: number
 	private readonly jitter: number
+	private readonly stableAfterMs: number
 	private readonly random: () => number
 
 	private attempt = 0
 	private timer: ReturnType<typeof setTimeout> | null = null
+	private stableTimer: ReturnType<typeof setTimeout> | null = null
 	private stopped = false
 	private running = false
+	/** A disconnect was reported while an attempt was in flight (NEW-SYNC-2). */
+	private pendingRetry = false
 	private waitResolve: (() => void) | null = null
 
 	constructor(config?: ReconnectionConfig) {
@@ -45,19 +60,26 @@ export class ReconnectionManager {
 		this.multiplier = config?.multiplier ?? 2
 		this.maxAttempts = config?.maxAttempts ?? 0
 		this.jitter = config?.jitter ?? 0.25
+		this.stableAfterMs = config?.stableAfterMs ?? 10_000
 		this.random = config?.randomSource ?? Math.random
 	}
 
 	/**
 	 * Start reconnection attempts. Calls `onReconnect` with exponential backoff.
 	 *
-	 * @param onReconnect - Called on each attempt. Return `true` if reconnection succeeded.
+	 * An attempt counts as successful only when `onReconnect` returns true AND no
+	 * disconnect was reported ({@link requestRetry}) while it ran: a session that
+	 * drops before the attempt returns is retried, never silently lost (NEW-SYNC-2).
+	 *
+	 * @param onReconnect - Called on each attempt. Return `true` if reconnection succeeded
+	 *   (the caller decides what success means; Kora waits for the `streaming` state).
 	 * @returns Promise that resolves when reconnection succeeds or maxAttempts reached.
 	 */
 	async start(onReconnect: () => Promise<boolean>): Promise<boolean> {
 		this.stopped = false
 		this.running = true
-		this.attempt = 0
+		this.pendingRetry = false
+		this.clearStableTimer()
 
 		try {
 			while (!this.stopped) {
@@ -72,10 +94,11 @@ export class ReconnectionManager {
 
 				if (this.stopped) return false
 
+				this.pendingRetry = false
 				try {
 					const success = await onReconnect()
-					if (success) {
-						this.reset()
+					if (this.stopped) return false
+					if (success && !this.pendingRetry) {
 						return true
 					}
 				} catch {
@@ -86,7 +109,45 @@ export class ReconnectionManager {
 			return false
 		} finally {
 			this.running = false
+			this.pendingRetry = false
 		}
+	}
+
+	/**
+	 * Report a disconnect. While a run is in flight it makes the current attempt count
+	 * as failed, so the loop retries (with backoff) instead of exiting on a session
+	 * that already dropped. Returns true when a running loop took the request; false
+	 * means the caller should start a new run.
+	 */
+	requestRetry(): boolean {
+		this.clearStableTimer()
+		if (!this.running) return false
+		this.pendingRetry = true
+		return true
+	}
+
+	/**
+	 * Report that a connection is up (it reached streaming). If it is still up after
+	 * `stableAfterMs`, the backoff resets to the initial delay. A disconnect reported
+	 * before then ({@link requestRetry} or {@link reportDisconnected}) cancels the reset.
+	 */
+	reportConnected(): void {
+		this.clearStableTimer()
+		if (this.stableAfterMs <= 0) {
+			this.attempt = 0
+			return
+		}
+		this.stableTimer = setTimeout(() => {
+			this.stableTimer = null
+			this.attempt = 0
+		}, this.stableAfterMs)
+		const timer = this.stableTimer as { unref?: () => void }
+		timer.unref?.()
+	}
+
+	/** Report that the connection dropped: a pending backoff reset is cancelled. */
+	reportDisconnected(): void {
+		this.clearStableTimer()
 	}
 
 	/**
@@ -109,6 +170,7 @@ export class ReconnectionManager {
 	 */
 	stop(): void {
 		this.stopped = true
+		this.clearStableTimer()
 		if (this.timer !== null) {
 			clearTimeout(this.timer)
 			this.timer = null
@@ -121,11 +183,12 @@ export class ReconnectionManager {
 	}
 
 	/**
-	 * Reset the attempt counter. Call after a successful manual reconnection.
+	 * Reset the attempt counter to the initial delay. Call after a deliberate
+	 * (user-initiated) reconnection. It never clears a {@link stop}: a stopped loop
+	 * stays stopped, so a stop racing a reset cannot resurrect it (SYNC-8).
 	 */
 	reset(): void {
 		this.attempt = 0
-		this.stopped = false
 	}
 
 	/**
@@ -153,6 +216,13 @@ export class ReconnectionManager {
 	 */
 	getAttemptCount(): number {
 		return this.attempt
+	}
+
+	private clearStableTimer(): void {
+		if (this.stableTimer !== null) {
+			clearTimeout(this.stableTimer)
+			this.stableTimer = null
+		}
 	}
 
 	private wait(ms: number): Promise<void> {
