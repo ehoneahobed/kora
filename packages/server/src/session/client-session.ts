@@ -835,10 +835,17 @@ export class ClientSession {
 	 * Retransmit relay batches this client has not acknowledged within `staleMs`.
 	 * Called on a periodic tick by the server (and directly by tests). Redelivering an
 	 * already-applied op is harmless: the client dedups by content-addressed id.
+	 *
+	 * For a delivery-watermark client it re-sends an outstanding (sent, unacknowledged)
+	 * delivery from the acknowledged position, under the same backed-off window as the
+	 * retransmit timer; `staleMs` 0 re-sends at once (a deterministic trigger for tests).
 	 */
 	retransmitPendingRelays(staleMs = 0): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark !== null) {
+			if (this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
+				this.pushDeliveryStreamIfSupported(staleMs, { serverFrontier: this.lastSentDeliverySeq })
+			}
 			return
 		}
 		if (this.pendingRelays.size === 0) return
