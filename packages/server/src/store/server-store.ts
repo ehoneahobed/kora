@@ -1,4 +1,10 @@
-import type { HLCTimestamp, HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
+import type {
+	HLCTimestamp,
+	HybridLogicalClock,
+	Operation,
+	RecordFieldVersions,
+	SchemaDefinition,
+} from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
@@ -225,6 +231,14 @@ export interface ServerStore extends SyncStore {
 	 * scope-entry operation is stamped with it so it never overrides newer client data.
 	 */
 	getRecordLatestTimestamp?(collection: string, recordId: string): Promise<HLCTimestamp | null>
+	/**
+	 * Per-field versions of one live record, folded from its stored operations exactly
+	 * as the materialization folds its values (RT-27): each field's version is the HLC
+	 * of the write that produced its current value, plus the record's first and newest
+	 * operation. Null when the record is deleted or has no operations. A scope-entry
+	 * operation carries them so a receiver resolves every field on its own.
+	 */
+	getRecordFieldVersions?(collection: string, recordId: string): Promise<RecordFieldVersions | null>
 	/** Close the store and release resources */
 	close(): Promise<void>
 

@@ -4,9 +4,12 @@
  */
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
+import { drizzle } from 'drizzle-orm/postgres-js'
+import postgres from 'postgres'
 import { expect, vi } from 'vitest'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
+import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
 
@@ -23,12 +26,40 @@ export interface Harness {
 	login: (token: string, nodeId: string, extra?: Partial<SyncMessage>) => Promise<TestClient>
 }
 
+let pgHarnesses = 0
+
+/**
+ * The store a harness runs on when the test passes none: a MemoryServerStore, or,
+ * with KORA_REPRO_STORE=postgres and KORA_PG_TEST_URL set, a PostgresServerStore in a
+ * fresh schema, so the same repros exercise the Postgres code paths. (Typed as the
+ * memory store for the tests' convenience; both implement ServerStore.)
+ */
+export async function createReproStore(): Promise<MemoryServerStore> {
+	const url = process.env.KORA_PG_TEST_URL
+	if (process.env.KORA_REPRO_STORE !== 'postgres' || !url) {
+		return new MemoryServerStore('server-1')
+	}
+	pgHarnesses += 1
+	const schemaName = `kora_rt_${process.pid}_${pgHarnesses}`
+	const admin = postgres(url, { max: 1 })
+	await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
+	await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+	await admin.end()
+	const client = postgres(url, {
+		max: 4,
+		idle_timeout: 1,
+		connection: { search_path: schemaName },
+	})
+	return new PostgresServerStore(drizzle(client), 'server-1') as unknown as MemoryServerStore
+}
+
 export async function createHarness(
 	schema: SchemaDefinition,
 	auth: AuthProvider | null,
 	extra: Partial<KoraSyncServerConfig> = {},
-	store: MemoryServerStore = new MemoryServerStore('server-1'),
+	storeArg?: MemoryServerStore,
 ): Promise<Harness> {
+	const store = storeArg ?? (await createReproStore())
 	await store.setSchema(schema)
 	const server = new KoraSyncServer({
 		store,

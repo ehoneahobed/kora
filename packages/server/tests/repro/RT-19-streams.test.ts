@@ -74,7 +74,8 @@ function expectEntry(ops: Operation[], history: Operation[]): Operation {
 	expect(entry).toBeDefined()
 	const op = entry as Operation
 	expect(op.data).toMatchObject({ title: 'handover notes', owner: 'bob' })
-	// Never above the record's newest write, so it cannot override newer client data.
+	// Every field carries its own version (RT-27), the newest of which reaches the
+	// record's newest write; the entry itself is stamped at the record's creation.
 	const newest = ops
 		.filter((o) => o.recordId === 'todo-1' && o.id !== op.id)
 		.reduce((max, o) => (HybridLogicalClock.compare(o.timestamp, max) > 0 ? o.timestamp : max), {
@@ -82,7 +83,16 @@ function expectEntry(ops: Operation[], history: Operation[]): Operation {
 			logical: 0,
 			nodeId: '',
 		})
-	expect(HybridLogicalClock.compare(op.timestamp, newest)).toBeGreaterThanOrEqual(0)
+	const versions = Object.values(op.fieldVersions ?? {})
+	expect(Object.keys(op.fieldVersions ?? {}).sort()).toEqual(Object.keys(op.data ?? {}).sort())
+	const entryNewest = versions.reduce(
+		(max, v) => (HybridLogicalClock.compare(v, max) > 0 ? v : max),
+		op.timestamp,
+	)
+	expect(HybridLogicalClock.compare(entryNewest, newest)).toBeGreaterThanOrEqual(0)
+	for (const version of versions) {
+		expect(HybridLogicalClock.compare(version, op.timestamp)).toBeGreaterThanOrEqual(0)
+	}
 	return op
 }
 

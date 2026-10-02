@@ -457,3 +457,21 @@ describe('handshake vector reveals only own and delivered nodes (RT-7)', () => {
 		expect(vector).toHaveProperty('alice-a', 1)
 	})
 })
+
+describe('per-field versions are server-authored only (RT-27)', () => {
+	test('a device-sent fieldVersions is dropped before the operation is stored or relayed', async () => {
+		const { login, store } = await setup()
+		const c = await login('bob-1', 'n-fv')
+		const forged = op('n-fv', {
+			sequenceNumber: 1,
+			fieldVersions: { title: { wallTime: 9_999_999_999_999, logical: 0, nodeId: 'n-fv' } },
+		})
+		c.client.send(batch([forged]))
+		await vi.waitFor(async () =>
+			expect(await store.getOperationRange('n-fv', 1, 1)).toHaveLength(1),
+		)
+		const [stored] = await store.getOperationRange('n-fv', 1, 1)
+		expect(stored?.fieldVersions).toBeUndefined()
+		expect(stored?.id).toBe(forged.id)
+	})
+})

@@ -9,6 +9,7 @@ import {
 	HybridLogicalClock,
 	KoraError,
 	createOperation,
+	expandFieldVersionedOperations,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
@@ -493,9 +494,8 @@ export class ApplyPipeline implements LocalMutationHandler {
 		// atomic chain. Folding fixes both: delete-vs-newer-update convergence and
 		// atomic resurrection (increments before and after the delete compose correctly).
 		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
-		const ops = [...priorOps, op].sort((a, b) =>
-			HybridLogicalClock.compare(a.timestamp, b.timestamp),
-		)
+		// Scope-entry inserts expand into their per-field writes (RT-27); HLC order.
+		const ops = expandFieldVersionedOperations([...priorOps, op])
 		const folded = replayOperationsForRecord(ops)
 
 		if (!folded) {
@@ -613,10 +613,9 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return mergedData
 		}
 		const priorOps = await this.deps.store.getOperationsForRecord(op.collection, op.recordId)
-		// The op being applied is not in the log yet; fold it in at its HLC position.
-		const ops = [...priorOps, op].sort((a, b) =>
-			HybridLogicalClock.compare(a.timestamp, b.timestamp),
-		)
+		// The op being applied is not in the log yet; fold it in at its HLC position
+		// (scope-entry inserts expand into their per-field writes, RT-27).
+		const ops = expandFieldVersionedOperations([...priorOps, op])
 		const folded = replayOperationsForRecord(ops)
 		if (!folded) {
 			return mergedData
@@ -661,9 +660,12 @@ export class ApplyPipeline implements LocalMutationHandler {
 		)) ?? { version: null, fieldVersions: null }
 
 		const snapshot = await this.deps.store.findMaterializedRow(op.collection, op.recordId)
-		if (!snapshot || snapshot.deleted) {
+		if (!snapshot || snapshot.deleted || op.fieldVersions) {
 			// Absent row and insert-vs-tombstone are resolved atomically inside the
-			// store; guard against a local write racing this decision.
+			// store; guard against a local write racing this decision. A server
+			// scope-entry insert (per-field versions, RT-27) is resolved there too, field
+			// by field against `_field_versions`: never as one whole-op merge, whose
+			// single timestamp would override a newer local edit of an older field.
 			return this.deps.store.applyRemoteOperation(op, { guardRowState: guard })
 		}
 

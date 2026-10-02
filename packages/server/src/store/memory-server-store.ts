@@ -1,5 +1,11 @@
-import type { HLCTimestamp, Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import { HybridLogicalClock, generateUUIDv7 } from '@korajs/core'
+import type {
+	HLCTimestamp,
+	Operation,
+	RecordFieldVersions,
+	SchemaDefinition,
+	VersionVector,
+} from '@korajs/core'
+import { HybridLogicalClock, generateUUIDv7, replayFieldVersionsForRecord } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
@@ -169,6 +175,17 @@ export class MemoryServerStore implements ServerStore {
 			}
 		}
 		return latest
+	}
+
+	async getRecordFieldVersions(
+		collection: string,
+		recordId: string,
+	): Promise<RecordFieldVersions | null> {
+		this.assertOpen()
+		const ops = this.operations
+			.filter((op) => op.collection === collection && op.recordId === recordId)
+			.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
+		return replayFieldVersionsForRecord(ops)
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {

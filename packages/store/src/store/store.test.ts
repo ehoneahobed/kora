@@ -174,6 +174,82 @@ describe('Store', () => {
 			expect(store.getVersionVector().get('kora:scope-entry')).toBeUndefined()
 		})
 
+		describe('scope-entry insert with per-field versions (RT-27)', () => {
+			const created = { wallTime: 1_000, logical: 0, nodeId: 'origin' }
+			function scopeEntry(
+				recordId: string,
+				fieldVersions: Operation['fieldVersions'],
+				id = 'scope-entry-rt27',
+			): Operation {
+				return {
+					id,
+					nodeId: 'kora:scope-entry',
+					type: 'insert',
+					collection: 'todos',
+					recordId,
+					data: { title: 'server title', completed: true },
+					previousData: null,
+					timestamp: created,
+					sequenceNumber: 0,
+					causalDeps: [],
+					schemaVersion: 1,
+					fieldVersions,
+				}
+			}
+
+			test('keeps a newer local field and takes a newer server field', async () => {
+				const col = store.collection('todos')
+				const record = await col.insert({ title: 'first' })
+				await col.update(record.id, { title: 'my offline edit' })
+				const later = { wallTime: Date.now() + 1_000, logical: 0, nodeId: 'server' }
+				const entry = scopeEntry(record.id, { title: created, completed: later })
+				expect(await store.applyRemoteOperation(entry)).toBe('applied')
+				expect(await col.findById(record.id)).toMatchObject({
+					title: 'my offline edit',
+					completed: true,
+				})
+				// Idempotent: the same entry again is a no-op.
+				expect(await store.applyRemoteOperation(entry)).toBe('duplicate')
+				expect((await col.findById(record.id))?.title).toBe('my offline edit')
+				// The clock moved past every version the entry carried.
+				const local = await col.update(record.id, { completed: false })
+				expect(local.completed).toBe(false)
+			})
+
+			test('a fresh row gets each field at its own version and the real createdAt', async () => {
+				const col = store.collection('todos')
+				const id = generateUUIDv7()
+				const later = { wallTime: Date.now() + 1_000, logical: 0, nodeId: 'server' }
+				expect(
+					await store.applyRemoteOperation(scopeEntry(id, { title: created, completed: later })),
+				).toBe('applied')
+				const row = await col.findById(id)
+				expect(row).toMatchObject({ title: 'server title', completed: true })
+				expect(row?.createdAt).toBe(created.wallTime)
+				// A remote update older than `completed`'s version loses; newer than title wins.
+				const mid = { wallTime: Date.now(), logical: 0, nodeId: 'peer' }
+				await store.applyRemoteOperation({
+					...scopeEntry(id, undefined, 'peer-update'),
+					nodeId: 'peer',
+					type: 'update',
+					data: { title: 'peer title', completed: false },
+					previousData: { title: 'server title', completed: true },
+					timestamp: mid,
+					sequenceNumber: 1,
+				})
+				expect(await col.findById(id)).toMatchObject({ title: 'peer title', completed: true })
+			})
+
+			test('a newer domain delete is not revived by an older entry', async () => {
+				const col = store.collection('todos')
+				const record = await col.insert({ title: 'x' })
+				await col.delete(record.id)
+				const entry = scopeEntry(record.id, { title: created, completed: created })
+				await store.applyRemoteOperation(entry)
+				expect(await col.findById(record.id)).toBeNull()
+			})
+		})
+
 		test('where query', async () => {
 			const col = store.collection('todos')
 			await col.insert({ title: 'A', completed: true })

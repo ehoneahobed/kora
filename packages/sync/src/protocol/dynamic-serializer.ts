@@ -1,4 +1,4 @@
-import type { Operation, SchemaDefinition } from '@korajs/core'
+import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
 import { SyncError, generateProtoDefinitions } from '@korajs/core'
 import protobuf from 'protobufjs'
 import type {
@@ -23,7 +23,7 @@ function decodeJsonBytes(value: unknown): string | undefined {
 }
 import { isSyncMessage } from './messages'
 import type { EncodedMessage, MessageSerializer } from './serializer'
-import { JsonMessageSerializer } from './serializer'
+import { JsonMessageSerializer, normalizeFieldVersions } from './serializer'
 
 /**
  * Compiled protobuf root and message types, cached after first compilation.
@@ -288,6 +288,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			if (op.mutationName !== undefined) {
 				dataPayload.__kora_mutation__ = op.mutationName
 			}
+			if (op.fieldVersions !== undefined) {
+				dataPayload.__kora_field_versions__ = op.fieldVersions
+			}
 			dataJson = JSON.stringify(dataPayload)
 		} else if (hasMetadata) {
 			const meta: Record<string, unknown> = {}
@@ -524,6 +527,7 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 		let atomicOps: Record<string, unknown> | undefined
 		let transactionId: string | undefined
 		let mutationName: string | undefined
+		let fieldVersions: Record<string, HLCTimestamp> | undefined
 
 		const dataJsonRaw = op.dataJson as string | undefined
 		if ((hasData || (dataJsonRaw && dataJsonRaw.length > 0)) && dataJsonRaw) {
@@ -540,10 +544,14 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 					if ('__kora_mutation__' in parsed) {
 						mutationName = parsed.__kora_mutation__ as string
 					}
+					if ('__kora_field_versions__' in parsed) {
+						fieldVersions = normalizeFieldVersions(parsed.__kora_field_versions__)
+					}
 					const {
 						__kora_atomic_ops__: _a,
 						__kora_tx_id__: _t,
 						__kora_mutation__: _m,
+						__kora_field_versions__: _f,
 						...rest
 					} = parsed
 					data = hasData && Object.keys(rest).length > 0 ? rest : null
@@ -595,6 +603,7 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 				: {}),
 			...(transactionId !== undefined ? { transactionId } : {}),
 			...(mutationName !== undefined ? { mutationName } : {}),
+			...(fieldVersions !== undefined ? { fieldVersions } : {}),
 		}
 	}
 }

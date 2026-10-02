@@ -59,6 +59,14 @@ export interface Operation {
 	transactionId?: string
 	/** Human-readable name for the mutation group (e.g., 'complete-sale'). For DevTools display. */
 	mutationName?: string
+	/**
+	 * Per-field HLC versions, present only on server-synthesized scope-entry inserts
+	 * (RT-27). The entry restates a record's current values; each field carries the
+	 * version of the write that produced it, so a receiver resolves every field by
+	 * last-write-wins against its own field version instead of one whole-row stamp.
+	 * `timestamp` is then the record's creation time. Not part of the content hash.
+	 */
+	fieldVersions?: Record<string, HLCTimestamp>
 }
 
 /**

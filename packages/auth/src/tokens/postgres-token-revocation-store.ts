@@ -1,3 +1,4 @@
+import { ensurePostgresSchema } from '../postgres/ensure-schema'
 import type { ConsumeResult, TokenRevocationStore } from './token-manager'
 
 /**
@@ -29,27 +30,30 @@ export class PostgresTokenRevocationStore implements TokenRevocationStore {
 	}
 
 	private async ensureTables(): Promise<void> {
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_token_revocations (
-				jti TEXT PRIMARY KEY,
-				expires_at BIGINT NOT NULL
-			)
-		`
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_token_consumptions (
-				jti TEXT PRIMARY KEY,
-				consumed_at BIGINT NOT NULL,
-				expires_at BIGINT NOT NULL
-			)
-		`
-		await this.sql`
-			CREATE TABLE IF NOT EXISTS auth_token_cutoffs (
-				kind TEXT NOT NULL,
-				subject_id TEXT NOT NULL,
-				revoked_before BIGINT NOT NULL,
-				PRIMARY KEY (kind, subject_id)
-			)
-		`
+		// Concurrency-safe on an empty database shared by several instances.
+		await ensurePostgresSchema(this.sql, async (sql) => {
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_token_revocations (
+					jti TEXT PRIMARY KEY,
+					expires_at BIGINT NOT NULL
+				)
+			`
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_token_consumptions (
+					jti TEXT PRIMARY KEY,
+					consumed_at BIGINT NOT NULL,
+					expires_at BIGINT NOT NULL
+				)
+			`
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_token_cutoffs (
+					kind TEXT NOT NULL,
+					subject_id TEXT NOT NULL,
+					revoked_before BIGINT NOT NULL,
+					PRIMARY KEY (kind, subject_id)
+				)
+			`
+		})
 	}
 
 	async isRevoked(jti: string): Promise<boolean> {

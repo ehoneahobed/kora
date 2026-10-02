@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { SchemaDefinition } from '@korajs/core'
-import { KoraSyncServer, MemoryServerStore } from '@korajs/server'
+import { KoraSyncServer, MemoryServerStore, PostgresServerStore } from '@korajs/server'
 import type { KoraSyncServerConfig, ServerTransport } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
@@ -32,11 +34,50 @@ export interface ScopedNetwork {
 	close: () => Promise<void>
 }
 
+let pgNetworks = 0
+
+/**
+ * The store a network runs on when the test passes none: a MemoryServerStore, or,
+ * with KORA_REPRO_STORE=postgres and KORA_PG_TEST_URL set, a PostgresServerStore in a
+ * fresh schema, so the same repros exercise the Postgres code paths end to end.
+ * `postgres` and `drizzle-orm` are resolved through @korajs/server's dependencies.
+ * (Typed as the memory store for the tests' convenience; both implement ServerStore.)
+ */
+async function defaultNetworkStore(): Promise<MemoryServerStore> {
+	const url = process.env.KORA_PG_TEST_URL
+	if (process.env.KORA_REPRO_STORE !== 'postgres' || !url) {
+		return new MemoryServerStore()
+	}
+	const serverRequire = createRequire(
+		new URL('../../../server/package.json', import.meta.url).pathname,
+	)
+	const load = async (specifier: string): Promise<unknown> =>
+		import(pathToFileURL(serverRequire.resolve(specifier)).href)
+	const postgres = ((await load('postgres')) as { default: PostgresFactory }).default
+	const { drizzle } = (await load('drizzle-orm/postgres-js')) as {
+		drizzle: (client: unknown) => ConstructorParameters<typeof PostgresServerStore>[0]
+	}
+	pgNetworks += 1
+	const schemaName = `kora_net_${process.pid}_${pgNetworks}`
+	const admin = postgres(url, { max: 1 })
+	await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
+	await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+	await admin.end()
+	const client = postgres(url, { max: 4, idle_timeout: 1, connection: { search_path: schemaName } })
+	return new PostgresServerStore(drizzle(client), 'server-pg') as unknown as MemoryServerStore
+}
+
+type PostgresFactory = (
+	url: string,
+	options: Record<string, unknown>,
+) => { unsafe: (query: string) => Promise<unknown>; end: () => Promise<void> }
+
 export async function scopedNetwork(
 	schema: SchemaDefinition,
 	config: Omit<KoraSyncServerConfig, 'store'>,
-	store: MemoryServerStore = new MemoryServerStore(),
+	storeArg?: MemoryServerStore,
 ): Promise<ScopedNetwork> {
+	const store = storeArg ?? (await defaultNetworkStore())
 	await store.setSchema(schema)
 	const server = new KoraSyncServer({
 		store,

@@ -25,6 +25,8 @@ export interface SerializedOperation {
 	transactionId?: string
 	/** Human-readable name for the mutation group. For DevTools display. */
 	mutationName?: string
+	/** Per-field versions of a server scope-entry insert (RT-27). Server-authored only. */
+	fieldVersions?: Record<string, HLCTimestamp>
 }
 
 /**
