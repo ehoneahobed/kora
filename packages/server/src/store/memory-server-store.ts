@@ -1,5 +1,5 @@
-import type { Operation, SchemaDefinition, VersionVector } from '@korajs/core'
-import { generateUUIDv7 } from '@korajs/core'
+import type { HLCTimestamp, Operation, SchemaDefinition, VersionVector } from '@korajs/core'
+import { HybridLogicalClock, generateUUIDv7 } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
@@ -8,7 +8,7 @@ import {
 	serializeFieldValue,
 	validateFieldName,
 } from './materialization'
-import { replayScopeSnapshots, scopeValuesOf } from './scope-snapshot'
+import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -45,6 +45,8 @@ export class MemoryServerStore implements ServerStore {
 	private readonly nodeOwners = new Map<string, string>()
 	/** Operation id -> scope snapshot captured at apply time (RT-14). */
 	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
+	/** Fields the current snapshots were captured with (RT-20). */
+	private snapshotFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
 
@@ -82,6 +84,12 @@ export class MemoryServerStore implements ServerStore {
 
 		// Backfill from existing operations
 		this.backfillAllCollections()
+		// A change in the fields snapshots capture invalidates every snapshot (RT-20).
+		const fingerprint = scopeSnapshotFingerprint(schema)
+		if (fingerprint !== this.snapshotFingerprint) {
+			this.scopeSnapshots.clear()
+			this.snapshotFingerprint = fingerprint
+		}
 		this.backfillScopeSnapshots()
 	}
 
@@ -146,6 +154,21 @@ export class MemoryServerStore implements ServerStore {
 			if (snapshot) result.set(id, snapshot)
 		}
 		return result
+	}
+
+	async getRecordLatestTimestamp(
+		collection: string,
+		recordId: string,
+	): Promise<HLCTimestamp | null> {
+		this.assertOpen()
+		let latest: HLCTimestamp | null = null
+		for (const op of this.operations) {
+			if (op.collection !== collection || op.recordId !== recordId) continue
+			if (latest === null || HybridLogicalClock.compare(op.timestamp, latest) > 0) {
+				latest = op.timestamp
+			}
+		}
+		return latest
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {

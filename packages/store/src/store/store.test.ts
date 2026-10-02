@@ -112,6 +112,35 @@ describe('Store', () => {
 			expect(await store.getOperationRange('test-node', 1, 100)).toEqual(before)
 		})
 
+		test('an insert for a retracted row shows it again and merges per field (RT-19)', async () => {
+			const col = store.collection('todos')
+			const record = await col.insert({ title: 'Stale copy' })
+			await store.applyScopeRetraction('todos', record.id)
+
+			// A scope-entry insert stamped before the local write loses that field's LWW
+			// comparison only where this device is newer; here it is newer than the row.
+			const entry: Operation = {
+				id: 'scope-entry-test',
+				nodeId: 'kora:scope-entry',
+				type: 'insert',
+				collection: 'todos',
+				recordId: record.id,
+				data: { title: 'Current title', completed: true },
+				previousData: null,
+				timestamp: { wallTime: Date.now() + 1000, logical: 0, nodeId: 'remote' },
+				sequenceNumber: 0,
+				causalDeps: [],
+				schemaVersion: 1,
+			}
+			expect(await store.applyRemoteOperation(entry)).toBe('applied')
+			expect(await col.findById(record.id)).toMatchObject({
+				title: 'Current title',
+				completed: true,
+			})
+			// The system node never enters the version vector (sequence 0).
+			expect(store.getVersionVector().get('kora:scope-entry')).toBeUndefined()
+		})
+
 		test('where query', async () => {
 			const col = store.collection('todos')
 			await col.insert({ title: 'A', completed: true })

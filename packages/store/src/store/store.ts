@@ -376,6 +376,47 @@ export class Store implements OperationLog {
 					// inside this same transaction. Per-field LWW makes the result
 					// identical to what an in-order device computed.
 					await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+				} else if (
+					row._deleted === 1 &&
+					(
+						await tx.query<{ record_id: string }>(
+							'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+							[collection, op.recordId],
+						)
+					).length > 0
+				) {
+					// The row is hidden by a scope retraction (a view change, not a domain
+					// delete) and the record is entering the scope again, typically through
+					// a server scope-entry insert (RT-19). Show it again and merge per field,
+					// exactly like an insert collision on a live row: fields this device
+					// holds newer versions of are kept.
+					const { winners, merged } = resolvePerFieldLww(
+						parseFieldVersions(row._field_versions),
+						Object.keys(serializedData),
+						remoteVersion,
+						typeof row._version === 'string' ? row._version : undefined,
+					)
+					const fieldChanges: Record<string, unknown> = {
+						_deleted: 0,
+						_field_versions: serializeFieldVersions(merged),
+					}
+					for (const field of winners) {
+						fieldChanges[field] = serializedData[field]
+					}
+					// `_created_at` is left alone: the record was created long before it
+					// re-entered this device's view.
+					const reactivate = buildFieldFastForwardUpdateQuery(
+						collection,
+						op.recordId,
+						fieldChanges,
+						remoteVersion,
+						wallTime,
+					)
+					await tx.execute(reactivate.sql, reactivate.params)
+					await tx.execute(
+						'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
 				} else if (row._deleted === 1) {
 					// Insert vs tombstone: a strictly newer insert resurrects the record
 					// with its full field set; an older one is stale (delete wins).

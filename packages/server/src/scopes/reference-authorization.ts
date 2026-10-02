@@ -23,6 +23,13 @@ export interface ReferenceAuthorizationContext {
 	 * Undefined means an unscoped writer (no tenant boundary): nothing is checked.
 	 */
 	downlinkScopes: ScopeMap | undefined
+	/**
+	 * What the writer may WRITE (its uplink scope), when it differs from what it may
+	 * read. A foreign-key parent inside it is accepted too (RT-22): a respondent may
+	 * attach answers to the submission it just created even though it can never read
+	 * submissions back. Blob references are still judged on the download scope only.
+	 */
+	uplinkScopes?: ScopeMap | undefined
 	/** Reads a stored row, inside the writer's transaction when one is available. */
 	readRow: StoredRowReader
 	/** Blob reference authority (RT-11). Without it blob fields are not checked. */
@@ -37,7 +44,8 @@ export interface ReferenceAuthorizationContext {
  *
  * - **Foreign keys (RT-13).** For an insert, or an update that sets a relation field,
  *   the referenced parent must exist (a soft-deleted parent counts, as stored) and be
- *   inside the writer's download scope. Otherwise a tenant could hang a child under
+ *   inside the writer's download scope or its upload scope (RT-22: a record the writer
+ *   was allowed to create, even if it cannot read it back). Otherwise a tenant could hang a child under
  *   another tenant's record (leaving its owner unable to delete it under `restrict`,
  *   or probing which ids exist).
  * - **Blob references (RT-11).** Every hash a blob field makes readable (its
@@ -72,7 +80,15 @@ export async function authorizeOperationReferences(
 			return violation(op, relation.field, 'the referenced record id is not a string')
 		}
 		const parent = await context.readRow(relation.to, target)
-		if (!parent || !recordMatchesScopes(relation.to, { ...parent, id: target }, downlinkScopes)) {
+		const parentRow = parent ? { ...parent, id: target } : null
+		// The parent must be a record the writer could read OR could have written itself
+		// (RT-22). A parent in neither scope belongs to another tenant (RT-13).
+		const reachable =
+			parentRow !== null &&
+			(recordMatchesScopes(relation.to, parentRow, downlinkScopes) ||
+				(context.uplinkScopes !== undefined &&
+					recordMatchesScopes(relation.to, parentRow, context.uplinkScopes)))
+		if (!reachable) {
 			return violation(
 				op,
 				relation.field,

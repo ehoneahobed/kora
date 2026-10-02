@@ -56,7 +56,10 @@ import {
 	normalizeScopeMap,
 	operationMatchesScopes,
 	recordMatchesScopes,
+	snapshotEntersScopes,
 	snapshotExitsScopes,
+	snapshotLacksScopeFields,
+	snapshotValuesWithFallback,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type {
@@ -68,6 +71,7 @@ import type {
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
+import { buildScopeEntryOperation } from './scope-entry'
 import {
 	DEFAULT_MAX_OPERATION_BYTES,
 	DEFAULT_MAX_OPS_PER_BATCH,
@@ -121,8 +125,12 @@ async function anonymousNodeOwner(nodeToken: string): Promise<string> {
 	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await hashBlob(new TextEncoder().encode(nodeToken))}`
 }
 
-/** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
-export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
+/**
+ * Session-ending error codes, all retriable. `AUTH_REVOKED` / `AUTH_EXPIRED`: the
+ * client refreshes its credential and re-handshakes. `SCOPE_CHANGED` (RT-26): the
+ * principal's grant changed; the client simply reconnects and gets the new scope.
+ */
+export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED' | 'SCOPE_CHANGED'
 
 /**
  * Same principal for re-validation: the same user and device, or both anonymous
@@ -392,6 +400,8 @@ export class ClientSession {
 	private nodeOwnerKey: string | null = null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
 	private credential: string | null = null
+	/** The scope the client asked for at handshake, kept to re-resolve scopes (RT-26). */
+	private handshakeScope: HandshakeMessage['syncScope'] = undefined
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	private resumeDeltaCursor: DeltaCursor | null = null
@@ -618,6 +628,9 @@ export class ClientSession {
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
 			if (await this.operationVisibleToClient(op, snapshot)) {
+				// A record entering the scope arrives whole, before the op that moved it (RT-19).
+				const entry = await this.scopeEntryFor(op, snapshot)
+				if (entry) visibleOperations.push(entry)
 				visibleOperations.push(op)
 			} else if (await this.scopeRetractionFor(op, snapshot)) {
 				retractions.push({ collection: op.collection, recordId: op.recordId })
@@ -773,10 +786,34 @@ export class ClientSession {
 		}
 		// The session may have closed (or re-authenticated) while the provider ran.
 		if (this.getState() === 'closed' || this.principal !== principal) return 'valid'
-		if (context && samePrincipal(principal, context)) return 'valid'
+		if (context && samePrincipal(principal, context)) {
+			// Same principal: the grant may still have changed (a role or team change).
+			// A session whose resolved scopes differ is ended so the client reconnects and
+			// is handed its new scope at handshake (RT-26).
+			if (this.scopesChangedFor(context)) {
+				this.terminate('SCOPE_CHANGED')
+				return 'terminated'
+			}
+			return 'valid'
+		}
 		const expired = principal.expiresAt !== undefined && Date.now() >= principal.expiresAt
 		this.terminate(expired ? 'AUTH_EXPIRED' : 'AUTH_REVOKED')
 		return 'terminated'
+	}
+
+	/**
+	 * True when `context` (a fresh authentication of this session's principal)
+	 * resolves to download or upload scopes other than the ones this session holds.
+	 * A grant that no longer resolves at all counts as changed.
+	 */
+	private scopesChangedFor(context: AuthContext): boolean {
+		if (this.state !== 'streaming' && this.state !== 'syncing') return false
+		const resolution = this.computeSessionScopes(context, this.handshakeScope)
+		if (!resolution.ok) return true
+		return (
+			!sameScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
+			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+		)
 	}
 
 	/**
@@ -797,9 +834,17 @@ export class ClientSession {
 		const message =
 			code === 'AUTH_EXPIRED'
 				? 'The credential for this sync session expired. Refresh it and reconnect.'
-				: 'The credential for this sync session was revoked. Refresh it and reconnect.'
+				: code === 'SCOPE_CHANGED'
+					? 'The sync scope granted to this session changed. Reconnect to receive the new scope.'
+					: 'The credential for this sync session was revoked. Refresh it and reconnect.'
 		this.sendError(code, message, true)
-		this.close(code === 'AUTH_EXPIRED' ? 'credential expired' : 'credential revoked')
+		this.close(
+			code === 'AUTH_EXPIRED'
+				? 'credential expired'
+				: code === 'SCOPE_CHANGED'
+					? 'sync scope changed'
+					: 'credential revoked',
+		)
 	}
 
 	/**
@@ -1113,6 +1158,7 @@ export class ClientSession {
 		return authorizeOperationReferences(op, stored, {
 			schema,
 			downlinkScopes: scopes,
+			uplinkScopes: this.uplinkScopes(),
 			readRow: async (collection, recordId) =>
 				(await this.lookupRecordFields(collection, recordId)) ?? null,
 			...(this.blobAccess ? { blobs: this.blobAccess } : {}),
@@ -1228,83 +1274,17 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
-		// Resolve download and upload authorization independently. The legacy `scopes`
-		// contract remains shorthand for both directions.
-		const directionalScopesConfigured =
-			this.authContext?.downlinkScopes !== undefined || this.authContext?.uplinkScopes !== undefined
-		const downlinkAuthScopes = directionalScopesConfigured
-			? (this.authContext?.downlinkScopes ?? this.authContext?.scopes ?? {})
-			: this.authContext?.scopes
-		const uplinkAuthScopes = directionalScopesConfigured
-			? (this.authContext?.uplinkScopes ?? this.authContext?.scopes ?? {})
-			: this.authContext?.scopes
-		// A real auth provider that grants nothing for a schema-scoped collection is
-		// refused, never handed the scope the client asked for (AUTH-1). A schemaless
-		// server has no scoped collections to protect, so it keeps the provider's
-		// (absent) grant as "unscoped" and the multi-tenant warning below.
-		const authenticated =
-			this.auth !== null &&
-			!(this.auth instanceof NoAuthProvider) &&
-			this.store.getSchema() !== null
-		let rawResolvedDownlinkScopes: ReturnType<typeof resolveSessionScopes>
-		let rawResolvedUplinkScopes: ReturnType<typeof resolveSessionScopes>
-		try {
-			rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
-				handshakeScope: msg.syncScope,
-				authScopes: downlinkAuthScopes,
-				authenticated,
-				onUnresolved: 'throw',
-			})
-			// A directional uplink grant goes through the same resolver as the downlink one
-			// (RT-16): verified `$claims` are bound to the schema, an unresolved binding
-			// denies the collection (fail closed; the session may still read), and the
-			// handshake can only narrow it, exactly as for a non-directional grant.
-			rawResolvedUplinkScopes = directionalScopesConfigured
-				? resolveSessionScopes(this.store.getSchema(), {
-						handshakeScope: msg.syncScope,
-						authScopes: uplinkAuthScopes,
-						authenticated,
-						onUnresolved: 'deny',
-					})
-				: rawResolvedDownlinkScopes
-		} catch (error) {
-			if (error instanceof InvalidScopePredicateError) {
-				this.sendError('INVALID_SCOPE_PREDICATE', error.message, false)
-				this.close('invalid scope predicate')
-				return
-			}
-			if (!(error instanceof ScopeRequiredError)) throw error
-			this.sendError('SCOPE_REQUIRED', error.message, false)
-			this.close('sync scope required')
+		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
+		if (!resolution.ok) {
+			this.sendError(resolution.code, resolution.message, false)
+			this.close(resolution.reason)
 			return
 		}
-		let resolvedDownlinkScopes: typeof rawResolvedDownlinkScopes
-		let resolvedUplinkScopes: typeof rawResolvedUplinkScopes
-		try {
-			resolvedDownlinkScopes = rawResolvedDownlinkScopes
-				? normalizeScopeMap(rawResolvedDownlinkScopes)
-				: directionalScopesConfigured
-					? {}
-					: undefined
-			resolvedUplinkScopes = rawResolvedUplinkScopes
-				? normalizeScopeMap(rawResolvedUplinkScopes)
-				: directionalScopesConfigured
-					? {}
-					: undefined
-		} catch (error) {
-			this.sendToClient({
-				type: 'error',
-				messageId: generateUUIDv7(),
-				code:
-					error instanceof InvalidScopePredicateError
-						? 'INVALID_SCOPE_PREDICATE'
-						: 'SCOPE_PREDICATE_LIMIT',
-				message: error instanceof Error ? error.message : 'Invalid scope predicate',
-				retriable: false,
-			})
-			this.close('invalid scope predicate')
-			return
-		}
+		this.handshakeScope = msg.syncScope
+		const resolvedDownlinkScopes = resolution.downlink
+		const resolvedUplinkScopes = resolution.uplink
+		const authenticated = resolution.authenticated
+		const downlinkAuthScopes = resolution.downlinkAuthScopes
 
 		if (resolvedDownlinkScopes || resolvedUplinkScopes) {
 			if (this.authContext) {
@@ -1499,6 +1479,103 @@ export class ClientSession {
 		// push (or the retransmit tick), which resumes from the client's acknowledged
 		// position. Draining here would re-scan from the not-yet-advanced acknowledged
 		// position and re-send the whole handshake stream.
+	}
+
+	/**
+	 * Resolve this session's download and upload scopes from an auth context and the
+	 * scope the client asked for at handshake. Side-effect free, so revalidation can
+	 * recompute it and compare (RT-26). The legacy `scopes` contract remains shorthand
+	 * for both directions.
+	 */
+	private computeSessionScopes(
+		context: AuthContext | null,
+		handshakeScope: HandshakeMessage['syncScope'],
+	):
+		| {
+				ok: true
+				downlink: ScopeMap | undefined
+				uplink: ScopeMap | undefined
+				downlinkAuthScopes: ScopeMap | undefined
+				authenticated: boolean
+		  }
+		| { ok: false; code: string; message: string; reason: string } {
+		const directionalScopesConfigured =
+			context?.downlinkScopes !== undefined || context?.uplinkScopes !== undefined
+		const downlinkAuthScopes = directionalScopesConfigured
+			? (context?.downlinkScopes ?? context?.scopes ?? {})
+			: context?.scopes
+		const uplinkAuthScopes = directionalScopesConfigured
+			? (context?.uplinkScopes ?? context?.scopes ?? {})
+			: context?.scopes
+		// A real auth provider that grants nothing for a schema-scoped collection is
+		// refused, never handed the scope the client asked for (AUTH-1). A schemaless
+		// server has no scoped collections to protect, so it keeps the provider's
+		// (absent) grant as "unscoped" and the multi-tenant warning.
+		const authenticated =
+			this.auth !== null &&
+			!(this.auth instanceof NoAuthProvider) &&
+			this.store.getSchema() !== null
+		let rawDownlink: ReturnType<typeof resolveSessionScopes>
+		let rawUplink: ReturnType<typeof resolveSessionScopes>
+		try {
+			rawDownlink = resolveSessionScopes(this.store.getSchema(), {
+				handshakeScope,
+				authScopes: downlinkAuthScopes,
+				authenticated,
+				onUnresolved: 'throw',
+			})
+			// A directional uplink grant goes through the same resolver as the downlink one
+			// (RT-16): verified `$claims` are bound to the schema, an unresolved binding
+			// denies the collection (fail closed; the session may still read), and the
+			// handshake can only narrow it, exactly as for a non-directional grant.
+			rawUplink = directionalScopesConfigured
+				? resolveSessionScopes(this.store.getSchema(), {
+						handshakeScope,
+						authScopes: uplinkAuthScopes,
+						authenticated,
+						onUnresolved: 'deny',
+					})
+				: rawDownlink
+		} catch (error) {
+			if (error instanceof InvalidScopePredicateError) {
+				return {
+					ok: false,
+					code: 'INVALID_SCOPE_PREDICATE',
+					message: error.message,
+					reason: 'invalid scope predicate',
+				}
+			}
+			if (!(error instanceof ScopeRequiredError)) throw error
+			return {
+				ok: false,
+				code: 'SCOPE_REQUIRED',
+				message: error.message,
+				reason: 'sync scope required',
+			}
+		}
+		try {
+			const downlink = rawDownlink
+				? normalizeScopeMap(rawDownlink)
+				: directionalScopesConfigured
+					? {}
+					: undefined
+			const uplink = rawUplink
+				? normalizeScopeMap(rawUplink)
+				: directionalScopesConfigured
+					? {}
+					: undefined
+			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
+		} catch (error) {
+			return {
+				ok: false,
+				code:
+					error instanceof InvalidScopePredicateError
+						? 'INVALID_SCOPE_PREDICATE'
+						: 'SCOPE_PREDICATE_LIMIT',
+				message: error instanceof Error ? error.message : 'Invalid scope predicate',
+				reason: 'invalid scope predicate',
+			}
+		}
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -1746,7 +1823,10 @@ export class ClientSession {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
-					if (await this.operationVisibleToClient(op, snapshots.get(op.id) ?? null)) {
+					const snapshot = snapshots.get(op.id) ?? null
+					if (await this.operationVisibleToClient(op, snapshot)) {
+						const entry = await this.scopeEntryFor(op, snapshot)
+						if (entry) missing.push(entry)
 						missing.push(op)
 					}
 				}
@@ -1846,7 +1926,7 @@ export class ClientSession {
 		const scanChunk = Math.max(this.batchSize, 1) * 5
 		let scanCursor = fromDeliverySeq
 		let maxScanned = fromDeliverySeq
-		const deliverable: Array<DeliveredOperation & { retraction?: boolean }> = []
+		const deliverable: DeliverableOperation[] = []
 
 		while (true) {
 			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
@@ -1867,6 +1947,16 @@ export class ClientSession {
 				}
 				const snapshot = delivered.scopeSnapshot ?? null
 				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
+					// The scope-entry shares the trigger's delivery sequence and precedes it,
+					// so a resend from any watermark regenerates it (same id) with its trigger.
+					const entry = await this.scopeEntryFor(delivered.operation, snapshot)
+					if (entry) {
+						deliverable.push({
+							operation: entry,
+							deliverySequence: delivered.deliverySequence,
+							scopeEntry: true,
+						})
+					}
 					deliverable.push(delivered)
 				} else if (await this.scopeRetractionFor(delivered.operation, snapshot)) {
 					deliverable.push({ ...delivered, retraction: true })
@@ -1896,10 +1986,21 @@ export class ClientSession {
 			return { sentOperations: 0, maxScanned, sent }
 		}
 
-		const totalBatches = Math.ceil(deliverable.length / this.batchSize)
+		// Chunk into batches. A batch never ends on a scope entry: the entry and the
+		// operation that triggered it share one delivery sequence, and a batch max of
+		// that sequence would claim the trigger was delivered too.
+		const slices: DeliverableOperation[][] = []
+		let start = 0
+		while (start < deliverable.length) {
+			let end = Math.min(start + Math.max(this.batchSize, 1), deliverable.length)
+			while (end < deliverable.length && deliverable[end - 1]?.scopeEntry === true) end += 1
+			slices.push(deliverable.slice(start, end))
+			start = end
+		}
+		const totalBatches = slices.length
 		let base = fromDeliverySeq
 		for (let i = 0; i < totalBatches; i++) {
-			const slice = deliverable.slice(i * this.batchSize, (i + 1) * this.batchSize)
+			const slice = slices[i] ?? []
 			const lastInSlice = slice[slice.length - 1]
 			if (lastInSlice === undefined) continue
 			const isFinal = i === totalBatches - 1
@@ -1919,7 +2020,7 @@ export class ClientSession {
 
 	/** Build, track, and send one chained delivery-stream batch. */
 	private sendDeliveryBatch(
-		slice: Array<DeliveredOperation & { retraction?: boolean }>,
+		slice: DeliverableOperation[],
 		base: number,
 		max: number,
 		batchIndex: number,
@@ -1991,11 +2092,19 @@ export class ClientSession {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
 		if (snapshot?.post) {
-			if (!recordMatchesScopes(op.collection, { ...snapshot.post, id: op.recordId }, scopes)) {
+			// A snapshot captured before a scope field existed lacks it: judge that field
+			// on the current row instead of as "no value" (RT-20).
+			let current: MaterializedRecord | undefined
+			let post: Record<string, unknown> | null = snapshot.post
+			if (snapshotLacksScopeFields(op.collection, { pre: null, post }, scopes)) {
+				current = await this.lookupRecordFields(op.collection, op.recordId)
+				post = snapshotValuesWithFallback(op.collection, post, scopes, current)
+			}
+			if (!post || !recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)) {
 				return false
 			}
 			if (subsets.length === 0) return true
-			const current = await this.lookupRecordFields(op.collection, op.recordId)
+			current ??= await this.lookupRecordFields(op.collection, op.recordId)
 			return operationMatchesQuerySubsets(op, subsets, current)
 		}
 		// Visibility is judged on the server-materialized row plus op.data, never on the
@@ -2065,7 +2174,54 @@ export class ClientSession {
 		if (this.scopeExitPolicy !== 'retract') return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!scopes || !snapshot) return false
-		return snapshotExitsScopes(op, snapshot, scopes)
+		const current = snapshotLacksScopeFields(op.collection, snapshot, scopes)
+			? await this.lookupRecordFields(op.collection, op.recordId)
+			: undefined
+		return snapshotExitsScopes(op, snapshot, scopes, current)
+	}
+
+	/**
+	 * The scope-entry operation to send before `op` when `op` moved an existing record
+	 * into this session's download scope (RT-19), or null. Judged on the store's own
+	 * pre/post snapshot; built from the record's CURRENT row, and only while that row
+	 * is live and still inside the scope (a record that has since left again, or was
+	 * deleted, gets no entry: its later operations retract or delete it anyway).
+	 * Operations without a snapshot (legacy rows, custom stores) never produce one.
+	 */
+	private async scopeEntryFor(
+		op: Operation,
+		snapshot: OperationScopeSnapshot | null,
+	): Promise<Operation | null> {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const schema = this.store.getSchema()
+		if (!scopes || !snapshot || !schema || op.type !== 'update') return null
+		// Cheap pre-check on the snapshot alone; the row is read only for a candidate.
+		if (
+			!snapshotLacksScopeFields(op.collection, snapshot, scopes) &&
+			!snapshotEntersScopes(op, snapshot, scopes)
+		) {
+			return null
+		}
+		const current = await this.lookupRecordFields(op.collection, op.recordId)
+		if (!current || current._deleted === 1 || current._deleted === true) return null
+		if (!snapshotEntersScopes(op, snapshot, scopes, current)) return null
+		if (!recordMatchesScopes(op.collection, { ...current, id: op.recordId }, scopes)) return null
+		let timestamp = op.timestamp
+		if (this.store.getRecordLatestTimestamp) {
+			try {
+				timestamp =
+					(await this.store.getRecordLatestTimestamp(op.collection, op.recordId)) ?? timestamp
+			} catch {
+				// Fall back to the trigger's timestamp: still at or above every field it wrote.
+			}
+		}
+		return buildScopeEntryOperation({
+			trigger: op,
+			row: current,
+			schema,
+			timestamp,
+			schemaVersion: this.schemaVersion,
+		})
 	}
 
 	/**
@@ -2174,9 +2330,15 @@ export class ClientSession {
 
 /** Delivery-log operations collected for one session, before they are batched. */
 interface CollectedDeliveryStream {
-	deliverable: Array<DeliveredOperation & { retraction?: boolean }>
+	deliverable: DeliverableOperation[]
 	maxScanned: number
 }
+
+/**
+ * One item of a session's delivery stream: a stored operation, a retraction of its
+ * record, or a synthesized scope entry sharing the triggering operation's sequence.
+ */
+type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEntry?: boolean }
 
 function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
 	if (supportedWireFormats?.includes('protobuf')) {

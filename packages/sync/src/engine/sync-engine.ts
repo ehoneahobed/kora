@@ -1506,7 +1506,10 @@ export class SyncEngine {
 			: deserialized
 
 		// Inbound filtering still uses the combined predicate; removing it is SYNC-2 (W4).
-		const inScopeOps = await this.filterAllowedForSync(operations)
+		// It is judged per operation, in apply order: a partial update that does not
+		// restate the scope field is judged on the record as materialized by the earlier
+		// operations of the same batch (its insert, or a scope-entry insert, RT-19).
+		const inScopeOps: Operation[] = []
 
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
 		const transforms = this.config.operationTransforms ?? []
@@ -1527,7 +1530,11 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 
 		// Apply each in-scope operation; per-op failures must not block batch ACK
-		for (const op of inScopeOps) {
+		for (const op of operations) {
+			if (!(await this.operationAllowedForSync(op))) {
+				continue
+			}
+			inScopeOps.push(op)
 			const transformed =
 				transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
 			if (transformed === null) {
@@ -2364,16 +2371,6 @@ export class SyncEngine {
 		const allowed: Operation[] = []
 		for (const op of ops) {
 			if (await this.operationAllowedForUpload(op)) {
-				allowed.push(op)
-			}
-		}
-		return allowed
-	}
-
-	private async filterAllowedForSync(ops: Operation[]): Promise<Operation[]> {
-		const allowed: Operation[] = []
-		for (const op of ops) {
-			if (await this.operationAllowedForSync(op)) {
 				allowed.push(op)
 			}
 		}

@@ -1,4 +1,4 @@
-import type { HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
+import type { HLCTimestamp, HybridLogicalClock, Operation, SchemaDefinition } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
@@ -207,6 +207,12 @@ export interface ServerStore extends SyncStore {
 	 * Operations without one are absent from the result.
 	 */
 	getOperationScopeSnapshots?(operationIds: string[]): Promise<Map<string, OperationScopeSnapshot>>
+	/**
+	 * The greatest HLC timestamp among every stored operation of one record (its
+	 * newest field write), or null when the record has no operations (RT-19). A
+	 * scope-entry operation is stamped with it so it never overrides newer client data.
+	 */
+	getRecordLatestTimestamp?(collection: string, recordId: string): Promise<HLCTimestamp | null>
 	/** Close the store and release resources */
 	close(): Promise<void>
 
