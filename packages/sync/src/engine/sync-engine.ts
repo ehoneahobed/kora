@@ -1728,6 +1728,14 @@ export class SyncEngine {
 
 		if (msg.accepted) {
 			this.credentialRefreshRequired = false
+			// W7: server node ids authoritative for merge('server-authoritative') fields.
+			// Read structurally: the protocol field lands with protocol v2.
+			const authoritative = (msg as { authoritativeNodeIds?: unknown }).authoritativeNodeIds
+			if (Array.isArray(authoritative) && this.store.setAuthoritativeNodeIds) {
+				await this.store.setAuthoritativeNodeIds(
+					authoritative.filter((id): id is string => typeof id === 'string'),
+				)
+			}
 		}
 
 		if (!msg.accepted) {

@@ -11,6 +11,7 @@ export type {
 	BlobApi,
 	BlobOptions,
 	KoraApp,
+	ExperimentalOptions,
 	KoraConfig,
 	LocalDatabaseInfo,
 	StorageApi,

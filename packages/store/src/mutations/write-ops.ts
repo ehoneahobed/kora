@@ -101,21 +101,27 @@ export async function writeInsertInTx(
 		extraCausalDeps,
 	})
 
-	const serialized = serializeRecord(insert.data, definition.fields)
-	const version = serializeRowVersion(operation.timestamp)
-	const row: Record<string, unknown> = {
-		id: insert.recordId,
-		...serialized,
-		_created_at: operation.timestamp.wallTime,
-		_updated_at: operation.timestamp.wallTime,
-		_version: version,
-		// Every inserted field is stamped with this operation's version, so later
-		// per-field LWW compares against a real writer, not the row fallback.
-		_field_versions: stampFieldVersions(null, Object.keys(serialized), version),
+	if (env.fold) {
+		// Append, then merge: the row is the materialization of the record's state.
+		await appendOperationRow(scope, operation)
+		await env.fold.applyInTx(scope.tx, operation, 'local')
+	} else {
+		const serialized = serializeRecord(insert.data, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
+		const row: Record<string, unknown> = {
+			id: insert.recordId,
+			...serialized,
+			_created_at: operation.timestamp.wallTime,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
+			// Every inserted field is stamped with this operation's version, so later
+			// per-field LWW compares against a real writer, not the row fallback.
+			_field_versions: stampFieldVersions(null, Object.keys(serialized), version),
+		}
+		const rowInsert = buildInsertQuery(insert.collection, row)
+		await scope.tx.execute(rowInsert.sql, rowInsert.params)
+		await appendOperationRow(scope, operation)
 	}
-	const rowInsert = buildInsertQuery(insert.collection, row)
-	await scope.tx.execute(rowInsert.sql, rowInsert.params)
-	await appendOperationRow(scope, operation)
 
 	return {
 		operation,
@@ -182,22 +188,27 @@ export async function writeUpdateInTx(
 		...(Object.keys(atomicOps).length > 0 ? { atomicOps } : {}),
 	})
 
-	const serializedChanges = serializeRecord(writeData, definition.fields)
-	const version = serializeRowVersion(operation.timestamp)
-	// A local edit is the newest writer of every field it touches (the HLC is past
-	// every timestamp this device has seen), so each changed field gets its stamp.
-	const rowUpdate = buildUpdateQuery(collection, id, {
-		...serializedChanges,
-		_updated_at: operation.timestamp.wallTime,
-		_version: version,
-		_field_versions: stampFieldVersions(
-			currentRow._field_versions,
-			Object.keys(serializedChanges),
-			version,
-		),
-	})
-	await scope.tx.execute(rowUpdate.sql, rowUpdate.params)
-	await appendOperationRow(scope, operation)
+	if (env.fold) {
+		await appendOperationRow(scope, operation)
+		await env.fold.applyInTx(scope.tx, operation, 'local')
+	} else {
+		const serializedChanges = serializeRecord(writeData, definition.fields)
+		const version = serializeRowVersion(operation.timestamp)
+		// A local edit is the newest writer of every field it touches (the HLC is past
+		// every timestamp this device has seen), so each changed field gets its stamp.
+		const rowUpdate = buildUpdateQuery(collection, id, {
+			...serializedChanges,
+			_updated_at: operation.timestamp.wallTime,
+			_version: version,
+			_field_versions: stampFieldVersions(
+				currentRow._field_versions,
+				Object.keys(serializedChanges),
+				version,
+			),
+		})
+		await scope.tx.execute(rowUpdate.sql, rowUpdate.params)
+		await appendOperationRow(scope, operation)
+	}
 
 	const updatedRow = await readLiveRow(scope, collection, id)
 	if (!updatedRow) {
@@ -252,10 +263,15 @@ export async function writeDeleteInTx(
 	// The row is tombstoned BEFORE side effects run, so a reference cycle
 	// (self-referencing or mutually-referencing records) cannot cascade back
 	// into this record.
-	const version = serializeRowVersion(operation.timestamp)
-	const softDelete = buildSoftDeleteQuery(collection, id, operation.timestamp.wallTime, version)
-	await scope.tx.execute(softDelete.sql, softDelete.params)
-	await appendOperationRow(scope, operation)
+	if (env.fold) {
+		await appendOperationRow(scope, operation)
+		await env.fold.applyInTx(scope.tx, operation, 'local')
+	} else {
+		const version = serializeRowVersion(operation.timestamp)
+		const softDelete = buildSoftDeleteQuery(collection, id, operation.timestamp.wallTime, version)
+		await scope.tx.execute(softDelete.sql, softDelete.params)
+		await appendOperationRow(scope, operation)
+	}
 
 	const sideEffects: Operation[] = []
 	if (!options.skipReferentialEnforcement && env.relationEnforcer) {

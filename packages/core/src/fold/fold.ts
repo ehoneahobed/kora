@@ -195,6 +195,7 @@ function mergeCarriedState(
 	state: FoldState,
 	op: Operation,
 	schema: SchemaDefinition,
+	options: FoldOptions,
 ): MergeOpResult | null {
 	let carried: FoldState
 	try {
@@ -211,7 +212,37 @@ function mergeCarriedState(
 	}
 	const joined = joinStates(state, carried, schema)
 	const changed = serializeFoldState(joined) !== serializeFoldState(state)
-	return { state: changed ? joined : state, traces: [], changed }
+	const traces: FoldTrace[] = []
+	if ((options.traces ?? 'conflicts') !== 'none') {
+		// One trace per field where this replica's value and the server's differed:
+		// the join's per-field decision, for DevTools (RT-29).
+		const collection = schema.collections[state.c]
+		for (const [field, incomingState] of Object.entries(carried.f)) {
+			const mine = state.f[field]
+			if (mine === undefined) continue
+			const prior = safeMaterializeField(mine, field, options)
+			const incoming = safeMaterializeField(incomingState, field, options)
+			if (canonicalKey(prior) === canonicalKey(incoming)) continue
+			const plan = planField(collection, field)
+			const output = safeMaterializeField(joined.f[field], field, options)
+			const redact = (value: unknown): unknown => (plan.secret ? SECRET_REDACTED : value)
+			traces.push({
+				field,
+				strategy: `scope-entry-${plan.strategy}`,
+				inputA: redact(prior),
+				inputB: redact(incoming),
+				base: null,
+				output: redact(output),
+				tier: plan.tier,
+				constraintViolated: null,
+				duration: 0,
+				operation: plan.secret ? redactOperation(op, field) : op,
+				priorOperationId: fieldStamp(mine)?.o ?? null,
+				conflict: true,
+			})
+		}
+	}
+	return { state: changed ? joined : state, traces, changed }
 }
 
 /**
@@ -332,7 +363,7 @@ export function mergeOp(
 		)
 	}
 	if (op.foldState !== undefined && op.type === 'insert') {
-		const carried = mergeCarriedState(state, op, schema)
+		const carried = mergeCarriedState(state, op, schema, options)
 		if (carried !== null) return carried
 	}
 	const mode = options.traces ?? 'conflicts'

@@ -1,5 +1,6 @@
 import { HybridLogicalClock, quoteIdent } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
+import { FOLD_BASE_TABLE, FOLD_STATE_TABLE } from '../fold/record-folder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import { SEQ_CONFLICTS_TABLE, insertConflictRow } from '../store/sequence-repair'
 import {
@@ -126,6 +127,10 @@ export async function restoreReplace(
 			await tx.execute(`DELETE FROM ${quoteIdent(`_kora_ops_${collection}`)}`)
 			await tx.execute(`DELETE FROM ${quoteIdent(collection)}`)
 			await tx.execute('DELETE FROM _kora_scope_retractions WHERE collection = ?', [collection])
+			// W7: the records' fold states go with their rows and log; the store
+			// re-materializes the restored collections afterwards.
+			await tx.execute(`DELETE FROM ${FOLD_STATE_TABLE} WHERE collection = ?`, [collection])
+			await tx.execute(`DELETE FROM ${FOLD_BASE_TABLE} WHERE collection = ?`, [collection])
 			if (hasConflicts) {
 				await tx.execute(
 					`DELETE FROM ${SEQ_CONFLICTS_TABLE} WHERE collection = ? AND reemitted_as IS NULL`,

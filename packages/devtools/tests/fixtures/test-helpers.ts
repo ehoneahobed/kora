@@ -363,6 +363,14 @@ export function createSampleEvent<T extends KoraEventType>(
 			clean: true,
 			message: 'Operation log repaired',
 		},
+		'store:rematerialized': {
+			type: 'store:rematerialized',
+			dbName: 'kora-db',
+			mode: 'log',
+			records: 3,
+			changedRows: 1,
+			message: 'Re-materialized 3 record(s)',
+		},
 		'store:storage-fallback': {
 			type: 'store:storage-fallback',
 			dbName: 'kora-db',

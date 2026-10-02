@@ -57,6 +57,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:persistence-error': 'connection',
 	'store:quota-exceeded': 'connection',
 	'store:log-integrity': 'operation',
+	'store:rematerialized': 'operation',
 	'store:storage-fallback': 'connection',
 	'store:opfs-unavailable': 'connection',
 	'store:durability-lost': 'connection',

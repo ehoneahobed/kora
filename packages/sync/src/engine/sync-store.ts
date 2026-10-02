@@ -109,6 +109,13 @@ export interface SyncStore {
 	): Promise<{ operations: Operation[]; idMapping: Record<string, string>; rebasedCount: number }>
 
 	/**
+	 * Optional (W7): the server's node ids whose writes win `merge('server-
+	 * authoritative')` fields, from the handshake response. The store persists them
+	 * and folds with them (re-folding affected records when the set changes).
+	 */
+	setAuthoritativeNodeIds?(nodeIds: readonly string[]): Promise<void>
+
+	/**
 	 * Optional: read a record's current materialized field values, used to backfill
 	 * scope / query-subset fields that a partial update (or a delete) does not carry
 	 * in its own data. Without it, such an operation would be judged out of scope by

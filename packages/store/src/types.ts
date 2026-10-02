@@ -119,6 +119,14 @@ export interface StoreConfig {
 	 * Required only when the schema declares encrypted secret fields.
 	 */
 	secretKeyProvider?: SecretKeyProvider
+	/**
+	 * How rows are materialized. `'fold'` (default, W7): every write merges into the
+	 * record's per-field CRDT fold state, which re-materializes the row. `'legacy'`:
+	 * the beta.13 per-field LWW write paths (used by `experimental.legacyMerge` for
+	 * one beta, to compare). Switching modes on an existing database re-materializes
+	 * it on open.
+	 */
+	materialization?: 'fold' | 'legacy'
 }
 
 /**
@@ -232,6 +240,11 @@ export type { ApplyResult } from '@korajs/core'
  * Options for applying a remote operation to materialized storage.
  */
 export interface ApplyRemoteOptions {
+	/**
+	 * W7: receives the merge traces of the operation (conflicting field decisions),
+	 * after commit. The store also emits them as `merge:*` events.
+	 */
+	onMergeTraces?: (traces: import('@korajs/core').MergeTrace[]) => void
 	/** When true, a winning remote update clears soft-delete on the row. */
 	reactivateIfDeleted?: boolean
 	/**

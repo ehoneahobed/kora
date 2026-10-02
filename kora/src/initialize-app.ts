@@ -95,6 +95,7 @@ export async function initializeApp(
 			dbName,
 			nodeId: authNodeId,
 			isolation: authNodeId ? 'shared' : config.store?.isolation,
+			materialization: config.experimental?.legacyMerge === true ? 'legacy' : 'fold',
 			...(secretKeyProvider ? { secretKeyProvider } : {}),
 			...(config.sync
 				? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }

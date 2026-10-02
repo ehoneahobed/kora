@@ -312,8 +312,15 @@ describe('MergeAwareSyncStore', () => {
 				nodeId: 'remote-node',
 			},
 		})
+		// W7: the delete is appended and merged (every replica must hold it); it loses
+		// record-level LWW to the newer local update, so the record stays live.
 		const result = await syncStore.applyRemoteOperation(deleteOp)
-		expect(result).toBe('skipped')
+		expect(result).toBe('applied')
+		expect(
+			(await store.getOperationsForRecord('todos', 'rec-1')).some(
+				(op) => op.id === 'op-delete-remote',
+			),
+		).toBe(true)
 
 		const record = await store.collection('todos').findById('rec-1')
 		expect(record).not.toBeNull()
