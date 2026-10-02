@@ -115,6 +115,14 @@ function isUniqueViolation(error: unknown): boolean {
 	return error instanceof Error && codeOf(error.cause) === PG_UNIQUE_VIOLATION
 }
 
+/** One record's re-folded state, for {@link PostgresServerStore}'s batched migration writes. */
+interface FoldedRecordWrite {
+	recordId: string
+	state: FoldState | null
+	coveredSeq: number
+	coveredOpId: string
+}
+
 /**
  * PostgreSQL-backed server store using Drizzle ORM.
  * All reads and writes go through Drizzle's typed query builder.
@@ -765,34 +773,57 @@ export class PostgresServerStore implements ServerStore {
 		const pending = (await this.db.execute(
 			sql`SELECT DISTINCT collection, record_id FROM operations WHERE scope_snapshot IS NULL`,
 		)) as unknown as { collection: string; record_id: string }[]
-		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
-		for (const target of targets) {
-			const rows = await this.db
-				.select()
-				.from(pgOperations)
-				.where(
-					and(
-						eq(pgOperations.collection, target.collection),
-						eq(pgOperations.recordId, target.record_id),
-					),
-				)
-				.orderBy(asc(pgOperations.deliverySeq))
-			const replayed = replayScopeSnapshots(
-				schema,
-				target.collection,
-				target.record_id,
-				rows.map((row) => this.deserializeOperation(row)),
-				this.foldOptions,
-			)
-			for (const row of rows) {
-				if (row.scopeSnapshot !== null) continue
-				const snapshot = replayed.get(row.id)
-				if (!snapshot) continue
-				// Only fill a still-empty column: a concurrent apply's own snapshot wins.
-				await this.db.execute(
-					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)}
-						WHERE id = ${row.id} AND scope_snapshot IS NULL`,
-				)
+		const byCollection = new Map<string, string[]>()
+		for (const row of pending) {
+			if (schema.collections[row.collection] === undefined) continue
+			const ids = byCollection.get(row.collection)
+			if (ids) ids.push(row.record_id)
+			else byCollection.set(row.collection, [row.record_id])
+		}
+		// Records in chunks: one read of their operations and one batched update per
+		// chunk, instead of a statement per record and per operation.
+		for (const [collection, recordIds] of byCollection) {
+			for (let i = 0; i < recordIds.length; i += FOLD_MIGRATION_BATCH) {
+				const chunk = recordIds.slice(i, i + FOLD_MIGRATION_BATCH)
+				const rows = await this.db
+					.select()
+					.from(pgOperations)
+					.where(
+						and(eq(pgOperations.collection, collection), inArray(pgOperations.recordId, chunk)),
+					)
+					.orderBy(asc(pgOperations.deliverySeq))
+				const byRecord = new Map<string, Array<(typeof rows)[number]>>()
+				for (const row of rows) {
+					const list = byRecord.get(row.recordId)
+					if (list) list.push(row)
+					else byRecord.set(row.recordId, [row])
+				}
+				const updates: Array<[string, string]> = []
+				for (const [recordId, recordRows] of byRecord) {
+					const replayed = replayScopeSnapshots(
+						schema,
+						collection,
+						recordId,
+						recordRows.map((row) => this.deserializeOperation(row)),
+						this.foldOptions,
+					)
+					for (const row of recordRows) {
+						if (row.scopeSnapshot !== null) continue
+						const snapshot = replayed.get(row.id)
+						if (snapshot) updates.push([row.id, JSON.stringify(snapshot)])
+					}
+				}
+				for (let j = 0; j < updates.length; j += 1000) {
+					const values = updates
+						.slice(j, j + 1000)
+						.map(([id, snapshot]) => sql`(${id}, ${snapshot})`)
+					// Only fill a still-empty column: a concurrent apply's own snapshot wins.
+					await this.db.execute(
+						sql`UPDATE operations AS o SET scope_snapshot = v.s
+							FROM (VALUES ${sql.join(values, sql.raw(', '))}) AS v(id, s)
+							WHERE o.id = v.id AND o.scope_snapshot IS NULL`,
+					)
+				}
 			}
 		}
 	}
@@ -1499,6 +1530,92 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
+	 * {@link writeFoldedRecord} for a batch of records of one collection, in a handful
+	 * of multi-row statements (the migration's write path). Rows are chunked so a
+	 * statement never nears the 65,535 bind-parameter limit, however wide the collection.
+	 */
+	private async writeFoldedRecords(
+		tx: PostgresJsDatabase,
+		collection: string,
+		batch: FoldedRecordWrite[],
+	): Promise<void> {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef || batch.length === 0) return
+		const kept = batch.filter((entry) => entry.state !== null)
+		for (let i = 0; i < kept.length; i += 1000) {
+			const values = kept
+				.slice(i, i + 1000)
+				.map(
+					(entry) =>
+						sql`(${collection}, ${entry.recordId}, ${serializeServerFoldState(entry.state as FoldState)}, ${entry.coveredSeq}, ${entry.coveredOpId})`,
+				)
+			await tx.execute(
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)
+					VALUES ${sql.join(values, sql.raw(', '))}
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id`,
+			)
+		}
+		const dropped = batch.filter((entry) => entry.state === null).map((entry) => entry.recordId)
+		if (dropped.length > 0) {
+			await tx.execute(
+				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id IN (${sql.join(
+					dropped.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+		}
+		const fieldNames = Object.keys(collectionDef.fields)
+		const columns = ['id', ...fieldNames, '_created_at', '_updated_at', '_deleted']
+		const rows: unknown[][] = []
+		const hidden: string[] = []
+		for (const entry of batch) {
+			const row = entry.state ? projectFoldState(entry.state, this.foldOptions) : null
+			if (!row) {
+				hidden.push(entry.recordId)
+				continue
+			}
+			rows.push([
+				entry.recordId,
+				...fieldNames.map((field) => {
+					const descriptor = collectionDef.fields[field]
+					return descriptor ? serializeFieldValue(row.values[field] ?? null, descriptor) : null
+				}),
+				row.createdAt,
+				row.updatedAt,
+				row.deleted ? 1 : 0,
+			])
+		}
+		const perStatement = Math.max(1, Math.floor(30_000 / columns.length))
+		const columnsSql = sql.raw(columns.map((c) => quoteIdent(c)).join(', '))
+		const updateSet = sql.raw(
+			columns
+				.slice(1)
+				.map((c) => `${quoteIdent(c)} = excluded.${quoteIdent(c)}`)
+				.join(', '),
+		)
+		for (let i = 0; i < rows.length; i += perStatement) {
+			const tuples = rows.slice(i, i + perStatement).map(
+				(values) =>
+					sql`(${sql.join(
+						values.map((v) => sql`${v}`),
+						sql.raw(', '),
+					)})`,
+			)
+			await tx.execute(
+				sql`INSERT INTO ${sql.raw(quoteIdent(collection))} (${columnsSql}) VALUES ${sql.join(tuples, sql.raw(', '))} ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
+			)
+		}
+		if (hidden.length > 0) {
+			await tx.execute(
+				sql`UPDATE ${sql.raw(quoteIdent(collection))} SET _deleted = 1 WHERE id IN (${sql.join(
+					hidden.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)
+		}
+	}
+
+	/**
 	 * Re-materialization migration (W7 step 7), run by setSchema and after a
 	 * replace-mode restore: every record whose fold state is missing, stale or built
 	 * under a different fold plan is re-folded from its log; nothing else is touched.
@@ -1597,6 +1714,7 @@ export class PostgresServerStore implements ServerStore {
 							if (list) list.push(row)
 							else byRecord.set(row.recordId, [row])
 						}
+						const batch: FoldedRecordWrite[] = []
 						for (const recordId of targets) {
 							const recordRows = byRecord.get(recordId) ?? []
 							let covered = 0
@@ -1607,20 +1725,19 @@ export class PostgresServerStore implements ServerStore {
 									coveredOpId = row.id
 								}
 							}
-							await this.writeFoldedRecord(
-								tx,
-								collection,
+							batch.push({
 								recordId,
-								refoldRecord(
+								state: refoldRecord(
 									recordRows.map((row) => this.deserializeOperation(row)),
 									schema,
 									this.foldOptions,
 								),
-								covered,
+								coveredSeq: covered,
 								coveredOpId,
-							)
+							})
 							report.records++
 						}
+						await this.writeFoldedRecords(tx, collection, batch)
 					})
 				}
 				if (page.length < FOLD_MIGRATION_BATCH) break

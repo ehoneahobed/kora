@@ -150,8 +150,18 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 				`  speedup proposed vs HEAD: ${(headMs / propMs).toFixed(1)}x; parallelism adds ${(seqMs / propMs).toFixed(2)}x`,
 			].join('\n'),
 		)
-		// The proposed batching must produce exactly HEAD's materialized state.
-		expect(propSnap).toBe(headSnap)
+		// W7 Stage B2 inverted this check. HEAD materializes through the per-record fold
+		// and keeps a fold state per record, so (NEW-SRV-4) a warm restart re-materializes
+		// nothing: one aggregate read per collection page instead of a replay of the log.
+		// The proposal re-implemented above is a replay of the pre-fold rules, so its rows
+		// legitimately differ from HEAD's wherever the fold changed semantics (for example
+		// a partial update restating a field unchanged is no longer a write); it stays
+		// only as a timing reference.
+		void propSnap
+		expect(store2.getFoldMigrationReport().records).toBe(0)
+		expect(warmQueries).toBeLessThan(records / 10)
+		expect(await snapshot(admin, lmsSchema)).not.toBe('')
+		void headSnap
 	}, 900_000)
 
 	test('proposed fix defect: a fixed 500-row batch exceeds the Postgres 65535 bind-parameter limit on wide collections', async () => {
