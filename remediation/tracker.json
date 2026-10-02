@@ -1487,6 +1487,21 @@
    "notes": ""
   },
   {
+   "id": "NEW-STORE-12",
+   "title": "No log-integrity check: rows damaged by beta.12 backup restore (JSON timestamps read as wallTime NaN/null) or unreadable rows are folded as-is, and compaction gaps are invisible; W7 re-materialization would bake the damage in",
+   "severity": "P0",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-STORE-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W8 step 0 (prerequisite for W7, plan section 3 dependency rules). Acceptance test kora/tests/repro/NEW-STORE-12.test.ts (fails before the fix: getAllOperations throws on the unreadable row and the restored row reads wallTime NaN). FIXED (store): new packages/store/src/log-integrity module. Every Store.open runs a quick scan (SQL prefilter, suspects checked in JS) before anything reads or folds the log: a row must round-trip through deserializeOperation/serializeOperation; a JSON-encoded timestamp (one beta.12 restore, or a nested restore-export-restore) is repaired in place; anything unrecoverable moves to _kora_log_quarantine (kept verbatim, never deleted) and store:log-integrity is emitted. Store.verifyLogIntegrity({ mode, repair }) runs the full scan and returns a LogIntegrityReport (clean, repaired, newlyQuarantined, quarantined, gaps in this database own nodes below their highest stored sequence, compactedAt). W7 re-materialization must refuse unless report.clean. Remote-node gaps are not reported (scoped sync delivers partial logs). Tests: store log-integrity.test.ts."
+  },
+  {
    "id": "MERGE-1",
    "title": "Array merge loses one-sided removals",
    "severity": "P1",

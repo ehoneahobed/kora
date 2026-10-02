@@ -821,6 +821,12 @@ const scenarios = {
 			`promoted=${promoted} titles=${J(pt.titles ?? pt.error)}`,
 		)
 		await F.evaluate(() => H.insert('f', 'after-promotion'))
+		// A table the store creates after the schema DDL (bookkeeping tables) must be
+		// recreated, with its constraints, when the snapshot is restored on reload.
+		await F.evaluate(() =>
+			H.exec('f', 'CREATE TABLE IF NOT EXISTS _kora_late (k TEXT PRIMARY KEY NOT NULL, v TEXT)'),
+		)
+		await F.evaluate(() => H.exec('f', "INSERT INTO _kora_late (k, v) VALUES ('a', '1')"))
 		await F.evaluate(() => H.close('f'))
 		await sleep(300)
 		const R = await tab(ctx)
@@ -831,6 +837,16 @@ const scenarios = {
 			'writes made after the promotion survive a reload',
 			J(rt.titles) === J(['after-promotion', 'flushed', 'from-follower', 'unflushed']),
 			`titles=${J(rt.titles ?? rt.error)}`,
+		)
+		await R.evaluate(() =>
+			H.exec('r', "INSERT OR REPLACE INTO _kora_late (k, v) VALUES ('a', '2')"),
+		)
+		const late = await R.evaluate(() => H.rows('r', 'SELECT k, v FROM _kora_late'))
+		check(
+			'STORE-6',
+			'a table created after the schema DDL is restored with its constraints',
+			late.ok && J(late.rows) === J([{ k: 'a', v: '2' }]),
+			J(late),
 		)
 		await R.evaluate(() => H.close('r'))
 		await ctx.close()

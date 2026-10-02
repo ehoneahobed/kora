@@ -248,6 +248,22 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * The log-integrity scan (W8 step 0) changed the operation log: it repaired rows
+			 * written by an earlier release (a JSON-encoded timestamp from a beta.12 backup
+			 * restore) and/or moved rows it could not repair to the quarantine table, where
+			 * no fold reads them. `clean` is false while anything is quarantined or this
+			 * database's own nodes have sequence gaps. See `store.verifyLogIntegrity()`.
+			 */
+			type: 'store:log-integrity'
+			dbName: string
+			repaired: number
+			quarantined: number
+			gaps: number
+			clean: boolean
+			message: string
+	  }
+	| {
+			/**
 			 * OPFS persistence was unavailable, so the store fell back to a
 			 * NON-PERSISTENT in-memory database. Anything written this session is lost
 			 * on reload. This is emitted instead of failing silently so the condition

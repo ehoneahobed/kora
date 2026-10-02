@@ -26,6 +26,11 @@ import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import {
+	LOG_QUARANTINE_TABLE,
+	type LogIntegrityReport,
+	scanLogIntegrity,
+} from '../log-integrity/log-integrity'
+import {
 	type FieldVersions,
 	effectiveFieldVersion,
 	fieldVersionsForFields,
@@ -231,19 +236,20 @@ export class Store implements OperationLog {
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
-		// Run schema migrations if needed
-		await this.runMigrationsIfNeeded()
-
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
+		// Every node id this database authors under is registered (RT-38, RT-40).
+		await registerLocalNode(this.adapter, this.nodeId)
+
+		// Log integrity first (W8 step 0): repair rows an earlier release damaged and
+		// quarantine the unrecoverable ones, before anything reads or folds the log.
+		await this.scanLog('quick')
 
 		// (node_id, sequence_number) is unique in the operation log: repair any
 		// duplicates an earlier version wrote, then enforce it with an index (W6).
 		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
-		// Every node id this database authors under is registered (RT-38, RT-40), and the
-		// terminal rejections an earlier release kept only in the app's list become
+		// The terminal rejections an earlier release kept only in the app's list become
 		// durable markers (RT-36).
-		await registerLocalNode(this.adapter, this.nodeId)
 		await seedTerminalRejectionsOnce(this.adapter)
 		if (this.isolation === 'per-tab' && !this.configNodeId) {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
@@ -252,6 +258,16 @@ export class Store implements OperationLog {
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
+
+		// Run schema migrations if needed. Backfills write operations through the local
+		// write path, so the node id and clock must exist first (STORE-13).
+		try {
+			await this.runMigrationsIfNeeded()
+		} catch (error) {
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = null
+			throw error
+		}
 
 		// Initialize sequence manager
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
@@ -301,6 +317,49 @@ export class Store implements OperationLog {
 			this.releaseNodeLock?.()
 			this.releaseNodeLock = null
 		}
+	}
+
+	/**
+	 * Check the operation log (W8 step 0): every row must round-trip through the
+	 * canonical operation serializer. Rows an earlier release damaged in a recoverable
+	 * way (a JSON-encoded timestamp written by a beta.12 backup restore) are repaired;
+	 * unrecoverable rows move to the quarantine table, where no fold reads them. Also
+	 * reports sequence gaps in this database's own nodes (compaction, a lost tail).
+	 *
+	 * The store runs a quick variant (SQL prefilter) on every open. Rebuilding state from
+	 * the log must only run on a `clean` report.
+	 *
+	 * @param options - `repair: false` only reports; `mode: 'quick'` checks only the rows
+	 *   a SQL prefilter flags (default `'full'`: every row)
+	 * @returns The integrity report; emits `store:log-integrity` when rows changed
+	 */
+	async verifyLogIntegrity(options?: {
+		repair?: boolean
+		mode?: 'full' | 'quick'
+	}): Promise<LogIntegrityReport> {
+		this.ensureOpen()
+		return this.scanLog(options?.mode ?? 'full', options?.repair ?? true)
+	}
+
+	private async scanLog(mode: 'full' | 'quick', repair = true): Promise<LogIntegrityReport> {
+		const localNodeIds = (await listLocalNodes(this.adapter)).map((node) => node.nodeId)
+		const report = await scanLogIntegrity(this.adapter, this.schema, {
+			mode,
+			repair,
+			localNodeIds,
+		})
+		if (repair && (report.repaired.length > 0 || report.newlyQuarantined.length > 0)) {
+			this.emitter?.emit({
+				type: 'store:log-integrity',
+				dbName: this.dbName,
+				repaired: report.repaired.length,
+				quarantined: report.newlyQuarantined.length,
+				gaps: report.gaps.length,
+				clean: report.clean,
+				message: `Operation log of "${this.dbName}": ${report.repaired.length} row(s) repaired, ${report.newlyQuarantined.length} row(s) quarantined (${LOG_QUARANTINE_TABLE}).`,
+			})
+		}
+		return report
 	}
 
 	/**

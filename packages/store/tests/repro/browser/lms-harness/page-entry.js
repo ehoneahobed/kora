@@ -110,6 +110,21 @@ window.H = {
 			}
 		}
 	},
+	async exec(key, sql, params) {
+		try {
+			await adapters.get(key).execute(sql, params)
+			return { ok: true }
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e) }
+		}
+	},
+	async rows(key, sql) {
+		try {
+			return { ok: true, rows: await adapters.get(key).query(sql) }
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e) }
+		}
+	},
 	async titles(key) {
 		const a = adapters.get(key)
 		const t0 = performance.now()

@@ -262,6 +262,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `store persistence error ${event.message}`
 		case 'store:quota-exceeded':
 			return 'store quota exceeded'
+		case 'store:log-integrity':
+			return `log integrity: ${event.repaired} repaired, ${event.quarantined} quarantined`
 		case 'store:storage-fallback':
 			return `store fallback ${event.from} → ${event.to}`
 		case 'store:opfs-unavailable':

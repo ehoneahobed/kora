@@ -117,14 +117,14 @@ describe('IndexedDbPersistenceScheduler', () => {
 	test('flushNow keeps writing while writes landed during the snapshot (STORE-7)', async () => {
 		let live = 1
 		const persisted: number[] = []
-		let release: (() => void) | null = null
+		const gate: { release: () => void } = { release: () => {} }
 		const scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: 60_000,
 			flush: async () => {
 				const snapshot = live
 				if (persisted.length === 0) {
 					await new Promise<void>((resolve) => {
-						release = resolve
+						gate.release = resolve
 					})
 				}
 				persisted.push(snapshot)
@@ -136,7 +136,7 @@ describe('IndexedDbPersistenceScheduler', () => {
 		scheduler.schedule()
 		expect(scheduler.isDirty()).toBe(true)
 		const second = scheduler.flushNow()
-		release?.()
+		gate.release()
 		await Promise.all([first, second])
 		expect(persisted.at(-1)).toBe(2)
 		expect(scheduler.isDirty()).toBe(false)
