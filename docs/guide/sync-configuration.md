@@ -35,6 +35,7 @@ Kora then handles the handshake, delta exchange, retries, and conflict resolutio
 | `url` | `string` | -- | WebSocket URL of your sync server (required) |
 | `auth` | `() => Promise<{ token: string }>` | -- | Async function that returns an auth token |
 | `authClient` | `AuthSyncBinding` | -- | Pre-built binding from `createKoraAuthSync()` in `@korajs/auth` |
+| `unassignedWrites` | `'hold' \| 'assign-to-first-user'` | `'hold'` | Writes made before the app knew who was signed in, on a database that never synced: held for `app.sync.assignHeld`/`discardHeld`, or assigned to the first user the server accepts (single-user apps). See [Authentication](./authentication.md#writes-belong-to-the-signed-in-user). |
 | `scope` | `Record<string, unknown>` | -- | Flat scope values combined with schema scope declarations |
 | `batchSize` | `number` | `100` | Max operations per sync batch |
 | `schemaVersion` | `number` | `1` | Schema version sent in handshake |
@@ -363,7 +364,7 @@ function SyncIndicator() {
 | `pendingOperations` | `number` | Operations queued but not yet sent |
 | `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
 | `heldOperations` | `number` | Unsynced writes of another user of this device's shared local database. They upload only when that user signs in again here, never on the current user's session. Show them as waiting for another user, not as pending. |
-| `heldNodes` | `HeldNodeInfo[]` | The local nodes behind `heldOperations`: `{ nodeId, operationCount, reason, principal }`. `reason` is `other-user` (they upload when their user signs in here) or `unassigned` (written before the app knew who was signed in, on a database that never synced: decide with `app.sync.assignHeld(nodeId, 'current-user')` or `app.sync.discardHeld(nodeId)`). |
+| `heldNodes` | `HeldNodeInfo[]` | The local nodes behind `heldOperations`: `{ nodeId, operationCount, reason, principal }`. `reason` is `other-user` (they upload when their user signs in here) or `unassigned` (written before the app knew who was signed in, on a database that never synced: decide with `app.sync.assignHeld(nodeId, 'current-user')` or `app.sync.discardHeld(nodeId)`, or set `sync.unassignedWrites: 'assign-to-first-user'` to give them to the first user the server accepts). |
 | `localDurability` | `'durable' \| 'degraded'` | `degraded` when the local database could not be made durable several times in a row (storage quota exceeded, IndexedDB broken). Uploads continue so the server keeps a copy, and a reload recovers from it; writes made while offline in this state can be lost if the page closes. Warn the user (free up storage, stay online). `sync:durability-degraded` / `sync:durability-restored` announce the changes. |
 
 ## Server-Side Scoping

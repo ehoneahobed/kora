@@ -1746,6 +1746,21 @@
    "notes": ""
   },
   {
+   "id": "NEW-DX-4",
+   "title": "Single-user apps cannot opt out of holding writes made before sign-in (RT-50 unassigned): every app must call app.sync.assignHeld itself",
+   "severity": "P3",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-DX-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 DX item (user decision pending; the recommended default implemented). New createApp option sync.unassignedWrites: hold | assign-to-first-user (default hold, RT-50 behavior unchanged). assign-to-first-user (kora/src/unassigned-writes.ts, wired in sync-lifecycle): on sync:connected (a session the server ACCEPTED for the signed-in user) every held node with reason unassigned is assigned via engine.assignHeld and the engine reconnects so they upload as that user; other-user nodes are never touched, a refused user never gets a session so never gets them; once assigned (and bound by the server) a later user is never offered them. Invalid values are rejected by createApp. Acceptance test packages/test/tests/repro/NEW-DX-4.test.ts (real server, both policies); unit tests kora unassigned-writes.test.ts. Docs: guide/authentication.md, guide/sync-configuration.md."
+  },
+  {
    "id": "NEW-TEST-1",
    "title": "Timing-dependent tests flake under load (indexeddb debounce, apply-order-determinism 5s timeout)",
    "severity": "P3",

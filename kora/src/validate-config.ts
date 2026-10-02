@@ -27,6 +27,14 @@ export function validateCreateAppConfig(config: KoraConfig): void {
 
 	if (config.sync) {
 		validateSyncUrl(config.sync.url, config.sync.transport ?? 'websocket')
+		const policy = config.sync.unassignedWrites
+		if (policy !== undefined && policy !== 'hold' && policy !== 'assign-to-first-user') {
+			throw new KoraError(
+				`sync.unassignedWrites must be 'hold' or 'assign-to-first-user', got ${JSON.stringify(policy)}.`,
+				'INVALID_SYNC_CONFIG',
+				{ unassignedWrites: policy, fix: "Use 'hold' (default) or 'assign-to-first-user'." },
+			)
+		}
 	}
 
 	const adapter = config.store?.adapter ?? detectAdapterType()
