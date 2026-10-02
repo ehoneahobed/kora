@@ -73,8 +73,15 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 		}
 	}
 
+	/**
+	 * Non-transactional write. Takes the same mutex as {@link transaction} so it
+	 * never lands inside another caller's open transaction, where a rollback of
+	 * that transaction would silently discard it (STORE-8). Code running inside a
+	 * transaction callback must use the `tx` handle, never this method.
+	 */
 	async execute(sql: string, params?: unknown[]): Promise<void> {
 		const db = this.getDb()
+		const release = await this.txMutex.acquire()
 		try {
 			db.prepare(sql).run(...(params ?? []))
 		} catch (error) {
@@ -82,11 +89,19 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 				sql,
 				params,
 			})
+		} finally {
+			release()
 		}
 	}
 
+	/**
+	 * Non-transactional read. Waits for any open transaction to finish so a reader
+	 * never observes another caller's uncommitted (possibly rolled-back) rows
+	 * (STORE-8). Inside a transaction callback, read through the `tx` handle.
+	 */
 	async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
 		const db = this.getDb()
+		const release = await this.txMutex.acquire()
 		try {
 			return db.prepare(sql).all(...(params ?? [])) as T[]
 		} catch (error) {
@@ -94,6 +109,8 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 				sql,
 				params,
 			})
+		} finally {
+			release()
 		}
 	}
 
