@@ -52,37 +52,40 @@ async function uploadBlob(
 
 /**
  * Automatically upload the bytes behind `blob` fields to the server as their
- * operations are synced. Triggered on `sync:sent`, so a blob authored offline is
- * uploaded when its operation is finally pushed on reconnect — the same event
- * that makes the reference visible to other devices. Each blob is uploaded once
- * per session (deduplicated by manifest hash).
+ * operations are synced. The bytes (every chunk, then the manifest) are pushed
+ * BEFORE the batch carrying the reference, on the same connection: the server only
+ * accepts a reference to content the writer can already read or has uploaded, so
+ * pushing first is the writer's proof of possession (RT-11). A blob authored offline
+ * is uploaded when its operation is finally pushed on reconnect. Each blob is
+ * uploaded once per sync engine (deduplicated by manifest hash).
  *
  * A no-op unless the connected server advertised central blob storage.
  *
  * @returns An unsubscribe function.
  */
 export function wireBlobUpload(
-	emitter: KoraEventEmitter,
+	_emitter: KoraEventEmitter,
 	syncEngine: SyncEngine,
 	blobStore: ContentAddressedBlobStore,
 ): () => void {
 	const uploaded = new Set<string>()
-	return emitter.on('sync:sent', (event) => {
+	return syncEngine.setOutboundPreparer(async (operations) => {
 		if (!syncEngine.isBlobStorageEnabled()) {
 			return
 		}
-		for (const op of event.operations) {
+		for (const op of operations) {
 			for (const ref of blobRefsInData(op.data)) {
 				const manifestHash = ref.manifestHash
 				if (manifestHash === undefined || uploaded.has(manifestHash)) {
 					continue
 				}
-				uploaded.add(manifestHash)
-				void uploadBlob(ref, syncEngine, blobStore).catch(() => {
-					// Upload is best-effort; a failure just means the blob is served
-					// peer-to-peer until a later successful upload. Allow a retry.
-					uploaded.delete(manifestHash)
-				})
+				try {
+					await uploadBlob(ref, syncEngine, blobStore)
+					uploaded.add(manifestHash)
+				} catch {
+					// Upload is best-effort; a failure leaves the blob to be served
+					// peer-to-peer, and the next batch carrying it retries the upload.
+				}
 			}
 		}
 	})

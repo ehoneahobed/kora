@@ -398,6 +398,7 @@ describe('ingest limits are charged before store work (RT-6)', () => {
 		expect([...session.values()][0]?.getIngestLimitCounts()).toEqual({
 			rateLimitedOperations: 0,
 			rejectedBatches: 1,
+			rateLimitedBlobRequests: 0,
 		})
 	})
 

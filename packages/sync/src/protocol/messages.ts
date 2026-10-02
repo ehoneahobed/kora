@@ -55,6 +55,13 @@ export interface HandshakeMessage {
 	lastDeliverySequence?: number
 	/** Opt in to client-local removal when records leave the accepted downlink view. */
 	scopeExitPolicy?: 'retain' | 'retract'
+	/**
+	 * The per-device secret the server issued at this node id's first claim
+	 * (`HandshakeResponseMessage.nodeToken`). An anonymous principal must present it
+	 * to reconnect with its node id, so another anonymous client cannot take the node
+	 * over (RT-12). Stored by the client next to its node id; never sent elsewhere.
+	 */
+	nodeToken?: string
 }
 
 /**
@@ -94,6 +101,12 @@ export interface HandshakeResponseMessage {
 	 * from the beginning instead of sitting above a frontier that no longer exists.
 	 */
 	serverMaxDeliverySequence?: number
+	/**
+	 * A per-device secret issued when this handshake made the first claim of the node
+	 * id for an anonymous principal (RT-12). The client stores it next to its node id
+	 * and presents it in every later handshake (`HandshakeMessage.nodeToken`).
+	 */
+	nodeToken?: string
 }
 
 /**

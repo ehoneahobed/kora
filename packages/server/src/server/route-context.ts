@@ -11,7 +11,8 @@ import {
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { type RoutePredicate, evaluateRoutePredicate } from '../apply/route-predicate'
 import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
-import type { ScopeMap } from '../scopes/server-scope-filter'
+import { authorizeOperationReferences } from '../scopes/reference-authorization'
+import type { ScopeMap, UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 import {
 	authorizeUplinkWrite,
 	recordMatchesScopes,
@@ -290,6 +291,19 @@ async function buildRouteOperation(
 	)
 }
 
+/** Deterministic key for a scope map (sorted keys at every level). */
+function stableScopeKey(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableScopeKey).join(',')}]`
+	if (value && typeof value === 'object') {
+		const record = value as Record<string, unknown>
+		return `{${Object.keys(record)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableScopeKey(record[key])}`)
+			.join(',')}}`
+	}
+	return JSON.stringify(value) ?? 'undefined'
+}
+
 /** Internal error carrying a stable code for route-context failures. */
 class RouteMutationError extends Error {
 	constructor(
@@ -313,6 +327,25 @@ export function createRouteContext(
 	server: KoraSyncServer,
 	store: ServerStore,
 ): ProductionHttpRouteContext {
+	// Reference authorization for a scoped route write (RT-11, RT-13). The route's
+	// scope is both what it may write and what it may read; blob claims are keyed by
+	// the scope, since a route has no device or session of its own.
+	function authorizeRouteReferences(
+		op: Operation,
+		stored: MaterializedRecord | null,
+		scope: ScopeMap | undefined,
+		readRow: (collection: string, id: string) => Promise<MaterializedRecord | null>,
+	): Promise<UplinkAuthorizationResult> {
+		if (!scope) return Promise.resolve({ allowed: true })
+		return authorizeOperationReferences(op, stored, {
+			schema: store.getSchema(),
+			downlinkScopes: scope,
+			readRow,
+			blobs: server.getBlobAccessIndex(),
+			blobOwner: `kora:route:${stableScopeKey(scope)}`,
+		})
+	}
+
 	// Promise chain that serializes apply() so sequence allocation + apply is
 	// atomic per mutation, even under concurrent in-flight requests.
 	let mutationTail: Promise<unknown> = Promise.resolve()
@@ -362,7 +395,14 @@ export function createRouteContext(
 		// therefore cannot edit, delete, take over or same-id-overwrite a record that
 		// belongs to someone else.
 		const stored = scope ? await readStoredRecord(store, op.collection, op.recordId) : null
-		const decision = authorizeUplinkWrite(op, stored, scope)
+		let decision = authorizeUplinkWrite(op, stored, scope)
+		// A scoped route may only point at parents and blob content inside its scope
+		// (RT-11, RT-13), exactly like a sync session.
+		if (decision.allowed) {
+			decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
+				readStoredRecord(store, collection, id),
+			)
+		}
 		if (!decision.allowed) {
 			return {
 				ok: false,
@@ -492,7 +532,14 @@ export function createRouteContext(
 								? await context.readStoredRow(op.collection, op.recordId)
 								: await readStoredRecord(store, op.collection, op.recordId)
 							: null
-						const decision = authorizeUplinkWrite(op, stored, scope)
+						let decision = authorizeUplinkWrite(op, stored, scope)
+						if (decision.allowed) {
+							decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
+								context.readStoredRow
+									? context.readStoredRow(collection, id)
+									: readStoredRecord(store, collection, id),
+							)
+						}
 						if (!decision.allowed) {
 							throw new RouteMutationError(
 								decision.code,

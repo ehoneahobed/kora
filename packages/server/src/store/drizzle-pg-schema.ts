@@ -33,6 +33,9 @@ export const pgOperations = pgTable(
 		// visibility order even across instances). Drives the gap-free server->client
 		// delivery watermark. Nullable only for pre-column rows, backfilled on startup.
 		deliverySeq: bigint('delivery_seq', { mode: 'number' }),
+		// JSON { pre, post }: the record's scope values around this operation, captured
+		// from the server's own rows at apply time (RT-14).
+		scopeSnapshot: text('scope_snapshot'),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_pg_node_seq').on(table.nodeId, table.sequenceNumber),

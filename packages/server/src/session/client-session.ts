@@ -40,6 +40,11 @@ import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
 import type { Logger } from '../logging/structured-logger'
+import type { BlobAccessIndex } from '../richtext/blob-access-index'
+import {
+	authorizeOperationReferences,
+	operationHasReferences,
+} from '../scopes/reference-authorization'
 import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { InvalidScopePredicateError } from '../scopes/scope-predicate-errors'
 import {
@@ -49,12 +54,17 @@ import {
 	authorizeUplinkWrite,
 	missingScopeFields,
 	normalizeScopeMap,
-	operationExitsScopes,
 	operationMatchesScopes,
 	recordMatchesScopes,
+	snapshotExitsScopes,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
-import type { DeliveredOperation, MaterializedRecord, ServerStore } from '../store/server-store'
+import type {
+	DeliveredOperation,
+	MaterializedRecord,
+	OperationScopeSnapshot,
+	ServerStore,
+} from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import { isOperationTimestampValid } from './operation-validation'
@@ -74,13 +84,55 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
 const MAX_PENDING_REVOCATIONS = 32
 
 /**
- * Node-claim owner for anonymous principals (`AuthContext.anonymous`). Contains
- * characters no Kora-issued user id uses, so it cannot collide with a real user.
+ * Legacy node-claim owner shared by every anonymous principal (RT-5, superseded by
+ * RT-12). Claims recorded under it by pre-release builds are not adopted by anyone;
+ * an administrator releases them with `KoraSyncServer.releaseNodeClaim`.
  */
 export const ANONYMOUS_NODE_OWNER = 'kora:anonymous'
 
+/**
+ * Prefix reserved for principals Kora itself synthesizes (node-claim owners of
+ * anonymous devices). An auth provider may not issue a user id that starts with it,
+ * so no real user can ever collide with an anonymous device's claim (RT-12).
+ */
+export const RESERVED_PRINCIPAL_PREFIX = 'kora:'
+
+/** Prefix of the node-claim owner of an anonymous device: `kora:anon-node:<sha256(token)>`. */
+const ANONYMOUS_NODE_OWNER_PREFIX = 'kora:anon-node:'
+/** Longest node token a client may present. */
+const MAX_NODE_TOKEN_LENGTH = 256
+/** Bytes of randomness in a server-issued node token (256 bits). */
+const NODE_TOKEN_BYTES = 32
+
+/** 256 random bits, base64url: an unguessable per-device node token. */
+function generateNodeToken(): string {
+	const bytes = new Uint8Array(NODE_TOKEN_BYTES)
+	globalThis.crypto.getRandomValues(bytes)
+	let binary = ''
+	for (const byte of bytes) binary += String.fromCharCode(byte)
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/**
+ * The node-claim owner of an anonymous device holding `nodeToken`. Only the hash is
+ * stored, so the claims table never holds a usable secret.
+ */
+async function anonymousNodeOwner(nodeToken: string): Promise<string> {
+	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await hashBlob(new TextEncoder().encode(nodeToken))}`
+}
+
 /** Credential-ending error codes. Retriable: the client refreshes and re-handshakes. */
 export type SessionTerminationCode = 'AUTH_REVOKED' | 'AUTH_EXPIRED'
+
+/**
+ * Same principal for re-validation: the same user and device, or both anonymous
+ * (an anonymous principal gets a fresh user id per authentication).
+ */
+function samePrincipal(a: AuthContext, b: AuthContext): boolean {
+	if (a.anonymous === true || b.anonymous === true)
+		return a.anonymous === true && b.anonymous === true
+	return a.userId === b.userId && a.metadata?.deviceId === b.metadata?.deviceId
+}
 
 function revocationMatches(principal: AuthContext, filter: SessionRevocation): boolean {
 	if (filter.userId === undefined && filter.deviceId === undefined) return false
@@ -298,6 +350,12 @@ export interface ClientSessionOptions {
 	validateOperation?: OperationValidator
 	/** Trusted data-plane context handed to the validator (read state, author derived ops). */
 	koraContext?: ProductionHttpRouteContext
+	/**
+	 * Blob reference authority (RT-11): decides which content hashes this session may
+	 * reference in blob fields and records the bytes it pushes. Without it, blob
+	 * references are not checked at ingest.
+	 */
+	blobAccess?: BlobAccessIndex
 }
 
 /**
@@ -328,6 +386,12 @@ export class ClientSession {
 	private expiryTimer: ReturnType<typeof setTimeout> | null = null
 	/** Revocations that arrived while the handshake was still authenticating. */
 	private readonly pendingRevocations: SessionRevocation[] = []
+	/** Node token issued by this handshake's first anonymous claim, sent once in the response (RT-12). */
+	private issuedNodeToken: string | null = null
+	/** The node-claim owner this session holds its node id under (userId, or an anonymous device key). */
+	private nodeOwnerKey: string | null = null
+	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
+	private credential: string | null = null
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	private resumeDeltaCursor: DeltaCursor | null = null
@@ -410,8 +474,11 @@ export class ClientSession {
 	private rateLimitedOperations = 0
 	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
 	private rejectedBatches = 0
+	/** Blob chunk requests answered "not held" because the session was over budget (RT-17). */
+	private rateLimitedBlobRequests = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
+	private readonly blobAccess: BlobAccessIndex | null
 
 	constructor(options: ClientSessionOptions) {
 		this.sessionId = options.sessionId
@@ -448,6 +515,7 @@ export class ClientSession {
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
+		this.blobAccess = options.blobAccess ?? null
 	}
 
 	/**
@@ -546,10 +614,12 @@ export class ClientSession {
 	private async relayVisibleOperations(operations: Operation[]): Promise<void> {
 		const visibleOperations: Operation[] = []
 		const retractions: Array<{ collection: string; recordId: string }> = []
+		const snapshots = await this.scopeSnapshotsFor(operations)
 		for (const op of operations) {
-			if (await this.operationVisibleToClient(op)) {
+			const snapshot = snapshots.get(op.id) ?? null
+			if (await this.operationVisibleToClient(op, snapshot)) {
 				visibleOperations.push(op)
-			} else if (await this.scopeRetractionFor(op)) {
+			} else if (await this.scopeRetractionFor(op, snapshot)) {
 				retractions.push({ collection: op.collection, recordId: op.recordId })
 			}
 		}
@@ -682,6 +752,34 @@ export class ClientSession {
 	}
 
 	/**
+	 * Re-authenticate the credential that opened this session (RT-18). The session is
+	 * ended with a retriable `AUTH_REVOKED` (`AUTH_EXPIRED` once past its expiry) when
+	 * the provider now refuses the credential or resolves it to another principal, for
+	 * example after a revocation persisted by another server instance.
+	 *
+	 * @returns `'terminated'` when this call ended the session, `'error'` when the
+	 *   provider threw (nothing is ended; the caller retries later), else `'valid'`
+	 */
+	async revalidateCredential(): Promise<'valid' | 'terminated' | 'error'> {
+		if (this.state === 'closed' || !this.auth || !this.principal || this.credential === null) {
+			return 'valid'
+		}
+		const principal = this.principal
+		let context: AuthContext | null
+		try {
+			context = await this.auth.authenticate(this.credential)
+		} catch {
+			return 'error'
+		}
+		// The session may have closed (or re-authenticated) while the provider ran.
+		if (this.getState() === 'closed' || this.principal !== principal) return 'valid'
+		if (context && samePrincipal(principal, context)) return 'valid'
+		const expired = principal.expiresAt !== undefined && Date.now() >= principal.expiresAt
+		this.terminate(expired ? 'AUTH_EXPIRED' : 'AUTH_REVOKED')
+		return 'terminated'
+	}
+
+	/**
 	 * End this session because an admin released its node id (RT-5). Retriable: a
 	 * client that still owns the node simply reconnects and claims it again.
 	 */
@@ -773,10 +871,15 @@ export class ClientSession {
 	 * Ingest refusals that happen before any store work (RT-6): operations refused by
 	 * the per-minute rate limiter and batches refused for exceeding the per-batch cap.
 	 */
-	getIngestLimitCounts(): { rateLimitedOperations: number; rejectedBatches: number } {
+	getIngestLimitCounts(): {
+		rateLimitedOperations: number
+		rejectedBatches: number
+		rateLimitedBlobRequests: number
+	} {
 		return {
 			rateLimitedOperations: this.rateLimitedOperations,
 			rejectedBatches: this.rejectedBatches,
+			rateLimitedBlobRequests: this.rateLimitedBlobRequests,
 		}
 	}
 
@@ -887,6 +990,20 @@ export class ClientSession {
 				await this.handleYjsDocUpdate(message)
 				break
 			case 'blob-chunk-request':
+				// Every request costs access checks and possibly a central-store read, so it
+				// is charged to the same per-session budget as operations (RT-17). Over
+				// budget it is answered "not held" rather than with an error, so a client
+				// pulling a large blob backs off and retries instead of being disconnected.
+				if (!this.rateLimiter.allow(1)) {
+					this.rateLimitedBlobRequests += 1
+					this.sendToClient({
+						type: 'blob-chunk-response',
+						messageId: `blob-resp-${message.requestId}`,
+						requestId: message.requestId,
+						bytes: null,
+					})
+					break
+				}
 				this.onBlobChunkRequest?.(this.sessionId, message)
 				break
 			case 'blob-chunk-response':
@@ -931,8 +1048,76 @@ export class ClientSession {
 			// Reject a mismatched upload rather than persisting untrusted bytes.
 			return
 		}
+		const owner = this.blobOwnerKey()
+		const scopes = this.referenceScopes()
+		// A manifest may only list chunks the pusher may reference itself (RT-11), so a
+		// crafted manifest cannot make another tenant's chunk reachable.
+		if (
+			this.blobAccess &&
+			scopes !== undefined &&
+			!(await this.blobAccess.authorizeManifestPush(bytes, scopes, owner))
+		) {
+			this.sendError(
+				'BLOB_REFERENCE_FORBIDDEN',
+				`Blob manifest ${message.hash} lists content this session cannot read and has not uploaded.`,
+				false,
+			)
+			return
+		}
 		this.blobBytesPushed += bytes.byteLength
 		await this.persistBlobChunk(message.hash, bytes)
+		// Pushing the bytes proves possession: the session may reference this hash.
+		await this.blobAccess?.recordPush(message.hash, bytes, owner)
+	}
+
+	/**
+	 * The download scope references are authorized against (RT-11, RT-13), or
+	 * undefined when they are not checked: without a real auth provider there is no
+	 * tenant boundary to protect.
+	 */
+	private referenceScopes(): ScopeMap | undefined {
+		if (!this.auth || this.auth instanceof NoAuthProvider) return undefined
+		if (!this.principal) return {}
+		return this.authContext?.downlinkScopes ?? this.authContext?.scopes
+	}
+
+	/**
+	 * Stable blob-ownership key of this session's principal: the user id, or for an
+	 * anonymous device its node-claim owner (never shared by two anonymous devices).
+	 */
+	private blobOwnerKey(): string {
+		if (this.principal?.anonymous === true) {
+			return this.nodeOwnerKey ?? `kora:node:${this.clientNodeId ?? this.sessionId}`
+		}
+		return this.principal?.userId ?? `kora:node:${this.clientNodeId ?? this.sessionId}`
+	}
+
+	/**
+	 * Partition key for peer-to-peer blob forwarding. Sessions with the same download
+	 * scope share a tenant view, except anonymous devices: every anonymous session has
+	 * the same grant but they are unrelated people, so each is its own partition.
+	 */
+	getBlobPartitionKey(): string {
+		const key = this.getScopePartitionKey()
+		return this.principal?.anonymous === true ? `${this.blobOwnerKey()}|${key}` : key
+	}
+
+	/** Authorize foreign-key targets and blob references of an untrusted write. */
+	private async authorizeReferences(op: Operation): Promise<UplinkAuthorizationResult> {
+		const scopes = this.referenceScopes()
+		const schema = this.store.getSchema()
+		if (scopes === undefined || !schema || !operationHasReferences(op, schema)) {
+			return { allowed: true }
+		}
+		const stored = (await this.lookupRecordFields(op.collection, op.recordId)) ?? null
+		return authorizeOperationReferences(op, stored, {
+			schema,
+			downlinkScopes: scopes,
+			readRow: async (collection, recordId) =>
+				(await this.lookupRecordFields(collection, recordId)) ?? null,
+			...(this.blobAccess ? { blobs: this.blobAccess } : {}),
+			blobOwner: this.blobOwnerKey(),
+		})
 	}
 
 	private handleMessageFailure(error: unknown): void {
@@ -972,13 +1157,40 @@ export class ClientSession {
 				this.close('authentication failed')
 				return
 			}
+			// The `kora:` namespace belongs to principals Kora synthesizes (anonymous node
+			// owners). A provider issuing such a user id could collide with them (RT-12).
+			if (context.anonymous !== true && context.userId.startsWith(RESERVED_PRINCIPAL_PREFIX)) {
+				this.sendError(
+					'AUTH_FAILED',
+					`The auth provider returned the user id "${context.userId}", which is in the reserved "${RESERVED_PRINCIPAL_PREFIX}" namespace. Issue user ids without that prefix.`,
+					false,
+				)
+				this.close('reserved principal id')
+				return
+			}
 			// Bind the device node id to this principal. A node id another user already
 			// claimed is refused, so nobody can upload operations as someone else's device.
-			// Anonymous principals get a fresh userId per connection, so they claim under
-			// one shared anonymous owner (RT-5). NoAuthProvider has no identity at all.
+			// Anonymous principals get a fresh userId per connection, so their claim is
+			// keyed by a per-device secret instead (RT-12): the server issues a node token
+			// at the first claim, the client stores it next to its node id, and only a
+			// handshake presenting it may use the node again. NoAuthProvider has no
+			// identity at all.
 			if (this.store.claimNode && !(this.auth instanceof NoAuthProvider)) {
-				const owner = context.anonymous === true ? ANONYMOUS_NODE_OWNER : context.userId
+				let owner = context.userId
+				if (context.anonymous === true) {
+					const presented =
+						typeof msg.nodeToken === 'string' &&
+						msg.nodeToken.length > 0 &&
+						msg.nodeToken.length <= MAX_NODE_TOKEN_LENGTH
+							? msg.nodeToken
+							: null
+					const nodeToken = presented ?? generateNodeToken()
+					if (presented === null) this.issuedNodeToken = nodeToken
+					owner = await anonymousNodeOwner(nodeToken)
+				}
+				this.nodeOwnerKey = owner
 				if (!(await this.store.claimNode(msg.nodeId, owner))) {
+					this.issuedNodeToken = null
 					this.sendError(
 						'NODE_ID_CLAIMED',
 						`Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
@@ -1012,6 +1224,7 @@ export class ClientSession {
 			}
 			this.principal = context
 			this.authContext = context
+			this.credential = token
 			this.state = 'authenticated'
 		}
 
@@ -1034,6 +1247,7 @@ export class ClientSession {
 			!(this.auth instanceof NoAuthProvider) &&
 			this.store.getSchema() !== null
 		let rawResolvedDownlinkScopes: ReturnType<typeof resolveSessionScopes>
+		let rawResolvedUplinkScopes: ReturnType<typeof resolveSessionScopes>
 		try {
 			rawResolvedDownlinkScopes = resolveSessionScopes(this.store.getSchema(), {
 				handshakeScope: msg.syncScope,
@@ -1041,6 +1255,18 @@ export class ClientSession {
 				authenticated,
 				onUnresolved: 'throw',
 			})
+			// A directional uplink grant goes through the same resolver as the downlink one
+			// (RT-16): verified `$claims` are bound to the schema, an unresolved binding
+			// denies the collection (fail closed; the session may still read), and the
+			// handshake can only narrow it, exactly as for a non-directional grant.
+			rawResolvedUplinkScopes = directionalScopesConfigured
+				? resolveSessionScopes(this.store.getSchema(), {
+						handshakeScope: msg.syncScope,
+						authScopes: uplinkAuthScopes,
+						authenticated,
+						onUnresolved: 'deny',
+					})
+				: rawResolvedDownlinkScopes
 		} catch (error) {
 			if (error instanceof InvalidScopePredicateError) {
 				this.sendError('INVALID_SCOPE_PREDICATE', error.message, false)
@@ -1052,9 +1278,6 @@ export class ClientSession {
 			this.close('sync scope required')
 			return
 		}
-		const rawResolvedUplinkScopes = directionalScopesConfigured
-			? uplinkAuthScopes
-			: rawResolvedDownlinkScopes
 		let resolvedDownlinkScopes: typeof rawResolvedDownlinkScopes
 		let resolvedUplinkScopes: typeof rawResolvedUplinkScopes
 		try {
@@ -1238,7 +1461,9 @@ export class ClientSession {
 			...(this.authContext?.uplinkScopes
 				? { acceptedUplinkScopes: this.authContext.uplinkScopes }
 				: {}),
+			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 		}
+		this.issuedNodeToken = null
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
@@ -1432,6 +1657,16 @@ export class ClientSession {
 				// action === 'accept' falls through to normal materialization.
 			}
 
+			// What the write points at (foreign-key parents, blob content) must be inside
+			// what this writer may read (RT-11, RT-13).
+			const references = await this.authorizeReferences(serverOp)
+			if (!references.allowed) {
+				this.sendOperationRejected(serverOp, references.code, references.message, false)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
 			// Re-check authorization inside the store's apply critical section against the
 			// row as it is at commit time, so a concurrent ownership change or same-id
 			// insert cannot slip in between the pre-check above and this write.
@@ -1509,8 +1744,9 @@ export class ClientSession {
 			const clientSeq = clientVector.get(nodeId) ?? 0
 			if (serverSeq > clientSeq) {
 				const ops = await this.store.getOperationRange(nodeId, clientSeq + 1, serverSeq)
+				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
-					if (await this.operationVisibleToClient(op)) {
+					if (await this.operationVisibleToClient(op, snapshots.get(op.id) ?? null)) {
 						missing.push(op)
 					}
 				}
@@ -1629,9 +1865,10 @@ export class ClientSession {
 				if (excludeNodeId !== undefined && delivered.operation.nodeId === excludeNodeId) {
 					continue
 				}
-				if (await this.operationVisibleToClient(delivered.operation)) {
+				const snapshot = delivered.scopeSnapshot ?? null
+				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
 					deliverable.push(delivered)
-				} else if (await this.scopeRetractionFor(delivered.operation)) {
+				} else if (await this.scopeRetractionFor(delivered.operation, snapshot)) {
 					deliverable.push({ ...delivered, retraction: true })
 				}
 			}
@@ -1726,9 +1963,41 @@ export class ClientSession {
 		return sent
 	}
 
-	private async operationVisibleToClient(op: Operation): Promise<boolean> {
+	/** The scope snapshots of these operations, when the store keeps them (RT-14). */
+	private async scopeSnapshotsFor(
+		operations: Operation[],
+	): Promise<Map<string, OperationScopeSnapshot>> {
+		if (!this.store.getOperationScopeSnapshots || operations.length === 0) return new Map()
+		try {
+			return await this.store.getOperationScopeSnapshots(operations.map((op) => op.id))
+		} catch {
+			return new Map()
+		}
+	}
+
+	/**
+	 * Download visibility of one operation. With a scope snapshot (RT-14) the
+	 * operation is judged on the record's scope values right after it was applied, so
+	 * history written while a record belonged to someone else stays hidden after an
+	 * ownership transfer, and a previous owner still receives its own history. Query
+	 * subsets (a client-chosen narrowing, not an authorization) keep using the current
+	 * row. Operations without a snapshot (legacy rows, custom stores) fall back to the
+	 * current row plus `op.data`.
+	 */
+	private async operationVisibleToClient(
+		op: Operation,
+		snapshot: OperationScopeSnapshot | null = null,
+	): Promise<boolean> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
+		if (snapshot?.post) {
+			if (!recordMatchesScopes(op.collection, { ...snapshot.post, id: op.recordId }, scopes)) {
+				return false
+			}
+			if (subsets.length === 0) return true
+			const current = await this.lookupRecordFields(op.collection, op.recordId)
+			return operationMatchesQuerySubsets(op, subsets, current)
+		}
 		// Visibility is judged on the server-materialized row plus op.data, never on the
 		// writer's previousData (RT-3: it is unverified, so it could push an op into
 		// another tenant's log or hide it from the writer's own devices). A partial
@@ -1783,12 +2052,20 @@ export class ClientSession {
 		return authorizeUplinkWrite(op, stored ?? null, scopes)
 	}
 
-	private async scopeRetractionFor(op: Operation): Promise<boolean> {
+	/**
+	 * True when this update moved the record out of the session's scope, judged on the
+	 * store's own before/after values (RT-15), never on the writer's previousData. An
+	 * operation without a snapshot never produces a retraction (fail quiet: the
+	 * client keeps what it already had, and no other tenant's record id leaks).
+	 */
+	private async scopeRetractionFor(
+		op: Operation,
+		snapshot: OperationScopeSnapshot | null = null,
+	): Promise<boolean> {
 		if (this.scopeExitPolicy !== 'retract') return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
-		if (!scopes) return false
-		const resultingRecord = await this.lookupRecordFields(op.collection, op.recordId)
-		return operationExitsScopes(op, scopes, resultingRecord)
+		if (!scopes || !snapshot) return false
+		return snapshotExitsScopes(op, snapshot, scopes)
 	}
 
 	/**

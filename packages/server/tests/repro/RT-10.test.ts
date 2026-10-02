@@ -79,16 +79,16 @@ describe('RT-10: referential side effects cross tenants', () => {
 		})
 		alice.send(batch([project]))
 		await tick()
-		bob.send(
-			batch([
-				makeOp('bob-node', 1, {
-					collection: 'tasks',
-					recordId: 'bob-task',
-					data: { title: 'mine', userId: 'bob', projectId: 'alice-project' },
-				}),
-			]),
+		// Since RT-13 Bob can no longer create a child under Alice's project through
+		// sync; such cross-tenant children still exist in data written before, so the
+		// child is seeded directly into the store.
+		await harness.store.applyRemoteOperation(
+			makeOp('bob-node', 1, {
+				collection: 'tasks',
+				recordId: 'bob-task',
+				data: { title: 'mine', userId: 'bob', projectId: 'alice-project' },
+			}),
 		)
-		await tick()
 		expect(await harness.store.findRecord('tasks', 'bob-task')).not.toBeNull()
 		alice.send(
 			batch([
@@ -118,16 +118,14 @@ describe('RT-10: referential side effects cross tenants', () => {
 		})
 		alice.send(batch([project]))
 		await tick()
-		bob.send(
-			batch([
-				makeOp('bob-node', 1, {
-					collection: 'comments',
-					recordId: 'bob-comment-xyz',
-					data: { body: 'hi', userId: 'bob', projectId: 'alice-project' },
-				}),
-			]),
+		// Seeded directly: since RT-13 sync refuses a child under another tenant's parent.
+		await harness.store.applyRemoteOperation(
+			makeOp('bob-node', 1, {
+				collection: 'comments',
+				recordId: 'bob-comment-xyz',
+				data: { body: 'hi', userId: 'bob', projectId: 'alice-project' },
+			}),
 		)
-		await tick()
 		expect(await harness.store.findRecord('comments', 'bob-comment-xyz')).not.toBeNull()
 		alice.send(
 			batch([

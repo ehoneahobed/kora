@@ -240,6 +240,13 @@ export interface SyncStatePersistence {
 	 * an evicted view back-fills from 0 (deduplicated) when next visited.
 	 */
 	deleteDeliveryWatermark?(signature: string): Promise<void>
+	/**
+	 * The per-device node token the server issued at this node id's first anonymous
+	 * claim (RT-12), stored next to the node id so the device can reconnect with it.
+	 * Optional: without it the token lives only as long as the sync engine.
+	 */
+	loadNodeToken?(): Promise<string | null>
+	saveNodeToken?(token: string): Promise<void>
 }
 
 /**

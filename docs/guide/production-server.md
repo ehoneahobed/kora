@@ -121,6 +121,37 @@ setInterval(async () => {
 a record still points at is always safe, even mid-upload. Only bytes no live
 record references are removed.
 
+### Who can read a blob
+
+**A content hash is not a secret.** Hashes of well-known files can be computed by
+anyone, and they travel inside records, manifests and logs. Kora therefore never
+treats knowing a hash as permission to read it:
+
+- A session can fetch blob bytes (from the central store or from a peer) only when a
+  live record inside its own download scope references them.
+- A write may put a blob reference into a record only when the writer can already
+  read a record that references the same content, has uploaded the bytes itself
+  (proof of possession), or is the first to present content nobody references, owns
+  or stores. Otherwise the write is refused with `SCOPE_VIOLATION`. The Kora client
+  uploads a blob's bytes before the operation that references it, so this is
+  automatic with central storage.
+- A manifest may only list chunks its uploader may reference.
+
+Without central storage (peer-to-peer blob transfer), a device has no way to prove
+it holds content that another tenant already referenced first, so a write that
+references identical bytes another tenant uploaded earlier is refused. Enable central
+blob storage if tenants routinely share identical files.
+
+## Session re-validation across instances
+
+Revoking a device or a user is persisted by the auth stores, but the revocation
+listener that ends live sync sessions runs only in the process that handled the
+revocation. Every `KoraSyncServer` therefore re-validates its own live sessions with
+its auth provider every `sessionRevalidationIntervalMs` (default 30 seconds, also
+driven by the delivery poll tick), and ends the ones whose credential is no longer
+accepted with a retriable `AUTH_REVOKED`. A provider error ends nothing; the next pass
+retries. Call `server.revalidateSessions()` to run a pass immediately.
+
 ## Gap-free delivery and the delivery-sequence migration
 
 The server guarantees that once an operation is in its log, it reaches every client whose scope includes it and is never silently skipped, across dropped messages, reconnects, client restarts, and scoped sync. This is driven by a server-assigned delivery sequence and a per-client delivery watermark, and it needs no configuration. The guarantee and its client-side behavior are described in [Sync configuration: delivery guarantees](./sync-configuration.md#delivery-guarantees-server-to-client), and the store methods and wire fields in the [server](../api/server.md#delivery-sequence-gap-free-server-to-client-sync) and [sync](../api/sync.md#protocol-messages) API references.
@@ -128,4 +159,5 @@ The server guarantees that once an operation is in its log, it reaches every cli
 Two operator notes:
 
 - **First startup after upgrading runs a one-time migration.** Each store adds a `delivery_seq` column and backfills existing operations. This is automatic and idempotent. On a very large Postgres operation log the backfill is a single ordered pass under an advisory lock; it runs once and subsequent startups skip it.
+- **Operation scope snapshots and blob owners (beta.13).** Each store adds a nullable `scope_snapshot` column to `operations` and a `blob_owners` table. Download visibility of a historical operation is judged on the record's scope values when that operation was applied, so an ownership transfer does not disclose the earlier history to the new owner, and scope-exit retractions come from the server's own rows. Existing operations are backfilled from the log when the schema is set (one replay per record); operations of collections outside the schema keep the previous behavior. Blob uploads made before the upgrade have no recorded owner: their existing references keep working, and a new reference to such bytes needs the writer to upload them again.
 - **Postgres serializes delivery-sequence assignment through one counter row** so delivery order matches commit order across instances. This is a deliberate correctness-over-throughput choice and is not a bottleneck for typical sync workloads. If you run a single Postgres at very high sustained write rates and measure contention on it, that is the place to look first.

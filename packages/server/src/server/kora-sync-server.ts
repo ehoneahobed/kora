@@ -41,6 +41,8 @@ const DEFAULT_PATH = '/'
 const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
 const DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS = 2 * 60_000
+/** Default interval between re-validations of live sessions' credentials (RT-18). */
+export const DEFAULT_SESSION_REVALIDATION_INTERVAL_MS = 30_000
 /** Bytes of randomness in a server-issued HTTP session id (256 bits). */
 const HTTP_SESSION_ID_BYTES = 32
 /** Default largest WebSocket message accepted (the ws library default is 100 MiB). */
@@ -140,6 +142,15 @@ export class KoraSyncServer {
 	private deliveryPollTimer: ReturnType<typeof setInterval> | null = null
 	private lastObservedDeliverySequence = 0
 	private deliveryPollInFlight = false
+	/**
+	 * Re-validates every live session's credential against the auth provider, so a
+	 * revocation persisted by ANOTHER server instance (whose in-process revocation
+	 * listeners never reach this one) still ends the session here (RT-18).
+	 */
+	private readonly sessionRevalidationIntervalMs: number
+	private sessionRevalidationTimer: ReturnType<typeof setInterval> | null = null
+	private lastSessionRevalidationAtMs = 0
+	private sessionRevalidationInFlight: Promise<number> | null = null
 	/** Unsubscribes from the auth provider's revocation feed (AUTH-11). */
 	private revocationUnsubscribe: (() => void) | null = null
 	/**
@@ -210,6 +221,10 @@ export class KoraSyncServer {
 					? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
 					: {}),
 			},
+		)
+		this.sessionRevalidationIntervalMs = validateIntervalOption(
+			'sessionRevalidationIntervalMs',
+			config.sessionRevalidationIntervalMs ?? DEFAULT_SESSION_REVALIDATION_INTERVAL_MS,
 		)
 		this.httpSessionIdleTimeoutMs = validateIntervalOption(
 			'httpSessionIdleTimeoutMs',
@@ -359,6 +374,83 @@ export class KoraSyncServer {
 			}, this.deliveryPollIntervalMs)
 			this.deliveryPollTimer.unref?.()
 		}
+
+		if (
+			this.sessionRevalidationIntervalMs > 0 &&
+			!this.sessionRevalidationTimer &&
+			this.auth !== null &&
+			!(this.auth instanceof NoAuthProvider)
+		) {
+			this.sessionRevalidationTimer = setInterval(() => {
+				void this.revalidateSessions()
+			}, this.sessionRevalidationIntervalMs)
+			this.sessionRevalidationTimer.unref?.()
+		}
+	}
+
+	/**
+	 * Re-validate the credential of every live session with the auth provider and end
+	 * the sessions whose credential is no longer accepted (RT-18).
+	 *
+	 * Revocations are persisted by the auth stores (token, device and per-user
+	 * cut-offs), but `onRevoke` listeners only run in the process that handled the
+	 * revocation. Every instance therefore re-checks its own live sessions
+	 * periodically (`sessionRevalidationIntervalMs`, default 30 seconds, also driven by
+	 * the delivery poll tick) by authenticating the session's credential again. A
+	 * session whose credential is refused, or now resolves to another principal, gets
+	 * a retriable `AUTH_REVOKED` (or `AUTH_EXPIRED`) and is closed. A provider error
+	 * (for example the auth database is unreachable) ends nothing: it is logged and the
+	 * next pass retries, so an outage does not disconnect every client.
+	 *
+	 * @returns The number of sessions ended by this pass
+	 *
+	 * @example
+	 * ```typescript
+	 * // After revoking through another instance's admin API:
+	 * await server.revalidateSessions()
+	 * ```
+	 */
+	revalidateSessions(): Promise<number> {
+		if (this.sessionRevalidationInFlight) return this.sessionRevalidationInFlight
+		const run = (async (): Promise<number> => {
+			this.lastSessionRevalidationAtMs = Date.now()
+			let terminated = 0
+			for (const session of [...this.sessions.values()]) {
+				const outcome = await session.revalidateCredential()
+				if (outcome === 'terminated') terminated++
+				if (outcome === 'error') {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'session.revalidation_failed',
+						sessionId: session.getSessionId(),
+					})
+				}
+			}
+			if (terminated > 0) {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'sessions.terminated',
+					count: terminated,
+					details: { code: 'AUTH_REVOKED', reason: 'revalidation' },
+				})
+			}
+			return terminated
+		})()
+		this.sessionRevalidationInFlight = run
+		void run.finally(() => {
+			if (this.sessionRevalidationInFlight === run) this.sessionRevalidationInFlight = null
+		})
+		return run
+	}
+
+	/** Run {@link revalidateSessions} from the delivery poll tick once the interval elapsed. */
+	private maybeRevalidateSessions(now = Date.now()): void {
+		if (this.sessionRevalidationIntervalMs <= 0) return
+		if (this.auth === null || this.auth instanceof NoAuthProvider) return
+		if (now - this.lastSessionRevalidationAtMs < this.sessionRevalidationIntervalMs) return
+		void this.revalidateSessions()
 	}
 
 	/**
@@ -393,6 +485,7 @@ export class KoraSyncServer {
 	async pollDeliveryLog(): Promise<void> {
 		if (this.deliveryPollInFlight) return
 		this.deliveryPollInFlight = true
+		this.maybeRevalidateSessions()
 		try {
 			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
 			if (maxDeliverySequence <= this.lastObservedDeliverySequence) {
@@ -404,9 +497,11 @@ export class KoraSyncServer {
 				}
 				return
 			}
+			const previous = this.lastObservedDeliverySequence
 			this.lastObservedDeliverySequence = maxDeliverySequence
-			// Records may have changed through another instance: rebuild blob access sets.
-			this.blobAccess.invalidate()
+			// Records may have changed through another instance: drop the blob access sets
+			// of the collections written since the last poll (RT-17).
+			await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
 			for (const session of this.sessions.values()) {
 				session.pushDeliveryStreamIfSupported(0, {
 					serverFrontier: maxDeliverySequence,
@@ -422,6 +517,32 @@ export class KoraSyncServer {
 		} finally {
 			this.deliveryPollInFlight = false
 		}
+	}
+
+	/**
+	 * Invalidate cached blob access sets for the collections written between two
+	 * delivery frontiers. Falls back to dropping every set when the gap is large.
+	 */
+	private async invalidateBlobAccessSince(from: number, to: number): Promise<void> {
+		const MAX_SCANNED = 1000
+		if (to - from > MAX_SCANNED) {
+			this.blobAccess.invalidate()
+			return
+		}
+		try {
+			const delivered = await this.store.getOperationsAfterDelivery(from, MAX_SCANNED)
+			this.blobAccess.invalidate(collectionsOf(delivered.map((d) => d.operation)))
+		} catch {
+			this.blobAccess.invalidate()
+		}
+	}
+
+	/**
+	 * The blob reference authority shared by every session and route (RT-11).
+	 * @internal Used by the route context; not part of the public API.
+	 */
+	getBlobAccessIndex(): BlobAccessIndex {
+		return this.blobAccess
 	}
 
 	/**
@@ -636,6 +757,10 @@ export class KoraSyncServer {
 		if (this.deliveryPollTimer) {
 			clearInterval(this.deliveryPollTimer)
 			this.deliveryPollTimer = null
+		}
+		if (this.sessionRevalidationTimer) {
+			clearInterval(this.sessionRevalidationTimer)
+			this.sessionRevalidationTimer = null
 		}
 		this.orphanedRelaysByNode.clear()
 		this.revocationUnsubscribe?.()
@@ -947,6 +1072,7 @@ export class KoraSyncServer {
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),
+			blobAccess: this.blobAccess,
 			onClose: (sid) => {
 				this.handleSessionClose(sid)
 			},
@@ -1015,7 +1141,7 @@ export class KoraSyncServer {
 		const result = await applyServerOperation(this.store, op, undefined, options)
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
-			this.blobAccess.invalidate()
+			this.blobAccess.invalidate(collectionsOf(result.appliedOperations))
 			for (const session of this.sessions.values()) {
 				session.relayOperations(result.appliedOperations)
 			}
@@ -1036,7 +1162,7 @@ export class KoraSyncServer {
 		if (operations.length === 0) {
 			return
 		}
-		this.blobAccess.invalidate()
+		this.blobAccess.invalidate(collectionsOf(operations))
 		for (const session of this.sessions.values()) {
 			session.relayOperations(operations)
 		}
@@ -1108,7 +1234,8 @@ export class KoraSyncServer {
 		const requester = this.sessions.get(requesterId)
 		const target = this.sessions.get(targetId)
 		if (!requester?.isStreaming() || !target?.isStreaming()) return false
-		if (requester.getScopePartitionKey() === target.getScopePartitionKey()) return true
+		// Same tenant view (anonymous devices are each their own partition, RT-11).
+		if (requester.getBlobPartitionKey() === target.getBlobPartitionKey()) return true
 		return (
 			(await this.sessionReferencesBlob(requesterId, hash)) &&
 			(await this.sessionReferencesBlob(targetId, hash))
@@ -1116,7 +1243,7 @@ export class KoraSyncServer {
 	}
 
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
-		this.blobAccess.invalidate()
+		this.blobAccess.invalidate(collectionsOf(operations))
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
 		this.metrics.recordSent(
@@ -1260,6 +1387,11 @@ function generateHttpSessionId(): string {
 	let binary = ''
 	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/** The distinct collections a set of operations writes. */
+function collectionsOf(operations: Operation[]): Set<string> {
+	return new Set(operations.map((op) => op.collection))
 }
 
 /**

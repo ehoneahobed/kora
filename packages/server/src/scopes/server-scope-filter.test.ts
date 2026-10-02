@@ -5,6 +5,7 @@ import {
 	missingScopeFields,
 	normalizeScopeMap,
 	operationMatchesScopes,
+	snapshotExitsScopes,
 } from './server-scope-filter'
 
 describe('normalizeScopeMap fails closed on missing predicate values (RT-8)', () => {
@@ -175,5 +176,43 @@ describe('operationMatchesScopes', () => {
 		const insert = createOp()
 		expect(missingScopeFields(insert, { todos: { ownerId: 'user-1' } })).toEqual([])
 		expect(missingScopeFields(insert, undefined)).toEqual([])
+	})
+})
+
+describe('snapshotExitsScopes judges exits on server values only (RT-15)', () => {
+	const scopes = { todos: { owner: 'alice' } }
+	const update = {
+		id: 'u',
+		nodeId: 'n',
+		type: 'update',
+		collection: 'todos',
+		recordId: 'r1',
+		data: { title: 'x' },
+		// Forged: never consulted.
+		previousData: { owner: 'alice' },
+		timestamp: { wallTime: 1, logical: 0, nodeId: 'n' },
+		sequenceNumber: 1,
+		causalDeps: [],
+		schemaVersion: 1,
+	} as Operation
+
+	test('an update from inside to outside the scope exits it', () => {
+		expect(
+			snapshotExitsScopes(update, { pre: { owner: 'alice' }, post: { owner: 'bob' } }, scopes),
+		).toBe(true)
+	})
+
+	test("the writer's previousData cannot fake a pre-image", () => {
+		expect(
+			snapshotExitsScopes(update, { pre: { owner: 'bob' }, post: { owner: 'bob' } }, scopes),
+		).toBe(false)
+	})
+
+	test('inserts, deletes, missing pre-images and unscoped sessions never exit', () => {
+		const exit = { pre: { owner: 'alice' }, post: { owner: 'bob' } }
+		expect(snapshotExitsScopes({ ...update, type: 'insert' }, exit, scopes)).toBe(false)
+		expect(snapshotExitsScopes({ ...update, type: 'delete' }, exit, scopes)).toBe(false)
+		expect(snapshotExitsScopes(update, { pre: null, post: { owner: 'bob' } }, scopes)).toBe(false)
+		expect(snapshotExitsScopes(update, exit, undefined)).toBe(false)
 	})
 })

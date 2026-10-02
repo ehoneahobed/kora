@@ -40,15 +40,33 @@ const request = (i: number): SyncMessage => ({
 
 describe('RT-17: blob request cost', () => {
 	test('blob chunk requests are charged to the session rate limiter', async () => {
+		const hash = 'a'.repeat(64)
 		const resolveBlobChunk = vi.fn(async () => null)
 		const harness = await createHarness(schema, auth, { maxOpsPerMinute: 10, resolveBlobChunk })
 		const alice = await harness.login('alice-token', 'alice-node')
-		for (let i = 0; i < 50; i++) alice.send(request(i))
+		// A record in Alice's scope references the hash, so every request reaches the
+		// central store read.
+		alice.send(
+			batch([
+				makeOp('alice-node', 1, {
+					collection: 'files',
+					recordId: 'f1',
+					data: { owner: 'alice', doc: { hash, size: 1 } },
+				}),
+			]),
+		)
+		await tick()
+		for (let i = 0; i < 50; i++) {
+			alice.send({ type: 'blob-chunk-request', messageId: `m${i}`, requestId: `r${i}`, hash })
+		}
 		await tick(80)
-		const limited = alice.messages.filter((m) => m.type === 'error' && m.code === 'RATE_LIMIT')
-		expect(limited.length).toBeGreaterThan(0)
+		// Work is bounded by the session budget...
+		expect(resolveBlobChunk.mock.calls.length).toBeLessThanOrEqual(10)
+		// ...and every request is still answered ("not held" over budget), so the client
+		// neither hangs nor is disconnected.
 		const answered = alice.messages.filter((m) => m.type === 'blob-chunk-response')
-		expect(answered.length).toBeLessThanOrEqual(10)
+		expect(answered.length).toBe(50)
+		expect(alice.messages.some((m) => m.type === 'error')).toBe(false)
 	})
 
 	test('concurrent requests for one scope share one rebuild of its blob index', async () => {

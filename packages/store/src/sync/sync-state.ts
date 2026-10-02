@@ -5,6 +5,7 @@ import type { MetaRow, StorageAdapter } from '../types'
 export const LAST_ACKED_SERVER_VECTOR_META_KEY = 'last_acked_server_vector'
 export const DELTA_CURSOR_META_KEY = 'delta_cursor'
 export const DELIVERY_WATERMARK_META_KEY = 'delivery_watermark'
+export const NODE_TOKEN_META_KEY = 'sync_node_token'
 
 /**
  * Serialize a version vector for `_kora_meta` storage.
@@ -90,6 +91,26 @@ export async function saveLastAckedServerVector(
 	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 		LAST_ACKED_SERVER_VECTOR_META_KEY,
 		serializeVersionVectorToMeta(vector),
+	])
+}
+
+/**
+ * Load the per-device node token the sync server issued for this node id (RT-12).
+ */
+export async function loadNodeToken(adapter: StorageAdapter): Promise<string | null> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		NODE_TOKEN_META_KEY,
+	])
+	return rows[0]?.value ?? null
+}
+
+/**
+ * Persist the per-device node token next to the node id in `_kora_meta`.
+ */
+export async function saveNodeToken(adapter: StorageAdapter, token: string): Promise<void> {
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		NODE_TOKEN_META_KEY,
+		token,
 	])
 }
 

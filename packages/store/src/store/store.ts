@@ -57,10 +57,12 @@ import {
 	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
+	loadNodeToken,
 	mergeVersionVectors,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
+	saveNodeToken,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import { TransactionSequenceAllocator } from '../transaction/transaction-sequence'
@@ -962,6 +964,22 @@ export class Store implements OperationLog {
 	async saveLastAckedServerVector(vector: VersionVector): Promise<void> {
 		this.ensureOpen()
 		await saveLastAckedServerVector(this.adapter, vector)
+	}
+
+	/**
+	 * Load the per-device node token the sync server issued for this node id (RT-12).
+	 */
+	async loadNodeToken(): Promise<string | null> {
+		this.ensureOpen()
+		return loadNodeToken(this.adapter)
+	}
+
+	/**
+	 * Persist the per-device node token next to the node id.
+	 */
+	async saveNodeToken(token: string): Promise<void> {
+		this.ensureOpen()
+		await saveNodeToken(this.adapter, token)
 	}
 
 	/**

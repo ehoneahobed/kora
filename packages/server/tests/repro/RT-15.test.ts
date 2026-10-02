@@ -82,14 +82,12 @@ describe('RT-15: retraction pre-image comes from the writer', () => {
 			]),
 		)
 		await tick()
-		const moved = await harness.server
-			.getKoraContext()
-			.apply({
-				collection: 'todos',
-				type: 'update',
-				recordId: 'alice-todo',
-				data: { owner: 'bob' },
-			})
+		const moved = await harness.server.getKoraContext().apply({
+			collection: 'todos',
+			type: 'update',
+			recordId: 'alice-todo',
+			data: { owner: 'bob' },
+		})
 		expect(moved.ok).toBe(true)
 		const alice2 = await harness.login('alice-token-2', 'alice-node-2', retract)
 		expect(retractedIds(alice2.messages)).toContain('alice-todo')

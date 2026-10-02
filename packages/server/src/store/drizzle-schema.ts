@@ -30,6 +30,10 @@ export const operations = sqliteTable(
 		// gap-free server->client delivery watermark. Nullable only for rows written
 		// before the column existed; those are backfilled on startup.
 		deliverySeq: integer('delivery_seq'),
+		// JSON { pre, post }: the record's scope values around this operation, captured
+		// from the server's own rows at apply time (RT-14). Null for legacy rows that
+		// could not be backfilled.
+		scopeSnapshot: text('scope_snapshot'),
 	},
 	(table) => ({
 		nodeSeqIdx: index('idx_node_seq').on(table.nodeId, table.sequenceNumber),

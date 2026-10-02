@@ -32,6 +32,14 @@ async function aliceFile(
 	hash: string,
 ): Promise<void> {
 	const alice = await harness.login('alice-token', 'alice-node-0')
+	// Since RT-11 a writer may only reference content it can read or has uploaded, so
+	// Alice uploads the bytes before referencing them (as the client does).
+	alice.send({
+		type: 'blob-chunk-push',
+		messageId: 'push',
+		hash,
+		bytes: Buffer.from(secret).toString('base64'),
+	})
 	alice.send(
 		batch([
 			makeOp('alice-node-0', 1, {
@@ -59,6 +67,9 @@ describe('RT-1: blob relay crosses tenants', () => {
 		const central = new Map([[hash, secret]])
 		const harness = await createHarness(schema, auth, {
 			resolveBlobChunk: async (h) => central.get(h) ?? null,
+			persistBlobChunk: (h, bytes) => {
+				central.set(h, bytes)
+			},
 		})
 		await aliceFile(harness, hash)
 		const bob = await harness.login('bob-token', 'bob-node')
@@ -73,6 +84,9 @@ describe('RT-1: blob relay crosses tenants', () => {
 		const central = new Map([[hash, secret]])
 		const harness = await createHarness(schema, auth, {
 			resolveBlobChunk: async (h) => central.get(h) ?? null,
+			persistBlobChunk: (h, bytes) => {
+				central.set(h, bytes)
+			},
 		})
 		await aliceFile(harness, hash)
 		const alice2 = await harness.login('alice-token-2', 'alice-node-2')

@@ -218,6 +218,14 @@ export class SyncEngine {
 	private readonly syncState: SyncStatePersistence | null
 
 	private remoteVector: VersionVector = new Map()
+	/** Runs before each outbound operation batch is sent (see setOutboundPreparer). */
+	private outboundPreparer: ((operations: Operation[]) => Promise<void>) | null = null
+	/**
+	 * Per-device node token the server issued at this node id's first anonymous claim
+	 * (RT-12). Presented in every handshake; persisted next to the node id when the
+	 * sync-state persistence supports it, otherwise kept for this engine's lifetime.
+	 */
+	private nodeToken: string | null = null
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -349,10 +357,14 @@ export class SyncEngine {
 			onSend: (
 				message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
 			) => {
-				// Blob transfer is only meaningful once the connection reaches steady
-				// state. A request dropped here is safe: the puller times out and
-				// retries, and blob transfer is resumable.
-				if (this.state !== 'streaming') {
+				// Blob transfer needs an accepted handshake. Pushes may also go out while
+				// syncing, so the bytes behind a handshake-delta operation reach the server
+				// before the operation does (RT-11). A request dropped here is safe: the
+				// puller times out and retries, and blob transfer is resumable.
+				const live =
+					this.state === 'streaming' ||
+					(this.state === 'syncing' && message.type === 'blob-chunk-push')
+				if (!live) {
 					return
 				}
 				this.transport.send(message)
@@ -414,6 +426,9 @@ export class SyncEngine {
 		await this.outboundQueue.initialize()
 		if (this.syncState) {
 			this.lastAckedServerVector = await this.syncState.loadLastAckedServerVector()
+			if (this.nodeToken === null && this.syncState.loadNodeToken) {
+				this.nodeToken = await this.syncState.loadNodeToken()
+			}
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
 			}
@@ -496,6 +511,7 @@ export class SyncEngine {
 				// that understands it drives server->client sync from delivery sequences; an
 				// older server ignores it and falls back to the version-vector delta.
 				lastDeliverySequence: this.deliveryWatermark,
+				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -1063,13 +1079,31 @@ export class SyncEngine {
 
 	/**
 	 * Upload a blob chunk (or manifest) to the server for central persistence.
-	 * A no-op unless connected and the server advertised blob storage.
+	 * A no-op unless the handshake was accepted (syncing or streaming) and the server
+	 * advertised blob storage.
 	 */
 	uploadBlobChunk(hash: string, bytes: Uint8Array): void {
-		if (this.state !== 'streaming' || !this.blobStorageEnabled) {
+		if ((this.state !== 'streaming' && this.state !== 'syncing') || !this.blobStorageEnabled) {
 			return
 		}
 		this.blobChunkChannel.send({ type: 'blob-chunk-push', hash, bytes })
+	}
+
+	/**
+	 * Register work that must reach the server before each outbound operation batch,
+	 * on the same connection (messages are processed in order). Used to upload the
+	 * bytes behind blob references first: the server only accepts a reference to
+	 * content the writer can read or has uploaded (RT-11). Errors are ignored; the
+	 * batch is sent regardless.
+	 *
+	 * @param preparer - Called with the operations about to be sent; null to remove
+	 * @returns A function that removes this preparer
+	 */
+	setOutboundPreparer(preparer: ((operations: Operation[]) => Promise<void>) | null): () => void {
+		this.outboundPreparer = preparer
+		return () => {
+			if (this.outboundPreparer === preparer) this.outboundPreparer = null
+		}
 	}
 
 	// --- Private methods ---
@@ -1201,6 +1235,11 @@ export class SyncEngine {
 			return
 		}
 
+		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
+			this.nodeToken = msg.nodeToken
+			await this.syncState?.saveNodeToken?.(msg.nodeToken)
+		}
+
 		this.remoteVector = wireToVersionVector(msg.versionVector)
 		void this.persistLastAckedServerVector(this.remoteVector)
 
@@ -1317,7 +1356,7 @@ export class SyncEngine {
 
 	private async sendDelta(): Promise<void> {
 		const localVector = this.store.getVersionVector()
-		const allMissingOps = await this.collectDelta(localVector, this.remoteVector)
+		const allMissingOps = await this.collectDelta(localVector, this.uploadBaseVector())
 
 		const missingOps = await this.filterAllowedForUpload(allMissingOps)
 
@@ -1353,6 +1392,13 @@ export class SyncEngine {
 			const start = i * this.batchSize
 			const batchOps = sorted.slice(start, start + this.batchSize)
 			const batchCursor = createDeltaCursorFromBatch(batchOps, i)
+			if (this.outboundPreparer) {
+				try {
+					await this.outboundPreparer(batchOps)
+				} catch {
+					// Best effort: the server decides on the operations themselves.
+				}
+			}
 
 			// Encrypt data fields before serialization if E2E encryption is enabled
 			const opsToSerialize = this.encryptor ? await this.encryptor.encryptBatch(batchOps) : batchOps
@@ -1882,16 +1928,61 @@ export class SyncEngine {
 		if (!this.syncState) {
 			return this.remoteVector
 		}
-		return this.syncState.mergeServerVectors(this.lastAckedServerVector, this.remoteVector)
+		const merged = this.syncState.mergeServerVectors(
+			this.lastAckedServerVector,
+			this.withoutOwnNode(this.remoteVector),
+		)
+		const own = this.ownAcknowledgedSequence()
+		const localNodeId = this.store.getNodeId()
+		if (own > 0) merged.set(localNodeId, own)
+		else merged.delete(localNodeId)
+		return merged
+	}
+
+	/**
+	 * How far the server holds THIS device's own operations, as far as the device can
+	 * trust it (RT-12). The server-advertised entry for the own node is never trusted
+	 * above what the server actually acknowledged: a forged high sequence (another
+	 * client that uploaded under this node id) would otherwise make the device treat
+	 * its unsynced writes as already uploaded and never send them. Bounded by
+	 * min(serverVector[self], last acknowledged own sequence); a lower server value
+	 * (a restored backup) is honoured so the device re-uploads what the server lost.
+	 *
+	 * Without sync-state persistence the acknowledged sequence is not tracked, and the
+	 * server's value is used as before; that mode re-enqueues the device's whole own
+	 * history from the op log on every start, so a forged value cannot hide a write.
+	 */
+	private ownAcknowledgedSequence(): number {
+		const localNodeId = this.store.getNodeId()
+		const remote = this.remoteVector.get(localNodeId)
+		if (!this.syncState) return remote ?? 0
+		const acked = this.lastAckedServerVector.get(localNodeId) ?? 0
+		return remote === undefined ? acked : Math.min(remote, acked)
+	}
+
+	/** The server vector the handshake upload is computed against (own entry bounded, RT-12). */
+	private uploadBaseVector(): VersionVector {
+		const base = new Map(this.remoteVector)
+		const own = this.ownAcknowledgedSequence()
+		base.set(this.store.getNodeId(), own)
+		return base
+	}
+
+	private withoutOwnNode(vector: VersionVector): VersionVector {
+		const copy = new Map(vector)
+		copy.delete(this.store.getNodeId())
+		return copy
 	}
 
 	private async persistLastAckedServerVector(vector: VersionVector): Promise<void> {
 		if (!this.syncState) {
 			return
 		}
+		// The own-node entry is only ever advanced by acknowledgments of this device's
+		// uploads (advanceLastAckedForLocalNode), never by what a handshake advertises.
 		this.lastAckedServerVector = this.syncState.mergeServerVectors(
 			this.lastAckedServerVector,
-			vector,
+			this.withoutOwnNode(vector),
 		)
 		await this.syncState.saveLastAckedServerVector(this.lastAckedServerVector)
 	}
@@ -1969,6 +2060,26 @@ export class SyncEngine {
 		this.currentBatchRequiresPartialAck = false
 		this.currentBatchRequiresRetryBackoff = false
 
+		const preparer = this.outboundPreparer
+		if (preparer) {
+			// Let the app send what the server needs BEFORE these operations (blob bytes,
+			// so the server sees proof of possession before the reference, RT-11). A
+			// batch returned to the queue meanwhile (disconnect) is not sent here.
+			void preparer(batch.operations)
+				.catch(() => {
+					// Best effort: the server decides on the operations themselves.
+				})
+				.then(() => {
+					if (this.currentBatch !== batch || this.state !== 'streaming') return
+					this.sendTakenBatch(batch)
+				})
+			return
+		}
+		this.sendTakenBatch(batch)
+	}
+
+	/** Encode and send a batch already taken from the outbound queue. */
+	private sendTakenBatch(batch: OutboundBatch): void {
 		if (this.encryptor) {
 			// Encryption is async — encrypt then send. Errors return the batch to the queue.
 			this.encryptor.encryptBatch(batch.operations).then(
