@@ -9,6 +9,15 @@ export const DEFAULT_MAX_OPS_PER_MINUTE = 600
 /** Default blob chunk requests accepted per client session per minute (RT-24). */
 export const DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE = 6000
 
+/**
+ * Rate-limit units one uploaded batch costs for the server's stored-id lookup (RT-39).
+ * Operations the lookup finds already stored are acknowledged without further charge,
+ * so a device re-uploading its history pays per batch, not per operation; the unit is
+ * credited against the batch's first operation that is charged, so a batch of new
+ * operations costs exactly one unit per operation.
+ */
+export const BATCH_LOOKUP_RATE_COST = 1
+
 /** Default largest operation batch a session accepts in one message. */
 export const DEFAULT_MAX_OPS_PER_BATCH = 1000
 

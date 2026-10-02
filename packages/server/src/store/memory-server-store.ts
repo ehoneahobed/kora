@@ -23,7 +23,12 @@ import type {
 	OperationScopeSnapshot,
 	ServerStore,
 } from './server-store'
-import { RELEASED_NODE_OWNER, SequenceConflictError, judgeSequenceHolders } from './server-store'
+import {
+	RELEASED_NODE_OWNER,
+	SequenceConflictError,
+	judgeSequenceHolders,
+	reportLegacyPair,
+} from './server-store'
 import type { StoredOperationKey } from './server-store'
 
 /** Key of a node's sequence number in {@link MemoryServerStore}'s sequence index. */
@@ -43,7 +48,8 @@ export class MemoryServerStore implements ServerStore {
 	private readonly operations: Operation[] = []
 	private readonly operationIndex = new Map<string, Operation>()
 	/** (nodeId, sequenceNumber) -> the id of the operation holding it (W3 step 4). */
-	private readonly operationIdBySequence = new Map<string, string>()
+	/** (node, sequence) -> ids holding it, in store order (several only for a legacy pair). */
+	private readonly operationIdsBySequence = new Map<string, string[]>()
 	private readonly versionVector: Map<string, number> = new Map()
 	/**
 	 * Server-assigned delivery sequence per operation id. Single-process, so a plain
@@ -120,16 +126,16 @@ export class MemoryServerStore implements ServerStore {
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'
 		}
-		// A different operation under the same (node, sequence) is refused (W3 step 4).
-		const holder = this.operationIdBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber))
-		if (holder !== undefined && holder !== op.id) {
-			const decision = judgeSequenceHolders(
-				op,
-				[{ id: holder, deliverySequence: this.deliverySeqByOpId.get(holder) ?? 1 }],
-				this.sequenceEpoch,
-			)
-			if (decision.verdict === 'conflict') throw new SequenceConflictError(op, holder)
-		}
+		// A different operation under the same (node, sequence) is refused (W3 step 4),
+		// unless the writer is a legacy client or every holder predates the epoch (RT-37).
+		const holders = this.operationIdsBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber)) ?? []
+		const decision = judgeSequenceHolders(
+			op,
+			holders.map((id) => ({ id, deliverySequence: this.deliverySeqByOpId.get(id) ?? 1 })),
+			this.sequenceEpoch,
+			{ legacySequenceWriter: options?.legacySequenceWriter === true },
+		)
+		if (decision.verdict === 'conflict') throw new SequenceConflictError(op, decision.holderId)
 
 		// Authorization re-check against the row as stored right now. Everything from
 		// here to the write is synchronous, so no other writer can interleave.
@@ -149,7 +155,7 @@ export class MemoryServerStore implements ServerStore {
 
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
-		this.operationIdBySequence.set(sequenceKey(op.nodeId, op.sequenceNumber), op.id)
+		this.addSequenceHolder(op)
 
 		// Assign the next delivery sequence in commit order (single-process: no race).
 		this.deliverySeqCounter += 1
@@ -172,7 +178,15 @@ export class MemoryServerStore implements ServerStore {
 			})
 		}
 
+		reportLegacyPair(op, decision, options)
 		return 'applied'
+	}
+
+	private addSequenceHolder(op: Operation): void {
+		const key = sequenceKey(op.nodeId, op.sequenceNumber)
+		const ids = this.operationIdsBySequence.get(key)
+		if (ids) ids.push(op.id)
+		else this.operationIdsBySequence.set(key, [op.id])
 	}
 
 	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
@@ -596,7 +610,7 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		this.operations.length = 0
 		this.operationIndex.clear()
-		this.operationIdBySequence.clear()
+		this.operationIdsBySequence.clear()
 		this.versionVector.clear()
 		this.materializedRecords.clear()
 		this.nodeOwners.clear()
@@ -627,7 +641,7 @@ export class MemoryServerStore implements ServerStore {
 		// Replace mode: clear and reload
 		this.operations.length = 0
 		this.operationIndex.clear()
-		this.operationIdBySequence.clear()
+		this.operationIdsBySequence.clear()
 		this.versionVector.clear()
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
@@ -640,7 +654,7 @@ export class MemoryServerStore implements ServerStore {
 		for (const op of operations) {
 			this.operations.push(op)
 			this.operationIndex.set(op.id, op)
-			this.operationIdBySequence.set(sequenceKey(op.nodeId, op.sequenceNumber), op.id)
+			this.addSequenceHolder(op)
 			// Re-assign delivery sequence in backup order (the order ops were shipped).
 			this.deliverySeqCounter += 1
 			this.deliverySeqByOpId.set(op.id, this.deliverySeqCounter)
