@@ -4,7 +4,7 @@
 
 ## Why upgrade
 
-beta.12 let a client of a multi-user sync server read and modify other users' data, and could silently lose or diverge data in common offline flows. beta.13 closes every known P0 security issue and every Phase 1 item in the remediation tracker. Each fix is proven by a reproduction test that failed on beta.12, and the result was attacked three times by independent red-team reviews.
+beta.12 let a client of a multi-user sync server read and modify other users' data, and could silently lose or diverge data in common offline flows. beta.13 closes every known P0 security issue (Phase 1) and the "no silent data loss" programme (Phase 2) of the remediation tracker. Each fix is proven by a reproduction test that failed on beta.12, and each phase was attacked three times by independent red-team reviews.
 
 ## Security fixes (summary)
 
@@ -36,6 +36,21 @@ beta.12 let a client of a multi-user sync server read and modify other users' da
 - **Array removals stick.** A removal on one device is no longer undone by another device's unchanged copy, and client and server agree.
 - **Shared devices keep working.** Many per-user databases on one device no longer stop all writes, because OPFS pool capacity is reserved. Kora never silently runs in memory: it emits `store:durability-lost` and refuses writes unless you opt in.
 
+## No silent data loss (Phase 2)
+
+- **Every local write gets a unique sequence number.** Single writes, `app.transaction` entries and cascades all go through one write path that reserves sequence numbers inside the commit. Concurrent transactions no longer share numbers, and concurrent atomic increments no longer lose updates. Transaction writes stamp per-field versions and pass state-machine checks like single writes.
+- **An op counts as synced only when the server has it.** Uploads are tracked per batch, and the device keeps a contiguous "stored on the server" prefix. Pending counts are accurate and `waitForSettled` resolves promptly.
+- **Nothing is uploaded before it is durable on the device.** If local storage keeps failing, uploads continue and the status reports `localDurability: 'degraded'`.
+- **Nothing delivered is skipped.** Ops the device cannot apply yet (unknown collection, failed decrypt, far-future timestamp, rejected apply) are kept in a durable quarantine and replayed, never silently dropped. Decrypt failures no longer end the session.
+- **Refused stays refused.** A permanently rejected write is never applied later, even if a device resubmits it.
+- **Devices and servers recover from each other.** A device that lost its newest writes gets them back from the server. A server restored from an older backup gets the missing writes re-uploaded. Cloned databases are detected and moved to a fresh node.
+- **Writes belong to the user who made them.** On shared devices, writes are bound to the signed-in user and are never uploaded under another account. Writes whose author cannot be known are held and reported for the app to assign or discard.
+- **Closed tabs' writes are uploaded** by the next tab (`isolation: 'per-tab'`).
+- **One owner per OPFS database.** Each database has its own storage pool held under a Web Lock; contention waits and reports instead of falling back. Existing databases move into their own pools automatically. A hung or frozen leader tab no longer blocks other tabs, and closing hands off cleanly.
+- **Kora never deletes your data on its own.** `app.storage.listDatabases()` and `deleteDatabase()` refuse to delete a database with unsynced writes.
+- **The server is gap-free and bounded.** Live delivery chains from a send cursor and retransmits only on timeout. First sync streams in chunks with backpressure (100k ops: peak heap 18.7 MB to 4.8 MB). Dead connections are detected by heartbeats, and connections, bodies and buffers have limits.
+- **Postgres is exact.** Version vectors are read from the database (correct across instances), duplicate ops are refused atomically, and sequence columns are BIGINT.
+
 ## Breaking changes and how to migrate
 
 | Change | What to do |
@@ -60,15 +75,25 @@ beta.12 let a client of a multi-user sync server read and modify other users' da
 | Scope helpers | `previousData` is ignored unless you pass `{ includePreviousData: true }`. |
 | `AuthSyncState.token` | May be `null` while authenticated-offline. `AuthBoundKoraProvider` gains a `locked` state. |
 | Server storage | New `scope_snapshot` column, plus `blob_owners`, `node_claims` and `kora_server_meta` tables. They are created automatically. Snapshots are recomputed once on first start. |
-| Wire protocol | New optional fields (protobuf envelope 39–42, `fieldVersions` on scope-entry ops). beta.12 clients interoperate only where noted above. Upgrade clients and server together. |
+| **Upgrade order** | Upgrade sync servers first, then clients. Old clients keep working against the new server. |
+| One-time client migration | On first open, duplicate sequence numbers are repaired, old index names are replaced, OPFS databases move into per-database pools, and each device re-uploads its own history once (the server deduplicates it). A tab still running beta.12 makes the upgraded tab wait (`store:storage-blocked`): ask users to close other tabs. |
+| One-time server migration | Postgres converts sequence columns to BIGINT (an exclusive table rewrite, once; schedule it). New `operation_resolutions` and `sequence_pairs` tables and a `seq_unique` column are created automatically. |
+| `SEQUENCE_CONFLICT` | A different op under an existing (node, sequence) is refused for clients of this release. Clients recover automatically. |
+| Held writes | Writes on a never-synced database made before the app knew the signed-in user are held: call `app.sync.assignHeld(nodeId, 'current-user')` or `app.sync.discardHeld(nodeId)`. `status.heldOperations` and `status.heldNodes` report them. |
+| `app.storage` | A collection named `storage` must be reached through `app.collections.storage`. |
+| Enum `.transitions()` | A single enum field with `.transitions()` now defines the collection's state machine (mode `reject`), enforced for transaction writes too. |
+| Client-side scope filtering | Removed. The server is the only scope authority. |
+| Removed internals | `LocalMutationHandler.commitTransaction` and the `TransactionBufferedEntry`/`TransactionCommitBatch`/`TransactionCommitResult` types. |
+| New server options | `heartbeatIntervalMs`, `appHeartbeatIntervalMs`, `handshakeTimeoutMs`, `maxBufferedBytes`, `deliveryHighWaterBytes`, `perMessageDeflate` (on by default), `maxRequestBodyBytes` (1 MiB, 413), `maxBackupBytes`, `maxConnections` (default 10,000), `maxOpsPerMinutePerUser`. |
+| New events and status | `store:storage-blocked`, `store:storage-migrated`, `store:quota-exceeded`, `sync:apply-failed`, `sync:durability-degraded` / `sync:durability-restored`, `sync:local-node`; status `localDurability`, `heldOperations`, `heldNodes`. |
+| Wire protocol | New optional fields (protobuf envelope 39–45, `fieldVersions` on scope-entry ops, a `heartbeat` message). beta.12 clients interoperate only where noted above. Upgrade clients and server together. |
 | New events | `store:durability-lost`, `sync:node-id-rotated`, `sync:operation-rejected` (`OUT_OF_UPLINK_SCOPE`). |
 
 ## Known limitations carried into later phases
 
 See `remediation/STATUS.md`; every item has an owner, a phase and a test. The notable ones:
-- **Concurrent transactions** can still share sequence numbers (STORE-1/STORE-2, Phase 2).
 - **Array and object merges** can still diverge under some multi-device orderings (MERGE-2, Phase 3).
 - **Backup restore** is unsafe (STORE-5, Phase 3).
-- **Per-database OPFS pools** are still to come (NEW-STORE-5, Phase 2).
 - **End-to-end encryption** does not yet work across devices (ENC-1, Phase 4).
 - **The app shell** does not yet open offline (NEW-DX-3, Phase 4).
+- **Android background freeze** of a leader tab is verified only by simulated events in headless Chromium; a real-device run is pending.
