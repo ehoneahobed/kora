@@ -24,9 +24,11 @@
  *   append / remove are the same multiset difference against the writer's base
  *   (without an array base: the value's first occurrence). `merge('append-only')`
  *   ignores removals.
- * - `merge('server-authoritative')` ('reg'): a register whose writes by
- *   `FoldOptions.authoritativeNodeIds` (the server's node ids) carry class 1 and
- *   beat every class-0 write regardless of HLC. Order: (class, HLC, op id).
+ * - `merge('server-authoritative')` ('reg'): a register whose writes by server
+ *   nodes carry class 1 and beat every class-0 write regardless of HLC. Order:
+ *   (class, HLC, op id). A server node is any node id in the reserved
+ *   `kora:server:` namespace, plus `FoldOptions.authoritativeNodeIds` (legacy
+ *   random server node ids the server keeps advertising).
  * - Objects / json ('map'): per-top-level-key LWW with removal markers; nested
  *   values are whole-value LWW per key. A non-object write (null, scalar, json
  *   array) replaces the whole value and clears keys written before it.
@@ -79,6 +81,7 @@
  * write decides; a revived record shows every field's merged value.
  */
 import type { CollectionDefinition, HLCTimestamp, Operation, SchemaDefinition } from '../types'
+import { isAuthoritativeNodeId } from './authority'
 import { FoldConfigurationError, FoldStateError } from './errors'
 import { type FieldPlan, planField } from './field-kind'
 import {
@@ -157,31 +160,49 @@ function fieldPlanFor(
 
 /**
  * The stamp of one field of an insert. A server-synthesized scope-entry insert
- * (RT-27) restates the record's current values, each produced at its own version:
- * the field is stamped at that version (never earlier than the insert itself), so
- * it lands exactly where its original writer did.
+ * (RT-27) restates the record's current values, each produced at its own version
+ * (`op.fieldVersions`): the field is stamped at exactly that version (tie-broken by
+ * the entry's id), so it lands where its original writer did, never later. Raising
+ * it to the entry's own timestamp (which a beta.13 server sets to the record's
+ * newest write) would let the restated value beat a device's concurrent edit that
+ * is newer than the field's real version (RT-67).
+ *
+ * A field the entry carries without a version (a column no write ever produced,
+ * e.g. a later schema default) is as old as the record: it is stamped at the
+ * oldest version the entry knows, the earlier of its own timestamp and its oldest
+ * field version. An entry with no versions at all (a custom server store that
+ * provides neither per-field versions nor a fold state) can only be stamped at its
+ * own timestamp; built-in stores always send versions or a fold state.
  */
 function fieldWriteStamp(op: Operation, field: string, opStamp: Stamp): Stamp {
 	if (op.type !== 'insert' || op.fieldVersions === undefined) return opStamp
-	let version: HLCTimestamp | undefined = op.fieldVersions[field]
-	if (version === undefined) {
-		for (const candidate of Object.values(op.fieldVersions)) {
-			if (version === undefined || stampOf(candidate, op.id).t > stampOf(version, op.id).t) {
-				version = candidate
-			}
-		}
+	const version: HLCTimestamp | undefined = op.fieldVersions[field]
+	if (version !== undefined) return stampOf(version, op.id)
+	let oldest = opStamp
+	for (const candidate of Object.values(op.fieldVersions)) {
+		const stamp = stampOf(candidate, op.id)
+		if (compareStamps(stamp, oldest) < 0) oldest = stamp
 	}
-	if (version === undefined) return opStamp
-	const versioned = stampOf(version, op.id)
-	return compareStamps(versioned, opStamp) > 0 ? versioned : opStamp
+	return oldest
 }
 
 /**
- * A write to a `merge('server-authoritative')` field by an authoritative node
- * gets authority class 1, which orders before the HLC (see {@link Stamp}).
+ * A write to a `merge('server-authoritative')` field by an authoritative node (a
+ * `kora:server:` node, or one of `FoldOptions.authoritativeNodeIds`) gets authority
+ * class 1, which orders before the HLC (see {@link Stamp}).
  */
-function classify(stamp: Stamp, op: Operation, plan: FieldPlan, options: FoldOptions): Stamp {
-	if (plan.authoritative && options.authoritativeNodeIds?.has(op.nodeId)) {
+function classify(
+	stamp: Stamp,
+	op: Operation,
+	field: string,
+	plan: FieldPlan,
+	options: FoldOptions,
+): Stamp {
+	if (!plan.authoritative) return stamp
+	// A scope entry restates the value of the write that produced it: that write's
+	// node (the version's node id) decides the class, not the entry's system node.
+	const author = op.type === 'insert' ? (op.fieldVersions?.[field]?.nodeId ?? op.nodeId) : op.nodeId
+	if (isAuthoritativeNodeId(author, options.authoritativeNodeIds)) {
 		return { ...stamp, c: 1 }
 	}
 	return stamp
@@ -190,8 +211,9 @@ function classify(stamp: Stamp, op: Operation, plan: FieldPlan, options: FoldOpt
 /**
  * Merge a server scope-entry operation that carries the record's serialized fold
  * state (`op.foldState`): a state-based join. Returns null when the carried state
- * cannot be read (another format version): the caller then merges the operation's
- * data like any insert (`fieldVersions` / whole-op stamp), as for an older server.
+ * cannot be read (another format version) or holds a field of another fold kind
+ * than this replica's schema: the caller then merges the operation's data like any
+ * insert (each field at its `fieldVersions` entry), as for an older server.
  */
 function mergeCarriedState(
 	state: FoldState,
@@ -212,7 +234,18 @@ function mergeCarriedState(
 			{ operationId: op.id, collection: op.collection, recordId: op.recordId },
 		)
 	}
-	const joined = joinStates(state, carried, schema)
+	let joined: FoldState
+	try {
+		joined = joinStates(state, carried, schema)
+	} catch (error) {
+		// The server folded a field under another plan (its schema differs from this
+		// replica's, e.g. mid-rollout of a merge-kind change): its state cannot be
+		// joined field by field, so the entry merges by its data and versions instead,
+		// like one from an older server (RT-63). A function of the op and the schema
+		// only, so every replica decides the same.
+		if (error instanceof FoldStateError) return null
+		throw error
+	}
 	const changed = serializeFoldState(joined) !== serializeFoldState(state)
 	const traces: FoldTrace[] = []
 	if ((options.traces ?? 'conflicts') !== 'none') {
@@ -414,7 +447,7 @@ export function mergeOp(
 			op,
 			field,
 			raw,
-			classify(fieldWriteStamp(op, field, stamp), op, plan, options),
+			classify(fieldWriteStamp(op, field, stamp), op, field, plan, options),
 		)
 		if (write === null) continue
 		const tracing = mode !== 'none'

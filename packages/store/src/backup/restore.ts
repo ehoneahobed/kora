@@ -1,6 +1,12 @@
 import { HybridLogicalClock, quoteIdent } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
-import { FOLD_BASE_TABLE, FOLD_STATE_TABLE } from '../fold/record-folder'
+import {
+	COMPACTED_THROUGH_TABLE,
+	FOLD_BASE_TABLE,
+	FOLD_SNAPSHOT_TABLE,
+	FOLD_STATE_TABLE,
+	PROVISIONAL_OPS_TABLE,
+} from '../fold/record-folder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import { SEQ_CONFLICTS_TABLE, insertConflictRow } from '../store/sequence-repair'
 import {
@@ -131,6 +137,8 @@ export async function restoreReplace(
 			// re-materializes the restored collections afterwards.
 			await tx.execute(`DELETE FROM ${FOLD_STATE_TABLE} WHERE collection = ?`, [collection])
 			await tx.execute(`DELETE FROM ${FOLD_BASE_TABLE} WHERE collection = ?`, [collection])
+			await tx.execute(`DELETE FROM ${FOLD_SNAPSHOT_TABLE} WHERE collection = ?`, [collection])
+			await tx.execute(`DELETE FROM ${PROVISIONAL_OPS_TABLE} WHERE collection = ?`, [collection])
 			if (hasConflicts) {
 				await tx.execute(
 					`DELETE FROM ${SEQ_CONFLICTS_TABLE} WHERE collection = ? AND reemitted_as IS NULL`,
@@ -170,6 +178,33 @@ export async function restoreReplace(
 				`INSERT OR IGNORE INTO ${TERMINAL_REJECTIONS_TABLE} (operation_id, node_id, sequence_number, code, rejected_at) VALUES (?, ?, ?, ?, ?)`,
 				[entry.operationId, entry.nodeId, entry.sequenceNumber, entry.code, entry.rejectedAt],
 			)
+		}
+
+		// W7 (RT-66): the exporting device's compacted history (base states), its row
+		// snapshots and compacted prefixes, so records rebuild from base + log exactly.
+		for (const row of backup.foldBases) {
+			if (!targets.includes(row.collection)) continue
+			await tx.execute(
+				`INSERT OR REPLACE INTO ${FOLD_BASE_TABLE} (collection, record_id, state) VALUES (?, ?, ?)`,
+				[row.collection, row.recordId, row.state],
+			)
+		}
+		for (const row of backup.foldSnapshots) {
+			if (!targets.includes(row.collection)) continue
+			await tx.execute(
+				`INSERT OR REPLACE INTO ${FOLD_SNAPSHOT_TABLE} (collection, record_id, state) VALUES (?, ?, ?)`,
+				[row.collection, row.recordId, row.state],
+			)
+		}
+		if (!options.collections) {
+			// Per node and global; a collection filter would claim other collections' ops.
+			await tx.execute(`DELETE FROM ${COMPACTED_THROUGH_TABLE}`)
+			for (const [nodeId, sequence] of backup.compactedThrough) {
+				await tx.execute(
+					`INSERT INTO ${COMPACTED_THROUGH_TABLE} (node_id, sequence_number) VALUES (?, ?)`,
+					[nodeId, sequence],
+				)
+			}
 		}
 
 		if (rawRecords) {

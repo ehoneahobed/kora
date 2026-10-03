@@ -206,6 +206,15 @@ const ostamp = (op: Operation): OStamp => ({
  */
 export const GATE_AUTHORITATIVE_NODES: ReadonlySet<string> = new Set(['node-1'])
 
+/**
+ * How a gate run names its simulated nodes and which are authoritative by list
+ * (nodes named `kora:server:<id>` are authoritative by prefix, listed or not).
+ */
+export interface GateAuthority {
+	nodeName?: (index: number) => string
+	authoritative?: ReadonlySet<string>
+}
+
 interface OWrite {
 	node: string
 	s: OStamp
@@ -488,12 +497,13 @@ export function oracleMaterialize(
 		const kind = oracleKind(collection?.fields[field], collection, field)
 		let writes = fieldWrites(sorted, field)
 		if (
-			authoritative.size > 0 &&
 			!collection?.resolvers[field] &&
 			collection?.fields[field]?.mergeStrategy === 'server-authoritative'
 		) {
 			// Authoritative writes order after every other write: (class, HLC, op id).
-			const cls = (w: OWrite) => (authoritative.has(w.node) ? 1 : 0)
+			// A node is authoritative by the reserved `kora:server:` prefix or by the list.
+			const cls = (w: OWrite) =>
+				authoritative.has(w.node) || /^kora:server:./.test(w.node) ? 1 : 0
 			writes = [...writes].sort((a, b) => cls(a) - cls(b) || ocmp(a.s, b.s))
 		}
 		const value = oracleField(kind, writes, collection?.resolvers[field], merger)
@@ -650,7 +660,11 @@ function randomValue(rng: Rng, field: GateField, current: unknown): { v: unknown
  * @param seed - PRNG seed
  * @param onlyFields - restrict the schema to these fields (per-kind gates)
  */
-export function generateScenario(seed: number, onlyFields?: readonly GateField[]): Scenario {
+export function generateScenario(
+	seed: number,
+	onlyFields?: readonly GateField[],
+	nodeName: (index: number) => string = (index) => `node-${index}`,
+): Scenario {
 	const rng = mulberry32(seed)
 	let fields: GateField[]
 	if (onlyFields) fields = [...onlyFields]
@@ -660,7 +674,7 @@ export function generateScenario(seed: number, onlyFields?: readonly GateField[]
 	const schema = buildGateSchema(fields)
 	const nodeCount = int(rng, 2, 4)
 	const nodes: SimNode[] = Array.from({ length: nodeCount }, (_, i) => ({
-		id: `node-${i}`,
+		id: nodeName(i),
 		wall: 0,
 		logical: 0,
 		seq: 0,
@@ -847,11 +861,13 @@ export function runGateSeed(
 	impl: FoldUnderTest,
 	seed: number,
 	onlyFields?: readonly GateField[],
+	authority: GateAuthority = {},
 ): GateFailure | null {
-	const scenario = generateScenario(seed, onlyFields)
+	const scenario = generateScenario(seed, onlyFields, authority.nodeName)
 	const { schema, ops } = scenario
 	const rng = mulberry32(seed ^ 0x9e3779b9)
-	const expected = canon(oracleMaterialize(ops, schema))
+	const authoritative = authority.authoritative ?? GATE_AUTHORITATIVE_NODES
+	const expected = canon(oracleMaterialize(ops, schema, fakeRichtextMerger, authoritative))
 	const fail = (check: string, detail: string): GateFailure => ({ seed, check, detail })
 
 	// 1. Commutativity + idempotency: replicas receiving the ops in different
@@ -894,6 +910,8 @@ export function runGateSeed(
 			oracleMaterialize(
 				ops.filter((o) => !excluded.has(o.id)),
 				schema,
+				fakeRichtextMerger,
+				authoritative,
 			),
 		)
 		if (withExclusion !== withoutOps) return fail('exclusion', `${withExclusion} !== ${withoutOps}`)

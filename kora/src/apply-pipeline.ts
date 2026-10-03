@@ -1,6 +1,6 @@
 import type { KoraEventEmitter, MergeTrace, Operation, SchemaDefinition } from '@korajs/core'
-import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
-import type { MergeEngine, ReferentialMergeContext, SideEffectOp } from '@korajs/merge'
+import { KoraError, quoteIdent } from '@korajs/core'
+import type { MergeEngine, ReferentialMergeContext } from '@korajs/merge'
 import {
 	buildMergeRelationLookup,
 	checkConstraints,
@@ -171,7 +171,21 @@ export class ApplyPipeline implements LocalMutationHandler {
 		if (row && !row.deleted) {
 			return result
 		}
-		await applySideEffectOps(this.deps.store, check.sideEffectOps, op)
+		// RT-69: the cascades of a REMOTE delete stay local. The author uploaded its own
+		// copies and the server derives its own; a copy authored here would be stored and
+		// relayed once per receiving device. They are folded as provisional effects (never
+		// logged, sequenced or queued) until the server's copy arrives.
+		await this.deps.store.applyProvisionalSideEffects(
+			op,
+			check.sideEffectOps.map((effect) => ({
+				type: effect.type,
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.data,
+				previousData: effect.previousData,
+				ruleId: `relation:${effect.relationName}:${effect.type === 'delete' ? 'cascade' : 'set-null'}`,
+			})),
+		)
 		return result
 	}
 
@@ -285,36 +299,5 @@ function createReferentialMergeContext(store: Store): ReferentialMergeContext {
 			const row = await store.collection(collection).findById(recordId)
 			return row !== null
 		},
-	}
-}
-
-/**
- * The cascades / set-nulls of a REMOTE delete, written as this device's operations.
- *
- * They are stamped right after the delete (its HLC, next logical ticks, this node),
- * exactly like the server's deterministic copy (`timestampAfter`), never with this
- * device's current time: a concurrent write to the child that is later than the delete
- * then wins over every copy, so the outcome does not depend on when this device
- * happened to apply the delete (Phase 3 seam 5). The copies are idempotent in effect
- * (two deletes, two writes of null).
- */
-async function applySideEffectOps(
-	store: Store,
-	sideEffects: SideEffectOp[],
-	parentOp: Operation,
-): Promise<void> {
-	const parent = parentOp.timestamp
-	const clock = new HybridLogicalClock(store.getNodeId(), { now: () => parent.wallTime })
-	clock.advanceTo(parent)
-	for (const effect of sideEffects) {
-		const ctx = store.createMutationContext(effect.collection, {
-			extraCausalDeps: [parentOp.id],
-			clock,
-		})
-		if (effect.type === 'delete') {
-			await executeDelete(ctx, effect.recordId, { skipReferentialEnforcement: true })
-		} else if (effect.type === 'update' && effect.data) {
-			await executeUpdate(ctx, effect.recordId, effect.data)
-		}
 	}
 }

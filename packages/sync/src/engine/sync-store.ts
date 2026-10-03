@@ -152,4 +152,13 @@ export interface SyncStore {
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,
 	): Promise<Array<{ collection: string; recordId: string }>>
+
+	/**
+	 * Optional (W7): the delivery stream caught up (its final batch fully applied).
+	 * The store retires local-only provisional cascades of remote deletes (RT-69) and
+	 * drops row snapshots whose history a full resync brought back (RT-68).
+	 *
+	 * @returns How many row snapshots were dropped
+	 */
+	settleAfterCatchUp?(): Promise<number>
 }

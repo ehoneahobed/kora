@@ -239,10 +239,12 @@ export interface FoldOptions {
 	/** Which traces to emit. Default `'conflicts'`. */
 	traces?: FoldTraceMode
 	/**
-	 * Node ids whose writes are authoritative for `merge('server-authoritative')`
-	 * fields (the server's node ids, learned at the sync handshake). Their writes beat
-	 * every non-authoritative write of such a field regardless of HLC; within a class
-	 * the later write wins. Every replica must fold with the same set.
+	 * Additional node ids whose writes are authoritative for
+	 * `merge('server-authoritative')` fields: legacy (randomly generated) server node
+	 * ids the server keeps advertising at the handshake. Every node id in the reserved
+	 * `kora:server:` namespace is authoritative without being listed. Authoritative
+	 * writes beat every non-authoritative write of such a field regardless of HLC;
+	 * within a class the later write wins. Every replica must fold with the same set.
 	 */
 	authoritativeNodeIds?: ReadonlySet<string>
 }

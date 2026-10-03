@@ -3,8 +3,13 @@ import {
 	HybridLogicalClock,
 	KoraError,
 	createVersionVector,
+	deriveSideEffectOpId,
+	deserializeFoldState,
 	expandFieldVersionedOperations,
+	foldPlanFingerprints,
 	generateUUIDv7,
+	isReservedNodeId,
+	mismatchedFoldFields,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
@@ -27,6 +32,7 @@ import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import {
+	COMPACTED_THROUGH_TABLE,
 	FOLD_MATERIALIZATION_CURRENT,
 	FOLD_MATERIALIZATION_LEGACY,
 	FOLD_MATERIALIZATION_META_KEY,
@@ -35,7 +41,11 @@ import {
 	RecordFolder,
 	isCompacted,
 } from '../fold/record-folder'
-import { type RematerializationMode, rematerializeDatabase } from '../fold/rematerialize'
+import {
+	type KeptRecords,
+	type RematerializationMode,
+	rematerializeDatabase,
+} from '../fold/rematerialize'
 import {
 	LOG_QUARANTINE_TABLE,
 	type LogIntegrityReport,
@@ -109,6 +119,8 @@ import {
 	saveUnappliedOperations,
 } from '../sync/sync-durability'
 import {
+	DELIVERY_WATERMARK_META_KEY,
+	DELTA_CURSOR_META_KEY,
 	NODE_TOKEN_META_KEY,
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
@@ -169,6 +181,88 @@ import { resolvePerTabNodeId } from './tab-node-id'
  * await store.close()
  * ```
  */
+/** `_kora_meta` key: per-collection fold plan fingerprints the rows were folded with (RT-63). */
+const FOLD_PLAN_META_KEY = 'fold_plan_fingerprints'
+/** `_kora_meta` key: a full resync was requested to settle row snapshots (RT-68). */
+const SNAPSHOT_RESYNC_META_KEY = 'fold_snapshot_resync'
+/**
+ * Node id of provisional side effects (RT-69). In the reserved `kora:` namespace: no
+ * device authors under it, and its effects never enter the log or the upload queue.
+ */
+const PROVISIONAL_NODE_ID = 'kora:provisional'
+
+/** A node id this client must never author under (RT-61): Kora's reserved namespace. */
+export class ReservedNodeIdError extends KoraError {
+	constructor(nodeId: string, source: string) {
+		super(
+			`Node id "${nodeId}" (${source}) is in Kora's reserved "kora:" namespace; devices never author under it.`,
+			'RESERVED_NODE_ID',
+			{ nodeId, source, fix: 'Configure a node id that does not start with "kora:".' },
+		)
+		this.name = 'ReservedNodeIdError'
+	}
+}
+
+/**
+ * Per collection, the record ids that own quarantined log rows (RT-68); a
+ * quarantined row whose record id cannot be read keeps its whole collection.
+ */
+async function loadQuarantinedRecords(adapter: StorageAdapter): Promise<KeptRecords> {
+	const records = new Map<string, Set<string>>()
+	const collections = new Set<string>()
+	const exists = await adapter.query<{ name: string }>(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+		[LOG_QUARANTINE_TABLE],
+	)
+	if (exists.length === 0) return { records, collections }
+	const rows = await adapter.query<{ collection: string; row_json: string }>(
+		`SELECT collection, row_json FROM ${LOG_QUARANTINE_TABLE}`,
+	)
+	for (const row of rows) {
+		let recordId: unknown = null
+		try {
+			recordId = (JSON.parse(row.row_json) as { record_id?: unknown }).record_id
+		} catch {
+			recordId = null
+		}
+		if (typeof recordId === 'string' && recordId.length > 0) {
+			const set = records.get(row.collection) ?? new Set<string>()
+			set.add(recordId)
+			records.set(row.collection, set)
+		} else {
+			collections.add(row.collection)
+		}
+	}
+	return { records, collections }
+}
+
+/** Collections whose stored fold states hold a field of another fold kind than the schema's. */
+async function collectionsWithMismatchedStates(
+	adapter: StorageAdapter,
+	schema: SchemaDefinition,
+): Promise<string[]> {
+	const out: string[] = []
+	for (const collection of Object.keys(schema.collections)) {
+		const rows = await adapter.query<{ state: string }>(
+			`SELECT state FROM ${FOLD_STATE_TABLE} WHERE collection = ?`,
+			[collection],
+		)
+		for (const row of rows) {
+			let state: FoldState
+			try {
+				state = deserializeFoldState(row.state)
+			} catch {
+				continue
+			}
+			if (mismatchedFoldFields(state, schema).length > 0) {
+				out.push(collection)
+				break
+			}
+		}
+	}
+	return out
+}
+
 /**
  * Make `nodeId` the database's node id (`_kora_meta.node_id`). The unkeyed legacy node
  * token belongs to the node id it replaces, so it moves to that node's own key first:
@@ -949,7 +1043,7 @@ export class Store implements OperationLog {
 	 * rebuilt from (rows are kept and become base snapshots), and
 	 * `store:rematerialized` reports which happened.
 	 */
-	private async ensureMaterialization(): Promise<void> {
+	private async ensureMaterialization(forceSnapshot = false): Promise<void> {
 		const current = await this.readMeta(FOLD_MATERIALIZATION_META_KEY)
 		if (!this.folder) {
 			if (current !== FOLD_MATERIALIZATION_LEGACY) {
@@ -959,18 +1053,34 @@ export class Store implements OperationLog {
 		}
 		if (current === FOLD_MATERIALIZATION_CURRENT) {
 			this.foldActive = true
+			await this.ensureFoldPlan()
 			return
 		}
 		const report = await this.scanLog('full')
-		const mode: RematerializationMode =
-			report.quarantined.length > 0
-				? 'kept'
-				: report.clean && report.compactedAt === null
-					? 'log'
-					: 'snapshot+log'
-		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode)
+		// Only the records that own a quarantined row are kept as they are (RT-68); the
+		// rest are rebuilt from a log that is complete for them unless it was compacted
+		// or has holes.
+		const kept = await loadQuarantinedRecords(this.adapter)
+		// A hole in an own node's sequence that a quarantined row explains belongs to
+		// that row's record (kept above), not to the whole log.
+		const quarantinedSeqs = new Set(
+			report.quarantined.map((row) => `${row.nodeId ?? ''}\u0000${row.sequenceNumber ?? ''}`),
+		)
+		const unexplainedGaps = report.gaps.filter((gap) => {
+			for (let s = gap.from; s <= gap.to; s++) {
+				if (!quarantinedSeqs.has(`${gap.nodeId}\u0000${s}`)) return true
+			}
+			return false
+		})
+		const mode: Exclude<RematerializationMode, 'kept'> =
+			!forceSnapshot && unexplainedGaps.length === 0 && report.compactedAt === null
+				? 'log'
+				: 'snapshot+log'
+		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode, kept)
 		await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_CURRENT)
+		await this.writeMeta(FOLD_PLAN_META_KEY, JSON.stringify(foldPlanFingerprints(this.schema)))
 		this.foldActive = true
+		if (result.snapshots > 0) await this.requestSnapshotResync()
 		if (result.records > 0) {
 			this.emitter?.emit({
 				type: 'store:rematerialized',
@@ -980,10 +1090,192 @@ export class Store implements OperationLog {
 				changedRows: result.changedRows,
 				message:
 					result.mode === 'kept'
-						? `Operation log of "${this.dbName}" has quarantined rows: ${result.records} record(s) kept as they were (base snapshots); nothing was rebuilt from the log.`
+						? `Operation log of "${this.dbName}" has quarantined rows: the records that own them were kept as they were (row snapshots); ${result.records} record(s) re-materialized, ${result.changedRows} row(s) changed.`
 						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
 			})
 		}
+	}
+
+	/**
+	 * Re-fold the records of every collection whose fold plan changed since the rows
+	 * were materialized (RT-63): a field that became `merge('counter')`, an array that
+	 * became append-only, a new or edited resolver. Their stored states hold fields of
+	 * the old kind, which the fold refuses (`FoldStateError`). Each record is rebuilt
+	 * from its log with the new plan; compacted bases and row snapshots are adapted
+	 * (a re-planned field restarts from its materialized value at its version). The
+	 * client's equivalent of the server stores' `fold_plan_fingerprint`.
+	 */
+	private async ensureFoldPlan(): Promise<void> {
+		const folder = this.folder
+		if (!folder) return
+		const current = foldPlanFingerprints(this.schema)
+		const storedRaw = await this.readMeta(FOLD_PLAN_META_KEY)
+		let changed: string[]
+		if (storedRaw === null) {
+			// Materialized before the fingerprint was recorded: re-fold the collections
+			// whose stored states actually hold a field of another kind.
+			changed = await collectionsWithMismatchedStates(this.adapter, this.schema)
+		} else {
+			let stored: Record<string, unknown> = {}
+			try {
+				stored = JSON.parse(storedRaw) as Record<string, unknown>
+			} catch {
+				stored = {}
+			}
+			changed = Object.keys(current).filter((name) => stored[name] !== current[name])
+		}
+		if (changed.length > 0) {
+			const result = await rematerializeDatabase(
+				this.adapter,
+				this.schema,
+				folder,
+				'log',
+				undefined,
+				changed,
+			)
+			if (result.snapshots > 0) await this.requestSnapshotResync()
+			this.emitter?.emit({
+				type: 'store:rematerialized',
+				dbName: this.dbName,
+				mode: result.mode,
+				records: result.records,
+				changedRows: result.changedRows,
+				message: `The fold plan of ${changed.map((name) => `"${name}"`).join(', ')} changed (schema): re-folded ${result.records} record(s) of "${this.dbName}"; ${result.changedRows} row(s) changed.`,
+			})
+		}
+		await this.writeMeta(FOLD_PLAN_META_KEY, JSON.stringify(current))
+	}
+
+	/**
+	 * Row snapshots were created (RT-68): ask the sync server for a full resync (the
+	 * delivery watermarks restart at 0, as after a restore), so each such record gets
+	 * its complete history back; {@link settleSnapshotRecords} then drops the
+	 * snapshots once the resync has caught up.
+	 */
+	private async requestSnapshotResync(): Promise<void> {
+		await this.adapter.transaction(async (tx) => {
+			await tx.execute('UPDATE _kora_meta SET value = ? WHERE key = ? OR key LIKE ?', [
+				'0',
+				DELIVERY_WATERMARK_META_KEY,
+				`${DELIVERY_WATERMARK_META_KEY}:%`,
+			])
+			await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [DELTA_CURSOR_META_KEY])
+			await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+				SNAPSHOT_RESYNC_META_KEY,
+				'pending',
+			])
+		})
+	}
+
+	/**
+	 * Records whose state still folds against a row snapshot (approximate: a late
+	 * concurrent write older than a field's version is not folded, RT-68).
+	 */
+	async getSnapshotRecords(): Promise<Array<{ collection: string; recordId: string }>> {
+		this.ensureOpen()
+		const folder = this.folder
+		if (!folder) return []
+		let out: Array<{ collection: string; recordId: string }> = []
+		await this.adapter.transaction(async (tx) => {
+			out = await folder.listSnapshotRecords(tx)
+		})
+		return out
+	}
+
+	/**
+	 * Called by sync when a delivery stream has caught up (its final batch fully
+	 * applied). After the full resync {@link requestSnapshotResync} asked for, every
+	 * row-snapshot record whose insert is back in the log is re-folded from its
+	 * complete history and stops being approximate (RT-68). Also retires the
+	 * provisional cascades of remote deletes (RT-69): the server's own copies were
+	 * delivered by now, and any it did not derive must not stay applied locally.
+	 *
+	 * @returns How many snapshots were dropped
+	 */
+	async settleAfterCatchUp(): Promise<number> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder) return 0
+		const pending = (await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
+		let settled = 0
+		const touched = new Set<string>()
+		await this.adapter.transaction(async (tx) => {
+			for (const { collection, recordId } of await folder.listProvisionalRecords(tx)) {
+				await folder.deleteProvisional(tx, collection, recordId, null)
+				await folder.refoldInTx(tx, collection, recordId)
+				touched.add(collection)
+			}
+			if (pending) {
+				for (const { collection, recordId } of await folder.listSnapshotRecords(tx)) {
+					if (await folder.settleSnapshotInTx(tx, collection, recordId)) {
+						settled += 1
+						touched.add(collection)
+					}
+				}
+				await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [SNAPSHOT_RESYNC_META_KEY])
+			}
+		})
+		for (const collection of touched) this.subscriptionManager.invalidate(collection)
+		return settled
+	}
+
+	/**
+	 * Apply the cascades / set-nulls of a REMOTE delete as local-only provisional
+	 * effects (RT-69): folded into the children like operations, but never logged,
+	 * sequenced or queued for upload. The server derives and relays its own copy;
+	 * when it arrives (same parent, same record) the provisional effect is retired.
+	 *
+	 * @param parent - The remote delete
+	 * @param effects - Its side effects, as the referential check derived them
+	 */
+	async applyProvisionalSideEffects(
+		parent: Operation,
+		effects: ReadonlyArray<{
+			type: 'delete' | 'update'
+			collection: string
+			recordId: string
+			data: Record<string, unknown> | null
+			previousData: Record<string, unknown> | null
+			ruleId: string
+		}>,
+	): Promise<number> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder || effects.length === 0) return 0
+		const touched = new Set<string>()
+		let applied = 0
+		// Stamped right after the parent (its HLC, next logical ticks), exactly like the
+		// server's copy, so a write to the child later than the delete still wins.
+		const clock = new HybridLogicalClock(PROVISIONAL_NODE_ID, {
+			now: () => parent.timestamp.wallTime,
+		})
+		clock.advanceTo(parent.timestamp)
+		const built: Operation[] = []
+		for (const effect of effects) {
+			if (!this.schema.collections[effect.collection]) continue
+			built.push({
+				id: await deriveSideEffectOpId(parent.id, `provisional/${effect.ruleId}`, effect.recordId),
+				nodeId: PROVISIONAL_NODE_ID,
+				type: effect.type,
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.type === 'delete' ? null : effect.data,
+				previousData: effect.type === 'delete' ? null : effect.previousData,
+				timestamp: clock.now(),
+				sequenceNumber: 0,
+				causalDeps: [parent.id],
+				schemaVersion: this.schema.version,
+			})
+		}
+		await this.adapter.transaction(async (tx) => {
+			for (const op of built) {
+				await folder.applyProvisionalInTx(tx, op, parent.id)
+				touched.add(op.collection)
+				applied += 1
+			}
+		})
+		for (const collection of touched) this.subscriptionManager.invalidate(collection)
+		return applied
 	}
 
 	/**
@@ -1872,6 +2164,7 @@ export class Store implements OperationLog {
 			)
 		}
 		if (nodeId === this.nodeId) return
+		if (isReservedNodeId(nodeId)) throw new ReservedNodeIdError(nodeId, 'switchNodeId')
 		const known = (await listLocalNodes(this.adapter)).some((node) => node.nodeId === nodeId)
 		if (!known) {
 			throw new KoraError(
@@ -2492,6 +2785,7 @@ export class Store implements OperationLog {
 				internal?.applyOperation ?? ((op: Operation) => this.applyRemoteOperation(op)),
 			listLocalNodes: () => listLocalNodes(this.adapter),
 		}
+		if (options?.merge) await this.mergeBackupFoldState(parsed, options.collections !== undefined)
 		const counts = options?.merge
 			? await restoreMerge(host, parsed, options.collections !== undefined)
 			: await restoreReplace(host, parsed, {
@@ -2499,12 +2793,15 @@ export class Store implements OperationLog {
 					keepUnsyncedWrites: options?.keepUnsyncedWrites ?? true,
 				})
 		if (!options?.merge && this.folder) {
-			// Restored rows and log replace what the fold states described: rebuild them.
+			// Restored rows and log replace what the fold states described: rebuild them,
+			// from the backup's base states and log (RT-66). A file from an earlier
+			// release carries no base states, and its log may have been compacted: its
+			// records are rebuilt on top of its rows instead (row snapshots).
 			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
 				FOLD_MATERIALIZATION_META_KEY,
 			])
 			this.foldActive = false
-			await this.ensureMaterialization()
+			await this.ensureMaterialization(parsed.manifest.includesFoldState !== true)
 		}
 		await this.reloadFromDisk()
 		onProgress({ phase: 'restoring', progress: 1, message: 'Done' })
@@ -2515,6 +2812,57 @@ export class Store implements OperationLog {
 			success: true,
 			duration: Date.now() - started,
 		}
+	}
+
+	/**
+	 * Merge mode (RT-66): join the backup's compacted base states and row snapshots
+	 * into this database's, and re-fold those records, before the backup's operations
+	 * are applied. The join is the fold's state-based merge, so the result equals
+	 * folding both devices' histories together. Compacted prefixes advance by MAX
+	 * (unfiltered restores only: the prefix is per node, across collections).
+	 */
+	private async mergeBackupFoldState(
+		parsed: import('../backup/backup').ParsedBackup,
+		filtered: boolean,
+	): Promise<void> {
+		const folder = this.activeFold()
+		if (!folder) return
+		const touched = new Map<string, Set<string>>()
+		await this.adapter.transaction(async (tx) => {
+			for (const [rows, kind] of [
+				[parsed.foldBases, 'base'],
+				[parsed.foldSnapshots, 'snapshot'],
+			] as const) {
+				for (const row of rows) {
+					if (!this.schema.collections[row.collection]) continue
+					let state: FoldState
+					try {
+						state = deserializeFoldState(row.state)
+					} catch {
+						continue
+					}
+					if (state.c !== row.collection || state.r !== row.recordId) continue
+					if (kind === 'base') await folder.joinIntoBase(tx, state)
+					else await folder.saveSnapshot(tx, state)
+					const ids = touched.get(row.collection) ?? new Set<string>()
+					ids.add(row.recordId)
+					touched.set(row.collection, ids)
+				}
+			}
+			if (!filtered) {
+				for (const [nodeId, sequence] of parsed.compactedThrough) {
+					await tx.execute(
+						`INSERT INTO ${COMPACTED_THROUGH_TABLE} (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+						[nodeId, sequence],
+					)
+				}
+			}
+			for (const [collection, ids] of touched) {
+				for (const recordId of ids) await folder.refoldInTx(tx, collection, recordId)
+			}
+		})
+		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
 	}
 
 	/**
@@ -2623,6 +2971,11 @@ export class Store implements OperationLog {
 	}
 
 	private async loadOrGenerateNodeId(): Promise<string> {
+		// The `kora:` namespace is Kora's own (server nodes `kora:server:<id>` are
+		// authoritative by prefix, RT-61): a device never authors under such an id.
+		if (this.configNodeId && isReservedNodeId(this.configNodeId)) {
+			throw new ReservedNodeIdError(this.configNodeId, 'StoreConfig.nodeId')
+		}
 		if (this.configNodeId) {
 			if (this.isolation !== 'per-tab') {
 				await this.adapter.execute(
@@ -2641,15 +2994,18 @@ export class Store implements OperationLog {
 		const rows = await this.adapter.query<MetaRow>(
 			"SELECT value FROM _kora_meta WHERE key = 'node_id'",
 		)
-		if (rows[0]) {
+		if (rows[0] && !isReservedNodeId(rows[0].value)) {
 			return rows[0].value
 		}
 
-		// Generate new node ID
+		// Generate a new node id (a UUIDv7, never in the reserved `kora:` namespace). A
+		// persisted reserved id (written by something other than this client) is never
+		// adopted: the database gets a fresh identity instead.
 		const newNodeId = generateUUIDv7()
-		await this.adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', ?)", [
-			newNodeId,
-		])
+		await this.adapter.execute(
+			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
+			[newNodeId],
+		)
 		return newNodeId
 	}
 

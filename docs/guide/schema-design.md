@@ -369,6 +369,12 @@ export default defineSchema({
 | `'restrict'` | Prevent deletion if references exist |
 | `'no-action'` | Do nothing (may leave dangling references) |
 
+The device that deletes a record writes its cascades / set-nulls as its own operations
+and syncs them; the sync server derives its own copy too. A device that receives the
+delete from sync applies the effects locally only (they are never uploaded) until the
+server's copy arrives, so a workspace stores the same number of cascade operations
+however many devices apply the delete.
+
 ### Querying Relations
 
 Use `.include()` to load related data:

@@ -16,9 +16,9 @@
  * Asserts the CORRECT behaviour (fails at 959b791): the newer device edit survives.
  */
 import { describe, expect, test } from 'vitest'
+import { foldRecord, materialize } from '../../src/fold/fold'
 import { defineSchema } from '../../src/schema/define'
 import { t } from '../../src/schema/types'
-import { foldRecord, materialize } from '../../src/fold/fold'
 import type { HLCTimestamp, Operation } from '../../src/types'
 
 const schema = defineSchema({

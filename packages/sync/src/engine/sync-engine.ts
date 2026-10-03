@@ -16,6 +16,7 @@ import {
 	SyncError,
 	applyOperationTransforms,
 	defaultApplyFailureReason,
+	isAuthoritativeNodeId,
 } from '@korajs/core'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
@@ -120,6 +121,8 @@ const ADOPTION_PARK_BASE_MS = 30_000
 const ADOPTION_PARK_MAX_MS = 60 * 60_000
 /** Terminal marker of held writes the app discarded from sync (RT-50). */
 const HELD_DISCARDED_CODE = 'HELD_DISCARDED'
+/** `FoldStateError.code` (`@korajs/core`): a record state the fold cannot merge into. */
+const FOLD_STATE_INVALID_CODE = 'FOLD_STATE_INVALID'
 /** Times one start() begins again because the signed-in user changed while connecting (RT-52). */
 const MAX_PRINCIPAL_RESTARTS = 2
 /**
@@ -2683,6 +2686,7 @@ export class SyncEngine {
 			this.deltaReceiveComplete = true
 			this.resumeDeltaCursor = null
 			await this.persistDeltaCursor(null)
+			await this.settleAfterCatchUp()
 			this.metricsCollector.recordSyncCompleted()
 			await this.checkDeltaComplete()
 		}
@@ -2823,6 +2827,13 @@ export class SyncEngine {
 			if (error instanceof RemoteClockDriftError || error instanceof InvalidTimestampError) {
 				return quarantine(transformed, code, message, 'rejected', true, op)
 			}
+			if (code === FOLD_STATE_INVALID_CODE) {
+				// The record's fold state cannot take this operation even after the store
+				// re-folded it once (RT-63; for example a carried state of an unknown plan).
+				// Not transient: quarantined (and replayed on start, after an upgrade)
+				// rather than stalling every later operation of the delivery stream.
+				return quarantine(transformed, code, message, 'rejected', false, op)
+			}
 			if (code === APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY) {
 				// Not appliable now (for example a child whose parent is outside this view);
 				// kept and replayed rather than stalling every later operation.
@@ -2832,6 +2843,28 @@ export class SyncEngine {
 			// custody, so stall; the server re-sends it.
 			this.emitApplyFailure(transformed, 'rejected', { code, message, retriable: true }, 'blocking')
 			return { kind: 'stall', operation: op }
+		}
+	}
+
+	/**
+	 * The delivery stream caught up: let the store retire provisional cascades of
+	 * remote deletes (RT-69) and settle row-snapshot records after a full resync
+	 * (RT-68). A failure is reported, never fatal: both are retried on the next
+	 * catch-up.
+	 */
+	private async settleAfterCatchUp(): Promise<void> {
+		if (!this.store.settleAfterCatchUp) return
+		try {
+			await this.store.settleAfterCatchUp()
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Settling provisional effects and row snapshots after catch-up failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'SETTLE_AFTER_CATCH_UP_FAILED',
+			})
 		}
 	}
 
@@ -2941,7 +2974,8 @@ export class SyncEngine {
 	 */
 	private isServerAuthoredCleartext(op: Operation): boolean {
 		if (!this.encryptor || op.encrypted !== undefined) return false
-		if (!this.authoritativeNodeIds?.includes(op.nodeId)) return false
+		// A server node: `kora:server:<id>` by prefix, or a legacy id the handshake listed.
+		if (!isAuthoritativeNodeId(op.nodeId, new Set(this.authoritativeNodeIds ?? []))) return false
 		return this.encryptor.isCleartextOnly(op)
 	}
 

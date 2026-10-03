@@ -22,8 +22,15 @@
  */
 import fc from 'fast-check'
 import { describe, expect, test } from 'vitest'
-import { w7Fold } from './fold-impl'
-import { type GateField, naiveArrivalOrderFold, runGateSeed } from './harness'
+import { makeW7Fold, w7Fold } from './fold-impl'
+import {
+	type GateAuthority,
+	type GateField,
+	generateScenario,
+	naiveArrivalOrderFold,
+	oracleMaterialize,
+	runGateSeed,
+} from './harness'
 
 const SEEDS = Number(process.env.KORA_FOLD_SEEDS ?? 200)
 const SEED_BASE = Number(process.env.KORA_FOLD_SEED_BASE ?? 0x4b6f7261)
@@ -69,6 +76,80 @@ describe('W7 convergence gate', () => {
 		['custom resolvers (additive, order-sensitive, throwing)', ['inv', 'label', 'risky']],
 		['richtext opaque updates + string resets', ['body']],
 	]
+	// Authority by the reserved `kora:server:` prefix (Phase 3, RT-61/62 shared rule):
+	// a server node is authoritative without being listed, so replicas that never
+	// learned its id (or learned a different explicit list) still fold identically.
+	const AUTHORITY_CASES: Array<[string, GateAuthority]> = [
+		[
+			'prefix only (no explicit list)',
+			{
+				nodeName: (i) => (i === 1 ? 'kora:server:main' : `node-${i}`),
+				authoritative: new Set(),
+			},
+		],
+		[
+			'prefix node plus a legacy listed node',
+			{
+				nodeName: (i) => (i === 0 ? 'kora:server:main' : `node-${i}`),
+				authoritative: new Set(['node-2']),
+			},
+		],
+		[
+			'a bare "kora:server:" id is not a server node',
+			{
+				nodeName: (i) => (i === 1 ? 'kora:server:' : `node-${i}`),
+				authoritative: new Set(),
+			},
+		],
+	]
+	for (const [name, authority] of AUTHORITY_CASES) {
+		test(`server-authoritative by node-id prefix: ${name}`, () => {
+			const impl = makeW7Fold(authority.authoritative)
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: 0x7fffffff }), (seed) => {
+					expect(runGateSeed(impl, seed, ['title', 'auth', 'count'], authority)).toBeNull()
+				}),
+				{ numRuns: 80, seed: SEED_BASE },
+			)
+		})
+	}
+
+	test('the prefix rule has teeth: folding prefix nodes as plain LWW diverges', () => {
+		const authority: GateAuthority = {
+			nodeName: (i) => (i === 1 ? 'kora:server:main' : `node-${i}`),
+			authoritative: new Set(),
+		}
+		// The same streams with the server node renamed out of the namespace (what a
+		// list-only fold that never learned the id sees) must fold differently on some
+		// seeds, or the prefix cases above would prove nothing.
+		let disagreements = 0
+		for (let i = 0; i < 80; i++) {
+			const seed = (SEED_BASE + i) >>> 0
+			const scenario = generateScenario(seed, ['title', 'auth'], authority.nodeName)
+			const prefixAware = JSON.stringify(
+				oracleMaterialize(scenario.ops, scenario.schema, undefined, new Set()),
+			)
+			const listOnly = JSON.stringify(
+				oracleMaterialize(
+					scenario.ops.map((op) =>
+						op.nodeId === 'kora:server:main'
+							? {
+									...op,
+									nodeId: 'renamed',
+									timestamp: { ...op.timestamp, nodeId: 'renamed' },
+								}
+							: op,
+					),
+					scenario.schema,
+					undefined,
+					new Set(),
+				),
+			)
+			if (prefixAware !== listOnly) disagreements++
+		}
+		expect(disagreements).toBeGreaterThan(0)
+	})
+
 	for (const [name, fields] of KIND_GROUPS) {
 		test(`per-kind: ${name}`, () => {
 			fc.assert(
