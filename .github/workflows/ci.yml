@@ -35,6 +35,12 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Docs code blocks typecheck (DX-3)
+        run: pnpm docs:check-code
+
+      - name: Getting Started tutorial against a scaffolded app (DX-3)
+        run: pnpm docs:check-tutorial
+
       - name: Benchmark gates
         run: pnpm benchmark:gates
 

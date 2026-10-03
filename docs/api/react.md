@@ -22,6 +22,48 @@ import {
 } from '@korajs/react'
 ```
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { useState } from 'react'
+import {
+  KoraProvider,
+  useCollaborators,
+  useCollection,
+  useMutation,
+  usePresence,
+  useQuery,
+  useQueryState,
+  useRichText,
+  useSyncStatus,
+} from '@korajs/react'
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    projects: { fields: { name: t.string() } },
+    notes: { fields: { content: t.richtext().optional() } },
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        assignee: t.string().optional(),
+        dueDate: t.timestamp().optional(),
+        projectId: t.string().optional(),
+        createdAt: t.timestamp().auto(),
+      },
+    },
+  },
+  relations: {
+    todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'set-null' },
+  },
+})
+const app = createApp({ schema })
+type Todo = import('@korajs/react').AppRecord<typeof app, 'todos'>
+type User = { name: string; color: string }
+declare function DocumentEditor(): JSX.Element
+declare function TodoList(): JSX.Element
+declare function TodoTable(props: { todos: readonly Todo[] }): JSX.Element
+-->
+
 ---
 
 ## KoraProvider
@@ -33,30 +75,17 @@ Context provider that makes the Kora app instance available to all hooks in the 
 | Prop | Type | Required | Description |
 |------|------|----------|-------------|
 | `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render once `app.ready` resolves. |
-| `store` | `Store` | One of `app` / `store` | Advanced: an opened store (with optional `syncEngine`) instead of an app. Children render immediately. |
+| `store` | `Store` | One of `app` / `store` | Advanced: an opened store instead of an app. Children render immediately. |
+| `syncEngine` | `SyncEngine \| null` | No | With `store`: the sync engine for `useSyncStatus` and presence. |
 | `fallback` | `ReactNode` | No | Rendered until `app.ready` resolves, and during a server render (where the app is inert). |
 | `children` | `ReactNode` | Yes | Child components. |
+
+If `app.ready` rejects, the provider renders the error message in place of its children and logs
+it to the console.
 
 ### Example
 
 ```tsx
-import { createApp, defineSchema, t } from 'korajs'
-import { KoraProvider } from '@korajs/react'
-
-const schema = defineSchema({
-  version: 1,
-  collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        completed: t.boolean().default(false),
-      },
-    },
-  },
-})
-
-const app = createApp({ schema })
-
 function App() {
   return (
     <KoraProvider app={app}>
@@ -82,6 +111,7 @@ Returns a reactive array of records matching a query. The component re-renders a
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useQuery<T = CollectionRecord>(
   query: QueryBuilder<T>,
@@ -101,7 +131,7 @@ function useQuery<T = CollectionRecord>(
 
 `readonly T[]` -- The records matching the query, the same array until the result changes. Returns an empty array if no records match, and during a server render or hydration.
 
-Data is always returned synchronously from the local store. There is no loading state for local data.
+The local query runs right after the component mounts, so the first render returns `[]` and the rows follow immediately. Use [`useQueryState`](#usequerystate) to distinguish "not loaded yet" (`ready: false`) from "no rows".
 
 ### Errors
 
@@ -110,9 +140,7 @@ A query that fails (for example a `where` or `orderBy` on a field that does not 
 ### Example
 
 ```tsx
-import { useQuery } from '@korajs/react'
-
-function TodoList() {
+function OpenTodos() {
   const todos = useQuery(
     app.todos.where({ completed: false }).orderBy('createdAt', 'desc')
   )
@@ -149,7 +177,7 @@ function TodosWithProjects() {
 
   return todos.map((todo) => (
     <div key={todo.id}>
-      {todo.title} - {todo.project?.name}
+      {todo.title}: {todo.project?.name}
     </div>
   ))
 }
@@ -170,6 +198,7 @@ function TodosWithProjects() {
 
 Like `useQuery`, but returns the query's error instead of throwing it, and whether the first result has arrived.
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useQueryState<T = CollectionRecord>(
   query: QueryBuilder<T>,
@@ -180,7 +209,7 @@ function useQueryState<T = CollectionRecord>(
 The returned object keeps its identity until `data`, `error` or `ready` changes. `error` clears when results flow again; `data` keeps the last good rows meanwhile. `ready` is `false` until the first result of the current query (always `false` on the server).
 
 ```tsx
-function TodoList() {
+function SafeTodoList() {
   const { data: todos, error } = useQueryState(app.todos.where({ completed: false }))
   if (error) return <p role="alert">Could not load todos: {error.message}</p>
   return <ul>{todos.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
@@ -191,10 +220,11 @@ function TodoList() {
 
 ## useMutation()
 
-Returns a mutation function for performing write operations. Mutations are optimistic by default -- the local store is updated immediately, and the operation is queued for sync.
+Returns a mutation object for performing write operations. Writes are local first: the local store is updated immediately, and the operation is queued for sync.
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useMutation<TData, TArgs extends unknown[], TContext = void>(
   fn: (...args: TArgs) => Promise<TData>,
@@ -218,7 +248,8 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `fn` | `(input: TInput) => Promise<TOutput>` | A collection method such as `app.todos.insert` or a custom function that performs mutations. |
+| `fn` | `(...args: TArgs) => Promise<TData>` | A collection method such as `app.todos.insert` or a custom function that performs mutations. |
+| `options` | `UseMutationOptions` | `onMutate` (its return value is the context), `onRollback(context, ...args)` when the write fails, `onSuccess`, `onError`, `onSettled`. |
 
 ### Returns
 
@@ -228,15 +259,13 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
 | `mutateAsync` | `(...args: TArgs) => Promise<TData>` | Awaitable mutation. Resolves when the operation is persisted locally. |
 | `isLoading` | `boolean` | `true` while a mutation is running. |
 | `error` | `Error \| null` | The last mutation's error, or `null`. |
-| `reset` | `() => void` | Clears `error`. |
+| `reset` | `() => void` | Clears `error` and `isLoading`. |
 
 `mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are safe in effect dependency arrays and as props of memoized children. The result object only changes when `isLoading` or `error` changes. The latest `fn` and `options` are always used, even though the callbacks are stable.
 
 ### Example
 
 ```tsx
-import { useMutation } from '@korajs/react'
-
 function AddTodo() {
   const { mutate: addTodo } = useMutation(app.todos.insert)
 
@@ -253,7 +282,7 @@ function AddTodo() {
 ```tsx
 function TodoItem({ todo }: { todo: Todo }) {
   const { mutate: updateTodo } = useMutation(
-    (data: Partial<Todo>) => app.todos.update(todo.id, data)
+    (data: { completed: boolean }) => app.todos.update(todo.id, data)
   )
   const { mutate: deleteTodo } = useMutation(
     () => app.todos.delete(todo.id)
@@ -263,7 +292,7 @@ function TodoItem({ todo }: { todo: Todo }) {
     <div>
       <input
         type="checkbox"
-        checked={todo.completed}
+        checked={todo.completed ?? false}
         onChange={() => updateTodo({ completed: !todo.completed })}
       />
       <span>{todo.title}</span>
@@ -282,7 +311,8 @@ function AddTodoForm() {
   const { mutateAsync: addTodo } = useMutation(app.todos.insert)
   const [title, setTitle] = useState('')
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
     const todo = await addTodo({ title })
     setTitle('')
     console.log('Created todo:', todo.id)
@@ -305,6 +335,7 @@ Owns authenticated app creation and teardown on shared browsers. It removes the 
 tree and awaits `app.close()` before creating a different user's app. Same-user token refreshes do
 not replace the app.
 
+<!-- docs-check: skip fragment: the props of AuthBoundKoraProvider -->
 ```tsx
 <AuthBoundKoraProvider
   authClient={binding}
@@ -331,23 +362,30 @@ Returns the current sync connection status and metadata. Re-renders only when th
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
-function useSyncStatus(): SyncStatus
+function useSyncStatus(): SyncStatusInfo
 ```
 
 ### Returns
 
-#### SyncStatus
+#### SyncStatusInfo
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `status` | `SyncStatus` | Compatible high-level connection state, including `auth-required`. |
+| `status` | `SyncStatus` | High-level state; see the table below. |
+| `reconnecting` | `boolean` | True while the engine is re-establishing a session. |
 | `phase` | `SyncPhase` | Detailed suspended/offline/connecting/handshaking/uploading/receiving/applying/streaming/blocked phase. |
 | `pendingOperations` | `number` | Number of local operations waiting to be sent to the server. |
 | `inFlightUploadOperations` | `number` | Operations sent but not yet acknowledged. |
 | `activeViewComplete` | `boolean` | Whether the active downlink view is applied through the accepted frontier. |
 | `blockedFailure` | `ActiveApplyFailure \| null` | Current delivery-blocking apply failure. |
 | `lastSyncedAt` | `number \| null` | Timestamp (milliseconds) of the last successful sync. `null` if never synced. |
+| `lastSuccessfulPush` / `lastSuccessfulPull` | `number \| null` | Last successful upload and download. |
+| `conflicts` | `number` | Merge conflicts seen this session. |
+| `clockSkewMs` | `number \| null` | Server time minus local time at the last handshake (negative: this device is fast). |
+| `initialSync` | `{ complete, receivedBatches, totalBatches, progress }` | First-sync progress. |
+| `deliveryWatermark` / `serverFrontier` | `number` / `number \| null` | Delivery applied without gaps, and the server's newest delivery sequence. |
 | `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`) until that user signs in again on this device. |
 | `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
 | `localDurability` | `'durable' \| 'degraded'` | `'degraded'` when the local database could not be persisted several times in a row (storage quota, broken IndexedDB). Warn the user to free up storage and stay online. |
@@ -360,21 +398,23 @@ The returned object keeps its identity while the status is unchanged, and so do 
 
 | Status | Description |
 |--------|-------------|
-| `'connected'` | WebSocket connection is open but initial sync has not completed. |
+| `'connected'` | The session is open but the initial exchange has not completed. |
+| `'reconnecting'` | The connection dropped; the engine is reconnecting with backoff. |
 | `'syncing'` | Actively exchanging operations with the server. |
-| `'synced'` | All local operations have been sent and acknowledged. Up to date. |
-| `'offline'` | No connection to the server. The app continues to work locally. |
-| `'error'` | A sync error occurred. Operations are queued and will retry. |
+| `'synced'` | Every local operation is acknowledged and the active view is complete. |
+| `'offline'` | No connection to the server (or sync is not configured). The app keeps working locally. |
+| `'auth-required'` | Sync is suspended until a user signs in (or the credential is refreshed). |
+| `'clock-error'` | This device's clock is too far ahead of the server; writes are blocked until it is fixed. |
+| `'schema-mismatch'` | The server does not accept this client's schema version; upgrade the app. |
+| `'error'` | A sync error occurred. Operations stay queued and retry. |
 
 ### Example
 
 ```tsx
-import { useSyncStatus } from '@korajs/react'
-
 function StorageWarning() {
   const { localDurability, heldOperations } = useSyncStatus()
   if (localDurability === 'degraded') return <p role="alert">Storage is full: stay online until it syncs.</p>
-  if (heldOperations > 0) return <p>{heldOperations} changes from another account wait on this device.</p>
+  if (heldOperations) return <p>{heldOperations} changes from another account wait on this device.</p>
   return null
 }
 
@@ -404,6 +444,7 @@ function SyncIndicator() {
 
 Creates hooks typed for your app, so components get schema-checked collection names, inserts, updates and query rows without passing generics around. Call it once next to `createApp`; nothing runs at call time.
 
+<!-- docs-check: skip signature -->
 ```typescript
 function createKoraHooks<TApp>(): {
   useApp: () => TApp
@@ -415,12 +456,20 @@ function createKoraHooks<TApp>(): {
 }
 ```
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } },
+  }),
+})
+-->
+
 ```tsx
-// kora.ts
-import { createApp } from 'korajs'
 import { createKoraHooks } from 'korajs/react'
 
-export const app = createApp({ schema })
+// kora.ts: next to `export const app = createApp({ schema })`
 export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
 
 // TodoList.tsx
@@ -432,18 +481,61 @@ function TodoList() {
 }
 ```
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { useState } from 'react'
+import {
+  KoraProvider,
+  useCollaborators,
+  useCollection,
+  useMutation,
+  usePresence,
+  useQuery,
+  useQueryState,
+  useRichText,
+  useSyncStatus,
+} from '@korajs/react'
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    projects: { fields: { name: t.string() } },
+    notes: { fields: { content: t.richtext().optional() } },
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        assignee: t.string().optional(),
+        dueDate: t.timestamp().optional(),
+        projectId: t.string().optional(),
+        createdAt: t.timestamp().auto(),
+      },
+    },
+  },
+  relations: {
+    todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'set-null' },
+  },
+})
+const app = createApp({ schema })
+type Todo = import('@korajs/react').AppRecord<typeof app, 'todos'>
+type User = { name: string; color: string }
+declare function DocumentEditor(): JSX.Element
+declare function TodoList(): JSX.Element
+declare function TodoTable(props: { todos: readonly Todo[] }): JSX.Element
+-->
+
 The typed `useCollection` returns the app's own accessor (`app.collections[name]`), the same object across renders. The types are read from `typeof app`, so they follow whatever `createApp` infers from your schema. The helper types `AppCollectionName<TApp>`, `AppCollections<TApp>` and `AppRecord<TApp, Name>` are exported too.
 
 ---
 
 ## useCollection()
 
-Returns a typed collection accessor for performing operations on a specific collection. This is a convenience hook when you need the collection reference inside a component without importing the app instance directly.
+Returns the store's collection accessor for a collection name. This plain hook is untyped (records are `CollectionRecord`); the `useCollection` from [`createKoraHooks`](#createkorahooks) returns the typed accessor.
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
-function useCollection<T extends CollectionRecord>(name: string): CollectionAccessor<T>
+function useCollection(name: string): CollectionAccessor
 ```
 
 ### Parameters
@@ -454,13 +546,11 @@ function useCollection<T extends CollectionRecord>(name: string): CollectionAcce
 
 ### Returns
 
-`CollectionAccessor<T>` -- A typed accessor with `insert`, `update`, `delete`, `findById`, `where`, and other query methods.
+`CollectionAccessor`: `insert`, `update`, `delete`, `findById` and `where`, the same object while `name` is unchanged.
 
 ### Example
 
 ```tsx
-import { useCollection } from '@korajs/react'
-
 function TodoActions() {
   const todos = useCollection('todos')
 
@@ -492,6 +582,7 @@ Provides binding helpers for rich text fields backed by Yjs CRDTs. Returns the Y
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useRichText(
   collection: string,
@@ -531,7 +622,6 @@ The result object keeps its identity until one of its values changes.
 ### Example with TipTap
 
 ```tsx
-import { useRichText } from '@korajs/react'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
@@ -563,12 +653,13 @@ function NoteEditor({ noteId }: { noteId: string }) {
 
 ## usePresence()
 
-Sets the local user's collaborative presence state. When this hook is active, other connected clients will see this user's presence information (name, color, and optional avatar). Presence is ephemeral -- it is not persisted, only shared with currently connected peers.
+Sets the local user's collaborative presence state. When this hook is active, other connected clients see this user's presence information (name, color, and optional avatar). Presence is ephemeral: it is not persisted, only shared with currently connected peers.
 
 Automatically clears presence on unmount.
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
 function usePresence(
   user: { name: string; color: string; avatar?: string } | null,
@@ -590,8 +681,6 @@ function usePresence(
 ### Example
 
 ```tsx
-import { usePresence } from '@korajs/react'
-
 function Editor({ currentUser }: { currentUser: { name: string; color: string } }) {
   // Set presence when this component mounts, clear on unmount
   usePresence({ name: currentUser.name, color: currentUser.color })
@@ -623,10 +712,11 @@ function CollaborativeEditor({ user, isActive }: { user: User; isActive: boolean
 
 ## useCollaborators()
 
-Returns all currently connected collaborators' awareness states. Excludes the local user -- only returns remote peers. Re-renders only when the set of collaborators or their states change.
+Returns all currently connected collaborators' awareness states. Excludes the local user: only remote peers are returned. Re-renders only when the set of collaborators or their states change.
 
 ### Signature
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useCollaborators(): AwarenessState[]
 ```
@@ -637,6 +727,7 @@ function useCollaborators(): AwarenessState[]
 
 #### AwarenessState
 
+<!-- docs-check: skip signature -->
 ```typescript
 interface AwarenessState {
   /** User identity information */
@@ -668,8 +759,6 @@ interface AwarenessState {
 ### Example
 
 ```tsx
-import { useCollaborators } from '@korajs/react'
-
 function CollaboratorList() {
   const collaborators = useCollaborators()
 
@@ -703,8 +792,6 @@ function CollaboratorList() {
 A typical pattern uses both hooks together:
 
 ```tsx
-import { usePresence, useCollaborators } from '@korajs/react'
-
 function CollaborativeDocument({ currentUser }: { currentUser: User }) {
   // Announce our presence
   usePresence({ name: currentUser.name, color: currentUser.color })
@@ -724,7 +811,7 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
           ))}
         </div>
       </header>
-      <Editor />
+      <DocumentEditor />
     </div>
   )
 }
@@ -745,6 +832,10 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
 
 A complete example combining all hooks:
 
+<!-- docs-check-prelude
+import { useState } from 'react'
+-->
+
 ```tsx
 import { createApp, defineSchema, t } from 'korajs'
 import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@korajs/react'
@@ -764,7 +855,7 @@ const schema = defineSchema({
 
 const app = createApp({
   schema,
-  sync: { url: 'wss://my-server.com/kora' },
+  sync: { url: 'wss://my-server.example.com/kora-sync', autoConnect: true },
 })
 
 function App() {
@@ -804,7 +895,7 @@ function TodoList() {
     app.todos.where({ completed: false }).orderBy('createdAt', 'desc')
   )
   const { mutate: updateTodo } = useMutation(
-    (args: { id: string; data: Partial<Todo> }) => app.todos.update(args.id, args.data)
+    (args: { id: string; data: { completed: boolean } }) => app.todos.update(args.id, args.data)
   )
 
   return (
@@ -813,7 +904,7 @@ function TodoList() {
         <li key={todo.id}>
           <input
             type="checkbox"
-            checked={todo.completed}
+            checked={todo.completed ?? false}
             onChange={() => updateTodo({ id: todo.id, data: { completed: true } })}
           />
           {todo.title}

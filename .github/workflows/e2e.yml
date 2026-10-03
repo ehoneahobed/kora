@@ -38,3 +38,6 @@ jobs:
 
       - name: Run E2E tests
         run: pnpm --filter kora-e2e test:e2e
+
+      - name: Getting Started tutorial in Chromium (DX-3)
+        run: pnpm docs:check-tutorial --require-browser
