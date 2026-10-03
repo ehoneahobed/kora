@@ -1,14 +1,15 @@
-import { HybridLogicalClock, deriveSideEffectOpId } from '@korajs/core'
+import { HybridLogicalClock } from '@korajs/core'
 import type { HLCTimestamp, Operation } from '@korajs/core'
 import type { SideEffectOp } from '@korajs/merge'
 import { SERVER_RULE_PREFIX, timestampAfter } from '../constraints/constraint-authority'
 import type { ServerStore } from '../store/server-store'
+import { deriveServerOpId } from './derive-server-op-id'
 
 /**
  * Converts a merge-package referential side effect (cascade delete, set-null) of
  * `parentOp` into a server-originated operation.
  *
- * Deterministic (W7 step 3): the id is `deriveSideEffectOpId(parent, rule, target)`
+ * Deterministic (W7 step 3): the id is `deriveServerOpId(store, parent, rule, target)` (keyed, RT-64)
  * with rule `server/relation:<relation>:<policy>`, and the timestamp is the parent's
  * next HLC tick on the server's node, never the wall clock. Every server instance,
  * session or retry that generates the effect of the same parent on the same record
@@ -31,7 +32,8 @@ export async function createServerSideEffectOperation(
 	const nodeId = store.getNodeId()
 	const policy = effect.type === 'delete' ? 'cascade' : 'set-null'
 	return {
-		id: await deriveSideEffectOpId(
+		id: await deriveServerOpId(
+			store,
 			parentOp.id,
 			`${SERVER_RULE_PREFIX}relation:${effect.relationName}:${policy}`,
 			effect.recordId,

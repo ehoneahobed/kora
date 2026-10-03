@@ -641,7 +641,10 @@ describe('re-materialization migration (W7 step 7)', () => {
 			expect(last?.name).toBe('edited-live')
 			expect(last?.tags).toEqual(foldedTags(ops, 'l-0699'))
 			expect((await store.findRecord('lists', 'l-0007'))?.tags).toEqual(foldedTags(ops, 'l-0007'))
-			const restart = new PostgresServerStore(drizzle(second), 'server-3')
+			// Restarted with the same configuration: the authority set (the persisted legacy
+			// ids plus the configured 'server-2') is unchanged, so nothing is re-folded. (A
+			// new configured id would be a new legacy authority, and re-fold every record.)
+			const restart = new PostgresServerStore(drizzle(second), 'server-2')
 			await restart.setSchema(migrationSchema)
 			expect(restart.getFoldMigrationReport().records).toBe(0)
 			const rows = (await client.unsafe(

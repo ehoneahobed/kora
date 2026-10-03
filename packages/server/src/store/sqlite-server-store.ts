@@ -8,7 +8,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { generateUUIDv7, quoteIdent } from '@korajs/core'
+import { quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
@@ -38,13 +38,13 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
-	foldPlanFingerprint,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
+	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
@@ -53,6 +53,25 @@ import {
 	scopeSnapshotFingerprint,
 	scopeValuesOf,
 } from './scope-snapshot'
+import {
+	type ConfiguredIdentity,
+	SERVER_DEPLOYMENT_ID_KEY,
+	SERVER_DERIVATION_SECRET_KEY,
+	SERVER_INSTANCE_ID_KEY,
+	SERVER_LEGACY_AUTHORITY_KEY,
+	SERVER_LEGACY_SCAN_KEY,
+	SERVER_NODE_PREFIX,
+	type ServerIdentityOptions,
+	authoritativeStampOpIds,
+	deriveKeyedServerOpId,
+	generateDeploymentId,
+	generateDerivationSecret,
+	isServerNodeId,
+	normalizeLegacyAuthorities,
+	parseIdentityOptions,
+	parseLegacyAuthorities,
+	serverNodeIdFor,
+} from './server-identity'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -139,7 +158,12 @@ export class SqliteServerStore implements ServerStore {
 		ran: false,
 		totalQuarantined: 0,
 	}
-	private readonly authoritativeNodeIds: string[]
+	/** Derivation secret of server-derived ids, shared by the deployment (RT-64). */
+	private readonly derivationSecret: string
+	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
+	private readonly explicitAuthorities: string[]
+	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
+	private readonly otherServerNodes = new Set<string>()
 	private readonly foldOptions: ServerFoldOptions
 	private foldMigration: FoldMigrationReport = {
 		ran: false,
@@ -148,20 +172,127 @@ export class SqliteServerStore implements ServerStore {
 		fullRefold: false,
 	}
 
+	/**
+	 * @param db - The Drizzle database
+	 * @param nodeId - Deprecated: a plain id is recorded as a legacy authoritative id; a
+	 *   `kora:server:` id is used verbatim. Leave unset: the store authors under
+	 *   `kora:server:<deployment>:<instance>`, both persisted in the database (RT-62).
+	 * @param options - Extra authoritative ids and the instance id
+	 */
 	constructor(
 		db: BetterSQLite3Database,
 		nodeId?: string,
-		options: { authoritativeNodeIds?: string[] } = {},
+		options: Omit<ServerIdentityOptions, 'nodeId'> = {},
 	) {
 		this.db = db
-		this.nodeId = nodeId ?? generateUUIDv7()
-		this.authoritativeNodeIds = [...new Set([this.nodeId, ...(options.authoritativeNodeIds ?? [])])]
-		this.foldOptions = serverFoldOptions(this.authoritativeNodeIds)
+		const configured = parseIdentityOptions({
+			...(nodeId !== undefined ? { nodeId } : {}),
+			...options,
+		})
 		this.ensureTables()
+		const identity = this.loadIdentity(configured)
+		this.nodeId = identity.nodeId
+		this.derivationSecret = identity.secret
+		this.explicitAuthorities = identity.explicitAuthorities
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
+		for (const row of this.db.all<{ node_id: string }>(
+			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
+		)) {
+			this.noteServerAuthor(row.node_id)
+		}
 	}
 
+	/**
+	 * Node ids advertised as authoritative: this store's node id, every other
+	 * `kora:server:` node with history in this database (earlier instances, a restored
+	 * deployment), and the legacy and configured ids. The prefix rule makes every
+	 * `kora:server:` id authoritative anyway; listing them serves clients that predate it.
+	 */
 	getAuthoritativeNodeIds(): string[] {
-		return [...this.authoritativeNodeIds]
+		return [this.nodeId, ...this.otherServerNodes, ...this.explicitAuthorities]
+	}
+
+	/** Legacy and configured authorities (beside the `kora:server:` namespace). */
+	getLegacyAuthoritativeNodeIds(): string[] {
+		return [...this.explicitAuthorities]
+	}
+
+	async deriveServerOperationId(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string> {
+		return deriveKeyedServerOpId(this.derivationSecret, parentOpId, ruleId, targetRecordId)
+	}
+
+	/** Remember another `kora:server:` node that authored stored operations. */
+	private noteServerAuthor(nodeId: string): void {
+		if (nodeId !== this.nodeId && isServerNodeId(nodeId)) this.otherServerNodes.add(nodeId)
+	}
+
+	/**
+	 * Load (creating on first start) the persisted server identity: the deployment id,
+	 * the derivation secret, this database's instance id and the legacy authoritative
+	 * ids. At the first start of this release, every node id whose operations hold an
+	 * authority class in a stored fold state (a server decision folded under an earlier,
+	 * per-process server node id) is recorded as a legacy authority, before any re-fold
+	 * could drop that class.
+	 */
+	private loadIdentity(configured: ConfiguredIdentity): {
+		nodeId: string
+		secret: string
+		explicitAuthorities: string[]
+	} {
+		const meta = (tx: BetterSQLite3Database, key: string): string | undefined =>
+			tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+				?.value
+		const setOnce = (tx: BetterSQLite3Database, key: string, value: string): string => {
+			tx.run(sql`INSERT OR IGNORE INTO kora_server_meta (key, value) VALUES (${key}, ${value})`)
+			return meta(tx, key) ?? value
+		}
+		return this.db.transaction((tx) => {
+			const deploymentId = setOnce(tx, SERVER_DEPLOYMENT_ID_KEY, generateDeploymentId())
+			const secret = setOnce(tx, SERVER_DERIVATION_SECRET_KEY, generateDerivationSecret())
+			// One SQLite database has one writer process, so one persisted instance id.
+			const instanceId = configured.instanceId ?? setOnce(tx, SERVER_INSTANCE_ID_KEY, '1')
+			const nodeId = configured.verbatimNodeId ?? serverNodeIdFor(deploymentId, instanceId)
+
+			let legacy = parseLegacyAuthorities(meta(tx, SERVER_LEGACY_AUTHORITY_KEY))
+			if (meta(tx, SERVER_LEGACY_SCAN_KEY) === undefined) {
+				const stampOpIds = new Set<string>()
+				for (const row of tx.all<{ state: string }>(sql`SELECT state FROM kora_fold_state`)) {
+					for (const id of authoritativeStampOpIds(row.state)) stampOpIds.add(id)
+				}
+				const ids = [...stampOpIds]
+				for (let i = 0; i < ids.length; i += 500) {
+					const chunk = ids.slice(i, i + 500)
+					const rows = tx.all<{ node_id: string }>(
+						sql`SELECT DISTINCT node_id FROM operations WHERE id IN (${sql.join(
+							chunk.map((id) => sql`${id}`),
+							sql`, `,
+						)})`,
+					)
+					legacy.push(...rows.map((row) => row.node_id))
+				}
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_SCAN_KEY}, ${String(Date.now())})`,
+				)
+			}
+			// A configured plain node id is the id this server authored under before (RT-62).
+			if (configured.legacyNodeId !== null) legacy.push(configured.legacyNodeId)
+			legacy = normalizeLegacyAuthorities(legacy.filter((id) => id !== nodeId))
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_AUTHORITY_KEY}, ${JSON.stringify(legacy)})`,
+			)
+			return {
+				nodeId,
+				secret,
+				explicitAuthorities: normalizeLegacyAuthorities([
+					...legacy,
+					...configured.explicitAuthorities,
+				]),
+			}
+		})
 	}
 
 	/** What the last startup re-materialization did (W7 step 7). */
@@ -326,7 +457,10 @@ export class SqliteServerStore implements ServerStore {
 			return 'applied' as const
 		})
 
-		if (result === 'applied') reportLegacyPair(op, sequenceDecision, options)
+		if (result === 'applied') {
+			this.noteServerAuthor(op.nodeId)
+			reportLegacyPair(op, sequenceDecision, options)
+		}
 		return result
 	}
 
@@ -885,6 +1019,7 @@ export class SqliteServerStore implements ServerStore {
 				tx.insert(syncState)
 					.values({ nodeId: nid, maxSequenceNumber: seq, lastSeenAt: Date.now() })
 					.run()
+				this.noteServerAuthor(nid)
 			}
 
 			// Re-assign delivery sequence from scratch in backup order.
@@ -1172,7 +1307,7 @@ export class SqliteServerStore implements ServerStore {
 		}
 		if (!schema) return { ...report, ran: false }
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const fingerprint = foldPlanFingerprint(schema)
+		const fingerprint = serverFoldPlanFingerprint(schema, this.explicitAuthorities)
 		const storedFingerprint = this.db.all<{ value: string }>(
 			sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
 		)[0]?.value
@@ -1870,7 +2005,9 @@ export class SqliteServerStore implements ServerStore {
  *
  * @param options - Configuration options
  * @param options.filename - Path to SQLite database file. Defaults to ':memory:' for testing.
- * @param options.nodeId - Server node ID. Auto-generated if not provided.
+ * @param options.nodeId - Deprecated (a plain id becomes a legacy authoritative id). Leave
+ *   unset: the server authors under the persisted `kora:server:<deployment>:<instance>`.
+ * @param options.instanceId - Optional stable instance id
  * @returns A ready-to-use SqliteServerStore
  *
  * @example
@@ -1885,12 +2022,11 @@ export class SqliteServerStore implements ServerStore {
  * const server = createKoraServer({ store, port: 3001 })
  * ```
  */
-export function createSqliteServerStore(options: {
-	filename?: string
-	nodeId?: string
-	/** Node ids, besides the store's own, whose operations win server-authoritative fields. */
-	authoritativeNodeIds?: string[]
-}): SqliteServerStore {
+export function createSqliteServerStore(
+	options: {
+		filename?: string
+	} & ServerIdentityOptions,
+): SqliteServerStore {
 	// better-sqlite3 is a native CJS addon — use esmRequire (from createRequire)
 	// so this works in both ESM and CJS contexts.
 	const Database = esmRequire('better-sqlite3')
@@ -1905,5 +2041,6 @@ export function createSqliteServerStore(options: {
 	const db = drizzle(sqlite)
 	return new SqliteServerStore(db, options.nodeId, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
+		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
 }

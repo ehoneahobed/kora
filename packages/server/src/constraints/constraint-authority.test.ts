@@ -174,7 +174,8 @@ for (const [name, make] of makers) {
 			}
 			expect(corrections).toHaveLength(2)
 			for (const correction of corrections) {
-				expect(correction.nodeId).toBe('server')
+				expect(correction.nodeId).toBe(store.getNodeId())
+				expect(correction.nodeId.startsWith('kora:server:')).toBe(true)
 				expect(correction.type).toBe('delete')
 			}
 			const live = await store.queryCollection('tags', { where: { name: 'kora' } })
@@ -274,7 +275,7 @@ for (const [name, make] of makers) {
 			expect(result.result).toBe('applied')
 			const correction = result.appliedOperations.find((o) => o.id !== late.id)
 			expect(correction?.type).toBe('delete')
-			expect(correction?.timestamp).toEqual(timestampAfter(late.timestamp, 'server'))
+			expect(correction?.timestamp).toEqual(timestampAfter(late.timestamp, store.getNodeId()))
 			expect(await store.findRecord('todos', 't1')).toBeNull()
 			await store.close()
 		})
@@ -345,12 +346,16 @@ for (const [name, make] of makers) {
 			const first = await run()
 			const second = await run()
 			expect(first).toHaveLength(1)
-			const strip = (o: Operation): Omit<Operation, 'sequenceNumber'> => {
-				const { sequenceNumber: _sequence, ...rest } = o
-				return rest
+			// Two stores here are two deployments: the content is identical, while the id
+			// and the server node id are the deployment's own (keyed ids, RT-64; within one
+			// deployment every instance derives the same id, see server-identity.test.ts).
+			const strip = (o: Operation): Omit<Operation, 'sequenceNumber' | 'id' | 'nodeId'> => {
+				const { sequenceNumber: _sequence, id: _id, nodeId: _node, ...rest } = o
+				return { ...rest, timestamp: { ...rest.timestamp, nodeId: '' } }
 			}
 			expect(first.map(strip)).toEqual(second.map(strip))
-			expect(first[0]?.timestamp).toEqual({ wallTime: 2000, logical: 1, nodeId: 'server' })
+			expect(first[0]?.id).not.toBe(second[0]?.id)
+			expect(first[0]?.timestamp).toMatchObject({ wallTime: 2000, logical: 1 })
 			expect(first[0]?.mutationName).toBe('kora:side-effect:cascade')
 			expect(SERVER_RULE_PREFIX).toBe('server/')
 		})
@@ -380,14 +385,18 @@ test('fold-state serialization of a corrected record is identical on every repli
 			await enforceCrossRecordRules(store, insert, () => nextServerSequenceNumber(store))
 		}
 	}
-	const states = await Promise.all(
-		[memory, sqlite].map(async (store) => {
-			const state = await store.getRecordFoldState('tags', 'tag-y')
-			return state ? serializeFoldState(state) : null
-		}),
-	)
-	expect(states[0]).toBe(states[1])
+	// Each server's state equals what a replica folding that server's log produces (the
+	// two stores are two deployments, so their correction ids and node ids differ).
+	for (const store of [memory, sqlite]) {
+		const state = await store.getRecordFoldState('tags', 'tag-y')
+		const replicaOps = (await log(store)).filter((o) => o.recordId === 'tag-y')
+		const replica = foldRecord([...replicaOps].reverse(), schema, serverFoldOptions([])).state
+		expect(state ? serializeFoldState(state) : null).toBe(
+			replica ? serializeFoldState(replica) : null,
+		)
+	}
 	expect(await memory.findRecord('tags', 'tag-y')).toBeNull()
+	expect(await sqlite.findRecord('tags', 'tag-y')).toBeNull()
 })
 
 describe('every server-authored operation verifies (or is exempt) on a client (Phase 3 seam 2)', () => {

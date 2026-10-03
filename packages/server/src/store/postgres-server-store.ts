@@ -8,7 +8,7 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, generateUUIDv7, quoteIdent } from '@korajs/core'
+import { HybridLogicalClock, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -38,13 +38,13 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
-	foldPlanFingerprint,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
+	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
@@ -53,6 +53,25 @@ import {
 	scopeSnapshotFingerprint,
 	scopeValuesOf,
 } from './scope-snapshot'
+import {
+	type ConfiguredIdentity,
+	SERVER_DEPLOYMENT_ID_KEY,
+	SERVER_DERIVATION_SECRET_KEY,
+	SERVER_INSTANCE_COUNTER_KEY,
+	SERVER_LEGACY_AUTHORITY_KEY,
+	SERVER_LEGACY_SCAN_KEY,
+	ServerIdentityError,
+	type ServerIdentityOptions,
+	authoritativeStampOpIds,
+	deriveKeyedServerOpId,
+	generateDeploymentId,
+	generateDerivationSecret,
+	isServerNodeId,
+	normalizeLegacyAuthorities,
+	parseIdentityOptions,
+	parseLegacyAuthorities,
+	serverNodeIdFor,
+} from './server-identity'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -132,7 +151,15 @@ interface FoldedRecordWrite {
  * collection tables for efficient indexed queries (dual-write).
  */
 export class PostgresServerStore implements ServerStore {
-	private readonly nodeId: string
+	/** This instance's server node id; loaded from the database during startup (RT-62). */
+	private loadedNodeId: string | null = null
+	private readonly configuredIdentity: ConfiguredIdentity
+	/** Derivation secret of server-derived ids, shared by the deployment (RT-64). */
+	private derivationSecret = ''
+	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
+	private explicitAuthorities: string[] = []
+	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
+	private readonly otherServerNodes = new Set<string>()
 	private readonly db: PostgresJsDatabase
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
@@ -161,8 +188,7 @@ export class PostgresServerStore implements ServerStore {
 	 * exist to make correct). Defaults to the system clock in production.
 	 */
 	private readonly timeSource: TimeSource
-	private readonly authoritativeNodeIds: string[]
-	private readonly foldOptions: ServerFoldOptions
+	private foldOptions: ServerFoldOptions = serverFoldOptions([])
 	private foldMigration: FoldMigrationReport = {
 		ran: false,
 		records: 0,
@@ -170,22 +196,164 @@ export class PostgresServerStore implements ServerStore {
 		fullRefold: false,
 	}
 
+	/**
+	 * @param db - The Drizzle database
+	 * @param nodeId - Deprecated: a plain id is recorded as a legacy authoritative id; a
+	 *   `kora:server:` id is used verbatim (it must then be unique per instance). Leave
+	 *   unset: the store authors under `kora:server:<deployment>:<instance>`, with the
+	 *   deployment persisted in the database and a distinct instance per process (RT-62).
+	 * @param timeSource - Clock for server-originated operations (tests)
+	 * @param options - Extra authoritative ids and a stable instance id
+	 */
 	constructor(
 		db: PostgresJsDatabase,
 		nodeId?: string,
 		timeSource?: TimeSource,
-		options: { authoritativeNodeIds?: string[] } = {},
+		options: Omit<ServerIdentityOptions, 'nodeId'> = {},
 	) {
 		this.db = db
-		this.nodeId = nodeId ?? generateUUIDv7()
+		this.configuredIdentity = parseIdentityOptions({
+			...(nodeId !== undefined ? { nodeId } : {}),
+			...options,
+		})
 		this.timeSource = timeSource ?? { now: () => Date.now() }
-		this.authoritativeNodeIds = [...new Set([this.nodeId, ...(options.authoritativeNodeIds ?? [])])]
-		this.foldOptions = serverFoldOptions(this.authoritativeNodeIds)
 		this.ready = this.initialize()
 	}
 
+	/** Resolves once the store's tables and identity are loaded. */
+	whenReady(): Promise<void> {
+		return this.ready
+	}
+
+	/**
+	 * Node ids advertised as authoritative: this instance's node id, every other
+	 * `kora:server:` node with history in the database (other instances of the
+	 * deployment), and the legacy and configured ids. The prefix rule makes every
+	 * `kora:server:` id authoritative anyway; listing them serves clients that predate it.
+	 */
 	getAuthoritativeNodeIds(): string[] {
-		return [...this.authoritativeNodeIds]
+		return [this.nodeId, ...this.otherServerNodes, ...this.explicitAuthorities]
+	}
+
+	/** Legacy and configured authorities (beside the `kora:server:` namespace). */
+	getLegacyAuthoritativeNodeIds(): string[] {
+		return [...this.explicitAuthorities]
+	}
+
+	async deriveServerOperationId(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string> {
+		await this.ready
+		return deriveKeyedServerOpId(this.derivationSecret, parentOpId, ruleId, targetRecordId)
+	}
+
+	private get nodeId(): string {
+		if (this.loadedNodeId === null) {
+			throw new ServerIdentityError(
+				'The Postgres server store is still starting: await store.setSchema(...) (or store.whenReady()) before using it.',
+			)
+		}
+		return this.loadedNodeId
+	}
+
+	/** Remember another `kora:server:` node that authored stored operations. */
+	private noteServerAuthor(nodeId: string): void {
+		if (nodeId !== this.loadedNodeId && isServerNodeId(nodeId)) this.otherServerNodes.add(nodeId)
+	}
+
+	/**
+	 * Load (creating on first start) the persisted server identity under an advisory
+	 * lock: the deployment id and derivation secret (one per database, shared by every
+	 * instance), a fresh instance id from the database counter (unless configured), and
+	 * the legacy authoritative ids. At the first start of this release, every node id
+	 * whose operations hold an authority class in a stored fold state (a server decision
+	 * folded under an earlier, per-process server node id) is recorded as a legacy
+	 * authority, before any re-fold could drop that class.
+	 */
+	private async loadIdentity(): Promise<void> {
+		const configured = this.configuredIdentity
+		const identity = await this.db.transaction(async (tx) => {
+			await tx.execute(
+				sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:server-identity', 0))`,
+			)
+			const meta = async (key: string): Promise<string | undefined> =>
+				(
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+			const setOnce = async (key: string, value: string): Promise<string> => {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value}) ON CONFLICT (key) DO NOTHING`,
+				)
+				return (await meta(key)) ?? value
+			}
+			const deploymentId = await setOnce(SERVER_DEPLOYMENT_ID_KEY, generateDeploymentId())
+			const secret = await setOnce(SERVER_DERIVATION_SECRET_KEY, generateDerivationSecret())
+			let instanceId = configured.instanceId
+			if (instanceId === null) {
+				// Every process start draws a new instance id, so two running instances never
+				// share a node id (and never collide on its sequence numbers).
+				await setOnce(SERVER_INSTANCE_COUNTER_KEY, '0')
+				const next = (await tx.execute(
+					sql`UPDATE kora_server_meta SET value = ((value)::bigint + 1)::text WHERE key = ${SERVER_INSTANCE_COUNTER_KEY} RETURNING value`,
+				)) as unknown as { value: string }[]
+				instanceId = String(next[0]?.value ?? '1')
+			}
+			const nodeId = configured.verbatimNodeId ?? serverNodeIdFor(deploymentId, instanceId)
+
+			let legacy = parseLegacyAuthorities(await meta(SERVER_LEGACY_AUTHORITY_KEY))
+			if ((await meta(SERVER_LEGACY_SCAN_KEY)) === undefined) {
+				const stampOpIds = new Set<string>()
+				let after = ''
+				let afterRecord = ''
+				for (;;) {
+					const page = (await tx.execute(
+						sql`SELECT collection, record_id, state FROM kora_fold_state
+							WHERE (collection, record_id) > (${after}, ${afterRecord})
+							ORDER BY collection, record_id LIMIT 1000`,
+					)) as unknown as { collection: string; record_id: string; state: string }[]
+					for (const row of page) {
+						for (const id of authoritativeStampOpIds(row.state)) stampOpIds.add(id)
+					}
+					const last = page[page.length - 1]
+					if (!last || page.length < 1000) break
+					after = last.collection
+					afterRecord = last.record_id
+				}
+				const ids = [...stampOpIds]
+				for (let i = 0; i < ids.length; i += 500) {
+					const chunk = ids.slice(i, i + 500)
+					const rows = (await tx.execute(
+						sql`SELECT DISTINCT node_id FROM operations WHERE id IN (${sql.join(
+							chunk.map((id) => sql`${id}`),
+							sql`, `,
+						)})`,
+					)) as unknown as { node_id: string }[]
+					legacy.push(...rows.map((row) => row.node_id))
+				}
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_SCAN_KEY}, ${String(Date.now())}) ON CONFLICT (key) DO NOTHING`,
+				)
+			}
+			// A configured plain node id is the id this server authored under before (RT-62).
+			if (configured.legacyNodeId !== null) legacy.push(configured.legacyNodeId)
+			legacy = normalizeLegacyAuthorities(legacy.filter((id) => id !== nodeId))
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_AUTHORITY_KEY}, ${JSON.stringify(legacy)})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+			return { secret, nodeId, legacy }
+		})
+		this.loadedNodeId = identity.nodeId
+		this.derivationSecret = identity.secret
+		this.explicitAuthorities = normalizeLegacyAuthorities([
+			...identity.legacy,
+			...configured.explicitAuthorities,
+		])
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
 	}
 
 	/** What the last startup re-materialization did (W7 step 7). */
@@ -336,6 +504,7 @@ export class PostgresServerStore implements ServerStore {
 		if (op.sequenceNumber > currentMax) {
 			this.versionVector.set(op.nodeId, op.sequenceNumber)
 		}
+		this.noteServerAuthor(op.nodeId)
 
 		reportLegacyPair(op, sequenceDecision, options)
 		return 'applied'
@@ -359,6 +528,7 @@ export class PostgresServerStore implements ServerStore {
 			const seq = Number(row.maxSequenceNumber)
 			vector.set(row.nodeId, seq)
 			if (seq > (this.versionVector.get(row.nodeId) ?? 0)) this.versionVector.set(row.nodeId, seq)
+			this.noteServerAuthor(row.nodeId)
 		}
 		return vector
 	}
@@ -1642,7 +1812,7 @@ export class PostgresServerStore implements ServerStore {
 		}
 		if (!schema) return { ...report, ran: false }
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const fingerprint = foldPlanFingerprint(schema)
+		const fingerprint = serverFoldPlanFingerprint(schema, this.explicitAuthorities)
 		await this.db.transaction(async (tx) => {
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:fold-plan', 0))`)
 			const stored = (
@@ -1849,6 +2019,7 @@ export class PostgresServerStore implements ServerStore {
 
 	private async initialize(): Promise<void> {
 		await this.ensureTables()
+		await this.loadIdentity()
 		this.logIntegrity = await this.scanLogIntegrityOnce()
 
 		// Hydrate in-memory version vector cache
@@ -1861,6 +2032,7 @@ export class PostgresServerStore implements ServerStore {
 
 		for (const row of rows) {
 			this.versionVector.set(row.nodeId, row.maxSequenceNumber)
+			this.noteServerAuthor(row.nodeId)
 		}
 	}
 
@@ -2319,18 +2491,18 @@ export class PostgresServerStore implements ServerStore {
 /**
  * Creates a PostgresServerStore from a PostgreSQL connection string.
  */
-export async function createPostgresServerStore(options: {
-	connectionString: string
-	nodeId?: string
-	/** Node ids, besides the store's own, whose operations win server-authoritative fields. */
-	authoritativeNodeIds?: string[]
-}): Promise<PostgresServerStore> {
+export async function createPostgresServerStore(
+	options: {
+		connectionString: string
+	} & ServerIdentityOptions,
+): Promise<PostgresServerStore> {
 	const { postgresClient, drizzleFn } = await loadPostgresDeps()
 	const client = postgresClient(options.connectionString)
 	const db = drizzleFn(client)
 
 	return new PostgresServerStore(db, options.nodeId, undefined, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
+		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
 }
 

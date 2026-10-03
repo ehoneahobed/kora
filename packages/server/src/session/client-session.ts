@@ -7,7 +7,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { applyOperationTransforms } from '@korajs/core'
-import { SyncError, generateUUIDv7, hashBlob, verifyOperationId } from '@korajs/core'
+import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
 	AwarenessUpdateMessage,
@@ -21,7 +21,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
-import { decodeBlobChunkBytes } from '@korajs/sync'
+import { SyncEncryptor, decodeBlobChunkBytes } from '@korajs/sync'
 import {
 	type DeltaCursor,
 	INVALID_OPERATION_ID,
@@ -43,7 +43,7 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import { scopeViewKey } from '@korajs/sync/internal'
+import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
 import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
@@ -1779,6 +1779,18 @@ export class ClientSession {
 			this.close('reserved node id')
 			return
 		}
+		// The server's own node ids, current and legacy (published in the handshake's
+		// `authoritativeNodeIds`), are never a device's: a device presenting one would
+		// author `merge('server-authoritative')` writes as the server (RT-61).
+		if (this.isServerAuthorNodeId(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				`Node id "${msg.nodeId}" is a server node id (an authoritative node of this deployment). Use a generated device node id.`,
+				false,
+			)
+			this.close('server node id')
+			return
+		}
 
 		// Authenticate if provider is configured
 		if (this.auth) {
@@ -2486,7 +2498,7 @@ export class ClientSession {
 				continue
 			}
 
-			const serverOp = this.transformForServerSchema(op)
+			const serverOp = this.transformForServerSchema(this.declareVerifiedHashVersion(op))
 			if (serverOp === null) {
 				await this.refuseTerminally(
 					op,
@@ -2668,6 +2680,13 @@ export class ClientSession {
 	private async checkUploadIntegrity(
 		op: Operation,
 	): Promise<{ code: string; message: string } | null> {
+		// Defense in depth: the handshake already refused a server node id (RT-61).
+		if (this.isServerAuthorNodeId(op.nodeId)) {
+			return {
+				code: 'INVALID_NODE_ID',
+				message: `Operation "${op.id}" is authored by "${op.nodeId}", a server node id. A device may never upload operations under one.`,
+			}
+		}
 		const declared = op.hashVersion
 		if (declared !== undefined && declared !== 1 && declared !== 2) {
 			return {
@@ -2686,14 +2705,62 @@ export class ClientSession {
 					message: `Operation "${op.id}" is plaintext but this server requires end-to-end encryption. Enable sync encryption on the client, or open a plaintext migration window (encryption.allowPlaintextMigration) on the server.`,
 				}
 			}
-			if (declared === 2 && !(await verifyOperationId(op))) {
+			// A protocol-1 encrypted payload: its id covers the plaintext, which the server
+			// never sees, so it cannot be checked here (the receivers refuse the format).
+			if (
+				SyncEncryptor.isEncryptedPayload(op.data) ||
+				SyncEncryptor.isEncryptedPayload(op.previousData)
+			) {
+				return null
+			}
+			// Every plaintext id is verified, version 1 included (RT-64): an operation that
+			// declares no version is checked as a version-1 hash, so omitting `hashVersion`
+			// skips nothing and no client can store an operation under an id it chose.
+			const integrity = await verifyInboundOperation(op, {
+				encrypted: false,
+				absentVersion: 'verify-v1',
+			})
+			if (!integrity.ok) {
 				return {
 					code: INVALID_OPERATION_ID,
-					message: `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`,
+					message:
+						declared === 2
+							? `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`
+							: `Operation "${op.id}" does not match its content hash (hash version 1: type, collection, recordId, data, timestamp, nodeId, atomicOps): its id was not computed from its content, or the content was altered. It is refused and never stored or relayed.`,
 				}
 			}
 		}
 		return null
+	}
+
+	/**
+	 * The operation as the server stores it: a plaintext id this server verified as a
+	 * version-1 hash declares `hashVersion: 1`, so receivers verify it too (RT-64). An
+	 * absent version is left only on ids nobody could verify (protocol-1 encrypted
+	 * payloads, envelopes keep their own declaration, server-side transforms).
+	 */
+	private declareVerifiedHashVersion(op: Operation): Operation {
+		if (op.hashVersion !== undefined || op.encrypted !== undefined) return op
+		if (
+			SyncEncryptor.isEncryptedPayload(op.data) ||
+			SyncEncryptor.isEncryptedPayload(op.previousData)
+		) {
+			return op
+		}
+		return { ...op, hashVersion: 1 }
+	}
+
+	/**
+	 * True for a node id that is (or was) the server's own: the `kora:` namespace, the
+	 * store's node id, and every id the server advertises or folds as authoritative
+	 * (other instances, legacy server node ids, configured extras). No device may use one
+	 * (RT-61), whether or not it has history yet.
+	 */
+	private isServerAuthorNodeId(nodeId: string): boolean {
+		if (nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) return true
+		if (nodeId === this.store.getNodeId()) return true
+		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
+		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
 	}
 
 	/** Node ids this server authors operations under (protocol v2 handshake response). */

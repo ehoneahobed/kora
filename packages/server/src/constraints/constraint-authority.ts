@@ -15,7 +15,7 @@
  *    ordinary operations authored by the server's node (so they win
  *    `server-authoritative` fields and otherwise merge by HLC like any write).
  *
- * Corrections are deterministic: their ids come from `deriveSideEffectOpId` over the
+ * Corrections are deterministic: their ids come from `deriveServerOpId` (keyed with the deployment secret, RT-64) over the
  * losing write and the rule, and their timestamps and data are derived from the fold
  * state, so two detectors (two sessions, two instances, a retry) produce the same
  * operation, which the log stores once. Rule ids start with
@@ -40,13 +40,7 @@
  * A revival is an update with empty data: it is a write (newer than the delete) that
  * changes no field, so the record comes back with every field's merged value.
  */
-import {
-	HybridLogicalClock,
-	deriveSideEffectOpId,
-	foldRecord,
-	isFoldStateLive,
-	materialize,
-} from '@korajs/core'
+import { HybridLogicalClock, foldRecord, isFoldStateLive, materialize } from '@korajs/core'
 import type {
 	Constraint,
 	FoldState,
@@ -56,6 +50,7 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 import { checkConstraints } from '@korajs/merge'
+import { deriveServerOpId } from '../apply/derive-server-op-id'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import { createServerConstraintContext } from './server-constraint-context'
 
@@ -98,7 +93,12 @@ async function buildCorrection(
 ): Promise<Operation> {
 	const nodeId = store.getNodeId()
 	return {
-		id: await deriveSideEffectOpId(spec.parent, `${SERVER_RULE_PREFIX}${spec.rule}`, spec.recordId),
+		id: await deriveServerOpId(
+			store,
+			spec.parent,
+			`${SERVER_RULE_PREFIX}${spec.rule}`,
+			spec.recordId,
+		),
 		nodeId,
 		type: spec.type,
 		collection: spec.collection,

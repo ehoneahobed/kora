@@ -1,4 +1,6 @@
+import type { Operation } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
+import { withContentId } from '../fixtures/content-id'
 import { createTestOperations, setupTestServer } from '../fixtures/test-helpers'
 
 describe('Multi-client sync', () => {
@@ -95,7 +97,7 @@ describe('Multi-client sync', () => {
 		clientA.sendOps(ops)
 
 		await vi.waitFor(() => {
-			const bOps = clientB.getReceivedOperations().filter((op) => op.id === 'client-a-op-1')
+			const bOps = clientB.getReceivedOperations().filter((op) => op.id === ops[0]?.id)
 			expect(bOps.length).toBe(1)
 		})
 	})
@@ -151,13 +153,18 @@ describe('Multi-client sync', () => {
 		expect(received).toHaveLength(0)
 
 		// Send more ops
-		const moreOps = createTestOperations(2, 'client-a').map((op, i) => ({
-			...op,
-			id: `client-a-op-${4 + i}`,
-			sequenceNumber: 4 + i,
-			timestamp: { wallTime: 2000 + i, logical: 0, nodeId: 'client-a' },
-			causalDeps: [i === 0 ? 'client-a-op-3' : `client-a-op-${3 + i}`],
-		}))
+		const earlier = createTestOperations(3, 'client-a')
+		const moreOps: Operation[] = []
+		for (const [i, op] of createTestOperations(2, 'client-a').entries()) {
+			moreOps.push(
+				withContentId({
+					...op,
+					sequenceNumber: 4 + i,
+					timestamp: { wallTime: 2000 + i, logical: 0, nodeId: 'client-a' },
+					causalDeps: [moreOps[i - 1]?.id ?? earlier[2]?.id ?? ''],
+				}),
+			)
+		}
 		clientA2.sendOps(moreOps)
 
 		await vi.waitFor(async () => {

@@ -41,7 +41,7 @@ function createFakeDrizzleDb(): unknown {
 		select: (..._args: unknown[]) => chainable(),
 		insert: (..._args: unknown[]) => chainable(),
 		execute: async () => [],
-		transaction: async (fn: (tx: unknown) => Promise<void>) => {
+		transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
 			const tx: Record<string, unknown> = {
 				select: (..._args: unknown[]) => chainable(),
 				insert: (..._args: unknown[]) => chainable(),
@@ -49,16 +49,22 @@ function createFakeDrizzleDb(): unknown {
 			}
 			// Nested transactions (savepoints) run against the same fake.
 			tx.transaction = async (nested: (inner: unknown) => Promise<void>) => nested(tx)
-			await fn(tx)
+			return fn(tx)
 		},
 	}
 }
 
 describe('PostgresServerStore', () => {
-	test('getNodeId returns provided node ID', async () => {
+	test('getNodeId is the persisted kora:server: id; a configured plain id is a legacy authority (RT-62)', async () => {
 		const store = new PostgresServerStore(createFakeDrizzleDb() as never, 'server-pg')
-		await Promise.resolve()
-		expect(store.getNodeId()).toBe('server-pg')
+		await store.whenReady()
+		expect(store.getNodeId().startsWith('kora:server:')).toBe(true)
+		expect(store.getAuthoritativeNodeIds()).toEqual([store.getNodeId(), 'server-pg'])
+	})
+
+	test('getNodeId before startup completes throws an explicit error', () => {
+		const store = new PostgresServerStore(createFakeDrizzleDb() as never)
+		expect(() => store.getNodeId()).toThrow(/still starting/)
 	})
 
 	test('getVersionVector returns empty map initially', async () => {

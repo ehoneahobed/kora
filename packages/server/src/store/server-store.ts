@@ -535,6 +535,17 @@ export interface ServerStore extends SyncStore {
 	 * clients fold with the same authority.
 	 */
 	getAuthoritativeNodeIds?(): string[]
+	/**
+	 * Keyed id of a server-derived operation (cascade, set-null, constraint correction):
+	 * deterministic across every instance of the deployment, unpredictable to clients
+	 * (RT-64). Built-in stores key it with a persisted deployment secret. A store
+	 * without it falls back to the unkeyed `deriveSideEffectOpId`.
+	 */
+	deriveServerOperationId?(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string>
 	/** Close the store and release resources */
 	close(): Promise<void>
 

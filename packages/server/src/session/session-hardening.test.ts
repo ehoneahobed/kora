@@ -2,6 +2,7 @@ import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
+import { withContentId } from '../../tests/fixtures/content-id'
 import { TokenAuthProvider } from '../auth/token-auth'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { MemoryServerStore } from '../store/memory-server-store'
@@ -15,7 +16,7 @@ const schema = defineSchema({
 let seq = 0
 function op(nodeId: string, overrides: Partial<Operation> = {}): Operation {
 	seq += 1
-	return {
+	const built: Operation = {
 		id: `op-${seq}`,
 		nodeId,
 		type: 'insert',
@@ -29,6 +30,8 @@ function op(nodeId: string, overrides: Partial<Operation> = {}): Operation {
 		schemaVersion: 1,
 		...overrides,
 	}
+	// A real content-addressed id unless the test chose one (the server verifies it, RT-64).
+	return overrides.id === undefined ? withContentId(built) : built
 }
 
 async function setup(

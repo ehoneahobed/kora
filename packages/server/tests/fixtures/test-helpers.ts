@@ -4,16 +4,19 @@ import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
+import { withContentId } from './content-id'
 
 /**
  * Create a chain of test operations from a single node.
- * Each operation causally depends on the previous one.
+ * Each operation causally depends on the previous one. Ids are real (version-1)
+ * content hashes: the server verifies every uploaded id (RT-64).
  */
 export function createTestOperations(count: number, nodeId: string): Operation[] {
 	const ops: Operation[] = []
 	for (let i = 1; i <= count; i++) {
-		ops.push({
-			id: `${nodeId}-op-${i}`,
+		const previous = ops[i - 2]
+		const op = withContentId({
+			id: '',
 			nodeId,
 			type: 'insert',
 			collection: 'todos',
@@ -22,9 +25,10 @@ export function createTestOperations(count: number, nodeId: string): Operation[]
 			previousData: null,
 			timestamp: { wallTime: 1000 + i, logical: 0, nodeId },
 			sequenceNumber: i,
-			causalDeps: i > 1 ? [`${nodeId}-op-${i - 1}`] : [],
+			causalDeps: previous ? [previous.id] : [],
 			schemaVersion: 1,
 		})
+		ops.push(op)
 	}
 	return ops
 }
