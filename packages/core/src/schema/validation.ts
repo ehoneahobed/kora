@@ -1,7 +1,7 @@
 import { isBlobRef } from '../blob/blob-ref'
 import { SchemaValidationError } from '../errors/errors'
 import { isAtomicOp } from '../operations/atomic-ops'
-import { stripUndefinedMembers } from '../operations/strip-undefined'
+import { NonCanonicalValueError, canonicalValue } from '../operations/canonical-body'
 import type { CollectionDefinition, FieldDescriptor, OperationType } from '../types'
 
 /**
@@ -59,7 +59,7 @@ export function validateRecord(
 					result[fieldName] = value
 				} else if (value !== undefined && value !== null) {
 					validateFieldValue(collection, fieldName, descriptor, value)
-					result[fieldName] = stripUndefinedMembers(value)
+					result[fieldName] = canonicalFieldValue(collection, fieldName, descriptor, value)
 				} else {
 					result[fieldName] = value
 				}
@@ -95,12 +95,43 @@ export function validateRecord(
 		}
 
 		validateFieldValue(collection, fieldName, descriptor, value)
-		// An `undefined` member of an object value is absent (RT-72): the stored and synced
-		// form is JSON, which drops it, so the record holds exactly what peers will see.
-		result[fieldName] = stripUndefinedMembers(value)
+		result[fieldName] = canonicalFieldValue(collection, fieldName, descriptor, value)
 	}
 
 	return result
+}
+
+/**
+ * The value in the canonical form an operation carries (core canonical-body.ts): an
+ * `undefined` member of an object value is absent, a `Date` inside a json/object value is
+ * its ISO string, `-0` is `0`; a value with no JSON form (Map, Set, class instance,
+ * BigInt, ...) is refused here, naming the field, instead of being silently changed on
+ * the way to the log (RT-72, RT-79). The record therefore holds exactly what peers will
+ * see. Richtext values (Yjs bytes) are encoded by the store, not here.
+ */
+function canonicalFieldValue(
+	collection: string,
+	fieldName: string,
+	descriptor: FieldDescriptor,
+	value: unknown,
+): unknown {
+	if (descriptor.kind === 'richtext') return value
+	try {
+		return canonicalValue(value, `${collection}.${fieldName}`)
+	} catch (error) {
+		if (error instanceof NonCanonicalValueError) {
+			throw new SchemaValidationError(
+				`Field "${fieldName}" in collection "${collection}": ${error.message}`,
+				{
+					collection,
+					field: fieldName,
+					path: error.path,
+					receivedType: error.receivedType,
+				},
+			)
+		}
+		throw error
+	}
 }
 
 function validateFieldValue(

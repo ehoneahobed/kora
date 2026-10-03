@@ -198,9 +198,13 @@ function decodeRichtextColumnValue(value: unknown): unknown {
 export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor): unknown {
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
+		case 'json':
+			// A json value may itself be a string ("abc", "123", ""): it is stored as JSON
+			// like every other json value, so it reads back as that string, never parsed as
+			// JSON text (the canonical value is what folds, on every store).
+			return JSON.stringify(value)
 		case 'array':
 		case 'object':
-		case 'json':
 		case 'blob':
 			return typeof value === 'string' ? value : JSON.stringify(value)
 		case 'boolean':
@@ -218,15 +222,28 @@ export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor)
 export function deserializeFieldValue(value: unknown, descriptor: FieldDescriptor): unknown {
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
+		case 'json':
+			return typeof value === 'string' ? parseJsonColumn(value) : value
 		case 'array':
 		case 'object':
-		case 'json':
 		case 'blob':
 			return typeof value === 'string' ? JSON.parse(value) : value
 		case 'boolean':
 			return value === 1 || value === true
 		default:
 			return value
+	}
+}
+
+/**
+ * A json column's text. Rows written before json strings were stored as JSON hold a raw
+ * string that is not JSON text; it is read back as that string instead of failing.
+ */
+function parseJsonColumn(text: string): unknown {
+	try {
+		return JSON.parse(text)
+	} catch {
+		return text
 	}
 }
 

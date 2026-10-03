@@ -48,6 +48,16 @@ export const SERVER_INSTANCE_COUNTER_KEY = 'server_instance_counter'
 /** `kora_server_meta` key: JSON array of legacy authoritative node ids. */
 export const SERVER_LEGACY_AUTHORITY_KEY = 'server_legacy_authoritative_node_ids'
 
+/**
+ * `kora_server_meta` key: JSON array of every explicit node id the deployment ever held
+ * authoritative (RT-81). Such an id stays authoritative until revoked, and is never
+ * accepted as a device node id, even after it is revoked.
+ */
+export const SERVER_EVER_AUTHORITY_KEY = 'server_ever_authoritative_node_ids'
+
+/** `kora_server_meta` key: JSON array of revoked explicit authoritative node ids (RT-81). */
+export const SERVER_REVOKED_AUTHORITY_KEY = 'server_revoked_authoritative_node_ids'
+
 /** `kora_server_meta` key: set once the legacy server node ids were collected from the log. */
 export const SERVER_LEGACY_SCAN_KEY = 'server_legacy_authority_scan_v1'
 
@@ -79,8 +89,19 @@ export interface ServerIdentityOptions {
 	 * Postgres allocates a new one per start when it is not configured.
 	 */
 	instanceId?: string
-	/** Extra node ids whose operations win `merge('server-authoritative')` fields. */
+	/**
+	 * Extra node ids whose operations win `merge('server-authoritative')` fields. Every id
+	 * listed here once stays authoritative (devices keep it too) until it is revoked with
+	 * {@link revokedAuthoritativeNodeIds}: removing it from this list does not revoke it.
+	 */
 	authoritativeNodeIds?: string[]
+	/**
+	 * Explicit authoritative node ids to revoke (RT-81): they stop being authoritative on
+	 * the server, the handshake tells every device to drop them (devices re-fold), and they
+	 * are still never accepted as device node ids. Revocation is permanent (persisted); an
+	 * id may not be both listed in `authoritativeNodeIds` and revoked.
+	 */
+	revokedAuthoritativeNodeIds?: string[]
 }
 
 /** The configuration part of an identity, validated. */
@@ -93,6 +114,8 @@ export interface ConfiguredIdentity {
 	instanceId: string | null
 	/** Configured ids that are explicit (legacy) authorities: a plain `nodeId` and the extras. */
 	explicitAuthorities: string[]
+	/** Configured revocations (RT-81). */
+	revokedAuthorities: string[]
 }
 
 /**
@@ -135,7 +158,88 @@ export function parseIdentityOptions(options: ServerIdentityOptions): Configured
 			explicitAuthorities.push(extra)
 		}
 	}
-	return { verbatimNodeId, legacyNodeId, instanceId: instanceId ?? null, explicitAuthorities }
+	const revokedAuthorities: string[] = []
+	for (const revoked of options.revokedAuthoritativeNodeIds ?? []) {
+		if (typeof revoked !== 'string' || revoked.length === 0) {
+			throw new ServerIdentityError(
+				'revokedAuthoritativeNodeIds entries must be non-empty strings.',
+				{
+					revoked,
+				},
+			)
+		}
+		if (revoked.startsWith(RESERVED_NODE_PREFIX)) {
+			throw new ServerIdentityError(
+				`"${revoked}" cannot be revoked: ids in the "kora:" namespace are the server's own (authoritative by prefix).`,
+				{ revoked },
+			)
+		}
+		if (explicitAuthorities.includes(revoked)) {
+			throw new ServerIdentityError(
+				`"${revoked}" is both configured as authoritative and revoked. Remove it from authoritativeNodeIds (and nodeId); revocation is permanent, so give a new authority a new id.`,
+				{ revoked },
+			)
+		}
+		revokedAuthorities.push(revoked)
+	}
+	return {
+		verbatimNodeId,
+		legacyNodeId,
+		instanceId: instanceId ?? null,
+		explicitAuthorities,
+		revokedAuthorities,
+	}
+}
+
+/** The explicit authority state of a deployment (RT-81). */
+export interface AuthorityHistory {
+	/** Authoritative now: every explicit id ever held authoritative, minus the revoked. */
+	explicitAuthorities: string[]
+	/** Revoked for good. */
+	revoked: string[]
+	/** Every explicit id ever held authoritative, revoked ones included (never a device id). */
+	everAuthoritative: string[]
+}
+
+/**
+ * Resolve the explicit authorities from the persisted history and this start's
+ * configuration (RT-81). Authority is a union over time, exactly as devices keep it:
+ * an id listed once stays authoritative until it is revoked explicitly, and stays
+ * reserved (refused as a device node id) after that.
+ *
+ * @throws {ServerIdentityError} When a configured authority was revoked earlier
+ */
+export function resolveAuthorityHistory(input: {
+	legacy: readonly string[]
+	configured: ConfiguredIdentity
+	persistedEver: readonly string[]
+	persistedRevoked: readonly string[]
+	ownNodeId: string
+}): AuthorityHistory {
+	const revoked = normalizeLegacyAuthorities([
+		...input.persistedRevoked,
+		...input.configured.revokedAuthorities,
+	])
+	const conflict = input.configured.explicitAuthorities.find((id) => revoked.includes(id))
+	if (conflict !== undefined) {
+		throw new ServerIdentityError(
+			`"${conflict}" is configured as authoritative but was revoked earlier. Revocation is permanent: give the authority a new id.`,
+			{ nodeId: conflict },
+		)
+	}
+	const everAuthoritative = normalizeLegacyAuthorities(
+		[
+			...input.persistedEver,
+			...input.legacy,
+			...input.configured.explicitAuthorities,
+			...revoked,
+		].filter((id) => id !== input.ownNodeId),
+	)
+	return {
+		explicitAuthorities: everAuthoritative.filter((id) => !revoked.includes(id)),
+		revoked,
+		everAuthoritative,
+	}
 }
 
 /** The node id of an instance of a deployment. */

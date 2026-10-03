@@ -6,7 +6,7 @@
  * Covers the live relay, the version-vector backfill and the delivery-stream
  * backfill. Asserts the CORRECT behaviour (fails before the fix).
  */
-import { defineSchema, t } from '@korajs/core'
+import { computeOperationId, defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { batch, createHarness, deliveredOpIds, makeOp, tick } from './rt-fixture'
@@ -32,13 +32,19 @@ async function aliceLies(harness: Awaited<ReturnType<typeof createHarness>>) {
 		recordId: 'alice-note',
 		data: { title: 'mine', userId: 'alice' },
 	})
-	const lie = makeOp('alice-node', 2, {
+	// A version-2 update: its previousData is only a hint, so the lie is a valid op. (A
+	// version-1 update whose previousData names a field its data lacks reads as a clear
+	// of that field, and one whose id does not cover the clear is refused at ingest,
+	// round 4 canonical body.)
+	const draft = makeOp('alice-node', 2, {
 		type: 'update',
 		recordId: 'alice-note',
 		data: { title: 'injected into bob' },
 		previousData: { title: 'mine', userId: 'bob' },
 		causalDeps: [insert.id],
+		hashVersion: 2,
 	})
+	const lie = { ...draft, id: await computeOperationId(draft, 2) }
 	alice.send(batch([insert]))
 	await tick()
 	alice.send(batch([lie]))

@@ -22,7 +22,7 @@ import type {
 	StorageAdapter,
 } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { SyncEncryptor, SyncEngine } from '@korajs/sync'
+import { SyncEncryptor, SyncEngine, validateEncryptedRelations } from '@korajs/sync'
 import type { SyncEncryptionConfig, SyncTransport } from '@korajs/sync'
 import {
 	ApplyPipeline,
@@ -30,7 +30,6 @@ import {
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
 	createSyncEngineChunkPort,
-	sealedRelationNames,
 	wireAuditPersistence,
 	wireBlobUpload,
 } from 'korajs/testing'
@@ -213,6 +212,8 @@ export class TestDevice {
 		this.reconnectable = options.reconnectable === true
 		this.encryption = options.encryption
 		this.batchSize = options.batchSize
+		// Like createApp: encryption may not seal a foreign key the server must enforce.
+		validateEncryptedRelations(options.schema, options.encryption?.config)
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -236,8 +237,6 @@ export class TestDevice {
 			emitter: this.emitter,
 		})
 		this.store.setLocalMutationHandler(this.applyPipeline)
-		// Like createApp: relations sealed by end-to-end encryption are cascaded by devices.
-		this.store.setSealedRelations(sealedRelationNames(this.schema, this.encryption?.config))
 		// Match production wiring (createApp): merge/constraint traces persist to
 		// `_kora_audit_traces`. Without this, harness devices emit merge events
 		// but the durable audit trail every real app has stays empty — a fidelity

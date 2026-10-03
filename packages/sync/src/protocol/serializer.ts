@@ -529,6 +529,8 @@ interface ProtoEnvelope {
 	authoritativeNodeIds?: string[]
 	/** Field 47: sync protocol version (handshake and handshake-response, protocol v2). */
 	protocolVersion?: number
+	/** Field 48 (repeated): revoked explicit authoritative node ids (handshake-response, RT-81). */
+	revokedAuthoritativeNodeIds?: string[]
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -599,6 +601,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 					: {}),
 				...(message.authoritativeNodeIds !== undefined
 					? { authoritativeNodeIds: [...message.authoritativeNodeIds] }
+					: {}),
+				...(message.revokedAuthoritativeNodeIds !== undefined
+					? { revokedAuthoritativeNodeIds: [...message.revokedAuthoritativeNodeIds] }
 					: {}),
 			}
 		case 'operation-batch':
@@ -764,6 +769,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 					: {}),
 				...(envelope.authoritativeNodeIds !== undefined
 					? { authoritativeNodeIds: envelope.authoritativeNodeIds }
+					: {}),
+				...(envelope.revokedAuthoritativeNodeIds !== undefined
+					? { revokedAuthoritativeNodeIds: envelope.revokedAuthoritativeNodeIds }
 					: {}),
 			}
 		case 'operation-batch':
@@ -931,7 +939,8 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 			__kora_field_versions__: _f,
 			...rest
 		} = parsed
-		data = operation.hasData && Object.keys(rest).length > 0 ? rest : null
+		// `hasData` says whether the op carried data: `{}` stays `{}` (its id covers it).
+		data = operation.hasData ? rest : null
 	}
 
 	return {
@@ -1097,6 +1106,8 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	for (const nodeId of envelope.authoritativeNodeIds ?? []) writer.uint32(370).string(nodeId)
 	// Field 47 (uint32, wiretype 0): 47 << 3 = 376.
 	if (envelope.protocolVersion !== undefined) writer.uint32(376).uint32(envelope.protocolVersion)
+	// Field 48 (repeated string, wiretype 2): 48 << 3 | 2 = 386.
+	for (const nodeId of envelope.revokedAuthoritativeNodeIds ?? []) writer.uint32(386).string(nodeId)
 	return writer.finish()
 }
 
@@ -1250,6 +1261,12 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 				break
 			case 47:
 				envelope.protocolVersion = reader.uint32()
+				break
+			case 48:
+				envelope.revokedAuthoritativeNodeIds = [
+					...(envelope.revokedAuthoritativeNodeIds ?? []),
+					reader.string(),
+				]
 				break
 			default:
 				reader.skipType(tag & 7)

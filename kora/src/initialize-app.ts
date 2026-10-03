@@ -20,7 +20,6 @@ import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
-import { sealedRelationNames } from './sealed-relations'
 import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
@@ -167,8 +166,6 @@ export async function initializeApp(
 		onMergeConflict: () => recordConflict?.(),
 	})
 	store.setLocalMutationHandler(applyPipeline)
-	// Relations end-to-end encryption seals from the server: devices cascade them (RT-74).
-	store.setSealedRelations(sealedRelationNames(config.schema, config.sync?.encryption))
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
 	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter)
 

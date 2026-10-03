@@ -22,6 +22,12 @@
  *
  * Asserts the CORRECT behaviour (fails at 97981a7): a child moved to a live project
  * survives, on every device.
+ *
+ * REDESIGN (Phase 3 round 4, 2026-10-03): the late-cascade authoring on the deleting
+ * device is removed. A sealed foreign key on a cascade relation is refused at device
+ * creation (SEALED_RELATION_FIELD); with the key in cleartextFields the server's
+ * cascade-late correction judges the folded child, as without encryption. This repro now
+ * asserts (1) the refusal and (2) the moved todo surviving with the cleartext key.
  */
 import { defineSchema, t } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
@@ -47,7 +53,12 @@ const schema = defineSchema({
 }) as unknown as SchemaDefinition
 
 const encryption = {
-	config: { enabled: true, key: 'correct horse battery staple' },
+	// The foreign key the server enforces travels in cleartext (a sealed one is refused).
+	config: {
+		enabled: true,
+		key: 'correct horse battery staple',
+		cleartextFields: { todos: ['projectId'] },
+	},
 	salt: new Uint8Array(16).fill(7),
 	iterations: 1_000,
 }
@@ -88,7 +99,16 @@ async function todoProject(device: TestDevice): Promise<string | null | 'gone'> 
 }
 
 describe('RT-78: sealed cascades and a child moved to a live project', () => {
-	test('the deleting device cascades a child that was already moved away (late authoring)', async () => {
+	test('a sealed foreign key on the cascade relation is refused at device creation', async () => {
+		await expect(
+			createTestNetwork(schema, {
+				devices: 1,
+				encryption: { ...encryption, config: { enabled: true, key: 'k' } },
+			}),
+		).rejects.toMatchObject({ code: 'SEALED_RELATION_FIELD', relation: 'todoProject' })
+	})
+
+	test('encrypted, foreign key in cleartext: a child moved to a live project survives everywhere', async () => {
 		const { control, wrap } = deafener()
 		const network = await createTestNetwork(schema, { devices: 2, encryption, wrapTransport: wrap })
 		try {

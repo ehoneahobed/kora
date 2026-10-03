@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, t } from '@korajs/core'
+import { HybridLogicalClock, createOperation, defineSchema, t } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 import { afterAll, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
@@ -55,5 +55,47 @@ describe('authoritative node ids: the union of explicit ids (RT-75)', () => {
 		expect(refolds).toHaveBeenCalledTimes(5)
 		refolds.mockRestore()
 		await store.close()
+	})
+})
+
+describe('explicit revocation (RT-81)', () => {
+	test('a revoked id leaves the union for good, and records re-fold without its authority', async () => {
+		const store = await open('revoke.db')
+		await store.setAuthoritativeNodeIds(['admin-svc', 'legacy-a'])
+		// The admin service decided 'approved' first; the device wrote 'client' later.
+		const admin = await createOperation(
+			{
+				nodeId: 'admin-svc',
+				type: 'insert',
+				collection: 'items',
+				recordId: 'i1',
+				data: { title: 't', status: 'approved' },
+				previousData: null,
+				sequenceNumber: 1,
+				causalDeps: [],
+				schemaVersion: 1,
+			},
+			new HybridLogicalClock('admin-svc', { now: () => 1_000 }),
+		)
+		await store.applyRemoteOperation(admin)
+		await store.collection('items').update('i1', { status: 'client' })
+		expect((await store.collection('items').findById('i1'))?.status).toBe('approved')
+
+		const refolds = vi.spyOn(RecordFolder.prototype, 'refoldInTx')
+		await store.setAuthoritativeNodeIds(['legacy-a'], ['admin-svc'])
+		expect(refolds).toHaveBeenCalled()
+		refolds.mockRestore()
+		expect(await store.loadAuthoritativeNodeIds()).toEqual(['legacy-a'])
+		expect((await store.collection('items').findById('i1'))?.status).toBe('client')
+
+		// An instance that still lists it (stale config) never brings it back.
+		await store.setAuthoritativeNodeIds(['admin-svc', 'legacy-a'])
+		expect(await store.loadAuthoritativeNodeIds()).toEqual(['legacy-a'])
+		await store.close()
+		const reopened = await open('revoke.db')
+		await reopened.setAuthoritativeNodeIds(['admin-svc'])
+		expect(await reopened.loadAuthoritativeNodeIds()).toEqual(['legacy-a'])
+		expect((await reopened.collection('items').findById('i1'))?.status).toBe('client')
+		await reopened.close()
 	})
 })

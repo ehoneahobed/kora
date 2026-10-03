@@ -101,6 +101,13 @@ export {
 	computeOperationId,
 } from './operations/content-hash'
 export type { HashableOperation, OperationHashVersion } from './operations/content-hash'
+export {
+	NonCanonicalValueError,
+	canonicalValue,
+	canonicalizeLegacyOperation,
+	canonicalizeOperationBody,
+} from './operations/canonical-body'
+export type { CanonicalizableBody, LegacyBody } from './operations/canonical-body'
 
 // === Atomic Operations ===
 export {

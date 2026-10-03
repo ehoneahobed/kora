@@ -15,6 +15,12 @@
  *
  * Asserts the CORRECT behaviour (fails at 4d6c8a7): the child stays deleted on B
  * across a reconnect.
+ *
+ * REDESIGN (Phase 3 round 4, 2026-10-03): devices no longer cascade sealed relations.
+ * Encryption may not seal the foreign key of a cascade / set-null / restrict relation:
+ * createApp (and TestDevice) refuse it with SEALED_RELATION_FIELD, and with the key in
+ * cleartextFields the server cascades exactly as without encryption. This repro now
+ * asserts (1) the refusal and (2) the original scenario converging with the cleartext key.
  */
 import { defineSchema, t } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
@@ -41,7 +47,12 @@ const schema = defineSchema({
 
 const encryption = {
 	// projectId is sealed: the server cannot cascade, devices must.
-	config: { enabled: true, key: 'correct horse battery staple' },
+	// The foreign key the server enforces travels in cleartext (a sealed one is refused).
+	config: {
+		enabled: true,
+		key: 'correct horse battery staple',
+		cleartextFields: { todos: ['projectId'] },
+	},
 	salt: new Uint8Array(16).fill(7),
 	iterations: 1_000,
 }
@@ -68,7 +79,16 @@ function wrap(pair: TransportPair): TransportPair {
 }
 
 describe('RT-74: encrypted cascades are retired at catch-up', () => {
-	test('a cascade only the receiving device can apply stays applied', async () => {
+	test('a sealed foreign key on the cascade relation is refused at device creation', async () => {
+		await expect(
+			createTestNetwork(schema, {
+				devices: 1,
+				encryption: { ...encryption, config: { enabled: true, key: 'k' } },
+			}),
+		).rejects.toMatchObject({ code: 'SEALED_RELATION_FIELD', relation: 'todoProject' })
+	})
+
+	test('encrypted, foreign key in cleartext: the cascade of a child the deleter never saw stays applied', async () => {
 		const network = await createTestNetwork(schema, {
 			devices: 2,
 			encryption,

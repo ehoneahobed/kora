@@ -160,6 +160,18 @@ describe('protocol v2 handshake fields', () => {
 		expect(back.authoritativeNodeIds).toEqual(['server', 'kora:scope-entry'])
 	})
 
+	test.each(serializers)(
+		'%s: response carries revoked authoritative ids (field 48, RT-81)',
+		(_n, s) => {
+			const revoking = { ...response, revokedAuthoritativeNodeIds: ['admin-svc', 'legacy-a'] }
+			const back = s.decode(s.encode(revoking)) as HandshakeResponseMessage
+			expect(back.revokedAuthoritativeNodeIds).toEqual(['admin-svc', 'legacy-a'])
+			expect(
+				(s.decode(s.encode(response)) as HandshakeResponseMessage).revokedAuthoritativeNodeIds,
+			).toBeUndefined()
+		},
+	)
+
 	test.each(serializers)('%s: a beta.13 message (no v2 fields) decodes as protocol 1', (_n, s) => {
 		const { protocolVersion: _p, ...legacy } = handshake
 		const back = s.decode(s.encode(legacy)) as HandshakeMessage

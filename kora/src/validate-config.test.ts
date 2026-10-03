@@ -49,6 +49,43 @@ describe('validateCreateAppConfig', () => {
 		).toThrow(KoraError)
 	})
 
+	it('refuses end-to-end encryption that seals the foreign key of a cascade relation (RT-74/78/82)', () => {
+		const relational = defineSchema({
+			version: 1,
+			collections: {
+				projects: { fields: { name: t.string() } },
+				todos: { fields: { title: t.string(), projectId: t.string().optional() } },
+			},
+			relations: {
+				todoProject: {
+					from: 'todos',
+					to: 'projects',
+					type: 'many-to-one',
+					field: 'projectId',
+					onDelete: 'cascade',
+				},
+			},
+		})
+		const sync = (cleartextFields?: Record<string, string[]>) => ({
+			url: 'wss://example.com/kora',
+			encryption: { enabled: true, key: 'k', ...(cleartextFields ? { cleartextFields } : {}) },
+		})
+		expect(() => validateCreateAppConfig(baseConfig({ schema: relational, sync: sync() }))).toThrow(
+			expect.objectContaining({ code: 'SEALED_RELATION_FIELD', field: 'projectId' }),
+		)
+		expect(() =>
+			validateCreateAppConfig(
+				baseConfig({ schema: relational, sync: sync({ todos: ['projectId'] }) }),
+			),
+		).not.toThrow()
+		// Without encryption nothing is sealed.
+		expect(() =>
+			validateCreateAppConfig(
+				baseConfig({ schema: relational, sync: { url: 'wss://example.com/kora' } }),
+			),
+		).not.toThrow()
+	})
+
 	it('accepts valid wss URL', () => {
 		expect(() =>
 			validateCreateAppConfig(

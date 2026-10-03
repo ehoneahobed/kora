@@ -102,6 +102,40 @@ describe('beta.13 undefined members (RT-71)', () => {
 		await server.stop()
 	})
 
+	test('a version-1 update whose id does not cover the clear its previousData implies is refused (round 4)', async () => {
+		const { store, server, client } = await setup()
+		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', assignee: 'bob' } })
+		// The id verifies over { title: 'y' } alone, but every replica folds a version-1
+		// update in its canonical body, where `assignee` (named by previousData) is cleared.
+		const update = legacyOp('legacy-node', 2, {
+			type: 'update',
+			data: { title: 'y' },
+			previousData: { title: 'x', assignee: 'bob' },
+			causalDeps: [insert.id],
+		})
+		// What beta.13 really sends for update(id, { title: 'y', assignee: undefined }).
+		const honest = legacyOp('legacy-node', 3, {
+			type: 'update',
+			data: { title: 'z', assignee: undefined },
+			previousData: { title: 'y', assignee: 'bob' },
+			causalDeps: [insert.id],
+		})
+		await sendAndAwaitAck(client, [insert, update, honest])
+		expect(store.getAllOperations().some((o) => o.id === update.id)).toBe(false)
+		expect(
+			client.messages.some(
+				(m) =>
+					m.type === 'operation-rejected' &&
+					m.operationId === update.id &&
+					m.code === 'INVALID_OPERATION_ID',
+			),
+		).toBe(true)
+		const stored = store.getAllOperations().find((o) => o.id === honest.id)
+		expect(stored?.data).toEqual({ title: 'z', assignee: null })
+		expect((await store.findRecord('notes', 'n-1'))?.assignee ?? null).toBeNull()
+		await server.stop()
+	})
+
 	test('a protocol-2 session is refused the same unverifiable id (RT-64)', async () => {
 		const { store, server, client, unverified } = await setup(2)
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', extra: { k: undefined } } })

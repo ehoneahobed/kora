@@ -32,6 +32,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:schema-mismatch': 'sync',
 	'sync:protocol-deprecated': 'sync',
 	'sync:unverified-legacy-operation': 'sync',
+	'sync:forged-duplicate': 'sync',
 	'sync:apply-failed': 'sync',
 	'sync:apply-blocked': 'sync',
 	'sync:apply-retrying': 'sync',

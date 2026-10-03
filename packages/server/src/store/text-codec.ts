@@ -125,7 +125,11 @@ export function serializePgFieldValue(value: unknown, descriptor: FieldDescripto
 	if (RAW_TEXT_KINDS.has(descriptor.kind) && typeof value === 'string') {
 		return encodePgText(value)
 	}
-	if (JSONB_KINDS.has(descriptor.kind) && typeof value !== 'string') {
+	// A json value that is a string is JSON too (a JSONB string), never raw column text.
+	if (
+		JSONB_KINDS.has(descriptor.kind) &&
+		(typeof value !== 'string' || descriptor.kind === 'json')
+	) {
 		return JSON.stringify(encodePgJsonValue(value))
 	}
 	return serializeFieldValue(value, descriptor)
@@ -137,6 +141,9 @@ export function deserializePgFieldValue(value: unknown, descriptor: FieldDescrip
 	if (RAW_TEXT_KINDS.has(descriptor.kind) && typeof value === 'string') {
 		return decodePgText(value)
 	}
+	// The driver returns a JSONB column parsed: a json value that is a string arrives as
+	// that string and must not be parsed again ("123" stays "123").
+	if (descriptor.kind === 'json') return decodePgJsonValue(value)
 	const parsed = deserializeFieldValue(value, descriptor)
 	return JSONB_KINDS.has(descriptor.kind) ? decodePgJsonValue(parsed) : parsed
 }

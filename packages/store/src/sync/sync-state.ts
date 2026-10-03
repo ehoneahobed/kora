@@ -256,6 +256,39 @@ export async function saveAuthoritativeNodeIds(
 	])
 }
 
+/** `_kora_meta` key of the explicit authoritative ids a server revoked (RT-81). */
+const REVOKED_AUTHORITATIVE_NODE_IDS_META_KEY = 'sync_revoked_authoritative_node_ids'
+
+/**
+ * Persist the explicit authoritative node ids a sync server revoked (RT-81). A revoked
+ * id is never authoritative again on this device, whatever a later handshake lists.
+ */
+export async function saveRevokedAuthoritativeNodeIds(
+	adapter: StorageAdapter,
+	nodeIds: string[],
+): Promise<void> {
+	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+		REVOKED_AUTHORITATIVE_NODE_IDS_META_KEY,
+		JSON.stringify(nodeIds),
+	])
+}
+
+/** Load the persisted revoked authoritative node ids (empty when none, or unreadable). */
+export async function loadRevokedAuthoritativeNodeIds(adapter: StorageAdapter): Promise<string[]> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		REVOKED_AUTHORITATIVE_NODE_IDS_META_KEY,
+	])
+	const raw = rows[0]?.value
+	if (raw === undefined) return []
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		if (Array.isArray(parsed)) return parsed.filter((id): id is string => typeof id === 'string')
+	} catch {
+		// Unreadable: no revocation known; the next handshake that carries one rewrites it.
+	}
+	return []
+}
+
 /**
  * Load the persisted authoritative node ids, or null when no protocol-2 server ever
  * answered (or the stored value is unreadable).

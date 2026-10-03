@@ -32,6 +32,8 @@ function op(overrides: Partial<Operation>): Operation {
 		sequenceNumber: seq,
 		causalDeps: [],
 		schemaVersion: 1,
+		// Version 2: previousData is only a hint (a version-1 update would read it as a clear).
+		hashVersion: 2,
 		...overrides,
 	}
 }

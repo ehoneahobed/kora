@@ -1,13 +1,13 @@
 /**
- * RT-74 acceptance: cascades under end-to-end encryption with the relation's field
- * sealed (the server cannot derive them).
+ * Cascades under end-to-end encryption (RT-74, RT-78, RT-82 redesign).
  *
- * - Receivers apply a remote delete's cascades as DURABLE provisional effects: kept at
- *   catch-up and retired only by a real copy (the deleting device's).
- * - Receivers never author copies (no write amplification, RT-69).
- * - The deleting device authors the copies of the children it knew, and, when it
- *   later learns of a child it did not know, authors that cascade too (exactly once).
- * - Every device converges, the deleting device included.
+ * The sync server enforces referential `onDelete` policies for every device, so a
+ * relation with `cascade`, `set-null` or `restrict` must keep its foreign key in
+ * cleartext (`cleartextFields`). A sealed foreign key is refused when the app (or a test
+ * device) is created. With the key in cleartext, cascades work exactly like unencrypted
+ * ones: the server derives the effects of children the deleting device did not know,
+ * the deleting device authors those it knew, and receivers apply a remote delete's
+ * effects provisionally until the real copies arrive.
  */
 import { defineSchema, t } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
@@ -41,7 +41,12 @@ const schema = defineSchema({
 }) as unknown as SchemaDefinition
 
 const encryption = {
-	config: { enabled: true, key: 'correct horse battery staple' },
+	config: {
+		enabled: true,
+		key: 'correct horse battery staple',
+		// The foreign keys the server enforces travel in cleartext; everything else is sealed.
+		cleartextFields: { todos: ['projectId'], notes: ['projectId'] },
+	},
 	salt: new Uint8Array(16).fill(7),
 	iterations: 1_000,
 }
@@ -92,8 +97,26 @@ function childEffectsBy(ops: Operation[], collection: string, recordId: string):
 		.map((op) => op.nodeId)
 }
 
-describe('RT-74: sealed relations, devices cascade', () => {
-	test('a child the deleting device did not know: durable on receivers, cascaded by the deleter when it returns', async () => {
+describe('encrypted cascades with the foreign key in cleartext', () => {
+	test('a sealed foreign key on a cascade / set-null relation is refused at device creation', async () => {
+		await expect(
+			createTestNetwork(schema, {
+				devices: 1,
+				encryption: { ...encryption, config: { enabled: true, key: 'k' } },
+			}),
+		).rejects.toMatchObject({ code: 'SEALED_RELATION_FIELD', relation: 'todoProject' })
+		await expect(
+			createTestNetwork(schema, {
+				devices: 1,
+				encryption: {
+					...encryption,
+					config: { enabled: true, key: 'k', cleartextFields: { todos: ['projectId'] } },
+				},
+			}),
+		).rejects.toMatchObject({ code: 'SEALED_RELATION_FIELD', relation: 'noteProject' })
+	})
+
+	test('children the deleting device did not know: the server cascades them, every device converges', async () => {
 		const { control, wrap } = deafener()
 		const network = await createTestNetwork(schema, {
 			devices: 3,
@@ -112,24 +135,10 @@ describe('RT-74: sealed relations, devices cascade', () => {
 			await b.sync()
 			await a.collection('projects').delete(String(project.id))
 			await syncAll([a, b, c])
-
-			// Receivers cascaded (durably) and authored nothing.
-			for (const d of [b, c]) {
-				expect(await d.getState('todos')).toHaveLength(0)
-				expect((await d.getState('notes'))[0]?.projectId ?? null).toBeNull()
-				expect(await provisionalCount(d)).toBe(2)
-			}
 			for (const d of [b, c]) {
 				await d.disconnect()
 				await d.reconnect()
 			}
-			await syncAll([b, c])
-			for (const d of [b, c]) {
-				expect(await d.getState('todos')).toHaveLength(0)
-				expect((await d.getState('notes'))[0]?.projectId ?? null).toBeNull()
-			}
-
-			// A comes back, learns of the children, and authors their effects once.
 			control.deaf = false
 			await a.disconnect()
 			await a.reconnect()
@@ -138,28 +147,27 @@ describe('RT-74: sealed relations, devices cascade', () => {
 				expect(await d.getState('projects')).toHaveLength(0)
 				expect(await d.getState('todos')).toHaveLength(0)
 				expect((await d.getState('notes'))[0]?.projectId ?? null).toBeNull()
+				expect(await provisionalCount(d)).toBe(0)
 			}
-			// The real copies retired the receivers' provisional effects.
-			expect(await provisionalCount(b)).toBe(0)
-			expect(await provisionalCount(c)).toBe(0)
+			// One effect per child, the server's: no device authored a copy of a child it did
+			// not know, and no receiver authored one.
 			const ops = await b.store.getAllOperations()
 			const todo = ops.find((op) => op.collection === 'todos' && op.type === 'insert')
 			const note = ops.find((op) => op.collection === 'notes' && op.type === 'insert')
-			expect(childEffectsBy(ops, 'todos', String(todo?.recordId))).toEqual([a.getNodeId()])
-			expect(childEffectsBy(ops, 'notes', String(note?.recordId))).toEqual([a.getNodeId()])
-
-			// A further reconnect authors nothing more.
-			await a.disconnect()
-			await a.reconnect()
-			await syncAll([a, b, c])
-			const again = await b.store.getAllOperations()
-			expect(childEffectsBy(again, 'todos', String(todo?.recordId))).toEqual([a.getNodeId()])
+			for (const [collection, recordId] of [
+				['todos', todo?.recordId],
+				['notes', note?.recordId],
+			] as const) {
+				const authors = childEffectsBy(ops, collection, String(recordId))
+				expect(authors).toHaveLength(1)
+				expect(authors[0]?.startsWith('kora:server:')).toBe(true)
+			}
 		} finally {
 			await network.close()
 		}
 	}, 120_000)
 
-	test("children the deleting device knew: its copies retire the receivers' durable effects", async () => {
+	test("children the deleting device knew: one copy per child, the author's", async () => {
 		const network = await createTestNetwork(schema, { devices: 3, encryption })
 		try {
 			const [a, b, c] = network.devices as [TestDevice, TestDevice, TestDevice]
@@ -174,7 +182,6 @@ describe('RT-74: sealed relations, devices cascade', () => {
 				expect(await d.getState('todos')).toHaveLength(0)
 				expect(await provisionalCount(d)).toBe(0)
 			}
-			// One copy per child, the author's.
 			const ops = await c.store.getAllOperations()
 			const deletes = ops.filter((op) => op.collection === 'todos' && op.type === 'delete')
 			expect(deletes).toHaveLength(3)
