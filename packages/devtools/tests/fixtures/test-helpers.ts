@@ -165,6 +165,19 @@ export function createSampleEvent<T extends KoraEventType>(
 			duration: 2.5,
 			resultCount: 10,
 		},
+		'query:error': {
+			type: 'query:error',
+			queryId: 'q-001',
+			collection: 'todos',
+			phase: 'refresh',
+			code: 'QUERY_ERROR',
+			message: 'boom',
+		},
+		'storage:persistence': {
+			type: 'storage:persistence',
+			state: 'checked',
+			persisted: false,
+		},
 		'connection:quality': { type: 'connection:quality', quality: 'good' },
 		'sync:schema-mismatch': {
 			type: 'sync:schema-mismatch',

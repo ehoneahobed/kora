@@ -34,6 +34,12 @@ export interface StorageOpenState {
 	fallbackReason?: StorageFallbackReason
 	/** OPFS pool that owns the database file (one pool per database), when known. */
 	poolName?: string
+	/**
+	 * SQLite journal mode the database actually runs with, when known (NEW-STORE-11).
+	 * OPFS (opfs-sahpool): `delete`, the rollback journal; WAL is not available on
+	 * that VFS. In-memory fallback: `memory`. Native better-sqlite3: `wal`.
+	 */
+	journalMode?: string
 }
 
 /**
@@ -198,6 +204,41 @@ export interface QueryDescriptor {
 export type SubscriptionCallback<T> = (results: T[]) => void
 
 /**
+ * Where a subscription failure happened.
+ * - `initial`: the first run of the query, before any result was delivered.
+ * - `refresh`: a re-run after a write to a collection the query reads.
+ * - `callback`: the query succeeded but the subscriber's own callback threw.
+ */
+export type QueryErrorPhase = 'initial' | 'refresh' | 'callback'
+
+/**
+ * A failure delivered to a subscriber's `onError` (STORE-12). The previous result
+ * set stays current; the subscription stays registered and is re-run on the next
+ * write, and a later success is delivered even if it equals the last results.
+ */
+export interface QuerySubscriptionError {
+	/** The error thrown by the query or the callback. */
+	error: Error
+	phase: QueryErrorPhase
+	/** The collection the query reads. */
+	collection: string
+	/** Subscription id, the same `queryId` carried by the `query:error` event. */
+	queryId: string
+}
+
+/**
+ * Options for `QueryBuilder.subscribe()`.
+ */
+export interface SubscribeOptions {
+	/**
+	 * Called when the query fails (or the callback throws) instead of the failure
+	 * becoming an unhandled rejection. Every failure is also emitted as a
+	 * `query:error` event; without `onError` it is additionally logged.
+	 */
+	onError?: (failure: QuerySubscriptionError) => void
+}
+
+/**
  * Serialized row in the operations log table.
  */
 export interface OperationRow {
@@ -249,6 +290,16 @@ export interface Subscription<T = CollectionRecord> {
 	callback: SubscriptionCallback<T>
 	executeFn: () => Promise<T[]>
 	lastResults: T[]
+	/** Result-set comparator (structural, per field kind). */
+	resultsEqual?: (prev: readonly T[], next: readonly T[]) => boolean
+	onError?: (failure: QuerySubscriptionError) => void
+	/** Monotonic run counter: a slower, older run never overwrites a newer result. */
+	runsStarted?: number
+	lastAppliedRun?: number
+	/** True after a failure until the next successful delivery. */
+	errored?: boolean
+	/** True once a result set has been delivered to the callback. */
+	delivered?: boolean
 }
 
 export type { ApplyResult } from '@korajs/core'

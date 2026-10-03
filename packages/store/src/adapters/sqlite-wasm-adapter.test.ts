@@ -64,10 +64,34 @@ describe('SqliteWasmAdapter', () => {
 			expect(names).toContain('_kora_ops_todos')
 		})
 
-		test('sets WAL journal mode (falls back to memory for in-memory DBs)', async () => {
+		test('does not claim WAL: the mock in-memory database reports memory (NEW-STORE-11)', async () => {
+			// The real worker runs `delete` on opfs-sahpool (WAL is unavailable there) and
+			// `memory` in memory; neither path requests WAL any more. The real-browser
+			// mode is checked by benchmarks/browser/store-browser-bench.mjs.
 			const result = await adapter.query<{ journal_mode: string }>('PRAGMA journal_mode')
-			// In-memory databases cannot use WAL, they report 'memory'
-			expect(['wal', 'memory']).toContain(result[0]?.journal_mode)
+			expect(result[0]?.journal_mode).toBe('memory')
+		})
+
+		test('the open state parser carries journalMode from the worker (NEW-STORE-11)', async () => {
+			const bridge = new MockWorkerBridge()
+			const send = bridge.send.bind(bridge)
+			bridge.send = async (request) => {
+				const response = await send(request)
+				return request.type === 'open'
+					? { ...response, data: { persistent: true, journalMode: 'delete' } }
+					: response
+			}
+			const reporting = new SqliteWasmAdapter({ bridge, dbName: 'journal-mode-report' })
+			await reporting.open(minimalSchema)
+			try {
+				expect(reporting.getStorageOpenState?.()).toMatchObject({
+					persistent: true,
+					mode: 'opfs',
+					journalMode: 'delete',
+				})
+			} finally {
+				await reporting.close()
+			}
 		})
 	})
 

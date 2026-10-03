@@ -1,5 +1,5 @@
 import { quoteIdent } from '../schema/quote-ident'
-import { collectionIndexName } from '../schema/sql-gen'
+import { collectionIndexName, enumCheckConstraint, sqlDefaultLiteral } from '../schema/sql-gen'
 import type { FieldDescriptor } from '../types'
 import type { MigrationDefinition, MigrationStep } from './migration-builder'
 import { generateRollbackSteps } from './migration-rollback'
@@ -91,12 +91,11 @@ function addFieldSQL(collection: string, field: string, descriptor: FieldDescrip
 	const parts = [`ALTER TABLE ${quoteIdent(collection)} ADD COLUMN ${quoteIdent(field)}`, sqlType]
 
 	if (descriptor.defaultValue !== undefined) {
-		parts.push(`DEFAULT ${sqlDefault(descriptor.defaultValue)}`)
+		parts.push(`DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`)
 	}
 
 	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-		parts.push(`CHECK (${quoteIdent(field)} IN (${values}))`)
+		parts.push(enumCheckConstraint(field, descriptor.enumValues))
 	}
 
 	return parts.join(' ')
@@ -127,12 +126,4 @@ function mapFieldType(descriptor: FieldDescriptor): string {
 		case 'richtext':
 			return 'BLOB'
 	}
-}
-
-function sqlDefault(value: unknown): string {
-	if (value === null) return 'NULL'
-	if (typeof value === 'string') return `'${value}'`
-	if (typeof value === 'number') return String(value)
-	if (typeof value === 'boolean') return value ? '1' : '0'
-	return `'${JSON.stringify(value)}'`
 }

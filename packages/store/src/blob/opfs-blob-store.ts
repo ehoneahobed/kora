@@ -114,7 +114,6 @@ interface OpfsDirectoryHandle {
 
 interface StorageManagerLike {
 	getDirectory(): Promise<OpfsDirectoryHandle>
-	persist?(): Promise<boolean>
 }
 
 function getStorageManager(): StorageManagerLike {
@@ -137,8 +136,8 @@ function isNotFoundError(error: unknown): boolean {
 
 /**
  * Create an {@link OpfsBlobDirectory} backed by the browser's Origin Private
- * File System, rooted at a named subdirectory. Best-effort requests persistent
- * storage so the browser is less likely to evict blobs under storage pressure.
+ * File System, rooted at a named subdirectory. It does not request persistent
+ * storage: that is `app.storage.persistence`, kept off the startup path.
  *
  * @param rootDirName - The OPFS subdirectory to store blobs under (default `kora-blobs`)
  * @throws {Error} If OPFS is unavailable (e.g. called outside a browser)
@@ -147,14 +146,10 @@ export async function createOpfsBlobDirectory(
 	rootDirName = 'kora-blobs',
 ): Promise<OpfsBlobDirectory> {
 	const storage = getStorageManager()
-	// Best-effort durability: ask the browser not to evict this origin's storage.
-	if (typeof storage.persist === 'function') {
-		try {
-			await storage.persist()
-		} catch {
-			// Persistence is an optimization, not a requirement; ignore failures.
-		}
-	}
+	// NEW-STORE-4: no persist() here. In Firefox it opens a permission prompt that
+	// stays pending until the user answers, and this runs inside app startup.
+	// Durable storage is checked and requested by StoragePersistence
+	// (app.storage.persistence), never on the startup path.
 	const opfsRoot = await storage.getDirectory()
 	const root = await opfsRoot.getDirectoryHandle(rootDirName, { create: true })
 

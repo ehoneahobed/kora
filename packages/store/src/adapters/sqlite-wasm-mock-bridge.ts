@@ -88,7 +88,8 @@ export class MockWorkerBridge implements WorkerBridge {
 		}
 		const database = this.createDb(':memory:')
 		this.db = database
-		database.pragma('journal_mode = WAL')
+		// Mirrors the real worker (NEW-STORE-11): no WAL pragma. The mock database is
+		// in memory, where SQLite reports `memory` whatever is requested.
 		database.pragma('foreign_keys = ON')
 		for (const sql of ddlStatements) {
 			if (sql.startsWith('--kora:safe-alter')) {

@@ -6,14 +6,19 @@ import { MockWorkerBridge } from '../adapters/sqlite-wasm-mock-bridge'
 import { Store } from '../store/store'
 
 /**
- * WASM adapter gates use MockWorkerBridge (better-sqlite3 in-process) in CI.
- * Browser OPFS runs the same adapter surface with a real worker; see docs/benchmarks/baseline.md.
+ * STORE-16: this is NOT a SQLite WASM or OPFS measurement. It runs the
+ * SqliteWasmAdapter's request protocol (worker message encoding, transaction
+ * spans) over MockWorkerBridge, which executes in-process on native
+ * better-sqlite3: no WASM, no worker, no structured clone, no OPFS. It guards the
+ * adapter-side overhead only. The real browser path (dedicated worker, SQLite
+ * WASM, OPFS sahpool, IndexedDB snapshot persistence) is measured by
+ * `benchmarks/browser/store-browser-bench.mjs`; see docs/benchmarks/baseline.md.
  */
 const REGRESSION_FACTOR = 1.1
 const INSERT_10K_LIMIT_MS = 2000 * REGRESSION_FACTOR
 const QUERY_1K_LIMIT_MS = 50 * REGRESSION_FACTOR
 
-describe('SQLite WASM adapter performance gates', () => {
+describe('SqliteWasmAdapter protocol over MockWorkerBridge (native better-sqlite3, not WASM/OPFS)', () => {
 	let store: Store
 
 	beforeEach(async () => {

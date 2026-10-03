@@ -1,7 +1,9 @@
+import type { KoraEvent } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
 import { Store } from '../../src/store/store'
-import type { CollectionRecord } from '../../src/types'
+import type { CollectionRecord, QuerySubscriptionError } from '../../src/types'
 import { minimalSchema } from '../fixtures/test-schema'
 
 /** Wait for microtask + async flush to complete */
@@ -154,5 +156,64 @@ describe('Integration: Reactive queries', () => {
 
 		unsub1()
 		unsub2()
+	})
+})
+
+describe('Integration: query errors and virtual timestamp fields (STORE-11, STORE-12)', () => {
+	test('a failing subscription emits query:error and reaches onError', async () => {
+		const emitter = new SimpleEventEmitter()
+		const events: KoraEvent[] = []
+		emitter.on('query:error', (event) => events.push(event))
+		const store = new Store({
+			schema: minimalSchema,
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'err-node',
+			emitter,
+		})
+		await store.open()
+		try {
+			const failures: QuerySubscriptionError[] = []
+			store
+				.collection('todos')
+				.where({ title: { $regex: 'x' } })
+				.subscribe(() => {}, { onError: (failure) => failures.push(failure) })
+			await tick()
+			expect(failures).toHaveLength(1)
+			expect(failures[0]?.phase).toBe('initial')
+			expect(events).toEqual([
+				expect.objectContaining({
+					type: 'query:error',
+					collection: 'todos',
+					phase: 'initial',
+					code: 'QUERY_ERROR',
+				}),
+			])
+		} finally {
+			await store.close()
+		}
+	})
+
+	test('orderBy createdAt and where updatedAt work and re-run reactively', async () => {
+		const store = new Store({
+			schema: minimalSchema,
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'ts-node',
+		})
+		await store.open()
+		try {
+			const todos = store.collection('todos')
+			const first = await todos.insert({ title: 'first' })
+			const results: CollectionRecord[][] = []
+			todos
+				.where({ updatedAt: { $gte: first.updatedAt } })
+				.orderBy('createdAt', 'desc')
+				.subscribe((r) => results.push([...r]))
+			await tick()
+			await todos.insert({ title: 'second' })
+			await tick()
+			expect(results.at(-1)?.map((r) => r.title)).toEqual(['second', 'first'])
+		} finally {
+			await store.close()
+		}
 	})
 })

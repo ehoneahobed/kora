@@ -146,11 +146,18 @@ orderBy(field: string, direction?: 'asc' | 'desc'): QueryBuilder
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `field` | `string` | -- | Field name to sort by. |
-| `direction` | `'asc' \| 'desc'` | `'asc'` | Sort direction. |
+| `field` | `string` | -- | Field name to sort by. Any schema field, `id`, or the record metadata fields `createdAt` / `updatedAt`. |
+| `direction` | `'asc' \| 'desc'` | `'asc'` | Sort direction. Any other value throws `QueryError`; it is never placed into SQL. |
 
 ```typescript
 app.todos.where({ completed: false }).orderBy('createdAt', 'desc')
+```
+
+`createdAt` and `updatedAt` are available on every record and work in both `.where()` and `.orderBy()` (they read the record's insert and last-write times). If your schema declares a field with one of those names, the query uses your field instead. The names are exported as `VIRTUAL_TIMESTAMP_FIELDS` from `@korajs/store`.
+
+```typescript
+const startOfDay = new Date().setHours(0, 0, 0, 0)
+const changedToday = await app.todos.where({ updatedAt: { $gte: startOfDay } }).exec()
 ```
 
 ### .limit(n)
@@ -163,7 +170,7 @@ limit(n: number): QueryBuilder
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `n` | `number` | Maximum number of records to return. |
+| `n` | `number` | Maximum number of records to return. Must be a non-negative safe integer, otherwise `QueryError` is thrown. It is passed to SQLite as a bound parameter. |
 
 ```typescript
 app.todos.where({ completed: false }).orderBy('createdAt').limit(10)
@@ -179,7 +186,7 @@ offset(n: number): QueryBuilder
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `n` | `number` | Number of records to skip. |
+| `n` | `number` | Number of records to skip. Must be a non-negative safe integer, otherwise `QueryError` is thrown. Works with or without `.limit()`. |
 
 ```typescript
 // Page 2 of 10 results per page
@@ -242,14 +249,22 @@ const todos = await app.todos
 Subscribes to live query results. The callback is called immediately with the current results, and again whenever the result set changes due to local mutations or incoming sync operations.
 
 ```typescript
-subscribe(callback: (results: CollectionRecord[]) => void): () => void
+subscribe(
+  callback: (results: CollectionRecord[]) => void,
+  options?: { onError?: (failure: QuerySubscriptionError) => void },
+): () => void
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `callback` | `(results: CollectionRecord[]) => void` | Function called with the current result set on every change. |
+| `options.onError` | `(failure: QuerySubscriptionError) => void` | Called when the query fails, instead of the failure becoming an unhandled rejection. `failure` has `error`, `phase` (`'initial'`, `'refresh'` or `'callback'`), `collection` and `queryId`. |
 
 **Returns:** `() => void` -- An unsubscribe function. Call it to stop receiving updates.
+
+The callback runs only when the results actually changed. Results are compared value by value for every field kind, so a write elsewhere in the collection that leaves this result set equal (including array, object and rich-text fields) does not call it again.
+
+If a query fails, the subscription stays registered and keeps its last results. The failure goes to `onError` and is emitted as a `query:error` event (without `onError` it is also logged). The next successful run is always delivered, even if its results equal the previous ones, so UI bindings can leave their error state. `QueryStore.getError()` exposes the same state to framework bindings.
 
 ```typescript
 const unsubscribe = app.todos

@@ -242,6 +242,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `query invalidated ${event.queryId}`
 		case 'query:executed':
 			return `query executed ${event.queryId}`
+		case 'query:error':
+			return `query error ${event.collection} (${event.phase}): ${event.message}`
+		case 'storage:persistence':
+			return `storage persistence ${event.state}: ${event.persisted ? 'persisted' : 'best-effort'}`
 		case 'connection:quality':
 			return `connection ${event.quality}`
 		case 'sync:diagnostics':

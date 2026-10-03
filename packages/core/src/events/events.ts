@@ -228,6 +228,33 @@ export type KoraEvent =
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
+	| {
+			/**
+			 * A reactive query subscription failed (STORE-12). `phase` is `initial` (the
+			 * first run), `refresh` (a re-run after a write) or `callback` (the
+			 * subscriber's callback threw). The subscription stays registered and keeps
+			 * its last results; the subscriber's `onError` receives the same failure.
+			 */
+			type: 'query:error'
+			queryId: string
+			collection: string
+			phase: 'initial' | 'refresh' | 'callback'
+			code: string
+			message: string
+	  }
+	| {
+			/**
+			 * Durable-storage (`navigator.storage.persist`) state (NEW-STORE-4).
+			 * `checked`: the boot-time `persisted()` read, which never prompts.
+			 * `requested`: the outcome of an explicit `app.storage.persistence.request()`.
+			 * `unsupported`: the runtime has no StorageManager persistence API.
+			 * `error`: the check or request threw (`message` says why).
+			 */
+			type: 'storage:persistence'
+			state: 'checked' | 'requested' | 'unsupported' | 'error'
+			persisted: boolean
+			message?: string
+	  }
 	| { type: 'connection:quality'; quality: ConnectionQuality }
 	| { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
 	| {

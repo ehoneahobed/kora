@@ -87,6 +87,7 @@
 		"dev": "tsup --watch",
 		"test": "vitest run",
 		"test:benchmarks": "vitest run --config vitest.benchmark.config.ts",
+		"test:benchmarks:browser": "node benchmarks/browser/store-browser-bench.mjs",
 		"test:watch": "vitest",
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check .",

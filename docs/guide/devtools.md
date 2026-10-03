@@ -224,6 +224,8 @@ The full set of instrumentation events (the `KoraEvent` union) that Kora emits a
 | `query:subscribed` | A reactive query subscription was registered. |
 | `query:invalidated` | A query's results were invalidated by an operation. |
 | `query:executed` | A query ran (includes duration and result count). |
+| `query:error` | A reactive query subscription failed (`phase`: `initial`, `refresh` or `callback`). The subscription keeps its last results. |
+| `storage:persistence` | Durable-storage state: the boot `persisted()` check, the outcome of a `persist()` request, or an error. |
 | `connection:quality` | The measured connection quality changed. |
 | `sync:diagnostics` | A sync diagnostics snapshot was emitted. |
 | `sync:bandwidth` | A sync bandwidth sample (bytes per second and direction). |

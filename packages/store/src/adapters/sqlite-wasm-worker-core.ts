@@ -250,7 +250,11 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 				persistent = false
 			}
 
-			db.exec({ sql: 'PRAGMA journal_mode = WAL' })
+			// NEW-STORE-11: no `PRAGMA journal_mode = WAL` here. WAL needs the VFS's
+			// shared-memory methods, which opfs-sahpool does not implement, so the pragma
+			// was a silent no-op (the mode stayed `delete`). The OPFS database uses
+			// SQLite's default rollback journal (DELETE), the in-memory fallback uses
+			// `memory`; the actual mode is reported in the open result (`journalMode`).
 			db.exec({ sql: 'PRAGMA foreign_keys = ON' })
 			applyDdl(db, ddlStatements)
 			attachProgressHandler(db)
@@ -294,8 +298,28 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 		}
 	}
 
+	function readJournalMode(): string | undefined {
+		if (!db) return undefined
+		try {
+			let mode: string | undefined
+			db.exec({
+				sql: 'PRAGMA journal_mode',
+				rowMode: 'object',
+				callback: (row: Record<string, unknown>) => {
+					if (typeof row.journal_mode === 'string') mode = row.journal_mode
+				},
+			})
+			return mode
+		} catch {
+			// Diagnostic only: an unreadable mode must not fail the open.
+			return undefined
+		}
+	}
+
 	function buildOpenData(): Record<string, unknown> {
+		const journalMode = readJournalMode()
 		return {
+			...(journalMode ? { journalMode } : {}),
 			persistent,
 			...(persistent ? {} : { fallbackReason: fallbackReason ?? 'unsupported' }),
 			...(poolName && persistent ? { poolName } : {}),

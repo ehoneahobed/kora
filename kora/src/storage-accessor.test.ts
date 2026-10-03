@@ -1,7 +1,11 @@
-import { defineSchema, t } from '@korajs/core'
+import { type KoraEvent, defineSchema, t } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
+import { StoragePersistence } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { createStorageApi, hasUnsyncedOperations } from './storage-accessor'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { createApp } from './create-app'
+import { createStorageApi, hasUnsyncedOperations, wireStoragePersistence } from './storage-accessor'
+import type { AuthSyncBinding } from './types'
 
 const schema = defineSchema({
 	version: 1,
@@ -102,5 +106,101 @@ describe('app.storage outside browsers', () => {
 		const api = createStorageApi({ schema })
 		await expect(api.listDatabases()).resolves.toEqual([])
 		await expect(api.deleteDatabase('x')).rejects.toMatchObject({ code: 'STORAGE_UNSUPPORTED' })
+	})
+})
+
+describe('durable storage off the startup path (NEW-STORE-4)', () => {
+	/** Firefox-like StorageManager: persist() prompts and never settles in a test. */
+	function stubPendingPrompt(): { persistCalls: () => number } {
+		let calls = 0
+		vi.stubGlobal('navigator', {
+			storage: {
+				persist: () => {
+					calls++
+					return new Promise<boolean>(() => {})
+				},
+				persisted: async () => false,
+			},
+		})
+		return { persistCalls: () => calls }
+	}
+
+	afterEach(() => {
+		vi.unstubAllGlobals()
+	})
+
+	test('app.ready resolves while a persist() prompt is pending; boot only checks persisted()', async () => {
+		const stub = stubPendingPrompt()
+		const app = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
+		const events: KoraEvent[] = []
+		app.on('storage:persistence', (event) => events.push(event))
+		await app.ready
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(stub.persistCalls()).toBe(0)
+		expect(events).toEqual([{ type: 'storage:persistence', state: 'checked', persisted: false }])
+		expect(app.storage.persistence.status()).toMatchObject({ state: 'best-effort' })
+
+		// The first local write requests persistence in the background, never awaited.
+		const todos = (app as unknown as Record<string, { insert(v: unknown): Promise<unknown> }>).todos
+		await todos?.insert({ title: 'a' })
+		await todos?.insert({ title: 'b' })
+		expect(stub.persistCalls()).toBe(1)
+		expect(app.storage.persistence.status().requested).toBe(true)
+		await app.close()
+	})
+
+	test("store.persistence: 'manual' never requests on its own", async () => {
+		const stub = stubPendingPrompt()
+		const app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:', persistence: 'manual' },
+		})
+		await app.ready
+		const todos = (app as unknown as Record<string, { insert(v: unknown): Promise<unknown> }>).todos
+		await todos?.insert({ title: 'a' })
+		expect(stub.persistCalls()).toBe(0)
+		void app.storage.persistence.request()
+		expect(stub.persistCalls()).toBe(1)
+		await app.close()
+	})
+
+	test('sign-in (a transition into authenticated) requests persistence', async () => {
+		let persistCalls = 0
+		const persistence = new StoragePersistence({
+			storage: {
+				persisted: async () => false,
+				persist: async () => {
+					persistCalls++
+					return false
+				},
+			},
+		})
+		let state: 'signed-out' | 'authenticated' = 'signed-out'
+		const listeners = new Set<() => void>()
+		const binding = {
+			auth: async () => ({ token: '' }),
+			resolveSyncState: async () =>
+				state === 'authenticated'
+					? ({ state: 'authenticated', userId: 'u', token: 't' } as const)
+					: ({ state: 'signed-out', mayConnectAnonymously: false } as const),
+			subscribe: (listener: () => void) => {
+				listeners.add(listener)
+				return () => listeners.delete(listener)
+			},
+		}
+		const off = wireStoragePersistence(
+			{ schema },
+			new SimpleEventEmitter(),
+			persistence,
+			binding as unknown as AuthSyncBinding,
+		)
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(persistCalls).toBe(0)
+		state = 'authenticated'
+		for (const listener of listeners) listener()
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(persistCalls).toBe(1)
+		off()
+		expect(listeners.size).toBe(0)
 	})
 })

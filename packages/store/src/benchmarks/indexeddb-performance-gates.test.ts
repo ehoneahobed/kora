@@ -7,6 +7,7 @@ import { MockWorkerBridge } from '../adapters/sqlite-wasm-mock-bridge'
 
 const REGRESSION_FACTOR = 1.1
 const INSERT_1K_LIMIT_MS = 10_000 * REGRESSION_FACTOR
+const PERSIST_1K_LIMIT_MS = 1_000 * REGRESSION_FACTOR
 
 describe('IndexedDB adapter performance gates', () => {
 	let adapter: IndexedDbAdapter
@@ -37,5 +38,29 @@ describe('IndexedDB adapter performance gates', () => {
 		const elapsedMs = performance.now() - startMs
 
 		expect(elapsedMs).toBeLessThan(INSERT_1K_LIMIT_MS)
+	}, 30_000)
+
+	test('persisting the 1,000-record snapshot (durability barrier) under target', async () => {
+		// STORE-16: the snapshot write used to happen fire-and-forget outside the timed
+		// window, so persistence cost was never measured. ensureDurable() resolves once
+		// the committed writes are in IndexedDB. Node uses fake-indexeddb; the real
+		// browser cost is measured by benchmarks/browser/store-browser-bench.mjs.
+		await adapter.transaction(async (tx) => {
+			for (let index = 0; index < 1_000; index++) {
+				await tx.execute(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+					// Distinct ids: the previous test's snapshot is restored into this database.
+					[`persist-${index}`, `todo-${index}`, index % 10 === 0 ? 1 : 0, 1000, 1000],
+				)
+			}
+		})
+		const startMs = performance.now()
+		await adapter.ensureDurable()
+		const elapsedMs = performance.now() - startMs
+		console.log(
+			`[bench] IndexedDB snapshot persist (1,000 rows, fake-indexeddb): ${elapsedMs.toFixed(1)} ms`,
+		)
+
+		expect(elapsedMs).toBeLessThan(PERSIST_1K_LIMIT_MS)
 	}, 30_000)
 })
