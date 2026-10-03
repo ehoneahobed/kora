@@ -197,11 +197,12 @@ export interface HandshakeResponseMessage {
 	 */
 	protocolVersion?: number
 	/**
-	 * Node ids whose operations are authored by the server itself (its own node id and
-	 * the reserved scope-entry node). Only operations from these nodes may carry
-	 * server-authored metadata (`fieldVersions`, `foldState`); the client persists the
-	 * list (`SyncStatePersistence.saveAuthoritativeNodeIds`). Absent from older
-	 * servers. Protobuf field 46 (repeated).
+	 * Explicit authoritative node ids (RT-75): legacy server node ids from before protocol
+	 * 2 and extras configured on the server store. Every `kora:server:` node id is
+	 * authoritative by its prefix and is not listed. Only operations of authoritative
+	 * nodes may carry server-authored metadata (`fieldVersions`, `foldState`); the client
+	 * keeps the union of every id it learns (`SyncStatePersistence.saveAuthoritativeNodeIds`).
+	 * Absent from older servers. Protobuf field 46 (repeated).
 	 */
 	authoritativeNodeIds?: string[]
 	/**

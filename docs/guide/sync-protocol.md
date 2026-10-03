@@ -1,113 +1,238 @@
 ---
-title: Sync Protocol v2
-description: "The Kora.js sync protocol v2 (beta.14): content-hash v2 operation ids, the encryption envelope, verification rules, protobuf field numbers and compatibility."
+title: Sync Protocol
+description: "The Kora.js sync protocol v2: message flow, content-hash v2 ids, the encryption envelope, delivery watermark, heartbeats, verification, the protobuf field table and version compatibility."
 ---
 
-# Sync Protocol v2 (beta.14)
+# Sync Protocol v2
 
-Protocol v2 is the single wire bump of decision D2 in the remediation plan. It carries
-every wire break of the Phase 3 programme in one compatibility window:
+This page is the reference for what travels between a Kora client and the sync server. You do
+not need it to build an app; it is for operators, protocol implementers and anyone debugging a
+deployment. Kora 1.0.0-beta.13 speaks **protocol 2**. Kora 1.0.0-beta.12 and earlier speak
+protocol 1.
 
-- **Content-hash version 2 (CORE-1).** New operations get ids that also cover
-  `previousData`, `sequenceNumber`, `causalDeps` (as a set) and `schemaVersion`.
-  `hashVersion` travels with the operation and is verified on receive.
-- **Encryption envelope v2 (ENC-3, NEW-ENC-1).** Ciphertext lives in `op.encrypted`,
-  bound to the operation by AES-GCM additional data. See
-  [Sync Encryption](./sync-encryption.md).
-- **Sequence reservation (RT-37).** Protocol-2 clients always send
-  `sequenceReservation: true`; `SEQUENCE_CONFLICT` behaves as in Phase 2.
-- **Server-authored metadata (W7).** `authoritativeNodeIds` in the handshake response;
-  `foldState` on server scope-entry operations.
+Protocol 2 is one wire bump carrying every wire change of the remediation programme:
 
-The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2),
-`INVALID_OPERATION_ID`, `PLAINTEXT_REJECTED`, `PROTOCOL_V1_DEPRECATED`.
+- **Content-hash version 2.** New operation ids also cover `previousData`, `sequenceNumber`,
+  `causalDeps` (as a set) and `schemaVersion`. `hashVersion` travels with each operation and is
+  verified on receive.
+- **Encryption envelope v2.** Ciphertext lives in `op.encrypted`, bound to the operation by
+  AES-GCM additional data, and keys come from a server-stored wrapped keyring. See
+  [Sync Encryption](/guide/sync-encryption).
+- **Sequence reservation.** A protocol-2 client reserves each operation's sequence number in the
+  same local transaction that writes it, so it never puts two operations under one
+  `(nodeId, sequenceNumber)`.
+- **Server-authored metadata.** `authoritativeNodeIds` and `revokedAuthoritativeNodeIds` in the
+  handshake response; `foldState` on scope-entry operations.
 
-## Handshake
+The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2), `INVALID_OPERATION_ID`,
+`PLAINTEXT_REJECTED` and `PROTOCOL_V1_DEPRECATED`.
+
+## Message flow
+
+```
+Client                                      Server
+  |--- handshake (vector, watermark, scope) -->|  refused: every other message before it
+  |<-- handshake-response (accepted scopes) ---|
+  |<-- encryption-key-* (encrypted apps) ----->|  keyring side channel
+  |--- operation-batch (own missing ops) ----->|
+  |<-- acknowledgment / operation-rejected ----|
+  |<-- operation-batch (base..max delivery) ---|  delivery stream, chained
+  |--- acknowledgment (deliverySequence) ----->|
+  |<-- heartbeat (every 25 s) -----------------|
+  |    awareness-update, yjs-doc-update, blob-chunk-* (side channels, scoped)
+```
+
+- **The handshake comes first.** The server refuses every other message until an authenticated
+  handshake has completed (`HANDSHAKE_REQUIRED`), on WebSocket and HTTP long-poll. A connection
+  has `handshakeTimeoutMs` (default 10 s) to send it.
+- **Uploads (client to server)** are decided by version vectors: the client sends the operations
+  of its own nodes that the server's vector does not cover, in causal order, in batches of
+  `batchSize` (default 100; the server refuses batches over `maxOpsPerBatch`, default 1000, with
+  `BATCH_TOO_LARGE`).
+- **Downloads (server to client)** are a gap-free delivery stream (below).
+- Each operation the server refuses is answered with `operation-rejected` (operation id, code,
+  message, `retriable`); the rest of the batch is acknowledged. Connection-level problems are
+  `error` messages.
+
+## Delivery watermark
+
+Every stored operation has a monotonic **delivery sequence**. Each client persists a **delivery
+watermark** per view (scope plus query subsets): the highest delivery sequence up to which it
+has applied, or durably quarantined, every in-scope operation with no gap.
+
+- Server batches chain `baseDeliverySequence -> maxDeliverySequence`. The client applies a batch
+  only when its watermark equals the base, and advances it only after the batch is fully applied,
+  in the same transaction as the applied rows. A dropped or failed batch stalls the watermark and
+  is re-sent; nothing is skipped.
+- The handshake reports the watermark (`lastDeliverySequence`), and the server resumes just after
+  it. A server whose log was rolled back (a restore) reports `serverMaxDeliverySequence` below the
+  client's watermark; the client then resets to 0 and resyncs.
+- `acceptedScopeKey` and `acceptedScopeWatermark` resume an auth-scoped client's accepted view
+  after a reconnect instead of restarting it.
+- First sync streams in chunks with backpressure: the server pauses a client's stream above
+  `deliveryHighWaterBytes` (1 MiB) and disconnects a consumer that leaves more than
+  `maxBufferedBytes` (32 MiB) unsent.
+- Live delivery chains from a send cursor; unacknowledged batches are retransmitted on a timer
+  (`relayRetransmitIntervalMs`, 2 s).
+
+See the design note [Durable delivery](/design/durable-delivery).
+
+## Quarantine
+
+An operation the client cannot apply yet is not dropped. It is stored in `_kora_unapplied_ops`
+(and the watermark passes it) when:
+
+| Code | Cause | Applies on a replay once |
+|------|-------|---------------|
+| `DECRYPT_FAILED` | no key, a wrong key (`KEY_ID_MISMATCH`), a plaintext op under encryption (`PLAINTEXT_REJECTED`), a protocol-1 encrypted payload (`LEGACY_ENCRYPTED_PAYLOAD`) | the keyring unlocks or gains the key (replayed at once) |
+| `INVALID_OPERATION_ID` | the id is not the content hash it declares | never (kept for inspection) |
+| `SCHEMA_TRANSFORM_UNAVAILABLE` / `SCHEMA_TRANSFORM_INVALID` | no transform path to this client's schema version, or a transform broke its contract | the app upgrades |
+| `REMOTE_CLOCK_DRIFT`, `INVALID_TIMESTAMP_FIELDS` | the operation is stamped too far in the future | time catches up |
+| `FOLD_STATE_INVALID` | the record's merge state cannot take it even after one re-fold | an upgrade |
+| `REFERENTIAL_INTEGRITY` | not appliable in this view (a child whose parent is outside it) | the parent is present |
+
+The quarantine is replayed on every start and whenever the keyring gains keys (and on demand
+with the sync engine's `retryQuarantinedOperations()`); each quarantine and release is an event
+(`sync:apply-failed`, `sync:apply-recovered`). A failure that may be
+transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, status
+`blockedFailure`) and the server re-sends.
+
+## Liveness
+
+- The server pings every WebSocket every `heartbeatIntervalMs` (25 s) and terminates a connection
+  that leaves two pings unanswered.
+- Browsers cannot see pings, so a client that sets `supportsHeartbeat` also receives an
+  application `heartbeat` message every `appHeartbeatIntervalMs` (25 s, announced as
+  `heartbeatIntervalMs` in the handshake response). A client that hears nothing for about 2.5
+  intervals treats the connection as dead and reconnects.
+- A reconnect succeeds only once the new session reaches streaming. The backoff starts at
+  `reconnectInterval` (1 s), doubles up to `maxReconnectInterval` (30 s) with 25% jitter, and
+  resets only after a connection stayed up for 10 s.
+
+## Handshake fields
 
 | Message | Field | Meaning |
 |---|---|---|
-| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora <= beta.13). |
-| `handshake` | `sequenceReservation` | Always `true` from a protocol-2 client. |
-| `handshake-response` | `protocolVersion` | `2`. Absent: a beta.13-era server. |
-| `handshake-response` | `authoritativeNodeIds` | The server's node ids (`ServerStore.getAuthoritativeNodeIds()`, `KoraSyncServer.authoritativeNodeIds`): this instance's `kora:server:<deploymentId>:<instanceId>` id, which authors route writes, side effects and constraint corrections, the other `kora:server:` ids with stored operations, and the legacy ids (server node ids from before beta.14, found in the log at the upgrade, and configured extras). Every `kora:server:` node id is authoritative whether listed or not (the prefix rule); the list carries the legacy ids, and serves clients that predate the rule. No device may hand-shake with any of these ids (`INVALID_NODE_ID`, not retriable). Their writes win `merge('server-authoritative')` fields on every replica. The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`, one meta key shared with the store's fold) and re-folds affected records when they change. Under end-to-end encryption, a plaintext operation from these nodes touching only cleartext fields is accepted. `kora:scope-entry` is not listed: scope entries carry the server's fold state and are joined, not folded as writes. |
-| `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit authoritative ids the deployment revoked (store option `revokedAuthoritativeNodeIds`, RT-81). Absent when there is none. A client removes them from the union of explicit authorities it keeps, persists them as revoked so no later handshake (an instance with a stale configuration) brings them back, and re-folds the records of collections with server-authoritative fields. The server keeps every explicit id it ever held authoritative, revoked ones included, and refuses each at handshake as a device node id (`INVALID_NODE_ID`). |
+| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora 1.0.0-beta.12 and earlier). |
+| `handshake` | `nodeId`, `versionVector`, `schemaVersion` | The device's node, what it holds, its schema version. |
+| `handshake` | `authToken` | The credential, unless the transport sends it out of band. |
+| `handshake` | `syncScope`, `syncQueries` | What the client asks for; the server's grant can only be narrowed by it. |
+| `handshake` | `lastDeliverySequence`, `acceptedScopeKey`, `acceptedScopeWatermark` | Where the delivery stream resumes. |
+| `handshake` | `nodeToken` | An anonymous device's secret for its node id. |
+| `handshake` | `supportsHeartbeat`, `sequenceReservation` | Capabilities; a protocol-2 client always sends `sequenceReservation: true`. |
+| `handshake` | `supportedWireFormats` | Always `['json']`: protobuf is never negotiated (below). |
+| `handshake-response` | `accepted`, `rejectReason`, `supportedSchemaMin/Max` | The verdict. |
+| `handshake-response` | `acceptedScope`, `acceptedDownlinkScopes`, `acceptedUplinkScopes` | The scopes the server granted. |
+| `handshake-response` | `serverTime`, `serverMaxDeliverySequence`, `heartbeatIntervalMs`, `blobStorageEnabled`, `blobPossessionProof`, `nodeToken` | Session facts. |
+| `handshake-response` | `authoritativeNodeIds` | The explicit authoritative node ids: legacy server ids (from before beta.13) and configured extras. Every `kora:server:` id is authoritative by its prefix whether listed or not. Clients keep the union of every id they learn and re-fold affected records when it grows. |
+| `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit ids the deployment revoked (permanent): clients drop them for good and re-fold. |
 
-A protocol-1 client is accepted for beta.14 only: the server logs
-`session.protocol_deprecated` (warn) and emits `sync:protocol-deprecated`.
+No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
+current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted in
+1.0.0-beta.13 only: the server logs `session.protocol_deprecated` and emits
+`sync:protocol-deprecated`; the next release refuses it.
 
 ## Operation fields
 
-| Field | Type | Hashed | Notes |
+| Field | Type | Hashed (v2) | Notes |
 |---|---|---|---|
-| `hashVersion` | `1 \| 2` | domain tag of v2 | Absent means 1. Persisted by the client store (op row) and every server store (`operations.hash_version`). Operations whose id is not a content hash (server side effects and constraint corrections, `server/` derived ids; scope entries) never declare it. |
-| `foldState` | `string` | no | Server-authored (scope entries). Stripped by the server from every device upload, like `fieldVersions`. |
-| `encrypted` | `EncryptedOperationEnvelope` | no | `{ v: 2, alg, keyId, keyVersion, data, previousData, atomicOps? }`; each member `{ iv, ct }`. `data` is then `null` or the cleartext scope fields; `previousData`/`atomicOps` are absent. The id is the v2 hash of the plaintext. Every server store keeps it verbatim (`operations.encrypted`, JSON) and relays it; the server fold folds only the cleartext fields, and an envelope with `data: null` still creates the record (insert) and counts as a write against deletes. |
+| `id` | string | | SHA-256 content hash of the canonical body. |
+| `nodeId`, `type`, `collection`, `recordId` | string | yes | |
+| `data`, `previousData` | object or `null` | yes | Canonical JSON (see [Schema Design](/guide/schema-design#how-values-are-normalized)). |
+| `timestamp` | `{ wallTime, logical, nodeId }` | yes | HLC. |
+| `sequenceNumber` | number | yes | Unique and gap-free per node. |
+| `causalDeps` | string[] | yes (as a set) | |
+| `schemaVersion` | number | yes | |
+| `hashVersion` | `1 \| 2` | domain tag | Absent means 1. Persisted on the client and every server store. Operations whose id is not a content hash (server side effects, constraint corrections, scope entries) never declare it. |
+| `atomicOps`, `transactionId`, `mutationName` | | | Ride inside the data JSON. |
+| `fieldVersions`, `foldState` | | no | Server-authored (scope entries). The server strips them from every device upload. |
+| `encrypted` | envelope | no | `{ v: 2, alg, keyId, keyVersion, data, previousData, atomicOps? }`, each member `{ iv, ct }`. `data` is then `null` or the cleartext fields; the id is the v2 hash of the plaintext. Every server store keeps it verbatim and relays it. |
 
 ## Verification
 
 | Where | What | On mismatch |
 |---|---|---|
-| Server ingest (`ClientSession.handleOperationBatch`) | Plaintext ops declaring `hashVersion: 2`, on the op **as uploaded**, after the authorization, timestamp and size checks and before the operation validator, the reference checks and any schema transform. An unknown declared version fails closed. Envelope ops are not verifiable by the server (it lacks the plaintext). | Non-retriable `operation-rejected` `INVALID_OPERATION_ID`; never stored or relayed. |
-| Schema transforms (beta.14, RT-84) | Run at fold time, never on a stored operation: the server stores every op exactly as uploaded (all hashed fields, `hashVersion`, envelope) and judges and folds its view (`operationSchemaView`); devices do the same. Envelope ops are transformed only after decryption, on devices. | n/a |
-| Client (`packages/sync/src/engine/verify-inbound.ts`) | After decryption, before transforms and apply: envelope ops always (against their declared version, which the AAD binds); plaintext ops declaring `hashVersion: 2`. Version-1 ops and reserved `kora:` system nodes are not checked. | Quarantined (`_kora_unapplied_ops`, code `INVALID_OPERATION_ID`), `sync:apply-failed`; never released by the quarantine replay. |
-| Client decryption (encryption enabled) | Envelope present and authenticates. | `DECRYPT_FAILED` quarantine (`PLAINTEXT_REJECTED`, `LEGACY_ENCRYPTED_PAYLOAD`, `KEY_ID_MISMATCH` in the error context). `allowPlaintextMigration` passes plaintext through. |
+| Server ingest | A plaintext operation declaring `hashVersion: 2` is verified as uploaded, after authorization, timestamp and size checks, before validators and transforms. An operation without `hashVersion` is verified as a version-1 hash. An unknown version fails closed. Encrypted operations cannot be verified by the server (no plaintext). | `INVALID_OPERATION_ID`, not retriable; never stored or relayed. |
+| Server ingest, duplicates | An upload reusing a stored id is a duplicate only when every hashed field is equal. | `FORGED_DUPLICATE`, not retriable, no effect; logged, emitted (`sync:forged-duplicate`) and counted. |
+| Client, after decryption | Encrypted operations always; plaintext operations declaring version 1 or 2. Reserved `kora:` system nodes are exempt. | Quarantined (`INVALID_OPERATION_ID`), never released. |
 
-Version-1 operations stored before beta.14 keep `hashVersion: 1` (absent) and are never
-verified against version-2 rules. Local rewrites before an op is shared (clock rebase,
-node rotation, `SEQUENCE_CONFLICT` renumbering, legacy sequence repair) re-hash a
-version-2 op with its own version, remapping causal deps first. A renumbered
-version-2 op gets a new id: never-sent later operations naming it in `causalDeps` are
-rewritten (and re-hashed, transitively) in the same transaction; operations already
-sent keep their ids and resolve the old id through `_kora_seq_conflicts.reemitted_as`
-(used by `replayTo`). The legacy sequence repair never renumbers a version-2 op when
-the other half of the pair is version 1 (that one keeps its id, which the server
-deduplicates).
+Protocol-1 sessions: an operation of a protocol-1 client whose undeclared id cannot be verified
+(Kora 1.0.0-beta.12 hashed `undefined` members as `null`, which the JSON upload no longer holds)
+is stored unverified for that session's own node, with a warning
+(`session.unverified_legacy_operation`, event `sync:unverified-legacy-operation`, metric
+`unverifiedLegacyOperations`). A beta.12 `update(id, { field: undefined })` is stored with that
+field `null`, as the beta.12 client applied it.
 
-## Protobuf field numbers
+Local rewrites of a version-2 operation before it is shared (clock rebase, node rotation,
+`SEQUENCE_CONFLICT` renumbering) re-hash it; never-sent operations naming it in `causalDeps` are
+rewritten in the same transaction.
 
-Envelope (`SyncEnvelope`, static serializer):
+## Wire format
 
-| # | Field | Wire type | Messages |
-|---|---|---|---|
-| 1-23, 25-45 | unchanged | | see `packages/sync/src/protocol/serializer.ts` |
-| 24 | (unused, never reuse) | | |
-| 46 | `authoritativeNodeIds` | repeated string | handshake-response |
-| 47 | `protocolVersion` | uint32 | handshake, handshake-response |
-| 48 | `revokedAuthoritativeNodeIds` | repeated string | handshake-response |
-| 49 | `extJson` | string (JSON `{ set?, unset? }`) | any message |
+JSON on every transport. `ProtobufMessageSerializer` is lossless for every message type (members
+without a native slot ride in field 49, `extJson`), but it is **not negotiated**: clients advertise
+`supportedWireFormats: ['json']` and the server reports the format its transport frames with. Use
+protobuf only as an explicit choice on both ends of a transport you control. Encryption-key
+messages are always JSON. WebSocket messages of 1 KiB or more are compressed with
+permessage-deflate unless the server disables it.
 
-Field 49 makes the protobuf wire lossless for every message type (SYNC-9): the encoder
-writes each member with a native slot natively, then carries every member the native
-slots did not reproduce exactly (for example `syncQueries`, `deltaCursor`,
-`supportedSchemaMin/Max`, and the awareness and Yjs message bodies) in `extJson`. A
-protobuf round trip therefore decodes to exactly what the JSON wire decodes to.
+### Protobuf field table
 
-Protobuf is **not negotiated**. Clients advertise `supportedWireFormats: ['json']`, and the
-server's `selectedWireFormat` reports the format its transport actually frames with
-(JSON unless the server was built with a protobuf serializer). Use
-`ProtobufMessageSerializer` only as an explicit choice on both ends of a transport.
+Envelope (`SyncEnvelope`):
 
-Operation (`SyncOperation`, nested in envelope field 11):
+| # | Field | Type | # | Field | Type |
+|---|---|---|---|---|---|
+| 1 | `type` | string | 26 | `operationId` | string |
+| 2 | `messageId` | string | 27 | `collection` | string |
+| 3 | `nodeId` | string | 28 | `recordId` | string |
+| 4 | `versionVector` | repeated `{1 key, 2 value}` | 29 | `lastDeliverySequence` | int64 |
+| 5 | `schemaVersion` | int32 | 30 | `baseDeliverySequence` | int64 |
+| 6 | `authToken` | string | 31 | `maxDeliverySequence` | int64 |
+| 7 | `supportedWireFormats` | repeated string | 32 | `deliverySequence` | int64 |
+| 8 | `accepted` | bool | 33 | `serverMaxDeliverySequence` | int64 |
+| 9 | `rejectReason` | string | 34 | `acceptedScopeJson` | string |
+| 10 | `selectedWireFormat` | string | 35 | `acceptedDownlinkScopesJson` | string |
+| 11 | `operations` | repeated `SyncOperation` | 36 | `acceptedUplinkScopesJson` | string |
+| 12 | `isFinal` | bool | 37 | `retractionsJson` | string |
+| 13 | `batchIndex` | uint32 | 38 | `scopeExitPolicy` | string |
+| 14 | `acknowledgedMessageId` | string | 39 | `nodeToken` | string |
+| 15 | `lastSequenceNumber` | int64 | 40 | `blobPossessionProof` | bool |
+| 16 | `errorCode` | string | 41 | `throttled` | bool |
+| 17 | `errorMessage` | string | 42 | `retryAfterMs` | int64 |
+| 18 | `retriable` | bool | 43 | `acceptedScopeKey` | string |
+| 19 | `serverTime` | int64 | 44 | `acceptedScopeWatermark` | int64 |
+| 20 | `requestId` | string | 45 | `sequenceReservation` | bool |
+| 21 | `hash` | string | 46 | `authoritativeNodeIds` | repeated string |
+| 22 | `chunkBytes` | string (base64) | 47 | `protocolVersion` | uint32 |
+| 23 | `hasBytes` | bool | 48 | `revokedAuthoritativeNodeIds` | repeated string |
+| 24 | unused, never reuse | | 49 | `extJson` | string (`{ set?, unset? }`) |
+| 25 | `blobStorageEnabled` | bool | | | |
 
-| # | Field | Wire type |
+Operation (`SyncOperation`, envelope field 11):
+
+| # | Field | Type |
 |---|---|---|
-| 1-13 | unchanged (`id` ... `hasPreviousData`) | |
+| 1-5 | `id`, `nodeId`, `type`, `collection`, `recordId` | string |
+| 6, 7 | `dataJson`, `previousDataJson` | string |
+| 8 | `timestamp` | `{1 wallTime int64, 2 logical uint32, 3 nodeId string}` |
+| 9 | `sequenceNumber` | int64 |
+| 10 | `causalDeps` | repeated string |
+| 11 | `schemaVersion` | int32 |
+| 12, 13 | `hasData`, `hasPreviousData` | bool |
 | 14 | `hashVersion` | uint32 (absent = 1) |
 | 15 | `foldState` | string |
-| 16 | `encrypted` | string (envelope JSON) |
+| 16 | `encryptedJson` | string (envelope JSON) |
 
-Older decoders skip fields 14-16 and 46-47 as unknown fields. `atomicOps`,
-`transactionId`, `mutationName` and `fieldVersions` still ride in the data JSON; an
-operation without data now carries `atomicOps` there too. (The unused schema-driven
-`DynamicProtobufSerializer` was removed in 1.0.0-beta.13, NEW-DX-2.)
+Older decoders skip unknown fields. The unused `DynamicProtobufSerializer` was removed.
 
-## Compatibility matrix
+## Compatibility
 
-Run with `node scripts/remediation/protocol-v2-compat.mjs <beta13-build>` against a real
-33bca46 build, plus the unit and integration suites.
+Upgrade sync servers first, then clients. Checked with
+`node scripts/remediation/protocol-v2-compat.mjs <protocol-1 build>` (run against the protocol-1
+build 33bca46) plus the unit and integration suites.
 
 | Client | Server | Result |
 |---|---|---|
-| v2 | v2 | Full v2: ids verified on both sides, envelope stored opaquely. |
-| beta.13 (protocol 1) | v2 | Accepted with a deprecation warning; its version-1 ops are stored and relayed unverified; v2 clients converge with it. Its protocol-1 encrypted payloads are refused by v2 clients with encryption enabled. |
-| v2 | beta.13 | Plaintext sync converges (inserts and updates both ways). The old server drops `hashVersion`, so relayed ops are treated as version 1 (not verified by clients). It also drops `op.encrypted`: encrypted sync does not work through a beta.13 server (the receiver quarantines the op as plaintext; nothing is applied wrongly). Upgrade the server first. |
+| protocol 2 | protocol 2 | Full protocol 2: ids verified on both sides, encrypted operations stored opaquely. |
+| protocol 1 (beta.12) | protocol 2 | Accepted for this release with a deprecation warning. Its version-1 operations are stored and relayed; protocol-2 clients converge with it. Its encrypted payloads (per-device keys) are refused by protocol-2 clients with encryption on. The beta.13 security rules apply to it too: the server grants scopes, the node must be claimable, and an HTTP long-poll client must be upgraded. |
+| protocol 2 | protocol 1 | Plaintext sync converges, but an old server drops `hashVersion` (relayed operations are treated as version 1) and `op.encrypted` (encrypted sync does not work: receivers quarantine). There is no key service (`KEY_SERVICE_UNSUPPORTED`). Do not run this way: upgrade the server first. |
