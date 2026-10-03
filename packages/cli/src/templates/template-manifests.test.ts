@@ -62,3 +62,30 @@ describe('bundled template manifests', () => {
 		for (const name of read) expect(typed, `${template}: ${name}`).toContain(name)
 	})
 })
+
+describe('flagship template (react-tailwind-sync, the --yes default) is on the typed path', () => {
+	const src = join(templatesDir, 'react-tailwind-sync', 'src')
+
+	test('hooks come from createKoraHooks<typeof app>() bound to the app', () => {
+		const kora = readFileSync(join(src, 'kora.ts'), 'utf-8')
+		expect(kora).toMatch(/createKoraHooks<typeof app>\(\)/)
+		expect(kora).toMatch(/from 'korajs\/react'/)
+	})
+
+	test('no module reaches for the untyped hooks or CollectionAccessor', () => {
+		const files = [
+			'App.tsx',
+			'main.tsx',
+			'modules/todos/useTodos.ts',
+			'modules/todos/todo.queries.ts',
+			'modules/todos/todo.mutations.ts',
+		]
+		const untypedHook =
+			/import \{[^}]*\b(useCollection|useQuery|useMutation|useSyncStatus)\b[^}]*\} from '@korajs\/react'/
+		for (const file of files) {
+			const text = readFileSync(join(src, file), 'utf-8')
+			expect(text, file).not.toMatch(/\bCollectionAccessor\b/)
+			expect(text, file).not.toMatch(untypedHook)
+		}
+	})
+})

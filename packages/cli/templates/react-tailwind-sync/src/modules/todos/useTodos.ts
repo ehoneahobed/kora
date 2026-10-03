@@ -1,4 +1,4 @@
-import { useCollection, useMutation, useQuery } from '@korajs/react'
+import { useCollection, useMutation, useQuery } from '../../kora'
 import {
 	type CreateTodoInput,
 	type UpdateTodoStatusInput,
