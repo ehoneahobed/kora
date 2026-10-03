@@ -54,12 +54,7 @@ export const FOLD_SNAPSHOT_TABLE = '_kora_fold_snapshot'
  * never logged, sequenced or uploaded (the server derives and relays its own
  * copy); each is retired when the server's copy for the same parent and record
  * arrives, or when the device's delivery stream has caught up.
- *
- * A `durable` effect (RT-74: a relation whose field is sealed by end-to-end
- * encryption, so the server cannot derive it) is NOT retired at catch-up: no server
- * copy will ever come. It is retired only by a real copy (the deleting device's,
- * naming the parent in its causal dependencies) and otherwise stays folded: each
- * device cascades for itself, deterministically (stamped right after the parent).
+
  */
 export const PROVISIONAL_OPS_TABLE = '_kora_provisional_ops'
 /**
@@ -80,7 +75,7 @@ export const FOLD_TABLES_DDL: readonly string[] = [
 	`CREATE TABLE IF NOT EXISTS ${FOLD_BASE_TABLE} (collection TEXT NOT NULL, record_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (collection, record_id))`,
 	`CREATE TABLE IF NOT EXISTS ${COMPACTED_THROUGH_TABLE} (node_id TEXT PRIMARY KEY, sequence_number INTEGER NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS ${FOLD_SNAPSHOT_TABLE} (collection TEXT NOT NULL, record_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (collection, record_id))`,
-	`CREATE TABLE IF NOT EXISTS ${PROVISIONAL_OPS_TABLE} (id TEXT PRIMARY KEY, collection TEXT NOT NULL, record_id TEXT NOT NULL, parent_id TEXT NOT NULL, operation TEXT NOT NULL, durable INTEGER NOT NULL DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS ${PROVISIONAL_OPS_TABLE} (id TEXT PRIMARY KEY, collection TEXT NOT NULL, record_id TEXT NOT NULL, parent_id TEXT NOT NULL, operation TEXT NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS ${PROVISIONAL_OPS_TABLE}_record ON ${PROVISIONAL_OPS_TABLE} (collection, record_id)`,
 ]
 
@@ -469,22 +464,16 @@ export class RecordFolder {
 	 * the effect arrives or the delivery stream catches up.
 	 *
 	 * @param parentId - The remote operation that caused it (the parent delete)
-	 * @param durable - Kept at catch-up; retired only by a real copy (RT-74)
 	 */
-	async applyProvisionalInTx(
-		tx: Transaction,
-		op: Operation,
-		parentId: string,
-		durable = false,
-	): Promise<void> {
+	async applyProvisionalInTx(tx: Transaction, op: Operation, parentId: string): Promise<void> {
 		const existing = await tx.query<{ id: string }>(
 			`SELECT id FROM ${PROVISIONAL_OPS_TABLE} WHERE id = ?`,
 			[op.id],
 		)
 		if (existing.length > 0) return
 		await tx.execute(
-			`INSERT INTO ${PROVISIONAL_OPS_TABLE} (id, collection, record_id, parent_id, operation, durable) VALUES (?, ?, ?, ?, ?, ?)`,
-			[op.id, op.collection, op.recordId, parentId, JSON.stringify(op), durable ? 1 : 0],
+			`INSERT INTO ${PROVISIONAL_OPS_TABLE} (id, collection, record_id, parent_id, operation) VALUES (?, ?, ?, ?, ?)`,
+			[op.id, op.collection, op.recordId, parentId, JSON.stringify(op)],
 		)
 		const prior = await this.loadOrRebuild(tx, op.collection, op.recordId, op.id)
 		const result = mergeOp(prior.state, op, this.schema, this.options())
@@ -500,8 +489,7 @@ export class RecordFolder {
 
 	/**
 	 * Remove provisional effects of a record (those caused by one of `parentIds`, or
-	 * all of them when null; with `retirableOnly`, never a durable one). The caller
-	 * re-folds the record.
+	 * all of them when null). The caller re-folds the record.
 	 *
 	 * @returns How many were removed
 	 */
@@ -510,12 +498,10 @@ export class RecordFolder {
 		collection: string,
 		recordId: string,
 		parentIds: readonly string[] | null,
-		options: { retirableOnly?: boolean } = {},
 	): Promise<number> {
 		if (parentIds !== null && parentIds.length === 0) return 0
 		const filter =
-			(parentIds === null ? '' : ` AND parent_id IN (${parentIds.map(() => '?').join(', ')})`) +
-			(options.retirableOnly ? ' AND durable = 0' : '')
+			parentIds === null ? '' : ` AND parent_id IN (${parentIds.map(() => '?').join(', ')})`
 		const rows = await tx.query<{ id: string }>(
 			`SELECT id FROM ${PROVISIONAL_OPS_TABLE} WHERE collection = ? AND record_id = ?${filter}`,
 			[collection, recordId, ...(parentIds ?? [])],
@@ -528,13 +514,12 @@ export class RecordFolder {
 		return rows.length
 	}
 
-	/** Records with provisional effects (with `retirableOnly`, non-durable ones only). */
+	/** Records with provisional effects. */
 	async listProvisionalRecords(
 		tx: Transaction,
-		options: { retirableOnly?: boolean } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		const rows = await tx.query<{ collection: string; record_id: string }>(
-			`SELECT DISTINCT collection, record_id FROM ${PROVISIONAL_OPS_TABLE}${options.retirableOnly ? ' WHERE durable = 0' : ''} ORDER BY collection, record_id`,
+			`SELECT DISTINCT collection, record_id FROM ${PROVISIONAL_OPS_TABLE} ORDER BY collection, record_id`,
 		)
 		return rows.map((row) => ({ collection: row.collection, recordId: row.record_id }))
 	}
@@ -783,22 +768,4 @@ function persistedForm(state: FoldState): string {
 
 function isDeadState(state: FoldState): boolean {
 	return !isFoldStateLive(state)
-}
-
-/**
- * Bring a provisional-effects table created before RT-74 up to date (the `durable`
- * column). Idempotent; run once per open after {@link FOLD_TABLES_DDL}.
- */
-export async function migrateProvisionalTable(adapter: {
-	query<T>(sql: string, params?: unknown[]): Promise<T[]>
-	execute(sql: string, params?: unknown[]): Promise<void>
-}): Promise<void> {
-	const columns = await adapter.query<{ name: string }>(
-		`PRAGMA table_info(${PROVISIONAL_OPS_TABLE})`,
-	)
-	if (!columns.some((column) => column.name === 'durable')) {
-		await adapter.execute(
-			`ALTER TABLE ${PROVISIONAL_OPS_TABLE} ADD COLUMN durable INTEGER NOT NULL DEFAULT 0`,
-		)
-	}
 }

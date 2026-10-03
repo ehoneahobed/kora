@@ -202,6 +202,14 @@ export interface HandshakeResponseMessage {
 	 * servers. Protobuf field 46 (repeated).
 	 */
 	authoritativeNodeIds?: string[]
+	/**
+	 * Explicit authoritative node ids the deployment revoked (RT-81, server config
+	 * `revokedAuthoritativeNodeIds`). A client removes them from the authority union it
+	 * keeps, never learns them again, and re-folds the affected records; the server
+	 * never accepts them as device node ids. Absent when nothing was revoked, and from
+	 * older servers. Protobuf field 48 (repeated).
+	 */
+	revokedAuthoritativeNodeIds?: string[]
 }
 
 /**

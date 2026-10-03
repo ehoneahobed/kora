@@ -63,12 +63,15 @@ import {
 	scopeValuesOf,
 } from './scope-snapshot'
 import {
+	type AuthorityHistory,
 	type ConfiguredIdentity,
 	SERVER_DEPLOYMENT_ID_KEY,
 	SERVER_DERIVATION_SECRET_KEY,
+	SERVER_EVER_AUTHORITY_KEY,
 	SERVER_INSTANCE_COUNTER_KEY,
 	SERVER_LEGACY_AUTHORITY_KEY,
 	SERVER_LEGACY_SCAN_KEY,
+	SERVER_REVOKED_AUTHORITY_KEY,
 	ServerIdentityError,
 	type ServerIdentityOptions,
 	authoritativeStampOpIds,
@@ -78,6 +81,7 @@ import {
 	normalizeLegacyAuthorities,
 	parseIdentityOptions,
 	parseLegacyAuthorities,
+	resolveAuthorityHistory,
 	serverNodeIdFor,
 } from './server-identity'
 import type {
@@ -206,6 +210,12 @@ export class PostgresServerStore implements ServerStore {
 	private derivationSecret = ''
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private explicitAuthorities: string[] = []
+	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
+	private authorityHistory: AuthorityHistory = {
+		explicitAuthorities: [],
+		revoked: [],
+		everAuthoritative: [],
+	}
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
@@ -288,6 +298,19 @@ export class PostgresServerStore implements ServerStore {
 	/** Legacy and configured authorities (beside the `kora:server:` namespace). */
 	getLegacyAuthoritativeNodeIds(): string[] {
 		return [...this.explicitAuthorities]
+	}
+
+	/** Explicit authoritative ids the deployment revoked (RT-81), advertised at handshake. */
+	getRevokedAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.revoked]
+	}
+
+	/**
+	 * Every explicit id the deployment ever held authoritative, revoked ones included
+	 * (RT-81): never accepted as a device node id.
+	 */
+	getEverAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.everAuthoritative]
 	}
 
 	async deriveServerOperationId(
@@ -392,14 +415,30 @@ export class PostgresServerStore implements ServerStore {
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_AUTHORITY_KEY}, ${JSON.stringify(legacy)})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
-			return { secret, nodeId, legacy }
+			// Authority over time (RT-81), under the same lock: every explicit id ever held
+			// stays authoritative until revoked, and reserved for good.
+			const history = resolveAuthorityHistory({
+				legacy,
+				configured,
+				persistedEver: parseLegacyAuthorities(await meta(SERVER_EVER_AUTHORITY_KEY)),
+				persistedRevoked: parseLegacyAuthorities(await meta(SERVER_REVOKED_AUTHORITY_KEY)),
+				ownNodeId: nodeId,
+			})
+			for (const [key, value] of [
+				[SERVER_EVER_AUTHORITY_KEY, history.everAuthoritative],
+				[SERVER_REVOKED_AUTHORITY_KEY, history.revoked],
+			] as const) {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${JSON.stringify(value)})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
+			return { secret, nodeId, history }
 		})
 		this.loadedNodeId = identity.nodeId
 		this.derivationSecret = identity.secret
-		this.explicitAuthorities = normalizeLegacyAuthorities([
-			...identity.legacy,
-			...configured.explicitAuthorities,
-		])
+		this.explicitAuthorities = identity.history.explicitAuthorities
+		this.authorityHistory = identity.history
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
 	}
 
@@ -2690,6 +2729,9 @@ export async function createPostgresServerStore(
 
 	return new PostgresServerStore(db, options.nodeId, undefined, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
+		...(options.revokedAuthoritativeNodeIds
+			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
+			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
 }

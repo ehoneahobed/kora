@@ -63,13 +63,16 @@ import {
 	scopeValuesOf,
 } from './scope-snapshot'
 import {
+	type AuthorityHistory,
 	type ConfiguredIdentity,
 	SERVER_DEPLOYMENT_ID_KEY,
 	SERVER_DERIVATION_SECRET_KEY,
+	SERVER_EVER_AUTHORITY_KEY,
 	SERVER_INSTANCE_ID_KEY,
 	SERVER_LEGACY_AUTHORITY_KEY,
 	SERVER_LEGACY_SCAN_KEY,
 	SERVER_NODE_PREFIX,
+	SERVER_REVOKED_AUTHORITY_KEY,
 	type ServerIdentityOptions,
 	authoritativeStampOpIds,
 	deriveKeyedServerOpId,
@@ -78,6 +81,7 @@ import {
 	normalizeLegacyAuthorities,
 	parseIdentityOptions,
 	parseLegacyAuthorities,
+	resolveAuthorityHistory,
 	serverNodeIdFor,
 } from './server-identity'
 import type {
@@ -178,6 +182,8 @@ export class SqliteServerStore implements ServerStore {
 	private readonly derivationSecret: string
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
+	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
+	private readonly authorityHistory: AuthorityHistory
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
@@ -210,7 +216,8 @@ export class SqliteServerStore implements ServerStore {
 		const identity = this.loadIdentity(configured)
 		this.nodeId = identity.nodeId
 		this.derivationSecret = identity.secret
-		this.explicitAuthorities = identity.explicitAuthorities
+		this.explicitAuthorities = identity.history.explicitAuthorities
+		this.authorityHistory = identity.history
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
 		for (const row of this.db.all<{ node_id: string }>(
 			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
@@ -234,6 +241,19 @@ export class SqliteServerStore implements ServerStore {
 		return [...this.explicitAuthorities]
 	}
 
+	/** Explicit authoritative ids the deployment revoked (RT-81), advertised at handshake. */
+	getRevokedAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.revoked]
+	}
+
+	/**
+	 * Every explicit id the deployment ever held authoritative, revoked ones included
+	 * (RT-81): never accepted as a device node id.
+	 */
+	getEverAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.everAuthoritative]
+	}
+
 	async deriveServerOperationId(
 		parentOpId: string,
 		ruleId: string,
@@ -255,7 +275,7 @@ export class SqliteServerStore implements ServerStore {
 	private loadIdentity(configured: ConfiguredIdentity): {
 		nodeId: string
 		secret: string
-		explicitAuthorities: string[]
+		history: AuthorityHistory
 	} {
 		const meta = (tx: BetterSQLite3Database, key: string): string | undefined =>
 			tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -298,14 +318,22 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_LEGACY_AUTHORITY_KEY}, ${JSON.stringify(legacy)})`,
 			)
-			return {
-				nodeId,
-				secret,
-				explicitAuthorities: normalizeLegacyAuthorities([
-					...legacy,
-					...configured.explicitAuthorities,
-				]),
-			}
+			// Authority over time (RT-81): every explicit id ever held stays authoritative
+			// until revoked, and reserved for good.
+			const history = resolveAuthorityHistory({
+				legacy,
+				configured,
+				persistedEver: parseLegacyAuthorities(meta(tx, SERVER_EVER_AUTHORITY_KEY)),
+				persistedRevoked: parseLegacyAuthorities(meta(tx, SERVER_REVOKED_AUTHORITY_KEY)),
+				ownNodeId: nodeId,
+			})
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_EVER_AUTHORITY_KEY}, ${JSON.stringify(history.everAuthoritative)})`,
+			)
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SERVER_REVOKED_AUTHORITY_KEY}, ${JSON.stringify(history.revoked)})`,
+			)
+			return { nodeId, secret, history }
 		})
 	}
 
@@ -2181,6 +2209,9 @@ export function createSqliteServerStore(
 	const db = drizzle(sqlite)
 	return new SqliteServerStore(db, options.nodeId, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
+		...(options.revokedAuthoritativeNodeIds
+			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
+			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
 }

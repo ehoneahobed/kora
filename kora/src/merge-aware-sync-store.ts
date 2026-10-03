@@ -71,8 +71,11 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.settleAfterCatchUp()
 	}
 
-	async setAuthoritativeNodeIds(nodeIds: readonly string[]): Promise<void> {
-		await this.store.setAuthoritativeNodeIds(nodeIds)
+	async setAuthoritativeNodeIds(
+		nodeIds: readonly string[],
+		revokedNodeIds: readonly string[] = [],
+	): Promise<void> {
+		await this.store.setAuthoritativeNodeIds(nodeIds, revokedNodeIds)
 	}
 
 	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {

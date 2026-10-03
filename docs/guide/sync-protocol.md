@@ -30,6 +30,7 @@ The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2),
 | `handshake` | `sequenceReservation` | Always `true` from a protocol-2 client. |
 | `handshake-response` | `protocolVersion` | `2`. Absent: a beta.13-era server. |
 | `handshake-response` | `authoritativeNodeIds` | The server's node ids (`ServerStore.getAuthoritativeNodeIds()`, `KoraSyncServer.authoritativeNodeIds`): this instance's `kora:server:<deploymentId>:<instanceId>` id, which authors route writes, side effects and constraint corrections, the other `kora:server:` ids with stored operations, and the legacy ids (server node ids from before beta.14, found in the log at the upgrade, and configured extras). Every `kora:server:` node id is authoritative whether listed or not (the prefix rule); the list carries the legacy ids, and serves clients that predate the rule. No device may hand-shake with any of these ids (`INVALID_NODE_ID`, not retriable). Their writes win `merge('server-authoritative')` fields on every replica. The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`, one meta key shared with the store's fold) and re-folds affected records when they change. Under end-to-end encryption, a plaintext operation from these nodes touching only cleartext fields is accepted. `kora:scope-entry` is not listed: scope entries carry the server's fold state and are joined, not folded as writes. |
+| `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit authoritative ids the deployment revoked (store option `revokedAuthoritativeNodeIds`, RT-81). Absent when there is none. A client removes them from the union of explicit authorities it keeps, persists them as revoked so no later handshake (an instance with a stale configuration) brings them back, and re-folds the records of collections with server-authoritative fields. The server keeps every explicit id it ever held authoritative, revoked ones included, and refuses each at handshake as a device node id (`INVALID_NODE_ID`). |
 
 A protocol-1 client is accepted for beta.14 only: the server logs
 `session.protocol_deprecated` (warn) and emits `sync:protocol-deprecated`.
@@ -72,6 +73,7 @@ Envelope (`SyncEnvelope`, static serializer):
 | 24 | (unused, never reuse) | | |
 | 46 | `authoritativeNodeIds` | repeated string | handshake-response |
 | 47 | `protocolVersion` | uint32 | handshake, handshake-response |
+| 48 | `revokedAuthoritativeNodeIds` | repeated string | handshake-response |
 
 Operation (`SyncOperation`, nested in envelope field 11):
 

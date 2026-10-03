@@ -558,6 +558,15 @@ export interface ServerStore extends SyncStore {
 	 * clients fold with the same authority.
 	 */
 	getAuthoritativeNodeIds?(): string[]
+
+	/** Explicit authoritative ids the deployment revoked (RT-81); advertised at handshake. */
+	getRevokedAuthoritativeNodeIds?(): string[]
+
+	/**
+	 * Every explicit id the deployment ever held authoritative, revoked ones included
+	 * (RT-81). The session never accepts one as a device node id.
+	 */
+	getEverAuthoritativeNodeIds?(): string[]
 	/**
 	 * Keyed id of a server-derived operation (cascade, set-null, constraint correction):
 	 * deterministic across every instance of the deployment, unpredictable to clients

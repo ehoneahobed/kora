@@ -121,7 +121,10 @@ export interface SyncStore {
 	 * authoritative')` fields, from the handshake response. The store persists them
 	 * and folds with them (re-folding affected records when the set changes).
 	 */
-	setAuthoritativeNodeIds?(nodeIds: readonly string[]): Promise<void>
+	setAuthoritativeNodeIds?(
+		nodeIds: readonly string[],
+		revokedNodeIds?: readonly string[],
+	): Promise<void>
 
 	/**
 	 * Optional: read a record's current materialized field values, used to backfill

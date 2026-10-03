@@ -1780,6 +1780,7 @@ export class SyncEngine {
 			if (Array.isArray(authoritative) && this.store.setAuthoritativeNodeIds) {
 				await this.store.setAuthoritativeNodeIds(
 					authoritative.filter((id): id is string => typeof id === 'string'),
+					revokedAuthoritativeIds(msg),
 				)
 			}
 		}
@@ -1842,11 +1843,20 @@ export class SyncEngine {
 			// The union of every explicit id learned, never a replacement (RT-75): each
 			// server instance lists what it knows, and `kora:server:` ids are
 			// authoritative by prefix, so they are not kept.
-			const known = new Set((this.authoritativeNodeIds ?? []).filter((id) => !isServerNodeId(id)))
+			// Ids the server revoked (RT-81) leave the union and are never learned again (the
+			// store persists them, and its union, which this list mirrors, filters them).
+			const revoked = new Set(revokedAuthoritativeIds(msg))
+			const previous = (this.authoritativeNodeIds ?? []).filter((id) => !isServerNodeId(id))
+			const known = new Set(previous.filter((id) => !revoked.has(id)))
 			const learned = msg.authoritativeNodeIds.filter(
-				(id): id is string => typeof id === 'string' && !isServerNodeId(id) && !known.has(id),
+				(id): id is string =>
+					typeof id === 'string' && !isServerNodeId(id) && !known.has(id) && !revoked.has(id),
 			)
-			if (learned.length > 0 || this.authoritativeNodeIds === null) {
+			if (
+				learned.length > 0 ||
+				known.size < previous.length ||
+				this.authoritativeNodeIds === null
+			) {
 				this.authoritativeNodeIds = [...known, ...learned].sort()
 				await this.syncState?.saveAuthoritativeNodeIds?.(this.authoritativeNodeIds)
 			}
@@ -4714,4 +4724,15 @@ function wireToAwarenessStates(
 		}
 	}
 	return states
+}
+
+/**
+ * The explicit authoritative ids a handshake response revokes (RT-81), read structurally
+ * (the field is optional, protocol v2).
+ */
+function revokedAuthoritativeIds(msg: unknown): string[] {
+	const revoked = (msg as { revokedAuthoritativeNodeIds?: unknown }).revokedAuthoritativeNodeIds
+	return Array.isArray(revoked)
+		? revoked.filter((id): id is string => typeof id === 'string' && !isServerNodeId(id))
+		: []
 }

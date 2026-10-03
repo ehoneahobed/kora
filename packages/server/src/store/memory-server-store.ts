@@ -22,11 +22,13 @@ import {
 } from './record-fold'
 import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
 import {
+	type AuthorityHistory,
 	deriveKeyedServerOpId,
 	generateDeploymentId,
 	generateDerivationSecret,
 	normalizeLegacyAuthorities,
 	parseIdentityOptions,
+	resolveAuthorityHistory,
 	serverNodeIdFor,
 } from './server-identity'
 import type {
@@ -83,6 +85,8 @@ export interface MemoryServerStoreOptions {
 	 * `kora:server:` node id is authoritative without being listed.
 	 */
 	authoritativeNodeIds?: string[]
+	/** Revoked explicit authorities (see `ServerIdentityOptions.revokedAuthoritativeNodeIds`). */
+	revokedAuthoritativeNodeIds?: string[]
 	/** Instance id within the deployment (see `ServerIdentityOptions.instanceId`). */
 	instanceId?: string
 }
@@ -134,6 +138,8 @@ export class MemoryServerStore implements ServerStore {
 	private readonly authoritativeNodeIds: string[]
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
+	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
+	private readonly authorityHistory: AuthorityHistory
 	private readonly foldOptions: ServerFoldOptions
 
 	private closed = false
@@ -162,7 +168,15 @@ export class MemoryServerStore implements ServerStore {
 		this.nodeId =
 			configured.verbatimNodeId ??
 			serverNodeIdFor(generateDeploymentId(), configured.instanceId ?? '1')
-		this.explicitAuthorities = normalizeLegacyAuthorities(configured.explicitAuthorities)
+		// A memory store persists nothing: its history is this configuration (RT-81).
+		this.authorityHistory = resolveAuthorityHistory({
+			legacy: [],
+			configured,
+			persistedEver: [],
+			persistedRevoked: [],
+			ownNodeId: this.nodeId,
+		})
+		this.explicitAuthorities = this.authorityHistory.explicitAuthorities
 		this.authoritativeNodeIds = [this.nodeId, ...this.explicitAuthorities]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
 	}
@@ -177,6 +191,19 @@ export class MemoryServerStore implements ServerStore {
 
 	getAuthoritativeNodeIds(): string[] {
 		return [...this.authoritativeNodeIds]
+	}
+
+	/** Explicit authoritative ids the deployment revoked (RT-81), advertised at handshake. */
+	getRevokedAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.revoked]
+	}
+
+	/**
+	 * Every explicit id the deployment ever held authoritative, revoked ones included
+	 * (RT-81): never accepted as a device node id.
+	 */
+	getEverAuthoritativeNodeIds(): string[] {
+		return [...this.authorityHistory.everAuthoritative]
 	}
 
 	getVersionVector(): VersionVector {

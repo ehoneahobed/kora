@@ -2122,6 +2122,7 @@ export class ClientSession {
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
 			protocolVersion: SYNC_PROTOCOL_VERSION,
 			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
+			...this.advertisedRevocations(),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
@@ -3025,6 +3026,9 @@ export class ClientSession {
 		if (nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) return true
 		if (nodeId === this.store.getNodeId()) return true
 		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
+		// Every id the deployment ever held authoritative, revoked ones included (RT-81):
+		// devices may still hold it as authoritative (until they learn the revocation).
+		if (this.store.getEverAuthoritativeNodeIds?.().includes(nodeId)) return true
 		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
 	}
 
@@ -3034,6 +3038,14 @@ export class ClientSession {
 	 * prefix on every replica, and listing instance ids would make the list differ per
 	 * instance and per start, which devices would have to treat as news.
 	 */
+	/** The handshake's explicit revocations (RT-81), when the deployment has any. */
+	private advertisedRevocations(): { revokedAuthoritativeNodeIds?: string[] } {
+		const revoked = (this.store.getRevokedAuthoritativeNodeIds?.() ?? []).filter(
+			(id) => !isServerNodeId(id),
+		)
+		return revoked.length > 0 ? { revokedAuthoritativeNodeIds: revoked } : {}
+	}
+
 	private advertisedAuthoritativeNodeIds(): string[] {
 		return [...new Set(this.serverAuthoritativeNodeIds())].filter((id) => !isServerNodeId(id))
 	}
