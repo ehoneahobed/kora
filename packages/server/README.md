@@ -1,6 +1,8 @@
 # @korajs/server
 
-Self-hosted sync server for Kora.js applications. Accepts WebSocket and HTTP connections from Kora clients, stores operations, and relays changes between devices. Supports multiple storage backends via Drizzle ORM.
+The self-hosted sync server for Kora.js: stores every operation, folds records exactly as devices
+do, enforces scopes, constraints and your validators, and relays changes between devices over
+WebSocket or HTTP long-polling. SQLite and Postgres stores are built in.
 
 ## Install
 
@@ -8,107 +10,80 @@ Self-hosted sync server for Kora.js applications. Accepts WebSocket and HTTP con
 pnpm add @korajs/server@beta
 ```
 
-## Quick Start
+## Quick start
 
+<!-- docs-check: standalone -->
 ```typescript
-import { createKoraServer, MemoryServerStore } from '@korajs/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import { defineSchema, t } from 'korajs'
 
-const server = createKoraServer({
-  store: new MemoryServerStore(),
-  port: 4567,
-})
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
-await server.start()
-// Kora sync server listening on ws://localhost:4567
-```
-
-## Production Setup with PostgreSQL
-
-```typescript
-import { createKoraServer, PostgresServerStore, TokenAuthProvider } from '@korajs/server'
-
-const server = createKoraServer({
-  store: new PostgresServerStore({
-    connectionString: process.env.DATABASE_URL,
-  }),
-  port: 4567,
-  auth: new TokenAuthProvider({
-    validate: async (token) => {
-      // Validate JWT or session token
-      const user = await verifyToken(token)
-      return { userId: user.id, scopes: { todos: { userId: user.id } } }
-    },
-  }),
-})
-
-await server.start()
-```
-
-## Storage Backends
-
-| Backend | Package | Use Case |
-|---------|---------|----------|
-| `MemoryServerStore` | Built-in | Development and testing |
-| `SqliteServerStore` | Built-in | Small deployments, prototyping |
-| `PostgresServerStore` | Built-in | Production |
-
-## Mixed Auth (Authenticated + Anonymous)
-
-For apps where some users are authenticated and others are anonymous:
-
-```typescript
-import { MixedAuthProvider } from '@korajs/server'
-
-const server = createKoraServer({
-  store: serverStore,
-  auth: new MixedAuthProvider({
-    primary: authRoutes.toSyncAuthProvider(),
-    anonymousScopes: { responses: {} },
-  }),
-})
-```
-
-## Materialized Collections
-
-Enable server-side queries on your data:
-
-```typescript
+const store = createSqliteServerStore({ filename: './kora-server.db' })
 await store.setSchema(schema)
 
-// Query with filters
-const forms = await store.queryCollection('forms', {
-  where: { status: 'published' },
-  limit: 10,
+const server = createProductionServer({
+  store,
+  staticDir: './dist', // the built app, served with an offline app shell
+  syncPath: '/kora-sync',
+  syncOptions: { schemaVersion: schema.version },
+  operationalAuth: { adminToken: process.env.KORA_ADMIN_TOKEN },
 })
 
-// Count records
-const count = await store.countCollection('responses', { formId: 'abc' })
+console.log(`Listening on ${await server.start()}`) // PORT, default 3001
 ```
 
-## Configuration
+For production use Postgres (`await createPostgresServerStore({ connectionString })`), an auth
+provider (`createKoraAuthServer().auth` from `@korajs/auth/server`, or your own
+`TokenAuthProvider`), and the operational tokens.
 
+<!-- docs-check: standalone -->
 ```typescript
-createKoraServer({
-  store: serverStore,         // Required: storage backend
-  port: 4567,                 // Default: 4567
-  auth: authProvider,         // Optional: authentication provider
-  batchSize: 1000,            // Optional: max operations per sync batch
-  maxConnections: 0,          // Optional: 0 = unlimited
+import { createPostgresServerStore, createProductionServer, TokenAuthProvider } from '@korajs/server'
+
+declare function verifyToken(token: string): Promise<{ id: string } | null>
+
+const server = createProductionServer({
+  store: await createPostgresServerStore({ connectionString: process.env.DATABASE_URL ?? '' }),
+  syncOptions: {
+    auth: new TokenAuthProvider({
+      validate: async (token) => {
+        const user = await verifyToken(token)
+        // The grant decides what this session may read and write.
+        return user ? { userId: user.id, scopes: { todos: { userId: user.id } } } : null
+      },
+    }),
+  },
 })
 ```
+
+## Stores
+
+| Store | Use |
+|-------|-----|
+| `createSqliteServerStore({ filename })` | One server process |
+| `await createPostgresServerStore({ connectionString })` | Production, several instances |
+| `new MemoryServerStore()` | Tests |
+
+`store.setSchema(schema)` creates one table per collection and enables scope, constraint and
+relation checks; `queryCollection`, `findRecord` and `countCollection` read them. Server-side
+writes go through `server.kora.apply(...)`, the same pipeline as sync.
 
 ## Testing
 
-Integration tests include **store parity** coverage for `MemoryServerStore` and `SqliteServerStore`. To run the same parity suite against a live PostgreSQL database:
+The store parity suite runs against Memory and SQLite, and against Postgres when `DATABASE_URL` is
+set:
 
 ```bash
 DATABASE_URL="postgres://user:pass@localhost:5432/kora_test" pnpm --filter @korajs/server test -- tests/integration/server-store-parity.test.ts
 ```
 
-Postgres tests are skipped when `DATABASE_URL` is unset.
+## Documentation
+
+[Production Server](https://korajs.dev/guide/production-server),
+[Server-side Validation](https://korajs.dev/guide/server-side-validation) and the
+[Server API reference](https://korajs.dev/api/server).
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.

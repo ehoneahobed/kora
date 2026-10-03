@@ -5,8 +5,9 @@
  * Run `pnpm build` first: imports of `korajs`, `korajs/*` and `@korajs/*` resolve to each
  * package's `dist` type declarations, exactly what an installed app sees.
  *
- * Which files: every Markdown file under docs/ (except plans/, releases/, CHANGELOG.md and
- * node_modules), the root README.md, kora/README.md and every packages/<name>/README.md.
+ * Which files: every published Markdown file under docs/ (not plans/, design/, releases/,
+ * benchmarks/, CHANGELOG.md or node_modules), the root README.md, kora/README.md and every
+ * packages/<name>/README.md.
  * Which blocks: fences tagged ts, typescript or tsx. Each block is one module, checked in strict mode.
  *
  * Markers (HTML comments, invisible on the rendered page), on the lines just above a fence:
@@ -44,7 +45,17 @@ const args = process.argv.slice(2)
 const verbose = args.includes('--verbose')
 const explicitFiles = args.filter((a) => !a.startsWith('--'))
 
-const EXCLUDED_DIRS = new Set(['node_modules', '.vitepress', 'plans', 'releases', 'public'])
+// plans, design, releases and benchmarks are internal working docs that the site does not publish
+// (INTERNAL_DIRS in docs/.vitepress/config.ts); their snippets record proposals, not the API.
+const EXCLUDED_DIRS = new Set([
+	'node_modules',
+	'.vitepress',
+	'plans',
+	'design',
+	'releases',
+	'benchmarks',
+	'public',
+])
 const LANGS = new Set(['ts', 'typescript', 'tsx'])
 
 function walk(dir) {

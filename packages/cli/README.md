@@ -1,126 +1,44 @@
 # @korajs/cli
 
-CLI tooling for Kora.js. Scaffold new apps, run the development server, manage schema migrations, and generate TypeScript types.
+The `kora` command for Kora.js: scaffold apps, run the dev environment, generate migrations and
+types, check a project, operate and deploy a sync server, and inspect data with Kora Studio.
 
 ## Install
 
+Projects created with `create-kora-app` already have it as a dev dependency (`pnpm dev` runs
+`kora dev`). Elsewhere:
+
 ```bash
-pnpm add -g @korajs/cli@beta
+pnpm add -D @korajs/cli@beta
 ```
 
-Or use directly with `npx`:
+## Quick start
 
 ```bash
-npx create-kora-app@beta my-app
-```
-
-## Commands
-
-### create-kora-app
-
-Scaffold a new Kora.js project:
-
-```bash
-npx create-kora-app@beta my-app
-
-# Interactive prompts:
-#   Select a template: React (basic) | React (with sync)
-#   Package manager: pnpm | npm | yarn | bun
-```
-
-### kora dev
-
-Start the development environment:
-
-```bash
-kora dev
-```
-
-This runs:
-- Vite dev server for your application
-- Kora sync server (if configured)
-- Schema file watcher with auto type generation
-- Embedded DevTools (toggle with `Ctrl+Shift+K`)
-
-### kora migrate
-
-Detect schema changes and generate migrations:
-
-```bash
-kora migrate
-# Detects changes, generates migration file, prompts to apply
-```
-
-### kora deploy
-
-Deploy your Kora app to a cloud platform with a single command:
-
-```bash
-kora deploy
-```
-
-Supported platforms: **Fly.io**, **Railway** (Render, Docker, Kora Cloud coming soon).
-
-#### Options
-
-| Flag | Description |
-|------|-------------|
-| `--platform` | Target platform: `fly`, `railway`, `render`, `docker`, `kora-cloud` |
-| `--app` | Application name on the platform |
-| `--region` | Deployment region (e.g., `iad`, `lhr`, `syd`) |
-| `--prod` | Deploy to production environment (default: preview) |
-| `--confirm` | Non-interactive mode — fail fast if required data is missing |
-| `--reset` | Delete `.kora/deploy/` state and generated artifacts |
-
-#### Subcommands
-
-```bash
-kora deploy status      # Show deployment health, URLs, and metadata
-kora deploy logs        # View recent deployment logs
-kora deploy rollback    # Revert to the previous deployment
-```
-
-#### Non-interactive (CI/CD)
-
-```bash
-kora deploy --platform=fly --app=my-app --region=iad --confirm
-```
-
-#### What it does
-
-1. Generates a `Dockerfile` and `.dockerignore` in `.kora/deploy/`
-2. Bundles your server entry (`server.ts`) with esbuild into a single file
-3. Builds your client with Vite
-4. Generates platform config (`fly.toml` or `railway.json`)
-5. Provisions the app on the platform (creates it if new)
-6. Deploys and returns your live URL and sync WebSocket endpoint
-
-#### Prerequisites
-
-- **Fly.io**: Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/) and run `fly auth login`
-- **Railway**: Install [@railway/cli](https://docs.railway.com/guides/cli) and run `railway login`
-
-### kora generate types
-
-Generate TypeScript types from your schema:
-
-```bash
-kora generate types
-# Output: kora/generated/types.ts
-```
-
-## Quick Start
-
-```bash
-npx create-kora-app@beta my-app
+npx create-kora-app@beta my-app   # or: kora create my-app
 cd my-app
 pnpm dev
 ```
 
-You'll have a working offline-first app in under 2 minutes.
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `kora create [name]` | Scaffold from a bundled template (React, Vue, Svelte, with or without Tailwind and sync, or Tauri desktop). Works offline. |
+| `kora dev` | Vite, the sync server (`server.ts` or a managed one from `kora.config.ts`) and the schema watcher. |
+| `kora migrate` | Diff the schema against its snapshot and write up/down SQL, an operation-transform stub and a manifest; `--apply` runs them on the configured server databases. |
+| `kora generate types` / `kora generate hooks` | Optional generated types and React hook stubs (types are already inferred from `defineSchema`). |
+| `kora doctor` | Check the project setup and the sync server. |
+| `kora status`, `kora logs` | A running server's status and live events. |
+| `kora backup create \| restore \| info` | Server backups. |
+| `kora compact` | Compact a local SQLite operation log after server acknowledgement. |
+| `kora deploy` | Build and deploy to Fly.io, Railway, AWS ECS or AWS Lightsail (`status`, `logs`, `rollback`). |
+| `kora studio` | Inspect a database, run a multi-device sync lab, or watch a live server. |
+| `kora agents-md` | Write an `AGENTS.md` with Kora's rules for AI coding agents. |
+
+Run `kora <command> --help` for options. The [CLI reference](https://korajs.dev/api/cli) documents
+every flag.
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.

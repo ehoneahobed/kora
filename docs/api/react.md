@@ -129,7 +129,7 @@ function useQuery<T = CollectionRecord>(
 
 ### Returns
 
-`readonly T[]` -- The records matching the query, the same array until the result changes. Returns an empty array if no records match, and during a server render or hydration.
+`readonly T[]`: the records matching the query, the same array until the result changes. Returns an empty array if no records match, and during a server render or hydration.
 
 The local query runs right after the component mounts, so the first render returns `[]` and the rows follow immediately. Use [`useQueryState`](#usequerystate) to distinguish "not loaded yet" (`ready: false`) from "no rows".
 
@@ -723,7 +723,7 @@ function useCollaborators(): AwarenessState[]
 
 ### Returns
 
-`AwarenessState[]` -- An array of awareness states for all connected remote users. Returns an empty array if no peers are connected or sync is not configured.
+`AwarenessState[]`: an array of awareness states for all connected remote users. Returns an empty array if no peers are connected or sync is not configured.
 
 #### AwarenessState
 

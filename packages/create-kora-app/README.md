@@ -1,36 +1,39 @@
 # create-kora-app
 
-Scaffold a new [Kora.js](https://github.com/ehoneahobed/kora) offline-first application.
-
-## Usage
+Scaffold a new [Kora.js](https://korajs.dev) offline-first application. Kora 1.0 is in beta, so use
+the `beta` tag (the `latest` tag is the older 0.x line):
 
 ```bash
 npx create-kora-app@beta my-app
 cd my-app
-pnpm install
 pnpm dev
 ```
 
+The CLI asks for the platform, framework, styling, sync and package manager, then installs the
+dependencies. `--yes` takes the recommended setup (`react-tailwind-sync`).
+
 ## Templates
 
-- **react-tailwind-sync** — React + Tailwind + sync server (recommended)
-- **react-tailwind** — React + Tailwind, local-only
-- **react-sync** — React + CSS + sync server
-- **react-basic** — React + CSS, local-only
+| Framework | Templates |
+|-----------|-----------|
+| React | `react-basic`, `react-sync`, `react-tailwind`, `react-tailwind-sync` |
+| Vue | `vue-basic`, `vue-sync`, `vue-tailwind`, `vue-tailwind-sync` |
+| Svelte | `svelte-basic`, `svelte-sync`, `svelte-tailwind`, `svelte-tailwind-sync` |
+| Desktop | `tauri-react` |
 
 ## Options
 
-```bash
-npx create-kora-app@beta my-app --template react-tailwind-sync --pm pnpm
-```
-
 | Option | Description |
 |--------|-------------|
-| `--template` | `react-tailwind-sync`, `react-tailwind`, `react-sync`, or `react-basic` |
-| `--pm` | Package manager: `pnpm`, `npm`, `yarn`, `bun` |
-| `--skip-install` | Skip dependency installation |
-| `--yes` / `-y` | Accept recommended defaults |
-| `--tailwind` / `--no-tailwind` | Choose Tailwind styling |
-| `--sync` / `--no-sync` | Choose sync-enabled template |
+| `--template <id>` | Use a template directly. |
+| `--platform web\|desktop-tauri` | Web or Tauri desktop. |
+| `--framework react\|vue\|svelte` | UI framework. |
+| `--tailwind` / `--no-tailwind` | Tailwind CSS or plain CSS. |
+| `--sync` / `--no-sync` | Include a sync server. |
+| `--db sqlite\|postgres`, `--db-provider <name>` | Database of the sync server. |
+| `--pm pnpm\|npm\|yarn\|bun` | Package manager. |
+| `--yes`, `-y` | Accept the defaults. |
+| `--skip-install` | Do not install dependencies. |
 
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.
+See [Getting Started](https://korajs.dev/getting-started) and the
+[CLI reference](https://korajs.dev/api/cli).

@@ -1,6 +1,6 @@
 # @korajs/svelte
 
-Svelte bindings for [Kora.js](https://github.com/ehoneahobed/kora) offline-first applications (Svelte 4 stores + Svelte 5 components).
+Svelte bindings for [Kora.js](https://korajs.dev) offline-first applications (Svelte 4 stores + Svelte 5 components).
 
 ## Install
 
@@ -12,6 +12,7 @@ pnpm add korajs@beta @korajs/svelte@beta
 
 Create the Kora app at module scope, connect sync after `ready`, then mount a root layout with provider components (matches the CLI `svelte-sync` template):
 
+<!-- docs-check: skip template excerpt: imports the project's own auth and schema modules -->
 ```typescript
 // main.ts
 import { createKoraAuthSync } from '@korajs/auth'
@@ -24,7 +25,7 @@ import koraWorkerUrl from './kora-worker.ts?worker&url'
 
 const kora = createKoraApp({
   schema,
-  sync: { url: 'ws://localhost:3000/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
+  sync: { url: 'ws://localhost:3001/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
   store: { workerUrl: koraWorkerUrl },
 })
 
@@ -54,7 +55,7 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 
 ## Queries
 
-### Static filters — readable store
+### Static filters: a readable store
 
 ```svelte
 <script lang="ts">
@@ -69,7 +70,7 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 {/each}
 ```
 
-### Reactive filters — `KoraQuery` component
+### Reactive filters: the `KoraQuery` component
 
 ```svelte
 <script lang="ts">
@@ -98,7 +99,7 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 | `createSyncStatusStore()` | Sync status readable store |
 | `getApp()` / `getCollection()` | Context accessors |
 | `createRichTextBinding()` / `useRichText()` | Yjs richtext editor binding |
-| `applyPresence(user)` | Set local presence — use in `$effect(() => applyPresence(user))` |
+| `applyPresence(user)` | Set local presence; use it in `$effect(() => applyPresence(user))` |
 | `createCollaboratorsStore()` | Remote collaborator awareness states |
 | `KoraQuery.svelte` | Descriptor-reactive query snippet |
 
