@@ -1069,9 +1069,14 @@ export class SyncEngine {
 
 	getStatus(): SyncStatusInfo {
 		const pendingOperations = this.computePendingCount()
+		const locked = this.isLockedSuspension()
 		const base = {
 			phase: this.resolvePhase(),
-			...(this.suspensionReason ? { reason: this.suspensionReason } : {}),
+			...(this.suspensionReason
+				? { reason: this.suspensionReason }
+				: locked
+					? { reason: 'encryption-locked' }
+					: {}),
 			reconnecting: this.reconnecting,
 			pendingOperations,
 			lastSyncedAt: this.lastSyncedAt,
@@ -1107,6 +1112,7 @@ export class SyncEngine {
 			blockedFailure: this.blockedFailure,
 		}
 		if (this.suspensionReason) return { ...base, status: 'auth-required' }
+		if (locked) return { ...base, status: 'encryption-locked' }
 		switch (this.state) {
 			case 'disconnected':
 				// A durable block outranks plain offline: the user must act
@@ -1132,8 +1138,19 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Sync is paused on a locked keyring (ENC-1): no session runs until the app unlocks
+	 * it. Reported as a suspension (`phase: 'suspended'`, `reason: 'encryption-locked'`,
+	 * `status: 'encryption-locked'`) rather than as plain offline, so the UI can ask for
+	 * the passphrase and `waitForSettled` reports why it cannot settle.
+	 */
+	private isLockedSuspension(): boolean {
+		return this.encryptionLocked && (this.state === 'disconnected' || this.state === 'error')
+	}
+
 	private resolvePhase(): import('../types').SyncPhase {
 		if (this.suspensionReason) return 'suspended'
+		if (this.isLockedSuspension()) return 'suspended'
 		if (this.blockedFailure || this.schemaBlocked || this.clockBlocked) return 'blocked'
 		if (this.hasInFlightDeliveryBatch) return 'applying'
 		if (this.inFlightUploads.size > 0) return 'uploading'

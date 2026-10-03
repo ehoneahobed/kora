@@ -31,6 +31,9 @@ export const SYNC_STATUSES = [
 	'error',
 	'schema-mismatch',
 	'auth-required',
+	// End-to-end encryption is on and this device's keyring is locked (ENC-1): sync is
+	// paused until `app.encryption.unlock(passphrase)`. Local reads and writes go on.
+	'encryption-locked',
 ] as const
 export type SyncStatus = (typeof SYNC_STATUSES)[number]
 

@@ -168,6 +168,17 @@ describe('ENC-1: shared key material through createApp', () => {
 		expect(locked.encryption?.getStatus().state).toBe('locked')
 		expect(suspended).toContain('encryption-locked')
 		expect(stored(row.id)).toHaveLength(0)
+		// useSyncStatus & co: a locked keyring is a suspension the user can act on (enter
+		// the passphrase), not a plain "offline".
+		expect(locked.getSyncEngine()?.getStatus()).toMatchObject({
+			status: 'encryption-locked',
+			phase: 'suspended',
+			reason: 'encryption-locked',
+		})
+		await expect(locked.sync?.waitForSettled({ timeoutMs: 1000 })).resolves.toMatchObject({
+			outcome: 'suspended',
+			reason: 'encryption-locked',
+		})
 
 		await expect(locked.encryption?.unlock('wrong')).resolves.toMatchObject({
 			code: 'AWAITING_SERVER',
