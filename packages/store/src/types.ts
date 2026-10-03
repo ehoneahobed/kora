@@ -34,6 +34,12 @@ export interface StorageOpenState {
 	fallbackReason?: StorageFallbackReason
 	/** OPFS pool that owns the database file (one pool per database), when known. */
 	poolName?: string
+	/**
+	 * SQLite journal mode the database actually runs with, when known (NEW-STORE-11).
+	 * OPFS (opfs-sahpool): `delete`, the rollback journal; WAL is not available on
+	 * that VFS. In-memory fallback: `memory`. Native better-sqlite3: `wal`.
+	 */
+	journalMode?: string
 }
 
 /**
