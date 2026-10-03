@@ -9,7 +9,9 @@ export type {
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,
+	UseQueryStateResult,
 	UseRichTextResult,
+	QueryInput,
 } from '@korajs/vue'
 
 export type { UseRichTextOptions } from '@korajs/vue'
@@ -25,6 +27,7 @@ export {
 	useKoraContext,
 	useMutation,
 	useQuery,
+	useQueryState,
 	useRichText,
 	useSyncStatus,
 	usePresence,

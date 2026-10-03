@@ -33,6 +33,13 @@ import {
 } from '../delta/delta-cursor'
 import { SyncMetricsCollector } from '../diagnostics/metrics-collector'
 import type { MetricsCollectorConfig } from '../diagnostics/metrics-collector'
+import type {
+	EncryptionKeyResponseMessage,
+	EncryptionKeyResponseStatus,
+} from '../encryption/key-messages'
+import type { WrappedKeyRecord } from '../encryption/key-record'
+import type { EncryptionKeyring, KeyServiceChannel, KeyServiceReply } from '../encryption/keyring'
+import { EncryptionKeyError } from '../encryption/keyring'
 import type { SyncEncryptor } from '../encryption/sync-encryptor'
 import type {
 	AcknowledgmentMessage,
@@ -208,6 +215,14 @@ export interface SyncEngineOptions {
 	 * before sending and decrypted after receiving. The server never sees plaintext data.
 	 */
 	encryptor?: SyncEncryptor
+	/**
+	 * End-to-end encryption keyring (ENC-1): the server-stored, passphrase-wrapped data
+	 * keys, opened during each handshake before any operation is exchanged. Takes the
+	 * place of `encryptor`. While it is locked, sync does not connect.
+	 */
+	keyring?: EncryptionKeyring
+	/** How long a key-service request may take before the session is retried (ms). */
+	keyServiceTimeoutMs?: number
 	/** Optional configuration for the metrics collector. */
 	metricsConfig?: MetricsCollectorConfig
 	/** Op-log backed sync state (last acked server vector, unsynced counts). */
@@ -251,6 +266,9 @@ const NON_TERMINAL_REJECTION_CODES: ReadonlySet<string> = new Set([
 	'NODE_ID_MISMATCH',
 	OUT_OF_UPLINK_SCOPE,
 ])
+/** Default deadline of one key-service request. */
+const DEFAULT_KEY_SERVICE_TIMEOUT_MS = 15_000
+
 function generateMessageId(): string {
 	return `msg-${Date.now()}-${nextMessageId++}`
 }
@@ -308,6 +326,21 @@ export class SyncEngine {
 	private readonly outboundRetryBaseDelayMs: number
 	private readonly outboundRetryMaxDelayMs: number
 	private readonly encryptor: SyncEncryptor | null
+	private readonly keyring: EncryptionKeyring | null
+	private readonly keyServiceTimeoutMs: number
+	/** Key-service requests awaiting their response, by request id. */
+	private readonly keyRequests = new Map<
+		string,
+		{
+			resolve: (message: EncryptionKeyResponseMessage) => void
+			reject: (error: Error) => void
+			timer: ReturnType<typeof setTimeout>
+		}
+	>()
+	/** Sync is paused because the encryption keyring is locked (ENC-1). */
+	private encryptionLocked = false
+	/** A key-record refresh for an unknown key version is running. */
+	private keyRefreshInFlight = false
 	private readonly awarenessManager: AwarenessManager
 	private readonly richtextDocChannel: RichtextDocChannel
 	private readonly blobChunkChannel: BlobChunkChannel
@@ -331,6 +364,8 @@ export class SyncEngine {
 	private authoritativeNodeIds: string[] | null = null
 	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
 	private serverProtocolVersion = 1
+	/** Whether any server answered a handshake (serverProtocolVersion is then real). */
+	private serverProtocolKnown = false
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -558,6 +593,8 @@ export class SyncEngine {
 			options.config.outboundRetryMaxDelayMs ?? DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS,
 		)
 		this.encryptor = options.encryptor ?? null
+		this.keyring = options.keyring ?? null
+		this.keyServiceTimeoutMs = options.keyServiceTimeoutMs ?? DEFAULT_KEY_SERVICE_TIMEOUT_MS
 		this.syncState = options.syncState ?? null
 		this.activeScope = options.config.scopeMap
 		this.activeUplinkScope = options.config.scopeMap
@@ -659,6 +696,14 @@ export class SyncEngine {
 			}
 		}
 		this.suspensionReason = null
+		if (this.keyring && !this.keyring.canConnect()) {
+			// Nothing to open the keyring with: sync stays paused (local reads and writes go
+			// on) until the app unlocks it. No connection, so no plaintext can leave.
+			this.encryptionLocked = true
+			this.emitter?.emit({ type: 'sync:suspended', reason: 'encryption-locked' })
+			return
+		}
+		this.encryptionLocked = false
 		// Each handshake reports the watermark of the REQUESTED view (SYNC-11). The server
 		// resumes from it only when it serves exactly the requested scope; when it serves
 		// another (it restarts that stream from 0), the response switches to that view.
@@ -801,7 +846,10 @@ export class SyncEngine {
 				versionVector: versionVectorToWire(localVector),
 				schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 				authToken,
-				supportedWireFormats: ['json', 'protobuf'],
+				// JSON only (SYNC-9): the transports frame with their own serializer, so a
+				// negotiated protobuf switch would never reach the wire. Protobuf stays an
+				// explicit, both-ends transport choice.
+				supportedWireFormats: ['json'],
 				...(this.config.scopeMap ? { syncScope: this.config.scopeMap } : {}),
 				...(this.config.scopeExit ? { scopeExitPolicy: this.config.scopeExit } : {}),
 				...(activeQuerySubsets.length > 0 ? { syncQueries: activeQuerySubsets } : {}),
@@ -1021,9 +1069,14 @@ export class SyncEngine {
 
 	getStatus(): SyncStatusInfo {
 		const pendingOperations = this.computePendingCount()
+		const locked = this.isLockedSuspension()
 		const base = {
 			phase: this.resolvePhase(),
-			...(this.suspensionReason ? { reason: this.suspensionReason } : {}),
+			...(this.suspensionReason
+				? { reason: this.suspensionReason }
+				: locked
+					? { reason: 'encryption-locked' }
+					: {}),
 			reconnecting: this.reconnecting,
 			pendingOperations,
 			lastSyncedAt: this.lastSyncedAt,
@@ -1033,6 +1086,9 @@ export class SyncEngine {
 			heldOperations: this.computeHeldCount(),
 			heldNodes: this.heldNodeInfos.map((node) => ({ ...node })),
 			localDurability: this.durabilityDegraded ? ('degraded' as const) : ('durable' as const),
+			serverProtocolVersion: this.serverProtocolKnown ? this.serverProtocolVersion : null,
+			protocolDeprecated:
+				this.serverProtocolKnown && this.serverProtocolVersion < SYNC_PROTOCOL_VERSION,
 			clockSkewMs: this.clockSkewMs,
 			inFlightUploadOperations: this.inFlightUploadCount(),
 			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
@@ -1056,6 +1112,7 @@ export class SyncEngine {
 			blockedFailure: this.blockedFailure,
 		}
 		if (this.suspensionReason) return { ...base, status: 'auth-required' }
+		if (locked) return { ...base, status: 'encryption-locked' }
 		switch (this.state) {
 			case 'disconnected':
 				// A durable block outranks plain offline: the user must act
@@ -1081,8 +1138,19 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Sync is paused on a locked keyring (ENC-1): no session runs until the app unlocks
+	 * it. Reported as a suspension (`phase: 'suspended'`, `reason: 'encryption-locked'`,
+	 * `status: 'encryption-locked'`) rather than as plain offline, so the UI can ask for
+	 * the passphrase and `waitForSettled` reports why it cannot settle.
+	 */
+	private isLockedSuspension(): boolean {
+		return this.encryptionLocked && (this.state === 'disconnected' || this.state === 'error')
+	}
+
 	private resolvePhase(): import('../types').SyncPhase {
 		if (this.suspensionReason) return 'suspended'
+		if (this.isLockedSuspension()) return 'suspended'
 		if (this.blockedFailure || this.schemaBlocked || this.clockBlocked) return 'blocked'
 		if (this.hasInFlightDeliveryBatch) return 'applying'
 		if (this.inFlightUploads.size > 0) return 'uploading'
@@ -1116,6 +1184,25 @@ export class SyncEngine {
 	 */
 	isClockBlocked(): boolean {
 		return this.clockBlocked
+	}
+
+	/**
+	 * True when sync is paused because the end-to-end encryption keyring is locked (no
+	 * passphrase, a wrong one, or a key record that must not be used). Local writes go
+	 * on and queue; `retryNow()` after an unlock resumes sync.
+	 */
+	isEncryptionLocked(): boolean {
+		return this.encryptionLocked
+	}
+
+	/**
+	 * The key service over the live sync session, for keyring management (rotation,
+	 * passphrase change, recovery). Null while not connected: those calls need the
+	 * server.
+	 */
+	getKeyServiceChannel(): KeyServiceChannel | null {
+		if (this.state !== 'syncing' && this.state !== 'streaming') return null
+		return this.liveKeyServiceChannel()
 	}
 
 	/** serverTime - localTime measured at the last handshake, or null before first connect. */
@@ -1209,6 +1296,7 @@ export class SyncEngine {
 	 */
 	async retryNow(): Promise<void> {
 		if (this.schemaBlocked) return
+		this.encryptionLocked = false
 		this.authRejected = false
 		this.suspensionReason = null
 		if (this.state === 'disconnected' || this.state === 'error') {
@@ -1692,6 +1780,17 @@ export class SyncEngine {
 		if (message.type === 'error' && isCredentialEndingCode(message.code)) {
 			this.credentialRefreshRequired = true
 		}
+		// A key-service answer resolves its request directly, outside the message chain:
+		// the handshake response awaits it inside the chain (ENC-1).
+		if (message.type === 'encryption-key-response' && message.requestId !== undefined) {
+			const pending = this.keyRequests.get(message.requestId)
+			if (pending) {
+				this.keyRequests.delete(message.requestId)
+				clearTimeout(pending.timer)
+				pending.resolve(message)
+				return
+			}
+		}
 		this.messageChain = this.messageChain
 			.then(() => this.handleMessageAsync(message))
 			.catch((error) => this.handleMessageFailure(error))
@@ -1725,6 +1824,141 @@ export class SyncEngine {
 			case 'blob-chunk-push':
 				this.blobChunkChannel.deliver(message)
 				break
+			case 'encryption-key-response':
+				// Unsolicited: another device of this user rotated keys or changed the
+				// passphrase. In the chain, so operations after it decrypt with the new key.
+				await this.handlePushedKeyRecord(message)
+				break
+		}
+	}
+
+	/** Adopt a key record the server pushed; stop the session if it locks the keyring. */
+	private async handlePushedKeyRecord(message: EncryptionKeyResponseMessage): Promise<void> {
+		if (!this.keyring || message.status !== 'ok' || message.record === null) return
+		if (message.keyring !== this.keyring.name) return
+		const before = this.keyring.getStatus().availableVersions.length
+		const outcome = await this.keyring.adoptPushed(message.record)
+		if (outcome === 'ready') {
+			// Operations that arrived under a key this device did not hold yet decrypt now.
+			if (this.keyring.getStatus().availableVersions.length > before) {
+				await this.replayQuarantine()
+			}
+			return
+		}
+		this.pauseForLockedKeyring()
+	}
+
+	/**
+	 * An operation sealed under a key version newer than any this device holds: another
+	 * device rotated keys and the server's push did not reach this session (another
+	 * server instance). Fetch the record once, then replay the quarantine in the chain.
+	 */
+	private maybeRefreshKeyring(op: Operation): void {
+		const keyring = this.keyring
+		const version = op.encrypted?.keyVersion
+		if (!keyring || version === undefined || this.keyRefreshInFlight) return
+		const held = keyring.getStatus().availableVersions
+		if (held.length === 0 || version <= Math.max(...held)) return
+		const channel = this.getKeyServiceChannel()
+		if (!channel) return
+		this.keyRefreshInFlight = true
+		void keyring
+			.synchronize(channel, this.sessionPrincipal ?? null)
+			.then((outcome) => {
+				if (outcome !== 'ready') {
+					this.pauseForLockedKeyring()
+					return
+				}
+				this.messageChain = this.messageChain
+					.then(async () => {
+						await this.replayQuarantine()
+					})
+					.catch((error) => this.handleMessageFailure(error))
+			})
+			.catch(() => {
+				// The next handshake opens the record again.
+			})
+			.finally(() => {
+				this.keyRefreshInFlight = false
+			})
+	}
+
+	/** End the session because the keyring is locked; no reconnect until unlocked. */
+	private pauseForLockedKeyring(): void {
+		this.encryptionLocked = true
+		this.emitter?.emit({ type: 'sync:suspended', reason: 'encryption-locked' })
+		this.abandonSession('End-to-end encryption is locked')
+	}
+
+	/** One key-service round trip over the live session. */
+	private keyServiceRequest(
+		request:
+			| { kind: 'fetch'; keyring: string }
+			| { kind: 'put'; keyring: string; record: WrappedKeyRecord; expectedRevision: number },
+	): Promise<KeyServiceReply> {
+		if (this.serverProtocolVersion < SYNC_PROTOCOL_VERSION) {
+			return Promise.reject(
+				new EncryptionKeyError(
+					'The sync server does not provide end-to-end encryption keys. Upgrade @korajs/server to 1.0.0-beta.13 or later.',
+					{ code: 'KEY_SERVICE_UNSUPPORTED' },
+				),
+			)
+		}
+		const requestId = generateMessageId()
+		const response = new Promise<EncryptionKeyResponseMessage>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.keyRequests.delete(requestId)
+				reject(
+					new EncryptionKeyError(
+						`The sync server did not answer a key request within ${this.keyServiceTimeoutMs}ms.`,
+						{ code: 'KEY_SERVICE_TIMEOUT' },
+					),
+				)
+			}, this.keyServiceTimeoutMs)
+			this.keyRequests.set(requestId, { resolve, reject, timer })
+		})
+		try {
+			this.transport.send(
+				request.kind === 'fetch'
+					? {
+							type: 'encryption-key-request',
+							messageId: generateMessageId(),
+							requestId,
+							keyring: request.keyring,
+						}
+					: {
+							type: 'encryption-key-put',
+							messageId: generateMessageId(),
+							requestId,
+							keyring: request.keyring,
+							record: request.record,
+							expectedRevision: request.expectedRevision,
+						},
+			)
+		} catch (error) {
+			const pending = this.keyRequests.get(requestId)
+			if (pending) {
+				clearTimeout(pending.timer)
+				this.keyRequests.delete(requestId)
+			}
+			return Promise.reject(error)
+		}
+		return response.then((message) => keyServiceReply(message))
+	}
+
+	/** Fail every pending key-service request (the session ended). */
+	private rejectKeyRequests(reason: string): void {
+		for (const [requestId, pending] of this.keyRequests) {
+			clearTimeout(pending.timer)
+			pending.reject(
+				new EncryptionKeyError(
+					`The sync session ended before the key service answered (${reason}).`,
+					{
+						code: 'KEY_SERVICE_DISCONNECTED',
+					},
+				),
+			)
+			this.keyRequests.delete(requestId)
 		}
 	}
 
@@ -1846,6 +2080,25 @@ export class SyncEngine {
 		}
 
 		this.serverProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		this.serverProtocolKnown = true
+
+		// Open the encryption keyring against the server's record BEFORE any operation is
+		// exchanged (ENC-1): inbound batches wait behind this in the message chain, and
+		// nothing is uploaded until it is unlocked with the user's shared keys.
+		if (this.keyring) {
+			const keySession = this.sessionEpoch
+			const outcome = await this.keyring.synchronize(
+				this.liveKeyServiceChannel(),
+				this.sessionPrincipal ?? null,
+			)
+			if (this.state !== 'handshaking' || this.sessionEpoch !== keySession) return
+			if (outcome !== 'ready') {
+				this.pauseForLockedKeyring()
+				return
+			}
+			// Operations quarantined while the keyring could not open them decrypt now.
+			await this.replayQuarantine()
+		}
 		if (Array.isArray(msg.authoritativeNodeIds)) {
 			// The union of every explicit id learned, never a replacement (RT-75): each
 			// server instance lists what it knows, and `kora:server:` ids are
@@ -2432,9 +2685,9 @@ export class SyncEngine {
 		}
 
 		let wireOperations = operations
-		if (this.encryptor) {
+		if (this.encryptionConfigured()) {
 			try {
-				wireOperations = await this.encryptor.encryptBatch(operations)
+				wireOperations = await this.requireEncryptor().encryptBatch(operations)
 			} catch (err) {
 				// Nothing was sent: return the batch so no data is lost.
 				if (this.inFlightUploads.get(entry.batch.batchId) === entry) this.returnUpload(entry)
@@ -2773,10 +3026,11 @@ export class SyncEngine {
 		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
 		// corrupted payload) is quarantined; the session and every other operation go on.
 		let op = delivered
-		if (this.encryptor && !this.isServerAuthoredCleartext(delivered)) {
+		if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(delivered)) {
 			try {
-				op = await this.encryptor.decryptOperation(delivered)
+				op = await this.requireEncryptor().decryptOperation(delivered)
 			} catch (error) {
+				this.maybeRefreshKeyring(delivered)
 				return quarantine(
 					delivered,
 					QUARANTINE_CODES.DECRYPT_FAILED,
@@ -3030,18 +3284,53 @@ export class SyncEngine {
 	 * (or an operation from any other node) still has to arrive sealed.
 	 */
 	private isServerAuthoredCleartext(op: Operation): boolean {
-		if (!this.encryptor || op.encrypted !== undefined) return false
+		const encryptor = this.activeEncryptor()
+		if (!encryptor || op.encrypted !== undefined) return false
 		// A server node: `kora:server:<id>` by prefix, or a legacy id the handshake listed.
 		if (!isAuthoritativeNodeId(op.nodeId, new Set(this.authoritativeNodeIds ?? []))) return false
-		return this.encryptor.isCleartextOnly(op)
+		return encryptor.isCleartextOnly(op)
+	}
+
+	/** Whether end-to-end encryption is configured (a keyring or a fixed encryptor). */
+	private encryptionConfigured(): boolean {
+		return this.keyring !== null || this.encryptor !== null
+	}
+
+	/** The encryptor in force: the unlocked keyring's, or the fixed one; null when locked. */
+	private activeEncryptor(): SyncEncryptor | null {
+		return this.keyring ? this.keyring.getEncryptor() : this.encryptor
+	}
+
+	/**
+	 * The encryptor in force. With encryption configured and the keyring locked this
+	 * throws: an operation is never sent or applied unencrypted because a key is missing.
+	 */
+	private requireEncryptor(): SyncEncryptor {
+		const encryptor = this.activeEncryptor()
+		if (!encryptor) {
+			throw new EncryptionKeyError(
+				'End-to-end encryption is locked: unlock it with the passphrase before syncing.',
+				{ code: 'ENCRYPTION_LOCKED' },
+			)
+		}
+		return encryptor
+	}
+
+	/** The key service over this session (the handshake has been accepted). */
+	private liveKeyServiceChannel(): KeyServiceChannel {
+		return {
+			fetch: (keyring) => this.keyServiceRequest({ kind: 'fetch', keyring }),
+			put: (keyring, record, expectedRevision) =>
+				this.keyServiceRequest({ kind: 'put', keyring, record, expectedRevision }),
+		}
 	}
 
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
 	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
 		let op = stored
-		if (this.encryptor && !this.isServerAuthoredCleartext(stored)) {
+		if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(stored)) {
 			try {
-				op = await this.encryptor.decryptOperation(stored)
+				op = await this.requireEncryptor().decryptOperation(stored)
 			} catch {
 				return false
 			}
@@ -4527,6 +4816,7 @@ export class SyncEngine {
 	}
 
 	private handleTransportClose(reason: string): void {
+		this.rejectKeyRequests(reason)
 		this.clearOutboundRetryTimer()
 		this.awarenessManager.stopCleanupTimer()
 		// Return in-flight batches to the queue: nothing unacknowledged is resolved.
@@ -4614,8 +4904,17 @@ export class SyncEngine {
 	private async recordOutOfUplinkScope(op: Operation): Promise<void> {
 		const uplink = this.activeUplinkScope
 		if (!uplink) return
+		// Local-only means the CLIENT leaves the collection out: its own scope map, or, with
+		// none, the schema's synced collections. A synced collection the server's grant
+		// omits is a refusal to surface, never a silent local fork (RT-89: a token-auth
+		// grant that named no collection dropped every write with status "synced").
+		const requested = this.config.scopeMap
 		const syncsCollection =
-			uplink[op.collection] !== undefined || this.activeScope?.[op.collection] !== undefined
+			uplink[op.collection] !== undefined ||
+			this.activeScope?.[op.collection] !== undefined ||
+			(requested !== undefined
+				? requested[op.collection] !== undefined
+				: (this.config.syncedCollections?.includes(op.collection) ?? false))
 		if (!syncsCollection) return
 
 		const message = `Operation on "${op.collection}" record "${op.recordId}" is outside this client's upload scope and was not sent to the server. The local change is not synced; roll it back or move the record back into scope.`
@@ -4792,4 +5091,21 @@ function resolveOperationTransforms(
 		}
 	}
 	return own
+}
+
+/** Map a key-service response to the keyring's reply, or the error it stands for. */
+function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply {
+	if (message.status === 'ok' || message.status === 'conflict') {
+		return { status: message.status, record: message.record }
+	}
+	const codes: Record<Exclude<EncryptionKeyResponseStatus, 'ok' | 'conflict'>, string> = {
+		forbidden: 'KEY_SERVICE_FORBIDDEN',
+		invalid: 'KEY_RECORD_REFUSED',
+		unsupported: 'KEY_SERVICE_UNSUPPORTED',
+		throttled: 'KEY_SERVICE_THROTTLED',
+	}
+	throw new EncryptionKeyError(
+		message.message ?? `The sync server refused the key request (${message.status}).`,
+		{ code: codes[message.status] },
+	)
 }

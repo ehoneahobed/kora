@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'vitest'
 import { FULL_SCHEMA, MINIMAL_SCHEMA } from '../../tests/fixtures/schemas'
 import { defineSchema } from './define'
-import { collectionIndexName, generateFullDDL, generateSQL } from './sql-gen'
+import {
+	collectionIndexName,
+	enumCheckConstraint,
+	generateFullDDL,
+	generateSQL,
+	sqlDefaultLiteral,
+	sqlStringLiteral,
+} from './sql-gen'
 import { t } from './types'
 
 describe('generateSQL', () => {
@@ -186,5 +193,43 @@ describe('generateFullDDL', () => {
 		expect(name(ab)).toBe('"idx_3_a_b_c"')
 		expect(name(a)).toBe('"idx_1_a_b_c"')
 		expect(collectionIndexName('a_b', 'c')).not.toBe(collectionIndexName('a', 'b_c'))
+	})
+})
+
+describe('SQL literals in DDL (SEC-9b)', () => {
+	test('sqlStringLiteral doubles single quotes and leaves backslashes alone', () => {
+		expect(sqlStringLiteral("don't")).toBe("'don''t'")
+		expect(sqlStringLiteral("''")).toBe("''''''")
+		expect(sqlStringLiteral('a\\b')).toBe("'a\\b'")
+	})
+
+	test('sqlDefaultLiteral quotes strings and JSON, maps non-finite numbers to NULL', () => {
+		expect(sqlDefaultLiteral("it's")).toBe("'it''s'")
+		expect(sqlDefaultLiteral(["o'k"])).toBe(`'["o''k"]'`)
+		expect(sqlDefaultLiteral({ a: "'" })).toBe(`'{"a":"''"}'`)
+		expect(sqlDefaultLiteral(1.5)).toBe('1.5')
+		expect(sqlDefaultLiteral(Number.POSITIVE_INFINITY)).toBe('NULL')
+		expect(sqlDefaultLiteral(true)).toBe('1')
+		expect(sqlDefaultLiteral(null)).toBe('NULL')
+	})
+
+	test('defaults and enum CHECKs with quotes cannot break out of the literal', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				notes: {
+					fields: {
+						status: t.string().default("x'); DROP TABLE notes; --"),
+						mood: t.enum(["it's fine", 'ok']).default("it's fine"),
+					},
+				},
+			},
+		})
+		const notes = schema.collections.notes
+		if (!notes) throw new Error('missing collection')
+		const create = generateSQL('notes', notes)[0] ?? ''
+		expect(create).toContain(`DEFAULT 'x''); DROP TABLE notes; --'`)
+		expect(create).toContain(`CHECK ("mood" IN ('it''s fine', 'ok'))`)
+		expect(enumCheckConstraint('m', ["a'b"])).toBe(`CHECK ("m" IN ('a''b'))`)
 	})
 })

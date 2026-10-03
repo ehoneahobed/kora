@@ -200,6 +200,8 @@ function timelineLabel(event: KoraEvent): string {
 			return 'sync auth failed'
 		case 'sync:suspended':
 			return `sync suspended (${event.reason})`
+		case 'encryption:status':
+			return `encryption ${event.status.state}${event.status.code ? ` (${event.status.code})` : ''}`
 		case 'sync:clock-skew':
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
 		case 'sync:node-id-rotated':
@@ -242,6 +244,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `query invalidated ${event.queryId}`
 		case 'query:executed':
 			return `query executed ${event.queryId}`
+		case 'query:error':
+			return `query error ${event.collection} (${event.phase}): ${event.message}`
+		case 'storage:persistence':
+			return `storage persistence ${event.state}: ${event.persisted ? 'persisted' : 'best-effort'}`
 		case 'connection:quality':
 			return `connection ${event.quality}`
 		case 'sync:diagnostics':

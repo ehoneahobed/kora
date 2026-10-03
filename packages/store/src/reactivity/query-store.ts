@@ -20,6 +20,7 @@ export class QueryStore<T = CollectionRecord> {
 	private unsubscribeQuery: (() => void) | null = null
 	private active = false
 	private hasEmittedSnapshot = false
+	private error: Error | null = null
 	private readonly queryBuilder: QueryBuilder<T>
 
 	constructor(queryBuilder: QueryBuilder<T>) {
@@ -59,22 +60,44 @@ export class QueryStore<T = CollectionRecord> {
 		return this.hasEmittedSnapshot
 	}
 
+	/**
+	 * The latest query failure, or null. Set when the query (or a re-run after a
+	 * write) fails; cleared by the next successful delivery. Listeners are notified
+	 * on both transitions, so bindings read it next to `getSnapshot()`.
+	 */
+	getError = (): Error | null => {
+		return this.error
+	}
+
 	/** Tear down listeners and the underlying query subscription. */
 	destroy(): void {
 		this.stopSubscription()
 		this.listeners.clear()
 		this.snapshot = EMPTY_ARRAY as readonly T[]
 		this.hasEmittedSnapshot = false
+		this.error = null
 	}
 
 	private startSubscription(): void {
 		this.active = true
-		this.unsubscribeQuery = this.queryBuilder.subscribe((results: readonly T[]) => {
-			if (!this.active) return
-			this.hasEmittedSnapshot = true
-			this.snapshot = Object.freeze([...results])
-			this.notifyListeners()
-		})
+		this.unsubscribeQuery = this.queryBuilder.subscribe(
+			(results: readonly T[]) => {
+				if (!this.active) return
+				this.hasEmittedSnapshot = true
+				this.error = null
+				this.snapshot = Object.freeze([...results])
+				this.notifyListeners()
+			},
+			{
+				// STORE-12: the failure reaches bindings as error state; the last
+				// snapshot stays readable and the next success clears the error.
+				onError: (failure) => {
+					if (!this.active) return
+					this.error = failure.error
+					this.notifyListeners()
+				},
+			},
+		)
 	}
 
 	private stopSubscription(): void {

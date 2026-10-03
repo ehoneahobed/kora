@@ -21,6 +21,7 @@ describe('getEventCategory', () => {
 			'sync:apply-recovered': 'sync',
 			'sync:apply-abandoned': 'sync',
 			'sync:clock-skew': 'sync',
+			'encryption:status': 'sync',
 			'sync:node-id-rotated': 'sync',
 			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',
@@ -58,6 +59,8 @@ describe('getEventCategory', () => {
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',
 			'query:executed': 'query',
+			'query:error': 'query',
+			'storage:persistence': 'connection',
 			'connection:quality': 'connection',
 		}
 

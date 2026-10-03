@@ -1024,6 +1024,7 @@ function parseStorageOpenState(data: unknown): StorageOpenState | null {
 		persistent?: boolean
 		fallbackReason?: StorageFallbackReason
 		poolName?: string
+		journalMode?: string
 	}
 	if (typeof mode.persistent !== 'boolean') {
 		return null
@@ -1033,5 +1034,6 @@ function parseStorageOpenState(data: unknown): StorageOpenState | null {
 		mode: mode.persistent ? 'opfs' : 'memory',
 		...(mode.fallbackReason ? { fallbackReason: mode.fallbackReason } : {}),
 		...(typeof mode.poolName === 'string' ? { poolName: mode.poolName } : {}),
+		...(typeof mode.journalMode === 'string' ? { journalMode: mode.journalMode } : {}),
 	}
 }

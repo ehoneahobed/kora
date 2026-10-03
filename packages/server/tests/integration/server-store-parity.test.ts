@@ -2,7 +2,8 @@ import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
-import { describe, expect, test } from 'vitest'
+import postgres from 'postgres'
+import { afterAll, describe, expect, test } from 'vitest'
 import { applyServerOperation } from '../../src/apply/apply-server-operation'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createPostgresServerStore } from '../../src/store/postgres-server-store'
@@ -205,13 +206,31 @@ describe('server store parity', () => {
 		return new SqliteServerStore(drizzle(sqlite), 'parity-sqlite')
 	})
 
-	const postgresUrl = process.env.DATABASE_URL
+	// Live Postgres, like every other Postgres test: KORA_PG_TEST_URL (DATABASE_URL is
+	// accepted for older setups). Each store gets its own fresh schema, so runs never see
+	// each other's rows, and the schemas are dropped afterwards (RT-30).
+	const postgresUrl = process.env.KORA_PG_TEST_URL ?? process.env.DATABASE_URL
 	describe.skipIf(!postgresUrl)('postgres (live)', () => {
-		runSharedStoreParityTests('postgres', async () =>
-			createPostgresServerStore({
-				connectionString: postgresUrl as string,
+		const url = postgresUrl as string
+		const schemas: string[] = []
+		afterAll(async () => {
+			const admin = postgres(url, { max: 1, onnotice: () => {} })
+			for (const name of schemas) await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+			await admin.end()
+		})
+		runSharedStoreParityTests('postgres', async () => {
+			const name = `kora_parity_${process.pid}_${schemas.length + 1}`
+			schemas.push(name)
+			const admin = postgres(url, { max: 1, onnotice: () => {} })
+			await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+			await admin.unsafe(`CREATE SCHEMA ${name}`)
+			await admin.end()
+			const scoped = new URL(url)
+			scoped.searchParams.set('search_path', name)
+			return createPostgresServerStore({
+				connectionString: scoped.toString(),
 				nodeId: 'parity-postgres',
-			}),
-		)
+			})
+		})
 	})
 })

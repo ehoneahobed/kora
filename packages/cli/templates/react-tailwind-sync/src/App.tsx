@@ -1,5 +1,4 @@
 import { useAuth } from '@korajs/auth/react'
-import { useSyncStatus } from '@korajs/react'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -12,6 +11,7 @@ import {
 	WifiOff,
 } from 'lucide-react'
 import { useState } from 'react'
+import { useSyncStatus } from './kora'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'

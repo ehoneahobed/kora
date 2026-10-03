@@ -130,11 +130,21 @@ export function resolveSessionScopeGrant(
 		// A grant value of undefined/null (a failed lookup) would match every record
 		// lacking the field: refuse it rather than widen the grant (RT-8).
 		assertScopeValuesDefined(explicit)
-		grant = { ...explicit }
-		if (claims && schema) {
-			const derived = bindClaimsToSchema(schema, claims, denied)
-			for (const [collection, predicate] of Object.entries(derived)) {
-				if (!(collection in grant)) grant[collection] = predicate
+		if (!schema && claims && Object.keys(explicit).length === 0) {
+			// RT-89: verified claims alone (TokenAuthProvider without explicit scopes) bind to
+			// schema-scoped collections, and a schemaless server has none it knows of. Such a
+			// grant names no collection, so it is no grant at all: "unscoped", exactly like an
+			// absent grant on a schemaless server. Treating it as an EMPTY grant hid every
+			// collection from the session and refused every upload.
+			grant = undefined
+			warnSchemalessClaims()
+		} else {
+			grant = { ...explicit }
+			if (claims && schema) {
+				const derived = bindClaimsToSchema(schema, claims, denied)
+				for (const [collection, predicate] of Object.entries(derived)) {
+					if (!(collection in grant)) grant[collection] = predicate
+				}
 			}
 		}
 	} else if (options.authenticated) {
@@ -252,6 +262,20 @@ function withoutReservedKeys(scopes: ScopeMap): ScopeMap {
 		result[collection] = { ...(predicate ?? {}) }
 	}
 	return result
+}
+
+let warnedSchemalessClaims = false
+
+function warnSchemalessClaims(): void {
+	if (warnedSchemalessClaims) return
+	warnedSchemalessClaims = true
+	console.warn(
+		'[kora] The auth provider returned verified claims but no sync scopes, and this sync ' +
+			'server has no schema, so the claims cannot be bound to any collection: sessions sync ' +
+			'unscoped (each client chooses its own scope). Give the server store your schema ' +
+			'(await store.setSchema(schema)) to bind them, ' +
+			'or return explicit `scopes` from the auth provider.',
+	)
 }
 
 function warnDenied(denied: DeniedScopeCollection[]): void {

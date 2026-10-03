@@ -13,6 +13,7 @@ export interface KoraBindingSyncStatus {
 		| 'schema-mismatch'
 		| 'clock-error'
 		| 'auth-required'
+		| 'encryption-locked'
 	reconnecting: boolean
 	pendingOperations: number
 	lastSyncedAt: number | null

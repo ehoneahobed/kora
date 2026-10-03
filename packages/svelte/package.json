@@ -38,10 +38,8 @@
   },
   "files": [
     "dist",
-    "src/components/KoraQuery.svelte",
-    "src/components/KoraRichText.svelte",
-    "src/components/KoraProvider.svelte",
-    "src/components/KoraStoreProvider.svelte"
+    "src",
+    "!src/**/*.test.ts"
   ],
   "scripts": {
     "build": "tsup && node scripts/build-components.mjs",

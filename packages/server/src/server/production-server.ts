@@ -9,6 +9,7 @@ import {
 	resolvePerMessageDeflate,
 } from './kora-sync-server'
 import type { ProductionHttpRouteContext } from './route-context'
+import { createStaticFileHandler } from './static-files'
 import { type TrustProxySetting, resolveClientIp } from './trust-proxy'
 
 /**
@@ -146,22 +147,6 @@ export interface ProductionServer {
 	 * @returns Every live blob reference the server can currently see.
 	 */
 	getLiveBlobRefs(): Promise<BlobRef[]>
-}
-
-// MIME types for static file serving
-const MIME_TYPES: Record<string, string> = {
-	'.html': 'text/html',
-	'.js': 'text/javascript',
-	'.css': 'text/css',
-	'.json': 'application/json',
-	'.png': 'image/png',
-	'.jpg': 'image/jpeg',
-	'.svg': 'image/svg+xml',
-	'.ico': 'image/x-icon',
-	'.wasm': 'application/wasm',
-	'.woff': 'font/woff',
-	'.woff2': 'font/woff2',
-	'.map': 'application/json',
 }
 
 /**
@@ -438,11 +423,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 		async start(): Promise<string> {
 			const { createServer } = await import('node:http')
-			const { createReadStream, existsSync, statSync } = await import('node:fs')
-			const { extname, join, resolve } = await import('node:path')
 			const { WebSocketServer } = await import('ws')
 
-			const distDir = resolve(staticDir)
+			const serveStatic = createStaticFileHandler(staticDir)
 
 			httpServer = createServer(async (req, res) => {
 				try {
@@ -642,42 +625,8 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					return
 				}
 
-				// ── Static file serving ───────────────────────────────────────
-				let filePath = join(distDir, url.pathname)
-
-				// SPA fallback: serve index.html for non-file routes
-				if (!extname(filePath)) {
-					const indexPath = join(filePath, 'index.html')
-					if (existsSync(indexPath)) {
-						filePath = indexPath
-					} else {
-						filePath = join(distDir, 'index.html')
-					}
-				}
-
-				if (!existsSync(filePath)) {
-					filePath = join(distDir, 'index.html')
-				}
-
-				try {
-					const stat = statSync(filePath)
-					if (stat.isDirectory()) {
-						filePath = join(filePath, 'index.html')
-					}
-				} catch {
-					filePath = join(distDir, 'index.html')
-				}
-
-				if (!existsSync(filePath)) {
-					res.writeHead(404)
-					res.end('Not Found')
-					return
-				}
-
-				const ext = extname(filePath)
-				const contentType = MIME_TYPES[ext] || 'application/octet-stream'
-				res.writeHead(200, { 'Content-Type': contentType })
-				createReadStream(filePath).pipe(res)
+				// ── Static file serving (NEW-SRV-8) ───────────────────────────
+				await serveStatic(req, res, url.pathname)
 			}
 
 			const wss = new WebSocketServer({

@@ -9,7 +9,7 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, quoteIdent } from '@korajs/core'
+import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -290,6 +290,11 @@ export class PostgresServerStore implements ServerStore {
 		})
 		this.timeSource = timeSource ?? { now: () => Date.now() }
 		this.ready = this.initialize()
+		// RT-88: startup runs before anyone awaits it. The failure is not swallowed: every
+		// method awaits `ready` and rejects with it, `whenReady()` returns it, and
+		// createPostgresServerStore awaits it. Without this handler an unreachable
+		// database would be an unhandled rejection, which terminates Node.
+		this.ready.catch(() => {})
 	}
 
 	/** Resolves once the store's tables and identity are loaded. */
@@ -1527,6 +1532,41 @@ export class PostgresServerStore implements ServerStore {
 		return { wallTime: row.wallTime, logical: row.logical, nodeId: row.timestampNodeId }
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+		)) as unknown as { record: string }[]
+		return rows[0]?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		const now = Date.now()
+		// One statement each, atomic on the (owner, keyring) primary key: concurrent writes
+		// from any number of server instances have exactly one winner.
+		const rows = (expectedRevision === 0
+			? await this.db.execute(
+					sql`INSERT INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+							VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now})
+							ON CONFLICT (owner, keyring) DO NOTHING RETURNING owner`,
+				)
+			: await this.db.execute(
+					sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+							WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+							RETURNING owner`,
+				)) as unknown as { owner: string }[]
+		return rows.length > 0
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		await this.ready
@@ -2515,6 +2555,19 @@ export class PostgresServerStore implements ServerStore {
 				)
 			`)
 
+			// Wrapped end-to-end encryption key records (ENC-1, D4b): salt, KDF parameters
+			// and wrapped keys per (owner, keyring). Never a usable key.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_encryption_keys (
+					owner TEXT NOT NULL,
+					keyring TEXT NOT NULL,
+					revision BIGINT NOT NULL,
+					record TEXT NOT NULL,
+					updated_at BIGINT NOT NULL,
+					PRIMARY KEY (owner, keyring)
+				)
+			`)
+
 			// Node id -> principal binding (see claimNode). One row per device node id.
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS node_claims (
@@ -2803,36 +2856,88 @@ export async function createPostgresServerStore(
 	const client = postgresClient(options.connectionString)
 	const db = drizzleFn(client)
 
-	return new PostgresServerStore(db, options.nodeId, undefined, {
+	const store = new PostgresServerStore(db, options.nodeId, undefined, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
 		...(options.revokedAuthoritativeNodeIds
 			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
 			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
+	// RT-88: fail at startup, where the caller awaits, rather than on the first sync.
+	try {
+		await store.whenReady()
+	} catch (error) {
+		await endPostgresClient(client)
+		throw new ServerStoreUnavailableError(options.connectionString, error)
+	}
+	return store
+}
+
+/**
+ * The Postgres server store could not start: the database is unreachable, refused the
+ * credentials, or its tables could not be created. `cause` is the driver's error.
+ */
+export class ServerStoreUnavailableError extends KoraError {
+	constructor(connectionString: string, cause: unknown) {
+		const reason = cause instanceof Error ? cause.message : String(cause)
+		super(
+			`Could not start the PostgreSQL server store (${redactConnectionString(connectionString)}): ${reason}. Check that the database is running and reachable, and that the connection string and credentials are correct.`,
+			'SERVER_STORE_UNAVAILABLE',
+			{ target: redactConnectionString(connectionString) },
+		)
+		this.name = 'ServerStoreUnavailableError'
+		;(this as { cause?: unknown }).cause = cause
+	}
+}
+
+/** host:port/database of a connection string, never its credentials. */
+function redactConnectionString(connectionString: string): string {
+	try {
+		const url = new URL(connectionString)
+		return `${url.hostname}${url.port ? `:${url.port}` : ''}${url.pathname}`
+	} catch {
+		return 'invalid connection string'
+	}
+}
+
+async function endPostgresClient(client: unknown): Promise<void> {
+	const end = (client as { end?: (options?: { timeout?: number }) => Promise<void> }).end
+	if (typeof end !== 'function') return
+	try {
+		await end.call(client, { timeout: 0 })
+	} catch {
+		// Best effort: the startup error above is the one that matters.
+	}
 }
 
 async function loadPostgresDeps(): Promise<{
 	postgresClient: (connectionString: string) => unknown
 	drizzleFn: (client: unknown) => PostgresJsDatabase
 }> {
+	// `postgres` is an optional peer: imported only when this backend is used. The
+	// specifiers come from an array so no bundler resolves them at build time (an app
+	// without `postgres` must still bundle), and the import is a real `import()` so it runs
+	// inside vitest's module runner too. A `new Function('return import(x)')` wrapper did
+	// neither reliably: it escaped vitest's VM (RT-30) and hid the real error.
+	const [postgresSpecifier, drizzleSpecifier] = POSTGRES_DRIVER_SPECIFIERS
+	let postgresMod: { default: (cs: string) => unknown }
+	let drizzleMod: { drizzle: (client: unknown) => PostgresJsDatabase }
 	try {
-		const dynamicImport = new Function('specifier', 'return import(specifier)') as (
-			specifier: string,
-		) => Promise<unknown>
-
-		const postgresMod = (await dynamicImport('postgres')) as { default: (cs: string) => unknown }
-		const drizzleMod = (await dynamicImport('drizzle-orm/postgres-js')) as {
-			drizzle: (client: unknown) => PostgresJsDatabase
-		}
-
-		return {
-			postgresClient: postgresMod.default,
-			drizzleFn: drizzleMod.drizzle,
-		}
-	} catch {
+		postgresMod = (await import(/* @vite-ignore */ postgresSpecifier)) as typeof postgresMod
+		drizzleMod = (await import(/* @vite-ignore */ drizzleSpecifier)) as typeof drizzleMod
+	} catch (error) {
 		throw new Error(
-			'PostgreSQL backend requires the "postgres" package. Install it in your project dependencies.',
+			`PostgreSQL backend requires the "postgres" package. Install it in your project dependencies. (${error instanceof Error ? error.message : String(error)})`,
 		)
 	}
+	return {
+		postgresClient: postgresMod.default,
+		drizzleFn: drizzleMod.drizzle,
+	}
 }
+
+/** Optional driver modules, loaded on first use of the Postgres backend. */
+const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
+	'postgres',
+	'drizzle-orm/postgres-js',
+]

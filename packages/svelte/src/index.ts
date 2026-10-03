@@ -4,6 +4,7 @@ export type {
 	KoraContextValue,
 	UseMutationOptions,
 	UseMutationResult,
+	QueryState,
 	UseQueryOptions,
 	UseRichTextResult,
 } from './types'
@@ -16,7 +17,13 @@ export {
 	setKoraContext,
 } from './context'
 
-export { createQueryStore, useQuery } from './stores/query-store'
+export {
+	createQueryStateStore,
+	createQueryStore,
+	useQuery,
+	useQueryState,
+} from './stores/query-store'
+export type { QueryInput } from './stores/query-store'
 export { createMutation, useMutation } from './composables/use-mutation'
 export { createSyncStatusStore, useSyncStatus } from './composables/use-sync-status'
 export { getApp, useApp } from './composables/use-app'

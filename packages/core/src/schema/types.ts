@@ -1,11 +1,82 @@
 import { SchemaValidationError } from '../errors/errors'
 import type {
+	BlobRef,
 	FieldDescriptor,
 	FieldKind,
 	FieldMergeStrategy,
 	SecretMode,
 	TransitionMap,
 } from '../types'
+import type { FieldKindToType } from './infer'
+
+/**
+ * A value a `t.richtext()` field accepts on write: a plain string (stored as a fresh
+ * Yjs document holding that text) or Yjs update bytes. Reads always return the Yjs
+ * update bytes (`Uint8Array`).
+ */
+export type RichtextInput = string | Uint8Array | ArrayBuffer
+
+/**
+ * Compile-time description of a field, carried by every {@link FieldBuilder} under the
+ * `'~field'` key. It exists only in the type system (the property is `declare`d, so it is
+ * never present at runtime) and is what makes builders structurally distinct:
+ * `t.string()` and `t.string().optional()` are different types, so inference can tell a
+ * required field from an optional one.
+ */
+export interface FieldTypeInfo<
+	Kind extends FieldKind,
+	Req extends boolean,
+	Auto extends boolean,
+	Output,
+	Input,
+> {
+	/** The field kind. */
+	readonly kind: Kind
+	/** Whether the developer must provide the field on insert. */
+	readonly required: Req
+	/** Whether the framework fills the field (it cannot be written). */
+	readonly auto: Auto
+	/** The type a read returns for the field (before nullability). */
+	readonly output: Output
+	/** The type a write accepts for the field (before optionality). */
+	readonly input: Input
+}
+
+/**
+ * The value types of each scalar field kind: what a read returns. `timestamp` is integer
+ * milliseconds since the epoch (a `Date` is not accepted; use `date.getTime()`).
+ */
+export interface ScalarKindToType {
+	string: string
+	number: number
+	boolean: boolean
+	timestamp: number
+	richtext: Uint8Array
+	blob: BlobRef
+	secret: string
+}
+
+/** The type a scalar field kind accepts on write. */
+export interface ScalarKindToInput {
+	string: string
+	number: number
+	boolean: boolean
+	timestamp: number
+	richtext: RichtextInput
+	blob: BlobRef
+	secret: string
+}
+
+/** A scalar field kind: one whose builder is a plain {@link FieldBuilder}. */
+export type ScalarFieldKind = keyof ScalarKindToType
+
+/** The read type a field kind has when its builder declares nothing more specific. */
+export type DefaultFieldOutput<Kind extends FieldKind> = FieldKindToType[Kind]
+
+/** The write type a field kind has when its builder declares nothing more specific. */
+export type DefaultFieldInput<Kind extends FieldKind> = Kind extends 'richtext'
+	? RichtextInput
+	: FieldKindToType[Kind]
 
 /**
  * Base field builder implementing the builder pattern for schema field definitions.
@@ -15,6 +86,10 @@ import type {
  * - Kind: the field kind ('string', 'number', etc.)
  * - Req: whether the field is required (true = required on insert)
  * - Auto: whether the field is auto-populated (true = excluded from insert input)
+ * - Output: the type a read returns
+ * - Input: the type a write accepts (differs from Output only for richtext)
+ *
+ * A bare `FieldBuilder` (no type arguments) means "any field builder".
  *
  * @example
  * ```typescript
@@ -26,9 +101,18 @@ import type {
  */
 export class FieldBuilder<
 	Kind extends FieldKind = FieldKind,
-	Req extends boolean = true,
-	Auto extends boolean = false,
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+	Output = DefaultFieldOutput<Kind>,
+	Input = Kind extends 'richtext' ? DefaultFieldInput<Kind> : Output,
 > {
+	/**
+	 * Type-only brand (never present at runtime). It makes the builder's kind,
+	 * requiredness, auto flag and value types part of its structure, which is what
+	 * schema inference reads.
+	 */
+	declare readonly '~field': FieldTypeInfo<Kind, Req, Auto, Output, Input>
+
 	protected readonly _kind: Kind
 	protected readonly _required: boolean
 	protected readonly _defaultValue: unknown
@@ -37,30 +121,36 @@ export class FieldBuilder<
 
 	constructor(
 		kind: Kind,
-		required = true as unknown as Req,
+		required = true,
 		defaultValue: unknown = undefined,
-		auto = false as unknown as Auto,
+		auto = false,
 		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
 		this._kind = kind
-		this._required = required as unknown as boolean
+		this._required = required
 		this._defaultValue = defaultValue
-		this._auto = auto as unknown as boolean
+		this._auto = auto
 		this._mergeStrategy = mergeStrategy
 	}
 
-	/** Mark this field as optional (not required on insert) */
-	optional(): FieldBuilder<Kind, false, Auto> {
+	/** Mark this field as optional (not required on insert; reads may return `null`). */
+	optional(): FieldBuilder<Kind, false, Auto, Output, Input> {
 		return new FieldBuilder(this._kind, false, this._defaultValue, this._auto, this._mergeStrategy)
 	}
 
-	/** Set a default value for this field. Implicitly makes the field optional. */
-	default(value: unknown): FieldBuilder<Kind, false, Auto> {
+	/**
+	 * Set a default value for this field. Implicitly makes the field optional on insert.
+	 * The value must be of the field's type (`t.number().default('x')` is a type error).
+	 */
+	default(value: Input): FieldBuilder<Kind, false, Auto, Output, Input> {
 		return new FieldBuilder(this._kind, false, value, this._auto, this._mergeStrategy)
 	}
 
-	/** Mark this field as auto-populated (e.g., createdAt timestamps). Developers cannot set auto fields. */
-	auto(): FieldBuilder<Kind, false, true> {
+	/**
+	 * Mark this field as auto-populated (e.g., createdAt timestamps). Developers cannot
+	 * set auto fields; the framework fills `t.timestamp().auto()` with the insert time.
+	 */
+	auto(): FieldBuilder<Kind, false, true, Output, Input> {
 		return new FieldBuilder(this._kind, false, undefined, true, this._mergeStrategy)
 	}
 
@@ -77,23 +167,17 @@ export class FieldBuilder<
 	 *   - `'append-only'`: Concatenate additions (for arrays)
 	 *   - `'server-authoritative'`: Always prefer the remote/server value
 	 */
-	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto> {
-		return new FieldBuilder(
-			this._kind,
-			this._required as unknown as Req,
-			this._defaultValue,
-			this._auto as unknown as Auto,
-			strategy,
-		)
+	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto, Output, Input> {
+		return new FieldBuilder(this._kind, this._required, this._defaultValue, this._auto, strategy)
 	}
 
 	/** @internal Build the final FieldDescriptor. Used by defineSchema(). */
 	_build(): FieldDescriptor {
 		return {
 			kind: this._kind,
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
@@ -108,17 +192,17 @@ export class FieldBuilder<
  */
 export class EnumFieldBuilder<
 	Values extends readonly string[] = readonly string[],
-	Req extends boolean = true,
-	Auto extends boolean = false,
-> extends FieldBuilder<'enum', Req, Auto> {
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+> extends FieldBuilder<'enum', Req, Auto, Values[number]> {
 	private readonly _enumValues: Values
 	private readonly _transitions: TransitionMap | null
 
 	constructor(
 		values: Values,
-		required = true as unknown as Req,
+		required = true,
 		defaultValue: unknown = undefined,
-		auto = false as unknown as Auto,
+		auto = false,
 		mergeStrategy: FieldMergeStrategy | null = null,
 		transitions: TransitionMap | null = null,
 	) {
@@ -163,9 +247,9 @@ export class EnumFieldBuilder<
 	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto> {
 		return new EnumFieldBuilder(
 			this._enumValues,
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			strategy,
 			this._transitions,
 		)
@@ -210,9 +294,9 @@ export class EnumFieldBuilder<
 		}
 		return new EnumFieldBuilder(
 			this._enumValues,
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			this._mergeStrategy,
 			map as TransitionMap,
 		)
@@ -221,9 +305,9 @@ export class EnumFieldBuilder<
 	override _build(): FieldDescriptor {
 		return {
 			kind: 'enum',
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: this._enumValues,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
@@ -232,31 +316,41 @@ export class EnumFieldBuilder<
 	}
 }
 
+/** The read type of the values a field builder holds (before nullability). */
+export type FieldOutput<F> = F extends { readonly '~field': { readonly output: infer O } }
+	? O
+	: unknown
+
+/** The write type a field builder accepts (before optionality). */
+export type FieldInput<F> = F extends { readonly '~field': { readonly input: infer I } }
+	? I
+	: unknown
+
 /**
- * Field builder for array fields with a typed item kind.
- * Preserves the item kind type parameter for inference.
+ * Field builder for array fields. Carries the item builder's type, so
+ * `t.array(t.enum(['a', 'b']))` infers `('a' | 'b')[]`.
  */
 export class ArrayFieldBuilder<
-	ItemKind extends FieldKind = FieldKind,
-	Req extends boolean = true,
-	Auto extends boolean = false,
-> extends FieldBuilder<'array', Req, Auto> {
-	private readonly _itemKind: ItemKind
+	Item extends FieldBuilder = FieldBuilder,
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+> extends FieldBuilder<'array', Req, Auto, FieldOutput<Item>[], FieldInput<Item>[]> {
+	private readonly _item: Item
 
 	constructor(
-		itemBuilder: FieldBuilder<ItemKind>,
-		required = true as unknown as Req,
+		itemBuilder: Item,
+		required = true,
 		defaultValue: unknown = undefined,
-		auto = false as unknown as Auto,
+		auto = false,
 		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
 		super('array', required, defaultValue, auto, mergeStrategy)
-		this._itemKind = itemBuilder._build().kind as ItemKind
+		this._item = itemBuilder
 	}
 
-	override optional(): ArrayFieldBuilder<ItemKind, false, Auto> {
+	override optional(): ArrayFieldBuilder<Item, false, Auto> {
 		return new ArrayFieldBuilder(
-			new FieldBuilder(this._itemKind),
+			this._item,
 			false,
 			this._defaultValue,
 			this._auto,
@@ -264,32 +358,20 @@ export class ArrayFieldBuilder<
 		)
 	}
 
-	override default(value: unknown[]): ArrayFieldBuilder<ItemKind, false, Auto> {
-		return new ArrayFieldBuilder(
-			new FieldBuilder(this._itemKind),
-			false,
-			value,
-			this._auto,
-			this._mergeStrategy,
-		)
+	override default(value: FieldInput<Item>[]): ArrayFieldBuilder<Item, false, Auto> {
+		return new ArrayFieldBuilder(this._item, false, value, this._auto, this._mergeStrategy)
 	}
 
-	override auto(): ArrayFieldBuilder<ItemKind, false, true> {
-		return new ArrayFieldBuilder(
-			new FieldBuilder(this._itemKind),
-			false,
-			undefined,
-			true,
-			this._mergeStrategy,
-		)
+	override auto(): ArrayFieldBuilder<Item, false, true> {
+		return new ArrayFieldBuilder(this._item, false, undefined, true, this._mergeStrategy)
 	}
 
-	override merge(strategy: FieldMergeStrategy): ArrayFieldBuilder<ItemKind, Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): ArrayFieldBuilder<Item, Req, Auto> {
 		return new ArrayFieldBuilder(
-			new FieldBuilder(this._itemKind),
-			this._required as unknown as Req,
+			this._item,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			strategy,
 		)
 	}
@@ -297,19 +379,44 @@ export class ArrayFieldBuilder<
 	override _build(): FieldDescriptor {
 		return {
 			kind: 'array',
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: null,
-			itemKind: this._itemKind,
+			itemKind: this._item._build().kind,
 			mergeStrategy: this._mergeStrategy,
 			transitions: null,
 		}
 	}
 }
 
+/** Flattens an intersection of object types into one object type (for readable hovers). */
+export type Simplify<T> = { [K in keyof T]: T[K] } & {}
+
+type RequiredNestedKeys<F> = {
+	[K in keyof F]: F[K] extends { readonly '~field': { readonly required: true } } ? K : never
+}[keyof F]
+
 /**
- * Field builder for structured object fields with a nested field schema.
+ * The value type of a `t.object({...})` field built from its nested builders. A required
+ * nested key is required; an optional or defaulted nested key may be absent or `null`.
+ */
+export type ObjectFieldValue<
+	F extends Record<string, FieldBuilder>,
+	Mode extends 'output' | 'input',
+> = Simplify<
+	{
+		[K in RequiredNestedKeys<F>]: Mode extends 'output' ? FieldOutput<F[K]> : FieldInput<F[K]>
+	} & {
+		[K in Exclude<keyof F, RequiredNestedKeys<F>>]?:
+			| (Mode extends 'output' ? FieldOutput<F[K]> : FieldInput<F[K]>)
+			| null
+	}
+>
+
+/**
+ * Field builder for structured object fields with a nested field schema. Carries the
+ * nested builders' types, so `t.object({ theme: t.string() })` infers `{ theme: string }`.
  *
  * Each nested key merges by its own declared kind (scalars via LWW, nested
  * arrays via add-wins, nested objects recursively), so two devices editing
@@ -317,23 +424,30 @@ export class ArrayFieldBuilder<
  * of one clobbering the other.
  */
 export class ObjectFieldBuilder<
-	Req extends boolean = true,
-	Auto extends boolean = false,
-> extends FieldBuilder<'object', Req, Auto> {
-	private readonly _fields: Record<string, FieldBuilder>
+	Fields extends Record<string, FieldBuilder> = Record<string, FieldBuilder>,
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+> extends FieldBuilder<
+	'object',
+	Req,
+	Auto,
+	ObjectFieldValue<Fields, 'output'>,
+	ObjectFieldValue<Fields, 'input'>
+> {
+	private readonly _fields: Fields
 
 	constructor(
-		fields: Record<string, FieldBuilder>,
-		required = true as unknown as Req,
+		fields: Fields,
+		required = true,
 		defaultValue: unknown = undefined,
-		auto = false as unknown as Auto,
+		auto = false,
 		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
 		super('object', required, defaultValue, auto, mergeStrategy)
 		this._fields = fields
 	}
 
-	override optional(): ObjectFieldBuilder<false, Auto> {
+	override optional(): ObjectFieldBuilder<Fields, false, Auto> {
 		return new ObjectFieldBuilder(
 			this._fields,
 			false,
@@ -343,20 +457,22 @@ export class ObjectFieldBuilder<
 		)
 	}
 
-	override default(value: Record<string, unknown>): ObjectFieldBuilder<false, Auto> {
+	override default(
+		value: ObjectFieldValue<Fields, 'input'>,
+	): ObjectFieldBuilder<Fields, false, Auto> {
 		return new ObjectFieldBuilder(this._fields, false, value, this._auto, this._mergeStrategy)
 	}
 
-	override auto(): ObjectFieldBuilder<false, true> {
+	override auto(): ObjectFieldBuilder<Fields, false, true> {
 		return new ObjectFieldBuilder(this._fields, false, undefined, true, this._mergeStrategy)
 	}
 
-	override merge(strategy: FieldMergeStrategy): ObjectFieldBuilder<Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): ObjectFieldBuilder<Fields, Req, Auto> {
 		return new ObjectFieldBuilder(
 			this._fields,
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			strategy,
 		)
 	}
@@ -368,9 +484,9 @@ export class ObjectFieldBuilder<
 		}
 		return {
 			kind: 'object',
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
@@ -385,18 +501,21 @@ export class ObjectFieldBuilder<
  * for inference while merging structurally as a convergent CRDT: a plain-object
  * value recurses as a map, an array merges add-wins, any other value is a scalar
  * leaf under last-write-wins.
+ *
+ * A `Date` nested inside a json value is stored as its ISO string (the canonical
+ * operation form), so declare such members as `string` in `T`.
  */
 export class JsonFieldBuilder<
 	T = unknown,
-	Req extends boolean = true,
-	Auto extends boolean = false,
-> extends FieldBuilder<'json', Req, Auto> {
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+> extends FieldBuilder<'json', Req, Auto, T> {
 	override optional(): JsonFieldBuilder<T, false, Auto> {
 		return new JsonFieldBuilder<T, false, Auto>(
 			'json',
 			false,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			this._mergeStrategy,
 		)
 	}
@@ -406,7 +525,7 @@ export class JsonFieldBuilder<
 			'json',
 			false,
 			value,
-			this._auto as unknown as Auto,
+			this._auto,
 			this._mergeStrategy,
 		)
 	}
@@ -418,9 +537,9 @@ export class JsonFieldBuilder<
 	override merge(strategy: FieldMergeStrategy): JsonFieldBuilder<T, Req, Auto> {
 		return new JsonFieldBuilder<T, Req, Auto>(
 			'json',
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			strategy,
 		)
 	}
@@ -428,9 +547,9 @@ export class JsonFieldBuilder<
 	override _build(): FieldDescriptor {
 		return {
 			kind: 'json',
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
@@ -449,16 +568,16 @@ export class JsonFieldBuilder<
  * for tokens); the default is `encrypted`.
  */
 export class SecretFieldBuilder<
-	Req extends boolean = true,
-	Auto extends boolean = false,
-> extends FieldBuilder<'secret', Req, Auto> {
+	Req extends boolean = boolean,
+	Auto extends boolean = boolean,
+> extends FieldBuilder<'secret', Req, Auto, string> {
 	private readonly _secretMode: SecretMode
 
 	constructor(
 		secretMode: SecretMode = 'encrypted',
-		required = true as unknown as Req,
+		required = true,
 		defaultValue: unknown = undefined,
-		auto = false as unknown as Auto,
+		auto = false,
 		mergeStrategy: FieldMergeStrategy | null = null,
 	) {
 		super('secret', required, defaultValue, auto, mergeStrategy)
@@ -469,9 +588,9 @@ export class SecretFieldBuilder<
 	hashed(): SecretFieldBuilder<Req, Auto> {
 		return new SecretFieldBuilder(
 			'hashed',
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			this._mergeStrategy,
 		)
 	}
@@ -480,9 +599,9 @@ export class SecretFieldBuilder<
 	encrypted(): SecretFieldBuilder<Req, Auto> {
 		return new SecretFieldBuilder(
 			'encrypted',
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			this._mergeStrategy,
 		)
 	}
@@ -497,6 +616,10 @@ export class SecretFieldBuilder<
 		)
 	}
 
+	override default(value: string): SecretFieldBuilder<false, Auto> {
+		return new SecretFieldBuilder(this._secretMode, false, value, this._auto, this._mergeStrategy)
+	}
+
 	override auto(): SecretFieldBuilder<false, true> {
 		return new SecretFieldBuilder(this._secretMode, false, undefined, true, this._mergeStrategy)
 	}
@@ -504,9 +627,9 @@ export class SecretFieldBuilder<
 	override merge(strategy: FieldMergeStrategy): SecretFieldBuilder<Req, Auto> {
 		return new SecretFieldBuilder(
 			this._secretMode,
-			this._required as unknown as Req,
+			this._required,
 			this._defaultValue,
-			this._auto as unknown as Auto,
+			this._auto,
 			strategy,
 		)
 	}
@@ -514,9 +637,9 @@ export class SecretFieldBuilder<
 	override _build(): FieldDescriptor {
 		return {
 			kind: 'secret',
-			required: this._required as unknown as boolean,
+			required: this._required,
 			defaultValue: this._defaultValue,
-			auto: this._auto as unknown as boolean,
+			auto: this._auto,
 			enumValues: null,
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
@@ -526,8 +649,26 @@ export class SecretFieldBuilder<
 	}
 }
 
+/** The builder `t.<kind>()` returns for a scalar kind: required, not auto. */
+export type ScalarFieldBuilder<K extends ScalarFieldKind> = FieldBuilder<
+	K,
+	true,
+	false,
+	ScalarKindToType[K],
+	ScalarKindToInput[K]
+>
+
+function scalar<K extends ScalarFieldKind>(kind: K): ScalarFieldBuilder<K> {
+	return new FieldBuilder(kind, true, undefined, false)
+}
+
 /**
  * Type builder namespace. The developer's primary interface for defining field types.
+ *
+ * Value types: `string` and `secret` are strings, `number` is a finite number,
+ * `timestamp` is integer milliseconds since the epoch (`Date` is not accepted; pass
+ * `date.getTime()`), `richtext` reads as Yjs update bytes and accepts a string or bytes,
+ * `blob` is a `BlobRef`.
  *
  * @example
  * ```typescript
@@ -547,46 +688,59 @@ export class SecretFieldBuilder<
  * ```
  */
 export const t = {
-	string(): FieldBuilder<'string', true, false> {
-		return new FieldBuilder('string', true, undefined, false)
+	/** A string field. */
+	string(): ScalarFieldBuilder<'string'> {
+		return scalar('string')
 	},
 
-	number(): FieldBuilder<'number', true, false> {
-		return new FieldBuilder('number', true, undefined, false)
+	/** A finite-number field. */
+	number(): ScalarFieldBuilder<'number'> {
+		return scalar('number')
 	},
 
-	boolean(): FieldBuilder<'boolean', true, false> {
-		return new FieldBuilder('boolean', true, undefined, false)
+	/** A boolean field. */
+	boolean(): ScalarFieldBuilder<'boolean'> {
+		return scalar('boolean')
 	},
 
-	timestamp(): FieldBuilder<'timestamp', true, false> {
-		return new FieldBuilder('timestamp', true, undefined, false)
+	/** A timestamp field: integer milliseconds since the epoch (not a `Date`). */
+	timestamp(): ScalarFieldBuilder<'timestamp'> {
+		return scalar('timestamp')
 	},
 
-	richtext(): FieldBuilder<'richtext', true, false> {
-		return new FieldBuilder('richtext', true, undefined, false)
+	/** A collaborative rich-text field (Yjs). Reads return the Yjs update bytes. */
+	richtext(): ScalarFieldBuilder<'richtext'> {
+		return scalar('richtext')
 	},
 
+	/** An enum field whose value is one of `values`. */
 	enum<const V extends readonly string[]>(values: V): EnumFieldBuilder<V, true, false> {
 		return new EnumFieldBuilder(values, true, undefined, false)
 	},
 
-	array<K extends FieldKind>(itemBuilder: FieldBuilder<K>): ArrayFieldBuilder<K, true, false> {
+	/** An array field whose items have the type of `itemBuilder`. */
+	array<Item extends FieldBuilder>(itemBuilder: Item): ArrayFieldBuilder<Item, true, false> {
 		return new ArrayFieldBuilder(itemBuilder, true, undefined, false)
 	},
 
-	object(fields: Record<string, FieldBuilder>): ObjectFieldBuilder<true, false> {
+	/** A structured object field whose keys are declared by nested builders. */
+	object<const F extends Record<string, FieldBuilder>>(
+		fields: F,
+	): ObjectFieldBuilder<F, true, false> {
 		return new ObjectFieldBuilder(fields, true, undefined, false)
 	},
 
+	/** A dynamic JSON field typed as `T` (compile-time only; not validated against `T`). */
 	json<T = unknown>(): JsonFieldBuilder<T, true, false> {
 		return new JsonFieldBuilder<T, true, false>('json', true, undefined, false)
 	},
 
-	blob(): FieldBuilder<'blob', true, false> {
-		return new FieldBuilder('blob', true, undefined, false)
+	/** A blob reference field (`BlobRef`); the bytes live in the blob store. */
+	blob(): ScalarFieldBuilder<'blob'> {
+		return scalar('blob')
 	},
 
+	/** A secret field (password, token): redacted from traces, hashed or encrypted at rest. */
 	secret(): SecretFieldBuilder<true, false> {
 		return new SecretFieldBuilder('encrypted', true, undefined, false)
 	},

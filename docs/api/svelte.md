@@ -70,27 +70,55 @@ Root layout component that waits for `app.ready`, sets Kora context, and renders
 Returns a Svelte `Readable` store of query results. Subscribe with `$store` or `store.subscribe()`.
 
 ```typescript
-function createQueryStore<T extends CollectionRecord>(
-  query: QueryBuilder<T>,
-  options?: UseQueryOptions,
-): Readable<T[]>
+function createQueryStore<T = CollectionRecord>(
+  query: QueryBuilder<T> | Readable<QueryBuilder<T> | null | undefined>,
+  options?: {
+    enabled?: boolean | Readable<boolean>
+    onError?: (error: Error) => void
+  },
+): Readable<readonly T[]>
 ```
 
 `useQuery` is an alias for `createQueryStore`.
+
+The query and `enabled` can be plain values or readable stores. Pass a store of the query (for example a `derived` of your filter) and the rows follow it: the store re-subscribes when the query's descriptor changes, releases the previous subscription, and keeps the previous rows until the new query answers. A store value of `null` disables the query.
+
+A query that fails (for example a `where` or `orderBy` on an unknown field) is reported to `onError`, or logged with `console.error` when there is no handler. Use `createQueryStateStore` to render the error.
 
 ### Example
 
 ```svelte
 <script lang="ts">
+  import { derived, writable } from 'svelte/store'
   import { getApp, createQueryStore } from '@korajs/svelte'
 
   const app = getApp()
-  const todos = createQueryStore(app.todos.where({ completed: false }))
+  const showDone = writable(false)
+  const todos = createQueryStore(
+    derived(showDone, (done) => app.todos.where({ completed: done })),
+  )
 </script>
 
+<label><input type="checkbox" bind:checked={$showDone} /> Show done</label>
 {#each $todos as todo}
   <p>{todo.title}</p>
 {/each}
+```
+
+### createQueryStateStore() / useQueryState()
+
+Same inputs; the store holds `{ data, error, ready }`. `error` clears when results flow again, and `data` keeps the last good rows meanwhile.
+
+```svelte
+<script lang="ts">
+  const state = createQueryStateStore(app.todos.where({ completed: false }))
+</script>
+
+{#if $state.error}
+  <p role="alert">{$state.error.message}</p>
+{:else}
+  {#each $state.data as todo}<p>{todo.title}</p>{/each}
+{/if}
 ```
 
 ---
@@ -117,7 +145,7 @@ Mutation controller with optimistic hooks. Returns `mutate`, `mutateAsync`, `sub
 
 ## createSyncStatusStore() / useSyncStatus()
 
-Readable store of `SyncStatusInfo`.
+Readable store of `SyncStatusInfo`. It updates only when the status changes, and also reports `heldOperations` / `heldNodes`, `localDurability` and `serverProtocolVersion` / `protocolDeprecated` (see the [React reference](/api/react#usesyncstatus) for their meaning).
 
 ```svelte
 <script lang="ts">

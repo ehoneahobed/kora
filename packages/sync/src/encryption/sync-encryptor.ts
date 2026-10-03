@@ -86,13 +86,13 @@ interface EncryptableOperation {
  * a migration window (`allowPlaintextMigration`). Protocol-1 payloads (ciphertext inside
  * `data`, no binding) are refused the same way.
  *
- * **Key id.** The envelope names its key material (`keyId`, a fingerprint of the
- * key-derivation salt), so a device holding different material (ENC-1, Phase 4) reports
- * a diagnosable mismatch rather than a bare authentication failure.
+ * **Key id.** The envelope names its key material (`keyId`: the keyring's random key
+ * id, ENC-1), so a device holding different material reports a diagnosable
+ * `KEY_ID_MISMATCH` rather than a bare authentication failure.
  *
  * @example
  * ```typescript
- * const encryptor = await SyncEncryptor.create({ enabled: true, key: 'user-passphrase' })
+ * const encryptor = SyncEncryptor.fromKeys([{ version: 1, key: dataKey, keyId }])
  * const sealed = await encryptor.encryptOperation(operation)
  * const opened = await encryptor.decryptOperation(sealed)
  * ```
@@ -122,24 +122,24 @@ export class SyncEncryptor {
 	}
 
 	/**
-	 * Creates a SyncEncryptor from a {@link SyncEncryptionConfig}.
+	 * Creates a SyncEncryptor from a passphrase and an explicit, shared salt.
 	 *
-	 * Derives the encryption key from the passphrase using PBKDF2. The key
-	 * derivation is async because it uses the Web Crypto API.
+	 * Low-level: apps use the keyring (`createApp` with `sync.encryption`), which
+	 * distributes random data keys wrapped by the passphrase. This derives the data key
+	 * directly from the passphrase, so every device must pass the same salt; there is
+	 * no random-salt default any more (ENC-1: a per-process random salt made every
+	 * device derive a different key).
 	 *
-	 * @param config - Encryption configuration with passphrase
-	 * @param salt - Optional salt for deterministic key derivation.
-	 *              If omitted, a random salt is generated (ENC-1: shared key
-	 *              material across devices is Phase 4 work).
-	 * @param iterations - Optional PBKDF2 iteration count. Defaults to the
-	 *              production-strength value. Lower it only in tests.
+	 * @param config - Encryption configuration with the passphrase in `key`
+	 * @param salt - The key-derivation salt, shared by every device (16 bytes or more)
+	 * @param iterations - Optional PBKDF2 iteration count. Lower it only in tests.
 	 * @returns A configured SyncEncryptor instance
-	 * @throws {EncryptionError} If configuration is invalid
+	 * @throws {EncryptionError} If configuration is invalid or the salt is missing
 	 * @throws {KeyDerivationError} If key derivation fails
 	 */
 	static async create(
 		config: SyncEncryptionConfig,
-		salt?: Uint8Array,
+		salt: Uint8Array,
 		iterations?: number,
 	): Promise<SyncEncryptor> {
 		if (!config.enabled) {
@@ -148,8 +148,14 @@ export class SyncEncryptor {
 					'Set enabled: true in the encryption config.',
 			)
 		}
+		if (!(salt instanceof Uint8Array) || salt.length < 16) {
+			throw new EncryptionError(
+				'SyncEncryptor.create needs the shared key-derivation salt (16 bytes or more). Devices that derive with different salts cannot read each other; use the keyring (sync.encryption in createApp) for shared keys.',
+				{ code: 'SALT_REQUIRED' },
+			)
+		}
 
-		const passphrase = typeof config.key === 'function' ? await config.key() : config.key
+		const passphrase = typeof config.key === 'function' ? await config.key() : (config.key ?? '')
 
 		if (passphrase.length === 0) {
 			throw new EncryptionError(
@@ -229,8 +235,8 @@ export class SyncEncryptor {
 	}
 
 	/**
-	 * The key id written into envelopes for a key version: a fingerprint of its
-	 * key-derivation salt (never the key itself).
+	 * The key id written into envelopes for a key version: the keyring's random key id,
+	 * or for a passphrase-derived key a fingerprint of its salt (never the key itself).
 	 *
 	 * @param version - Key version (defaults to the current one)
 	 */
@@ -239,8 +245,15 @@ export class SyncEncryptor {
 		if (!key) {
 			throw new EncryptionError(`Encryption key version ${version} not found.`, { version })
 		}
+		if (key.keyId !== undefined) return key.keyId
 		let cached = this.keyIds.get(version)
 		if (!cached) {
+			if (!key.salt) {
+				throw new EncryptionError(
+					`Encryption key version ${version} has neither a key id nor a salt to name it.`,
+					{ version },
+				)
+			}
 			cached = keyFingerprint(key.salt)
 			this.keyIds.set(version, cached)
 		}
@@ -432,7 +445,7 @@ export class SyncEncryptor {
 		const localKeyId = await this.getKeyId(envelope.keyVersion)
 		if (localKeyId !== envelope.keyId) {
 			throw new DecryptionError(
-				`Operation ${operation.id} was encrypted with key material "${envelope.keyId}" (version ${envelope.keyVersion}), but this device holds "${localKeyId}". The devices derived different keys: they need the same passphrase AND the same key-derivation salt.`,
+				`Operation ${operation.id} was encrypted with key material "${envelope.keyId}" (version ${envelope.keyVersion}), but this device holds "${localKeyId}". The devices hold different keys: they must open the same keyring (the same user and keyring name) on the same sync server.`,
 				{
 					operationId: operation.id,
 					code: 'KEY_ID_MISMATCH',

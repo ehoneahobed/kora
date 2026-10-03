@@ -9,12 +9,15 @@ export type {
 	UseMutationResult,
 	UseQueryOptions,
 	UseRichTextResult,
+	QueryInput,
+	QueryState,
 } from '@korajs/svelte'
 
 export type { UseRichTextOptions } from '@korajs/svelte'
 
 export {
 	createMutation,
+	createQueryStateStore,
 	createQueryStore,
 	createRichTextBinding,
 	createSyncStatusStore,
@@ -29,6 +32,7 @@ export {
 	useCollection,
 	useMutation,
 	useQuery,
+	useQueryState,
 	useRichText,
 	useSyncStatus,
 	applyPresence,

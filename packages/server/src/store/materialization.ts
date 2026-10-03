@@ -5,6 +5,8 @@ import type {
 	ReplayOperation,
 	SchemaDefinition,
 } from '@korajs/core'
+// SEC-9b: one DDL literal generator for client and server tables.
+import { enumCheckConstraint, sqlDefaultLiteral } from '@korajs/core/internal'
 
 // Legacy comparison only (W7 Stage B2): the server stores no longer materialize with
 // the pre-fold replay. Every store merges operations into a per-record fold state
@@ -50,14 +52,6 @@ function fieldTypeToSql(descriptor: FieldDescriptor, dialect: SqlDialect): strin
 	}
 }
 
-function sqlDefaultLiteral(value: unknown): string {
-	if (value === null) return 'NULL'
-	if (typeof value === 'string') return `'${value}'`
-	if (typeof value === 'number') return String(value)
-	if (typeof value === 'boolean') return value ? '1' : '0'
-	return `'${JSON.stringify(value)}'`
-}
-
 /**
  * Generate DDL statements for creating a materialized collection table.
  * Includes CREATE TABLE, safe ALTER TABLE for schema evolution, and indexes.
@@ -82,8 +76,8 @@ export function generateCollectionDDL(
 			colDef += ` DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`
 		}
 		if (descriptor.kind === 'enum' && descriptor.enumValues) {
-			const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-			colDef += ` CHECK (${quoteIdent(fieldName)} IN (${values}))`
+			// SEC-9b: the shared generator quotes every value (embedded quotes doubled).
+			colDef += ` ${enumCheckConstraint(fieldName, descriptor.enumValues)}`
 		}
 		columns.push(colDef)
 	}

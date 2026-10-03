@@ -1,6 +1,7 @@
-import { KoraError, quoteIdent } from '@korajs/core'
+import { KoraError, type KoraEventEmitter, quoteIdent } from '@korajs/core'
+import { StoragePersistence } from '@korajs/store'
 import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
-import type { KoraConfig, LocalDatabaseInfo, StorageApi } from './types'
+import type { AuthSyncBinding, KoraConfig, LocalDatabaseInfo, StorageApi } from './types'
 
 /** Read access to a database, as handed to the unsynced-data check. */
 interface DatabaseReader {
@@ -45,8 +46,15 @@ export async function hasUnsyncedOperations(
  * Kora never deletes a database on its own; these calls are the only way, and
  * deletion refuses while the database is open or has unsynced operations.
  */
-export function createStorageApi(config: KoraConfig): StorageApi {
+export function createStorageApi(
+	config: KoraConfig,
+	persistence: StoragePersistence = new StoragePersistence(),
+): StorageApi {
 	return {
+		persistence: {
+			status: () => persistence.status(),
+			request: () => persistence.request(),
+		},
 		async listDatabases(): Promise<LocalDatabaseInfo[]> {
 			if (typeof indexedDB === 'undefined') return []
 			const { listLocalDatabases } = await import('@korajs/store/sqlite-wasm')
@@ -69,5 +77,74 @@ export function createStorageApi(config: KoraConfig): StorageApi {
 				hasUnsyncedOperations: (db) => hasUnsyncedOperations(db, config.sync !== undefined),
 			})
 		},
+	}
+}
+
+/** Whether the page runs as an installed app (PWA / home-screen web app). */
+function runningAsInstalledApp(): boolean {
+	const g = globalThis as {
+		matchMedia?: (query: string) => { matches: boolean }
+		navigator?: { standalone?: boolean }
+	}
+	try {
+		if (g.navigator?.standalone === true) return true
+		return g.matchMedia?.('(display-mode: standalone)').matches === true
+	} catch {
+		// matchMedia can throw in exotic embedders; not installed is the safe answer.
+		return false
+	}
+}
+
+/**
+ * Start durable-storage tracking for an app after its store opened (NEW-STORE-4).
+ * Nothing here is awaited by `app.ready`: the boot `persisted()` check never
+ * prompts and runs in the background, and in `'auto'` mode `persist()` is
+ * requested fire-and-forget after sign-in, the first local write, or at boot when
+ * running as an installed app. Results arrive as `storage:persistence` events.
+ *
+ * @returns A cleanup function that removes the triggers
+ */
+export function wireStoragePersistence(
+	config: KoraConfig,
+	emitter: KoraEventEmitter,
+	persistence: StoragePersistence,
+	authBinding: AuthSyncBinding | null,
+): () => void {
+	void persistence.check()
+	if (config.store?.persistence === 'manual') return () => {}
+
+	const cleanups: Array<() => void> = []
+	if (runningAsInstalledApp()) persistence.requestInBackground('installed-app')
+
+	const offWrite = emitter.on('operation:created', () => {
+		offWrite()
+		persistence.requestInBackground('first-write')
+	})
+	cleanups.push(offWrite)
+
+	if (authBinding?.subscribe && authBinding.resolveSyncState) {
+		const resolveState = authBinding.resolveSyncState.bind(authBinding)
+		let wasAuthenticated: boolean | null = null
+		const observe = (): void => {
+			resolveState().then(
+				(state) => {
+					const authenticated = state.state === 'authenticated'
+					// Only a transition into a signed-in state counts as "after sign-in".
+					if (authenticated && wasAuthenticated === false) {
+						persistence.requestInBackground('sign-in')
+					}
+					wasAuthenticated = authenticated
+				},
+				() => {
+					// Auth state unknown: no trigger; persistence is best-effort here.
+				},
+			)
+		}
+		observe()
+		cleanups.push(authBinding.subscribe(observe))
+	}
+
+	return () => {
+		for (const cleanup of cleanups) cleanup()
 	}
 }

@@ -11,9 +11,7 @@ import {
 
 /**
  * Per-field versions of a server scope-entry insert (RT-27) survive every wire
- * format: JSON and protobuf. (The schema-driven DynamicProtobufSerializer carries them
- * the same way, but it is unused and cannot encode an envelope today, so it is not
- * exercised here.)
+ * format: JSON and protobuf.
  */
 const serializers: [string, MessageSerializer][] = [
 	['json', new JsonMessageSerializer()],

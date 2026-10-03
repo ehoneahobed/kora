@@ -2,17 +2,24 @@ import type { SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import type { Store } from '@korajs/store'
-import { QueryStoreCache } from '@korajs/store'
+import { QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
 import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
+import {
+	createAppKeyring,
+	createEncryptionControl,
+	createInertEncryptionControl,
+} from './encryption-control'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
+import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
-import { createStorageApi } from './storage-accessor'
+import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
+import { createStorageApi, wireStoragePersistence } from './storage-accessor'
 import { createSyncControl } from './sync-control'
 import {
 	type SyncRuntimeState,
@@ -37,7 +44,14 @@ import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
  * Wires together store, merge engine, event emitter, and optionally sync
  * into a single developer-facing `KoraApp` object. Collection accessors
  * are always available through `app.collections`. Non-reserved names also retain
- * the convenient direct form (for example, `app.todos`).
+ * the convenient direct form (for example, `app.todos`). A collection named after a
+ * framework property (`ready`, `events`, `sync`, `storage`, ... see
+ * `RESERVED_APP_PROPERTIES`) is only reachable as `app.collections.<name>`; createApp
+ * warns about it in development.
+ *
+ * During a server render (no `window`, see {@link KoraConfig.ssr}) the app is inert:
+ * it opens no storage and starts no sync, and `app.ready` rejects with
+ * `ServerRenderingAppError` (handled, so it never surfaces as an unhandled rejection).
  */
 export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
 export function createApp(config: KoraConfig): KoraApp
@@ -79,21 +93,46 @@ export function createApp<const S extends SchemaInput>(
 		removeOnlineListener: null,
 	}
 
-	const devtools = setupDevtools(config, emitter)
+	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
+	// database (or start sync) in the server process.
+	const inert = isServerRenderingInert(config)
+	const devtools = inert
+		? { instrumenter: null, destroyOverlay: null }
+		: setupDevtools(config, emitter)
 	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
+	const storagePersistence = new StoragePersistence({ emitter })
+	let unwirePersistence: (() => void) | null = null
 
-	const ready = initializeApp(config, emitter, mergeEngine).then((init) => {
-		store = init.store
-		applyPipeline = init.applyPipeline
-		unsubscribeSync = init.unsubscribeSync
-		unsubscribeAudit = init.unsubscribeAudit
-		unsubscribeLocalOperations = init.unsubscribeLocalOperations
-		blobApi = createBlobApi(init.blobStore, init.blobChunkProvider, config.blob?.chunkSize, () =>
-			enumerateLiveBlobRefs(init.store, config.schema),
-		)
-		currentStoreInfo = init.storeInfo
-		wireSyncLifecycleAfterReady(config, emitter, syncState, init)
-	})
+	// End-to-end encryption keyring (ENC-1): created up front so its status is
+	// observable (and unlock() callable) before the store opens. Never during a
+	// server render (DX-6): the inert app opens nothing.
+	const keyring = inert ? null : createAppKeyring(config, emitter)
+
+	const ready = inert
+		? inertReady()
+		: initializeApp(config, emitter, mergeEngine, keyring).then((init) => {
+				store = init.store
+				applyPipeline = init.applyPipeline
+				unsubscribeSync = init.unsubscribeSync
+				unsubscribeAudit = init.unsubscribeAudit
+				unsubscribeLocalOperations = init.unsubscribeLocalOperations
+				blobApi = createBlobApi(
+					init.blobStore,
+					init.blobChunkProvider,
+					config.blob?.chunkSize,
+					() => enumerateLiveBlobRefs(init.store, config.schema),
+				)
+				currentStoreInfo = init.storeInfo
+				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+				// NEW-STORE-4: durable-storage check and triggers start here, after the store
+				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
+				unwirePersistence = wireStoragePersistence(
+					config,
+					emitter,
+					storagePersistence,
+					init.authBinding,
+				)
+			})
 
 	const getStore = (): Store | null => store
 	const requireBlobApi = (): BlobApi => {
@@ -123,6 +162,9 @@ export function createApp<const S extends SchemaInput>(
 		on: emitter.on.bind(emitter),
 		collections,
 		sync: createSyncControl({ config, ready, state: syncState }),
+		encryption: inert
+			? createInertEncryptionControl(config, ready)
+			: createEncryptionControl({ keyring, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),
 		blobs: {
 			get store() {
@@ -153,7 +195,7 @@ export function createApp<const S extends SchemaInput>(
 				return requireBlobApi().gc(options)
 			},
 		},
-		storage: createStorageApi(config),
+		storage: createStorageApi(config, storagePersistence),
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
@@ -176,11 +218,20 @@ export function createApp<const S extends SchemaInput>(
 			return executeTransaction(fn, name)
 		},
 		async close() {
+			if (inert) {
+				queryStoreCache.clear()
+				emitter.clear()
+				return
+			}
 			await ready
 			syncState.intentionalDisconnect = true
 			teardownSyncLifecycle(syncState)
 			devtools.destroyOverlay?.()
 			devtools.instrumenter?.destroy()
+			if (unwirePersistence) {
+				unwirePersistence()
+				unwirePersistence = null
+			}
 			if (unsubscribeSync) {
 				unsubscribeSync()
 				unsubscribeSync = null
@@ -238,6 +289,7 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))
+	warnShadowedCollections(Object.keys(config.schema.collections), reservedProperties)
 	for (const collectionName of Object.keys(config.schema.collections)) {
 		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {
@@ -250,4 +302,15 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	return app
+}
+
+/**
+ * `app.ready` of an inert (server-rendered) app: rejected with a clear error for
+ * anyone who awaits it, but marked handled so a module-scope app that nobody awaits
+ * never crashes the server with an unhandled rejection.
+ */
+function inertReady(): Promise<void> {
+	const ready = Promise.reject(new ServerRenderingAppError())
+	ready.catch(() => {})
+	return ready
 }

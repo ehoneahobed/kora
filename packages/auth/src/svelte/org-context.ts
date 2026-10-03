@@ -2,7 +2,8 @@ import { getContext, setContext } from 'svelte'
 import { type OrgSession, createOrgSession } from '../bindings/create-org-session'
 import type { OrgClient } from '../client/org-client'
 
-const orgContextKey = Symbol('korajs-org-context')
+// Registered key: OrgProvider.svelte (src/) and the org hooks (dist/) must share it.
+const orgContextKey = Symbol.for('@korajs/auth:svelte-org-context')
 
 export interface OrgContextValue {
 	client: OrgClient

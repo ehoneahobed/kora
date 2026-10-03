@@ -201,7 +201,9 @@ describe('create command flow', () => {
 				packageManager: 'pnpm',
 				koraVersion: '0.1.0',
 			})
-			const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+			// The flagship creates its app in src/kora.ts (typed hooks bound to the app).
+			const appModule = template === 'react-tailwind-sync' ? 'kora.ts' : 'main.tsx'
+			const main = await readFile(join(targetDir, 'src', appModule), 'utf-8')
 			expect(main).toContain('devtools: import.meta.env.DEV')
 		}
 	})

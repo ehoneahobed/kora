@@ -7,6 +7,7 @@ export type {
 	KoraContextValue,
 	KoraProviderProps,
 	UseQueryOptions,
+	UseQueryStateResult,
 	UseMutationOptions,
 	UseMutationResult,
 	UseRichTextResult,
@@ -27,7 +28,15 @@ export type {
 
 // === Hooks ===
 export { useApp } from './hooks/use-app'
-export { useQuery } from './hooks/use-query'
+export { useQuery, useQueryState } from './hooks/use-query'
+export { createKoraHooks } from './hooks/create-kora-hooks'
+export type {
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
+	KoraHooks,
+} from './hooks/create-kora-hooks'
 export { useMutation } from './hooks/use-mutation'
 export { useSyncStatus } from './hooks/use-sync-status'
 export { useCollection } from './hooks/use-collection'

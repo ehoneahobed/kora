@@ -69,12 +69,14 @@ If you bump collections in a way that changes shapes, increment `version` and ru
 
 ## Sync and auth
 
-Sync is configured in `src/main.*` via `createApp({ sync: { url, authClient } })`. In dev, the sync URL is derived from the page host and proxied by Vite; in production set `VITE_SYNC_URL`. Auth (if present in this template) uses `@korajs/auth`; the client is created in `src/auth.ts`. Local writes work without sign-in; sync requires the server to accept the connection.
+Sync is configured in `src/kora.ts` via `createApp({ sync: { url, authClient } })`. In dev, the sync URL is derived from the page host and proxied by Vite; in production set `VITE_SYNC_URL`. Auth (if present in this template) uses `@korajs/auth`; the client is created in `src/auth.ts`. Local writes work without sign-in; sync requires the server to accept the connection.
 
 ## React bindings
 
+Import the hooks from `src/kora.ts`, where `createKoraHooks<typeof app>()` binds them to this app's schema: collection names, inserts, updates, `where` and the rows `useQuery` returns are type-checked. Do not import them from `@korajs/react` directly (those are untyped).
+
 ```tsx
-import { useCollection, useMutation, useQuery, useSyncStatus } from '@korajs/react'
+import { useCollection, useMutation, useQuery, useSyncStatus } from './kora'
 
 const todos = useCollection('todos')
 const rows = useQuery(orderedTodos(todos))            // reactive, no loading state for local data
