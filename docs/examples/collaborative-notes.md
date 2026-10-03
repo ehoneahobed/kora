@@ -1,14 +1,17 @@
 ---
 title: Collaborative Notes Example
-description: "Build collaborative notes with Kora.js: CRDT rich text with Yjs, presence, and conflict-free multi-user editing that works offline."
+description: "Build collaborative notes with Kora.js: CRDT rich text with Yjs, tags that merge, counters that add up, and editing that works offline."
 ---
 
 # Collaborative Notes
 
-Build a collaborative note-taking app where multiple users can edit the same document simultaneously. This example demonstrates Kora's `t.richtext()` field type backed by Yjs CRDTs and custom conflict resolvers for computed fields.
+A note-taking app where several people edit the same note at once, online or offline. It shows
+`t.richtext()` (character-level merging with Yjs), arrays that merge, and a counter field. Every
+block below is a file of the app.
 
-## Define Your Schema
+## Schema
 
+<!-- docs-check: file schema.ts -->
 ```typescript
 // schema.ts
 import { defineSchema, t } from 'korajs'
@@ -20,79 +23,72 @@ export const schema = defineSchema({
       fields: {
         title: t.string(),
         content: t.richtext(),
-        wordCount: t.number().default(0),
         tags: t.array(t.string()).default([]),
+        views: t.number().default(0).merge('counter'),
         lastEditedBy: t.string().optional(),
         createdAt: t.timestamp().auto(),
-        updatedAt: t.timestamp().auto(),
       },
-      indexes: ['tags', 'updatedAt'],
-      resolve: {
-        wordCount: (local: number, remote: number, base: number): number => {
-          // Additive merge: apply both deltas to the base value.
-          // If base was 50, local changed it to 55 (+5), and remote
-          // changed it to 48 (-2), the merged result is 50 + 5 + (-2) = 53.
-          const localDelta = local - base
-          const remoteDelta = remote - base
-          return Math.max(0, base + localDelta + remoteDelta)
-        },
-      },
+      indexes: ['createdAt'],
     },
   },
 })
 ```
 
-Two things to notice here:
+- **`t.richtext()`** is backed by a Yjs `Y.Text`: concurrent edits merge character by character.
+- **`t.array(...)`** merges as an element set: concurrent additions and removals both apply.
+- **`.merge('counter')`** adds up concurrent changes instead of keeping the last one: two devices
+  that each count a view from 10 end at 12, whether they write `op.increment(1)` or `11`.
+- Every record also has `updatedAt` (the last write time), so the schema does not declare it.
 
-- **`t.richtext()`** declares a field backed by a Yjs `Y.Text` CRDT. Concurrent character-level edits merge automatically without any conflict resolution code.
-- **`resolve.wordCount`** is a custom Tier 3 resolver. Because word count is derived from content, a simple last-write-wins strategy would lose one user's contribution. The additive merge preserves both deltas relative to the shared base value.
+## App
 
-## Create the App
-
+<!-- docs-check: file app.ts -->
 ```typescript
 // app.ts
 import { createApp } from 'korajs'
+import { createKoraHooks } from 'korajs/react'
 import { schema } from './schema'
 
 export const app = createApp({
   schema,
-  sync: {
-    url: 'wss://my-server.com/kora',
-  },
+  sync: { url: 'wss://my-server.example.com/kora-sync', autoConnect: true },
 })
+
+export const { useMutation, useQuery, useSyncStatus } = createKoraHooks<typeof app>()
 ```
 
-## React Components
+## Root
 
-### App Root
-
+<!-- docs-check: file main.tsx -->
 ```tsx
 // main.tsx
 import { KoraProvider } from '@korajs/react'
+import { createRoot } from 'react-dom/client'
 import { app } from './app'
 import { NotesApp } from './NotesApp'
 
-function Main() {
-  return (
-    <KoraProvider app={app}>
+const root = document.getElementById('root')
+if (root) {
+  createRoot(root).render(
+    <KoraProvider app={app} fallback={<p>Loading...</p>}>
       <NotesApp />
-    </KoraProvider>
+    </KoraProvider>,
   )
 }
 ```
 
-### Notes List and Editor Layout
+## Notes list
 
+<!-- docs-check: file NotesApp.tsx -->
 ```tsx
 // NotesApp.tsx
 import { useState } from 'react'
-import { useQuery, useMutation, useSyncStatus } from '@korajs/react'
-import { app } from './app'
+import { app, useMutation, useQuery, useSyncStatus } from './app'
 import { NoteEditor } from './NoteEditor'
 
 export function NotesApp() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const notes = useQuery(app.notes.orderBy('updatedAt', 'desc'))
+  const notes = useQuery(app.notes.where({}).orderBy('updatedAt', 'desc'))
   const createNote = useMutation(app.notes.insert)
   const deleteNote = useMutation(app.notes.delete)
   const status = useSyncStatus()
@@ -105,29 +101,18 @@ export function NotesApp() {
   return (
     <div style={{ display: 'flex', height: '100vh' }}>
       <aside style={{ width: 260, borderRight: '1px solid #eee', padding: 16 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2>Notes</h2>
-          <span>{status.status === 'offline' ? 'Offline' : 'Synced'}</span>
-        </div>
-        <button onClick={handleNewNote}>New Note</button>
+        <h2>Notes</h2>
+        <p>{status.status === 'offline' ? 'Offline: changes are kept on this device' : status.status}</p>
+        <button type="button" onClick={handleNewNote}>
+          New note
+        </button>
         <ul style={{ listStyle: 'none', padding: 0 }}>
           {notes.map((note) => (
-            <li
-              key={note.id}
-              onClick={() => setSelectedId(note.id)}
-              style={{
-                padding: 8,
-                cursor: 'pointer',
-                background: note.id === selectedId ? '#f0f0f0' : 'transparent',
-              }}
-            >
-              <strong>{note.title || 'Untitled'}</strong>
-              <br />
-              <small>{note.wordCount} words</small>
-              <button
-                onClick={(e) => { e.stopPropagation(); deleteNote.mutate(note.id) }}
-                style={{ float: 'right' }}
-              >
+            <li key={note.id}>
+              <button type="button" onClick={() => setSelectedId(note.id)}>
+                {note.title || 'Untitled'} ({note.views ?? 0} views)
+              </button>
+              <button type="button" onClick={() => deleteNote.mutate(note.id)}>
                 Delete
               </button>
             </li>
@@ -135,128 +120,100 @@ export function NotesApp() {
         </ul>
       </aside>
       <main style={{ flex: 1, padding: 16 }}>
-        {selectedId ? <NoteEditor noteId={selectedId} /> : <p>Select a note or create a new one.</p>}
+        {selectedId ? <NoteEditor noteId={selectedId} /> : <p>Select a note or create one.</p>}
       </main>
     </div>
   )
 }
 ```
 
-### Rich Text Editor
+## Rich text editor
 
-The `useRichText` hook connects a Kora `t.richtext()` field to a text editor. It returns the shared Yjs document (`doc`) and its bound `Y.Text` (`text`), which any Yjs-compatible editor (Tiptap, ProseMirror, Quill, etc.) can consume through its collaboration plugin.
+`useRichText` binds a `t.richtext()` field to a shared Yjs document. Any Yjs-aware editor (Tiptap,
+ProseMirror with y-prosemirror, Quill) consumes `doc` through its collaboration plugin.
 
+<!-- docs-check: file NoteEditor.tsx -->
 ```tsx
 // NoteEditor.tsx
-import { useEffect } from 'react'
-import { useEditor, EditorContent } from '@tiptap/react'
-import StarterKit from '@tiptap/starter-kit'
+import { useRichText } from '@korajs/react'
 import Collaboration from '@tiptap/extension-collaboration'
-import { useQuery, useMutation, useRichText } from '@korajs/react'
-import { app } from './app'
+import { EditorContent, useEditor } from '@tiptap/react'
+import StarterKit from '@tiptap/starter-kit'
+import { useEffect, useState } from 'react'
+import { op } from 'korajs'
+import { app, useMutation, useQuery } from './app'
 
 export function NoteEditor({ noteId }: { noteId: string }) {
   const [note] = useQuery(app.notes.where({ id: noteId }))
   const updateNote = useMutation(app.notes.update)
-  const { doc, text, ready } = useRichText('notes', noteId, 'content')
+  const { doc, text, ready } = useRichText('notes', noteId, 'content', {
+    user: { name: 'Ada', color: '#e91e63' },
+  })
+  const [wordCount, setWordCount] = useState(0)
 
-  const editor = useEditor(
-    {
-      extensions: [StarterKit, Collaboration.configure({ document: doc })],
-    },
-    [doc],
-  )
+  const editor = useEditor({ extensions: [StarterKit, Collaboration.configure({ document: doc })] }, [doc])
 
-  // Recompute the word count whenever the shared text changes.
+  // Count a view once per opened note; concurrent views from other devices add up.
   useEffect(() => {
-    if (!text) return
+    updateNote.mutate(noteId, { views: op.increment(1) })
+  }, [noteId, updateNote.mutate])
+
+  // A derived value: compute it from the merged text instead of storing it.
+  useEffect(() => {
     const recount = () => {
-      const value = text.toString()
-      const count = value.trim() ? value.trim().split(/\s+/).length : 0
-      updateNote.mutate(noteId, { wordCount: count, lastEditedBy: 'current-user' })
+      const value = text.toString().trim()
+      setWordCount(value ? value.split(/\s+/).length : 0)
     }
+    recount()
     text.observe(recount)
     return () => text.unobserve(recount)
-  }, [text, noteId, updateNote])
+  }, [text])
 
   if (!note) return <p>Note not found.</p>
   if (!ready) return <p>Loading...</p>
-
-  const handleTitleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    updateNote.mutate(noteId, { title: e.target.value })
-  }
 
   return (
     <div>
       <input
         value={note.title}
-        onChange={handleTitleChange}
+        onChange={(e) => updateNote.mutate(noteId, { title: e.target.value, lastEditedBy: 'Ada' })}
         style={{ fontSize: 24, border: 'none', width: '100%' }}
       />
-      <p style={{ color: '#888' }}>{note.wordCount} words</p>
+      <p style={{ color: '#888' }}>{wordCount} words</p>
+      <button type="button" onClick={() => updateNote.mutate(noteId, { tags: op.append('work') })}>
+        Tag as work
+      </button>
       <EditorContent editor={editor} />
     </div>
   )
 }
 ```
 
-`useRichText` returns, among other fields:
+`useRichText` returns `doc` and `text` (the field's `Y.Text`), `ready` once the field has loaded
+from the local store, `undo`/`redo`, and the other editors' `cursors` with `setCursor`. Editor
+changes are written to the record as rich-text updates and sync like any other write; large fields
+stream their Yjs updates over the connection.
 
-- **`doc`** is the shared Yjs `Y.Doc`. Hand it to your editor's collaboration plugin (here, Tiptap's `Collaboration` extension, or `y-prosemirror` for a bare ProseMirror view).
-- **`text`** is the bound `Y.Text` for the field. Read `text.toString()` for the current plain text, or call `text.observe(...)` to react to edits.
-- **`ready`** turns `true` once the document has loaded from the local store.
+## What happens when two people edit at once
 
-Edits made through the editor are automatically captured as Kora operations and synced to other clients.
+**Rich text.** User A types "Hello" at the start of the note while user B types "World" at the
+same place. Both edits are kept and merged character by character; every device ends with the same
+text ("HelloWorld" or "WorldHello", decided deterministically by Yjs). Nothing is lost.
 
-## How Rich Text Sync Works
+**Title.** `title` is a plain string: the later write wins, ordered by hybrid logical clock. Use
+`t.richtext()` for text that several people edit together.
 
-When two users edit the same note at the same time, here is what happens:
+**Tags.** A adds `work` while B adds `urgent` from the same starting list: both tags are kept. If
+both add `work`, it appears once. A removal and a concurrent addition of different tags both apply.
+`op.append(tag)` and `op.remove(tag)` express exactly that intent.
 
-1. **User A** types "Hello" at position 0. Kora records this as a Yjs operation on the `content` field.
-2. **User B** types "World" at position 0 in the same note, at the same time. Kora records a separate Yjs operation.
-3. Both operations sync to the server and fan out to the other client.
-4. The Yjs CRDT merges the operations at the character level. The result deterministically becomes "HelloWorld" or "WorldHello" depending on the node IDs (used for tie-breaking), but both users always see the same result.
+**Views.** Two devices at 10 views each count one view offline. `op.increment(1)` keeps both
+increments on any number field, so every device shows 12. `.merge('counter')` makes every write of
+the field add up, also plain ones (`{ views: 11 }` written from 10 counts as +1); under the default
+last-write-wins rule two plain writes of 11 would leave 11.
+For domain rules beyond the built-in strategies, a collection can declare
+`resolve: { field: (local, remote, base) => value }`; see
+[Conflict Resolution](/guide/conflict-resolution#custom-resolvers).
 
-There is no last-write-wins for rich text. No content is ever lost. Each keystroke is preserved independently, and the CRDT guarantees convergence across all clients.
-
-This is different from the `title` field, which uses last-write-wins (LWW) via the hybrid logical clock. For short scalar values like titles, LWW is sufficient. For long-form text where users expect character-level merging, `t.richtext()` provides a CRDT.
-
-## Custom Resolver: Additive Word Count
-
-The `wordCount` field uses a custom Tier 3 resolver. Here is why it matters.
-
-Consider this scenario:
-
-| State | Base | User A | User B |
-|-------|------|--------|--------|
-| Word count | 50 | 55 (added 5 words) | 48 (deleted 2 words) |
-
-With default last-write-wins, the later write would overwrite the earlier one. If User A's edit arrives last, the count becomes 55, ignoring User B's deletion. The count would be wrong.
-
-The additive resolver fixes this:
-
-```typescript
-wordCount: (local: number, remote: number, base: number): number => {
-  const localDelta = local - base    // +5
-  const remoteDelta = remote - base  // -2
-  return Math.max(0, base + localDelta + remoteDelta) // 50 + 5 + (-2) = 53
-}
-```
-
-Both contributions are preserved. The `Math.max(0, ...)` guard prevents the count from going negative in edge cases.
-
-## Tags: Add-Wins Set
-
-The `tags` field is declared as `t.array(t.string())`. Kora merges arrays using an add-wins set strategy by default: if User A adds the tag "work" and User B adds the tag "urgent" concurrently, the merged result contains both tags. If both users add the same tag, it appears once.
-
-```typescript
-// User A
-updateNote.mutate(noteId, { tags: [...note.tags, 'work'] })
-
-// User B (concurrently)
-updateNote.mutate(noteId, { tags: [...note.tags, 'urgent'] })
-
-// After sync, both users see: ['work', 'urgent']
-```
-
-No duplicates, no lost tags, no conflict resolution code required.
+**Derived values** such as a word count belong in the UI, computed from the merged content.
+Stored copies would be rewritten by every device that recomputes them and could drift.
