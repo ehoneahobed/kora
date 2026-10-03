@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { QueryBuilder } from '../query/query-builder'
-import type { CollectionRecord, SubscriptionCallback } from '../types'
+import type {
+	CollectionRecord,
+	QuerySubscriptionError,
+	SubscribeOptions,
+	SubscriptionCallback,
+} from '../types'
 import { QueryStore } from './query-store'
 
 function createMockQueryBuilder(initialResults: CollectionRecord[] = []): {
@@ -240,5 +245,34 @@ describe('QueryStore', () => {
 
 		// Only one underlying subscription should exist
 		expect(queryBuilder.subscribe).toHaveBeenCalledTimes(1)
+	})
+
+	it('exposes query failures as error state and clears it on the next result (STORE-12)', () => {
+		let onError: ((failure: QuerySubscriptionError) => void) | undefined
+		let deliver: SubscriptionCallback<CollectionRecord> | null = null
+		const queryBuilder = {
+			subscribe: vi.fn(
+				(callback: SubscriptionCallback<CollectionRecord>, options?: SubscribeOptions) => {
+					deliver = callback
+					onError = options?.onError
+					return () => {}
+				},
+			),
+		} as unknown as QueryBuilder
+		const store = new QueryStore(queryBuilder)
+		const listener = vi.fn()
+		store.subscribe(listener)
+		expect(store.getError()).toBeNull()
+
+		const error = new Error('query failed')
+		onError?.({ error, phase: 'initial', collection: 'todos', queryId: 'sub_1' })
+		expect(store.getError()).toBe(error)
+		expect(store.hasSnapshot()).toBe(false)
+		expect(listener).toHaveBeenCalledTimes(1)
+
+		deliver?.([createRecord('a')])
+		expect(store.getError()).toBeNull()
+		expect(store.getSnapshot()).toHaveLength(1)
+		expect(listener).toHaveBeenCalledTimes(2)
 	})
 })

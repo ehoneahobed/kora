@@ -1,8 +1,9 @@
 import type { FieldDescriptor } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { QueryError } from '../errors'
-import type { QueryDescriptor } from '../types'
+import type { OrderByDirection, QueryDescriptor } from '../types'
 import {
+	VIRTUAL_TIMESTAMP_FIELDS,
 	buildCountQuery,
 	buildInsertQuery,
 	buildLwwSoftDeleteQuery,
@@ -95,7 +96,83 @@ describe('buildSelectQuery', () => {
 			offset: 20,
 		}
 		const result = buildSelectQuery(descriptor, todoFields)
-		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 LIMIT 10 OFFSET 20')
+		// SEC-7: bound as parameters, never spliced into the SQL text.
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 LIMIT ? OFFSET ?')
+		expect(result.params).toEqual([10, 20])
+	})
+
+	test('OFFSET without LIMIT is valid SQLite (LIMIT -1)', () => {
+		const result = buildSelectQuery(
+			{ collection: 'todos', where: {}, orderBy: [], offset: 5 },
+			todoFields,
+		)
+		expect(result.sql).toBe('SELECT * FROM "todos" WHERE _deleted = 0 LIMIT -1 OFFSET ?')
+		expect(result.params).toEqual([5])
+	})
+
+	test.each([
+		['a non-integer', 1.5],
+		['a negative number', -1],
+		['NaN', Number.NaN],
+		['an unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+		['a SQL string', '1; DROP TABLE todos'],
+	])('rejects %s as limit or offset (SEC-7)', (_label, value) => {
+		const bad = value as unknown as number
+		expect(() =>
+			buildSelectQuery({ collection: 'todos', where: {}, orderBy: [], limit: bad }, todoFields),
+		).toThrow(QueryError)
+		expect(() =>
+			buildSelectQuery({ collection: 'todos', where: {}, orderBy: [], offset: bad }, todoFields),
+		).toThrow(QueryError)
+	})
+
+	test('accepts uppercase directions and rejects anything else (SEC-7)', () => {
+		const upper = buildSelectQuery(
+			{
+				collection: 'todos',
+				where: {},
+				orderBy: [{ field: 'title', direction: 'DESC' as OrderByDirection }],
+			},
+			todoFields,
+		)
+		expect(upper.sql).toContain('ORDER BY "title" DESC')
+		for (const direction of ['ASC; DROP TABLE todos', 'up', '', 'asc ', 'constructor']) {
+			expect(() =>
+				buildSelectQuery(
+					{
+						collection: 'todos',
+						where: {},
+						orderBy: [{ field: 'title', direction: direction as OrderByDirection }],
+					},
+					todoFields,
+				),
+			).toThrow(QueryError)
+		}
+	})
+
+	test('maps createdAt / updatedAt to their system columns (STORE-11)', () => {
+		const result = buildSelectQuery(
+			{
+				collection: 'todos',
+				where: { updatedAt: { $gt: 100 }, createdAt: 5 },
+				orderBy: [{ field: 'createdAt', direction: 'desc' }],
+			},
+			todoFields,
+		)
+		expect(result.sql).toBe(
+			'SELECT * FROM "todos" WHERE _deleted = 0 AND "_updated_at" > ? AND "_created_at" = ? ORDER BY "_created_at" DESC',
+		)
+		expect(result.params).toEqual([100, 5])
+		expect(VIRTUAL_TIMESTAMP_FIELDS).toEqual({ createdAt: '_created_at', updatedAt: '_updated_at' })
+	})
+
+	test('a schema field named createdAt keeps its own column (STORE-11)', () => {
+		const fields = { ...todoFields, createdAt: field('timestamp', { auto: true }) }
+		const result = buildSelectQuery(
+			{ collection: 'todos', where: {}, orderBy: [{ field: 'createdAt', direction: 'asc' }] },
+			fields,
+		)
+		expect(result.sql).toContain('ORDER BY "createdAt" ASC')
 	})
 
 	test('handles multiple where conditions (AND)', () => {

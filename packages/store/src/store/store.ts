@@ -355,6 +355,19 @@ export class Store implements OperationLog {
 		this.secretKeyProvider = config.secretKeyProvider
 		this.subscriptionManager = new SubscriptionManager({
 			onQuerySubscribed: config.onQuerySubscribed,
+			// STORE-12: every subscription failure is observable (DevTools, app listeners).
+			onQueryError: (failure) => {
+				const code =
+					failure.error instanceof KoraError ? failure.error.code : failure.error.name || 'Error'
+				this.emitter?.emit({
+					type: 'query:error',
+					queryId: failure.queryId,
+					collection: failure.collection,
+					phase: failure.phase,
+					code,
+					message: failure.error.message,
+				})
+			},
 		})
 	}
 

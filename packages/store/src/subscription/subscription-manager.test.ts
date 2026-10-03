@@ -182,15 +182,22 @@ describe('SubscriptionManager', () => {
 
 	test('handles executeFn errors gracefully', async () => {
 		const callback = vi.fn()
+		const onError = vi.fn()
 
-		manager.register({ collection: 'todos', where: {}, orderBy: [] }, callback, async () => {
-			throw new Error('Query failed')
-		})
+		manager.register(
+			{ collection: 'todos', where: {}, orderBy: [] },
+			callback,
+			async () => {
+				throw new Error('Query failed')
+			},
+			{ onError },
+		)
 
 		manager.notify('todos', makeOp('todos'))
-		// Should not throw
+		// Should not throw; the failure reaches the error channel (STORE-12).
 		await manager.flush()
 		expect(callback).not.toHaveBeenCalled()
+		expect(onError).toHaveBeenCalledTimes(1)
 	})
 
 	test('empty flush is a no-op', async () => {
@@ -576,5 +583,147 @@ describe('SubscriptionManager registerAndFetch', () => {
 		await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 		expect(callback).not.toHaveBeenCalled()
+	})
+})
+
+describe('SubscriptionManager structural diff and error channel (STORE-12)', () => {
+	const descriptor = { collection: 'todos', where: {}, orderBy: [] }
+	const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+	test('fresh but structurally equal arrays and objects do not re-notify', async () => {
+		const manager = new SubscriptionManager()
+		const callback = vi.fn()
+		manager.registerAndFetch(descriptor, callback, async () => [
+			{ id: 'a', createdAt: 1, updatedAt: 1, tags: ['x', 'y'], meta: { n: 1, deep: [1] } },
+		])
+		await tick()
+		manager.invalidate('todos')
+		await manager.flush()
+		expect(callback).toHaveBeenCalledTimes(1)
+	})
+
+	test('a changed nested value re-notifies', async () => {
+		const manager = new SubscriptionManager()
+		const callback = vi.fn()
+		let tags = ['x']
+		manager.registerAndFetch(descriptor, callback, async () => [
+			{ id: 'a', createdAt: 1, updatedAt: 1, tags: [...tags] },
+		])
+		await tick()
+		tags = ['x', 'z']
+		manager.invalidate('todos')
+		await manager.flush()
+		expect(callback).toHaveBeenCalledTimes(2)
+	})
+
+	test('an initial failure goes to onError and the query:error hook, not an unhandled rejection', async () => {
+		const onQueryError = vi.fn()
+		const manager = new SubscriptionManager({ onQueryError })
+		const onError = vi.fn()
+		const callback = vi.fn()
+		manager.registerAndFetch(
+			descriptor,
+			callback,
+			async () => {
+				throw new Error('boom')
+			},
+			{ onError },
+		)
+		await tick()
+		expect(callback).not.toHaveBeenCalled()
+		expect(onError).toHaveBeenCalledTimes(1)
+		expect(onError.mock.calls[0]?.[0]).toMatchObject({ phase: 'initial', collection: 'todos' })
+		expect(onError.mock.calls[0]?.[0].error.message).toBe('boom')
+		expect(onQueryError).toHaveBeenCalledTimes(1)
+	})
+
+	test('a refresh failure keeps the subscription; the next success is delivered even if equal', async () => {
+		const manager = new SubscriptionManager()
+		const onError = vi.fn()
+		const callback = vi.fn()
+		let fail = false
+		const rows = [{ id: 'a', createdAt: 1, updatedAt: 1 }]
+		manager.registerAndFetch(
+			descriptor,
+			callback,
+			async () => {
+				if (fail) throw new Error('transient')
+				return rows.map((r) => ({ ...r }))
+			},
+			{ onError },
+		)
+		await tick()
+		fail = true
+		manager.invalidate('todos')
+		await manager.flush()
+		expect(onError).toHaveBeenCalledTimes(1)
+		expect(onError.mock.calls[0]?.[0].phase).toBe('refresh')
+		fail = false
+		manager.invalidate('todos')
+		await manager.flush()
+		// Recovery is delivered so bindings can clear their error state.
+		expect(callback).toHaveBeenCalledTimes(2)
+		manager.invalidate('todos')
+		await manager.flush()
+		expect(callback).toHaveBeenCalledTimes(2)
+	})
+
+	test('a throwing callback is reported with phase "callback" and does not block other subscriptions', async () => {
+		const manager = new SubscriptionManager()
+		const onError = vi.fn()
+		const other = vi.fn()
+		let n = 0
+		const exec = async () => [{ id: `r${n}`, createdAt: 1, updatedAt: 1 }]
+		manager.register(
+			descriptor,
+			() => {
+				throw new Error('render failed')
+			},
+			exec,
+			{ onError },
+		)
+		manager.register(descriptor, other, exec)
+		n = 1
+		manager.invalidate('todos')
+		await manager.flush()
+		expect(onError.mock.calls[0]?.[0].phase).toBe('callback')
+		expect(other).toHaveBeenCalledTimes(1)
+	})
+
+	test('without onError the failure is logged, never silent', async () => {
+		const manager = new SubscriptionManager()
+		const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+		try {
+			manager.registerAndFetch(descriptor, vi.fn(), async () => {
+				throw new Error('nobody listening')
+			})
+			await tick()
+			expect(spy).toHaveBeenCalledTimes(1)
+		} finally {
+			spy.mockRestore()
+		}
+	})
+
+	test('a slow initial run never overwrites a newer refresh result', async () => {
+		const manager = new SubscriptionManager()
+		const callback = vi.fn()
+		let release: (() => void) | null = null
+		let call = 0
+		manager.registerAndFetch(descriptor, callback, async () => {
+			call++
+			if (call === 1) {
+				await new Promise<void>((resolve) => {
+					release = resolve
+				})
+				return [{ id: 'old', createdAt: 1, updatedAt: 1 }]
+			}
+			return [{ id: 'new', createdAt: 2, updatedAt: 2 }]
+		})
+		manager.invalidate('todos')
+		await manager.flush()
+		release?.()
+		await tick()
+		expect(callback).toHaveBeenCalledTimes(1)
+		expect(callback.mock.calls[0]?.[0][0].id).toBe('new')
 	})
 })

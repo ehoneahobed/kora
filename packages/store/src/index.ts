@@ -85,6 +85,9 @@ export type { CollectionAccessor } from './store/store'
 
 // === Query ===
 export { QueryBuilder } from './query/query-builder'
+export { VIRTUAL_TIMESTAMP_FIELDS, VIRTUAL_TIMESTAMP_FIELD_NAMES } from './query/sql-builder'
+export type { VirtualTimestampField } from './query/sql-builder'
+export type { QueryErrorPhase, QuerySubscriptionError, SubscribeOptions } from './types'
 export { QueryStore } from './reactivity/query-store'
 export { assertQueryReady } from './reactivity/assert-query-ready'
 export {
@@ -95,9 +98,11 @@ export {
 // === Subscription ===
 export { SubscriptionManager } from './subscription/subscription-manager'
 export type {
+	RegisterOptions,
 	SubscriptionManagerOptions,
 	SubscriptionStats,
 } from './subscription/subscription-manager'
+export type { ResultsEqual } from './subscription/result-equality'
 export { SubscriptionBloomFilter } from './subscription/bloom-filter'
 
 // === Collection ===
