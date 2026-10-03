@@ -1527,6 +1527,41 @@ export class PostgresServerStore implements ServerStore {
 		return { wallTime: row.wallTime, logical: row.logical, nodeId: row.timestampNodeId }
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+		)) as unknown as { record: string }[]
+		return rows[0]?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		const now = Date.now()
+		// One statement each, atomic on the (owner, keyring) primary key: concurrent writes
+		// from any number of server instances have exactly one winner.
+		const rows = (expectedRevision === 0
+			? await this.db.execute(
+					sql`INSERT INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+							VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now})
+							ON CONFLICT (owner, keyring) DO NOTHING RETURNING owner`,
+				)
+			: await this.db.execute(
+					sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+							WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+							RETURNING owner`,
+				)) as unknown as { owner: string }[]
+		return rows.length > 0
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		await this.ready
@@ -2512,6 +2547,19 @@ export class PostgresServerStore implements ServerStore {
 				CREATE TABLE IF NOT EXISTS kora_server_meta (
 					key TEXT PRIMARY KEY,
 					value TEXT NOT NULL
+				)
+			`)
+
+			// Wrapped end-to-end encryption key records (ENC-1, D4b): salt, KDF parameters
+			// and wrapped keys per (owner, keyring). Never a usable key.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_encryption_keys (
+					owner TEXT NOT NULL,
+					keyring TEXT NOT NULL,
+					revision BIGINT NOT NULL,
+					record TEXT NOT NULL,
+					updated_at BIGINT NOT NULL,
+					PRIMARY KEY (owner, keyring)
 				)
 			`)
 

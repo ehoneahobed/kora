@@ -200,6 +200,8 @@ function timelineLabel(event: KoraEvent): string {
 			return 'sync auth failed'
 		case 'sync:suspended':
 			return `sync suspended (${event.reason})`
+		case 'encryption:status':
+			return `encryption ${event.status.state}${event.status.code ? ` (${event.status.code})` : ''}`
 		case 'sync:clock-skew':
 			return `clock skew ${Math.round(event.skewMs / 1000)}s (${event.severity})`
 		case 'sync:node-id-rotated':

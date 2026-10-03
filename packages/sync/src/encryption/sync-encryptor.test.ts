@@ -71,7 +71,11 @@ function makeDeleteOperation(): Operation {
 }
 
 async function createEncryptor(passphrase = 'test-passphrase'): Promise<SyncEncryptor> {
-	return SyncEncryptor.create({ enabled: true, key: passphrase }, undefined, TEST_KDF_ITERATIONS)
+	return SyncEncryptor.create(
+		{ enabled: true, key: passphrase },
+		generateSalt(),
+		TEST_KDF_ITERATIONS,
+	)
 }
 
 async function createEncryptorWithSalt(
@@ -95,27 +99,42 @@ describe('SyncEncryptor.create', () => {
 			enabled: true,
 			key: async () => 'async-passphrase',
 		}
-		const encryptor = await SyncEncryptor.create(config, undefined, TEST_KDF_ITERATIONS)
+		const encryptor = await SyncEncryptor.create(config, generateSalt(), TEST_KDF_ITERATIONS)
 		expect(encryptor).toBeInstanceOf(SyncEncryptor)
 	})
 
 	test('throws EncryptionError when encryption is disabled', async () => {
-		await expect(SyncEncryptor.create({ enabled: false, key: 'test' })).rejects.toThrow(
-			EncryptionError,
-		)
+		await expect(
+			SyncEncryptor.create({ enabled: false, key: 'test' }, generateSalt()),
+		).rejects.toThrow(EncryptionError)
 	})
 
 	test('throws EncryptionError for empty passphrase', async () => {
-		await expect(SyncEncryptor.create({ enabled: true, key: '' })).rejects.toThrow(EncryptionError)
-		await expect(SyncEncryptor.create({ enabled: true, key: '' })).rejects.toThrow(
+		await expect(SyncEncryptor.create({ enabled: true, key: '' }, generateSalt())).rejects.toThrow(
+			EncryptionError,
+		)
+		await expect(SyncEncryptor.create({ enabled: true, key: '' }, generateSalt())).rejects.toThrow(
 			'must not be empty',
 		)
 	})
 
 	test('throws EncryptionError for async provider returning empty string', async () => {
-		await expect(SyncEncryptor.create({ enabled: true, key: async () => '' })).rejects.toThrow(
-			EncryptionError,
-		)
+		await expect(
+			SyncEncryptor.create({ enabled: true, key: async () => '' }, generateSalt()),
+		).rejects.toThrow(EncryptionError)
+	})
+
+	test('ENC-1: refuses to derive without a shared salt (no per-process random salt)', async () => {
+		await expect(
+			SyncEncryptor.create(
+				{ enabled: true, key: 'p' },
+				undefined as unknown as Uint8Array,
+				TEST_KDF_ITERATIONS,
+			),
+		).rejects.toThrow('shared key-derivation salt')
+		await expect(
+			SyncEncryptor.create({ enabled: true, key: 'p' }, new Uint8Array(8), TEST_KDF_ITERATIONS),
+		).rejects.toThrow(EncryptionError)
 	})
 
 	test('deterministic key with same salt', async () => {
@@ -466,7 +485,7 @@ describe('backward compatibility', () => {
 	test('allowPlaintextMigration passes plaintext through during a migration window', async () => {
 		const encryptor = await SyncEncryptor.create(
 			{ enabled: true, key: 'k', allowPlaintextMigration: true },
-			undefined,
+			generateSalt(),
 			TEST_KDF_ITERATIONS,
 		)
 		const op = makeOperation()
@@ -476,7 +495,7 @@ describe('backward compatibility', () => {
 	test('mixed encrypted/unencrypted batch during migration', async () => {
 		const encryptor = await SyncEncryptor.create(
 			{ enabled: true, key: 'k', allowPlaintextMigration: true },
-			undefined,
+			generateSalt(),
 			TEST_KDF_ITERATIONS,
 		)
 		const plainOp = makeOperation({ id: 'plain-1' })
@@ -647,7 +666,7 @@ describe('isCleartextOnly (server-authored plaintext under encryption)', () => {
 	async function withCleartext(): Promise<SyncEncryptor> {
 		return SyncEncryptor.create(
 			{ enabled: true, key: 'k', cleartextFields: { todos: ['ownerId', 'projectId'] } },
-			undefined,
+			generateSalt(),
 			TEST_KDF_ITERATIONS,
 		)
 	}

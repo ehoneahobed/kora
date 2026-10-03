@@ -12,6 +12,7 @@ export const RESERVED_APP_PROPERTIES = [
 	'on',
 	'collections',
 	'sync',
+	'encryption',
 	'sequences',
 	'blobs',
 	'storage',

@@ -751,14 +751,15 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "ENC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Decision D4b (Phase 4): per-user keyring of random 256-bit data keys, AES-GCM-wrapped by a PBKDF2-SHA256 (600k, per-user random salt) passphrase KEK; the server stores only {salt, kdf, wrapped keys, keyId, keyVersion, revision} (table kora_encryption_keys, compare-and-set, append-only versions, per-principal) and serves it over the sync side channel encryption-key-request/put/response before any op is exchanged. Random per-process salt removed (SyncEncryptor.create now requires a salt). Locked state explicit (app.encryption, encryption:status, sync:suspended encryption-locked); rotation, passphrase change, optional ECDH recovery key; non-extractable key cache (IndexedDB in browsers). ENC-2 repro setup moved to a second keyring (with shared keys, one user no longer has two keys). Repro kora/tests/repro/ENC-1 green.",
+   "acceptanceTest": "packages/sync/src/encryption/keyring.test.ts"
   },
   {
    "id": "ENC-2",

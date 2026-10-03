@@ -377,6 +377,47 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 }
 
 /**
+ * End-to-end encryption keyring controls (`app.encryption`, ENC-1). Null when
+ * `sync.encryption` is not enabled.
+ *
+ * While the keyring is locked sync is paused; local reads and writes continue (this
+ * layer encrypts the sync wire, not the local database).
+ */
+export interface EncryptionControl {
+	/** Current lock state, key version and reason. */
+	getStatus(): import('@korajs/sync').EncryptionStatus
+	/** Subscribe to status changes. Returns an unsubscribe function. */
+	onStatusChange(listener: (status: import('@korajs/sync').EncryptionStatus) => void): () => void
+	/**
+	 * Unlock with the user's passphrase. Opens the cached or server key record (on the
+	 * user's first device, creates it) and resumes sync. When no record is known yet and
+	 * sync is not connected, resolves with `code: 'AWAITING_SERVER'` and finishes at the
+	 * next handshake (watch `onStatusChange`). Rejects with `WRONG_PASSPHRASE`, or
+	 * `UNLOCK_THROTTLED` after repeated failures (a device-side backoff).
+	 */
+	unlock(passphrase: string): Promise<import('@korajs/sync').EncryptionStatus>
+	/** Forget the keys on this device (and its key cache) and pause sync until unlock. */
+	lock(): Promise<import('@korajs/sync').EncryptionStatus>
+	/** Create a new key version for new operations; old versions stay readable. Online only. */
+	rotateKey(): Promise<import('@korajs/sync').EncryptionStatus>
+	/** Re-wrap every key version under a new passphrase (no data re-encrypted). Online only. */
+	changePassphrase(
+		newPassphrase: string,
+		options?: { currentPassphrase?: string },
+	): Promise<import('@korajs/sync').EncryptionStatus>
+	/**
+	 * Create (or replace) the recovery key and return it ONCE. Store it offline: it is
+	 * the only way back after a lost passphrase. Online only.
+	 */
+	enableRecovery(): Promise<string>
+	/** Recover after a lost passphrase with the recovery key, setting a new passphrase. */
+	recover(
+		recoveryKey: string,
+		newPassphrase: string,
+	): Promise<import('@korajs/sync').EncryptionStatus>
+}
+
+/**
  * Controls for the sync subsystem exposed on the KoraApp.
  */
 export interface SyncControl {
@@ -518,6 +559,8 @@ export interface KoraApp {
 	collections: Readonly<Record<string, CollectionAccessor>>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */
+	encryption: EncryptionControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
@@ -611,6 +654,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	collections: TypedCollections<S>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */
+	encryption: EncryptionControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */

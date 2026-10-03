@@ -12,6 +12,7 @@ import type { OperationValidator } from '../apply/operation-validator'
 import { NoAuthProvider } from '../auth/no-auth'
 import { AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
+import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
@@ -187,6 +188,8 @@ export class KoraSyncServer {
 	private readonly awarenessRelay = new AwarenessRelay()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
+	/** Wrapped encryption key records (ENC-1, D4b), persisted in the server store. */
+	private readonly encryptionKeys: EncryptionKeyService
 	/** Which blob hashes each download scope may obtain (RT-1). */
 	private readonly blobAccess: BlobAccessIndex
 	private readonly persistBlobChunk:
@@ -332,6 +335,7 @@ export class KoraSyncServer {
 		this.metrics.setSchemaVersion(this.schemaVersion)
 		this.blobLimits = config.blobLimits ?? {}
 		this.blobAccess = new BlobAccessIndex(this.store, config.resolveBlobChunk ?? null)
+		this.encryptionKeys = new EncryptionKeyService(this.store)
 		this.blobChunkRelay = new BlobChunkRelay(
 			config.resolveBlobChunk,
 			{
@@ -1292,6 +1296,17 @@ export class KoraSyncServer {
 			...(this.blobLimits.maxBytesPerSession !== undefined
 				? { maxBlobBytesPerSession: this.blobLimits.maxBytesPerSession }
 				: {}),
+			encryptionKeys: this.encryptionKeys,
+			onEncryptionKeyWritten: (sourceSessionId, owner, keyring, record) => {
+				// Every other live device of the same owner learns the new record at once
+				// (rotation, passphrase change), before the operations sealed under it.
+				for (const [sid, other] of this.sessions) {
+					if (sid === sourceSessionId) continue
+					if (other.getEncryptionKeyOwner() === owner) {
+						other.pushEncryptionKeyRecord(keyring, record)
+					}
+				}
+			},
 			// Side channels are joined only after an accepted handshake, never at connect.
 			onReady: (sid) => {
 				this.yjsDocRelay.addClient(sid, transport)

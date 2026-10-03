@@ -8,6 +8,7 @@ import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
 import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
+import { createAppKeyring, createEncryptionControl } from './encryption-control'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { warnShadowedCollections } from './reserved-app-properties'
@@ -98,9 +99,14 @@ export function createApp<const S extends SchemaInput>(
 	const storagePersistence = new StoragePersistence({ emitter })
 	let unwirePersistence: (() => void) | null = null
 
+	// End-to-end encryption keyring (ENC-1): created up front so its status is
+	// observable (and unlock() callable) before the store opens. Never during a
+	// server render (DX-6): the inert app opens nothing.
+	const keyring = inert ? null : createAppKeyring(config, emitter)
+
 	const ready = inert
 		? inertReady()
-		: initializeApp(config, emitter, mergeEngine).then((init) => {
+		: initializeApp(config, emitter, mergeEngine, keyring).then((init) => {
 				store = init.store
 				applyPipeline = init.applyPipeline
 				unsubscribeSync = init.unsubscribeSync
@@ -152,6 +158,7 @@ export function createApp<const S extends SchemaInput>(
 		on: emitter.on.bind(emitter),
 		collections,
 		sync: createSyncControl({ config, ready, state: syncState }),
+		encryption: createEncryptionControl({ keyring, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),
 		blobs: {
 			get store() {

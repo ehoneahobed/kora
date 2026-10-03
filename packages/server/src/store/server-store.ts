@@ -511,6 +511,26 @@ export interface ServerStore extends SyncStore {
 	 */
 	replaceNodeClaim?(nodeId: string, expectedOwner: string, newOwner: string): Promise<boolean>
 	/**
+	 * The wrapped encryption key record (JSON) of one owner's keyring, or null (ENC-1).
+	 * The record holds only salt, KDF parameters and wrapped keys: never a usable key.
+	 * Optional for custom stores; without it the server answers key requests with
+	 * `unsupported` (it never keeps key records in memory only, which would fork a
+	 * user's keys after a restart).
+	 */
+	getEncryptionKeyRecord?(owner: string, keyring: string): Promise<string | null>
+	/**
+	 * Write a key record with compare-and-set: store `record` at `revision` only when the
+	 * stored revision is `expectedRevision` (0: no record yet). Returns false when
+	 * another write won. Must be atomic per (owner, keyring) across server instances.
+	 */
+	putEncryptionKeyRecord?(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean>
+	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server
 	 * keeps ownership in memory (lost on restart, not shared between instances).

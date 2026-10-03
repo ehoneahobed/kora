@@ -1009,6 +1009,40 @@ export class SqliteServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ record: string }>(
+			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+		)
+		return rows[0]?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		const now = Date.now()
+		// Compare-and-set on the revision; better-sqlite3 runs it synchronously, and the
+		// primary key makes a concurrent first write from another process fail.
+		if (expectedRevision === 0) {
+			const rows = this.db.all<{ owner: string }>(
+				sql`INSERT OR IGNORE INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+					VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now}) RETURNING owner`,
+			)
+			return rows.length > 0
+		}
+		const rows = this.db.all<{ owner: string }>(
+			sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+				WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+				RETURNING owner`,
+		)
+		return rows.length > 0
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false
@@ -1904,6 +1938,19 @@ export class SqliteServerStore implements ServerStore {
 			CREATE TABLE IF NOT EXISTS kora_server_meta (
 				key TEXT PRIMARY KEY,
 				value TEXT NOT NULL
+			)
+		`)
+
+		// Wrapped end-to-end encryption key records (ENC-1, D4b): salt, KDF parameters and
+		// wrapped keys per (owner, keyring). Never a usable key.
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_encryption_keys (
+				owner TEXT NOT NULL,
+				keyring TEXT NOT NULL,
+				revision INTEGER NOT NULL,
+				record TEXT NOT NULL,
+				updated_at INTEGER NOT NULL,
+				PRIMARY KEY (owner, keyring)
 			)
 		`)
 

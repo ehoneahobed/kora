@@ -131,6 +131,8 @@ export class MemoryServerStore implements ServerStore {
 	private snapshotFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
+	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
+	private readonly encryptionKeyRecords = new Map<string, { record: string; revision: number }>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -779,6 +781,25 @@ export class MemoryServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		return this.encryptionKeyRecords.get(keyRecordKey(owner, keyring))?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		const key = keyRecordKey(owner, keyring)
+		if ((this.encryptionKeyRecords.get(key)?.revision ?? 0) !== expectedRevision) return false
+		this.encryptionKeyRecords.set(key, { record, revision })
+		return true
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false
@@ -1040,4 +1061,9 @@ export class MemoryServerStore implements ServerStore {
 			)
 		}
 	}
+}
+
+/** Map key of one owner's keyring (NUL never occurs in either part's meaning). */
+function keyRecordKey(owner: string, keyring: string): string {
+	return `${owner}\u0000${keyring}`
 }

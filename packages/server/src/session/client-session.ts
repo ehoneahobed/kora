@@ -15,11 +15,14 @@ import type {
 	BlobChunkPushMessage,
 	BlobChunkRequestMessage,
 	BlobChunkResponseMessage,
+	EncryptionKeyPutMessage,
+	EncryptionKeyRequestMessage,
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
 	SyncMessage,
 	WireFormat,
+	WrappedKeyRecord,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
 import { SyncEncryptor, decodeBlobChunkBytes } from '@korajs/sync'
@@ -60,6 +63,8 @@ import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-v
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
+import type { EncryptionKeyService } from '../encryption/key-record-service'
+import { ANONYMOUS_KEY_OWNER, userKeyOwner } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import type { BlobAccessIndex } from '../richtext/blob-access-index'
 import {
@@ -419,6 +424,17 @@ export interface ClientSessionOptions {
 	onBlobChunkRequest?: BlobChunkRequestCallback
 	/** Called when this session receives a blob chunk response to route back */
 	onBlobChunkResponse?: BlobChunkResponseCallback
+	/** The key service storing wrapped encryption key records (ENC-1). */
+	encryptionKeys?: EncryptionKeyService
+	/** Called after this session wrote a key record, to push it to the owner's other sessions. */
+	onEncryptionKeyWritten?: (
+		sessionId: string,
+		owner: string,
+		keyring: string,
+		record: WrappedKeyRecord,
+	) => void
+	/** Key-service messages allowed per session per minute. Defaults to 60. */
+	maxKeyRequestsPerMinute?: number
 	/** Persist a client-uploaded blob chunk centrally (keyed by content hash) */
 	persistBlobChunk?: PersistBlobChunk
 	/**
@@ -689,6 +705,10 @@ export class ClientSession {
 	private readonly onYjsDocUpdate: YjsDocRelayCallback | null
 	private readonly onBlobChunkRequest: BlobChunkRequestCallback | null
 	private readonly onBlobChunkResponse: BlobChunkResponseCallback | null
+	private readonly encryptionKeys: EncryptionKeyService | null
+	private readonly onEncryptionKeyWritten: ClientSessionOptions['onEncryptionKeyWritten'] | null
+	/** Budget of key-service messages (each may cost a store read and write). */
+	private readonly keyRateLimiter: SessionRateLimiter
 	private readonly persistBlobChunk: PersistBlobChunk | null
 	private readonly onClose: ((sessionId: string) => void) | null
 	private readonly onReady: ((sessionId: string) => void) | null
@@ -756,6 +776,9 @@ export class ClientSession {
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
 		this.onBlobChunkRequest = options.onBlobChunkRequest ?? null
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
+		this.encryptionKeys = options.encryptionKeys ?? null
+		this.onEncryptionKeyWritten = options.onEncryptionKeyWritten ?? null
+		this.keyRateLimiter = new SessionRateLimiter(options.maxKeyRequestsPerMinute ?? 60)
 		this.persistBlobChunk = options.persistBlobChunk ?? null
 		this.onClose = options.onClose ?? null
 		this.onReady = options.onReady ?? null
@@ -1566,6 +1589,69 @@ export class ClientSession {
 			case 'blob-chunk-push':
 				await this.handleBlobChunkPush(message)
 				break
+			case 'encryption-key-request':
+			case 'encryption-key-put':
+				await this.handleEncryptionKeyMessage(message)
+				break
+			case 'encryption-key-response':
+				// Server -> client only.
+				break
+		}
+	}
+
+	/**
+	 * The owner of this session's encryption key records (ENC-1), or null when it may
+	 * hold none: the authenticated user, or on a server without auth the one shared
+	 * anonymous owner. An anonymous principal of a mixed provider has no stable
+	 * identity, so it holds no keys.
+	 */
+	getEncryptionKeyOwner(): string | null {
+		if (this.state !== 'syncing' && this.state !== 'streaming') return null
+		if (!this.auth || this.auth instanceof NoAuthProvider) return ANONYMOUS_KEY_OWNER
+		if (!this.principal || this.principal.anonymous === true) return null
+		return userKeyOwner(this.principal.userId)
+	}
+
+	/** Push a key record another session of the same owner wrote (rotation, new passphrase). */
+	pushEncryptionKeyRecord(keyring: string, record: WrappedKeyRecord): void {
+		if (this.state !== 'syncing' && this.state !== 'streaming') return
+		this.sendToClient({
+			type: 'encryption-key-response',
+			messageId: generateUUIDv7(),
+			keyring,
+			status: 'ok',
+			record,
+		})
+	}
+
+	private async handleEncryptionKeyMessage(
+		message: EncryptionKeyRequestMessage | EncryptionKeyPutMessage,
+	): Promise<void> {
+		const refuse = (status: 'unsupported' | 'throttled', text: string): void => {
+			this.sendToClient({
+				type: 'encryption-key-response',
+				messageId: generateUUIDv7(),
+				requestId: message.requestId,
+				keyring: message.keyring,
+				status,
+				record: null,
+				message: text,
+			})
+		}
+		if (!this.encryptionKeys) {
+			refuse('unsupported', 'This sync server does not serve encryption keys.')
+			return
+		}
+		if (!this.keyRateLimiter.allow(1)) {
+			refuse('throttled', 'Too many encryption key requests; retry later.')
+			return
+		}
+		const owner = this.getEncryptionKeyOwner()
+		const outcome = await this.encryptionKeys.handle(owner, message)
+		if (this.state === 'closed') return
+		this.sendToClient(outcome.response)
+		if (outcome.written && owner !== null) {
+			this.onEncryptionKeyWritten?.(this.sessionId, owner, message.keyring, outcome.written)
 		}
 	}
 
