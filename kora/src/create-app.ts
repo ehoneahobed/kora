@@ -2,7 +2,7 @@ import type { SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import type { Store } from '@korajs/store'
-import { QueryStoreCache } from '@korajs/store'
+import { QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
@@ -12,7 +12,7 @@ import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
-import { createStorageApi } from './storage-accessor'
+import { createStorageApi, wireStoragePersistence } from './storage-accessor'
 import { createSyncControl } from './sync-control'
 import {
 	type SyncRuntimeState,
@@ -81,6 +81,8 @@ export function createApp<const S extends SchemaInput>(
 
 	const devtools = setupDevtools(config, emitter)
 	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
+	const storagePersistence = new StoragePersistence({ emitter })
+	let unwirePersistence: (() => void) | null = null
 
 	const ready = initializeApp(config, emitter, mergeEngine).then((init) => {
 		store = init.store
@@ -93,6 +95,14 @@ export function createApp<const S extends SchemaInput>(
 		)
 		currentStoreInfo = init.storeInfo
 		wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+		// NEW-STORE-4: durable-storage check and triggers start here, after the store
+		// opened, and are never awaited: a pending persist() prompt cannot hold ready.
+		unwirePersistence = wireStoragePersistence(
+			config,
+			emitter,
+			storagePersistence,
+			init.authBinding,
+		)
 	})
 
 	const getStore = (): Store | null => store
@@ -153,7 +163,7 @@ export function createApp<const S extends SchemaInput>(
 				return requireBlobApi().gc(options)
 			},
 		},
-		storage: createStorageApi(config),
+		storage: createStorageApi(config, storagePersistence),
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
@@ -181,6 +191,10 @@ export function createApp<const S extends SchemaInput>(
 			teardownSyncLifecycle(syncState)
 			devtools.destroyOverlay?.()
 			devtools.instrumenter?.destroy()
+			if (unwirePersistence) {
+				unwirePersistence()
+				unwirePersistence = null
+			}
 			if (unsubscribeSync) {
 				unsubscribeSync()
 				unsubscribeSync = null

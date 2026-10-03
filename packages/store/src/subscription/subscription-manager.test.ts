@@ -707,13 +707,13 @@ describe('SubscriptionManager structural diff and error channel (STORE-12)', () 
 	test('a slow initial run never overwrites a newer refresh result', async () => {
 		const manager = new SubscriptionManager()
 		const callback = vi.fn()
-		let release: (() => void) | null = null
+		const gate: { release?: () => void } = {}
 		let call = 0
 		manager.registerAndFetch(descriptor, callback, async () => {
 			call++
 			if (call === 1) {
 				await new Promise<void>((resolve) => {
-					release = resolve
+					gate.release = resolve
 				})
 				return [{ id: 'old', createdAt: 1, updatedAt: 1 }]
 			}
@@ -721,7 +721,7 @@ describe('SubscriptionManager structural diff and error channel (STORE-12)', () 
 		})
 		manager.invalidate('todos')
 		await manager.flush()
-		release?.()
+		gate.release?.()
 		await tick()
 		expect(callback).toHaveBeenCalledTimes(1)
 		expect(callback.mock.calls[0]?.[0][0].id).toBe('new')

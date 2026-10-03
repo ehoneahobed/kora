@@ -85,6 +85,14 @@ export interface StoreOptions {
 	 * `StorageDurabilityError` instead.
 	 */
 	allowNonDurable?: boolean
+	/**
+	 * When Kora asks the browser for persistent storage (NEW-STORE-4).
+	 * `'auto'` (default): in the background, never awaited, after sign-in, the
+	 * first local write, or when running as an installed app. `'manual'`: only when
+	 * the app calls `app.storage.persistence.request()`. Either way `app.ready`
+	 * never waits on it and the boot check (`persisted()`) never prompts.
+	 */
+	persistence?: 'auto' | 'manual'
 }
 
 export interface StoreInfo {
@@ -115,6 +123,26 @@ export interface StorageApi {
 	 * @returns true when a database was deleted, false when none existed
 	 */
 	deleteDatabase(name: string, options?: { force?: boolean }): Promise<boolean>
+	/**
+	 * Durable storage (`navigator.storage.persist()`), kept off the startup path
+	 * (NEW-STORE-4). `app.ready` never waits on it. Kora checks `persisted()` at
+	 * boot (never prompts) and, unless `store.persistence` is `'manual'`, requests
+	 * persistence in the background after sign-in, the first local write, or when
+	 * running as an installed app. Every result is also a `storage:persistence` event.
+	 */
+	persistence: StoragePersistenceApi
+}
+
+/** `app.storage.persistence`: durable-storage status and an explicit request. */
+export interface StoragePersistenceApi {
+	/** Last known state. Synchronous; never prompts. */
+	status(): import('@korajs/store').StoragePersistenceStatus
+	/**
+	 * Ask the browser for persistent storage. Firefox shows a permission prompt and
+	 * the promise settles when the user answers, so call it from a user gesture and
+	 * do not block rendering on it. Never throws.
+	 */
+	request(): Promise<import('@korajs/store').StoragePersistenceStatus>
 }
 
 /**

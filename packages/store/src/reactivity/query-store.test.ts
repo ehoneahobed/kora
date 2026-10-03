@@ -248,13 +248,15 @@ describe('QueryStore', () => {
 	})
 
 	it('exposes query failures as error state and clears it on the next result (STORE-12)', () => {
-		let onError: ((failure: QuerySubscriptionError) => void) | undefined
-		let deliver: SubscriptionCallback<CollectionRecord> | null = null
+		const captured: {
+			onError?: (failure: QuerySubscriptionError) => void
+			deliver?: SubscriptionCallback<CollectionRecord>
+		} = {}
 		const queryBuilder = {
 			subscribe: vi.fn(
 				(callback: SubscriptionCallback<CollectionRecord>, options?: SubscribeOptions) => {
-					deliver = callback
-					onError = options?.onError
+					captured.deliver = callback
+					captured.onError = options?.onError
 					return () => {}
 				},
 			),
@@ -265,12 +267,12 @@ describe('QueryStore', () => {
 		expect(store.getError()).toBeNull()
 
 		const error = new Error('query failed')
-		onError?.({ error, phase: 'initial', collection: 'todos', queryId: 'sub_1' })
+		captured.onError?.({ error, phase: 'initial', collection: 'todos', queryId: 'sub_1' })
 		expect(store.getError()).toBe(error)
 		expect(store.hasSnapshot()).toBe(false)
 		expect(listener).toHaveBeenCalledTimes(1)
 
-		deliver?.([createRecord('a')])
+		captured.deliver?.([createRecord('a')])
 		expect(store.getError()).toBeNull()
 		expect(store.getSnapshot()).toHaveLength(1)
 		expect(listener).toHaveBeenCalledTimes(2)

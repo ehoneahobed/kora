@@ -88,6 +88,16 @@ export { QueryBuilder } from './query/query-builder'
 export { VIRTUAL_TIMESTAMP_FIELDS, VIRTUAL_TIMESTAMP_FIELD_NAMES } from './query/sql-builder'
 export type { VirtualTimestampField } from './query/sql-builder'
 export type { QueryErrorPhase, QuerySubscriptionError, SubscribeOptions } from './types'
+
+// === Durable storage (navigator.storage.persist), never on the startup path ===
+export { StoragePersistence } from './persistence/storage-persistence'
+export type {
+	PersistenceRequestReason,
+	PersistenceStorageManager,
+	StoragePersistenceOptions,
+	StoragePersistenceState,
+	StoragePersistenceStatus,
+} from './persistence/storage-persistence'
 export { QueryStore } from './reactivity/query-store'
 export { assertQueryReady } from './reactivity/assert-query-ready'
 export {
