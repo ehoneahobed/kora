@@ -374,6 +374,28 @@ describe('RT-84: transforms at fold time', () => {
 		expect(rejections(c.messages).map((r) => r.code)).toEqual(['FORGED_DUPLICATE'])
 	})
 
+	test("a device echoing another node's operation its earlier release stored rewritten is not refused", async () => {
+		const { login } = await setup(v2Server, schemaV2)
+		const writer = await login('dev-v1', { schemaVersion: 1 })
+		const op = await note('dev-v1', 1)
+		writer.send(batch([op], 'b1'))
+		await acked(writer.messages, 'b1')
+		// An earlier client build stored the delivered op transformed, keeping hashVersion 2.
+		const rewritten: Operation = {
+			...op,
+			data: { title: 't1', tag: 'migrated' },
+			schemaVersion: 2,
+		}
+		const echo = await login('dev-v2')
+		echo.send(batch([rewritten], 'b2'))
+		await acked(echo.messages, 'b2')
+		expect(rejections(echo.messages)).toEqual([])
+		// A forged echo (another record under the same id) is still refused.
+		echo.send(batch([{ ...rewritten, recordId: 'elsewhere' }], 'b3'))
+		await acked(echo.messages, 'b3')
+		expect(rejections(echo.messages).map((r) => r.code)).toEqual(['FORGED_DUPLICATE'])
+	})
+
 	test('a store given transforms after its schema re-folds once with them', async () => {
 		const store = new MemoryServerStore('server-1')
 		await store.setSchema(schemaV2)

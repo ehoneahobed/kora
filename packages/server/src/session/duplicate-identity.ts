@@ -103,12 +103,39 @@ export async function isSameOperationAsStored(
 	if (upload.id !== stored.id) return false
 	if (stored.hashVersion !== undefined || stored.encrypted !== undefined) return false
 	if (await operationIdMatches(stored, schema)) return false
+	return sameHeader(upload, stored)
+}
+
+/**
+ * Whether an upload is a device's echo of ANOTHER node's operation that the device's
+ * earlier release stored REWRITTEN (RT-84): before transforms ran at fold time, devices
+ * stored a delivered operation of another schema version as its transformed copy under
+ * the original id (keeping its declared hash version). Such a body does not verify
+ * against its id; with the header the id covers equal to the stored operation's, the
+ * echo is that operation. The caller acknowledges it as a duplicate (effects come from
+ * the stored copy only, RT-77) instead of refusing it, which would make the echoing
+ * device record a refusal of someone else's write.
+ *
+ * @param upload - The echoed operation (of a node other than the session's)
+ * @param stored - The operation the store holds under the same id
+ * @param schema - The server schema (for beta.13 hash rebuilds)
+ */
+export async function isRewrittenEcho(
+	upload: Operation,
+	stored: Operation,
+	schema: SchemaDefinition | null,
+): Promise<boolean> {
+	if (upload.id !== stored.id || !sameHeader(upload, stored)) return false
+	if (upload.encrypted !== undefined) return false
+	return !(await operationIdMatches(upload, schema))
+}
+
+function sameHeader(a: Operation, b: Operation): boolean {
 	return (
-		upload.nodeId === stored.nodeId &&
-		upload.type === stored.type &&
-		upload.collection === stored.collection &&
-		upload.recordId === stored.recordId &&
-		HybridLogicalClock.serialize(upload.timestamp) ===
-			HybridLogicalClock.serialize(stored.timestamp)
+		a.nodeId === b.nodeId &&
+		a.type === b.type &&
+		a.collection === b.collection &&
+		a.recordId === b.recordId &&
+		HybridLogicalClock.serialize(a.timestamp) === HybridLogicalClock.serialize(b.timestamp)
 	)
 }

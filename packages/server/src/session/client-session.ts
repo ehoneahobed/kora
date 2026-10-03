@@ -96,7 +96,11 @@ import type {
 import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
-import { FORGED_DUPLICATE_CODE, isSameOperationAsStored } from './duplicate-identity'
+import {
+	FORGED_DUPLICATE_CODE,
+	isRewrittenEcho,
+	isSameOperationAsStored,
+} from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
@@ -2438,7 +2442,11 @@ export class ClientSession {
 				? await this.loadStoredOperation(op, stored)
 				: null
 			if (storedCopy !== null) {
-				if (!(await isSameOperationAsStored(op, storedCopy, this.store.getSchema()))) {
+				const schema = this.store.getSchema()
+				if (
+					!(await isSameOperationAsStored(op, storedCopy, schema)) &&
+					!(op.nodeId !== this.clientNodeId && (await isRewrittenEcho(op, storedCopy, schema)))
+				) {
 					this.refuseForgedDuplicate(op, storedCopy)
 					rejectedOperations += 1
 					acknowledgedThrough = op.sequenceNumber
