@@ -64,11 +64,18 @@ createApp({
 Returns a reactive array of records matching a query. Re-evaluates when the local store or sync updates the result set.
 
 ```typescript
-function useQuery<T extends CollectionRecord>(
-  query: QueryBuilder<T>,
-  options?: UseQueryOptions,
-): Readonly<Ref<T[]>>
+function useQuery<T = CollectionRecord>(
+  query: MaybeRefOrGetter<QueryBuilder<T> | null | undefined>,
+  options?: {
+    enabled?: MaybeRefOrGetter<boolean>
+    onError?: (error: Error) => void
+  },
+): Readonly<ShallowRef<readonly T[]>>
 ```
+
+The query and `enabled` can be plain values, refs or getters. Pass a **getter** to follow props or refs: the composable re-subscribes when the query's descriptor changes, releases the previous subscription, and keeps showing the previous rows until the new query answers. A getter that returns `null` disables the query.
+
+A query that fails (for example a `where` or `orderBy` on an unknown field) is reported to `onError`, or logged with `console.error` when there is no handler. Use `useQueryState` to render the error.
 
 In templates, refs auto-unwrap: use `todos` directly, not `todos.value`.
 
@@ -78,14 +85,32 @@ In templates, refs auto-unwrap: use `todos` directly, not `todos.value`.
 <script setup lang="ts">
 import { useApp, useQuery } from '@korajs/vue'
 
+const props = defineProps<{ done: boolean }>()
 const app = useApp()
-const todos = useQuery(app.todos.where({ completed: false }).orderBy('createdAt', 'desc'))
+
+// Follows the prop: switching `done` re-runs the query.
+const todos = useQuery(() => app.todos.where({ completed: props.done }).orderBy('createdAt', 'desc'))
 </script>
 
 <template>
   <ul>
     <li v-for="todo in todos" :key="todo.id">{{ todo.title }}</li>
   </ul>
+</template>
+```
+
+### useQueryState()
+
+Same inputs; returns `{ data, error, ready }` as readonly refs. `error` clears when results flow again, and `data` keeps the last good rows meanwhile.
+
+```vue
+<script setup lang="ts">
+const { data: todos, error } = useQueryState(() => app.todos.where({ completed: false }))
+</script>
+
+<template>
+  <p v-if="error" role="alert">{{ error.message }}</p>
+  <ul v-else><li v-for="todo in todos" :key="todo.id">{{ todo.title }}</li></ul>
 </template>
 ```
 
@@ -108,7 +133,7 @@ Returns `mutate`, `mutateAsync`, `isLoading` (ref), `error` (ref), and `reset`.
 
 ## useSyncStatus()
 
-Returns a readonly ref of `SyncStatusInfo`: connection state, pending operations, last sync time.
+Returns a readonly ref of `SyncStatusInfo`: connection state, pending operations, last sync time, plus `heldOperations` / `heldNodes`, `localDurability` and `serverProtocolVersion` / `protocolDeprecated` (see the [React reference](/api/react#usesyncstatus) for their meaning). The ref only changes when the status does.
 
 ```vue
 <script setup lang="ts">

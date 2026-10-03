@@ -1,16 +1,18 @@
 ---
 title: React API
-description: "@korajs/react API reference: KoraProvider, useQuery, useMutation, useSyncStatus, useRichText, usePresence, and useCollaborators."
+description: "@korajs/react API reference: KoraProvider, useQuery, useQueryState, useMutation, useSyncStatus, createKoraHooks, useRichText, usePresence, and useCollaborators."
 ---
 
 # React API Reference
 
-`@korajs/react` provides React hooks and components for building reactive offline-first UIs. All hooks are concurrent-mode safe (using `useSyncExternalStore` internally) and compatible with React.StrictMode.
+`@korajs/react` provides React hooks and components for building reactive offline-first UIs. All hooks are concurrent-mode safe (using `useSyncExternalStore` with stable `subscribe`/`getSnapshot`, so renders never tear), compatible with React.StrictMode, re-render only when their value changes, and render on the server (`renderToString`, Next.js App Router) with empty values. See [Server rendering and Next.js](/guide/nextjs-app-router).
 
 ```typescript
 import {
   KoraProvider,
+  createKoraHooks,
   useQuery,
+  useQueryState,
   useMutation,
   useSyncStatus,
   useCollection,
@@ -30,7 +32,9 @@ Context provider that makes the Kora app instance available to all hooks in the 
 
 | Prop | Type | Required | Description |
 |------|------|----------|-------------|
-| `app` | `KoraApp` | Yes | The app instance returned by `createApp()`. |
+| `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render once `app.ready` resolves. |
+| `store` | `Store` | One of `app` / `store` | Advanced: an opened store (with optional `syncEngine`) instead of an app. Children render immediately. |
+| `fallback` | `ReactNode` | No | Rendered until `app.ready` resolves, and during a server render (where the app is inert). |
 | `children` | `ReactNode` | Yes | Child components. |
 
 ### Example
@@ -66,6 +70,10 @@ function App() {
 Create the app instance outside of your component tree (e.g., in a module-level variable). Creating it inside a component would reinitialize the database on every render.
 :::
 
+::: tip Server rendering
+A module-scope `createApp` evaluated during a server render (no `window`) is inert: it opens no database and `<KoraProvider app={app}>` renders its `fallback`. The client then hydrates the same fallback and fills in local data. See [Server rendering and Next.js](/guide/nextjs-app-router).
+:::
+
 ---
 
 ## useQuery()
@@ -75,20 +83,29 @@ Returns a reactive array of records matching a query. The component re-renders a
 ### Signature
 
 ```typescript
-function useQuery<T extends CollectionRecord>(query: QueryBuilder<T>): T[]
+function useQuery<T = CollectionRecord>(
+  query: QueryBuilder<T>,
+  options?: { enabled?: boolean; throwOnError?: boolean },
+): readonly T[]
 ```
 
 ### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `query` | `QueryBuilder<T>` | A query built using collection methods (`.where()`, `.orderBy()`, etc.). |
+| `query` | `QueryBuilder<T>` | A query built using collection methods (`.where()`, `.orderBy()`, etc.). A new builder with the same descriptor on each render is fine: the hook keys on the descriptor. |
+| `options.enabled` | `boolean` | When `false`, no subscription is made and the hook returns `[]`. Defaults to `true`. |
+| `options.throwOnError` | `boolean` | When `true` (default), a failed query is thrown to the nearest error boundary. When `false`, the hook keeps returning the last good rows; read the error with [`useQueryState`](#usequerystate). |
 
 ### Returns
 
-`T[]` -- An array of records matching the query. Returns an empty array if no records match.
+`readonly T[]` -- The records matching the query, the same array until the result changes. Returns an empty array if no records match, and during a server render or hydration.
 
 Data is always returned synchronously from the local store. There is no loading state for local data.
+
+### Errors
+
+A query that fails (for example a `where` or `orderBy` on a field that does not exist) is not swallowed into an empty list. `useQuery` throws it to the nearest [error boundary](https://react.dev/reference/react/Component#catching-rendering-errors-with-an-error-boundary); the store also emits it as a `query:error` event for DevTools. To handle it inline, use `useQueryState` or pass `throwOnError: false`.
 
 ### Example
 
@@ -142,8 +159,33 @@ function TodosWithProjects() {
 
 - The callback is subscribed on mount and unsubscribed on unmount. No manual cleanup is needed.
 - Uses `useSyncExternalStore` internally, so it is safe in React 18+ concurrent mode (no tearing).
-- The component only re-renders when the result set actually changes (deep comparison), not on every sync event.
+- `subscribe` and `getSnapshot` are stable: React subscribes once per query, not once per render, and the component re-renders only when the result set changes, not on every sync event.
+- Identical queries in different components share one subscription.
 - Works correctly with React.StrictMode (double-mount safe).
+- On the server and during hydration it returns `[]`, so server HTML and the first client render agree; the rows arrive right after hydration.
+
+---
+
+## useQueryState()
+
+Like `useQuery`, but returns the query's error instead of throwing it, and whether the first result has arrived.
+
+```typescript
+function useQueryState<T = CollectionRecord>(
+  query: QueryBuilder<T>,
+  options?: { enabled?: boolean },
+): { data: readonly T[]; error: Error | null; ready: boolean }
+```
+
+The returned object keeps its identity until `data`, `error` or `ready` changes. `error` clears when results flow again; `data` keeps the last good rows meanwhile. `ready` is `false` until the first result of the current query (always `false` on the server).
+
+```tsx
+function TodoList() {
+  const { data: todos, error } = useQueryState(app.todos.where({ completed: false }))
+  if (error) return <p role="alert">Could not load todos: {error.message}</p>
+  return <ul>{todos.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+}
+```
 
 ---
 
@@ -154,11 +196,21 @@ Returns a mutation function for performing write operations. Mutations are optim
 ### Signature
 
 ```typescript
-function useMutation<TInput, TOutput>(
-  fn: (input: TInput) => Promise<TOutput>
+function useMutation<TData, TArgs extends unknown[], TContext = void>(
+  fn: (...args: TArgs) => Promise<TData>,
+  options?: {
+    onMutate?: (...args: TArgs) => TContext | Promise<TContext>
+    onRollback?: (context: TContext, ...args: TArgs) => void | Promise<void>
+    onSuccess?: (data: TData, ...args: TArgs) => void
+    onError?: (error: Error, ...args: TArgs) => void
+    onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
+  },
 ): {
-  mutate: (input: TInput) => void
-  mutateAsync: (input: TInput) => Promise<TOutput>
+  mutate: (...args: TArgs) => void
+  mutateAsync: (...args: TArgs) => Promise<TData>
+  isLoading: boolean
+  error: Error | null
+  reset: () => void
 }
 ```
 
@@ -172,8 +224,13 @@ function useMutation<TInput, TOutput>(
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `mutate` | `(input: TInput) => void` | Fire-and-forget mutation. Does not return a promise. |
-| `mutateAsync` | `(input: TInput) => Promise<TOutput>` | Awaitable mutation. Resolves when the operation is persisted locally. |
+| `mutate` | `(...args: TArgs) => void` | Fire-and-forget mutation. Does not return a promise. |
+| `mutateAsync` | `(...args: TArgs) => Promise<TData>` | Awaitable mutation. Resolves when the operation is persisted locally. |
+| `isLoading` | `boolean` | `true` while a mutation is running. |
+| `error` | `Error \| null` | The last mutation's error, or `null`. |
+| `reset` | `() => void` | Clears `error`. |
+
+`mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are safe in effect dependency arrays and as props of memoized children. The result object only changes when `isLoading` or `error` changes. The latest `fn` and `options` are always used, even though the callbacks are stable.
 
 ### Example
 
@@ -291,6 +348,13 @@ function useSyncStatus(): SyncStatus
 | `activeViewComplete` | `boolean` | Whether the active downlink view is applied through the accepted frontier. |
 | `blockedFailure` | `ActiveApplyFailure \| null` | Current delivery-blocking apply failure. |
 | `lastSyncedAt` | `number \| null` | Timestamp (milliseconds) of the last successful sync. `null` if never synced. |
+| `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`) until that user signs in again on this device. |
+| `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
+| `localDurability` | `'durable' \| 'degraded'` | `'degraded'` when the local database could not be persisted several times in a row (storage quota, broken IndexedDB). Warn the user to free up storage and stay online. |
+| `serverProtocolVersion` | `number \| null` | Sync protocol version of the server in the current or last session; `null` before any server answered. |
+| `protocolDeprecated` | `boolean` | `true` when the server speaks an older sync protocol than this client (a pre-beta.13 server). Sync still works, but upgrade the server: a later release refuses that protocol. |
+
+The returned object keeps its identity while the status is unchanged, and so do its nested `heldNodes`, `initialSync` and `blockedFailure` values when only other fields change, so all of them are safe as effect or memo dependencies. Before the component mounts, and on the server, the status is `'offline'`.
 
 #### Status values
 
@@ -306,6 +370,13 @@ function useSyncStatus(): SyncStatus
 
 ```tsx
 import { useSyncStatus } from '@korajs/react'
+
+function StorageWarning() {
+  const { localDurability, heldOperations } = useSyncStatus()
+  if (localDurability === 'degraded') return <p role="alert">Storage is full: stay online until it syncs.</p>
+  if (heldOperations > 0) return <p>{heldOperations} changes from another account wait on this device.</p>
+  return null
+}
 
 function SyncIndicator() {
   const { status, pendingOperations, lastSyncedAt } = useSyncStatus()
@@ -326,6 +397,42 @@ function SyncIndicator() {
   )
 }
 ```
+
+---
+
+## createKoraHooks()
+
+Creates hooks typed for your app, so components get schema-checked collection names, inserts, updates and query rows without passing generics around. Call it once next to `createApp`; nothing runs at call time.
+
+```typescript
+function createKoraHooks<TApp>(): {
+  useApp: () => TApp
+  useCollection: <N extends AppCollectionName<TApp>>(name: N) => AppCollections<TApp>[N]
+  useQuery: typeof useQuery
+  useQueryState: typeof useQueryState
+  useMutation: typeof useMutation
+  useSyncStatus: typeof useSyncStatus
+}
+```
+
+```tsx
+// kora.ts
+import { createApp } from 'korajs'
+import { createKoraHooks } from 'korajs/react'
+
+export const app = createApp({ schema })
+export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
+
+// TodoList.tsx
+function TodoList() {
+  const todos = useCollection('todos')                    // 'todoz' is a type error
+  const rows = useQuery(todos.where({ completed: false })) // rows: readonly Todo[]
+  const { mutate: add } = useMutation(todos.insert)        // add({ title: 1 }) is a type error
+  return <button onClick={() => add({ title: 'New' })}>Add ({rows.length})</button>
+}
+```
+
+The typed `useCollection` returns the app's own accessor (`app.collections[name]`), the same object across renders. The types are read from `typeof app`, so they follow whatever `createApp` infers from your schema. The helper types `AppCollectionName<TApp>`, `AppCollections<TApp>` and `AppRecord<TApp, Name>` are exported too.
 
 ---
 
@@ -387,28 +494,39 @@ Provides binding helpers for rich text fields backed by Yjs CRDTs. Returns the Y
 
 ```typescript
 function useRichText(
+  collection: string,
   recordId: string,
-  field: string
-): RichTextBinding
+  field: string,
+  options?: { user?: AwarenessUser; useDocChannel?: boolean },
+): UseRichTextResult
 ```
 
 ### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
+| `collection` | `string` | Collection containing the record. |
 | `recordId` | `string` | ID of the record containing the rich text field. |
 | `field` | `string` | Name of the `t.richtext()` field on the record. |
+| `options.user` | `AwarenessUser` | Identity shown with this user's cursor. |
+| `options.useDocChannel` | `boolean` | Force the incremental document channel on or off. |
 
 ### Returns
 
-#### RichTextBinding
+#### UseRichTextResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `yText` | `Y.Text` | The Yjs `Y.Text` instance for this field. Pass this to your editor's Yjs binding. |
-| `yDoc` | `Y.Doc` | The parent Yjs document. Needed by some editor bindings. |
-| `isLoading` | `boolean` | `true` while the Yjs state is being loaded from storage. |
-| `isEmpty` | `boolean` | `true` if the rich text field has no content. |
+| `doc` | `Y.Doc` | The Yjs document. Pass it to your editor's Yjs binding. |
+| `text` | `Y.Text` | The document's text (`doc.getText('content')`). |
+| `ready` | `boolean` | `false` while the Yjs state is being loaded from storage. |
+| `error` | `Error \| null` | Load failure, if any. |
+| `undo` / `redo` | `() => void` | Local undo and redo. Stable identities. |
+| `canUndo` / `canRedo` | `boolean` | Whether undo / redo is possible. |
+| `cursors` | `CursorInfo[]` | Remote collaborators' cursors in this field. |
+| `setCursor` / `clearCursor` | functions | Publish or clear the local cursor. Stable identities. |
+
+The result object keeps its identity until one of its values changes.
 
 ### Example with TipTap
 
@@ -419,16 +537,16 @@ import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
 
 function NoteEditor({ noteId }: { noteId: string }) {
-  const { yText, yDoc, isLoading } = useRichText(noteId, 'content')
+  const { doc, ready } = useRichText('notes', noteId, 'content')
 
   const editor = useEditor({
     extensions: [
       StarterKit,
-      Collaboration.configure({ document: yDoc, field: 'content' }),
+      Collaboration.configure({ document: doc, field: 'content' }),
     ],
-  }, [yDoc])
+  }, [doc])
 
-  if (isLoading) return <div>Loading editor...</div>
+  if (!ready) return <div>Loading editor...</div>
 
   return <EditorContent editor={editor} />
 }
@@ -616,6 +734,7 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
 
 - Uses `useSyncExternalStore` internally for concurrent-mode safety (no tearing).
 - Only re-renders when the collaborator list actually changes (deep comparison via JSON serialization).
+- Renders `[]` on the server and during hydration.
 - Returns an empty array if the sync engine is not configured or not connected.
 - Automatically subscribes to the sync engine's `AwarenessManager` on mount and unsubscribes on unmount.
 - Works correctly with React.StrictMode (double-mount safe).
