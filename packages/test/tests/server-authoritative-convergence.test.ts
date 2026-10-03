@@ -2,10 +2,10 @@ import { mkdtempSync, rmSync } from 'node:fs'
 /**
  * Phase 3 seam 3: one source of truth for the authoritative node ids.
  *
- * The handshake advertises exactly the node ids the server stores fold with
- * (`KoraSyncServer.authoritativeNodeIds` = `ServerStore.getAuthoritativeNodeIds()`),
- * including the node that authors route writes, side effects and constraint
- * corrections. A `merge('server-authoritative')` field then converges identically on
+ * The handshake advertises the explicit node ids the server stores fold with
+ * (`ServerStore.getAuthoritativeNodeIds()` without `kora:server:` ids, which are
+ * authoritative by prefix on every replica, RT-75); the node that authors route
+ * writes, side effects and constraint corrections is a `kora:server:` node. A `merge('server-authoritative')` field then converges identically on
  * the server (memory, SQLite, Postgres) and on every device: a server write beats any
  * device write of the field whatever its HLC; among server writes the later wins.
  */
@@ -89,13 +89,15 @@ describe.each(kinds)('server-authoritative field through the %s store', (kind) =
 			const [a, b] = network.devices as [TestDevice, TestDevice]
 			await syncAll([a, b], 1)
 
-			// One source of truth: what the stores fold with is what clients learn.
+			// One source of truth: what the stores fold with is what clients learn; the
+			// server's own node is authoritative by its kora:server: prefix (RT-75).
 			expect(server.authoritativeNodeIds).toEqual(store.getAuthoritativeNodeIds?.())
-			expect(server.authoritativeNodeIds).toContain(store.getNodeId())
+			expect(store.getNodeId().startsWith('kora:server:')).toBe(true)
+			const explicit = (server.authoritativeNodeIds ?? []).filter(
+				(id) => !id.startsWith('kora:server:'),
+			)
 			for (const device of [a, b]) {
-				expect(device.getSyncEngine()?.getAuthoritativeNodeIds()).toEqual(
-					server.authoritativeNodeIds,
-				)
+				expect(device.getSyncEngine()?.getAuthoritativeNodeIds()).toEqual(explicit.sort())
 			}
 
 			const item = await a.collection('items').insert({ title: 'x', status: 'draft' })

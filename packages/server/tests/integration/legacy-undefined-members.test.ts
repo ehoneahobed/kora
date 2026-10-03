@@ -12,7 +12,7 @@ import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { withContentId } from '../fixtures/content-id'
-import { batch, createHarness, tick } from '../repro/rt-fixture'
+import { createHarness, sendAndAwaitAck } from '../repro/rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -70,8 +70,7 @@ describe('beta.13 undefined members (RT-71)', () => {
 			previousData: { title: 'x', assignee: 'bob' },
 			causalDeps: [insert.id],
 		})
-		client.send(batch([insert, update]))
-		await tick(100)
+		await sendAndAwaitAck(client, [insert, update])
 		const stored = store.getAllOperations().find((o) => o.id === update.id)
 		expect(stored?.hashVersion).toBe(1)
 		expect(stored?.data).toEqual({ title: 'y', assignee: null })
@@ -85,8 +84,7 @@ describe('beta.13 undefined members (RT-71)', () => {
 		const insert = legacyOp('legacy-node', 1, {
 			data: { title: 'x', meta: { a: 1, b: undefined } },
 		})
-		client.send(batch([insert]))
-		await tick(100)
+		await sendAndAwaitAck(client, [insert])
 		const stored = store.getAllOperations().find((o) => o.id === insert.id)
 		expect(stored).toBeDefined()
 		expect(stored?.hashVersion).toBeUndefined()
@@ -97,8 +95,7 @@ describe('beta.13 undefined members (RT-71)', () => {
 	test('an unrecoverable form (undefined inside a json value) is stored unverified and reported', async () => {
 		const { store, server, client, unverified } = await setup()
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', extra: { k: undefined } } })
-		client.send(batch([insert]))
-		await tick(100)
+		await sendAndAwaitAck(client, [insert])
 		const stored = store.getAllOperations().find((o) => o.id === insert.id)
 		expect(stored?.hashVersion).toBeUndefined()
 		expect(unverified()).toBe(1)
@@ -108,8 +105,7 @@ describe('beta.13 undefined members (RT-71)', () => {
 	test('a protocol-2 session is refused the same unverifiable id (RT-64)', async () => {
 		const { store, server, client, unverified } = await setup(2)
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', extra: { k: undefined } } })
-		client.send(batch([insert]))
-		await tick(100)
+		await sendAndAwaitAck(client, [insert])
 		expect(store.getAllOperations().some((o) => o.id === insert.id)).toBe(false)
 		expect(
 			client.messages.some(

@@ -8,12 +8,12 @@ import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import type { ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { batch, createHarness, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -119,8 +119,7 @@ async function setup(kind: (typeof kinds)[number]) {
 		data: { postId: 'post-1' },
 		causalDeps: [post.id],
 	})
-	owner.send(batch([post, comment, like]))
-	await tick(150)
+	await sendAndAwaitAck(owner, [post, comment, like])
 	const del = makeOp('owner-node', 4, {
 		type: 'delete',
 		collection: 'posts',
@@ -146,18 +145,17 @@ describe.each(kinds)('stored delete effects (RT-73, %s store)', (kind) => {
 		// derives what is still undone.
 		failOnce(store, (op) => op.collection === 'comments' && op.type === 'delete')
 		owner.send(batch([del, unrelated]))
-		await tick(150)
+		// The delete commits; the batch fails after it.
+		await vi.waitFor(async () => expect(await store.findRecord('posts', 'post-1')).toBeNull())
 		expect(await store.findRecord('posts', 'post-1')).toBeNull()
 		const again = await login()
-		again.send(batch([del, unrelated]))
-		await tick(200)
+		await sendAndAwaitAck(again, [del, unrelated])
 		expect(await store.findRecord('comments', 'c-1')).toBeNull()
 		expect((await store.findRecord('likes', 'l-1'))?.postId ?? null).toBeNull()
 		// A third send stores nothing new (the effects are done).
 		const before = await store.getOperationCount()
 		const third = await login()
-		third.send(batch([del, unrelated]))
-		await tick(150)
+		await sendAndAwaitAck(third, [del, unrelated])
 		const after = await store.getOperationCount()
 		expect(after).toBe(before)
 	})
@@ -176,10 +174,10 @@ describe.each(kinds)('stored delete effects (RT-73, %s store)', (kind) => {
 		}
 		failOnce(store, unrelated.id)
 		owner.send(batch([del, unrelated, copy]))
-		await tick(150)
+		// The delete commits; the batch fails after it.
+		await vi.waitFor(async () => expect(await store.findRecord('posts', 'post-1')).toBeNull())
 		const again = await login()
-		again.send(batch([del, unrelated, copy]))
-		await tick(200)
+		await sendAndAwaitAck(again, [del, unrelated, copy])
 		expect(await store.findRecord('posts', 'post-1')).toBeNull()
 		expect(await store.findRecord('comments', 'c-1')).toBeNull()
 	})
@@ -195,10 +193,10 @@ describe.each(kinds)('stored delete effects (RT-73, %s store)', (kind) => {
 		})
 		failOnce(store, unrelated.id)
 		owner.send(batch([del, unrelated, copy]))
-		await tick(150)
+		// The delete commits; the batch fails after it.
+		await vi.waitFor(async () => expect(await store.findRecord('posts', 'post-1')).toBeNull())
 		const again = await login()
-		again.send(batch([del, unrelated, copy]))
-		await tick(200)
+		await sendAndAwaitAck(again, [del, unrelated, copy])
 		expect(await store.findRecord('comments', 'c-1')).toBeNull()
 		const stored = await store.findStoredOperations?.([copy.id])
 		expect(stored?.has(copy.id)).toBe(true)

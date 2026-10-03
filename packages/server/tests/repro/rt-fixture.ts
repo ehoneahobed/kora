@@ -146,6 +146,26 @@ export function batch(ops: Operation[], messageId = `b-${Math.random()}`): SyncM
 	return { type: 'operation-batch', messageId, operations: ops, isFinal: true, batchIndex: 0 }
 }
 
+/**
+ * Send an upload batch and wait until the server acknowledged it (the whole batch was
+ * processed, deferred side effects included): no timing assumption.
+ */
+export async function sendAndAwaitAck(client: TestClient, ops: Operation[]): Promise<void> {
+	const message = batch(ops)
+	client.send(message)
+	await vi.waitFor(
+		() =>
+			expect(
+				client.messages.some(
+					(m) =>
+						m.type === 'acknowledgment' &&
+						(m as { acknowledgedMessageId?: string }).acknowledgedMessageId === message.messageId,
+				),
+			).toBe(true),
+		{ timeout: 10_000, interval: 5 },
+	)
+}
+
 /** Every operation id delivered to a client in operation batches so far. */
 export function deliveredOpIds(messages: SyncMessage[]): string[] {
 	const ids: string[] = []
