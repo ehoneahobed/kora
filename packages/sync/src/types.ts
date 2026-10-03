@@ -114,6 +114,17 @@ export interface SyncStatusInfo {
 	 * a warning (free up storage, stay online). `durable` otherwise.
 	 */
 	localDurability?: 'durable' | 'degraded'
+	/**
+	 * Sync protocol version the server answered with in the current (or last) session,
+	 * or null before any server answered.
+	 */
+	serverProtocolVersion?: number | null
+	/**
+	 * True when the server speaks an older sync protocol than this client (a pre-beta.13
+	 * server). It still syncs, but that protocol is deprecated and a later release
+	 * refuses it: upgrade the sync server.
+	 */
+	protocolDeprecated?: boolean
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
 	inFlightUploadOperations?: number

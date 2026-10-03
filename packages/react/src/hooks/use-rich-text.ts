@@ -23,7 +23,7 @@ export function useRichText(
 	const { store, syncEngine } = useKoraContext()
 	const collection = useMemo(() => store.collection(collectionName), [store, collectionName])
 
-	const getController = useController(
+	const controller = useController(
 		() =>
 			createRichTextController({
 				collection,
@@ -35,19 +35,23 @@ export function useRichText(
 				useDocChannel: options?.useDocChannel,
 				user: options?.user,
 			}),
-		(controller) => controller.destroy(),
+		(instance) => instance.destroy(),
 		[collection, collectionName, fieldName, options?.useDocChannel, recordId, store, syncEngine],
 	)
+	const getController = controller.get
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a replaced controller (version) needs the user again
 	useEffect(() => {
 		getController().setUser(options?.user)
-	}, [getController, options?.user])
+	}, [getController, options?.user, controller.version])
 
-	const snapshot = useSyncExternalStore(
-		(onStoreChange) => getController().subscribe(onStoreChange),
-		() => getController().getSnapshot(),
-		() => getController().getSnapshot(),
+	// biome-ignore lint/correctness/useExhaustiveDependencies: version re-keys subscribe when the controller is replaced
+	const subscribe = useCallback(
+		(onStoreChange: () => void) => getController().subscribe(onStoreChange),
+		[getController, controller.version],
 	)
+	const getSnapshot = useCallback(() => getController().getSnapshot(), [getController])
+	const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
 	const undo = useCallback(() => {
 		getController().undo()
@@ -61,7 +65,13 @@ export function useRichText(
 	)
 	const clearCursor = useCallback(() => getController().clearCursor(), [getController])
 
-	return buildResult(getController(), snapshot, undo, redo, setCursor, clearCursor)
+	const live = getController()
+	// The result keeps its identity until the snapshot or the controller changes (DX-5).
+	// biome-ignore lint/correctness/useExhaustiveDependencies: version marks a replaced controller
+	return useMemo(
+		() => buildResult(live, snapshot, undo, redo, setCursor, clearCursor),
+		[live, snapshot, undo, redo, setCursor, clearCursor, controller.version],
+	)
 }
 
 function buildResult(
