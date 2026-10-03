@@ -82,6 +82,14 @@ made on another device does not turn this device into a clone of it.
   - In a local-only app (no `sync`), replace is exact by default. Pass
     `keepUnsyncedWrites: true` to keep the writes made since the backup was taken.
 
+A backup also carries the device's **compacted history**. Compaction folds operations
+the server acknowledged into per-record base states and removes them from the log; the
+backup holds those base states (and the compacted sequence prefixes), so restoring a
+compacted device's backup on another device keeps every record and field, in merge and
+replace mode, with or without a connection. Backups written by beta.13 carry no base
+states: their records are rebuilt on top of the backup's rows instead (see
+`store.getSnapshotRecords()` in the conflict-resolution guide).
+
 The result reports failures instead of throwing for a file it cannot restore:
 `result.success` is false and `result.errorCode` says why (`BACKUP_CHECKSUM_MISMATCH`,
 `BACKUP_SCHEMA_NEWER` for a backup written by a newer schema version, or

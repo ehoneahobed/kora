@@ -2719,14 +2719,14 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-63.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: core/src/fold/fold.ts:150 and :412 (fieldPlanFor throws), store/src/store/store.ts:960 (ensureMaterialization re-materializes once per database: fold_materialization = fold-v1, no plan fingerprint); sync/src/engine/sync-engine.ts:2831 (an apply error other than REFERENTIAL_INTEGRITY stalls the watermark, so the device stops applying everything after it; by code reading). The server re-folds on a plan change (record-fold.ts foldPlanFingerprint), so the server keeps working and devices diverge. A changed resolver source is not detected on devices either. Required fix: persist the client's fold plan fingerprint (same definition as the server's) and re-fold affected records on open when it changes; treat FoldStateError on apply as a re-fold of that record, never a stall. Repro kora/tests/repro/RT-63.test.ts."
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: core/src/fold/fold.ts:150 and :412 (fieldPlanFor throws), store/src/store/store.ts:960 (ensureMaterialization re-materializes once per database: fold_materialization = fold-v1, no plan fingerprint); sync/src/engine/sync-engine.ts:2831 (an apply error other than REFERENTIAL_INTEGRITY stalls the watermark, so the device stops applying everything after it; by code reading). The server re-folds on a plan change (record-fold.ts foldPlanFingerprint), so the server keeps working and devices diverge. A changed resolver source is not detected on devices either. Required fix: persist the client's fold plan fingerprint (same definition as the server's) and re-fold affected records on open when it changes; treat FoldStateError on apply as a re-fold of that record, never a stall. Repro kora/tests/repro/RT-63.test.ts. FIXED (Phase 3 round 1, 2026-10-03). Core: foldPlanFingerprint / foldPlanFingerprints (the server's definition, moved to core/src/fold/plan.ts), mismatchedFoldFields, adaptFoldState. Store: per-collection fingerprints in _kora_meta (fold_plan_fingerprints); ensureFoldPlan re-folds re-planned collections on open (a database without the meta re-folds collections whose stored states hold a field of another kind); loadState treats a mismatched state as missing (rebuild on the write path); compacted bases and row snapshots are adapted on read (a re-planned field restarts from its materialized value at its newest write, approximate for its compacted history only). A carried scope-entry foldState of another plan falls back to the entry data (core). RecordFolder.applyInTx retries once via a re-fold on FoldStateError; SyncEngine quarantines a remaining FOLD_STATE_INVALID (non-transient, replayed on start) instead of stalling. Stall PROVEN at 827adc9: packages/sync/src/engine/fold-state-quarantine.test.ts fails with the quarantine branch disabled (the next delivery batch never applies). Tests: kora/tests/repro/RT-63, packages/store/src/fold/phase3-fold-fixes.test.ts (open re-fold + remote counter op, stale state on write path, adapted compacted base), core phase3-authority-plan.test.ts."
   },
   {
    "id": "RT-64",
@@ -2764,14 +2764,14 @@
    "severity": "P2",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-66.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: store/src/backup/restore.ts:126-133 (fold state and base tables deleted), backup.ts (no _kora_fold_base, _kora_compacted_through or compaction marker exported), store/src/store/store.ts:2502-2509 (ensureMaterialization after the restore) with log-integrity/log-integrity.ts:229-231 (gaps for local nodes only; compactedAt from the restoring device's meta) and store.ts:965-970 (mode 'log'). The backup's own rows are overwritten by the rebuild. A synced device gets the records back on its full resync (the restore resets delivery to 0); a device that restores while offline, or a restore used for disaster recovery, keeps the loss. Required fix: export and import the fold base states (or never compact what a backup cannot carry); at least treat a restored log as 'snapshot+log' when the backup's manifest says its source compacted."
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: store/src/backup/restore.ts:126-133 (fold state and base tables deleted), backup.ts (no _kora_fold_base, _kora_compacted_through or compaction marker exported), store/src/store/store.ts:2502-2509 (ensureMaterialization after the restore) with log-integrity/log-integrity.ts:229-231 (gaps for local nodes only; compactedAt from the restoring device's meta) and store.ts:965-970 (mode 'log'). The backup's own rows are overwritten by the rebuild. A synced device gets the records back on its full resync (the restore resets delivery to 0); a device that restores while offline, or a restore used for disaster recovery, keeps the loss. Required fix: export and import the fold base states (or never compact what a backup cannot carry); at least treat a restored log as 'snapshot+log' when the backup's manifest says its source compacted. FIXED (Phase 3 round 1, 2026-10-03). Backup format 2 gains sections fold_base, fold_snapshot, compacted_through and manifest flags includesFoldState / compacted. Replace restore imports them (compacted_through only unfiltered), then re-materializes from base + log (exact). Merge restore joins the bases/snapshots (state-based join) and re-folds those records before applying the ops; compacted_through by MAX (unfiltered). A file without fold state (beta.13) is re-materialized as 'snapshot+log' on its rows. All restores are offline (no sync involved). Tests: packages/store/tests/repro/RT-66 (replace, offline), phase3-fold-fixes.test.ts (merge on another device, collection-filtered replace, legacy file)."
   },
   {
    "id": "RT-67",
@@ -2779,14 +2779,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-67.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Mixed versions / fallback path. Locations: core/src/fold/fold.ts:164-177 (fieldWriteStamp), server/src/session/client-session.ts:3375 (timestamp = fieldVersions.latest; the beta.13 server does the same), fold.ts:196-207 (an unreadable foldState, e.g. another FOLD_STATE_VERSION, falls back to this path). The device keeps the restated old value while the server folds the device's upload: permanent divergence on that device. beta.13 devices honoured the per-field versions (resolvePerFieldLww). Required fix: stamp each restated field at exactly its own version and never raise it to the op's stamp; for a field without a version use the record's creation version."
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Mixed versions / fallback path. Locations: core/src/fold/fold.ts:164-177 (fieldWriteStamp), server/src/session/client-session.ts:3375 (timestamp = fieldVersions.latest; the beta.13 server does the same), fold.ts:196-207 (an unreadable foldState, e.g. another FOLD_STATE_VERSION, falls back to this path). The device keeps the restated old value while the server folds the device's upload: permanent divergence on that device. beta.13 devices honoured the per-field versions (resolvePerFieldLww). Required fix: stamp each restated field at exactly its own version and never raise it to the op's stamp; for a field without a version use the record's creation version. FIXED (Phase 3 round 1, 2026-10-03). core fold.ts fieldWriteStamp: a scope-entry insert's field is stamped at exactly its fieldVersions entry (tie-broken by the entry id), never raised to the op stamp; a field without a version at the oldest version the entry knows (min of the op timestamp and its field versions). A restated server-authoritative field takes the class of its version's node. An entry with neither foldState nor fieldVersions (a custom server store providing neither) can only be stamped at its own timestamp: documented; built-in stores always send one. Tests: packages/core/tests/repro/RT-67, core phase3-authority-plan.test.ts."
   },
   {
    "id": "RT-68",
@@ -2794,14 +2794,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-68.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). The documented 'approximate' path, constructed: device c held insert + restock (stock 15, tags [x, y]); an offline device's older write (stock -1, tag z) arrives later; every replica folds stock 14 and tags [x, z, y], the snapshot replica keeps 15 and [x, y] for good. Snapshot stamps also carry no authority class, so a server-authoritative value whose winning server write is older than a losing device write flips when that device write is merged again (by code reading). Also reached on a FOLD_STATE_VERSION bump with a compacted log (old base states become unreadable and are replaced by row snapshots). Locations: core/src/fold/snapshot.ts:110-137, store/src/fold/rematerialize.ts:84-96, store/src/store/store.ts:965-970. Required fix: re-bootstrap such records from the server's fold state (a scope entry carries foldState) instead of folding against a row snapshot; for 'kept', snapshot only the records that own a quarantined row, not the whole database."
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). The documented 'approximate' path, constructed: device c held insert + restock (stock 15, tags [x, y]); an offline device's older write (stock -1, tag z) arrives later; every replica folds stock 14 and tags [x, z, y], the snapshot replica keeps 15 and [x, y] for good. Snapshot stamps also carry no authority class, so a server-authoritative value whose winning server write is older than a losing device write flips when that device write is merged again (by code reading). Also reached on a FOLD_STATE_VERSION bump with a compacted log (old base states become unreadable and are replaced by row snapshots). Locations: core/src/fold/snapshot.ts:110-137, store/src/fold/rematerialize.ts:84-96, store/src/store/store.ts:965-970. Required fix: re-bootstrap such records from the server's fold state (a scope entry carries foldState) instead of folding against a row snapshot; for 'kept', snapshot only the records that own a quarantined row, not the whole database. FIXED with a documented, converging residual (Phase 3 round 1, 2026-10-03). (1) 'kept' is per record: only records owning a quarantined row (record id read from the quarantine row; unknown id keeps its collection) are kept; gaps explained by quarantined rows no longer force 'snapshot+log' on the rest. (2) createSnapshotState takes a seed (the record's stored fold state): fields of unchanged kind are exact; and a server-authoritative field keeps authority class 1 when its version's node is authoritative (fixes the by-code-reading flip). (3) Row snapshots now live in _kora_fold_snapshot (bases stay exact); state = join(base, snapshot, fold(log)). (4) Convergence: a scope entry carrying a readable server foldState drops the snapshot and re-folds (exact); creating snapshots requests one full resync (delivery watermarks reset, as a restore does), and SyncEngine calls store.settleAfterCatchUp on a fully applied final batch, which drops each snapshot whose record has its insert back in the log. RESIDUAL: a row-ONLY snapshot (no fold state: pre-W7 compaction, beta.13 backup) still does not fold a late write OLDER than a field's version until it settles (it must stay dominant: the row cannot say whether such a write is already in its value, and re-merging reflected writes must not double count). store.getSnapshotRecords() lists such records. A server-side fold-state refresh request (protocol message) would settle them without a full resync: not done (protocol is server-owned). Tests: packages/core/tests/repro/RT-68 (rewritten: seeded snapshot exact for the original scenario; authority kept), packages/store/tests/repro/RT-68 (pre-W7 compacted device converges after resync + settle), phase3-fold-fixes.test.ts (scope-entry replacement, per-record kept, settle)."
   },
   {
    "id": "RT-69",
@@ -2809,14 +2809,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-69.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Write amplification, unbounded in the number of devices over time. Location: kora/src/apply-pipeline.ts:301-320 (applySideEffectOps writes through createMutationContext, so the copies queue for sync). Repro: 4 devices, 20 children: 100 task deletes stored (author 20, server 20, three receivers 60); a fifth device syncing afterwards added 20 more. Copies from users without write grants on the children are refused and recorded as terminal rejections. Required fix: a receiving device's cascades of a REMOTE delete stay local (fold them without enqueuing: the author uploaded its copy and the server derives its own), or give them an id and content every device derives identically so the log stores one."
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Write amplification, unbounded in the number of devices over time. Location: kora/src/apply-pipeline.ts:301-320 (applySideEffectOps writes through createMutationContext, so the copies queue for sync). Repro: 4 devices, 20 children: 100 task deletes stored (author 20, server 20, three receivers 60); a fifth device syncing afterwards added 20 more. Copies from users without write grants on the children are refused and recorded as terminal rejections. Required fix: a receiving device's cascades of a REMOTE delete stay local (fold them without enqueuing: the author uploaded its copy and the server derives its own), or give them an id and content every device derives identically so the log stores one. FIXED (Phase 3 round 1, 2026-10-03). Mirroring the server's cascade exactly is impossible (it carries the server's node and a server-allocated sequence number; and RT-64 may make server-derived ids unpredictable), so a receiving device applies the cascades / set-nulls of a REMOTE delete as local-only provisional effects: Store.applyProvisionalSideEffects folds them (node kora:provisional, stamped right after the parent like the server's copy, id deriveSideEffectOpId(parent, provisional/<rule>, target)) into _kora_provisional_ops; they are never logged, sequenced or queued. A remote op of the record whose causalDeps include the parent (the server's or author's copy) retires them; SyncEngine -> store.settleAfterCatchUp retires the rest when the stream catches up (an effect the server did not derive does not stay applied locally). Local deletes still author and upload their cascades. Tests: packages/test/tests/repro/RT-69 (<= 2 per child), packages/test/tests/phase3-remote-cascades.test.ts (4 devices + late joiner: per child exactly one from the author and one from the server, none from receivers or the late joiner), phase3-fold-fixes.test.ts (not logged/queued; retire by real copy; retire on catch-up)."
   },
   {
    "id": "RT-70",

@@ -533,10 +533,29 @@ Each change fixes a case where devices or the server could disagree forever:
 
 On the first open with beta.14 the store **re-materializes** every record from its log
 (emitting `store:rematerialized`), which also repairs devices that diverged under
-earlier betas. A database whose log was compacted uses its current rows as the starting
-point; a database whose log has quarantined rows (see `store.verifyLogIntegrity()`)
-keeps its rows exactly as they are. For one beta, `createApp({ experimental: {
-legacyMerge: true } })` runs the beta.13 pipeline instead, for comparison.
+earlier betas. A database whose log was compacted before beta.14 uses its current rows
+as the starting point ("row snapshots"); a record that owns quarantined log rows (see
+`store.verifyLogIntegrity()`) keeps its row exactly as it is, and every other record is
+rebuilt normally. A row snapshot cannot tell whether an older concurrent write is
+already in its value, so until the record's history is complete again such a late,
+older write (a counter delta, an array add) is not folded on that device. The store
+therefore asks the sync server for a full resync once, and drops each snapshot when
+the record's history is back (or when the record's server fold state arrives in a
+scope entry); `store.getSnapshotRecords()` lists the records still on one. For one
+beta, `createApp({ experimental: { legacyMerge: true } })` runs the beta.13 pipeline
+instead, for comparison.
+
+**Changing how a field merges.** Changing a field's merge kind in a new schema version
+(`t.number()` to `.merge('counter')`, an array to `append-only`, adding or editing a
+custom resolver) re-folds that collection's records on the next open (the client
+records a fold-plan fingerprint per collection, like the server). Compacted history of
+a re-planned field restarts from its value at its newest write.
+
+**Server authority.** A write is authoritative for `merge('server-authoritative')`
+fields when its node id is in the reserved `kora:server:` namespace (the server's own
+nodes), or one of the ids the server lists at the handshake. Devices never author
+under a `kora:` node id: a configured one is refused (`RESERVED_NODE_ID`) and a
+persisted one is replaced.
 
 What this guarantees in practice:
 
