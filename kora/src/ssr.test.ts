@@ -2,6 +2,18 @@ import { defineSchema, t } from '@korajs/core'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 const initializeSpy = vi.hoisted(() => ({ calls: 0 }))
+const keyringSpy = vi.hoisted(() => ({ created: 0 }))
+vi.mock('./encryption-control', async (importOriginal) => {
+	const mod = await importOriginal<typeof import('./encryption-control')>()
+	return {
+		...mod,
+		createAppKeyring: (...args: Parameters<typeof mod.createAppKeyring>) => {
+			const keyring = mod.createAppKeyring(...args)
+			if (keyring) keyringSpy.created++
+			return keyring
+		},
+	}
+})
 vi.mock('./initialize-app', async (importOriginal) => {
 	const mod = await importOriginal<typeof import('./initialize-app')>()
 	return {
@@ -14,6 +26,7 @@ vi.mock('./initialize-app', async (importOriginal) => {
 })
 
 import { createApp } from './create-app'
+import { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
 import type { KoraApp } from './types'
 
@@ -52,6 +65,59 @@ describe('createApp during server rendering (DX-6)', () => {
 		await expect(app.collections.todos?.insert({ title: 'x' })).rejects.toMatchObject({
 			code: 'APP_NOT_READY',
 		})
+	})
+
+	test('ENC-1: an encrypted app creates no keyring during a server render', async () => {
+		keyringSpy.created = 0
+		const events: string[] = []
+		app = createApp({
+			schema,
+			sync: {
+				url: 'wss://sync.example.com',
+				encryption: { enabled: true, key: 'correct horse battery staple', keyring: 'team' },
+			},
+		})
+		app.events.on('encryption:status', (event) => events.push(event.type))
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(keyringSpy.created).toBe(0)
+		expect(initializeSpy.calls).toBe(0)
+		expect(events).toEqual([])
+		// The surface keeps its client shape (no hydration branch flip on `app.encryption`):
+		// locked, silent, and every action rejects with the inert app's error.
+		const encryption = app.encryption
+		expect(encryption).not.toBeNull()
+		expect(encryption?.getStatus()).toMatchObject({
+			state: 'locked',
+			keyring: 'team',
+			keyVersion: null,
+			availableVersions: [],
+		})
+		const unsubscribe = encryption?.onStatusChange(() => events.push('status'))
+		unsubscribe?.()
+		await expect(encryption?.unlock('pw')).rejects.toMatchObject({ code: 'SSR_INERT_APP' })
+		await expect(encryption?.rotateKey()).rejects.toMatchObject({ code: 'SSR_INERT_APP' })
+		await expect(encryption?.enableRecovery()).rejects.toMatchObject({ code: 'SSR_INERT_APP' })
+		expect(events).toEqual([])
+		// `encryption` is framework API: a collection of that name never shadows it.
+		expect(RESERVED_APP_PROPERTIES).toContain('encryption')
+	})
+
+	test('ENC-1: the same config in the browser path does create the keyring', async () => {
+		keyringSpy.created = 0
+		app = createApp({
+			schema,
+			ssr: false,
+			store: { name: ':memory:' },
+			sync: { url: 'wss://sync.example.com', encryption: { enabled: true } },
+		})
+		expect(keyringSpy.created).toBe(1)
+		expect(app.encryption?.getStatus().state).not.toBe('unlocked')
+		await app.ready
+	})
+
+	test('an inert app without encryption has app.encryption null, like the client', () => {
+		app = createApp({ schema, sync: { url: 'wss://sync.example.com' } })
+		expect(app.encryption).toBeNull()
 	})
 
 	test('ssr: false opens a real database in Node.js', async () => {

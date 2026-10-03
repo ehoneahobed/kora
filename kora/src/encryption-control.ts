@@ -1,6 +1,12 @@
 import type { KoraEventEmitter } from '@korajs/core'
 import type { EncryptionStatus, KeyServiceChannel } from '@korajs/sync'
-import { EncryptionKeyError, EncryptionKeyring, createKeyCache } from '@korajs/sync'
+import {
+	DEFAULT_KEYRING,
+	EncryptionKeyError,
+	EncryptionKeyring,
+	createKeyCache,
+} from '@korajs/sync'
+import { ServerRenderingAppError } from './ssr'
 import type { SyncRuntimeState } from './sync-lifecycle'
 import type { EncryptionControl, KoraConfig } from './types'
 
@@ -134,5 +140,45 @@ export function createEncryptionControl(
 			await resumeSync()
 			return status
 		},
+	}
+}
+
+/**
+ * `app.encryption` of an inert server-render app (DX-6) whose config enables encryption.
+ * No keyring exists (nothing is derived, cached or fetched in the server process), but
+ * the surface keeps its client shape so components render the same branch on both
+ * sides: the status is `locked`, listeners never fire, and every action rejects with the
+ * app's `ready` error (`SSR_INERT_APP`). Null when encryption is not enabled.
+ */
+export function createInertEncryptionControl(
+	config: KoraConfig,
+	ready: Promise<void>,
+): EncryptionControl | null {
+	const encryption = config.sync?.encryption
+	if (!config.sync || encryption?.enabled !== true) return null
+	const keyringName = encryption.keyring ?? DEFAULT_KEYRING
+	const status = (): EncryptionStatus => ({
+		state: 'locked',
+		keyring: keyringName,
+		keyVersion: null,
+		keyId: null,
+		availableVersions: [],
+		cache: 'none',
+		message: 'Server render: encryption is available in the browser only.',
+	})
+	const refuse = async <T>(): Promise<T> => {
+		// An inert app's ready always rejects with ServerRenderingAppError (SSR_INERT_APP).
+		await ready
+		throw new ServerRenderingAppError()
+	}
+	return {
+		getStatus: status,
+		onStatusChange: () => () => {},
+		unlock: () => refuse(),
+		lock: () => refuse(),
+		rotateKey: () => refuse(),
+		changePassphrase: () => refuse(),
+		enableRecovery: () => refuse(),
+		recover: () => refuse(),
 	}
 }

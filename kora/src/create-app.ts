@@ -8,7 +8,11 @@ import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
 import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
-import { createAppKeyring, createEncryptionControl } from './encryption-control'
+import {
+	createAppKeyring,
+	createEncryptionControl,
+	createInertEncryptionControl,
+} from './encryption-control'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { warnShadowedCollections } from './reserved-app-properties'
@@ -158,7 +162,9 @@ export function createApp<const S extends SchemaInput>(
 		on: emitter.on.bind(emitter),
 		collections,
 		sync: createSyncControl({ config, ready, state: syncState }),
-		encryption: createEncryptionControl({ keyring, ready, state: syncState }),
+		encryption: inert
+			? createInertEncryptionControl(config, ready)
+			: createEncryptionControl({ keyring, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),
 		blobs: {
 			get store() {
