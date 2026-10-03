@@ -779,14 +779,15 @@
    "severity": "P2",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "ENC-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Protocol v2 envelope (Phase 3 Stage B3): ciphertext in op.encrypted (v2, alg, keyId, keyVersion, per-member {iv, ct}); AES-GCM AAD = canonical(nodeId, collection, recordId, type, timestamp, sequenceNumber, field, keyVersion, hashVersion); data and previousData sealed even when null; plaintext and protocol-1 payloads refused unless allowPlaintextMigration; the v2 id over the plaintext is verified after decryption. Repro sync/tests/repro/ENC-3 green.",
+   "acceptanceTest": "packages/sync/src/encryption/envelope-v2.test.ts"
   },
   {
    "id": "NEW-ENC-1",
@@ -794,14 +795,15 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-ENC-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Protocol v2 envelope (Phase 3 Stage B3): data is null (or the listed cleartextFields), so a schema-aware server's shape validation passes; envelope ops are stored opaquely and never schema-transformed by the server. Repro kora/tests/repro/NEW-ENC-1 green (memory store). Residual: the SQLite/Postgres server stores must persist op.encrypted (W7 store work) before encrypted sync runs on them.",
+   "acceptanceTest": "packages/server/src/session/protocol-v2-ingest.test.ts (NEW-ENC-1 case)"
   },
   {
    "id": "SRV-1",
@@ -809,14 +811,15 @@
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Array case now agrees (S1 interim: replayOperationsForRecord uses mergeArraySet against previousData). Object and custom-resolver cases remain for W7."
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). Arrays, objects and the additive resolver fold to the client values in fold.test.ts ('SRV-1' cases). The repro stays red until Stage B makes the memory/sqlite/postgres server stores materialize through mergeOp (fold-state column + re-materialization migration). W7 Stage B1 (client): client half done: both clients agree on arrays, objects and the additive resolver (18) through the real pipeline; the array case passes end to end. The object and resolver cases stay red on the server assertion until B2 (server stores materialize via the fold). 2 (server): Server half done: memory/SQLite/Postgres materialize through the fold (packages/server/src/store/record-fold.ts); server rows equal foldRecord of the same ops in any order (packages/server/tests/integration/fold-materialization.test.ts: parity on random workloads across the 3 stores, and the SRV-1 array/object/resolver case). The repro (packages/test, real client pipeline) needs the client half (Stage B1) to go green. Repro (packages/test SRV-1, 3 cases) green with the server fold; the client pipeline still merges pairwise for other shapes until B1 (MERGE-2 tracks that).",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "SRV-2",
@@ -911,14 +914,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SRV-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED. All three server stores keep a per-record fold state (kora_fold_state on SQLite/Postgres, a map in memory) and apply = append + mergeOp: O(fields touched); the freshness check is one index probe on (collection, record_id, delivery_seq). Repro green (sqlite late/early ratio 0.6x, memory 0.3x). Benchmark per write at record history 0/1k/3k/6k: memory 140/2819/10233/15135us -> 61/30/334/12us; SQLite 8727/10363/30583/31789us -> 1450/965/869/839us; Postgres 0/1k/3k 5341/9744/18804us -> 5089/5317/3566us."
   },
   {
    "id": "NEW-SRV-1",
@@ -969,7 +972,7 @@
    "severity": "P2",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-10.test.ts",
@@ -977,7 +980,8 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: a restart re-folds only records whose fold state is missing, stale (covered_seq/covered_op_id differ from the record's newest op) or built under another fold plan (kora_server_meta.fold_plan_fingerprint). Warm restart at 20k ops: 0 records re-materialized, 318 SQL, 2.7 s (beta.13: 23.8 s and 30k SQL at 50k ops); cold 13.6 s with batched multi-row writes. The LMS-10 benchmark assertion was inverted: the report's proposal is a pre-fold replay, so its rows legitimately differ from HEAD now; the test asserts the warm restart re-materializes nothing.",
+   "acceptanceTest": "packages/server/tests/repro/LMS-10.test.ts 'benchmark:' (a warm restart re-materializes nothing; with LMS_OPS=20000 its key is a baseline observation, so the checker does not map it as a repro) + packages/server/tests/integration/fold-materialization.test.ts"
   },
   {
    "id": "NEW-SRV-5",
@@ -985,7 +989,7 @@
    "severity": "P1",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-10.test.ts",
@@ -993,7 +997,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B2 (server): FIXED by the fold migration: Postgres re-materialization runs in 500-record batches, each one transaction under the delivery-counter row lock every append takes, reading each record's complete log; a live write on another instance commits before the batch (and is folded) or after it (and is merged into the stored state). LMS-10 rolling-deploy test green."
   },
   {
    "id": "NEW-SRV-6",
@@ -1119,14 +1123,14 @@
    "severity": "P0",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 1). Backup format version 2 (BACKUP_VERSION 2): canonical Operation NDJSON in HLC order (incl. atomicOps, transactionId, mutationName, fieldVersions, and ops kept only in _kora_seq_conflicts), raw rows incl. tombstones (bytes base64-tagged), version vector, terminal rejections; no _kora_meta at all. Read inside one transaction. Import parses and verifies every op through the canonical serializer (BackupFormatError). Merge mode: every op through the remote-apply path (app.importBackup passes the ApplyPipeline sync uses), vector by MAX, terminal markers added, node_id/node tokens/local nodes/principal bindings/watermarks/acked prefixes never imported. Replace mode (backup/restore.ts): one transaction wipes the target collections and loads ops + rows, keeps node id, tokens, local node registry, principal bindings, acked prefixes; own counters never move backwards; unacknowledged writes of an accepted node are always re-applied on top, other unsynced own writes when keepUnsyncedWrites (default true at store level; app.importBackup defaults it to whether sync is configured and refuses false with sync); a never-accepted node whose writes are dropped restarts its counter after the highest restored number (contiguous); delivery watermarks reset to 0, delta cursor dropped; dropped ops leave the outbound queue. Then Store.reloadFromDisk() (node id, vector, sequence counter, clock advanced past the newest logged timestamp, fresh causal tracker, every subscription invalidated). app.importBackup pauses sync for a replace and resumes it. Version-1 files are refused with BACKUP_FORMAT_OUTDATED; convertBackupV1(data, { dropUnrecoverable }) converts them (drops meta, recovers misread timestamps, decodes bytes). Breaking: restoreBackup(adapter, ...) is deprecated and now opens a temporary Store on the adapter (closing it). Tests: store backup/backup.test.ts, kora import-backup.test.ts. Docs: guide/backup-restore.md. Server backups (server-backup.ts) already used canonical Operation JSON and are unchanged."
   },
   {
    "id": "STORE-6",
@@ -1134,14 +1138,17 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-6.test.ts"
+    },
+    {
+     "browser": "STORE-6"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 2). Only the storage leader restores an IndexedDB snapshot, and only into a worker database no snapshot was restored into yet (a connection-local TEMP marker, never dumped). A browser leader restores inside its own worker right after the open and BEFORE the worker serves other tabs (SqliteWasmAdapter onLeaderWorkerOpened), on first open and on promotion, in one transaction; a follower never restores, and a failed restore fails the open/promotion instead of serving a partial database. Before the fix a promoted follower also started from an EMPTY worker database (the real-browser check showed it). Tests: store indexeddb-adapter.test.ts (STORE-6 block), real-Chromium LMS-5-6-7.browser.mjs scenario STORE-6 (two tabs, IndexedDB fallback, leader writes, follower opens, promotion, reload)."
   },
   {
    "id": "STORE-7",
@@ -1149,14 +1156,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 3). IndexedDbPersistenceScheduler.flushNow waits for an in-flight snapshot and then writes again while any scheduled write is not covered by a successful snapshot (generation counters = dirty flag); a failed snapshot ends the loop (reported via onError; flushBarrier/ensureDurable still rejects). The snapshot dump is read inside one transaction (no torn snapshot). The RT-35 ensureDurable contract is unchanged. Tests: indexeddb-persistence-scheduler.test.ts (STORE-7 tests)."
   },
   {
    "id": "STORE-8",
@@ -1239,14 +1246,14 @@
    "severity": "P1",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-13.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4). New packages/store/src/migrations/run-migrations.ts: each schema version runs in ONE transaction (structural DDL, every backfill, the schema_version write); a throwing backfill or a crash leaves nothing of that version, versions already committed are not repeated. Backfills write update operations through the single local write path (writeUpdateInTx: in-tx sequence reservation, per-field stamps, previousData) with mutationName migration:v<N>, so they sync; core migrate().backfill(collection, transform, { localOnly: true }) rewrites rows only. Store.open now loads the node id and clock before migrations. Unchanged values write nothing; fields outside the schema fail the version (MIGRATION_UNKNOWN_FIELD). Tests: store migration.test.ts (STORE-13 block), core migration-builder.test.ts. Docs: guide/schema-design.md, api/core.md."
   },
   {
    "id": "STORE-14",
@@ -1254,14 +1261,15 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-14.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage B1 (client): the record's fold state is the snapshot: compaction (store.compact, after-ack/after-days) folds acknowledged ops into a per-record base state (_kora_fold_base) before removing them, keeps delete, atomic and custom-resolver ops, and records the per-node contiguous acknowledged prefix (_kora_compacted_through) so a re-delivered compacted id is a duplicate. A stale remote update after compaction folds against the persisted state (delete stamp kept) and cannot resurrect the record. Repro passes; unit tests in packages/store/src/fold/record-folder.test.ts.",
+   "acceptanceTest": "packages/store/src/fold/record-folder.test.ts (compaction cases)"
   },
   {
    "id": "STORE-15",
@@ -1296,14 +1304,14 @@
    "severity": "P2",
    "workstream": "W8b",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-STORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 3, W8b step 4): backfill transforms receive deserializeRecord(row) (typed booleans, arrays, objects); returned values go through validateRecord + serializeRecord on the write path. Tests: store migration.test.ts."
   },
   {
    "id": "NEW-STORE-2",
@@ -1484,12 +1492,27 @@
    "notes": ""
   },
   {
+   "id": "NEW-STORE-12",
+   "title": "No log-integrity check: rows damaged by beta.12 backup restore (JSON timestamps read as wallTime NaN/null) or unreadable rows are folded as-is, and compaction gaps are invisible; W7 re-materialization would bake the damage in",
+   "severity": "P0",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-STORE-12.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "W8 step 0 (prerequisite for W7, plan section 3 dependency rules). Acceptance test kora/tests/repro/NEW-STORE-12.test.ts (fails before the fix: getAllOperations throws on the unreadable row and the restored row reads wallTime NaN). FIXED (store): new packages/store/src/log-integrity module. Every Store.open runs a quick scan (SQL prefilter, suspects checked in JS) before anything reads or folds the log: a row must round-trip through deserializeOperation/serializeOperation; a JSON-encoded timestamp (one beta.12 restore, or a nested restore-export-restore) is repaired in place; anything unrecoverable moves to _kora_log_quarantine (kept verbatim, never deleted) and store:log-integrity is emitted. Store.verifyLogIntegrity({ mode, repair }) runs the full scan and returns a LogIntegrityReport (clean, repaired, newlyQuarantined, quarantined, gaps in this database own nodes below their highest stored sequence, compactedAt). W7 re-materialization must refuse unless report.clean. Remote-node gaps are not reported (scoped sync delivers partial logs). Tests: store log-integrity.test.ts. Server half: packages/server/src/store/log-integrity.ts (checkServerOperationRow); the SQLite and Postgres stores run a one-time startup scan (meta key log_integrity_scan_v1; Postgres under an advisory lock, keyset pages) that moves unreadable rows (malformed JSON, out-of-range HLC, bad type/sequence) to operations_quarantine verbatim and logs a warning; getLogIntegrityReport() returns the result. Typed server columns rule out the beta.12 null-wallTime damage, so there is nothing to repair in place. Tests: server log-integrity.test.ts (Postgres case gated by KORA_PG_TEST_URL, not run in this environment)."
+  },
+  {
    "id": "MERGE-1",
    "title": "Array merge loses one-sided removals",
    "severity": "P1",
    "workstream": "W7",
    "phase": 3,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "file": "MERGE-1.test.ts"
@@ -1501,7 +1524,8 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open."
+   "notes": "S1 interim: one three-way set rule (local ∩ remote) ∪ (local − base) ∪ (remote − base), implemented once as mergeArraySet in @korajs/core and used by addWinsSet and by replayOperationsForRecord (server and client folds; server stores now pass previousData). All MERGE-1 repro tests pass. Structural fix (per-element LWW set, order-independent fold) remains W7; MERGE-2 still open. W7 Stage A: arrays fold as an LWW element set in @korajs/core (fold/field-states.ts); fold.test.ts 'MERGE-1' passes in both orders. Stays mitigated until Stage B wires the fold into the client store and server stores and retires addWinsSet/mergeArraySet. W7 Stage B1 (client): the client store materializes every record from a persisted per-field fold state (arrays: occurrence-indexed LWW element multiset); apply-pipeline's pairwise merge, applyMergedUpdate, buildLocalDiff and the fast-forward/merge split are gone (beta.13 pipeline kept only behind experimental.legacyMerge). All MERGE-1 repro tests pass. addWinsSet is deprecated (legacy only).",
+   "acceptanceTest": "packages/test/tests/fold-gate/fold-gate-e2e.test.ts (W7 convergence gate END TO END: 200 seeds, every field kind incl. real Yjs richtext and arrays with duplicates, 2-4 real TestDevices (Store + fold + ApplyPipeline + SyncEngine) going offline/online, deleting and editing concurrently; every device holds the same ops and materializes the same record, equal to the reference fold; the gate rejects the beta.13 pipeline) + packages/test/tests/fold-gate/fold-vs-legacy.test.ts (legacyMerge comparison: every fold/legacy difference explained by a documented semantic change) + packages/core/tests/property/fold/fold-convergence.property.test.ts (pure gate, 200 seeds, extended to duplicates and server-authoritative classes)"
   },
   {
    "id": "MERGE-2",
@@ -1509,14 +1533,15 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "MERGE-2.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "W7 Stage A landed (pure library, not wired): @korajs/core fold/* (mergeOp, foldRecord, materialize, joinStates; per-field CRDT state serialized by serializeFoldState v1; FoldTrace -> MergeTrace; deriveSideEffectOpId). The pure fold converges for all field kinds (gate). The repro (packages/test, real pipeline) stays red until Stage B replaces apply-pipeline's pairwise merge with append-then-mergeOp and re-materializes stores. W7 Stage B1 (client): clients now converge on every MERGE-2 seed (the repro's first assertion, 'clients diverge', passes for all 6 cases). The repro stays red only on its second assertion (server materialization vs clients) until B2 makes the server stores materialize through the fold. Phase 3 seam review (2026-10-02): all 6 repro cases green with the client fold (B1) and the server fold (B2) merged; marked fixed.",
+   "acceptanceTest": "packages/core/tests/property/fold/fold-convergence.property.test.ts (W7 convergence gate: 200 fixed seeds, every field kind, 2-4 nodes, random delivery order + duplicates + reloads, from-scratch == incremental, join associativity, exclusion; checked against an independent whole-log oracle; rejects a naive arrival-order fold; 14/14 deliberate fold mutants caught; 10,000-seed sweep green) + packages/core/src/fold/fold.test.ts + packages/test/tests/fold-richtext-yjs.test.ts. Pure-library acceptance only (Stage A); the repro stays the bar for 'fixed'."
   },
   {
    "id": "NEW-MERGE-1",
@@ -1524,7 +1549,7 @@
    "severity": "P0",
    "workstream": "W7",
    "phase": 3,
-   "status": "mitigated",
+   "status": "fixed",
    "tests": [
     {
      "file": "NEW-MERGE-1.test.ts"
@@ -1536,7 +1561,8 @@
     "status": "fixed"
    },
    "pr": null,
-   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7."
+   "notes": "S1 interim: buildLocalDiff only includes fields whose local value differs from the remote op's base, and the server fold applies the same set rule, so an unchanged restated array no longer undoes a removal. Repro passes. Structural fix remains W7. W7 Stage A: the fold treats an unchanged restated field as no write (all kinds); fold.test.ts 'NEW-MERGE-1' passes. Stays mitigated until Stage B replaces the pairwise apply path. W7 Stage B1 (client): an unchanged restated field is not a write in the client fold (all kinds); repro passes through the real pipeline with no pairwise path left.",
+   "acceptanceTest": "packages/test/tests/fold-gate/fold-gate-e2e.test.ts (W7 convergence gate END TO END: 200 seeds, every field kind incl. real Yjs richtext and arrays with duplicates, 2-4 real TestDevices (Store + fold + ApplyPipeline + SyncEngine) going offline/online, deleting and editing concurrently; every device holds the same ops and materializes the same record, equal to the reference fold; the gate rejects the beta.13 pipeline) + packages/test/tests/fold-gate/fold-vs-legacy.test.ts (legacyMerge comparison: every fold/legacy difference explained by a documented semantic change) + packages/core/tests/property/fold/fold-convergence.property.test.ts (pure gate, 200 seeds, extended to duplicates and server-authoritative classes)"
   },
   {
    "id": "CORE-1",
@@ -1544,14 +1570,15 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "CORE-1.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Protocol v2 (Phase 3 Stage B3): createOperation defaults to hash version 2; hashVersion is carried on the wire (JSON + protobuf operation field 14) and persisted in the client op log; rebase/rotation/SEQUENCE_CONFLICT renumbering re-hash v2 ops. The server verifies plaintext v2 ids before any schema transform (non-retriable INVALID_OPERATION_ID; transformed copies stored as v1); clients verify after decryption in packages/sync/src/engine/verify-inbound.ts and quarantine mismatches. v1 ops are never verified against v2. Repros core/tests/repro/CORE-1 and packages/test/tests/repro/CORE-1 green. Residual: SQLite/Postgres server stores do not yet persist hashVersion (W7 store work), so ops they relay are treated as v1 (unverified) by clients.",
+   "acceptanceTest": "packages/core/tests/integration/core-1-hash-v2.test.ts + packages/core/src/operations/content-hash-v2.test.ts (Stage A, pure core)"
   },
   {
    "id": "DX-1",
@@ -1726,6 +1753,21 @@
    ],
    "pr": null,
    "notes": ""
+  },
+  {
+   "id": "NEW-DX-4",
+   "title": "Single-user apps cannot opt out of holding writes made before sign-in (RT-50 unassigned): every app must call app.sync.assignHeld itself",
+   "severity": "P3",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-DX-4.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 DX item (user decision pending; the recommended default implemented). New createApp option sync.unassignedWrites: hold | assign-to-first-user (default hold, RT-50 behavior unchanged). assign-to-first-user (kora/src/unassigned-writes.ts, wired in sync-lifecycle): on sync:connected (a session the server ACCEPTED for the signed-in user) every held node with reason unassigned is assigned via engine.assignHeld and the engine reconnects so they upload as that user; other-user nodes are never touched, a refused user never gets a session so never gets them; once assigned (and bound by the server) a later user is never offered them. Invalid values are rejected by createApp. Acceptance test packages/test/tests/repro/NEW-DX-4.test.ts (real server, both policies); unit tests kora unassigned-writes.test.ts. Docs: guide/authentication.md, guide/sync-configuration.md."
   },
   {
    "id": "NEW-TEST-1",
@@ -2172,11 +2214,14 @@
    "severity": "P3",
    "workstream": "W7",
    "phase": 3,
-   "status": "open",
-   "tests": [],
-   "acceptance": "Write a repro when the workstream starts.",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-29.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state."
+   "notes": "Residual of RT-27; resolved structurally by W7 per-field CRDT state. W7 Stage B1 (client): a scope-entry insert carrying Operation.foldState (server-authored serialized fold state, B3 wire / B2 server) is JOINED into the device's state (core mergeOp -> joinStates), so counters, custom resolvers, arrays and richtext keep the device's concurrent edits; one merge:conflict trace per field where the device and the server differed (strategy scope-entry-<strategy>). Entries from older servers (fieldVersions only) still merge per field. Repro kora/tests/repro/RT-29 (counter/resolver/array + traces) and packages/test/tests/fold-scope-entry-richtext.test.ts (real Yjs). End to end it needs the server to send foldState (B2/B3). 2 (server): Server half done: scope-entry ops carry foldState (serialized fold state filtered to the fields the entry restates; fieldVersions kept, now derived from the fold) built from ServerStore.getRecordFoldState; client-session passes it (2 call-site lines). Repro packages/server/tests/repro/RT-29.test.ts (memory + SQLite): joining the entry state with a receiver's concurrent counter/resolver/richtext writes equals the server fold of the union. Wire + client join are B3/B1."
   },
   {
    "id": "RT-30",
@@ -2531,6 +2576,520 @@
    ],
    "pr": null,
    "notes": "Phase 2 red-team review round 3, 2026-10-02 (remediation/evidence/redteam-phase2.md, Round 3). Liveness. Locations: sync/src/engine/sync-engine.ts:3927 maybeYieldToDeferredNode (requires sessionAcked > 0 and is only reached from maybeEndSessionForNodeWork after an ack, :3892); :3665 parkAdoption (untilMs is never armed as a timer). A closed tab's write deferred once (retriable) is parked for 30 s; the open tab reconnects as its own node and stays connected and idle (dashboard, kiosk, tab left open): the write is never retried while the connection holds (reported as pending, but it lives only on this device). Required fix: arm a timer for the earliest parked untilMs (and for causal deferrals) that ends an idle own-node session, or upload parked nodes on a side session; keep the bound of one retry per backoff. Repro packages/test/tests/repro/RT-53.test.ts (36 s real wait). FIXED (sync): an own-node session arms a timer for the earliest parked adoption's untilMs; when it fires on an idle session (nothing queued or in flight) the engine reconnects and the next session adopts the node; a busy session hands over when its uploads drain (an expired park is due without own progress). One retry per backoff kept. Timer cleared with the session. TestDevice gains an opt-in reconnectable transport; the repro runs on fake timers (Date + setTimeout, advancing with real time) instead of a 36 s wait. Tests: sync local-nodes.test.ts (RT-53)."
+  },
+  {
+   "id": "RT-54",
+   "title": "Merged server fold passed authoritativeNodeIds as an array where the core fold calls Set.has (every server-authored write to a merge('server-authoritative') field throws), and the handshake's authoritativeNodeIds came from a second source (a KoraSyncServerConfig option defaulting to [store node, 'kora:scope-entry']) instead of the list the stores fold with",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-54.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Also build breakage of the merge: Operation.foldState declared twice (core), two Store.loadAuthoritativeNodeIds under two meta keys (store), KoraSyncServer.authoritativeNodeIds declared as field and getter (server). Fixed: ServerFoldOptions = FoldOptions with a Set; one persisted list (sync_authoritative_node_ids) feeds the client fold and the sync engine; KoraSyncServer.authoritativeNodeIds = ServerStore.getAuthoritativeNodeIds() (store node id, which authors route writes, side effects and corrections, plus configured extras) is what every session advertises; the separate server option is removed. Repro packages/test/tests/repro/RT-54.test.ts (= tests/server-authoritative-convergence.test.ts: a server-authoritative field converges identically on server and devices through memory, SQLite and Postgres stores; handshake list == stores list)."
+  },
+  {
+   "id": "RT-55",
+   "title": "A scope retraction quarantines (and since W7 B1 excludes from the fold) an own write already on the wire; the server stores it, so the device diverges from every other replica (RT-27 retract case regressed)",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-27.test.ts",
+     "title": "a device regaining scope after a retraction keeps its newer offline edit"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Location: sync/src/engine/outbound-queue.ts rejectRecord took in-flight (sent) operations; sync-engine applyScopeRetraction recorded them as terminal SCOPE_RETRACTED, which B1 excludes from the fold. Fixed: rejectRecord never takes an operation already put on the wire; its ack (stored) or rejection resolves it. Unit test sync outbound-queue.test.ts."
+  },
+  {
+   "id": "RT-56",
+   "title": "SQLite and Postgres server stores drop the protocol v2 encryption envelope: a relayed encrypted op has no ciphertext and every receiving device quarantines it (encrypted sync through a SQL store never works)",
+   "severity": "P0",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-56.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: operations.encrypted (JSON, verbatim) on SQLite and Postgres next to hash_version (both migrate with ADD COLUMN), deserialized back onto op.encrypted; an unreadable envelope column throws so the startup integrity scan quarantines the row. Repro packages/test/tests/repro/RT-56.test.ts (= tests/encryption-server-stores.test.ts: two encrypted devices through memory, SQLite and Postgres stores; stored ops keep envelope and hashVersion 2, verify after decryption, the server never materializes sealed values, nothing quarantined)."
+  },
+  {
+   "id": "RT-57",
+   "title": "Encrypted devices quarantine every server-authored plaintext operation (cascades, set-nulls, constraint corrections, route writes) as PLAINTEXT_REJECTED: the server has no key, so its side effects never reach encrypted devices",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-57.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: the sync engine accepts a plaintext operation from a node the handshake named authoritative when it touches only the collection's cleartextFields (SyncEncryptor.isCleartextOnly; a delete carries no fields); a server write to a sealed field is still refused. Scope entries (kora:scope-entry) restate sealed fields as null and stay refused under encryption (documented limitation). Repro RT-57.test.ts (the cascade step of the encrypted e2e); unit tests sync-encryptor.test.ts."
+  },
+  {
+   "id": "RT-58",
+   "title": "Server fold ignores envelope operations with data null (no cleartext field): a sealed insert never creates the record and a sealed update does not count against a delete, so the server's record existence (scopes, cascades, cross-record rules) disagrees with the devices",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [],
+   "pr": null,
+   "acceptanceTest": "packages/core/src/fold/fold.test.ts (sealed envelope operations: insert creates the record, a later sealed update revives, cleartext fields fold) + packages/test/tests/encryption-server-stores.test.ts (sealed-only collection)",
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed in core mergeOp: an operation carrying op.encrypted with data null sets the record's creation stamp (insert) and write stamp; sealed values are never materialized."
+  },
+  {
+   "id": "RT-59",
+   "title": "Renumbering a version-2 op (SEQUENCE_CONFLICT, RT-35) gives it a new id but leaves later ops naming the old id in causalDeps; the W6 legacy repair could re-hash a server-stored version-2 op, which would then be stored a second time (atomic increments applied twice)",
+   "severity": "P2",
+   "workstream": "W3",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-59.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. Fixed: Store.resequenceOperation rewrites never-sent dependents (re-hashed, transitively) in the same transaction and returns them; the engine passes its unsent queued ops and swaps them in the queue and own-ack tracking; already-sent dependents keep their ids and replayTo resolves the old id through _kora_seq_conflicts.reemitted_as; the W6 repair renumbers the version-1 half of a mixed pair (id kept, deduplicated by the server). Invariant review (RT-31/32/35/36/43/44) in the seam report. Repro RT-59.test.ts (= tests/renumber-v2-chain.test.ts: 3-op chain insert + 2 increments, first op renumbered, dependents unsent and already stored); unit tests store local-sync-records.test.ts, sequence-repair.test.ts."
+  },
+  {
+   "id": "RT-60",
+   "title": "A device applying a remote delete cascades with operations stamped at its own current time: if it applies the delete after another device's later edit or re-point of the child, its cascade erases that edit on every replica (the server's own copy, stamped right after the delete, would not)",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-60.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 seam review (B1 client fold x B2 server fold x B3 protocol v2), 2026-10-02. B1 residual (client cascades of remote deletes vs server/ cascades). Fixed: kora apply-pipeline stamps a remote delete's side effects with a clock seeded at the delete's HLC (next logical ticks on this node), like timestampAfter on the server; Store.createMutationContext accepts a clock. All copies are idempotent in effect and a later write wins everywhere. Repro RT-60.test.ts (= tests/client-cascade-convergence.test.ts, 3 devices, cascade and set-null)."
+  },
+  {
+   "id": "RT-61",
+   "title": "A device can hand-shake with the server's own node id (published in the handshake's authoritativeNodeIds) and author merge('server-authoritative') writes: the session reserves only the kora: namespace, and a server node with no stored history has no claim, so the first device to present it claims it",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-61.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Security (authority bypass). Locations: server/src/session/client-session.ts:1773 (only the reserved kora: prefix is refused), :1834 (the claim rule refuses a node with stored history and no owner, so the window is a server node with no history yet: a new deployment, or every restart with an auto-generated node id, RT-62); :2075 (the handshake publishes the ids); core/src/fold/fold.ts:183 (classify: class 1 by op.nodeId). The forged node's uploads beat every device write of the field and earlier server decisions, on the server and on every device. Consequences by code reading: on Postgres its sequence numbers also collide with the server's cached reserveSequenceNumber counter (postgres-server-store.ts:208), so later server side effects and corrections are refused with SEQUENCE_CONFLICT; under encryption, plaintext ops from the forged node that touch only cleartext fields are accepted without decryption (sync-engine.ts:2942). Required fix: refuse at handshake any nodeId in ServerStore.getAuthoritativeNodeIds() (and any id the store authors under); pre-claim the server node ids in the node-claims table at startup; refuse uploads whose nodeId is authoritative. Repro packages/server/tests/repro/RT-61.test.ts. Fixed (commit 371cf12): the handshake refuses (INVALID_NODE_ID, non-retriable) any kora: node id, the store's node id and every advertised authoritative id, current or legacy, whether or not it has history; uploads are re-checked (checkUploadIntegrity). Server node ids are kora:server:<deployment>:<instance> (RT-62), so a device can never claim one. HTTP long-poll sessions keep the final queued error pollable after the close. Tests: src/session/server-node-identity.test.ts (memory, WebSocket, HTTP). Repro adapted: the configured 'server-1' is now a legacy authoritative id; both it and the current id are refused. Round 2 (2026-10-03): both halves verified end to end with two Postgres instances (packages/test/tests/phase3-multi-instance-authority.test.ts): instance B, started after the device connected to A, authors kora:server:<deployment>:<instanceB>; its route write reaches the device through A's delivery polling and beats the device's later write on the device (prefix rule, B's id never advertised to it) and on both instances; the configured plain id is advertised as a legacy authority and its write stays authoritative."
+  },
+  {
+   "id": "RT-62",
+   "title": "Server node ids are auto-generated per process by default (memory, SQLite, Postgres stores): every restart advertises a new authoritativeNodeIds list, devices replace their persisted list and re-fold, demoting every earlier server write of a merge('server-authoritative') field while the server's fold states keep its class; instances on one Postgres database each advertise only their own random id, and configuring one shared id instead makes the instances collide on the server node's sequence numbers",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-62.test.ts"
+    },
+    {
+     "file": "RT-62-shared-node.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Convergence. Locations: server/src/store/memory-server-store.ts:135, sqlite-server-store.ts:157, postgres-server-store.ts:180 (nodeId ?? generateUUIDv7(), never persisted); docs/guide/storage-configuration.md:119 ('Usually left to auto-generate'); store/src/store/store.ts:998 (setAuthoritativeNodeIds replaces the set and re-folds); server/src/store/record-fold.ts foldPlanFingerprint (does not cover the authoritative ids, so server states are never re-folded); postgres-server-store.ts:208 (reserveSequenceNumber caches a per-instance counter). Repro 1 (packages/test, SQLite file store restarted): the server keeps 'approved', the old device and a new device show the device's later 'client'. Repro 2 (packages/server, Postgres, two instances with one configured nodeId): the second instance's route writes are refused with SEQUENCE_CONFLICT. Consequences by code reading: encrypted devices quarantine (PLAINTEXT_REJECTED) every plaintext server op of an earlier process (cascades, set-nulls, corrections), because the cleartext exemption keys on the current list; a compacted client base keeps the old classes, so compacted and uncompacted records disagree after the switch. Required fix: persist the server node id in the database (kora_server_meta) on first start and share it across instances; allocate server sequence numbers from the database (under the delivery-counter lock), not a per-process counter; make authority stable (devices union, never drop, ids they learned, or authority is recorded with the persisted server id list); include the authoritative set in the fold plan fingerprint on both sides. Fixed (commit 371cf12): persisted deployment identity in kora_server_meta (server_deployment_id, server_derivation_secret); node id kora:server:<deploymentId>:<instanceId>; SQLite persists its instance id, Postgres draws one per start from server_instance_counter (or a configured instanceId), so instances never share (node, seq). Authority = prefix rule (ServerAuthoritySet) + explicit legacy ids; at the first start of this release the ids whose ops hold class 1 in stored fold states, and a configured plain nodeId, are persisted as server_legacy_authoritative_node_ids and advertised. The fold plan fingerprint covers the explicit authorities. Client half (prefix rule in core fold, union of learned ids) is owned by the other Phase 3 engineer. Repros: RT-62.test.ts (restart keeps the same authoritativeNodeIds; assertion inverted from 'a new random id') and RT-62-shared-node.test.ts (adapted: two instances, distinct instance ids in one deployment, server-authoritative writes from both beat a later device write). Tests: src/store/server-identity.test.ts. Round 2 (2026-10-03): both halves verified end to end with two Postgres instances (packages/test/tests/phase3-multi-instance-authority.test.ts): instance B, started after the device connected to A, authors kora:server:<deployment>:<instanceB>; its route write reaches the device through A's delivery polling and beats the device's later write on the device (prefix rule, B's id never advertised to it) and on both instances; the configured plain id is advertised as a legacy authority and its write stays authoritative."
+  },
+  {
+   "id": "RT-63",
+   "title": "The client fold has no plan fingerprint: after a schema change of a field's fold kind (number -> merge('counter'), array -> append-only, a field gaining a resolver), every existing record keeps a fold state of the old kind and mergeOp throws FoldStateError for every later write to that field: local writes fail, and a remote op touching it stalls the device's delivery stream",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-63.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: core/src/fold/fold.ts:150 and :412 (fieldPlanFor throws), store/src/store/store.ts:960 (ensureMaterialization re-materializes once per database: fold_materialization = fold-v1, no plan fingerprint); sync/src/engine/sync-engine.ts:2831 (an apply error other than REFERENTIAL_INTEGRITY stalls the watermark, so the device stops applying everything after it; by code reading). The server re-folds on a plan change (record-fold.ts foldPlanFingerprint), so the server keeps working and devices diverge. A changed resolver source is not detected on devices either. Required fix: persist the client's fold plan fingerprint (same definition as the server's) and re-fold affected records on open when it changes; treat FoldStateError on apply as a re-fold of that record, never a stall. Repro kora/tests/repro/RT-63.test.ts. FIXED (Phase 3 round 1, 2026-10-03). Core: foldPlanFingerprint / foldPlanFingerprints (the server's definition, moved to core/src/fold/plan.ts), mismatchedFoldFields, adaptFoldState. Store: per-collection fingerprints in _kora_meta (fold_plan_fingerprints); ensureFoldPlan re-folds re-planned collections on open (a database without the meta re-folds collections whose stored states hold a field of another kind); loadState treats a mismatched state as missing (rebuild on the write path); compacted bases and row snapshots are adapted on read (a re-planned field restarts from its materialized value at its newest write, approximate for its compacted history only). A carried scope-entry foldState of another plan falls back to the entry data (core). RecordFolder.applyInTx retries once via a re-fold on FoldStateError; SyncEngine quarantines a remaining FOLD_STATE_INVALID (non-transient, replayed on start) instead of stalling. Stall PROVEN at 827adc9: packages/sync/src/engine/fold-state-quarantine.test.ts fails with the quarantine branch disabled (the next delivery batch never applies). Tests: kora/tests/repro/RT-63, packages/store/src/fold/phase3-fold-fixes.test.ts (open re-fold + remote counter op, stale state on write path, adapted compacted base), core phase3-authority-plan.test.ts. Round 2: server record-fold.ts re-exports the core foldPlanFingerprint (no copy); test packages/server/src/store/fold-plan-fingerprint.test.ts (client per-collection and server fingerprints agree for the same schema)."
+  },
+  {
+   "id": "RT-64",
+   "title": "A protocol-2 client can omit hashVersion: version-1 ids are verified nowhere (server or clients) and stores deduplicate by id alone, so a writer can pre-store an arbitrary operation under a predictable server-derived id (cascade-late, constraint corrections) and the server's later correction is dropped as a duplicate",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-64.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Integrity bypass. Locations: server/src/session/client-session.ts:2689 (only a declared version 2 is verified), sync/src/engine/verify-inbound.ts:53 (clients skip version 1), server/src/store/memory-server-store.ts:182 (dedup by id; SQLite and Postgres the same); server/src/constraints/constraint-authority.ts:337 (cascade-late parent key = parent delete id | child newest op id, both known to the writer) and :196 (unique/capacity correction parent = hlc:<losing write's HLC>, chosen by the writer). Repro: a comment written under an already deleted cascade parent survives on the server (control without the squat op: deleted). The same squat keeps a losing unique/capacity write (by code reading). Required fix: a protocol-2 session must declare hashVersion 2 on every op and pass verification (version 1 only from protocol-1 sessions); verify version-1 ids too (they cover type, collection, recordId, data, timestamp, nodeId); never let a client op occupy an id the server derives (dedup server-derived ops by (nodeId, id), or refuse a client op whose id is a derived id). Fixed (commit 371cf12): the server verifies every plaintext upload id; an op without hashVersion is verified as a version-1 hash (binary values accepted in bytes or $koraBytes form) and stored declaring hashVersion 1; verify-inbound verifies declared version-1 ops on clients (absent = unverified: pre-beta.14 rows, server transforms, protocol-1 encrypted payloads; kora:* nodes exempt). Server-derived ids are HMAC-SHA-256 keyed with the persisted deployment secret (deriveServerOpId), deterministic across instances. Repro strengthened: honest ops carry real ids, the squat is refused INVALID_OPERATION_ID and the late child is deleted. Test helpers now build real content-addressed ids. Round 2 (2026-10-03): verify-inbound no longer exempts every kora: node: only scope entries (kora:scope-entry) and server-derived ops (keyed HMAC ids, no declared hashVersion) are exempt; a kora:server: route write declaring hashVersion 1 or 2 is verified (tampered data or a chosen id is refused INVALID_OPERATION_ID). Inverted verify-inbound.test.ts; honest route writes verify end to end (server-authoritative-convergence, no quarantine). Round 3 (2026-10-03, RT-71): a protocol-1 session's undeclared id that cannot be verified (beta.13 hashed undefined members as null) is stored unverified instead of refused; the RT-64 repro's attacker now speaks protocol 2 (as its title states) and a protocol-1 case pins that the keyed derived ids still defeat the squat."
+  },
+  {
+   "id": "RT-65",
+   "title": "The Postgres server store cannot store a string containing U+0000 or a lone UTF-16 surrogate: a NUL from ordinary user input drops the session on every upload, so the device re-sends it forever and every later write of that device never reaches anyone; a lone surrogate reaches peers corrupted (U+FFFD) with no error",
+   "severity": "P1",
+   "workstream": "W5",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-65.test.ts"
+    },
+    {
+     "browser": "RT-65"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Not a Phase 3 regression (first found here). Locations: server/src/store/materialization.ts:37-41 (arrays, objects and json materialize as JSONB, which refuses \\u0000 and unpaired surrogate escapes), postgres-server-store.ts collection rows (TEXT refuses NUL). The SQLite and memory server stores and every client store keep both values. Repro packages/test/tests/repro/RT-65.test.ts (KORA_PG_TEST_URL; NUL in a string, lone surrogate in a string, NUL in an array element): the NUL cases never deliver the device's later ordinary write (the client only sees 'server disconnected', repeatedly); the surrogate case delivers the title with replacement characters to the peer. Required fix: one value encoding at the Postgres boundary that round-trips every JS string (escape NUL and lone surrogates in TEXT/JSONB, or keep materialized JSON in TEXT), and a non-retriable, surfaced refusal for anything a store still cannot hold (never a session drop that loops). Server half fixed (commit b53ab47): text codec (U+FFFF-introduced escapes) for Postgres TEXT/JSONB and SQLite TEXT raw-string columns, per-table migration of legacy U+FFFF values, identifiers with NUL/lone surrogates refused (INVALID_IDENTIFIER), database value refusals mapped to non-retriable UNSTORABLE_VALUE (never a dropped session). Parity test src/store/string-fidelity.test.ts (memory/SQLite/Postgres). Repro: both NUL cases pass; the lone-surrogate case still fails because the CLIENT SQLite store (packages/store, better-sqlite3 UTF-8 binding) turns a lone surrogate into U+FFFD on the writing device and the peer (the server now holds and relays it intact). Remaining: the client store codec (store owner). Client half fixed (Phase 3 round 2, 2026-10-03): the stored-text codec moved to @korajs/core (encodeStoredText/decodeStoredText; the server text-codec delegates to it, identical escaping). The client store encodes raw-string columns (string, secret; not enum, whose CHECK holds schema literals) in serializeRecord/deserializeRecord for every adapter (better-sqlite3, SQLite WASM on OPFS, the IndexedDB fallback, which runs SQLite WASM); where/$in filters and relation lookups bind the encoded form (injective, so equality is exact); JSON columns and the op log data need none (JSON.stringify escapes NUL and lone surrogates). Rows written before the codec get their U+FFFF re-encoded once on open (_kora_meta stored_text_codec). Tests: packages/test/tests/repro/RT-65 (all three cases green with Postgres), core src/text/stored-text.test.ts (property: round trip, injective), store src/serialization/stored-text.test.ts (rows, filters, op log across reopen, legacy U+FFFF migration), real Chromium browser check RT-65 in packages/store/tests/repro/browser/LMS-5-6-7.browser.mjs (OPFS and IndexedDB: rows, filters and op log keep NUL, lone surrogates and U+FFFF across close/reopen; 3/6 checks fail without the codec)."
+  },
+  {
+   "id": "RT-66",
+   "title": "A replace-mode restore of a compacted device's backup on another device rebuilds records from an incomplete log: the backup carries no fold base states, the restoring device clears its own, and it judges the log clean from its own meta (never compacted; gaps checked only for its own nodes), so records whose insert was compacted disappear and fields whose last write was compacted revert",
+   "severity": "P2",
+   "workstream": "W8b",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-66.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: store/src/backup/restore.ts:126-133 (fold state and base tables deleted), backup.ts (no _kora_fold_base, _kora_compacted_through or compaction marker exported), store/src/store/store.ts:2502-2509 (ensureMaterialization after the restore) with log-integrity/log-integrity.ts:229-231 (gaps for local nodes only; compactedAt from the restoring device's meta) and store.ts:965-970 (mode 'log'). The backup's own rows are overwritten by the rebuild. A synced device gets the records back on its full resync (the restore resets delivery to 0); a device that restores while offline, or a restore used for disaster recovery, keeps the loss. Required fix: export and import the fold base states (or never compact what a backup cannot carry); at least treat a restored log as 'snapshot+log' when the backup's manifest says its source compacted. FIXED (Phase 3 round 1, 2026-10-03). Backup format 2 gains sections fold_base, fold_snapshot, compacted_through and manifest flags includesFoldState / compacted. Replace restore imports them (compacted_through only unfiltered), then re-materializes from base + log (exact). Merge restore joins the bases/snapshots (state-based join) and re-folds those records before applying the ops; compacted_through by MAX (unfiltered). A file without fold state (beta.13) is re-materialized as 'snapshot+log' on its rows. All restores are offline (no sync involved). Tests: packages/store/tests/repro/RT-66 (replace, offline), phase3-fold-fixes.test.ts (merge on another device, collection-filtered replace, legacy file)."
+  },
+  {
+   "id": "RT-67",
+   "title": "The fold voids the per-field versions of a scope-entry insert that carries no fold state: fieldWriteStamp takes max(fieldVersion, op stamp) and the op is stamped at the record's latest version, so every restated field is written at the latest write of any field and beats a device's concurrent offline edit (beta.13 servers, stores without fold state, an unreadable carried state)",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-67.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Mixed versions / fallback path. Locations: core/src/fold/fold.ts:164-177 (fieldWriteStamp), server/src/session/client-session.ts:3375 (timestamp = fieldVersions.latest; the beta.13 server does the same), fold.ts:196-207 (an unreadable foldState, e.g. another FOLD_STATE_VERSION, falls back to this path). The device keeps the restated old value while the server folds the device's upload: permanent divergence on that device. beta.13 devices honoured the per-field versions (resolvePerFieldLww). Required fix: stamp each restated field at exactly its own version and never raise it to the op's stamp; for a field without a version use the record's creation version. FIXED (Phase 3 round 1, 2026-10-03). core fold.ts fieldWriteStamp: a scope-entry insert's field is stamped at exactly its fieldVersions entry (tie-broken by the entry id), never raised to the op stamp; a field without a version at the oldest version the entry knows (min of the op timestamp and its field versions). A restated server-authoritative field takes the class of its version's node. An entry with neither foldState nor fieldVersions (a custom server store providing neither) can only be stamped at its own timestamp: documented; built-in stores always send one. Tests: packages/core/tests/repro/RT-67, core phase3-authority-plan.test.ts."
+  },
+  {
+   "id": "RT-68",
+   "title": "Row-based base snapshots (client 'snapshot+log' after a pre-W7 compaction; client 'kept' when the log has ANY quarantined row, which turns every record of the database into a snapshot) drop every late concurrent write older than a field's version: counter deltas, array adds and richtext updates that every other replica folds",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-68.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). The documented 'approximate' path, constructed: device c held insert + restock (stock 15, tags [x, y]); an offline device's older write (stock -1, tag z) arrives later; every replica folds stock 14 and tags [x, z, y], the snapshot replica keeps 15 and [x, y] for good. Snapshot stamps also carry no authority class, so a server-authoritative value whose winning server write is older than a losing device write flips when that device write is merged again (by code reading). Also reached on a FOLD_STATE_VERSION bump with a compacted log (old base states become unreadable and are replaced by row snapshots). Locations: core/src/fold/snapshot.ts:110-137, store/src/fold/rematerialize.ts:84-96, store/src/store/store.ts:965-970. Required fix: re-bootstrap such records from the server's fold state (a scope entry carries foldState) instead of folding against a row snapshot; for 'kept', snapshot only the records that own a quarantined row, not the whole database. FIXED with a documented, converging residual (Phase 3 round 1, 2026-10-03). (1) 'kept' is per record: only records owning a quarantined row (record id read from the quarantine row; unknown id keeps its collection) are kept; gaps explained by quarantined rows no longer force 'snapshot+log' on the rest. (2) createSnapshotState takes a seed (the record's stored fold state): fields of unchanged kind are exact; and a server-authoritative field keeps authority class 1 when its version's node is authoritative (fixes the by-code-reading flip). (3) Row snapshots now live in _kora_fold_snapshot (bases stay exact); state = join(base, snapshot, fold(log)). (4) Convergence: a scope entry carrying a readable server foldState drops the snapshot and re-folds (exact); creating snapshots requests one full resync (delivery watermarks reset, as a restore does), and SyncEngine calls store.settleAfterCatchUp on a fully applied final batch, which drops each snapshot whose record has its insert back in the log. RESIDUAL: a row-ONLY snapshot (no fold state: pre-W7 compaction, beta.13 backup) still does not fold a late write OLDER than a field's version until it settles (it must stay dominant: the row cannot say whether such a write is already in its value, and re-merging reflected writes must not double count). store.getSnapshotRecords() lists such records. A server-side fold-state refresh request (protocol message) would settle them without a full resync: not done (protocol is server-owned). Tests: packages/core/tests/repro/RT-68 (rewritten: seeded snapshot exact for the original scenario; authority kept), packages/store/tests/repro/RT-68 (pre-W7 compacted device converges after resync + settle), phase3-fold-fixes.test.ts (scope-entry replacement, per-record kept, settle)."
+  },
+  {
+   "id": "RT-69",
+   "title": "Every device that applies a remote cascading delete authors, stores and uploads its own copy of every cascade/set-null (own node, own id): deleting a parent with N children stores about N x (devices + 2) child deletes, relayed to every device, and every device that later syncs from scratch adds N more",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-69.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Write amplification, unbounded in the number of devices over time. Location: kora/src/apply-pipeline.ts:301-320 (applySideEffectOps writes through createMutationContext, so the copies queue for sync). Repro: 4 devices, 20 children: 100 task deletes stored (author 20, server 20, three receivers 60); a fifth device syncing afterwards added 20 more. Copies from users without write grants on the children are refused and recorded as terminal rejections. Required fix: a receiving device's cascades of a REMOTE delete stay local (fold them without enqueuing: the author uploaded its copy and the server derives its own), or give them an id and content every device derives identically so the log stores one. FIXED (Phase 3 round 1, 2026-10-03). Mirroring the server's cascade exactly is impossible (it carries the server's node and a server-allocated sequence number; and RT-64 may make server-derived ids unpredictable), so a receiving device applies the cascades / set-nulls of a REMOTE delete as local-only provisional effects: Store.applyProvisionalSideEffects folds them (node kora:provisional, stamped right after the parent like the server's copy, id deriveSideEffectOpId(parent, provisional/<rule>, target)) into _kora_provisional_ops; they are never logged, sequenced or queued. A remote op of the record whose causalDeps include the parent (the server's or author's copy) retires them; SyncEngine -> store.settleAfterCatchUp retires the rest when the stream catches up (an effect the server did not derive does not stay applied locally). Local deletes still author and upload their cascades. Tests: packages/test/tests/repro/RT-69 (<= 2 per child), packages/test/tests/phase3-remote-cascades.test.ts (4 devices + late joiner: per child exactly one from the author and one from the server, none from receivers or the late joiner), phase3-fold-fixes.test.ts (not logged/queued; retire by real copy; retire on catch-up). Residual fixed (Phase 3 round 2, 2026-10-03): the server stored two copies per child (the author's and its own derived one). applyServerOperation now defers an effect the author covers in the same upload (an op of the deleting node, causalDeps including the delete, same record and effect: a delete for cascade; an update nulling every field the set-null nulls, never an encrypted update) and the session derives it after the batch only when no authored copy was stored (refused, rate-limited, not reached, or not stored by another session). Children the author did not know and legacy clients that author no cascades are derived as before. The client SyncEngine flushes a streaming upload only once every concurrent pushOperation is enqueued, so a commit block (delete + cascades) uploads as one batch. Tests: server tests/integration/authored-side-effects.test.ts (authored, legacy, unknown child, refused copy, non-null update), packages/test/tests/phase3-remote-cascades.test.ts (4 devices + late joiner: exactly one cascade per child, the author's; a child the author never saw is cascaded by the server on every device), sync-engine.test.ts commit-block batch. Residual: a commit block larger than the upload batch size (default batchSize) still splits; children whose authored copy lands in a later batch also get a server copy (correct, idempotent, two copies for those only)."
+  },
+  {
+   "id": "RT-70",
+   "title": "Server stores with an unclean log (quarantined rows) keep pre-fold rows at the upgrade, but the next write to such a record re-folds it from the remaining log: the quarantined operation's effect vanishes, and a record whose insert was quarantined disappears from the server",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-70.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: server/src/store/sqlite-server-store.ts:1214-1217 (skippedUnclean leaves no fold state); the next apply takes the 'no state' path and re-folds from the log (Postgres the same). The console message promises the rows 'keep their pre-fold values until their next write'; that next write is what drops them, and new devices then enter scope without the record. Required fix: on the unclean path build the record's base from its kept row and fold later writes onto it (with RT-68's caveats), or refuse writes to records with quarantined history until an operator repairs them. Repro packages/server/tests/repro/RT-70.test.ts (SQLite). Fixed (commit b53ab47): records that own quarantined rows (from operations_quarantine.row_json; an unreadable collection/record widens the scope) are never re-folded from their incomplete log: the startup migration, the next write and reads rebuild them from the stored fold state or a createSnapshotState base of the kept row (fields stamped at least at the quarantined ops' newest HLC) with the remaining ops merged on top; records whose every op was quarantined get a state too; complete records fold from their log. SQLite and Postgres. Inverted the fold-materialization test that encoded the bug. Tests: tests/integration/quarantine-base.test.ts."
+  },
+  {
+   "id": "RT-71",
+   "title": "The strict version-1 id check (RT-64 fix) refuses legitimate writes of beta.13 (protocol 1) clients: beta.13 hashes an undefined object member as \"key\":null, but the op log and the wire are JSON, so the member is gone when the server recomputes the hash; update(id, { field: undefined }) and object values with an undefined member are refused INVALID_OPERATION_ID and the beta.13 client diverges for good",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-71.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of the RT-64 fix (commit 371cf12). Locations: server/src/session/client-session.ts:2846-2852 (every plaintext upload without hashVersion verified with absentVersion 'verify-ids'), sync/src/engine/verify-inbound.ts:123-144 (operationIdMatches: only the binary-form variants are tried), beta.13 core content-hash canonicalize (undefined member -> \"key\":null) with beta.13 validateRecord copying undefined for updates and nested object members. Confirmed against the real beta.13 build (33bca46) over WebSockets with scripts/remediation/rt-legacy-id-probe.mjs: 3 of 4 ordinary write shapes refused (insert with { a: 1, b: undefined } in an object field; update(id, { assignee: undefined, title }); update(id, { meta: { a: 2, b: undefined } })); increments, numbers (1e21, -0, 5e-324), unicode, key order, timestamps and arrays all verified. The refusal is terminal; beta.13 keeps the value locally, no peer ever sees the write. Postgres store the same (KORA_REPRO_STORE=postgres). Required fix: accept the beta.13 hash form when verifying version 1: rebuild the undefined members (for an update every previousData key absent from data, since beta.13 writes previousData[key] for every validated key; declared nested fields of object values), or, since server-derived ids are now keyed (RT-64), accept an unverifiable version-1 id from a protocol-1 session as unverified (no hashVersion) and dedup client ops by (nodeId, id). Repro packages/server/tests/repro/RT-71.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit 8df53b8). Version-1 verification (sync verify-inbound matchOperationId, shared by server and clients) rebuilds the forms beta.13 actually hashed: for an update, every previousData key absent from data restored as null (schema-free, so clients repeat it); with the schema, declared nested object members absent from the value. An update matched through the previousData rebuild is STORED with those fields null (what the beta.13 writer applied locally; null and undefined hash identically under v1) and declares hashVersion 1, so peers clear the field too (before, the probe showed the server would keep the old value: divergence). A match that needed the schema is stored without a declared version (receivers cannot repeat it). Any other undeclared id a protocol-1 session cannot verify, for the session's own node only, is stored unverified (no hashVersion), logged (session.unverified_legacy_operation), emitted (sync:unverified-legacy-operation) and counted (ServerMetricsSnapshot.unverifiedLegacyOperations). RT-64 intent kept: a protocol-2 session never reaches the unverified path, server-derived ids are HMAC-keyed. Repro tests that relied on a protocol-1 session's refusal of a chosen id (RT-64, RT-73, authored-side-effects, operation-resolutions oracle test) now log in with protocolVersion 2; RT-64 gained a protocol-1 case (squat stored unverified, late child still deleted). RT-71 repro reads ops store-agnostically and passes on memory and Postgres (KORA_REPRO_STORE=postgres). scripts/remediation/rt-legacy-id-probe.mjs now also checks a beta.14 peer converges: against the real beta.13 build (33bca46) all 6 cases (the 4 write shapes plus increments and numbers/unicode) are accepted and converge (update clearing a field: verified v1, stored null; nested undefined: verified with the schema, stored undeclared). Tests: sync verify-inbound.test.ts (RT-71 block), server tests/integration/legacy-undefined-members.test.ts. Residual: an unverified protocol-1 op could occupy an id another device later uploads (only by predicting that op's exact content and timestamp); protocol 1 is refused by the next release."
+  },
+  {
+   "id": "RT-72",
+   "title": "A beta.14 device's insert whose object field holds an undefined member ({ a: 1, b: undefined }) is refused INVALID_OPERATION_ID and the record vanishes from the writing device: the version-2 hash covers \"b\":null, the uploaded JSON has no b",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-72.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Not a round-2 regression: present since protocol v2 verifies declared version-2 ids. Locations: core/src/operations/content-hash.ts:141-160 (canonicalize writes an undefined object member as null), core/src/schema/validation.ts (an object value with an undefined declared member passes; only present members are type-checked), store op log and wire (JSON.stringify drops the member). The server recomputes the hash over what it received, refuses the insert terminally, and the device excludes it from its fold: the user's record disappears with only a rejection event. A form building { a, b: input || undefined } is enough. Top-level undefined (insert and update) and nested undefined in an update are normalized elsewhere and pass. Required fix: one canonical form for hashing and storage: strip undefined object members (deeply) from data/previousData/atomicOps before the id is computed (createOperation) and in validateRecord, so the hashed content is exactly the JSON content; and make canonicalize treat an undefined member as absent for version 2. Repro packages/test/tests/repro/RT-72.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit 8df53b8). One rule: an undefined object member is absent. core stripUndefinedMembers (deep; undefined array elements become null, like JSON) runs in createOperation on data, previousData and atomicOps before the id is computed, and in validateRecord on object values (insert and update); the version-2 canonical form drops undefined members, so the hashed content is exactly the JSON content. Version 1 keeps beta.13's form (undefined as null) for verification of old ids. Tests: core src/operations/strip-undefined.test.ts, sync verify-inbound.test.ts (v2 JSON form), repro packages/test/tests/repro/RT-72."
+  },
+  {
+   "id": "RT-73",
+   "title": "A cascade the server deferred to the end of an upload batch (RT-69 residual fix) is lost for good when the batch fails after the delete committed: the deferred list is in memory, the retried delete is a stored duplicate that derives nothing, and a refused author copy leaves the child an orphan of a deleted parent",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-73.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of commit fb5dcae. Locations: server/src/apply/apply-server-operation.ts:207-220 (effects the author claims are returned in deferredSideEffects, not derived), server/src/session/client-session.ts:2390-2393, 2636-2647, 2688-2691 (deferred list kept in memory and derived after the loop), the duplicate path (isStoredDuplicate -> continue, no effect re-check). Any exception after the delete committed (database error, failover, process restart during a deploy) drops the list; the client re-sends the batch; the delete is a duplicate; when the author's copy is refused on the retry (no write grant on another user's child, a validator, an invalid id) no copy of the cascade is ever stored. Control (no transient failure): the child is deleted. Before fb5dcae the effect was derived right after the delete committed. Required fix: make the deferral durable or self-healing: record pending effects in the delete's transaction (an outbox the session drains, and a startup sweep), or on a duplicate delete re-check its referential effects and derive any not covered by a stored copy. Repro packages/server/tests/repro/RT-73.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit 8df53b8). Self-healing: a delete that arrives again as a stored duplicate re-checks its referential effects (apply-server-operation undoneSideEffectsOfStoredDelete: children still referencing the deleted record, filtered by the writer's side-effect authorization); effects the author covers later in the same batch are deferred exactly like a fresh delete's (derived after the batch unless a copy is stored), the rest are derived at once (deterministic keyed ids, idempotent). The client re-sends an unacknowledged batch, so a failure after the delete committed (or a copy refused on the retry) no longer leaves an orphan. Tests: server tests/integration/stored-delete-effects.test.ts on memory, SQLite and Postgres 16 (cascade + set-null after a failure on the server's own derivation; refused author copy; honest author copy stores no server copy); verified failing with the re-check disabled. Residual: if the batch fails after the delete committed and the device never reconnects, the deferred effect stays undone until any later upload of that delete (no startup sweep / outbox)."
+  },
+  {
+   "id": "RT-74",
+   "title": "Under end-to-end encryption a remote delete's cascade the server cannot derive (relation field sealed) is retired at the next catch-up: the child the user saw deleted comes back, an orphan of a deleted parent, because settleAfterCatchUp drops every provisional effect and nobody makes it durable",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-74.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of the RT-69 fix (commit 581f87f). Locations: kora/src/apply-pipeline.ts:172-186 (cascades of a REMOTE delete applied only as provisional effects), store/src/store/store.ts:1199-1213 (settleAfterCatchUp retires every pending provisional effect: 'an effect the server did not derive does not stay applied locally'), docs/guide/sync-encryption.md:254 ('cascades and set-nulls run on the server only when the relation's field is listed in cleartextFields; otherwise each device cascades for itself'). Repro: encrypted network, projectId sealed; B adds a child A never receives (A goes away after uploading its delete of the project); B applies the cascade provisionally, then after a reconnect the child is back for good. Before the RT-69 fix B authored a durable copy. Required fix: when the server cannot derive the effect (encryption without the relation field in cleartextFields, or any relation the server does not cascade), author the receiving device's cascade as a real operation with a deterministic id (deriveSideEffectOpId(parent, rule, target), identical on every device, so copies dedupe to one), or never retire a provisional effect the server is known not to derive. Repro packages/test/tests/repro/RT-74.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit f3ddd91). Decision: receivers never author copies; the deleting device does. Store.setSealedRelations (createApp and TestDevice set it from the sync encryption config via sealedRelationNames: cascade/set-null relations whose field is not in the child's cleartextFields) marks relations the server cannot cascade. A remote delete's effects on a sealed relation are durable provisional effects (_kora_provisional_ops.durable, column migrated on open): settleAfterCatchUp keeps them, only a real copy (an op naming the delete in causalDeps) retires them, and they survive reopen and re-fold. The deleting device authors copies for children it knew (unchanged) and, when it later receives a child of a sealed relation whose parent it deleted and has not cascaded, authors that cascade / set-null once (extraCausalDeps = the delete), which retires every receiver's provisional effect. Until then (or if the deleter never returns) every device folds the same effect stamped right after the parent. Documented in docs/guide/sync-encryption.md. Tests: repro RT-74; packages/test/tests/phase3-sealed-cascades.test.ts (3 devices: unknown child durable on receivers across reconnects, cascaded once by the deleter on return, provisional retired; known children: one copy per child, the author's); store phase3-fold-fixes (durable survives catch-up/reopen, real copy retires; old table migrated); kora sealed-relations.test.ts. Residual: the server's (sealed) copy of an unknown child stays alive until the deleter syncs; a new device syncing before that cascades it locally (same result). REDESIGNED (Phase 3 round 4, 2026-10-03, commits 3d86b2f, 3b2d3d7): the round-3 machinery (durable provisional effects, late-known child authoring by the deleting device, Store.setSealedRelations) produced RT-78 and RT-82 and is removed. Decision: under sync encryption, the foreign key of a relation whose onDelete is cascade, set-null or restrict must be in cleartextFields; createApp and TestDevice refuse a sealed one at init (SealedRelationFieldError, SEALED_RELATION_FIELD, naming the field and the fix). Cascades then work like unencrypted ones (server derives, the deleting device authors what it knew, receivers provisional-then-retired). Repro converted to (1) the refusal and (2) the original scenario converging with the cleartext key; packages/test/tests/phase3-sealed-cascades.test.ts rewritten the same way; docs/guide/sync-encryption.md and the beta.14 notes updated (breaking for encrypted apps with sealed FKs)."
+  },
+  {
+   "id": "RT-75",
+   "title": "Devices replace their authoritative node ids with each handshake's list instead of keeping the union: every reconnect after a Postgres restart or to another instance re-folds every record of every collection with a server-authoritative field, and an explicit (legacy or configured) authority an instance does not list is dropped, so the legacy server's decision loses to a later device write on that device",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-75.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). The RT-62 required fix says devices union, never drop, the ids they learn; the tracker attributes that to the client half; it is not implemented. Locations: store/src/store/store.ts:1292-1318 (setAuthoritativeNodeIds: next = the handshake's set, re-folds every authoritative collection when it differs), store/src/fold/record-folder.ts:149 (replaces the set), sync/src/engine/sync-engine.ts:1778-1782 and 1840-1843 (passes and persists the handshake list as is). The handshake list is per instance: its own kora:server:<d>:<i> id (a new one per Postgres start unless instanceId is configured), the other kora:server: ids that instance noted, and the legacy ids it loaded at its own start. Repro (store level): 50 records, lists differing only in kora:server: ids -> 100 re-folds (expected 0: those ids are authoritative by prefix); an explicit 'legacy-server' approval flips to the later device write when a handshake omits the id. Aggravating (by code reading): Postgres hydrates every kora:server: node of sync_state into otherServerNodes (postgres-server-store.ts:2228-2231) and advertises all of them, so the list grows by one id per instance start that wrote anything and never shrinks; every handshake after a deploy carries a list the device has not seen. Required fix: persist the union of learned explicit ids (never drop), compare only explicit (non kora:server:) ids, and re-fold only when the explicit set grows. Repro packages/store/tests/repro/RT-75.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit f3ddd91). Store.setAuthoritativeNodeIds and the SyncEngine keep the UNION of explicit (non kora:server:) ids, persisted, never dropped; kora:server: ids are not stored (authoritative by prefix); records re-fold only when the explicit set grows. Servers advertise only explicit ids (ClientSession.advertisedAuthoritativeNodeIds); the SQLite and Postgres stores no longer collect other instances' kora:server: ids (getAuthoritativeNodeIds = own node id + explicit authorities), so the list no longer grows per Postgres start. Tests: repro RT-75; store src/store/authority-union.test.ts; server protocol-v2-ingest.test.ts (handshake lists explicit ids only)."
+  },
+  {
+   "id": "RT-76",
+   "title": "The one-time legacy authority scan reads authority stamps out of device-written values: a json value holding { c: 1, t, o: <op id> } makes the named op's node a server authority (its writes win server-authoritative fields; its own handshake is refused for good)",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-76.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Locations: server/src/store/server-identity.ts:210-233 (authoritativeStampOpIds walks the whole state JSON, values included), sqlite-server-store.ts:280-298 and postgres-server-store.ts:359-391 (scan at the first start of this release). Reach: only databases that already hold fold states at their first beta.14 start (a pre-release fold build); new and beta.13 databases have none when the scan runs. The repro clears the scan marker to simulate one. Required fix: deserialize each state and collect only stamp positions (cr/w/d/u and each field kind's stamp members), never values; optionally intersect with node ids that never hand-shook as devices (node claims). Repro packages/server/tests/repro/RT-76.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit f3ddd91). authoritativeStampOpIds reads stamps only from stamp positions of the fold-state format (cr/w/d/u; reg/res entries; set sh/clr/element a/f/r; map sh/clr/keys; ctr base/deltas; max/min best/reg; rt reset/updates), never values; the format version is not enforced (pre-release states). Tests: repro RT-76; server-identity.test.ts (every stamp position; stamp-shaped values ignored)."
+  },
+  {
+   "id": "RT-77",
+   "title": "A forged 'duplicate' delete makes the server cascade a live record: the RT-73 re-check derives the referential effects of the UPLOADED op's collection/record, and the duplicate test matches on (node, id) only (own node: any sequence; other node: same sequence), before integrity checks, validators and rate charging",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-77.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-73 fix (commit 8df53b8). Locations: server/src/session/client-session.ts:2425-2440 (the duplicate path calls resumeStoredDeleteEffects(op) whenever the UPLOADED op says type 'delete'), :3466-3471 (isStoredDuplicate: id + node only; own node any sequence; content never compared; runs before checkUploadIntegrity at :2561), :2772-2792 (resumeStoredDeleteEffects uses the uploaded op), server/src/apply/apply-server-operation.ts:252-283 (undoneSideEffectsOfStoredDelete evaluates checkReferentialIntegrityOnDelete for op.collection/op.recordId; only authorizeUplinkWrite, no validator). A device re-sends the id of any stored op it knows (its own, any sequence; or a delivered op of another node, with that node id and sequence) as type 'delete' with any collection/recordId: the server derives server-authored (kora:server:) cascade deletes / set-nulls of every child of a LIVE record that the device's uplink scopes allow and relays them to every device, bypassing validateOperation and the rate limiter (a duplicate is free). The derived ops are stamped right after the forged op's timestamp, so the id of any op newer than the children works. Repro packages/server/tests/repro/RT-77.test.ts (memory, and Postgres 16 with KORA_REPRO_STORE=postgres; the server has a validator refusing every delete by the attacker). Required fix: on the duplicate path re-check only the STORED delete: load the stored operation (by id and node) and use its content, never the uploaded body; ack a duplicate whose body differs from the stored one without any effect (or refuse it). FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit fca23ce). A batch-lookup duplicate now loads the stored operation (getOperationRange at the found node and sequence) and must be the SAME operation: server session/duplicate-identity.ts isSameStoredOperation compares every field the stored id's hash version covers, in canonical form (v1: type, collection, recordId, data, timestamp, nodeId, atomicOps, with legacy clears as null; v2: also previousData, sequenceNumber, causalDeps as a set, schemaVersion; an envelope by header, the ciphertext is re-sealed per upload). Otherwise the upload is refused FORGED_DUPLICATE (terminal, no resolution recorded, nothing derived), logged session.forged_duplicate, emitted sync:forged-duplicate, counted (ServerMetricsSnapshot.forgedDuplicates). The RT-73 re-check runs on the STORED delete only. A store read failure judges the upload as new (verified, validated, charged). Validators and the rate limiter are never skipped for a non-identical duplicate (it never reaches the duplicate ack). Tests: duplicate-identity.test.ts; tests/integration/forged-duplicate.test.ts (refusal, no effect, no validator call, honest re-upload still free; re-sent delete re-checked on the stored delete); repro RT-77 on memory and Postgres 16 (KORA_REPRO_STORE=postgres)."
+  },
+  {
+   "id": "RT-78",
+   "title": "Under end-to-end encryption with a sealed relation, the deleting device's late cascade (RT-74 fix) deletes a child that was already moved to a live parent: cascadeLateChildOfOwnDelete judges the child right after applying its insert, before the same batch's move, and its delete (stamped now) wins on every device",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-78.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-74 fix (commit f3ddd91). Location: kora/src/apply-pipeline.ts:135-138 (runs after every applied remote op) and :211-256 (reads the materialized child after that one op; authors a real delete / set-null with extraCausalDeps = own delete, stamped by the local HLC, i.e. after every op it has seen). Repro: A (deaf to batches) deletes project P; B had inserted a todo under P and moved it to Q; B shows the todo under Q; when A reconnects it applies the insert, authors the cascade, then applies the move; the todo is gone on A and B. Control without encryption (server cascade-late correction on the folded state): the todo survives under Q. Data loss of a live record on every device. Required fix: judge late children on the folded state after the delivered batch (or at catch-up), author the cascade only if the child still references the deleted parent then, and never stamp it later than a move it did not see (e.g. stamp it like the receivers' provisional effect, right after the delete). FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 3d86b2f). Redesign, not a patch: the deleting device's late-cascade authoring (kora apply-pipeline cascadeLateChildOfOwnDelete) is removed. With sync encryption, the foreign key of a cascade/set-null/restrict relation must be in cleartextFields: @korajs/sync validateEncryptedRelations throws SealedRelationFieldError (SEALED_RELATION_FIELD) at createApp (validateCreateAppConfig) and TestDevice creation. With the key in cleartext, the server's cascade-late correction judges the folded child, as without encryption. Repro converted: (1) the sealed configuration is refused at device creation; (2) the original scenario with the cleartext key: the moved todo survives under Q on every device (unencrypted control kept). See RT-74."
+  },
+  {
+   "id": "RT-79",
+   "title": "A Date inside a t.json() value is hashed as {} (the version-2 canonical form walks Object.entries) but stored and uploaded as its ISO string: the server refuses the insert INVALID_OPERATION_ID and the record vanishes from the writing device",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-79.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not a round-2 regression (same at 07e4f45); same class and outcome as RT-72 (P1). Locations: core/src/operations/content-hash.ts:117-132 (canonicalBinary: any object via Object.entries; a Date has none), core/src/schema/validation.ts (json values: the JSON-serializable check accepts a Date; a custom toJSON is refused as a function member), core/src/operations/strip-undefined.ts (non-plain objects untouched), op log and wire = JSON.stringify (ISO string). Repro packages/test/tests/repro/RT-79.test.ts. Required fix: hash exactly the JSON form (normalize op data to its JSON round trip before the id, keeping binary in its canonical form), or refuse non-plain objects (Date, Map, Set, class instances) in json/object values at validation with a clear error. Map and Set are accepted today and silently become {} on every replica. FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 44f11ed). Root cause (RT-72 family): hashed, stored, wire and folded bodies were produced by different code. core canonicalizeOperationBody (operations/canonical-body.ts) is applied once in createOperation and the version-2 hash is computed over its output, so they are one by construction. A Date inside a json/object value becomes its ISO string (validateRecord produces the same canonical values via canonicalValue, so the record holds what peers see); Map, Set, class instances, functions, BigInt, NaN, Infinity, invalid Date, toJSON objects, cycles and array holes are refused (NonCanonicalValueError NON_CANONICAL_VALUE; SchemaValidationError on the field at validation, naming path and fix), never silently {}. strip-undefined.ts removed. Tests: core canonical-body.test.ts (table, refusals, property: id stable across JSON round trips); store tests/integration/canonical-body-roundtrip (SQLite, WASM mock bridge, IndexedDB); server tests/integration/canonical-body-roundtrip (JSON + protobuf wire, memory/SQLite/Postgres 16 stores: id, body and materialized row stable). Found by the property test and fixed: a t.json() value that is a string was stored raw by the server stores (\"123\" read back as 123 on SQLite and Postgres, non-JSON text crashed SQLite reads and Postgres writes)."
+  },
+  {
+   "id": "RT-80",
+   "title": "update(id, { field: undefined }) on a beta.14 device is refused INVALID_OPERATION_ID by its own server: the stripped data {} is hashed, the op log reads it back as null, and a no-op write is reported as tampering",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-80.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not a round-2 regression (same at 07e4f45); the round-2 register said top-level undefined in an update passes. Locations: core/src/operations/operation.ts normalizeOperationInput (data {} after stripping), store/src/serialization/serializer.ts:186 (deserializeOperation: empty data read back as null), store/src/mutations/write-ops.ts:165-189 (previousData keeps the undefined field's key). The field is not cleared on any replica, while a beta.13 client's same call clears it (and the server stores it as a clear, RT-71): the API means different things per version. Repro packages/test/tests/repro/RT-80.test.ts. Required fix: decide the meaning (clear, as beta.13, or ignore); if ignored, drop the key from previousData too and write no op when nothing is left; never hash a data shape the op log does not round-trip ({} vs null). FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 44f11ed). Decision: update(id, { field: undefined }) CLEARS the field (beta.13 semantics); the canonical body writes it explicitly as null, so it hashes, stores and folds as a clear on every replica. Also, an insert/update with data {} reads back as {} (store op log, protobuf and dynamic decoders), never null. Tests: core canonical-body.test.ts (RT-80 case), property tests above, repro RT-80."
+  },
+  {
+   "id": "RT-81",
+   "title": "The device-side authority union has no revocation: an explicit authoritative id a server once advertised stays authoritative on devices for good, and once no server lists it any more a device may hand-shake with it (the handshake refuses only currently listed ids) and its writes then win server-authoritative fields on every device, but not on the server",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-81.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Consequence of the RT-75 fix (commit f3ddd91). Locations: store/src/store/store.ts setAuthoritativeNodeIds (union, never dropped), sync/src/engine/sync-engine.ts:1840-1853 (union), server/src/session/client-session.ts:2994-2999 (isServerAuthorNodeId: current lists only) and the claim rule (an id with no stored history is claimable). Reach: an operator removes a configured authoritativeNodeIds extra (or a legacy id that never authored anything), for example to revoke it, or one instance of several listed it. The forged node's server-authoritative writes are authoritative on every device that learned the id and ordinary on the server: permanent divergence plus authority on devices. Repro packages/server/tests/repro/RT-81.test.ts. Required fix: persist every id the deployment ever advertised (server side) and refuse it at handshake for good; give operators an explicit revocation (a signed or versioned authority list that devices replace, rather than union). FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 3b2d3d7). Authority is a union over time on the server too: resolveAuthorityHistory persists every explicit id the deployment ever held authoritative (kora_server_meta server_ever_authoritative_node_ids) and the revoked ones (server_revoked_authoritative_node_ids), under the identity lock on Postgres; an id stays authoritative until revoked (removing it from authoritativeNodeIds does not revoke it), so server and devices fold alike, and the session refuses every ever-authoritative id at handshake, revoked ones included. Explicit, versioned revocation: store option revokedAuthoritativeNodeIds (memory, SQLite, Postgres; permanent; kora: ids and authoritative+revoked at once refused), advertised in HandshakeResponseMessage.revokedAuthoritativeNodeIds (optional; JSON, protobuf envelope field 48). Clients (SyncEngine -> Store.setAuthoritativeNodeIds(nodeIds, revoked)) remove revoked ids from the union, persist them (sync_revoked_authoritative_node_ids), never learn them again, and re-fold collections with server-authoritative fields. Tests: server store/authority-revocation.test.ts (SQLite and Postgres 16 persistence), store authority-union.test.ts, sync protocol-v2-wire (field 48), packages/test tests/authority-revocation.test.ts (end to end), repro RT-81."
+  },
+  {
+   "id": "RT-82",
+   "title": "Under end-to-end encryption with a sealed relation, a refused cascade copy leaves every receiver's durable provisional effect in place for good: the deleting device excludes its refused copy and shows the child, the server keeps it, receivers keep it deleted, and nothing retires the effect",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-82.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-74 fix (commit f3ddd91): before it, the receiver's provisional effect was retired at catch-up (RT-74), so replicas agreed on the child (alive); before RT-69 the receiver's own copy was accepted. Locations: kora/src/apply-pipeline.ts:181-197 (durable provisional effect for a sealed relation), store/src/store/store.ts settleAfterCatchUp (keeps durable effects) and RecordFolder (only a real copy naming the delete in causalDeps retires one). Reach: any refusal of the deleting device's copy: a write grant the deleting user lacks on another user's child (shared parent, per-user children), a validator, a rate-limit turned terminal. Repro packages/test/tests/repro/RT-82.test.ts (validator: only a todo's creator deletes it): A deletes the shared project; its copy of B's todo is refused; A shows the todo, B does not, across reconnects. Required fix: a terminal refusal of the copy must reach the receivers (e.g. the server relays a 'refused copy' marker, or the deleting device authors a retraction), or receivers retire a durable effect when the server reports the parent's delete fully resolved; alternatively apply sealed cascades only from real copies and accept the transient orphan. FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 3d86b2f). Redesign, not a patch: durable provisional effects are removed (RecordFolder durable column and retirable filters, migrateProvisionalTable, Store.setSealedRelations / isRelationSealed); settleAfterCatchUp retires every provisional effect again. A sealed foreign key on a cascade/set-null/restrict relation is refused at createApp / TestDevice creation (SEALED_RELATION_FIELD). With the key in cleartextFields the server derives the cascade the deleter's refused copy did not cover (RT-69 deferral), as without encryption. Repro converted: (1) refusal; (2) the original scenario with the cleartext key: the deleter and the receiver agree. See RT-74."
+  },
+  {
+   "id": "RT-83",
+   "title": "Upgrading a beta.13 database to beta.14 brings back every field the user cleared with undefined: the one-time fold materialization rebuilds rows from the JSON op log, where beta.13's cleared members are absent; the server stores the same op as a clear (RT-71), so the upgraded device also diverges from every peer for good",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-83.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not caught by rounds 1-2; made a permanent divergence by the RT-71 fix (server stores the beta.13 update with the cleared fields null). Locations: store/src/store/store.ts:1055 ensureMaterialization (mode 'log' rebuilds every row from the log), store/src/fold/rematerialize.ts, beta.13 op log (JSON.stringify drops undefined members; previousData keeps the key), sync/src/engine/verify-inbound.ts restoreUndefinedFromPrevious (the rule exists, used by the server only). Confirmed against the real beta.13 build (33bca46) with scripts/remediation/rt3-upgrade-clear-probe.mjs: update(id, { assignee: undefined, title }) and update(id, { assignee: undefined }) both revert to the old value after the upgrade; a nested undefined member does not. The device holds the server's copy's id already, so the server's null never reaches it. Repro packages/store/tests/repro/RT-83.test.ts (beta.13 database shape built with materialization 'legacy' and the JSON beta.13 logged). Required fix: when folding an undeclared (version-1) update of a local legacy node, apply the same rebuild the server applies (every previousData key absent from data is a clear), or rewrite such ops in the log once at the upgrade (same id: null and undefined hash identically under version 1); add an upgrade test from a real beta.13 database. FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 44f11ed). core canonicalizeLegacyOperation (a version-1 update's previousData key absent from data is a clear -> null, also for null data) is applied by mergeOp, so the server, peers and a device re-folding its own beta.13 log at the upgrade fold the same body; sync verify-inbound restoreUndefinedFromPrevious delegates to it. The server refuses (INVALID_OPERATION_ID) a version-1 update whose id verifies only WITHOUT that clear (no Kora client writes it), so authorization and the fold always see one body. Real beta.13 build (33bca46): scripts/remediation/rt3-upgrade-clear-probe.mjs extended with a sync phase (beta.13 writes synced, and offline then uploaded after the upgrade; a fresh beta.14 peer joins): all 3 cases same locally and converged (upgraded device, peer, server) in both sync modes. Repro RT-83 passes."
+  },
+  {
+   "id": "RT-84",
+   "title": "An honest re-upload of an operation the server stored through a schema transform is refused FORGED_DUPLICATE (terminal): the stored copy has transformed data and no hashVersion, so the RT-77 identity check never matches; the device then re-folds without its own write while the server and every peer keep it",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-84.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Regression of the RT-77 fix (commit fca23ce) combined with transformForServerSchema. Locations: server/src/session/client-session.ts:2844-2861 (transformForServerSchema stores the TRANSFORMED op under the original id and strips hashVersion), :2431-2440 (duplicate path: refuseForgedDuplicate when !isSameStoredOperation), server/src/session/duplicate-identity.ts:35-41 (upload.hashVersion 2 !== stored version 1 -> false; otherwise contentKey compares the transformed data/schemaVersion with the original). Triggers: any re-upload of an own op the server stored transformed: an acknowledgment lost after the batch committed (the device re-sends its unacked queue every session; the server's vector is never trusted as an ack, RT-12), and an app upgrade with unacked old-schema ops. Effect: FORGED_DUPLICATE is non-retriable and not in NON_TERMINAL_REJECTION_CODES, so the device records a terminal marker and Store.recordTerminalRejections re-folds the record WITHOUT the write ('the server never stored these operations'); the server and peers keep it; the device holds the id, so it never applies the server's copy: permanent divergence and a write lost on its author. Both a beta.14 writer (hash v2) and a beta.13 writer (protocol 1) are refused. By code reading, a second trigger: a beta.13 protocol-1 encrypted payload (ciphertext inside data, re-encrypted with a fresh IV per upload) accepted by a server without required encryption or with allowPlaintextMigration is refused FORGED_DUPLICATE on every re-upload. Repro packages/server/tests/repro/RT-84.test.ts (memory store; same code path on every store). Required fix: compare a duplicate against what the client SENT, not what the server stored after rewriting it: persist the as-uploaded identity (or its content key) beside a transformed copy, or compare a transformed stored copy on (id, node, sequence, type, collection, recordId, timestamp) only; never treat a body the server itself rewrote (transform, restored legacy data, protocol-1 ciphertext) as evidence of forgery. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commits 1a134ab, a012d57). Root cause: the server stored a schema-transformed REWRITE under the original id (an immutable, content-addressed operation mutated after creation). Transforms now run at fold time: the server stores every upload exactly as uploaded (all hashed fields, hashVersion, envelope; plus only the verified hash-version declaration and a beta.13 clear made explicit, both identical under the id) and delivers that original; core operationSchemaView is the one place transforms run (server authorization, validators, constraint checks, scope filters, every server store fold via ServerStore.setOperationTransforms / setSchema options, every device fold via StoreConfig.operationTransforms from createApp). FORGED_DUPLICATE now compares against the as-uploaded copy; copies earlier releases rewrote (no hashVersion and an id that does not verify against their own body, incl. protocol-1 ciphertext) compare on id, node, type, collection, record and timestamp (duplicate-identity.ts isSameOperationAsStored); a device echoing another node's operation that its earlier build stored rewritten is acknowledged as a duplicate (isRewrittenEcho). Transforms must be pure and deterministic (identity changes refused SCHEMA_TRANSFORM_INVALID) and are part of the fold plan fingerprint (server and client). Tests: repro RT-84 (memory and Postgres), core migration/operation-view.test.ts, server protocol-v2-ingest.test.ts (stored as uploaded, delivered as uploaded to v1 and v2 clients, legacy rewritten copies, store re-fold on transforms), packages/test schema-version-convergence (old-schema clients receive each other's ops as written), fold gate mixed-schema sweep (200 seeds)."
+  },
+  {
+   "id": "RT-85",
+   "title": "A server schema transform that drops a field from an update's data now clears that field on the server and on every peer: the transformed copy is stored without hashVersion, and mergeOp folds every undeclared update with canonicalizeLegacyOperation (a previousData key absent from data is a clear)",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-85.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Regression of the round-4 canonical body (commit 44f11ed: canonicalizeLegacyOperation applied in mergeOp) combined with transformForServerSchema stripping hashVersion. Locations: core/src/fold/fold.ts:398, core/src/operations/canonical-body.ts:260-270 (any op without hashVersion 2 and no envelope is 'legacy'), server/src/session/client-session.ts:2844-2861. The OperationTransform contract (core/src/migration/operation-transform.ts) and docs speak of rewriting data only; a transform that stops older clients from writing a field (delete data.score) leaves score in previousData, and every replica folds the stored copy as score: null. Before round 4 the copy did not touch score. Repro packages/server/tests/repro/RT-85.test.ts. Required fix: apply the legacy clear rule only to genuine beta.13 bodies (mark them at ingest, e.g. a 'legacy' body flag or hashVersion 1 declared by the server only when the id verified WITH the restore), never to server-transformed copies; or have transformForServerSchema drop from previousData every key the transform removed from data. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commit 1a134ab). Root cause: the fold applied the beta.13 clear rule to every op without hashVersion 2, a property transformed copies share. The rule left mergeOp: a genuine beta.13 body is made canonical ONCE where its provenance is known, and stored canonical (null and undefined hash alike under v1, so the id is unchanged): server ingest of protocol-1 uploads (as before), a device's own undeclared updates at its one-time upgrade pass (store fold/legacy-bodies.ts), and any body whose id PROVES the clear (core canonicalizeProvenLegacyClear) on inbound delivery and in one-time passes over the client log and the SQLite/Postgres server logs (server store/legacy-bodies.ts, marker legacy_bodies_canonical). A transform runs on the as-uploaded body at fold time, after nothing, so a dropped field stays in previousData without ever being read as a clear. Tests: repro RT-85 (memory and Postgres), core operation-view.test.ts (fold applies no legacy rule; proven vs rewritten bodies), store legacy-bodies.test.ts, server legacy-bodies.test.ts (SQLite, Postgres), repro RT-83 still green, rt3-upgrade-clear-probe 3/3 + 6/6."
+  },
+  {
+   "id": "RT-86",
+   "title": "A local write larger than the server's maxOperationBytes (default 256 KiB) is accepted by the API and then wedges the device's upload stream for good: the server answers with a session-level OPERATION_TOO_LARGE error and stops acknowledging the batch, the device re-sends it every session, and no later write of that device reaches the server or a peer",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-86.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression (no client-side size check exists; the server path is older). Locations: server/src/session/client-session.ts:2560-2569 (validateOperationSize -> sendError('OPERATION_TOO_LARGE', ..., false) and canAdvanceAck = false, not a per-op operation-rejected), server/src/session/session-operation-limits.ts:4 (DEFAULT_MAX_OPERATION_BYTES 256 KiB); store/sync: no size check before the write is accepted. Repro packages/test/tests/repro/RT-86.test.ts: a 300 KiB string field, then a small insert; after three reconnects the peer has neither, and A has no rejection recorded (the app is told nothing about which write is at fault). Required fix: refuse the oversized operation terminally and per operation (operation-rejected OPERATION_TOO_LARGE, retriable false, ack advances past it), and/or refuse it in the local API before it is written (the limit advertised in the handshake), so one write can never block every later one. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commit 1a134ab). One value domain (core schema/value-domain.ts). maxOperationBytes is checked in the local write path (write-ops buildLocalOperation, same measure as the server: UTF-8 of the op JSON; OperationTooLargeError, nothing written; StoreConfig.maxOperationBytes / createApp store.maxOperationBytes, default 256 KiB = server default). The server refuses an oversized op per operation and terminally (operation-rejected OPERATION_TOO_LARGE, retriable false, ack past it): never a session error. Tests: repro RT-86, store mutations/value-domain.test.ts, server value-domain-ingest.test.ts and kora-sync-server.test.ts (inverted: per-op rejection, no session error), packages/test value-domain-roundtrip.test.ts (device limit above the server's: refused per op, reported, later writes sync, writer excludes the refused write)."
+  },
+  {
+   "id": "RT-87",
+   "title": "A t.timestamp() value the API accepts does not fit the Postgres server store's BIGINT column: a fractional timestamp is refused UNSTORABLE_VALUE and the record vanishes from the writing device; one beyond the BIGINT range (1e20) fails the batch unmapped and wedges the device's upload stream",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-87.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression. Locations: core/src/schema/validation.ts (timestamp: any finite number), server/src/store/materialization.ts fieldTypeToSql ('timestamp' -> BIGINT on Postgres), server/src/store/postgres-server-store.ts:160-187 (PG_UNSTORABLE_VALUE_CODES = 22021, 22P05, 22P02: a fractional value fails 22P02 and is refused terminally; 1e20 fails 22003 numeric_value_out_of_range, not mapped, so the batch fails and is re-sent every session). Memory and SQLite server stores and every client store hold both values. Repro packages/test/tests/repro/RT-87.test.ts (KORA_PG_TEST_URL): fractional -> A shows only the next write, rejection UNSTORABLE_VALUE; 1e20 -> B receives nothing, A has no rejection. Required fix: define the timestamp domain once and enforce it where the value is written (validateFieldValue: a safe integer, or round in the canonical body), so every store holds every accepted value; map every Postgres value refusal (SQLSTATE class 22) to a per-operation terminal refusal, never a failed batch. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commit 1a134ab). One value domain (core schema/value-domain.ts, table in docs/guide/schema-design.md#value-domain): t.timestamp() = integer ms in [-8.64e15, 8.64e15] (fractions refused with a clear error, not rounded), t.number() finite, structured values depth <= 64, no __proto__ key, not exactly the wire's { __kora_bytes__ } form; enforced in validateRecord, after atomic ops resolve (assertResolvedFieldValue), and on server ingest of uploads and route writes (operationValueViolation on the view, SCHEMA_VALIDATION_ERROR per op). Every Postgres class-22/23 refusal except 23505 maps to per-op UNSTORABLE_VALUE; SQLite CHECK/NOTNULL/TOOBIG/MISMATCH too. Also found by the new property test: Postgres BIGINT timestamps were read back as strings (fixed in deserializeFieldValue), and the wire decoded json/object values with integer keys and number values (even { \" \": 0 }) as bytes and stripped objects containing __kora_bytes__ (fixed in the sync serializer). Tests: repro RT-87 (Postgres), core value-domain.test.ts, server value-domain-ingest.test.ts (memory, SQLite, Postgres), sync wire-value-domain.test.ts, packages/test value-domain-roundtrip.test.ts (seeded random values per field type through memory, SQLite and Postgres server stores, the protobuf wire and a peer client store)."
   }
  ],
  "rejectedProposalPins": {

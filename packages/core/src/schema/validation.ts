@@ -1,7 +1,15 @@
 import { isBlobRef } from '../blob/blob-ref'
 import { SchemaValidationError } from '../errors/errors'
 import { isAtomicOp } from '../operations/atomic-ops'
+import { NonCanonicalValueError, canonicalValue } from '../operations/canonical-body'
 import type { CollectionDefinition, FieldDescriptor, OperationType } from '../types'
+import {
+	MAX_VALUE_DEPTH,
+	protoKeyViolation,
+	reservedWireShapeViolation,
+	timestampDomainViolation,
+	valueDepthViolation,
+} from './value-domain'
 
 /**
  * Validates a record's data against a collection's field definitions.
@@ -58,7 +66,7 @@ export function validateRecord(
 					result[fieldName] = value
 				} else if (value !== undefined && value !== null) {
 					validateFieldValue(collection, fieldName, descriptor, value)
-					result[fieldName] = value
+					result[fieldName] = canonicalFieldValue(collection, fieldName, descriptor, value)
 				} else {
 					result[fieldName] = value
 				}
@@ -94,10 +102,43 @@ export function validateRecord(
 		}
 
 		validateFieldValue(collection, fieldName, descriptor, value)
-		result[fieldName] = value
+		result[fieldName] = canonicalFieldValue(collection, fieldName, descriptor, value)
 	}
 
 	return result
+}
+
+/**
+ * The value in the canonical form an operation carries (core canonical-body.ts): an
+ * `undefined` member of an object value is absent, a `Date` inside a json/object value is
+ * its ISO string, `-0` is `0`; a value with no JSON form (Map, Set, class instance,
+ * BigInt, ...) is refused here, naming the field, instead of being silently changed on
+ * the way to the log (RT-72, RT-79). The record therefore holds exactly what peers will
+ * see. Richtext values (Yjs bytes) are encoded by the store, not here.
+ */
+function canonicalFieldValue(
+	collection: string,
+	fieldName: string,
+	descriptor: FieldDescriptor,
+	value: unknown,
+): unknown {
+	if (descriptor.kind === 'richtext') return value
+	try {
+		return canonicalValue(value, `${collection}.${fieldName}`)
+	} catch (error) {
+		if (error instanceof NonCanonicalValueError) {
+			throw new SchemaValidationError(
+				`Field "${fieldName}" in collection "${collection}": ${error.message}`,
+				{
+					collection,
+					field: fieldName,
+					path: error.path,
+					receivedType: error.receivedType,
+				},
+			)
+		}
+		throw error
+	}
 }
 
 function validateFieldValue(
@@ -118,9 +159,11 @@ function validateFieldValue(
 		}
 
 		case 'number': {
-			if (typeof value !== 'number' || Number.isNaN(value)) {
+			// The value domain (value-domain.ts): a finite double. Infinity has no JSON form
+			// and no store column holds it.
+			if (typeof value !== 'number' || !Number.isFinite(value)) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a number, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a finite number, got ${typeof value === 'number' ? String(value) : typeof value}`,
 					{ collection, field: fieldName, expectedType: 'number', receivedType: typeof value },
 				)
 			}
@@ -138,14 +181,18 @@ function validateFieldValue(
 		}
 
 		case 'timestamp': {
-			if (typeof value !== 'number' || !Number.isFinite(value)) {
+			// The value domain (value-domain.ts, RT-87): whole milliseconds within the range
+			// of a JavaScript Date, which every store holds (Postgres BIGINT included).
+			const violation = timestampDomainViolation(value)
+			if (violation !== null) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a timestamp (number), got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" ${violation}`,
 					{
 						collection,
 						field: fieldName,
 						expectedType: 'timestamp',
 						receivedType: typeof value,
+						received: value,
 					},
 				)
 			}
@@ -184,6 +231,18 @@ function validateFieldValue(
 				const expectedType = jsTypeForKind(descriptor.itemKind)
 				for (let i = 0; i < value.length; i++) {
 					const item = value[i]
+					if (
+						(descriptor.itemKind === 'timestamp' || descriptor.itemKind === 'number') &&
+						item !== null &&
+						item !== undefined
+					) {
+						validateFieldValue(
+							collection,
+							`${fieldName}[${i}]`,
+							{ ...descriptor, kind: descriptor.itemKind, itemKind: null },
+							item,
+						)
+					}
 					if (!matchesJsType(item, expectedType)) {
 						throw new SchemaValidationError(
 							`Field "${fieldName}[${i}]" in collection "${collection}" must be a ${descriptor.itemKind}, got ${typeof item}`,
@@ -197,6 +256,7 @@ function validateFieldValue(
 					}
 				}
 			}
+			assertStructureInDomain(collection, fieldName, value)
 			break
 		}
 
@@ -249,6 +309,7 @@ function validateFieldValue(
 					}
 				}
 			}
+			assertStructureInDomain(collection, fieldName, value)
 			break
 		}
 
@@ -269,6 +330,7 @@ function validateFieldValue(
 					},
 				)
 			}
+			assertStructureInDomain(collection, fieldName, value)
 			break
 		}
 
@@ -303,6 +365,56 @@ function validateFieldValue(
 			break
 		}
 	}
+}
+
+/**
+ * The value domain of structured values (value-domain.ts): nesting depth and no own
+ * `__proto__` key (JSON can carry one, but JavaScript object handling turns it into a
+ * prototype and silently drops it, so it is refused everywhere instead).
+ */
+function assertStructureInDomain(collection: string, fieldName: string, value: unknown): void {
+	const reserved = reservedWireShapeViolation(value)
+	if (reserved !== null) {
+		throw new SchemaValidationError(
+			`Field "${fieldName}" in collection "${collection}" ${reserved}.`,
+			{ collection, field: fieldName },
+		)
+	}
+	const deep = valueDepthViolation(value)
+	if (deep !== null) {
+		throw new SchemaValidationError(
+			`Field "${fieldName}" in collection "${collection}" nests deeper than ${MAX_VALUE_DEPTH} levels (at "${fieldName}${deep}"). Flatten the value.`,
+			{ collection, field: fieldName, path: `${fieldName}${deep}`, maxDepth: MAX_VALUE_DEPTH },
+		)
+	}
+	const proto = protoKeyViolation(value)
+	if (proto !== null) {
+		throw new SchemaValidationError(
+			`Field "${fieldName}" in collection "${collection}" holds a "__proto__" key (at "${fieldName}${proto}"), which cannot be stored and synced unchanged. Rename the key.`,
+			{ collection, field: fieldName, path: `${fieldName}${proto}` },
+		)
+	}
+}
+
+/**
+ * The domain check of one resolved field value (value-domain.ts), for values produced
+ * after validation: an atomic op's resolved result (`op.increment(0.5)` on a timestamp,
+ * an increment past the largest finite number).
+ *
+ * @param collection - The collection (for the message)
+ * @param fieldName - The field
+ * @param descriptor - The field's descriptor
+ * @param value - The resolved value
+ * @throws {SchemaValidationError} When the value is outside the field's domain
+ */
+export function assertResolvedFieldValue(
+	collection: string,
+	fieldName: string,
+	descriptor: FieldDescriptor,
+	value: unknown,
+): void {
+	if (value === null || value === undefined || descriptor.kind === 'richtext') return
+	validateFieldValue(collection, fieldName, descriptor, value)
 }
 
 /** True for plain data objects only (not arrays, null, or class instances). */

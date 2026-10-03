@@ -48,6 +48,20 @@ export interface SyncEncryptionConfig {
 	 * Currently only AES-256-GCM is supported.
 	 */
 	algorithm?: SyncEncryptionAlgorithm
+	/**
+	 * Per collection, the data fields that travel in cleartext beside the encryption
+	 * envelope, so the server can evaluate sync scopes on them (for example
+	 * `{ todos: ['ownerId'] }`). Every other field, `previousData` and atomic ops are
+	 * ciphertext. Values listed here are visible to the server: list only scope keys.
+	 */
+	cleartextFields?: Record<string, string[]>
+	/**
+	 * Accept inbound operations without an encryption envelope during a migration from
+	 * plaintext sync. Off by default: with encryption enabled a plaintext operation is
+	 * refused (quarantined), because anyone who can reach the sync server could have
+	 * written it (ENC-3). Turn it on only for the migration window.
+	 */
+	allowPlaintextMigration?: boolean
 }
 
 /**

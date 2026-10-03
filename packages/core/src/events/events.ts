@@ -49,6 +49,42 @@ export type KoraEvent =
 			supportedMax: number
 			reason: string
 	  }
+	| {
+			/**
+			 * A sync peer speaks an older, deprecated protocol version (protocol v2): a
+			 * server emits it for a protocol-1 client (Kora <= beta.13), accepted in
+			 * beta.14 only. `message` says what to upgrade.
+			 */
+			type: 'sync:protocol-deprecated'
+			nodeId: string
+			clientProtocolVersion: number
+			serverProtocolVersion: number
+			message: string
+	  }
+	| {
+			/**
+			 * A server stored a protocol-1 (Kora <= beta.13) client's operation whose
+			 * version-1 id it could not verify (RT-71: beta.13 hashed `undefined` members
+			 * as `null`, which the JSON upload no longer holds). Counted in metrics.
+			 */
+			type: 'sync:unverified-legacy-operation'
+			nodeId: string
+			operationId: string
+			collection: string
+			message: string
+	  }
+	| {
+			/**
+			 * A server refused an upload that reused a stored operation's id with different
+			 * content (RT-77). Operation ids are content hashes, so this is tampering; the
+			 * upload had no effect. Counted in metrics.
+			 */
+			type: 'sync:forged-duplicate'
+			nodeId: string
+			operationId: string
+			collection: string
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'
@@ -244,6 +280,38 @@ export type KoraEvent =
 	| {
 			type: 'store:quota-exceeded'
 			dbName: string
+			message: string
+	  }
+	| {
+			/**
+			 * The log-integrity scan (W8 step 0) changed the operation log: it repaired rows
+			 * written by an earlier release (a JSON-encoded timestamp from a beta.12 backup
+			 * restore) and/or moved rows it could not repair to the quarantine table, where
+			 * no fold reads them. `clean` is false while anything is quarantined or this
+			 * database's own nodes have sequence gaps. See `store.verifyLogIntegrity()`.
+			 */
+			type: 'store:log-integrity'
+			dbName: string
+			repaired: number
+			quarantined: number
+			gaps: number
+			clean: boolean
+			message: string
+	  }
+	| {
+			/**
+			 * The database was re-materialized with the W7 per-field fold (once, on the
+			 * first open with fold-state version N, or after a replace-mode restore).
+			 * `mode`: `'log'` rebuilt every record from its clean log (repairing
+			 * pre-W7 divergence); `'snapshot+log'` used each row as a base snapshot
+			 * because the log was compacted or has gaps; `'kept'` left every row as it
+			 * was because the log has quarantined rows (never rebuilt from).
+			 */
+			type: 'store:rematerialized'
+			dbName: string
+			mode: 'log' | 'snapshot+log' | 'kept'
+			records: number
+			changedRows: number
 			message: string
 	  }
 	| {

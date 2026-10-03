@@ -1,6 +1,6 @@
 import {
 	type AtomicOp,
-	HybridLogicalClock,
+	type HybridLogicalClock,
 	type Operation,
 	createOperation,
 	generateUUIDv7,
@@ -11,7 +11,7 @@ import {
 import { validateIngestedOperation } from '../apply/ingest-validation'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { type RoutePredicate, evaluateRoutePredicate } from '../apply/route-predicate'
-import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
+import { nextServerSequenceNumber, serverClock } from '../apply/server-side-effect-operation'
 import { authorizeOperationReferences } from '../scopes/reference-authorization'
 import type { ScopeMap, UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 import {
@@ -209,7 +209,16 @@ async function buildRouteOperation(
 	clockOverride?: HybridLogicalClock,
 ): Promise<Operation> {
 	const nodeId = store.getNodeId()
-	const clock = clockOverride ?? new HybridLogicalClock(nodeId)
+	// W7: the server node's one clock, advanced past the record's newest write, so this
+	// write sorts after every write it read (the fold orders a record's writes by HLC).
+	const clock =
+		clockOverride ??
+		serverClock(
+			store,
+			mutation.recordId
+				? await store.getRecordLatestTimestamp?.(mutation.collection, mutation.recordId)
+				: null,
+		)
 	const schemaVersion = store.getSchema()?.version ?? 1
 	const sequenceNumber = nextServerSequenceNumber(store)
 

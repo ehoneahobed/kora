@@ -6,9 +6,10 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { applyOperationTransforms } from '@korajs/core'
+import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
+import type { SideEffectOp } from '@korajs/merge'
 import type {
 	AwarenessUpdateMessage,
 	BlobChunkPushMessage,
@@ -21,13 +22,19 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
-import { decodeBlobChunkBytes } from '@korajs/sync'
+import { SyncEncryptor, decodeBlobChunkBytes } from '@korajs/sync'
 import {
 	type DeltaCursor,
+	INVALID_OPERATION_ID,
+	LEGACY_SYNC_PROTOCOL_VERSION,
 	NegotiatedMessageSerializer,
+	PLAINTEXT_REJECTED,
+	PROTOCOL_V1_DEPRECATED,
 	SCHEMA_MISMATCH_PREFIX,
+	SYNC_PROTOCOL_VERSION,
 	type SyncQuerySubset,
 	createDeltaCursorFromBatch,
+	declaredProtocolVersion,
 	decodeDeltaCursor,
 	dedupeQuerySubsets,
 	encodeDeltaCursor,
@@ -37,8 +44,19 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import { scopeViewKey } from '@korajs/sync/internal'
-import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
+import {
+	restoreUndefinedFromPrevious,
+	scopeViewKey,
+	verifyInboundOperation,
+} from '@korajs/sync/internal'
+import {
+	RESTRICTED_REJECTION_CODE,
+	applyServerOperation,
+	deriveServerSideEffects,
+	isAuthoredCopyOfSideEffect,
+	undoneSideEffectsOfStoredDelete,
+} from '../apply/apply-server-operation'
+import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-validation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
@@ -78,6 +96,11 @@ import type {
 import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
+import {
+	FORGED_DUPLICATE_CODE,
+	isRewrittenEcho,
+	isSameOperationAsStored,
+} from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
@@ -93,6 +116,12 @@ import {
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+
+/** Refusal of an operation larger than `maxOperationBytes` (RT-86), per operation. */
+export const OPERATION_TOO_LARGE_CODE = 'OPERATION_TOO_LARGE'
+
+/** Refusal of an operation whose schema transform broke its contract (RT-84). */
+export const SCHEMA_TRANSFORM_INVALID_CODE = 'SCHEMA_TRANSFORM_INVALID'
 /** Default time a connection has to send its handshake before it is closed (SRV-6). */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 /**
@@ -378,7 +407,7 @@ export interface ClientSessionOptions {
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake */
 	supportedSchemaVersions?: { min: number; max: number }
-	/** Transform accepted legacy operations into the server schema before validation. */
+	/** Schema transforms: judged views of older operations (transforms at fold time, RT-84). */
 	operationTransforms?: OperationTransform[]
 	/** Called when this session has operations to relay to other sessions */
 	onRelay?: RelayCallback
@@ -482,6 +511,31 @@ export interface ClientSessionOptions {
 	 * interval so it can declare the connection dead after missing two. 0 disables it.
 	 */
 	appHeartbeatIntervalMs?: number
+	/**
+	 * Node ids whose operations this server authors (protocol v2). Sent to clients in
+	 * the handshake response (`authoritativeNodeIds`); only operations from these nodes
+	 * may carry server-authored metadata (`fieldVersions`, `foldState`). Defaults to the
+	 * ids the store folds with (`ServerStore.getAuthoritativeNodeIds`), which is what
+	 * `KoraSyncServer` always passes. Scope-entry operations (`kora:scope-entry`) are not
+	 * listed: they carry the server's fold state and are joined, never folded as writes.
+	 */
+	authoritativeNodeIds?: readonly string[]
+	/**
+	 * End-to-end encryption policy (protocol v2, ENC-3). With `required`, every uploaded
+	 * data-bearing operation must carry the encryption envelope; a plaintext one is
+	 * refused non-retriably (`PLAINTEXT_REJECTED`), unless `allowPlaintextMigration` is
+	 * set for a migration window. Without it, the server stores whatever it receives
+	 * (envelope operations always opaquely).
+	 */
+	encryption?: { required: boolean; allowPlaintextMigration?: boolean }
+}
+
+/** A side effect of an applied delete whose server copy waits for the author's own (RT-69). */
+interface DeferredSideEffect {
+	parent: Operation
+	effect: SideEffectOp
+	/** Ids of the author's operations in the batch that are copies of this effect. */
+	copyIds: string[]
 }
 
 /**
@@ -664,6 +718,19 @@ export class ClientSession {
 	private sequenceReservation = false
 	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
 	private legacySequencePairs = 0
+	/** Protocol version the client declared in its handshake (1 when absent). */
+	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
+	private readonly authoritativeNodeIds: readonly string[] | null
+	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
+	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
+	/** Uploads whose data is stored as the beta.13 writer held it (RT-71). */
+	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
+	/** Operations accepted with an unverified legacy (beta.13) id (RT-71). */
+	private unverifiedLegacyOperations = 0
+	private forgedDuplicates = 0
+	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
+	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
+	private invalidOperationIds = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -698,6 +765,13 @@ export class ClientSession {
 		this.onOrphanedRelays = options.onOrphanedRelays ?? null
 		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
+		this.authoritativeNodeIds = options.authoritativeNodeIds
+			? [...options.authoritativeNodeIds]
+			: null
+		this.encryptionPolicy = {
+			required: options.encryption?.required === true,
+			allowPlaintextMigration: options.encryption?.allowPlaintextMigration === true,
+		}
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
 		this.blobRateLimiter = new SessionRateLimiter(
@@ -1730,6 +1804,7 @@ export class ClientSession {
 		this.clientNodeId = msg.nodeId
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 		this.sequenceReservation = msg.sequenceReservation === true
+		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -1740,6 +1815,27 @@ export class ClientSession {
 				false,
 			)
 			this.close('reserved node id')
+			return
+		}
+		if (!isStorableIdentifier(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				'The node id holds U+0000 or an unpaired UTF-16 surrogate. Use a generated device node id.',
+				false,
+			)
+			this.close('malformed node id')
+			return
+		}
+		// The server's own node ids, current and legacy (published in the handshake's
+		// `authoritativeNodeIds`), are never a device's: a device presenting one would
+		// author `merge('server-authoritative')` writes as the server (RT-61).
+		if (this.isServerAuthorNodeId(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				`Node id "${msg.nodeId}" is a server node id (an authoritative node of this deployment). Use a generated device node id.`,
+				false,
+			)
+			this.close('server node id')
 			return
 		}
 
@@ -2034,11 +2130,15 @@ export class ClientSession {
 				: {}),
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
+			protocolVersion: SYNC_PROTOCOL_VERSION,
+			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
+			...this.advertisedRevocations(),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
+		if (this.clientProtocolVersion < SYNC_PROTOCOL_VERSION) this.warnLegacyProtocol(msg.nodeId)
 
 		// The ingest rate limit follows the node across reconnects (SRV-6): the node id
 		// is bound to this principal by now (claimed when auth is configured).
@@ -2261,11 +2361,16 @@ export class ClientSession {
 			)
 			return
 		}
-		// Per-field versions are server-authored only (scope-entry operations, RT-27). A
-		// device never sends them; one that does would forge field precedence on its
-		// peers, so they are dropped before anything else sees the operation.
+		// Per-field versions and fold state are server-authored only (scope-entry
+		// operations, RT-27, W7). A device never sends them; one that does would forge
+		// field precedence on its peers, so they are dropped before anything else sees
+		// the operation.
 		const operations = msg.operations.map((s) => {
-			const { fieldVersions: _forged, ...op } = this.serializer.decodeOperation(s)
+			const {
+				fieldVersions: _forged,
+				foldState: _forgedFold,
+				...op
+			} = this.serializer.decodeOperation(s)
 			return op
 		})
 		const applied: Operation[] = []
@@ -2292,8 +2397,10 @@ export class ClientSession {
 		if (operations.length > 0) {
 			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
 				lookupCredit = BATCH_LOOKUP_RATE_COST
-				stored = await this.findStoredOperations(operations)
-				resolved = await this.findResolutions(operations, stored)
+				// Identifiers a store cannot hold are refused in the loop, never looked up (RT-65).
+				const lookupable = operations.filter((op) => operationIdentifiersStorable(op))
+				stored = await this.findStoredOperations(lookupable)
+				resolved = await this.findResolutions(lookupable, stored)
 			} else {
 				this.rateLimitedOperations += operations.length
 				this.sendRateLimited()
@@ -2301,14 +2408,61 @@ export class ClientSession {
 			}
 		}
 
+		// The author's own cascades / set-nulls of a delete in this batch (RT-69): the
+		// server does not derive a second copy of an effect the author uploads itself.
+		const authoredCopies = this.indexAuthoredSideEffectCopies(operations)
+		const deferredEffects: DeferredSideEffect[] = []
+		const storedInBatch = new Set<string>()
+
 		for (const op of operations) {
 			if (!canAdvanceAck) {
 				continue
 			}
 
-			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
-			if (this.isStoredDuplicate(op, stored)) {
+			// An identifier holding U+0000 or a lone surrogate cannot be stored or looked up
+			// (Postgres refuses it). Refused terminally without touching the store, so it
+			// never fails the session (RT-65); nothing is recorded under such an id.
+			if (!operationIdentifiersStorable(op)) {
+				this.sendOperationRejected(
+					op,
+					INVALID_IDENTIFIER_CODE,
+					`Operation "${String(op.id)}" has an identifier holding U+0000 or an unpaired UTF-16 surrogate. Identifiers must be well-formed strings.`,
+					false,
+				)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
+			// Already stored (found by the batch lookup): a duplicate ack, free of charge,
+			// but only for the SAME operation (RT-77). The stored copy is loaded and compared
+			// on every field its id covers; an upload that reuses a stored id with any other
+			// content is refused (non-retriable, logged as tampering) with no effect at all.
+			const storedCopy = this.isStoredDuplicate(op, stored)
+				? await this.loadStoredOperation(op, stored)
+				: null
+			if (storedCopy !== null) {
+				const schema = this.store.getSchema()
+				if (
+					!(await isSameOperationAsStored(op, storedCopy, schema)) &&
+					!(op.nodeId !== this.clientNodeId && (await isRewrittenEcho(op, storedCopy, schema)))
+				) {
+					this.refuseForgedDuplicate(op, storedCopy)
+					rejectedOperations += 1
+					acknowledgedThrough = op.sequenceNumber
+					continue
+				}
 				await this.noteStoredElsewhere(op, stored)
+				// A delete sent again (the batch that stored it failed later, or was never
+				// acknowledged): any referential effect still undone is derived (or deferred
+				// to the author's copies in this batch) now, so an effect deferred in memory
+				// by a failed batch is never lost (RT-73). Judged on the STORED delete only.
+				if (storedCopy.type === 'delete') {
+					applied.push(
+						...(await this.resumeStoredDeleteEffects(storedCopy, authoredCopies, deferredEffects)),
+					)
+				}
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2387,6 +2541,7 @@ export class ClientSession {
 				(!this.store.findStoredOperations && (await this.isStoredOperation(op, stored)))
 			) {
 				await this.noteStoredElsewhere(op, stored)
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2416,28 +2571,50 @@ export class ClientSession {
 				continue
 			}
 
+			// An oversized operation is refused on its own, terminally, and the ack moves
+			// past it (RT-86): a session-level error would stop acknowledging the batch, and
+			// the device would re-send it every session, so none of its later writes would
+			// ever reach the server. The device records the refusal (sync:operation-rejected).
 			const sizeCheck = validateOperationSize(op, this.maxOperationBytes)
 			if (!sizeCheck.valid) {
-				this.sendError(
-					'OPERATION_TOO_LARGE',
-					sizeCheck.message ?? `Operation "${op.id}" is too large`,
-					false,
-				)
-				canAdvanceAck = false
-				continue
-			}
-
-			const serverOp = this.transformForServerSchema(op)
-			if (serverOp === null) {
 				await this.refuseTerminally(
 					op,
-					'SCHEMA_TRANSFORM_UNAVAILABLE',
-					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
+					OPERATION_TOO_LARGE_CODE,
+					`${sizeCheck.message ?? `Operation "${op.id}" is too large.`} Store large content as a blob, or raise maxOperationBytes on the server and the client together.`,
 				)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
+
+			// Content-hash verification (CORE-1, protocol v2) runs on the operation exactly
+			// as uploaded, BEFORE any schema transform (which rewrites data) and before any
+			// validator or store sees it. Only plaintext version-2 ids are verified here: an
+			// envelope's id covers the plaintext, which only the clients can check (they do,
+			// after decryption), and a version-1 id never covered every field.
+			const integrity = await this.checkUploadIntegrity(op)
+			if (integrity !== null) {
+				if (integrity.code === INVALID_OPERATION_ID) this.invalidOperationIds += 1
+				await this.refuseTerminally(op, integrity.code, integrity.message)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+
+			// Transforms at fold time (RT-84): the operation is stored exactly as uploaded
+			// (plus the hash version the server verified, and a beta.13 clear made explicit,
+			// both identical under its id), never as a transformed rewrite under its id.
+			// Authorization, validators and constraint checks judge its view in the server
+			// schema; every store folds that same view.
+			const storedOp = this.declareVerifiedHashVersion(op)
+			const view = this.schemaView(storedOp)
+			if (!view.ok) {
+				await this.refuseTerminally(op, view.code, view.message)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
+				continue
+			}
+			const serverOp = view.op
 
 			// Server-side adjudication of untrusted client operations. Runs after
 			// the built-in guards and before materialization, so a rejected op never
@@ -2504,7 +2681,8 @@ export class ClientSession {
 			// row as it is at commit time, so a concurrent ownership change or same-id
 			// insert cannot slip in between the pre-check above and this write.
 			const uplinkScopes = this.uplinkScopes()
-			const applyResult = await applyServerOperation(this.store, serverOp, undefined, {
+			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
+				view: serverOp,
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
 				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
@@ -2512,7 +2690,17 @@ export class ClientSession {
 				// produce two operations under one sequence: store the pair (RT-37).
 				legacySequenceWriter: !this.sequenceReservation,
 				onLegacySequencePair: (pair) => this.recordLegacySequencePair(pair),
+				isAuthoredSideEffect: (effect) =>
+					(authoredCopies.get(serverOp.id) ?? []).some((copy) =>
+						isAuthoredCopyOfSideEffect(copy, serverOp.id, effect),
+					),
 			})
+			for (const effect of applyResult.deferredSideEffects ?? []) {
+				const copyIds = (authoredCopies.get(serverOp.id) ?? [])
+					.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverOp.id, effect))
+					.map((copy) => copy.id)
+				deferredEffects.push({ parent: storedOp, effect, copyIds })
+			}
 			if (applyResult.rejection) {
 				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
 				// resubmits it under the same id, so it is never remembered as refused.
@@ -2543,13 +2731,20 @@ export class ClientSession {
 			}
 			if (applyResult.result === 'applied') {
 				applied.push(...applyResult.appliedOperations)
+				storedInBatch.add(op.id)
 				uniqueOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			} else {
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			}
 		}
+
+		// Derive the server's copy of every deferred effect whose authored copy did not
+		// end up stored (refused, rate-limited, or not reached in this batch): the
+		// referential effect of an applied delete is never left undone (RT-69).
+		applied.push(...(await this.deriveUncoveredSideEffects(deferredEffects, storedInBatch)))
 
 		if (operations.length > 0) {
 			this.emitter?.emit({
@@ -2578,11 +2773,353 @@ export class ClientSession {
 		}
 	}
 
-	private transformForServerSchema(op: Operation): Operation | null {
-		if (op.schemaVersion === this.schemaVersion) {
-			return op
+	/**
+	 * For each delete of this session's node in an upload batch, the batch's later
+	 * operations of the same node that name it as a causal parent: candidates for the
+	 * author's own copies of its cascades and set-nulls (RT-69). Indexed by the delete's
+	 * id, in the server's schema (field names as the server derives effects).
+	 */
+	private indexAuthoredSideEffectCopies(operations: Operation[]): Map<string, Operation[]> {
+		const copies = new Map<string, Operation[]>()
+		const deletes = new Set<string>()
+		for (const op of operations) {
+			if (op.nodeId !== this.clientNodeId) continue
+			const parents = op.causalDeps.filter((dep) => deletes.has(dep))
+			if (parents.length > 0) {
+				const view = this.schemaView(op)
+				if (view.ok) {
+					for (const parent of parents) {
+						copies.set(parent, [...(copies.get(parent) ?? []), view.op])
+					}
+				}
+			}
+			if (op.type === 'delete') deletes.add(op.id)
 		}
-		return applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
+		return copies
+	}
+
+	/**
+	 * The referential effects of a delete that arrived again as a stored duplicate and
+	 * are still undone (RT-73): effects the author covers later in this batch are
+	 * deferred like a fresh delete's (derived after the batch unless a copy is stored);
+	 * the rest are derived now. Derived ids are deterministic, so a concurrent retry or
+	 * another instance stores the same operations.
+	 *
+	 * @returns The derived operations (to relay)
+	 */
+	private async resumeStoredDeleteEffects(
+		op: Operation,
+		authoredCopies: Map<string, Operation[]>,
+		deferredEffects: DeferredSideEffect[],
+	): Promise<Operation[]> {
+		const view = this.schemaView(op)
+		if (!view.ok) return []
+		const serverDelete = view.op
+		const uplinkScopes = this.uplinkScopes()
+		const effects = await undoneSideEffectsOfStoredDelete(this.store, serverDelete, (effect, row) =>
+			authorizeUplinkWrite(effect, row, uplinkScopes),
+		)
+		const derive: SideEffectOp[] = []
+		for (const effect of effects) {
+			const copyIds = (authoredCopies.get(serverDelete.id) ?? [])
+				.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverDelete.id, effect))
+				.map((copy) => copy.id)
+			if (copyIds.length > 0) deferredEffects.push({ parent: serverDelete, effect, copyIds })
+			else derive.push(effect)
+		}
+		return derive.length > 0 ? deriveServerSideEffects(this.store, serverDelete, derive) : []
+	}
+
+	/**
+	 * Derive the server's copy of each deferred side effect unless one of the author's
+	 * copies is stored (applied or already held). A store with the batch lookup is asked
+	 * again, so a copy stored by a concurrent session counts too.
+	 */
+	private async deriveUncoveredSideEffects(
+		deferred: DeferredSideEffect[],
+		storedInBatch: Set<string>,
+	): Promise<Operation[]> {
+		if (deferred.length === 0) return []
+		const unresolved = [
+			...new Set(deferred.flatMap((d) => d.copyIds).filter((id) => !storedInBatch.has(id))),
+		]
+		const storedElsewhere: Map<string, unknown> =
+			unresolved.length > 0 ? await this.findStoredOperationIds(unresolved) : new Map()
+		const derived: Operation[] = []
+		for (const { parent, effect, copyIds } of deferred) {
+			if (copyIds.some((id) => storedInBatch.has(id) || storedElsewhere.has(id))) continue
+			derived.push(...(await deriveServerSideEffects(this.store, parent, [effect])))
+		}
+		return derived
+	}
+
+	/** {@link ServerStore.findStoredOperations} by id; empty without it or on a failed read. */
+	private async findStoredOperationIds(ids: string[]): Promise<Map<string, unknown>> {
+		if (!this.store.findStoredOperations) return new Map()
+		try {
+			return await this.store.findStoredOperations(ids)
+		} catch (error) {
+			console.warn(
+				`[kora] findStoredOperations failed; deriving the server's side effects: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
+		}
+	}
+
+	/**
+	 * The operation as the server schema reads it (transforms at fold time, RT-84): the
+	 * view authorization, validators, constraint checks and scope filters judge, and the
+	 * one the server stores fold (core `operationSchemaView`, same transforms). Never
+	 * stored: the store keeps the operation as uploaded. An envelope operation is opaque
+	 * to the server (NEW-ENC-1) and judged as is; devices transform after decryption.
+	 */
+	private schemaView(
+		op: Operation,
+	): { ok: true; op: Operation } | { ok: false; code: string; message: string } {
+		let view: Operation | null
+		try {
+			view = operationSchemaView(op, this.schemaVersion, this.operationTransforms)
+		} catch (error) {
+			return {
+				ok: false,
+				code: SCHEMA_TRANSFORM_INVALID_CODE,
+				message: `Operation "${op.id}" cannot be read in server schema v${this.schemaVersion}: ${error instanceof Error ? error.message : String(error)}`,
+			}
+		}
+		if (view === null) {
+			return {
+				ok: false,
+				code: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+				message: `Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
+			}
+		}
+		return { ok: true, op: view }
+	}
+
+	/**
+	 * Integrity checks on an uploaded operation before anything else judges it:
+	 * - a version-2 plaintext id must be the content hash (`INVALID_OPERATION_ID`);
+	 * - an unknown declared hash version is refused the same way;
+	 * - with required encryption, a data-bearing plaintext operation is refused
+	 *   (`PLAINTEXT_REJECTED`) unless the plaintext migration window is open.
+	 *
+	 * @returns null when the operation passes, or the refusal
+	 */
+	private async checkUploadIntegrity(
+		op: Operation,
+	): Promise<{ code: string; message: string } | null> {
+		// Defense in depth: the handshake already refused a server node id (RT-61).
+		if (this.isServerAuthorNodeId(op.nodeId)) {
+			return {
+				code: 'INVALID_NODE_ID',
+				message: `Operation "${op.id}" is authored by "${op.nodeId}", a server node id. A device may never upload operations under one.`,
+			}
+		}
+		const declared = op.hashVersion
+		if (declared !== undefined && declared !== 1 && declared !== 2) {
+			return {
+				code: INVALID_OPERATION_ID,
+				message: `Operation "${op.id}" declares unknown content-hash version ${String(declared)}. Upgrade the server or the client so both speak the same protocol version.`,
+			}
+		}
+		if (op.encrypted === undefined) {
+			if (
+				this.encryptionPolicy.required &&
+				!this.encryptionPolicy.allowPlaintextMigration &&
+				(op.data !== null || op.previousData !== null)
+			) {
+				return {
+					code: PLAINTEXT_REJECTED,
+					message: `Operation "${op.id}" is plaintext but this server requires end-to-end encryption. Enable sync encryption on the client, or open a plaintext migration window (encryption.allowPlaintextMigration) on the server.`,
+				}
+			}
+			// A protocol-1 encrypted payload: its id covers the plaintext, which the server
+			// never sees, so it cannot be checked here (the receivers refuse the format).
+			if (
+				SyncEncryptor.isEncryptedPayload(op.data) ||
+				SyncEncryptor.isEncryptedPayload(op.previousData)
+			) {
+				return null
+			}
+			// Every plaintext id is verified, version 1 included (RT-64): an operation that
+			// declares no version must carry its version-1 (or version-2) content hash, so
+			// omitting `hashVersion` skips nothing and no client stores an op under a chosen id.
+			const integrity = await verifyInboundOperation(op, {
+				encrypted: false,
+				absentVersion: 'verify-ids',
+				schema: this.store.getSchema(),
+			})
+			if (
+				integrity.ok &&
+				integrity.matchedVersion !== undefined &&
+				integrity.declarable !== false
+			) {
+				this.matchedHashVersions.set(op, integrity.matchedVersion)
+			}
+			if (integrity.ok && integrity.restoredData !== undefined) {
+				this.restoredLegacyData.set(op, integrity.restoredData)
+			}
+			// Every replica folds a version-1 update in its canonical body: a previousData key
+			// absent from data is a clear (core canonicalizeLegacyOperation). beta.13 only
+			// ever produced that shape from `undefined` members, whose id covers the clear;
+			// an id that verifies WITHOUT the clear names a body no beta.13 wrote, and storing
+			// it would let authorization judge one body while every fold applies another.
+			if (
+				integrity.ok &&
+				declared === undefined &&
+				integrity.restoredData === undefined &&
+				canonicalizeLegacyOperation(op) !== op
+			) {
+				return {
+					code: INVALID_OPERATION_ID,
+					message: `Operation "${op.id}" is a version-1 update whose previousData names fields its data lacks, but its id does not cover clearing them. No Kora client writes this shape; it is refused and never stored or relayed.`,
+				}
+			}
+			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
+				// RT-71: a beta.13 (protocol 1) client hashed `undefined` members as `null`;
+				// the JSON it uploaded no longer holds them, so the id cannot always be
+				// rebuilt. The operation is stored unverified (no declared version), as every
+				// beta.13 operation was before RT-64. This skips no protection RT-64 needs:
+				// the ids the server derives are keyed (HMAC), so no client can predict and
+				// pre-store one, and a protocol-2 session never reaches this branch.
+				this.reportUnverifiedLegacyOperation(op)
+				const restored = restoreUndefinedFromPrevious(op)
+				if (restored !== op.data) this.restoredLegacyData.set(op, restored)
+				return null
+			}
+			if (!integrity.ok) {
+				return {
+					code: INVALID_OPERATION_ID,
+					message:
+						declared === 2
+							? `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`
+							: `Operation "${op.id}" does not match its content hash (hash version 1: type, collection, recordId, data, timestamp, nodeId, atomicOps): its id was not computed from its content, or the content was altered. It is refused and never stored or relayed.`,
+				}
+			}
+		}
+		return null
+	}
+
+	/**
+	 * Whether an undeclared version-1 id that does not verify is accepted unverified
+	 * (RT-71): only from a protocol-1 session (Kora <= beta.13), and only for the
+	 * session's own node.
+	 */
+	private acceptsUnverifiedLegacyId(op: Operation): boolean {
+		return this.clientProtocolVersion < SYNC_PROTOCOL_VERSION && op.nodeId === this.clientNodeId
+	}
+
+	/** Log, count and emit an operation accepted with an unverified legacy id (RT-71). */
+	private reportUnverifiedLegacyOperation(op: Operation): void {
+		this.unverifiedLegacyOperations++
+		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.13 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.unverified_legacy_operation',
+			sessionId: this.sessionId,
+			nodeId: op.nodeId,
+			details: { operationId: op.id, collection: op.collection, type: op.type, message },
+		})
+		this.emitter?.emit({
+			type: 'sync:unverified-legacy-operation',
+			nodeId: op.nodeId,
+			operationId: op.id,
+			collection: op.collection,
+			message,
+		})
+	}
+
+	/** Operations this session accepted with an unverified legacy id (RT-71). */
+	getUnverifiedLegacyOperationCount(): number {
+		return this.unverifiedLegacyOperations
+	}
+
+	/**
+	 * The operation as the server stores it: an undeclared plaintext id this server
+	 * verified declares the version it matched (1, or 2 when the declaration was lost),
+	 * so receivers verify it too (RT-64). An absent version is left only on ids nobody
+	 * could verify (protocol-1 encrypted payloads, server-side transforms).
+	 */
+	private declareVerifiedHashVersion(op: Operation): Operation {
+		if (op.hashVersion !== undefined) return op
+		const matched = this.matchedHashVersions.get(op)
+		// A beta.13 update that cleared fields with `undefined` is stored with those fields
+		// `null` (RT-71): what the writer applied, and the same version-1 hash.
+		const restored = this.restoredLegacyData.get(op)
+		const content = restored === undefined ? op : { ...op, data: restored }
+		return matched === undefined ? content : { ...content, hashVersion: matched }
+	}
+
+	/**
+	 * True for a node id that is (or was) the server's own: the `kora:` namespace, the
+	 * store's node id, and every id the server advertises or folds as authoritative
+	 * (other instances, legacy server node ids, configured extras). No device may use one
+	 * (RT-61), whether or not it has history yet.
+	 */
+	private isServerAuthorNodeId(nodeId: string): boolean {
+		if (nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) return true
+		if (nodeId === this.store.getNodeId()) return true
+		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
+		// Every id the deployment ever held authoritative, revoked ones included (RT-81):
+		// devices may still hold it as authoritative (until they learn the revocation).
+		if (this.store.getEverAuthoritativeNodeIds?.().includes(nodeId)) return true
+		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
+	}
+
+	/**
+	 * The authoritative ids a handshake advertises (RT-75): only explicit ones (legacy
+	 * server node ids, configured extras). Every `kora:server:` id is authoritative by
+	 * prefix on every replica, and listing instance ids would make the list differ per
+	 * instance and per start, which devices would have to treat as news.
+	 */
+	/** The handshake's explicit revocations (RT-81), when the deployment has any. */
+	private advertisedRevocations(): { revokedAuthoritativeNodeIds?: string[] } {
+		const revoked = (this.store.getRevokedAuthoritativeNodeIds?.() ?? []).filter(
+			(id) => !isServerNodeId(id),
+		)
+		return revoked.length > 0 ? { revokedAuthoritativeNodeIds: revoked } : {}
+	}
+
+	private advertisedAuthoritativeNodeIds(): string[] {
+		return [...new Set(this.serverAuthoritativeNodeIds())].filter((id) => !isServerNodeId(id))
+	}
+
+	/** Node ids this server authors operations under (protocol v2 handshake response). */
+	private serverAuthoritativeNodeIds(): string[] {
+		if (this.authoritativeNodeIds !== null) return [...this.authoritativeNodeIds]
+		// Exactly the ids the server stores fold with (seam 3): a client that folded with
+		// a different set would resolve `merge('server-authoritative')` differently.
+		return this.store.getAuthoritativeNodeIds?.() ?? [this.store.getNodeId()]
+	}
+
+	/**
+	 * A protocol-1 client (Kora <= beta.13) is served for one release (beta.14) with a
+	 * deprecation warning: its operation ids are version-1 hashes and its encrypted
+	 * payloads have no envelope binding.
+	 */
+	private warnLegacyProtocol(nodeId: string): void {
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.13) are accepted in beta.14 only and will be refused by the next release. Upgrade the client.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.protocol_deprecated',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				code: PROTOCOL_V1_DEPRECATED,
+				clientProtocolVersion: this.clientProtocolVersion,
+				serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+				message,
+			},
+		})
+		this.emitter?.emit({
+			type: 'sync:protocol-deprecated',
+			nodeId,
+			clientProtocolVersion: this.clientProtocolVersion,
+			serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+			message,
+		})
 	}
 
 	/** The in-scope operations a version-vector client is missing (not yet sent). */
@@ -2935,9 +3472,13 @@ export class ClientSession {
 	 * current row plus `op.data`.
 	 */
 	private async operationVisibleToClient(
-		op: Operation,
+		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
 	): Promise<boolean> {
+		// Judged on the operation as the server schema reads it (RT-84): a stored
+		// operation of an older schema version names its fields as its author did.
+		const judged = this.schemaView(stored)
+		const op = judged.ok ? judged.op : stored
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
 		if (snapshot?.post) {
@@ -3008,6 +3549,73 @@ export class ClientSession {
 		if (!known || known.nodeId !== op.nodeId) return false
 		const own = op.nodeId === this.clientNodeId && op.timestamp.nodeId === op.nodeId
 		return own || known.sequenceNumber === op.sequenceNumber
+	}
+
+	/**
+	 * The operation the store holds under `op`'s id (at the node and sequence the batch
+	 * lookup found), or null when it cannot be read (the upload is then judged like any
+	 * other: verified, validated, charged, and deduplicated by the store at apply).
+	 */
+	private async loadStoredOperation(
+		op: Operation,
+		batch: Map<string, StoredOperationKey>,
+	): Promise<Operation | null> {
+		const known = batch.get(op.id)
+		if (!known) return null
+		try {
+			const range = await this.store.getOperationRange(
+				known.nodeId,
+				known.sequenceNumber,
+				known.sequenceNumber,
+			)
+			return range.find((candidate) => candidate.id === op.id) ?? null
+		} catch (error) {
+			console.warn(
+				`[kora] could not load stored operation ${op.id}; judging the upload as new: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return null
+		}
+	}
+
+	/**
+	 * Refuse an upload that reuses a stored operation's id with different content (RT-77):
+	 * terminal, nothing recorded or derived, logged and emitted as tampering. An honest
+	 * client never does this (ids are content hashes), so the rejection only reaches a
+	 * forger. No resolution is recorded: the id belongs to the stored operation.
+	 */
+	private refuseForgedDuplicate(op: Operation, storedCopy: Operation): void {
+		this.forgedDuplicates += 1
+		const message = `Operation "${op.id}" reuses the id of an operation the server stores, with different content (${storedCopy.type} ${storedCopy.collection}/${storedCopy.recordId} is stored; ${op.type} ${op.collection}/${op.recordId} was sent). Operation ids are content hashes, so this upload was altered. It is refused and has no effect.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.forged_duplicate',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			details: {
+				operationId: op.id,
+				uploadedNodeId: op.nodeId,
+				uploaded: { type: op.type, collection: op.collection, recordId: op.recordId },
+				stored: {
+					type: storedCopy.type,
+					collection: storedCopy.collection,
+					recordId: storedCopy.recordId,
+				},
+			},
+		})
+		this.emitter?.emit({
+			type: 'sync:forged-duplicate',
+			nodeId: op.nodeId,
+			operationId: op.id,
+			collection: op.collection,
+			message,
+		})
+		this.sendOperationRejected(op, FORGED_DUPLICATE_CODE, message, false)
+	}
+
+	/** Uploads refused for reusing a stored id with other content (RT-77). */
+	getForgedDuplicateCount(): number {
+		return this.forgedDuplicates
 	}
 
 	/**
@@ -3220,6 +3828,10 @@ export class ClientSession {
 				// Fall back to a single whole-row stamp below.
 			}
 		}
+		// W7 / RT-29 (B2): the record's fold state rides on the entry (filtered to its fields).
+		const foldState = await this.store
+			.getRecordFoldState?.(op.collection, op.recordId)
+			.catch(() => null)
 		let timestamp = fieldVersions?.latest ?? op.timestamp
 		if (!fieldVersions && this.store.getRecordLatestTimestamp) {
 			try {
@@ -3235,6 +3847,7 @@ export class ClientSession {
 			schema,
 			timestamp,
 			fieldVersions,
+			foldState,
 			schemaVersion: this.schemaVersion,
 		})
 	}
@@ -3383,4 +3996,15 @@ function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
 	}
 
 	return 'json'
+}
+
+/** True when every identifier of `op` can be stored and looked up by every store (RT-65). */
+function operationIdentifiersStorable(op: Operation): boolean {
+	return (
+		isStorableIdentifier(op.id) &&
+		isStorableIdentifier(op.nodeId) &&
+		isStorableIdentifier(op.collection) &&
+		isStorableIdentifier(op.recordId) &&
+		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
+	)
 }

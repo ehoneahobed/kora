@@ -1,7 +1,9 @@
 // LMS-8: scope predicates on `id` (e.g. { id: { $in: [...] } }).
 // Tests assert CORRECT behaviour. "[fails today]" = reproduces a live bug.
+import { createHash } from 'node:crypto'
 import type { Operation } from '@korajs/core'
-import { defineSchema, t } from '@korajs/core'
+import { HybridLogicalClock, defineSchema, t } from '@korajs/core'
+import { canonicalize } from '@korajs/core/internal'
 import { ClientSession, MemoryServerStore, operationMatchesScopes } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncEngine } from '@korajs/sync'
@@ -145,7 +147,29 @@ describe('LMS-8 id-scoped predicates, end to end (real server + SyncEngine + SQL
 // Server upload path (ClientSession): id-scoped uplink authorization.
 // ---------------------------------------------------------------------------
 
+/**
+ * A version-1 content id, computed synchronously: the server verifies every uploaded
+ * id (RT-64), so a hand-built upload must carry its real hash. Seeds applied to the
+ * store directly keep their readable ids.
+ */
+function contentId(o: Operation): string {
+	const input: Record<string, unknown> = {
+		type: o.type,
+		collection: o.collection,
+		recordId: o.recordId,
+		data: o.data,
+		timestamp: HybridLogicalClock.serialize(o.timestamp),
+		nodeId: o.nodeId,
+	}
+	return createHash('sha256').update(canonicalize(input)).digest('hex')
+}
+
 function op(overrides: Partial<Operation>): Operation {
+	const built = baseOp(overrides)
+	return built.nodeId === 'seed' ? built : { ...built, id: contentId(built) }
+}
+
+function baseOp(overrides: Partial<Operation>): Operation {
 	return {
 		id: `op-${Math.random().toString(36).slice(2)}`,
 		nodeId: 'attacker-node',

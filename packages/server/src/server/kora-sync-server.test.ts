@@ -5,6 +5,7 @@ import { type Operation, defineSchema, generateUUIDv7, t } from '@korajs/core'
 import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
+import { withContentId } from '../../tests/fixtures/content-id'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createSqliteServerStore } from '../store/sqlite-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
@@ -258,7 +259,7 @@ describe('KoraSyncServer', () => {
 		})
 
 		// Client A sends an operation
-		const op = createTestOp({ id: 'op-from-a', nodeId: 'client-a', sequenceNumber: 1 })
+		const op = withContentId(createTestOp({ nodeId: 'client-a', sequenceNumber: 1 }))
 		pairA.client.send({
 			type: 'operation-batch',
 			messageId: 'batch-from-a',
@@ -276,14 +277,14 @@ describe('KoraSyncServer', () => {
 		// Client B should receive the relayed operation
 		await vi.waitFor(() => {
 			const relayed = messagesB.filter(
-				(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'op-from-a'),
+				(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === op.id),
 			)
 			expect(relayed.length).toBeGreaterThanOrEqual(1)
 		})
 
 		// Client A should NOT receive its own operation back
 		const relayedToA = messagesA.filter(
-			(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'op-from-a'),
+			(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === op.id),
 		)
 		expect(relayedToA).toHaveLength(0)
 	})
@@ -352,7 +353,7 @@ describe('KoraSyncServer', () => {
 		})
 
 		// A sends an op
-		const op = createTestOp({ id: 'op-from-a', nodeId: 'client-a', sequenceNumber: 1 })
+		const op = withContentId(createTestOp({ nodeId: 'client-a', sequenceNumber: 1 }))
 		pairA.client.send({
 			type: 'operation-batch',
 			messageId: 'batch-from-a',
@@ -370,7 +371,7 @@ describe('KoraSyncServer', () => {
 		// B should NOT receive the operation (not streaming)
 		await new Promise((r) => setTimeout(r, 100))
 		const relayed = messagesB.filter(
-			(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === 'op-from-a'),
+			(m) => m.type === 'operation-batch' && m.operations.some((o) => o.id === op.id),
 		)
 		expect(relayed).toHaveLength(0)
 	})
@@ -448,7 +449,8 @@ describe('KoraSyncServer', () => {
 			})
 
 			// A payload well past the 64-byte cap: rejected as a permanent
-			// OPERATION_TOO_LARGE (resending the same bytes can never fit).
+			// OPERATION_TOO_LARGE (resending the same bytes can never fit), per operation
+			// (RT-86): never a session error that would stop acknowledging the batch.
 			const big = createTestOp({
 				id: 'big-1',
 				nodeId: 'client-size',
@@ -464,13 +466,27 @@ describe('KoraSyncServer', () => {
 			})
 
 			await vi.waitFor(() => {
-				const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
-				expect(err).toBeDefined()
+				const rejected = messages.find(
+					(m) => m.type === 'operation-rejected' && m.code === 'OPERATION_TOO_LARGE',
+				)
+				expect(rejected).toBeDefined()
 			})
-			const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
-			if (err?.type === 'error') {
-				expect(err.retriable).toBe(false)
+			const rejected = messages.find(
+				(m) => m.type === 'operation-rejected' && m.code === 'OPERATION_TOO_LARGE',
+			)
+			if (rejected?.type === 'operation-rejected') {
+				expect(rejected.retriable).toBe(false)
+				expect(rejected.operationId).toBe('big-1')
 			}
+			expect(messages.some((m) => m.type === 'error')).toBe(false)
+			// The batch is acknowledged past the refused operation.
+			await vi.waitFor(() =>
+				expect(
+					messages.some(
+						(m) => m.type === 'acknowledgment' && m.acknowledgedMessageId === 'size-batch',
+					),
+				).toBe(true),
+			)
 
 			await server.stop()
 		})
@@ -483,13 +499,14 @@ describe('KoraSyncServer', () => {
 		})
 
 		function submissionOp(id: string, text: string): Operation {
-			return createTestOp({
-				id,
-				nodeId: 'client-sub',
-				collection: 'submissions',
-				recordId: id,
-				data: { text },
-			})
+			return withContentId(
+				createTestOp({
+					nodeId: 'client-sub',
+					collection: 'submissions',
+					recordId: id,
+					data: { text },
+				}),
+			)
 		}
 
 		async function connectStreaming(server: KoraSyncServer) {

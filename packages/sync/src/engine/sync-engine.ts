@@ -3,6 +3,7 @@ import type {
 	ApplyResult,
 	KoraEventEmitter,
 	Operation,
+	OperationTransform,
 	SyncDiagnosticsSnapshot,
 	VersionVector,
 } from '@korajs/core'
@@ -14,8 +15,12 @@ import {
 	KoraError,
 	RemoteClockDriftError,
 	SyncError,
-	applyOperationTransforms,
+	canonicalizeProvenLegacyClear,
 	defaultApplyFailureReason,
+	isAuthoritativeNodeId,
+	isServerNodeId,
+	operationSchemaView,
+	operationTransformsFingerprint,
 } from '@korajs/core'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
@@ -43,6 +48,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '../protocol/messages'
+import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from '../protocol/protocol-version'
 import { isSchemaMismatchReject } from '../protocol/schema-version'
 import {
 	NegotiatedMessageSerializer,
@@ -80,6 +86,7 @@ import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
 import type { SyncStore } from './sync-store'
+import { verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
@@ -118,6 +125,8 @@ const ADOPTION_PARK_BASE_MS = 30_000
 const ADOPTION_PARK_MAX_MS = 60 * 60_000
 /** Terminal marker of held writes the app discarded from sync (RT-50). */
 const HELD_DISCARDED_CODE = 'HELD_DISCARDED'
+/** `FoldStateError.code` (`@korajs/core`): a record state the fold cannot merge into. */
+const FOLD_STATE_INVALID_CODE = 'FOLD_STATE_INVALID'
 /** Times one start() begins again because the signed-in user changed while connecting (RT-52). */
 const MAX_PRINCIPAL_RESTARTS = 2
 /**
@@ -133,6 +142,7 @@ const QUARANTINE_CODES = {
 	DECRYPT_FAILED: 'DECRYPT_FAILED',
 	REMOTE_CLOCK_DRIFT: 'REMOTE_CLOCK_DRIFT',
 	TRANSFORM_UNAVAILABLE: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+	TRANSFORM_INVALID: 'SCHEMA_TRANSFORM_INVALID',
 } as const
 
 /** A taken outbound batch, from the moment it leaves the queue until it is resolved. */
@@ -313,6 +323,14 @@ export class SyncEngine {
 	 * sync-state persistence supports it, otherwise kept for this engine's lifetime.
 	 */
 	private nodeToken: string | null = null
+	/**
+	 * Node ids the server named authoritative in its last accepted handshake response
+	 * (protocol v2). Null until a protocol-2 server answered in this engine's lifetime;
+	 * loaded from persistence on start. See {@link SyncEngine.getAuthoritativeNodeIds}.
+	 */
+	private authoritativeNodeIds: string[] | null = null
+	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
+	private serverProtocolVersion = 1
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -354,6 +372,8 @@ export class SyncEngine {
 	private readonly memoryQuarantine = new Map<string, QuarantinedOperation>()
 	private outboundRetryAttempt = 0
 	private outboundRetryTimer: ReturnType<typeof setTimeout> | null = null
+	/** {@link pushOperation} calls not yet enqueued; the streaming flush waits for 0. */
+	private pendingPushes = 0
 	private reconnecting = false
 	private schemaBlocked = false
 	private clockBlocked = false
@@ -514,6 +534,8 @@ export class SyncEngine {
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
 	 */
 	private readonly deliverySignatureWatermarks = new Map<string, number>()
+	/** Schema transforms: the engine checks views, the store folds them (RT-84). */
+	private readonly operationTransforms: readonly OperationTransform[]
 	private deliveryGapRepeatCount = 0
 	private lastDeliveryGapKey: string | null = null
 
@@ -521,6 +543,7 @@ export class SyncEngine {
 		this.transport = options.transport
 		this.store = options.store
 		this.config = options.config
+		this.operationTransforms = resolveOperationTransforms(options.config, options.store)
 		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
@@ -676,6 +699,9 @@ export class SyncEngine {
 			if (this.nodeToken === null && this.syncState.loadNodeToken) {
 				this.nodeToken = await this.syncState.loadNodeToken(this.currentNodeId())
 			}
+			if (this.authoritativeNodeIds === null && this.syncState.loadAuthoritativeNodeIds) {
+				this.authoritativeNodeIds = await this.syncState.loadAuthoritativeNodeIds()
+			}
 			if (this.syncState.loadDeltaCursor) {
 				this.resumeDeltaCursor = await this.syncState.loadDeltaCursor()
 			}
@@ -794,6 +820,8 @@ export class SyncEngine {
 				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
 				// (node, sequence) uniqueness against this client (RT-37).
 				sequenceReservation: true,
+				// Protocol v2: hash-version-2 ids, the encryption envelope v2 (D2).
+				protocolVersion: SYNC_PROTOCOL_VERSION,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -933,23 +961,33 @@ export class SyncEngine {
 	 * kept as a silent local fork.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
-		if (!(await this.operationAllowedForUpload(op))) {
-			await this.recordOutOfUplinkScope(op)
-			// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
-			await this.withOwnTracking(async () => {
-				this.trackOwnOperation(op, false)
-				await this.advanceOwnPrefixLocked()
-			})
-			return
-		}
+		// A committed write publishes all of its operations synchronously (a delete and
+		// its cascades, a transaction). The streaming flush waits until every push that
+		// started is enqueued, so the commit block uploads in one batch: the server then
+		// sees a delete's authored cascades with the delete and does not derive a second
+		// copy of each (RT-69).
+		this.pendingPushes += 1
+		try {
+			if (!(await this.operationAllowedForUpload(op))) {
+				await this.recordOutOfUplinkScope(op)
+				// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
+				await this.withOwnTracking(async () => {
+					this.trackOwnOperation(op, false)
+					await this.advanceOwnPrefixLocked()
+				})
+				return
+			}
 
-		await this.withOwnTracking(async () => {
-			await this.outboundQueue.enqueue(op)
-			this.trackOwnOperation(op, true)
-		})
-		await this.refreshPendingCount()
-		if (this.state === 'streaming') {
-			this.flushQueue()
+			await this.withOwnTracking(async () => {
+				await this.outboundQueue.enqueue(op)
+				this.trackOwnOperation(op, true)
+			})
+			await this.refreshPendingCount()
+		} finally {
+			this.pendingPushes -= 1
+			if (this.pendingPushes === 0 && this.state === 'streaming') {
+				this.flushQueue()
+			}
 		}
 	}
 
@@ -966,6 +1004,21 @@ export class SyncEngine {
 	/**
 	 * Get the current developer-facing sync status.
 	 */
+	/**
+	 * Node ids the sync server named authoritative (protocol v2): operations from these
+	 * nodes are server-authored and are the only ones that may carry `fieldVersions` or
+	 * `foldState`. Null until a protocol-2 server answered (or one answered in an earlier
+	 * session and the list was persisted).
+	 */
+	getAuthoritativeNodeIds(): readonly string[] | null {
+		return this.authoritativeNodeIds
+	}
+
+	/** Protocol version of the server in the current (or last) session; 1 before any. */
+	getServerProtocolVersion(): number {
+		return this.serverProtocolVersion
+	}
+
 	getStatus(): SyncStatusInfo {
 		const pendingOperations = this.computePendingCount()
 		const base = {
@@ -1728,6 +1781,15 @@ export class SyncEngine {
 
 		if (msg.accepted) {
 			this.credentialRefreshRequired = false
+			// W7: server node ids authoritative for merge('server-authoritative') fields.
+			// Read structurally: the protocol field lands with protocol v2.
+			const authoritative = (msg as { authoritativeNodeIds?: unknown }).authoritativeNodeIds
+			if (Array.isArray(authoritative) && this.store.setAuthoritativeNodeIds) {
+				await this.store.setAuthoritativeNodeIds(
+					authoritative.filter((id): id is string => typeof id === 'string'),
+					revokedAuthoritativeIds(msg),
+				)
+			}
 		}
 
 		if (!msg.accepted) {
@@ -1780,6 +1842,30 @@ export class SyncEngine {
 					lastSequenceNumber: 0,
 					nodeToken: msg.nodeToken,
 				})
+			}
+		}
+
+		this.serverProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		if (Array.isArray(msg.authoritativeNodeIds)) {
+			// The union of every explicit id learned, never a replacement (RT-75): each
+			// server instance lists what it knows, and `kora:server:` ids are
+			// authoritative by prefix, so they are not kept.
+			// Ids the server revoked (RT-81) leave the union and are never learned again (the
+			// store persists them, and its union, which this list mirrors, filters them).
+			const revoked = new Set(revokedAuthoritativeIds(msg))
+			const previous = (this.authoritativeNodeIds ?? []).filter((id) => !isServerNodeId(id))
+			const known = new Set(previous.filter((id) => !revoked.has(id)))
+			const learned = msg.authoritativeNodeIds.filter(
+				(id): id is string =>
+					typeof id === 'string' && !isServerNodeId(id) && !known.has(id) && !revoked.has(id),
+			)
+			if (
+				learned.length > 0 ||
+				known.size < previous.length ||
+				this.authoritativeNodeIds === null
+			) {
+				this.authoritativeNodeIds = [...known, ...learned].sort()
+				await this.syncState?.saveAuthoritativeNodeIds?.(this.authoritativeNodeIds)
 			}
 		}
 
@@ -2638,6 +2724,7 @@ export class SyncEngine {
 			this.deltaReceiveComplete = true
 			this.resumeDeltaCursor = null
 			await this.persistDeltaCursor(null)
+			await this.settleAfterCatchUp()
 			this.metricsCollector.recordSyncCompleted()
 			await this.checkDeltaComplete()
 		}
@@ -2686,7 +2773,7 @@ export class SyncEngine {
 		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
 		// corrupted payload) is quarantined; the session and every other operation go on.
 		let op = delivered
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(delivered)) {
 			try {
 				op = await this.encryptor.decryptOperation(delivered)
 			} catch (error) {
@@ -2699,6 +2786,16 @@ export class SyncEngine {
 					null,
 				)
 			}
+		}
+
+		// Content-addressed id check (CORE-1, protocol v2), on the plaintext and before
+		// any transform. A forged or altered operation is kept in quarantine, never
+		// applied; it never verifies later, so the replay leaves it there.
+		const integrity = await verifyInboundOperation(op, {
+			encrypted: delivered.encrypted !== undefined,
+		})
+		if (!integrity.ok) {
+			return quarantine(delivered, integrity.code, integrity.message, 'rejected', false, null)
 		}
 
 		// A far-future timestamp is never applied: adopting it would make every later
@@ -2716,10 +2813,29 @@ export class SyncEngine {
 			)
 		}
 
+		// A beta.13 clear the id proves (delivered by a beta.13 server, which stored the
+		// body without it) is made explicit before the body is stored (RT-85): the fold
+		// folds bodies as written.
+		op = await canonicalizeProvenLegacyClear(op)
+
+		// Transforms at fold time (RT-84): the operation is stored exactly as delivered and
+		// the store folds its view. Here the view is only checked: an operation with no
+		// view (authored under a newer schema than this device's) is kept aside and
+		// replayed after an upgrade, as before.
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
-		const transforms = this.config.operationTransforms ?? []
-		const transformed =
-			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
+		let transformed: Operation | null
+		try {
+			transformed = operationSchemaView(op, targetSchemaVersion, this.operationTransforms)
+		} catch (error) {
+			return quarantine(
+				op,
+				QUARANTINE_CODES.TRANSFORM_INVALID,
+				error instanceof Error ? error.message : String(error),
+				'rejected',
+				false,
+				op,
+			)
+		}
 		if (transformed === null) {
 			return quarantine(
 				op,
@@ -2732,7 +2848,7 @@ export class SyncEngine {
 		}
 
 		try {
-			const result = await this.store.applyRemoteOperation(transformed)
+			const result = await this.store.applyRemoteOperation(op)
 			if (result === 'applied' || result === 'duplicate') {
 				return { kind: 'applied', operation: op }
 			}
@@ -2768,6 +2884,13 @@ export class SyncEngine {
 			if (error instanceof RemoteClockDriftError || error instanceof InvalidTimestampError) {
 				return quarantine(transformed, code, message, 'rejected', true, op)
 			}
+			if (code === FOLD_STATE_INVALID_CODE) {
+				// The record's fold state cannot take this operation even after the store
+				// re-folded it once (RT-63; for example a carried state of an unknown plan).
+				// Not transient: quarantined (and replayed on start, after an upgrade)
+				// rather than stalling every later operation of the delivery stream.
+				return quarantine(transformed, code, message, 'rejected', false, op)
+			}
 			if (code === APPLY_FAILURE_CODES.REFERENTIAL_INTEGRITY) {
 				// Not appliable now (for example a child whose parent is outside this view);
 				// kept and replayed rather than stalling every later operation.
@@ -2777,6 +2900,28 @@ export class SyncEngine {
 			// custody, so stall; the server re-sends it.
 			this.emitApplyFailure(transformed, 'rejected', { code, message, retriable: true }, 'blocking')
 			return { kind: 'stall', operation: op }
+		}
+	}
+
+	/**
+	 * The delivery stream caught up: let the store retire provisional cascades of
+	 * remote deletes (RT-69) and settle row-snapshot records after a full resync
+	 * (RT-68). A failure is reported, never fatal: both are retried on the next
+	 * catch-up.
+	 */
+	private async settleAfterCatchUp(): Promise<void> {
+		if (!this.store.settleAfterCatchUp) return
+		try {
+			await this.store.settleAfterCatchUp()
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Settling provisional effects and row snapshots after catch-up failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'SETTLE_AFTER_CATCH_UP_FAILED',
+			})
 		}
 	}
 
@@ -2876,26 +3021,48 @@ export class SyncEngine {
 		return released.length
 	}
 
+	/**
+	 * Under end-to-end encryption, a plaintext operation authored by the server (a node
+	 * the handshake named authoritative: cascades, set-nulls, constraint corrections,
+	 * route writes) that touches only the collection's cleartext fields is accepted
+	 * without an envelope: the server holds no key, so it cannot seal its own writes, and
+	 * such an operation carries nothing the server cannot already read. Any sealed field
+	 * (or an operation from any other node) still has to arrive sealed.
+	 */
+	private isServerAuthoredCleartext(op: Operation): boolean {
+		if (!this.encryptor || op.encrypted !== undefined) return false
+		// A server node: `kora:server:<id>` by prefix, or a legacy id the handshake listed.
+		if (!isAuthoritativeNodeId(op.nodeId, new Set(this.authoritativeNodeIds ?? []))) return false
+		return this.encryptor.isCleartextOnly(op)
+	}
+
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
 	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
 		let op = stored
-		if (this.encryptor) {
+		if (this.encryptor && !this.isServerAuthoredCleartext(stored)) {
 			try {
 				op = await this.encryptor.decryptOperation(stored)
 			} catch {
 				return false
 			}
 		}
+		if (!(await verifyInboundOperation(op, { encrypted: stored.encrypted !== undefined })).ok) {
+			return false
+		}
 		const reference = Date.now() + (this.clockSkewMs ?? 0)
 		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) return false
+		op = await canonicalizeProvenLegacyClear(op)
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
-		const transforms = this.config.operationTransforms ?? []
-		const transformed =
-			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
-		if (transformed === null) return false
-		const result = await this.store.applyRemoteOperation(transformed)
+		try {
+			if (operationSchemaView(op, targetSchemaVersion, this.operationTransforms) === null) {
+				return false
+			}
+		} catch {
+			return false
+		}
+		const result = await this.store.applyRemoteOperation(op)
 		if (result === 'applied' || result === 'duplicate') return true
-		return result === 'skipped' && this.store.hasCollection?.(transformed.collection) === true
+		return result === 'skipped' && this.store.hasCollection?.(op.collection) === true
 	}
 
 	/** Acknowledge a delivery batch (used for duplicates) without re-applying it. */
@@ -4102,7 +4269,18 @@ export class SyncEngine {
 		const resequence = this.store.resequenceOperation?.bind(this.store)
 		if (!op || op.nodeId !== node || !resequence) return false
 		const floor = Math.max(this.remoteVector.get(node) ?? 0, op.sequenceNumber)
-		const renumbered = await resequence(op.id, node, floor)
+		// A version-2 op is re-hashed under a new id; queued operations of this node that
+		// were never put on the wire (the server cannot hold them) and name it in their
+		// causalDeps are rewritten with it (seam 4).
+		const unsentDependents = this.outboundQueue
+			.getAll()
+			.filter(
+				(queued) =>
+					queued.nodeId === node && queued.id !== op.id && !this.outboundQueue.wasSent(queued.id),
+			)
+			.map((queued) => queued.id)
+		const resequenced = await resequence(op.id, node, floor, unsentDependents)
+		const renumbered = resequenced?.operation ?? null
 		await this.withOwnTracking(async () => {
 			// Out of its batch, so the batch's ack cannot resolve it under the old number.
 			await this.outboundQueue.reject(op.id)
@@ -4111,6 +4289,21 @@ export class SyncEngine {
 			if (renumbered) {
 				await this.outboundQueue.enqueue(renumbered)
 				this.trackOwnOperation(renumbered, true)
+			}
+			if (resequenced && resequenced.dependents.length > 0) {
+				const previousId = new Map<string, string>()
+				for (const [oldId, newId] of Object.entries(resequenced.idMapping)) {
+					previousId.set(newId, oldId)
+				}
+				const oldIds = resequenced.dependents.map((dep) => previousId.get(dep.id) ?? dep.id)
+				await this.outboundQueue.replace(oldIds, resequenced.dependents)
+				// Same sequence, new id: the tracked id moves with it, or the prefix would
+				// wait forever for the old one.
+				for (const dependent of resequenced.dependents) {
+					const oldId = previousId.get(dependent.id)
+					if (oldId) this.ownUnresolved.get(dependent.sequenceNumber)?.delete(oldId)
+					this.trackOwnOperation(dependent, true)
+				}
 			}
 			await this.advanceOwnPrefixLocked()
 		})
@@ -4561,4 +4754,42 @@ function wireToAwarenessStates(
 		}
 	}
 	return states
+}
+
+/**
+ * The explicit authoritative ids a handshake response revokes (RT-81), read structurally
+ * (the field is optional, protocol v2).
+ */
+function revokedAuthoritativeIds(msg: unknown): string[] {
+	const revoked = (msg as { revokedAuthoritativeNodeIds?: unknown }).revokedAuthoritativeNodeIds
+	return Array.isArray(revoked)
+		? revoked.filter((id): id is string => typeof id === 'string' && !isServerNodeId(id))
+		: []
+}
+
+/**
+ * The schema transforms of an engine: its own `operationTransforms`, or the store's.
+ * Both sides must use the same list, because the store folds what the engine judges
+ * (transforms at fold time, RT-84): a mismatch is refused at construction.
+ */
+function resolveOperationTransforms(
+	config: SyncConfig,
+	store: SyncStore,
+): readonly OperationTransform[] {
+	const own = config.operationTransforms
+	const stores = store.getOperationTransforms?.()
+	if (own === undefined) return stores ?? []
+	if (stores !== undefined) {
+		const version = config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		if (
+			operationTransformsFingerprint(version, own) !==
+			operationTransformsFingerprint(version, stores)
+		) {
+			throw new SyncError(
+				'The sync engine and the local store were given different operationTransforms. The store folds every operation through its transforms (transforms at fold time); pass the same list to both (createApp does).',
+				{ engineTransforms: own.length, storeTransforms: stores.length },
+			)
+		}
+	}
+	return own
 }

@@ -1,4 +1,4 @@
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, decodeStoredText, encodeStoredText } from '@korajs/core'
 import type { CollectionDefinition, FieldDescriptor, Operation } from '@korajs/core'
 import type { CollectionRecord, OperationRow, RawCollectionRow } from '../types'
 import { decodeRichtext, encodeRichtext } from './richtext-serializer'
@@ -80,13 +80,21 @@ const MUTATION_NAME_KEY = '__kora_mutation__'
 const FIELD_VERSIONS_KEY = '__kora_field_versions__'
 
 /**
+ * Internal key used to embed the operation's content-hash version (CORE-1, protocol
+ * v2) in the data JSON column. Absent means version 1. Kept in the row so id
+ * verification and re-hashing (rebase, rotation, resequence) use the right version.
+ */
+const HASH_VERSION_KEY = '__kora_hash_version__'
+
+/**
  * Serialize an Operation to a row for the operations log table.
  *
  * @param op - The operation to serialize
  * @returns An OperationRow suitable for SQL INSERT
  */
 export function serializeOperation(op: Operation): OperationRow {
-	const hasMetadata = op.transactionId !== undefined || op.mutationName !== undefined
+	const hasMetadata =
+		op.transactionId !== undefined || op.mutationName !== undefined || op.hashVersion !== undefined
 	let dataPayload: Record<string, unknown> | null = null
 	if (op.data) {
 		// Embed metadata in the data JSON when present
@@ -103,6 +111,9 @@ export function serializeOperation(op: Operation): OperationRow {
 		if (op.fieldVersions !== undefined) {
 			dataPayload[FIELD_VERSIONS_KEY] = op.fieldVersions
 		}
+		if (op.hashVersion !== undefined) {
+			dataPayload[HASH_VERSION_KEY] = op.hashVersion
+		}
 	} else if (hasMetadata) {
 		// For delete operations (data is null), we still need to store metadata
 		dataPayload = {}
@@ -111,6 +122,9 @@ export function serializeOperation(op: Operation): OperationRow {
 		}
 		if (op.mutationName !== undefined) {
 			dataPayload[MUTATION_NAME_KEY] = op.mutationName
+		}
+		if (op.hashVersion !== undefined) {
+			dataPayload[HASH_VERSION_KEY] = op.hashVersion
 		}
 	}
 
@@ -140,6 +154,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 	let transactionId: string | undefined
 	let mutationName: string | undefined
 	let fieldVersions: Operation['fieldVersions']
+	let hashVersion: Operation['hashVersion']
 
 	if (row.data) {
 		const parsed = JSON.parse(row.data) as Record<string, unknown>
@@ -156,15 +171,22 @@ export function deserializeOperation(row: OperationRow): Operation {
 		if (FIELD_VERSIONS_KEY in parsed) {
 			fieldVersions = parsed[FIELD_VERSIONS_KEY] as Operation['fieldVersions']
 		}
+		if (HASH_VERSION_KEY in parsed) {
+			hashVersion = parsed[HASH_VERSION_KEY] as Operation['hashVersion']
+		}
 		// Remove metadata keys from data
 		const {
 			[ATOMIC_OPS_KEY]: _a,
 			[TX_ID_KEY]: _t,
 			[MUTATION_NAME_KEY]: _m,
 			[FIELD_VERSIONS_KEY]: _f,
+			[HASH_VERSION_KEY]: _h,
 			...rest
 		} = parsed
-		data = Object.keys(rest).length > 0 ? rest : null
+		// An insert or update always carries data, possibly `{}` (an insert of only
+		// optional fields): its id covers `{}`, so `{}` is read back, never `null`. Only a
+		// delete's payload is metadata alone (RT-80).
+		data = row.type !== 'delete' || Object.keys(rest).length > 0 ? rest : null
 	}
 
 	return {
@@ -185,6 +207,7 @@ export function deserializeOperation(row: OperationRow): Operation {
 		...(transactionId !== undefined ? { transactionId } : {}),
 		...(mutationName !== undefined ? { mutationName } : {}),
 		...(fieldVersions !== undefined ? { fieldVersions } : {}),
+		...(hashVersion !== undefined ? { hashVersion } : {}),
 	}
 }
 
@@ -217,8 +240,43 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 			// (tagged { $koraBytes }) — encodeRichtext accepts every form.
 			return encodeRichtext(value as Parameters<typeof encodeRichtext>[0])
 		default:
-			return value
+			// Raw string columns: SQLite binds strings as UTF-8, which cannot hold a lone
+			// surrogate (stored as U+FFFD) and SQLite WASM reads TEXT up to a NUL. The
+			// shared stored-text codec keeps every JS string (RT-65); JSON columns above
+			// need none (JSON.stringify escapes both).
+			return typeof value === 'string' && isRawTextKind(descriptor.kind)
+				? encodeStoredText(value)
+				: value
 	}
+}
+
+/**
+ * Field kinds whose column holds the raw string (the stored-text codec applies). Not
+ * `enum`: its column has a `CHECK (col IN (...))` of the schema's literal values, so it
+ * must hold them verbatim (an enum value SQL text cannot express is already refused by
+ * the DDL).
+ */
+const RAW_TEXT_KINDS: ReadonlySet<string> = new Set(['string', 'secret'])
+
+/** True for a field kind stored as a raw string, encoded with the stored-text codec. */
+export function isRawTextKind(kind: string): boolean {
+	return RAW_TEXT_KINDS.has(kind)
+}
+
+/**
+ * Encode a filter value compared against a field's column: a raw-string field stores
+ * the encoded form, and the codec is injective, so equality and `IN` stay exact.
+ *
+ * @param value - The value from the developer's `where`
+ * @param descriptor - The field's descriptor, when the field is known
+ */
+export function encodeStoredFilterValue(
+	value: unknown,
+	descriptor: FieldDescriptor | undefined,
+): unknown {
+	return typeof value === 'string' && descriptor !== undefined && isRawTextKind(descriptor.kind)
+		? encodeStoredText(value)
+		: value
 }
 
 function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
@@ -240,6 +298,8 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 		case 'richtext':
 			return decodeRichtext(value)
 		default:
-			return value
+			return typeof value === 'string' && isRawTextKind(descriptor.kind)
+				? decodeStoredText(value)
+				: value
 	}
 }

@@ -226,6 +226,7 @@ export default defineConfig({
 					{ text: 'Authentication', link: '/guide/authentication' },
 					{ text: 'State Machines', link: '/guide/state-machines' },
 					{ text: 'Sync Encryption', link: '/guide/sync-encryption' },
+					{ text: 'Sync Protocol v2', link: '/guide/sync-protocol' },
 					{ text: 'Presence & Awareness', link: '/guide/presence' },
 					{ text: 'Common Patterns', link: '/guide/common-patterns' },
 					{ text: 'Testing', link: '/guide/testing' },

@@ -11,7 +11,7 @@ export type {
 
 // === Device ===
 export { TestDevice } from './test-device'
-export type { TestDeviceOptions } from './test-device'
+export type { TestDeviceOptions, TestDeviceEncryption, TestDeviceServer } from './test-device'
 
 // === Server ===
 export { TestServer } from './test-server'

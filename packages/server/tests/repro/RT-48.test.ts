@@ -1,3 +1,15 @@
+import type { Operation } from '@korajs/core'
+import { defineSchema, t } from '@korajs/core'
+import type { SyncMessage } from '@korajs/sync'
+import { drizzle } from 'drizzle-orm/postgres-js'
+import postgres from 'postgres'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer } from '../../src/server/kora-sync-server'
+import { MemoryServerStore } from '../../src/store/memory-server-store'
+import { PostgresServerStore } from '../../src/store/postgres-server-store'
+import type { ServerStore } from '../../src/store/server-store'
+import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
+import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 /**
  * RT-48 repro (Phase 2 red team round 2, 2026-10-02): the second op of an RT-37 legacy
  * pair never reaches a version-vector client (no delivery watermark: Kora <= beta.12,
@@ -12,18 +24,7 @@
  *
  * Asserts the CORRECT behaviour (fails today on every store): the vector client gets Y.
  */
-import type { Operation } from '@korajs/core'
-import { defineSchema, t } from '@korajs/core'
-import type { SyncMessage } from '@korajs/sync'
-import { drizzle } from 'drizzle-orm/postgres-js'
-import postgres from 'postgres'
-import { afterEach, describe, expect, test, vi } from 'vitest'
-import { KoraSyncServer } from '../../src/server/kora-sync-server'
-import { MemoryServerStore } from '../../src/store/memory-server-store'
-import { PostgresServerStore } from '../../src/store/postgres-server-store'
-import type { ServerStore } from '../../src/store/server-store'
-import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
-import { createServerTransportPair } from '../../src/transport/memory-server-transport'
+import { withContentId } from '../fixtures/content-id'
 
 const schema = defineSchema({
 	version: 1,
@@ -41,7 +42,8 @@ const tick = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(res
 let counter = 0
 function makeOp(nodeId: string, sequenceNumber: number, title: string): Operation {
 	counter += 1
-	return {
+	// A real content-addressed id: the server verifies it (RT-64).
+	return withContentId({
 		id: `rt48-op-${nodeId}-${sequenceNumber}-${counter}`,
 		nodeId,
 		type: 'insert',
@@ -53,7 +55,7 @@ function makeOp(nodeId: string, sequenceNumber: number, title: string): Operatio
 		sequenceNumber,
 		causalDeps: [],
 		schemaVersion: 1,
-	}
+	})
 }
 
 let pgSchemas = 0

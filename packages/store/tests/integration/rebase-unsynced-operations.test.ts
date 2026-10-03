@@ -1,5 +1,5 @@
 import type { Operation, OperationInput } from '@korajs/core'
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, foldRecord, materialize } from '@korajs/core'
 import { computeOperationId } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
@@ -28,7 +28,10 @@ async function deriveId(op: Operation): Promise<string> {
 		schemaVersion: op.schemaVersion,
 		...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
 	}
-	return computeOperationId(input, HybridLogicalClock.serialize(op.timestamp))
+	// The operation's own hash version (2 since protocol v2 also covers causalDeps).
+	return op.hashVersion === 2
+		? computeOperationId({ ...input, timestamp: op.timestamp }, 2)
+		: computeOperationId(input, HybridLogicalClock.serialize(op.timestamp))
 }
 
 describe('Integration: rebaseUnsyncedOperations', () => {
@@ -187,7 +190,18 @@ describe('Integration: rebaseUnsyncedOperations', () => {
 		expect(keptRow[0]?._version).toBe(serializeRowVersion(keptOp.timestamp))
 	})
 
-	test('materialized row is left alone when its current version came from a non-rebased op', async () => {
+	test('legacy: materialized row is left alone when its current version came from a non-rebased op', async () => {
+		// The beta.13 paths left the row alone. Under the W7 fold the row is always the
+		// fold of the (rebased) log: see the next test.
+		await store.close()
+		adapter = new BetterSqlite3Adapter(':memory:')
+		store = new Store({
+			schema: fullSchema,
+			adapter,
+			nodeId: 'rebase-node',
+			materialization: 'legacy',
+		})
+		await store.open()
 		const todos = store.collection('todos')
 
 		// Future insert (will be rebased) followed by a normal-time update that
@@ -210,6 +224,32 @@ describe('Integration: rebaseUnsyncedOperations', () => {
 			[record.id],
 		)
 		expect(row[0]?._version).toBe(serializeRowVersion(updateOp.timestamp))
+	})
+
+	test('W7: after a rebase the row is the fold of the re-stamped log', async () => {
+		const todos = store.collection('todos')
+		const record = await withClockAt(realNow + CLOCK_AHEAD_MS, async () =>
+			todos.insert({ title: 'v1', completed: false }),
+		)
+		await todos.update(record.id, { completed: true })
+		const insertOp = (await store.getAllOperations()).find((op) => op.type === 'insert')
+		if (!insertOp) throw new Error('setup failed')
+
+		const result = await store.rebaseUnsyncedOperations([insertOp.id], realNow)
+		const rebased = result.operations[0]
+		if (!rebased) throw new Error('nothing rebased')
+
+		// The fold state names the re-stamped insert; the row reflects every op in the log.
+		const state = await store.getFoldState('todos', record.id)
+		expect(state?.cr?.o).toBe(rebased.id)
+		const row = await todos.findById(record.id)
+		// Rebasing only the insert puts it after the update (keptWall + 1), so by HLC the
+		// insert is now the newest writer of `completed`: the row says what the server's
+		// fold of the same log will say.
+		const log = (await store.getAllOperations()).filter((op) => op.recordId === record.id)
+		const folded = foldRecord(log, fullSchema).state
+		expect(row).toMatchObject(folded ? (materialize(folded) ?? {}) : {})
+		expect(row?.title).toBe('v1')
 	})
 
 	test('empty input and unknown ids are no-ops', async () => {

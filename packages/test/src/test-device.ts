@@ -22,8 +22,8 @@ import type {
 	StorageAdapter,
 } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { SyncEngine } from '@korajs/sync'
-import type { SyncTransport } from '@korajs/sync'
+import { SyncEncryptor, SyncEngine, validateEncryptedRelations } from '@korajs/sync'
+import type { SyncEncryptionConfig, SyncTransport } from '@korajs/sync'
 import {
 	ApplyPipeline,
 	MergeAwareSyncStore,
@@ -33,7 +33,23 @@ import {
 	wireAuditPersistence,
 	wireBlobUpload,
 } from 'korajs/testing'
-import type { TestServer } from './test-server'
+
+/** What a device needs from its server: a way to open a session on it. */
+export interface TestDeviceServer {
+	handleConnection(transport: import('@korajs/server').ServerTransport): string
+}
+
+/**
+ * End-to-end encryption of a test device's sync traffic. Devices that must read each
+ * other's operations share the passphrase AND the key-derivation salt (shared key
+ * distribution, ENC-1, is not built yet).
+ */
+export interface TestDeviceEncryption {
+	config: SyncEncryptionConfig
+	salt: Uint8Array
+	/** PBKDF2 iterations (lower in tests for speed). */
+	iterations?: number
+}
 
 /**
  * Options for creating a TestDevice.
@@ -44,7 +60,7 @@ export interface TestDeviceOptions {
 	/** Schema definition */
 	schema: SchemaDefinition
 	/** Test server to connect to */
-	server: TestServer
+	server: TestDeviceServer
 	/** Transport factory — creates a linked client/server transport pair */
 	createTransportPair: () => {
 		client: SyncTransport
@@ -54,8 +70,10 @@ export interface TestDeviceOptions {
 	tmpDir: string
 	/** Client handshake schema version. Defaults to `schema.version`. */
 	syncSchemaVersion?: number
-	/** Transforms applied to inbound operations before local apply. */
+	/** Schema transforms: the store folds every operation's view (transforms at fold time). */
 	operationTransforms?: OperationTransform[]
+	/** The store's local `maxOperationBytes` (RT-86). Default: the store default (256 KiB). */
+	maxOperationBytes?: number
 	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
 	scopeExit?: 'retain' | 'retract'
 	/**
@@ -70,6 +88,15 @@ export interface TestDeviceOptions {
 	 * (a closed pair stays closed until the next {@link TestDevice.sync}).
 	 */
 	reconnectable?: boolean
+	/**
+	 * Run the device on the beta.13 pairwise pipeline (`experimental.legacyMerge`)
+	 * instead of the W7 fold. Used by the comparison harness.
+	 */
+	legacyMerge?: boolean
+	/** Encrypt sync traffic end to end (protocol v2 envelope). */
+	encryption?: TestDeviceEncryption
+	/** Upload batch size of the sync engine (default: the engine's). */
+	batchSize?: number
 }
 
 type TransportPairFactory = TestDeviceOptions['createTransportPair']
@@ -87,7 +114,7 @@ class ReconnectingClientTransport implements SyncTransport {
 	constructor(
 		private inner: SyncTransport,
 		private readonly createPair: TransportPairFactory,
-		private readonly server: TestServer,
+		private readonly server: TestDeviceServer,
 	) {}
 
 	async connect(url: string, options?: Parameters<SyncTransport['connect']>[1]): Promise<void> {
@@ -152,7 +179,10 @@ export class TestDevice {
 	readonly blobStore = new MemoryBlobStore()
 
 	private readonly schema: SchemaDefinition
-	private readonly server: TestServer
+	private readonly server: TestDeviceServer
+	private readonly encryption: TestDeviceEncryption | undefined
+	private readonly batchSize: number | undefined
+	private encryptor: SyncEncryptor | null = null
 	private readonly mergeEngine: MergeEngine
 	private readonly createTransportPair: TestDeviceOptions['createTransportPair']
 	private readonly adapter: StorageAdapter
@@ -182,6 +212,10 @@ export class TestDevice {
 		this.scopeExit = options.scopeExit
 		this.principal = options.principal
 		this.reconnectable = options.reconnectable === true
+		this.encryption = options.encryption
+		this.batchSize = options.batchSize
+		// Like createApp: encryption may not seal a foreign key the server must enforce.
+		validateEncryptedRelations(options.schema, options.encryption?.config)
 
 		this.emitter = new SimpleEventEmitter()
 		this.mergeEngine = new MergeEngine()
@@ -190,6 +224,13 @@ export class TestDevice {
 			schema: options.schema,
 			adapter: this.adapter,
 			emitter: this.emitter,
+			materialization: options.legacyMerge === true ? 'legacy' : 'fold',
+			...(options.operationTransforms && options.operationTransforms.length > 0
+				? { operationTransforms: options.operationTransforms }
+				: {}),
+			...(options.maxOperationBytes !== undefined
+				? { maxOperationBytes: options.maxOperationBytes }
+				: {}),
 		})
 	}
 
@@ -248,6 +289,14 @@ export class TestDevice {
 			: created.client
 		this.currentTransport = client
 
+		if (this.encryption && !this.encryptor) {
+			this.encryptor = await SyncEncryptor.create(
+				this.encryption.config,
+				this.encryption.salt,
+				this.encryption.iterations,
+			)
+		}
+
 		const conflictHandler: { fn?: () => void } = {}
 		const syncStore = new MergeAwareSyncStore(this.store, this.mergeEngine, this.emitter, {
 			onMergeConflict: () => conflictHandler.fn?.(),
@@ -267,8 +316,11 @@ export class TestDevice {
 				...(this.principal
 					? { principal: async () => (this.principal ? this.principal() : null) }
 					: {}),
+				...(this.encryption ? { encryption: this.encryption.config } : {}),
+				...(this.batchSize !== undefined ? { batchSize: this.batchSize } : {}),
 			},
 			emitter: this.emitter,
+			...(this.encryptor ? { encryptor: this.encryptor } : {}),
 		})
 		conflictHandler.fn = () => this.syncEngine?.recordConflict()
 

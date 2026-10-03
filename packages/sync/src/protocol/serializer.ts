@@ -1,5 +1,10 @@
 import { SyncError } from '@korajs/core'
-import type { HLCTimestamp, Operation, VersionVector } from '@korajs/core'
+import type {
+	EncryptedOperationEnvelope,
+	HLCTimestamp,
+	Operation,
+	VersionVector,
+} from '@korajs/core'
 // protobufjs/minimal is CJS — named ESM imports fail in some runtimes (tsx, Node ESM).
 // Use a default import for the runtime values and type aliases for annotations.
 // The explicit .js extension is required: protobufjs has no "exports" map, so
@@ -111,44 +116,33 @@ function deserializeWireRecord(
 	return out
 }
 
+/**
+ * A top-level op-data value in the wire's binary form: an object whose ONLY member is
+ * `__kora_bytes__` (a base64 string), as `serializeWireValue` writes a `Uint8Array`
+ * (beta.13 richtext). Any other object is data and is returned as is.
+ *
+ * Two earlier rules corrupted json and object values and are gone (value domain, RT-86):
+ * an object that merely CONTAINED `__kora_bytes__` lost its other members, and an object
+ * whose keys were all integers with number values (`{ "1": 2 }`, even `{ " ": 0 }`) was
+ * read as the indexed byte record of the 0.5 internal beta and became a `Uint8Array`.
+ * The local API refuses a field value that is exactly the binary form, so nothing a
+ * device writes can be mistaken for it.
+ */
 function deserializeWireValue(value: unknown): unknown {
-	if (typeof value === 'object' && value !== null && WIRE_BYTES_KEY in value) {
-		const encoded = (value as Record<string, unknown>)[WIRE_BYTES_KEY]
-		if (typeof encoded === 'string') {
-			return fromBase64(encoded)
-		}
+	if (isWireBytesValue(value)) {
+		return fromBase64(value[WIRE_BYTES_KEY])
 	}
-
-	if (isLegacyIndexedByteRecord(value)) {
-		return legacyIndexedByteRecordToUint8Array(value)
-	}
-
 	return value
 }
 
-function isLegacyIndexedByteRecord(value: unknown): value is Record<string, number> {
-	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-		return false
-	}
-
-	const entries = Object.entries(value)
-	if (entries.length === 0) {
-		return false
-	}
-
-	return entries.every(([key, entryValue]) => {
-		const index = Number(key)
-		return Number.isInteger(index) && index >= 0 && typeof entryValue === 'number'
-	})
-}
-
-function legacyIndexedByteRecordToUint8Array(value: Record<string, number>): Uint8Array {
-	const maxIndex = Math.max(...Object.keys(value).map((key) => Number(key)))
-	const bytes = new Uint8Array(maxIndex + 1)
-	for (const [key, entryValue] of Object.entries(value)) {
-		bytes[Number(key)] = entryValue
-	}
-	return bytes
+function isWireBytesValue(value: unknown): value is Record<typeof WIRE_BYTES_KEY, string> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+	const keys = Object.keys(value)
+	return (
+		keys.length === 1 &&
+		keys[0] === WIRE_BYTES_KEY &&
+		typeof (value as Record<string, unknown>)[WIRE_BYTES_KEY] === 'string'
+	)
 }
 
 /**
@@ -206,6 +200,9 @@ export class JsonMessageSerializer implements MessageSerializer {
 			...(op.fieldVersions !== undefined
 				? { fieldVersions: copyFieldVersions(op.fieldVersions) }
 				: {}),
+			...(op.hashVersion !== undefined ? { hashVersion: op.hashVersion } : {}),
+			...(op.foldState !== undefined ? { foldState: op.foldState } : {}),
+			...(op.encrypted !== undefined ? { encrypted: copyEnvelope(op.encrypted) } : {}),
 		}
 	}
 
@@ -232,8 +229,83 @@ export class JsonMessageSerializer implements MessageSerializer {
 				: {}),
 			...(serialized.mutationName !== undefined ? { mutationName: serialized.mutationName } : {}),
 			...withFieldVersions(serialized.fieldVersions),
+			...withHashVersion(serialized.hashVersion),
+			...(typeof serialized.foldState === 'string' ? { foldState: serialized.foldState } : {}),
+			...withEnvelope(serialized.encrypted),
 		}
 	}
+}
+
+/**
+ * Carry a wire hash version through. 1 and 2 are the defined versions. Any other
+ * declared value (an unknown future version, garbage from an untrusted peer) is kept,
+ * so id verification fails closed instead of treating the operation as version 1.
+ */
+function withHashVersion(raw: unknown): { hashVersion?: 1 | 2 } {
+	if (raw === undefined || raw === null) return {}
+	return { hashVersion: raw as 1 | 2 }
+}
+
+/**
+ * Validate a wire encryption envelope (protocol v2). A malformed envelope from an
+ * untrusted peer is dropped; the operation then has no envelope and fails decryption
+ * (encryption enabled: plaintext is refused) or id verification. It never applies
+ * as garbage.
+ *
+ * @param raw - The decoded `encrypted` value
+ * @returns A validated copy, or undefined
+ */
+export function normalizeEnvelope(raw: unknown): EncryptedOperationEnvelope | undefined {
+	if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+	const env = raw as Record<string, unknown>
+	if (
+		env.v !== 2 ||
+		env.alg !== 'aes-256-gcm' ||
+		typeof env.keyId !== 'string' ||
+		typeof env.keyVersion !== 'number' ||
+		!Number.isInteger(env.keyVersion)
+	) {
+		return undefined
+	}
+	const data = normalizeEnvelopeField(env.data)
+	const previousData = normalizeEnvelopeField(env.previousData)
+	if (data === undefined || previousData === undefined) return undefined
+	const atomicOps = env.atomicOps === undefined ? null : normalizeEnvelopeField(env.atomicOps)
+	if (atomicOps === undefined) return undefined
+	return {
+		v: 2,
+		alg: 'aes-256-gcm',
+		keyId: env.keyId,
+		keyVersion: env.keyVersion,
+		data,
+		previousData,
+		...(atomicOps !== null ? { atomicOps } : {}),
+	}
+}
+
+function normalizeEnvelopeField(raw: unknown): { iv: string; ct: string } | null | undefined {
+	if (raw === null) return null
+	if (typeof raw !== 'object' || raw === undefined) return undefined
+	const field = raw as Record<string, unknown>
+	if (typeof field.iv !== 'string' || typeof field.ct !== 'string') return undefined
+	return { iv: field.iv, ct: field.ct }
+}
+
+function copyEnvelope(envelope: EncryptedOperationEnvelope): EncryptedOperationEnvelope {
+	return {
+		v: envelope.v,
+		alg: envelope.alg,
+		keyId: envelope.keyId,
+		keyVersion: envelope.keyVersion,
+		data: envelope.data ? { ...envelope.data } : null,
+		previousData: envelope.previousData ? { ...envelope.previousData } : null,
+		...(envelope.atomicOps ? { atomicOps: { ...envelope.atomicOps } } : {}),
+	}
+}
+
+function withEnvelope(raw: unknown): { encrypted?: EncryptedOperationEnvelope } {
+	const encrypted = raw === undefined ? undefined : normalizeEnvelope(raw)
+	return encrypted !== undefined ? { encrypted } : {}
 }
 
 /**
@@ -375,6 +447,12 @@ interface ProtoOperation {
 	schemaVersion: number
 	hasData: boolean
 	hasPreviousData: boolean
+	/** Field 14: content-hash version (protocol v2). 0/absent = 1. */
+	hashVersion?: number
+	/** Field 15: serialized fold state of a server scope-entry operation. */
+	foldState?: string
+	/** Field 16: JSON of the encryption envelope v2. */
+	encryptedJson?: string
 }
 
 interface ProtoEnvelope {
@@ -436,6 +514,12 @@ interface ProtoEnvelope {
 	acceptedScopeWatermark?: number
 	/** Field 45: the handshake's sequence-reservation capability (RT-37). */
 	sequenceReservation?: boolean
+	/** Field 46 (repeated): server-authoritative node ids (handshake-response, protocol v2). */
+	authoritativeNodeIds?: string[]
+	/** Field 47: sync protocol version (handshake and handshake-response, protocol v2). */
+	protocolVersion?: number
+	/** Field 48 (repeated): revoked explicit authoritative node ids (handshake-response, RT-81). */
+	revokedAuthoritativeNodeIds?: string[]
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -465,6 +549,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
 				...(message.sequenceReservation !== undefined
 					? { sequenceReservation: message.sequenceReservation }
+					: {}),
+				...(message.protocolVersion !== undefined
+					? { protocolVersion: message.protocolVersion }
 					: {}),
 			}
 		case 'handshake-response':
@@ -497,6 +584,15 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 				...(message.nodeToken !== undefined ? { nodeToken: message.nodeToken } : {}),
 				...(message.blobPossessionProof !== undefined
 					? { blobPossessionProof: message.blobPossessionProof }
+					: {}),
+				...(message.protocolVersion !== undefined
+					? { protocolVersion: message.protocolVersion }
+					: {}),
+				...(message.authoritativeNodeIds !== undefined
+					? { authoritativeNodeIds: [...message.authoritativeNodeIds] }
+					: {}),
+				...(message.revokedAuthoritativeNodeIds !== undefined
+					? { revokedAuthoritativeNodeIds: [...message.revokedAuthoritativeNodeIds] }
 					: {}),
 			}
 		case 'operation-batch':
@@ -616,6 +712,9 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.sequenceReservation !== undefined
 					? { sequenceReservation: envelope.sequenceReservation }
 					: {}),
+				...(envelope.protocolVersion !== undefined
+					? { protocolVersion: envelope.protocolVersion }
+					: {}),
 			}
 		case 'handshake-response':
 			return {
@@ -653,6 +752,15 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				...(envelope.nodeToken ? { nodeToken: envelope.nodeToken } : {}),
 				...(envelope.blobPossessionProof !== undefined
 					? { blobPossessionProof: envelope.blobPossessionProof }
+					: {}),
+				...(envelope.protocolVersion !== undefined
+					? { protocolVersion: envelope.protocolVersion }
+					: {}),
+				...(envelope.authoritativeNodeIds !== undefined
+					? { authoritativeNodeIds: envelope.authoritativeNodeIds }
+					: {}),
+				...(envelope.revokedAuthoritativeNodeIds !== undefined
+					? { revokedAuthoritativeNodeIds: envelope.revokedAuthoritativeNodeIds }
 					: {}),
 			}
 		case 'operation-batch':
@@ -734,7 +842,10 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 
 function serializeProtoOperation(operation: SerializedOperation): ProtoOperation {
 	// Embed metadata in the data JSON when present (piggyback on existing field)
-	const hasMetadata = operation.transactionId !== undefined || operation.mutationName !== undefined
+	const hasMetadata =
+		operation.transactionId !== undefined ||
+		operation.mutationName !== undefined ||
+		(operation.atomicOps !== undefined && Object.keys(operation.atomicOps).length > 0)
 	let dataJson = ''
 	if (operation.data !== null) {
 		const dataPayload: Record<string, unknown> = { ...operation.data }
@@ -752,8 +863,12 @@ function serializeProtoOperation(operation: SerializedOperation): ProtoOperation
 		}
 		dataJson = JSON.stringify(dataPayload)
 	} else if (hasMetadata) {
-		// For delete operations (data is null), still need to carry metadata
+		// For operations without data (deletes), still carry metadata. hasData stays
+		// false, so the decoder keeps data null.
 		const meta: Record<string, unknown> = {}
+		if (operation.atomicOps !== undefined && Object.keys(operation.atomicOps).length > 0) {
+			meta.__kora_atomic_ops__ = operation.atomicOps
+		}
 		if (operation.transactionId !== undefined) meta.__kora_tx_id__ = operation.transactionId
 		if (operation.mutationName !== undefined) meta.__kora_mutation__ = operation.mutationName
 		dataJson = JSON.stringify(meta)
@@ -777,6 +892,11 @@ function serializeProtoOperation(operation: SerializedOperation): ProtoOperation
 		schemaVersion: operation.schemaVersion,
 		hasData: operation.data !== null,
 		hasPreviousData: operation.previousData !== null,
+		...(operation.hashVersion !== undefined ? { hashVersion: operation.hashVersion } : {}),
+		...(operation.foldState !== undefined ? { foldState: operation.foldState } : {}),
+		...(operation.encrypted !== undefined
+			? { encryptedJson: JSON.stringify(operation.encrypted) }
+			: {}),
 	}
 }
 
@@ -808,7 +928,8 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 			__kora_field_versions__: _f,
 			...rest
 		} = parsed
-		data = operation.hasData && Object.keys(rest).length > 0 ? rest : null
+		// `hasData` says whether the op carried data: `{}` stays `{}` (its id covers it).
+		data = operation.hasData ? rest : null
 	}
 
 	return {
@@ -835,7 +956,28 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 		...(transactionId !== undefined ? { transactionId } : {}),
 		...(mutationName !== undefined ? { mutationName } : {}),
 		...(fieldVersions !== undefined ? { fieldVersions } : {}),
+		...(operation.hashVersion !== undefined && operation.hashVersion !== 0
+			? { hashVersion: operation.hashVersion as 1 | 2 }
+			: {}),
+		...(operation.foldState !== undefined ? { foldState: operation.foldState } : {}),
+		...decodeEnvelopeJson(operation.encryptedJson),
 	}
+}
+
+function decodeEnvelopeJson(json: string | undefined): {
+	encrypted?: EncryptedOperationEnvelope
+} {
+	if (json === undefined || json.length === 0) return {}
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(json)
+	} catch {
+		throw new SyncError('Failed to decode sync message: invalid encryption envelope JSON', {
+			length: json.length,
+		})
+	}
+	const encrypted = normalizeEnvelope(parsed)
+	return encrypted !== undefined ? { encrypted } : {}
 }
 
 function decodeTextPayload(data: string | Uint8Array | ArrayBuffer): string {
@@ -949,6 +1091,12 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	// so a client that explicitly opts out is told apart from one that predates it.
 	if (envelope.sequenceReservation !== undefined)
 		writer.uint32(360).bool(envelope.sequenceReservation)
+	// Field 46 (repeated string, wiretype 2): 46 << 3 | 2 = 370.
+	for (const nodeId of envelope.authoritativeNodeIds ?? []) writer.uint32(370).string(nodeId)
+	// Field 47 (uint32, wiretype 0): 47 << 3 = 376.
+	if (envelope.protocolVersion !== undefined) writer.uint32(376).uint32(envelope.protocolVersion)
+	// Field 48 (repeated string, wiretype 2): 48 << 3 | 2 = 386.
+	for (const nodeId of envelope.revokedAuthoritativeNodeIds ?? []) writer.uint32(386).string(nodeId)
 	return writer.finish()
 }
 
@@ -1097,6 +1245,18 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 			case 45:
 				envelope.sequenceReservation = reader.bool()
 				break
+			case 46:
+				envelope.authoritativeNodeIds = [...(envelope.authoritativeNodeIds ?? []), reader.string()]
+				break
+			case 47:
+				envelope.protocolVersion = reader.uint32()
+				break
+			case 48:
+				envelope.revokedAuthoritativeNodeIds = [
+					...(envelope.revokedAuthoritativeNodeIds ?? []),
+					reader.string(),
+				]
+				break
 			default:
 				reader.skipType(tag & 7)
 		}
@@ -1125,6 +1285,10 @@ function encodeProtoOperation(writer: Writer, operation: ProtoOperation): void {
 	writer.uint32(88).int32(operation.schemaVersion)
 	writer.uint32(96).bool(operation.hasData)
 	writer.uint32(104).bool(operation.hasPreviousData)
+	// Fields 14-16 (protocol v2). Older decoders skip them as unknown fields.
+	if (operation.hashVersion !== undefined) writer.uint32(112).uint32(operation.hashVersion)
+	if (operation.foldState !== undefined) writer.uint32(122).string(operation.foldState)
+	if (operation.encryptedJson !== undefined) writer.uint32(130).string(operation.encryptedJson)
 }
 
 function decodeProtoOperation(reader: Reader, length: number): ProtoOperation {
@@ -1203,6 +1367,15 @@ function decodeProtoOperation(reader: Reader, length: number): ProtoOperation {
 				break
 			case 13:
 				operation.hasPreviousData = reader.bool()
+				break
+			case 14:
+				operation.hashVersion = reader.uint32()
+				break
+			case 15:
+				operation.foldState = reader.string()
+				break
+			case 16:
+				operation.encryptedJson = reader.string()
 				break
 			default:
 				reader.skipType(tag & 7)

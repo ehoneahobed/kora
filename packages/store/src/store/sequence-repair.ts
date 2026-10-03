@@ -1,5 +1,7 @@
 import { quoteIdent } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
+import { deserializeOperationWithCollection } from '../serialization/serializer'
+import { renumberOperationRow } from '../sync/rehash-operation'
 import type { OperationRow, StorageAdapter, Transaction } from '../types'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 
@@ -200,7 +202,20 @@ async function repairDuplicates(
 	const losers: LoggedIdentity[] = []
 	for (const group of groups.values()) {
 		if (group.length < 2) continue
-		group.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+		// A version-2 operation (beta.14+) keeps its place: renumbering would re-hash it
+		// under a new id, and if the server already stored it under the old id the new
+		// copy would be stored as a second write (an atomic increment applied twice). A
+		// version-1 loser keeps its id, which the server deduplicates (RT-31). Ties by id.
+		const version2 = new Set<string>()
+		for (const member of group) {
+			if (await isVersion2Row(tx, member)) version2.add(member.id)
+		}
+		group.sort((a, b) => {
+			const va = version2.has(a.id) ? 0 : 1
+			const vb = version2.has(b.id) ? 0 : 1
+			if (va !== vb) return va - vb
+			return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+		})
 		losers.push(...group.slice(1))
 	}
 	// Re-emit in original order so the new numbers keep the authoring order.
@@ -223,16 +238,16 @@ async function repairDuplicates(
 		if (!row) continue
 		if (loser.node_id === nodeId) {
 			const newSeq = await allocateNextSequenceInTransaction(tx, nodeId)
+			const moved = await renumberOperationRow(tx, loser.collection, row, newSeq)
 			await insertConflictRow(
 				tx,
 				loser.collection,
 				row,
 				'duplicate-sequence',
-				loser.id,
+				moved.id,
 				newSeq,
 				now,
 			)
-			await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [newSeq, loser.id])
 			result.resequenced++
 		} else {
 			await insertConflictRow(tx, loser.collection, row, 'duplicate-sequence', null, null, now)
@@ -241,6 +256,17 @@ async function repairDuplicates(
 		}
 	}
 	return result
+}
+
+/** Whether a logged operation declares content-hash version 2. */
+async function isVersion2Row(tx: Transaction, identity: LoggedIdentity): Promise<boolean> {
+	const rows = await tx.query<OperationRow>(
+		`SELECT * FROM ${quoteIdent(`_kora_ops_${identity.collection}`)} WHERE id = ?`,
+		[identity.id],
+	)
+	const row = rows[0]
+	if (!row) return false
+	return deserializeOperationWithCollection(row, identity.collection).hashVersion === 2
 }
 
 /**

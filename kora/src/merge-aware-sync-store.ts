@@ -1,6 +1,6 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
-import type { Store } from '@korajs/store'
+import type { ResequenceResult, Store } from '@korajs/store'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
 
@@ -66,6 +66,18 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.pipeline.applyRemote(op)
 	}
 
+	/** W7: the server's authoritative node ids (handshake), persisted by the store. */
+	async settleAfterCatchUp(): Promise<number> {
+		return this.store.settleAfterCatchUp()
+	}
+
+	async setAuthoritativeNodeIds(
+		nodeIds: readonly string[],
+		revokedNodeIds: readonly string[] = [],
+	): Promise<void> {
+		await this.store.setAuthoritativeNodeIds(nodeIds, revokedNodeIds)
+	}
+
 	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
 		return this.store.applyScopeRetraction(collection, recordId)
 	}
@@ -103,13 +115,14 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.raiseSequenceFloor(nodeId, floor)
 	}
 
-	/** Renumber an operation refused with SEQUENCE_CONFLICT, keeping its id (RT-35). */
+	/** Renumber an operation refused with SEQUENCE_CONFLICT (RT-35); a version-2 op is re-hashed. */
 	resequenceOperation(
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null> {
-		return this.store.resequenceOperation(operationId, nodeId, floor)
+		rewritableDependents?: readonly string[],
+	): Promise<ResequenceResult | null> {
+		return this.store.resequenceOperation(operationId, nodeId, floor, rewritableDependents)
 	}
 
 	/** Take over a closed tab's node id (RT-40). */

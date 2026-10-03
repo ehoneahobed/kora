@@ -1,4 +1,5 @@
 import type {
+	FoldState,
 	HLCTimestamp,
 	HybridLogicalClock,
 	Operation,
@@ -7,6 +8,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { KoraError } from '@korajs/core'
+import type { OperationTransform } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
@@ -36,6 +38,29 @@ export class SequenceConflictError extends KoraError {
 			},
 		)
 		this.name = 'SequenceConflictError'
+	}
+}
+
+/** Rejection code for an operation holding a value the store cannot represent. */
+export const UNSTORABLE_VALUE_CODE = 'UNSTORABLE_VALUE'
+
+/**
+ * Thrown by a store when an operation carries a value the database cannot represent
+ * (RT-65). Nothing was written. Not retriable: the same bytes always fail, so the
+ * session refuses the operation terminally instead of failing the connection (which
+ * made the device re-send it forever and blocked every later write of that device).
+ */
+export class UnstorableValueError extends KoraError {
+	constructor(
+		readonly operation: Pick<Operation, 'id' | 'collection' | 'recordId'>,
+		detail: string,
+	) {
+		super(
+			`Operation "${operation.id}" on ${operation.collection}/${operation.recordId} holds a value this server's database cannot store (${detail}). It is refused; nothing was written.`,
+			UNSTORABLE_VALUE_CODE,
+			{ operationId: operation.id, collection: operation.collection, recordId: operation.recordId },
+		)
+		this.name = 'UnstorableValueError'
 	}
 }
 
@@ -354,6 +379,12 @@ export interface ApplyRemoteOptions {
 	onLegacySequencePair?: (pair: LegacySequencePair) => void
 }
 
+/** Options of {@link ServerStore.setSchema}. */
+export interface ServerSchemaOptions {
+	/** Schema transforms the store folds with (transforms at fold time, RT-84). */
+	operationTransforms?: readonly OperationTransform[]
+}
+
 /**
  * Server-side store interface. Extends SyncStore with lifecycle,
  * introspection, and materialization methods needed by the sync server.
@@ -512,6 +543,48 @@ export interface ServerStore extends SyncStore {
 	 * operation carries them so a receiver resolves every field on its own.
 	 */
 	getRecordFieldVersions?(collection: string, recordId: string): Promise<RecordFieldVersions | null>
+	/**
+	 * The record's fold state (W7): the per-field CRDT state its row is projected from.
+	 * Null when the record has no operations or its collection is not materialized. A
+	 * scope-entry operation carries it (filtered to the fields the receiver may see) so
+	 * the receiver merges richtext, counter and resolver fields exactly (RT-29).
+	 */
+	getRecordFoldState?(collection: string, recordId: string): Promise<FoldState | null>
+	/** Every stored operation of one record, in delivery (commit) order. */
+	getRecordOperations?(collection: string, recordId: string): Promise<Operation[]>
+	/**
+	 * The record's row as it would be after merging `op` into its fold state, with
+	 * nothing written: the candidate a Tier-2 constraint check judges at ingest. Null
+	 * when the record would not be live (deleted, or never inserted).
+	 */
+	previewOperation?(op: Operation): Promise<MaterializedRecord | null>
+	/**
+	 * Node ids whose operations win `merge('server-authoritative')` fields in the fold:
+	 * this store's own node id (every server-originated operation is authored by it)
+	 * plus any configured extras. The sync server advertises them in the handshake so
+	 * clients fold with the same authority.
+	 */
+	getAuthoritativeNodeIds?(): string[]
+
+	/** Explicit authoritative ids the deployment revoked (RT-81); advertised at handshake. */
+	getRevokedAuthoritativeNodeIds?(): string[]
+
+	/**
+	 * Every explicit id the deployment ever held authoritative, revoked ones included
+	 * (RT-81). The session never accepts one as a device node id.
+	 */
+	getEverAuthoritativeNodeIds?(): string[]
+	/**
+	 * Keyed id of a server-derived operation (cascade, set-null, constraint correction):
+	 * deterministic across every instance of the deployment, unpredictable to clients
+	 * (RT-64). Built-in stores key it with a persisted deployment secret. A store
+	 * without it falls back to the unkeyed `deriveSideEffectOpId`.
+	 */
+	deriveServerOperationId?(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string>
 	/** Close the store and release resources */
 	close(): Promise<void>
 
@@ -567,11 +640,26 @@ export interface ServerStore extends SyncStore {
 	 * tables from the operation log.
 	 *
 	 * @param schema - The schema definition describing all collections
+	 * @param options - `operationTransforms`: the schema transforms the store folds with
+	 *   (transforms at fold time, RT-84). Pass the same list as the sync server's
+	 *   `operationTransforms`, so the startup re-materialization folds with them once.
 	 */
-	setSchema(schema: SchemaDefinition): Promise<void>
+	setSchema(schema: SchemaDefinition, options?: ServerSchemaOptions): Promise<void>
 
 	/** Schema used for materialized tables and server-side validation, if set. */
 	getSchema(): SchemaDefinition | null
+
+	/**
+	 * Set the schema transforms the store folds with (RT-84). Operations are stored
+	 * exactly as uploaded; the fold merges each operation as
+	 * `operationSchemaView(op, schema.version, transforms)` reads it. Transforms are part
+	 * of the fold plan fingerprint: a change re-folds every record (once). The sync
+	 * server calls this with its `operationTransforms` at construction.
+	 */
+	setOperationTransforms?(transforms: readonly OperationTransform[]): Promise<void>
+
+	/** The schema transforms the store folds with (empty when none). */
+	getOperationTransforms?(): readonly OperationTransform[]
 
 	/**
 	 * Get all records from a materialized collection.

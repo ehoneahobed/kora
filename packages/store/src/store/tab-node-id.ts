@@ -31,7 +31,8 @@ export function savePerTabNodeId(dbName: string, nodeId: string): void {
  */
 export function resolvePerTabNodeId(dbName: string): string {
 	const existing = loadPerTabNodeId(dbName)
-	if (existing) {
+	// Never adopt an id in Kora's reserved `kora:` namespace (RT-61).
+	if (existing && !existing.startsWith('kora:')) {
 		return existing
 	}
 	const nodeId = generateUUIDv7()

@@ -78,6 +78,15 @@ export {
 } from './protocol/schema-version'
 
 export {
+	declaredProtocolVersion,
+	INVALID_OPERATION_ID,
+	LEGACY_SYNC_PROTOCOL_VERSION,
+	PLAINTEXT_REJECTED,
+	PROTOCOL_V1_DEPRECATED,
+	SYNC_PROTOCOL_VERSION,
+} from './protocol/protocol-version'
+
+export {
 	isAcknowledgmentMessage,
 	isErrorMessage,
 	isHandshakeMessage,
@@ -216,6 +225,12 @@ export {
 	DecryptionError,
 	isEncryptedPayload,
 } from './encryption/sync-encryptor'
+
+export {
+	SealedRelationFieldError,
+	validateEncryptedRelations,
+} from './encryption/encrypted-relations'
+export type { EncryptedRelationConfig } from './encryption/encrypted-relations'
 
 export {
 	KeyDerivationError,

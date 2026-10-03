@@ -34,15 +34,19 @@ describe('MemoryServerStore', () => {
 		expect(vv.size).toBe(0)
 	})
 
-	test('getNodeId returns the provided node ID', () => {
+	test('a configured plain node id is a legacy authority, not the authoring id (RT-62)', () => {
 		const store = new MemoryServerStore('server-1')
-		expect(store.getNodeId()).toBe('server-1')
+		expect(store.getNodeId()).toMatch(/^kora:server:[0-9a-f-]{36}:1$/)
+		expect(store.getAuthoritativeNodeIds()).toEqual([store.getNodeId(), 'server-1'])
 	})
 
-	test('getNodeId generates a UUID when none provided', () => {
+	test('getNodeId is a kora:server: id when none provided', () => {
 		const store = new MemoryServerStore()
 		expect(store.getNodeId()).toMatch(
-			/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+			/^kora:server:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:1$/,
+		)
+		expect(new MemoryServerStore(undefined, { instanceId: 'east-1' }).getNodeId()).toMatch(
+			/:east-1$/,
 		)
 	})
 

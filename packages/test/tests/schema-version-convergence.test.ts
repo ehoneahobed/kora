@@ -153,4 +153,52 @@ describe('schema version cross-version sync', () => {
 		expect(onLegacy?.done).toBe(true)
 		expect(onModern?.completed).toBe(true)
 	}, 30000)
+
+	test("RT-84: old-schema clients receive each other's operations exactly as written", async () => {
+		network = await createMixedTestNetwork(
+			schemaV2,
+			{
+				schemaVersion: 2,
+				supportedSchemaVersions: { min: 1, max: 2 },
+				operationTransforms: v1ToV2Transforms,
+			},
+			[
+				{ name: 'legacy-a', schema: schemaV1, syncSchemaVersion: 1 },
+				{ name: 'legacy-b', schema: schemaV1, syncSchemaVersion: 1 },
+				{
+					name: 'modern',
+					schema: schemaV2,
+					syncSchemaVersion: 2,
+					operationTransforms: v1ToV2Transforms,
+				},
+			],
+		)
+		const [legacyA, legacyB, modern] = network.devices
+		const created = await legacyA.collection('todos').insert({ title: 'from a', done: true })
+		await legacyA.collection('todos').update(created.id, { done: false, title: 'edited' })
+		await legacyA.sync()
+		await legacyB.sync()
+		await modern.sync()
+
+		// Before transforms ran at fold time the server stored (and delivered) the v2
+		// rewrite, which a v1 client cannot read; now it delivers the original.
+		expect(await legacyB.collection('todos').findById(created.id)).toMatchObject({
+			title: 'edited',
+			done: false,
+		})
+		expect(await modern.collection('todos').findById(created.id)).toMatchObject({
+			title: 'edited',
+			completed: false,
+		})
+		const written = await legacyA.store.getOperationsForRecord('todos', created.id)
+		const stored = await network.server.store.getRecordOperations?.('todos', created.id)
+		expect(stored?.map((op) => op.id).sort()).toEqual(written.map((op) => op.id).sort())
+		for (const op of written) {
+			expect(stored?.find((candidate) => candidate.id === op.id)?.data).toEqual(op.data)
+		}
+		// Nothing was quarantined or refused anywhere.
+		for (const device of network.devices) {
+			expect(await device.getSyncEngine()?.getQuarantinedOperations()).toEqual([])
+		}
+	}, 30000)
 })

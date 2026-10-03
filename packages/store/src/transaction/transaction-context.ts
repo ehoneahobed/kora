@@ -15,6 +15,7 @@ import {
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
+import type { RecordFolder } from '../fold/record-folder'
 import { toAtRestWriteData } from '../mutations/secret-write'
 import {
 	CausalScope,
@@ -74,6 +75,8 @@ export interface TransactionContextConfig {
 	beforeLocalDelete?: LocalDeleteHook
 	/** Called when the commit's storage transaction fails, before the error propagates. */
 	onStorageError?: (error: unknown) => void
+	/** The W7 record fold (see `WriteEnv.fold`). */
+	fold?: RecordFolder
 }
 
 /**
@@ -250,6 +253,7 @@ export class TransactionContext {
 			...(this.config.beforeLocalDelete
 				? { beforeLocalDelete: this.config.beforeLocalDelete }
 				: {}),
+			...(this.config.fold ? { fold: this.config.fold } : {}),
 		}
 	}
 

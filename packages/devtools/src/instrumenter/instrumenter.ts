@@ -34,6 +34,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'sync:durability-restored',
 	'store:persistence-error',
 	'store:quota-exceeded',
+	'store:log-integrity',
+	'store:rematerialized',
 	'store:storage-fallback',
 	'store:opfs-unavailable',
 	'store:durability-lost',

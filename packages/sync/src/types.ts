@@ -227,7 +227,13 @@ export interface SyncConfig {
 	 * entering streaming. Improves backpressure for large initial syncs.
 	 */
 	strictHandshake?: boolean
-	/** Optional operation transforms for cross-schema-version sync. */
+	/**
+	 * Optional schema transforms for cross-schema-version sync. They run at fold time
+	 * (RT-84): delivered operations are stored exactly as received and the local store
+	 * folds their transformed view, so the store must be given the same list (`createApp`
+	 * does). An operation with no transform path to this schema version is kept aside
+	 * and replayed after an upgrade.
+	 */
 	operationTransforms?: import('@korajs/core').OperationTransform[]
 	/**
 	 * Richtext snapshot size (bytes) at which the optional Yjs doc channel is used.
@@ -297,6 +303,14 @@ export interface SyncStatePersistence {
 	 * several node ids (a rotated identity, per-tab isolation) keeps one token per node.
 	 */
 	saveNodeToken?(token: string, nodeId?: string): Promise<void>
+	/**
+	 * The node ids the server named authoritative in its last accepted handshake response
+	 * (`HandshakeResponseMessage.authoritativeNodeIds`, protocol v2): operations from
+	 * these nodes are server-authored and may carry `fieldVersions` / `foldState`.
+	 * Returns null when no protocol-2 server ever answered. Optional.
+	 */
+	loadAuthoritativeNodeIds?(): Promise<string[] | null>
+	saveAuthoritativeNodeIds?(nodeIds: string[]): Promise<void>
 	/**
 	 * The contiguous acknowledged prefix of this device's own operations (W3): the highest
 	 * sequence s such that every own operation with sequence <= s is stored on the server,

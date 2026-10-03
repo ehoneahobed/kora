@@ -156,9 +156,10 @@ describe('encrypt/decrypt roundtrip', () => {
 		const op = makeOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		// data should be encrypted (not the original values)
-		expect(encrypted.data).not.toEqual(op.data)
-		expect(SyncEncryptor.isEncryptedPayload(encrypted.data)).toBe(true)
+		// The plaintext moved into the envelope (protocol v2); data is null on the wire.
+		expect(encrypted.data).toBeNull()
+		expect(SyncEncryptor.isEncryptedOperation(encrypted)).toBe(true)
+		expect(encrypted.encrypted?.data).not.toBeNull()
 
 		// Metadata should be unchanged
 		expect(encrypted.id).toBe(op.id)
@@ -183,9 +184,11 @@ describe('encrypt/decrypt roundtrip', () => {
 		const op = makeUpdateOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		// Both data and previousData should be encrypted
-		expect(SyncEncryptor.isEncryptedPayload(encrypted.data)).toBe(true)
-		expect(SyncEncryptor.isEncryptedPayload(encrypted.previousData)).toBe(true)
+		// Both data and previousData travel only as ciphertext
+		expect(encrypted.data).toBeNull()
+		expect(encrypted.previousData).toBeNull()
+		expect(encrypted.encrypted?.data?.ct).toEqual(expect.any(String))
+		expect(encrypted.encrypted?.previousData?.ct).toEqual(expect.any(String))
 
 		const decrypted = await encryptor.decryptOperation(encrypted)
 		expect(decrypted.data).toEqual(op.data)
@@ -197,9 +200,10 @@ describe('encrypt/decrypt roundtrip', () => {
 		const op = makeDeleteOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		// null fields stay null
+		// null members are still sealed, so a delete is authenticated too
 		expect(encrypted.data).toBeNull()
 		expect(encrypted.previousData).toBeNull()
+		expect(encrypted.encrypted?.data).not.toBeNull()
 
 		const decrypted = await encryptor.decryptOperation(encrypted)
 		expect(decrypted.data).toBeNull()
@@ -223,10 +227,10 @@ describe('encrypt/decrypt roundtrip', () => {
 		const enc2 = await encryptor.encryptOperation(op)
 
 		// The encrypted payloads should have different IVs and thus different ciphertext
-		const payload1 = enc1.data as Record<string, unknown>
-		const payload2 = enc2.data as Record<string, unknown>
-		expect(payload1.iv).not.toBe(payload2.iv)
-		expect(payload1.ct).not.toBe(payload2.ct)
+		const payload1 = enc1.encrypted?.data
+		const payload2 = enc2.encrypted?.data
+		expect(payload1?.iv).not.toBe(payload2?.iv)
+		expect(payload1?.ct).not.toBe(payload2?.ct)
 
 		// But both should decrypt to the same value
 		const dec1 = await encryptor.decryptOperation(enc1)
@@ -241,12 +245,12 @@ describe('encrypted payload structure', () => {
 		const op = makeOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		const payload = encrypted.data as Record<string, unknown>
-		expect(payload.__kora_e2e_encrypted).toBe(true)
-		expect(typeof payload.v).toBe('number')
-		expect(typeof payload.iv).toBe('string')
-		expect(typeof payload.ct).toBe('string')
-		expect(payload.alg).toBe('aes-256-gcm')
+		const envelope = encrypted.encrypted
+		expect(envelope?.v).toBe(2)
+		expect(envelope?.alg).toBe('aes-256-gcm')
+		expect(envelope?.keyId).toMatch(/^k1-[0-9a-f]{16}$/)
+		expect(typeof envelope?.data?.iv).toBe('string')
+		expect(typeof envelope?.data?.ct).toBe('string')
 	})
 
 	test('key version matches current version', async () => {
@@ -254,17 +258,18 @@ describe('encrypted payload structure', () => {
 		const op = makeOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		const payload = encrypted.data as Record<string, unknown>
-		expect(payload.v).toBe(1)
+		expect(encrypted.encrypted?.keyVersion).toBe(1)
 	})
 })
 
 describe('isEncryptedPayload', () => {
-	test('returns true for encrypted payload', async () => {
+	test('recognizes a protocol-1 payload (refused since protocol v2)', async () => {
+		const legacy = { __kora_e2e_encrypted: true, v: 1, iv: 'aaa', ct: 'bbb', alg: 'aes-256-gcm' }
+		expect(isEncryptedPayload(legacy)).toBe(true)
 		const encryptor = await createEncryptor()
-		const op = makeOperation()
-		const encrypted = await encryptor.encryptOperation(op)
-		expect(isEncryptedPayload(encrypted.data)).toBe(true)
+		await expect(encryptor.decryptOperation(makeOperation({ data: legacy }))).rejects.toMatchObject(
+			{ context: expect.objectContaining({ code: 'LEGACY_ENCRYPTED_PAYLOAD' }) },
+		)
 	})
 
 	test('returns false for null', () => {
@@ -290,7 +295,8 @@ describe('key mismatch', () => {
 		const encrypted = await encryptor1.encryptOperation(op)
 
 		await expect(encryptor2.decryptOperation(encrypted)).rejects.toThrow(DecryptionError)
-		await expect(encryptor2.decryptOperation(encrypted)).rejects.toThrow('wrong encryption key')
+		// Different random salts: the key id names the mismatch (ENC-1 stays Phase 4).
+		await expect(encryptor2.decryptOperation(encrypted)).rejects.toThrow('different keys')
 	})
 })
 
@@ -336,8 +342,7 @@ describe('key rotation', () => {
 		const op = makeOperation()
 		const encrypted = await encryptor.encryptOperation(op)
 
-		const payload = encrypted.data as Record<string, unknown>
-		expect(payload.v).toBe(2)
+		expect(encrypted.encrypted?.keyVersion).toBe(2)
 	})
 
 	test('decryption fails when key version is not available', async () => {
@@ -362,9 +367,10 @@ describe('batch operations', () => {
 		const encrypted = await encryptor.encryptBatch(ops)
 
 		expect(encrypted).toHaveLength(3)
-		expect(SyncEncryptor.isEncryptedPayload(encrypted[0]?.data ?? null)).toBe(true)
-		expect(SyncEncryptor.isEncryptedPayload(encrypted[1]?.data ?? null)).toBe(true)
-		expect(encrypted[2]?.data).toBeNull() // delete has null data
+		for (const sealed of encrypted) {
+			expect(sealed.data).toBeNull()
+			expect(SyncEncryptor.isEncryptedOperation(sealed)).toBe(true)
+		}
 	})
 
 	test('decryptBatch decrypts all operations', async () => {
@@ -397,7 +403,8 @@ describe('serialized operation support', () => {
 		}
 
 		const encrypted = await encryptor.encryptSerializedOperation(serialized)
-		expect(SyncEncryptor.isEncryptedPayload(encrypted.data)).toBe(true)
+		expect(encrypted.data).toBeNull()
+		expect(encrypted.encrypted?.v).toBe(2)
 		expect(encrypted.previousData).toBeNull()
 
 		const decrypted = await encryptor.decryptSerializedOperation(encrypted)
@@ -447,17 +454,31 @@ describe('protobuf serializer compatibility', () => {
 })
 
 describe('backward compatibility', () => {
-	test('decrypting unencrypted operation passes through unchanged', async () => {
+	test('a plaintext operation is refused when encryption is enabled (ENC-3)', async () => {
 		const encryptor = await createEncryptor()
-		const op = makeOperation()
-
-		// Decrypt an operation that was never encrypted
-		const decrypted = await encryptor.decryptOperation(op)
-		expect(decrypted.data).toEqual(op.data)
+		await expect(encryptor.decryptOperation(makeOperation())).rejects.toMatchObject({
+			context: expect.objectContaining({ code: 'PLAINTEXT_REJECTED' }),
+		})
+		// Deletes too: an unauthenticated delete is as dangerous as an insert.
+		await expect(encryptor.decryptOperation(makeDeleteOperation())).rejects.toThrow(DecryptionError)
 	})
 
-	test('mixed encrypted/unencrypted batch', async () => {
-		const encryptor = await createEncryptor()
+	test('allowPlaintextMigration passes plaintext through during a migration window', async () => {
+		const encryptor = await SyncEncryptor.create(
+			{ enabled: true, key: 'k', allowPlaintextMigration: true },
+			undefined,
+			TEST_KDF_ITERATIONS,
+		)
+		const op = makeOperation()
+		expect((await encryptor.decryptOperation(op)).data).toEqual(op.data)
+	})
+
+	test('mixed encrypted/unencrypted batch during migration', async () => {
+		const encryptor = await SyncEncryptor.create(
+			{ enabled: true, key: 'k', allowPlaintextMigration: true },
+			undefined,
+			TEST_KDF_ITERATIONS,
+		)
 		const plainOp = makeOperation({ id: 'plain-1' })
 		const encOp = await encryptor.encryptOperation(
 			makeOperation({ id: 'enc-1', data: { secret: 'value' } }),
@@ -487,8 +508,8 @@ describe('server relay simulation', () => {
 		const serverStored = JSON.parse(JSON.stringify(encrypted)) as Operation
 
 		// Verify server cannot read the data
-		expect(serverStored.data).not.toEqual(op.data)
-		expect(SyncEncryptor.isEncryptedPayload(serverStored.data)).toBe(true)
+		expect(serverStored.data).toBeNull()
+		expect(JSON.stringify(serverStored)).not.toContain('Private Note')
 
 		// "Server" relays to Client B
 		const decrypted = await clientBEncryptor.decryptOperation(serverStored)
@@ -619,5 +640,59 @@ describe('edge cases', () => {
 		const encrypted = await encryptor.encryptOperation(op)
 		const decrypted = await encryptor.decryptOperation(encrypted)
 		expect(decrypted.data).toEqual(op.data)
+	})
+})
+
+describe('isCleartextOnly (server-authored plaintext under encryption)', () => {
+	async function withCleartext(): Promise<SyncEncryptor> {
+		return SyncEncryptor.create(
+			{ enabled: true, key: 'k', cleartextFields: { todos: ['ownerId', 'projectId'] } },
+			undefined,
+			TEST_KDF_ITERATIONS,
+		)
+	}
+
+	test('a delete (whatever its previousData) and a cleartext-only write qualify', async () => {
+		const encryptor = await withCleartext()
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({ type: 'delete', data: null, previousData: { title: null, ownerId: 'u' } }),
+			),
+		).toBe(true)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({
+					type: 'update',
+					data: { projectId: null },
+					previousData: { projectId: 'p' },
+				}),
+			),
+		).toBe(true)
+	})
+
+	test('a sealed field, atomic ops, an envelope or an unknown collection do not', async () => {
+		const encryptor = await withCleartext()
+		expect(encryptor.isCleartextOnly(makeOperation({ type: 'update', data: { title: 'x' } }))).toBe(
+			false,
+		)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({ type: 'update', data: { ownerId: 'u' }, previousData: { title: 'x' } }),
+			),
+		).toBe(false)
+		expect(
+			encryptor.isCleartextOnly(
+				makeOperation({
+					type: 'update',
+					data: { ownerId: 'u' },
+					atomicOps: { ownerId: { type: 'max', value: 1 } },
+				}),
+			),
+		).toBe(false)
+		const sealed = await encryptor.encryptOperation(makeOperation({ data: { ownerId: 'u' } }))
+		expect(encryptor.isCleartextOnly(sealed)).toBe(false)
+		expect(
+			encryptor.isCleartextOnly(makeOperation({ collection: 'other', data: { ownerId: 'u' } })),
+		).toBe(false)
 	})
 })

@@ -176,6 +176,8 @@ export class KoraSyncServer {
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
 	private readonly operationTransforms: OperationTransform[]
+	/** The store's re-fold for the configured transforms (RT-84), awaited by start(). */
+	private storeTransformsReady: Promise<void> | undefined
 	private readonly port: number | undefined
 	private readonly host: string
 	private readonly path: string
@@ -200,6 +202,9 @@ export class KoraSyncServer {
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
+	private readonly encryptionPolicy:
+		| { required: boolean; allowPlaintextMigration?: boolean }
+		| undefined
 	private readonly handshakeTimeoutMs: number | undefined
 	private readonly maxBufferedBytes: number
 	private readonly deliveryHighWaterBytes: number | undefined
@@ -301,7 +306,24 @@ export class KoraSyncServer {
 			min: this.schemaVersion,
 			max: this.schemaVersion,
 		}
-		this.operationTransforms = config.operationTransforms ?? []
+		this.operationTransforms = config.operationTransforms ?? [
+			...(this.store.getOperationTransforms?.() ?? []),
+		]
+		// Transforms run at fold time (RT-84): the store folds every operation as the
+		// server schema reads it, with exactly the transforms sessions judge with.
+		if (config.operationTransforms !== undefined && this.store.setOperationTransforms) {
+			const ready = this.store.setOperationTransforms(this.operationTransforms)
+			this.storeTransformsReady = ready
+			// Surfaced by start(); logged here for attach mode (handleConnection only).
+			ready.catch((error: unknown) => {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'error',
+					event: 'server.operation_transforms_failed',
+					details: { message: error instanceof Error ? error.message : String(error) },
+				})
+			})
+		}
 		this.port = config.port
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
@@ -344,6 +366,7 @@ export class KoraSyncServer {
 			'appHeartbeatIntervalMs',
 			config.appHeartbeatIntervalMs ?? DEFAULT_APP_HEARTBEAT_INTERVAL_MS,
 		)
+		this.encryptionPolicy = config.encryption ? { ...config.encryption } : undefined
 		this.handshakeTimeoutMs =
 			config.handshakeTimeoutMs === undefined
 				? undefined
@@ -644,6 +667,8 @@ export class KoraSyncServer {
 		for (const entry of [...this.httpSessions.values()]) {
 			if (entry.lastSeenAtMs <= cutoff) {
 				entry.transport.close(4008, 'http session idle')
+				// A closed session left only for its final messages is dropped too.
+				this.httpSessions.delete(entry.id)
 			}
 		}
 	}
@@ -799,6 +824,14 @@ export class KoraSyncServer {
 			})
 		})
 
+		sessionEmitter.on('sync:unverified-legacy-operation', () => {
+			this.metrics.recordUnverifiedLegacyOperation()
+		})
+
+		sessionEmitter.on('sync:forged-duplicate', () => {
+			this.metrics.recordForgedDuplicate()
+		})
+
 		sessionEmitter.on('sync:sent', (event) => {
 			const byteSize = estimateByteSize(event.operations)
 			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
@@ -862,6 +895,7 @@ export class KoraSyncServer {
 		if (this.running) {
 			throw new SyncError('Server is already running', { port: this.port })
 		}
+		await this.storeTransformsReady
 
 		if (!wsServerImpl && this.port === undefined) {
 			throw new SyncError(
@@ -1029,6 +1063,9 @@ export class KoraSyncServer {
 		}
 
 		const polled = entry.transport.poll(request.ifNoneMatch)
+		if (!entry.transport.isConnected() && !entry.transport.hasPending()) {
+			this.httpSessions.delete(entry.id)
+		}
 		return {
 			status: polled.status,
 			body: polled.body,
@@ -1160,6 +1197,14 @@ export class KoraSyncServer {
 			})
 		})
 
+		sessionEmitter.on('sync:unverified-legacy-operation', () => {
+			this.metrics.recordUnverifiedLegacyOperation()
+		})
+
+		sessionEmitter.on('sync:forged-duplicate', () => {
+			this.metrics.recordForgedDuplicate()
+		})
+
 		sessionEmitter.on('sync:sent', (event) => {
 			const byteSize = estimateOperationByteSize(event.operations)
 			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
@@ -1275,6 +1320,8 @@ export class KoraSyncServer {
 			isNodeLive: (nodeId, exceptSessionId) => this.isNodeLive(nodeId, exceptSessionId),
 			rateLimiterFor: (nodeId, principal) => this.rateLimiterFor(nodeId, principal),
 			appHeartbeatIntervalMs: this.appHeartbeatIntervalMs,
+			authoritativeNodeIds: this.authoritativeNodeIds,
+			...(this.encryptionPolicy ? { encryption: this.encryptionPolicy } : {}),
 			...(this.handshakeTimeoutMs !== undefined
 				? { handshakeTimeoutMs: this.handshakeTimeoutMs }
 				: {}),
@@ -1416,6 +1463,18 @@ export class KoraSyncServer {
 		return this.sessions.size
 	}
 
+	/**
+	 * Node ids whose operations win `merge('server-authoritative')` fields in the fold
+	 * (W7): the store's own node id, which authors every server-originated operation
+	 * (side effects, constraint corrections, route writes), plus any extras the store
+	 * was configured with (`authoritativeNodeIds` store option). This is the one source
+	 * of truth: every session advertises exactly this list in the handshake, so clients
+	 * fold with the same authority as the server's stores.
+	 */
+	get authoritativeNodeIds(): string[] {
+		return this.store.getAuthoritativeNodeIds?.() ?? [this.store.getNodeId()]
+	}
+
 	// --- Private ---
 
 	/**
@@ -1506,7 +1565,11 @@ export class KoraSyncServer {
 		const httpSessionId = this.httpSessionIdBySession.get(sessionId)
 		if (httpSessionId) {
 			this.httpSessionIdBySession.delete(sessionId)
-			this.httpSessions.delete(httpSessionId)
+			// Keep a closed HTTP session until the client polls what was queued before the
+			// close (the error that explains it); the idle sweep drops it otherwise.
+			if (!this.httpSessions.get(httpSessionId)?.transport.hasPending()) {
+				this.httpSessions.delete(httpSessionId)
+			}
 		}
 	}
 

@@ -388,8 +388,12 @@ export class OutboundQueue {
 
 	/** Remove every pending/in-flight operation for a record so authorization loss cannot upload it. */
 	async rejectRecord(collection: string, recordId: string): Promise<Operation[]> {
+		// An operation already put on the wire may be stored by the server whatever this
+		// device decides now: it stays in flight and its ack (stored) or rejection
+		// resolves it. Quarantining it here would exclude from this device's fold a write
+		// every other replica folds (merge breakage found in Phase 3: RT-27 retract case).
 		const matching = [...this.queue, ...[...this.inFlight.values()].flat()].filter(
-			(op) => op.collection === collection && op.recordId === recordId,
+			(op) => op.collection === collection && op.recordId === recordId && !this.sent.has(op.id),
 		)
 		const removed: Operation[] = []
 		for (const operation of matching) {

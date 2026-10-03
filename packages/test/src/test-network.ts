@@ -32,6 +32,19 @@ export interface TestNetworkOptions {
 	blobStorage?: boolean
 	/** Adjudicate untrusted client operations on the server before materialization. */
 	validateOperation?: import('@korajs/server').OperationValidator
+	/** Devices use the beta.13 pairwise pipeline (`experimental.legacyMerge`). */
+	legacyMerge?: boolean
+	/**
+	 * The server's store (SQLite, Postgres). Defaults to a fresh memory store. The
+	 * network closes it.
+	 */
+	serverStore?: import('@korajs/server').ServerStore
+	/** Every device encrypts its sync traffic with this shared key material. */
+	encryption?: import('./test-device').TestDeviceEncryption
+	/** The sync server's encryption policy. */
+	serverEncryption?: import('@korajs/server').KoraSyncServerConfig['encryption']
+	/** Every device store's local `maxOperationBytes` (RT-86). */
+	deviceMaxOperationBytes?: number
 }
 
 /**
@@ -39,7 +52,7 @@ export interface TestNetworkOptions {
  */
 export interface TestNetwork {
 	/** The test server */
-	server: TestServer
+	server: TestServer<import('@korajs/server').ServerStore>
 	/** All devices in the network */
 	devices: TestDevice[]
 	/** Temporary directory for DB files */
@@ -85,10 +98,13 @@ export async function createTestNetwork(
 	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
 
 	// Create server
-	const server = new TestServer(schema, {
+	const server = new TestServer<import('@korajs/server').ServerStore>(schema, {
 		blobStorage: options?.blobStorage,
 		validateOperation: options?.validateOperation,
+		...(options?.serverStore ? { store: options.serverStore } : {}),
+		...(options?.serverEncryption ? { encryption: options.serverEncryption } : {}),
 	})
+	await server.ready
 
 	// Create devices
 	const devices: TestDevice[] = []
@@ -108,6 +124,11 @@ export async function createTestNetwork(
 				return options?.wrapTransport ? options.wrapTransport(base) : base
 			},
 			tmpDir,
+			...(options?.legacyMerge ? { legacyMerge: true } : {}),
+			...(options?.encryption ? { encryption: options.encryption } : {}),
+			...(options?.deviceMaxOperationBytes !== undefined
+				? { maxOperationBytes: options.deviceMaxOperationBytes }
+				: {}),
 		})
 		await device.open()
 		devices.push(device)

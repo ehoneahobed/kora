@@ -10,6 +10,8 @@ export type {
 	Constraint,
 	CustomResolver,
 	BlobRef,
+	EncryptedEnvelopeField,
+	EncryptedOperationEnvelope,
 	FieldDescriptor,
 	FieldKind,
 	SecretMode,
@@ -47,6 +49,7 @@ export {
 	MergeConflictError,
 	OperationError,
 	SchemaValidationError,
+	OperationTooLargeError,
 	StorageError,
 	SyncError,
 } from './errors/errors'
@@ -90,8 +93,23 @@ export type { ApplyFailureReason, ApplyResult } from './operations/apply-result'
 export {
 	createOperation,
 	isValidOperation,
+	verifyOperationId,
 	verifyOperationIntegrity,
 } from './operations/operation'
+export type { CreateOperationOptions } from './operations/operation'
+export {
+	DEFAULT_OPERATION_HASH_VERSION,
+	computeOperationId,
+} from './operations/content-hash'
+export type { HashableOperation, OperationHashVersion } from './operations/content-hash'
+export {
+	NonCanonicalValueError,
+	canonicalValue,
+	canonicalizeLegacyOperation,
+	canonicalizeOperationBody,
+	canonicalizeProvenLegacyClear,
+} from './operations/canonical-body'
+export type { CanonicalizableBody, LegacyBody } from './operations/canonical-body'
 
 // === Atomic Operations ===
 export {
@@ -115,6 +133,77 @@ export type {
 	ReplayOperation,
 	VersionedReplayOperation,
 } from './operations/replay-record'
+
+// === Record fold: one deterministic per-field CRDT merge (W7) ===
+export {
+	FOLD_RECORD_TRACE_FIELD,
+	createFoldState,
+	foldRecord,
+	getFoldFieldVersionStrings,
+	getFoldFieldVersions,
+	isFoldStateLive,
+	joinStates,
+	materialize,
+	mergeOp,
+} from './fold/fold'
+export { deserializeFoldState, serializeFoldState } from './fold/serialize'
+export {
+	adaptFoldState,
+	createSnapshotState,
+	type AdaptedFoldState,
+	type FoldSnapshotInput,
+	type FoldSnapshotOptions,
+} from './fold/snapshot'
+export {
+	foldPlanFingerprint,
+	foldPlanFingerprints,
+	mismatchedFoldFields,
+} from './fold/plan'
+export {
+	RESERVED_NODE_ID_PREFIX,
+	SERVER_NODE_ID_PREFIX,
+	isAuthoritativeNodeId,
+	isReservedNodeId,
+	isServerNodeId,
+} from './fold/authority'
+export { toMergeTrace } from './fold/trace'
+
+// === Lossless stored text (RT-65) ===
+export {
+	STORED_TEXT_ESCAPE,
+	decodeStoredJsonValue,
+	decodeStoredText,
+	encodeStoredJsonValue,
+	encodeStoredText,
+	needsStoredTextEncoding,
+} from './text/stored-text'
+export { deriveSideEffectOpId } from './fold/side-effect-id'
+export { FoldConfigurationError, FoldStateError } from './fold/errors'
+export { FOLD_STATE_VERSION } from './fold/types'
+export type {
+	CounterFieldState,
+	ElementSetFieldState,
+	ElementState,
+	ExtremumFieldState,
+	FieldLogEntry,
+	FieldState,
+	FoldFieldKind,
+	FoldFieldVersions,
+	FoldOptions,
+	FoldRecordResult,
+	FoldState,
+	FoldTrace,
+	FoldTraceMode,
+	KeyMapFieldState,
+	KeyState,
+	MergeOpResult,
+	RegisterFieldState,
+	ResolverFieldState,
+	RichtextFieldState,
+	RichtextSubsumes,
+	RichtextUpdateMerger,
+	Stamp,
+} from './fold/types'
 
 // === Binary op-data encoding ===
 export {
@@ -140,7 +229,19 @@ export type {
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
 export { quoteIdent } from './schema/quote-ident'
 export { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './schema/types'
-export { validateRecord } from './schema/validation'
+export { assertResolvedFieldValue, validateRecord } from './schema/validation'
+export {
+	DEFAULT_MAX_OPERATION_BYTES,
+	MAX_VALUE_DEPTH,
+	TIMESTAMP_MAX_MS,
+	TIMESTAMP_MIN_MS,
+	measureOperationBytes,
+	operationValueViolation,
+	protoKeyViolation,
+	reservedWireShapeViolation,
+	timestampDomainViolation,
+	valueDepthViolation,
+} from './schema/value-domain'
 
 // === Type Inference ===
 export type {
@@ -185,8 +286,17 @@ export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence
 // === Migrations ===
 export type { OperationTransform } from './migration/operation-transform'
 export { applyOperationTransforms } from './migration/apply-operation-transforms'
+export {
+	OperationTransformError,
+	operationSchemaView,
+	operationTransformsFingerprint,
+} from './migration/operation-view'
 export { MigrationBuilder, RollbackBuilder, migrate } from './migrations/migration-builder'
-export type { MigrationDefinition, MigrationStep } from './migrations/migration-builder'
+export type {
+	BackfillOptions,
+	MigrationDefinition,
+	MigrationStep,
+} from './migrations/migration-builder'
 export { migrationStepsToSQL, rollbackStepsToSQL } from './migrations/migration-sql'
 export {
 	MigrationRollbackError,

@@ -113,6 +113,13 @@ export interface KoraSyncServerConfig {
 	 */
 	appHeartbeatIntervalMs?: number
 	/**
+	 * End-to-end encryption policy (protocol v2, ENC-3). With `required: true` an
+	 * uploaded plaintext operation that carries data is refused non-retriably
+	 * (`PLAINTEXT_REJECTED`), unless `allowPlaintextMigration` opens a migration window.
+	 * Encrypted operations (envelope v2) are always stored opaquely, never transformed.
+	 */
+	encryption?: { required: boolean; allowPlaintextMigration?: boolean }
+	/**
 	 * Time a new connection has to send its handshake, in ms. Defaults to 10 seconds;
 	 * 0 disables the deadline.
 	 */
@@ -160,10 +167,13 @@ export interface KoraSyncServerConfig {
 	 */
 	supportedSchemaVersions?: { min: number; max: number }
 	/**
-	 * Transform accepted legacy client operations into the server schema version
-	 * before validation and materialization. Required when
-	 * `supportedSchemaVersions.min` is lower than `schemaVersion` and operation
-	 * shapes changed across versions.
+	 * Schema transforms from older client schema versions to the server schema version.
+	 * Required when `supportedSchemaVersions.min` is lower than `schemaVersion` and
+	 * operation shapes changed across versions. They run at fold time (RT-84): every
+	 * operation is stored and delivered exactly as uploaded; authorization, validators
+	 * and the store's fold use its transformed view. The server hands this list to its
+	 * store (`setOperationTransforms`); pass it to `store.setSchema` too to fold with it
+	 * from the first start. Transforms must be pure and deterministic.
 	 */
 	operationTransforms?: OperationTransform[]
 	/** WebSocket path (standalone mode). Defaults to '/'. */

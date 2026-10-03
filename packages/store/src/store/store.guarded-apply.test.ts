@@ -51,7 +51,8 @@ describe('guarded / override apply', () => {
 
 	beforeEach(async () => {
 		adapter = new BetterSqlite3Adapter(':memory:')
-		store = new Store({ schema, adapter, nodeId: 'local-node' })
+		// These options (guard, materializeData/Timestamp) belong to the legacy (beta.13) paths.
+		store = new Store({ schema, adapter, nodeId: 'local-node', materialization: 'legacy' })
 		await store.open()
 		await store.applyRemoteOperation(
 			makeOp({

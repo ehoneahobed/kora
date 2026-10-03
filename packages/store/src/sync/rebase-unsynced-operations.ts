@@ -1,11 +1,11 @@
 import { HybridLogicalClock, MAX_LOGICAL, quoteIdent } from '@korajs/core'
-import type { HLCTimestamp, Operation, OperationInput, SchemaDefinition } from '@korajs/core'
-import { computeOperationId } from '@korajs/core/internal'
+import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
 import { parseFieldVersions, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
+import { rehashOperation } from './rehash-operation'
 
 /**
  * Result of re-stamping unsynced operations after a clock correction.
@@ -106,53 +106,25 @@ export async function rebaseUnsyncedOperationsInLog(
 		nodeId: op.nodeId,
 	}))
 
-	// Recompute content-addressed ids first: the hash covers only
-	// {type, collection, recordId, data, timestamp, nodeId} (+ atomicOps when
-	// present), NOT causalDeps, so ids can be derived before dep remapping.
-	// The deserialized `data` has the embedded metadata keys (transactionId,
-	// mutationName, atomicOps) already stripped, matching exactly what the
-	// original creation path hashed.
+	// Recompute content-addressed ids in the original (causal) order. A version-2 id
+	// (protocol v2, CORE-1) covers causalDeps, so each dependency's new id must be known
+	// before its dependents are hashed: deps among the rebased set are remapped first.
+	// Deps on non-rebased (already acknowledged or foreign) operations keep their ids.
+	// Each operation keeps its own hash version: a version-1 operation (written before
+	// beta.14) is re-hashed with version 1. The deserialized `data` has the embedded
+	// metadata keys already stripped, matching exactly what the creation path hashed.
 	const idMapping: Record<string, string> = {}
-	const newIds: string[] = []
+	const newOperations: Operation[] = []
 	for (let i = 0; i < rebased.length; i++) {
 		const op = rebased[i]
 		const ts = newTimestamps[i]
 		if (!op || !ts) {
 			continue
 		}
-		const input: OperationInput = {
-			nodeId: op.nodeId,
-			type: op.type,
-			collection: op.collection,
-			recordId: op.recordId,
-			data: op.data,
-			previousData: op.previousData,
-			sequenceNumber: op.sequenceNumber,
-			causalDeps: op.causalDeps,
-			schemaVersion: op.schemaVersion,
-			...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
-		}
-		const newId = await computeOperationId(input, HybridLogicalClock.serialize(ts))
+		const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+		const newId = await rehashOperation({ ...op, timestamp: ts, causalDeps })
 		idMapping[op.id] = newId
-		newIds.push(newId)
-	}
-
-	// Remap causal deps among the rebased set; deps on non-rebased (already
-	// acknowledged or foreign) operations keep their original ids.
-	const newOperations: Operation[] = []
-	for (let i = 0; i < rebased.length; i++) {
-		const op = rebased[i]
-		const ts = newTimestamps[i]
-		const newId = newIds[i]
-		if (!op || !ts || newId === undefined) {
-			continue
-		}
-		newOperations.push({
-			...op,
-			id: newId,
-			timestamp: ts,
-			causalDeps: op.causalDeps.map((dep) => idMapping[dep] ?? dep),
-		})
+		newOperations.push({ ...op, id: newId, timestamp: ts, causalDeps })
 	}
 
 	// Write phase: one transaction so a crash can never leave the log with a

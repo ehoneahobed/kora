@@ -53,9 +53,14 @@ export {
 	computeAckCompactionWatermark,
 } from './compaction/compact-operation-log'
 
+// === W7 record fold (client materialization) ===
+export { mergeYjsUpdates } from './fold/record-folder'
+export type { RematerializationMode } from './fold/rematerialize'
+
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
+export type { ResequenceResult } from './sync/rehash-operation'
 export type { UnappliedOperation } from './sync/sync-durability'
 export type {
 	AdoptionSchedule,
@@ -140,18 +145,31 @@ export { pluralize, singularize } from './query/pluralize'
 
 // === Backup/Restore ===
 export {
+	BACKUP_VERSION,
+	BackupFormatError,
+	convertBackupV1,
 	exportBackup,
 	readBackupManifest,
 	restoreBackup,
 	verifyBackupChecksum,
 } from './backup'
 export type {
+	ConvertBackupV1Options,
 	BackupManifest,
 	BackupOptions,
 	BackupProgress,
 	RestoreOptions,
 	RestoreResult,
 } from './backup'
+
+// === Log integrity (W8 step 0) ===
+export { LOG_QUARANTINE_TABLE } from './log-integrity/log-integrity'
+export type {
+	LogIntegrityReport,
+	LogIntegrityRow,
+	LogRowProblem,
+	LogSequenceGap,
+} from './log-integrity/log-integrity'
 
 // === Audit export ===
 export {

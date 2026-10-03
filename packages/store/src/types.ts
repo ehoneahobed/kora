@@ -2,6 +2,7 @@ import type {
 	HLCTimestamp,
 	KoraEventEmitter,
 	Operation,
+	OperationTransform,
 	SchemaDefinition,
 	SecretKeyProvider,
 } from '@korajs/core'
@@ -119,6 +120,30 @@ export interface StoreConfig {
 	 * Required only when the schema declares encrypted secret fields.
 	 */
 	secretKeyProvider?: SecretKeyProvider
+	/**
+	 * How rows are materialized. `'fold'` (default, W7): every write merges into the
+	 * record's per-field CRDT fold state, which re-materializes the row. `'legacy'`:
+	 * the beta.13 per-field LWW write paths (used by `experimental.legacyMerge` for
+	 * one beta, to compare). Switching modes on an existing database re-materializes
+	 * it on open.
+	 */
+	materialization?: 'fold' | 'legacy'
+	/**
+	 * Schema transforms applied at fold time (RT-84): an operation authored under an
+	 * older schema version is stored exactly as written and folded as
+	 * `operationSchemaView(op, schema.version, transforms)` reads it. Pass the same list
+	 * as the sync engine's `operationTransforms` (`createApp` does). Transforms must be
+	 * pure and deterministic; they are part of the fold plan fingerprint, so changing
+	 * them re-folds once.
+	 */
+	operationTransforms?: readonly OperationTransform[]
+	/**
+	 * Largest serialized operation a local write may produce, in bytes (RT-86). Set it to
+	 * the sync server's `maxOperationBytes`. A write over it is refused with
+	 * `OperationTooLargeError` and nothing is written. Default 256 KiB, the server's
+	 * default.
+	 */
+	maxOperationBytes?: number
 }
 
 /**
@@ -232,6 +257,11 @@ export type { ApplyResult } from '@korajs/core'
  * Options for applying a remote operation to materialized storage.
  */
 export interface ApplyRemoteOptions {
+	/**
+	 * W7: receives the merge traces of the operation (conflicting field decisions),
+	 * after commit. The store also emits them as `merge:*` events.
+	 */
+	onMergeTraces?: (traces: import('@korajs/core').MergeTrace[]) => void
 	/** When true, a winning remote update clears soft-delete on the row. */
 	reactivateIfDeleted?: boolean
 	/**

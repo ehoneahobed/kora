@@ -67,6 +67,71 @@ export interface Operation {
 	 * `timestamp` is then the record's creation time. Not part of the content hash.
 	 */
 	fieldVersions?: Record<string, HLCTimestamp>
+	/**
+	 * Content-hash version of `id` (CORE-1). Absent means 1: the id covers type,
+	 * collection, recordId, data, timestamp, nodeId and atomicOps. 2: it also
+	 * covers previousData, sequenceNumber, causalDeps and schemaVersion. Verify
+	 * with `verifyOperationId`. New operations are version 2 (protocol v2); the
+	 * field is carried on the wire (protobuf operation field 14) and persisted.
+	 */
+	hashVersion?: 1 | 2
+	/**
+	 * Server-authored serialized fold state (`serializeFoldState`) of the record (W7),
+	 * carried on scope-entry inserts instead of `fieldVersions`, and present only on
+	 * operations from a node the handshake named authoritative
+	 * (`HandshakeResponseMessage.authoritativeNodeIds`). A receiver joins it into its own
+	 * state (`joinStates`), so every field kind (richtext, counters, resolvers, element
+	 * sets) enters with its full merge state. Opaque to the protocol layer. NOT part of
+	 * the content hash; the server strips it from every device upload. Protobuf
+	 * operation field 15.
+	 */
+	foldState?: string
+	/**
+	 * End-to-end encryption envelope (protocol v2, W9). When present the operation's
+	 * `data`, `previousData` and `atomicOps` travel only inside this envelope as
+	 * ciphertext; `data` is null (or holds only the documented cleartext scope fields)
+	 * and `previousData`/`atomicOps` are absent. The id is the version-2 hash of the
+	 * PLAINTEXT operation and is verified after decryption. Not part of the content hash.
+	 * Protobuf operation field 16 (JSON).
+	 */
+	encrypted?: EncryptedOperationEnvelope
+}
+
+/**
+ * One AES-GCM ciphertext inside an {@link EncryptedOperationEnvelope}.
+ */
+export interface EncryptedEnvelopeField {
+	/** Base64 12-byte IV, unique per field encryption. */
+	iv: string
+	/** Base64 AES-GCM ciphertext including the 16-byte tag. */
+	ct: string
+}
+
+/**
+ * Versioned end-to-end encryption envelope of an operation (protocol v2, ENC-3,
+ * NEW-ENC-1). Each encrypted member is bound by AES-GCM additional authenticated data
+ * to canonical(nodeId, collection, recordId, type, timestamp, sequenceNumber, field,
+ * keyVersion), so a ciphertext cannot be moved to another operation, record or field.
+ */
+export interface EncryptedOperationEnvelope {
+	/** Envelope format version. 2 is the only defined value. */
+	v: 2
+	/** Cipher. Only AES-256-GCM is defined. */
+	alg: 'aes-256-gcm'
+	/**
+	 * Identifier of the key material (key-derivation salt fingerprint), so a device
+	 * holding different key material reports a diagnosable mismatch instead of a bare
+	 * authentication failure (ENC-1 key distribution is still to come).
+	 */
+	keyId: string
+	/** Key version used (rotation). */
+	keyVersion: number
+	/** Ciphertext of `data`, or null when the plaintext `data` is null. */
+	data: EncryptedEnvelopeField | null
+	/** Ciphertext of `previousData`, or null when it is null. */
+	previousData: EncryptedEnvelopeField | null
+	/** Ciphertext of `atomicOps`, present only when the plaintext operation had them. */
+	atomicOps?: EncryptedEnvelopeField
 }
 
 /**

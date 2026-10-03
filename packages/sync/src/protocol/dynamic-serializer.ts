@@ -1,4 +1,9 @@
-import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
+import type {
+	EncryptedOperationEnvelope,
+	HLCTimestamp,
+	Operation,
+	SchemaDefinition,
+} from '@korajs/core'
 import { SyncError, generateProtoDefinitions } from '@korajs/core'
 import protobuf from 'protobufjs'
 import type {
@@ -23,7 +28,7 @@ function decodeJsonBytes(value: unknown): string | undefined {
 }
 import { isSyncMessage } from './messages'
 import type { EncodedMessage, MessageSerializer } from './serializer'
-import { JsonMessageSerializer, normalizeFieldVersions } from './serializer'
+import { JsonMessageSerializer, normalizeEnvelope, normalizeFieldVersions } from './serializer'
 
 /**
  * Compiled protobuf root and message types, cached after first compilation.
@@ -275,7 +280,17 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 	 */
 	private serializeOperation(op: SerializedOperation): Record<string, unknown> {
 		// Build data JSON, embedding metadata for backward compatibility
-		const hasMetadata = op.transactionId !== undefined || op.mutationName !== undefined
+		// Protocol v2 operation fields ride in the data JSON here (this serializer's proto
+		// is generated from the app schema and has no operation fields 14-16).
+		const v2Meta: Record<string, unknown> = {}
+		if (op.hashVersion !== undefined) v2Meta.__kora_hash_version__ = op.hashVersion
+		if (op.foldState !== undefined) v2Meta.__kora_fold_state__ = op.foldState
+		if (op.encrypted !== undefined) v2Meta.__kora_encrypted__ = op.encrypted
+		const hasMetadata =
+			op.transactionId !== undefined ||
+			op.mutationName !== undefined ||
+			Object.keys(v2Meta).length > 0 ||
+			(op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0)
 		let dataJson = ''
 		if (op.data !== null) {
 			const dataPayload: Record<string, unknown> = { ...op.data }
@@ -291,9 +306,13 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			if (op.fieldVersions !== undefined) {
 				dataPayload.__kora_field_versions__ = op.fieldVersions
 			}
+			Object.assign(dataPayload, v2Meta)
 			dataJson = JSON.stringify(dataPayload)
 		} else if (hasMetadata) {
-			const meta: Record<string, unknown> = {}
+			const meta: Record<string, unknown> = { ...v2Meta }
+			if (op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0) {
+				meta.__kora_atomic_ops__ = op.atomicOps
+			}
 			if (op.transactionId !== undefined) meta.__kora_tx_id__ = op.transactionId
 			if (op.mutationName !== undefined) meta.__kora_mutation__ = op.mutationName
 			dataJson = JSON.stringify(meta)
@@ -528,6 +547,9 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 		let transactionId: string | undefined
 		let mutationName: string | undefined
 		let fieldVersions: Record<string, HLCTimestamp> | undefined
+		let hashVersion: unknown
+		let foldState: unknown
+		let encrypted: EncryptedOperationEnvelope | undefined
 
 		const dataJsonRaw = op.dataJson as string | undefined
 		if ((hasData || (dataJsonRaw && dataJsonRaw.length > 0)) && dataJsonRaw) {
@@ -547,14 +569,21 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 					if ('__kora_field_versions__' in parsed) {
 						fieldVersions = normalizeFieldVersions(parsed.__kora_field_versions__)
 					}
+					hashVersion = parsed.__kora_hash_version__
+					foldState = parsed.__kora_fold_state__
+					encrypted = normalizeEnvelope(parsed.__kora_encrypted__)
 					const {
 						__kora_atomic_ops__: _a,
 						__kora_tx_id__: _t,
 						__kora_mutation__: _m,
 						__kora_field_versions__: _f,
+						__kora_hash_version__: _h,
+						__kora_fold_state__: _s,
+						__kora_encrypted__: _e,
 						...rest
 					} = parsed
-					data = hasData && Object.keys(rest).length > 0 ? rest : null
+					// `hasData`: `{}` stays `{}` (the op's id covers it).
+					data = hasData ? rest : null
 				}
 			} catch {
 				// Fall back: data stays null
@@ -604,6 +633,11 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 			...(transactionId !== undefined ? { transactionId } : {}),
 			...(mutationName !== undefined ? { mutationName } : {}),
 			...(fieldVersions !== undefined ? { fieldVersions } : {}),
+			...(hashVersion !== undefined && hashVersion !== null
+				? { hashVersion: hashVersion as 1 | 2 }
+				: {}),
+			...(typeof foldState === 'string' ? { foldState } : {}),
+			...(encrypted !== undefined ? { encrypted } : {}),
 		}
 	}
 }

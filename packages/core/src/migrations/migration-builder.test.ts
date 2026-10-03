@@ -119,6 +119,28 @@ describe('MigrationBuilder', () => {
 		}
 	})
 
+	test('backfill options: localOnly and reverseTransform', () => {
+		const forward = (r: Record<string, unknown>) => ({ cached: r.id })
+		const reverse = (r: Record<string, unknown>) => ({ cached: r.cached })
+		const builder = migrate()
+			.backfill('products', forward, { localOnly: true })
+			.backfill('products', forward, { reverseTransform: reverse })
+		const [local, synced] = builder.steps
+		expect(local).toEqual({
+			type: 'backfill',
+			collection: 'products',
+			transform: forward,
+			localOnly: true,
+		})
+		expect(synced).toEqual({
+			type: 'backfill',
+			collection: 'products',
+			transform: forward,
+			reverseTransform: reverse,
+		})
+		expect(builder.safelyReversible).toBe(false)
+	})
+
 	test('chaining produces ordered steps', () => {
 		const builder = migrate()
 			.addField('products', 'taxInclusive', t.boolean().default(false))

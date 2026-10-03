@@ -2,6 +2,7 @@ import type { Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { JsonMessageSerializer } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { withContentId } from '../../tests/fixtures/content-id'
 import { TokenAuthProvider } from '../auth/token-auth'
 import { MemoryServerStore } from '../store/memory-server-store'
 import type { HttpSyncRequest } from '../types'
@@ -102,7 +103,7 @@ describe('KoraSyncServer HTTP sync endpoint', () => {
 		await drainPollQueue(server, a)
 		await drainPollQueue(server, b)
 
-		const op = createTestOp({ id: 'relay-op-1' })
+		const op = withContentId(createTestOp())
 		await server.handleHttpRequest({
 			sessionId: a,
 			method: 'POST',
@@ -118,10 +119,11 @@ describe('KoraSyncServer HTTP sync endpoint', () => {
 
 		const relayed = await pollForMessage(server, b, (message) => {
 			if (message.type !== 'operation-batch') return false
-			return message.operations.some((operation) => operation.id === 'relay-op-1')
+			return message.operations.some((operation) => operation.id === op.id)
 		})
 
-		expect(relayed).toBeDefined()
+		// pollForMessage returns null when nothing matched (toBeDefined accepted it).
+		expect(relayed).not.toBeNull()
 		await server.stop()
 	})
 })

@@ -90,6 +90,9 @@ export class IndexedDbAdapter implements StorageAdapter {
 			allowNonDurable: true,
 			storage: 'memory',
 			skipBackendRecord: true,
+			// A browser leader restores the snapshot into its own fresh worker database
+			// before serving other tabs (first open and promotion, STORE-6).
+			onLeaderWorkerOpened: (tx) => this.restoreDumpIfFresh(tx),
 		})
 		this.scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: options.persistenceDebounceMs,
@@ -109,7 +112,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 		await this.inner.open(schema)
 		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
 
-		if (carried) {
+		if (carried && this.inner.isLeader()) {
+			// The fresh worker database is marked restored, then receives the OPFS copy.
+			await this.inner.transaction(async (tx) => {
+				await markRestored(tx)
+			})
 			await this.applyDump(carried)
 			await this.scheduler.flushNow()
 			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' })
@@ -123,15 +130,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 			return
 		}
 
-		const persisted = await loadFromIndexedDB(this.dbName)
-		if (!persisted) {
-			await this.restoreFromDumpFallback()
-		} else {
-			try {
-				await this.inner.importDatabase(persisted)
-			} catch {
-				await this.restoreFromDumpFallback()
-			}
+		// Only the storage leader restores, and only into a database no snapshot was
+		// restored into yet: a follower tab (or a second adapter on the same worker)
+		// opening must never rewrite the leader's live database (STORE-6).
+		if (this.inner.isLeader()) {
+			await this.restoreIfFresh()
 		}
 		if (tracksBackend) {
 			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' }).catch((error: unknown) =>
@@ -272,17 +275,68 @@ export class IndexedDbAdapter implements StorageAdapter {
 		})
 	}
 
-	private async restoreFromDumpFallback(): Promise<void> {
+	/**
+	 * Restore the persisted snapshot into the worker database unless one was restored
+	 * into it already (this adapter or another one sharing the worker). The binary
+	 * snapshot (Node / test workers that support export) is imported whole; the JSON dump
+	 * (browsers) is restored in one transaction.
+	 */
+	private async restoreIfFresh(): Promise<void> {
+		const persisted = await loadFromIndexedDB(this.dbName)
+		if (persisted) {
+			const fresh = { value: false }
+			await this.inner.transaction(async (tx) => {
+				fresh.value = !(await isRestored(tx))
+			})
+			if (!fresh.value) return
+			try {
+				await this.inner.importDatabase(persisted)
+				await this.inner.transaction(markRestored)
+				return
+			} catch {
+				// Fall through to the JSON dump.
+			}
+		}
+		await this.inner.transaction((tx) => this.restoreDumpIfFresh(tx))
+	}
+
+	/** In `tx`: restore the JSON dump when no snapshot was restored into this database. */
+	private async restoreDumpIfFresh(tx: Transaction): Promise<void> {
+		if (await isRestored(tx)) return
+		await markRestored(tx)
 		const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
 		if (!dump) return
 		for (const statement of restoreDumpStatements(dump)) {
-			await this.inner.execute(statement.sql, statement.params)
+			await tx.execute(statement.sql, statement.params)
 		}
 	}
 
+	/** A consistent snapshot: every table is read inside one transaction (STORE-7). */
 	private async exportDump(): Promise<DatabaseDump> {
-		return exportDump((sql, params) => this.inner.query(sql, params))
+		let dump: DatabaseDump = { tables: [] }
+		await this.inner.transaction(async (tx) => {
+			dump = await exportDump((sql, params) => tx.query(sql, params))
+		})
+		return dump
 	}
+}
+
+/**
+ * Connection-local marker (a TEMP table: never part of the database file or of a dump)
+ * recording that a snapshot was restored into this worker database (STORE-6).
+ */
+const RESTORED_MARKER = '_kora_idb_restored'
+
+async function isRestored(tx: Transaction): Promise<boolean> {
+	const rows = await tx.query<{ name: string }>(
+		"SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
+		[RESTORED_MARKER],
+	)
+	return rows.length > 0
+}
+
+async function markRestored(tx: Transaction): Promise<void> {
+	await tx.execute(`CREATE TEMP TABLE IF NOT EXISTS ${RESTORED_MARKER} (restored INTEGER)`)
 }
 
 function isUnsupportedWorkerExport(error: unknown): boolean {

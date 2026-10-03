@@ -18,6 +18,7 @@ export type {
 	ServerStore,
 	MaterializedRecord,
 	CollectionQueryOptions,
+	ServerSchemaOptions,
 	StoredOperationKey,
 } from './store/server-store'
 export type { TrustProxySetting } from './server/trust-proxy'
@@ -96,9 +97,16 @@ export type { KoraAuthProviderOptions } from './auth/kora-auth-provider'
 export type { MixedAuthProviderOptions } from './auth/mixed-auth-provider'
 
 // === Classes ===
-export { MemoryServerStore } from './store/memory-server-store'
+export { MemoryServerStore, type MemoryServerStoreOptions } from './store/memory-server-store'
+export type { FoldMigrationReport } from './store/record-fold'
 export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
+export {
+	SERVER_NODE_PREFIX,
+	ServerIdentityError,
+	type ServerIdentityOptions,
+	isServerNodeId,
+} from './store/server-identity'
 export { HttpServerTransport } from './transport/http-server-transport'
 export { WsServerTransport } from './transport/ws-server-transport'
 export { ClientSession, type SessionTerminationCode } from './session/client-session'

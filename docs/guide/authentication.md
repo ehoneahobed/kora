@@ -1435,6 +1435,26 @@ made, even when several users share one local database (`namespaceByAuthUser` of
 
     Only `unassigned` writes can be assigned or discarded; writes held for another user
     (reason `other-user`) wait for that user.
+
+    A single-user app, where writes made before sign-in can only belong to the user who
+    signs in, can skip that decision with one line:
+
+    ```typescript
+    createApp({
+      schema,
+      sync: {
+        url: 'wss://sync.example.com/kora',
+        authClient,
+        // Default 'hold': wait for app.sync.assignHeld / discardHeld.
+        unassignedWrites: 'assign-to-first-user',
+      },
+    })
+    ```
+
+    The writes are then assigned to the first user the sync server accepts a session for on
+    this device, and upload as that user. A user the server refuses never gets them, and
+    writes held for another user (`other-user`) are never reassigned. Keep the default in apps
+    where several people can use the same browser profile.
 - The binding moves to the new user as soon as the auth binding reports the change, even while
   an earlier reconnect is still fetching a credential or connecting. That attempt re-checks the
   signed-in user before its handshake and starts over if it changed, so a node is never

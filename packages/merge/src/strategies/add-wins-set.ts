@@ -24,6 +24,9 @@ import { mergeArraySet } from '@korajs/core'
  * Interim (S1): this is still a pairwise merge. W7 replaces it with a per-element
  * LWW set whose result is independent of merge order.
  *
+ * @deprecated W7 (beta.14): arrays fold as an occurrence-indexed LWW element
+ * multiset in `@korajs/core`. Kept for `experimental.legacyMerge` (one beta).
+ *
  * @param localArray - The local array after local modifications
  * @param remoteArray - The remote array after remote modifications
  * @param baseArray - The array state before either modification

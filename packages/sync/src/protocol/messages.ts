@@ -1,4 +1,9 @@
-import type { AtomicOp, HLCTimestamp, OperationType } from '@korajs/core'
+import type {
+	AtomicOp,
+	EncryptedOperationEnvelope,
+	HLCTimestamp,
+	OperationType,
+} from '@korajs/core'
 import type { SyncQuerySubset } from '../scopes/query-subset'
 
 export type WireFormat = 'json' | 'protobuf'
@@ -27,6 +32,21 @@ export interface SerializedOperation {
 	mutationName?: string
 	/** Per-field versions of a server scope-entry insert (RT-27). Server-authored only. */
 	fieldVersions?: Record<string, HLCTimestamp>
+	/**
+	 * Content-hash version of `id` (CORE-1, protocol v2). Absent means 1. Protobuf
+	 * operation field 14.
+	 */
+	hashVersion?: 1 | 2
+	/**
+	 * Serialized fold state of a server scope-entry operation (W7). Server-authored
+	 * only: the server strips it from device uploads. Protobuf operation field 15.
+	 */
+	foldState?: string
+	/**
+	 * End-to-end encryption envelope v2 (W9). `data` is then null or holds only the
+	 * documented cleartext scope fields. Protobuf operation field 16 (JSON).
+	 */
+	encrypted?: EncryptedOperationEnvelope
 }
 
 /**
@@ -91,6 +111,12 @@ export interface HandshakeMessage {
 	 * ignore it. Protobuf field 45.
 	 */
 	sequenceReservation?: boolean
+	/**
+	 * Sync protocol version the client speaks (`SYNC_PROTOCOL_VERSION`). Absent means 1
+	 * (Kora <= beta.13). A protocol-2 client sends hash-version-2 operation ids, the
+	 * encryption envelope v2 and always `sequenceReservation`. Protobuf field 47.
+	 */
+	protocolVersion?: number
 }
 
 /**
@@ -163,6 +189,27 @@ export interface HandshakeResponseMessage {
 	 * `supportsHeartbeat` and the server sends them (LMS #12).
 	 */
 	heartbeatIntervalMs?: number
+	/**
+	 * Sync protocol version the server speaks. Absent means 1 (a beta.13-era server).
+	 * Protobuf field 47.
+	 */
+	protocolVersion?: number
+	/**
+	 * Node ids whose operations are authored by the server itself (its own node id and
+	 * the reserved scope-entry node). Only operations from these nodes may carry
+	 * server-authored metadata (`fieldVersions`, `foldState`); the client persists the
+	 * list (`SyncStatePersistence.saveAuthoritativeNodeIds`). Absent from older
+	 * servers. Protobuf field 46 (repeated).
+	 */
+	authoritativeNodeIds?: string[]
+	/**
+	 * Explicit authoritative node ids the deployment revoked (RT-81, server config
+	 * `revokedAuthoritativeNodeIds`). A client removes them from the authority union it
+	 * keeps, never learns them again, and re-folds the affected records; the server
+	 * never accepts them as device node ids. Absent when nothing was revoked, and from
+	 * older servers. Protobuf field 48 (repeated).
+	 */
+	revokedAuthoritativeNodeIds?: string[]
 }
 
 /**

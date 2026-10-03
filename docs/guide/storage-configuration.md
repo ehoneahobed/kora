@@ -116,7 +116,12 @@ await server.start()
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `filename` | `string` | `':memory:'` | Path to the SQLite database file. Use `':memory:'` for in-memory (testing only). |
-| `nodeId` | `string` | Auto-generated | Server node ID. Usually left to auto-generate. |
+| `instanceId` | `string` | Persisted (`1`) | Instance id within the deployment. Leave unset: one SQLite database has one server process. |
+| `nodeId` | `string` | -- | Deprecated. Leave unset. A value set before beta.14 is kept as a legacy server id (its earlier decisions keep their authority). |
+| `authoritativeNodeIds` | `string[]` | -- | Extra node ids whose writes win `merge('server-authoritative')` fields (for example a back-office service). An id listed once stays authoritative, on the server and on every device, until it is revoked: removing it from this list does not revoke it. |
+| `revokedAuthoritativeNodeIds` | `string[]` | -- | Explicit authoritative ids to revoke. They stop winning on the server, every handshake tells devices to drop them (devices re-fold the affected records), and they are never accepted as device node ids. Permanent: a revoked id cannot be configured as authoritative again. |
+
+The server authors its writes (route mutations, cascades, constraint corrections) under the node id `kora:server:<deploymentId>:<instanceId>`. Both parts are stored in the database (`kora_server_meta`) on first start, so the id survives restarts, and devices keep treating earlier server decisions as the server's.
 
 ### PostgreSQL (Recommended for Production)
 
@@ -144,7 +149,12 @@ await server.start()
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `connectionString` | `string` | -- | PostgreSQL connection URL. Required. |
-| `nodeId` | `string` | Auto-generated | Server node ID. |
+| `instanceId` | `string` | New per start | Stable id of this instance within the deployment (`[A-Za-z0-9._-]`, at most 64 characters). It must be different on every running instance. Unset, each start draws a fresh one from a counter in the database. |
+| `nodeId` | `string` | -- | Deprecated. Leave unset. A value set before beta.14 is kept as a legacy server id. |
+| `authoritativeNodeIds` | `string[]` | -- | Extra node ids whose writes win `merge('server-authoritative')` fields (for example a back-office service). An id listed once stays authoritative, on the server and on every device, until it is revoked: removing it from this list does not revoke it. |
+| `revokedAuthoritativeNodeIds` | `string[]` | -- | Explicit authoritative ids to revoke. They stop winning on the server, every handshake tells devices to drop them (devices re-fold the affected records), and they are never accepted as device node ids. Permanent: a revoked id cannot be configured as authoritative again. |
+
+Every instance that shares the database belongs to one deployment (its id and a derivation secret live in `kora_server_meta`). Each instance authors under its own `kora:server:<deploymentId>:<instanceId>` node id, so instances never collide on sequence numbers, and every `kora:server:` id is authoritative on every replica. Strings are stored losslessly: U+0000 and unpaired UTF-16 surrogates, which Postgres `TEXT` and `JSONB` cannot hold, are escaped in materialized rows (see the beta.14 release notes).
 
 The required tables are created automatically on first connection.
 

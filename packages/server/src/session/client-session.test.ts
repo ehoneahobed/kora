@@ -3,6 +3,7 @@ import { defineSchema, t } from '@korajs/core'
 import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { encodeDeltaCursor } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
+import { withContentId } from '../../tests/fixtures/content-id'
 import { NoAuthProvider } from '../auth/no-auth'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
@@ -138,7 +139,7 @@ describe('ClientSession', () => {
 				// The session's own node is always advertised, 0 when the server holds none
 				// of its operations (RT-45).
 				expect(response.versionVector).toEqual({ 'node-a': 5, 'client-1': 0 })
-				expect(response.nodeId).toBe('server-1')
+				expect(response.nodeId).toBe(store.getNodeId())
 				expect(response.selectedWireFormat).toBe('protobuf')
 			}
 		})
@@ -602,14 +603,14 @@ describe('ClientSession', () => {
 			sendHandshake(client)
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			const op = createTestOp({ id: 'op-new', sequenceNumber: 1 })
+			const op = withContentId(createTestOp({ sequenceNumber: 1 }))
 			sendOpBatch(client, [op])
 
 			await vi.waitFor(async () => {
 				expect(await store.getOperationCount()).toBe(1)
 			})
 
-			expect(store.getAllOperations()[0]?.id).toBe('op-new')
+			expect(store.getAllOperations()[0]?.id).toBe(op.id)
 		})
 
 		test('logs and closes loudly when operation persistence fails', async () => {
@@ -630,7 +631,7 @@ describe('ClientSession', () => {
 			sendHandshake(client)
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			sendOpBatch(client, [createTestOp({ id: 'op-fails' })])
+			sendOpBatch(client, [withContentId(createTestOp())])
 
 			await vi.waitFor(() => {
 				expect(logger.log).toHaveBeenCalledWith(
@@ -698,14 +699,14 @@ describe('ClientSession', () => {
 			sendHandshake(client)
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			const op = createTestOp({ id: 'op-1', sequenceNumber: 1 })
+			const op = withContentId(createTestOp({ sequenceNumber: 1 }))
 			sendOpBatch(client, [op])
 
 			await vi.waitFor(() => {
 				expect(onRelay).toHaveBeenCalled()
 			})
 
-			expect(onRelay).toHaveBeenCalledWith('sess-1', [expect.objectContaining({ id: 'op-1' })])
+			expect(onRelay).toHaveBeenCalledWith('sess-1', [expect.objectContaining({ id: op.id })])
 		})
 
 		test('does not relay duplicate operations', async () => {
@@ -1098,24 +1099,21 @@ describe('ClientSession', () => {
 			sendHandshake(client, { authToken: 'ok' })
 			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
 
-			sendOpBatch(
-				client,
-				[
-					createTestOp({
-						id: 'legacy-other-user',
-						recordId: 'legacy-other-user',
-						sequenceNumber: 1,
-						data: { ownerId: 'other-user', title: 'Must not upload' },
-					}),
-					createTestOp({
-						id: 'current-user',
-						recordId: 'current-user',
-						sequenceNumber: 2,
-						data: { ownerId: 'user-1', title: 'Must still upload' },
-					}),
-				],
-				'mixed-scope-batch',
+			const legacyOther = withContentId(
+				createTestOp({
+					recordId: 'legacy-other-user',
+					sequenceNumber: 1,
+					data: { ownerId: 'other-user', title: 'Must not upload' },
+				}),
 			)
+			const currentUser = withContentId(
+				createTestOp({
+					recordId: 'current-user',
+					sequenceNumber: 2,
+					data: { ownerId: 'user-1', title: 'Must still upload' },
+				}),
+			)
+			sendOpBatch(client, [legacyOther, currentUser], 'mixed-scope-batch')
 
 			await vi.waitFor(() =>
 				expect(
@@ -1129,12 +1127,12 @@ describe('ClientSession', () => {
 
 			const rejection = messages.filter(
 				(message) =>
-					message.type === 'operation-rejected' && message.operationId === 'legacy-other-user',
+					message.type === 'operation-rejected' && message.operationId === legacyOther.id,
 			)
 			expect(rejection).toHaveLength(1)
 			expect(rejection[0]).toMatchObject({ code: 'SCOPE_VIOLATION', retriable: false })
 			expect(await store.getOperationRange('client-1', 1, 2)).toEqual([
-				expect.objectContaining({ id: 'current-user' }),
+				expect.objectContaining({ id: currentUser.id }),
 			])
 		})
 
@@ -1173,21 +1171,17 @@ describe('ClientSession', () => {
 				)
 			expect(deliveredIds).not.toContain('foreign-row')
 
-			sendOpBatch(
-				client,
-				[
-					createTestOp({
-						id: 'self-owned',
-						recordId: 'self-owned',
-						sequenceNumber: 2,
-						data: { ownerId: 'user-1', viewerId: 'other-user', title: 'Allowed upload' },
-					}),
-				],
-				'allowed-batch',
+			const selfOwned = withContentId(
+				createTestOp({
+					recordId: 'self-owned',
+					sequenceNumber: 2,
+					data: { ownerId: 'user-1', viewerId: 'other-user', title: 'Allowed upload' },
+				}),
 			)
+			sendOpBatch(client, [selfOwned], 'allowed-batch')
 			await vi.waitFor(async () => {
 				expect((await store.getOperationRange('client-1', 2, 2)).map((op) => op.id)).toContain(
-					'self-owned',
+					selfOwned.id,
 				)
 			})
 

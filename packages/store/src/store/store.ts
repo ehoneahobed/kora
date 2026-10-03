@@ -3,18 +3,26 @@ import {
 	HybridLogicalClock,
 	KoraError,
 	createVersionVector,
+	deriveSideEffectOpId,
+	deserializeFoldState,
 	expandFieldVersionedOperations,
+	foldPlanFingerprints,
 	generateUUIDv7,
-	migrationStepsToSQL,
+	isReservedNodeId,
+	isServerNodeId,
+	mismatchedFoldFields,
+	operationSchemaView,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
 import type {
+	FoldState,
 	HLCTimestamp,
 	KoraEventEmitter,
-	MigrationStep,
+	MergeTrace,
 	Operation,
 	OperationLog,
+	OperationTransform,
 	SchemaDefinition,
 	SecretKeyProvider,
 	VersionVector,
@@ -25,6 +33,28 @@ import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
+import { compactFoldedLog } from '../fold/compact-folded-log'
+import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
+import {
+	COMPACTED_THROUGH_TABLE,
+	FOLD_MATERIALIZATION_CURRENT,
+	FOLD_MATERIALIZATION_LEGACY,
+	FOLD_MATERIALIZATION_META_KEY,
+	FOLD_STATE_TABLE,
+	FOLD_TABLES_DDL,
+	RecordFolder,
+	isCompacted,
+} from '../fold/record-folder'
+import {
+	type KeptRecords,
+	type RematerializationMode,
+	rematerializeDatabase,
+} from '../fold/rematerialize'
+import {
+	LOG_QUARANTINE_TABLE,
+	type LogIntegrityReport,
+	scanLogIntegrity,
+} from '../log-integrity/log-integrity'
 import {
 	type FieldVersions,
 	effectiveFieldVersion,
@@ -34,6 +64,7 @@ import {
 	serializeFieldVersions,
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
+import { runSchemaMigrations } from '../migrations/run-migrations'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -53,6 +84,7 @@ import {
 	serializeOperation,
 	serializeRecord,
 } from '../serialization/serializer'
+import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
 import { SubscriptionManager } from '../subscription/subscription-manager'
 import {
 	type AdoptionSchedule,
@@ -77,6 +109,8 @@ import {
 } from '../sync/local-sync-records'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
+import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
+import type { ResequenceResult } from '../sync/rehash-operation'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
@@ -90,20 +124,26 @@ import {
 	saveUnappliedOperations,
 } from '../sync/sync-durability'
 import {
+	DELIVERY_WATERMARK_META_KEY,
+	DELTA_CURSOR_META_KEY,
 	NODE_TOKEN_META_KEY,
 	collectOperationsAheadOfServer,
 	deleteDeliveryWatermark,
 	loadAllDeliveryWatermarks,
+	loadAuthoritativeNodeIds,
 	loadDeliveryWatermark,
 	loadDeltaCursor,
 	loadLastAckedServerVector,
 	loadNodeToken,
+	loadRevokedAuthoritativeNodeIds,
 	mergeVersionVectors,
 	nodeTokenKey,
+	saveAuthoritativeNodeIds,
 	saveDeliveryWatermark,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
 	saveNodeToken,
+	saveRevokedAuthoritativeNodeIds,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import type {
@@ -125,6 +165,7 @@ import { dropLegacyIndexes } from './legacy-indexes'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
+	SEQ_CONFLICTS_TABLE,
 	insertConflictRow,
 	isOperationLogged,
 	loadRetainedConflictRows,
@@ -147,6 +188,88 @@ import { resolvePerTabNodeId } from './tab-node-id'
  * await store.close()
  * ```
  */
+/** `_kora_meta` key: per-collection fold plan fingerprints the rows were folded with (RT-63). */
+const FOLD_PLAN_META_KEY = 'fold_plan_fingerprints'
+/** `_kora_meta` key: a full resync was requested to settle row snapshots (RT-68). */
+const SNAPSHOT_RESYNC_META_KEY = 'fold_snapshot_resync'
+/**
+ * Node id of provisional side effects (RT-69). In the reserved `kora:` namespace: no
+ * device authors under it, and its effects never enter the log or the upload queue.
+ */
+const PROVISIONAL_NODE_ID = 'kora:provisional'
+
+/** A node id this client must never author under (RT-61): Kora's reserved namespace. */
+export class ReservedNodeIdError extends KoraError {
+	constructor(nodeId: string, source: string) {
+		super(
+			`Node id "${nodeId}" (${source}) is in Kora's reserved "kora:" namespace; devices never author under it.`,
+			'RESERVED_NODE_ID',
+			{ nodeId, source, fix: 'Configure a node id that does not start with "kora:".' },
+		)
+		this.name = 'ReservedNodeIdError'
+	}
+}
+
+/**
+ * Per collection, the record ids that own quarantined log rows (RT-68); a
+ * quarantined row whose record id cannot be read keeps its whole collection.
+ */
+async function loadQuarantinedRecords(adapter: StorageAdapter): Promise<KeptRecords> {
+	const records = new Map<string, Set<string>>()
+	const collections = new Set<string>()
+	const exists = await adapter.query<{ name: string }>(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+		[LOG_QUARANTINE_TABLE],
+	)
+	if (exists.length === 0) return { records, collections }
+	const rows = await adapter.query<{ collection: string; row_json: string }>(
+		`SELECT collection, row_json FROM ${LOG_QUARANTINE_TABLE}`,
+	)
+	for (const row of rows) {
+		let recordId: unknown = null
+		try {
+			recordId = (JSON.parse(row.row_json) as { record_id?: unknown }).record_id
+		} catch {
+			recordId = null
+		}
+		if (typeof recordId === 'string' && recordId.length > 0) {
+			const set = records.get(row.collection) ?? new Set<string>()
+			set.add(recordId)
+			records.set(row.collection, set)
+		} else {
+			collections.add(row.collection)
+		}
+	}
+	return { records, collections }
+}
+
+/** Collections whose stored fold states hold a field of another fold kind than the schema's. */
+async function collectionsWithMismatchedStates(
+	adapter: StorageAdapter,
+	schema: SchemaDefinition,
+): Promise<string[]> {
+	const out: string[] = []
+	for (const collection of Object.keys(schema.collections)) {
+		const rows = await adapter.query<{ state: string }>(
+			`SELECT state FROM ${FOLD_STATE_TABLE} WHERE collection = ?`,
+			[collection],
+		)
+		for (const row of rows) {
+			let state: FoldState
+			try {
+				state = deserializeFoldState(row.state)
+			} catch {
+				continue
+			}
+			if (mismatchedFoldFields(state, schema).length > 0) {
+				out.push(collection)
+				break
+			}
+		}
+	}
+	return out
+}
+
 /**
  * Make `nodeId` the database's node id (`_kora_meta.node_id`). The unkeyed legacy node
  * token belongs to the node id it replaces, so it moves to that node's own key first:
@@ -203,8 +326,25 @@ export class Store implements OperationLog {
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
 	/** Releases the per-tab node lock (RT-40); null when none is held. */
 	private releaseNodeLock: (() => void) | null = null
+	/** How rows are materialized ({@link StoreConfig.materialization}). */
+	private readonly materialization: 'fold' | 'legacy'
+	/** The W7 record fold; null under legacy materialization. */
+	private readonly folder: RecordFolder | null
+	/** True once every row of the database is a materialization of its fold state. */
+	private foldActive = false
+	/** Schema transforms applied at fold time (RT-84); never to stored operations. */
+	private readonly operationTransforms: readonly OperationTransform[]
+	/** Largest operation a local write may produce (RT-86); default in the write path. */
+	private readonly maxOperationBytes: number | undefined
 
 	constructor(config: StoreConfig) {
+		this.materialization = config.materialization ?? 'fold'
+		this.operationTransforms = config.operationTransforms ?? []
+		this.maxOperationBytes = config.maxOperationBytes
+		this.folder =
+			this.materialization === 'fold'
+				? new RecordFolder(config.schema, this.operationTransforms)
+				: null
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.configNodeId = config.nodeId
@@ -227,24 +367,30 @@ export class Store implements OperationLog {
 		await this.adapter.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
+		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
+		this.foldActive = false
 
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
-		// Run schema migrations if needed
-		await this.runMigrationsIfNeeded()
-
 		// Load or generate node ID
 		this.nodeId = await this.loadOrGenerateNodeId()
+		// Every node id this database authors under is registered (RT-38, RT-40).
+		await registerLocalNode(this.adapter, this.nodeId)
+
+		// Log integrity first (W8 step 0): repair rows an earlier release damaged and
+		// quarantine the unrecoverable ones, before anything reads or folds the log.
+		await this.scanLog('quick')
 
 		// (node_id, sequence_number) is unique in the operation log: repair any
 		// duplicates an earlier version wrote, then enforce it with an index (W6).
 		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
-		// Every node id this database authors under is registered (RT-38, RT-40), and the
-		// terminal rejections an earlier release kept only in the app's list become
+		// The terminal rejections an earlier release kept only in the app's list become
 		// durable markers (RT-36).
-		await registerLocalNode(this.adapter, this.nodeId)
 		await seedTerminalRejectionsOnce(this.adapter)
+		// Raw-string columns use the lossless stored-text codec (RT-65); rows written
+		// before it get their U+FFFF re-encoded once, before anything reads them.
+		await ensureStoredTextCodec(this.adapter, this.schema)
 		if (this.isolation === 'per-tab' && !this.configNodeId) {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
 			// writes only after this tab is gone (RT-40).
@@ -252,6 +398,27 @@ export class Store implements OperationLog {
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
+
+		// The fold is active for writes as soon as the database's rows are known to be
+		// fold materializations (W7); a pre-W7 database is re-materialized after its
+		// schema migrations, whose backfills then write the legacy way.
+		if (this.folder) {
+			this.folder.setAuthoritativeNodeIds((await loadAuthoritativeNodeIds(this.adapter)) ?? [])
+			this.foldActive =
+				(await this.readMeta(FOLD_MATERIALIZATION_META_KEY)) === FOLD_MATERIALIZATION_CURRENT
+		}
+
+		// Run schema migrations if needed. Backfills write operations through the local
+		// write path, so the node id and clock must exist first (STORE-13).
+		try {
+			await this.runMigrationsIfNeeded()
+			await this.ensureLegacyBodiesCanonical()
+			await this.ensureMaterialization()
+		} catch (error) {
+			this.releaseNodeLock?.()
+			this.releaseNodeLock = null
+			throw error
+		}
 
 		// Initialize sequence manager
 		this.sequenceManager = new SequenceManager(this.adapter, this.nodeId)
@@ -281,6 +448,8 @@ export class Store implements OperationLog {
 				this.causalTracker,
 				this.secretKeyProvider,
 				(error) => this.reportStorageError(error),
+				() => this.activeFold(),
+				this.maxOperationBytes,
 			)
 			this.collections.set(name, col)
 		}
@@ -301,6 +470,49 @@ export class Store implements OperationLog {
 			this.releaseNodeLock?.()
 			this.releaseNodeLock = null
 		}
+	}
+
+	/**
+	 * Check the operation log (W8 step 0): every row must round-trip through the
+	 * canonical operation serializer. Rows an earlier release damaged in a recoverable
+	 * way (a JSON-encoded timestamp written by a beta.12 backup restore) are repaired;
+	 * unrecoverable rows move to the quarantine table, where no fold reads them. Also
+	 * reports sequence gaps in this database's own nodes (compaction, a lost tail).
+	 *
+	 * The store runs a quick variant (SQL prefilter) on every open. Rebuilding state from
+	 * the log must only run on a `clean` report.
+	 *
+	 * @param options - `repair: false` only reports; `mode: 'quick'` checks only the rows
+	 *   a SQL prefilter flags (default `'full'`: every row)
+	 * @returns The integrity report; emits `store:log-integrity` when rows changed
+	 */
+	async verifyLogIntegrity(options?: {
+		repair?: boolean
+		mode?: 'full' | 'quick'
+	}): Promise<LogIntegrityReport> {
+		this.ensureOpen()
+		return this.scanLog(options?.mode ?? 'full', options?.repair ?? true)
+	}
+
+	private async scanLog(mode: 'full' | 'quick', repair = true): Promise<LogIntegrityReport> {
+		const localNodeIds = (await listLocalNodes(this.adapter)).map((node) => node.nodeId)
+		const report = await scanLogIntegrity(this.adapter, this.schema, {
+			mode,
+			repair,
+			localNodeIds,
+		})
+		if (repair && (report.repaired.length > 0 || report.newlyQuarantined.length > 0)) {
+			this.emitter?.emit({
+				type: 'store:log-integrity',
+				dbName: this.dbName,
+				repaired: report.repaired.length,
+				quarantined: report.newlyQuarantined.length,
+				gaps: report.gaps.length,
+				clean: report.clean,
+				message: `Operation log of "${this.dbName}": ${report.repaired.length} row(s) repaired, ${report.newlyQuarantined.length} row(s) quarantined (${LOG_QUARANTINE_TABLE}).`,
+			})
+		}
+		return report
 	}
 
 	/**
@@ -364,19 +576,37 @@ export class Store implements OperationLog {
 		return this.nodeId
 	}
 
+	/** The schema transforms the fold applies (transforms at fold time, RT-84). */
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.operationTransforms
+	}
+
 	/**
 	 * Apply a remote operation received from sync.
 	 * Checks for duplicates, applies to the data table, persists the operation,
 	 * and updates the version vector.
 	 */
-	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
+	async applyRemoteOperation(
+		stored: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
 		this.ensureOpen()
 
-		const collection = op.collection
+		const collection = stored.collection
 		const definition = this.schema.collections[collection]
 		if (!definition) {
 			return 'skipped'
 		}
+		const fold = this.activeFold()
+		if (fold) {
+			// The fold reads the operation through the schema transforms itself (RT-84).
+			return this.applyRemoteFolded(stored, fold, options)
+		}
+		// Legacy materialization writes rows directly: it materializes the operation as
+		// this schema reads it, and logs the operation exactly as written (RT-84).
+		const view = operationSchemaView(stored, this.schema.version, this.operationTransforms)
+		if (view === null) return 'skipped'
+		const op = view
 
 		// Materialization may use overridden data/timestamp (authoritative merge
 		// results), but the LOG below always stores the canonical operation:
@@ -676,7 +906,7 @@ export class Store implements OperationLog {
 				}
 
 				// Persist the operation
-				await this.appendRemoteOperationRow(tx, op)
+				await this.appendRemoteOperationRow(tx, stored)
 
 				// Version vector: MAX with the stored value, never a value computed outside
 				// this transaction (another tab may have advanced it). The in-memory
@@ -713,6 +943,499 @@ export class Store implements OperationLog {
 		})
 
 		return 'applied'
+	}
+
+	/**
+	 * W7 remote apply: append the operation, then merge it into its record's fold
+	 * state, which re-materializes the row, all in one write transaction. There is no
+	 * read-decide-write race to guard: the state is read and written inside the
+	 * transaction, and the merge does not depend on the order operations arrive in.
+	 */
+	private async applyRemoteFolded(
+		op: Operation,
+		fold: RecordFolder,
+		options: ApplyRemoteOptions | undefined,
+	): Promise<ApplyResult> {
+		const collection = op.collection
+		const startedAt = Date.now()
+		const outcome = { duplicate: false, revived: false, traces: [] as MergeTrace[] }
+		try {
+			await this.adapter.transaction(async (tx) => {
+				if ((await isOperationLogged(tx, collection, op.id)) || (await isCompacted(tx, op))) {
+					outcome.duplicate = true
+					const retracted = await tx.query<{ record_id: string }>(
+						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+						[collection, op.recordId],
+					)
+					if (retracted.length > 0) {
+						// The record re-enters the scope: show it again with every field of
+						// its state (writes merged while it was hidden included).
+						const state = await fold.loadState(tx, collection, op.recordId)
+						if (state) {
+							await fold.materializeRow(tx, state, 'all', { clearRetraction: true })
+						} else {
+							await tx.execute(
+								'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+								[collection, op.recordId],
+							)
+						}
+						outcome.revived = true
+					}
+					return
+				}
+				if (this.clock) {
+					// A scope entry's newest field version can be later than its timestamp (the
+					// record's creation, RT-27): the clock must move past every version it carries.
+					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+				}
+				await this.appendRemoteOperationRow(tx, op)
+				const applied = await fold.applyInTx(tx, op, 'remote')
+				outcome.traces = applied.traces
+				await tx.execute(
+					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+					[op.nodeId, op.sequenceNumber],
+				)
+			})
+		} catch (error) {
+			this.reportStorageError(error)
+			throw error
+		}
+
+		this.recordOperationSequence(op)
+		if (outcome.duplicate) {
+			if (outcome.revived) {
+				this.subscriptionManager.invalidate(collection)
+			} else {
+				this.subscriptionManager.notify(collection, op)
+			}
+			return 'duplicate'
+		}
+		this.subscriptionManager.notify(collection, op)
+		this.emitMergeTraces(op, outcome.traces)
+		options?.onMergeTraces?.(outcome.traces)
+		this.emitter?.emit({
+			type: 'operation:applied',
+			operation: op,
+			duration: Date.now() - startedAt,
+		})
+		return 'applied'
+	}
+
+	/** DevTools: every fold decision that was a conflict, plus one completion per merge. */
+	private emitMergeTraces(op: Operation, traces: MergeTrace[]): void {
+		if (!this.emitter || traces.length === 0) return
+		const first = traces[0] as MergeTrace
+		this.emitter.emit({ type: 'merge:started', operationA: first.operationA, operationB: op })
+		for (const trace of traces) this.emitter.emit({ type: 'merge:conflict', trace })
+		this.emitter.emit({ type: 'merge:completed', trace: first })
+	}
+
+	/** The record fold, once the database's rows are fold materializations. */
+	private activeFold(): RecordFolder | undefined {
+		return this.foldActive && this.folder ? this.folder : undefined
+	}
+
+	/**
+	 * The record's W7 fold state (null under legacy materialization or when the
+	 * record has none). For DevTools, tests and the server-comparison harness.
+	 */
+	async getFoldState(collection: string, recordId: string): Promise<FoldState | null> {
+		this.ensureOpen()
+		const fold = this.activeFold()
+		if (!fold) return null
+		let state: FoldState | null = null
+		await this.adapter.transaction(async (tx) => {
+			state = await fold.loadState(tx, collection, recordId)
+		})
+		return state
+	}
+
+	/** Whether rows are materialized by the W7 fold (false under `materialization: 'legacy'`). */
+	isFoldMaterialized(): boolean {
+		return this.activeFold() !== undefined
+	}
+
+	private async readMeta(key: string): Promise<string | null> {
+		const rows = await this.adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+			key,
+		])
+		return rows[0]?.value ?? null
+	}
+
+	private async writeMeta(key: string, value: string): Promise<void> {
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			key,
+			value,
+		])
+	}
+
+	/**
+	 * Write every genuine beta.13 clear of the op log into its logged body, once per
+	 * database (RT-83, RT-85): the fold folds bodies as written, so the clear must be in
+	 * the body. Records already materialized by the fold are re-folded.
+	 */
+	private async ensureLegacyBodiesCanonical(): Promise<void> {
+		const folder = this.folder
+		if (!folder) return
+		if ((await this.readMeta(LEGACY_BODIES_META_KEY)) !== null) return
+		const rewritten = await canonicalizeLegacyLogBodies(this.adapter, this.schema, this.nodeId)
+		if (rewritten.length > 0 && this.foldActive) {
+			const seen = new Set<string>()
+			await this.adapter.transaction(async (tx) => {
+				for (const { collection, recordId } of rewritten) {
+					const key = `${collection}\u0000${recordId}`
+					if (seen.has(key)) continue
+					seen.add(key)
+					await folder.refoldInTx(tx, collection, recordId)
+				}
+			})
+		}
+		await this.writeMeta(LEGACY_BODIES_META_KEY, String(rewritten.length))
+	}
+
+	/**
+	 * Make every row a materialization of its record's fold state (W7), once per
+	 * database and fold-state version. Runs after the W8 log-integrity scan: a
+	 * clean log is rebuilt with the fold; an incomplete (compacted) log rebuilds on
+	 * top of the rows as base snapshots; a log with quarantined rows is never
+	 * rebuilt from (rows are kept and become base snapshots), and
+	 * `store:rematerialized` reports which happened.
+	 */
+	private async ensureMaterialization(forceSnapshot = false): Promise<void> {
+		const current = await this.readMeta(FOLD_MATERIALIZATION_META_KEY)
+		if (!this.folder) {
+			if (current !== FOLD_MATERIALIZATION_LEGACY) {
+				await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_LEGACY)
+			}
+			return
+		}
+		if (current === FOLD_MATERIALIZATION_CURRENT) {
+			this.foldActive = true
+			await this.ensureFoldPlan()
+			return
+		}
+		const report = await this.scanLog('full')
+		// Only the records that own a quarantined row are kept as they are (RT-68); the
+		// rest are rebuilt from a log that is complete for them unless it was compacted
+		// or has holes.
+		const kept = await loadQuarantinedRecords(this.adapter)
+		// A hole in an own node's sequence that a quarantined row explains belongs to
+		// that row's record (kept above), not to the whole log.
+		const quarantinedSeqs = new Set(
+			report.quarantined.map((row) => `${row.nodeId ?? ''}\u0000${row.sequenceNumber ?? ''}`),
+		)
+		const unexplainedGaps = report.gaps.filter((gap) => {
+			for (let s = gap.from; s <= gap.to; s++) {
+				if (!quarantinedSeqs.has(`${gap.nodeId}\u0000${s}`)) return true
+			}
+			return false
+		})
+		const mode: Exclude<RematerializationMode, 'kept'> =
+			!forceSnapshot && unexplainedGaps.length === 0 && report.compactedAt === null
+				? 'log'
+				: 'snapshot+log'
+		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode, kept)
+		await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_CURRENT)
+		await this.writeMeta(
+			FOLD_PLAN_META_KEY,
+			JSON.stringify(foldPlanFingerprints(this.schema, this.operationTransforms)),
+		)
+		this.foldActive = true
+		if (result.snapshots > 0) await this.requestSnapshotResync()
+		if (result.records > 0) {
+			this.emitter?.emit({
+				type: 'store:rematerialized',
+				dbName: this.dbName,
+				mode: result.mode,
+				records: result.records,
+				changedRows: result.changedRows,
+				message:
+					result.mode === 'kept'
+						? `Operation log of "${this.dbName}" has quarantined rows: the records that own them were kept as they were (row snapshots); ${result.records} record(s) re-materialized, ${result.changedRows} row(s) changed.`
+						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
+			})
+		}
+	}
+
+	/**
+	 * Re-fold the records of every collection whose fold plan changed since the rows
+	 * were materialized (RT-63): a field that became `merge('counter')`, an array that
+	 * became append-only, a new or edited resolver. Their stored states hold fields of
+	 * the old kind, which the fold refuses (`FoldStateError`). Each record is rebuilt
+	 * from its log with the new plan; compacted bases and row snapshots are adapted
+	 * (a re-planned field restarts from its materialized value at its version). The
+	 * client's equivalent of the server stores' `fold_plan_fingerprint`.
+	 */
+	private async ensureFoldPlan(): Promise<void> {
+		const folder = this.folder
+		if (!folder) return
+		const current = foldPlanFingerprints(this.schema, this.operationTransforms)
+		const storedRaw = await this.readMeta(FOLD_PLAN_META_KEY)
+		let changed: string[]
+		if (storedRaw === null) {
+			// Materialized before the fingerprint was recorded: re-fold the collections
+			// whose stored states actually hold a field of another kind.
+			changed = await collectionsWithMismatchedStates(this.adapter, this.schema)
+		} else {
+			let stored: Record<string, unknown> = {}
+			try {
+				stored = JSON.parse(storedRaw) as Record<string, unknown>
+			} catch {
+				stored = {}
+			}
+			changed = Object.keys(current).filter((name) => stored[name] !== current[name])
+		}
+		if (changed.length > 0) {
+			const result = await rematerializeDatabase(
+				this.adapter,
+				this.schema,
+				folder,
+				'log',
+				undefined,
+				changed,
+			)
+			if (result.snapshots > 0) await this.requestSnapshotResync()
+			this.emitter?.emit({
+				type: 'store:rematerialized',
+				dbName: this.dbName,
+				mode: result.mode,
+				records: result.records,
+				changedRows: result.changedRows,
+				message: `The fold plan of ${changed.map((name) => `"${name}"`).join(', ')} changed (schema): re-folded ${result.records} record(s) of "${this.dbName}"; ${result.changedRows} row(s) changed.`,
+			})
+		}
+		await this.writeMeta(FOLD_PLAN_META_KEY, JSON.stringify(current))
+	}
+
+	/**
+	 * Row snapshots were created (RT-68): ask the sync server for a full resync (the
+	 * delivery watermarks restart at 0, as after a restore), so each such record gets
+	 * its complete history back; {@link settleSnapshotRecords} then drops the
+	 * snapshots once the resync has caught up.
+	 */
+	private async requestSnapshotResync(): Promise<void> {
+		await this.adapter.transaction(async (tx) => {
+			await tx.execute('UPDATE _kora_meta SET value = ? WHERE key = ? OR key LIKE ?', [
+				'0',
+				DELIVERY_WATERMARK_META_KEY,
+				`${DELIVERY_WATERMARK_META_KEY}:%`,
+			])
+			await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [DELTA_CURSOR_META_KEY])
+			await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+				SNAPSHOT_RESYNC_META_KEY,
+				'pending',
+			])
+		})
+	}
+
+	/**
+	 * Records whose state still folds against a row snapshot (approximate: a late
+	 * concurrent write older than a field's version is not folded, RT-68).
+	 */
+	async getSnapshotRecords(): Promise<Array<{ collection: string; recordId: string }>> {
+		this.ensureOpen()
+		const folder = this.folder
+		if (!folder) return []
+		let out: Array<{ collection: string; recordId: string }> = []
+		await this.adapter.transaction(async (tx) => {
+			out = await folder.listSnapshotRecords(tx)
+		})
+		return out
+	}
+
+	/**
+	 * Called by sync when a delivery stream has caught up (its final batch fully
+	 * applied). After the full resync {@link requestSnapshotResync} asked for, every
+	 * row-snapshot record whose insert is back in the log is re-folded from its
+	 * complete history and stops being approximate (RT-68). Also retires the
+	 * provisional cascades of remote deletes (RT-69): the server's own copies were
+	 * delivered by now, and any it did not derive must not stay applied locally.
+	 *
+	 * @returns How many snapshots were dropped
+	 */
+	async settleAfterCatchUp(): Promise<number> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder) return 0
+		const pending = (await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
+		let settled = 0
+		const touched = new Set<string>()
+		await this.adapter.transaction(async (tx) => {
+			for (const { collection, recordId } of await folder.listProvisionalRecords(tx)) {
+				await folder.deleteProvisional(tx, collection, recordId, null)
+				await folder.refoldInTx(tx, collection, recordId)
+				touched.add(collection)
+			}
+			if (pending) {
+				for (const { collection, recordId } of await folder.listSnapshotRecords(tx)) {
+					if (await folder.settleSnapshotInTx(tx, collection, recordId)) {
+						settled += 1
+						touched.add(collection)
+					}
+				}
+				await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [SNAPSHOT_RESYNC_META_KEY])
+			}
+		})
+		for (const collection of touched) this.subscriptionManager.invalidate(collection)
+		return settled
+	}
+
+	/**
+	 * Apply the cascades / set-nulls of a REMOTE delete as local-only provisional
+	 * effects (RT-69): folded into the children like operations, but never logged,
+	 * sequenced or queued for upload. The server derives and relays its own copy;
+	 * when it arrives (same parent, same record) the provisional effect is retired.
+	 *
+	 * @param parent - The remote delete
+	 * @param effects - Its side effects, as the referential check derived them
+	 */
+	async applyProvisionalSideEffects(
+		parent: Operation,
+		effects: ReadonlyArray<{
+			type: 'delete' | 'update'
+			collection: string
+			recordId: string
+			data: Record<string, unknown> | null
+			previousData: Record<string, unknown> | null
+			ruleId: string
+		}>,
+	): Promise<number> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder || effects.length === 0) return 0
+		const touched = new Set<string>()
+		let applied = 0
+		// Stamped right after the parent (its HLC, next logical ticks), exactly like the
+		// server's copy, so a write to the child later than the delete still wins.
+		const clock = new HybridLogicalClock(PROVISIONAL_NODE_ID, {
+			now: () => parent.timestamp.wallTime,
+		})
+		clock.advanceTo(parent.timestamp)
+		const built: Operation[] = []
+		for (const effect of effects) {
+			if (!this.schema.collections[effect.collection]) continue
+			const op: Operation = {
+				id: await deriveSideEffectOpId(parent.id, `provisional/${effect.ruleId}`, effect.recordId),
+				nodeId: PROVISIONAL_NODE_ID,
+				type: effect.type,
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.type === 'delete' ? null : effect.data,
+				previousData: effect.type === 'delete' ? null : effect.previousData,
+				timestamp: clock.now(),
+				sequenceNumber: 0,
+				causalDeps: [parent.id],
+				schemaVersion: this.schema.version,
+			}
+			built.push(op)
+		}
+		await this.adapter.transaction(async (tx) => {
+			for (const op of built) {
+				await folder.applyProvisionalInTx(tx, op, parent.id)
+				touched.add(op.collection)
+				applied += 1
+			}
+		})
+		for (const collection of touched) this.subscriptionManager.invalidate(collection)
+		return applied
+	}
+
+	/**
+	 * Node ids whose writes win `merge('server-authoritative')` fields (the server's,
+	 * from the sync handshake). Every `kora:server:` id is authoritative by prefix, so
+	 * only explicit ids (legacy server node ids, configured extras) are kept: the device
+	 * persists the UNION of every explicit id it has learned and never drops one (RT-75).
+	 * Handshakes differ per server instance (each lists what it knows), so a list that
+	 * omits an id is not a revocation.
+	 *
+	 * Revocation is explicit (RT-81): ids a handshake lists in `revokedAuthoritativeNodeIds`
+	 * are removed from the union, persisted as revoked, and never learned again. Records
+	 * of collections with such fields are re-folded only when the explicit set changes
+	 * (grows, or loses a revoked id).
+	 *
+	 * @param nodeIds - The server's authoritative node ids (one handshake's list)
+	 * @param revokedNodeIds - Explicit ids the server revoked (one handshake's list)
+	 */
+	async setAuthoritativeNodeIds(
+		nodeIds: readonly string[],
+		revokedNodeIds: readonly string[] = [],
+	): Promise<void> {
+		this.ensureOpen()
+		const folder = this.folder
+		const persisted = await loadAuthoritativeNodeIds(this.adapter)
+		const persistedRevoked = await loadRevokedAuthoritativeNodeIds(this.adapter)
+		const revoked = new Set(
+			[...persistedRevoked, ...revokedNodeIds].filter((id) => !isServerNodeId(id)),
+		)
+		if (revoked.size > persistedRevoked.length) {
+			await saveRevokedAuthoritativeNodeIds(this.adapter, [...revoked].sort())
+		}
+		const previous = new Set(
+			[...(persisted ?? []), ...(folder ? folder.getAuthoritativeNodeIds() : [])].filter(
+				(id) => !isServerNodeId(id),
+			),
+		)
+		const known = new Set([...previous].filter((id) => !revoked.has(id)))
+		const dropped = previous.size - known.size
+		const learned = [...new Set(nodeIds)].filter(
+			(id) => !isServerNodeId(id) && !known.has(id) && !revoked.has(id),
+		)
+		const next = [...known, ...learned].sort()
+		const stored = persisted === null ? null : [...persisted].sort()
+		if (stored === null || JSON.stringify(stored) !== JSON.stringify(next)) {
+			// One persisted list (`sync_authoritative_node_ids`) serves the fold and the
+			// sync engine's verification exemptions, so they can never disagree.
+			await saveAuthoritativeNodeIds(this.adapter, next)
+		}
+		if (!folder) return
+		folder.setAuthoritativeNodeIds(next)
+		if (learned.length === 0 && dropped === 0) return
+		const fold = this.activeFold()
+		if (!fold) return
+		for (const collection of Object.keys(this.schema.collections)) {
+			if (!fold.hasAuthoritativeFields(collection)) continue
+			const ids = await this.adapter.query<{ record_id: string }>(
+				`SELECT record_id FROM ${FOLD_STATE_TABLE} WHERE collection = ?`,
+				[collection],
+			)
+			await this.adapter.transaction(async (tx) => {
+				for (const { record_id } of ids) await fold.refoldInTx(tx, collection, record_id)
+			})
+			this.subscriptionManager.invalidate(collection)
+		}
+	}
+
+	/**
+	 * Re-fold the records of these operations from base + log (W7 exclusion: an
+	 * operation with a terminal-rejection marker is left out).
+	 */
+	private async refoldRecordsOf(operationIds: readonly string[]): Promise<void> {
+		const fold = this.activeFold()
+		if (!fold || operationIds.length === 0) return
+		const touched = new Map<string, Set<string>>()
+		for (const collection of Object.keys(this.schema.collections)) {
+			const table = quoteIdent(`_kora_ops_${collection}`)
+			for (let i = 0; i < operationIds.length; i += 500) {
+				const chunk = operationIds.slice(i, i + 500)
+				const rows = await this.adapter.query<{ record_id: string }>(
+					`SELECT DISTINCT record_id FROM ${table} WHERE id IN (${chunk.map(() => '?').join(', ')})`,
+					chunk,
+				)
+				for (const row of rows) {
+					const set = touched.get(collection) ?? new Set<string>()
+					set.add(row.record_id)
+					touched.set(collection, set)
+				}
+			}
+		}
+		if (touched.size === 0) return
+		await this.adapter.transaction(async (tx) => {
+			for (const [collection, records] of touched) {
+				for (const recordId of records) await fold.refoldInTx(tx, collection, recordId)
+			}
+		})
+		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
 	}
 
 	/**
@@ -1088,7 +1811,17 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		const start = Date.now()
 		const allOps = await this.getAllOperations()
-		const snapshot = buildReplaySnapshot(this.schema, allOps, operationId)
+		const aliasRows = await this.adapter.query<{ id: string; reemitted_as: string }>(
+			`SELECT id, reemitted_as FROM ${SEQ_CONFLICTS_TABLE} WHERE reemitted_as IS NOT NULL AND reemitted_as <> id`,
+		)
+		const aliases = new Map(aliasRows.map((row) => [row.id, row.reemitted_as]))
+		const snapshot = buildReplaySnapshot(
+			this.schema,
+			allOps,
+			operationId,
+			aliases,
+			this.operationTransforms,
+		)
 
 		if (this.emitter) {
 			this.emitter.emit({
@@ -1171,7 +1904,15 @@ export class Store implements OperationLog {
 	 */
 	createMutationContext(
 		collection: string,
-		options?: { extraCausalDeps?: string[] },
+		options?: {
+			extraCausalDeps?: string[]
+			/**
+			 * Stamp the writes with this clock instead of the store's (it must be this
+			 * node's). Used for the side effects of a remote delete, stamped right after
+			 * the delete like the server's copy (seam 5), never with the device's "now".
+			 */
+			clock?: HybridLogicalClock
+		},
 	): LocalMutationContext {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
@@ -1179,12 +1920,14 @@ export class Store implements OperationLog {
 			throw new StoreNotOpenError()
 		}
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
+		const fold = this.activeFold()
 		return {
+			...(fold ? { fold } : {}),
 			collection,
 			definition,
 			schema: this.schema,
 			adapter: this.adapter,
-			clock: this.clock,
+			clock: options?.clock ?? this.clock,
 			nodeId: this.nodeId,
 			onMutation: (collectionName, operation) =>
 				this.publishLocalOperation(collectionName, operation),
@@ -1192,6 +1935,9 @@ export class Store implements OperationLog {
 			causalTracker: this.causalTracker,
 			...(options?.extraCausalDeps ? { extraCausalDeps: options.extraCausalDeps } : {}),
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -1286,6 +2032,24 @@ export class Store implements OperationLog {
 	async saveNodeToken(token: string, nodeId?: string): Promise<void> {
 		this.ensureOpen()
 		await saveNodeToken(this.adapter, token, nodeId ?? this.nodeId)
+	}
+
+	/**
+	 * Load the node ids the sync server named authoritative (protocol v2), or null when
+	 * no protocol-2 server ever answered.
+	 */
+	async loadAuthoritativeNodeIds(): Promise<string[] | null> {
+		this.ensureOpen()
+		return loadAuthoritativeNodeIds(this.adapter)
+	}
+
+	/**
+	 * Persist the node ids the sync server named authoritative (protocol v2). Same as
+	 * {@link setAuthoritativeNodeIds}: merged into the union of learned explicit ids,
+	 * and the fold re-folds affected records only when that set grows.
+	 */
+	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
+		await this.setAuthoritativeNodeIds(nodeIds)
 	}
 
 	/**
@@ -1478,6 +2242,9 @@ export class Store implements OperationLog {
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
+		// The re-authored operations have new ids: their records' fold states still name
+		// the old ones, so they are re-folded from the log.
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
 		return result
 	}
 
@@ -1498,6 +2265,7 @@ export class Store implements OperationLog {
 			)
 		}
 		if (nodeId === this.nodeId) return
+		if (isReservedNodeId(nodeId)) throw new ReservedNodeIdError(nodeId, 'switchNodeId')
 		const known = (await listLocalNodes(this.adapter)).some((node) => node.nodeId === nodeId)
 		if (!known) {
 			throw new KoraError(
@@ -1697,22 +2465,34 @@ export class Store implements OperationLog {
 	/**
 	 * Give one of a local node's operations a fresh sequence number above `floor`
 	 * (RT-35): the server refused it with `SEQUENCE_CONFLICT` because it holds another
-	 * operation of this node under that number (one this device lost). The operation
-	 * keeps its id and content (protocol v1 does not hash the sequence number), exactly
-	 * like the W6 sequence repair, and the old identity is recorded in
-	 * `_kora_seq_conflicts`.
+	 * operation of this node under that number (one this device lost). A version-1
+	 * operation keeps its id (its hash does not cover the sequence number), exactly like
+	 * the W6 sequence repair; a version-2 operation (protocol v2) is re-hashed under the
+	 * new number, so it carries a new id. The old identity is recorded in
+	 * `_kora_seq_conflicts` (`reemitted_as`).
 	 *
-	 * @returns The renumbered operation, or null when it is not in the log
+	 * A new id would leave later operations naming the old one in `causalDeps`: those in
+	 * `rewritableDependents` (operations the server never stored: never sent) are
+	 * rewritten to name the new id, and re-hashed, transitively, in the same
+	 * transaction. Dependents already sent keep their ids (the server may hold them);
+	 * their dep resolves through the `_kora_seq_conflicts` record. Every touched record
+	 * is re-folded (fold stamps carry operation ids).
+	 *
+	 * @param rewritableDependents - Ids of this node's operations that were never sent
+	 * @returns The renumbered operation and the rewritten dependents, or null when the
+	 *   operation is not in the log
 	 */
 	async resequenceOperation(
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null> {
+		rewritableDependents: readonly string[] = [],
+	): Promise<ResequenceResult | null> {
 		this.ensureOpen()
-		const found: { op: Operation | null } = { op: null }
+		const found: { result: ResequenceResult | null } = { result: null }
+		const collections = Object.keys(this.schema.collections)
 		await this.adapter.transaction(async (tx) => {
-			for (const collection of Object.keys(this.schema.collections)) {
+			for (const collection of collections) {
 				const table = quoteIdent(`_kora_ops_${collection}`)
 				const rows = await tx.query<OperationRow>(
 					`SELECT * FROM ${table} WHERE id = ? AND node_id = ?`,
@@ -1726,25 +2506,36 @@ export class Store implements OperationLog {
 					[nodeId, floor],
 				)
 				const sequence = await allocateNextSequenceInTransaction(tx, nodeId)
+				// A version-2 id covers the sequence number (CORE-1): such an operation is
+				// re-hashed under the new number (the server never stored it).
+				const moved = await renumberOperationRow(tx, collection, row, sequence)
 				await insertConflictRow(
 					tx,
 					collection,
 					row,
 					'server-sequence-conflict',
-					row.id,
+					moved.id,
 					sequence,
 					Date.now(),
 				)
-				await tx.execute(`UPDATE ${table} SET sequence_number = ? WHERE id = ?`, [sequence, row.id])
-				found.op = deserializeOperationWithCollection(
-					{ ...row, sequence_number: sequence },
-					collection,
-				)
+				const idMapping: Record<string, string> = moved.id !== row.id ? { [row.id]: moved.id } : {}
+				const rewritable = new Set(rewritableDependents)
+				rewritable.delete(row.id)
+				const dependents =
+					moved.id !== row.id
+						? await rewriteDependentsInTx(tx, collections, nodeId, idMapping, rewritable)
+						: []
+				found.result = { operation: moved, dependents, idMapping }
 				return
 			}
 		})
-		if (found.op) this.recordOperationSequence(found.op)
-		return found.op
+		const result = found.result
+		if (!result) return null
+		this.recordOperationSequence(result.operation)
+		if (Object.keys(result.idMapping).length > 0) {
+			await this.refoldRecordsOf([result.operation.id, ...result.dependents.map((op) => op.id)])
+		}
+		return result
 	}
 
 	/**
@@ -1760,6 +2551,9 @@ export class Store implements OperationLog {
 	async recordTerminalRejections(entries: TerminalRejection[]): Promise<void> {
 		this.ensureOpen()
 		await recordTerminalRejections(this.adapter, entries)
+		// The server never stored these operations: re-fold their records without them,
+		// so this device converges to the server's state (W7 step 2).
+		await this.refoldRecordsOf(entries.map((entry) => entry.operationId))
 	}
 
 	/** Which of these operation ids the server refused for good (RT-36). */
@@ -1831,6 +2625,8 @@ export class Store implements OperationLog {
 		if (result.newMaxTimestamp && this.clock) {
 			this.clock.advanceTo(result.newMaxTimestamp)
 		}
+		// Re-stamped operations order differently: re-fold their records.
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
 		return result
 	}
 
@@ -1843,16 +2639,25 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Compact the local operation log using materialized rows as the baseline.
-	 * Only removes ops the server has acknowledged (per {@link CompactionStrategy}).
+	 * Compact the local operation log. Only removes ops the server has acknowledged
+	 * (per {@link CompactionStrategy}). With the W7 fold (STORE-14), the effect of the
+	 * removed operations is first joined into each record's base fold state, so a
+	 * re-fold (rejection exclusion, a later re-materialization) and the merge of a
+	 * late operation stay exact; delete, atomic and custom-resolver operations are
+	 * kept, and a re-delivered compacted id is a duplicate by its node's compacted
+	 * prefix.
 	 */
 	async compact(strategy: CompactionStrategy): Promise<CompactionResult> {
 		this.ensureOpen()
+		const fold = this.activeFold()
 		if (strategy.mode === 'never') {
 			return compactOperationLog(this.adapter, this.schema, strategy, createVersionVector())
 		}
 
 		const serverVector = strategy.serverVector ?? (await loadLastAckedServerVector(this.adapter))
+		if (fold) {
+			return compactFoldedLog(this.adapter, this.schema, fold, strategy, serverVector)
+		}
 		return compactOperationLog(this.adapter, this.schema, strategy, serverVector)
 	}
 
@@ -1957,7 +2762,9 @@ export class Store implements OperationLog {
 			throw new StoreNotOpenError()
 		}
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
+		const fold = this.activeFold()
 		return new TransactionContext({
+			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,
 			clock: this.clock,
@@ -2014,16 +2821,194 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Restore data from a backup binary.
+	 * Restore data from a backup binary (format version 2, STORE-5).
+	 *
+	 * - `merge: true`: every backup operation is applied through the remote-apply path
+	 *   (deduplicated by id, merged per field), the version vector advances by MAX, and
+	 *   nothing of the exporting device's identity or sync state is imported.
+	 * - Replace (default): the data is replaced by the backup's while this device keeps
+	 *   its node id, local nodes and principal bindings, its own sequence counters never
+	 *   move backwards, and unsynced own writes are kept (see
+	 *   `RestoreOptions.keepUnsyncedWrites`). Then {@link reloadFromDisk} runs.
+	 *
+	 * A version-1 file is refused (`errorCode: 'BACKUP_FORMAT_OUTDATED'`); convert it with
+	 * `convertBackupV1`.
 	 *
 	 * @param data - The backup data
-	 * @param options - Restore options (merge, collections, onProgress)
+	 * @param options - Restore options (merge, collections, keepUnsyncedWrites, onProgress)
+	 * @param internal - `applyOperation`: the app's remote-apply path (defaults to
+	 *   {@link applyRemoteOperation}); `createApp` passes the merge-aware pipeline sync uses
 	 * @returns Result of the restore operation
 	 */
-	async importBackup(data: Uint8Array, options?: RestoreOptions): Promise<RestoreResult> {
+	async importBackup(
+		data: Uint8Array,
+		options?: RestoreOptions,
+		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
+	): Promise<RestoreResult> {
 		this.ensureOpen()
-		const { restoreBackup: doRestore } = await import('../backup/backup')
-		return doRestore(this.adapter, this.schema, data, options)
+		const started = Date.now()
+		const onProgress = options?.onProgress ?? (() => {})
+		const { BackupFormatError, parseBackup } = await import('../backup/backup')
+		const { restoreMerge, restoreReplace } = await import('../backup/restore')
+		onProgress({ phase: 'verifying', progress: 0, message: 'Verifying backup' })
+		let parsed: Awaited<ReturnType<typeof parseBackup>>
+		try {
+			parsed = await parseBackup(
+				data,
+				options?.collections ? { collections: options.collections } : undefined,
+			)
+		} catch (error) {
+			if (!(error instanceof BackupFormatError)) throw error
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: error.message,
+				errorCode: error.code,
+				duration: Date.now() - started,
+			}
+		}
+		if (parsed.manifest.schemaVersion > this.schema.version) {
+			return {
+				operationsRestored: 0,
+				recordsRestored: 0,
+				success: false,
+				error: `The backup was written by schema version ${parsed.manifest.schemaVersion}; this app runs version ${this.schema.version}. Update the app before restoring it.`,
+				errorCode: 'BACKUP_SCHEMA_NEWER',
+				duration: Date.now() - started,
+			}
+		}
+		onProgress({ phase: 'restoring', progress: 0.3, message: 'Restoring' })
+		const explicitAuthorities = new Set((await loadAuthoritativeNodeIds(this.adapter)) ?? [])
+		const host = {
+			adapter: this.adapter,
+			schema: this.schema,
+			applyOperation:
+				internal?.applyOperation ?? ((op: Operation) => this.applyRemoteOperation(op)),
+			listLocalNodes: () => listLocalNodes(this.adapter),
+			isServerAuthority: (nodeId: string) =>
+				isReservedNodeId(nodeId) || explicitAuthorities.has(nodeId),
+		}
+		if (options?.merge) await this.mergeBackupFoldState(parsed, options.collections !== undefined)
+		const counts = options?.merge
+			? await restoreMerge(host, parsed, options.collections !== undefined)
+			: await restoreReplace(host, parsed, {
+					collections: options?.collections ?? null,
+					keepUnsyncedWrites: options?.keepUnsyncedWrites ?? true,
+				})
+		if (!options?.merge && this.folder) {
+			// Restored rows and log replace what the fold states described: rebuild them,
+			// from the backup's base states and log (RT-66). A file from an earlier
+			// release carries no base states, and its log may have been compacted: its
+			// records are rebuilt on top of its rows instead (row snapshots).
+			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
+				FOLD_MATERIALIZATION_META_KEY,
+			])
+			this.foldActive = false
+			await this.ensureMaterialization(parsed.manifest.includesFoldState !== true)
+		}
+		await this.reloadFromDisk()
+		onProgress({ phase: 'restoring', progress: 1, message: 'Done' })
+		return {
+			operationsRestored: counts.operationsRestored,
+			recordsRestored: counts.recordsRestored,
+			...(options?.merge ? {} : { unsyncedWritesKept: counts.unsyncedWritesKept }),
+			...(counts.serverOperationsSkipped
+				? { serverOperationsSkipped: counts.serverOperationsSkipped }
+				: {}),
+			success: true,
+			duration: Date.now() - started,
+		}
+	}
+
+	/**
+	 * Merge mode (RT-66): join the backup's compacted base states and row snapshots
+	 * into this database's, and re-fold those records, before the backup's operations
+	 * are applied. The join is the fold's state-based merge, so the result equals
+	 * folding both devices' histories together. Compacted prefixes advance by MAX
+	 * (unfiltered restores only: the prefix is per node, across collections).
+	 */
+	private async mergeBackupFoldState(
+		parsed: import('../backup/backup').ParsedBackup,
+		filtered: boolean,
+	): Promise<void> {
+		const folder = this.activeFold()
+		if (!folder) return
+		const touched = new Map<string, Set<string>>()
+		await this.adapter.transaction(async (tx) => {
+			for (const [rows, kind] of [
+				[parsed.foldBases, 'base'],
+				[parsed.foldSnapshots, 'snapshot'],
+			] as const) {
+				for (const row of rows) {
+					if (!this.schema.collections[row.collection]) continue
+					let state: FoldState
+					try {
+						state = deserializeFoldState(row.state)
+					} catch {
+						continue
+					}
+					if (state.c !== row.collection || state.r !== row.recordId) continue
+					if (kind === 'base') await folder.joinIntoBase(tx, state)
+					else await folder.saveSnapshot(tx, state)
+					const ids = touched.get(row.collection) ?? new Set<string>()
+					ids.add(row.recordId)
+					touched.set(row.collection, ids)
+				}
+			}
+			if (!filtered) {
+				for (const [nodeId, sequence] of parsed.compactedThrough) {
+					await tx.execute(
+						`INSERT INTO ${COMPACTED_THROUGH_TABLE} (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+						[nodeId, sequence],
+					)
+				}
+			}
+			for (const [collection, ids] of touched) {
+				for (const recordId of ids) await folder.refoldInTx(tx, collection, recordId)
+			}
+		})
+		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
+	}
+
+	/**
+	 * Re-read this store's state from the database after it changed underneath it (a
+	 * backup restore): the node id, version vector and own sequence counter, the clock
+	 * (advanced past every timestamp in the log), and a fresh causal tracker. Every live
+	 * query re-runs. The local node registry and terminal rejections are always read
+	 * from the database, so they need no reload.
+	 */
+	async reloadFromDisk(): Promise<void> {
+		this.ensureOpen()
+		let nodeId = this.nodeId
+		if (!this.configNodeId && this.isolation !== 'per-tab') {
+			const rows = await this.adapter.query<MetaRow>(
+				"SELECT value FROM _kora_meta WHERE key = 'node_id'",
+			)
+			nodeId = rows[0]?.value ?? this.nodeId
+		}
+		await this.rebindToNode(nodeId)
+		const newest = await this.loadNewestLogTimestamp()
+		if (newest && this.clock) {
+			this.clock.advanceTo({ ...newest, nodeId: this.nodeId })
+		}
+		for (const collection of Object.keys(this.schema.collections)) {
+			this.subscriptionManager.invalidate(collection)
+		}
+	}
+
+	/** The greatest HLC timestamp in the operation log (canonical strings sort by HLC). */
+	private async loadNewestLogTimestamp(): Promise<HLCTimestamp | null> {
+		let newest: string | null = null
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ t: string | null }>(
+				`SELECT MAX(timestamp) AS t FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			const value = rows[0]?.t ?? null
+			if (value !== null && (newest === null || value > newest)) newest = value
+		}
+		return newest === null ? null : HybridLogicalClock.deserialize(newest)
 	}
 
 	/**
@@ -2068,112 +3053,36 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Check the stored schema version and run any pending migrations.
-	 * Migrations are applied in version order within a transaction.
+	 * Run pending schema migrations (STORE-13, NEW-STORE-1): one transaction per version
+	 * (DDL, backfills, `schema_version`); backfills write operations through the local
+	 * write path so they sync, unless declared `localOnly`.
 	 */
 	private async runMigrationsIfNeeded(): Promise<void> {
-		const storedVersion = await this.getStoredSchemaVersion()
-		const targetVersion = this.schema.version
-
-		if (storedVersion >= targetVersion) {
-			// Already up to date (or first run with version 1)
-			if (storedVersion === 0) {
-				// First open — store the initial version
-				await this.adapter.execute(
-					"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-					[String(targetVersion)],
-				)
-			}
-			return
-		}
-
-		// Run each migration in order from storedVersion+1 to targetVersion
-		const migrations = this.schema.migrations ?? {}
-		for (let v = storedVersion + 1; v <= targetVersion; v++) {
-			const migration = migrations[v]
-			if (!migration) continue
-
-			// Generate SQL from structural steps
-			const sqlStatements = migrationStepsToSQL(migration.steps)
-
-			// Execute structural changes individually, tolerating "duplicate column" errors
-			// because generateSQL already emits --kora:safe-alter ALTER TABLE statements
-			// for the current schema's columns (run via generateFullDDL in adapter.open()).
-			for (const sql of sqlStatements) {
-				try {
-					await this.adapter.execute(sql)
-				} catch (e) {
-					const msg = (e as Error).message || ''
-					if (!msg.includes('duplicate column name')) {
-						throw e
-					}
-					// Column already exists (added by safe-alter in generateSQL) — safe to skip
-				}
-			}
-
-			// Run backfills in a transaction
-			const backfillSteps = migration.steps.filter(
-				(s): s is Extract<MigrationStep, { type: 'backfill' }> => s.type === 'backfill',
-			)
-			for (const step of backfillSteps) {
-				await this.runBackfill(step.collection, step.transform)
-			}
-		}
-
-		// Update stored schema version
-		await this.adapter.execute(
-			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('schema_version', ?)",
-			[String(targetVersion)],
-		)
-	}
-
-	/**
-	 * Get the stored schema version from _kora_meta. Returns 0 if not set.
-	 */
-	private async getStoredSchemaVersion(): Promise<number> {
-		const rows = await this.adapter.query<MetaRow>(
-			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
-		)
-		return rows[0] ? Number(rows[0].value) : 0
-	}
-
-	/**
-	 * Run a backfill transform on all records in a collection.
-	 * Reads all rows, applies the transform, and updates changed fields.
-	 */
-	private async runBackfill(
-		collection: string,
-		transform: (record: Record<string, unknown>) => Record<string, unknown>,
-	): Promise<void> {
-		const rows = await this.adapter.query<RawCollectionRow>(
-			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
-		)
-
-		await this.adapter.transaction(async (tx) => {
-			for (const row of rows) {
-				const updates = transform(row as Record<string, unknown>)
-				const fields = Object.keys(updates)
-				if (fields.length === 0) continue
-
-				const setClauses = fields.map((f) => `${quoteIdent(f)} = ?`).join(', ')
-				const values = fields.map((f) => {
-					const val = updates[f]
-					// Serialize booleans to 0/1 for SQLite
-					if (typeof val === 'boolean') return val ? 1 : 0
-					// Serialize arrays/objects to JSON
-					if (Array.isArray(val) || (typeof val === 'object' && val !== null)) {
-						return JSON.stringify(val)
-					}
-					return val
-				})
-				values.push(row.id)
-
-				await tx.execute(`UPDATE ${quoteIdent(collection)} SET ${setClauses} WHERE id = ?`, values)
-			}
+		const clock = this.clock
+		if (!clock) throw new StoreNotOpenError()
+		const fold = this.activeFold()
+		await runSchemaMigrations({
+			adapter: this.adapter,
+			schema: this.schema,
+			env: {
+				...(fold ? { fold } : {}),
+				schema: this.schema,
+				clock,
+				nodeId: this.nodeId,
+				relationEnforcer: null,
+				...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			},
+			causalTracker: this.causalTracker,
+			onOperation: (operation) => this.publishLocalOperation(operation.collection, operation),
 		})
 	}
 
 	private async loadOrGenerateNodeId(): Promise<string> {
+		// The `kora:` namespace is Kora's own (server nodes `kora:server:<id>` are
+		// authoritative by prefix, RT-61): a device never authors under such an id.
+		if (this.configNodeId && isReservedNodeId(this.configNodeId)) {
+			throw new ReservedNodeIdError(this.configNodeId, 'StoreConfig.nodeId')
+		}
 		if (this.configNodeId) {
 			if (this.isolation !== 'per-tab') {
 				await this.adapter.execute(
@@ -2192,15 +3101,18 @@ export class Store implements OperationLog {
 		const rows = await this.adapter.query<MetaRow>(
 			"SELECT value FROM _kora_meta WHERE key = 'node_id'",
 		)
-		if (rows[0]) {
+		if (rows[0] && !isReservedNodeId(rows[0].value)) {
 			return rows[0].value
 		}
 
-		// Generate new node ID
+		// Generate a new node id (a UUIDv7, never in the reserved `kora:` namespace). A
+		// persisted reserved id (written by something other than this client) is never
+		// adopted: the database gets a fresh identity instead.
 		const newNodeId = generateUUIDv7()
-		await this.adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', ?)", [
-			newNodeId,
-		])
+		await this.adapter.execute(
+			"INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)",
+			[newNodeId],
+		)
 		return newNodeId
 	}
 

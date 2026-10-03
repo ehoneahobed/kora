@@ -1,4 +1,10 @@
-import type { ApplyFailureReason, ApplyResult, Operation, VersionVector } from '@korajs/core'
+import type {
+	ApplyFailureReason,
+	ApplyResult,
+	Operation,
+	OperationTransform,
+	VersionVector,
+} from '@korajs/core'
 
 export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
 
@@ -25,6 +31,13 @@ export interface SyncStore {
 	 * @returns 'applied' if the operation was new, 'duplicate' if already seen, 'skipped' if filtered
 	 */
 	applyRemoteOperation(op: Operation): Promise<ApplyResult>
+
+	/**
+	 * Optional: the schema transforms the store folds with (transforms at fold time,
+	 * RT-84). The engine hands the store every operation exactly as delivered; the store
+	 * folds its view. When present, it must match the engine's `operationTransforms`.
+	 */
+	getOperationTransforms?(): readonly OperationTransform[]
 
 	/**
 	 * Get operations from a specific node within a sequence range.
@@ -86,16 +99,24 @@ export interface SyncStore {
 	raiseSequenceFloor?(nodeId: string, floor: number): Promise<boolean>
 
 	/**
-	 * Optional: give a local operation a fresh sequence number above `floor`, keeping its
-	 * id (RT-35: the server refused it with `SEQUENCE_CONFLICT` because it holds another
-	 * operation of this node, lost locally, under that number).
-	 * @returns The renumbered operation, or null when it is not in the log
+	 * Optional: give a local operation a fresh sequence number above `floor` (RT-35: the
+	 * server refused it with `SEQUENCE_CONFLICT` because it holds another operation of
+	 * this node, lost locally, under that number). A version-2 operation is re-hashed
+	 * under a new id; its never-sent dependents (`rewritableDependents`) are rewritten
+	 * to name the new id, transitively.
+	 * @returns The renumbered operation, the rewritten dependents and the id mapping,
+	 *   or null when it is not in the log
 	 */
 	resequenceOperation?(
 		operationId: string,
 		nodeId: string,
 		floor: number,
-	): Promise<Operation | null>
+		rewritableDependents?: readonly string[],
+	): Promise<{
+		operation: Operation
+		dependents: Operation[]
+		idMapping: Record<string, string>
+	} | null>
 
 	/**
 	 * Optional: take over another local node id's unsynced writes (RT-40). Resolves to a
@@ -107,6 +128,16 @@ export interface SyncStore {
 		ids: string[],
 		correctedNowMs: number,
 	): Promise<{ operations: Operation[]; idMapping: Record<string, string>; rebasedCount: number }>
+
+	/**
+	 * Optional (W7): the server's node ids whose writes win `merge('server-
+	 * authoritative')` fields, from the handshake response. The store persists them
+	 * and folds with them (re-folding affected records when the set changes).
+	 */
+	setAuthoritativeNodeIds?(
+		nodeIds: readonly string[],
+		revokedNodeIds?: readonly string[],
+	): Promise<void>
 
 	/**
 	 * Optional: read a record's current materialized field values, used to backfill
@@ -137,4 +168,13 @@ export interface SyncStore {
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,
 	): Promise<Array<{ collection: string; recordId: string }>>
+
+	/**
+	 * Optional (W7): the delivery stream caught up (its final batch fully applied).
+	 * The store retires local-only provisional cascades of remote deletes (RT-69) and
+	 * drops row snapshots whose history a full resync brought back (RT-68).
+	 *
+	 * @returns How many row snapshots were dropped
+	 */
+	settleAfterCatchUp?(): Promise<number>
 }

@@ -1,15 +1,3 @@
-/**
- * RT-37 and RT-39 at the session level, through a real KoraSyncServer and in-memory
- * transports.
- *
- * RT-37: a client without the `sequenceReservation` handshake capability (Kora <=
- * beta.13) may legitimately put two operations under one (node, sequence). Its pair is
- * stored and delivered to every other device; a capable client is still refused.
- *
- * RT-39: operations the server already stores (the upgrade re-upload) do not consume
- * the per-operation ingest budget; each batch costs one unit for its lookup, so
- * lookups are never free; and the budget is per device node.
- */
 import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
@@ -24,6 +12,19 @@ import type { ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { KoraSyncServerConfig } from '../../src/types'
+/**
+ * RT-37 and RT-39 at the session level, through a real KoraSyncServer and in-memory
+ * transports.
+ *
+ * RT-37: a client without the `sequenceReservation` handshake capability (Kora <=
+ * beta.13) may legitimately put two operations under one (node, sequence). Its pair is
+ * stored and delivered to every other device; a capable client is still refused.
+ *
+ * RT-39: operations the server already stores (the upgrade re-upload) do not consume
+ * the per-operation ingest budget; each batch costs one unit for its lookup, so
+ * lookups are never free; and the budget is per device node.
+ */
+import { withContentId } from '../fixtures/content-id'
 
 const schema = defineSchema({
 	version: 1,
@@ -46,8 +47,9 @@ const tick = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(res
 let counter = 0
 function makeOp(nodeId: string, sequenceNumber: number, title = 't'): Operation {
 	counter += 1
-	return {
-		id: `legacy-op-${nodeId}-${sequenceNumber}-${counter}`,
+	// A real content-addressed id: the server verifies it (RT-64).
+	return withContentId({
+		id: '',
 		nodeId,
 		type: 'insert',
 		collection: 'notes',
@@ -58,7 +60,7 @@ function makeOp(nodeId: string, sequenceNumber: number, title = 't'): Operation 
 		sequenceNumber,
 		causalDeps: [],
 		schemaVersion: 1,
-	}
+	})
 }
 
 function batch(ops: Operation[]): SyncMessage {

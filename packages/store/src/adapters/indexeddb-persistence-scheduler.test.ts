@@ -113,4 +113,47 @@ describe('IndexedDbPersistenceScheduler', () => {
 			scheduler.dispose()
 		})
 	})
+
+	test('flushNow keeps writing while writes landed during the snapshot (STORE-7)', async () => {
+		let live = 1
+		const persisted: number[] = []
+		const gate: { release: () => void } = { release: () => {} }
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 60_000,
+			flush: async () => {
+				const snapshot = live
+				if (persisted.length === 0) {
+					await new Promise<void>((resolve) => {
+						gate.release = resolve
+					})
+				}
+				persisted.push(snapshot)
+			},
+		})
+		const first = scheduler.flushNow()
+		await Promise.resolve()
+		live = 2
+		scheduler.schedule()
+		expect(scheduler.isDirty()).toBe(true)
+		const second = scheduler.flushNow()
+		gate.release()
+		await Promise.all([first, second])
+		expect(persisted.at(-1)).toBe(2)
+		expect(scheduler.isDirty()).toBe(false)
+		scheduler.dispose()
+	})
+
+	test('flushNow stops after a failed snapshot instead of retrying forever', async () => {
+		const onError = vi.fn()
+		const flush = vi.fn(async () => {
+			throw new Error('quota')
+		})
+		const scheduler = new IndexedDbPersistenceScheduler({ debounceMs: 60_000, flush, onError })
+		scheduler.schedule()
+		await scheduler.flushNow()
+		expect(flush).toHaveBeenCalledTimes(1)
+		expect(onError).toHaveBeenCalledTimes(1)
+		expect(scheduler.isDirty()).toBe(true)
+		scheduler.dispose()
+	})
 })

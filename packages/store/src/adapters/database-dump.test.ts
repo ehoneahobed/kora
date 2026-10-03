@@ -48,6 +48,36 @@ describe('database dump (explicit backend migration)', () => {
 		await scratch.close()
 	})
 
+	test('a table the target lacks is recreated from its recorded DDL, constraints included', async () => {
+		await source.execute('CREATE TABLE _kora_late (k TEXT NOT NULL, v TEXT, PRIMARY KEY (k))')
+		await source.execute("INSERT INTO _kora_late (k, v) VALUES ('a', '1')")
+		const dump = await exportDump((sql, params) => source.query(sql, params))
+		expect(dump.tables.find((t) => t.name === '_kora_late')?.sql).toMatch(/PRIMARY KEY/)
+		await target.transaction(async (tx) => {
+			for (const statement of restoreDumpStatements(dump)) {
+				await tx.execute(statement.sql, statement.params)
+			}
+		})
+		await target.execute("INSERT OR REPLACE INTO _kora_late (k, v) VALUES ('a', '2')")
+		const rows = await target.query<{ v: string }>('SELECT v FROM _kora_late')
+		expect(rows).toEqual([{ v: '2' }])
+	})
+
+	test('a recorded statement that is not a plain CREATE TABLE of that table is ignored', () => {
+		const statements = restoreDumpStatements({
+			tables: [
+				{ name: 't', sql: 'CREATE TABLE other (a)', columns: ['a'], rows: [] },
+				{ name: 'u', sql: 'CREATE TABLE u (a); DROP TABLE x', columns: ['a'], rows: [] },
+			],
+		})
+		expect(statements.map((s) => s.sql)).toEqual([
+			'CREATE TABLE IF NOT EXISTS "t" ("a")',
+			'DELETE FROM "t"',
+			'CREATE TABLE IF NOT EXISTS "u" ("a")',
+			'DELETE FROM "u"',
+		])
+	})
+
 	test('unsafe identifiers in a dump are rejected', () => {
 		expect(() =>
 			restoreDumpStatements({ tables: [{ name: 'x; DROP TABLE y', columns: [], rows: [] }] }),

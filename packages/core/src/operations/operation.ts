@@ -1,7 +1,21 @@
 import { HybridLogicalClock } from '../clock/hlc'
 import { OperationError } from '../errors/errors'
 import type { HLCTimestamp, Operation, OperationInput } from '../types'
-import { computeOperationId } from './content-hash'
+import { canonicalizeOperationBody } from './canonical-body'
+import {
+	DEFAULT_OPERATION_HASH_VERSION,
+	type OperationHashVersion,
+	computeOperationId,
+} from './content-hash'
+
+/** Options for {@link createOperation}. */
+export interface CreateOperationOptions {
+	/**
+	 * Content-hash version of the new operation's id. Defaults to 2 (protocol v2),
+	 * which commits the id to every semantic field (CORE-1); 1 is the legacy hash.
+	 */
+	hashVersion?: OperationHashVersion
+}
 
 /**
  * Creates an immutable, content-addressed Operation from the given parameters.
@@ -9,6 +23,7 @@ import { computeOperationId } from './content-hash'
  *
  * @param input - The operation parameters (without id, which is computed)
  * @param clock - The HLC clock to generate the timestamp
+ * @param options - Optional hash version (default 2)
  * @returns A frozen Operation with a content-addressed id
  *
  * @example
@@ -27,14 +42,22 @@ import { computeOperationId } from './content-hash'
  * ```
  */
 export async function createOperation(
-	input: OperationInput,
+	rawInput: OperationInput,
 	clock: HybridLogicalClock,
+	options: CreateOperationOptions = {},
 ): Promise<Operation> {
-	validateOperationParams(input)
+	validateOperationParams(rawInput)
+	// One canonical body (canonical-body.ts), applied once, here: the id is computed over
+	// it and it is what the operation carries, so the hashed content is exactly what the
+	// op log, the wire and the fold see (RT-72, RT-79, RT-80).
+	const input = canonicalizeOperationBody(rawInput)
+	const hashVersion = options.hashVersion ?? DEFAULT_OPERATION_HASH_VERSION
 
 	const timestamp = clock.now()
-	const serializedTs = HybridLogicalClock.serialize(timestamp)
-	const id = await computeOperationId(input, serializedTs)
+	const id =
+		hashVersion === 1
+			? await computeOperationId(input, HybridLogicalClock.serialize(timestamp))
+			: await computeOperationId({ ...input, timestamp }, hashVersion)
 
 	const operation: Operation = {
 		id,
@@ -53,6 +76,7 @@ export async function createOperation(
 			: {}),
 		...(input.transactionId !== undefined ? { transactionId: input.transactionId } : {}),
 		...(input.mutationName !== undefined ? { mutationName: input.mutationName } : {}),
+		...(hashVersion !== 1 ? { hashVersion } : {}),
 	}
 
 	return deepFreeze(operation)
@@ -138,25 +162,52 @@ export function validateOperationParams(input: OperationInput): void {
 }
 
 /**
+ * Verify an operation's id against its content, using the hash version the
+ * operation declares (`hashVersion`, absent = 1). A version-1 id does not cover
+ * previousData, sequenceNumber, causalDeps or schemaVersion (CORE-1), so only a
+ * version-2 operation is protected against rewriting those.
+ *
+ * Returns false for an unknown hash version.
+ *
+ * @param op - The operation to verify
+ * @returns true when `op.id` is the content hash of `op`
+ */
+export async function verifyOperationId(op: Operation): Promise<boolean> {
+	const version = op.hashVersion ?? 1
+	if (version !== 1 && version !== 2) return false
+	let expectedId: string
+	try {
+		expectedId = await computeOperationId(
+			{
+				nodeId: op.nodeId,
+				type: op.type,
+				collection: op.collection,
+				recordId: op.recordId,
+				data: op.data,
+				previousData: op.previousData,
+				timestamp: op.timestamp,
+				sequenceNumber: op.sequenceNumber,
+				causalDeps: op.causalDeps,
+				schemaVersion: op.schemaVersion,
+				...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
+			},
+			version,
+		)
+	} catch {
+		// A body with no canonical form (never produced by createOperation, never
+		// decoded from JSON) cannot be the content of any id.
+		return false
+	}
+	return op.id === expectedId
+}
+
+/**
  * Verify the integrity of an operation by recomputing its content hash.
- * Returns true if the id matches the recomputed hash.
+ * Returns true if the id matches the recomputed hash. Same as
+ * {@link verifyOperationId}.
  */
 export async function verifyOperationIntegrity(op: Operation): Promise<boolean> {
-	const input: OperationInput = {
-		nodeId: op.nodeId,
-		type: op.type,
-		collection: op.collection,
-		recordId: op.recordId,
-		data: op.data,
-		previousData: op.previousData,
-		sequenceNumber: op.sequenceNumber,
-		causalDeps: op.causalDeps,
-		schemaVersion: op.schemaVersion,
-		...(op.atomicOps !== undefined ? { atomicOps: op.atomicOps } : {}),
-	}
-	const serializedTs = HybridLogicalClock.serialize(op.timestamp)
-	const expectedId = await computeOperationId(input, serializedTs)
-	return op.id === expectedId
+	return verifyOperationId(op)
 }
 
 /**

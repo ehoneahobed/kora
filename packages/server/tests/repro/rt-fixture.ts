@@ -12,6 +12,7 @@ import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
+import { withContentId } from '../fixtures/content-id'
 
 export interface TestClient {
 	client: ReturnType<typeof createServerTransportPair>['client']
@@ -122,7 +123,7 @@ export function makeOp(
 	overrides: Partial<Operation>,
 ): Operation {
 	counter += 1
-	return {
+	const op: Operation = {
 		id: `rt-op-${nodeId}-${sequenceNumber}-${counter}`,
 		nodeId,
 		type: 'insert',
@@ -136,10 +137,33 @@ export function makeOp(
 		schemaVersion: 1,
 		...overrides,
 	}
+	// A real (version-1) content-addressed id unless the test chose one: since RT-64 the
+	// server verifies every uploaded id.
+	return overrides.id === undefined ? withContentId(op) : op
 }
 
 export function batch(ops: Operation[], messageId = `b-${Math.random()}`): SyncMessage {
 	return { type: 'operation-batch', messageId, operations: ops, isFinal: true, batchIndex: 0 }
+}
+
+/**
+ * Send an upload batch and wait until the server acknowledged it (the whole batch was
+ * processed, deferred side effects included): no timing assumption.
+ */
+export async function sendAndAwaitAck(client: TestClient, ops: Operation[]): Promise<void> {
+	const message = batch(ops)
+	client.send(message)
+	await vi.waitFor(
+		() =>
+			expect(
+				client.messages.some(
+					(m) =>
+						m.type === 'acknowledgment' &&
+						(m as { acknowledgedMessageId?: string }).acknowledgedMessageId === message.messageId,
+				),
+			).toBe(true),
+		{ timeout: 10_000, interval: 5 },
+	)
 }
 
 /** Every operation id delivered to a client in operation batches so far. */
@@ -153,6 +177,7 @@ export function deliveredOpIds(messages: SyncMessage[]): string[] {
 }
 
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {
-	const digest = await crypto.subtle.digest('SHA-256', bytes)
+	// A fresh ArrayBuffer-backed copy: WebCrypto's BufferSource excludes SharedArrayBuffer views.
+	const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes))
 	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }

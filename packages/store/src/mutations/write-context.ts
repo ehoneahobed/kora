@@ -6,6 +6,7 @@ import type {
 	SecretKeyProvider,
 } from '@korajs/core'
 import { KoraError } from '@korajs/core'
+import type { RecordFolder } from '../fold/record-folder'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
 import type { Transaction } from '../types'
 
@@ -35,6 +36,19 @@ export interface WriteEnv {
 	readonly mutationName?: string
 	/** See {@link LocalDeleteHook}. */
 	readonly beforeLocalDelete?: LocalDeleteHook
+	/**
+	 * The W7 record fold. When set, a local write appends its operation and then
+	 * merges it into the record's fold state, which re-materializes the row (the
+	 * same path remote operations take). Absent only under
+	 * `experimental.legacyMerge` (and while a pre-W7 database is migrated, before its
+	 * re-materialization): the row is then written directly, as in beta.13.
+	 */
+	readonly fold?: RecordFolder
+	/**
+	 * Largest operation a local write may produce (RT-86), the server's
+	 * `maxOperationBytes`. Default `DEFAULT_MAX_OPERATION_BYTES` (256 KiB).
+	 */
+	readonly maxOperationBytes?: number
 }
 
 /**

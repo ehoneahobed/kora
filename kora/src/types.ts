@@ -72,6 +72,13 @@ export interface StoreOptions {
 	/** Max wait for a worker RPC (e.g. `open`). Defaults to 30000ms. */
 	workerResponseTimeoutMs?: number
 	/**
+	 * Largest serialized operation a write may produce, in bytes. Set it to the sync
+	 * server's `maxOperationBytes`; a larger write is refused locally with
+	 * `OperationTooLargeError` (nothing is written). Defaults to 256 KiB, the server's
+	 * default.
+	 */
+	maxOperationBytes?: number
+	/**
 	 * Accept writes when no durable browser storage can be obtained (the store runs
 	 * in memory and loses local writes on reload). Defaults to false: Kora emits the
 	 * blocking `store:durability-lost` event and refuses writes with
@@ -135,6 +142,17 @@ export interface SyncOptions {
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
 	 */
 	authClient?: AuthSyncBinding
+	/**
+	 * What happens to writes made on a database that never synced, before the app knew
+	 * who was signed in (they cannot be attributed to a user, RT-50):
+	 *
+	 * - `'hold'` (default): they are held, reported in `status.heldNodes` with reason
+	 *   `unassigned`, until the app calls `app.sync.assignHeld` or `app.sync.discardHeld`.
+	 * - `'assign-to-first-user'`: they are assigned to the first user the sync server
+	 *   accepts a session for on this device, and upload as that user. Use it for
+	 *   single-user apps, where those writes can only be that user's.
+	 */
+	unassignedWrites?: 'hold' | 'assign-to-first-user'
 	/** Controls whether reactive queries affect the replicated view. Defaults to `reactive`. */
 	querySubsets?: { mode?: 'reactive' | 'static' | 'disabled' }
 	/** Remove records from the local active view when server authorization retracts them. */
@@ -165,7 +183,11 @@ export interface SyncOptions {
 	autoConnect?: boolean
 	/** Wait for server ACK on each handshake delta batch before streaming. Defaults to false. */
 	strictHandshake?: boolean
-	/** Rewrites legacy operations during sync when schema versions differ. */
+	/**
+	 * Schema transforms for operations of other schema versions. They run at fold time
+	 * (RT-84): operations are stored as written and the local store folds their
+	 * transformed view. Must be pure and deterministic, and match the server's.
+	 */
 	operationTransforms?: import('@korajs/core').OperationTransform[]
 	/** Enable auto-reconnection on unexpected disconnect. Defaults to true. */
 	autoReconnect?: boolean
@@ -251,6 +273,19 @@ export interface KoraConfig {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: Extract<KoraEvent, { type: `sync:${string}` }>) => void
+	/** Switches for behaviour that is being phased in or out. */
+	experimental?: ExperimentalOptions
+}
+
+/** {@link KoraConfig.experimental}. */
+export interface ExperimentalOptions {
+	/**
+	 * Use the beta.13 pairwise merge pipeline instead of the W7 per-field fold.
+	 * Available for ONE beta (beta.14) to compare behaviour; removed afterwards.
+	 * Switching it on an existing database re-materializes every row on open.
+	 * Defaults to false.
+	 */
+	legacyMerge?: boolean
 }
 
 /** Sync event types delivered to {@link KoraConfig.onSyncEvent}. */
@@ -272,6 +307,8 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: KoraSyncEvent) => void
+	/** Switches for behaviour that is being phased in or out. */
+	experimental?: ExperimentalOptions
 }
 
 /**

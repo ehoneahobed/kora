@@ -6,9 +6,9 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 
-// Re-exported so existing server-internal imports keep working; the implementation
-// now lives in @korajs/core so the client apply pipeline and the server materialize
-// records through the exact same atomic-aware fold.
+// Legacy comparison only (W7 Stage B2): the server stores no longer materialize with
+// the pre-fold replay. Every store merges operations into a per-record fold state
+// (see ./record-fold.ts). Kept so tests can compare the old and new results.
 export { replayOperationsForRecord }
 export type { ReplayOperation }
 
@@ -198,9 +198,13 @@ function decodeRichtextColumnValue(value: unknown): unknown {
 export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor): unknown {
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
+		case 'json':
+			// A json value may itself be a string ("abc", "123", ""): it is stored as JSON
+			// like every other json value, so it reads back as that string, never parsed as
+			// JSON text (the canonical value is what folds, on every store).
+			return JSON.stringify(value)
 		case 'array':
 		case 'object':
-		case 'json':
 		case 'blob':
 			return typeof value === 'string' ? value : JSON.stringify(value)
 		case 'boolean':
@@ -218,15 +222,32 @@ export function serializeFieldValue(value: unknown, descriptor: FieldDescriptor)
 export function deserializeFieldValue(value: unknown, descriptor: FieldDescriptor): unknown {
 	if (value === null || value === undefined) return null
 	switch (descriptor.kind) {
+		case 'json':
+			return typeof value === 'string' ? parseJsonColumn(value) : value
 		case 'array':
 		case 'object':
-		case 'json':
 		case 'blob':
 			return typeof value === 'string' ? JSON.parse(value) : value
 		case 'boolean':
 			return value === 1 || value === true
+		case 'timestamp':
+			// A Postgres BIGINT column is read back as a string (or a bigint); the value
+			// domain keeps timestamps safe integers, so the number is exact (RT-87).
+			return typeof value === 'string' || typeof value === 'bigint' ? Number(value) : value
 		default:
 			return value
+	}
+}
+
+/**
+ * A json column's text. Rows written before json strings were stored as JSON hold a raw
+ * string that is not JSON text; it is read back as that string instead of failing.
+ */
+function parseJsonColumn(text: string): unknown {
+	try {
+		return JSON.parse(text)
+	} catch {
+		return text
 	}
 }
 

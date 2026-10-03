@@ -52,6 +52,27 @@ for (const invite of stale) {
 }
 ```
 
+**`undefined` in an update clears the field**, exactly as `app.<collection>.update()`
+does on a device (an update's `field: undefined` is written as `null`). A route that
+forwards optional request fields therefore clears every field the request omitted:
+
+```typescript
+// Clears `notes` whenever the request body has no `notes`:
+await request.kora.apply({ collection: 'todos', type: 'update', recordId, data: { notes: body.notes } })
+
+// Writes only the fields the request carries:
+const data = Object.fromEntries(
+  Object.entries({ title: body.title, notes: body.notes }).filter(([, value]) => value !== undefined),
+)
+await request.kora.apply({ collection: 'todos', type: 'update', recordId, data })
+```
+
+This is deliberate: one meaning of `undefined` everywhere (device API, route writes,
+beta.13 clients), so a write means the same thing on every path. Route writes are also
+held to the [value domain](./schema-design.md#value-domain): a value outside it (a
+`Date` in a `t.timestamp()` field, a fractional timestamp, a value of an undeclared enum
+member) is refused with `SCHEMA_VALIDATION_ERROR` and nothing is written.
+
 Every failed `apply` carries a `retriable` flag. `true` means the rejection is
 transient (a rate limit) and resubmitting the identical operation may later
 succeed; `false` means it is permanent for the operation as written (a constraint
@@ -75,8 +96,11 @@ const server = createProductionServer({
 })
 ```
 
-An operation over `maxOperationBytes` is rejected as a permanent
-`OPERATION_TOO_LARGE` (the same bytes can never fit). Exceeding `maxOpsPerMinute`
+An operation over `maxOperationBytes` is rejected on its own as a permanent
+`OPERATION_TOO_LARGE` (the same bytes can never fit): the client records the refusal
+(`sync:operation-rejected`) and the server keeps acknowledging the client's later
+operations. Devices refuse such a write before it is accepted when their
+`store.maxOperationBytes` matches the server's (default 256 KiB on both). Exceeding `maxOpsPerMinute`
 yields a retriable `RATE_LIMIT` (the client should back off and resend). Both
 defaults (256 KiB and 600 ops/min) apply when you omit the knobs.
 
@@ -236,4 +260,5 @@ Two operator notes:
 
 - **First startup after upgrading runs a one-time migration.** Each store adds a `delivery_seq` column and backfills existing operations. This is automatic and idempotent. On a very large Postgres operation log the backfill is a single ordered pass under an advisory lock; it runs once and subsequent startups skip it.
 - **Operation scope snapshots and blob owners (beta.13).** Each store adds a nullable `scope_snapshot` column to `operations` and a `blob_owners` table. Download visibility of a historical operation is judged on the record's scope values when that operation was applied, so an ownership transfer does not disclose the earlier history to the new owner, and scope-exit retractions come from the server's own rows. Existing operations are backfilled from the log when the schema is set (one replay per record); operations of collections outside the schema keep the previous behavior. Blob uploads made before the upgrade have no recorded owner: their existing references keep working, and a new reference to such bytes needs the writer to upload them again.
+- **Operation log integrity check (beta.14).** On the first start of this release the SQLite and Postgres stores read every stored operation once (keyset pages; Postgres under an advisory lock) and move rows that cannot be read back into an operation (malformed JSON, an out-of-range timestamp) to an `operations_quarantine` table, verbatim, so no materialization ever folds them. A warning is logged when rows move; `store.getLogIntegrityReport()` returns the result. Later starts skip the scan.
 - **Postgres serializes delivery-sequence assignment through one counter row** so delivery order matches commit order across instances. This is a deliberate correctness-over-throughput choice and is not a bottleneck for typical sync workloads. If you run a single Postgres at very high sustained write rates and measure contention on it, that is the place to look first.

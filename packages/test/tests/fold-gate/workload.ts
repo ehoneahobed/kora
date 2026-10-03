@@ -1,0 +1,541 @@
+/**
+ * Randomized multi-device workloads for the W7 convergence gate, run END TO END
+ * through real devices (Store + ApplyPipeline + SyncEngine) and the test server.
+ *
+ * A seed picks a schema (a subset of every field kind a device can write: scalars,
+ * enum, timestamp, numbers with atomic increments, arrays with duplicates, objects,
+ * json with shape changes, counter / max / min / append-only / server-authoritative
+ * strategies, an additive custom resolver, real Yjs richtext) and drives 2-4
+ * devices that go offline, edit concurrently, delete, and reconnect in random
+ * order. Deterministic in the seed (mulberry32), except wall-clock timing.
+ */
+import {
+	type OperationTransform,
+	type SchemaDefinition,
+	defineSchema,
+	foldRecord,
+	materialize,
+	op,
+	t,
+} from '@korajs/core'
+import { mergeYjsUpdates } from '@korajs/store'
+import * as Y from 'yjs'
+import type { TestDevice, TestNetwork } from '../../src/index'
+import { createMixedTestNetwork, createTestNetwork } from '../../src/index'
+
+export type Rng = () => number
+
+export function mulberry32(seed: number): Rng {
+	let a = seed >>> 0
+	return () => {
+		a = (a + 0x6d2b79f5) >>> 0
+		let x = a
+		x = Math.imul(x ^ (x >>> 15), x | 1)
+		x ^= x + Math.imul(x ^ (x >>> 7), x | 61)
+		return ((x ^ (x >>> 14)) >>> 0) / 4294967296
+	}
+}
+
+const pick = <T>(rng: Rng, items: readonly T[]): T => items[Math.floor(rng() * items.length)] as T
+const chance = (rng: Rng, p: number): boolean => rng() < p
+const int = (rng: Rng, lo: number, hi: number): number => lo + Math.floor(rng() * (hi - lo + 1))
+
+const FIELDS = {
+	title: () => t.string(),
+	count: () => t.number(),
+	done: () => t.boolean(),
+	prio: () => t.enum(['low', 'mid', 'high']),
+	due: () => t.timestamp().optional(),
+	tags: () => t.array(t.string()),
+	meta: () => t.object({ a: t.string(), b: t.number() }),
+	doc: () => t.json().optional(),
+	score: () => t.number().merge('counter'),
+	hi: () => t.number().merge('max'),
+	lo: () => t.number().merge('min'),
+	log: () => t.array(t.string()).merge('append-only'),
+	auth: () => t.string().merge('server-authoritative'),
+	inv: () => t.number(),
+	body: () => t.richtext(),
+} as const
+
+export type GateField = keyof typeof FIELDS
+
+/** Name of the schema-v1 device of the mixed-version sweep. */
+export const LEGACY_DEVICE = 'device-v1'
+export const GATE_FIELDS = Object.keys(FIELDS) as GateField[]
+
+/** Field kind label for reports (which documented semantic change can explain a difference). */
+export const FIELD_KIND: Record<GateField, string> = {
+	title: 'scalar',
+	count: 'atomic',
+	done: 'scalar',
+	prio: 'scalar',
+	due: 'scalar',
+	tags: 'array',
+	meta: 'object',
+	doc: 'object',
+	score: 'counter',
+	hi: 'extremum',
+	lo: 'extremum',
+	log: 'append-only',
+	auth: 'scalar',
+	inv: 'resolver',
+	body: 'richtext',
+}
+
+/**
+ * The gate's schema. `version` 2 with `legacyTitle` builds the schema of an OLDER
+ * client instead: version 1, where `title` is still called `name` (see
+ * {@link GATE_TRANSFORMS}).
+ */
+export function buildSchema(
+	fields: readonly GateField[],
+	version = 1,
+	legacyTitle = false,
+): SchemaDefinition {
+	const builders: Record<string, ReturnType<(typeof FIELDS)[GateField]>> = {}
+	for (const field of fields)
+		builders[legacyTitle && field === 'title' ? 'name' : field] = FIELDS[field]()
+	return defineSchema({
+		version,
+		collections: {
+			items: {
+				fields: builders,
+				resolve: fields.includes('inv')
+					? {
+							inv: (local: unknown, remote: unknown, base: unknown) =>
+								(Number(local) || 0) + ((Number(remote) || 0) - (Number(base) || 0)),
+						}
+					: {},
+			},
+		},
+	}) as unknown as SchemaDefinition
+}
+
+/**
+ * Schema transforms of the gate's mixed-version sweep (RT-84): schema v1 called the
+ * `title` field `name`. Pure and deterministic, as the contract requires. Every replica
+ * stores a v1 operation exactly as written and folds this view of it.
+ */
+export const GATE_TRANSFORMS: OperationTransform[] = [
+	{
+		fromVersion: 1,
+		toVersion: 2,
+		transform: (operation) => {
+			const rename = (record: Record<string, unknown> | null): Record<string, unknown> | null => {
+				if (record === null || !('name' in record)) return record
+				const { name, ...rest } = record
+				return { ...rest, title: name }
+			}
+			const atomicOps = operation.atomicOps
+			return {
+				...operation,
+				schemaVersion: 2,
+				data: rename(operation.data),
+				previousData: rename(operation.previousData),
+				...(atomicOps !== undefined ? { atomicOps: rename(atomicOps) as typeof atomicOps } : {}),
+			}
+		},
+	},
+]
+
+const STRINGS = ['a', 'b', 'c', 'd']
+const TAGS = ['t1', 't2', 't3', 't4']
+
+export function richtextText(value: unknown): string | null {
+	if (!(value instanceof Uint8Array))
+		return value === null || value === undefined ? null : String(value)
+	const doc = new Y.Doc()
+	Y.applyUpdate(doc, value)
+	return doc.getText('content').toString()
+}
+
+function editRichtext(rng: Rng, current: unknown, clientId: number): Uint8Array {
+	const doc = new Y.Doc()
+	// A fresh client id per edit: Yjs needs one per editing session.
+	doc.clientID = clientId * 1_000_000 + int(rng, 1, 999_999)
+	if (current instanceof Uint8Array) Y.applyUpdate(doc, current)
+	const text = doc.getText('content')
+	if (text.length > 0 && chance(rng, 0.3)) text.delete(int(rng, 0, text.length - 1), 1)
+	else text.insert(int(rng, 0, text.length), pick(rng, STRINGS))
+	return Y.encodeStateAsUpdate(doc)
+}
+
+function initialValue(field: GateField): unknown {
+	switch (field) {
+		case 'title':
+		case 'auth':
+			return 'x'
+		case 'count':
+		case 'score':
+		case 'hi':
+		case 'lo':
+		case 'inv':
+			return 10
+		case 'done':
+			return false
+		case 'prio':
+			return 'low'
+		case 'due':
+			return 1000
+		case 'tags':
+			return ['t1']
+		case 'log':
+			return ['created']
+		case 'meta':
+			return { a: 'x', b: 0 }
+		case 'doc':
+			return { x: 'a' }
+		case 'body':
+			return 'hi'
+	}
+}
+
+/** A new value for `field`, written by a device that currently sees `current`. */
+function nextValue(rng: Rng, field: GateField, current: unknown, clientId: number): unknown {
+	switch (field) {
+		case 'title':
+		case 'auth':
+			return pick(rng, STRINGS)
+		case 'count':
+			return chance(rng, 0.5) ? op.increment(int(rng, -2, 5)) : int(rng, 0, 20)
+		case 'done':
+			return !current
+		case 'prio':
+			return pick(rng, ['low', 'mid', 'high'])
+		case 'due':
+			return chance(rng, 0.15) ? null : int(rng, 1, 9) * 1000
+		case 'tags':
+		case 'log': {
+			const next = Array.isArray(current) ? [...(current as string[])] : []
+			if (next.length > 0 && chance(rng, 0.45)) next.splice(int(rng, 0, next.length - 1), 1)
+			if (chance(rng, 0.75)) {
+				const tag = pick(rng, TAGS)
+				// Duplicates are data: arrays are multisets.
+				if (!next.includes(tag) || chance(rng, 0.35)) next.push(tag)
+			}
+			return next
+		}
+		case 'meta': {
+			const base = { a: 'x', b: 0, ...((current as Record<string, unknown>) ?? {}) }
+			return chance(rng, 0.5) ? { ...base, a: pick(rng, STRINGS) } : { ...base, b: int(rng, 0, 5) }
+		}
+		case 'doc': {
+			const r = rng()
+			if (r < 0.08) return null
+			if (r < 0.14) return [int(rng, 0, 2)]
+			const base =
+				typeof current === 'object' && current !== null && !Array.isArray(current)
+					? { ...(current as Record<string, unknown>) }
+					: {}
+			const key = pick(rng, ['x', 'y', 'z'])
+			if (chance(rng, 0.25)) delete base[key]
+			else base[key] = chance(rng, 0.3) ? { deep: pick(rng, STRINGS) } : pick(rng, STRINGS)
+			return base
+		}
+		case 'score':
+			return (Number(current) || 0) + int(rng, -3, 4)
+		case 'hi':
+		case 'lo':
+			return int(rng, 0, 30)
+		case 'inv':
+			return (Number(current) || 0) + int(rng, -3, 5)
+		case 'body':
+			return editRichtext(rng, current, clientId)
+	}
+}
+
+export interface WorkloadResult {
+	seed: number
+	fields: GateField[]
+	/** device name -> materialized record (null when deleted / absent), normalized. */
+	devices: Record<string, Record<string, unknown> | null>
+	/** The from-scratch fold of the union of every device's log, normalized. */
+	oracle: Record<string, unknown> | null
+	/** Every device holds the same operation ids for the record. */
+	sameLogs: boolean
+	/** The server's materialized row, normalized (B2: server materialization). */
+	server: Record<string, unknown> | null
+	log: string[]
+	/** The union of every device's operations for the record. */
+	operations: import('@korajs/core').Operation[]
+	/** The schema of the run. */
+	schema: SchemaDefinition
+	/** Operations any device quarantined (undecryptable, unverifiable, ...). */
+	quarantined: string[]
+}
+
+/** Comparable form of a record: richtext as its text, no metadata. */
+export function normalizeRecord(
+	record: Record<string, unknown> | null | undefined,
+	fields: readonly GateField[],
+): Record<string, unknown> | null {
+	if (!record) return null
+	const out: Record<string, unknown> = {}
+	for (const field of fields) {
+		const value = record[field]
+		out[field] = field === 'body' ? richtextText(value) : (value ?? null)
+	}
+	return out
+}
+
+/**
+ * Run one seeded workload through real devices and return every replica's view.
+ *
+ * @param seed - The seed
+ * @param options - `legacyMerge` runs the devices on the beta.13 pipeline
+ */
+export interface WorkloadOptions {
+	/** Devices run the beta.13 pairwise pipeline. */
+	legacyMerge?: boolean
+	/** Exactly these fields (default: a seeded subset). */
+	onlyFields?: readonly GateField[]
+	/**
+	 * Every device encrypts end to end (protocol v2 envelope, shared key material); the
+	 * server stores ciphertext and folds only the cleartext field (`auth`, so server
+	 * writes to it reach encrypted devices).
+	 */
+	encryption?: boolean
+	/**
+	 * The server writes the `merge('server-authoritative')` field (`auth`) through its
+	 * trusted route API at random steps; it is always in the schema then.
+	 */
+	serverWrites?: boolean
+	/**
+	 * Mixed schema versions (transforms at fold time, RT-84): the server and the devices
+	 * run schema v2 with {@link GATE_TRANSFORMS}, plus one more device on schema v1 (where
+	 * `title` is `name`) that writes too. Its operations must reach every v2 replica
+	 * exactly as written (same ids, verifiable), and every v2 replica and the server must
+	 * fold to the reference fold of the union through the transforms. The v1 device keeps
+	 * v2 operations aside (no transform path), so it is not compared.
+	 */
+	schemaTransforms?: boolean
+}
+
+const GATE_ENCRYPTION = {
+	config: { enabled: true, key: 'fold gate passphrase', cleartextFields: { items: ['auth'] } },
+	salt: new Uint8Array(16).fill(3),
+	iterations: 1_000,
+}
+
+export async function runWorkload(
+	seed: number,
+	options: WorkloadOptions = {},
+): Promise<WorkloadResult> {
+	const rng = mulberry32(seed)
+	// A separate stream, so the device workload of a seed is the same with or without
+	// server writes.
+	const serverRng = mulberry32(seed ^ 0x5e4e)
+	const picked = options.onlyFields
+		? [...options.onlyFields]
+		: GATE_FIELDS.filter((field) => field === 'title' || chance(rng, 0.55))
+	const fields =
+		options.serverWrites && !picked.includes('auth') ? [...picked, 'auth' as const] : picked
+	const mixed = options.schemaTransforms === true
+	const schema = buildSchema(fields, mixed ? 2 : 1)
+	const deviceCount = int(rng, 2, 4)
+	const log: string[] = []
+	let network: TestNetwork | null = null
+	try {
+		network = mixed
+			? await createMixedTestNetwork(
+					schema,
+					{
+						schemaVersion: 2,
+						supportedSchemaVersions: { min: 1, max: 2 },
+						operationTransforms: GATE_TRANSFORMS,
+					},
+					[
+						...Array.from({ length: deviceCount }, (_, i) => ({
+							name: `device-${i}`,
+							schema,
+							syncSchemaVersion: 2,
+							operationTransforms: GATE_TRANSFORMS,
+						})),
+						{
+							name: LEGACY_DEVICE,
+							schema: buildSchema(fields, 1, true),
+							syncSchemaVersion: 1,
+							operationTransforms: GATE_TRANSFORMS,
+						},
+					],
+				)
+			: await createTestNetwork(schema, {
+					devices: deviceCount,
+					...(options.legacyMerge ? { legacyMerge: true } : {}),
+					...(options.encryption
+						? { encryption: GATE_ENCRYPTION, serverEncryption: { required: true } }
+						: {}),
+				})
+		const devices = network.devices
+		const isLegacy = (device: TestDevice): boolean => device.name === LEGACY_DEVICE
+		// The v1 device's names for the fields (title is `name` there).
+		const local = (device: TestDevice, field: string): string =>
+			isLegacy(device) && field === 'title' ? 'name' : field
+		// In the mixed sweep the v1 device creates the record: it never sees v2 operations.
+		const first = (mixed ? devices.find(isLegacy) : devices[0]) as TestDevice
+		const initial: Record<string, unknown> = {}
+		for (const field of fields) initial[local(first, field)] = initialValue(field)
+		const created = await first.collection('items').insert(initial)
+		const id = String(created.id)
+		for (const device of devices) await device.sync()
+		const online = new Set(devices.map((device) => device.name))
+
+		const steps = int(rng, 6, 14)
+		for (let step = 0; step < steps; step++) {
+			if (options.serverWrites && chance(serverRng, 0.3)) {
+				const value = `srv-${pick(serverRng, STRINGS)}`
+				const result = await network.server
+					.getKoraContext()
+					.apply({ collection: 'items', type: 'update', recordId: id, data: { auth: value } })
+				log.push(`server auth=${value} ${result.ok ? 'ok' : `refused ${JSON.stringify(result)}`}`)
+			}
+			const index = int(rng, 0, devices.length - 1)
+			const device = devices[index] as TestDevice
+			const roll = rng()
+			if (roll < 0.25) {
+				if (online.has(device.name)) {
+					await device.disconnect()
+					online.delete(device.name)
+					log.push(`${device.name} offline`)
+				} else {
+					await device.sync()
+					online.add(device.name)
+					log.push(`${device.name} online`)
+				}
+				continue
+			}
+			const current = await device.collection('items').findById(id)
+			if (!current) continue
+			if (roll < 0.3) {
+				await device.collection('items').delete(id)
+				log.push(`${device.name} delete`)
+				continue
+			}
+			const count = int(rng, 1, Math.min(3, fields.length))
+			const chosen = [...fields].sort(() => rng() - 0.5).slice(0, count)
+			const patch: Record<string, unknown> = {}
+			for (const field of chosen) {
+				patch[local(device, field)] = nextValue(
+					rng,
+					field,
+					current[local(device, field)],
+					index + 1,
+				)
+			}
+			log.push(
+				`${device.name} update ${JSON.stringify(patch, (_k, v) => (v instanceof Uint8Array ? `<yjs ${v.length}B>` : v))}`,
+			)
+			await device.collection('items').update(id, patch)
+			if (online.has(device.name) && chance(rng, 0.5)) await device.sync()
+		}
+
+		// Quiesce: everyone online, several passes in a random order.
+		const order = [...devices].sort(() => rng() - 0.5)
+		for (let pass = 0; pass < 3; pass++) for (const device of order) await device.sync()
+
+		const views: Record<string, Record<string, unknown> | null> = {}
+		const logs: string[] = []
+		const union = new Map<string, import('@korajs/core').Operation>()
+		for (const device of devices) {
+			if (isLegacy(device)) {
+				// Its own operations must be held by every replica exactly as it wrote them.
+				for (const written of await device.store.getOperationsForRecord('items', id)) {
+					if (written.nodeId !== device.getNodeId()) continue
+					const held = await network.server.store.getRecordOperations?.('items', id)
+					const stored = held?.find((candidate) => candidate.id === written.id)
+					if (!stored || JSON.stringify(stored.data) !== JSON.stringify(written.data)) {
+						log.push(`server holds ${written.id} rewritten: ${JSON.stringify(stored ?? null)}`)
+						views[`${LEGACY_DEVICE}-stored`] = { rewritten: written.id }
+					}
+					union.set(written.id, written)
+				}
+				continue
+			}
+			views[device.name] = normalizeRecord(await device.collection('items').findById(id), fields)
+			const ops = await device.store.getOperationsForRecord('items', id)
+			logs.push(
+				ops
+					.map((op) => op.id)
+					.sort()
+					.join(','),
+			)
+			for (const op of ops) union.set(op.id, op)
+		}
+		const folded = foldRecord([...union.values()], schema, {
+			richtext: mergeYjsUpdates,
+			// The oracle folds with the authority the devices learned at the handshake.
+			authoritativeNodeIds: new Set(network.server.authoritativeNodeIds),
+			...(mixed ? { transforms: GATE_TRANSFORMS } : {}),
+		}).state
+		const oracleRaw = folded ? materialize(folded, { richtext: mergeYjsUpdates }) : null
+		const oracle = oracleRaw ? normalizeRecord(decodeOracle(oracleRaw), fields) : null
+		const quarantined: string[] = []
+		for (const device of devices) {
+			// The v1 device keeps v2 operations aside by design (no transform path).
+			if (isLegacy(device)) continue
+			for (const entry of (await device.getSyncEngine()?.getQuarantinedOperations()) ?? []) {
+				quarantined.push(`${device.name}: ${entry.code} ${entry.message}`)
+			}
+		}
+		const serverRow = (await network.server.store.findRecord('items', id)) as Record<
+			string,
+			unknown
+		> | null
+		const serverLive =
+			serverRow && serverRow._deleted !== 1 && serverRow._deleted !== true ? serverRow : null
+		return {
+			seed,
+			fields,
+			devices: views,
+			oracle,
+			sameLogs: new Set(logs).size === 1,
+			server: normalizeRecord(
+				serverLive,
+				fields.filter((field) => field !== 'body'),
+			),
+			log,
+			operations: [...union.values()],
+			schema,
+			quarantined,
+		}
+	} finally {
+		await network?.close()
+	}
+}
+
+/** The fold materializes op-data form (tagged bytes); turn richtext into bytes. */
+function decodeOracle(record: Record<string, unknown>): Record<string, unknown> {
+	const out = { ...record }
+	const body = out.body
+	if (body && typeof body === 'object' && '$koraBytes' in body) {
+		out.body = Uint8Array.from(
+			Buffer.from(String((body as { $koraBytes: string }).$koraBytes), 'base64'),
+		)
+	} else if (typeof body === 'string') {
+		// A plain-string (reset) value: as a device stores it, a Yjs doc with the text.
+		const doc = new Y.Doc()
+		doc.clientID = 0
+		doc.getText('content').insert(0, body)
+		out.body = Y.encodeStateAsUpdate(doc)
+	}
+	return out
+}
+
+/** Run `count` seeds starting at `base`, `parallel` at a time. */
+export async function runSeeds(
+	base: number,
+	count: number,
+	parallel: number,
+	run: (seed: number) => Promise<WorkloadResult>,
+): Promise<WorkloadResult[]> {
+	const results: WorkloadResult[] = []
+	for (let i = 0; i < count; i += parallel) {
+		const batch = Array.from(
+			{ length: Math.min(parallel, count - i) },
+			(_, j) => (base + i + j) >>> 0,
+		)
+		results.push(...(await Promise.all(batch.map((seed) => run(seed)))))
+	}
+	return results
+}

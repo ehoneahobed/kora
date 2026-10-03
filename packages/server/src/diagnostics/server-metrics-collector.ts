@@ -13,6 +13,13 @@ export interface ServerMetricsSnapshot {
 	uniqueOperationsReceived: number
 	duplicateOperationsReceived: number
 	rejectedOperations: number
+	/**
+	 * Operations from protocol-1 (beta.13) clients stored with an id that could not be
+	 * verified (RT-71). Non-zero only while beta.13 clients write `undefined` members.
+	 */
+	unverifiedLegacyOperations: number
+	/** Uploads refused for reusing a stored operation id with other content (RT-77). */
+	forgedDuplicates: number
 	operationsSent: number
 	bytesReceived: number
 	bytesSent: number
@@ -69,6 +76,8 @@ export class ServerMetricsCollector {
 	private uniqueOperationsReceived = 0
 	private duplicateOperationsReceived = 0
 	private rejectedOperations = 0
+	private unverifiedLegacyOperations = 0
+	private forgedDuplicates = 0
 	private operationsSent = 0
 	private bytesReceived = 0
 	private bytesSent = 0
@@ -162,6 +171,16 @@ export class ServerMetricsCollector {
 		}
 	}
 
+	/** Record an operation stored with an unverified legacy id (RT-71). */
+	recordUnverifiedLegacyOperation(): void {
+		this.unverifiedLegacyOperations++
+	}
+
+	/** Record an upload refused for reusing a stored id with other content (RT-77). */
+	recordForgedDuplicate(): void {
+		this.forgedDuplicates++
+	}
+
 	/** Record an error. */
 	recordError(): void {
 		this.errorCount++
@@ -186,6 +205,8 @@ export class ServerMetricsCollector {
 			uniqueOperationsReceived: this.uniqueOperationsReceived,
 			duplicateOperationsReceived: this.duplicateOperationsReceived,
 			rejectedOperations: this.rejectedOperations,
+			unverifiedLegacyOperations: this.unverifiedLegacyOperations,
+			forgedDuplicates: this.forgedDuplicates,
 			operationsSent: this.operationsSent,
 			bytesReceived: this.bytesReceived,
 			bytesSent: this.bytesSent,
@@ -207,6 +228,8 @@ export class ServerMetricsCollector {
 		this.uniqueOperationsReceived = 0
 		this.duplicateOperationsReceived = 0
 		this.rejectedOperations = 0
+		this.unverifiedLegacyOperations = 0
+		this.forgedDuplicates = 0
 		this.operationsSent = 0
 		this.bytesReceived = 0
 		this.bytesSent = 0

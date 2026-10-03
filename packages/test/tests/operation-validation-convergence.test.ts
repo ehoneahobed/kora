@@ -82,11 +82,15 @@ describe('operation validation convergence', () => {
 		const onB = await deviceB.getState('submissions')
 		expect(onB.some((r) => r.id === spam.id)).toBe(false)
 
-		// The submitter's own optimistic copy is still present and reconcilable — the
-		// framework surfaces the rejection rather than silently rolling back, so the
-		// app decides whether to delete it or resubmit a corrected op.
+		// W7 step 2: the submitter's fold excludes the refused operation, so it converges
+		// to the server and B. Nothing is lost: the operation stays in its log and in the
+		// rejected store above (explained, tied to the op), so the app can resubmit a
+		// corrected one.
 		const onA = await deviceA.getState('submissions')
-		expect(onA.some((r) => r.id === spam.id)).toBe(true)
+		expect(onA.some((r) => r.id === spam.id)).toBe(false)
+		expect(
+			(await deviceA.store.getOperationsForRecord('submissions', spam.id)).map((op) => op.type),
+		).toEqual(['insert'])
 	})
 
 	test('a rejected op is not resent on a later sync, and convergence stays stable', async () => {

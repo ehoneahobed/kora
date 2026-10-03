@@ -1,16 +1,3 @@
-/**
- * Resolved-through advertisement, remembered refusals and legacy-pair delivery, at the
- * store and session level, on every built-in store.
- *
- * RT-43: the handshake's own-node entry is the highest sequence the server RESOLVED for
- * the node (stored, validator-ignored, terminally refused, stored under another
- * number), so a device never re-submits an operation the server decided without
- * storing it. RT-45: the own node is always in the handshake vector (0 when the server
- * holds nothing of it). RT-47: a terminally refused id is answered with its original
- * rejection, never judged again, and only for the device that submitted it. RT-48: a
- * version-vector client receives both operations of a legacy pair. Per-user ingest
- * budget: a user cannot multiply the per-node budget by minting node ids.
- */
 import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
@@ -25,6 +12,20 @@ import type { ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { KoraSyncServerConfig } from '../../src/types'
+/**
+ * Resolved-through advertisement, remembered refusals and legacy-pair delivery, at the
+ * store and session level, on every built-in store.
+ *
+ * RT-43: the handshake's own-node entry is the highest sequence the server RESOLVED for
+ * the node (stored, validator-ignored, terminally refused, stored under another
+ * number), so a device never re-submits an operation the server decided without
+ * storing it. RT-45: the own node is always in the handshake vector (0 when the server
+ * holds nothing of it). RT-47: a terminally refused id is answered with its original
+ * rejection, never judged again, and only for the device that submitted it. RT-48: a
+ * version-vector client receives both operations of a legacy pair. Per-user ingest
+ * budget: a user cannot multiply the per-node budget by minting node ids.
+ */
+import { withContentId } from '../fixtures/content-id'
 
 const schema = defineSchema({
 	version: 1,
@@ -49,8 +50,8 @@ const tick = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(res
 let counter = 0
 function makeOp(nodeId: string, sequenceNumber: number, title = 't', id?: string): Operation {
 	counter += 1
-	return {
-		id: id ?? `res-op-${nodeId}-${sequenceNumber}-${counter}`,
+	const op: Operation = {
+		id: id ?? '',
 		nodeId,
 		type: 'insert',
 		collection: 'notes',
@@ -62,6 +63,8 @@ function makeOp(nodeId: string, sequenceNumber: number, title = 't', id?: string
 		causalDeps: [],
 		schemaVersion: 1,
 	}
+	// A real content-addressed id unless the test chooses one (RT-64: the server verifies it).
+	return id === undefined ? withContentId(op) : op
 }
 
 function batch(ops: Operation[]): SyncMessage {
@@ -448,12 +451,22 @@ describe.each(kinds)('operation resolutions: sessions (%s store)', (kind) => {
 		expect(rejections(alice.messages).map((r) => r.code)).toEqual(['SECRET_REASON'])
 
 		// Mallory submits an op under her own node that reuses Alice's refused id: it is
-		// judged on its own (validator runs), and she never sees Alice's rejection.
-		const mallory = await login('mallory-phone', { authToken: 'mallory' })
+		// judged on its own, and she never sees Alice's rejection. Since RT-64 the id is
+		// verified first: it is not the hash of Mallory's content, so it is refused as
+		// INVALID_OPERATION_ID before the validator (or the refusal memory) is consulted.
+		const mallory = await login('mallory-phone', { authToken: 'mallory', protocolVersion: 2 })
 		mallory.send(batch([makeOp('mallory-phone', 1, 'm', refused.id)]))
 		await acked(mallory, 1)
+		expect(calls).toBe(1)
+		expect(rejections(mallory.messages).map((r) => r.code)).toEqual(['INVALID_OPERATION_ID'])
+
+		// A protocol-1 session may store an unverifiable legacy id unverified (RT-71): the
+		// op is then judged on its own by the validator, and Alice's refusal never leaks.
+		const legacy = await login('legacy-phone', { authToken: 'legacy' })
+		legacy.send(batch([makeOp('legacy-phone', 1, 'l', refused.id)]))
+		await acked(legacy, 1)
 		expect(calls).toBe(2)
-		expect(rejections(mallory.messages)).toEqual([])
+		expect(rejections(legacy.messages).map((r) => r.code)).not.toContain('SECRET_REASON')
 	})
 
 	test('retriable rejections and SEQUENCE_CONFLICT are not remembered', async () => {
