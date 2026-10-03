@@ -989,6 +989,8 @@ type KoraEvent =
   | { type: 'query:subscribed'; queryId: string; collection: string }
   | { type: 'query:invalidated'; queryId: string; trigger: Operation }
   | { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
+  | { type: 'query:error'; queryId: string; collection: string; phase: 'initial' | 'refresh' | 'callback'; code: string; message: string }
+  | { type: 'storage:persistence'; state: 'checked' | 'requested' | 'unsupported' | 'error'; persisted: boolean; message?: string }
   | { type: 'connection:quality'; quality: ConnectionQuality }
   | { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
   | { type: 'sync:bandwidth'; bytesPerSecond: number; direction: 'in' | 'out' }

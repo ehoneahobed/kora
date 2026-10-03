@@ -105,14 +105,15 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "ORDER BY direction whitelisted to ASC/DESC (QueryError otherwise); LIMIT/OFFSET bound as parameters after a non-negative safe-integer check; OFFSET without LIMIT emits LIMIT -1. Inverted sql-builder test that asserted spliced literals.",
+   "acceptanceTest": "packages/store/src/query/sql-builder.test.ts (SEC-7 cases)"
   },
   {
    "id": "SEC-8",
@@ -151,7 +152,7 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SEC-9.test.ts",
@@ -159,7 +160,8 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "One literal generator in core sql-gen (sqlStringLiteral / sqlDefaultLiteral / enumCheckConstraint, quotes doubled, non-finite numbers -> NULL) used by client DDL, migration ADD COLUMN and the server materialized tables (SQLite + Postgres).",
+   "acceptanceTest": "packages/core/src/schema/sql-gen.test.ts (SEC-9b block) + packages/store/tests/integration/sql-identifier-safety.test.ts (real SQLite: defaults applied, enum CHECK enforced)"
   },
   {
    "id": "NEW-SEC-1",
@@ -1216,14 +1218,15 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-11.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "where/orderBy map createdAt/updatedAt to _created_at/_updated_at (a schema field of the same name wins); names exported from @korajs/store as VIRTUAL_TIMESTAMP_FIELDS / VIRTUAL_TIMESTAMP_FIELD_NAMES / VirtualTimestampField for the collection API types.",
+   "acceptanceTest": "packages/store/src/query/sql-builder.test.ts (STORE-11 cases) + packages/store/tests/integration/reactive-queries.test.ts (orderBy createdAt / where updatedAt reactive)"
   },
   {
    "id": "STORE-12",
@@ -1231,14 +1234,15 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "STORE-12.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Subscription diff compares per field kind (scalars by value; array/object/json/blob/richtext and included relations structurally). Error channel: subscribe(cb, { onError }), `query:error` event (queryId, collection, phase initial|refresh|callback, code, message), QueryStore.getError() for React/Vue. No unhandled rejection on the initial run, refresh failures and throwing callbacks reported (logged when no onError), first success after a failure always delivered, runs numbered so an older slow run never overwrites a newer result.",
+   "acceptanceTest": "packages/store/src/subscription/subscription-manager.test.ts (STORE-12 block) + result-equality.test.ts + reactivity/query-store.test.ts + tests/integration/reactive-queries.test.ts (query:error)"
   },
   {
    "id": "STORE-13",
@@ -1292,11 +1296,12 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [],
    "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
    "pr": null,
-   "notes": ""
+   "notes": "Node \"SQLite WASM\" gate renamed wasm-adapter-protocol-gates (says it is MockWorkerBridge/native). Playwright browser benchmark (real worker + SQLite WASM + OPFS sahpool, IndexedDB snapshot persistence timed) gated at CLAUDE.md targets; node IndexedDB persistence gate; 1,000-subscription fan-out gates. Browser gates currently FAIL on the loaded 2-core container (only the subscription check meets target); not wired into CI as blocking until a CI-hardware baseline is recorded (benchmark-gates.yml is tab-indented, check its YAML first).",
+   "acceptanceTest": "packages/store/src/benchmarks/subscription-fanout-gates.test.ts + indexeddb-performance-gates.test.ts (persistence) + packages/store/benchmarks/browser/store-browser-bench.mjs"
   },
   {
    "id": "NEW-STORE-1",
@@ -1349,14 +1354,15 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "persist() removed from createOpfsBlobDirectory. StoragePersistence (store) + app.storage.persistence.{status,request}: boot check uses persisted() in the background (never prompts, never awaited by ready); store.persistence auto (default) requests fire-and-forget after a transition into signed-in, the first local write, or at boot as an installed app; manual only on request(). Every outcome is a `storage:persistence` event. Manual Firefox prompt check still recommended.",
+   "acceptanceTest": "packages/store/src/persistence/storage-persistence.test.ts + kora/src/storage-accessor.test.ts (createApp ready with a never-settling persist())"
   },
   {
    "id": "NEW-STORE-5",
@@ -1485,11 +1491,12 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [],
    "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
    "pr": null,
-   "notes": ""
+   "notes": "WAL pragma removed from the browser worker (and the mock bridge); worker reports PRAGMA journal_mode after open as getStorageOpenState().journalMode (OPFS: delete; memory fallback: memory). Docs corrected in docs/guide/storage-configuration.md and docs/benchmarks/baseline.md (journal-mode measurements on sahpool). CLAUDE.md still says WAL: left for the docs pass.",
+   "acceptanceTest": "packages/store/src/adapters/sqlite-wasm-adapter.test.ts (NEW-STORE-11 cases) + packages/store/benchmarks/browser/store-browser-bench.mjs (real OPFS reports journal_mode=delete; WAL request returns delete)"
   },
   {
    "id": "NEW-STORE-12",

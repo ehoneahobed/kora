@@ -37,6 +37,31 @@ This is the only durable SQLite WASM multi-tab path. OPFS synchronous access han
 
 Kora also keeps open tabs reactive on this path. Local operations committed in one tab are announced over a database-scoped same-origin channel, and sibling tabs invalidate only the affected queries. The operation is not re-applied by receivers; the shared local database remains the source of truth. Worker RPC is serialized across complete transaction spans at the leader boundary, and abandoned follower spans are rolled back so closing a tab mid-transaction cannot freeze the database for other tabs. The crash-case idle reclaim defaults to 10s.
 
+### Journal Mode
+
+Browser databases on OPFS use SQLite's default rollback journal (`journal_mode = delete`), not WAL. WAL needs shared-memory support from the file system layer, and the OPFS SyncAccessHandle pool (`opfs-sahpool`) that Kora uses does not provide it: SQLite keeps `delete` whatever is requested. Earlier releases issued `PRAGMA journal_mode = WAL` there, which silently had no effect. Each open database holds one OPFS pool slot at rest plus one transient slot for its `-journal` file during a write transaction. The IndexedDB fallback runs SQLite in memory (`journal_mode = memory`). Native SQLite (`better-sqlite3` on Node.js and Electron) runs in WAL mode.
+
+The adapter reports the mode it actually got as `journalMode` in `getStorageOpenState()`.
+
+### Durable Storage (`persist()`)
+
+Browsers may evict an origin's storage under storage pressure unless the origin was granted persistent storage. Kora never puts that permission request on the startup path: in Firefox, `navigator.storage.persist()` shows a prompt and does not settle until the user answers, so awaiting it would hold `app.ready`.
+
+- At startup Kora only checks `navigator.storage.persisted()`, which never prompts, in the background.
+- With `store.persistence: 'auto'` (the default) Kora requests persistence in the background, never awaited, after a sign-in, after the first local write, or at startup when the page runs as an installed app.
+- With `store.persistence: 'manual'` Kora only requests it when you call `app.storage.persistence.request()`, for example from a "Keep my data on this device" button.
+
+```typescript
+const { state, persisted } = app.storage.persistence.status()
+// state: 'unknown' | 'persisted' | 'best-effort' | 'unsupported' | 'error'
+
+app.on('storage:persistence', (event) => {
+  if (!event.persisted) showBackupReminder()
+})
+
+button.onclick = () => app.storage.persistence.request()
+```
+
 ### Database Name
 
 Each app has a database name that defaults to `'kora-db'`. If you're running multiple Kora apps on the same domain, you **must** set a unique name for each app to avoid data collisions:
@@ -91,6 +116,7 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 | `name` | `string` | `'kora-db'` | Database name. Must be unique per app on the same origin. |
 | `workerUrl` | `string \| URL` | -- | URL to the SQLite WASM worker script. Required for `sqlite-wasm` adapter in browsers. |
 | `sharedWorkerUrl` | `string \| URL` | -- | Deprecated and ignored. SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and is never durable. |
+| `persistence` | `'auto' \| 'manual'` | `'auto'` | When Kora asks the browser for persistent storage. See [Durable Storage](#durable-storage-persist). Never delays `app.ready`. |
 
 ---
 
