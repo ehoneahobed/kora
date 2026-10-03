@@ -5,6 +5,7 @@
 export { ApplyPipeline } from './apply-pipeline'
 export type { ApplyContext, ApplyMode, ApplyPipelineDeps } from './apply-pipeline'
 export { MergeAwareSyncStore } from './merge-aware-sync-store'
+export { sealedRelationNames } from './sealed-relations'
 export type { MergeAwareSyncStoreOptions } from './merge-aware-sync-store'
 export { StoreQueueStorage } from './store-queue-storage'
 export { StoreSyncStatePersistence } from './store-sync-state'

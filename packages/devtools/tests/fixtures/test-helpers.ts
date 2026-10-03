@@ -181,6 +181,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			serverProtocolVersion: 2,
 			message: 'Upgrade the client.',
 		},
+		'sync:unverified-legacy-operation': {
+			type: 'sync:unverified-legacy-operation',
+			nodeId: 'node-a',
+			operationId: 'op-1',
+			collection: 'todos',
+			message: 'Stored unverified.',
+		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
 		'sync:suspended': { type: 'sync:suspended', reason: 'auth-required' },
 		'sync:apply-blocked': {

@@ -61,6 +61,18 @@ export type KoraEvent =
 			serverProtocolVersion: number
 			message: string
 	  }
+	| {
+			/**
+			 * A server stored a protocol-1 (Kora <= beta.13) client's operation whose
+			 * version-1 id it could not verify (RT-71: beta.13 hashed `undefined` members
+			 * as `null`, which the JSON upload no longer holds). Counted in metrics.
+			 */
+			type: 'sync:unverified-legacy-operation'
+			nodeId: string
+			operationId: string
+			collection: string
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'

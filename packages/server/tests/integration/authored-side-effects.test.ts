@@ -8,7 +8,7 @@ import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { createHarness, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -50,7 +50,9 @@ interface Seeded {
 async function seed(childrenFromOther = 0): Promise<Seeded> {
 	const store = new MemoryServerStore('server-1')
 	const { login } = await createHarness(schema, null, {}, store)
-	const author = await login('t', AUTHOR)
+	// Protocol 2: an id that is not its content hash is refused (a protocol-1 session may
+	// store an unverifiable legacy id unverified, RT-71).
+	const author = await login('t', AUTHOR, { protocolVersion: 2 })
 	let seq = 0
 	const nextSeq = (): number => {
 		seq += 1
@@ -77,8 +79,7 @@ async function seed(childrenFromOther = 0): Promise<Seeded> {
 			causalDeps: [project.id],
 		}),
 	)
-	author.send(batch([project, ...tasks, ...notes]))
-	await tick()
+	await sendAndAwaitAck(author, [project, ...tasks, ...notes])
 	if (childrenFromOther > 0) {
 		// Children the author never saw (another device, not yet synced to the author).
 		const other = await login('t', OTHER)
@@ -89,15 +90,11 @@ async function seed(childrenFromOther = 0): Promise<Seeded> {
 				data: { title: 'x', projectId: 'p1' },
 			}),
 		)
-		other.send(batch(extra))
-		await tick()
+		await sendAndAwaitAck(other, extra)
 	}
 	return {
 		store,
-		send: async (ops) => {
-			author.send(batch(ops))
-			await tick()
-		},
+		send: (ops) => sendAndAwaitAck(author, ops),
 		project,
 		tasks,
 		notes,

@@ -17,6 +17,7 @@ import {
 	applyOperationTransforms,
 	defaultApplyFailureReason,
 	isAuthoritativeNodeId,
+	isServerNodeId,
 } from '@korajs/core'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
@@ -1838,9 +1839,17 @@ export class SyncEngine {
 
 		this.serverProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
 		if (Array.isArray(msg.authoritativeNodeIds)) {
-			const ids = msg.authoritativeNodeIds.filter((id): id is string => typeof id === 'string')
-			this.authoritativeNodeIds = ids
-			await this.syncState?.saveAuthoritativeNodeIds?.(ids)
+			// The union of every explicit id learned, never a replacement (RT-75): each
+			// server instance lists what it knows, and `kora:server:` ids are
+			// authoritative by prefix, so they are not kept.
+			const known = new Set((this.authoritativeNodeIds ?? []).filter((id) => !isServerNodeId(id)))
+			const learned = msg.authoritativeNodeIds.filter(
+				(id): id is string => typeof id === 'string' && !isServerNodeId(id) && !known.has(id),
+			)
+			if (learned.length > 0 || this.authoritativeNodeIds === null) {
+				this.authoritativeNodeIds = [...known, ...learned].sort()
+				await this.syncState?.saveAuthoritativeNodeIds?.(this.authoritativeNodeIds)
+			}
 		}
 
 		this.remoteVector = wireToVersionVector(msg.versionVector)

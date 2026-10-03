@@ -204,8 +204,14 @@ export class ServerAuthoritySet extends Set<string> {
 /**
  * The operation ids of every stamp with authority class 1 in a serialized fold state:
  * the writes that won a `merge('server-authoritative')` field because their node was
- * authoritative when the server folded them. Walks the JSON generically, so it does
- * not depend on the per-kind layout.
+ * authoritative when the server folded them.
+ *
+ * Reads stamps only from their positions in the fold-state format (RT-76): the
+ * record's `cr`/`w`/`d`/`u` registers and each field kind's stamp members. Values
+ * (`v`, element values, key values, resolver bases) are never walked: a device writes
+ * them, and a json value shaped like a stamp must not name an authority. The format
+ * version is not enforced (the scan reads states a pre-release fold build wrote);
+ * anything that does not have the expected shape is skipped.
  */
 export function authoritativeStampOpIds(stateJson: string): string[] {
 	let parsed: unknown
@@ -214,21 +220,76 @@ export function authoritativeStampOpIds(stateJson: string): string[] {
 	} catch {
 		return []
 	}
+	if (!isObject(parsed)) return []
 	const found = new Set<string>()
-	const visit = (value: unknown): void => {
-		if (Array.isArray(value)) {
-			for (const item of value) visit(item)
-			return
+	const stamp = (value: unknown): void => {
+		if (
+			isObject(value) &&
+			value.c === 1 &&
+			typeof value.t === 'string' &&
+			typeof value.o === 'string'
+		) {
+			found.add(value.o)
 		}
-		if (value === null || typeof value !== 'object') return
-		const record = value as Record<string, unknown>
-		if (record.c === 1 && typeof record.t === 'string' && typeof record.o === 'string') {
-			found.add(record.o)
-		}
-		for (const member of Object.values(record)) visit(member)
 	}
-	visit(parsed)
+	/** `{ s: Stamp, ... }` members (shape registers, base/best/reset registers, map keys). */
+	const wrapped = (value: unknown): void => {
+		if (isObject(value)) stamp(value.s)
+	}
+	for (const key of ['cr', 'w', 'd', 'u'] as const) stamp(parsed[key])
+	const fields = isObject(parsed.f) ? parsed.f : {}
+	for (const field of Object.values(fields)) {
+		if (!isObject(field)) continue
+		switch (field.k) {
+			case 'reg':
+			case 'res':
+				for (const entry of asArray(field.e)) wrapped(entry)
+				break
+			case 'set':
+				wrapped(field.sh)
+				stamp(field.clr)
+				for (const element of Object.values(isObject(field.el) ? field.el : {})) {
+					if (!isObject(element)) continue
+					stamp(element.a)
+					wrapped(element.f)
+					stamp(element.r)
+				}
+				break
+			case 'map':
+				wrapped(field.sh)
+				stamp(field.clr)
+				for (const keyState of Object.values(isObject(field.keys) ? field.keys : {})) {
+					wrapped(keyState)
+				}
+				break
+			case 'ctr':
+				wrapped(field.base)
+				for (const delta of asArray(field.d)) wrapped(delta)
+				break
+			case 'max':
+			case 'min':
+				wrapped(field.best)
+				wrapped(field.reg)
+				break
+			case 'rt':
+				wrapped(field.reset)
+				for (const updateStamp of Object.values(isObject(field.u) ? field.u : {})) {
+					stamp(updateStamp)
+				}
+				break
+			default:
+				break
+		}
+	}
 	return [...found]
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function asArray(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : []
 }
 
 /** Imported HMAC keys, per secret. */

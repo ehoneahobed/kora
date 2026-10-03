@@ -1,4 +1,4 @@
-import { HybridLogicalClock, defineSchema, op, t } from '@korajs/core'
+import { HybridLogicalClock, createOperation, defineSchema, op, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
@@ -214,6 +214,38 @@ describe('importBackup merge mode', () => {
 		const again = await b.store.importBackup(await a.store.exportBackup(), { merge: true })
 		expect(again.operationsRestored).toBe(0)
 		expect((await b.store.verifyLogIntegrity()).clean).toBe(true)
+	})
+
+	test('operations of server-authority nodes are never applied from a file', async () => {
+		const a = await seeded()
+		const serverOp = async (nodeId: string, recordId: string): Promise<Operation> => {
+			return createOperation(
+				{
+					nodeId,
+					type: 'insert',
+					collection: 'todos',
+					recordId,
+					data: { title: `from ${nodeId}` },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				new HybridLogicalClock(nodeId),
+			)
+		}
+		await a.store.applyRemoteOperation(await serverOp('kora:server:dep:1', 'srv-1'))
+		await a.store.applyRemoteOperation(await serverOp('legacy-srv', 'srv-2'))
+		const b = await open()
+		await b.store.setAuthoritativeNodeIds(['legacy-srv'])
+		const result = await b.store.importBackup(await a.store.exportBackup(), { merge: true })
+		expect(result).toMatchObject({ success: true, serverOperationsSkipped: 2 })
+		expect(await b.store.collection('todos').findById('srv-1')).toBeNull()
+		expect(await b.store.collection('todos').findById('srv-2')).toBeNull()
+		expect(await vector(b.adapter, 'kora:server:dep:1')).toBeUndefined()
+		expect(await vector(b.adapter, 'legacy-srv')).toBeUndefined()
+		// The device's own data still merges.
+		expect(await b.store.collection('todos').findById(a.id)).toMatchObject({ title: 'b' })
 	})
 })
 

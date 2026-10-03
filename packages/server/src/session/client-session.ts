@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { applyOperationTransforms } from '@korajs/core'
+import { applyOperationTransforms, isServerNodeId } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -44,12 +44,17 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
+import {
+	restoreUndefinedFromPrevious,
+	scopeViewKey,
+	verifyInboundOperation,
+} from '@korajs/sync/internal'
 import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
 	deriveServerSideEffects,
 	isAuthoredCopyOfSideEffect,
+	undoneSideEffectsOfStoredDelete,
 } from '../apply/apply-server-operation'
 import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-validation'
 import type { OperationValidator } from '../apply/operation-validator'
@@ -707,6 +712,10 @@ export class ClientSession {
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
+	/** Uploads whose data is stored as the beta.13 writer held it (RT-71). */
+	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
+	/** Operations accepted with an unverified legacy (beta.13) id (RT-71). */
+	private unverifiedLegacyOperations = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
 	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
 	private invalidOperationIds = 0
@@ -2110,7 +2119,7 @@ export class ClientSession {
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
 			protocolVersion: SYNC_PROTOCOL_VERSION,
-			authoritativeNodeIds: this.serverAuthoritativeNodeIds(),
+			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
@@ -2415,6 +2424,15 @@ export class ClientSession {
 			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
 			if (this.isStoredDuplicate(op, stored)) {
 				await this.noteStoredElsewhere(op, stored)
+				// A delete sent again (the batch that stored it failed later, or was never
+				// acknowledged): any referential effect still undone is derived (or deferred
+				// to the author's copies in this batch) now, so an effect deferred in memory
+				// by a failed batch is never lost (RT-73).
+				if (op.type === 'delete') {
+					applied.push(
+						...(await this.resumeStoredDeleteEffects(op, authoredCopies, deferredEffects)),
+					)
+				}
 				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -2743,6 +2761,37 @@ export class ClientSession {
 	}
 
 	/**
+	 * The referential effects of a delete that arrived again as a stored duplicate and
+	 * are still undone (RT-73): effects the author covers later in this batch are
+	 * deferred like a fresh delete's (derived after the batch unless a copy is stored);
+	 * the rest are derived now. Derived ids are deterministic, so a concurrent retry or
+	 * another instance stores the same operations.
+	 *
+	 * @returns The derived operations (to relay)
+	 */
+	private async resumeStoredDeleteEffects(
+		op: Operation,
+		authoredCopies: Map<string, Operation[]>,
+		deferredEffects: DeferredSideEffect[],
+	): Promise<Operation[]> {
+		const serverDelete = this.transformForServerSchema(op)
+		if (serverDelete === null) return []
+		const uplinkScopes = this.uplinkScopes()
+		const effects = await undoneSideEffectsOfStoredDelete(this.store, serverDelete, (effect, row) =>
+			authorizeUplinkWrite(effect, row, uplinkScopes),
+		)
+		const derive: SideEffectOp[] = []
+		for (const effect of effects) {
+			const copyIds = (authoredCopies.get(serverDelete.id) ?? [])
+				.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverDelete.id, effect))
+				.map((copy) => copy.id)
+			if (copyIds.length > 0) deferredEffects.push({ parent: serverDelete, effect, copyIds })
+			else derive.push(effect)
+		}
+		return derive.length > 0 ? deriveServerSideEffects(this.store, serverDelete, derive) : []
+	}
+
+	/**
 	 * Derive the server's copy of each deferred side effect unless one of the author's
 	 * copies is stored (applied or already held). A store with the batch lookup is asked
 	 * again, so a copy stored by a concurrent session counts too.
@@ -2848,9 +2897,29 @@ export class ClientSession {
 			const integrity = await verifyInboundOperation(op, {
 				encrypted: false,
 				absentVersion: 'verify-ids',
+				schema: this.store.getSchema(),
 			})
-			if (integrity.ok && integrity.matchedVersion !== undefined) {
+			if (
+				integrity.ok &&
+				integrity.matchedVersion !== undefined &&
+				integrity.declarable !== false
+			) {
 				this.matchedHashVersions.set(op, integrity.matchedVersion)
+			}
+			if (integrity.ok && integrity.restoredData !== undefined) {
+				this.restoredLegacyData.set(op, integrity.restoredData)
+			}
+			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
+				// RT-71: a beta.13 (protocol 1) client hashed `undefined` members as `null`;
+				// the JSON it uploaded no longer holds them, so the id cannot always be
+				// rebuilt. The operation is stored unverified (no declared version), as every
+				// beta.13 operation was before RT-64. This skips no protection RT-64 needs:
+				// the ids the server derives are keyed (HMAC), so no client can predict and
+				// pre-store one, and a protocol-2 session never reaches this branch.
+				this.reportUnverifiedLegacyOperation(op)
+				const restored = restoreUndefinedFromPrevious(op)
+				if (restored !== op.data) this.restoredLegacyData.set(op, restored)
+				return null
 			}
 			if (!integrity.ok) {
 				return {
@@ -2866,6 +2935,41 @@ export class ClientSession {
 	}
 
 	/**
+	 * Whether an undeclared version-1 id that does not verify is accepted unverified
+	 * (RT-71): only from a protocol-1 session (Kora <= beta.13), and only for the
+	 * session's own node.
+	 */
+	private acceptsUnverifiedLegacyId(op: Operation): boolean {
+		return this.clientProtocolVersion < SYNC_PROTOCOL_VERSION && op.nodeId === this.clientNodeId
+	}
+
+	/** Log, count and emit an operation accepted with an unverified legacy id (RT-71). */
+	private reportUnverifiedLegacyOperation(op: Operation): void {
+		this.unverifiedLegacyOperations++
+		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.13 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.unverified_legacy_operation',
+			sessionId: this.sessionId,
+			nodeId: op.nodeId,
+			details: { operationId: op.id, collection: op.collection, type: op.type, message },
+		})
+		this.emitter?.emit({
+			type: 'sync:unverified-legacy-operation',
+			nodeId: op.nodeId,
+			operationId: op.id,
+			collection: op.collection,
+			message,
+		})
+	}
+
+	/** Operations this session accepted with an unverified legacy id (RT-71). */
+	getUnverifiedLegacyOperationCount(): number {
+		return this.unverifiedLegacyOperations
+	}
+
+	/**
 	 * The operation as the server stores it: an undeclared plaintext id this server
 	 * verified declares the version it matched (1, or 2 when the declaration was lost),
 	 * so receivers verify it too (RT-64). An absent version is left only on ids nobody
@@ -2874,7 +2978,11 @@ export class ClientSession {
 	private declareVerifiedHashVersion(op: Operation): Operation {
 		if (op.hashVersion !== undefined) return op
 		const matched = this.matchedHashVersions.get(op)
-		return matched === undefined ? op : { ...op, hashVersion: matched }
+		// A beta.13 update that cleared fields with `undefined` is stored with those fields
+		// `null` (RT-71): what the writer applied, and the same version-1 hash.
+		const restored = this.restoredLegacyData.get(op)
+		const content = restored === undefined ? op : { ...op, data: restored }
+		return matched === undefined ? content : { ...content, hashVersion: matched }
 	}
 
 	/**
@@ -2888,6 +2996,16 @@ export class ClientSession {
 		if (nodeId === this.store.getNodeId()) return true
 		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
 		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
+	}
+
+	/**
+	 * The authoritative ids a handshake advertises (RT-75): only explicit ones (legacy
+	 * server node ids, configured extras). Every `kora:server:` id is authoritative by
+	 * prefix on every replica, and listing instance ids would make the list differ per
+	 * instance and per start, which devices would have to treat as news.
+	 */
+	private advertisedAuthoritativeNodeIds(): string[] {
+		return [...new Set(this.serverAuthoritativeNodeIds())].filter((id) => !isServerNodeId(id))
 	}
 
 	/** Node ids this server authors operations under (protocol v2 handshake response). */

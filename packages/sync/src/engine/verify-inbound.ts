@@ -1,5 +1,5 @@
 import { base64ToBytes, bytesToBase64, isKoraBytesValue, verifyOperationId } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import type { FieldDescriptor, Operation, SchemaDefinition } from '@korajs/core'
 import { INVALID_OPERATION_ID } from '../protocol/protocol-version'
 
 /** Prefix of node ids reserved for Kora itself (server-authored and server-synthesized). */
@@ -36,6 +36,21 @@ export type InboundVerification =
 			 * for a version-2 id whose declaration was lost on the way.
 			 */
 			matchedVersion?: 1 | 2
+			/**
+			 * False when the id matched only through the schema-dependent rebuild of a
+			 * beta.13 hash (declared nested object members that were `undefined`): a
+			 * receiver without the schema cannot repeat that check, so the server must not
+			 * declare the matched version on the stored copy. Absent: true.
+			 */
+			declarable?: boolean
+			/**
+			 * The update's data with each top-level member beta.13 hashed as `undefined`
+			 * restored as `null` (RT-71): beta.13 cleared those fields locally, and `null`
+			 * hashes identically under version 1, so the stored copy carries the write the
+			 * beta.13 client made, under the same verified id. Present only when the id
+			 * matched through that rebuild.
+			 */
+			restoredData?: Operation['data']
 	  }
 	| { ok: false; code: typeof INVALID_OPERATION_ID; message: string }
 
@@ -83,7 +98,12 @@ export type AbsentHashVersionPolicy =
  */
 export async function verifyInboundOperation(
 	op: Operation,
-	context: { encrypted: boolean; absentVersion?: AbsentHashVersionPolicy },
+	context: {
+		encrypted: boolean
+		absentVersion?: AbsentHashVersionPolicy
+		/** The schema, for rebuilding beta.13 hashes of `undefined` nested members (RT-71). */
+		schema?: SchemaDefinition | null
+	},
 ): Promise<InboundVerification> {
 	if (isExemptFromIdVerification(op)) return { ok: true, verified: false }
 	const declared = op.hashVersion
@@ -102,11 +122,21 @@ export async function verifyInboundOperation(
 		return { ok: true, verified: false }
 	}
 	if (declared === undefined && !context.encrypted) {
-		if (await operationIdMatches(op)) return { ok: true, verified: true, matchedVersion: 1 }
+		if (await verifyOperationId(op)) return { ok: true, verified: true, matchedVersion: 1 }
 		if (await verifyOperationId({ ...op, hashVersion: 2 })) {
 			return { ok: true, verified: true, matchedVersion: 2 }
 		}
-	} else if (await operationIdMatches(op)) {
+		const match = await matchOperationId(op, context.schema ?? null)
+		if (match !== null) {
+			return {
+				ok: true,
+				verified: true,
+				matchedVersion: 1,
+				declarable: !match.usedSchema,
+				...(match.usedPrevious ? { restoredData: restoreUndefinedFromPrevious(op) } : {}),
+			}
+		}
+	} else if ((await matchOperationId(op, context.schema ?? null)) !== null) {
 		return { ok: true, verified: true }
 	}
 	return {
@@ -118,24 +148,155 @@ export async function verifyInboundOperation(
 
 /**
  * Whether the operation's id is its content hash under its declared version (absent:
- * 1). A version-1 id is also accepted over the other form of its binary values.
+ * 1). A version-1 id is also accepted over the other form of its binary values, and
+ * over the beta.13 form of `undefined` members (see {@link matchOperationId}).
+ *
+ * @param op - The operation (plaintext)
+ * @param schema - Optional schema, to rebuild declared nested members
+ * @returns true when the id is the content hash
  */
-export async function operationIdMatches(op: Operation): Promise<boolean> {
-	if (await verifyOperationId(op)) return true
-	if ((op.hashVersion ?? 1) !== 1) return false
-	for (const convert of [toBytesForm, toKoraBytesForm]) {
-		const data = convert(op.data)
-		const atomicOps = op.atomicOps === undefined ? undefined : convert(op.atomicOps)
-		if (data.changed || atomicOps?.changed) {
-			const variant: Operation = {
-				...op,
-				data: data.value as Operation['data'],
-				...(atomicOps ? { atomicOps: atomicOps.value as Operation['atomicOps'] } : {}),
+export async function operationIdMatches(
+	op: Operation,
+	schema: SchemaDefinition | null = null,
+): Promise<boolean> {
+	return (await matchOperationId(op, schema)) !== null
+}
+
+/** How an id matched: which beta.13 rebuilds (if any) its content needed. */
+export interface OperationIdMatch {
+	/** Top-level members restored from an update's `previousData` keys. */
+	usedPrevious: boolean
+	/** Declared nested members restored (needs the schema). */
+	usedSchema: boolean
+}
+
+/**
+ * Match an operation's id against its content hash (RT-64, RT-71).
+ *
+ * Version 2 is checked as is: its canonical form is the JSON form (an `undefined`
+ * member is absent, RT-72), so what was hashed is what arrives.
+ *
+ * Version 1 (beta.13 and earlier) hashed the in-memory value with `canonicalize`,
+ * which writes an `undefined` object member as `"key":null`; the op log and the wire
+ * are JSON, so the member is gone on arrival. The forms beta.13 actually produced are
+ * rebuilt where they are recoverable:
+ * - an update: beta.13 writes `previousData[key]` for every key it validated, so every
+ *   `previousData` key absent from `data` was an `undefined` value in `data`
+ *   (`update(id, { assignee: undefined })`);
+ * - an object field (needs the schema): declared nested members absent from the value
+ *   (`{ a: 1, b: undefined }`), recursively for declared nested objects.
+ * Each form is also tried with the other form of its binary values (bytes, or the
+ * canonical `{ $koraBytes }` form a JSON round trip produces).
+ *
+ * @param op - The operation (plaintext)
+ * @param schema - The schema, or null (no nested rebuild)
+ * @returns how the id matched, or null when it is not the content hash
+ */
+export async function matchOperationId(
+	op: Operation,
+	schema: SchemaDefinition | null,
+): Promise<OperationIdMatch | null> {
+	if (await verifyOperationId(op)) return { usedPrevious: false, usedSchema: false }
+	if ((op.hashVersion ?? 1) !== 1) return null
+	const candidates: Array<{ data: Operation['data']; kind: OperationIdMatch }> = [
+		{ data: op.data, kind: { usedPrevious: false, usedSchema: false } },
+	]
+	const filled = restoreUndefinedFromPrevious(op)
+	if (filled !== op.data) {
+		candidates.push({ data: filled, kind: { usedPrevious: true, usedSchema: false } })
+	}
+	if (schema) {
+		for (const candidate of [...candidates]) {
+			const nested = fillDeclaredNestedMembers(candidate.data, op.collection, schema)
+			if (nested !== null) {
+				candidates.push({ data: nested, kind: { ...candidate.kind, usedSchema: true } })
 			}
-			if (await verifyOperationId(variant)) return true
 		}
 	}
-	return false
+	for (const candidate of candidates) {
+		if (candidate.data !== op.data && (await verifyOperationId({ ...op, data: candidate.data }))) {
+			return candidate.kind
+		}
+		for (const convert of [toBytesForm, toKoraBytesForm]) {
+			const data = convert(candidate.data)
+			const atomicOps = op.atomicOps === undefined ? undefined : convert(op.atomicOps)
+			if (data.changed || atomicOps?.changed) {
+				const variant: Operation = {
+					...op,
+					data: data.value as Operation['data'],
+					...(atomicOps ? { atomicOps: atomicOps.value as Operation['atomicOps'] } : {}),
+				}
+				if (await verifyOperationId(variant)) return candidate.kind
+			}
+		}
+	}
+	return null
+}
+
+/**
+ * A beta.13 update's data with every `previousData` key it lacks restored as `null`
+ * (RT-71). beta.13 writes `previousData[key]` for every key it validated, so such a key
+ * held `undefined` in `data`: hashed as `null`, applied locally as a cleared field, and
+ * dropped by the JSON upload. Returns `op.data` itself when there is none to restore.
+ *
+ * @param op - A plaintext operation
+ * @returns The restored data, or `op.data` unchanged
+ */
+export function restoreUndefinedFromPrevious(op: Operation): Operation['data'] {
+	const data = op.data
+	if (op.type !== 'update' || data === null || op.previousData === null) return data
+	const missing = Object.keys(op.previousData).filter((key) => !(key in data))
+	if (missing.length === 0) return data
+	const out: Record<string, unknown> = { ...data }
+	for (const key of missing) out[key] = null
+	return out
+}
+
+/**
+ * The data with each declared nested member an object value lacks restored as `null`
+ * (recursively), or null when nothing was restored.
+ */
+function fillDeclaredNestedMembers(
+	data: Operation['data'],
+	collection: string,
+	schema: SchemaDefinition,
+): Operation['data'] {
+	const fields = schema.collections[collection]?.fields
+	if (data === null || fields === undefined) return null
+	let changed = false
+	const out: Record<string, unknown> = { ...data }
+	for (const [name, value] of Object.entries(data)) {
+		const descriptor = fields[name]
+		if (descriptor === undefined) continue
+		const filled = fillNested(value, descriptor)
+		if (filled !== value) {
+			out[name] = filled
+			changed = true
+		}
+	}
+	return changed ? out : null
+}
+
+function fillNested(value: unknown, descriptor: FieldDescriptor): unknown {
+	const nested = descriptor.nestedFields
+	if (descriptor.kind !== 'object' || !nested) return value
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
+	const record = value as Record<string, unknown>
+	let changed = false
+	const out: Record<string, unknown> = { ...record }
+	for (const [name, child] of Object.entries(nested)) {
+		if (!(name in record)) {
+			out[name] = null
+			changed = true
+			continue
+		}
+		const filled = fillNested(record[name], child)
+		if (filled !== record[name]) {
+			out[name] = filled
+			changed = true
+		}
+	}
+	return changed ? out : value
 }
 
 interface Converted {

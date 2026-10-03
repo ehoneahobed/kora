@@ -1,7 +1,11 @@
-import { bytesToBase64, computeOperationId } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import { bytesToBase64, computeOperationId, defineSchema, t } from '@korajs/core'
+import type { Operation, SchemaDefinition } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { verifyInboundOperation } from './verify-inbound'
+import {
+	operationIdMatches,
+	restoreUndefinedFromPrevious,
+	verifyInboundOperation,
+} from './verify-inbound'
 
 async function v1Op(partial: Partial<Operation> = {}): Promise<Operation> {
 	const base: Operation = {
@@ -118,5 +122,112 @@ describe('verifyInboundOperation: version-1 ids (RT-64)', () => {
 		expect((await verifyInboundOperation({ ...v1, id: 'keyed' }, { encrypted: false })).ok).toBe(
 			false,
 		)
+	})
+})
+
+describe('verifyInboundOperation: beta.13 hashes of undefined members (RT-71)', () => {
+	const schema = defineSchema({
+		version: 1,
+		collections: {
+			notes: {
+				fields: {
+					title: t.string(),
+					assignee: t.string().optional(),
+					meta: t.object({ a: t.number().optional(), b: t.string().optional() }).optional(),
+				},
+			},
+		},
+	}) as unknown as SchemaDefinition
+
+	/** A beta.13 upload: id over the in-memory data, content after a JSON round trip. */
+	async function legacyUpload(partial: Partial<Operation>): Promise<Operation> {
+		return JSON.parse(JSON.stringify(await v1Op(partial))) as Operation
+	}
+
+	test('an update clearing a field with undefined verifies; its data is restored as null', async () => {
+		const op = await legacyUpload({
+			type: 'update',
+			data: { title: 'y', assignee: undefined },
+			previousData: { title: 'x', assignee: 'bob' },
+		})
+		expect(op.data).toEqual({ title: 'y' })
+		const result = await verifyInboundOperation(op, {
+			encrypted: false,
+			absentVersion: 'verify-ids',
+		})
+		expect(result).toEqual({
+			ok: true,
+			verified: true,
+			matchedVersion: 1,
+			declarable: true,
+			restoredData: { title: 'y', assignee: null },
+		})
+		// The restored copy, declared version 1, verifies on a client without the schema.
+		const stored = { ...op, data: { title: 'y', assignee: null }, hashVersion: 1 as const }
+		expect(await verifyInboundOperation(stored, { encrypted: false })).toEqual({
+			ok: true,
+			verified: true,
+		})
+		expect(await operationIdMatches(stored)).toBe(true)
+	})
+
+	test('a nested undefined member verifies only with the schema, and is not declarable', async () => {
+		const op = await legacyUpload({ data: { title: 'x', meta: { a: 1, b: undefined } } })
+		expect(
+			(await verifyInboundOperation(op, { encrypted: false, absentVersion: 'verify-ids' })).ok,
+		).toBe(false)
+		expect(
+			await verifyInboundOperation(op, { encrypted: false, absentVersion: 'verify-ids', schema }),
+		).toEqual({ ok: true, verified: true, matchedVersion: 1, declarable: false })
+	})
+
+	test('both rebuilds together (a nested value plus a cleared field)', async () => {
+		const op = await legacyUpload({
+			type: 'update',
+			data: { meta: { a: 2, b: undefined }, assignee: undefined },
+			previousData: { meta: null, assignee: 'bob' },
+		})
+		expect(
+			await verifyInboundOperation(op, { encrypted: false, absentVersion: 'verify-ids', schema }),
+		).toMatchObject({ ok: true, verified: true, declarable: false })
+	})
+
+	test('a rebuild never turns altered content into a verified id', async () => {
+		const op = await legacyUpload({
+			type: 'update',
+			data: { title: 'y' },
+			previousData: { title: 'x', assignee: 'bob' },
+		})
+		const forged = { ...op, data: { title: 'z' } }
+		const result = await verifyInboundOperation(forged, {
+			encrypted: false,
+			absentVersion: 'verify-ids',
+			schema,
+		})
+		expect(result.ok).toBe(false)
+	})
+
+	test('restoreUndefinedFromPrevious restores only absent previousData keys of updates', async () => {
+		const update = await v1Op({
+			type: 'update',
+			data: { title: 'y' },
+			previousData: { title: 'x', assignee: 'bob' },
+		})
+		expect(restoreUndefinedFromPrevious(update)).toEqual({ title: 'y', assignee: null })
+		const insert = await v1Op()
+		expect(restoreUndefinedFromPrevious(insert)).toBe(insert.data)
+		const full = await v1Op({ type: 'update', data: { title: 'y' }, previousData: { title: 'x' } })
+		expect(restoreUndefinedFromPrevious(full)).toBe(full.data)
+	})
+
+	test('a version-2 id covers the JSON form: an undefined member is absent (RT-72)', async () => {
+		const base = await v1Op({ data: { title: 'x', meta: { a: 1, b: undefined } } })
+		const v2 = { ...base, hashVersion: 2 as const }
+		const id = await computeOperationId(v2, 2)
+		const uploaded = JSON.parse(JSON.stringify({ ...v2, id })) as Operation
+		expect(await verifyInboundOperation(uploaded, { encrypted: false })).toEqual({
+			ok: true,
+			verified: true,
+		})
 	})
 })

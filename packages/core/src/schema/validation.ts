@@ -1,6 +1,7 @@
 import { isBlobRef } from '../blob/blob-ref'
 import { SchemaValidationError } from '../errors/errors'
 import { isAtomicOp } from '../operations/atomic-ops'
+import { stripUndefinedMembers } from '../operations/strip-undefined'
 import type { CollectionDefinition, FieldDescriptor, OperationType } from '../types'
 
 /**
@@ -58,7 +59,7 @@ export function validateRecord(
 					result[fieldName] = value
 				} else if (value !== undefined && value !== null) {
 					validateFieldValue(collection, fieldName, descriptor, value)
-					result[fieldName] = value
+					result[fieldName] = stripUndefinedMembers(value)
 				} else {
 					result[fieldName] = value
 				}
@@ -94,7 +95,9 @@ export function validateRecord(
 		}
 
 		validateFieldValue(collection, fieldName, descriptor, value)
-		result[fieldName] = value
+		// An `undefined` member of an object value is absent (RT-72): the stored and synced
+		// form is JSON, which drops it, so the record holds exactly what peers will see.
+		result[fieldName] = stripUndefinedMembers(value)
 	}
 
 	return result

@@ -66,6 +66,12 @@ export interface RestoreResult {
 	 * re-applied on top of the restored data (see `RestoreOptions.keepUnsyncedWrites`).
 	 */
 	unsyncedWritesKept?: number
+	/**
+	 * Merge mode: operations of server-authority nodes (`kora:` nodes and the explicit
+	 * server authorities this device learned) the file held and the import left out.
+	 * Server decisions reach a device only from the sync server.
+	 */
+	serverOperationsSkipped?: number
 	/** Duration in ms */
 	duration: number
 }

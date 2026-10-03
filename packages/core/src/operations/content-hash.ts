@@ -106,16 +106,26 @@ function v2HashInput(op: HashableOperation, timestamp: string): Record<string, u
 }
 
 /**
- * Binary values hash in their canonical op-log form (`{ $koraBytes: base64 }`), so
- * an op hashed before and after a JSON round-trip has one id.
+ * The version-2 canonical form of a value: what survives a JSON round trip, so an op
+ * hashed before and after one has one id.
+ * - Binary values hash in their canonical op-log form (`{ $koraBytes: base64 }`).
+ * - An object member whose value is `undefined` is absent (RT-72): JSON drops it, so
+ *   the receiver never sees it. (Version 1, beta.13, hashed it as `null`; that form is
+ *   kept for version 1 only.)
+ * - An `undefined` array element is `null`, as JSON writes it.
  */
 function canonicalBinary(value: unknown): unknown {
 	if (value instanceof Uint8Array) return { $koraBytes: bytesToBase64(value) }
 	if (value instanceof ArrayBuffer) return { $koraBytes: bytesToBase64(new Uint8Array(value)) }
-	if (Array.isArray(value)) return value.map(canonicalBinary)
+	if (Array.isArray(value)) {
+		return value.map((item) => (item === undefined ? null : canonicalBinary(item)))
+	}
 	if (typeof value === 'object' && value !== null) {
 		const out: Record<string, unknown> = {}
-		for (const [key, member] of Object.entries(value)) out[key] = canonicalBinary(member)
+		for (const [key, member] of Object.entries(value)) {
+			if (member === undefined) continue
+			out[key] = canonicalBinary(member)
+		}
 		return out
 	}
 	return value
