@@ -201,6 +201,8 @@ encryption: { enabled: true, key: passphrase, allowPlaintextMigration: true }
 
 During the window, plaintext operations are applied as before. Close it once every device has upgraded and re-synced. A server can enforce the same rule for uploads with `createKoraServer({ encryption: { required: true } })` (`PLAINTEXT_REJECTED`, with the same `allowPlaintextMigration` escape hatch).
 
+Encrypted beta.12 (protocol 1) clients cannot sync with a server of this release: their uploads are refused terminally (`PLAINTEXT_REJECTED` when the server requires encryption, `SCHEMA_VALIDATION_ERROR` otherwise; `allowPlaintextMigration` admits plaintext only, never protocol-1 ciphertext), as a schema-aware beta.12 server already refused them. Writes refused that way stay on the device after it upgrades; they are not uploaded again.
+
 ## Performance Considerations
 
 Encryption adds overhead to every sync operation. Key factors to consider:
