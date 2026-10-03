@@ -5,7 +5,7 @@ Scaffold a new [Kora.js](https://github.com/ehoneahobed/kora) offline-first appl
 ## Usage
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 cd my-app
 pnpm install
 pnpm dev
@@ -21,7 +21,7 @@ pnpm dev
 ## Options
 
 ```bash
-npx create-kora-app my-app --template react-tailwind-sync --pm pnpm
+npx create-kora-app@beta my-app --template react-tailwind-sync --pm pnpm
 ```
 
 | Option | Description |

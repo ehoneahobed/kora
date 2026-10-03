@@ -286,7 +286,9 @@ Writes still land locally first. They upload when a connection exists, survive r
 offline, and concurrent edits from other devices merge per field the same way on every device
 ([Conflict Resolution](/guide/conflict-resolution)). For a working client and server, scaffold a
 sync template (`npx create-kora-app@beta my-app --yes` gives `react-tailwind-sync`): `pnpm dev`
-then starts the app and a local sync server together. Running a server is covered in
+then starts the app and a local sync server together. Its sync is bound to the signed-in user, so
+it waits (`auth-required`) until someone signs in; the project README explains the
+`KORA_AUTH_SECRET` and OAuth settings. Running a server is covered in
 [Sync Configuration](/guide/sync-configuration) and [Production Server](/guide/production-server).
 
 ## 7. Deploy

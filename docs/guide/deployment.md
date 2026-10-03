@@ -11,7 +11,7 @@ This guide walks you through deploying a Kora.js app to the internet. By the end
 
 ## The Fastest Path: `kora deploy`
 
-If you scaffolded your app with `npx create-kora-app` and chose a sync template, you already have everything needed. One command handles the entire deployment:
+If you scaffolded your app with `npx create-kora-app@beta` and chose a sync template, you already have everything needed. One command handles the entire deployment:
 
 ```bash
 kora deploy
@@ -32,18 +32,14 @@ If you've never deployed an app before, we recommend **Fly.io**. It has a genero
 Skip this if you already have a Kora app. Otherwise:
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app --yes
 ```
 
-When prompted:
-- **Template:** Pick "React + Tailwind (with sync)" (the recommended option)
-- **Package manager:** Pick whichever you prefer (pnpm, npm, yarn, or bun)
-
-Then install dependencies and verify it runs locally:
+`--yes` picks the recommended template (React, Tailwind, with sync) and your package manager, and
+installs the dependencies. Then verify it runs locally:
 
 ```bash
 cd my-app
-pnpm install
 pnpm dev
 ```
 
@@ -125,7 +121,20 @@ Open that URL in your browser. Your app is live.
 
 ### Step 5: Verify sync works
 
-Open the URL in two browser tabs (or on your phone). Add a todo in one tab. It should appear in the other tab within a second. That's real-time sync working.
+The sync templates sync only for **signed-in** users: while nobody is signed in, the app works
+locally and sync waits (`status: 'auth-required'`). To sign in, set `KORA_AUTH_SECRET` and the
+Google OAuth variables (`KORA_GOOGLE_CLIENT_ID`, `KORA_GOOGLE_CLIENT_SECRET`,
+`KORA_GOOGLE_REDIRECT_URI`) as secrets on the platform (`fly secrets set ...`), redeploy, and sign
+in with Google. See the project's README and [Authentication](/guide/authentication).
+
+Then open the URL in two browsers signed in as the same user (or on your phone). A todo added in
+one appears in the other within a second.
+
+::: tip A quick demo without accounts
+For a throwaway demo, change `createKoraAuthSync({ authClient, schema })` in `src/main.tsx` to
+`createKoraAuthSync({ authClient, schema, anonymous: 'allow' })` and leave `KORA_AUTH_SECRET`
+unset. Every visitor then syncs anonymously into **one shared data space**, so never ship it.
+:::
 
 ---
 
@@ -521,6 +530,7 @@ pnpm add @korajs/server@beta
 
 Create `server.ts` in your project root:
 
+<!-- docs-check: skip imports the project's own src/schema -->
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 import schema from './src/schema'
@@ -558,6 +568,7 @@ node --import tsx server.ts   # Start the production server
 
 In your app code, point sync to the server:
 
+<!-- docs-check: skip fragment of the app's main module -->
 ```typescript
 const app = createApp({
   schema,
@@ -587,7 +598,7 @@ pnpm add postgres
 import { createPostgresServerStore } from '@korajs/server'
 
 const store = await createPostgresServerStore({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL ?? 'postgres://localhost/kora',
 })
 ```
 

@@ -11,7 +11,7 @@ pnpm add -g @korajs/cli@beta
 Or use directly with `npx`:
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 ```
 
 ## Commands
@@ -21,7 +21,7 @@ npx create-kora-app my-app
 Scaffold a new Kora.js project:
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 
 # Interactive prompts:
 #   Select a template: React (basic) | React (with sync)
@@ -112,7 +112,7 @@ kora generate types
 ## Quick Start
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 cd my-app
 pnpm dev
 ```

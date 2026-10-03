@@ -26,7 +26,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Scaffold a Tauri desktop project:
 
 ```bash
-npx create-kora-app my-desktop-app --platform desktop-tauri
+npx create-kora-app@beta my-desktop-app --platform desktop-tauri
 ```
 
 Or select **Desktop (Tauri)** when prompted for platform:
