@@ -12,6 +12,7 @@ import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
+import { withContentId } from '../fixtures/content-id'
 
 export interface TestClient {
 	client: ReturnType<typeof createServerTransportPair>['client']
@@ -122,7 +123,7 @@ export function makeOp(
 	overrides: Partial<Operation>,
 ): Operation {
 	counter += 1
-	return {
+	const op: Operation = {
 		id: `rt-op-${nodeId}-${sequenceNumber}-${counter}`,
 		nodeId,
 		type: 'insert',
@@ -136,6 +137,9 @@ export function makeOp(
 		schemaVersion: 1,
 		...overrides,
 	}
+	// A real (version-1) content-addressed id unless the test chose one: since RT-64 the
+	// server verifies every uploaded id.
+	return overrides.id === undefined ? withContentId(op) : op
 }
 
 export function batch(ops: Operation[], messageId = `b-${Math.random()}`): SyncMessage {

@@ -10,14 +10,37 @@ export const INVALID_TIMESTAMP_CODE = 'INVALID_TIMESTAMP'
 /** Rejection code for a sequence number that is not a safe positive integer (SRV-4). */
 export const INVALID_SEQUENCE_NUMBER_CODE = 'INVALID_SEQUENCE_NUMBER'
 
+/**
+ * Rejection code for an identifier (operation id, node id, collection, record id,
+ * causal dependency) holding U+0000 or a lone UTF-16 surrogate (RT-65).
+ */
+export const INVALID_IDENTIFIER_CODE = 'INVALID_IDENTIFIER'
+
 /** Result of {@link validateIngestedOperation}. */
 export type IngestValidationResult =
 	| { valid: true }
 	| {
 			valid: false
-			code: typeof INVALID_TIMESTAMP_CODE | typeof INVALID_SEQUENCE_NUMBER_CODE
+			code:
+				| typeof INVALID_TIMESTAMP_CODE
+				| typeof INVALID_SEQUENCE_NUMBER_CODE
+				| typeof INVALID_IDENTIFIER_CODE
 			message: string
 	  }
+
+// NUL, or a high surrogate not followed by a low one, or a low surrogate not preceded by a high one.
+const UNSTORABLE_IDENTIFIER =
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: U+0000 is exactly what identifiers may not hold (RT-65)
+	/\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
+
+/**
+ * True for a string every store can hold as an identifier: no U+0000 (Postgres TEXT
+ * refuses it) and no lone surrogate (UTF-8 cannot encode it). Data values may hold
+ * both (they are encoded losslessly); identifiers are keys, compared and indexed raw.
+ */
+export function isStorableIdentifier(value: unknown): value is string {
+	return typeof value === 'string' && !UNSTORABLE_IDENTIFIER.test(value)
+}
 
 /**
  * True when `sequenceNumber` can identify a node's write: a positive integer no larger
@@ -33,7 +56,8 @@ export function isValidSequenceNumber(sequenceNumber: unknown): sequenceNumber i
 
 /**
  * The checks every path that brings an operation INTO the server's log runs (sync
- * ingest, route `kora.apply`, `applyLocalOperation`, backup import): the HLC
+ * ingest, route `kora.apply`, `applyLocalOperation`, backup import): identifiers are
+ * well-formed strings (RT-65), the HLC
  * timestamp is well formed and not more than {@link SERVER_MAX_TIMESTAMP_FUTURE_MS}
  * ahead of the server's clock, and the sequence number is a safe positive integer.
  *
@@ -48,6 +72,21 @@ export function validateIngestedOperation(
 	op: Operation,
 	now: number = Date.now(),
 ): IngestValidationResult {
+	const identifiers: unknown[] = [
+		op.id,
+		op.nodeId,
+		op.collection,
+		op.recordId,
+		op.timestamp?.nodeId,
+		...(Array.isArray(op.causalDeps) ? op.causalDeps : []),
+	]
+	if (!identifiers.every(isStorableIdentifier)) {
+		return {
+			valid: false,
+			code: INVALID_IDENTIFIER_CODE,
+			message: `Operation "${String(op.id)}" has an identifier (id, node id, collection, record id or causal dependency) that is not a string or holds U+0000 or an unpaired UTF-16 surrogate. Identifiers must be well-formed strings.`,
+		}
+	}
 	if (!isValidSequenceNumber(op.sequenceNumber)) {
 		return {
 			valid: false,

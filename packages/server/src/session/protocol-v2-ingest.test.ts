@@ -107,19 +107,24 @@ describe('protocol v2 handshake', () => {
 		const response = c.messages.find((m) => m.type === 'handshake-response')
 		if (response?.type !== 'handshake-response') throw new Error('no response')
 		expect(response.protocolVersion).toBe(2)
-		expect(response.authoritativeNodeIds).toEqual(['server-1'])
+		// The store's own kora:server: node id, then the configured legacy id (RT-62).
+		expect(response.authoritativeNodeIds?.[0]?.startsWith('kora:server:')).toBe(true)
+		expect(response.authoritativeNodeIds?.slice(1)).toEqual(['server-1'])
 	})
 
 	test('the handshake sends exactly the node ids the store folds with', async () => {
 		const { login, store } = await setup({}, schemaV1, ['srv-a', 'srv-b'])
-		expect(store.getAuthoritativeNodeIds()).toEqual(['server-1', 'srv-a', 'srv-b'])
-		const c = await login('dev-a')
-		const response = c.messages.find((m) => m.type === 'handshake-response')
-		expect(response?.type === 'handshake-response' && response.authoritativeNodeIds).toEqual([
+		expect(store.getAuthoritativeNodeIds()).toEqual([
+			store.getNodeId(),
 			'server-1',
 			'srv-a',
 			'srv-b',
 		])
+		const c = await login('dev-a')
+		const response = c.messages.find((m) => m.type === 'handshake-response')
+		expect(response?.type === 'handshake-response' && response.authoritativeNodeIds).toEqual(
+			store.getAuthoritativeNodeIds(),
+		)
 	})
 
 	test('a protocol-1 client is accepted with a deprecation warning', async () => {
@@ -203,6 +208,33 @@ describe('CORE-1: server verification of uploaded ids', () => {
 		expect(stored?.data).toEqual({ title: 't1', tag: 'migrated' })
 		// Rewritten under the original id: no longer a version-2 content hash.
 		expect(stored?.hashVersion).toBeUndefined()
+	})
+
+	test('RT-64: an op without hashVersion is verified as version 1; a chosen id is refused', async () => {
+		const { login, store } = await setup()
+		const c = await login('dev-a')
+		const { hashVersion: _v, ...honest } = await note('dev-a', 1, {}, 1)
+		const forged: Operation = { ...(await note('dev-a', 2, {}, 1)), id: 'f'.repeat(64) }
+		const { hashVersion: _f, ...forgedNoVersion } = forged
+		c.send(batch([honest as Operation, forgedNoVersion as Operation], 'b1'))
+		await acked(c.messages, 'b1')
+		expect(rejections(c.messages).map((r) => [r.operationId, r.code])).toEqual([
+			['f'.repeat(64), 'INVALID_OPERATION_ID'],
+		])
+		// Verified as version 1: stored declaring it, so receivers verify it too.
+		expect(store.getAllOperations().find((o) => o.id === honest.id)?.hashVersion).toBe(1)
+		expect(store.getAllOperations().some((o) => o.id === forged.id)).toBe(false)
+		// A peer receives the declared version.
+		const peer = await login('dev-b')
+		await vi.waitFor(() =>
+			expect(
+				peer.messages.some(
+					(m) =>
+						m.type === 'operation-batch' &&
+						m.operations.some((o) => o.id === honest.id && o.hashVersion === 1),
+				),
+			).toBe(true),
+		)
 	})
 })
 

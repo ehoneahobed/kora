@@ -5,8 +5,10 @@
  * re-validation or per-user/device session termination.
  * Asserts CORRECT behavior, so it FAILS today.
  */
+import { createHash } from 'node:crypto'
 import type { Operation } from '@korajs/core'
-import { defineSchema, t } from '@korajs/core'
+import { HybridLogicalClock, defineSchema, t } from '@korajs/core'
+import { canonicalize } from '@korajs/core/internal'
 import { KoraSyncServer, MemoryServerStore } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage } from '@korajs/sync'
@@ -18,8 +20,24 @@ const schema = defineSchema({
 	collections: { todos: { fields: { title: t.string(), userId: t.string() }, scope: ['userId'] } },
 })
 
+/**
+ * A version-1 content id, computed synchronously: the server verifies every uploaded
+ * id (RT-64), so a hand-built upload must carry its real hash.
+ */
+function withContentId(o: Operation): Operation {
+	const input: Record<string, unknown> = {
+		type: o.type,
+		collection: o.collection,
+		recordId: o.recordId,
+		data: o.data,
+		timestamp: HybridLogicalClock.serialize(o.timestamp),
+		nodeId: o.nodeId,
+	}
+	return { ...o, id: createHash('sha256').update(canonicalize(input)).digest('hex') }
+}
+
 function op(nodeId: string, userId: string, seq: number, title: string): Operation {
-	return {
+	return withContentId({
 		id: `op-${nodeId}-${seq}`,
 		nodeId,
 		type: 'insert',
@@ -31,7 +49,7 @@ function op(nodeId: string, userId: string, seq: number, title: string): Operati
 		sequenceNumber: seq,
 		causalDeps: [],
 		schemaVersion: 1,
-	}
+	})
 }
 
 describe('AUTH-11: live sync sessions survive revocation', () => {

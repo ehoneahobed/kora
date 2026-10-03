@@ -648,6 +648,8 @@ export class KoraSyncServer {
 		for (const entry of [...this.httpSessions.values()]) {
 			if (entry.lastSeenAtMs <= cutoff) {
 				entry.transport.close(4008, 'http session idle')
+				// A closed session left only for its final messages is dropped too.
+				this.httpSessions.delete(entry.id)
 			}
 		}
 	}
@@ -1033,6 +1035,9 @@ export class KoraSyncServer {
 		}
 
 		const polled = entry.transport.poll(request.ifNoneMatch)
+		if (!entry.transport.isConnected() && !entry.transport.hasPending()) {
+			this.httpSessions.delete(entry.id)
+		}
 		return {
 			status: polled.status,
 			body: polled.body,
@@ -1524,7 +1529,11 @@ export class KoraSyncServer {
 		const httpSessionId = this.httpSessionIdBySession.get(sessionId)
 		if (httpSessionId) {
 			this.httpSessionIdBySession.delete(sessionId)
-			this.httpSessions.delete(httpSessionId)
+			// Keep a closed HTTP session until the client polls what was queued before the
+			// close (the error that explains it); the idle sweep drops it otherwise.
+			if (!this.httpSessions.get(httpSessionId)?.transport.hasPending()) {
+				this.httpSessions.delete(httpSessionId)
+			}
 		}
 	}
 

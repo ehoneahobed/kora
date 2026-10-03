@@ -72,7 +72,10 @@ export class HttpServerTransport implements ServerTransport {
 		})
 		this.queuedBytes += bytes
 		if (this.maxQueuedBytes > 0 && this.queuedBytes > this.maxQueuedBytes) {
-			// The client stopped polling: end the session rather than buffer without bound.
+			// The client stopped polling: end the session rather than buffer without bound
+			// (and drop what it never collected).
+			this.queue.length = 0
+			this.queuedBytes = 0
 			this.close(1001, 'http session queue overflow')
 		}
 	}
@@ -98,12 +101,21 @@ export class HttpServerTransport implements ServerTransport {
 		return this.connected
 	}
 
+	/**
+	 * Close the session. Messages already queued (typically the final error that
+	 * explains the close, for example a refused handshake) stay pollable, so a
+	 * long-polling client learns why, exactly as a WebSocket client receives the error
+	 * frame before the close; once drained, polls answer 410.
+	 */
 	close(code = 1000, reason = 'transport closed'): void {
 		if (!this.connected) return
 		this.connected = false
-		this.queue.length = 0
-		this.queuedBytes = 0
 		this.closeHandler?.(code, reason)
+	}
+
+	/** True while messages queued before the close are still waiting to be polled. */
+	hasPending(): boolean {
+		return this.queue.length > 0
 	}
 
 	receive(payload: string | Uint8Array): void {
@@ -120,7 +132,7 @@ export class HttpServerTransport implements ServerTransport {
 	}
 
 	poll(ifNoneMatch?: string): HttpPollResponse {
-		if (!this.connected) {
+		if (!this.connected && this.queue.length === 0) {
 			return { status: 410 }
 		}
 

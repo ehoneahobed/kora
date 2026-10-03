@@ -20,6 +20,7 @@ import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
+import { withContentId } from '../fixtures/content-id'
 import { tick } from './rt-fixture'
 
 const schema = defineSchema({
@@ -61,7 +62,8 @@ async function login(server: KoraSyncServer, nodeId: string) {
 }
 
 function op(nodeId: string, seq: number, partial: Partial<Operation>): Operation {
-	return {
+	// A real content-addressed id: the server verifies every uploaded id (RT-64).
+	return withContentId({
 		id: `rt61-${nodeId}-${seq}`,
 		nodeId,
 		type: 'insert',
@@ -74,7 +76,7 @@ function op(nodeId: string, seq: number, partial: Partial<Operation>): Operation
 		causalDeps: [],
 		schemaVersion: 1,
 		...partial,
-	}
+	})
 }
 
 describe('RT-61: a device claims the server node id', () => {
@@ -95,8 +97,13 @@ describe('RT-61: a device claims the server node id', () => {
 		// Alice, legitimately, learns the server's node id from the handshake.
 		const alice = await login(server, 'alice-node')
 		expect(alice.response?.accepted).toBe(true)
-		const serverNode = alice.response?.authoritativeNodeIds?.[0]
-		expect(serverNode).toBe('server-1')
+		// beta.14 (RT-62): the store authors under `kora:server:<deployment>:<instance>`;
+		// the configured 'server-1' is a legacy server id, still advertised. Both are
+		// the server's, and neither has history yet.
+		const advertised = alice.response?.authoritativeNodeIds ?? []
+		expect(advertised).toContain('server-1')
+		expect(advertised).toContain(store.getNodeId())
+		const serverNode = 'server-1'
 		alice.client.send({
 			type: 'operation-batch',
 			messageId: 'b1',
@@ -116,14 +123,12 @@ describe('RT-61: a device claims the server node id', () => {
 		const forged = await login(server, serverNode as string)
 
 		// The server (a moderator route) decides.
-		const decision = await server
-			.getKoraContext()
-			.apply({
-				collection: 'tasks',
-				type: 'update',
-				recordId: 'task-1',
-				data: { status: 'rejected' },
-			})
+		const decision = await server.getKoraContext().apply({
+			collection: 'tasks',
+			type: 'update',
+			recordId: 'task-1',
+			data: { status: 'rejected' },
+		})
 		expect(decision.ok).toBe(true)
 		expect(await store.findRecord('tasks', 'task-1')).toMatchObject({ status: 'rejected' })
 
@@ -147,6 +152,10 @@ describe('RT-61: a device claims the server node id', () => {
 		// Correct: the handshake is refused (or the upload is), and the decision stands.
 		expect(await store.findRecord('tasks', 'task-1')).toMatchObject({ status: 'rejected' })
 		expect(forged.response?.accepted).not.toBe(true)
+		// The current server node id is refused the same way.
+		const current = await login(server, store.getNodeId())
+		expect(current.response?.accepted).not.toBe(true)
+		expect(current.messages.some((m) => m.type === 'error')).toBe(true)
 		await server.stop()
 	})
 })

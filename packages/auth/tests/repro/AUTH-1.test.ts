@@ -5,8 +5,10 @@
  * handshake with the victim's scope and read and write the victim's rows.
  * Asserts CORRECT behavior, so it FAILS today.
  */
+import { createHash } from 'node:crypto'
 import type { Operation } from '@korajs/core'
-import { defineSchema, t } from '@korajs/core'
+import { HybridLogicalClock, defineSchema, t } from '@korajs/core'
+import { canonicalize } from '@korajs/core/internal'
 import {
 	KoraAuthProvider,
 	KoraSyncServer,
@@ -29,6 +31,22 @@ const schema = defineSchema({
 	},
 })
 
+/**
+ * A version-1 content id, computed synchronously: the server verifies every uploaded
+ * id (RT-64), so a hand-built upload must carry its real hash.
+ */
+function withContentId(o: Operation): Operation {
+	const input: Record<string, unknown> = {
+		type: o.type,
+		collection: o.collection,
+		recordId: o.recordId,
+		data: o.data,
+		timestamp: HybridLogicalClock.serialize(o.timestamp),
+		nodeId: o.nodeId,
+	}
+	return { ...o, id: createHash('sha256').update(canonicalize(input)).digest('hex') }
+}
+
 let opCounter = 0
 function insert(
 	nodeId: string,
@@ -37,7 +55,7 @@ function insert(
 	seq: number,
 ): Operation {
 	opCounter++
-	return {
+	return withContentId({
 		id: `op-${nodeId}-${opCounter}`,
 		nodeId,
 		type: 'insert',
@@ -49,7 +67,7 @@ function insert(
 		sequenceNumber: seq,
 		causalDeps: [],
 		schemaVersion: 1,
-	}
+	})
 }
 
 async function signUp(auth: ReturnType<typeof createKoraAuthServer>, email: string) {

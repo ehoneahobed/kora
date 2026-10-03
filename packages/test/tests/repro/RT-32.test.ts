@@ -15,7 +15,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, t } from '@korajs/core'
+import { computeOperationId, defineSchema, t } from '@korajs/core'
 import { KoraSyncServer, createSqliteServerStore } from '@korajs/server'
 import type { ServerStore, ServerTransport } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
@@ -81,10 +81,12 @@ describe('RT-32: a legacy duplicate sequence the server holds the other half of'
 		const nodeId = legacy.getNodeId()
 		// beta.12 wrote version-1 ids (protocol v2 made version 2 the default): the
 		// fixture's operations are legacy, so they carry no hash version.
-		const [opA, opB] = (await legacy.store.getAllOperations())
+		const [firstOp, secondOp] = (await legacy.store.getAllOperations())
 			.map(({ hashVersion: _v2, ...op }) => op)
 			.sort((x, y) => x.sequenceNumber - y.sequenceNumber)
-		if (!opA || !opB) throw new Error('expected two operations')
+		if (!firstOp || !secondOp) throw new Error('expected two operations')
+		let opA = firstOp
+		let opB = secondOp
 		const adapter = (legacy as unknown as { adapter: StorageAdapter }).adapter
 		const indexes = await adapter.query<{ name: string }>(
 			"SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'uidx_kora_ops_%_node_seq'",
@@ -94,6 +96,47 @@ describe('RT-32: a legacy duplicate sequence the server holds the other half of'
 		await adapter.execute(
 			"UPDATE _kora_ops_todos SET data = json_remove(data, '$.__kora_hash_version__')",
 		)
+		// beta.12 ids are version-1 content hashes (they do not cover the sequence number,
+		// which is why a renumbering keeps them). This release creates version-2 ids, and
+		// the server verifies every uploaded id (RT-64), so give the fixture's operations
+		// the version-1 ids a beta.12 device would have written, everywhere they appear.
+		const v1Ids = new Map<string, string>()
+		for (const legacyOp of [opA, opB]) {
+			v1Ids.set(legacyOp.id, await computeOperationId(legacyOp, 1))
+		}
+		const queue = await adapter.query<{ id: string; payload: string }>(
+			'SELECT id, payload FROM _kora_sync_queue',
+		)
+		for (const row of queue) {
+			const payload = JSON.parse(row.payload) as { data?: string | null }
+			if (typeof payload.data === 'string') {
+				const data = JSON.parse(payload.data) as Record<string, unknown>
+				// biome-ignore lint/performance/noDelete: removing the key is the point
+				delete data.__kora_hash_version__
+				payload.data = JSON.stringify(data)
+			}
+			await adapter.execute('UPDATE _kora_sync_queue SET payload = ? WHERE id = ?', [
+				JSON.stringify(payload),
+				row.id,
+			])
+		}
+		const tables = await adapter.query<{ name: string }>(
+			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+		)
+		for (const { name } of tables) {
+			const columns = await adapter.query<{ name: string }>(`PRAGMA table_info("${name}")`)
+			for (const column of columns) {
+				for (const [from, to] of v1Ids) {
+					await adapter.execute(
+						`UPDATE "${name}" SET "${column.name}" = replace("${column.name}", ?, ?) WHERE instr("${column.name}", ?) > 0`,
+						[from, to, from],
+					)
+				}
+			}
+		}
+		const v1 = (op: typeof opA): typeof opA => ({ ...op, id: v1Ids.get(op.id) ?? op.id })
+		opA = v1(opA)
+		opB = v1(opB)
 		await adapter.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [opB.id])
 		await adapter.execute('UPDATE _kora_version_vector SET sequence_number = 1 WHERE node_id = ?', [
 			nodeId,

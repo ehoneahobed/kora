@@ -35,6 +35,11 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 import { mergeRichtext } from '@korajs/merge'
+import {
+	SERVER_NODE_PREFIX,
+	ServerAuthoritySet,
+	normalizeLegacyAuthorities,
+} from './server-identity'
 
 /**
  * Fold options as the server passes them. `authoritativeNodeIds` holds the node ids
@@ -62,8 +67,9 @@ export interface FoldMigrationReport {
 	/** Records re-folded and rewritten. */
 	records: number
 	/**
-	 * Records left with their pre-fold rows because the log has quarantined rows (see
-	 * `ServerLogIntegrityReport`); they fold from their remaining log on their next write.
+	 * Records that own quarantined operations (see `ServerLogIntegrityReport`): their log
+	 * is incomplete, so their pre-fold rows were kept as a snapshot base with the
+	 * remaining operations folded onto it (RT-70), never re-folded from the log alone.
 	 */
 	skippedUnclean: number
 	/** True when the fold plan (field kinds, strategies, resolvers) changed: every record was re-folded. */
@@ -94,14 +100,32 @@ export function mergeRichtextUpdatesForServer(updates: Uint8Array[]): Uint8Array
 
 /**
  * The fold options every server store uses: the richtext merger, no traces (the
- * server has no DevTools subscriber), and the server's authoritative node ids.
+ * server has no DevTools subscriber), and the server's authority: every node id in
+ * the `kora:server:` namespace (the prefix rule, RT-62) plus `explicitAuthorities`
+ * (legacy server node ids and configured extras).
  */
-export function serverFoldOptions(authoritativeNodeIds: readonly string[]): ServerFoldOptions {
+export function serverFoldOptions(explicitAuthorities: readonly string[]): ServerFoldOptions {
 	return {
 		richtext: mergeRichtextUpdatesForServer,
 		traces: 'none',
-		authoritativeNodeIds: new Set(authoritativeNodeIds),
+		authoritativeNodeIds: new ServerAuthoritySet(explicitAuthorities),
 	}
+}
+
+/**
+ * Fold plan fingerprint of the server: the schema's plan plus the explicit authorities
+ * (the prefix rule is constant). A change in the explicit authorities re-folds every
+ * record, so a stored fold state never keeps (or lacks) an authority class the current
+ * authority set would not give.
+ */
+export function serverFoldPlanFingerprint(
+	schema: SchemaDefinition,
+	explicitAuthorities: readonly string[],
+): string {
+	const explicit = normalizeLegacyAuthorities(explicitAuthorities)
+	return `${foldPlanFingerprint(schema)}|auth:${SERVER_NODE_PREFIX}*${
+		explicit.length > 0 ? `,${explicit.join(',')}` : ''
+	}`
 }
 
 /**

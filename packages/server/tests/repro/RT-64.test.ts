@@ -19,6 +19,7 @@
 import { defineSchema, deriveSideEffectOpId, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
+import { withContentId } from '../fixtures/content-id'
 import { batch, createHarness, tick } from './rt-fixture'
 
 const schema = defineSchema({
@@ -39,7 +40,7 @@ const schema = defineSchema({
 })
 
 function op(nodeId: string, seq: number, partial: Partial<Operation>): Operation {
-	return {
+	const built: Operation = {
 		id: `rt64-${nodeId}-${seq}`,
 		nodeId,
 		type: 'insert',
@@ -53,6 +54,8 @@ function op(nodeId: string, seq: number, partial: Partial<Operation>): Operation
 		schemaVersion: 1,
 		...partial,
 	}
+	// Honest operations carry real (version-1) content ids; only the squat chooses one.
+	return partial.id === undefined ? withContentId(built) : built
 }
 
 describe('RT-64: unverified version-1 ids squat server-derived correction ids', () => {
@@ -73,7 +76,6 @@ describe('RT-64: unverified version-1 ids squat server-derived correction ids', 
 		// The attacker saw the delete (its id is on the wire) and chooses its own op id.
 		const attacker = await login('t', 'attacker-node')
 		const comment = op('attacker-node', 2, {
-			id: 'rt64-orphan-comment',
 			collection: 'comments',
 			recordId: 'c-1',
 			data: { text: 'still here', postId: 'post-1' },
@@ -96,6 +98,16 @@ describe('RT-64: unverified version-1 ids squat server-derived correction ids', 
 
 		// Correct: the late child of a deleted cascade parent does not survive.
 		expect(await store.findRecord('comments', 'c-1')).toBeNull()
+		// The squat itself is refused: its id is not the hash of its content.
+		expect(
+			attacker.messages.some(
+				(m) =>
+					m.type === 'operation-rejected' &&
+					m.operationId === correctionId &&
+					m.code === 'INVALID_OPERATION_ID',
+			),
+		).toBe(true)
+		expect(await store.findRecord('comments', 'decoy')).toBeNull()
 		await server.stop()
 	})
 })

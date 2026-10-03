@@ -1,3 +1,15 @@
+import type { Operation } from '@korajs/core'
+import { defineSchema, t } from '@korajs/core'
+import type { SyncMessage } from '@korajs/sync'
+import { drizzle } from 'drizzle-orm/postgres-js'
+import postgres from 'postgres'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer } from '../../src/server/kora-sync-server'
+import { MemoryServerStore } from '../../src/store/memory-server-store'
+import { PostgresServerStore } from '../../src/store/postgres-server-store'
+import type { ServerStore } from '../../src/store/server-store'
+import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
+import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 /**
  * RT-51 repro (Phase 2 red team round 3, 2026-10-02): a 'stored-elsewhere' resolution
  * (RT-43 fix) answers for an operation the server no longer stores.
@@ -17,18 +29,7 @@
  *
  * Asserts the CORRECT behaviour (fails today): X is stored again after the restore.
  */
-import type { Operation } from '@korajs/core'
-import { defineSchema, t } from '@korajs/core'
-import type { SyncMessage } from '@korajs/sync'
-import { drizzle } from 'drizzle-orm/postgres-js'
-import postgres from 'postgres'
-import { afterEach, describe, expect, test, vi } from 'vitest'
-import { KoraSyncServer } from '../../src/server/kora-sync-server'
-import { MemoryServerStore } from '../../src/store/memory-server-store'
-import { PostgresServerStore } from '../../src/store/postgres-server-store'
-import type { ServerStore } from '../../src/store/server-store'
-import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
-import { createServerTransportPair } from '../../src/transport/memory-server-transport'
+import { withContentId } from '../fixtures/content-id'
 
 const schema = defineSchema({
 	version: 1,
@@ -44,7 +45,8 @@ afterEach(async () => {
 const tick = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 function makeOp(nodeId: string, sequenceNumber: number, key: string): Operation {
-	return {
+	// A real content-addressed id: the server verifies it (RT-64).
+	return withContentId({
 		id: `rt51-${key}`,
 		nodeId,
 		type: 'insert',
@@ -60,7 +62,7 @@ function makeOp(nodeId: string, sequenceNumber: number, key: string): Operation 
 		sequenceNumber,
 		causalDeps: [],
 		schemaVersion: 1,
-	}
+	})
 }
 
 let pgSchemas = 0

@@ -85,7 +85,9 @@ describe('RT-62: auto-generated server node id across a restart', () => {
 			await holder.server.close()
 			holder.server = new TestServer(schema, { store: createSqliteServerStore({ filename }) })
 			await holder.server.ready
-			expect(holder.server.authoritativeNodeIds).not.toEqual(firstIds) // a new random id
+			// beta.14: the server identity is persisted in the database (RT-62), so a restart
+			// keeps the same authoritative node ids (at 959b791 this was a new random id).
+			expect(holder.server.authoritativeNodeIds).toEqual(firstIds)
 
 			await a.sync()
 			await a.sync()

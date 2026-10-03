@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, generateUUIDv7 } from '@korajs/core'
+import { HybridLogicalClock } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
@@ -21,6 +21,14 @@ import {
 	serverFoldOptions,
 } from './record-fold'
 import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
+import {
+	deriveKeyedServerOpId,
+	generateDeploymentId,
+	generateDerivationSecret,
+	normalizeLegacyAuthorities,
+	parseIdentityOptions,
+	serverNodeIdFor,
+} from './server-identity'
 import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
@@ -71,9 +79,12 @@ function recordKey(collection: string, recordId: string): string {
 export interface MemoryServerStoreOptions {
 	/**
 	 * Node ids, besides this store's own, whose operations win
-	 * `merge('server-authoritative')` fields (for example other server instances).
+	 * `merge('server-authoritative')` fields (legacy server node ids). Every
+	 * `kora:server:` node id is authoritative without being listed.
 	 */
 	authoritativeNodeIds?: string[]
+	/** Instance id within the deployment (see `ServerIdentityOptions.instanceId`). */
+	instanceId?: string
 }
 
 /**
@@ -121,6 +132,8 @@ export class MemoryServerStore implements ServerStore {
 	/** Every operation of a record, in store (delivery) order. */
 	private readonly recordOps = new Map<string, Operation[]>()
 	private readonly authoritativeNodeIds: string[]
+	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
+	private readonly explicitAuthorities: string[]
 	private readonly foldOptions: ServerFoldOptions
 
 	private closed = false
@@ -131,10 +144,35 @@ export class MemoryServerStore implements ServerStore {
 	 */
 	private sequenceEpoch = 0
 
+	/** Derivation secret of server-derived ids (RT-64). Per process: nothing persists. */
+	private readonly derivationSecret = generateDerivationSecret()
+
+	/**
+	 * @param nodeId - Deprecated: a plain id is recorded as a legacy authoritative id; a
+	 *   `kora:server:` id is used verbatim. Leave unset: the store authors under
+	 *   `kora:server:<deployment>:<instance>` (a fresh deployment per process, since a
+	 *   memory store persists nothing).
+	 * @param options - Extra authoritative ids and the instance id
+	 */
 	constructor(nodeId?: string, options: MemoryServerStoreOptions = {}) {
-		this.nodeId = nodeId ?? generateUUIDv7()
-		this.authoritativeNodeIds = [...new Set([this.nodeId, ...(options.authoritativeNodeIds ?? [])])]
-		this.foldOptions = serverFoldOptions(this.authoritativeNodeIds)
+		const configured = parseIdentityOptions({
+			...(nodeId !== undefined ? { nodeId } : {}),
+			...options,
+		})
+		this.nodeId =
+			configured.verbatimNodeId ??
+			serverNodeIdFor(generateDeploymentId(), configured.instanceId ?? '1')
+		this.explicitAuthorities = normalizeLegacyAuthorities(configured.explicitAuthorities)
+		this.authoritativeNodeIds = [this.nodeId, ...this.explicitAuthorities]
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
+	}
+
+	async deriveServerOperationId(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string> {
+		return deriveKeyedServerOpId(this.derivationSecret, parentOpId, ruleId, targetRecordId)
 	}
 
 	getAuthoritativeNodeIds(): string[] {

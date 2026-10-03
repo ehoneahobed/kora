@@ -7,7 +7,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { applyOperationTransforms } from '@korajs/core'
-import { SyncError, generateUUIDv7, hashBlob, verifyOperationId } from '@korajs/core'
+import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type {
 	AwarenessUpdateMessage,
@@ -21,7 +21,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
-import { decodeBlobChunkBytes } from '@korajs/sync'
+import { SyncEncryptor, decodeBlobChunkBytes } from '@korajs/sync'
 import {
 	type DeltaCursor,
 	INVALID_OPERATION_ID,
@@ -43,8 +43,9 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import { scopeViewKey } from '@korajs/sync/internal'
+import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
 import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
+import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-validation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
@@ -690,6 +691,8 @@ export class ClientSession {
 	/** Protocol version the client declared in its handshake (1 when absent). */
 	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
 	private readonly authoritativeNodeIds: readonly string[] | null
+	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
+	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
 	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
 	private invalidOperationIds = 0
@@ -1779,6 +1782,27 @@ export class ClientSession {
 			this.close('reserved node id')
 			return
 		}
+		if (!isStorableIdentifier(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				'The node id holds U+0000 or an unpaired UTF-16 surrogate. Use a generated device node id.',
+				false,
+			)
+			this.close('malformed node id')
+			return
+		}
+		// The server's own node ids, current and legacy (published in the handshake's
+		// `authoritativeNodeIds`), are never a device's: a device presenting one would
+		// author `merge('server-authoritative')` writes as the server (RT-61).
+		if (this.isServerAuthorNodeId(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				`Node id "${msg.nodeId}" is a server node id (an authoritative node of this deployment). Use a generated device node id.`,
+				false,
+			)
+			this.close('server node id')
+			return
+		}
 
 		// Authenticate if provider is configured
 		if (this.auth) {
@@ -2337,8 +2361,10 @@ export class ClientSession {
 		if (operations.length > 0) {
 			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
 				lookupCredit = BATCH_LOOKUP_RATE_COST
-				stored = await this.findStoredOperations(operations)
-				resolved = await this.findResolutions(operations, stored)
+				// Identifiers a store cannot hold are refused in the loop, never looked up (RT-65).
+				const lookupable = operations.filter((op) => operationIdentifiersStorable(op))
+				stored = await this.findStoredOperations(lookupable)
+				resolved = await this.findResolutions(lookupable, stored)
 			} else {
 				this.rateLimitedOperations += operations.length
 				this.sendRateLimited()
@@ -2348,6 +2374,21 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+
+			// An identifier holding U+0000 or a lone surrogate cannot be stored or looked up
+			// (Postgres refuses it). Refused terminally without touching the store, so it
+			// never fails the session (RT-65); nothing is recorded under such an id.
+			if (!operationIdentifiersStorable(op)) {
+				this.sendOperationRejected(
+					op,
+					INVALID_IDENTIFIER_CODE,
+					`Operation "${String(op.id)}" has an identifier holding U+0000 or an unpaired UTF-16 surrogate. Identifiers must be well-formed strings.`,
+					false,
+				)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -2486,7 +2527,7 @@ export class ClientSession {
 				continue
 			}
 
-			const serverOp = this.transformForServerSchema(op)
+			const serverOp = this.transformForServerSchema(this.declareVerifiedHashVersion(op))
 			if (serverOp === null) {
 				await this.refuseTerminally(
 					op,
@@ -2668,6 +2709,13 @@ export class ClientSession {
 	private async checkUploadIntegrity(
 		op: Operation,
 	): Promise<{ code: string; message: string } | null> {
+		// Defense in depth: the handshake already refused a server node id (RT-61).
+		if (this.isServerAuthorNodeId(op.nodeId)) {
+			return {
+				code: 'INVALID_NODE_ID',
+				message: `Operation "${op.id}" is authored by "${op.nodeId}", a server node id. A device may never upload operations under one.`,
+			}
+		}
 		const declared = op.hashVersion
 		if (declared !== undefined && declared !== 1 && declared !== 2) {
 			return {
@@ -2686,14 +2734,60 @@ export class ClientSession {
 					message: `Operation "${op.id}" is plaintext but this server requires end-to-end encryption. Enable sync encryption on the client, or open a plaintext migration window (encryption.allowPlaintextMigration) on the server.`,
 				}
 			}
-			if (declared === 2 && !(await verifyOperationId(op))) {
+			// A protocol-1 encrypted payload: its id covers the plaintext, which the server
+			// never sees, so it cannot be checked here (the receivers refuse the format).
+			if (
+				SyncEncryptor.isEncryptedPayload(op.data) ||
+				SyncEncryptor.isEncryptedPayload(op.previousData)
+			) {
+				return null
+			}
+			// Every plaintext id is verified, version 1 included (RT-64): an operation that
+			// declares no version must carry its version-1 (or version-2) content hash, so
+			// omitting `hashVersion` skips nothing and no client stores an op under a chosen id.
+			const integrity = await verifyInboundOperation(op, {
+				encrypted: false,
+				absentVersion: 'verify-ids',
+			})
+			if (integrity.ok && integrity.matchedVersion !== undefined) {
+				this.matchedHashVersions.set(op, integrity.matchedVersion)
+			}
+			if (!integrity.ok) {
 				return {
 					code: INVALID_OPERATION_ID,
-					message: `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`,
+					message:
+						declared === 2
+							? `Operation "${op.id}" does not match its content hash (hash version 2): its id, data, previousData, sequenceNumber, causalDeps or schemaVersion was altered after it was created. It is refused and never stored or relayed.`
+							: `Operation "${op.id}" does not match its content hash (hash version 1: type, collection, recordId, data, timestamp, nodeId, atomicOps): its id was not computed from its content, or the content was altered. It is refused and never stored or relayed.`,
 				}
 			}
 		}
 		return null
+	}
+
+	/**
+	 * The operation as the server stores it: an undeclared plaintext id this server
+	 * verified declares the version it matched (1, or 2 when the declaration was lost),
+	 * so receivers verify it too (RT-64). An absent version is left only on ids nobody
+	 * could verify (protocol-1 encrypted payloads, server-side transforms).
+	 */
+	private declareVerifiedHashVersion(op: Operation): Operation {
+		if (op.hashVersion !== undefined) return op
+		const matched = this.matchedHashVersions.get(op)
+		return matched === undefined ? op : { ...op, hashVersion: matched }
+	}
+
+	/**
+	 * True for a node id that is (or was) the server's own: the `kora:` namespace, the
+	 * store's node id, and every id the server advertises or folds as authoritative
+	 * (other instances, legacy server node ids, configured extras). No device may use one
+	 * (RT-61), whether or not it has history yet.
+	 */
+	private isServerAuthorNodeId(nodeId: string): boolean {
+		if (nodeId.startsWith(RESERVED_PRINCIPAL_PREFIX)) return true
+		if (nodeId === this.store.getNodeId()) return true
+		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
+		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
 	}
 
 	/** Node ids this server authors operations under (protocol v2 handshake response). */
@@ -3536,4 +3630,15 @@ function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
 	}
 
 	return 'json'
+}
+
+/** True when every identifier of `op` can be stored and looked up by every store (RT-65). */
+function operationIdentifiersStorable(op: Operation): boolean {
+	return (
+		isStorableIdentifier(op.id) &&
+		isStorableIdentifier(op.nodeId) &&
+		isStorableIdentifier(op.collection) &&
+		isStorableIdentifier(op.recordId) &&
+		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
+	)
 }

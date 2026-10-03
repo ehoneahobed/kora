@@ -48,17 +48,20 @@ describe('SqliteServerStore', () => {
 		expect(vv.size).toBe(0)
 	})
 
-	test('getNodeId returns the provided node ID', () => {
-		expect(store.getNodeId()).toBe('server-1')
+	test('a configured plain node id is a legacy authority, not the authoring id (RT-62)', () => {
+		expect(store.getNodeId()).toMatch(/^kora:server:[0-9a-f-]{36}:1$/)
+		expect(store.getAuthoritativeNodeIds()).toEqual([store.getNodeId(), 'server-1'])
 	})
 
-	test('getNodeId generates a UUID when none provided', () => {
+	test('getNodeId is a persisted kora:server: id when none provided', () => {
 		const sqlite = new Database(':memory:')
 		const db = drizzle(sqlite)
 		const autoStore = new SqliteServerStore(db)
 		expect(autoStore.getNodeId()).toMatch(
-			/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+			/^kora:server:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:1$/,
 		)
+		// Same database, new store instance (a restart): the same identity.
+		expect(new SqliteServerStore(db).getNodeId()).toBe(autoStore.getNodeId())
 	})
 
 	test('materializes concurrent atomic increments to the composed sum', async () => {

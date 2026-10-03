@@ -40,6 +40,29 @@ export class SequenceConflictError extends KoraError {
 	}
 }
 
+/** Rejection code for an operation holding a value the store cannot represent. */
+export const UNSTORABLE_VALUE_CODE = 'UNSTORABLE_VALUE'
+
+/**
+ * Thrown by a store when an operation carries a value the database cannot represent
+ * (RT-65). Nothing was written. Not retriable: the same bytes always fail, so the
+ * session refuses the operation terminally instead of failing the connection (which
+ * made the device re-send it forever and blocked every later write of that device).
+ */
+export class UnstorableValueError extends KoraError {
+	constructor(
+		readonly operation: Pick<Operation, 'id' | 'collection' | 'recordId'>,
+		detail: string,
+	) {
+		super(
+			`Operation "${operation.id}" on ${operation.collection}/${operation.recordId} holds a value this server's database cannot store (${detail}). It is refused; nothing was written.`,
+			UNSTORABLE_VALUE_CODE,
+			{ operationId: operation.id, collection: operation.collection, recordId: operation.recordId },
+		)
+		this.name = 'UnstorableValueError'
+	}
+}
+
 /**
  * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
  * sequence in the log when this release first opened the store. Operations stored at
@@ -535,6 +558,17 @@ export interface ServerStore extends SyncStore {
 	 * clients fold with the same authority.
 	 */
 	getAuthoritativeNodeIds?(): string[]
+	/**
+	 * Keyed id of a server-derived operation (cascade, set-null, constraint correction):
+	 * deterministic across every instance of the deployment, unpredictable to clients
+	 * (RT-64). Built-in stores key it with a persisted deployment secret. A store
+	 * without it falls back to the unkeyed `deriveSideEffectOpId`.
+	 */
+	deriveServerOperationId?(
+		parentOpId: string,
+		ruleId: string,
+		targetRecordId: string,
+	): Promise<string>
 	/** Close the store and release resources */
 	close(): Promise<void>
 
