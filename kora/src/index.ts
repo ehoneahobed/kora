@@ -17,6 +17,7 @@ export type {
 	StorageApi,
 	StoreOptions,
 	StoreInfo,
+	EncryptionControl,
 	SyncControl,
 	SyncOptions,
 	SequenceAccessor,
@@ -142,8 +143,11 @@ export { MergeEngine } from '@korajs/merge'
 export type { MergeInput, MergeResult } from '@korajs/merge'
 
 // === @korajs/sync re-exports ===
-export { SyncEngine, WebSocketTransport } from '@korajs/sync'
+export { EncryptionKeyError, SyncEngine, WebSocketTransport } from '@korajs/sync'
 export type {
+	EncryptionLockState,
+	EncryptionStatus,
+	EncryptionStatusCode,
 	SyncConfig,
 	SyncDiagnostics,
 	SyncEncryptionConfig,

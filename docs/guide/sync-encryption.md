@@ -1,15 +1,17 @@
 ---
 title: Sync Encryption
-description: "Encrypt Kora.js sync traffic end to end: encryption hooks, key management, and what the sync server can and cannot see."
+description: "Encrypt Kora.js sync traffic end to end: shared per-user keys, unlock and lock, rotation, recovery, and what the sync server can and cannot see."
 ---
 
 # Sync Encryption
 
-Kora supports end-to-end encryption for sync. When enabled, operation data is encrypted on the client before it leaves the device. The sync server stores and relays encrypted payloads without ever seeing plaintext user data.
+Kora supports end-to-end encryption for sync. When enabled, operation data is encrypted on the client before it leaves the device. The sync server stores and relays encrypted payloads without ever seeing plaintext user data, and it never holds a usable key.
+
+Encryption covers the **sync wire and the server**. It does not encrypt the device's local database: data on the device is as readable as it is without sync encryption.
 
 ## What Gets Encrypted
 
-Since protocol v2 (beta.14) an operation's `data`, `previousData` and atomic ops (`increment` amounts and similar) travel only as ciphertext, inside the operation's encryption envelope (`op.encrypted`). On the wire `data` is `null`, or holds only the cleartext scope fields you list (see below). Metadata stays in cleartext:
+Since protocol v2 (1.0.0-beta.13) an operation's `data`, `previousData` and atomic ops (`increment` amounts and similar) travel only as ciphertext, inside the operation's encryption envelope (`op.encrypted`). On the wire `data` is `null`, or holds only the cleartext scope fields you list (see below). Metadata stays in cleartext:
 
 | Encrypted (in `op.encrypted`) | Not Encrypted |
 |-----------|---------------|
@@ -68,56 +70,128 @@ const app = createApp({
   schema,
   sync: {
     url: 'wss://my-server.com/kora',
-    encryption: {
-      enabled: true,
-      key: 'my-secure-passphrase',
-    },
+    authClient, // one keyring per signed-in user (see "Who can read a key record")
+    encryption: { enabled: true },
   },
 })
+
+// Later, when the user enters their encryption passphrase:
+await app.encryption?.unlock(passphrase)
 ```
 
-That is all. Operations are encrypted before sending and decrypted after receiving, transparently.
+Until the keyring is unlocked, sync is paused (`sync:suspended` with reason `encryption-locked`) and nothing leaves the device. Local reads and writes keep working; writes queue and upload, encrypted, once the keyring is unlocked.
 
-### Using a Key Provider Function
-
-Instead of a static passphrase, you can provide an async function. This is useful when the passphrase comes from a user prompt, a vault, or a key management service:
+You can also pass the passphrase (or an async provider of it) in the config. The keyring is then opened automatically at the first sync handshake:
 
 ```typescript
-sync: {
-  url: 'wss://my-server.com/kora',
-  encryption: {
-    enabled: true,
-    key: async () => {
-      // Fetch from a vault, prompt the user, etc.
-      return await getEncryptionPassphrase()
-    },
-  },
+encryption: {
+  enabled: true,
+  key: async () => await getEncryptionPassphrase(), // called only when the keyring needs it
 }
 ```
 
-The key provider is called once during initialization. The derived key is held in memory for the lifetime of the app instance.
+The provider is called when a device has no unlocked keys yet (first start, after `lock()`, or after the passphrase changed on another device). It is not called on every start when the keys are cached.
 
-## How Key Derivation Works
+## How Keys Work
 
-Kora derives encryption keys from passphrases using PBKDF2 (Password-Based Key Derivation Function 2) with the following parameters:
+Every user has a **keyring**: random 256-bit AES-GCM data keys, one per key version. The sync server stores the keyring only in wrapped form. Each data key is wrapped (AES-256-GCM key wrap) by a key-encryption key derived from the user's passphrase:
 
 | Parameter | Value |
 |-----------|-------|
-| Algorithm | PBKDF2 |
-| Hash | SHA-256 |
-| Iterations | 600,000 (OWASP recommended minimum) |
-| Salt | 32 bytes, randomly generated |
-| Derived key | AES-256-GCM (256-bit) |
+| Key derivation | PBKDF2-SHA256, 600,000 iterations (OWASP) |
+| Salt | 32 random bytes per user, stored on the server next to the wrapped keys |
+| Data keys | Random 256-bit AES-GCM keys, one per key version |
+| Key wrap | AES-256-GCM, additional data binds keyring, key version and key id |
 
-The high iteration count makes brute-force attacks against weak passphrases computationally expensive. The random salt ensures that the same passphrase on different devices produces different derived keys (unless the salt is shared).
+The server stores exactly one record per user and keyring: `{ salt, KDF parameters, wrapped keys, key ids, key versions, revision }`. It never sees the passphrase, the derived key or a data key, and it cannot unwrap anything.
 
-### Salt Management
+At each sync handshake the device fetches the record **before any operation is exchanged**, and then:
 
-When a key is first derived, a random 32-byte salt is generated. This salt must be shared with all devices that need to decrypt the data. Kora handles this automatically through the versioned key system -- the salt is stored alongside the key version.
+- On the user's first device (no record yet) it generates the first data key, wraps it, and stores the record. If two first devices race, the server's compare-and-set lets one win and the other opens the winner's record, so a user never ends up with two keys.
+- On every other device it derives the key-encryption key from the passphrase, unwraps the data keys and caches them locally.
+
+Every device of a user therefore holds the same data keys and decrypts everything the others wrote, including history written before it joined.
+
+### Where unlocked keys are kept
+
+| `encryption.keyCache` | Where | After a restart |
+|---|---|---|
+| `'auto'` (default) | IndexedDB in browsers, memory elsewhere (Node, tests) | Browser: unlocked, offline. Node: the configured `key` re-opens the keyring at the next handshake |
+| `'indexeddb'` | IndexedDB | Unlocked, offline |
+| `'memory'` | Memory | Locked until `key` or `unlock()` |
+| `'none'` | Nothing beyond the running keyring | Locked until `key` or `unlock()` |
+
+Cached data keys and the key-encryption key are stored as **non-extractable** `CryptoKey`s: script running in the page can use them, but cannot read their bytes. Anyone who controls the page (an XSS bug, a malicious extension) can still decrypt while the app runs, as with any web E2E scheme. The cache also keeps the wrapped record, so with a persistent cache `unlock(passphrase)` works offline on a device that has synced once.
+
+### Lock state
+
+`app.encryption.getStatus()` (and the `encryption:status` event) reports:
+
+| `state` | Meaning |
+|---|---|
+| `unlocked` | Keys are available; sync runs. `keyVersion`, `keyId` and `availableVersions` are set. |
+| `unlocking` | The record is being fetched or opened. |
+| `locked` | No keys. `code` says why: `NO_PASSPHRASE`, `AWAITING_SERVER` (a passphrase was given; the record arrives with the next handshake), `LOCKED_BY_APP`, `PASSPHRASE_REQUIRED` (another device changed the passphrase and this device needs a key it does not hold yet). |
+| `error` | `WRONG_PASSPHRASE`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED`. Sync stays paused until `unlock()` succeeds. |
+
+```typescript
+app.encryption?.onStatusChange((status) => {
+  if (status.state !== 'unlocked') showUnlockPrompt(status.code)
+})
+
+await app.encryption?.lock() // forget the keys on this device (and its cache); sync stops
+```
+
+Once unlocked, the keyring needs no server: a device keeps encrypting and decrypting offline, and its queued writes upload when it reconnects.
+
+**Wrong passphrases.** The server cannot check a passphrase (it never sees one). `unlock()` rejects a wrong passphrase with `WRONG_PASSPHRASE`, and after three failures on a device it backs off (1 s, 2 s, 4 s, ... up to 60 s; `UNLOCK_THROTTLED` with `retryAfterMs`). This is a usability guard, not a security boundary: whoever obtains the wrapped record (the server operator, or anyone who can read its database) can try passphrases offline at PBKDF2 speed. Passphrase strength is the protection. Ask for a long passphrase.
+
+## Key Rotation and Passphrase Changes
+
+Both need a live sync connection (they write the key record with compare-and-set):
+
+```typescript
+// A new data key for new operations. Old versions stay in the record, so history
+// still decrypts on every device, including devices that join later.
+await app.encryption?.rotateKey()
+
+// Re-wrap every key version under a new passphrase. No operation is re-encrypted.
+await app.encryption?.changePassphrase(newPassphrase, { currentPassphrase })
+```
+
+- **Rotation.** The server pushes the new record to the user's other connected devices before any operation sealed under the new version reaches them. A device that receives such an operation without the push (another server instance) fetches the record once and replays it. Rotation limits what a leaked data key exposes from now on; it does not re-encrypt old operations.
+- **Passphrase change.** Other devices keep working with the data keys they hold. A device that later needs a key it does not hold (for example after a rotation following the passphrase change) asks for the new passphrase (`PASSPHRASE_REQUIRED`). A device that only knows the old passphrase cannot open the keyring any more (`WRONG_PASSPHRASE`).
+- A record never loses a key version: the server refuses writes that drop or relabel one, and a device refuses a record missing a version it already accepted (`KEY_RECORD_ROLLBACK`).
+
+## Lost Passphrase and the Recovery Key
+
+**Without a recovery key, a lost passphrase means the encrypted data cannot be recovered**, by you or by the server operator. Devices that are still unlocked keep working (and can set a new passphrase with `changePassphrase`), but once no device holds the keys, the data on the server is unreadable. This is inherent to end-to-end encryption.
+
+To offer recovery, create a recovery key while the keyring is unlocked and show it to the user once:
+
+```typescript
+const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk1-..."; store it offline
+// ...later, on any device, after the passphrase was lost:
+await app.encryption?.recover(recoveryKey, newPassphrase)
+```
+
+Every key version is also wrapped to the recovery key's public half (ECDH P-256 + AES-GCM), so any unlocked device keeps recovery current across rotations without knowing the recovery key. The recovery key itself is never sent to the server. Calling `enableRecovery()` again replaces it.
+
+## Who Can Read a Key Record
+
+- **With authentication**, records are per authenticated user: a session reads and writes only its own user's record. Key messages never name a user, so one user cannot fetch or overwrite another's record. An anonymous principal (`MixedAuthProvider` fallback) gets `KEY_SERVICE_FORBIDDEN`.
+- **Without authentication** (no `auth` on the server, or `NoAuthProvider`), every client shares one data space, so they share one keyring. Anyone who can reach the server can fetch its wrapped record and try passphrases offline.
+- Use a separate `encryption.keyring` name per encryption scope. Different keyrings have different keys; a device decrypts only the keyrings it has opened.
+
+## Server Requirements
+
+- The key service ships in `@korajs/server` 1.0.0-beta.13 and needs protocol v2. Against an older server the keyring reports `KEY_SERVICE_UNSUPPORTED`.
+- The memory, SQLite and Postgres server stores persist key records (table `kora_encryption_keys`). A custom `ServerStore` implements `getEncryptionKeyRecord` and `putEncryptionKeyRecord` (compare-and-set); without them the server answers `unsupported` rather than keeping records in memory, which would give users a new key after every restart.
+- Back up `kora_encryption_keys` with the rest of the database; the server store's `exportBackup()` covers operations only. If the server loses a record, the next device that still holds it uploads its copy again, so nothing is lost while one device has synced.
 
 ## Encryption Algorithm
 
-Each envelope member (`data`, `previousData`, `atomicOps`) is encrypted with AES-256-GCM and a fresh random 12-byte IV (NIST SP 800-38D). `data` and `previousData` are sealed even when they are `null`, so a delete is authenticated too.
+Each envelope member (`data`, `previousData`, `atomicOps`) is encrypted with AES-256-GCM under the current data key and a fresh random 12-byte IV (NIST SP 800-38D). `data` and `previousData` are sealed even when they are `null`, so a delete is authenticated too.
 
 **Binding (ENC-3).** Every ciphertext is authenticated with AES-GCM additional data: the canonical JSON of `(nodeId, collection, recordId, type, timestamp, sequenceNumber, field, keyVersion, hashVersion)`. A ciphertext moved to another operation, record or member, or an envelope whose metadata was rewritten, fails authentication and the operation is quarantined (`DECRYPT_FAILED`). The operation id is the version-2 content hash of the **plaintext**; the receiving client verifies it after decryption, which covers `causalDeps` and `schemaVersion` as well (`INVALID_OPERATION_ID`).
 
@@ -130,7 +204,7 @@ The envelope (protocol v2) looks like this on the wire:
   "encrypted": {
     "v": 2,
     "alg": "aes-256-gcm",
-    "keyId": "k1-3fa9c1d2e4b5a6f7",
+    "keyId": "k2-5d0c1e9a7b3f42c68e1d0a9b7c6f5e4d",
     "keyVersion": 1,
     "data": { "iv": "base64-12-byte-iv", "ct": "base64-ciphertext-and-tag" },
     "previousData": { "iv": "...", "ct": "..." },
@@ -139,59 +213,15 @@ The envelope (protocol v2) looks like this on the wire:
 }
 ```
 
-`keyVersion` selects the key (rotation). `keyId` names the key material (a fingerprint of the key-derivation salt, never the key), so a device holding different material reports `KEY_ID_MISMATCH` instead of a bare authentication failure.
+`keyVersion` selects the data key. `keyId` is the key version's random id from the key record (never derived from key material), so a device holding a different keyring reports `KEY_ID_MISMATCH` instead of a bare authentication failure; such an operation is quarantined, not lost, and decrypts once the right keys are available.
 
-## Key Rotation
+## Low-Level API
 
-When you need to change the encryption passphrase (user changes password, security policy, key compromise), Kora supports key rotation through versioned keys.
-
-### How It Works
-
-1. The old key (version 1) continues to be available for decrypting previously encrypted operations.
-2. A new key (version 2) is derived from the new passphrase.
-3. All new operations are encrypted with the latest key version.
-4. The key version is embedded in each encrypted payload, so the decryptor selects the correct key automatically.
-
-### Using Versioned Keys
-
-For advanced key rotation, create a `SyncEncryptor` with multiple key versions:
-
-```typescript
-import { SyncEncryptor, deriveVersionedKey } from '@korajs/sync'
-
-// Derive keys from old and new passphrases
-const oldKey = await deriveVersionedKey('old-passphrase', 1, savedSaltV1)
-const newKey = await deriveVersionedKey('new-passphrase', 2)
-
-// Create encryptor with both keys
-const encryptor = SyncEncryptor.fromKeys([oldKey, newKey])
-
-// New operations encrypt with version 2
-// Old operations (version 1) can still be decrypted
-```
-
-The encryptor always encrypts with the highest version key. All registered key versions remain available for decryption.
-
-### Adding Keys at Runtime
-
-You can also add keys after creation:
-
-```typescript
-const encryptor = await SyncEncryptor.create({
-  enabled: true,
-  key: 'original-passphrase',
-})
-
-// Later, rotate to a new key
-const newKey = await deriveVersionedKey('new-passphrase', 2)
-encryptor.addKey(newKey)
-
-// Now encrypts with version 2, can still decrypt version 1
-```
+`SyncEncryptor` remains available for custom setups (`@korajs/sync`). `SyncEncryptor.fromKeys([{ version, key, keyId }])` builds an encryptor from keys you manage yourself. `SyncEncryptor.create(config, salt)` derives a key directly from a passphrase and **requires** the salt: every device must pass the same one. There is no random-salt default any more (a per-process random salt is why encryption in 1.0.0-beta.12 could not work across devices). `EncryptionKeyring` is the class behind `app.encryption`, for apps that drive `SyncEngine` directly (`new SyncEngine({ ..., keyring })`).
 
 ## Plaintext and Older Payloads
 
-With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. One exception: the server's own operations (from a node the handshake names authoritative: cascades and set-nulls of a deleted parent, constraint corrections, route writes) are accepted in plaintext when they touch only the collection's `cleartextFields` (a delete carries no fields). The server holds no key, so it cannot seal them, and they carry nothing the server cannot already read. A server write to a sealed field is still refused. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.13, not bound to their operation) are refused the same way.
+With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. One exception: the server's own operations (from a node the handshake names authoritative: cascades and set-nulls of a deleted parent, constraint corrections, route writes) are accepted in plaintext when they touch only the collection's `cleartextFields` (a delete carries no fields). The server holds no key, so it cannot seal them, and they carry nothing the server cannot already read. A server write to a sealed field is still refused. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= 1.0.0-beta.12, not bound to their operation) are refused the same way (`LEGACY_ENCRYPTED_PAYLOAD`).
 
 To migrate an existing plaintext app to encryption, open a migration window:
 
@@ -201,74 +231,39 @@ encryption: { enabled: true, key: passphrase, allowPlaintextMigration: true }
 
 During the window, plaintext operations are applied as before. Close it once every device has upgraded and re-synced. A server can enforce the same rule for uploads with `createKoraServer({ encryption: { required: true } })` (`PLAINTEXT_REJECTED`, with the same `allowPlaintextMigration` escape hatch).
 
+## Migrating from 1.0.0-beta.12 Encryption
+
+In beta.12, `createApp` derived the key from the passphrase with a random salt in every process, and never stored it. Encrypted data was therefore never readable on another device, nor on the same device after a reload. What that means now:
+
+- **On the device that wrote it**, the data is still in its local database in plaintext (sync encryption never encrypted local storage). It stays readable there.
+- **On the server**, those operations are protocol-1 payloads under a key that no longer exists anywhere. They cannot be decrypted by anyone, and every beta.13 device refuses them (`LEGACY_ENCRYPTED_PAYLOAD`, quarantined).
+- **To share such records** with other devices, write them again from a device that has them (for example, copy each one into a new record). There is no automatic re-encryption: the old ciphertext cannot be opened.
+
+New data is encrypted under the user's keyring from the first beta.13 handshake on.
+
 ## Performance Considerations
 
-Encryption adds overhead to every sync operation. Key factors to consider:
-
-- **Key derivation is slow by design**: PBKDF2 with 600,000 iterations takes roughly 200-500ms depending on the device. This happens once at app startup, not on every operation.
-- **Per-operation encryption is fast**: AES-256-GCM runs in hardware on modern devices. Encrypting a typical operation's data takes under 1ms.
-- **Batch operations**: `encryptBatch()` and `decryptBatch()` process operations in parallel using `Promise.all`, so batches of 100 operations complete in roughly the same time as a single operation.
-- **Payload size increase**: Encrypted payloads are larger than plaintext due to the IV (12 bytes), GCM authentication tag (16 bytes), and base64 encoding (~33% overhead). For most applications, this is negligible.
-- **Web Crypto API required**: Encryption uses `crypto.subtle`, which is available in all modern browsers and Node.js 20+. It is not available in older environments or some non-browser runtimes.
+- **Key derivation is slow by design**: PBKDF2 with 600,000 iterations takes roughly 200-500 ms depending on the device. It runs when a device opens the keyring with a passphrase (first unlock, a passphrase change, recovery), not on every start when keys are cached, and never per operation.
+- **Per-operation encryption is fast**: AES-256-GCM runs in hardware on modern devices. Encrypting a typical operation's data takes under 1 ms.
+- **Batch operations**: batches are encrypted in parallel.
+- **Payload size increase**: the IV (12 bytes), GCM tag (16 bytes) and base64 (~33%) per envelope member. For most applications this is negligible.
+- **Web Crypto API required**: encryption uses `crypto.subtle` (browsers in a secure context, Node.js 20+).
+- `encryption.kdfIterations` lowers the PBKDF2 cost for tests only. A device refuses a key record with fewer iterations than its own setting, so a server cannot downgrade the KDF.
 
 ## Error Handling
 
-Encryption and decryption errors are specific and actionable:
+- **`EncryptionKeyError`** (from `app.encryption` calls): `context.code` names the reason (`WRONG_PASSPHRASE`, `UNLOCK_THROTTLED`, `PASSPHRASE_REQUIRED`, `KEY_RECORD_CONFLICT`, `KEY_SERVICE_OFFLINE`, `KEY_SERVICE_UNSUPPORTED`, `NO_RECOVERY_KEY`, ...).
+- **`DecryptionError`** on an inbound operation does not end the session: the operation is quarantined (`DECRYPT_FAILED`, `sync:apply-failed`) and retried when new keys arrive. Common causes: an operation from another keyring (`KEY_ID_MISMATCH`), tampered ciphertext, a key version this device does not hold yet, a plaintext operation (`PLAINTEXT_REJECTED`).
+- **`EncryptionError`** when sealing fails (no `crypto.subtle`). Nothing is sent; the batch stays queued.
 
-- **`EncryptionError`**: Thrown when encryption fails. Typically indicates that `crypto.subtle` is unavailable or the key is invalid.
-- **`DecryptionError`**: Thrown when decryption fails. Common causes:
-  - Wrong passphrase (key mismatch)
-  - Tampered or corrupted ciphertext
-  - Missing key version (data encrypted with a rotated key that was not registered)
-  - Unsupported algorithm
-
-All errors include context fields (`operationId`, `fieldName`, `keyVersion`) to help diagnose the issue without reproduction.
-
-## Example: Full Setup with User Passphrase
-
-A common pattern is to derive the encryption key from the user's password or a dedicated encryption passphrase:
-
-```typescript
-import { createApp } from 'korajs'
-import schema from './schema'
-
-async function initApp(userPassphrase: string) {
-  const app = createApp({
-    schema,
-    sync: {
-      url: 'wss://my-server.com/kora',
-      auth: async () => ({ token: await getAuthToken() }),
-      encryption: {
-        enabled: true,
-        key: userPassphrase,
-      },
-    },
-  })
-
-  await app.ready
-  await app.sync?.connect()
-
-  return app
-}
-
-// At login time:
-const passphrase = await promptUserForEncryptionKey()
-const app = await initApp(passphrase)
-```
-
-With this setup:
-
-- All operation data is encrypted before leaving the device.
-- The sync server stores only encrypted blobs for `data` and `previousData`.
-- Other authenticated devices with the same passphrase can decrypt and read the data.
-- No one with server access alone can read the plaintext field values.
+All errors carry context fields (`operationId`, `keyVersion`, `keyId`, `code`) to diagnose without reproduction.
 
 ## Limitations
 
-- **Server cannot query encrypted fields**: Since the server sees only ciphertext, server-side filtering or indexing of encrypted field values is not possible. Sync scoping works on metadata (collection names, scope fields in cleartext) rather than encrypted content.
-- **Key loss is data loss**: If all devices lose the encryption key and no backup exists, encrypted operations cannot be recovered. There is no server-side recovery mechanism -- this is inherent to end-to-end encryption.
-- **All clients must share keys**: Every device that needs to decrypt operations must have the correct key version registered. Key distribution is the application's responsibility.
-- **Key material is per device until Phase 4 (ENC-1)**: `createApp` derives the key with a random salt per process, so two devices with the same passphrase do not yet derive the same key. Decryption then fails with `KEY_ID_MISMATCH` (the envelope's `keyId` names the material) and the operation is quarantined, not lost. Until shared key material ships, construct the encryptor with a shared salt (`SyncEncryptor.create(config, salt)`) or `SyncEncryptor.fromKeys`.
+- **Server cannot query encrypted fields**: the server sees only ciphertext, so server-side filtering or indexing of encrypted field values is not possible. Sync scoping works on metadata and `cleartextFields`.
+- **Key loss is data loss** unless a recovery key was set up (see above).
+- **Local data is not encrypted** by this feature; protect the device.
+- **Key management needs the server**: rotation, passphrase changes and recovery write the key record. Everyday encryption, decryption and `unlock()` with a cached record work offline.
 - **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
-- **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (beta.14 or later on the server).
+- **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (1.0.0-beta.13 or later on the server).
 - **Server-side rules see only cleartext fields**: referential policies (cascade, set-null, restrict) are enforced on the server, so their foreign keys must be cleartext (see above; a sealed one is refused at startup). A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.

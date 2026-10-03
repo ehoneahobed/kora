@@ -1,5 +1,5 @@
 import { KoraError, SchemaValidationError } from '@korajs/core'
-import { validateEncryptedRelations } from '@korajs/sync'
+import { isValidKeyringName, validateEncryptedRelations } from '@korajs/sync'
 import { detectAdapterType } from './adapter-resolver'
 import type { KoraConfig } from './types'
 
@@ -39,6 +39,7 @@ export function validateCreateAppConfig(config: KoraConfig): void {
 		// End-to-end encryption may not seal the foreign key of a relation the server must
 		// enforce on delete (cascade, set-null, restrict): RT-74, RT-78, RT-82.
 		validateEncryptedRelations(config.schema, config.sync.encryption)
+		validateEncryptionConfig(config.sync.encryption)
 	}
 
 	const adapter = config.store?.adapter ?? detectAdapterType()
@@ -90,6 +91,37 @@ function validateSyncUrl(url: string, transport: 'websocket' | 'http'): void {
 						? 'Use an absolute http:// or https:// URL.'
 						: 'Use an absolute ws:// or wss:// URL.',
 			},
+		)
+	}
+}
+
+function validateEncryptionConfig(
+	encryption: import('@korajs/sync').SyncEncryptionConfig | undefined,
+): void {
+	if (!encryption?.enabled) return
+	if (encryption.keyring !== undefined && !isValidKeyringName(encryption.keyring)) {
+		throw new KoraError(
+			`sync.encryption.keyring must be 1-128 characters of [A-Za-z0-9._:-], got ${JSON.stringify(encryption.keyring)}.`,
+			'INVALID_ENCRYPTION_CONFIG',
+			{ fix: "Use a simple name such as 'default' or 'notes'." },
+		)
+	}
+	if (
+		encryption.kdfIterations !== undefined &&
+		(!Number.isSafeInteger(encryption.kdfIterations) || encryption.kdfIterations < 1)
+	) {
+		throw new KoraError(
+			'sync.encryption.kdfIterations must be a positive integer.',
+			'INVALID_ENCRYPTION_CONFIG',
+			{ fix: 'Leave it unset (600,000) outside tests.' },
+		)
+	}
+	const cache = encryption.keyCache
+	if (cache !== undefined && !['auto', 'indexeddb', 'memory', 'none'].includes(cache)) {
+		throw new KoraError(
+			`sync.encryption.keyCache must be 'auto', 'indexeddb', 'memory' or 'none', got ${JSON.stringify(cache)}.`,
+			'INVALID_ENCRYPTION_CONFIG',
+			{ fix: "Use 'auto' (the default)." },
 		)
 	}
 }

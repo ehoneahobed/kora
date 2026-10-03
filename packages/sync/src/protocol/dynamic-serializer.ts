@@ -26,6 +26,7 @@ function decodeJsonBytes(value: unknown): string | undefined {
 	}
 	return undefined
 }
+import { isEncryptionKeyMessageType } from '../encryption/key-messages'
 import { isSyncMessage } from './messages'
 import type { EncodedMessage, MessageSerializer } from './serializer'
 import { JsonMessageSerializer, normalizeEnvelope, normalizeFieldVersions } from './serializer'
@@ -118,6 +119,8 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 	 * @returns A Uint8Array containing the protobuf-encoded message
 	 */
 	encode(message: SyncMessage): EncodedMessage {
+		// Key distribution is JSON on every wire format (ENC-1).
+		if (isEncryptionKeyMessageType(message.type)) return this.jsonSerializer.encode(message)
 		const compiled = this.compile()
 		const envelope = this.toEnvelope(message)
 		const verified = compiled.SyncEnvelope.verify(envelope)

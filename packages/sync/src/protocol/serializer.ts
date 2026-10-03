@@ -15,6 +15,7 @@ import protobuf from 'protobufjs/minimal.js'
 type Reader = protobuf.Reader
 type Writer = protobuf.Writer
 const { Reader, Writer } = protobuf
+import { isEncryptionKeyMessageType } from '../encryption/key-messages'
 import type {
 	AcknowledgmentMessage,
 	ErrorMessage,
@@ -386,7 +387,7 @@ export class NegotiatedMessageSerializer implements MessageSerializer {
 	}
 
 	encode(message: SyncMessage): EncodedMessage {
-		if (this.wireFormat === 'protobuf') {
+		if (this.wireFormat === 'protobuf' && !isEncryptionKeyMessageType(message.type)) {
 			return this.protobuf.encode(message)
 		}
 
@@ -678,6 +679,12 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 			}
 		case 'heartbeat':
 			return { type: message.type, messageId: message.messageId }
+		case 'encryption-key-request':
+		case 'encryption-key-put':
+		case 'encryption-key-response':
+			// Key distribution is JSON on every wire format (ENC-1): NegotiatedMessageSerializer
+			// sends it as a JSON text frame, never through the protobuf envelope.
+			throw new SyncError('Encryption key messages travel as JSON', { type: message.type })
 	}
 }
 

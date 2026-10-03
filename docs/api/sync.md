@@ -949,9 +949,9 @@ Key rotation is supported via versioned keys. The key version is embedded in the
 
 #### Static Factory Methods
 
-- **`SyncEncryptor.create(config: SyncEncryptionConfig, salt?: Uint8Array): Promise<SyncEncryptor>`** -- Create a `SyncEncryptor` from a `SyncEncryptionConfig`. Derives the encryption key from the passphrase using PBKDF2 (600,000 iterations, SHA-256). The optional `salt` parameter allows deterministic key derivation (primarily for testing). Throws `EncryptionError` if `enabled` is `false` or the key is empty.
+- **`SyncEncryptor.create(config: SyncEncryptionConfig, salt: Uint8Array, iterations?: number): Promise<SyncEncryptor>`** -- Derive the encryption key directly from the passphrase in `config.key` with PBKDF2 (600,000 iterations, SHA-256) and the given salt. The salt is **required** (16 bytes or more) and every device must use the same one; there is no random-salt default (ENC-1). Throws `EncryptionError` if `enabled` is `false`, the key is empty or the salt is missing (`SALT_REQUIRED`). Apps normally use the keyring instead (`sync.encryption` in `createApp`, or `EncryptionKeyring` with `new SyncEngine({ keyring })`), which distributes random data keys wrapped by the passphrase; see the [Sync Encryption guide](../guide/sync-encryption.md).
 
-- **`SyncEncryptor.fromKeys(versionedKeys: VersionedKey[]): SyncEncryptor`** -- Create a `SyncEncryptor` from pre-derived versioned keys. Use this when you need multiple key versions for key rotation, or when you have already derived the keys externally. The highest version number is used for encryption. Throws `EncryptionError` if no keys are provided.
+- **`SyncEncryptor.fromKeys(versionedKeys: VersionedKey[], options?: EncryptorOptions): SyncEncryptor`** -- Create a `SyncEncryptor` from versioned keys (`{ version, key, keyId? , salt? }`; `keyId` is written into envelopes). Use this when you need multiple key versions for key rotation, or when you have already derived the keys externally. The highest version number is used for encryption. Throws `EncryptionError` if no keys are provided.
 
 #### Instance Methods
 
@@ -980,14 +980,11 @@ Key rotation is supported via versioned keys. The key version is embedded in the
 ```typescript
 import { SyncEncryptor, deriveVersionedKey } from '@korajs/sync'
 
-// Create with initial key
-const encryptor = await SyncEncryptor.create({
-  enabled: true,
-  key: 'initial-passphrase'
-})
+// Create with initial key (every device passes the same, stored salt)
+const encryptor = await SyncEncryptor.create({ enabled: true, key: 'initial-passphrase' }, sharedSalt)
 
 // Later, rotate to a new key
-const newKey = await deriveVersionedKey('new-passphrase', 2)
+const newKey = await deriveVersionedKey('new-passphrase', 2, sharedSaltV2)
 encryptor.addKey(newKey)
 
 // New operations are encrypted with version 2

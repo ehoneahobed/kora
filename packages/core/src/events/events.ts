@@ -95,6 +95,21 @@ export type KoraEvent =
 	| { type: 'sync:apply-recovered'; failure: SyncApplyFailureEvent }
 	| { type: 'sync:apply-abandoned'; failure: SyncApplyFailureEvent }
 	| {
+			/**
+			 * End-to-end encryption keyring status changed (ENC-1): locked (no passphrase,
+			 * a wrong one, or a key record that must not be used), unlocking, unlocked.
+			 * While not unlocked, sync is paused; local reads and writes continue.
+			 */
+			type: 'encryption:status'
+			status: {
+				state: 'locked' | 'unlocking' | 'unlocked' | 'error'
+				keyring: string
+				keyVersion: number | null
+				code?: string
+				message?: string
+			}
+	  }
+	| {
 			type: 'sync:clock-skew'
 			/** serverTime - localTime in ms. Negative = this device's clock is fast. */
 			skewMs: number

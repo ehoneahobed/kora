@@ -4,6 +4,8 @@ import type {
 	HLCTimestamp,
 	OperationType,
 } from '@korajs/core'
+import type { EncryptionKeyMessage } from '../encryption/key-messages'
+import { isEncryptionKeyMessage } from '../encryption/key-messages'
 import type { SyncQuerySubset } from '../scopes/query-subset'
 
 export type WireFormat = 'json' | 'protobuf'
@@ -430,6 +432,7 @@ export type SyncMessage =
 	| BlobChunkResponseMessage
 	| BlobChunkPushMessage
 	| HeartbeatMessage
+	| EncryptionKeyMessage
 
 // --- Type Guards ---
 
@@ -465,6 +468,10 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isBlobChunkPushMessage(value)
 		case 'heartbeat':
 			return true
+		case 'encryption-key-request':
+		case 'encryption-key-put':
+		case 'encryption-key-response':
+			return isEncryptionKeyMessage(value)
 		default:
 			return false
 	}

@@ -116,7 +116,7 @@ describe('ENC-1: same passphrase, different devices', () => {
 
 		await appA.close()
 		await appB.close()
-		await server.close()
+		await server.stop()
 		rmSync(dir, { recursive: true, force: true })
 	}, 20000)
 })
