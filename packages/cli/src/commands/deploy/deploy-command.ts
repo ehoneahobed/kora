@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { defineCommand } from 'citty'
-import { InvalidProjectError } from '../../errors'
+import { DeployPlatformUnavailableError, InvalidProjectError } from '../../errors'
 import { createPromptClient } from '../../prompts/prompt-client'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
@@ -10,8 +10,10 @@ import {
 	DEPLOY_PLATFORMS,
 	type DeployAdapter,
 	type DeployPlatform,
+	IMPLEMENTED_DEPLOY_PLATFORMS,
 	type ProjectConfig,
 	isDeployPlatform,
+	isImplementedDeployPlatform,
 } from './adapters/adapter'
 import { createDeployAdapter } from './adapters/factory'
 import {
@@ -195,6 +197,10 @@ export const deployCommand = defineCommand({
 			storedPlatform: existingState?.platform,
 			confirm: confirmMode,
 		})
+		// Refuse a coming-soon platform up front, before any artifact or state is written (DX-8).
+		if (!isImplementedDeployPlatform(platform)) {
+			throw new DeployPlatformUnavailableError(platform, IMPLEMENTED_DEPLOY_PLATFORMS)
+		}
 		const appName = resolveAppName(args.app, existingState?.appName, projectRoot, confirmMode)
 		const region = resolveRegion(args.region, existingState?.region, confirmMode)
 		const deployDirectory = resolveDeployDirectory(projectRoot)
@@ -320,11 +326,11 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 			value: 'aws-lightsail',
 		},
 		{
-			label: 'Render',
+			label: 'Render (coming soon)',
 			value: 'render',
 		},
 		{
-			label: 'Docker (self-hosted)',
+			label: 'Docker (self-hosted, coming soon)',
 			value: 'docker',
 		},
 		{
