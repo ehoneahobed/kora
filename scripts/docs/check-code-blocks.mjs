@@ -357,7 +357,7 @@ const envFile = join(outDir, 'docs-env.d.ts')
 writeFileSync(
 	envFile,
 	[
-		'interface ImportMetaEnv { readonly [key: string]: string | undefined }',
+		'interface ImportMetaEnv { readonly [key: string]: string | boolean | undefined; readonly DEV: boolean; readonly PROD: boolean; readonly SSR: boolean; readonly MODE: string }',
 		'interface ImportMeta { readonly env: ImportMetaEnv }',
 		"declare module '*.vue' { const component: unknown; export default component }",
 		"declare module '*?worker&url' { const url: string; export default url }",

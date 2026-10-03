@@ -5,237 +5,105 @@ description: "Inspect operations, trace merge conflicts, and monitor sync in rea
 
 # DevTools
 
-Kora DevTools is a browser extension that gives you real-time visibility into your app's operations, sync state, and conflict resolution. It is built for debugging offline-first applications where understanding data flow across devices is essential.
+Kora DevTools shows what happens to your data as it happens: operations, merge decisions, sync
+traffic and connection state. It is a Chromium DevTools extension plus an in-page overlay, both fed
+by the same instrumentation events.
 
-## Installation
-
-### From the Chrome Web Store
-
-Install the Kora DevTools extension from the Chrome Web Store (search for "Kora DevTools"). It works in Chrome, Edge, Brave, and other Chromium-based browsers.
-
-### From Source
-
-For local development or contributing:
-
-```bash
-# From the Kora monorepo root
-pnpm --filter @korajs/devtools build
-
-# Load the unpacked extension
-# 1. Open chrome://extensions
-# 2. Enable "Developer mode"
-# 3. Click "Load unpacked"
-# 4. Select packages/devtools/dist
-```
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const app = createApp({ schema })
+-->
 
 ## Enabling DevTools
 
-DevTools connects to your Kora app when `devtools: true` is enabled and the extension is installed. New projects created with `create-kora-app` enable this by default. In an existing app, enable it in your app config:
+Every `create-kora-app` template enables it in development builds. In an existing app:
 
 ```typescript
-const app = createApp({
+const devApp = createApp({
   schema,
-  devtools: process.env.NODE_ENV === 'development',
+  devtools: import.meta.env.DEV,
 })
 ```
 
-When `devtools` is `true`, Kora emits instrumentation events that the DevTools extension consumes. In production builds, set this to `false` to eliminate the overhead.
+With `devtools: true`, `createApp` records events in a ring buffer (10 000 events), forwards them
+to the extension with `window.postMessage`, and mounts the overlay. Leave it off in production: the
+instrumentation runs only when enabled.
 
-::: tip
-DevTools is for browser-based inspection. Desktop and mobile apps still emit the same Kora events, and React/Tauri templates enable instrumentation, but you inspect them through a Chromium WebView/dev build or by listening to `app.events` programmatically.
-:::
+## The in-page overlay
 
-## Opening DevTools
+Press **Ctrl+Shift+K** (Cmd+Shift+K on macOS) in the running app to toggle the overlay. It needs no
+extension and shows the same panels.
 
-1. Open Chrome DevTools (F12 or Cmd+Opt+I).
-2. Navigate to the **Kora** tab in the DevTools panel.
-3. The panel connects automatically to the running Kora app on the page.
+## The browser extension
+
+The extension is not published to a store yet. Build and load it from the monorepo:
+
+```bash
+pnpm --filter @korajs/devtools build
+# chrome://extensions -> Developer mode -> Load unpacked -> packages/devtools/dist/extension
+```
+
+Then open Chrome DevTools (F12) on the app and select the **Kora** tab. It works in Chromium-based
+browsers (Chrome, Edge, Brave).
 
 ## Panels
 
-### Sync Timeline
+A toolbar switches panels, filters by text and toggles event categories (operation, merge, sync,
+query, connection). Click a row to expand it.
 
-A horizontal timeline showing operations and sync events in chronological order.
+| Panel | Shows |
+|-------|-------|
+| **Timeline** | Recorded events in order, color-coded by type; operations list the operations they depend on. |
+| **Conflicts** | Every merge conflict: time, collection, field, strategy, tier and result; expanding a row shows both inputs, the output and any violated constraint. |
+| **Operations** | Operations created on this device and applied from sync since DevTools started: id, type, collection, record, data, node, sequence number and causal dependencies. |
+| **Network** | Connection state and quality, operations sent and received, an estimate of unacknowledged uploads, the last sync time, a version vector derived from the recorded operations, and recent sync activity. |
 
-**What you see:**
+The panels show what was recorded since the page loaded (up to the buffer size), not the whole
+local database. For authoritative numbers use `app.sync.getStatus()` (for example
+`pendingOperations`) and `app.sync.exportDiagnostics()`. The toolbar's Pause and Clear buttons
+currently only change the button label and collapse expanded rows; they do not stop or clear the
+recording.
 
-- **Operations** represented as colored dots: green for inserts, blue for updates, red for deletes.
-- **Sync events** shown as vertical markers: connection established, disconnected, batch sent, batch received.
-- **Causal arrows** connecting dependent operations, visualizing the operation DAG.
+`kora studio` (see the [CLI](/api/cli)) offers a separate view of the same events for a running
+app.
 
-**How to use it:**
+## Debugging common issues
 
-- Click any operation dot to inspect its full payload (type, collection, record ID, data, timestamp, causal dependencies).
-- Zoom in/out to focus on specific time ranges.
-- Filter by collection using the dropdown at the top.
-- Use this panel to understand the sequence of events and verify that operations arrive in the expected order.
+**Why did this field change?** In **Operations**, filter by the record id and find the newest
+operation that wrote the field; its `nodeId` says which device wrote it. In **Conflicts**, the
+trace shows which strategy picked the value.
 
-### Conflict Inspector
+**Why did this conflict resolve this way?** Expand the conflict: the strategy names the rule from
+[Conflict Resolution](/guide/conflict-resolution) (`lww`, `lww-element-set`, `object-key-lww`,
+`crdt-text`, `schema-counter`, `custom`, ...). Tier 3 is a custom resolver.
 
-A table of all merge events, showing how conflicts were detected and resolved.
+**Why is data not syncing?** Check **Network** for the connection state, then
+`app.sync.getStatus()`: `status`, `phase`, `reason` (for example `auth-required` or
+`encryption-locked`), `pendingOperations`, and `blockedFailure` when a received operation cannot be
+applied. Refused uploads are in `app.sync.getRejectedOperations()`.
 
-**What you see:**
+**Why is the first sync slow?** Narrow what each client receives with server-side scopes (see
+[Authentication](/guide/authentication#sync-scopes)) or query views (see
+[Sync Configuration](/guide/sync-configuration#query-views)).
 
-| Column | Description |
-|--------|-------------|
-| Time | When the merge occurred |
-| Collection | Which collection was affected |
-| Field | The specific field with a conflict |
-| Tier | Which merge tier resolved it (1, 2, or 3) |
-| Strategy | The strategy applied (LWW, CRDT, constraint, custom) |
-| Local | The local value |
-| Remote | The remote value |
-| Result | The resolved value |
+## Listening to events in code
 
-**How to use it:**
-
-- Click any row to expand the full `MergeTrace`, showing the base value, both input values, the output, and the duration of the merge.
-- Filter by tier to focus on specific resolution strategies.
-- Filter by collection or field name.
-- Sort by time to see the most recent conflicts first.
-- Use this panel to verify that your constraints and custom resolvers produce the expected results.
-
-### Operation Log
-
-A searchable, filterable list of every operation in the local store.
-
-**What you see:**
-
-- Every insert, update, and delete operation with its full payload.
-- The operation ID (content-addressed hash).
-- The HLC timestamp and sequence number.
-- The causal dependencies.
-- The schema version at time of creation.
-
-**How to use it:**
-
-- Search by record ID, collection name, or field values.
-- Filter by operation type (insert, update, delete).
-- Filter by sync status (synced, pending, failed).
-- Click any operation to see the state of the record at that point in time (time-travel debugging).
-- Use this panel to trace the history of a specific record and understand how it reached its current state.
-
-### Network Status
-
-Real-time monitoring of the sync connection.
-
-**What you see:**
-
-- **Connection state**: Connected, disconnected, reconnecting.
-- **Pending operations**: Count of operations queued for sync.
-- **Bandwidth graph**: Data sent and received over time.
-- **Last sync**: Timestamp of the most recent successful sync.
-- **Latency**: Round-trip time to the sync server.
-- **Version vector**: The current version vector for this client and the server.
-
-**How to use it:**
-
-- Monitor pending operation count to ensure changes are syncing.
-- Check bandwidth usage to identify unexpectedly large sync payloads.
-- Verify that reconnection happens correctly after network interruptions.
-- Compare version vectors between client and server to diagnose sync gaps.
-
-## Debugging Common Issues
-
-### "Why did this field change?"
-
-1. Open the **Operation Log**.
-2. Search for the record ID.
-3. Find the most recent update operation that changed the field.
-4. Check its `nodeId` to see which device made the change.
-5. Check its `timestamp` and `causalDeps` to understand the context.
-
-### "Why did this conflict resolve this way?"
-
-1. Open the **Conflict Inspector**.
-2. Find the merge event for the field in question.
-3. Expand the row to see the full `MergeTrace`.
-4. The trace shows the tier, strategy, base value, local value, remote value, and the resolved output.
-5. If the resolution was unexpected, check your schema's constraints and custom resolvers.
-
-### "Why is data not syncing?"
-
-1. Open the **Network Status** panel.
-2. Check the connection state. If disconnected, check the server URL and auth configuration.
-3. Check the pending operations count. If operations are pending, the connection may be interrupted or the server may not be acknowledging.
-4. Check the version vectors. If the client's vector is ahead of the server's, operations have not been sent. If the server's vector is ahead, operations have not been received.
-5. Open the **Sync Timeline** and look for error events.
-
-### "Why is the initial sync slow?"
-
-1. Open the **Network Status** panel and check bandwidth.
-2. Check the operation count. A large number of operations means more data to sync.
-3. Consider adding server-side auth scopes in your sync server auth context to reduce the amount of data each client receives.
-4. Check whether operation compaction has been run on the server to reduce historical operations.
-
-## Performance Overhead
-
-DevTools instrumentation adds minimal overhead:
-
-- **Enabled** (`devtools: true`): Events are serialized and posted to the extension via `window.postMessage`. Expect less than 1ms per operation.
-- **Disabled** (`devtools: false`): No instrumentation code runs. Zero overhead.
-- **Extension not installed**: If `devtools: true` but the extension is not installed, events are posted but not consumed. The overhead is negligible.
-
-Always disable DevTools in production builds for the cleanest performance.
-
-## Extending DevTools
-
-Kora DevTools consumes events emitted by the core instrumentation layer. You can also listen to these events programmatically:
+Every event DevTools shows is available on the app:
 
 ```typescript
 app.events.on('operation:created', (event) => {
-  console.log('New operation:', event.operation)
+  console.log('New operation:', event.operation.id)
 })
 
 app.events.on('merge:conflict', (event) => {
-  console.log('Conflict resolved:', event.trace)
+  console.log('Conflict on', event.trace.field, 'resolved by', event.trace.strategy)
 })
 
-app.events.on('sync:sent', (event) => {
-  console.log('Sent', event.operations.length, 'operations')
+app.events.on('sync:operation-rejected', (event) => {
+  console.warn('Server refused', event.operationId, event.code)
 })
 ```
 
-This is useful for custom logging, analytics, or building your own debugging tools.
-
-### Event Reference
-
-The full set of instrumentation events (the `KoraEvent` union) that Kora emits and that DevTools consumes:
-
-| Event | Description |
-|-------|-------------|
-| `operation:created` | A new operation was created from a local mutation. |
-| `operation:applied` | An operation was applied to the local store (includes apply duration). |
-| `merge:started` | A merge between two conflicting operations began. |
-| `merge:completed` | A merge finished; carries the `MergeTrace`. |
-| `merge:conflict` | A merge resolved a genuine conflict; carries the `MergeTrace`. |
-| `constraint:violated` | A Tier 2 constraint was violated during merge. |
-| `sync:connected` | The sync connection to the server was established. |
-| `sync:disconnected` | The sync connection closed (includes a reason). |
-| `sync:schema-mismatch` | The client and server schema versions are incompatible. |
-| `sync:auth-failed` | Sync authentication was rejected. |
-| `sync:clock-skew` | Device clock skew was measured (`info`, `slow-warning`, or `fast-blocked`). |
-| `sync:clock-rebase` | Queued future-dated operations were re-stamped after the clock was corrected. |
-| `sync:sent` | A batch of operations was sent to the server. |
-| `sync:received` | A batch of operations was received from the server. |
-| `sync:acknowledged` | The server acknowledged operations up to a sequence number. |
-| `sync:apply-failed` | An incoming operation could not be applied to the local store. |
-| `sync:operation-rejected` | The server rejected one of this client's outbound operations; it was diverted to the durable rejected store rather than retried. |
-| `query:subscribed` | A reactive query subscription was registered. |
-| `query:invalidated` | A query's results were invalidated by an operation. |
-| `query:executed` | A query ran (includes duration and result count). |
-| `query:error` | A reactive query subscription failed (`phase`: `initial`, `refresh` or `callback`). The subscription keeps its last results. |
-| `storage:persistence` | Durable-storage state: the boot `persisted()` check, the outcome of a `persist()` request, or an error. |
-| `connection:quality` | The measured connection quality changed. |
-| `sync:diagnostics` | A sync diagnostics snapshot was emitted. |
-| `sync:bandwidth` | A sync bandwidth sample (bytes per second and direction). |
-| `sync:initial-sync-progress` | Progress of the initial sync (received and total batch counts). |
-| `awareness:updated` | Presence/awareness states changed. |
-| `state-machine:transition` | An enum state-machine field transitioned (includes a `valid` flag). |
-| `state-machine:rejected` | An invalid state-machine transition was rejected. |
-| `store:persistence-error` | The store failed to persist data. |
-| `store:quota-exceeded` | The store hit a storage quota limit. |
-| `store:storage-fallback` | OPFS was unavailable, so Kora recovered by using durable IndexedDB. |
-| `store:opfs-unavailable` | OPFS and IndexedDB were unavailable, so the store fell back to a non-persistent in-memory database (writes are lost on reload). |
-| `store:db-name-collision` | Another runtime on this origin already used this database name, so this runtime attached to it as a follower and shares that database. |
-| `replay:completed` | A time-travel replay to a target operation completed. |
+The complete catalog, with payloads and which events DevTools records, is in the
+[DevTools API reference](/api/devtools#events).
