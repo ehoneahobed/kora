@@ -1,4 +1,10 @@
-import type { ApplyFailureReason, ApplyResult, Operation, VersionVector } from '@korajs/core'
+import type {
+	ApplyFailureReason,
+	ApplyResult,
+	Operation,
+	OperationTransform,
+	VersionVector,
+} from '@korajs/core'
 
 export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
 
@@ -25,6 +31,13 @@ export interface SyncStore {
 	 * @returns 'applied' if the operation was new, 'duplicate' if already seen, 'skipped' if filtered
 	 */
 	applyRemoteOperation(op: Operation): Promise<ApplyResult>
+
+	/**
+	 * Optional: the schema transforms the store folds with (transforms at fold time,
+	 * RT-84). The engine hands the store every operation exactly as delivered; the store
+	 * folds its view. When present, it must match the engine's `operationTransforms`.
+	 */
+	getOperationTransforms?(): readonly OperationTransform[]
 
 	/**
 	 * Get operations from a specific node within a sequence range.

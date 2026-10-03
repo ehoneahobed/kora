@@ -1,4 +1,10 @@
-import { HybridLogicalClock, createOperation, defineSchema, t } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	createOperation,
+	defineSchema,
+	t,
+	verifyOperationId,
+} from '@korajs/core'
 import type { Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
@@ -184,7 +190,7 @@ describe('CORE-1: server verification of uploaded ids', () => {
 		expect(rejections(c.messages)[0]?.code).toBe('INVALID_OPERATION_ID')
 	})
 
-	test('verification runs before the schema transform; the transformed copy is stored as version 1', async () => {
+	test('RT-84: the operation is stored exactly as uploaded; the fold materializes its schema view', async () => {
 		const transforms: OperationTransform[] = [
 			{
 				fromVersion: 1,
@@ -206,9 +212,14 @@ describe('CORE-1: server verification of uploaded ids', () => {
 		await acked(c.messages, 'b1')
 		expect(rejections(c.messages)).toEqual([])
 		const stored = store.getAllOperations().find((o) => o.id === op.id)
-		expect(stored?.data).toEqual({ title: 't1', tag: 'migrated' })
-		// Rewritten under the original id: no longer a version-2 content hash.
-		expect(stored?.hashVersion).toBeUndefined()
+		// Never rewritten under its id: the stored operation is the uploaded one.
+		expect(stored).toEqual(op)
+		expect(await verifyOperationId(stored as Operation)).toBe(true)
+		// The row is the fold of the transformed view.
+		expect(await store.findRecord('notes', op.recordId)).toMatchObject({
+			title: 't1',
+			tag: 'migrated',
+		})
 	})
 
 	test('RT-64: an op without hashVersion is verified as version 1; a chosen id is refused', async () => {
@@ -306,5 +317,95 @@ describe('server-authored metadata and the encryption envelope', () => {
 		m.send(batch([await note('dev-a', 1)], 'b1'))
 		await acked(m.messages, 'b1')
 		expect(rejections(m.messages)).toEqual([])
+	})
+})
+
+describe('RT-84: transforms at fold time', () => {
+	const transforms: OperationTransform[] = [
+		{
+			fromVersion: 1,
+			toVersion: 2,
+			transform: (op) => ({ ...op, data: { ...op.data, tag: 'migrated' }, schemaVersion: 2 }),
+		},
+	]
+	const v2Server = {
+		schemaVersion: 2,
+		supportedSchemaVersions: { min: 1, max: 2 },
+		operationTransforms: transforms,
+	}
+
+	test('a v1 operation is delivered to every client exactly as uploaded', async () => {
+		const { login } = await setup(v2Server, schemaV2)
+		const writer = await login('dev-v1', { schemaVersion: 1 })
+		const op = await note('dev-v1', 1)
+		writer.send(batch([op], 'b1'))
+		await acked(writer.messages, 'b1')
+		for (const [peer, version] of [
+			['dev-v1b', 1],
+			['dev-v2', 2],
+		] as const) {
+			const reader = await login(peer, { schemaVersion: version })
+			await vi.waitFor(() => {
+				const delivered = reader.messages
+					.flatMap((m) => (m.type === 'operation-batch' ? m.operations : []))
+					.find((o) => o.id === op.id)
+				expect(delivered).toEqual(op)
+			})
+		}
+	})
+
+	test('a copy an earlier release REWROTE under the id: an honest re-upload is a duplicate, a forged header is refused', async () => {
+		const { login, store } = await setup(v2Server, schemaV2)
+		const op = await note('dev-old', 1)
+		// What earlier releases stored: the transformed body, no hash version.
+		const { hashVersion: _v, ...rest } = op
+		await store.applyRemoteOperation({
+			...rest,
+			data: { title: 't1', tag: 'migrated' },
+			schemaVersion: 2,
+		})
+		const c = await login('dev-old', { schemaVersion: 1 })
+		c.send(batch([op], 'b1'))
+		await acked(c.messages, 'b1')
+		expect(rejections(c.messages)).toEqual([])
+		const forged: Operation = { ...op, recordId: 'someone-elses', sequenceNumber: 2 }
+		c.send(batch([forged], 'b2'))
+		await acked(c.messages, 'b2')
+		expect(rejections(c.messages).map((r) => r.code)).toEqual(['FORGED_DUPLICATE'])
+	})
+
+	test("a device echoing another node's operation its earlier release stored rewritten is not refused", async () => {
+		const { login } = await setup(v2Server, schemaV2)
+		const writer = await login('dev-v1', { schemaVersion: 1 })
+		const op = await note('dev-v1', 1)
+		writer.send(batch([op], 'b1'))
+		await acked(writer.messages, 'b1')
+		// An earlier client build stored the delivered op transformed, keeping hashVersion 2.
+		const rewritten: Operation = {
+			...op,
+			data: { title: 't1', tag: 'migrated' },
+			schemaVersion: 2,
+		}
+		const echo = await login('dev-v2')
+		echo.send(batch([rewritten], 'b2'))
+		await acked(echo.messages, 'b2')
+		expect(rejections(echo.messages)).toEqual([])
+		// A forged echo (another record under the same id) is still refused.
+		echo.send(batch([{ ...rewritten, recordId: 'elsewhere' }], 'b3'))
+		await acked(echo.messages, 'b3')
+		expect(rejections(echo.messages).map((r) => r.code)).toEqual(['FORGED_DUPLICATE'])
+	})
+
+	test('a store given transforms after its schema re-folds once with them', async () => {
+		const store = new MemoryServerStore('server-1')
+		await store.setSchema(schemaV2)
+		const op = await note('dev-v1', 1)
+		await store.applyRemoteOperation(op)
+		expect(await store.findRecord('notes', op.recordId)).not.toHaveProperty('tag', 'migrated')
+		new KoraSyncServer({ store, ...v2Server })
+		await vi.waitFor(async () =>
+			expect(await store.findRecord('notes', op.recordId)).toMatchObject({ tag: 'migrated' }),
+		)
+		expect(store.getAllOperations()[0]).toEqual(op)
 	})
 })

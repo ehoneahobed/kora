@@ -1,7 +1,12 @@
+import { DEFAULT_MAX_OPERATION_BYTES as CORE_DEFAULT_MAX_OPERATION_BYTES } from '@korajs/core'
+import { measureOperationBytes as measureCoreOperationBytes } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 
-/** Default maximum serialized size of a single operation at server ingest (256 KiB). */
-export const DEFAULT_MAX_OPERATION_BYTES = 256 * 1024
+/**
+ * Default maximum serialized size of a single operation at server ingest (256 KiB). The
+ * same value the local write path enforces by default (core value domain, RT-86).
+ */
+export const DEFAULT_MAX_OPERATION_BYTES = CORE_DEFAULT_MAX_OPERATION_BYTES
 
 /** Default maximum operations accepted per client session per minute. */
 export const DEFAULT_MAX_OPS_PER_MINUTE = 600
@@ -22,10 +27,11 @@ export const BATCH_LOOKUP_RATE_COST = 1
 export const DEFAULT_MAX_OPS_PER_BATCH = 1000
 
 /**
- * Approximate UTF-8 byte length of an operation payload for rate/size guards.
+ * UTF-8 byte length of an operation's JSON, for size guards. The core definition, so the
+ * local write path and the server measure an operation identically (RT-86).
  */
 export function measureOperationBytes(op: Operation): number {
-	return Buffer.byteLength(JSON.stringify(op), 'utf8')
+	return measureCoreOperationBytes(op)
 }
 
 export interface OperationSizeValidation {

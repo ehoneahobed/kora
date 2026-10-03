@@ -3,6 +3,7 @@ import type {
 	ApplyResult,
 	KoraEventEmitter,
 	Operation,
+	OperationTransform,
 	SyncDiagnosticsSnapshot,
 	VersionVector,
 } from '@korajs/core'
@@ -14,10 +15,12 @@ import {
 	KoraError,
 	RemoteClockDriftError,
 	SyncError,
-	applyOperationTransforms,
+	canonicalizeProvenLegacyClear,
 	defaultApplyFailureReason,
 	isAuthoritativeNodeId,
 	isServerNodeId,
+	operationSchemaView,
+	operationTransformsFingerprint,
 } from '@korajs/core'
 import { AwarenessManager } from '../awareness/awareness-manager'
 import type { AwarenessMessage, AwarenessState } from '../awareness/types'
@@ -139,6 +142,7 @@ const QUARANTINE_CODES = {
 	DECRYPT_FAILED: 'DECRYPT_FAILED',
 	REMOTE_CLOCK_DRIFT: 'REMOTE_CLOCK_DRIFT',
 	TRANSFORM_UNAVAILABLE: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+	TRANSFORM_INVALID: 'SCHEMA_TRANSFORM_INVALID',
 } as const
 
 /** A taken outbound batch, from the moment it leaves the queue until it is resolved. */
@@ -530,6 +534,8 @@ export class SyncEngine {
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
 	 */
 	private readonly deliverySignatureWatermarks = new Map<string, number>()
+	/** Schema transforms: the engine checks views, the store folds them (RT-84). */
+	private readonly operationTransforms: readonly OperationTransform[]
 	private deliveryGapRepeatCount = 0
 	private lastDeliveryGapKey: string | null = null
 
@@ -537,6 +543,7 @@ export class SyncEngine {
 		this.transport = options.transport
 		this.store = options.store
 		this.config = options.config
+		this.operationTransforms = resolveOperationTransforms(options.config, options.store)
 		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
@@ -2806,10 +2813,29 @@ export class SyncEngine {
 			)
 		}
 
+		// A beta.13 clear the id proves (delivered by a beta.13 server, which stored the
+		// body without it) is made explicit before the body is stored (RT-85): the fold
+		// folds bodies as written.
+		op = await canonicalizeProvenLegacyClear(op)
+
+		// Transforms at fold time (RT-84): the operation is stored exactly as delivered and
+		// the store folds its view. Here the view is only checked: an operation with no
+		// view (authored under a newer schema than this device's) is kept aside and
+		// replayed after an upgrade, as before.
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
-		const transforms = this.config.operationTransforms ?? []
-		const transformed =
-			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
+		let transformed: Operation | null
+		try {
+			transformed = operationSchemaView(op, targetSchemaVersion, this.operationTransforms)
+		} catch (error) {
+			return quarantine(
+				op,
+				QUARANTINE_CODES.TRANSFORM_INVALID,
+				error instanceof Error ? error.message : String(error),
+				'rejected',
+				false,
+				op,
+			)
+		}
 		if (transformed === null) {
 			return quarantine(
 				op,
@@ -2822,7 +2848,7 @@ export class SyncEngine {
 		}
 
 		try {
-			const result = await this.store.applyRemoteOperation(transformed)
+			const result = await this.store.applyRemoteOperation(op)
 			if (result === 'applied' || result === 'duplicate') {
 				return { kind: 'applied', operation: op }
 			}
@@ -3025,14 +3051,18 @@ export class SyncEngine {
 		}
 		const reference = Date.now() + (this.clockSkewMs ?? 0)
 		if (op.timestamp.wallTime > reference + MAX_REMOTE_FUTURE_MS) return false
+		op = await canonicalizeProvenLegacyClear(op)
 		const targetSchemaVersion = this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
-		const transforms = this.config.operationTransforms ?? []
-		const transformed =
-			transforms.length > 0 ? applyOperationTransforms(op, targetSchemaVersion, transforms) : op
-		if (transformed === null) return false
-		const result = await this.store.applyRemoteOperation(transformed)
+		try {
+			if (operationSchemaView(op, targetSchemaVersion, this.operationTransforms) === null) {
+				return false
+			}
+		} catch {
+			return false
+		}
+		const result = await this.store.applyRemoteOperation(op)
 		if (result === 'applied' || result === 'duplicate') return true
-		return result === 'skipped' && this.store.hasCollection?.(transformed.collection) === true
+		return result === 'skipped' && this.store.hasCollection?.(op.collection) === true
 	}
 
 	/** Acknowledge a delivery batch (used for duplicates) without re-applying it. */
@@ -4735,4 +4765,31 @@ function revokedAuthoritativeIds(msg: unknown): string[] {
 	return Array.isArray(revoked)
 		? revoked.filter((id): id is string => typeof id === 'string' && !isServerNodeId(id))
 		: []
+}
+
+/**
+ * The schema transforms of an engine: its own `operationTransforms`, or the store's.
+ * Both sides must use the same list, because the store folds what the engine judges
+ * (transforms at fold time, RT-84): a mismatch is refused at construction.
+ */
+function resolveOperationTransforms(
+	config: SyncConfig,
+	store: SyncStore,
+): readonly OperationTransform[] {
+	const own = config.operationTransforms
+	const stores = store.getOperationTransforms?.()
+	if (own === undefined) return stores ?? []
+	if (stores !== undefined) {
+		const version = config.schemaVersion ?? DEFAULT_SCHEMA_VERSION
+		if (
+			operationTransformsFingerprint(version, own) !==
+			operationTransformsFingerprint(version, stores)
+		) {
+			throw new SyncError(
+				'The sync engine and the local store were given different operationTransforms. The store folds every operation through its transforms (transforms at fold time); pass the same list to both (createApp does).',
+				{ engineTransforms: own.length, storeTransforms: stores.length },
+			)
+		}
+	}
+	return own
 }

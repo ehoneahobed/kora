@@ -1,6 +1,7 @@
 import { KoraError } from '../errors/errors'
 import type { AtomicOp, Operation, OperationInput } from '../types'
 import { bytesToBase64 } from './op-data-binary'
+import { verifyOperationId } from './operation'
 
 /**
  * Thrown when an operation (or a record value) holds a value that has no canonical
@@ -41,7 +42,7 @@ export class NonCanonicalValueError extends KoraError {
  * | plain object (`Object.prototype` or `null` prototype) | plain object, members canonical   |
  * | array (dense)                           | array, elements canonical                       |
  * | string, finite number, boolean, `null`  | itself                                          |
- * | invalid `Date`, `NaN`, `±Infinity`, `BigInt`, function, symbol, `Map`, `Set`, `WeakMap`, `RegExp`, `Promise`, any other class instance, an object with a `toJSON` method, a circular reference | refused: {@link NonCanonicalValueError} naming the path and the fix |
+ * | invalid `Date`, `NaN`, `±Infinity`, `BigInt`, function, symbol, `Map`, `Set`, `WeakMap`, `RegExp`, `Promise`, any other class instance, an object with a `toJSON` method, an own `__proto__` key, a circular reference | refused: {@link NonCanonicalValueError} naming the path and the fix |
  *
  * Canonicalization is idempotent: a canonical body is returned unchanged (same
  * references where nothing changed).
@@ -203,6 +204,12 @@ function canonical(value: unknown, path: string, ancestors: Set<object>): unknow
 	if (typeof (object as { toJSON?: unknown }).toJSON === 'function') {
 		throw refusal(path, 'object with toJSON', 'Store the value toJSON() returns instead.')
 	}
+	// JSON can carry an own "__proto__" key, but assigning it to an object sets the
+	// prototype instead, so it would be lost on some replicas (the fold, any object
+	// rebuilt by assignment). Refused everywhere, never silently dropped.
+	if (Object.prototype.hasOwnProperty.call(object, '__proto__')) {
+		throw refusal(`${path}.__proto__`, '"__proto__" key', 'Rename the key.')
+	}
 	ancestors.add(object)
 	let changed = Object.getPrototypeOf(object) !== Object.prototype
 	const out: Record<string, unknown> = {}
@@ -242,6 +249,33 @@ function describe(value: unknown): string {
 }
 
 /**
+ * A legacy update in its canonical body when its id PROVES the beta.13 clear (RT-85):
+ * the id is the content hash of the body with every `previousData` key absent from
+ * `data` restored as `null` (version 1, or version 2 with a lost declaration), and not
+ * of the body as it is. Such an id can only come from a writer that hashed the clear,
+ * so the restored body is the one its author wrote and applied; a body a schema
+ * transform or anything else rewrote never proves it.
+ *
+ * Used where a legacy body enters a replica without a known provenance: a device's
+ * inbound delivery, and the one-time canonicalization of stored logs. The server's
+ * ingest of a protocol-1 upload applies the same rule (plus the unverifiable
+ * protocol-1 case, for the session's own node).
+ *
+ * @param op - Any operation
+ * @returns The canonical operation, or `op` itself when nothing is proven
+ */
+export async function canonicalizeProvenLegacyClear<T extends Operation>(op: T): Promise<T> {
+	const restored = canonicalizeLegacyOperation(op)
+	if (restored === op) return op
+	if (await verifyOperationId(op)) return op
+	if (await verifyOperationId(restored)) return restored
+	if (op.hashVersion === undefined && (await verifyOperationId({ ...restored, hashVersion: 2 }))) {
+		return restored
+	}
+	return op
+}
+
+/**
  * The canonical body of a legacy (version-1, beta.13) update (RT-71, RT-83): every
  * `previousData` key absent from `data` is a clear, restored as `null`. beta.13 wrote
  * `previousData[key]` for every key it validated, so such a key held `undefined` in
@@ -249,8 +283,11 @@ function describe(value: unknown): string {
  * and upload dropped it. `null` and `undefined` hash identically under version 1, so
  * the id is unchanged.
  *
- * Applied wherever an operation is folded (server and devices alike) and where a legacy
- * operation is ingested, so the server, peers and the upgraded writer agree. A no-op
+ * Applied ONCE, where a genuine beta.13 body is identified (RT-85), never at fold time:
+ * the server's ingest of a protocol-1 upload, a device's own beta.13 log at the
+ * upgrade, and any body whose id proves the clear
+ * ({@link canonicalizeProvenLegacyClear}). The result is stored, so the server, peers
+ * and the upgraded writer fold the same body. A no-op
  * for anything else (a declared version 2, an envelope, an insert or delete, an update
  * whose data covers its previousData). Idempotent.
  *

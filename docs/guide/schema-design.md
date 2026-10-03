@@ -245,6 +245,11 @@ A point in time, stored as `INTEGER` (milliseconds since Unix epoch) in SQLite.
 dueDate: t.timestamp()
 ```
 
+The value must be whole milliseconds within the range of a JavaScript `Date`
+(`-8.64e15` to `8.64e15`). A fraction (`performance.timeOrigin + performance.now()`) is
+refused with a `SchemaValidationError`, not rounded: round it yourself (`Math.round`) or
+use `date.getTime()`. See [Value domain](#value-domain).
+
 ### `t.array(innerType)`
 
 An ordered list of values. Stored as `TEXT` (JSON-serialized) in SQLite. During merge, arrays use an add-wins-set strategy (union of elements).
@@ -262,6 +267,43 @@ notes: t.richtext()
 ```
 
 Rich text fields are the only fields that use Yjs CRDTs. All other field types use Hybrid Logical Clock last-write-wins (LWW) for conflict resolution.
+
+### Value domain
+
+Every value the local API accepts is stored and synced unchanged by every built-in
+store (client SQLite and IndexedDB; server memory, SQLite and Postgres) and every
+transport. The domain is defined once in `@korajs/core` (`value-domain.ts`) and enforced
+where a value is written: `insert` and `update` (including the result of an atomic
+`op.increment`), and again by the sync server for every uploaded or route-written
+operation (refused per operation with `SCHEMA_VALIDATION_ERROR`, so it never blocks a
+device's later writes). A value outside it is refused up front with a clear error;
+nothing is written.
+
+| Field type | Accepted values | Client SQLite / IndexedDB | Server SQLite | Server Postgres | Wire |
+|---|---|---|---|---|---|
+| `t.string()` | any string, including U+0000 and lone surrogates | TEXT / string | TEXT (lossless text codec) | TEXT (lossless text codec) | JSON string |
+| `t.enum()` | one of the declared values | TEXT / string | TEXT + CHECK | TEXT + CHECK | JSON string |
+| `t.number()` | a finite double (`NaN` and `±Infinity` refused; `-0` becomes `0`) | REAL / number | REAL | DOUBLE PRECISION | JSON number |
+| `t.boolean()` | `true` / `false` | INTEGER 0/1 / boolean | INTEGER | INTEGER | JSON boolean |
+| `t.timestamp()` | integer milliseconds in `[-8.64e15, 8.64e15]` (fractions refused, not rounded) | INTEGER / number | INTEGER | BIGINT | JSON number |
+| `t.array()` | a dense array of the item type's values, nested at most 64 levels | TEXT (JSON) / array | TEXT (JSON) | JSONB | JSON array |
+| `t.object()` | a plain object; declared keys follow their own type | TEXT (JSON) / object | TEXT (JSON) | JSONB | JSON object |
+| `t.json()` | any JSON value: finite numbers, no `__proto__` key, nested at most 64 levels, and not exactly `{ __kora_bytes__: ... }` (the wire's binary form) | TEXT (JSON) / value | TEXT (JSON) | JSONB | JSON |
+| `t.blob()` | a `BlobRef` from the blob store | TEXT (JSON) | TEXT | TEXT | JSON object |
+| `t.secret()` | a string (stored hashed or encrypted) | TEXT | TEXT | TEXT | JSON string |
+| `t.richtext()` | Yjs update bytes or a string | BLOB / bytes | BLOB | BYTEA | bytes (`{ $koraBytes }` in JSON) |
+
+Every value must also have a canonical JSON form: `Map`, `Set`, class instances,
+`BigInt`, functions and cycles are refused; a `Date` inside a json or object value
+becomes its ISO string.
+
+**Operation size.** One write produces one operation, which must fit the sync server's
+`maxOperationBytes` (default 256 KiB, the UTF-8 size of the operation's JSON). The local
+store checks it before the write is accepted (`OperationTooLargeError`); set
+`store.maxOperationBytes` in `createApp` to the server's value when you change it. The
+server refuses a larger operation on its own, terminally (`OPERATION_TOO_LARGE`, reported
+through `sync:operation-rejected`), and keeps acknowledging the device's later
+operations. Store large content as a blob (`t.blob()`).
 
 ## Field Modifiers
 
@@ -466,6 +508,41 @@ Generated migration: kora/migrations/002-add-priority.ts
 ```
 
 Kora tracks the schema version on every operation. When syncing with clients on different schema versions, operations are transformed to maintain compatibility.
+
+### Schema transforms run at fold time
+
+An `OperationTransform` turns an operation authored under an older schema version into
+what the current schema reads (rename a field, drop a field the server now computes,
+fill a new one). Operations are immutable and content-addressed, so a transform never
+rewrites a stored operation:
+
+- **Stored as written, everywhere.** The sync server stores every operation exactly as
+  its author uploaded it (data, `previousData`, `schemaVersion`, `hashVersion`,
+  envelope), delivers that original to every client, and acknowledges an honest
+  re-upload of it as a duplicate. Devices store what they receive the same way.
+- **Folded as the schema reads it.** Every replica merges the operation's *view*, the
+  result of the transform chain for its own schema version (`operationSchemaView` in
+  `@korajs/core`, one function for the server stores and devices). The server's
+  authorization, validators, constraint checks and scope filters judge the same view.
+- **Same transforms everywhere.** Pass the list to the sync server
+  (`operationTransforms`, which hands it to its store; or `store.setSchema(schema, {
+  operationTransforms })`) and to the client (`sync.operationTransforms` in
+  `createApp`, which gives it to the local store too). Transforms are part of the fold
+  plan fingerprint: changing one, or the schema version, re-folds every record once.
+- **Pure and deterministic.** A transform may rewrite `data`, `previousData`,
+  `atomicOps` and `schemaVersion` only, with JSON values, and must give the same result
+  on every replica at every time (no clock, randomness, I/O or outside state). A
+  transform that changes an operation's id, node, type, collection, record or timestamp
+  is refused (`SCHEMA_TRANSFORM_INVALID`). Keep a transform registered for as long as
+  operations of its source version can exist in any log: a transform removed later makes
+  those operations fold as nothing.
+- **Older clients.** A client on an older schema receives operations of newer versions
+  as written; with no transform path to its version it keeps them aside (quarantine) and
+  replays them after it upgrades, as before. Operations of its own version (other older
+  clients' writes) now reach it unchanged, where the server used to send it a rewrite
+  for the newer schema that it could not read.
+- **Encrypted operations** are opaque to the server, which folds their cleartext fields
+  as written; devices transform them after decryption.
 
 ### Programmatic Migrations
 

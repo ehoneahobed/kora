@@ -1,4 +1,5 @@
 import { applyAtomicOp } from '../operations/atomic-ops'
+import { canonicalValue } from '../operations/canonical-body'
 import { base64ToBytes, bytesToBase64, decodeBytesFromOpData } from '../operations/op-data-binary'
 import type { AtomicOp } from '../types'
 import { FoldConfigurationError } from './errors'
@@ -20,7 +21,7 @@ import type {
 	RichtextUpdateMerger,
 	Stamp,
 } from './types'
-import { canonicalKey, isPlainObject, normalizeValue } from './values'
+import { canonicalKey, isPlainObject } from './values'
 
 /**
  * One operation's write to one field, already normalized. Built by the record
@@ -170,9 +171,12 @@ function resolveStep(
 	entry: FieldLogEntry,
 ): { value: unknown; error?: string } {
 	try {
-		// undefined is not representable in the persisted state: a resolver that
-		// returns it yields null, identically before and after a reload.
-		return { value: normalizeValue(plan.resolver?.(current, entry.v, entry.b)) ?? null }
+		// A resolver's output enters the state in its canonical form (core canonical-body),
+		// the form it has after the persisted state's JSON round trip: undefined is null,
+		// -0 is 0, a Date is its ISO string, bytes are tagged. So the in-memory state and
+		// the persisted one are identical on every replica. An output with no JSON form
+		// (NaN, Infinity, a Map, a cycle) is handled like a throwing resolver.
+		return { value: canonicalValue(plan.resolver?.(current, entry.v, entry.b), 'resolver') }
 	} catch (error) {
 		// A throwing resolver must not wedge the record on every replica. The fold
 		// falls back to the incoming (later) value, deterministically, and reports

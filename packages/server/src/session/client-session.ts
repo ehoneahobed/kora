@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { applyOperationTransforms, canonicalizeLegacyOperation, isServerNodeId } from '@korajs/core'
+import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -96,7 +96,11 @@ import type {
 import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
-import { FORGED_DUPLICATE_CODE, isSameStoredOperation } from './duplicate-identity'
+import {
+	FORGED_DUPLICATE_CODE,
+	isRewrittenEcho,
+	isSameOperationAsStored,
+} from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
@@ -112,6 +116,12 @@ import {
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
+
+/** Refusal of an operation larger than `maxOperationBytes` (RT-86), per operation. */
+export const OPERATION_TOO_LARGE_CODE = 'OPERATION_TOO_LARGE'
+
+/** Refusal of an operation whose schema transform broke its contract (RT-84). */
+export const SCHEMA_TRANSFORM_INVALID_CODE = 'SCHEMA_TRANSFORM_INVALID'
 /** Default time a connection has to send its handshake before it is closed (SRV-6). */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 /**
@@ -397,7 +407,7 @@ export interface ClientSessionOptions {
 	schemaVersion?: number
 	/** Inclusive client schema versions accepted at handshake */
 	supportedSchemaVersions?: { min: number; max: number }
-	/** Transform accepted legacy operations into the server schema before validation. */
+	/** Schema transforms: judged views of older operations (transforms at fold time, RT-84). */
 	operationTransforms?: OperationTransform[]
 	/** Called when this session has operations to relay to other sessions */
 	onRelay?: RelayCallback
@@ -2432,7 +2442,11 @@ export class ClientSession {
 				? await this.loadStoredOperation(op, stored)
 				: null
 			if (storedCopy !== null) {
-				if (!isSameStoredOperation(op, storedCopy)) {
+				const schema = this.store.getSchema()
+				if (
+					!(await isSameOperationAsStored(op, storedCopy, schema)) &&
+					!(op.nodeId !== this.clientNodeId && (await isRewrittenEcho(op, storedCopy, schema)))
+				) {
 					this.refuseForgedDuplicate(op, storedCopy)
 					rejectedOperations += 1
 					acknowledgedThrough = op.sequenceNumber
@@ -2557,14 +2571,19 @@ export class ClientSession {
 				continue
 			}
 
+			// An oversized operation is refused on its own, terminally, and the ack moves
+			// past it (RT-86): a session-level error would stop acknowledging the batch, and
+			// the device would re-send it every session, so none of its later writes would
+			// ever reach the server. The device records the refusal (sync:operation-rejected).
 			const sizeCheck = validateOperationSize(op, this.maxOperationBytes)
 			if (!sizeCheck.valid) {
-				this.sendError(
-					'OPERATION_TOO_LARGE',
-					sizeCheck.message ?? `Operation "${op.id}" is too large`,
-					false,
+				await this.refuseTerminally(
+					op,
+					OPERATION_TOO_LARGE_CODE,
+					`${sizeCheck.message ?? `Operation "${op.id}" is too large.`} Store large content as a blob, or raise maxOperationBytes on the server and the client together.`,
 				)
-				canAdvanceAck = false
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -2582,17 +2601,20 @@ export class ClientSession {
 				continue
 			}
 
-			const serverOp = this.transformForServerSchema(this.declareVerifiedHashVersion(op))
-			if (serverOp === null) {
-				await this.refuseTerminally(
-					op,
-					'SCHEMA_TRANSFORM_UNAVAILABLE',
-					`Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
-				)
+			// Transforms at fold time (RT-84): the operation is stored exactly as uploaded
+			// (plus the hash version the server verified, and a beta.13 clear made explicit,
+			// both identical under its id), never as a transformed rewrite under its id.
+			// Authorization, validators and constraint checks judge its view in the server
+			// schema; every store folds that same view.
+			const storedOp = this.declareVerifiedHashVersion(op)
+			const view = this.schemaView(storedOp)
+			if (!view.ok) {
+				await this.refuseTerminally(op, view.code, view.message)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
+			const serverOp = view.op
 
 			// Server-side adjudication of untrusted client operations. Runs after
 			// the built-in guards and before materialization, so a rejected op never
@@ -2659,7 +2681,8 @@ export class ClientSession {
 			// row as it is at commit time, so a concurrent ownership change or same-id
 			// insert cannot slip in between the pre-check above and this write.
 			const uplinkScopes = this.uplinkScopes()
-			const applyResult = await applyServerOperation(this.store, serverOp, undefined, {
+			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
+				view: serverOp,
 				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
 				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
@@ -2676,7 +2699,7 @@ export class ClientSession {
 				const copyIds = (authoredCopies.get(serverOp.id) ?? [])
 					.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverOp.id, effect))
 					.map((copy) => copy.id)
-				deferredEffects.push({ parent: serverOp, effect, copyIds })
+				deferredEffects.push({ parent: storedOp, effect, copyIds })
 			}
 			if (applyResult.rejection) {
 				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
@@ -2763,10 +2786,10 @@ export class ClientSession {
 			if (op.nodeId !== this.clientNodeId) continue
 			const parents = op.causalDeps.filter((dep) => deletes.has(dep))
 			if (parents.length > 0) {
-				const transformed = this.transformForServerSchema(op)
-				if (transformed !== null) {
+				const view = this.schemaView(op)
+				if (view.ok) {
 					for (const parent of parents) {
-						copies.set(parent, [...(copies.get(parent) ?? []), transformed])
+						copies.set(parent, [...(copies.get(parent) ?? []), view.op])
 					}
 				}
 			}
@@ -2789,8 +2812,9 @@ export class ClientSession {
 		authoredCopies: Map<string, Operation[]>,
 		deferredEffects: DeferredSideEffect[],
 	): Promise<Operation[]> {
-		const serverDelete = this.transformForServerSchema(op)
-		if (serverDelete === null) return []
+		const view = this.schemaView(op)
+		if (!view.ok) return []
+		const serverDelete = view.op
 		const uplinkScopes = this.uplinkScopes()
 		const effects = await undoneSideEffectsOfStoredDelete(this.store, serverDelete, (effect, row) =>
 			authorizeUplinkWrite(effect, row, uplinkScopes),
@@ -2842,23 +2866,34 @@ export class ClientSession {
 		}
 	}
 
-	private transformForServerSchema(op: Operation): Operation | null {
-		if (op.schemaVersion === this.schemaVersion) {
-			return op
+	/**
+	 * The operation as the server schema reads it (transforms at fold time, RT-84): the
+	 * view authorization, validators, constraint checks and scope filters judge, and the
+	 * one the server stores fold (core `operationSchemaView`, same transforms). Never
+	 * stored: the store keeps the operation as uploaded. An envelope operation is opaque
+	 * to the server (NEW-ENC-1) and judged as is; devices transform after decryption.
+	 */
+	private schemaView(
+		op: Operation,
+	): { ok: true; op: Operation } | { ok: false; code: string; message: string } {
+		let view: Operation | null
+		try {
+			view = operationSchemaView(op, this.schemaVersion, this.operationTransforms)
+		} catch (error) {
+			return {
+				ok: false,
+				code: SCHEMA_TRANSFORM_INVALID_CODE,
+				message: `Operation "${op.id}" cannot be read in server schema v${this.schemaVersion}: ${error instanceof Error ? error.message : String(error)}`,
+			}
 		}
-		// An envelope operation is opaque to the server (NEW-ENC-1): its data cannot be
-		// transformed here. It is stored as uploaded; clients transform after decryption.
-		if (op.encrypted !== undefined) {
-			return op
+		if (view === null) {
+			return {
+				ok: false,
+				code: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+				message: `Operation "${op.id}" cannot be transformed from schema v${op.schemaVersion} to server schema v${this.schemaVersion}.`,
+			}
 		}
-		const transformed = applyOperationTransforms(op, this.schemaVersion, this.operationTransforms)
-		if (transformed === null || transformed === op) return transformed
-		// The transform rewrote the content under the original id, so the id is no
-		// longer the content hash of what is stored. The original was verified above;
-		// the stored copy declares hash version 1 (never verified against version-2
-		// rules), so receivers do not quarantine a server-transformed operation.
-		const { hashVersion: _rewritten, ...rest } = transformed
-		return rest
+		return { ok: true, op: view }
 	}
 
 	/**
@@ -3437,9 +3472,13 @@ export class ClientSession {
 	 * current row plus `op.data`.
 	 */
 	private async operationVisibleToClient(
-		op: Operation,
+		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
 	): Promise<boolean> {
+		// Judged on the operation as the server schema reads it (RT-84): a stored
+		// operation of an older schema version names its fields as its author did.
+		const judged = this.schemaView(stored)
+		const op = judged.ok ? judged.op : stored
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets
 		if (snapshot?.post) {

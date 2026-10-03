@@ -4,6 +4,7 @@ import type {
 	FoldState,
 	HLCTimestamp,
 	Operation,
+	OperationTransform,
 	RecordFieldVersions,
 	SchemaDefinition,
 	VersionVector,
@@ -16,6 +17,7 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	SERVER_LOG_QUARANTINE_DDL,
@@ -92,6 +94,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ServerSchemaOptions,
 	ServerStore,
 } from './server-store'
 import {
@@ -103,6 +106,7 @@ import {
 	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
 	SequenceConflictError,
 	type SequenceHolderVerdict,
+	UnstorableValueError,
 	judgeSequenceHolders,
 	reportLegacyPair,
 } from './server-store'
@@ -158,6 +162,35 @@ function resolutionFromRow(row: ResolutionRow): OperationResolution {
 const esmRequire = createRequire(import.meta.url)
 
 /**
+ * SQLite result codes of values the database refuses (RT-87): an enum CHECK, a NOT NULL,
+ * a value larger than SQLite's limits. Such an operation is refused terminally and per
+ * operation (UNSTORABLE_VALUE), like the Postgres store's class-22/23 errors, so it can
+ * never block the session. (The server's value-domain check refuses every such value
+ * before it reaches a store; this is the safety net.)
+ */
+const SQLITE_UNSTORABLE_VALUE_CODES = new Set([
+	'SQLITE_CONSTRAINT_CHECK',
+	'SQLITE_CONSTRAINT_NOTNULL',
+	'SQLITE_TOOBIG',
+	'SQLITE_MISMATCH',
+])
+
+function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
+	const codeOf = (value: unknown): unknown =>
+		value && typeof value === 'object' && 'code' in value
+			? (value as { code: unknown }).code
+			: undefined
+	const code = codeOf(error) ?? (error instanceof Error ? codeOf(error.cause) : undefined)
+	if (typeof code === 'string' && SQLITE_UNSTORABLE_VALUE_CODES.has(code)) {
+		return new UnstorableValueError(
+			op,
+			`${code}: ${error instanceof Error ? error.message : String(error)}`,
+		)
+	}
+	return error
+}
+
+/**
  * SQLite-backed server store using Drizzle ORM.
  * Persists operations and version vectors to a real database file,
  * surviving process restarts.
@@ -187,7 +220,9 @@ export class SqliteServerStore implements ServerStore {
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
-	private readonly foldOptions: ServerFoldOptions
+	private foldOptions: ServerFoldOptions
+	/** Schema transforms the fold applies (transforms at fold time, RT-84). */
+	private operationTransforms: readonly OperationTransform[] = []
 	private foldMigration: FoldMigrationReport = {
 		ran: false,
 		records: 0,
@@ -218,7 +253,7 @@ export class SqliteServerStore implements ServerStore {
 		this.derivationSecret = identity.secret
 		this.explicitAuthorities = identity.history.explicitAuthorities
 		this.authorityHistory = identity.history
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		for (const row of this.db.all<{ node_id: string }>(
 			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
 		)) {
@@ -360,9 +395,13 @@ export class SqliteServerStore implements ServerStore {
 		return this.schema
 	}
 
-	async setSchema(schema: SchemaDefinition): Promise<void> {
+	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		this.schema = schema
+		if (options.operationTransforms !== undefined) {
+			this.operationTransforms = [...options.operationTransforms]
+			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		}
 
 		// Generate and execute DDL for all collection tables
 		const ddlStatements = generateAllCollectionDDL(schema, 'sqlite')
@@ -387,6 +426,9 @@ export class SqliteServerStore implements ServerStore {
 
 		this.migrateTextCodec(schema)
 
+		// beta.13 clears stored by an earlier server, made explicit once (RT-85); their
+		// records are re-folded by the re-materialization below.
+		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
 		this.foldMigration = this.rematerialize()
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
@@ -407,6 +449,19 @@ export class SqliteServerStore implements ServerStore {
 		}
 	}
 
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.operationTransforms
+	}
+
+	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
+		this.assertOpen()
+		this.operationTransforms = [...transforms]
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		// The fold plan fingerprint includes the transforms: when they changed, every
+		// record is re-folded from its log, once (RT-84).
+		if (this.schema) this.foldMigration = this.rematerialize()
+	}
+
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
 
@@ -414,7 +469,28 @@ export class SqliteServerStore implements ServerStore {
 
 		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
 		// Use a transaction for atomicity: insert op + update version vector + materialize
-		const result = this.db.transaction((tx) => {
+		let result: 'applied' | 'duplicate'
+		try {
+			result = this.applyInTransaction(op, now, options, (decision) => {
+				sequenceDecision = decision
+			})
+		} catch (error) {
+			throw sqliteUnstorableValueOr(error, op)
+		}
+
+		if (result === 'applied') {
+			reportLegacyPair(op, sequenceDecision, options)
+		}
+		return result
+	}
+
+	private applyInTransaction(
+		op: Operation,
+		now: number,
+		options: ApplyRemoteOptions | undefined,
+		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
+	): 'applied' | 'duplicate' {
+		return this.db.transaction((tx) => {
 			// Content-addressed dedup: check before assigning a delivery sequence so a
 			// duplicate never burns one (keeps the sequence gap-free on this store).
 			const existing = tx.all<{ id: string }>(
@@ -440,7 +516,7 @@ export class SqliteServerStore implements ServerStore {
 			if (decision.verdict === 'conflict') {
 				throw new SequenceConflictError(op, decision.holderId)
 			}
-			sequenceDecision = decision
+			onSequenceDecision(decision)
 
 			// Authorization re-check inside the write transaction: better-sqlite3 runs
 			// it synchronously under SQLite's single writer lock, so the row it sees is
@@ -500,11 +576,6 @@ export class SqliteServerStore implements ServerStore {
 
 			return 'applied' as const
 		})
-
-		if (result === 'applied') {
-			reportLegacyPair(op, sequenceDecision, options)
-		}
-		return result
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
@@ -1413,6 +1484,43 @@ export class SqliteServerStore implements ServerStore {
 		}
 	}
 
+	/**
+	 * Write the beta.13 clears the ids prove into the stored bodies, once per database
+	 * (RT-85, see `provenLegacyClears`), and mark their records' fold states stale.
+	 */
+	private async canonicalizeLegacyBodies(): Promise<void> {
+		const done = this.db.all(
+			sql`SELECT 1 AS one FROM kora_server_meta WHERE key = ${LEGACY_BODIES_META_KEY}`,
+		)
+		if (done.length > 0) return
+		const rows = this.db
+			.select()
+			.from(operations)
+			.where(
+				and(
+					eq(operations.type, 'update'),
+					sql`${operations.hashVersion} IS NULL`,
+					sql`${operations.previousData} IS NOT NULL`,
+				),
+			)
+			.all()
+		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
+		this.db.transaction((tx) => {
+			for (const op of changed) {
+				tx.update(operations)
+					.set({ data: JSON.stringify(op.data) })
+					.where(eq(operations.id, op.id))
+					.run()
+				tx.run(
+					sql`UPDATE kora_fold_state SET covered_seq = -1 WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+				)
+			}
+			tx.run(
+				sql`INSERT OR IGNORE INTO kora_server_meta (key, value) VALUES (${LEGACY_BODIES_META_KEY}, ${String(changed.length)})`,
+			)
+		})
+	}
+
 	private rematerialize(): FoldMigrationReport {
 		const schema = this.schema
 		const report: FoldMigrationReport = {
@@ -1423,7 +1531,11 @@ export class SqliteServerStore implements ServerStore {
 		}
 		if (!schema) return { ...report, ran: false }
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const fingerprint = serverFoldPlanFingerprint(schema, this.explicitAuthorities)
+		const fingerprint = serverFoldPlanFingerprint(
+			schema,
+			this.explicitAuthorities,
+			this.operationTransforms,
+		)
 		const storedFingerprint = this.db.all<{ value: string }>(
 			sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
 		)[0]?.value

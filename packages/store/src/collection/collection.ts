@@ -46,6 +46,7 @@ export class Collection {
 		private readonly secretKeyProvider?: SecretKeyProvider,
 		private readonly onStorageError?: (error: unknown) => void,
 		private readonly fold?: () => RecordFolder | undefined,
+		private readonly maxOperationBytes?: number,
 	) {}
 
 	/**
@@ -81,6 +82,9 @@ export class Collection {
 			causalTracker: this.causalTracker,
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
 			...(this.onStorageError ? { onStorageError: this.onStorageError } : {}),
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
 		}
 	}
 

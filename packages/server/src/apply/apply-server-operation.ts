@@ -1,3 +1,4 @@
+import { operationValueViolation } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@korajs/merge'
 import type { SideEffectOp } from '@korajs/merge'
@@ -9,6 +10,7 @@ import {
 	UplinkAuthorizationError,
 	type UplinkAuthorizationResult,
 } from '../scopes/server-scope-filter'
+import { serverOperationView } from '../store/record-fold'
 import type { ApplyRemoteOptions, MaterializedRecord, ServerStore } from '../store/server-store'
 import {
 	SEQUENCE_CONFLICT_CODE,
@@ -93,6 +95,13 @@ export interface ApplyServerOperationOptions {
 	 * derived as before.
 	 */
 	isAuthoredSideEffect?: (effect: SideEffectOp) => boolean
+	/**
+	 * The operation as the server schema reads it (transforms at fold time, RT-84), when
+	 * the caller already computed it. Shape, constraint and referential checks judge the
+	 * view; the store keeps `op` exactly as given and folds the same view. Default: the
+	 * store's own view (`serverOperationView`).
+	 */
+	view?: Operation
 }
 
 /**
@@ -125,6 +134,45 @@ export async function applyServerOperation(
 	const schema = store.getSchema()
 	const lookup = relationLookup ?? (schema ? buildMergeRelationLookup(schema) : new Map())
 
+	// Everything below judges the operation as the server schema reads it; only the
+	// store write (applyPrimary) and the relayed operation are the stored original.
+	const stored = op
+	let view: Operation | null
+	try {
+		view = options.view ?? serverOperationView(store, stored)
+	} catch (error) {
+		return {
+			result: 'skipped',
+			appliedOperations: [],
+			rejection: {
+				code: 'SCHEMA_TRANSFORM_INVALID',
+				message: error instanceof Error ? error.message : String(error),
+				retriable: false,
+			},
+		}
+	}
+	if (view === null) {
+		return {
+			result: 'skipped',
+			appliedOperations: [],
+			rejection: {
+				code: 'SCHEMA_TRANSFORM_UNAVAILABLE',
+				message: `Operation "${stored.id}" cannot be transformed from schema v${stored.schemaVersion} to the server schema.`,
+				retriable: false,
+			},
+		}
+	}
+	return applyJudgedOperation(store, stored, view, lookup, schema, options)
+}
+
+async function applyJudgedOperation(
+	store: ServerStore,
+	stored: Operation,
+	op: Operation,
+	lookup: ReturnType<typeof buildMergeRelationLookup>,
+	schema: ReturnType<ServerStore['getSchema']>,
+	options: ApplyServerOperationOptions,
+): Promise<ApplyServerOperationResult> {
 	const shapeCheck = validateOperationShape(op, schema)
 	if (!shapeCheck.valid) {
 		return {
@@ -193,7 +241,7 @@ export async function applyServerOperation(
 
 		let primaryResult: Awaited<ReturnType<ServerStore['applyRemoteOperation']>>
 		try {
-			primaryResult = await applyPrimary(store, op, options)
+			primaryResult = await applyPrimary(store, stored, options)
 		} catch (error) {
 			const rejection = authorizationRejection(error)
 			if (rejection) return { result: 'skipped', appliedOperations: [], rejection }
@@ -203,7 +251,7 @@ export async function applyServerOperation(
 			return { result: primaryResult, appliedOperations: [] }
 		}
 
-		const appliedOperations: Operation[] = [op]
+		const appliedOperations: Operation[] = [stored]
 		const deferred: SideEffectOp[] = []
 		const derive: SideEffectOp[] = []
 		for (const effect of referential.sideEffectOps) {
@@ -222,14 +270,14 @@ export async function applyServerOperation(
 
 	let result: Awaited<ReturnType<ServerStore['applyRemoteOperation']>>
 	try {
-		result = await applyPrimary(store, op, options)
+		result = await applyPrimary(store, stored, options)
 	} catch (error) {
 		const rejection = authorizationRejection(error)
 		if (rejection) return { result: 'skipped', appliedOperations: [], rejection }
 		throw error
 	}
 	if (result !== 'applied') return { result, appliedOperations: [] }
-	return { result, appliedOperations: [op, ...(await enforceAfterCommit(store, op))] }
+	return { result, appliedOperations: [stored, ...(await enforceAfterCommit(store, op))] }
 }
 
 /**
@@ -454,6 +502,26 @@ function validateOperationShape(
 			valid: false,
 			code: 'SCHEMA_VALIDATION_ERROR',
 			message: `Operation "${op.id}" contains undeclared field "${invalidPreviousField}" in previousData for collection "${op.collection}".`,
+		}
+	}
+
+	// One value domain (core value-domain.ts, RT-86, RT-87): every value the server stores
+	// must be one every server store holds unchanged and every client accepts. Checked on
+	// the operation as the server schema reads it, before any store sees it, so a value
+	// outside the domain is refused per operation (non-retriable) on every store alike,
+	// never by a database half-way through a batch.
+	if (op.data !== null && op.data !== undefined) {
+		for (const [field, value] of Object.entries(op.data)) {
+			const descriptor = collection.fields[field]
+			if (!descriptor) continue
+			const violation = operationValueViolation(descriptor, value)
+			if (violation !== null) {
+				return {
+					valid: false,
+					code: 'SCHEMA_VALIDATION_ERROR',
+					message: `Operation "${op.id}" writes a value outside the domain of "${op.collection}.${field}": it ${violation}.`,
+				}
+			}
 		}
 	}
 

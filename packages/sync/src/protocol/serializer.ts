@@ -116,44 +116,33 @@ function deserializeWireRecord(
 	return out
 }
 
+/**
+ * A top-level op-data value in the wire's binary form: an object whose ONLY member is
+ * `__kora_bytes__` (a base64 string), as `serializeWireValue` writes a `Uint8Array`
+ * (beta.13 richtext). Any other object is data and is returned as is.
+ *
+ * Two earlier rules corrupted json and object values and are gone (value domain, RT-86):
+ * an object that merely CONTAINED `__kora_bytes__` lost its other members, and an object
+ * whose keys were all integers with number values (`{ "1": 2 }`, even `{ " ": 0 }`) was
+ * read as the indexed byte record of the 0.5 internal beta and became a `Uint8Array`.
+ * The local API refuses a field value that is exactly the binary form, so nothing a
+ * device writes can be mistaken for it.
+ */
 function deserializeWireValue(value: unknown): unknown {
-	if (typeof value === 'object' && value !== null && WIRE_BYTES_KEY in value) {
-		const encoded = (value as Record<string, unknown>)[WIRE_BYTES_KEY]
-		if (typeof encoded === 'string') {
-			return fromBase64(encoded)
-		}
+	if (isWireBytesValue(value)) {
+		return fromBase64(value[WIRE_BYTES_KEY])
 	}
-
-	if (isLegacyIndexedByteRecord(value)) {
-		return legacyIndexedByteRecordToUint8Array(value)
-	}
-
 	return value
 }
 
-function isLegacyIndexedByteRecord(value: unknown): value is Record<string, number> {
-	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-		return false
-	}
-
-	const entries = Object.entries(value)
-	if (entries.length === 0) {
-		return false
-	}
-
-	return entries.every(([key, entryValue]) => {
-		const index = Number(key)
-		return Number.isInteger(index) && index >= 0 && typeof entryValue === 'number'
-	})
-}
-
-function legacyIndexedByteRecordToUint8Array(value: Record<string, number>): Uint8Array {
-	const maxIndex = Math.max(...Object.keys(value).map((key) => Number(key)))
-	const bytes = new Uint8Array(maxIndex + 1)
-	for (const [key, entryValue] of Object.entries(value)) {
-		bytes[Number(key)] = entryValue
-	}
-	return bytes
+function isWireBytesValue(value: unknown): value is Record<typeof WIRE_BYTES_KEY, string> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+	const keys = Object.keys(value)
+	return (
+		keys.length === 1 &&
+		keys[0] === WIRE_BYTES_KEY &&
+		typeof (value as Record<string, unknown>)[WIRE_BYTES_KEY] === 'string'
+	)
 }
 
 /**

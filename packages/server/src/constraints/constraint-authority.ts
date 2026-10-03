@@ -40,7 +40,13 @@
  * A revival is an update with empty data: it is a write (newer than the delete) that
  * changes no field, so the record comes back with every field's merged value.
  */
-import { HybridLogicalClock, foldRecord, isFoldStateLive, materialize } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	foldRecord,
+	isFoldStateLive,
+	materialize,
+	operationSchemaView,
+} from '@korajs/core'
 import type {
 	Constraint,
 	FoldState,
@@ -195,17 +201,22 @@ async function undoConstrainedWrite(
 	const newest = stampTimestamp(state?.u ?? null) ?? loser.key
 	const parent = `hlc:${HybridLogicalClock.serialize(loser.key)}`
 	const rule = `constraint:${collection}:${constraintIndex}:${constraint.type}`
+	// Stored operations are judged and folded as the server schema reads them (RT-84).
+	const transforms = store.getOperationTransforms?.() ?? []
 	const losing = new Set(
 		ops
-			.filter(
-				(op) =>
-					HybridLogicalClock.compare(op.timestamp, loser.key) === 0 &&
+			.filter((stored) => {
+				if (HybridLogicalClock.compare(stored.timestamp, loser.key) !== 0) return false
+				const op = operationSchemaView(stored, schema.version, transforms)
+				return (
+					op !== null &&
 					op.data !== null &&
-					constraint.fields.some((field) => op.data !== null && field in op.data),
-			)
+					constraint.fields.some((field) => op.data !== null && field in op.data)
+				)
+			})
 			.map((op) => op.id),
 	)
-	const without = foldRecord(ops, schema, { exclude: losing }).state
+	const without = foldRecord(ops, schema, { exclude: losing, transforms }).state
 	const previous = without && isFoldStateLive(without) ? materialize(without as FoldState) : null
 	const collides =
 		previous !== null &&

@@ -7,6 +7,7 @@ import {
 	HybridLogicalClock,
 	type MergeTrace,
 	type Operation,
+	type OperationTransform,
 	type SchemaDefinition,
 	adaptFoldState,
 	base64ToBytes,
@@ -139,7 +140,24 @@ export interface FoldApplyOutcome {
 export class RecordFolder {
 	private authoritative: ReadonlySet<string> = new Set()
 
-	constructor(private readonly schema: SchemaDefinition) {}
+	constructor(
+		private readonly schema: SchemaDefinition,
+		private readonly transforms: readonly OperationTransform[] = [],
+	) {}
+
+	/** The schema transforms every merge applies (transforms at fold time, RT-84). */
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.transforms
+	}
+
+	/**
+	 * The fields an operation's merge can change: its own data's keys, or every field
+	 * when the fold reads it through a schema transform (whose view may name others).
+	 */
+	private touchedFields(op: Operation): MaterializeFields {
+		if (this.transforms.length > 0 && op.schemaVersion !== this.schema.version) return 'all'
+		return new Set(Object.keys(op.data ?? {}))
+	}
 
 	/** Node ids whose writes win `merge('server-authoritative')` fields. */
 	getAuthoritativeNodeIds(): ReadonlySet<string> {
@@ -158,6 +176,7 @@ export class RecordFolder {
 			richtextSubsumes: yjsSubsumes,
 			traces,
 			...(this.authoritative.size > 0 ? { authoritativeNodeIds: this.authoritative } : {}),
+			...(this.transforms.length > 0 ? { transforms: this.transforms } : {}),
 		}
 	}
 
@@ -225,9 +244,7 @@ export class RecordFolder {
 		await this.saveState(tx, result.state)
 		const revived = isDeadState(prior.state) && !isDeadState(result.state)
 		const fields: MaterializeFields =
-			prior.rebuilt || revived || op.foldState !== undefined
-				? 'all'
-				: new Set(Object.keys(op.data ?? {}))
+			prior.rebuilt || revived || op.foldState !== undefined ? 'all' : this.touchedFields(op)
 		await this.materializeRow(tx, result.state, fields, {
 			clearRetraction: scopeEntry,
 			...(fresh ? { absent: true } : {}),
@@ -479,12 +496,9 @@ export class RecordFolder {
 		const result = mergeOp(prior.state, op, this.schema, this.options())
 		if (!result.changed && !prior.rebuilt) return
 		await this.saveState(tx, result.state)
-		await this.materializeRow(
-			tx,
-			result.state,
-			prior.rebuilt ? 'all' : new Set(Object.keys(op.data ?? {})),
-			{ clearRetraction: false },
-		)
+		await this.materializeRow(tx, result.state, prior.rebuilt ? 'all' : this.touchedFields(op), {
+			clearRetraction: false,
+		})
 	}
 
 	/**

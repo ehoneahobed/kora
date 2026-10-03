@@ -49,6 +49,7 @@ export {
 	MergeConflictError,
 	OperationError,
 	SchemaValidationError,
+	OperationTooLargeError,
 	StorageError,
 	SyncError,
 } from './errors/errors'
@@ -106,6 +107,7 @@ export {
 	canonicalValue,
 	canonicalizeLegacyOperation,
 	canonicalizeOperationBody,
+	canonicalizeProvenLegacyClear,
 } from './operations/canonical-body'
 export type { CanonicalizableBody, LegacyBody } from './operations/canonical-body'
 
@@ -227,7 +229,19 @@ export type {
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
 export { quoteIdent } from './schema/quote-ident'
 export { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './schema/types'
-export { validateRecord } from './schema/validation'
+export { assertResolvedFieldValue, validateRecord } from './schema/validation'
+export {
+	DEFAULT_MAX_OPERATION_BYTES,
+	MAX_VALUE_DEPTH,
+	TIMESTAMP_MAX_MS,
+	TIMESTAMP_MIN_MS,
+	measureOperationBytes,
+	operationValueViolation,
+	protoKeyViolation,
+	reservedWireShapeViolation,
+	timestampDomainViolation,
+	valueDepthViolation,
+} from './schema/value-domain'
 
 // === Type Inference ===
 export type {
@@ -272,6 +286,11 @@ export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence
 // === Migrations ===
 export type { OperationTransform } from './migration/operation-transform'
 export { applyOperationTransforms } from './migration/apply-operation-transforms'
+export {
+	OperationTransformError,
+	operationSchemaView,
+	operationTransformsFingerprint,
+} from './migration/operation-view'
 export { MigrationBuilder, RollbackBuilder, migrate } from './migrations/migration-builder'
 export type {
 	BackfillOptions,

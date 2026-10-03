@@ -9,11 +9,19 @@
  * devices that go offline, edit concurrently, delete, and reconnect in random
  * order. Deterministic in the seed (mulberry32), except wall-clock timing.
  */
-import { type SchemaDefinition, defineSchema, foldRecord, materialize, op, t } from '@korajs/core'
+import {
+	type OperationTransform,
+	type SchemaDefinition,
+	defineSchema,
+	foldRecord,
+	materialize,
+	op,
+	t,
+} from '@korajs/core'
 import { mergeYjsUpdates } from '@korajs/store'
 import * as Y from 'yjs'
 import type { TestDevice, TestNetwork } from '../../src/index'
-import { createTestNetwork } from '../../src/index'
+import { createMixedTestNetwork, createTestNetwork } from '../../src/index'
 
 export type Rng = () => number
 
@@ -51,6 +59,9 @@ const FIELDS = {
 } as const
 
 export type GateField = keyof typeof FIELDS
+
+/** Name of the schema-v1 device of the mixed-version sweep. */
+export const LEGACY_DEVICE = 'device-v1'
 export const GATE_FIELDS = Object.keys(FIELDS) as GateField[]
 
 /** Field kind label for reports (which documented semantic change can explain a difference). */
@@ -72,11 +83,21 @@ export const FIELD_KIND: Record<GateField, string> = {
 	body: 'richtext',
 }
 
-export function buildSchema(fields: readonly GateField[]): SchemaDefinition {
+/**
+ * The gate's schema. `version` 2 with `legacyTitle` builds the schema of an OLDER
+ * client instead: version 1, where `title` is still called `name` (see
+ * {@link GATE_TRANSFORMS}).
+ */
+export function buildSchema(
+	fields: readonly GateField[],
+	version = 1,
+	legacyTitle = false,
+): SchemaDefinition {
 	const builders: Record<string, ReturnType<(typeof FIELDS)[GateField]>> = {}
-	for (const field of fields) builders[field] = FIELDS[field]()
+	for (const field of fields)
+		builders[legacyTitle && field === 'title' ? 'name' : field] = FIELDS[field]()
 	return defineSchema({
-		version: 1,
+		version,
 		collections: {
 			items: {
 				fields: builders,
@@ -90,6 +111,33 @@ export function buildSchema(fields: readonly GateField[]): SchemaDefinition {
 		},
 	}) as unknown as SchemaDefinition
 }
+
+/**
+ * Schema transforms of the gate's mixed-version sweep (RT-84): schema v1 called the
+ * `title` field `name`. Pure and deterministic, as the contract requires. Every replica
+ * stores a v1 operation exactly as written and folds this view of it.
+ */
+export const GATE_TRANSFORMS: OperationTransform[] = [
+	{
+		fromVersion: 1,
+		toVersion: 2,
+		transform: (operation) => {
+			const rename = (record: Record<string, unknown> | null): Record<string, unknown> | null => {
+				if (record === null || !('name' in record)) return record
+				const { name, ...rest } = record
+				return { ...rest, title: name }
+			}
+			const atomicOps = operation.atomicOps
+			return {
+				...operation,
+				schemaVersion: 2,
+				data: rename(operation.data),
+				previousData: rename(operation.previousData),
+				...(atomicOps !== undefined ? { atomicOps: rename(atomicOps) as typeof atomicOps } : {}),
+			}
+		},
+	},
+]
 
 const STRINGS = ['a', 'b', 'c', 'd']
 const TAGS = ['t1', 't2', 't3', 't4']
@@ -253,6 +301,15 @@ export interface WorkloadOptions {
 	 * trusted route API at random steps; it is always in the schema then.
 	 */
 	serverWrites?: boolean
+	/**
+	 * Mixed schema versions (transforms at fold time, RT-84): the server and the devices
+	 * run schema v2 with {@link GATE_TRANSFORMS}, plus one more device on schema v1 (where
+	 * `title` is `name`) that writes too. Its operations must reach every v2 replica
+	 * exactly as written (same ids, verifiable), and every v2 replica and the server must
+	 * fold to the reference fold of the union through the transforms. The v1 device keeps
+	 * v2 operations aside (no transform path), so it is not compared.
+	 */
+	schemaTransforms?: boolean
 }
 
 const GATE_ENCRYPTION = {
@@ -274,22 +331,51 @@ export async function runWorkload(
 		: GATE_FIELDS.filter((field) => field === 'title' || chance(rng, 0.55))
 	const fields =
 		options.serverWrites && !picked.includes('auth') ? [...picked, 'auth' as const] : picked
-	const schema = buildSchema(fields)
+	const mixed = options.schemaTransforms === true
+	const schema = buildSchema(fields, mixed ? 2 : 1)
 	const deviceCount = int(rng, 2, 4)
 	const log: string[] = []
 	let network: TestNetwork | null = null
 	try {
-		network = await createTestNetwork(schema, {
-			devices: deviceCount,
-			...(options.legacyMerge ? { legacyMerge: true } : {}),
-			...(options.encryption
-				? { encryption: GATE_ENCRYPTION, serverEncryption: { required: true } }
-				: {}),
-		})
+		network = mixed
+			? await createMixedTestNetwork(
+					schema,
+					{
+						schemaVersion: 2,
+						supportedSchemaVersions: { min: 1, max: 2 },
+						operationTransforms: GATE_TRANSFORMS,
+					},
+					[
+						...Array.from({ length: deviceCount }, (_, i) => ({
+							name: `device-${i}`,
+							schema,
+							syncSchemaVersion: 2,
+							operationTransforms: GATE_TRANSFORMS,
+						})),
+						{
+							name: LEGACY_DEVICE,
+							schema: buildSchema(fields, 1, true),
+							syncSchemaVersion: 1,
+							operationTransforms: GATE_TRANSFORMS,
+						},
+					],
+				)
+			: await createTestNetwork(schema, {
+					devices: deviceCount,
+					...(options.legacyMerge ? { legacyMerge: true } : {}),
+					...(options.encryption
+						? { encryption: GATE_ENCRYPTION, serverEncryption: { required: true } }
+						: {}),
+				})
 		const devices = network.devices
-		const first = devices[0] as TestDevice
+		const isLegacy = (device: TestDevice): boolean => device.name === LEGACY_DEVICE
+		// The v1 device's names for the fields (title is `name` there).
+		const local = (device: TestDevice, field: string): string =>
+			isLegacy(device) && field === 'title' ? 'name' : field
+		// In the mixed sweep the v1 device creates the record: it never sees v2 operations.
+		const first = (mixed ? devices.find(isLegacy) : devices[0]) as TestDevice
 		const initial: Record<string, unknown> = {}
-		for (const field of fields) initial[field] = initialValue(field)
+		for (const field of fields) initial[local(first, field)] = initialValue(field)
 		const created = await first.collection('items').insert(initial)
 		const id = String(created.id)
 		for (const device of devices) await device.sync()
@@ -329,7 +415,14 @@ export async function runWorkload(
 			const count = int(rng, 1, Math.min(3, fields.length))
 			const chosen = [...fields].sort(() => rng() - 0.5).slice(0, count)
 			const patch: Record<string, unknown> = {}
-			for (const field of chosen) patch[field] = nextValue(rng, field, current[field], index + 1)
+			for (const field of chosen) {
+				patch[local(device, field)] = nextValue(
+					rng,
+					field,
+					current[local(device, field)],
+					index + 1,
+				)
+			}
 			log.push(
 				`${device.name} update ${JSON.stringify(patch, (_k, v) => (v instanceof Uint8Array ? `<yjs ${v.length}B>` : v))}`,
 			)
@@ -345,6 +438,20 @@ export async function runWorkload(
 		const logs: string[] = []
 		const union = new Map<string, import('@korajs/core').Operation>()
 		for (const device of devices) {
+			if (isLegacy(device)) {
+				// Its own operations must be held by every replica exactly as it wrote them.
+				for (const written of await device.store.getOperationsForRecord('items', id)) {
+					if (written.nodeId !== device.getNodeId()) continue
+					const held = await network.server.store.getRecordOperations?.('items', id)
+					const stored = held?.find((candidate) => candidate.id === written.id)
+					if (!stored || JSON.stringify(stored.data) !== JSON.stringify(written.data)) {
+						log.push(`server holds ${written.id} rewritten: ${JSON.stringify(stored ?? null)}`)
+						views[`${LEGACY_DEVICE}-stored`] = { rewritten: written.id }
+					}
+					union.set(written.id, written)
+				}
+				continue
+			}
 			views[device.name] = normalizeRecord(await device.collection('items').findById(id), fields)
 			const ops = await device.store.getOperationsForRecord('items', id)
 			logs.push(
@@ -359,11 +466,14 @@ export async function runWorkload(
 			richtext: mergeYjsUpdates,
 			// The oracle folds with the authority the devices learned at the handshake.
 			authoritativeNodeIds: new Set(network.server.authoritativeNodeIds),
+			...(mixed ? { transforms: GATE_TRANSFORMS } : {}),
 		}).state
 		const oracleRaw = folded ? materialize(folded, { richtext: mergeYjsUpdates }) : null
 		const oracle = oracleRaw ? normalizeRecord(decodeOracle(oracleRaw), fields) : null
 		const quarantined: string[] = []
 		for (const device of devices) {
+			// The v1 device keeps v2 operations aside by design (no transform path).
+			if (isLegacy(device)) continue
 			for (const entry of (await device.getSyncEngine()?.getQuarantinedOperations()) ?? []) {
 				quarantined.push(`${device.name}: ${entry.code} ${entry.message}`)
 			}

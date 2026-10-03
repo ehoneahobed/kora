@@ -8,6 +8,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { KoraError } from '@korajs/core'
+import type { OperationTransform } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
@@ -378,6 +379,12 @@ export interface ApplyRemoteOptions {
 	onLegacySequencePair?: (pair: LegacySequencePair) => void
 }
 
+/** Options of {@link ServerStore.setSchema}. */
+export interface ServerSchemaOptions {
+	/** Schema transforms the store folds with (transforms at fold time, RT-84). */
+	operationTransforms?: readonly OperationTransform[]
+}
+
 /**
  * Server-side store interface. Extends SyncStore with lifecycle,
  * introspection, and materialization methods needed by the sync server.
@@ -633,11 +640,26 @@ export interface ServerStore extends SyncStore {
 	 * tables from the operation log.
 	 *
 	 * @param schema - The schema definition describing all collections
+	 * @param options - `operationTransforms`: the schema transforms the store folds with
+	 *   (transforms at fold time, RT-84). Pass the same list as the sync server's
+	 *   `operationTransforms`, so the startup re-materialization folds with them once.
 	 */
-	setSchema(schema: SchemaDefinition): Promise<void>
+	setSchema(schema: SchemaDefinition, options?: ServerSchemaOptions): Promise<void>
 
 	/** Schema used for materialized tables and server-side validation, if set. */
 	getSchema(): SchemaDefinition | null
+
+	/**
+	 * Set the schema transforms the store folds with (RT-84). Operations are stored
+	 * exactly as uploaded; the fold merges each operation as
+	 * `operationSchemaView(op, schema.version, transforms)` reads it. Transforms are part
+	 * of the fold plan fingerprint: a change re-folds every record (once). The sync
+	 * server calls this with its `operationTransforms` at construction.
+	 */
+	setOperationTransforms?(transforms: readonly OperationTransform[]): Promise<void>
+
+	/** The schema transforms the store folds with (empty when none). */
+	getOperationTransforms?(): readonly OperationTransform[]
 
 	/**
 	 * Get all records from a materialized collection.

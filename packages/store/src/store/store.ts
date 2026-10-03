@@ -11,6 +11,7 @@ import {
 	isReservedNodeId,
 	isServerNodeId,
 	mismatchedFoldFields,
+	operationSchemaView,
 	quoteIdent,
 	replayOperationsForRecord,
 } from '@korajs/core'
@@ -21,6 +22,7 @@ import type {
 	MergeTrace,
 	Operation,
 	OperationLog,
+	OperationTransform,
 	SchemaDefinition,
 	SecretKeyProvider,
 	VersionVector,
@@ -32,6 +34,7 @@ import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import { OptimisticLockError, StoreNotOpenError } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
+import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
 	COMPACTED_THROUGH_TABLE,
 	FOLD_MATERIALIZATION_CURRENT,
@@ -329,10 +332,19 @@ export class Store implements OperationLog {
 	private readonly folder: RecordFolder | null
 	/** True once every row of the database is a materialization of its fold state. */
 	private foldActive = false
+	/** Schema transforms applied at fold time (RT-84); never to stored operations. */
+	private readonly operationTransforms: readonly OperationTransform[]
+	/** Largest operation a local write may produce (RT-86); default in the write path. */
+	private readonly maxOperationBytes: number | undefined
 
 	constructor(config: StoreConfig) {
 		this.materialization = config.materialization ?? 'fold'
-		this.folder = this.materialization === 'fold' ? new RecordFolder(config.schema) : null
+		this.operationTransforms = config.operationTransforms ?? []
+		this.maxOperationBytes = config.maxOperationBytes
+		this.folder =
+			this.materialization === 'fold'
+				? new RecordFolder(config.schema, this.operationTransforms)
+				: null
 		this.schema = config.schema
 		this.adapter = config.adapter
 		this.configNodeId = config.nodeId
@@ -400,6 +412,7 @@ export class Store implements OperationLog {
 		// write path, so the node id and clock must exist first (STORE-13).
 		try {
 			await this.runMigrationsIfNeeded()
+			await this.ensureLegacyBodiesCanonical()
 			await this.ensureMaterialization()
 		} catch (error) {
 			this.releaseNodeLock?.()
@@ -436,6 +449,7 @@ export class Store implements OperationLog {
 				this.secretKeyProvider,
 				(error) => this.reportStorageError(error),
 				() => this.activeFold(),
+				this.maxOperationBytes,
 			)
 			this.collections.set(name, col)
 		}
@@ -562,23 +576,37 @@ export class Store implements OperationLog {
 		return this.nodeId
 	}
 
+	/** The schema transforms the fold applies (transforms at fold time, RT-84). */
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.operationTransforms
+	}
+
 	/**
 	 * Apply a remote operation received from sync.
 	 * Checks for duplicates, applies to the data table, persists the operation,
 	 * and updates the version vector.
 	 */
-	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
+	async applyRemoteOperation(
+		stored: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
 		this.ensureOpen()
 
-		const collection = op.collection
+		const collection = stored.collection
 		const definition = this.schema.collections[collection]
 		if (!definition) {
 			return 'skipped'
 		}
 		const fold = this.activeFold()
 		if (fold) {
-			return this.applyRemoteFolded(op, fold, options)
+			// The fold reads the operation through the schema transforms itself (RT-84).
+			return this.applyRemoteFolded(stored, fold, options)
 		}
+		// Legacy materialization writes rows directly: it materializes the operation as
+		// this schema reads it, and logs the operation exactly as written (RT-84).
+		const view = operationSchemaView(stored, this.schema.version, this.operationTransforms)
+		if (view === null) return 'skipped'
+		const op = view
 
 		// Materialization may use overridden data/timestamp (authoritative merge
 		// results), but the LOG below always stores the canonical operation:
@@ -878,7 +906,7 @@ export class Store implements OperationLog {
 				}
 
 				// Persist the operation
-				await this.appendRemoteOperationRow(tx, op)
+				await this.appendRemoteOperationRow(tx, stored)
 
 				// Version vector: MAX with the stored value, never a value computed outside
 				// this transaction (another tab may have advanced it). The in-memory
@@ -1043,6 +1071,30 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Write every genuine beta.13 clear of the op log into its logged body, once per
+	 * database (RT-83, RT-85): the fold folds bodies as written, so the clear must be in
+	 * the body. Records already materialized by the fold are re-folded.
+	 */
+	private async ensureLegacyBodiesCanonical(): Promise<void> {
+		const folder = this.folder
+		if (!folder) return
+		if ((await this.readMeta(LEGACY_BODIES_META_KEY)) !== null) return
+		const rewritten = await canonicalizeLegacyLogBodies(this.adapter, this.schema, this.nodeId)
+		if (rewritten.length > 0 && this.foldActive) {
+			const seen = new Set<string>()
+			await this.adapter.transaction(async (tx) => {
+				for (const { collection, recordId } of rewritten) {
+					const key = `${collection}\u0000${recordId}`
+					if (seen.has(key)) continue
+					seen.add(key)
+					await folder.refoldInTx(tx, collection, recordId)
+				}
+			})
+		}
+		await this.writeMeta(LEGACY_BODIES_META_KEY, String(rewritten.length))
+	}
+
+	/**
 	 * Make every row a materialization of its record's fold state (W7), once per
 	 * database and fold-state version. Runs after the W8 log-integrity scan: a
 	 * clean log is rebuilt with the fold; an incomplete (compacted) log rebuilds on
@@ -1085,7 +1137,10 @@ export class Store implements OperationLog {
 				: 'snapshot+log'
 		const result = await rematerializeDatabase(this.adapter, this.schema, this.folder, mode, kept)
 		await this.writeMeta(FOLD_MATERIALIZATION_META_KEY, FOLD_MATERIALIZATION_CURRENT)
-		await this.writeMeta(FOLD_PLAN_META_KEY, JSON.stringify(foldPlanFingerprints(this.schema)))
+		await this.writeMeta(
+			FOLD_PLAN_META_KEY,
+			JSON.stringify(foldPlanFingerprints(this.schema, this.operationTransforms)),
+		)
 		this.foldActive = true
 		if (result.snapshots > 0) await this.requestSnapshotResync()
 		if (result.records > 0) {
@@ -1115,7 +1170,7 @@ export class Store implements OperationLog {
 	private async ensureFoldPlan(): Promise<void> {
 		const folder = this.folder
 		if (!folder) return
-		const current = foldPlanFingerprints(this.schema)
+		const current = foldPlanFingerprints(this.schema, this.operationTransforms)
 		const storedRaw = await this.readMeta(FOLD_PLAN_META_KEY)
 		let changed: string[]
 		if (storedRaw === null) {
@@ -1760,7 +1815,13 @@ export class Store implements OperationLog {
 			`SELECT id, reemitted_as FROM ${SEQ_CONFLICTS_TABLE} WHERE reemitted_as IS NOT NULL AND reemitted_as <> id`,
 		)
 		const aliases = new Map(aliasRows.map((row) => [row.id, row.reemitted_as]))
-		const snapshot = buildReplaySnapshot(this.schema, allOps, operationId, aliases)
+		const snapshot = buildReplaySnapshot(
+			this.schema,
+			allOps,
+			operationId,
+			aliases,
+			this.operationTransforms,
+		)
 
 		if (this.emitter) {
 			this.emitter.emit({
@@ -1874,6 +1935,9 @@ export class Store implements OperationLog {
 			causalTracker: this.causalTracker,
 			...(options?.extraCausalDeps ? { extraCausalDeps: options.extraCausalDeps } : {}),
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),

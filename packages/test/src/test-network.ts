@@ -43,6 +43,8 @@ export interface TestNetworkOptions {
 	encryption?: import('./test-device').TestDeviceEncryption
 	/** The sync server's encryption policy. */
 	serverEncryption?: import('@korajs/server').KoraSyncServerConfig['encryption']
+	/** Every device store's local `maxOperationBytes` (RT-86). */
+	deviceMaxOperationBytes?: number
 }
 
 /**
@@ -124,6 +126,9 @@ export async function createTestNetwork(
 			tmpDir,
 			...(options?.legacyMerge ? { legacyMerge: true } : {}),
 			...(options?.encryption ? { encryption: options.encryption } : {}),
+			...(options?.deviceMaxOperationBytes !== undefined
+				? { maxOperationBytes: options.deviceMaxOperationBytes }
+				: {}),
 		})
 		await device.open()
 		devices.push(device)

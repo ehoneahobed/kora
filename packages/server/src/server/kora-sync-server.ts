@@ -176,6 +176,8 @@ export class KoraSyncServer {
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
 	private readonly operationTransforms: OperationTransform[]
+	/** The store's re-fold for the configured transforms (RT-84), awaited by start(). */
+	private storeTransformsReady: Promise<void> | undefined
 	private readonly port: number | undefined
 	private readonly host: string
 	private readonly path: string
@@ -304,7 +306,24 @@ export class KoraSyncServer {
 			min: this.schemaVersion,
 			max: this.schemaVersion,
 		}
-		this.operationTransforms = config.operationTransforms ?? []
+		this.operationTransforms = config.operationTransforms ?? [
+			...(this.store.getOperationTransforms?.() ?? []),
+		]
+		// Transforms run at fold time (RT-84): the store folds every operation as the
+		// server schema reads it, with exactly the transforms sessions judge with.
+		if (config.operationTransforms !== undefined && this.store.setOperationTransforms) {
+			const ready = this.store.setOperationTransforms(this.operationTransforms)
+			this.storeTransformsReady = ready
+			// Surfaced by start(); logged here for attach mode (handleConnection only).
+			ready.catch((error: unknown) => {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'error',
+					event: 'server.operation_transforms_failed',
+					details: { message: error instanceof Error ? error.message : String(error) },
+				})
+			})
+		}
 		this.port = config.port
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
@@ -876,6 +895,7 @@ export class KoraSyncServer {
 		if (this.running) {
 			throw new SyncError('Server is already running', { port: this.port })
 		}
+		await this.storeTransformsReady
 
 		if (!wsServerImpl && this.port === undefined) {
 			throw new SyncError(

@@ -2,6 +2,7 @@ import type {
 	FoldState,
 	HLCTimestamp,
 	Operation,
+	OperationTransform,
 	RecordFieldVersions,
 	SchemaDefinition,
 	VersionVector,
@@ -19,6 +20,7 @@ import {
 	projectFoldState,
 	refoldRecord,
 	serverFoldOptions,
+	serverFoldPlanFingerprint,
 } from './record-fold'
 import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
 import {
@@ -38,6 +40,7 @@ import type {
 	MaterializedRecord,
 	OperationResolution,
 	OperationScopeSnapshot,
+	ServerSchemaOptions,
 	ServerStore,
 } from './server-store'
 import {
@@ -140,7 +143,9 @@ export class MemoryServerStore implements ServerStore {
 	private readonly explicitAuthorities: string[]
 	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
 	private readonly authorityHistory: AuthorityHistory
-	private readonly foldOptions: ServerFoldOptions
+	private foldOptions: ServerFoldOptions
+	/** Schema transforms the fold applies (transforms at fold time, RT-84). */
+	private operationTransforms: readonly OperationTransform[] = []
 
 	private closed = false
 	/**
@@ -218,9 +223,13 @@ export class MemoryServerStore implements ServerStore {
 		return this.schema
 	}
 
-	async setSchema(schema: SchemaDefinition): Promise<void> {
+	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		this.schema = schema
+		if (options.operationTransforms !== undefined) {
+			this.operationTransforms = [...options.operationTransforms]
+			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		}
 
 		// Initialize collection maps
 		for (const collectionName of Object.keys(schema.collections)) {
@@ -238,6 +247,27 @@ export class MemoryServerStore implements ServerStore {
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
+	}
+
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.operationTransforms
+	}
+
+	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
+		this.assertOpen()
+		const before = this.schema
+			? serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
+			: null
+		this.operationTransforms = [...transforms]
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		// The views changed: every record is re-folded from its log (RT-84).
+		if (
+			this.schema &&
+			before !==
+				serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
+		) {
+			this.backfillAllCollections()
+		}
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {

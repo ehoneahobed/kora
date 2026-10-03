@@ -60,7 +60,10 @@ export class TestServer<S extends ServerStore = MemoryServerStore> {
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 			...(options?.encryption ? { encryption: options.encryption } : {}),
 		})
-		this.ready = this.store.setSchema(schema)
+		this.ready = this.store.setSchema(
+			schema,
+			options?.operationTransforms ? { operationTransforms: options.operationTransforms } : {},
+		)
 		this.ready.catch(() => {})
 	}
 

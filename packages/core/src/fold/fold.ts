@@ -77,10 +77,14 @@
  *    (`op.foldState`) is joined into the local state instead of merged as one
  *    insert, so richtext, counters, resolvers and element sets enter with their
  *    merge state (RT-29). Without it (older servers) `fieldVersions` still apply.
+ * 11. Schema transforms run at fold time (RT-84): an operation of another schema
+ *    version is merged as its `operationSchemaView` (`FoldOptions.transforms`), and
+ *    is stored and synced exactly as written. A transform never rewrites a stored
+ *    operation, so its id stays the hash of its content on every replica.
  * Delete vs update is unchanged: the later of the newest delete and the newest
  * write decides; a revived record shows every field's merged value.
  */
-import { canonicalizeLegacyOperation } from '../operations/canonical-body'
+import { operationSchemaView } from '../migration/operation-view'
 import type { CollectionDefinition, HLCTimestamp, Operation, SchemaDefinition } from '../types'
 import { isAuthoritativeNodeId } from './authority'
 import { FoldConfigurationError, FoldStateError } from './errors'
@@ -382,7 +386,9 @@ function isAlive(state: FoldState): boolean {
  * @param state - The record's current state (not mutated)
  * @param op - The operation (must belong to the same collection and record)
  * @param schema - The schema; resolvers and merge strategies come from it
- * @param options - Exclusion, richtext merger (traces only), trace mode
+ * @param options - Exclusion, richtext merger (traces only), trace mode, schema
+ *   transforms (the operation is merged as `operationSchemaView` reads it for
+ *   `schema.version`)
  * @returns The new state, the merge traces, and whether anything changed
  */
 export function mergeOp(
@@ -392,10 +398,15 @@ export function mergeOp(
 	options: FoldOptions = {},
 ): MergeOpResult {
 	if (isExcluded(input, options.exclude)) return { state, traces: [], changed: false }
-	// Every replica folds a legacy (version-1, beta.13) update in its canonical form: a
-	// previousData key absent from data is a clear (RT-71, RT-83). The server stores it
-	// so; a device's own beta.13 log does not, and the one-time upgrade re-fold reads it.
-	const op = canonicalizeLegacyOperation(input)
+	// Transforms at fold time (RT-84, RT-85): the operation is stored exactly as its
+	// author wrote it, and folded as the schema reads it. A transform that drops the
+	// operation leaves it out of the fold, like an excluded one.
+	// The beta.13 clear rule is NOT applied here: a genuine beta.13 body is made
+	// canonical once, where its provenance is known (server ingest, a device's own
+	// log at the upgrade), so a body a transform or anything else rewrote is never
+	// mistaken for one (RT-85).
+	const op = operationSchemaView(input, schema.version, options.transforms)
+	if (op === null) return { state, traces: [], changed: false }
 	if (op.collection !== state.c || op.recordId !== state.r) {
 		throw new FoldStateError(
 			`Operation ${op.id} targets ${op.collection}/${op.recordId} but the fold state is for ${state.c}/${state.r}.`,

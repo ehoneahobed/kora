@@ -449,7 +449,8 @@ describe('KoraSyncServer', () => {
 			})
 
 			// A payload well past the 64-byte cap: rejected as a permanent
-			// OPERATION_TOO_LARGE (resending the same bytes can never fit).
+			// OPERATION_TOO_LARGE (resending the same bytes can never fit), per operation
+			// (RT-86): never a session error that would stop acknowledging the batch.
 			const big = createTestOp({
 				id: 'big-1',
 				nodeId: 'client-size',
@@ -465,13 +466,27 @@ describe('KoraSyncServer', () => {
 			})
 
 			await vi.waitFor(() => {
-				const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
-				expect(err).toBeDefined()
+				const rejected = messages.find(
+					(m) => m.type === 'operation-rejected' && m.code === 'OPERATION_TOO_LARGE',
+				)
+				expect(rejected).toBeDefined()
 			})
-			const err = messages.find((m) => m.type === 'error' && m.code === 'OPERATION_TOO_LARGE')
-			if (err?.type === 'error') {
-				expect(err.retriable).toBe(false)
+			const rejected = messages.find(
+				(m) => m.type === 'operation-rejected' && m.code === 'OPERATION_TOO_LARGE',
+			)
+			if (rejected?.type === 'operation-rejected') {
+				expect(rejected.retriable).toBe(false)
+				expect(rejected.operationId).toBe('big-1')
 			}
+			expect(messages.some((m) => m.type === 'error')).toBe(false)
+			// The batch is acknowledged past the refused operation.
+			await vi.waitFor(() =>
+				expect(
+					messages.some(
+						(m) => m.type === 'acknowledgment' && m.acknowledgedMessageId === 'size-batch',
+					),
+				).toBe(true),
+			)
 
 			await server.stop()
 		})
