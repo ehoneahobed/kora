@@ -48,7 +48,7 @@ declare const KORA_AUTH_SECRET: string
 Install the auth package:
 
 ```bash
-pnpm add @korajs/auth
+pnpm add @korajs/auth@beta
 ```
 
 For a standard Kora app, create the auth server with one call:

@@ -38,7 +38,7 @@ const authClient = createKoraAuth({
 ## Installation
 
 ```bash
-pnpm add @korajs/auth
+pnpm add @korajs/auth@beta
 ```
 
 ## Quick Start

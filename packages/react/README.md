@@ -5,7 +5,7 @@ React hooks and bindings for Kora.js. Reactive queries that update automatically
 ## Install
 
 ```bash
-pnpm add korajs @korajs/react
+pnpm add korajs@beta @korajs/react@beta
 ```
 
 ## Usage

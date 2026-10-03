@@ -5,7 +5,7 @@ Svelte bindings for [Kora.js](https://github.com/ehoneahobed/kora) offline-first
 ## Install
 
 ```bash
-pnpm add korajs @korajs/svelte
+pnpm add korajs@beta @korajs/svelte@beta
 ```
 
 ## Setup

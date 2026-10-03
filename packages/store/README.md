@@ -7,7 +7,7 @@ Local storage engine for Kora.js. Supports SQLite WASM with OPFS persistence, In
 ## Install
 
 ```bash
-pnpm add @korajs/store
+pnpm add @korajs/store@beta
 ```
 
 ## Usage

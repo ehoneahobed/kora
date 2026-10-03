@@ -5,7 +5,7 @@ Offline-first application framework. Local-first storage, reactive queries, auto
 ## Install
 
 ```bash
-pnpm add korajs
+pnpm add korajs@beta
 ```
 
 ## Quick Start

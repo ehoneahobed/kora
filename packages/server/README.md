@@ -5,7 +5,7 @@ Self-hosted sync server for Kora.js applications. Accepts WebSocket and HTTP con
 ## Install
 
 ```bash
-pnpm add @korajs/server
+pnpm add @korajs/server@beta
 ```
 
 ## Quick Start

@@ -16,7 +16,7 @@ The CLI is included when you install `kora` or can be installed standalone:
 pnpm add kora
 
 # Or install standalone
-pnpm add -D @korajs/cli
+pnpm add -D @korajs/cli@beta
 ```
 
 ---

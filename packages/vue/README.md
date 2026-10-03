@@ -5,7 +5,7 @@ Vue 3 composables for [Kora.js](https://github.com/ehoneahobed/kora) offline-fir
 ## Install
 
 ```bash
-pnpm add korajs @korajs/vue
+pnpm add korajs@beta @korajs/vue@beta
 ```
 
 ## Setup

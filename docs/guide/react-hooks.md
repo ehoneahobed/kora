@@ -10,7 +10,7 @@ description: "Kora.js React bindings: KoraProvider, typed hooks with createKoraH
 under `React.StrictMode` and in server rendering.
 
 ```bash
-pnpm add korajs @korajs/react
+pnpm add korajs@beta @korajs/react@beta
 ```
 
 The hooks are also re-exported from `korajs/react`.

@@ -5,7 +5,7 @@ CLI tooling for Kora.js. Scaffold new apps, run the development server, manage s
 ## Install
 
 ```bash
-pnpm add -g @korajs/cli
+pnpm add -g @korajs/cli@beta
 ```
 
 Or use directly with `npx`:

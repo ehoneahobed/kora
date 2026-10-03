@@ -7,7 +7,7 @@ Sync protocol and transports for Kora.js. Handles version vector delta sync, cau
 ## Install
 
 ```bash
-pnpm add @korajs/sync
+pnpm add @korajs/sync@beta
 ```
 
 ## Usage

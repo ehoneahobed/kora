@@ -7,7 +7,7 @@ Three-tier conflict resolution engine for Kora.js. Handles concurrent modificati
 ## Install
 
 ```bash
-pnpm add @korajs/merge
+pnpm add @korajs/merge@beta
 ```
 
 ## How It Works

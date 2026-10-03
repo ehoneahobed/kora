@@ -5,7 +5,7 @@ Browser DevTools extension for Kora.js. Inspect operations, trace conflict resol
 ## Install
 
 ```bash
-pnpm add -D @korajs/devtools
+pnpm add -D @korajs/devtools@beta
 ```
 
 ## Enable

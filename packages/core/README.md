@@ -7,7 +7,7 @@ Schema definitions, operations, Hybrid Logical Clock, version vectors, and type 
 ## Install
 
 ```bash
-pnpm add @korajs/core
+pnpm add @korajs/core@beta
 ```
 
 ## Usage

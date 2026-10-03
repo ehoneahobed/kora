@@ -514,7 +514,7 @@ If you want full control over your deployment (or need to deploy to a platform K
 ### Install the server package
 
 ```bash
-pnpm add @korajs/server
+pnpm add @korajs/server@beta
 ```
 
 ### Create a server entry file
