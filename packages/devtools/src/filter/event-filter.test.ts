@@ -58,6 +58,8 @@ describe('getEventCategory', () => {
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',
 			'query:executed': 'query',
+			'query:error': 'query',
+			'storage:persistence': 'connection',
 			'connection:quality': 'connection',
 		}
 
