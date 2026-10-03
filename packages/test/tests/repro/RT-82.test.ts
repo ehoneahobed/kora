@@ -14,6 +14,12 @@
  *
  * Asserts the CORRECT behaviour (fails at 97981a7): the deleting device and the receiver
  * agree on the child.
+ *
+ * REDESIGN (Phase 3 round 4, 2026-10-03): durable provisional effects are removed. A
+ * sealed foreign key on a cascade relation is refused at device creation
+ * (SEALED_RELATION_FIELD); with the key in cleartextFields the server derives the
+ * cascade the deleter's refused copy did not cover, as without encryption. This repro
+ * now asserts (1) the refusal and (2) the deleter and the receiver agreeing.
  */
 import { defineSchema, t } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
@@ -38,7 +44,12 @@ const schema = defineSchema({
 }) as unknown as SchemaDefinition
 
 const encryption = {
-	config: { enabled: true, key: 'correct horse battery staple' },
+	// The foreign key the server enforces travels in cleartext (a sealed one is refused).
+	config: {
+		enabled: true,
+		key: 'correct horse battery staple',
+		cleartextFields: { todos: ['projectId'] },
+	},
 	salt: new Uint8Array(16).fill(7),
 	iterations: 1_000,
 }
@@ -48,7 +59,16 @@ async function syncAll(devices: TestDevice[], passes = 3): Promise<void> {
 }
 
 describe('RT-82: a refused sealed cascade copy never retires the receivers effect', () => {
-	test("the deleting device and a receiver agree when the deleter's copy is refused", async () => {
+	test('a sealed foreign key on the cascade relation is refused at device creation', async () => {
+		await expect(
+			createTestNetwork(schema, {
+				devices: 1,
+				encryption: { ...encryption, config: { enabled: true, key: 'k' } },
+			}),
+		).rejects.toMatchObject({ code: 'SEALED_RELATION_FIELD', relation: 'todoProject' })
+	})
+
+	test("encrypted, foreign key in cleartext: the deleter and a receiver agree when the deleter's copy is refused", async () => {
 		// App policy: a todo may be deleted only by the device (user) that created it.
 		const creators = new Map<string, string>()
 		const network = await createTestNetwork(schema, {

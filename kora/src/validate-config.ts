@@ -1,4 +1,5 @@
 import { KoraError, SchemaValidationError } from '@korajs/core'
+import { validateEncryptedRelations } from '@korajs/sync'
 import { detectAdapterType } from './adapter-resolver'
 import type { KoraConfig } from './types'
 
@@ -35,6 +36,9 @@ export function validateCreateAppConfig(config: KoraConfig): void {
 				{ unassignedWrites: policy, fix: "Use 'hold' (default) or 'assign-to-first-user'." },
 			)
 		}
+		// End-to-end encryption may not seal the foreign key of a relation the server must
+		// enforce on delete (cascade, set-null, restrict): RT-74, RT-78, RT-82.
+		validateEncryptedRelations(config.schema, config.sync.encryption)
 	}
 
 	const adapter = config.store?.adapter ?? detectAdapterType()

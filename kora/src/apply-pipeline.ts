@@ -132,10 +132,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return this.applyRemoteDelete(op)
 		}
 		const result = await this.applyFolded(op)
-		if (result === 'applied') {
-			await this.checkConstraintsOptimistically(op)
-			await this.cascadeLateChildOfOwnDelete(op)
-		}
+		if (result === 'applied') await this.checkConstraintsOptimistically(op)
 		return result
 	}
 
@@ -178,12 +175,6 @@ export class ApplyPipeline implements LocalMutationHandler {
 		// copies and the server derives its own; a copy authored here would be stored and
 		// relayed once per receiving device. They are folded as provisional effects (never
 		// logged, sequenced or queued) until the server's copy arrives.
-		// RT-74: under end-to-end encryption with the relation's field sealed, the server
-		// derives nothing; the effect is durable (kept at catch-up) and retired only by
-		// the deleting device's real copy. Receivers author nothing: the deleting device
-		// covers the children it knew, and cascades a child it learns of later itself
-		// (cascadeLateChildOfOwnDelete); until then every device folds the same effect,
-		// stamped right after the parent.
 		await this.deps.store.applyProvisionalSideEffects(
 			op,
 			check.sideEffectOps.map((effect) => ({
@@ -193,66 +184,9 @@ export class ApplyPipeline implements LocalMutationHandler {
 				data: effect.data,
 				previousData: effect.previousData,
 				ruleId: `relation:${effect.relationName}:${effect.type === 'delete' ? 'cascade' : 'set-null'}`,
-				durable: this.deps.store.isRelationSealed(effect.relationName),
 			})),
 		)
 		return result
-	}
-
-	/**
-	 * RT-74: a remote write of a child under a sealed relation (the server cannot
-	 * cascade it) whose parent THIS device deleted, and which this device has not
-	 * cascaded yet (it did not know the child when it deleted the parent): this device,
-	 * the parent delete's author, authors the cascade (or set-null) now, as a real
-	 * operation naming the delete as a causal parent. It is the only device that does
-	 * (one copy per child), and the receivers' durable provisional effects are retired
-	 * by it. Without a sealed relation the server derives the late cascade instead.
-	 */
-	private async cascadeLateChildOfOwnDelete(op: Operation): Promise<void> {
-		const store = this.deps.store
-		const relations = store.getSchema().relations ?? {}
-		for (const [name, relation] of Object.entries(relations)) {
-			if (relation.from !== op.collection || !store.isRelationSealed(name)) continue
-			const child = await store.findMaterializedRow(op.collection, op.recordId)
-			if (!child || child.deleted) return
-			const parentId = child.record[relation.field]
-			if (typeof parentId !== 'string' || parentId.length === 0) continue
-			const parent = await store.findMaterializedRow(relation.to, parentId)
-			if (!parent?.deleted) continue
-			const parentOps = await store.getOperationsForRecord(relation.to, parentId)
-			const ownDelete = parentOps
-				.filter(
-					(candidate) => candidate.type === 'delete' && candidate.nodeId === store.getNodeId(),
-				)
-				.at(-1)
-			if (!ownDelete) continue
-			const childOps = await store.getOperationsForRecord(op.collection, op.recordId)
-			const covered = childOps.some(
-				(candidate) =>
-					candidate.nodeId === store.getNodeId() && candidate.causalDeps.includes(ownDelete.id),
-			)
-			if (covered) continue
-			const ctx = store.createMutationContext(relation.from, { extraCausalDeps: [ownDelete.id] })
-			try {
-				if (relation.onDelete === 'cascade') {
-					await executeDelete(ctx, op.recordId)
-					return
-				}
-				await executeUpdate(ctx, op.recordId, { [relation.field]: null })
-			} catch (error) {
-				// A restrict below the child, or a validation error: the child stays, and the
-				// failure is reported rather than failing the remote apply.
-				this.deps.emitter?.emit({
-					type: 'sync:apply-failed',
-					operationId: op.id,
-					collection: op.collection,
-					recordId: op.recordId,
-					code: 'LATE_CASCADE_FAILED',
-					message: `Late cascade of "${op.collection}/${op.recordId}" (relation "${name}") failed: ${error instanceof Error ? error.message : String(error)}`,
-					retriable: false,
-				})
-			}
-		}
 	}
 
 	/**

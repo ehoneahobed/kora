@@ -34,7 +34,27 @@ encryption: {
 }
 ```
 
-Values listed here are visible to the server. List only scope keys.
+Values listed here are visible to the server. List only scope keys and the foreign keys below.
+
+### Foreign keys of enforced relations must be cleartext
+
+The sync server enforces a relation's `onDelete` policy (`cascade`, `set-null`, `restrict`) for every device: it is the only replica that sees every child, including children created concurrently on devices that the deleting device has never heard of. It can do that only when it can read the foreign key. So, with encryption enabled, the foreign-key field of every relation whose `onDelete` is `cascade`, `set-null` or `restrict` **must** be listed in `cleartextFields`. `createApp` refuses a configuration that seals one, at startup, with a `SealedRelationFieldError` (`code: 'SEALED_RELATION_FIELD'`) naming the relation, the field and the fix:
+
+```typescript
+relations: {
+  todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'cascade' },
+},
+// ...
+encryption: {
+  enabled: true,
+  key: passphrase,
+  cleartextFields: { todos: ['ownerId', 'projectId'] }, // projectId: the server cascades
+}
+```
+
+The server then learns which project each todo belongs to, and nothing else about the todo. If that is not acceptable, use `onDelete: 'no-action'` for the relation (its foreign key may stay sealed) and delete the children in your own code.
+
+With the foreign key in cleartext, cascades behave exactly as without encryption: the deleting device authors the effects on the children it holds, the server derives the effects on children it holds and the deleting device did not know (its plaintext cascade and set-null operations touch only cleartext fields, so encrypted devices accept them), and every other device applies a remote delete's effects locally until the real copies arrive.
 
 ## Enabling Encryption
 
@@ -251,4 +271,4 @@ With this setup:
 - **Key material is per device until Phase 4 (ENC-1)**: `createApp` derives the key with a random salt per process, so two devices with the same passphrase do not yet derive the same key. Decryption then fails with `KEY_ID_MISMATCH` (the envelope's `keyId` names the material) and the operation is quarantined, not lost. Until shared key material ships, construct the encryptor with a shared salt (`SyncEncryptor.create(config, salt)`) or `SyncEncryptor.fromKeys`.
 - **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
 - **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (beta.14 or later on the server).
-- **Server-side rules see only cleartext fields**: cascades and set-nulls run on the server only when the relation's field is listed in `cleartextFields`; otherwise each device cascades for itself. Concretely (beta.14): the device that deletes the parent authors the cascades (or set-nulls) of the children it holds, and of any child it learns of later, as ordinary encrypted operations; every other device applies a remote delete's effects locally, keeps them across reconnects, and authors nothing (so one copy per child is stored). A child created concurrently on another device is therefore cascaded there at once and made durable for everyone when the deleting device next syncs; until then each device holds the same local result. A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.
+- **Server-side rules see only cleartext fields**: referential policies (cascade, set-null, restrict) are enforced on the server, so their foreign keys must be cleartext (see above; a sealed one is refused at startup). A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.

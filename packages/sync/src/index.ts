@@ -227,6 +227,12 @@ export {
 } from './encryption/sync-encryptor'
 
 export {
+	SealedRelationFieldError,
+	validateEncryptedRelations,
+} from './encryption/encrypted-relations'
+export type { EncryptedRelationConfig } from './encryption/encrypted-relations'
+
+export {
 	KeyDerivationError,
 	deriveKey,
 	deriveVersionedKey,
