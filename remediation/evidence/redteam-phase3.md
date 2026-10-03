@@ -204,3 +204,93 @@ Every finding has a repro under `tests/repro/` that fails at 97981a7. Each is tr
 - Key rotation across `keyVersion`, and shared key distribution (Phase 4).
 - An interrupted `importBackup`, and real Chromium beyond the `check.mjs --all` browser suites.
 - Third-party `ServerStore` implementations without `deriveServerOperationId` (unkeyed derivation, documented).
+
+# Round 4 (2026-10-03, final)
+
+Independent adversarial review of `fix/phase3-one-fold` at 5498764, covering the round-3 fixes (`git log 3fe7eec..5498764`):
+- one canonical operation body (`canonicalizeOperationBody`, applied once in `createOperation`) and the legacy rule (`canonicalizeLegacyOperation`, applied in `mergeOp`);
+- `update(id, { field: undefined })` as a clear (`null`);
+- `FORGED_DUPLICATE`: a duplicate upload must equal the stored operation;
+- `SEALED_RELATION_FIELD`: enforced foreign keys must be cleartext under encryption;
+- authority history and `revokedAuthoritativeNodeIds` (protobuf field 48);
+- json values that are strings, stored as JSON on the server stores.
+
+Method:
+- Executable repros against:
+  - the real `KoraSyncServer` and `ClientSession` (memory store, and Postgres 16 through `KORA_REPRO_STORE=postgres`);
+  - `TestDevice` networks (real SQLite store and `SyncEngine`) with memory, SQLite and Postgres server stores.
+- An end-to-end value probe (not kept, because it passes) through device A, the server (memory, SQLite, Postgres) and devices B and C. It compared every replica with the server row.
+- The real beta.13 build (33bca46), with the four probes under `scripts/remediation`.
+- Own Postgres 16 (`initdb -E UTF8 --locale=C.UTF-8`, port 54411).
+- Real Chromium through the `check.mjs --all` browser suites.
+
+Every finding has a repro under `tests/repro/` that fails at 5498764. Each is tracked as RT-84..RT-87 (status open, phase 3).
+
+| ID | Sev | Finding | Location | Required fix | Repro |
+|---|---|---|---|---|---|
+| RT-84 | P1 | Regression of the RT-77 fix. The server stores a schema-transformed operation under its original id, with the transformed data and schema version and without `hashVersion`. A re-upload of the device's own, unaltered operation therefore never equals the stored copy: a declared `hashVersion: 2` differs from the stored version 1, and an undeclared one differs in data. It is refused `FORGED_DUPLICATE`, which is non-retriable and terminal. The device re-folds the record without its own write. The server and every peer keep the write, and the device never applies the server's copy (it holds the id). The result is a permanent divergence and a write lost on its author. Re-uploads happen whenever an ack is lost after the batch committed, and after an app upgrade with unacked old-schema operations. Both a beta.14 writer and a beta.13 (protocol 1) writer are refused. By code reading, a beta.13 protocol-1 encrypted payload is refused the same way on every re-upload: it is re-encrypted with a fresh IV each time. | `server/src/session/client-session.ts:2844-2861, 2431-2440`; `server/src/session/duplicate-identity.ts:35-41` | Compare a duplicate with what the client sent, not with the copy the server rewrote. Either persist the as-uploaded identity beside a transformed copy, or compare such a copy on id, node, sequence, type, collection, record and timestamp only. | `packages/server/tests/repro/RT-84.test.ts` (memory and Postgres) |
+| RT-85 | P2 | Regression of the round-4 canonical body. `mergeOp` folds every update without `hashVersion: 2` as a beta.13 body, where a `previousData` key absent from `data` is a clear. Server-transformed copies have no `hashVersion`. A transform that stops older clients from writing a field (`delete data.score`) leaves `score` in `previousData`. Every replica then sets `score` to `null`. Before round 4 the copy did not touch it. | `core/src/fold/fold.ts:398`; `core/src/operations/canonical-body.ts:260-270`; `client-session.ts:2844-2861` | Apply the legacy clear only to genuine beta.13 bodies, marked at ingest. Or have the transform step drop from `previousData` every key the transform removed from `data`. | `packages/server/tests/repro/RT-85.test.ts` (memory and Postgres) |
+| RT-86 | P1 (not a round-4 regression) | A local write larger than the server's `maxOperationBytes` (256 KiB by default) is accepted by the API. The server answers with a session-level `OPERATION_TOO_LARGE` error and stops acknowledging the batch. The device re-sends it every session, so no later write of that device reaches the server or a peer. Nothing is recorded as rejected, so the app is not told. | `client-session.ts:2560-2569`; no client-side size check | Refuse the operation terminally, per operation (ack past it). And/or refuse it in the local API, using a limit the handshake advertises. | `packages/test/tests/repro/RT-86.test.ts` |
+| RT-87 | P1 (not a round-4 regression) | `t.timestamp()` accepts any finite number, and the Postgres server store materializes it as BIGINT. A fractional value fails with SQLSTATE 22P02, which maps to `UNSTORABLE_VALUE` (terminal), so the record vanishes from the writing device. A value beyond the BIGINT range (`1e20`) fails with 22003, which is not mapped: the batch fails, the device re-sends it forever, and its later writes never reach a peer. Memory and SQLite servers and every client store hold both values. | `core/src/schema/validation.ts` (timestamp); `server/src/store/materialization.ts` (`fieldTypeToSql`); `postgres-server-store.ts:160-187` | Define the timestamp domain once and enforce it where the value is written: a safe integer, or a value rounded in the canonical body. Map every class-22 refusal to a per-operation terminal refusal. | `packages/test/tests/repro/RT-87.test.ts` (Postgres) |
+
+## What held up (round 4)
+
+- **The canonical body, end to end.**
+  - The value probe passed on memory, SQLite and Postgres 16. A wrote each value, synced and updated it, and B and a fresh C received it through delivery.
+  - All three devices and the server row held identical values. Nothing was rejected or quarantined.
+  - Values covered:
+    - a literal user `{ $koraBytes: 'AAEC' }`, top level and nested in an array. It stays a plain object and is never decoded to bytes, because decoding is richtext-only;
+    - U+0000, U+FFFF and lone surrogates in json strings, json keys, `t.string()` values and array elements;
+    - `-0` in arrays and number fields (it becomes `0`), `1e308`, `5e-324`, `2^53` and `0.1 + 0.2`;
+    - json values that are strings: ISO-looking, json text (`'{"a":1}'`), `'123'` and `''`;
+    - json `42`, `false` and `{ a: null }`;
+    - nested `Date`s and `Date`s in arrays, which become ISO strings everywhere;
+    - nested `undefined` members of `t.object()` values.
+  - `hashed == stored == wire == folded` held on every path tried: protobuf `hasPreviousData`/`{}`, the SQLite and Postgres operation columns, scope entries and route writes.
+  - Set-null and constraint-correction shapes always have `previousData` keys equal to their `data` keys, so the legacy rule never fires on them.
+- **Update `field: undefined` = clear.** It behaves exactly like `null` on every path, with no new refusal or divergence:
+  - required fields and defaults;
+  - state machines: a clear bypasses one exactly as `null` always did;
+  - scope fields: a clear that leaves the uplink scope is refused `SCOPE_VIOLATION` and re-folded, as for `null`;
+  - backfills: `sameValue` treats `undefined` as `null`.
+  RT-80 passes.
+- **FORGED_DUPLICATE without transforms.** No false positive for these honest re-uploads:
+  - beta.13 history re-uploaded after the upgrade. Cleared fields are stored as `null` on the server (RT-71) and are absent from the device's log, and the two still compare equal;
+  - renumbered version-1 operations (the sequence is not compared for version 1);
+  - version-2 renumbering, which re-hashes to a new id;
+  - a clock rebase, which re-stamps only never-sent operations (`wasSent` is persisted);
+  - envelopes re-sealed with a fresh nonce.
+  RT-77's two forgeries are refused on memory and on Postgres.
+- **SEALED_RELATION_FIELD.**
+  - The check skips `onDelete: 'no-action'` and an omitted `onDelete` (possible from JS; the schema types require it).
+  - `relation.field` always lives on `relation.from` and is checked against that collection's `cleartextFields`.
+  - No bundled template or example enables encryption, so none fails at startup.
+  - The migration guidance (list the key, or use `no-action`) matches the code.
+- **Authority revocation.** Ids are refused at handshake for good. Revocations are persisted on devices and never re-learned. Field 48 decodes on beta.14, and beta.13 decoders skip it (`protocol-v2-compat.mjs`).
+- **beta.13 interop (real build 33bca46).** No rejection and no quarantine in any probe:
+  - `protocol-v2-compat.mjs`: both scenarios;
+  - `rt-legacy-id-probe.mjs`: 6/6;
+  - `rt3-legacy-probe.mjs`: 6/6;
+  - `rt3-upgrade-clear-probe.mjs`: 3/3 local, and 6/6 in both sync modes.
+- **Gates.**
+  - The fold gate on 400 new seeds (seed base 1720001) passed all four tests. Fold-vs-legacy (40 seeds) also passed.
+  - `chaos:nightly` passed: 10 clients × 1,000 ops, plus the no-silent-loss invariants (11/11).
+  - `test:release-gate` passed: production path, sync reconnect, real-path chaos and every benchmark gate.
+  - `check.mjs --all` ran with Postgres 16, real Chromium and `LMS_OPS=20000`: 169/197 fixed, every new repro failing as owned. The only error was NEW-STORE-9 (browser LMS-7b timing under load).
+  - In isolation every LMS-7 check passed. The browser suite scored 48/51, and the 3 failures are the expected rejected-proposal checks LMS-5h and LMS-6b.
+
+## Not filed (round 4, P3 or below)
+
+- A json object with an own `__proto__` key (from `JSON.parse`) silently loses that key on every replica. The fold's `normalizeValue` assigns it as a prototype. The loss is consistent across replicas, but such a value is not refused the way `Map` and `Set` are.
+- Custom resolvers' outputs are not canonicalized: `normalizeValue` keeps `Date`, `NaN` and `-0`. For such outputs, the in-memory state and the persisted (JSON) state can differ.
+- Route writes skip schema type checks:
+  - a `Date` in a `t.timestamp()` field becomes an ISO string on every replica, and on Postgres the write fails;
+  - a route PATCH that forwards optional request fields (`{ notes: body.notes }`) now clears them everywhere, where before round 4 they were stripped. Document this.
+- Client-side operation transforms keep `hashVersion: 2` on a rewritten body in the device's log. Nothing re-verifies that body today. Verifying it, or echoing it to the server, would fail.
+
+## Not attacked (round 4)
+
+- Real Chromium beyond the `check.mjs --all` browser suites. The canonical body sits above the adapters, which only see serialized strings.
+- Key rotation across `keyVersion`. Also, the cleartext set changing between an upload and its re-upload, which by code reading would also trip `FORGED_DUPLICATE`.
+- HTTP long-poll specifics, DevTools traces, and an interrupted `importBackup`.
+- Two Postgres instances running at the same time with different revocation configs.
