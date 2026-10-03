@@ -9,7 +9,7 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, quoteIdent } from '@korajs/core'
+import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -290,6 +290,11 @@ export class PostgresServerStore implements ServerStore {
 		})
 		this.timeSource = timeSource ?? { now: () => Date.now() }
 		this.ready = this.initialize()
+		// RT-88: startup runs before anyone awaits it. The failure is not swallowed: every
+		// method awaits `ready` and rejects with it, `whenReady()` returns it, and
+		// createPostgresServerStore awaits it. Without this handler an unreachable
+		// database would be an unhandled rejection, which terminates Node.
+		this.ready.catch(() => {})
 	}
 
 	/** Resolves once the store's tables and identity are loaded. */
@@ -2851,13 +2856,58 @@ export async function createPostgresServerStore(
 	const client = postgresClient(options.connectionString)
 	const db = drizzleFn(client)
 
-	return new PostgresServerStore(db, options.nodeId, undefined, {
+	const store = new PostgresServerStore(db, options.nodeId, undefined, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
 		...(options.revokedAuthoritativeNodeIds
 			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
 			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
+	// RT-88: fail at startup, where the caller awaits, rather than on the first sync.
+	try {
+		await store.whenReady()
+	} catch (error) {
+		await endPostgresClient(client)
+		throw new ServerStoreUnavailableError(options.connectionString, error)
+	}
+	return store
+}
+
+/**
+ * The Postgres server store could not start: the database is unreachable, refused the
+ * credentials, or its tables could not be created. `cause` is the driver's error.
+ */
+export class ServerStoreUnavailableError extends KoraError {
+	constructor(connectionString: string, cause: unknown) {
+		const reason = cause instanceof Error ? cause.message : String(cause)
+		super(
+			`Could not start the PostgreSQL server store (${redactConnectionString(connectionString)}): ${reason}. Check that the database is running and reachable, and that the connection string and credentials are correct.`,
+			'SERVER_STORE_UNAVAILABLE',
+			{ target: redactConnectionString(connectionString) },
+		)
+		this.name = 'ServerStoreUnavailableError'
+		;(this as { cause?: unknown }).cause = cause
+	}
+}
+
+/** host:port/database of a connection string, never its credentials. */
+function redactConnectionString(connectionString: string): string {
+	try {
+		const url = new URL(connectionString)
+		return `${url.hostname}${url.port ? `:${url.port}` : ''}${url.pathname}`
+	} catch {
+		return 'invalid connection string'
+	}
+}
+
+async function endPostgresClient(client: unknown): Promise<void> {
+	const end = (client as { end?: (options?: { timeout?: number }) => Promise<void> }).end
+	if (typeof end !== 'function') return
+	try {
+		await end.call(client, { timeout: 0 })
+	} catch {
+		// Best effort: the startup error above is the one that matters.
+	}
 }
 
 async function loadPostgresDeps(): Promise<{

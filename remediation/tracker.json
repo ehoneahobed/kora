@@ -3110,6 +3110,21 @@
    ],
    "pr": null,
    "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression. Locations: core/src/schema/validation.ts (timestamp: any finite number), server/src/store/materialization.ts fieldTypeToSql ('timestamp' -> BIGINT on Postgres), server/src/store/postgres-server-store.ts:160-187 (PG_UNSTORABLE_VALUE_CODES = 22021, 22P05, 22P02: a fractional value fails 22P02 and is refused terminally; 1e20 fails 22003 numeric_value_out_of_range, not mapped, so the batch fails and is re-sent every session). Memory and SQLite server stores and every client store hold both values. Repro packages/test/tests/repro/RT-87.test.ts (KORA_PG_TEST_URL): fractional -> A shows only the next write, rejection UNSTORABLE_VALUE; 1e20 -> B receives nothing, A has no rejection. Required fix: define the timestamp domain once and enforce it where the value is written (validateFieldValue: a safe integer, or round in the canonical body), so every store holds every accepted value; map every Postgres value refusal (SQLSTATE class 22) to a per-operation terminal refusal, never a failed batch. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commit 1a134ab). One value domain (core schema/value-domain.ts, table in docs/guide/schema-design.md#value-domain): t.timestamp() = integer ms in [-8.64e15, 8.64e15] (fractions refused with a clear error, not rounded), t.number() finite, structured values depth <= 64, no __proto__ key, not exactly the wire's { __kora_bytes__ } form; enforced in validateRecord, after atomic ops resolve (assertResolvedFieldValue), and on server ingest of uploads and route writes (operationValueViolation on the view, SCHEMA_VALIDATION_ERROR per op). Every Postgres class-22/23 refusal except 23505 maps to per-op UNSTORABLE_VALUE; SQLite CHECK/NOTNULL/TOOBIG/MISMATCH too. Also found by the new property test: Postgres BIGINT timestamps were read back as strings (fixed in deserializeFieldValue), and the wire decoded json/object values with integer keys and number values (even { \" \": 0 }) as bytes and stripped objects containing __kora_bytes__ (fixed in the sync serializer). Tests: repro RT-87 (Postgres), core value-domain.test.ts, server value-domain-ingest.test.ts (memory, SQLite, Postgres), sync wire-value-domain.test.ts, packages/test value-domain-roundtrip.test.ts (seeded random values per field type through memory, SQLite and Postgres server stores, the protobuf wire and a peer client store)."
+  },
+  {
+   "id": "RT-88",
+   "title": "The Postgres server store starts initializing in its constructor and nobody holds the promise: an unreachable database is an UNHANDLED rejection (terminates Node by default) while createPostgresServerStore() resolves as if the store were usable",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-88.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 4 integration, 2026-10-03 (platform engineer's note on the RT-30 merge). Location: server/src/store/postgres-server-store.ts constructor (this.ready = this.initialize(), never awaited until first use) and createPostgresServerStore (returned the store without awaiting ready; the postgres client was never closed on failure). Repro packages/server/tests/repro/RT-88.test.ts (no Postgres needed: closed local port): before, one unhandledRejection and the factory resolved. FIXED (Phase 4 integration, branch worktree-agent-a59f71e9346b34bbf): the constructor marks the startup promise handled (every method awaits ready and rejects with the error, whenReady() returns it, so nothing is swallowed); createPostgresServerStore awaits whenReady(), ends its client on failure and rejects with ServerStoreUnavailableError (new export, code SERVER_STORE_UNAVAILABLE, host:port/db only, never credentials, driver error as cause). Residual: PostgresServerStore.close() does not end the client createPostgresServerStore opened (pre-existing)."
   }
  ],
  "rejectedProposalPins": {
