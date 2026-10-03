@@ -14,12 +14,15 @@
  *                                         fragment of a larger file). The reason is required.
  *   <!-- docs-check: continue -->        append this block to the previous checked block of the
  *                                         same page and check them as one module (tutorials).
+ *   <!-- docs-check: standalone -->      check this block without the page prelude (a setup
+ *                                         block that defines what the prelude declares).
  * A page-level hidden prelude declares what the page's snippets assume (an `app`, a schema):
  *   <!-- docs-check-prelude
  *   import { createApp } from 'korajs'
  *   declare const app: ...
  *   -->
- * The prelude is prepended to every later checked block of that page; a new one replaces it,
+ * The prelude is prepended to every later checked block of that page, minus the names the block
+ * declares itself (its own imports and variables win); a new prelude replaces it,
  * and `<!-- docs-check-prelude -->` on one line clears it.
  *   <!-- docs-check: file src/schema.ts -->  write this block to that path in the page's own
  *                                         directory, so other blocks can import './src/schema'.
@@ -99,10 +102,10 @@ function extractUnits(file) {
 			pendingMarker = { kind: 'skip', arg: 'tutorial edit' }
 			continue
 		}
-		const marker = trimmed.match(/^<!--\s*docs-check:\s*(skip|continue|file)\b(.*?)-->$/)
+		const marker = trimmed.match(/^<!--\s*docs-check:\s*(skip|continue|file|standalone)\b(.*?)-->$/)
 		if (marker) {
 			const arg = marker[2].trim()
-			if (marker[1] !== 'continue' && arg === '') {
+			if ((marker[1] === 'skip' || marker[1] === 'file') && arg === '') {
 				problems.push(
 					`${file}:${i + 1}: a ${marker[1]} marker needs ${marker[1] === 'skip' ? 'a reason' : 'a path'}`,
 				)
@@ -141,13 +144,107 @@ function extractUnits(file) {
 			continue
 		}
 		const path = marked?.kind === 'file' ? marked.arg : null
-		units.push({ file, path, tsx: lang === 'tsx', prelude, segments: [{ startLine, code }] })
+		const unitPrelude = marked?.kind === 'standalone' ? '' : prelude
+		units.push({
+			file,
+			path,
+			tsx: lang === 'tsx',
+			prelude: unitPrelude,
+			segments: [{ startLine, code }],
+		})
 	}
 	return { units, problems, skipped }
 }
 
 const pkg = (name) => join(root, 'packages', name)
 const typesDir = (pkgName, typesName) => join(pkg(pkgName), 'node_modules', '@types', typesName)
+
+/** Names a module declares at its top level (imports, variables, functions, classes, types). */
+function topLevelNames(code, tsx) {
+	const source = ts.createSourceFile(
+		tsx ? 'x.tsx' : 'x.ts',
+		code,
+		ts.ScriptTarget.ES2022,
+		false,
+		tsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+	)
+	const names = new Set()
+	const bindingNames = (node) => {
+		if (ts.isIdentifier(node)) names.add(node.text)
+		else if (ts.isObjectBindingPattern(node) || ts.isArrayBindingPattern(node)) {
+			for (const element of node.elements) {
+				if (!ts.isOmittedExpression(element)) bindingNames(element.name)
+			}
+		}
+	}
+	for (const statement of source.statements) {
+		if (ts.isImportDeclaration(statement)) {
+			const clause = statement.importClause
+			if (clause?.name) names.add(clause.name.text)
+			const bindings = clause?.namedBindings
+			if (bindings && ts.isNamespaceImport(bindings)) names.add(bindings.name.text)
+			if (bindings && ts.isNamedImports(bindings)) {
+				for (const element of bindings.elements) names.add(element.name.text)
+			}
+		} else if (ts.isVariableStatement(statement)) {
+			for (const declaration of statement.declarationList.declarations) {
+				bindingNames(declaration.name)
+			}
+		} else if (
+			(ts.isFunctionDeclaration(statement) ||
+				ts.isClassDeclaration(statement) ||
+				ts.isInterfaceDeclaration(statement) ||
+				ts.isTypeAliasDeclaration(statement) ||
+				ts.isEnumDeclaration(statement)) &&
+			statement.name
+		) {
+			names.add(statement.name.text)
+		}
+	}
+	return names
+}
+
+/**
+ * The page prelude without the names the block declares itself: the block's own
+ * `import { createApp }` or `const app = ...` replaces the prelude's, as a reader expects.
+ */
+function preludeFor(prelude, blockCode, tsx) {
+	if (!prelude) return ''
+	const own = topLevelNames(blockCode, tsx)
+	if (own.size === 0) return prelude
+	const source = ts.createSourceFile(
+		'p.tsx',
+		prelude,
+		ts.ScriptTarget.ES2022,
+		true,
+		ts.ScriptKind.TSX,
+	)
+	const kept = []
+	for (const statement of source.statements) {
+		const text = prelude.slice(statement.getFullStart(), statement.getEnd())
+		const names = topLevelNames(text.trim(), true)
+		if (names.size === 0 || ![...names].some((name) => own.has(name))) {
+			kept.push(text)
+			continue
+		}
+		const bindings = ts.isImportDeclaration(statement)
+			? statement.importClause?.namedBindings
+			: undefined
+		if (bindings && ts.isNamedImports(bindings)) {
+			const remaining = bindings.elements
+				.filter((element) => !own.has(element.name.text))
+				.map((element) => element.getText(source))
+			const typeOnly = statement.importClause?.isTypeOnly ? 'type ' : ''
+			if (remaining.length > 0) {
+				kept.push(
+					`\nimport ${typeOnly}{ ${remaining.join(', ')} } from ${statement.moduleSpecifier.getText(source)}`,
+				)
+			}
+		}
+		// Any other statement declaring a name the block declares is dropped whole.
+	}
+	return kept.join('').replace(/^\n+/, '')
+}
 
 function slug(file) {
 	return file.replace(/[^\w]+/g, '_')
@@ -179,9 +276,14 @@ for (const file of files) {
 		const map = [] // [generatedLineStart, mdStartLine, lineCount]
 		let text = ''
 		let line = 0
-		if (unit.prelude) {
-			text += `${unit.prelude}\n`
-			line += unit.prelude.split('\n').length
+		const prelude = preludeFor(
+			unit.prelude,
+			unit.segments.map((seg) => seg.code).join('\n'),
+			unit.tsx,
+		)
+		if (prelude) {
+			text += `${prelude}\n`
+			line += prelude.split('\n').length
 		}
 		for (const seg of unit.segments) {
 			const n = seg.code.split('\n').length
