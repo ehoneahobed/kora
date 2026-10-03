@@ -3,18 +3,24 @@
  * late concurrent write older than the row's field version.
  *
  * A device re-materializes with row snapshots (`createSnapshotState`) when its log
- * was compacted before W7 ('snapshot+log') or holds ANY quarantined row ('kept': then
- * every record of the database becomes a snapshot). The snapshot stamps each field at
- * its version with a sentinel id that dominates every operation of that HLC, and
- * clears / resets older history. A concurrent operation that was offline (HLC older
- * than the field version) and arrives afterwards is folded by every other replica
- * (counters add the delta, arrays add the element, richtext merges the Yjs update)
- * but is ignored by the snapshot replica: permanent divergence on that device for
- * exactly the offline-concurrent writes Kora exists to merge. The same applies to
- * server stores that keep pre-fold rows of an unclean log.
+ * was compacted before W7 ('snapshot+log') or a record owns a quarantined row
+ * ('kept'). The snapshot stamps each field at its version with a sentinel id that
+ * dominates every operation of that HLC. A concurrent operation that was offline
+ * (HLC older than the field version) and arrives afterwards is folded by every other
+ * replica but ignored by the snapshot replica.
  *
- * Asserts the CORRECT behaviour (fails at 959b791): the snapshot replica folds the
- * late operation like every other replica.
+ * Resolution (Phase 3 fix, see tracker RT-68):
+ * - A snapshot is seeded from the record's stored fold state wherever the replica
+ *   still has one (a `kept` record of a W7 database, a plan change): exact. Test 1.
+ * - A server-authoritative field keeps the authority class of its version's writer, so
+ *   a device write the server's decision beat cannot overturn it when re-merged. Test 2.
+ * - A row-ONLY snapshot (no fold state left: a pre-W7 compaction, or a backup from an
+ *   earlier release) cannot know whether an older write is already in the row's value,
+ *   so it stays dominant (re-merging a reflected write must not double count). That
+ *   residual is bounded: such records are tracked as approximate, the store requests a
+ *   full resync, and the server's fold state (scope entry) or the record's restored
+ *   history replaces the snapshot. Convergence is proven in
+ *   `packages/store/tests/repro/RT-68.test.ts`.
  */
 import { describe, expect, test } from 'vitest'
 import { HybridLogicalClock } from '../../src/clock/hlc'
@@ -31,6 +37,7 @@ const schema = defineSchema({
 			fields: {
 				stock: t.number().default(0).merge('counter'),
 				tags: t.array(t.string()).default([]),
+				owner: t.string().optional().merge('server-authoritative'),
 			},
 		},
 	},
@@ -81,7 +88,8 @@ describe('RT-68: row snapshot vs a late concurrent operation', () => {
 		const expected = materialize(full as NonNullable<typeof full>)
 		expect(expected).toEqual({ stock: 14, tags: ['x', 'z', 'y'] })
 
-		// Device c held insert + restock; its row becomes the base snapshot.
+		// Device c held insert + restock; its row becomes the base snapshot, seeded from
+		// the fold state device c still holds for the record.
 		const known = foldRecord([insert, restock], schema).state
 		const versions = getFoldFieldVersions(known as NonNullable<typeof known>)
 		const row = materialize(known as NonNullable<typeof known>) as Record<string, unknown>
@@ -96,9 +104,34 @@ describe('RT-68: row snapshot vs a late concurrent operation', () => {
 				deleted: false,
 			},
 			schema,
+			{ seed: known },
 		)
 		const after = mergeOp(snapshot, late, schema).state
 		expect(materialize(after)).toEqual(expected)
 		expect(HybridLogicalClock.compare(late.timestamp, restock.timestamp)).toBeLessThan(0)
+	})
+
+	test('a snapshot keeps the authority of a server-written value', () => {
+		// The server's decision (t=200) beat a device write (t=250): the row shows it.
+		const snapshot = createSnapshotState(
+			{
+				collection: 'items',
+				recordId: 'r1',
+				values: { stock: 1, tags: [], owner: 'approved' },
+				fieldVersions: { owner: ts(200, 'kora:server:main') },
+				created: ts(100, 'a'),
+				latest: ts(250, 'device'),
+				deleted: false,
+			},
+			schema,
+		)
+		const deviceWrite = op({
+			id: 'dev',
+			nodeId: 'device',
+			timestamp: ts(250, 'device'),
+			data: { owner: 'client' },
+			previousData: { owner: null },
+		})
+		expect(materialize(mergeOp(snapshot, deviceWrite, schema).state)?.owner).toBe('approved')
 	})
 })

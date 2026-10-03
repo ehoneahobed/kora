@@ -23,6 +23,16 @@ export interface BackupManifest {
 	includesTombstones?: boolean
 	/** Set on a file produced by `convertBackupV1`. */
 	convertedFrom?: number
+	/**
+	 * The file carries the W7 fold's per-record base states (`fold_base`), row
+	 * snapshots (`fold_snapshot`) and the compacted prefixes (`compacted_through`), so
+	 * a compacted device's history survives a restore on another device (RT-66).
+	 * Absent on files from earlier releases: their log may be incomplete (compacted),
+	 * so a restore rebuilds their records on top of the backup's rows.
+	 */
+	includesFoldState?: boolean
+	/** The exporting database had compacted its log (it then needs `fold_base`). */
+	compacted?: boolean
 	/** SHA-256 hex checksum of all content sections */
 	checksum: string
 }

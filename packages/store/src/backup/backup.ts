@@ -1,5 +1,11 @@
 import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
+import { COMPACTION_BASELINE_META_KEY } from '../compaction/types'
+import {
+	COMPACTED_THROUGH_TABLE,
+	FOLD_BASE_TABLE,
+	FOLD_SNAPSHOT_TABLE,
+} from '../fold/record-folder'
 import { checkOperationRow, recoverTimestamp } from '../log-integrity/log-integrity'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import { SEQ_CONFLICTS_TABLE } from '../store/sequence-repair'
@@ -18,6 +24,11 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 //                       mutationName, fieldVersions), in HLC order. Includes
 //                       operations kept only in the sequence-conflicts table.
 //   terminal_rejections JSON TerminalRejection[] (operations the server refused for good)
+//   fold_base           NDJSON { collection, recordId, state }: per-record fold states of
+//                       compacted operations (W7, RT-66); a restore keeps them
+//   fold_snapshot       NDJSON { collection, recordId, state }: per-record row snapshots
+//                       (approximate bases, RT-68)
+//   compacted_through   JSON { nodeId: sequence }: per-node prefix folded into the bases
 //   records:<name>      NDJSON raw rows of the collection, tombstones included, bytes
 //                       tagged as { "$bytes": "<base64>" }
 //   checksum            SHA-256 hex over every section between manifest and checksum
@@ -144,7 +155,20 @@ export async function exportBackup(
 		operations: Operation[]
 		terminal: TerminalRejection[]
 		records: Map<string, Array<Record<string, unknown>>>
-	} = { vector: {}, operations: [], terminal: [], records: new Map() }
+		bases: FoldStateRow[]
+		snapshots: FoldStateRow[]
+		compactedThrough: Record<string, number>
+		compacted: boolean
+	} = {
+		vector: {},
+		operations: [],
+		terminal: [],
+		records: new Map(),
+		bases: [],
+		snapshots: [],
+		compactedThrough: {},
+		compacted: false,
+	}
 
 	onProgress({ phase: 'reading', progress: 0, message: 'Reading the local database' })
 	await adapter.transaction(async (tx) => {
@@ -154,6 +178,25 @@ export async function exportBackup(
 		for (const row of vector) snapshot.vector[row.node_id] = row.sequence_number
 		snapshot.operations = await readOperations(tx, collections)
 		snapshot.terminal = await readTerminalRejections(tx)
+		// W7 (RT-66): compacted history lives only in the base states; without them a
+		// restore on another device would rebuild records from an incomplete log.
+		snapshot.bases = await readFoldStateRows(tx, FOLD_BASE_TABLE, collections)
+		snapshot.snapshots = await readFoldStateRows(tx, FOLD_SNAPSHOT_TABLE, collections)
+		if (await hasTable(tx, COMPACTED_THROUGH_TABLE)) {
+			for (const row of await tx.query<{ node_id: string; sequence_number: number }>(
+				`SELECT node_id, sequence_number FROM ${COMPACTED_THROUGH_TABLE}`,
+			)) {
+				snapshot.compactedThrough[row.node_id] = row.sequence_number
+			}
+		}
+		snapshot.compacted =
+			snapshot.bases.length > 0 ||
+			Object.keys(snapshot.compactedThrough).length > 0 ||
+			(
+				await tx.query<{ value: string }>('SELECT value FROM _kora_meta WHERE key = ?', [
+					COMPACTION_BASELINE_META_KEY,
+				])
+			).length > 0
 		if (includeRecords) {
 			for (const collection of collections) {
 				snapshot.records.set(
@@ -169,6 +212,9 @@ export async function exportBackup(
 		encodeJsonSection('version_vector', snapshot.vector),
 		encodeNdjsonSection('operations', snapshot.operations),
 		encodeJsonSection('terminal_rejections', snapshot.terminal),
+		encodeNdjsonSection('fold_base', snapshot.bases),
+		encodeNdjsonSection('fold_snapshot', snapshot.snapshots),
+		encodeJsonSection('compacted_through', snapshot.compactedThrough),
 	]
 	for (const [collection, rows] of snapshot.records) {
 		if (rows.length > 0) content.push(encodeNdjsonSection(`records:${collection}`, rows))
@@ -186,6 +232,8 @@ export async function exportBackup(
 		collections,
 		includesRecords: includeRecords,
 		includesTombstones: true,
+		includesFoldState: true,
+		compacted: snapshot.compacted,
 		checksum,
 	}
 	return concat([
@@ -222,6 +270,31 @@ async function readOperations(tx: Transaction, collections: string[]): Promise<O
 	}
 	operations.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
 	return operations
+}
+
+/** One per-record fold state row (`_kora_fold_base` / `_kora_fold_snapshot`) in a backup. */
+export interface FoldStateRow {
+	collection: string
+	recordId: string
+	/** The serialized `FoldState`, as stored. */
+	state: string
+}
+
+async function readFoldStateRows(
+	tx: Transaction,
+	table: string,
+	collections: string[],
+): Promise<FoldStateRow[]> {
+	if (!(await hasTable(tx, table))) return []
+	const out: FoldStateRow[] = []
+	for (const collection of collections) {
+		const rows = await tx.query<{ record_id: string; state: string }>(
+			`SELECT record_id, state FROM ${table} WHERE collection = ? ORDER BY record_id`,
+			[collection],
+		)
+		for (const row of rows) out.push({ collection, recordId: row.record_id, state: row.state })
+	}
+	return out
 }
 
 async function readTerminalRejections(tx: Transaction): Promise<TerminalRejection[]> {
@@ -264,6 +337,12 @@ export interface ParsedBackup {
 	terminalRejections: TerminalRejection[]
 	/** Raw rows per collection (present only when the manifest includes records). */
 	records: Map<string, Array<Record<string, unknown>>>
+	/** Per-record compacted base states of the requested collections (RT-66). */
+	foldBases: FoldStateRow[]
+	/** Per-record row snapshots of the requested collections (RT-68). */
+	foldSnapshots: FoldStateRow[]
+	/** Per node, the sequence prefix compacted into the bases. */
+	compactedThrough: Map<string, number>
 }
 
 /**
@@ -363,6 +442,21 @@ export async function parseBackup(
 		}
 	}
 
+	const foldRows = (name: string): FoldStateRow[] =>
+		parseNdjson<FoldStateRow>(findSection(sections, name)).filter(
+			(row) =>
+				typeof row?.collection === 'string' &&
+				typeof row.recordId === 'string' &&
+				typeof row.state === 'string' &&
+				keep(row.collection),
+		)
+	const compactedThrough = new Map<string, number>()
+	for (const [nodeId, seq] of Object.entries(
+		parseJsonSection<Record<string, number>>(sections, 'compacted_through') ?? {},
+	)) {
+		if (Number.isInteger(seq) && seq > 0) compactedThrough.set(nodeId, seq)
+	}
+
 	return {
 		manifest,
 		operations,
@@ -370,6 +464,9 @@ export async function parseBackup(
 		terminalRejections:
 			parseJsonSection<TerminalRejection[]>(sections, 'terminal_rejections') ?? [],
 		records,
+		foldBases: foldRows('fold_base'),
+		foldSnapshots: foldRows('fold_snapshot'),
+		compactedThrough,
 	}
 }
 

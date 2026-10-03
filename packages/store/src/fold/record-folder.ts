@@ -8,6 +8,7 @@ import {
 	type MergeTrace,
 	type Operation,
 	type SchemaDefinition,
+	adaptFoldState,
 	base64ToBytes,
 	createFoldState,
 	deserializeFoldState,
@@ -16,6 +17,7 @@ import {
 	joinStates,
 	materialize,
 	mergeOp,
+	mismatchedFoldFields,
 	quoteIdent,
 	serializeFoldState,
 	toMergeTrace,
@@ -38,6 +40,23 @@ export const FOLD_BASE_TABLE = '_kora_fold_base'
 /** Per-node sequence prefix removed by compaction: ids at or below it are duplicates. */
 export const COMPACTED_THROUGH_TABLE = '_kora_compacted_through'
 /**
+ * Per-record row snapshots (RT-68): the base built from a materialized row when the
+ * record's history is not all in the log (a pre-W7 compaction, quarantined log rows).
+ * Kept apart from `_kora_fold_base` (which holds only exact, operation-built states)
+ * so the approximation can be dropped once the record's history is complete again:
+ * when the server's fold state arrives in a scope entry, or after a full resync.
+ * A record's state is `join(base, snapshot, fold(log))`.
+ */
+export const FOLD_SNAPSHOT_TABLE = '_kora_fold_snapshot'
+/**
+ * Local-only provisional side effects (RT-69): the cascades / set-nulls a device
+ * derives for a REMOTE delete. They fold into the record like operations but are
+ * never logged, sequenced or uploaded (the server derives and relays its own
+ * copy); each is retired when the server's copy for the same parent and record
+ * arrives, or when the device's delivery stream has caught up.
+ */
+export const PROVISIONAL_OPS_TABLE = '_kora_provisional_ops'
+/**
  * Terminal-rejection codes the fold does NOT exclude: the user discarded a held
  * node's writes (they stay in the local database; only their upload stops).
  */
@@ -54,6 +73,9 @@ export const FOLD_TABLES_DDL: readonly string[] = [
 	`CREATE TABLE IF NOT EXISTS ${FOLD_STATE_TABLE} (collection TEXT NOT NULL, record_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (collection, record_id))`,
 	`CREATE TABLE IF NOT EXISTS ${FOLD_BASE_TABLE} (collection TEXT NOT NULL, record_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (collection, record_id))`,
 	`CREATE TABLE IF NOT EXISTS ${COMPACTED_THROUGH_TABLE} (node_id TEXT PRIMARY KEY, sequence_number INTEGER NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS ${FOLD_SNAPSHOT_TABLE} (collection TEXT NOT NULL, record_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (collection, record_id))`,
+	`CREATE TABLE IF NOT EXISTS ${PROVISIONAL_OPS_TABLE} (id TEXT PRIMARY KEY, collection TEXT NOT NULL, record_id TEXT NOT NULL, parent_id TEXT NOT NULL, operation TEXT NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS ${PROVISIONAL_OPS_TABLE}_record ON ${PROVISIONAL_OPS_TABLE} (collection, record_id)`,
 ]
 
 /**
@@ -161,18 +183,41 @@ export class RecordFolder {
 		op: Operation,
 		mode: 'local' | 'remote',
 	): Promise<FoldApplyOutcome> {
+		const scopeEntry = op.type === 'insert'
+		if (mode === 'remote') {
+			// The record's approximations end here: a provisional cascade of this parent
+			// is replaced by the real one (RT-69), and a row snapshot by the server's
+			// complete fold state (RT-68). The operation is already in the log, so the
+			// record is re-folded without them.
+			const retired = await this.deleteProvisional(tx, op.collection, op.recordId, op.causalDeps)
+			const replaced = await this.dropSnapshotForCarriedState(tx, op)
+			if (retired > 0 || replaced) {
+				await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+				return { changed: true, traces: [] }
+			}
+		}
 		// A local insert has a fresh UUIDv7 record id: no state, log or row precedes it.
 		const fresh = mode === 'local' && op.type === 'insert'
 		const prior = fresh
 			? { state: createFoldState(op.collection, op.recordId), rebuilt: false }
 			: await this.loadOrRebuild(tx, op.collection, op.recordId, op.id)
-		const result = mergeOp(
-			prior.state,
-			op,
-			this.schema,
-			this.options(mode === 'remote' ? 'conflicts' : 'none'),
-		)
-		const scopeEntry = op.type === 'insert'
+		let result: ReturnType<typeof mergeOp>
+		try {
+			result = mergeOp(
+				prior.state,
+				op,
+				this.schema,
+				this.options(mode === 'remote' ? 'conflicts' : 'none'),
+			)
+		} catch (error) {
+			if (!(error instanceof FoldStateError)) throw error
+			// A stored state the current plan cannot take (RT-63): re-fold the record from
+			// its base and log (the operation is already appended) once. A second
+			// FoldStateError propagates; the sync engine then quarantines the operation
+			// instead of stalling its delivery stream.
+			await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+			return { changed: true, traces: [] }
+		}
 		if (!result.changed && !prior.rebuilt && !scopeEntry) {
 			return { changed: false, traces: await this.toMergeTraces(tx, result.traces) }
 		}
@@ -199,6 +244,7 @@ export class RecordFolder {
 		tx: Transaction,
 		collection: string,
 		recordId: string,
+		options: { clearRetraction?: boolean } = {},
 	): Promise<FoldState | null> {
 		const state = await this.foldFromLog(tx, collection, recordId)
 		if (state === null) {
@@ -211,22 +257,36 @@ export class RecordFolder {
 			return null
 		}
 		await this.saveState(tx, state)
-		await this.materializeRow(tx, state, 'all', { clearRetraction: false })
+		await this.materializeRow(tx, state, 'all', {
+			clearRetraction: options.clearRetraction ?? false,
+		})
 		return state
 	}
 
-	/** `join(base, fold(log - terminally rejected))`, or null when neither exists. */
+	/**
+	 * `join(base, snapshot, fold(log - terminally rejected, provisional effects))`, or
+	 * null when none exists. Base and snapshot are adapted to the current fold plan
+	 * (RT-63): a field whose kind changed is rebuilt from its materialized value.
+	 */
 	async foldFromLog(
 		tx: Transaction,
 		collection: string,
 		recordId: string,
 	): Promise<FoldState | null> {
-		const ops = await this.loadRecordOperations(tx, collection, recordId)
+		const ops = [
+			...(await this.loadRecordOperations(tx, collection, recordId)),
+			...(await this.loadProvisional(tx, collection, recordId)),
+		]
 		const rejected = await this.loadTerminalRejections(
 			tx,
 			ops.map((op) => op.id),
 		)
-		let state = await this.loadBase(tx, collection, recordId)
+		const base = await this.loadBase(tx, collection, recordId)
+		const snapshot = await this.loadSnapshot(tx, collection, recordId)
+		let state =
+			base !== null && snapshot !== null
+				? joinStates(base, snapshot, this.schema)
+				: (base ?? snapshot)
 		for (const op of ops) {
 			if (rejected.has(op.id)) continue
 			state = mergeOp(
@@ -279,8 +339,22 @@ export class RecordFolder {
 		return found
 	}
 
-	/** The record's stored state, or null (none, or another format version). */
+	/**
+	 * The record's stored state, or null (none, another format version, or a field
+	 * whose fold kind the schema has changed since: the caller re-folds, RT-63).
+	 */
 	async loadState(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+	): Promise<FoldState | null> {
+		const state = await this.readStateRow(tx, FOLD_STATE_TABLE, collection, recordId)
+		if (state === null || mismatchedFoldFields(state, this.schema).length > 0) return null
+		return state
+	}
+
+	/** The stored state as it is, even when the plan changed (a snapshot seed). */
+	async loadStoredState(
 		tx: Transaction,
 		collection: string,
 		recordId: string,
@@ -288,8 +362,177 @@ export class RecordFolder {
 		return this.readStateRow(tx, FOLD_STATE_TABLE, collection, recordId)
 	}
 
+	/** The record's compacted base, adapted to the current fold plan (RT-63). */
 	async loadBase(tx: Transaction, collection: string, recordId: string): Promise<FoldState | null> {
-		return this.readStateRow(tx, FOLD_BASE_TABLE, collection, recordId)
+		const base = await this.readStateRow(tx, FOLD_BASE_TABLE, collection, recordId)
+		return base === null ? null : adaptFoldState(base, this.schema, this.options()).state
+	}
+
+	/** The record's row snapshot (RT-68), adapted to the current fold plan. */
+	async loadSnapshot(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+	): Promise<FoldState | null> {
+		const snapshot = await this.readStateRow(tx, FOLD_SNAPSHOT_TABLE, collection, recordId)
+		return snapshot === null ? null : adaptFoldState(snapshot, this.schema, this.options()).state
+	}
+
+	/** Store `snapshot` as the record's row snapshot (joined with an existing one). */
+	async saveSnapshot(tx: Transaction, snapshot: FoldState): Promise<void> {
+		const existing = await this.loadSnapshot(tx, snapshot.c, snapshot.r)
+		const state = existing === null ? snapshot : joinStates(existing, snapshot, this.schema)
+		await tx.execute(
+			`INSERT OR REPLACE INTO ${FOLD_SNAPSHOT_TABLE} (collection, record_id, state) VALUES (?, ?, ?)`,
+			[state.c, state.r, persistedForm(state)],
+		)
+	}
+
+	/**
+	 * A scope entry carrying the server's fold state (RT-29) replaces the record's row
+	 * snapshot (RT-68): the server's state is built from every operation of the record
+	 * the device was missing, so with the device's own log it is the exact state.
+	 * Only a carried state this schema can read and join counts (otherwise the entry
+	 * merges by its data and the snapshot stays).
+	 *
+	 * @returns Whether a snapshot was dropped
+	 */
+	private async dropSnapshotForCarriedState(tx: Transaction, op: Operation): Promise<boolean> {
+		if (op.type !== 'insert' || op.foldState === undefined) return false
+		const rows = await tx.query<{ n: number }>(
+			`SELECT COUNT(*) AS n FROM ${FOLD_SNAPSHOT_TABLE} WHERE collection = ? AND record_id = ?`,
+			[op.collection, op.recordId],
+		)
+		if ((rows[0]?.n ?? 0) === 0) return false
+		let carried: FoldState
+		try {
+			carried = deserializeFoldState(op.foldState)
+		} catch (error) {
+			if (error instanceof FoldStateError) return false
+			throw error
+		}
+		if (carried.c !== op.collection || carried.r !== op.recordId) return false
+		if (mismatchedFoldFields(carried, this.schema).length > 0) return false
+		await tx.execute(`DELETE FROM ${FOLD_SNAPSHOT_TABLE} WHERE collection = ? AND record_id = ?`, [
+			op.collection,
+			op.recordId,
+		])
+		return true
+	}
+
+	/** Records that still fold against a row snapshot (approximate, RT-68). */
+	async listSnapshotRecords(
+		tx: Transaction,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		const rows = await tx.query<{ collection: string; record_id: string }>(
+			`SELECT collection, record_id FROM ${FOLD_SNAPSHOT_TABLE} ORDER BY collection, record_id`,
+		)
+		return rows.map((row) => ({ collection: row.collection, recordId: row.record_id }))
+	}
+
+	/**
+	 * After a full resync, a record whose log holds its insert again no longer needs
+	 * its row snapshot: drop it and re-fold the record from base and log (RT-68).
+	 *
+	 * @returns Whether the snapshot was dropped
+	 */
+	async settleSnapshotInTx(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+	): Promise<boolean> {
+		const ops = await this.loadRecordOperations(tx, collection, recordId)
+		const rejected = await this.loadTerminalRejections(
+			tx,
+			ops.map((op) => op.id),
+		)
+		const hasInsert = ops.some((op) => op.type === 'insert' && !rejected.has(op.id))
+		const base = await this.loadBase(tx, collection, recordId)
+		if (!hasInsert && (base?.cr ?? null) === null) return false
+		await tx.execute(`DELETE FROM ${FOLD_SNAPSHOT_TABLE} WHERE collection = ? AND record_id = ?`, [
+			collection,
+			recordId,
+		])
+		await this.refoldInTx(tx, collection, recordId)
+		return true
+	}
+
+	/**
+	 * Fold a local-only provisional side effect (RT-69) into its record: stored apart
+	 * from the log (never sequenced, never uploaded) and kept until the real copy of
+	 * the effect arrives or the delivery stream catches up.
+	 *
+	 * @param parentId - The remote operation that caused it (the parent delete)
+	 */
+	async applyProvisionalInTx(tx: Transaction, op: Operation, parentId: string): Promise<void> {
+		const existing = await tx.query<{ id: string }>(
+			`SELECT id FROM ${PROVISIONAL_OPS_TABLE} WHERE id = ?`,
+			[op.id],
+		)
+		if (existing.length > 0) return
+		await tx.execute(
+			`INSERT INTO ${PROVISIONAL_OPS_TABLE} (id, collection, record_id, parent_id, operation) VALUES (?, ?, ?, ?, ?)`,
+			[op.id, op.collection, op.recordId, parentId, JSON.stringify(op)],
+		)
+		const prior = await this.loadOrRebuild(tx, op.collection, op.recordId, op.id)
+		const result = mergeOp(prior.state, op, this.schema, this.options())
+		if (!result.changed && !prior.rebuilt) return
+		await this.saveState(tx, result.state)
+		await this.materializeRow(
+			tx,
+			result.state,
+			prior.rebuilt ? 'all' : new Set(Object.keys(op.data ?? {})),
+			{ clearRetraction: false },
+		)
+	}
+
+	/**
+	 * Remove provisional effects of a record (those caused by one of `parentIds`, or
+	 * all of them when null). The caller re-folds the record.
+	 *
+	 * @returns How many were removed
+	 */
+	async deleteProvisional(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+		parentIds: readonly string[] | null,
+	): Promise<number> {
+		if (parentIds !== null && parentIds.length === 0) return 0
+		const filter =
+			parentIds === null ? '' : ` AND parent_id IN (${parentIds.map(() => '?').join(', ')})`
+		const rows = await tx.query<{ id: string }>(
+			`SELECT id FROM ${PROVISIONAL_OPS_TABLE} WHERE collection = ? AND record_id = ?${filter}`,
+			[collection, recordId, ...(parentIds ?? [])],
+		)
+		if (rows.length === 0) return 0
+		await tx.execute(
+			`DELETE FROM ${PROVISIONAL_OPS_TABLE} WHERE id IN (${rows.map(() => '?').join(', ')})`,
+			rows.map((row) => row.id),
+		)
+		return rows.length
+	}
+
+	/** Records with provisional effects. */
+	async listProvisionalRecords(
+		tx: Transaction,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		const rows = await tx.query<{ collection: string; record_id: string }>(
+			`SELECT DISTINCT collection, record_id FROM ${PROVISIONAL_OPS_TABLE} ORDER BY collection, record_id`,
+		)
+		return rows.map((row) => ({ collection: row.collection, recordId: row.record_id }))
+	}
+
+	private async loadProvisional(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+	): Promise<Operation[]> {
+		const rows = await tx.query<{ operation: string }>(
+			`SELECT operation FROM ${PROVISIONAL_OPS_TABLE} WHERE collection = ? AND record_id = ?`,
+			[collection, recordId],
+		)
+		return rows.map((row) => JSON.parse(row.operation) as Operation)
 	}
 
 	async saveState(tx: Transaction, state: FoldState): Promise<void> {
@@ -443,7 +686,10 @@ export class RecordFolder {
 			collection,
 			recordId,
 		)
-		const hasBase = (await this.loadBase(tx, collection, recordId)) !== null
+		const hasBase =
+			(await this.loadBase(tx, collection, recordId)) !== null ||
+			(await this.loadSnapshot(tx, collection, recordId)) !== null ||
+			(await this.loadProvisional(tx, collection, recordId)).some((p) => p.id !== appendedId)
 		if (
 			!hasRow &&
 			!hasBase &&
