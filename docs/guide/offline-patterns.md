@@ -100,7 +100,7 @@ const found = await app.todos.findById(todo.id)
 
 Reactive queries pick up the write right after it commits: subscribers are notified after the
 commit, batched per microtask, and only when their result changed. Check the measured latency on
-your target devices with the store benchmarks; see [Benchmarks](/benchmarks/baseline).
+your target devices with the store benchmarks; see `docs/benchmarks/baseline.md` in the repository.
 
 This means your UI never waits for the network. Data is always local-first.
 

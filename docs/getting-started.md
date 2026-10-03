@@ -22,7 +22,7 @@ cd my-app
 pnpm dev
 ```
 
-Open http://localhost:5173. You have a todo app that stores its data in SQLite inside the
+Open `http://localhost:5173`. You have a todo app that stores its data in SQLite inside the
 browser. Add a few todos, reload, and they are still there. Stop the dev server and the data is
 still on the device: nothing here needs a network.
 

@@ -75,7 +75,7 @@ has applied, or durably quarantined, every in-scope operation with no gap.
 - Live delivery chains from a send cursor; unacknowledged batches are retransmitted on a timer
   (`relayRetransmitIntervalMs`, 2 s).
 
-See the design note [Durable delivery](/design/durable-delivery).
+The design note is `docs/design/durable-delivery.md` in the repository.
 
 ## Quarantine
 
