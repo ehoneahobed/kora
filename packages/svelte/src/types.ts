@@ -7,11 +7,28 @@ import type {
 } from '@korajs/core/bindings'
 import type { QueryStoreCache, Store } from '@korajs/store'
 import type { CursorInfo, SyncEngine, SyncStatusInfo } from '@korajs/sync'
+import type { Readable } from 'svelte/store'
 import type * as Y from 'yjs'
 
 export type KoraAppLike = CoreKoraAppLike<Store, SyncEngine, QueryStoreCache>
 export type KoraContextValue = CoreKoraContextValue<Store, SyncEngine, QueryStoreCache>
-export type UseQueryOptions = CoreUseQueryOptions
+/** Options for `createQueryStore` and `createQueryStateStore`. */
+export interface UseQueryOptions extends Omit<CoreUseQueryOptions, 'enabled'> {
+	/** When false, the query subscription is disabled. A value or a readable store. Defaults to true. */
+	enabled?: boolean | Readable<boolean>
+	/** Called when the query fails (STORE-12). `createQueryStore` logs to `console.error` without it. */
+	onError?: (error: Error) => void
+}
+
+/** Value of `createQueryStateStore`. */
+export interface QueryState<T> {
+	/** The current rows (the last good rows while `error` is set). */
+	data: readonly T[]
+	/** The query's failure, or null. Cleared when results flow again. */
+	error: Error | null
+	/** False until the first result for the current query arrived. */
+	ready: boolean
+}
 export type UseMutationOptions<
 	TData,
 	TArgs extends unknown[],

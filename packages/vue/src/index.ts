@@ -8,12 +8,14 @@ export type {
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,
+	UseQueryStateResult,
 	UseRichTextResult,
 } from './types'
 
 export { koraAppInjectionKey, koraContextKey, useKoraContext } from './context'
 export { KoraProvider } from './components/kora-provider'
-export { useQuery } from './composables/use-query'
+export { useQuery, useQueryState } from './composables/use-query'
+export type { QueryInput } from './composables/use-query'
 export { useMutation } from './composables/use-mutation'
 export { useSyncStatus } from './composables/use-sync-status'
 export { useApp } from './composables/use-app'
