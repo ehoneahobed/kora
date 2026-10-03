@@ -805,6 +805,10 @@ export class KoraSyncServer {
 			})
 		})
 
+		sessionEmitter.on('sync:unverified-legacy-operation', () => {
+			this.metrics.recordUnverifiedLegacyOperation()
+		})
+
 		sessionEmitter.on('sync:sent', (event) => {
 			const byteSize = estimateByteSize(event.operations)
 			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
@@ -1167,6 +1171,10 @@ export class KoraSyncServer {
 				count: event.batchSize,
 				bytes: byteSize,
 			})
+		})
+
+		sessionEmitter.on('sync:unverified-legacy-operation', () => {
+			this.metrics.recordUnverifiedLegacyOperation()
 		})
 
 		sessionEmitter.on('sync:sent', (event) => {

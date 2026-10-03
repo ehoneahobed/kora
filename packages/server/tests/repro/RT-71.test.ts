@@ -78,7 +78,9 @@ describe('RT-71: strict version-1 verification refuses legitimate beta.13 writes
 			(m) => m.type === 'operation-rejected' && m.operationId === write.id,
 		)
 		expect(refused).toEqual([])
-		expect(store.getAllOperations().some((o) => o.id === write.id)).toBe(true)
+		// Store-agnostic read (the Postgres store has no getAllOperations).
+		const all = (await store.getOperationsAfterDelivery(0, 10_000)).map((d) => d.operation)
+		expect(all.some((o) => o.id === write.id)).toBe(true)
 		await server.stop()
 	})
 })

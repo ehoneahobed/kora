@@ -58,7 +58,9 @@ describe('RT-73: deferred cascades are lost when the batch fails after the delet
 	test('the child of a deleted post does not survive a retried batch', async () => {
 		const store = new FlakyStore('server-1')
 		const { server, login } = await createHarness(schema, null, {}, store)
-		const owner = await login('t', 'owner-node')
+		// Protocol 2: a protocol-1 session may store an unverifiable id unverified (RT-71),
+		// which would let the bad-id copy below in; protocol 2 refuses it, as intended.
+		const owner = await login('t', 'owner-node', { protocolVersion: 2 })
 		const post = makeOp('owner-node', 1, {
 			collection: 'posts',
 			recordId: 'post-1',
@@ -106,7 +108,7 @@ describe('RT-73: deferred cascades are lost when the batch fails after the delet
 		expect(await store.findRecord('posts', 'post-1')).toBeNull()
 
 		// The client re-sends the unacknowledged batch on its next connection.
-		const again = await login('t', 'owner-node')
+		const again = await login('t', 'owner-node', { protocolVersion: 2 })
 		again.send(upload)
 		await tick(150)
 

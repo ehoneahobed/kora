@@ -6,6 +6,7 @@ import {
 	type OperationHashVersion,
 	computeOperationId,
 } from './content-hash'
+import { stripUndefinedMembers } from './strip-undefined'
 
 /** Options for {@link createOperation}. */
 export interface CreateOperationOptions {
@@ -41,11 +42,14 @@ export interface CreateOperationOptions {
  * ```
  */
 export async function createOperation(
-	input: OperationInput,
+	rawInput: OperationInput,
 	clock: HybridLogicalClock,
 	options: CreateOperationOptions = {},
 ): Promise<Operation> {
-	validateOperationParams(input)
+	validateOperationParams(rawInput)
+	// One canonical content (RT-72): `undefined` members are removed before the id is
+	// computed, so the hashed content is exactly what the op log and the wire carry.
+	const input = normalizeOperationInput(rawInput)
 	const hashVersion = options.hashVersion ?? DEFAULT_OPERATION_HASH_VERSION
 
 	const timestamp = clock.now()
@@ -75,6 +79,16 @@ export async function createOperation(
 	}
 
 	return deepFreeze(operation)
+}
+
+function normalizeOperationInput(input: OperationInput): OperationInput {
+	const data = stripUndefinedMembers(input.data)
+	const previousData = stripUndefinedMembers(input.previousData)
+	const atomicOps = stripUndefinedMembers(input.atomicOps)
+	if (data === input.data && previousData === input.previousData && atomicOps === input.atomicOps) {
+		return input
+	}
+	return { ...input, data, previousData, ...(atomicOps !== undefined ? { atomicOps } : {}) }
 }
 
 /**

@@ -9,4 +9,8 @@ export {
 	recordMatchesScopePredicates,
 } from './scopes/scope-snapshot'
 export { scopeViewKey } from './scopes/scope-view-key'
-export { verifyInboundOperation, type InboundVerification } from './engine/verify-inbound'
+export {
+	restoreUndefinedFromPrevious,
+	verifyInboundOperation,
+	type InboundVerification,
+} from './engine/verify-inbound'

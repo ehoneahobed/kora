@@ -50,7 +50,9 @@ interface Seeded {
 async function seed(childrenFromOther = 0): Promise<Seeded> {
 	const store = new MemoryServerStore('server-1')
 	const { login } = await createHarness(schema, null, {}, store)
-	const author = await login('t', AUTHOR)
+	// Protocol 2: an id that is not its content hash is refused (a protocol-1 session may
+	// store an unverifiable legacy id unverified, RT-71).
+	const author = await login('t', AUTHOR, { protocolVersion: 2 })
 	let seq = 0
 	const nextSeq = (): number => {
 		seq += 1

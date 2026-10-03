@@ -233,6 +233,56 @@ export async function applyServerOperation(
 }
 
 /**
+ * The referential side effects of an already stored delete that are still undone:
+ * children that still reference the deleted record (cascade), or still hold its id
+ * (set-null). Used when a delete arrives again as a stored duplicate (RT-73): an effect
+ * deferred to the end of a batch that failed after the delete committed (or one the
+ * author covered with a copy that was later refused) is found again here, so the
+ * referential effect of a committed delete is never lost with an in-memory list.
+ *
+ * Effects the writer may not cause (`authorizeSideEffect`) are left out: the original
+ * delete was only committed when every effect it had was authorized, so such an effect
+ * belongs to a child added later, which the cascade-late correction covers.
+ *
+ * @param store - The server store
+ * @param op - The stored delete (in the server's schema)
+ * @param authorizeSideEffect - The writer's side-effect authorization, if untrusted
+ * @returns The effects to derive (or to defer to the author's copies)
+ */
+export async function undoneSideEffectsOfStoredDelete(
+	store: ServerStore,
+	op: Operation,
+	authorizeSideEffect?: SideEffectAuthorizer,
+): Promise<SideEffectOp[]> {
+	const schema = store.getSchema()
+	if (op.type !== 'delete' || !schema) return []
+	const lookup = buildMergeRelationLookup(schema)
+	const referential = await checkReferentialIntegrityOnDelete(
+		op,
+		schema,
+		createServerReferentialContext(store),
+		lookup,
+	)
+	if (!authorizeSideEffect) return referential.sideEffectOps
+	const allowed: SideEffectOp[] = []
+	for (const effect of referential.sideEffectOps) {
+		const stored = await readStoredRow(store, effect.collection, effect.recordId)
+		const probe: Operation = {
+			...op,
+			id: `${op.id}:side-effect:${effect.collection}:${effect.recordId}`,
+			type: effect.type === 'delete' ? 'delete' : 'update',
+			collection: effect.collection,
+			recordId: effect.recordId,
+			data: effect.data,
+			previousData: effect.previousData,
+			causalDeps: [op.id],
+		}
+		if (authorizeSideEffect(probe, stored).allowed) allowed.push(effect)
+	}
+	return allowed
+}
+
+/**
  * Store the server's own copy of referential side effects (cascade delete, set-null)
  * of the applied delete `parentOp`: deterministic ids and timestamps (see
  * {@link createServerSideEffectOperation}), so a retry or another instance writes the

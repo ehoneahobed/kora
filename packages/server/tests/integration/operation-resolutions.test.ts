@@ -454,11 +454,19 @@ describe.each(kinds)('operation resolutions: sessions (%s store)', (kind) => {
 		// judged on its own, and she never sees Alice's rejection. Since RT-64 the id is
 		// verified first: it is not the hash of Mallory's content, so it is refused as
 		// INVALID_OPERATION_ID before the validator (or the refusal memory) is consulted.
-		const mallory = await login('mallory-phone', { authToken: 'mallory' })
+		const mallory = await login('mallory-phone', { authToken: 'mallory', protocolVersion: 2 })
 		mallory.send(batch([makeOp('mallory-phone', 1, 'm', refused.id)]))
 		await acked(mallory, 1)
 		expect(calls).toBe(1)
 		expect(rejections(mallory.messages).map((r) => r.code)).toEqual(['INVALID_OPERATION_ID'])
+
+		// A protocol-1 session may store an unverifiable legacy id unverified (RT-71): the
+		// op is then judged on its own by the validator, and Alice's refusal never leaks.
+		const legacy = await login('legacy-phone', { authToken: 'legacy' })
+		legacy.send(batch([makeOp('legacy-phone', 1, 'l', refused.id)]))
+		await acked(legacy, 1)
+		expect(calls).toBe(2)
+		expect(rejections(legacy.messages).map((r) => r.code)).not.toContain('SECRET_REASON')
 	})
 
 	test('retriable rejections and SEQUENCE_CONFLICT are not remembered', async () => {
