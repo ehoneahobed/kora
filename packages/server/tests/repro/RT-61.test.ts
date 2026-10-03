@@ -99,10 +99,12 @@ describe('RT-61: a device claims the server node id', () => {
 		expect(alice.response?.accepted).toBe(true)
 		// beta.14 (RT-62): the store authors under `kora:server:<deployment>:<instance>`;
 		// the configured 'server-1' is a legacy server id, still advertised. Both are
-		// the server's, and neither has history yet.
+		// the server's, and neither has history yet. Since RT-75 only explicit ids are
+		// advertised: the kora:server: id is authoritative (and reserved) by its prefix.
 		const advertised = alice.response?.authoritativeNodeIds ?? []
 		expect(advertised).toContain('server-1')
-		expect(advertised).toContain(store.getNodeId())
+		expect(store.getNodeId().startsWith('kora:server:')).toBe(true)
+		expect(advertised).not.toContain(store.getNodeId())
 		const serverNode = 'server-1'
 		alice.client.send({
 			type: 'operation-batch',
