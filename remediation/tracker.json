@@ -3125,6 +3125,21 @@
    ],
    "pr": null,
    "notes": "Phase 4 integration, 2026-10-03 (platform engineer's note on the RT-30 merge). Location: server/src/store/postgres-server-store.ts constructor (this.ready = this.initialize(), never awaited until first use) and createPostgresServerStore (returned the store without awaiting ready; the postgres client was never closed on failure). Repro packages/server/tests/repro/RT-88.test.ts (no Postgres needed: closed local port): before, one unhandledRejection and the factory resolved. FIXED (Phase 4 integration, branch worktree-agent-a59f71e9346b34bbf): the constructor marks the startup promise handled (every method awaits ready and rejects with the error, whenReady() returns it, so nothing is swallowed); createPostgresServerStore awaits whenReady(), ends its client on failure and rejects with ServerStoreUnavailableError (new export, code SERVER_STORE_UNAVAILABLE, host:port/db only, never credentials, driver error as cause). Residual: PostgresServerStore.close() does not end the client createPostgresServerStore opened (pre-existing)."
+  },
+  {
+   "id": "RT-89",
+   "title": "With a TokenAuthProvider whose validate() returns no scopes, a sync server without a schema grants the session NOTHING (the claims-only grant binds to no collection and became an empty grant): every write is refused, and the client drops it silently as 'local-only' (no rejection, pendingOperations 0, status 'synced'), with or without encryption",
+   "severity": "P1",
+   "workstream": "W2",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-89.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 4 integration, 2026-10-03 (reported by the ENC-1 engineer as 'with token auth no data is uploaded even with encryption off because the server accepted an empty scope'; real, not encryption-related). Locations: server/src/auth/token-auth.ts (no explicit scopes -> claimScopes({ userId })), server/src/scopes/resolve-session-scopes.ts (claims bound only when a schema exists; otherwise grant = {} = nothing visible), server/src/session/client-session.ts (an unscoped resolution left the provider's raw { $claims } grant on the session context, which the upload and delivery checks read: SCOPE_VIOLATION on every op), sync/src/engine/sync-engine.ts recordOutOfUplinkScope (a collection absent from the server's accepted scope and from the handshake view was treated as local-only by design: no rejection, no pending count). Repro kora/tests/repro/RT-89.test.ts (createApp + real engine + KoraSyncServer with TokenAuthProvider, schemaless): before, encryption off and on both timed out waiting for the upload. FIXED (Phase 4 integration, branch worktree-agent-a59f71e9346b34bbf): (1) a claims-only grant on a schemaless server is no grant ('unscoped', as the session code's AUTH-1 comment intends for schemaless servers), with a one-time console warning naming the fix (store.setSchema(schema) or explicit scopes); explicit collections in a schemaless grant stay authoritative and a deliberate {} grant still grants nothing; (2) an unscoped resolution strips the raw grant from the session context; (3) client: SyncEngineConfig.syncedCollections (set by createApp from the schema: all collections, or the sync-scoped ones under partial sync rules); without a scope map, a write on a synced collection the server's grant omits is recorded and emitted as OUT_OF_UPLINK_SCOPE instead of silently kept local. Tests: repro RT-89 (3 cases incl. a grant that omits the collection -> visible OUT_OF_UPLINK_SCOPE), server resolve-session-scopes RT-89 unit tests, sync engine 'RT-89: without a scope map...'. Security note: schemaless + token auth now syncs unscoped (each client's handshake narrows its own view), the documented schemaless behavior; multi-tenant deployments must give the server the schema (bindings) or explicit scopes, which the new warning says."
   }
  ],
  "rejectedProposalPins": {

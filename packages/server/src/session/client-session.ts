@@ -2040,6 +2040,18 @@ export class ClientSession {
 					uplinkScopes: resolvedUplinkScopes,
 				}
 			}
+		} else if (this.authContext) {
+			// The grant resolved to "unscoped" (RT-89: a claims-only grant on a schemaless
+			// server). The provider's raw grant must not stay on the context: it names no
+			// collection, so the upload and delivery checks, which read the context, would
+			// refuse every operation the handshake just accepted.
+			const {
+				scopes: _scopes,
+				downlinkScopes: _down,
+				uplinkScopes: _up,
+				...rest
+			} = this.authContext
+			this.authContext = rest
 		}
 
 		// Judge the provider's own grant: with `authenticated`, the resolved map is never

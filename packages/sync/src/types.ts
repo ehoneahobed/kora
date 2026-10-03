@@ -215,6 +215,14 @@ export interface SyncConfig {
 	 * Built automatically by createApp from schema scope declarations + flat scope values.
 	 */
 	scopeMap?: SyncScopeMap
+	/**
+	 * Collections the app's schema syncs (all of them, or the sync-scoped ones when the
+	 * schema declares partial sync rules). Set by createApp. When no `scopeMap` is
+	 * configured, a write on one of these that the server's accepted upload scope omits
+	 * is surfaced as `sync:operation-rejected` (`OUT_OF_UPLINK_SCOPE`) instead of being
+	 * treated as local-only (RT-89). Omitted: such writes stay local without a rejection.
+	 */
+	syncedCollections?: readonly string[]
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
 	/**

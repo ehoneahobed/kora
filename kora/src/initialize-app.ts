@@ -1,5 +1,5 @@
-import type { KoraEventEmitter } from '@korajs/core'
-import { buildScopeMap } from '@korajs/core'
+import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
+import { buildScopeMap, hasSchemaSyncRules, isCollectionSyncScoped } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type {
@@ -217,6 +217,7 @@ export async function initializeApp(
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
 				scopeMap,
+				syncedCollections: schemaSyncedCollections(config.schema),
 				encryption: config.sync.encryption,
 				strictHandshake: config.sync.strictHandshake,
 				operationTransforms: config.sync.operationTransforms,
@@ -308,4 +309,15 @@ function encodeDbNameComponent(value: string): string {
 		encoded += `_${char.codePointAt(0)?.toString(16) ?? '0'}`
 	}
 	return encoded || 'empty'
+}
+
+/**
+ * The collections a schema syncs: every collection, or only the sync-scoped ones when
+ * the schema declares partial sync rules (the others are local-only).
+ */
+function schemaSyncedCollections(schema: SchemaDefinition): string[] {
+	const names = Object.keys(schema.collections)
+	return hasSchemaSyncRules(schema)
+		? names.filter((name) => isCollectionSyncScoped(schema, name))
+		: names
 }

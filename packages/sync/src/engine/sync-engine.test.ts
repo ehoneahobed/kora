@@ -2283,6 +2283,31 @@ describe('SyncEngine upload selection (S1 stopgap)', () => {
 		)
 	})
 
+	test('RT-89: without a scope map, a schema-synced collection the grant omits is surfaced', async () => {
+		const { client } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', syncedCollections: ['notes'] },
+			emitter,
+		})
+		// What the handshake leaves when the server's grant names another collection only.
+		;(engine as unknown as { activeUplinkScope: Record<string, unknown> }).activeUplinkScope = {
+			other: {},
+		}
+
+		await engine.pushOperation({ ...makeOp('note-1', 1), collection: 'notes' })
+		await engine.pushOperation({ ...makeOp('draft-1', 2), collection: 'drafts' })
+
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
+		const rejected = await engine.getRejectedOperations()
+		// The synced collection is refused visibly; the schema's local-only one stays quiet.
+		expect(rejected.map((r) => [r.operationId, r.code])).toEqual([
+			['note-1', 'OUT_OF_UPLINK_SCOPE'],
+		])
+	})
+
 	test('an op on a local-only collection (absent from every scope) stays local without a rejection', async () => {
 		const { client } = createMemoryTransportPair()
 		const emitter = createMockEmitter()

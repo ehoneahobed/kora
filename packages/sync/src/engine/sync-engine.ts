@@ -4904,8 +4904,17 @@ export class SyncEngine {
 	private async recordOutOfUplinkScope(op: Operation): Promise<void> {
 		const uplink = this.activeUplinkScope
 		if (!uplink) return
+		// Local-only means the CLIENT leaves the collection out: its own scope map, or, with
+		// none, the schema's synced collections. A synced collection the server's grant
+		// omits is a refusal to surface, never a silent local fork (RT-89: a token-auth
+		// grant that named no collection dropped every write with status "synced").
+		const requested = this.config.scopeMap
 		const syncsCollection =
-			uplink[op.collection] !== undefined || this.activeScope?.[op.collection] !== undefined
+			uplink[op.collection] !== undefined ||
+			this.activeScope?.[op.collection] !== undefined ||
+			(requested !== undefined
+				? requested[op.collection] !== undefined
+				: (this.config.syncedCollections?.includes(op.collection) ?? false))
 		if (!syncsCollection) return
 
 		const message = `Operation on "${op.collection}" record "${op.recordId}" is outside this client's upload scope and was not sent to the server. The local change is not synced; roll it back or move the record back into scope.`
