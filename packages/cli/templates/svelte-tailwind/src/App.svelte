@@ -7,7 +7,7 @@ type Filter = 'all' | 'active' | 'completed'
 const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
 	createTodosStores()
 
-const filter = $state<Filter>('all')
+let filter = $state<Filter>('all')
 let input = $state('')
 
 const filteredTodos = $derived(

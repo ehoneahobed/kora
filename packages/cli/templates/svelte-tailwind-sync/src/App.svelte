@@ -21,7 +21,7 @@ const auth = createAuthStore()
 const todos = createTodosStores()
 const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 
-const filter = $state<Filter>('all')
+let filter = $state<Filter>('all')
 let input = $state('')
 
 const filteredTodos = $derived(
