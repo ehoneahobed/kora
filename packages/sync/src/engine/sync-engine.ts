@@ -2122,7 +2122,7 @@ export class SyncEngine {
 		// one-time re-upload restarts at 0 and queues its whole history), but that server
 		// acknowledged the node through the persisted vector entry: operations at or below
 		// it are on the server under this node, and a copy under the new node would apply
-		// them twice (an increment counted twice; RT-90). They are not re-authored, and the
+		// them twice (an increment counted twice; RT-92). They are not re-authored, and the
 		// refused node's prefix moves up to that entry so they no longer count as unsynced.
 		const ackedFloor = Math.max(this.ownAckedThrough, this.lastAckedServerVector.get(nodeId) ?? 0)
 		const unsent = this.outboundQueue
@@ -2699,8 +2699,8 @@ export class SyncEngine {
 		// batch, so it settles the provisional effects of remote deletes (RT-69) there too,
 		// exactly as at a catch-up. A server copy that confirms an effect is stored with
 		// its delete and arrives with it; an effect no copy confirms (a protocol-1 server,
-		// beta.12 and older, derives no cascades, RT-91; a delete this server derived
-		// nothing for, RT-92) was otherwise kept until the next reconnect, while every
+		// beta.12 and older, derives no cascades, RT-93; a delete this server derived
+		// nothing for, RT-94) was otherwise kept until the next reconnect, while every
 		// device that received the same delete during a catch-up dropped it.
 		if (streaming && msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
 			await this.settleAfterCatchUp({ provisionalOnly: true })

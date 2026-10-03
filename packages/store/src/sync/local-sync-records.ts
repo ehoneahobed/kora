@@ -289,7 +289,7 @@ function parsePrincipalList(value: string | null): string[] {
  * with node claims) is recorded as accepted, so a later refusal holds its writes
  * instead of re-authoring them under another principal (RT-38).
  *
- * Sync history alone is not that evidence (RT-90): beta.12 and older servers recorded
+ * Sync history alone is not that evidence (RT-92): beta.12 and older servers recorded
  * no node claims, so a node only they accepted belongs to nobody on an upgraded server.
  * It registers as not accepted, and a refusal re-authors its never-sent writes under a
  * fresh node (RT-21) instead of holding them for an owner that does not exist.
@@ -312,7 +312,7 @@ export async function registerLocalNode(adapter: StorageAdapter, nodeId: string)
  * Whether a claims-aware server accepted `nodeId` on this database before the registry
  * existed: a node token it issued (anonymous claims), or the acknowledged-prefix record
  * builds with node claims keep. beta.12's `last_acked_server_vector` does not count: its
- * server recorded no claims (RT-90).
+ * server recorded no claims (RT-92).
  */
 async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<boolean> {
 	const rows = await adapter.query<MetaRow & { key: string }>(

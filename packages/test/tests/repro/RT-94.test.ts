@@ -1,24 +1,21 @@
 /**
- * RT-91 repro (Phase 4 beta.12 compatibility, 2026-10-03): through a beta.12 (protocol 1)
- * server, a provisional cascade of a remote delete stays applied for as long as the
- * device stays connected, so devices diverge.
+ * RT-94 repro (Phase 4 beta.12 compatibility, 2026-10-03): with a server of this
+ * release, a provisional cascade that no server copy confirms stays applied on a
+ * streaming device until its next reconnect.
  *
  * Since RT-69 a receiving device applies the cascades of a remote delete as local-only
- * provisional effects, retired when the author's or the server's copy arrives, or when
- * the delivery stream catches up (the final batch after a handshake). A server of this
- * release always derives the cascade of a late child (one the deleting device did not
- * hold). A beta.12 server derives none. A device that holds such a child and is
- * STREAMING when the delete arrives keeps the provisional delete until it reconnects;
- * a device that received the same delete during a catch-up (or a fresh device) keeps
- * the child. Under a beta.12 server nothing else ever settles it.
+ * provisional effects, retired when the server's copy arrives or when the delivery
+ * stream catches up, which the client only recognised at the end of a handshake's
+ * initial sync. A delete the server derives no cascade for leaves the effect applied on
+ * every device that was streaming when it arrived, while devices that received the same
+ * delete during a catch-up (and the server) keep the child. Found in the mixed-fleet
+ * chaos matrix (`scripts/remediation/compat-beta12.mjs <b12> chaos/current-server`,
+ * seed 6): a second delete of an already-deleted project, whose late child the server
+ * revived from the child's later edits and derived nothing for; no beta.12 component is
+ * involved. The protocol-1 variant is RT-91.
  *
- * Found with the real beta.12 build (tag v1.0.0-beta.12):
- * `scripts/remediation/compat-beta12.mjs <b12> chaos/b12-server` (seed 8: the author of a
- * late child had it deleted provisionally, its peers and a fresh device had it).
- *
- * Simulated here with this release's server: device B's link strips the handshake's
- * `protocolVersion` (a beta.12 server sends none) and drops server-derived (`kora:`)
- * operations, which a beta.12 server never sends.
+ * Simulated deterministically: the author's link drops the server-derived (`kora:`)
+ * operations, so no server copy confirms the effect (protocol 2 kept).
  *
  * Asserts the CORRECT behaviour (fails before the fix): after the stream settles, the
  * streaming device agrees with a fresh device that received the same operations.
@@ -46,19 +43,13 @@ const schema = defineSchema({
 	},
 }) as unknown as SchemaDefinition
 
-/** What a beta.12 server sends: no protocol version, no server-derived operations. */
-function asBeta12Server(message: SyncMessage): SyncMessage {
-	if (message.type === 'handshake-response') {
-		const { protocolVersion: _v, ...rest } = message as SyncMessage & { protocolVersion?: number }
-		return rest as SyncMessage
+/** The server derived nothing for the delete: its own operations never arrive. */
+function withoutServerCopies(message: SyncMessage): SyncMessage {
+	if (message.type !== 'operation-batch') return message
+	return {
+		...message,
+		operations: message.operations.filter((op) => !op.nodeId.startsWith('kora:')),
 	}
-	if (message.type === 'operation-batch') {
-		return {
-			...message,
-			operations: message.operations.filter((op) => !op.nodeId.startsWith('kora:')),
-		}
-	}
-	return message
 }
 
 let net: ScopedNetwork | null = null
@@ -67,13 +58,13 @@ afterEach(async () => {
 	net = null
 })
 
-describe('RT-91: provisional cascades through a protocol-1 server', () => {
+describe('RT-94: an unconfirmed provisional cascade on a streaming device (protocol 2)', () => {
 	test('a streaming device and a fresh device agree on a late child', async () => {
 		net = await scopedNetwork(schema, {})
 		const n = net
 		for (const name of ['author-of-child', 'fresh']) {
 			n.intercept.set(name, (message, transport) => {
-				transport.send(asBeta12Server(message))
+				transport.send(withoutServerCopies(message))
 				return false
 			})
 		}
@@ -83,22 +74,17 @@ describe('RT-91: provisional cascades through a protocol-1 server', () => {
 		await deleter.sync()
 		await author.sync()
 		await author.sync()
-		expect(await author.collection('projects').findById(String(project.id))).not.toBeNull()
-
-		// The deleter goes offline; the author adds a child the deleter never sees.
 		await deleter.disconnect()
 		const child = await author
 			.collection('tasks')
 			.insert({ title: 'late child', projectId: String(project.id) })
 		await author.sync()
-		// The deleter deletes the project offline, then reconnects: the author is streaming.
 		await deleter.collection('projects').delete(String(project.id))
 		await deleter.sync()
 		for (let i = 0; i < 3; i++) {
 			await deleter.sync()
 			await author.sync()
 		}
-
 		const fresh = await n.device({ name: 'fresh', token: '' })
 		await fresh.sync()
 		await fresh.sync()

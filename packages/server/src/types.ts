@@ -260,7 +260,7 @@ export interface KoraSyncServerConfig {
 	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
-	 * beta.12 or older server, which recorded no claims; RT-89), nodes held by the
+	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the
 	 * pre-release shared anonymous owner, and provisional claims that expired without
 	 * the device ever confirming its node token (beta.12 and older clients have no
 	 * token support). Accepted with a deprecation warning and re-issued a token.

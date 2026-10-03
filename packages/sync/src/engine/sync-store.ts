@@ -174,7 +174,7 @@ export interface SyncStore {
 	 * The store retires local-only provisional cascades of remote deletes (RT-69) and
 	 * drops row snapshots whose history a full resync brought back (RT-68). With
 	 * `provisionalOnly` it only retires the provisional cascades: a stream batch that is
-	 * not the end of a resync must not settle row snapshots (RT-91).
+	 * not the end of a resync must not settle row snapshots (RT-93).
 	 *
 	 * @returns How many row snapshots were dropped
 	 */

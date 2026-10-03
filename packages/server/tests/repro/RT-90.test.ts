@@ -1,5 +1,5 @@
 /**
- * RT-88 repro (Phase 4 beta.12 compatibility, 2026-10-03): a `Date` inside a `t.json()`
+ * RT-90 repro (Phase 4 beta.12 compatibility, 2026-10-03): a `Date` inside a `t.json()`
  * value of a beta.12 (and older) write makes its version-1 id unverifiable.
  *
  * beta.12 accepted any JSON-serializable json value, a `Date` included. Its version-1
@@ -59,7 +59,7 @@ const shapes: Array<[string, Record<string, unknown>]> = [
 	],
 ]
 
-describe('RT-88: beta.12 hashed a Date inside a json value as {}', () => {
+describe('RT-90: beta.12 hashed a Date inside a json value as {}', () => {
 	test.each(shapes)('%s: an upgraded device (protocol 2) uploads it', async (_name, data) => {
 		const { store, server, login } = await createHarness(schema, null)
 		const device = await login('t', 'upgraded-node', { protocolVersion: 2 })

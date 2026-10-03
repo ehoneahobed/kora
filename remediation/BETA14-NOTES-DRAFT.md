@@ -130,7 +130,7 @@ disagree permanently in beta.12.
 - **Database refusals never block a stream** (RT-87): every Postgres class-22/23 error except a unique violation, and SQLite CHECK / NOT NULL / TOOBIG / MISMATCH errors, are a per-operation `UNSTORABLE_VALUE` refusal. Postgres `t.timestamp()` values are read back as numbers (they were strings). The sync wire no longer decodes a json/object value whose keys are all integers with number values (`{ "1": 2 }`) as bytes, nor strips an object that contains `__kora_bytes__` (beta.12 peers still do: a mixed-version caveat).
 - Custom resolver outputs are canonicalized like written values (`-0` is `0`, a `Date` its ISO string, `undefined` is `null`); an output with no JSON form (`NaN`, a `Map`) falls back like a throwing resolver and is reported. Route writes keep `undefined` as a clear in updates, like the device API (documented in the production-server guide, with the pattern for forwarding only present request fields).
 
-## Phase 4: compatibility with beta.12 (RT-88 to RT-92)
+## Phase 4: compatibility with beta.12 (RT-90 to RT-94)
 
 The legacy paths of this release are now verified against the last published release,
 1.0.0-beta.12 (tag v1.0.0-beta.12), not the never-released Phase 1 build: clients and
@@ -139,24 +139,24 @@ origin-wide pool, IndexedDB) and server databases (SQLite, Postgres) upgraded in
 and mixed fleets under chaos (`scripts/remediation/compat-beta12.mjs`,
 `compat-beta12-browser.mjs`; matrix in `remediation/evidence/compat-beta12.md`).
 
-- **A `Date` in a json value of a beta.12 write is accepted** (RT-88). beta.12 hashed it
+- **A `Date` in a json value of a beta.12 write is accepted** (RT-90). beta.12 hashed it
   as `{}` (its id never covered the instant); the server and clients now recognise that
   form, so a device that upgrades with unsynced beta.12 writes no longer has such a write
   refused `INVALID_OPERATION_ID` and undone. Other `toJSON` objects beta.12 accepted in
   json values (a `URL`, a date-library instance) are still unverifiable when uploaded by
   an upgraded device: sync beta.12 devices before upgrading them if they store those.
-- **Anonymous beta.12 devices keep syncing after the server upgrade** (RT-89). beta.12
+- **Anonymous beta.12 devices keep syncing after the server upgrade** (RT-91). beta.12
   servers recorded no node claims; with `allowLegacyAnonymousClaims` (default `true`) a
   node whose history predates claims is re-issued to an anonymous device like any legacy
   claim (warning `session.legacy_anonymous_claim`).
-- **Signed-in devices after upgrading a beta.12 server** (RT-90; RT-5 unchanged). Every
+- **Signed-in devices after upgrading a beta.12 server** (RT-92; RT-5 unchanged). Every
   node of the database has history and no owner, so it is refused `NODE_ID_CLAIMED` for
   signed-in users. A beta.13 client now moves to a fresh node and uploads what the
   beta.12 server never acknowledged under it (before, those writes were held forever,
   and re-authoring everything would have counted acknowledged increments twice). A
   beta.12 client cannot change node: release its node id with
   `server.releaseNodeClaim(nodeId)` (the production-server guide has the procedure).
-- **Provisional cascades settle while streaming** (RT-91, RT-92). A device that is
+- **Provisional cascades settle while streaming** (RT-93, RT-94). A device that is
   connected settles the provisional cascades of remote deletes after every fully applied
   stream batch, not only after a reconnect: through a beta.12 server (which derives no
   cascades) and for deletes the server derived nothing for, a connected device no longer

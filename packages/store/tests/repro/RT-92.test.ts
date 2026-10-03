@@ -1,5 +1,5 @@
 /**
- * RT-90 repro (Phase 4 beta.12 compatibility, 2026-10-03): a database a beta.12 (or
+ * RT-92 repro (Phase 4 beta.12 compatibility, 2026-10-03): a database a beta.12 (or
  * older) client synced registers its node as ACCEPTED, so after the server upgrade its
  * unsynced writes are held forever.
  *
@@ -40,7 +40,7 @@ const schema = defineSchema({
 const dir = mkdtempSync(join(tmpdir(), 'rt-90-'))
 afterAll(() => rmSync(dir, { recursive: true, force: true }))
 
-describe('RT-90: a node only a beta.12 server accepted is not a claimed node', () => {
+describe('RT-92: a node only a beta.12 server accepted is not a claimed node', () => {
 	test('a synced beta.12 database registers its node as not accepted', async () => {
 		const file = join(dir, 'beta12.db')
 		// What a synced beta.12 database holds in _kora_meta (no local node registry).

@@ -139,7 +139,7 @@ export async function verifyInboundOperation(
 				verified: true,
 				matchedVersion: 1,
 				// Not declarable: a receiver without the schema cannot repeat a nested rebuild,
-				// and a Date-form match never bound the Date's value (RT-88), so the stored
+				// and a Date-form match never bound the Date's value (RT-90), so the stored
 				// copy must not claim a verified version.
 				declarable: !match.usedSchema && match.usedDateForm !== true,
 				...(match.usedPrevious ? { restoredData: restoreUndefinedFromPrevious(op) } : {}),
@@ -178,7 +178,7 @@ export interface OperationIdMatch {
 	/** Declared nested members restored (needs the schema). */
 	usedSchema: boolean
 	/**
-	 * Strings in `Date#toISOString()` form hashed as `{}` (RT-88): beta.12 hashed a Date as
+	 * Strings in `Date#toISOString()` form hashed as `{}` (RT-90): beta.12 hashed a Date as
 	 * `{}`, so such an id never covered the Date's value.
 	 */
 	usedDateForm?: boolean
@@ -199,7 +199,7 @@ export interface OperationIdMatch {
  *   (`update(id, { assignee: undefined })`);
  * - an object field (needs the schema): declared nested members absent from the value
  *   (`{ a: 1, b: undefined }`), recursively for declared nested objects;
- * - a `Date` inside a json value (RT-88): `canonicalize` walks `Object.keys`, so it
+ * - a `Date` inside a json value (RT-90): `canonicalize` walks `Object.keys`, so it
  *   hashed as `{}`, while the JSON log and wire hold its `toISOString()` string. Strings
  *   in exactly that form are tried as `{}` (see {@link dateFormCandidates}).
  * Each form is also tried with the other form of its binary values (bytes, or the
@@ -230,7 +230,7 @@ export async function matchOperationId(
 			}
 		}
 	}
-	// beta.12 (and older) hashed a Date inside a json value as `{}` (RT-88).
+	// beta.12 (and older) hashed a Date inside a json value as `{}` (RT-90).
 	for (const candidate of [...candidates]) {
 		for (const data of dateFormCandidates(candidate.data)) {
 			candidates.push({ data, kind: { ...candidate.kind, usedDateForm: true } })
@@ -328,7 +328,7 @@ const MAX_DATE_FORM_STRINGS = 6
 
 /**
  * The data with strings in `Date#toISOString()` form replaced by `{}`: how beta.12 (and
- * older) hashed a `Date` held in a json value (RT-88). Which of the strings were Dates
+ * older) hashed a `Date` held in a json value (RT-90). Which of the strings were Dates
  * is unknown, so every non-empty subset is returned (all of them only, above
  * {@link MAX_DATE_FORM_STRINGS}). Empty when the data holds no such string.
  *

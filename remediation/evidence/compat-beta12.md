@@ -8,7 +8,7 @@ servers in the field are beta.12 and older. Protocol numbers are unchanged: prot
 beta.12 and older, protocol 2 = this release.
 
 This file is the matrix of every legacy scenario run against the real beta.12 build, with
-results after the fixes on this branch (RT-88 to RT-92).
+results after the fixes on this branch (RT-90 to RT-94).
 
 ## How it was run
 
@@ -42,16 +42,16 @@ results after the fixes on this branch (RT-88 to RT-92).
 
 | # | Scenario | Stores | Result |
 |---|---|---|---|
-| 1 | beta.12 client + current client, current server, every write shape | memory, SQLite, Postgres | Converge (12 records); concurrent increments 1+2+10+100 = 113 everywhere; a beta.12 cascade deletes the current client's child; nothing rejected or quarantined. Server warnings: `session.protocol_deprecated`, `session.legacy_sequence_pair` (beta.12 STORE-1 pairs, up to 4 operations under one sequence number). Before RT-88 one op per run was stored unverified (`session.unverified_legacy_operation`, the Date in json). |
+| 1 | beta.12 client + current client, current server, every write shape | memory, SQLite, Postgres | Converge (12 records); concurrent increments 1+2+10+100 = 113 everywhere; a beta.12 cascade deletes the current client's child; nothing rejected or quarantined. Server warnings: `session.protocol_deprecated`, `session.legacy_sequence_pair` (beta.12 STORE-1 pairs, up to 4 operations under one sequence number). Before RT-90 one op per run was stored unverified (`session.unverified_legacy_operation`, the Date in json). |
 | 2 | Two current clients + beta.12 client, beta.12 server | memory, SQLite | Current replicas converge exactly (113). The beta.12 client keeps beta.12 merge semantics: through a beta.12 server it misses a concurrent increment (13 instead of 113, memory) until it upgrades. |
-| 3 | beta.12 database (offline writes, never synced) opened by current client, then synced | better-sqlite3 | Rows unchanged on open; converges with a fresh peer; the write beta.12 numbered like the transaction before it arrives. Failed before RT-88 (`INVALID_OPERATION_ID`, write undone). |
+| 3 | beta.12 database (offline writes, never synced) opened by current client, then synced | better-sqlite3 | Rows unchanged on open; converges with a fresh peer; the write beta.12 numbered like the transaction before it arrives. Failed before RT-90 (`INVALID_OPERATION_ID`, write undone). |
 | 4 | beta.12 database synced with a beta.12 server; both upgrade (server on the same SQLite file) | better-sqlite3, SQLite | Rows unchanged; converges. |
 | 5 | beta.12 database synced with a current server, then upgraded | better-sqlite3 | Rows unchanged; converges. |
 | 6 | beta.12 server database upgraded by current server, no auth: a beta.12 device stays on beta.12, another upgrades its database, a fresh device joins; both old devices have unsynced offline writes | SQLite, Postgres | Converge; every offline write arrives. The `undefined` clear beta.12 peers never saw (the JSON wire dropped it) is applied everywhere after the upgrade (RT-71/RT-85 one-time pass), matching what the writer applied. |
-| 7 | Same, token auth | SQLite, Postgres | Upgraded device: refused `NODE_ID_CLAIMED` (pre-claims history, RT-5), moves to a fresh node, uploads only what beta.12 never acknowledged: converges, no double increment. Failed before RT-90 (offline write held forever as `other-user`; the first fix attempt re-authored everything and counted the +5 increment twice: 13 instead of 8). beta.12 device: refused until `server.releaseNodeClaim(nodeId)` (documented operator path), then converges with its offline write. |
-| 8 | Same, anonymous (`MixedAuthProvider`) | SQLite, Postgres | Converge; warning `session.legacy_anonymous_claim`. Failed before RT-89 (both old devices refused for good). |
-| 9 | Mixed fleet under chaos, current server, 12 seeds | SQLite server | 12/12: current replicas and a fresh peer converge; beta.12 replicas differ on 0 to 4 records (concurrent merges under beta.12 rules) and converge after upgrading. Seed 6 of an earlier run failed (RT-92). |
-| 10 | Mixed fleet under chaos, beta.12 server, 12 seeds | SQLite server | 12/12 after RT-91. Before: seed 8 failed (provisional cascade kept on the streaming author of a late child). |
+| 7 | Same, token auth | SQLite, Postgres | Upgraded device: refused `NODE_ID_CLAIMED` (pre-claims history, RT-5), moves to a fresh node, uploads only what beta.12 never acknowledged: converges, no double increment. Failed before RT-92 (offline write held forever as `other-user`; the first fix attempt re-authored everything and counted the +5 increment twice: 13 instead of 8). beta.12 device: refused until `server.releaseNodeClaim(nodeId)` (documented operator path), then converges with its offline write. |
+| 8 | Same, anonymous (`MixedAuthProvider`) | SQLite, Postgres | Converge; warning `session.legacy_anonymous_claim`. Failed before RT-91 (both old devices refused for good). |
+| 9 | Mixed fleet under chaos, current server, 12 seeds | SQLite server | 12/12: current replicas and a fresh peer converge; beta.12 replicas differ on 0 to 4 records (concurrent merges under beta.12 rules) and converge after upgrading. Seed 6 of an earlier run failed (RT-94). |
+| 10 | Mixed fleet under chaos, beta.12 server, 12 seeds | SQLite server | 12/12 after RT-93. Before: seed 8 failed (provisional cascade kept on the streaming author of a late child). |
 | 11 | Browser: beta.12 app on SQLite WASM / OPFS (origin-wide `kora-opfs` pool), opened by current app, then synced next to a Node peer | OPFS | Rows unchanged; `store:storage-migrated` (per-database pool), `store:rematerialized` (log); converges with the peer; STORE-1 write arrives. |
 | 12 | Browser: beta.12 app on IndexedDB, opened by current app, synced | IndexedDB | Rows unchanged; `store:rematerialized`; converges. |
 | 13 | `rt-legacy-id-probe.mjs` (6 shapes) | memory | 6/6 accepted and converged. Stored `v1` (verified) except nested-object `undefined` members (`v-`, schema rebuild not declarable). |
@@ -66,10 +66,10 @@ results after the fixes on this branch (RT-88 to RT-92).
 
 | Area | beta.12 | 33bca46 (what the code assumed) | Consequence | Fix |
 |---|---|---|---|---|
-| Version-1 hash of a `Date` in a json value | `{}` (canonicalize walks `Object.keys`); log and wire hold the ISO string | same code, never probed | Upgraded device's offline write refused and undone | RT-88: rebuild ISO strings as `{}` (not declarable) |
-| Node claims on the server | none recorded | claims rows (`kora:anonymous`, per user) | Every anonymous node refused after a server upgrade | RT-89 |
-| Local node registry seeding | `last_acked_server_vector` only | node token / claims-aware server | beta.12 database counted as "accepted by a claims-aware server": refusal held its writes forever | RT-90 (and the acknowledged floor when re-authoring) |
-| Server-derived cascades | none (protocol 1) | none either, but probes never streamed through it | Provisional cascades kept while streaming | RT-91 (generalised by RT-92) |
+| Version-1 hash of a `Date` in a json value | `{}` (canonicalize walks `Object.keys`); log and wire hold the ISO string | same code, never probed | Upgraded device's offline write refused and undone | RT-90: rebuild ISO strings as `{}` (not declarable) |
+| Node claims on the server | none recorded | claims rows (`kora:anonymous`, per user) | Every anonymous node refused after a server upgrade | RT-91 |
+| Local node registry seeding | `last_acked_server_vector` only | node token / claims-aware server | beta.12 database counted as "accepted by a claims-aware server": refusal held its writes forever | RT-92 (and the acknowledged floor when re-authoring) |
+| Server-derived cascades | none (protocol 1) | none either, but probes never streamed through it | Provisional cascades kept while streaming | RT-93 (generalised by RT-94) |
 | Transaction sequence numbers (STORE-1) | the next single write re-uses the transaction's last number; concurrent transactions share numbers; up to 4 ops seen under one number | the counter persisted inside commits; only concurrent transactions collide | More legacy pairs; covered by `legacy_sequence_pair` storage and the client sequence repair (rows 1, 3, 11) | none needed |
 | Scope-entry inserts, `fieldVersions`, `nodeToken`, `foldState` | absent (the beta.12 JSON decoder drops them) | understood `fieldVersions` and `nodeToken` | beta.12 clients apply a scope entry as a plain insert (residual below) | documented |
 | Encryption envelope | v1 (`data` replaced by ciphertext) | same | refused (row 17) | documented |
@@ -78,11 +78,11 @@ results after the fixes on this branch (RT-88 to RT-92).
 
 | ID | Sev | Summary | Repro |
 |---|---|---|---|
-| RT-88 | P1 | beta.12 hashed a `Date` in json as `{}`: upgraded device's pre-upgrade write refused `INVALID_OPERATION_ID` and undone | `packages/server/tests/repro/RT-88.test.ts`; row 3 |
-| RT-89 | P1 | Anonymous beta.12 devices refused for good after a server database upgrade, despite `allowLegacyAnonymousClaims` | `packages/server/tests/repro/RT-89.test.ts`; row 8 |
-| RT-90 | P1 | beta.12 database seeded as accepted: its offline writes held forever after the server upgrade (and naive re-authoring doubled acknowledged increments) | `packages/store/tests/repro/RT-90.test.ts`, `sync/src/engine/local-nodes.test.ts`; row 7 |
-| RT-91 | P2 | Provisional cascade kept by a streaming device behind a beta.12 server | `packages/test/tests/repro/RT-91.test.ts`; row 10 |
-| RT-92 | P2 | Same with a current server when no server copy confirms the effect (repeated delete of a deleted parent) | `packages/test/tests/repro/RT-92.test.ts`; row 9 |
+| RT-90 | P1 | beta.12 hashed a `Date` in json as `{}`: upgraded device's pre-upgrade write refused `INVALID_OPERATION_ID` and undone | `packages/server/tests/repro/RT-90.test.ts`; row 3 |
+| RT-91 | P1 | Anonymous beta.12 devices refused for good after a server database upgrade, despite `allowLegacyAnonymousClaims` | `packages/server/tests/repro/RT-91.test.ts`; row 8 |
+| RT-92 | P1 | beta.12 database seeded as accepted: its offline writes held forever after the server upgrade (and naive re-authoring doubled acknowledged increments) | `packages/store/tests/repro/RT-92.test.ts`, `sync/src/engine/local-nodes.test.ts`; row 7 |
+| RT-93 | P2 | Provisional cascade kept by a streaming device behind a beta.12 server | `packages/test/tests/repro/RT-93.test.ts`; row 10 |
+| RT-94 | P2 | Same with a current server when no server copy confirms the effect (repeated delete of a deleted parent) | `packages/test/tests/repro/RT-94.test.ts`; row 9 |
 
 ## Residual risks
 
@@ -100,7 +100,7 @@ results after the fixes on this branch (RT-88 to RT-92).
 - **`MixedAuthProvider` deployments**: with `allowLegacyAnonymousClaims`, an anonymous
   device can take a signed-in user's beta.12 node with pre-claims history (as on
   beta.12). Documented on the option.
-- **RT-90 floor**: on the refusal path, an operation at or below the beta.12 server's
+- **RT-92 floor**: on the refusal path, an operation at or below the beta.12 server's
   acknowledged entry is treated as stored. A beta.12 STORE-1 duplicate kept in place by
   the sequence repair that the beta.12 server never stored is not re-sent (the repair
   renumbers the other members of each pair above the entry, so only one per pair).

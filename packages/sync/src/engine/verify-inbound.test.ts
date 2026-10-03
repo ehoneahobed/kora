@@ -232,7 +232,7 @@ describe('verifyInboundOperation: beta.12 hashes of undefined members (RT-71)', 
 	})
 })
 
-describe('verifyInboundOperation: beta.12 hashes of Date values in json (RT-88)', () => {
+describe('verifyInboundOperation: beta.12 hashes of Date values in json (RT-90)', () => {
 	/** A beta.12 write: the id over the Date, the data after the JSON log and wire. */
 	async function dateOp(data: Record<string, unknown>): Promise<Operation> {
 		const op = await v1Op({ data })

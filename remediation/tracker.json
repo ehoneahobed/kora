@@ -3092,40 +3092,10 @@
    "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression. Locations: core/src/schema/validation.ts (timestamp: any finite number), server/src/store/materialization.ts fieldTypeToSql ('timestamp' -> BIGINT on Postgres), server/src/store/postgres-server-store.ts:160-187 (PG_UNSTORABLE_VALUE_CODES = 22021, 22P05, 22P02: a fractional value fails 22P02 and is refused terminally; 1e20 fails 22003 numeric_value_out_of_range, not mapped, so the batch fails and is re-sent every session). Memory and SQLite server stores and every client store hold both values. Repro packages/test/tests/repro/RT-87.test.ts (KORA_PG_TEST_URL): fractional -> A shows only the next write, rejection UNSTORABLE_VALUE; 1e20 -> B receives nothing, A has no rejection. Required fix: define the timestamp domain once and enforce it where the value is written (validateFieldValue: a safe integer, or round in the canonical body), so every store holds every accepted value; map every Postgres value refusal (SQLSTATE class 22) to a per-operation terminal refusal, never a failed batch. FIXED (Phase 3 round 5, root cause, 2026-10-03, branch worktree-agent-a2ac5bc3753e8df53, commit 1a134ab). One value domain (core schema/value-domain.ts, table in docs/guide/schema-design.md#value-domain): t.timestamp() = integer ms in [-8.64e15, 8.64e15] (fractions refused with a clear error, not rounded), t.number() finite, structured values depth <= 64, no __proto__ key, not exactly the wire's { __kora_bytes__ } form; enforced in validateRecord, after atomic ops resolve (assertResolvedFieldValue), and on server ingest of uploads and route writes (operationValueViolation on the view, SCHEMA_VALIDATION_ERROR per op). Every Postgres class-22/23 refusal except 23505 maps to per-op UNSTORABLE_VALUE; SQLite CHECK/NOTNULL/TOOBIG/MISMATCH too. Also found by the new property test: Postgres BIGINT timestamps were read back as strings (fixed in deserializeFieldValue), and the wire decoded json/object values with integer keys and number values (even { \" \": 0 }) as bytes and stripped objects containing __kora_bytes__ (fixed in the sync serializer). Tests: repro RT-87 (Postgres), core value-domain.test.ts, server value-domain-ingest.test.ts (memory, SQLite, Postgres), sync wire-value-domain.test.ts, packages/test value-domain-roundtrip.test.ts (seeded random values per field type through memory, SQLite and Postgres server stores, the protobuf wire and a peer client store)."
   },
   {
-   "id": "RT-88",
+   "id": "RT-90",
    "title": "A Date inside a t.json() value of a beta.12 write makes its version-1 id unverifiable: beta.12 hashed the Date as {} (canonicalize walks Object.keys) while its log and wire hold the ISO string; an upgraded device uploading a pre-upgrade offline write is refused INVALID_OPERATION_ID and the write is undone on its author",
    "severity": "P1",
    "workstream": "W9",
-   "phase": 4,
-   "status": "fixed",
-   "tests": [
-    {
-     "file": "RT-88.test.ts"
-    }
-   ],
-   "pr": null,
-   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/client-db/offline (1 op of the beta.12 workload refused INVALID_OPERATION_ID after the client database upgrade); packages/server/tests/repro/RT-88.test.ts (3 shapes, protocol-2 upload of a beta.12 op). Through a protocol-1 session the op was stored unverified (RT-71 fallback), so only the upgrade path lost data. Locations: sync/src/engine/verify-inbound.ts matchOperationId (rebuilt undefined members and binary forms only). FIXED: matchOperationId also tries strings in Date#toISOString() form as {} (every combination up to six such strings, all of them above), on every replica (server ingest, duplicate identity, client verification). Such an id never bound the Date value (neither did beta.12), so the match is not declarable: the server stores the op without a declared hash version, as every unverifiable protocol-1 id. Residual: other toJSON objects beta.12 accepted in json values (URL, Luxon/Moment/Decimal instances) are still unverifiable on the upgrade path; documented in compat-beta12.md. Unit tests: sync/src/engine/verify-inbound.test.ts (RT-88 block)."
-  },
-  {
-   "id": "RT-89",
-   "title": "After a beta.12 server database is upgraded every anonymous device is refused NODE_ID_CLAIMED even with allowLegacyAnonymousClaims: beta.12 recorded no node claims, and the legacy anonymous path only adopted the pre-release kora:anonymous owner and expired provisional claims",
-   "severity": "P1",
-   "workstream": "W1",
-   "phase": 4,
-   "status": "fixed",
-   "tests": [
-    {
-     "file": "RT-89.test.ts"
-    }
-   ],
-   "pr": null,
-   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/server-db/{sqlite,postgres}/anonymous (beta.12 device offline for good, its unsynced writes never arrive); packages/server/tests/repro/RT-89.test.ts. Location: server/src/session/client-session.ts claimAnonymousNode (current === null with history -> refused). beta.12 clients cannot rotate their node id, so they reconnect forever. FIXED: with allowLegacyAnonymousClaims a node whose history predates node claims is a legacy anonymous claim: releaseNodeClaim + provisional claim with a token, warning session.legacy_anonymous_claim; never while a session is live as that node; a concurrent claimant loses (and rotates). Signed-in users still cannot take pre-claims history (RT-5 unchanged). Documented residual (types.ts, production-server guide): with MixedAuthProvider an anonymous device can take a signed-in user's beta.12 node, as on beta.12; set allowLegacyAnonymousClaims:false to forbid it (anonymous beta.12 devices are then refused)."
-  },
-  {
-   "id": "RT-90",
-   "title": "A database a beta.12 client synced registers its node as accepted (seeded from last_acked_server_vector), so after the server upgrade refuses the node (pre-claims history, RT-5) its offline writes are held forever as other-user, neither assignable nor discardable; the first fix attempt (re-authoring) applied increments the beta.12 server had acknowledged twice",
-   "severity": "P1",
-   "workstream": "W3",
    "phase": 4,
    "status": "fixed",
    "tests": [
@@ -3134,13 +3104,13 @@
     }
    ],
    "pr": null,
-   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/server-db/{sqlite,postgres}/token (upgraded device's offline write never arrives; status.heldNodes reason other-user); packages/store/tests/repro/RT-90.test.ts. Locations: store/src/sync/local-sync-records.ts hasSyncHistory (accepted from last_acked_server_vector, which assumed the accepting server recorded a claim, true only for claims-aware builds); sync/src/engine/sync-engine.ts rotateNodeIdentity -> holdNodeAndSwitch. FIXED: only claims-aware evidence (a node token, the own_acked_through record) seeds accepted; a refused beta.12 node takes the RT-21 never-accepted path, which re-authors only what the beta.12 server never acknowledged: rotateUnsent floors at max(own prefix, last_acked_server_vector[node]) and moves the refused node's prefix to it (without the floor the upgrade re-upload queue was re-authored whole and an increment was applied twice: n=13 instead of 8). Unit tests: store/src/sync/local-sync-records.test.ts (inverted the test that encoded the claims-era assumption), sync/src/engine/local-nodes.test.ts (RT-90 block). beta.12 CLIENTS of an authenticated deployment remain refused until an admin releases their node (RT-5 decision, now documented in production-server.md with the operator procedure). Residual: a beta.12 STORE-1 duplicate at or below the acknowledged entry that the beta.12 server never stored is not re-sent on this path (sequence repair renumbers duplicates above it, so only pairs it kept in place)."
+   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/client-db/offline (1 op of the beta.12 workload refused INVALID_OPERATION_ID after the client database upgrade); packages/server/tests/repro/RT-90.test.ts (3 shapes, protocol-2 upload of a beta.12 op). Through a protocol-1 session the op was stored unverified (RT-71 fallback), so only the upgrade path lost data. Locations: sync/src/engine/verify-inbound.ts matchOperationId (rebuilt undefined members and binary forms only). FIXED: matchOperationId also tries strings in Date#toISOString() form as {} (every combination up to six such strings, all of them above), on every replica (server ingest, duplicate identity, client verification). Such an id never bound the Date value (neither did beta.12), so the match is not declarable: the server stores the op without a declared hash version, as every unverifiable protocol-1 id. Residual: other toJSON objects beta.12 accepted in json values (URL, Luxon/Moment/Decimal instances) are still unverifiable on the upgrade path; documented in compat-beta12.md. Unit tests: sync/src/engine/verify-inbound.test.ts (RT-90 block)."
   },
   {
    "id": "RT-91",
-   "title": "Through a beta.12 (protocol 1) server, which derives no cascades, a streaming device keeps a provisional cascade of a remote delete until its next reconnect, while devices that received the delete during a catch-up keep the late child: permanent divergence while connected",
-   "severity": "P2",
-   "workstream": "W7",
+   "title": "After a beta.12 server database is upgraded every anonymous device is refused NODE_ID_CLAIMED even with allowLegacyAnonymousClaims: beta.12 recorded no node claims, and the legacy anonymous path only adopted the pre-release kora:anonymous owner and expired provisional claims",
+   "severity": "P1",
+   "workstream": "W1",
    "phase": 4,
    "status": "fixed",
    "tests": [
@@ -3149,13 +3119,13 @@
     }
    ],
    "pr": null,
-   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs chaos/b12-server (seed 8 of 12: the author of a late child had it deleted provisionally, its peers and a fresh device had it); packages/test/tests/repro/RT-91.test.ts (protocol-1 server simulated: no protocolVersion, no kora: operations). Location: sync/src/engine/sync-engine.ts recordReceivedBatch (settleAfterCatchUp only while syncing). FIXED together with RT-92 (settle provisional effects after every fully applied final stream batch)."
+   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/server-db/{sqlite,postgres}/anonymous (beta.12 device offline for good, its unsynced writes never arrive); packages/server/tests/repro/RT-91.test.ts. Location: server/src/session/client-session.ts claimAnonymousNode (current === null with history -> refused). beta.12 clients cannot rotate their node id, so they reconnect forever. FIXED: with allowLegacyAnonymousClaims a node whose history predates node claims is a legacy anonymous claim: releaseNodeClaim + provisional claim with a token, warning session.legacy_anonymous_claim; never while a session is live as that node; a concurrent claimant loses (and rotates). Signed-in users still cannot take pre-claims history (RT-5 unchanged). Documented residual (types.ts, production-server guide): with MixedAuthProvider an anonymous device can take a signed-in user's beta.12 node, as on beta.12; set allowLegacyAnonymousClaims:false to forbid it (anonymous beta.12 devices are then refused)."
   },
   {
    "id": "RT-92",
-   "title": "With a server of this release, a provisional cascade no server copy confirms (a repeated delete of an already-deleted parent whose late child was revived by later edits) stays applied on a streaming device until its next reconnect, while the server and every peer keep the child",
-   "severity": "P2",
-   "workstream": "W7",
+   "title": "A database a beta.12 client synced registers its node as accepted (seeded from last_acked_server_vector), so after the server upgrade refuses the node (pre-claims history, RT-5) its offline writes are held forever as other-user, neither assignable nor discardable; the first fix attempt (re-authoring) applied increments the beta.12 server had acknowledged twice",
+   "severity": "P1",
+   "workstream": "W3",
    "phase": 4,
    "status": "fixed",
    "tests": [
@@ -3164,7 +3134,37 @@
     }
    ],
    "pr": null,
-   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. No beta.12 component needed; found by the mixed-fleet chaos matrix (compat-beta12.mjs chaos/current-server, seed 6 of 8: the device that wrote the child kept a provisional delete from a stale device's second delete of the project; the server had stamped its late cascade right after the child's insert, the child's later edits won, and it derived nothing for the second delete). Repro packages/test/tests/repro/RT-92.test.ts (the effect is left unconfirmed by withholding the server-derived operations from the streaming device; protocol 2). Location: sync/src/engine/sync-engine.ts recordReceivedBatch. FIXED: a streaming device is caught up after every fully applied final batch and settles provisional effects there (Store.settleAfterCatchUp({ provisionalOnly: true }): row snapshots still settle only at the end of a resync; unit test in store/src/fold/phase3-fold-fixes.test.ts). A server copy is stored with its delete and relayed with it, so confirmed effects are unaffected; one split across a batch boundary shows the child until the next batch. Open question for the cascade owner (not changed here): whether the server should derive a cascade for a delete of an already-deleted parent whose child was revived after the first delete (all replicas now agree the child stays)."
+   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs upgrade/server-db/{sqlite,postgres}/token (upgraded device's offline write never arrives; status.heldNodes reason other-user); packages/store/tests/repro/RT-92.test.ts. Locations: store/src/sync/local-sync-records.ts hasSyncHistory (accepted from last_acked_server_vector, which assumed the accepting server recorded a claim, true only for claims-aware builds); sync/src/engine/sync-engine.ts rotateNodeIdentity -> holdNodeAndSwitch. FIXED: only claims-aware evidence (a node token, the own_acked_through record) seeds accepted; a refused beta.12 node takes the RT-21 never-accepted path, which re-authors only what the beta.12 server never acknowledged: rotateUnsent floors at max(own prefix, last_acked_server_vector[node]) and moves the refused node's prefix to it (without the floor the upgrade re-upload queue was re-authored whole and an increment was applied twice: n=13 instead of 8). Unit tests: store/src/sync/local-sync-records.test.ts (inverted the test that encoded the claims-era assumption), sync/src/engine/local-nodes.test.ts (RT-92 block). beta.12 CLIENTS of an authenticated deployment remain refused until an admin releases their node (RT-5 decision, now documented in production-server.md with the operator procedure). Residual: a beta.12 STORE-1 duplicate at or below the acknowledged entry that the beta.12 server never stored is not re-sent on this path (sequence repair renumbers duplicates above it, so only pairs it kept in place)."
+  },
+  {
+   "id": "RT-93",
+   "title": "Through a beta.12 (protocol 1) server, which derives no cascades, a streaming device keeps a provisional cascade of a remote delete until its next reconnect, while devices that received the delete during a catch-up keep the late child: permanent divergence while connected",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-93.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. Repro: compat-beta12.mjs chaos/b12-server (seed 8 of 12: the author of a late child had it deleted provisionally, its peers and a fresh device had it); packages/test/tests/repro/RT-93.test.ts (protocol-1 server simulated: no protocolVersion, no kora: operations). Location: sync/src/engine/sync-engine.ts recordReceivedBatch (settleAfterCatchUp only while syncing). FIXED together with RT-94 (settle provisional effects after every fully applied final stream batch)."
+  },
+  {
+   "id": "RT-94",
+   "title": "With a server of this release, a provisional cascade no server copy confirms (a repeated delete of an already-deleted parent whose late child was revived by later edits) stays applied on a streaming device until its next reconnect, while the server and every peer keep the child",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-94.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. No beta.12 component needed; found by the mixed-fleet chaos matrix (compat-beta12.mjs chaos/current-server, seed 6 of 8: the device that wrote the child kept a provisional delete from a stale device's second delete of the project; the server had stamped its late cascade right after the child's insert, the child's later edits won, and it derived nothing for the second delete). Repro packages/test/tests/repro/RT-94.test.ts (the effect is left unconfirmed by withholding the server-derived operations from the streaming device; protocol 2). Location: sync/src/engine/sync-engine.ts recordReceivedBatch. FIXED: a streaming device is caught up after every fully applied final batch and settles provisional effects there (Store.settleAfterCatchUp({ provisionalOnly: true }): row snapshots still settle only at the end of a resync; unit test in store/src/fold/phase3-fold-fixes.test.ts). A server copy is stored with its delete and relayed with it, so confirmed effects are unaffected; one split across a batch boundary shows the child until the next batch. Open question for the cascade owner (not changed here): whether the server should derive a cascade for a delete of an already-deleted parent whose child was revived after the first delete (all replicas now agree the child stays)."
   }
  ],
  "rejectedProposalPins": {

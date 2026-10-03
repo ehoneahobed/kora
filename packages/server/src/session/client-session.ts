@@ -1683,7 +1683,7 @@ export class ClientSession {
 		const current = await store.getNodeClaimOwner(nodeId)
 		if (current === null) {
 			// History with no claim row: written before node claims existed (a database a
-			// beta.12 or older server wrote; RT-89). Such an anonymous device is a legacy
+			// beta.12 or older server wrote; RT-91). Such an anonymous device is a legacy
 			// anonymous claim exactly like the shared `kora:anonymous` owner below: adopted
 			// only with allowLegacyAnonymousClaims, provisionally, with a token for clients
 			// that can keep one. The release and the claim are separate steps, so of two
@@ -1715,7 +1715,7 @@ export class ClientSession {
 		return issued
 	}
 
-	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-89). */
+	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
 	private warnLegacyAnonymousClaim(nodeId: string): void {
 		this.logger?.log({
 			timestamp: Date.now(),

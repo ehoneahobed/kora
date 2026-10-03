@@ -107,7 +107,7 @@ describe('local node registry (RT-38, RT-40)', () => {
 		await adapter.close()
 	})
 
-	test('a node only a beta.12 (or older) server accepted is not accepted (RT-90)', async () => {
+	test('a node only a beta.12 (or older) server accepted is not accepted (RT-92)', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
 		await adapter.open(schema)
 		await adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'old')")

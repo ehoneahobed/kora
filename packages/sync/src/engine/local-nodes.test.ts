@@ -1055,7 +1055,7 @@ describe('RT-53: a parked adoption is retried when its backoff runs out', () => 
 	})
 })
 
-describe('RT-90: a node only a beta.12 server acknowledged', () => {
+describe('RT-92: a node only a beta.12 server acknowledged', () => {
 	test('NODE_ID_CLAIMED re-authors only what that server never acknowledged', async () => {
 		// A beta.12 database: the server acknowledged through 2 (persisted vector entry),
 		// no acknowledged prefix under this release's contract, op 3 written offline.

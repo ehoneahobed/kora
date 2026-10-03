@@ -1,5 +1,5 @@
 /**
- * RT-89 repro (Phase 4 beta.12 compatibility, 2026-10-03): after a beta.12 server
+ * RT-91 repro (Phase 4 beta.12 compatibility, 2026-10-03): after a beta.12 server
  * database is upgraded, every anonymous device that synced before is refused, even
  * with `allowLegacyAnonymousClaims` (default true in this release).
  *
@@ -52,7 +52,7 @@ async function beta12History(nodeId: string): Promise<MemoryServerStore> {
 	return store
 }
 
-describe('RT-89: anonymous beta.12 devices after a server database upgrade', () => {
+describe('RT-91: anonymous beta.12 devices after a server database upgrade', () => {
 	test('a node with pre-claims history is re-issued to an anonymous device', async () => {
 		const store = await beta12History('kiosk-node')
 		const harness = await createHarness(schema, auth, {}, store)
