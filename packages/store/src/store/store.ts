@@ -2824,12 +2824,15 @@ export class Store implements OperationLog {
 			}
 		}
 		onProgress({ phase: 'restoring', progress: 0.3, message: 'Restoring' })
+		const explicitAuthorities = new Set((await loadAuthoritativeNodeIds(this.adapter)) ?? [])
 		const host = {
 			adapter: this.adapter,
 			schema: this.schema,
 			applyOperation:
 				internal?.applyOperation ?? ((op: Operation) => this.applyRemoteOperation(op)),
 			listLocalNodes: () => listLocalNodes(this.adapter),
+			isServerAuthority: (nodeId: string) =>
+				isReservedNodeId(nodeId) || explicitAuthorities.has(nodeId),
 		}
 		if (options?.merge) await this.mergeBackupFoldState(parsed, options.collections !== undefined)
 		const counts = options?.merge
@@ -2855,6 +2858,9 @@ export class Store implements OperationLog {
 			operationsRestored: counts.operationsRestored,
 			recordsRestored: counts.recordsRestored,
 			...(options?.merge ? {} : { unsyncedWritesKept: counts.unsyncedWritesKept }),
+			...(counts.serverOperationsSkipped
+				? { serverOperationsSkipped: counts.serverOperationsSkipped }
+				: {}),
 			success: true,
 			duration: Date.now() - started,
 		}

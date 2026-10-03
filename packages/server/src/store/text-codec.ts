@@ -28,6 +28,15 @@
  * is s for every JS string. Rows written before the codec that contain U+FFFF are
  * re-encoded once per table by {@link pgTextCodecMigrationSql}.
  *
+ * Ordering of escaped strings: range filters (`$gt`, `$lt`, ...) and `orderBy` compare
+ * the stored (encoded) form, in the database's collation (UTF-8 byte order on SQLite and
+ * on Postgres with `C.UTF-8`). A string containing U+0000, U+FFFF or a lone surrogate
+ * therefore sorts by its escape, U+FFFF, at the position of the first such code unit:
+ * after every other BMP character there, and before supplementary-plane characters.
+ * For example `"a\u0000"` sorts after `"ab"` (in JavaScript it sorts before), and a
+ * lone surrogate sorts after `"\uFFFE"`. Such strings are rare and equality is exact;
+ * do not rely on their relative order in range queries.
+ *
  * Operation columns hold `JSON.stringify` output, which already escapes U+0000 and
  * lone surrogates (well-formed JSON.stringify), so they need no codec.
  */

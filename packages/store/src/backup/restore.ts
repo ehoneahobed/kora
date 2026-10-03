@@ -31,6 +31,12 @@ export interface RestoreHost {
 	applyOperation(operation: Operation): Promise<ApplyResult>
 	/** This database's own nodes (RT-38/40), never taken from a backup. */
 	listLocalNodes(): Promise<LocalNodeRecord[]>
+	/**
+	 * Whether a node's writes would be authoritative here (Kora's reserved `kora:`
+	 * nodes, and the explicit server authorities this device learned). A merge import
+	 * never applies their operations: only the sync server delivers them.
+	 */
+	isServerAuthority?(nodeId: string): boolean
 }
 
 /** Outcome counts of a restore. */
@@ -38,6 +44,8 @@ export interface RestoreCounts {
 	operationsRestored: number
 	recordsRestored: number
 	unsyncedWritesKept: number
+	/** Merge mode: operations of server-authority nodes left out (see `RestoreHost.isServerAuthority`). */
+	serverOperationsSkipped?: number
 }
 
 /**
@@ -53,19 +61,35 @@ export async function restoreMerge(
 ): Promise<RestoreCounts> {
 	await importTerminalRejections(host.adapter, backup)
 	let restored = 0
+	let skipped = 0
+	const authority = (nodeId: string): boolean => host.isServerAuthority?.(nodeId) ?? false
 	for (const operation of backup.operations) {
 		if (!host.schema.collections[operation.collection]) continue
+		// A server decision is applied only as the sync server delivers it: from a file,
+		// an operation under a server node would win `merge('server-authoritative')`
+		// fields on this device (and is never uploaded to be checked). One the server
+		// already delivered is in the log anyway; the rest arrive by sync.
+		if (authority(operation.nodeId)) {
+			skipped++
+			continue
+		}
 		if ((await host.applyOperation(operation)) === 'applied') restored++
 	}
 	if (!filtered && backup.versionVector.size > 0) {
 		// With a collection filter the vector would claim other collections' operations.
 		await host.adapter.transaction(async (tx) => {
 			for (const [nodeId, sequence] of backup.versionVector) {
+				if (authority(nodeId)) continue
 				await maxVector(tx, nodeId, sequence)
 			}
 		})
 	}
-	return { operationsRestored: restored, recordsRestored: 0, unsyncedWritesKept: 0 }
+	return {
+		operationsRestored: restored,
+		recordsRestored: 0,
+		unsyncedWritesKept: 0,
+		serverOperationsSkipped: skipped,
+	}
 }
 
 /**
