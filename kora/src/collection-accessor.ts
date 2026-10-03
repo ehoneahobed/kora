@@ -23,7 +23,10 @@ export function createCollectionAccessor(
 		},
 		async findById(id: string) {
 			const currentStore = getStore()
-			if (!currentStore) return null
+			// A null here would be indistinguishable from "no such record" (DX-4).
+			if (!currentStore) {
+				throw notReady('find a record in')
+			}
 			return currentStore.collection(collectionName).findById(id)
 		},
 		async update(id: string, data: Record<string, unknown>) {

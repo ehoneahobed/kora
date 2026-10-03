@@ -11,7 +11,6 @@ import type {
 	SchemaInput,
 	SequenceConfig,
 } from '@korajs/core'
-import type { FieldBuilder } from '@korajs/core'
 import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type {
 	AuditExportOptions,
@@ -31,6 +30,26 @@ import type {
 	TransactionContext,
 } from '@korajs/store'
 import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
+import type { ReservedAppProperty } from './reserved-app-properties'
+import type { TypedCollections, TypedTransactionProxy } from './typed-api'
+
+export type {
+	CollectionInsertOf,
+	CollectionRecordOf,
+	CollectionUpdateOf,
+	IncludeMap,
+	Pluralize,
+	RecordOf,
+	Singularize,
+	TypedCollectionAccessor,
+	TypedCollectionOf,
+	TypedCollections,
+	TypedQueryBuilder,
+	TypedTransactionCollection,
+	TypedTransactionProxy,
+	TypedWhere,
+	WhereOperatorsFor,
+} from './typed-api'
 
 /**
  * Adapter type for local storage.
@@ -530,55 +549,10 @@ export interface KoraApp {
 }
 
 /**
- * A typed collection accessor with full type inference.
- * Methods are parameterized by the inferred record, insert, and update types.
- */
-export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate> {
-	/** Insert a new record. Returns the full record with generated id and metadata. */
-	insert(data: TInsert): Promise<TRecord>
-	/** Find a record by its ID. */
-	findById(id: string): Promise<TRecord | null>
-	/** Update a record by ID with partial data. Returns the updated record. */
-	update(id: string, data: TUpdate): Promise<TRecord>
-	/** Soft-delete a record by ID. */
-	delete(id: string): Promise<void>
-	/** Start building a query with WHERE conditions. */
-	where(conditions: Record<string, unknown>): QueryBuilder<TRecord>
-}
-
-/**
  * A typed Kora application object with collection accessors inferred from the schema.
  * Each collection becomes a property with fully typed insert/update/query methods.
  */
-type KoraFrameworkProperty =
-	| 'ready'
-	| 'events'
-	| 'on'
-	| 'collections'
-	| 'sync'
-	| 'sequences'
-	| 'blobs'
-	| 'storage'
-	| 'getStore'
-	| 'getSyncEngine'
-	| 'getQueryStoreCache'
-	| 'storeInfo'
-	| 'close'
-	| 'transaction'
-	| 'mutation'
-	| 'exportBackup'
-	| 'importBackup'
-	| 'replayTo'
-	| 'exportAudit'
-
-export type TypedCollections<S extends SchemaInput> = {
-	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
-		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
-		fields: infer F extends Record<string, FieldBuilder<any, any, any>>
-	}
-		? TypedCollectionAccessor<InferRecord<F>, InferInsertInput<F>, InferUpdateInput<F>>
-		: CollectionAccessor
-}
+type KoraFrameworkProperty = ReservedAppProperty
 
 export type TypedKoraApp<S extends SchemaInput> = {
 	/** Resolves when the store is open and collections are ready. */
@@ -607,10 +581,13 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
-	/** Execute multiple mutations atomically within a transaction. */
-	transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/**
+	 * Execute multiple mutations atomically within a transaction. The callback's `tx` has
+	 * one typed accessor per schema collection.
+	 */
+	transaction(fn: (tx: TypedTransactionProxy<S>) => Promise<void>): Promise<Operation[]>
 	/** Execute a named mutation — a transaction with a DevTools-visible name. */
-	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	mutation(name: string, fn: (tx: TypedTransactionProxy<S>) => Promise<void>): Promise<Operation[]>
 	/** Export all data as a portable backup binary. */
 	exportBackup(options?: BackupOptions): Promise<Uint8Array>
 	/** Restore data from a backup binary. */

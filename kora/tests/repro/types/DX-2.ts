@@ -2,7 +2,7 @@
 // "@ts-expect-error" is unused (TS2578) and Equal<> checks fail.
 // Run: npx tsc --noEmit --strict --skipLibCheck --module esnext --moduleResolution bundler --target es2022 --jsx react-jsx tests/repro/types/DX-2.ts
 import { createApp, defineSchema, t } from 'korajs'
-import { useCollection } from 'korajs/react'
+import { createKoraHooks } from 'korajs/react'
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
 	? true
@@ -48,8 +48,14 @@ export async function probe(): Promise<void> {
 	})
 }
 
+// A bare `useCollection('todos')` cannot know the app's schema; the typed path is a
+// hooks factory bound to the app type (fix plan W11: createKoraHooks<typeof app>()).
+const { useCollection } = createKoraHooks<typeof app>()
+
 export function Hook(): void {
 	const todos = useCollection('todos')
 	// @ts-expect-error useCollection should be typed by schema (title is string)
 	void todos.insert({ title: 1 })
+	// @ts-expect-error unknown collection name
+	useCollection('nope')
 }

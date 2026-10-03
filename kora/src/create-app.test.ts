@@ -81,7 +81,7 @@ describe('createApp', () => {
 		})
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
-		expect(await todos.findById('missing')).toBeNull()
+		await expect(todos.findById('missing')).rejects.toThrow(/app\.ready/)
 		expect(() => todos.where({ completed: false })).toThrow(/app\.ready/)
 		await app.ready
 		await expect(todos.where({ completed: false }).exec()).resolves.toEqual([])
