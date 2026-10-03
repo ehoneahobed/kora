@@ -214,6 +214,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `protocol v${event.clientProtocolVersion} deprecated (node ${event.nodeId})`
 		case 'sync:unverified-legacy-operation':
 			return `unverified legacy op ${event.operationId} (node ${event.nodeId})`
+		case 'sync:forged-duplicate':
+			return `forged duplicate refused ${event.operationId} (node ${event.nodeId})`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
 		case 'sync:apply-blocked':

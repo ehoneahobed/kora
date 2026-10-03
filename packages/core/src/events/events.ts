@@ -73,6 +73,18 @@ export type KoraEvent =
 			collection: string
 			message: string
 	  }
+	| {
+			/**
+			 * A server refused an upload that reused a stored operation's id with different
+			 * content (RT-77). Operation ids are content hashes, so this is tampering; the
+			 * upload had no effect. Counted in metrics.
+			 */
+			type: 'sync:forged-duplicate'
+			nodeId: string
+			operationId: string
+			collection: string
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'

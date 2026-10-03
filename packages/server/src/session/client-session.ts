@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { applyOperationTransforms, isServerNodeId } from '@korajs/core'
+import { applyOperationTransforms, canonicalizeLegacyOperation, isServerNodeId } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -96,6 +96,7 @@ import type {
 import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
+import { FORGED_DUPLICATE_CODE, isSameStoredOperation } from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
 import { buildScopeEntryOperation } from './scope-entry'
 import {
@@ -716,6 +717,7 @@ export class ClientSession {
 	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
 	/** Operations accepted with an unverified legacy (beta.13) id (RT-71). */
 	private unverifiedLegacyOperations = 0
+	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
 	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
 	private invalidOperationIds = 0
@@ -2421,16 +2423,28 @@ export class ClientSession {
 				continue
 			}
 
-			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
-			if (this.isStoredDuplicate(op, stored)) {
+			// Already stored (found by the batch lookup): a duplicate ack, free of charge,
+			// but only for the SAME operation (RT-77). The stored copy is loaded and compared
+			// on every field its id covers; an upload that reuses a stored id with any other
+			// content is refused (non-retriable, logged as tampering) with no effect at all.
+			const storedCopy = this.isStoredDuplicate(op, stored)
+				? await this.loadStoredOperation(op, stored)
+				: null
+			if (storedCopy !== null) {
+				if (!isSameStoredOperation(op, storedCopy)) {
+					this.refuseForgedDuplicate(op, storedCopy)
+					rejectedOperations += 1
+					acknowledgedThrough = op.sequenceNumber
+					continue
+				}
 				await this.noteStoredElsewhere(op, stored)
 				// A delete sent again (the batch that stored it failed later, or was never
 				// acknowledged): any referential effect still undone is derived (or deferred
 				// to the author's copies in this batch) now, so an effect deferred in memory
-				// by a failed batch is never lost (RT-73).
-				if (op.type === 'delete') {
+				// by a failed batch is never lost (RT-73). Judged on the STORED delete only.
+				if (storedCopy.type === 'delete') {
 					applied.push(
-						...(await this.resumeStoredDeleteEffects(op, authoredCopies, deferredEffects)),
+						...(await this.resumeStoredDeleteEffects(storedCopy, authoredCopies, deferredEffects)),
 					)
 				}
 				storedInBatch.add(op.id)
@@ -2908,6 +2922,22 @@ export class ClientSession {
 			}
 			if (integrity.ok && integrity.restoredData !== undefined) {
 				this.restoredLegacyData.set(op, integrity.restoredData)
+			}
+			// Every replica folds a version-1 update in its canonical body: a previousData key
+			// absent from data is a clear (core canonicalizeLegacyOperation). beta.13 only
+			// ever produced that shape from `undefined` members, whose id covers the clear;
+			// an id that verifies WITHOUT the clear names a body no beta.13 wrote, and storing
+			// it would let authorization judge one body while every fold applies another.
+			if (
+				integrity.ok &&
+				declared === undefined &&
+				integrity.restoredData === undefined &&
+				canonicalizeLegacyOperation(op) !== op
+			) {
+				return {
+					code: INVALID_OPERATION_ID,
+					message: `Operation "${op.id}" is a version-1 update whose previousData names fields its data lacks, but its id does not cover clearing them. No Kora client writes this shape; it is refused and never stored or relayed.`,
+				}
 			}
 			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
 				// RT-71: a beta.13 (protocol 1) client hashed `undefined` members as `null`;
@@ -3468,6 +3498,73 @@ export class ClientSession {
 		if (!known || known.nodeId !== op.nodeId) return false
 		const own = op.nodeId === this.clientNodeId && op.timestamp.nodeId === op.nodeId
 		return own || known.sequenceNumber === op.sequenceNumber
+	}
+
+	/**
+	 * The operation the store holds under `op`'s id (at the node and sequence the batch
+	 * lookup found), or null when it cannot be read (the upload is then judged like any
+	 * other: verified, validated, charged, and deduplicated by the store at apply).
+	 */
+	private async loadStoredOperation(
+		op: Operation,
+		batch: Map<string, StoredOperationKey>,
+	): Promise<Operation | null> {
+		const known = batch.get(op.id)
+		if (!known) return null
+		try {
+			const range = await this.store.getOperationRange(
+				known.nodeId,
+				known.sequenceNumber,
+				known.sequenceNumber,
+			)
+			return range.find((candidate) => candidate.id === op.id) ?? null
+		} catch (error) {
+			console.warn(
+				`[kora] could not load stored operation ${op.id}; judging the upload as new: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return null
+		}
+	}
+
+	/**
+	 * Refuse an upload that reuses a stored operation's id with different content (RT-77):
+	 * terminal, nothing recorded or derived, logged and emitted as tampering. An honest
+	 * client never does this (ids are content hashes), so the rejection only reaches a
+	 * forger. No resolution is recorded: the id belongs to the stored operation.
+	 */
+	private refuseForgedDuplicate(op: Operation, storedCopy: Operation): void {
+		this.forgedDuplicates += 1
+		const message = `Operation "${op.id}" reuses the id of an operation the server stores, with different content (${storedCopy.type} ${storedCopy.collection}/${storedCopy.recordId} is stored; ${op.type} ${op.collection}/${op.recordId} was sent). Operation ids are content hashes, so this upload was altered. It is refused and has no effect.`
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.forged_duplicate',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			details: {
+				operationId: op.id,
+				uploadedNodeId: op.nodeId,
+				uploaded: { type: op.type, collection: op.collection, recordId: op.recordId },
+				stored: {
+					type: storedCopy.type,
+					collection: storedCopy.collection,
+					recordId: storedCopy.recordId,
+				},
+			},
+		})
+		this.emitter?.emit({
+			type: 'sync:forged-duplicate',
+			nodeId: op.nodeId,
+			operationId: op.id,
+			collection: op.collection,
+			message,
+		})
+		this.sendOperationRejected(op, FORGED_DUPLICATE_CODE, message, false)
+	}
+
+	/** Uploads refused for reusing a stored id with other content (RT-77). */
+	getForgedDuplicateCount(): number {
+		return this.forgedDuplicates
 	}
 
 	/**

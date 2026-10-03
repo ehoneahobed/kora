@@ -809,6 +809,10 @@ export class KoraSyncServer {
 			this.metrics.recordUnverifiedLegacyOperation()
 		})
 
+		sessionEmitter.on('sync:forged-duplicate', () => {
+			this.metrics.recordForgedDuplicate()
+		})
+
 		sessionEmitter.on('sync:sent', (event) => {
 			const byteSize = estimateByteSize(event.operations)
 			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
@@ -1175,6 +1179,10 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:unverified-legacy-operation', () => {
 			this.metrics.recordUnverifiedLegacyOperation()
+		})
+
+		sessionEmitter.on('sync:forged-duplicate', () => {
+			this.metrics.recordForgedDuplicate()
 		})
 
 		sessionEmitter.on('sync:sent', (event) => {
