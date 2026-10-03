@@ -29,17 +29,17 @@ features:
     title: Zero Sync Code
     details: Define your schema and build your UI. Kora owns the whole data plane, so storage, conflict resolution, and sync are handled before you write a single line of it.
   - icon: ⚖️
-    title: Three-Tier Merge Engine
-    details: Last-write-wins and CRDTs by default, declarative constraints when rules matter, custom resolvers when your domain demands it. Every merge decision is traceable.
+    title: Deterministic Merges
+    details: Every field merges as a CRDT (last-write-wins, element sets, counters, rich text), with server-checked constraints and custom resolvers when your domain needs them. Every merge decision is traceable.
   - icon: 🗄️
     title: A Real Database in the Browser
-    details: SQLite compiled to WebAssembly, persisted with OPFS, running in a worker so your UI never blocks. IndexedDB and native SQLite adapters included.
+    details: SQLite compiled to WebAssembly, persisted with OPFS, running in a worker so your UI never blocks. A durable IndexedDB fallback and native SQLite adapters are included.
   - icon: ⚡
     title: Type-Safe by Design
     details: Full TypeScript inference flows from your schema to your queries, mutations, and hooks. Your IDE knows your data shape everywhere.
   - icon: 🚀
     title: Scaffold to Deployed in Two Commands
-    details: npx create-kora-app scaffolds a working offline-first app. kora deploy ships your sync server with Dockerfile and platform config generated for you.
+    details: create-kora-app scaffolds a working offline-first app with an offline app shell. kora deploy ships your sync server to Fly.io, Railway or AWS with the Dockerfile and platform config generated for you.
 ---
 
 <div class="home-section">
@@ -49,12 +49,16 @@ features:
 No boilerplate, no sync plumbing, no distributed-systems reading list. Scaffold, run, and you have an app with local persistence, reactive queries, and an optional sync server.
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 cd my-app
 npm run dev
 ```
 
 Your data layer is just a schema. Everything else is inferred:
+
+<!-- docs-check-prelude
+declare function render(rows: readonly { title: string }[]): void
+-->
 
 ```typescript
 import { createApp, defineSchema, t } from 'korajs'
@@ -72,7 +76,7 @@ const app = createApp({
       },
     },
   }),
-  sync: { url: 'wss://your-server.com/kora' }, // optional: one line for multi-device sync
+  sync: { url: 'wss://your-server.com/kora-sync', autoConnect: true }, // optional: one line for multi-device sync
 })
 
 await app.ready
@@ -90,7 +94,7 @@ app.todos
 
 ## Built for real-world networks
 
-Kora treats offline as the normal state, not the error state. Writes land in local SQLite instantly and queue durably, surviving page refreshes. When a connection appears, sync sends compact binary deltas of only the operations the other side is missing, in causal order, and resumes from the last acknowledgment if the connection drops mid-sync. Concurrent edits from different devices converge deterministically through a merge engine whose every decision can be inspected in DevTools.
+Kora treats offline as the normal state, not the error state. Writes land in local SQLite instantly and queue durably, surviving page refreshes. When a connection appears, sync sends only the operations the other side is missing, in causal order, and resumes from the last acknowledged position if the connection drops mid-sync; nothing delivered is ever skipped. Concurrent edits from different devices converge deterministically: every replica folds the same operations into the same record, and every merge decision can be inspected in DevTools.
 
 That makes Kora a fit wherever connectivity is expensive, intermittent, or hostile: field data collection, point of sale, clinics, warehouses, and any app whose users ride elevators, board planes, or live beyond reliable coverage.
 

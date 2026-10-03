@@ -396,7 +396,7 @@ export async function parseBackup(
 	}
 	if (manifest.version === 1) {
 		throw new BackupFormatError(
-			'This backup was written by Kora 1.0.0-beta.13 or earlier (format version 1), whose restore corrupted operation timestamps and copied the exporting device identity. Convert it first: `restoreBackup`/`importBackup(await convertBackupV1(data))`.',
+			'This backup was written by Kora 1.0.0-beta.12 or earlier (format version 1), whose restore corrupted operation timestamps and copied the exporting device identity. Convert it first: `restoreBackup`/`importBackup(await convertBackupV1(data))`.',
 			'BACKUP_FORMAT_OUTDATED',
 			{ version: 1, fix: 'Call convertBackupV1(data) and import the result.' },
 		)
@@ -505,7 +505,7 @@ export interface ConvertBackupV1Options {
 }
 
 /**
- * Convert a version-1 backup (Kora 1.0.0-beta.13 and earlier) to version 2.
+ * Convert a version-1 backup (Kora 1.0.0-beta.12 and earlier) to version 2.
  *
  * - Operations: a v1 file exported from a database that a v1 restore had damaged holds
  *   misread timestamps (`wallTime: null`); they are recovered from the misread values

@@ -2,7 +2,7 @@
  * RT-76 repro (Phase 3 red team round 2, 2026-10-03): the one-time legacy authority
  * scan reads authority stamps out of device-written VALUES.
  *
- * At the first start of beta.14 the server stores record as legacy authoritative ids
+ * At the first start of protocol 2 the server stores record as legacy authoritative ids
  * the node ids of every op id found under an object shaped `{ c: 1, t: <string>,
  * o: <op id> }` anywhere in a stored fold state (`authoritativeStampOpIds` walks the
  * JSON generically). A fold state also holds field values (`"v": value`), so a json
@@ -13,7 +13,7 @@
  * is refused for good (INVALID_NODE_ID). The attacker can name its own op id instead,
  * which turns its past writes into server decisions.
  *
- * Reach: only a database that already holds fold states at its first beta.14 start
+ * Reach: only a database that already holds fold states at its first protocol-2 start
  * (written by a pre-release fold build); the repro simulates one by clearing the scan
  * marker. P3.
  *

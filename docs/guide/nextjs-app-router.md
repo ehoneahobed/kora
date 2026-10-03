@@ -15,6 +15,20 @@ This works with any React server renderer (`renderToString`, `renderToPipeableSt
 
 ## 1. Create the app in a client module
 
+<!-- docs-check: file app/schema.ts -->
+```typescript
+// app/schema.ts
+import { defineSchema, t } from 'korajs'
+
+export default defineSchema({
+  version: 1,
+  collections: {
+    todos: { fields: { title: t.string(), completed: t.boolean().default(false) } },
+  },
+})
+```
+
+<!-- docs-check: file app/kora.ts -->
 ```typescript
 // app/kora.ts: import it only from 'use client' modules
 import { createApp } from 'korajs'
@@ -46,6 +60,7 @@ Inertness only applies where there is no `window`. A Node.js program that wants 
 
 ## 2. Put the provider behind the `'use client'` boundary
 
+<!-- docs-check: file app/providers.tsx -->
 ```tsx
 // app/providers.tsx
 'use client'
@@ -63,6 +78,7 @@ export function Providers({ children }: { children: ReactNode }) {
 }
 ```
 
+<!-- docs-check: file app/layout.tsx -->
 ```tsx
 // app/layout.tsx (a Server Component)
 import { Providers } from './providers'
@@ -82,6 +98,7 @@ On the server, `KoraProvider` renders the `fallback` (the app is never ready the
 
 ## 3. Use the hooks in client components
 
+<!-- docs-check: file app/todos/todo-list.tsx -->
 ```tsx
 // app/todos/todo-list.tsx
 'use client'

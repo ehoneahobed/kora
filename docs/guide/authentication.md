@@ -39,35 +39,41 @@ Client                                Server
 
 ---
 
+<!-- docs-check-prelude
+declare const KORA_AUTH_SECRET: string
+-->
+
 ## Quick Start: Server-Side Setup
 
 Install the auth package:
 
 ```bash
-pnpm add @korajs/auth
+pnpm add @korajs/auth@beta
 ```
 
 For a standard Kora app, create the auth server with one call:
 
+<!-- docs-check: file auth-server.ts -->
 ```typescript
 // server.ts
 import {
   createKoraAuthServer,
   createSqliteOAuthStores,
+  createSqliteUserStore,
   googleProvider,
 } from '@korajs/auth/server'
 
-const oauthStores = await createSqliteOAuthStores({
-  filename: './auth.db',
-})
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+const oauthStores = await createSqliteOAuthStores({ filename: './auth.db' })
 
-const auth = createKoraAuthServer({
-  jwtSecret: process.env.KORA_AUTH_SECRET!,
+export const auth = createKoraAuthServer({
+  jwtSecret: KORA_AUTH_SECRET,
+  userStore, // users and token revocations persist across restarts
   oauth: {
     providers: [
       googleProvider({
-        clientId: process.env.GOOGLE_CLIENT_ID!,
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        clientId: 'your-google-client-id',
+        clientSecret: 'your-google-client-secret',
         redirectUri: 'https://app.example.com/auth/oauth/google/callback',
       }),
     ],
@@ -81,10 +87,16 @@ const auth = createKoraAuthServer({
 Run `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` to create a 256-bit secret. Store it in `KORA_AUTH_SECRET`, never in source code.
 :::
 
+In production (`NODE_ENV=production`) `createKoraAuthServer` refuses the in-memory user and
+revocation stores, which lose every account and every sign-out on restart: pass
+`createSqliteUserStore` or `createPostgresUserStore` (revocations are stored with the users), or
+set `allowInMemory: true` deliberately.
+
 Mount the auth routes on the Kora production server:
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import { auth } from './auth-server'
 
 const store = createSqliteServerStore({ filename: './kora.db' })
 
@@ -102,14 +114,35 @@ const server = createProductionServer({
 })
 ```
 
-`createKoraAuthServer()` includes token revocation, refresh-token rotation, rate limiting, device registration, OAuth sign-in routes, account linking, and sync-server authentication. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `OAuthManager`, `TokenManager`, and `UserStore` directly.
+`createKoraAuthServer()` includes token revocation, atomic refresh-token rotation, rate limiting (per account and per IP), device registration, OAuth sign-in routes with browser-bound state, account linking, MFA at sign-in (with `mfa`), and sync-server authentication with server-granted scopes. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `OAuthManager`, `TokenManager`, and `UserStore` directly.
+
+Behind a reverse proxy, set `trustProxy` on the production server so `request.ip` (the key sign-in
+rate limits use) comes from `X-Forwarded-For` only for the proxies you trust.
 
 ---
+
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import type { AuthKeyValueStorage, DeviceKeyStore } from '@korajs/auth'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), userId: t.string() } } } })
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare const secureStore: AuthKeyValueStorage
+declare const deviceKeyStore: DeviceKeyStore
+declare const url: string
+declare const code: string
+declare const state: string
+declare function openSystemBrowser(url: string): Promise<void>
+declare function Spinner(): JSX.Element
+declare function SignIn(): JSX.Element
+declare function AuthenticatedApp(): JSX.Element
+-->
 
 ## Quick Start: Client-Side Setup
 
 Create a Kora auth client and wrap your React app with `AuthProvider`:
 
+<!-- docs-check: file auth.ts -->
 ```typescript
 // auth.ts
 import { createKoraAuth } from '@korajs/auth'
@@ -173,7 +206,10 @@ function Main() {
 }
 ```
 
-The `AuthProvider` calls `authClient.initialize()` on mount, which restores any existing session from stored tokens. If the access token has expired, it automatically refreshes using the stored refresh token. This means returning users are signed in without any action.
+The `AuthProvider` calls `authClient.initialize()` on mount, which restores any existing session from stored tokens. If the access token has expired, it refreshes using the stored refresh token. Returning users are signed in without any action, also offline: network errors, timeouts, 5xx responses, rate limits and captive portals never sign anyone out or destroy tokens. While the auth server cannot be reached the session is `authenticated-offline` (the user's identity is known, `token` is `null`), the user's own local database opens, and only sync waits for a fresh token.
+
+A user with MFA enabled gets `MfaRequiredError` from `signIn`; complete it with
+`authClient.verifyMfa(error.mfaToken, { code })` (or `{ recoveryCode }`).
 
 ### React Hooks Reference
 
@@ -221,6 +257,7 @@ The auth server exposes a sync auth provider through `auth.auth`. If you used th
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import { auth } from './auth-server'
 
 const store = createSqliteServerStore({ filename: './kora.db' })
 
@@ -236,63 +273,65 @@ const syncServer = createProductionServer({
 ```
 
 The sync auth provider:
-- Validates the access token on every WebSocket connection
-- Verifies that the user still exists in the user store
-- Checks device revocation status (revoked devices are rejected even if their tokens have not expired)
+- Validates the access token at every handshake (WebSocket and every HTTP long-poll request), with the same `authenticateAccess` check that guards every auth route
+- Verifies that the user still exists and that neither the device nor the user was revoked
+- Returns the **server-derived scope grant** for the session (see [Sync scopes](#sync-scopes))
+- Ends live sessions when their credential is revoked or expires, on this instance at once and on other instances within `sessionRevalidationIntervalMs`
 - Updates the device's `lastSeenAt` timestamp on each connection
 
 On the client side, wire auth to sync with **`createKoraAuthSync()`** (recommended):
 
 ```typescript
-import { createApp } from 'korajs'
-import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuthSync } from '@korajs/auth'
 import { authClient } from './auth'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
 const app = createApp({
   schema,
   sync: {
     url: 'wss://my-server.com/kora-sync',
     authClient: createKoraAuthSync({ authClient, schema }),
+    autoConnect: true,
   },
 })
 ```
 
 `createKoraAuthSync()` returns an `AuthSyncBinding` that `createApp` understands. It:
 
-- Calls `authClient.getAccessToken()` on every connection attempt (auto-refresh included)
-- Builds a per-collection **scope map** from JWT claims and your schema's `scope` declarations
-- Sets the store **sync node id** from the JWT `dev` claim (device), separate from the user id (`sub`)
-- Reconnects and refreshes scope when auth state changes (sign-in, sign-out, token refresh)
-
-When the user is signed out, the binding returns an empty token. Use this with `MixedAuthProvider` on the server for anonymous + authenticated sync.
+- Supplies the access token at every connection attempt, refreshing it when the server ended a session as expired or revoked
+- Tells Kora who is signed in, so every local write is bound to that user (see [Writes belong to the signed-in user](#writes-belong-to-the-signed-in-user))
+- Suspends sync while auth is loading or signed out (`anonymous: 'allow'` syncs anonymously instead)
+- Sends a client-side scope hint built from JWT claims and your schema's scope declarations; the server only uses it to **narrow** its own grant
+- Reconnects when auth state changes (sign-in, sign-out, a different user)
 
 #### Manual auth wiring (advanced)
 
 If you need custom token logic, pass `sync.auth` directly:
 
 ```typescript
-import { createApp } from 'korajs'
-import { authClient } from './auth'
-
-const app = createApp({
+const manualApp = createApp({
   schema,
   sync: {
     url: 'wss://my-server.com/kora-sync',
-    auth: async () => {
-      const token = await authClient.getAccessToken()
-      return token ? { token } : { token: '' }
+    auth: async (options) => {
+      const token = options?.forceRefresh
+        ? await authClient.refreshAccessToken()
+        : await authClient.getAccessToken()
+      return { token: token ?? '' }
     },
   },
 })
 ```
 
-Do not pass both `auth` and `authClient`; `authClient` takes precedence when both are set.
+Do not pass both `auth` and `authClient`; `authClient` takes precedence when both are set. A
+plain `auth` function does not tell Kora who is signed in, so writes are not bound to users on
+shared devices; prefer the binding.
 
-The `getAccessToken()` method automatically refreshes an expired access token before returning it, so the sync engine always receives a valid token.
+#### Client scope hints from JWT claims
 
-#### Automatic scope from JWT claims
-
-When you pass `schema` to `createKoraAuthSync()`, Kora extracts flat scope values from the access token using `extractScopeValuesFromClaims()` and builds the handshake scope map with `buildScopeMap()`:
+When you pass `schema` to `createKoraAuthSync()`, Kora extracts flat scope values from the access token using `extractScopeValuesFromClaims()` and builds the handshake scope map with `buildScopeMap()`. This is only a hint that narrows the session: the server decides what the session may sync (next section).
 
 | Claim source | Maps to scope field |
 |--------------|---------------------|
@@ -314,6 +353,64 @@ createKoraAuthSync({
 ```
 
 For static scope values unrelated to the token, use `sync.scope` instead (merged only when no auth binding resolves scope).
+
+### Sync scopes
+
+What a session may sync is decided by the server, from the verified identity, never from the
+client. `createKoraAuthServer()` (and `routes.toSyncAuthProvider()`) grants every schema-scoped
+collection bound to the verified `{ userId }`. Collections scoped by any other key (for example
+`orgId`) are **denied** until you supply the value on the server:
+
+<!-- docs-check: standalone -->
+```typescript
+import { createKoraAuthServer, createSqliteUserStore } from '@korajs/auth/server'
+import { claimScopes } from '@korajs/core'
+
+declare function orgOf(userId: string): Promise<string>
+declare function teamsOf(userId: string): Promise<string[]>
+
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+
+// Extra verified values, merged over { userId }:
+export const authServer = createKoraAuthServer({
+  userStore,
+  jwtSecret: process.env.KORA_AUTH_SECRET,
+  scopeValues: async ({ userId }) => ({ orgId: await orgOf(userId) }),
+})
+
+// Or a full explicit grant (collections it omits are not visible):
+export const explicitAuthServer = createKoraAuthServer({
+  userStore,
+  jwtSecret: process.env.KORA_AUTH_SECRET,
+  resolveScopes: async ({ userId }) =>
+    claimScopes({ userId }, { projects: { teamId: { $in: await teamsOf(userId) } } }),
+})
+```
+
+- The client handshake (`syncScope`, scope hints, query views) can only **narrow** the grant; a
+  collection the grant does not name is not synced.
+- A grant value that is `undefined` or `null` fails closed: the session is refused with
+  `SCOPE_REQUIRED` (or `INVALID_SCOPE_PREDICATE`) instead of matching every record without the
+  field. A custom provider must return scopes for scoped collections.
+- Uploads are authorized against the **stored** record and the resulting record, never against
+  client-sent `previousData`, inside the store's write path on every server store. A client cannot
+  move a record out of its own scope (ownership transfer goes through a server route), and foreign
+  keys must point at parents inside the writer's scope.
+- Downloads are judged per operation, from the scope values recorded when it was applied, so a
+  record that changes owner does not disclose its earlier history; a record entering a scope
+  arrives complete.
+- Rich-text updates, presence and blobs are authorized and delivered within scope too.
+- When a user's grant changes (removed from a team), live sessions end with `SCOPE_CHANGED`
+  within `sessionRevalidationIntervalMs` and reconnect with the new grant.
+
+### Node ids belong to users
+
+Operations must come from the session's own node (`NODE_ID_MISMATCH` otherwise), and the server
+records which principal claimed each node id. A signed-in device keeps its node per user; another
+user's node is refused, and a device whose node has history from before claims existed is refused
+with `NODE_ID_CLAIMED` until an administrator calls `syncServer.releaseNodeClaim(nodeId)`. A device
+refused its node moves to a fresh node id and re-sends its unsynced writes under it
+(`sync:node-id-rotated`). Anonymous devices prove their node with a secret node token.
 
 ### Desktop and Tauri apps
 
@@ -339,28 +436,25 @@ const app = createApp({
   sync: {
     url: 'wss://acme.example.com/kora-sync',
     authClient: createKoraAuthSync({ authClient, schema }),
+    autoConnect: true,
   },
 })
 ```
 
 Email/password auth, OAuth sign-in, account linking, token refresh, sync authorization, MFA, organizations, and RBAC all use HTTP plus WebSocket tokens and apply to web and desktop clients the same way. Passkeys depend on WebAuthn support in the platform WebView and should be feature-detected with `isPasskeySupported()`.
 
-For desktop and mobile OAuth, use an app redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app. After the provider returns `code` and `state`, send them to Kora:
+For desktop and mobile OAuth, use an app redirect strategy such as a loopback callback, custom URL scheme, or hosted web sign-in that returns control to the app. Create the authorization URL without redirecting, open it with the platform's browser, then hand the returned `code` and `state` to the client:
 
 ```typescript
-const response = await fetch('https://acme.example.com/auth/oauth/google/callback', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    code,
-    state,
-    deviceId,
-    devicePublicKey,
-  }),
-})
+const { url: authorizationUrl } = await authClient.getOAuthAuthorizationUrl('google')
+await openSystemBrowser(authorizationUrl)
+// ...the app receives code and state from its redirect handler:
+const user = await authClient.completeOAuthSignIn('google', { code, state })
 ```
 
-The response contains the normal Kora user and tokens, so the same token storage and sync auth flow works across web, desktop, and mobile.
+OAuth state is bound to the device and to its purpose (sign-in or linking), so a callback
+completed elsewhere is refused. Linking an account to a signed-in user starts at
+`POST /auth/oauth/:provider/link/start` (`authClient.linkOAuth`).
 
 ### Secure token storage for desktop and mobile
 
@@ -401,32 +495,71 @@ The device identity provider stores a stable device ID and a non-extractable ECD
 If your app needs both authenticated and anonymous sync (e.g., signed-in users create forms, anyone can submit responses), use `MixedAuthProvider`:
 
 ```typescript
-import { MixedAuthProvider } from '@korajs/server'
+import { KoraSyncServer, MixedAuthProvider, createSqliteServerStore } from '@korajs/server'
+import { auth } from './auth-server'
 
 const syncServer = new KoraSyncServer({
-  store,
+  store: createSqliteServerStore({ filename: './kora.db' }),
   auth: new MixedAuthProvider({
-    primary: authRoutes.toSyncAuthProvider(),
+    primary: auth.auth,
     anonymousScopes: {
-      responses: {},  // anonymous users can only sync 'responses'
+      responses: {}, // anonymous users can only sync 'responses'
     },
   }),
 })
 ```
 
-On the client, return an empty token for unauthenticated users. `createKoraAuthSync` does this automatically; with manual wiring:
-
-```typescript
-sync: {
-  authClient: createKoraAuthSync({ authClient, schema }),
-  // or manually:
-  // auth: async () => ({ token: (await authClient.getAccessToken()) ?? '' }),
-}
-```
+On the client, sync while signed out with `createKoraAuthSync({ authClient, schema, anonymous: 'allow' })`.
+An anonymous device receives a node token at its first handshake and must present it to reconnect
+with its node id.
 
 See the [Common Patterns guide](/guide/common-patterns#anonymous-public-data-access) for a full walkthrough.
 
 ---
+
+<!-- docs-check-prelude
+import {
+  BuiltInAuthRoutes,
+  EmailVerificationManager,
+  OrgRoutes,
+  PasswordResetManager,
+  RbacEngine,
+  SessionManager,
+  TokenManager,
+  TotpManager,
+} from '@korajs/auth/server'
+import type { OrgStore, UserStore } from '@korajs/auth/server'
+// An Express-style router; req and res are your framework's.
+// biome-ignore lint: documentation scaffolding
+type Handler = (req: any, res: any, next: () => void) => unknown
+declare const app: {
+  get(path: string, ...handlers: Handler[]): void
+  post(path: string, ...handlers: Handler[]): void
+  patch(path: string, ...handlers: Handler[]): void
+  delete(path: string, ...handlers: Handler[]): void
+}
+declare const userStore: UserStore
+declare const orgStore: OrgStore
+declare const tokenManager: TokenManager
+declare const authRoutes: BuiltInAuthRoutes
+declare const sessions: SessionManager
+declare const totp: TotpManager
+declare const orgRoutes: OrgRoutes
+declare const rbac: RbacEngine
+declare const emailVerifier: EmailVerificationManager
+declare const passwordReset: PasswordResetManager
+declare const userId: string
+declare const orgId: string
+declare const code: string
+declare const sessionId: string
+declare const currentSessionId: string
+declare function sendVerificationEmail(email: string, link: string): Promise<void>
+declare function sendPasswordResetEmail(email: string, link: string): Promise<void>
+declare function storePasskeyCredential(userId: string, credential: unknown): Promise<void>
+declare function getUserCredentialIds(email: string): Promise<string[]>
+declare function getStoredCredential(credentialId: string): Promise<{ userId: string; publicKey: string; signCount: number }>
+declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
+-->
 
 ## Email Verification
 
@@ -540,13 +673,34 @@ app.post('/auth/password/change', async (req, res) => {
 })
 ```
 
-The `requestReset` method always returns HTTP 200 regardless of whether the email exists. This prevents attackers from using the reset endpoint to enumerate registered email addresses.
+The `requestReset` method always returns HTTP 200 regardless of whether the email exists, and it
+never returns the reset token: without `onResetRequested` nobody receives it. For local
+development only, `exposeTokenForDevelopment: true` returns it in the response (never in
+production). Wire `onPasswordChanged: authServer.revokeAllForUser` so a password change ends
+every session and token of that user.
 
 ---
 
 ## Device Identity
 
 Kora uses ECDSA P-256 key pairs to establish device identity. Each device generates a non-extractable private key that stays in the browser and a public key that is registered with the server. This enables proof-of-possession verification: the server can confirm that a request genuinely comes from a specific device.
+
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import type { AuthKeyValueStorage, DeviceKeyStore } from '@korajs/auth'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), userId: t.string() } } } })
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare const secureStore: AuthKeyValueStorage
+declare const deviceKeyStore: DeviceKeyStore
+declare const url: string
+declare const code: string
+declare const state: string
+declare function openSystemBrowser(url: string): Promise<void>
+declare function Spinner(): JSX.Element
+declare function SignIn(): JSX.Element
+declare function AuthenticatedApp(): JSX.Element
+-->
 
 ### Client: Generate and Register a Device Key Pair
 
@@ -562,7 +716,7 @@ import {
 const keyPair = await generateDeviceKeyPair()
 
 // Export the public key as a JWK for server registration
-const publicKeyJwk = await exportPublicKeyJwk(keyPair.publicKey)
+const publicKeyJwk = await exportPublicKeyJwk(keyPair)
 const publicKeyJson = JSON.stringify(publicKeyJwk)
 
 // Compute the SHA-256 thumbprint (RFC 7638) for unique device identification
@@ -574,17 +728,65 @@ const thumbprint = await computePublicKeyThumbprint(publicKeyJwk)
 Device keys must survive page refreshes. Use the `DeviceKeyStore`:
 
 ```typescript
-import { createDeviceKeyStore } from '@korajs/auth'
+import { createDeviceKeyStore, generateDeviceKeyPair } from '@korajs/auth'
 
-// Uses IndexedDB by default, falls back to in-memory
-const deviceKeyStore = createDeviceKeyStore()
+// IndexedDB in browsers, in-memory elsewhere
+const keyStore = createDeviceKeyStore()
 
 // Save after generation
-await deviceKeyStore.save('my-device-id', keyPair)
+const keyPair = await generateDeviceKeyPair()
+await keyStore.saveKeyPair('my-device-id', keyPair)
 
 // Load on subsequent visits
-const storedKeyPair = await deviceKeyStore.load('my-device-id')
+const storedKeyPair = await keyStore.loadKeyPair('my-device-id')
 ```
+
+`createKoraAuth()` does this for you (`createPersistentDeviceIdentity`): the device id and key
+pair are created once and presented at every sign-in.
+
+<!-- docs-check-prelude
+import {
+  BuiltInAuthRoutes,
+  EmailVerificationManager,
+  OrgRoutes,
+  PasswordResetManager,
+  RbacEngine,
+  SessionManager,
+  TokenManager,
+  TotpManager,
+} from '@korajs/auth/server'
+import type { OrgStore, UserStore } from '@korajs/auth/server'
+// An Express-style router; req and res are your framework's.
+// biome-ignore lint: documentation scaffolding
+type Handler = (req: any, res: any, next: () => void) => unknown
+declare const app: {
+  get(path: string, ...handlers: Handler[]): void
+  post(path: string, ...handlers: Handler[]): void
+  patch(path: string, ...handlers: Handler[]): void
+  delete(path: string, ...handlers: Handler[]): void
+}
+declare const userStore: UserStore
+declare const orgStore: OrgStore
+declare const tokenManager: TokenManager
+declare const authRoutes: BuiltInAuthRoutes
+declare const sessions: SessionManager
+declare const totp: TotpManager
+declare const orgRoutes: OrgRoutes
+declare const rbac: RbacEngine
+declare const emailVerifier: EmailVerificationManager
+declare const passwordReset: PasswordResetManager
+declare const userId: string
+declare const orgId: string
+declare const code: string
+declare const sessionId: string
+declare const currentSessionId: string
+declare function sendVerificationEmail(email: string, link: string): Promise<void>
+declare function sendPasswordResetEmail(email: string, link: string): Promise<void>
+declare function storePasskeyCredential(userId: string, credential: unknown): Promise<void>
+declare function getUserCredentialIds(email: string): Promise<string[]>
+declare function getStoredCredential(credentialId: string): Promise<{ userId: string; publicKey: string; signCount: number }>
+declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
+-->
 
 ### Server: Register and Verify Devices
 
@@ -612,8 +814,8 @@ app.post('/auth/device/challenge', async (req, res) => {
   res.status(result.status).json(result.body)
 })
 
-// Step 2: Client signs the challenge with the device private key
-const signature = await signChallenge(keyPair.privateKey, challenge)
+// Step 2 (on the client): sign the challenge with the device private key,
+// const signature = await signChallenge(keyPair.privateKey, challenge)
 
 // Step 3: Server verifies the signature and issues fresh tokens
 app.post('/auth/device/verify', async (req, res) => {
@@ -649,6 +851,13 @@ app.delete('/auth/device/:id', async (req, res) => {
 ## Multi-Factor Authentication (TOTP)
 
 Kora supports TOTP-based multi-factor authentication, compatible with Google Authenticator, Authy, 1Password, and other authenticator apps. The implementation follows RFC 6238 (TOTP) and RFC 4226 (HOTP).
+
+::: tip MFA at sign-in
+Pass the manager to the auth server (`createKoraAuthServer({ ..., mfa: totp })`) and sign-in
+enforces it: a user with MFA enabled receives `{ mfaRequired, mfaToken }` instead of tokens and
+completes it at `POST /auth/mfa/verify` (`authClient.verifyMfa`). The routes below are for
+enrolment and for apps that wire their own endpoints.
+:::
 
 ### Server Setup
 
@@ -805,7 +1014,8 @@ const sessions = new SessionManager({
 ```typescript
 app.post('/auth/signin', async (req, res) => {
   const authResult = await authRoutes.handleSignIn(req.body, req.ip)
-  if (authResult.status !== 200) {
+  if (!('data' in authResult.body) || !('user' in authResult.body.data)) {
+    // An error, or an MFA challenge the client completes first
     return res.status(authResult.status).json(authResult.body)
   }
 
@@ -827,7 +1037,7 @@ app.post('/auth/signin', async (req, res) => {
 ### Validate Sessions on Requests
 
 ```typescript
-async function requireSession(req, res, next) {
+async function requireSession(req: any, res: any, next: () => void) {
   const sessionId = req.headers['x-session-id']
   if (!sessionId) return res.status(401).json({ error: 'Session required.' })
 
@@ -859,7 +1069,7 @@ app.post('/auth/mfa/verify', async (req, res) => {
 Require MFA on sensitive endpoints:
 
 ```typescript
-async function requireMfa(req, res, next) {
+async function requireMfa(req: any, res: any, next: () => void) {
   try {
     await sessions.requireMfa(req.session.id)
     next()
@@ -868,6 +1078,7 @@ async function requireMfa(req, res, next) {
   }
 }
 
+declare function requireSession(req: any, res: any, next: () => void): Promise<void>
 app.post('/auth/password/change', requireSession, requireMfa, async (req, res) => {
   // Only reachable if session is valid AND MFA-verified
 })
@@ -883,10 +1094,10 @@ const activeSessions = await sessions.listSessions(userId)
 await sessions.revoke(sessionId)
 
 // Sign out everywhere (revoke all sessions)
-const revokedCount = await sessions.revokeAll(userId)
+const revokedAll = await sessions.revokeAll(userId)
 
 // Sign out other devices (keep current session)
-const revokedCount = await sessions.revokeOthers(userId, currentSessionId)
+const revokedOthers = await sessions.revokeOthers(userId, currentSessionId)
 
 // Clean up expired sessions (call periodically)
 const cleanedCount = await sessions.cleanExpired()
@@ -1021,7 +1232,7 @@ For fine-grained permission checks beyond role hierarchy, use the `RbacEngine`:
 import { RbacEngine, defineRoles, OrgScopeResolver } from '@korajs/auth/server'
 
 // Use built-in roles
-const rbac = new RbacEngine(orgStore)
+const builtInRbac = new RbacEngine(orgStore)
 
 // Or define custom roles
 const customRoles = defineRoles()
@@ -1031,7 +1242,7 @@ const customRoles = defineRoles()
   .role('owner', ['*:*'])
   .build()
 
-const rbac = new RbacEngine(orgStore, { roles: customRoles })
+const customRbac = new RbacEngine(orgStore, { roles: customRoles })
 ```
 
 Check permissions:
@@ -1060,8 +1271,9 @@ todos:*          -> all actions on todos
 
 ```tsx
 import { OrgProvider, useOrg, useOrgMembers, usePermission } from '@korajs/auth/react'
-import { OrgClient } from '@korajs/auth'
+import { OrgClient, createKoraAuth } from '@korajs/auth'
 
+const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 const orgClient = new OrgClient({
   serverUrl: 'http://localhost:3001',
   getAccessToken: () => authClient.getAccessToken(),
@@ -1076,17 +1288,29 @@ function App() {
 }
 
 function OrgSwitcher() {
-  const { org, switchOrg, listOrgs, createOrg, error } = useOrg()
-
-  // org?.name, org?.id, org?.slug
-  // switchOrg(orgId), createOrg({ name, slug }), listOrgs()
+  const { org, switchOrg, error } = useOrg()
+  // Also: role, orgId, createOrg({ name, slug }), listOrgs(), leaveOrg(), clearOrg()
+  return (
+    <div>
+      <p>{org?.name ?? 'No organization'}</p>
+      {error && <p role="alert">{error}</p>}
+      <button onClick={() => switchOrg('org-123')}>Switch</button>
+    </div>
+  )
 }
 
 function MembersList({ orgId }: { orgId: string }) {
-  const { members, isLoading, invite, removeMember, updateRole } = useOrgMembers(orgId)
-
-  // members: ClientMembership[]
-  // invite(email, role), removeMember(userId), updateRole(userId, role)
+  const { members, isLoading, invite } = useOrgMembers(orgId)
+  // Also: refresh(), removeMember(userId), updateRole(userId, role), error
+  if (isLoading) return null
+  return (
+    <ul>
+      {members.map((m) => (
+        <li key={m.userId}>{m.role}</li>
+      ))}
+      <button onClick={() => invite('bob@example.com', 'member')}>Invite</button>
+    </ul>
+  )
 }
 
 function AdminPanel() {
@@ -1103,6 +1327,23 @@ function AdminPanel() {
 
 Passkeys provide passwordless authentication using biometrics (Touch ID, Face ID, Windows Hello) or hardware security keys. Kora implements the WebAuthn standard with both client-side and server-side components.
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import type { AuthKeyValueStorage, DeviceKeyStore } from '@korajs/auth'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), userId: t.string() } } } })
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare const secureStore: AuthKeyValueStorage
+declare const deviceKeyStore: DeviceKeyStore
+declare const url: string
+declare const code: string
+declare const state: string
+declare function openSystemBrowser(url: string): Promise<void>
+declare function Spinner(): JSX.Element
+declare function SignIn(): JSX.Element
+declare function AuthenticatedApp(): JSX.Element
+-->
+
 ### Check Support
 
 ```typescript
@@ -1118,6 +1359,19 @@ if (isPasskeySupported()) {
   }
 }
 ```
+
+<!-- docs-check-prelude
+import { TokenManager } from '@korajs/auth/server'
+// biome-ignore lint: documentation scaffolding
+type Handler = (req: any, res: any) => unknown
+declare const app: { post(path: string, ...handlers: Handler[]): void }
+declare const tokenManager: TokenManager
+declare const serverOptions: { challenge: string; userId: string; allowCredentialIds?: string[] }
+declare function storePasskeyCredential(userId: string, credential: unknown): Promise<void>
+declare function getUserCredentialIds(email: string): Promise<string[]>
+declare function getStoredCredential(credentialId: string): Promise<{ userId: string; publicKey: string; signCount: number }>
+declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
+-->
 
 ### Registration Flow
 
@@ -1263,6 +1517,23 @@ app.post('/auth/passkey/login/verify', async (req, res) => {
 
 ---
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import type { AuthKeyValueStorage, DeviceKeyStore } from '@korajs/auth'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), userId: t.string() } } } })
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare const secureStore: AuthKeyValueStorage
+declare const deviceKeyStore: DeviceKeyStore
+declare const url: string
+declare const code: string
+declare const state: string
+declare function openSystemBrowser(url: string): Promise<void>
+declare function Spinner(): JSX.Element
+declare function SignIn(): JSX.Element
+declare function AuthenticatedApp(): JSX.Element
+-->
+
 ## Encrypted Token Storage
 
 By default, `AuthClient` stores tokens in plaintext `localStorage`. While convenient, this is vulnerable to XSS attacks since any JavaScript running on the page can read the tokens. `EncryptedTokenStore` encrypts tokens with AES-256-GCM before writing them to storage.
@@ -1274,21 +1545,22 @@ import { EncryptedTokenStore, deriveEncryptionKey, generateSalt } from '@korajs/
 
 // Option A: Derive a key from a user passphrase
 const salt = generateSalt() // store this alongside the user's account
-const { key } = await deriveEncryptionKey('user-passphrase', salt)
+const { key: passphraseKey } = await deriveEncryptionKey('user-passphrase', salt)
 
 // Option B: Use a randomly generated key
 import { generateEncryptionKey } from '@korajs/auth'
-const key = await generateEncryptionKey()
+const randomKey = await generateEncryptionKey()
 
 // Create the encrypted store
-const encryptedStore = new EncryptedTokenStore({
-  key,
+export const encryptedStore = new EncryptedTokenStore({
+  key: passphraseKey, // or randomKey
   // storageKey: 'my_app_encrypted_tokens',  // optional custom key
 })
 ```
 
 ### Usage
 
+<!-- docs-check: continue -->
 ```typescript
 // After login: encrypt and save tokens
 await encryptedStore.saveTokens({
@@ -1314,6 +1586,50 @@ The stored format in `localStorage` is a JSON object with two base64url-encoded 
 
 ---
 
+<!-- docs-check-prelude
+import {
+  BuiltInAuthRoutes,
+  EmailVerificationManager,
+  OrgRoutes,
+  PasswordResetManager,
+  RbacEngine,
+  SessionManager,
+  TokenManager,
+  TotpManager,
+} from '@korajs/auth/server'
+import type { OrgStore, UserStore } from '@korajs/auth/server'
+// An Express-style router; req and res are your framework's.
+// biome-ignore lint: documentation scaffolding
+type Handler = (req: any, res: any, next: () => void) => unknown
+declare const app: {
+  get(path: string, ...handlers: Handler[]): void
+  post(path: string, ...handlers: Handler[]): void
+  patch(path: string, ...handlers: Handler[]): void
+  delete(path: string, ...handlers: Handler[]): void
+}
+declare const userStore: UserStore
+declare const orgStore: OrgStore
+declare const tokenManager: TokenManager
+declare const authRoutes: BuiltInAuthRoutes
+declare const sessions: SessionManager
+declare const totp: TotpManager
+declare const orgRoutes: OrgRoutes
+declare const rbac: RbacEngine
+declare const emailVerifier: EmailVerificationManager
+declare const passwordReset: PasswordResetManager
+declare const userId: string
+declare const orgId: string
+declare const code: string
+declare const sessionId: string
+declare const currentSessionId: string
+declare function sendVerificationEmail(email: string, link: string): Promise<void>
+declare function sendPasswordResetEmail(email: string, link: string): Promise<void>
+declare function storePasskeyCredential(userId: string, credential: unknown): Promise<void>
+declare function getUserCredentialIds(email: string): Promise<string[]>
+declare function getStoredCredential(credentialId: string): Promise<{ userId: string; publicKey: string; signCount: number }>
+declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
+-->
+
 ## Security Considerations
 
 ### Password Hashing
@@ -1332,9 +1648,9 @@ Passwords are hashed using PBKDF2-SHA512 with 600,000 iterations and a 32-byte r
 The `TokenManager` supports key rotation via an array of secrets:
 
 ```typescript
-const tokenManager = new TokenManager({
-  secret: [newSecret, oldSecret], // index 0 = signing key
-  // Old tokens signed with oldSecret are still valid for verification
+const rotatingTokenManager = new TokenManager({
+  secret: [process.env.NEW_SECRET ?? '', process.env.OLD_SECRET ?? ''], // index 0 = signing key
+  // Old tokens signed with the old secret are still valid for verification
 })
 ```
 
@@ -1342,16 +1658,20 @@ To rotate: add the new secret at index 0, then remove the old secret after all t
 
 ### Rate Limiting
 
-The `InMemoryRateLimiter` implements a sliding-window rate limiter (default: 10 attempts per 60 seconds). Sign-in uses a composite key of `email + IP` for per-account protection. Successful logins reset the rate limit counter.
+The `InMemoryRateLimiter` implements a sliding-window rate limiter (default: 10 attempts per 60 seconds). Sign-in has two independent budgets: one per account (rotating source IPs cannot buy unlimited guesses against one user) and one per client IP (one client cannot spray many accounts). A successful sign-in clears that account's budget. Sign-in always runs the password KDF, also for unknown emails, so response time does not reveal whether an account exists. The client IP comes from the socket or from proxies listed in `trustProxy`, never from a raw header.
 
 For production multi-server deployments, implement the `RateLimiter` interface with a Redis-backed store.
 
-### Device Revocation
+### Revocation
 
-When a device is revoked via `handleRevokeDevice()`:
-1. The device is marked as revoked in the user store
-2. All tokens issued to that device are invalidated in the revocation store
-3. The sync auth provider rejects connections from revoked devices, even if their tokens have not expired
+When a device is revoked (`handleRevokeDevice()`), or every credential of a user
+(`authServer.revokeAllForUser(userId)`, `AdminApi`, `onPasswordChanged`):
+1. The device (or user) is marked revoked, with a cut-off time in the revocation store
+2. Every route and the sync auth provider refuse its tokens at once through the same `authenticateAccess` check, even before they expire, also on other server instances that share the stores
+3. Live sync sessions end immediately on this instance (the provider's `onRevoke` feed) and within `sessionRevalidationIntervalMs` (30 s) on others; a narrowed scope ends sessions with `SCOPE_CHANGED`
+4. Refresh-token rotation is atomic and safe across tabs: a reused refresh token is refused after a short grace period (`DEFAULT_REFRESH_REUSE_GRACE_MS`)
+
+Custom `TokenRevocationStore` implementations must provide `consume`, `isConsumed` and the revocation cut-offs.
 
 ### Challenge Security
 
@@ -1363,18 +1683,33 @@ Device proof-of-possession challenges are:
 
 ### Production Checklist
 
-- [ ] Use a persistent user store (database-backed, not `InMemoryUserStore`)
-- [ ] Use a persistent token revocation store (Redis or database, not `InMemoryTokenRevocationStore`)
+- [ ] Use a persistent user store (`createSqliteUserStore` / `createPostgresUserStore`; production refuses in-memory stores unless `allowInMemory`)
+- [ ] Use a persistent token revocation store (the SQLite and Postgres user stores include one)
 - [ ] Use a persistent session store (not `InMemorySessionStore`)
 - [ ] Use a persistent TOTP store (not `InMemoryTotpStore`)
-- [ ] Set `AUTH_SECRET` as an environment variable (at least 32 characters)
+- [ ] Set `KORA_AUTH_SECRET` as an environment variable (at least 32 characters)
+- [ ] Set `trustProxy` on the production server when it runs behind a proxy
+- [ ] Wire `onPasswordChanged: authServer.revokeAllForUser` and the `AdminApi` `revokeAllForUser`
 - [ ] Serve all auth endpoints over HTTPS
 - [ ] Implement the `RateLimiter` interface with Redis for multi-server deployments
 - [ ] Configure `onResetRequested` and `onVerificationRequired` callbacks for production email delivery
 - [ ] Set appropriate CORS headers on auth endpoints
 - [ ] Consider using `EncryptedTokenStore` for sensitive environments
 - [ ] Periodically call `cleanExpired()` on session and token stores to prevent unbounded memory growth
-# Authenticated app lifecycle
+<!-- docs-check-prelude
+import { AuthBoundKoraProvider } from '@korajs/react'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+const binding = createKoraAuthSync({ authClient, schema })
+const app = createApp({ schema, sync: { url: 'wss://sync.example.com/kora-sync', authClient: binding } })
+declare const url: string
+declare function SignIn(): JSX.Element
+declare function AuthenticatedApp(): JSX.Element
+-->
+
+## Authenticated app lifecycle
 
 Authenticated sync is suspended while auth is loading or signed out. `createKoraAuthSync()`
 uses `anonymous: 'suspend'` by default, so a sign-in screen opens no WebSocket and schedules
@@ -1384,18 +1719,25 @@ configured with `MixedAuthProvider`.
 On shared browsers, bind the whole app lifetime to the authenticated user:
 
 ```tsx
-<AuthBoundKoraProvider
-  authClient={createKoraAuthSync({ authClient, schema })}
-  createApp={({ userId }) => createApp({
-    schema,
-    store: { name: 'acme', namespaceByAuthUser: true },
-    sync: { url, authClient: createKoraAuthSync({ authClient, schema }), autoConnect: true },
-  })}
-  signedOut={<SignIn />}
->
-  <AuthenticatedApp />
-</AuthBoundKoraProvider>
+const lifecycle = (
+  <AuthBoundKoraProvider
+    authClient={binding}
+    createApp={() =>
+      createApp({
+        schema,
+        store: { name: 'acme', namespaceByAuthUser: true },
+        sync: { url, authClient: binding, autoConnect: true },
+      })
+    }
+    signedOut={<SignIn />}
+  >
+    <AuthenticatedApp />
+  </AuthBoundKoraProvider>
+)
 ```
+
+`createApp` receives the authenticated session (`userId`), `locked` renders while the session
+is locked, and `error` renders initialization failures with a `retry()`.
 
 The host waits for initial auth restoration, removes the old provider tree, closes the old
 app, and only then creates the next user's app. A refresh or scope change for the same user
@@ -1403,6 +1745,8 @@ keeps the app and store. `app.storeInfo()` exposes the active database identity 
 without providing access to any other user's data. `app.close()` remains the teardown boundary.
 
 ## Writes belong to the signed-in user
+
+### Held writes
 
 With `sync.authClient`, Kora binds every local write to the user who is signed in when it is
 made, even when several users share one local database (`namespaceByAuthUser` off, the default):
@@ -1424,12 +1768,12 @@ made, even when several users share one local database (`namespaceByAuthUser` of
     `status.heldNodes` with reason `unassigned`, until the app decides:
 
     ```typescript
-    for (const node of await app.sync.getHeldOperations()) {
+    for (const node of (await app.sync?.getHeldOperations()) ?? []) {
       if (node.reason !== 'unassigned') continue
       // A single-user device, or after asking the user:
-      await app.sync.assignHeld(node.nodeId, 'current-user')
+      await app.sync?.assignHeld(node.nodeId, 'current-user')
       // Or never upload them (they stay in this device's local database only):
-      // await app.sync.discardHeld(node.nodeId)
+      // await app.sync?.discardHeld(node.nodeId)
     }
     ```
 
@@ -1443,8 +1787,8 @@ made, even when several users share one local database (`namespaceByAuthUser` of
     createApp({
       schema,
       sync: {
-        url: 'wss://sync.example.com/kora',
-        authClient,
+        url: 'wss://sync.example.com/kora-sync',
+        authClient: binding,
         // Default 'hold': wait for app.sync.assignHeld / discardHeld.
         unassignedWrites: 'assign-to-first-user',
       },

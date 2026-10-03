@@ -1,77 +1,59 @@
 # @korajs/merge
 
-Three-tier conflict resolution engine for Kora.js. Handles concurrent modifications across offline devices and produces deterministic, commutative merge results.
+Cross-record rules for Kora.js: constraint checks (unique, capacity, referential), referential
+integrity on delete, and rich-text helpers.
 
-> Most developers don't install this directly. Use [`korajs`](https://www.npmjs.com/package/korajs) instead.
+> Most apps do not install this directly. Records are merged by the per-field fold in
+> `@korajs/core` on every device and server; `createApp` and the sync server wire this package.
 
 ## Install
 
 ```bash
-pnpm add @korajs/merge
+pnpm add @korajs/merge@beta
 ```
 
-## How It Works
+## How Kora merges
 
-The merge engine resolves conflicts in three tiers:
+Since 1.0.0-beta.13 every replica computes a record from its operations with one deterministic
+per-field CRDT (the fold in `@korajs/core`), so the result depends only on the set of operations,
+not their order or duplicates:
 
-**Tier 1 -- Auto-Merge (default for all fields):**
-- `string`, `number`, `boolean`, `enum`, `timestamp` -- Last-Write-Wins via HLC
-- `array` -- Add-wins set (union of elements)
-- `richtext` -- Yjs CRDT (character-level merge)
+- strings, numbers, booleans, enums, timestamps: the later write wins (hybrid logical clock)
+- arrays: an element set (concurrent additions and removals both apply)
+- objects: per top-level key
+- rich text: Yjs, character by character
+- `.merge('counter' | 'max' | 'min' | 'append-only' | 'server-authoritative')` and custom
+  `resolve` functions where declared
 
-**Tier 2 -- Constraint Validation:**
-After auto-merge, constraints (unique, capacity, referential) are checked. Violations trigger the configured `onConflict` strategy.
+Constraints span records, so the **sync server** enforces them: a violating operation is refused,
+and races are corrected with deterministic server operations.
 
-**Tier 3 -- Custom Resolvers:**
-For domain-specific logic that neither auto-merge nor constraints can handle.
-
-## Usage
-
+<!-- docs-check: standalone -->
 ```typescript
-import { MergeEngine } from '@korajs/merge'
+import { defineSchema, t } from 'korajs'
 
-const engine = new MergeEngine({ schema })
-
-// Merge two concurrent operations
-const result = engine.merge(localOperation, remoteOperation)
-
-// result.value   -- the resolved value
-// result.trace   -- full MergeTrace for debugging/DevTools
-// result.tier    -- which tier resolved it (1, 2, or 3)
-```
-
-### Custom Resolver
-
-```typescript
-const schema = defineSchema({
+export const schema = defineSchema({
+  version: 1,
   collections: {
     inventory: {
       fields: {
-        productId: t.string(),
-        quantity: t.number(),
+        sku: t.string(),
+        quantity: t.number().merge('counter'), // concurrent changes add up
       },
-      resolve: {
-        quantity: (local, remote, base) => {
-          // Additive merge: apply both deltas
-          const localDelta = local - base
-          const remoteDelta = remote - base
-          return Math.max(0, base + localDelta + remoteDelta)
-        },
-      },
+      constraints: [{ type: 'unique', fields: ['sku'], onConflict: 'first-write-wins' }],
     },
   },
 })
 ```
 
-## Guarantees
+`MergeEngine` and the pairwise strategy functions implement the 1.0.0-beta.12 merge. They remain
+only for `experimental.legacyMerge` in this release and will be removed.
 
-- **Deterministic** -- same operations always produce the same result
-- **Commutative** -- `merge(A, B)` equals `merge(B, A)`
-- **Idempotent** -- applying the same operation twice has no additional effect
-- **Traceable** -- every decision produces a `MergeTrace` for inspection
+## Documentation
+
+[Conflict Resolution](https://korajs.dev/guide/conflict-resolution) and the
+[Merge API reference](https://korajs.dev/api/merge).
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.

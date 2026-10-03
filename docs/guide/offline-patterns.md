@@ -13,11 +13,11 @@ This guide covers how Kora's offline-first architecture works and how to build U
 
 When your app performs a mutation (insert, update, delete), Kora does three things:
 
-1. **Writes to the local store immediately.** The data is persisted to SQLite WASM (via OPFS) on the device. This happens synchronously from the developer's perspective.
+1. **Writes to the local store.** The record and its operation are committed to the local database (SQLite WASM on OPFS, or IndexedDB) in one transaction before the call resolves.
 
-2. **Creates an operation.** Every mutation produces an immutable, content-addressed Operation that captures exactly what changed.
+2. **Creates an operation.** Every mutation produces an immutable, content-addressed Operation that captures exactly what changed, with a sequence number reserved in the same commit.
 
-3. **Queues the operation for sync.** If a sync connection is active, the operation is sent immediately. If offline, it is added to a persistent outbound queue.
+3. **Queues the operation for sync.** The operation joins a persistent outbound queue. When a connection exists it is uploaded once it is durable on the device; it counts as synced only when the server acknowledged it.
 
 There is no "offline mode" to enable. The app is always offline-capable.
 
@@ -28,6 +28,7 @@ Kora keeps your **data** on the device, but the browser also needs the app's **i
 created by `create-kora-app` ships a service worker for that, generated at build time by
 the `koraServiceWorker()` Vite plugin:
 
+<!-- docs-check: skip excerpt of the scaffolded vite.config.ts (its other plugins are defined there) -->
 ```typescript
 // vite.config.ts
 import { koraServiceWorker } from '@korajs/cli/vite'
@@ -43,7 +44,7 @@ export default defineConfig({
 - **Precache:** the built shell and every hashed asset, the sqlite WASM, the OPFS proxy and
   your `public/` files, in a cache versioned by their content (`kora-shell-<version>`).
   Old versions are deleted when a new one activates.
-- **Navigations** are network first (4 s timeout) with the cached shell as the fallback, so
+- **Navigations** are network first (4 s timeout, `navigationTimeoutMs`) with the cached shell as the fallback, so
   online users always get the latest deploy and offline users still get the app.
 - **Hashed assets** are cache first; everything else is network first with a cache
   fallback (an unhashed `sqlite3.wasm` is never served stale next to new JavaScript).
@@ -54,10 +55,14 @@ export default defineConfig({
   one page never mixes old and new assets. To use your own UI, pass
   `koraServiceWorker({ updatePrompt: false })` and handle the event:
 
+<!-- docs-check-prelude
+declare function showMyToast(options: { onReload: () => void }): void
+-->
+
 ```typescript
 window.addEventListener('kora:update-available', (event) => {
   event.preventDefault() // also suppresses the built-in prompt when updatePrompt is true
-  showMyToast({ onReload: () => (event as CustomEvent).detail.update() })
+  showMyToast({ onReload: () => (event as CustomEvent<{ update: () => void }>).detail.update() })
 })
 ```
 
@@ -66,27 +71,36 @@ The production server's static headers are designed to work with it (see
 The `tauri-react` template has no service worker: its interface is embedded in the
 desktop binary and always opens offline.
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { useMutation, useQuery, useQueryState, useSyncStatus } from '@korajs/react'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } },
+  }),
+})
+declare function showToast(message: string): void
+-->
+
 ## Optimistic Mutations
 
 All mutations in Kora are optimistic. When you call `app.todos.insert(...)`, the record appears in the local store and in any reactive queries immediately, before the operation syncs to the server.
 
 ```typescript
-// This returns instantly - no network round-trip
+// No network round-trip: resolves once the local write committed
 const todo = await app.todos.insert({
   title: 'Buy groceries',
 })
 
 // The record is immediately available
 const found = await app.todos.findById(todo.id)
-// found.title === 'Buy groceries'
+// found?.title === 'Buy groceries'
 ```
 
-Reactive queries update immediately too:
-
-```typescript
-const todos = useQuery(app.todos.where({ completed: false }))
-// The new todo appears in `todos` within a single frame (< 16ms)
-```
+Reactive queries pick up the write right after it commits: subscribers are notified after the
+commit, batched per microtask, and only when their result changed. Check the measured latency on
+your target devices with the store benchmarks; see [Benchmarks](/benchmarks/baseline).
 
 This means your UI never waits for the network. Data is always local-first.
 
@@ -97,10 +111,10 @@ When the device is offline, operations accumulate in a persistent outbound queue
 When connectivity returns:
 
 1. Kora reconnects to the sync server.
-2. The client and server exchange version vectors to determine what each side is missing.
-3. Queued operations are sent to the server in causal order (dependencies before dependents).
-4. The server sends any operations from other clients that this device has not seen.
-5. Incoming operations are merged into the local store using the [three-tier merge engine](/guide/conflict-resolution).
+2. The client sends its version vector and its delivery watermark.
+3. Queued operations of this device are sent to the server in causal order (dependencies before dependents).
+4. The server resumes its delivery stream after the device's watermark, so the device receives exactly what it has not applied.
+5. Incoming operations are folded into the local store per field (see [Conflict Resolution](/guide/conflict-resolution)); one the device cannot apply yet is quarantined and retried, never dropped.
 
 The entire process is automatic. No developer intervention required.
 
@@ -117,17 +131,15 @@ Kora manages reconnection automatically with exponential backoff:
 | 5 | 16 seconds |
 | 6+ | 30 seconds (max) |
 
-The base delay is `min(initialDelay * 2^attempt, maxDelay)`, capped at a maximum of 30 seconds. A jitter of plus or minus 25% is applied to each delay so that many clients do not reconnect in lockstep.
+The base delay is `min(initialDelay * 2^attempt, maxDelay)`, capped at a maximum of 30 seconds. A jitter of plus or minus 25% is applied to each delay so that many clients do not reconnect in lockstep. The backoff resets only after a connection stayed up for 10 seconds, and a reconnect counts only once the session reaches streaming. Dead connections are detected by heartbeats (about a minute of silence).
 
-On each successful reconnection, the full sync handshake runs to bring both sides up to date. The protocol is resumable -- if the connection drops during sync, it picks up from the last acknowledged operation, not from the beginning.
+On each reconnection the handshake runs again. The protocol is resumable: if the connection drops during sync, delivery resumes from the device's watermark, not from the beginning.
 
 ## Monitoring Sync Status
 
 Use `useSyncStatus` in React to track the current sync state:
 
 ```tsx
-import { useSyncStatus } from '@korajs/react'
-
 function SyncIndicator() {
   const status = useSyncStatus()
 
@@ -146,34 +158,35 @@ function SyncIndicator() {
 
 | State | Meaning |
 |-------|---------|
-| `'connected'` | WebSocket is open, idle |
+| `'connected'` | Session open; the initial exchange has not finished |
+| `'reconnecting'` | Connection lost; reconnecting with backoff |
 | `'syncing'` | Actively exchanging operations |
-| `'synced'` | All local operations acknowledged by server |
-| `'offline'` | No connection to sync server |
-| `'clock-error'` | Device clock skew is too large to sync safely |
+| `'synced'` | All local operations acknowledged by the server |
+| `'offline'` | No connection to the sync server |
+| `'auth-required'` | Sync waits for a sign-in or a fresh credential |
+| `'clock-error'` | Device clock is too far ahead of the server to sync safely |
 | `'error'` | Connection failed (will retry automatically) |
 | `'schema-mismatch'` | Client and server schema versions are incompatible |
 
-### Status Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `status` | `string` | Current sync status |
-| `pendingOperations` | `number` | Operations queued but not yet sent |
-| `lastSyncedAt` | `number \| null` | Timestamp of last successful sync |
+Besides `status` and `pendingOperations`, the status reports `heldOperations` (writes waiting for
+another user, or unassigned writes), `localDurability` (`'degraded'` when local storage cannot
+persist) and more; see [React Hooks](/guide/react-hooks#usesyncstatus).
 
 ## Designing UIs for Offline-First
 
 Building offline-first UIs requires a shift in thinking. Here are the key patterns.
 
-### No Loading Spinners for Local Data
+### No Network Spinners for Local Data
 
-Since all data comes from the local store, queries always return results immediately. Do not show loading spinners for initial data loads:
+All data comes from the local store, so queries never wait for the network. The local query runs
+right after a component mounts: the first render returns `[]` and the rows follow immediately. For
+most lists that is invisible. Where an empty state would flash ("No todos yet"), wait for `ready`:
 
 ```tsx
-// GOOD: Data is always available
 function TodoList() {
-  const todos = useQuery(app.todos.where({ completed: false }))
+  const { data: todos, ready } = useQueryState(app.todos.where({ completed: false }))
+  if (!ready) return null
+  if (todos.length === 0) return <p>No todos yet</p>
   return (
     <ul>
       {todos.map((todo) => (
@@ -182,15 +195,10 @@ function TodoList() {
     </ul>
   )
 }
-
-// AVOID: Unnecessary loading states for local data
-function TodoList() {
-  const [loading, setLoading] = useState(true)
-  // This pattern is not needed with Kora
-}
 ```
 
-The only time you might show a loading indicator is during the initial app startup while the local store is being opened for the first time.
+The other loading state is app startup: `<KoraProvider fallback={...}>` covers the time the local
+database takes to open.
 
 ### Show Sync Status, Not Connection Status
 
@@ -209,7 +217,7 @@ function StatusBar() {
   }
 
   if (status.status === 'offline') {
-    return <span>Working offline - changes will sync when connected</span>
+    return <span>Working offline: changes will sync when connected</span>
   }
 
   return null
@@ -237,16 +245,16 @@ If a particular action requires server confirmation (such as a payment), you can
 
 ### Handle Conflicts Gracefully
 
-Most conflicts resolve automatically through Kora's merge engine. For cases where you want to inform the user that a conflict was resolved, listen for merge events:
+Concurrent edits merge automatically. For cases where you want to inform the user that a conflict was resolved, listen for merge events:
 
 ```typescript
-app.events.on('merge:conflict', (event) => {
+app.on('merge:conflict', (event) => {
   // Show a non-blocking notification
   showToast(`"${event.trace.field}" was updated by another device`)
 })
 ```
 
-This is optional. By default, conflicts resolve silently and the UI updates to reflect the merged state.
+This is optional. By default, conflicts resolve silently and the UI updates to reflect the merged state. Separately, a write the server **refuses** (a constraint, a validator) is reported with `sync:operation-rejected` and undone on its author; surface that one to the user.
 
 ## Offline-First Checklist
 
@@ -256,6 +264,7 @@ When building features, verify these offline behaviors:
 - [ ] Reactive queries update immediately on local mutations
 - [ ] No loading spinners for data that comes from the local store
 - [ ] The app starts and is usable before the sync connection is established
+- [ ] The deployed build reopens with the network off (the app shell)
 - [ ] Pending changes survive a page refresh
 - [ ] When connectivity returns, changes sync without user intervention
 - [ ] Conflicting edits from multiple devices merge cleanly
@@ -271,6 +280,10 @@ Operations are durable by design:
 
 3. **Persisted locally.** The operation log is stored in the same local database as your data. It persists across page refreshes, app restarts, and device reboots.
 
-4. **Idempotent sync.** Receiving the same operation twice is harmless. Content-addressing catches duplicates automatically. This means the sync protocol does not need exactly-once delivery -- at-least-once is sufficient.
+4. **Idempotent sync.** Receiving the same operation twice is harmless. Content-addressing catches duplicates automatically. This means the sync protocol does not need exactly-once delivery: at-least-once is sufficient.
 
-These properties mean that data loss requires the local database itself to be destroyed. As long as the browser's storage is intact, no operation is ever lost.
+5. **Never dropped.** An operation the device cannot apply yet is quarantined durably and retried; one the server refuses is kept in the rejected list with its reason; and the device recovers its own writes from the server if its local log lost them.
+
+As long as the browser's storage is intact, no operation is lost. Ask for persistent storage
+(`store.persistence`, see [Storage Configuration](/guide/storage-configuration#durable-storage-persist))
+so the browser does not evict it under storage pressure.

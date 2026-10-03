@@ -10,8 +10,11 @@ This page is written for AI coding agents (Cursor, Claude Code, Copilot, and sim
 If you scaffolded with `create-kora-app`, an `AGENTS.md` already sits in your project root with these rules. If you added Kora to an existing project, drop the same file in with:
 
 ```bash
-npx kora agents-md
+npx -p @korajs/cli@beta kora agents-md
 ```
+
+(`npx kora` alone works inside projects that have `@korajs/cli` installed; elsewhere it would fetch
+an unrelated npm package named `kora`.)
 
 Commit it so agents pick up the conventions automatically. Re-run with `--force` to regenerate it after an upgrade.
 
@@ -33,9 +36,18 @@ Prefer these over fetching HTML. They are smaller, stable, and free of navigatio
 4. Offline must keep working. Every feature must function with the network off. Never gate a read or write on connectivity. Checking `navigator.onLine` before a data operation is a sign you have taken a wrong turn.
 5. Surface mutation errors. Fire-and-forget `mutate` folds errors into the mutation state, so render `mutation.error`, or use `mutateAsync` and handle the promise.
 6. Do not add a state library for app data. Reactive queries are the store. Reaching for react-query, SWR, Redux, or Zustand to hold collection data duplicates what Kora already does.
-7. Do not add loading spinners for local reads. `useQuery` returns data synchronously from the local store, so there is nothing to wait on.
+7. Do not add loading spinners for local reads. Local queries need no network: `useQuery` renders `[]` on the very first render and the rows arrive right after mount. Use `useQueryState`'s `ready` when "not loaded yet" must look different from "no rows".
 
 ## The data API
+
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({
+  version: 1,
+  collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } },
+})
+const app = createApp({ schema })
+-->
 
 ```ts
 await app.ready
@@ -52,17 +64,28 @@ const unsubscribe = app.todos
   })
 ```
 
-In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, and `error`. Sync state comes from `useSyncStatus().status`, which is one of `connected`, `syncing`, `synced`, `offline`, `clock-error`, `error`, or `schema-mismatch`.
+In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, and `error`. Sync state comes from `useSyncStatus().status`, which is one of `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch` or `auth-required`.
 
 ```tsx
-import { useCollection, useMutation, useQuery, useSyncStatus } from '@korajs/react'
+import { createKoraHooks } from '@korajs/react'
 
-const todos = useCollection('todos')
-const rows = useQuery(todos.where({ completed: false }).orderBy('createdAt'))
-const addTodo = useMutation((data) => todos.insert(data))
-addTodo.mutate({ title: 'x' })            // errors land in addTodo.error
-await addTodo.mutateAsync({ title: 'x' }) // resolves with the result; throws on failure
-const status = useSyncStatus()            // status.status, status.pendingOperations
+// Typed hooks: collection names, inserts and rows are checked against the schema.
+const { useCollection, useMutation, useQuery, useSyncStatus } = createKoraHooks<typeof app>()
+
+function Todos() {
+  const todos = useCollection('todos')
+  const rows = useQuery(todos.where({ completed: false }).orderBy('createdAt'))
+  const addTodo = useMutation(todos.insert)
+  const status = useSyncStatus() // status.status, status.pendingOperations
+
+  return (
+    <>
+      <button onClick={() => addTodo.mutate({ title: 'x' })}>Add</button>
+      {addTodo.error && <p role="alert">{addTodo.error.message}</p>}
+      <p>{rows.length} open, sync {status.status}</p>
+    </>
+  )
+}
 ```
 
 The Vue and Svelte bindings expose the same names from `@korajs/vue` and `@korajs/svelte`. See [React Hooks](/guide/react-hooks) for the full reference.
@@ -76,16 +99,16 @@ If your instinct comes from REST plus a client cache, here is the mapping.
 | `fetch('/api/todos')` then cache the JSON | `app.todos.where(...)` or `useQuery(...)`, already local and reactive |
 | A REST or GraphQL endpoint for CRUD | `app.todos.insert / update / delete`, synced automatically |
 | react-query, SWR, or a Redux slice for server state | Reactive queries; they are the store |
-| A loading spinner for a data read | Nothing; local reads are synchronous |
+| A loading spinner for a data read | Nothing; local reads need no network (`useQueryState().ready` if you must tell "not loaded yet" apart) |
 | `useEffect` to fetch on mount | Subscribe with `useQuery`; it fires immediately and on change |
 | `navigator.onLine` guards before writing | Write unconditionally; offline writes queue and sync later |
 | Hand-written TypeScript interfaces for records | Types inferred from `defineSchema` |
-| Manual conflict handling on the server | The three-tier merge engine; add a `resolve` function only for domain-specific merges |
+| Manual conflict handling on the server | The built-in per-field merge; declare `.merge('counter')` and similar, or a `resolve` function, only for domain-specific merges |
 | `localStorage` or `IndexedDB` glue | The local SQLite store, configured through the schema |
 
 ## Conflict handling
 
-Concurrent edits converge automatically: last-write-wins per field, add-wins for arrays, and character-level CRDT for `t.richtext()` fields. When a field needs domain-specific merging, such as an inventory counter, add a `resolve` function to that field in the schema. Do not write your own merge or sync code. See [Conflict Resolution](/guide/conflict-resolution) for the model.
+Concurrent edits converge automatically: last-write-wins per field, an element set for arrays (concurrent additions and removals both apply), per-key merging for objects, and character-level CRDT for `t.richtext()` fields. When a field needs domain-specific merging, declare it in the schema: `.merge('counter')` for an inventory quantity (or use `op.increment`), `.merge('max')`/`'min'`, or a collection-level `resolve: { field: (local, remote, base) => ... }`. Rules across records (unique, capacity) are `constraints`, enforced by the sync server. Do not write your own merge or sync code. See [Conflict Resolution](/guide/conflict-resolution) for the model.
 
 ## Verifying you did it right
 

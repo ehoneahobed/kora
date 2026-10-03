@@ -1,67 +1,57 @@
 # @korajs/sync
 
-Sync protocol and transports for Kora.js. Handles version vector delta sync, causal ordering, Protobuf wire format, and automatic reconnection with operation queuing.
+The sync engine of Kora.js: protocol v2 over WebSocket or HTTP long-polling, an outbound queue that
+survives reloads, gap-free resumable downloads, reconnection with backoff, end-to-end encryption
+and presence.
 
-> Most developers don't install this directly. Use [`korajs`](https://www.npmjs.com/package/korajs) instead.
+> Most apps do not install this directly: `createApp({ sync: { url } })` from
+> [`korajs`](https://www.npmjs.com/package/korajs) creates and runs the engine.
 
 ## Install
 
 ```bash
-pnpm add @korajs/sync
+pnpm add @korajs/sync@beta
 ```
 
 ## Usage
 
-### WebSocket Transport
-
+<!-- docs-check: standalone -->
 ```typescript
-import { SyncEngine, WebSocketTransport } from '@korajs/sync'
+import { createApp, defineSchema, t } from 'korajs'
 
-const transport = new WebSocketTransport({
-  url: 'wss://my-server.com/kora',
-  auth: async () => ({ token: await getAuthToken() }),
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+
+const app = createApp({
+  schema,
+  sync: { url: 'wss://sync.example.com/kora-sync', autoConnect: true },
 })
 
-const sync = new SyncEngine({
-  transport,
-  mergeEngine,
-  operationLog,
+app.sync?.subscribeStatus((status) => {
+  console.log(status.status, status.pendingOperations)
 })
-
-sync.start()
+app.events.on('sync:operation-rejected', (event) => console.warn(event.code, event.message))
 ```
 
-### HTTP Transport
-
-```typescript
-import { HttpTransport } from '@korajs/sync'
-
-const transport = new HttpTransport({
-  url: 'https://my-server.com/kora/sync',
-  pollInterval: 5000,
-})
-```
-
-### Sync Events
-
-```typescript
-sync.on('connected', () => console.log('Connected'))
-sync.on('disconnected', (reason) => console.log('Disconnected:', reason))
-sync.on('sent', (ops) => console.log('Sent', ops.length, 'operations'))
-sync.on('received', (ops) => console.log('Received', ops.length, 'operations'))
-```
+`SyncEngine`, `WebSocketTransport`, `HttpLongPollingTransport`, `ChaosTransport`, the protocol
+message types and the encryption keyring are exported for custom runtimes and tests.
 
 ## Protocol
 
-1. **Handshake** -- exchange version vectors to determine what each side is missing
-2. **Delta sync** -- send only the operations the other side doesn't have
-3. **Real-time streaming** -- bidirectional operation flow after initial sync
-4. **Resumable** -- reconnects pick up from the last acknowledged sequence number
+1. **Handshake**: protocol version, schema version, the client's version vector and scope; the
+   server answers with its grant, its time (clock skew) and the delivery position to resume from.
+2. **Upload**: the operations the server has not acknowledged, in causal order.
+3. **Download**: batches chained by server delivery sequence. The client applies a batch only when
+   it continues its durable watermark, so a dropped or failed operation is re-sent, never skipped.
+4. **Streaming**: both directions continue in real time; heartbeats detect dead connections.
 
-Operations are always sent in causal order. The protocol is idempotent -- duplicate operations are detected via content-addressing and safely ignored.
+Operations are content-addressed, so a duplicate is a no-op. Messages are JSON.
+
+## Documentation
+
+[Sync Configuration](https://korajs.dev/guide/sync-configuration),
+[Sync Protocol](https://korajs.dev/guide/sync-protocol) and the
+[Sync API reference](https://korajs.dev/api/sync).
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.

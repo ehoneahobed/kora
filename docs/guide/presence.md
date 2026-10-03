@@ -5,7 +5,7 @@ description: "Show who is online and where they are working: presence, awareness
 
 # Presence & Awareness
 
-Kora includes a presence system for sharing ephemeral collaborative state between connected clients. Unlike operations, presence data is never persisted -- it exists only while clients are connected and is used for features like showing who is online, displaying cursor positions, and indicating which records are being edited.
+Kora includes a presence system for sharing ephemeral collaborative state between connected clients. Unlike operations, presence data is never persisted: it exists only while clients are connected and is used for features like showing who is online, displaying cursor positions, and indicating which records are being edited.
 
 ## How Presence Works
 
@@ -13,13 +13,19 @@ Presence flows through the sync layer but operates independently from the operat
 
 1. A client sets its local awareness state (user info, cursor position, custom data).
 2. The state is sent to the sync server through the existing transport.
-3. The server's `AwarenessRelay` broadcasts the state to all other connected clients.
+3. The server's `AwarenessRelay` forwards the state to the other connected clients that share the
+   sender's download scope (its presence partition). Users who cannot sync the same data never see
+   each other's presence.
 4. When a client disconnects, the server broadcasts a removal notification.
 5. As a safety net, clients run a timeout-based cleanup that removes stale remote states after 30 seconds of inactivity.
 
 Presence data is lightweight and designed for frequent updates (e.g., cursor movements). It does not use the operation log, version vectors, or merge engine.
 
 ## Setting Presence with `usePresence`
+
+<!-- docs-check-prelude
+import { usePresence, useCollaborators } from '@korajs/react'
+-->
 
 The `usePresence` hook sets the local user's presence state and broadcasts it to peers. It automatically cleans up on unmount.
 
@@ -113,9 +119,9 @@ The `cursor` field is optional. When present, it indicates the user's cursor pos
 
 On the server, the `AwarenessRelay` handles presence broadcasting:
 
-- **Client joins**: When a new client registers, the relay sends it all existing awareness states so it immediately sees who is online.
-- **State update**: When a client updates its awareness state, the relay stores it and forwards it to all other connected clients.
-- **Client leaves**: When a client disconnects, the relay broadcasts a removal notification (`null` state) to all remaining clients.
+- **Client joins**: A session takes part after its handshake is accepted. Its first update binds its awareness client id (later updates must use it, so a client cannot impersonate another) and its partition; the relay sends it every existing state in that partition.
+- **State update**: The relay stores the state and forwards it to the other clients in the same partition.
+- **Client leaves**: When a client disconnects, the relay sends a removal (`null` state) to the remaining clients in its partition.
 
 The relay is built into `KoraSyncServer` and requires no additional configuration. It is active whenever sync is enabled.
 
@@ -123,10 +129,10 @@ The relay is built into `KoraSyncServer` and requires no additional configuratio
 Client A                    Server (AwarenessRelay)              Client B
    |                               |                                |
    |-- awareness update ---------->|                                |
-   |   {user: {name: "Alice"}}     |-- relay to all others ------->|
+   |   {user: {name: "Alice"}}     |-- relay within partition ---->|
    |                               |                                |
    |                               |<-- awareness update ----------|
-   |<-- relay to all others -------|   {user: {name: "Bob"}}       |
+   |<-- relay within partition ----|   {user: {name: "Bob"}}       |
    |                               |                                |
    |   (Alice disconnects)         |                                |
    |                               |-- removal broadcast --------->|
@@ -224,71 +230,42 @@ function generateColor(name: string): string {
 
 ## Example: Cursor Positions in a Collaborative Editor
 
-For richtext fields using `t.richtext()`, you can share cursor positions so users see where others are typing:
+For `t.richtext()` fields, `useRichText` publishes this user's cursor and returns the cursors of
+everyone else editing the same field:
 
+<!-- docs-check: standalone -->
 ```tsx
-import { usePresence, useCollaborators } from '@korajs/react'
-import { useCallback } from 'react'
+import { useRichText } from '@korajs/react'
 
-function CollaborativeEditor({
-  recordId,
-  currentUser,
-}: {
-  recordId: string
-  currentUser: { name: string }
-}) {
-  const color = generateColor(currentUser.name)
-
-  // Set presence with cursor position
-  usePresence({
-    name: currentUser.name,
-    color,
+function NoteEditor({ noteId, me }: { noteId: string; me: { name: string; color: string } }) {
+  const { text, ready, cursors, setCursor, clearCursor } = useRichText('notes', noteId, 'content', {
+    user: me,
   })
-
-  // Get collaborators for rendering their cursors
-  const collaborators = useCollaborators()
-
-  // Filter to collaborators editing the same record
-  const editingHere = collaborators.filter(
-    (c) => c.cursor?.recordId === recordId && c.cursor?.field === 'content'
-  )
-
-  // Update cursor position as the user types/selects
-  const handleSelectionChange = useCallback(
-    (anchor: number, head: number) => {
-      // Update the awareness state with cursor info
-      // (This would integrate with your editor's selection API)
-    },
-    [recordId]
-  )
+  if (!ready) return null
 
   return (
     <div>
-      {/* Render remote cursors */}
-      {editingHere.map((c) => (
-        <div key={c.user.name}>
-          <span
-            style={{
-              backgroundColor: c.user.color,
-              color: 'white',
-              padding: '0 4px',
-              borderRadius: 2,
-              fontSize: 12,
-            }}
-          >
-            {c.user.name}
-          </span>
-        </div>
+      <textarea
+        defaultValue={text.toString()}
+        onSelect={(event) => {
+          const { selectionStart, selectionEnd } = event.currentTarget
+          setCursor(selectionStart, selectionEnd)
+        }}
+        onBlur={clearCursor}
+      />
+      {cursors.map((cursor) => (
+        <span key={cursor.clientId} style={{ color: cursor.color }}>
+          {cursor.userName} at {cursor.anchor}
+        </span>
       ))}
-
-      {/* Your editor component */}
-      <div>{/* TipTap, ProseMirror, Quill, etc. */}</div>
     </div>
   )
 }
 ```
 
-The cursor positions use Yjs-compatible anchor/head values, making them compatible with editors built on Yjs bindings (TipTap, ProseMirror with y-prosemirror, etc.).
+Positions are Yjs anchor/head offsets, so editors with Yjs bindings (TipTap, ProseMirror with
+y-prosemirror) can render them directly. A plain textarea like this one does not apply remote
+edits; bind `text` to a Yjs-aware editor for real collaborative editing.
 
 ## Differences from Sync Operations
 

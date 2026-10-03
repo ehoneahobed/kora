@@ -12,6 +12,17 @@ Kora supports two backup paths:
 
 Use local app backups for user-controlled export/import, desktop app data portability, or support workflows. Use sync server backups for production operations, disaster recovery, and environment migration.
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: { projects: { fields: { name: t.string() } }, todos: { fields: { title: t.string() } } },
+  }),
+})
+declare const oldBackup: Uint8Array
+-->
+
 ## Local App Backups
 
 Every Kora app exposes backup methods after `app.ready` resolves:
@@ -22,7 +33,7 @@ await app.ready
 const backup = await app.exportBackup()
 ```
 
-`backup` is a `Uint8Array` containing the operation log and metadata needed to restore the local store.
+`backup` is a `Uint8Array` (format version 2) containing the operation log and metadata needed to restore the local store.
 
 ### Download a Backup in the Browser
 
@@ -30,7 +41,7 @@ const backup = await app.exportBackup()
 async function downloadBackup() {
   await app.ready
   const data = await app.exportBackup()
-  const blob = new Blob([data], { type: 'application/octet-stream' })
+  const blob = new Blob([new Uint8Array(data)], { type: 'application/octet-stream' })
   const url = URL.createObjectURL(blob)
 
   const link = document.createElement('a')
@@ -86,18 +97,23 @@ A backup also carries the device's **compacted history**. Compaction folds opera
 the server acknowledged into per-record base states and removes them from the log; the
 backup holds those base states (and the compacted sequence prefixes), so restoring a
 compacted device's backup on another device keeps every record and field, in merge and
-replace mode, with or without a connection. Backups written by beta.13 carry no base
-states: their records are rebuilt on top of the backup's rows instead (see
-`store.getSnapshotRecords()` in the conflict-resolution guide).
+replace mode, with or without a connection (manifest flags `includesFoldState` and
+`compacted`). A format-2 file without these sections (written by a pre-release build) is rebuilt
+on top of its rows instead (see `store.getSnapshotRecords()` in the
+[conflict-resolution guide](/guide/conflict-resolution#what-changed-from-beta-12)).
+
+A merge-mode restore never applies the server's own decisions from a file: operations of `kora:`
+nodes and of the device's known server authorities are skipped (`result.serverOperationsSkipped`);
+they arrive from the sync server.
 
 The result reports failures instead of throwing for a file it cannot restore:
 `result.success` is false and `result.errorCode` says why (`BACKUP_CHECKSUM_MISMATCH`,
 `BACKUP_SCHEMA_NEWER` for a backup written by a newer schema version, or
 `BACKUP_FORMAT_OUTDATED`).
 
-### Backups made before beta.14
+### Backups made by beta.12 and earlier
 
-Backups written by Kora 1.0.0-beta.13 and earlier use format version 1, whose restore
+Backups written by Kora 1.0.0-beta.12 and earlier use format version 1, whose restore
 corrupted operation timestamps and copied the exporting device's identity. They are refused
 with `errorCode: 'BACKUP_FORMAT_OUTDATED'`. Convert them once, then import the result:
 
@@ -161,18 +177,25 @@ Inspect a backup file before restoring:
 kora backup info ./backup.kora
 ```
 
-The CLI talks to the sync server backup endpoints:
+The CLI talks to the sync server backup endpoints of `createProductionServer`:
 
 - `POST /__kora/backup/export`
-- `POST /__kora/backup/import?merge=true|false`
+- `POST /__kora/backup/import?merge=true|false` (bodies above `maxBackupBytes`, 256 MiB by default, are refused)
 
 Your sync server must be running and reachable from the machine running the CLI.
-Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`.
+Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`
+(`operationalAuth.backupToken` / `adminToken`). Imported operations go through the same ingest
+validation as uploads.
+
+After a server is restored from an older backup, connected devices notice that the server holds
+fewer of their operations than it had acknowledged and re-upload them
+(`sync:local-node`, `server-behind`), and devices whose delivery watermark is now ahead of the
+server resync from the start.
 
 ## Recommended Practice
 
 - Store server backups outside the application host.
 - Test restores regularly against a staging server.
 - Keep a backup before running schema migrations or changing sync scopes.
-- If sync encryption is enabled, keep encryption keys/passphrases safe. A backup cannot decrypt data without the correct key.
+- If sync encryption is enabled, the server's backup holds only ciphertext and the users' wrapped keyrings: keep the passphrases (or recovery keys) safe, because nothing can decrypt the data without them.
 - Treat backup files as sensitive data. They can contain application records and operation history.

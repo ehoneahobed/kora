@@ -2,31 +2,31 @@
 
 **Offline-first application framework.**
 
-Kora.js makes building offline-first applications as simple as building a Next.js app. Go from `npx create-kora-app` to a working offline-first app in under 10 minutes, writing zero lines of sync, conflict resolution, or distributed systems code.
+Kora.js makes building offline-first applications as simple as building a Next.js app. Go from `npx create-kora-app@beta` to a working offline-first app in under 10 minutes, writing zero lines of sync, conflict resolution, or distributed systems code.
 
 > The name comes from the West African kora instrument: 21 strings that resonate independently but produce harmony together. Independent devices, independent writes, eventual harmony.
 
 ## Status
 
-**Public beta (v1.0.0-beta.0).** The full data plane is implemented and covered by 3,300+ automated tests (run `pnpm test` to verify the current count), plus a Playwright E2E suite, a documentation site, and CI pipelines. This is the first `1.0.0-beta` — the API is what we intend to ship as 1.0; the beta period is for real-world usage feedback before the stable cut.
+**Public beta (v1.0.0-beta.12).** 1.0.0-beta.13, the security and data-safety release, is in preparation: see its [release notes](remediation/BETA13-RELEASE-NOTES.md). The API is what we intend to ship as 1.0; the beta period is for real-world feedback before the stable cut.
 
-Beta packages publish under the `beta` npm dist-tag; install a specific package with `npm install korajs@beta` (or `@korajs/<pkg>@beta`).
+Beta packages publish under the `beta` npm dist-tag. Install with `npm install korajs@beta` (or `@korajs/<pkg>@beta`), and scaffold with `npx create-kora-app@beta`: the untagged `create-kora-app` installs the older 0.x line.
 
 | Package | Status | Description |
 |---------|--------|-------------|
-| `korajs` | Beta | Meta-package: `createApp`, full type inference from schema to hooks |
-| `@korajs/core` | Beta | Schema, operations, HLC, version vectors, type inference |
-| `@korajs/store` | Beta | Local storage (SQLite WASM, IndexedDB, native SQLite), CRUD, reactive queries |
-| `@korajs/merge` | Beta | Three-tier conflict resolution with Yjs CRDT richtext merge |
-| `@korajs/sync` | Beta | Sync protocol, WebSocket + HTTP transports, protobuf wire format |
-| `@korajs/server` | Beta | Sync server with Memory, SQLite, and PostgreSQL stores (Drizzle ORM) |
-| `@korajs/react` | Beta | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `useRichText` |
-| `@korajs/cli` | Beta | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy` |
-| `@korajs/auth` | Experimental | Authentication, sessions, MFA, organizations, RBAC, passkeys, encryption |
-| `@korajs/devtools` | Experimental | Browser DevTools extension with sync timeline, conflict inspector |
+| `korajs` | Beta | Meta-package: `createApp`, schema-typed collections, queries and transactions |
+| `@korajs/core` | Beta | Schema, operations, HLC, version vectors, the per-field CRDT fold |
+| `@korajs/store` | Beta | Local storage (SQLite WASM on OPFS, IndexedDB, native SQLite), CRUD, reactive queries |
+| `@korajs/merge` | Beta | Cross-record constraints and referential integrity (per-field merging lives in the core fold) |
+| `@korajs/sync` | Beta | Sync protocol v2, WebSocket and HTTP long-poll transports, end-to-end encryption |
+| `@korajs/server` | Beta | Sync server with Memory, SQLite and PostgreSQL stores, production server, static files |
+| `@korajs/react` | Beta | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `createKoraHooks`, `useRichText` |
+| `@korajs/cli` | Beta | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy`, offline app shell |
+| `@korajs/auth` | Experimental | Authentication, sessions, MFA, organizations, RBAC, passkeys |
+| `@korajs/devtools` | Experimental | Browser DevTools extension with sync timeline and conflict inspector |
 | `@korajs/vue` | Experimental | Vue composables mirroring the React bindings |
 | `@korajs/svelte` | Experimental | Svelte stores mirroring the React bindings |
-| `@korajs/tauri` | Experimental | Tauri desktop integration |
+| `@korajs/tauri` | Experimental | Tauri desktop integration (native SQLite) |
 
 Beta means the API is stable enough to build on and covered by the release gates. Experimental means it works and is tested, but has had less production exposure and its API may still move.
 
@@ -34,34 +34,28 @@ Beta means the API is stable enough to build on and covered by the release gates
 
 Kora sits alongside your UI layer (React, Vue, Svelte) and owns the entire data plane:
 
-- **Local persistence** — SQLite WASM with OPFS, IndexedDB fallback, native SQLite for Node.js
-- **Reactive queries** — Subscribe to query results, get notified on changes within one frame (16ms)
-- **Conflict resolution** — Three-tier merge: auto-merge (LWW/CRDT), constraints, custom resolvers
-- **Synchronization** — Causal ordering via HLC, delta sync via version vectors, protobuf wire format
-- **Binary blobs** — Content-addressed `blob` fields: durable OPFS storage, deduplicated, integrity-verified, transferred out of band over the sync connection, `app.blobs.pull(ref)` from a bare reference, optional central server storage for availability after the author goes offline, and mark-and-sweep GC via `app.blobs.gc()`
-- **Offline by default** — Every code path works without network. Sync is a bonus, not a requirement.
-- **Authentication** — Built-in auth with sessions, TOTP MFA, organizations, RBAC, passkeys, and encrypted tokens
-- **Full type inference** — Schema types flow through `createApp` to collection accessors and React hooks
-- **DevTools** — Real-time operation inspector, conflict tracer, sync timeline in a browser extension
-- **Schema migrations** — Diff, generate, and apply schema changes with `kora migrate`
+- **Local persistence**: SQLite WASM on OPFS in a worker, a durable IndexedDB fallback, native SQLite for Node.js and Tauri. Kora never silently runs in memory.
+- **Reactive queries**: subscribe to query results and get notified when they change.
+- **Conflict resolution**: every replica folds a record's operations into a per-field CRDT state (last-write-wins registers, element multisets for arrays, per-key maps, counters, Yjs rich text, custom resolvers), so the result depends only on which operations it holds. Cross-record constraints are enforced by the sync server.
+- **Synchronization**: causal order via HLC, version vectors for uploads, a gap-free delivery watermark for downloads, and nothing silently dropped: operations a device cannot apply yet are quarantined and retried.
+- **Binary blobs**: content-addressed `blob` fields stored in OPFS, deduplicated, integrity-verified and transferred out of band (`app.blobs`).
+- **Offline by default**: every code path works without a network, and scaffolded apps open offline through a service worker.
+- **Authentication and encryption**: server-granted sync scopes, sessions, MFA, organizations, RBAC, passkeys, and end-to-end encryption with a shared per-user keyring.
+- **Type inference**: schema types flow through `createApp` to collection accessors, queries, transactions and `createKoraHooks`.
+- **DevTools**: operation inspector, conflict tracer and sync timeline.
+- **Schema migrations**: versioned migrations that apply atomically, backfills that sync, and transforms for devices on older schema versions.
 
 ## Quick Start
 
 ### Scaffold a new app
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 cd my-app
 pnpm dev
 ```
 
-Choose from 13 templates across React, Vue, Svelte, and Tauri, each in sync and local-only variants (with or without Tailwind). The recommended default is **React + Tailwind (with sync)**. Or skip the prompts:
-
-```bash
-npx create-kora-app my-app --yes    # Recommended defaults
-```
-
-This gives you a polished dark-themed React app with local persistence, reactive queries, DevTools, and optional sync — all working out of the box.
+Choose from 13 templates across React, Vue, Svelte and Tauri, each with and without sync (the web ones with or without Tailwind). The recommended default is **React + Tailwind with a SQLite sync server**. Skip the prompts with `--yes`. The [Getting Started](https://ehoneahobed.github.io/kora/getting-started) tutorial walks through a scaffolded app.
 
 ### Or start from scratch
 
@@ -77,13 +71,13 @@ const app = createApp({
           title: t.string(),
           completed: t.boolean().default(false),
           createdAt: t.timestamp().auto(),
-        }
-      }
-    }
-  })
+        },
+      },
+    },
+  }),
 })
 
-// CRUD — works offline, always
+// CRUD: works offline, always
 await app.ready
 const todo = await app.todos.insert({ title: 'Ship Kora v1' })
 await app.todos.update(todo.id, { completed: true })
@@ -97,41 +91,53 @@ app.todos
   })
 ```
 
-### Enable sync (one line)
+### Enable sync
 
+<!-- docs-check: skip assumes the schema of the previous example -->
 ```typescript
 const app = createApp({
   schema,
-  sync: { url: 'wss://my-server.com/kora' }
+  sync: { url: 'wss://my-server.example.com/kora-sync', autoConnect: true },
 })
-
-await app.ready
-await app.sync?.connect()
 ```
 
-### Deploy (one command)
+Without `autoConnect: true`, call `await app.sync?.connect()` after `app.ready`.
+
+### Deploy
 
 ```bash
 kora deploy
 ```
 
-Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io or Railway. See the [Deployment guide](https://ehoneahobed.github.io/kora/guide/deployment) for a full walkthrough.
+Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io, Railway or AWS. See the [Deployment guide](https://ehoneahobed.github.io/kora/guide/deployment).
 
 ### React hooks
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } },
+  }),
+})
+-->
+
 ```tsx
-import { KoraProvider, useQuery, useMutation, useSyncStatus } from '@korajs/react'
+import { useMutation, useQuery, useSyncStatus } from '@korajs/react'
 
 function TodoList() {
   const todos = useQuery(app.todos.where({ completed: false }))
-  const { mutate: addTodo } = useMutation((data) => app.todos.insert(data))
+  const { mutate: addTodo } = useMutation(app.todos.insert)
   const status = useSyncStatus()
 
   return (
     <div>
       <p>Sync: {status.status}</p>
       <button onClick={() => addTodo({ title: 'New todo' })}>Add</button>
-      {todos.map(todo => <div key={todo.id}>{todo.title}</div>)}
+      {todos.map((todo) => (
+        <div key={todo.id}>{todo.title}</div>
+      ))}
     </div>
   )
 }
@@ -139,30 +145,32 @@ function TodoList() {
 
 ## Architecture
 
-Every mutation produces an **Operation** — an immutable, content-addressed record that forms a DAG:
+Every mutation produces an **Operation**: an immutable, content-addressed record. Operations
+reference their causal dependencies, so the log forms a DAG:
 
 ```
 Operation {
-  id: SHA-256 hash (content-addressed)
+  id: SHA-256 content hash (hash version 2 covers the whole canonical body)
+  nodeId: the authoring device
   type: 'insert' | 'update' | 'delete'
-  collection: string
-  recordId: string
-  data: { ...changed fields only }
-  previousData: { ...for 3-way merge }
+  collection, recordId
+  data: changed fields only
+  previousData: the writer's values before the change
   timestamp: HLC (Hybrid Logical Clock)
-  sequenceNumber: number
-  causalDeps: string[]
+  sequenceNumber: per node, unique and gap-free
+  causalDeps: ids of direct causal parents
+  schemaVersion, hashVersion
 }
 ```
 
-**Ordering** uses Hybrid Logical Clocks (Kulkarni et al.) — total order that respects causality without synchronized clocks.
+**Ordering** uses Hybrid Logical Clocks (Kulkarni et al.): a total order that respects causality without synchronized clocks.
 
-**Sync** uses version vectors for efficient delta computation — only send operations the other side hasn't seen. Wire format negotiates between JSON and Protocol Buffers.
+**Sync** (protocol v2, JSON on the wire) sends a peer only the operations it is missing: version vectors decide what a client uploads, and a durable, gap-free delivery watermark decides what the server delivers.
 
-**Merge** is three-tiered:
-1. **Auto-merge** — LWW for scalars, add-wins set for arrays, Yjs CRDT for rich text
-2. **Constraints** — Unique, capacity, referential integrity with configurable resolution
-3. **Custom resolvers** — Developer-provided functions for domain-specific logic
+**Merge** is a deterministic fold that every replica (device, server, restored backup) runs the same way:
+1. **Per-field CRDTs**: last-write-wins by HLC for scalars, an element multiset for arrays, per-key last-write-wins for objects, Yjs for rich text, and `merge('counter' | 'max' | 'min' | 'append-only' | 'server-authoritative')`.
+2. **Constraints**: unique, capacity and referential rules across records, enforced by the sync server and checked optimistically on devices.
+3. **Custom resolvers**: developer functions folded over a field's writes in HLC order.
 
 ## Monorepo Structure
 
@@ -215,7 +223,10 @@ pnpm lint:fix           # Auto-fix lint/format issues
 pnpm test:e2e           # Run Playwright E2E tests (requires Chromium)
 pnpm benchmark:gates    # Run performance benchmark gates
 pnpm test:production-path  # PRODUCTION_PATH convergence tests (korajs)
-pnpm test:release-gate  # v0.5 gate: production-path + reconnect + chaos + benchmarks
+pnpm test:release-gate  # production-path + reconnect + chaos + benchmarks
+pnpm remediation        # remediation tracker: every repro test, writes remediation/STATUS.md
+pnpm docs:check-code    # typecheck the docs' code blocks against the built packages
+pnpm docs:check-tutorial  # run the Getting Started tutorial against a scaffolded app
 pnpm chaos:nightly      # Run chaos convergence test (10 clients, 1000 ops)
 pnpm docs:dev           # Start docs site dev server
 ```
@@ -259,8 +270,9 @@ Opens the VitePress docs site at `http://localhost:5173` with guides, API refere
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| `ci.yml` | PRs + push to main | Lint, build, test, typecheck |
-| `e2e.yml` | Push to main + manual | Playwright E2E tests |
+| `ci.yml` | PRs + push to main | Lint, build, docs code blocks, tutorial, tests, typecheck |
+| `e2e.yml` | PRs + push to main + manual | Playwright E2E tests, tutorial in Chromium |
+| `remediation.yml` | PRs + push to main | Remediation tracker: repro tests and guards |
 | `release.yml` | Push to main | Changesets: version PR or npm publish |
 | `canary.yml` | Push to main | Canary snapshot releases to npm |
 | `docs.yml` | Push to main (docs/**) | Build + deploy docs to GitHub Pages |
@@ -296,9 +308,8 @@ pnpm dev                   # Start Vite dev server
 Once published, anyone can create a new Kora app with a single command:
 
 ```bash
-npx create-kora-app my-app
+npx create-kora-app@beta my-app
 cd my-app
-pnpm install
 pnpm dev
 ```
 
@@ -334,10 +345,9 @@ After this, all packages are live on npm. The scaffolded project will pin its ko
 Once packages are on npm, share these instructions:
 
 ```bash
-npx create-kora-app my-app --template react-tailwind-sync
+npx create-kora-app@beta my-app --template react-tailwind-sync
 cd my-app
-pnpm install
-pnpm dev
+pnpm dev     # starts the app and its local sync server
 # Open http://localhost:5173 in two browser tabs
 ```
 
@@ -363,21 +373,22 @@ Or scaffold a standalone project from the local CLI:
 
 ```bash
 # From the kora repo root (after pnpm install && pnpm build)
-node packages/cli/dist/index.js create ~/my-test-app --template react-sync
-
-cd ~/my-test-app
-pnpm install
-pnpm dev:server &
-pnpm dev
+node packages/cli/dist/bin.js create ~/my-test-app --template react-sync --skip-install
 ```
+
+The scaffold pins the published `@korajs/*` versions; to run it against your local build, point
+its dependencies at the workspace packages (`pnpm add korajs@link:<repo>/kora ...`) and run
+`pnpm dev`.
 
 **Option C: Deploy sync server for multi-device testing**
 
 To test sync across different machines/locations, deploy the sync server:
 
+<!-- docs-check-prelude -->
+
 ```typescript
-// server.ts — deploy to any Node.js host (Railway, Render, Fly.io, VPS)
-import { createKoraServer, MemoryServerStore } from '@korajs/server'
+// server.ts: deploy to any Node.js host (Railway, Fly.io, a VPS)
+import { MemoryServerStore, createKoraServer } from '@korajs/server'
 
 const server = createKoraServer({
   store: new MemoryServerStore(),
@@ -389,21 +400,19 @@ server.start().then(() => {
 })
 ```
 
-Then each tester's app points to the deployed URL:
-
-```typescript
-sync: { url: 'wss://your-server.example.com' }
-```
+For anything beyond a test, use `createProductionServer` with a SQLite or Postgres store and an
+auth provider: see [Production Server](https://ehoneahobed.github.io/kora/guide/production-server).
+Then each tester's app points to the deployed URL: `sync: { url: 'wss://your-server.example.com', autoConnect: true }`.
 
 **Option D: Quick remote testing with ngrok**
 
-Run everything locally and share via tunnels — no deployment needed:
+Run everything locally and share via tunnels (no deployment needed):
 
 ```bash
 # Terminal 1: sync server
 cd e2e/fixture-app && pnpm dev:server
 
-# Terminal 2: Vite app (after updating sync URL — see below)
+# Terminal 2: Vite app (after updating the sync URL, see below)
 cd e2e/fixture-app && pnpm dev
 
 # Terminal 3: tunnel the sync server
@@ -415,36 +424,33 @@ npx ngrok http 5173
 # Share this URL with testers
 ```
 
-Update `e2e/fixture-app/src/main.tsx` to use the ngrok WebSocket URL before starting Vite:
-```typescript
-sync: { url: 'wss://abc123.ngrok.io' }
-```
+Update `e2e/fixture-app/src/main.tsx` to use the ngrok WebSocket URL (`sync: { url: 'wss://abc123.ngrok.io' }`) before starting Vite.
 
 Share the web app tunnel URL. Testers open it in their browsers and their changes sync through your local server in real time.
 
 ## Core Principles
 
-1. **Correctness over performance** — A slow merge that's right beats a fast merge that loses data
-2. **Developer experience over internal elegance** — The public API must feel inevitable
-3. **Explicit over implicit for data** — Every merge decision is traceable and loggable
-4. **Convention over configuration** — Zero-config produces a working offline-first app
-5. **Compose, don't reinvent** — SQLite for storage, Yjs for CRDTs, proven algorithms for clocks
-6. **Offline is the default** — Never assume connectivity
+1. **Correctness over performance**: a slow merge that is right beats a fast merge that loses data
+2. **Developer experience over internal elegance**: the public API must feel inevitable
+3. **Explicit over implicit for data**: every merge decision is traceable and loggable
+4. **Convention over configuration**: zero-config produces a working offline-first app
+5. **Compose, don't reinvent**: SQLite for storage, Yjs for CRDTs, proven algorithms for clocks
+6. **Offline is the default**: never assume connectivity
 
 ## Documentation
 
 Full documentation is available at **[ehoneahobed.github.io/kora](https://ehoneahobed.github.io/kora/)**.
 
 Covers:
-- [Getting Started](https://ehoneahobed.github.io/kora/getting-started) — Zero to working app in 5 minutes
-- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design) — Field types, relations, versioning
-- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration) — Client and server storage, multiple apps, PostgreSQL
-- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) — Auth, reconnection, and runtime behavior
-- [React Hooks](https://ehoneahobed.github.io/kora/guide/react-hooks) — useQuery, useMutation, useSyncStatus
-- [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution) — Three-tier merge engine
-- [Authentication](https://ehoneahobed.github.io/kora/guide/authentication) — Sessions, MFA, organizations, RBAC, passkeys
-- [Deployment](https://ehoneahobed.github.io/kora/guide/deployment) — Deploy to Fly.io or Railway in 10 minutes with `kora deploy`
-- [API Reference](https://ehoneahobed.github.io/kora/api/) — Complete reference for all packages
+- [Getting Started](https://ehoneahobed.github.io/kora/getting-started): a scaffolded app, a migration, the core API
+- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design): field types, the value domain, relations, migrations
+- [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution): the per-field fold, constraints, resolvers
+- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) and [Sync Protocol](https://ehoneahobed.github.io/kora/guide/sync-protocol)
+- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration): OPFS, IndexedDB, multi-tab, persistence
+- [Authentication](https://ehoneahobed.github.io/kora/guide/authentication) and [Sync Encryption](https://ehoneahobed.github.io/kora/guide/sync-encryption)
+- [Production Server](https://ehoneahobed.github.io/kora/guide/production-server) and [Deployment](https://ehoneahobed.github.io/kora/guide/deployment)
+- [Error Codes](https://ehoneahobed.github.io/kora/api/errors): every error code with cause and fix
+- [API Reference](https://ehoneahobed.github.io/kora/api/): every package
 
 To run docs locally: `pnpm docs:dev`
 

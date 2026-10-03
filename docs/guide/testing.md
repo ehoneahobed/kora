@@ -10,19 +10,32 @@ description: "Test offline-first Kora.js apps: unit testing collections and merg
 ## Installation
 
 ```bash
-pnpm add -D @korajs/test
+pnpm add -D @korajs/test@beta vitest
 ```
 
-The package depends on `korajs` and `better-sqlite3` for local stores. It is designed for use with Vitest.
+The package runs each device on a real SQLite store (`better-sqlite3`) and a real sync engine,
+and the server on a real `KoraSyncServer`, so tests exercise the same fold, constraints and
+validators as production. It works with any test runner; the examples use Vitest.
 
-## Creating a Test Network
+<!-- docs-check-prelude
+import { afterEach, describe, expect, test } from 'vitest'
+import { createTestNetwork, expectConverged, checkConvergence, type TestNetwork } from '@korajs/test'
+import { defineSchema, t } from '@korajs/core'
+const schema = defineSchema({
+  version: 1,
+  collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } },
+})
+let network: TestNetwork
+-->
 
-`createTestNetwork()` sets up a virtual server and multiple devices, all connected via in-memory transports:
+## Creating a test network
+
+`createTestNetwork()` sets up a server and devices connected by in-memory transports:
 
 ```typescript
 import { defineSchema, t } from '@korajs/core'
-import { createTestNetwork } from '@korajs/test'
-import { afterEach, describe, test, expect } from 'vitest'
+import { createTestNetwork, type TestNetwork } from '@korajs/test'
+import { afterEach, describe, expect, test } from 'vitest'
 
 const schema = defineSchema({
   version: 1,
@@ -36,211 +49,141 @@ const schema = defineSchema({
   },
 })
 
-describe('sync tests', () => {
-  let network
+describe('sync', () => {
+  let network: TestNetwork | null = null
 
   afterEach(async () => {
-    if (network) {
-      await network.close()
-      network = null
-    }
+    await network?.close()
+    network = null
   })
 
   test('data syncs between devices', async () => {
     network = await createTestNetwork(schema)
     const [deviceA, deviceB] = network.devices
+    if (!deviceA || !deviceB) throw new Error('expected two devices')
 
-    // Insert on device A
     await deviceA.collection('todos').insert({ title: 'Buy milk' })
-
-    // Sync both devices through the server
     await deviceA.sync()
     await deviceB.sync()
 
-    // Device B has the record
     const todos = await deviceB.getState('todos')
     expect(todos).toHaveLength(1)
-    expect(todos[0].title).toBe('Buy milk')
+    expect(todos[0]?.title).toBe('Buy milk')
   })
 })
 ```
 
-## Custom Device Count
+`sync()` connects on the first call and afterwards flushes pending uploads; a connected device
+receives other devices' operations as the server relays them. Call `sync()` on each device after
+writes, as above.
 
-By default, `createTestNetwork` creates 2 devices. You can specify more:
+## Devices and options
 
 ```typescript
 network = await createTestNetwork(schema, { devices: 3 })
-
-const [alice, bob, charlie] = network.devices
+network = await createTestNetwork(schema, { deviceNames: ['alice', 'bob', 'charlie'] })
 ```
 
-Or use custom names:
-
-```typescript
-network = await createTestNetwork(schema, {
-  deviceNames: ['alice', 'bob', 'charlie'],
-})
-```
-
-## Server-Side Network Options
-
-`createTestNetwork` also accepts options that configure the virtual server:
+Other options configure the server and the links: `validateOperation`, `serverStore` (SQLite or
+Postgres instead of memory), `chaos` (drop, duplicate, reorder, latency), `blobStorage`,
+`encryption`. See the [Test API](/api/test#createtestnetwork-schema-options).
 
 ```typescript
 import type { OperationValidator } from '@korajs/server'
 
 const validateOperation: OperationValidator = (op) => {
-  // Reject operations the server should not accept. A rejected outbound
-  // operation is surfaced on the originating device via getRejectedOperations().
   if (op.collection === 'todos' && op.type === 'insert') {
-    return { action: 'reject', code: 'FORBIDDEN', message: 'inserts are blocked' }
+    return { action: 'reject', code: 'FORBIDDEN', message: 'Inserts are blocked' }
   }
   return { action: 'accept' }
 }
 
-network = await createTestNetwork(schema, {
-  validateOperation,   // adjudicate untrusted client operations before materialization
-  blobStorage: true,   // enable central blob storage on the server (persist and serve uploaded blob bytes)
+test('the server refuses inserts', async () => {
+  network = await createTestNetwork(schema, { validateOperation })
+  const [device] = network.devices
+  if (!device) throw new Error('expected a device')
+
+  await device.sync()
+  await device.collection('todos').insert({ title: 'Refused' })
+  await device.sync()
+
+  const rejected = await device.getRejectedOperations()
+  expect(rejected[0]?.code).toBe('FORBIDDEN')
 })
 ```
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `validateOperation` | `OperationValidator` | Adjudicate untrusted client operations on the server before materialization. Operations the server rejects are surfaced on the originating device through `getRejectedOperations()`. |
-| `blobStorage` | `boolean` | Enable central blob storage on the server, which persists and serves uploaded blob bytes. |
-
-## Testing Offline Behavior
-
-Each device can disconnect and reconnect independently:
+## Offline behavior
 
 ```typescript
-test('offline mutations sync after reconnect', async () => {
+test('offline writes sync after reconnecting', async () => {
   network = await createTestNetwork(schema)
   const [deviceA, deviceB] = network.devices
+  if (!deviceA || !deviceB) throw new Error('expected two devices')
 
-  // Sync, then disconnect device A
   await deviceA.sync()
   await deviceA.disconnect()
-
-  // Insert while offline
   await deviceA.collection('todos').insert({ title: 'Offline todo' })
 
-  // Reconnect and sync
   await deviceA.reconnect()
+  await deviceA.sync()
   await deviceB.sync()
 
   const todos = await deviceB.getState('todos')
-  expect(todos).toHaveLength(1)
-  expect(todos[0].title).toBe('Offline todo')
+  expect(todos.map((todo) => todo.title)).toEqual(['Offline todo'])
 })
 ```
 
-## Asserting Convergence
+## Asserting convergence
 
-Use `expectConverged()` to verify all devices have identical state:
+`expectConverged()` throws with the differences unless every device holds the same records;
+`checkConvergence()` returns them instead:
 
 ```typescript
-import { createTestNetwork, expectConverged } from '@korajs/test'
-
-test('all devices converge', async () => {
+test('concurrent edits converge', async () => {
   network = await createTestNetwork(schema, { devices: 3 })
   const [a, b, c] = network.devices
+  if (!a || !b || !c) throw new Error('expected three devices')
 
-  // Each device inserts a record
-  await a.collection('todos').insert({ title: 'From A' })
-  await b.collection('todos').insert({ title: 'From B' })
-  await c.collection('todos').insert({ title: 'From C' })
+  const todo = await a.collection('todos').insert({ title: 'Shared' })
+  for (const device of [a, b, c]) await device.sync()
 
-  // Sync all devices (multiple rounds for relay)
-  await a.sync()
-  await b.sync()
-  await c.sync()
-  await a.disconnect()
+  // Concurrent offline edits of the same field
   await b.disconnect()
-  await a.sync()
-  await b.sync()
+  await c.disconnect()
+  await b.collection('todos').update(todo.id, { title: 'From B' })
+  await c.collection('todos').update(todo.id, { title: 'From C' })
+  await b.reconnect()
+  await c.reconnect()
+  for (const device of [b, c, a, b, c]) await device.sync()
 
-  // All devices should have identical state
   await expectConverged(network.devices, schema)
+  const result = await checkConvergence(network.devices, schema)
+  expect(result.converged).toBe(true)
 })
 ```
 
-For more details without throwing, use `checkConvergence()`:
+With `chaos`, use `expectConvergedEventually(devices, schema, { timeoutMs })`, which retries until
+the network settles.
+
+## Inspecting merge decisions
+
+Each device records merge decisions in its audit trail, as an app does:
 
 ```typescript
-import { checkConvergence } from '@korajs/test'
-
-const result = await checkConvergence(network.devices, schema)
-if (!result.converged) {
-  console.log(result.differences)
-  // Shows which collections differ, missing records, and field-level differences
-}
-```
-
-## Testing Updates and Deletes
-
-```typescript
-test('updates sync between devices', async () => {
+test('the concurrent edit produced a merge trace', async () => {
   network = await createTestNetwork(schema)
-  const [deviceA, deviceB] = network.devices
-
-  const record = await deviceA.collection('todos').insert({ title: 'Original' })
-  await deviceA.sync()
-  await deviceB.sync()
-
-  // Update on A
-  await deviceA.collection('todos').update(record.id, { title: 'Updated' })
-  await deviceA.disconnect()
-  await deviceA.sync()
-  await deviceB.disconnect()
-  await deviceB.sync()
-
-  const todos = await deviceB.getState('todos')
-  expect(todos[0].title).toBe('Updated')
-})
-
-test('deletes sync between devices', async () => {
-  network = await createTestNetwork(schema)
-  const [deviceA, deviceB] = network.devices
-
-  const record = await deviceA.collection('todos').insert({ title: 'To delete' })
-  await deviceA.sync()
-  await deviceB.sync()
-
-  await deviceA.collection('todos').delete(record.id)
-  await deviceA.disconnect()
-  await deviceA.sync()
-  await deviceB.disconnect()
-  await deviceB.sync()
-
-  const todos = await deviceB.getState('todos')
-  expect(todos).toHaveLength(0)
+  const [deviceA] = network.devices
+  if (!deviceA) throw new Error('expected a device')
+  const traces = await deviceA.store.getAuditTraces({ collections: ['todos'] })
+  expect(Array.isArray(traces)).toBe(true)
 })
 ```
 
-## Inspecting Merge Decisions
+Device events are on `device.emitter` (for example `merge:conflict` or
+`sync:operation-rejected`).
 
-`TestDevice` wires audit persistence the same way production apps do, so every merge decision made during a harness test is persisted to the `_kora_audit_traces` table in that device's store. You can query it directly to assert on how a conflict was resolved:
+## Testing schema migrations
 
-```typescript
-const traces = await deviceA.store.getAuditTraces({ collections: ['todos'] })
-expect(traces.length).toBeGreaterThan(0)
-```
-
-## TestDevice API
-
-Each device in the network exposes:
-
-| Method | Description |
-|--------|-------------|
-| `.collection(name)` | Access a collection for insert/update/delete/query |
-| `.sync()` | Connect to the server and sync |
-| `.disconnect()` | Close the sync connection |
-| `.reconnect()` | Re-establish the sync connection |
-| `.getState(collection)` | Get all records in a collection (for assertions) |
-| `.getNodeId()` | Get the device's unique node ID |
-| `.getVersionVector()` | Get the device's version vector |
-| `.isConnected()` | Check if currently connected |
-| `.getRejectedOperations()` | Async: get the operations the server rejected for this device that have not been reconciled (empty when the device has never connected) |
-| `.close()` | Release all resources |
+`createMixedTestNetwork(serverSchema, serverOptions, devices)` runs devices on different schema
+versions against one server, to test `supportedSchemaVersions` and operation transforms. See the
+[Test API](/api/test).

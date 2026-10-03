@@ -1,11 +1,11 @@
 # korajs
 
-Offline-first application framework. Local-first storage, reactive queries, automatic conflict resolution, and real-time sync -- with zero distributed systems code.
+Offline-first application framework: local storage, reactive queries, automatic conflict resolution and real-time sync, with zero distributed-systems code.
 
 ## Install
 
 ```bash
-pnpm add korajs
+pnpm add korajs@beta
 ```
 
 ## Quick Start
@@ -13,20 +13,21 @@ pnpm add korajs
 ```typescript
 import { createApp, defineSchema, t } from 'korajs'
 
-const app = createApp({
-  schema: defineSchema({
-    version: 1,
-    collections: {
-      todos: {
-        fields: {
-          title: t.string(),
-          completed: t.boolean().default(false),
-          createdAt: t.timestamp().auto(),
-        },
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        createdAt: t.timestamp().auto(),
       },
     },
-  }),
+  },
 })
+
+const app = createApp({ schema })
+await app.ready
 
 const todo = await app.todos.insert({ title: 'Ship Kora v1' })
 const active = await app.todos.where({ completed: false }).orderBy('createdAt').exec()
@@ -36,20 +37,22 @@ app.todos.where({ completed: false }).subscribe((todos) => console.log(todos))
 
 ## Enable Sync
 
-Add one line to sync across devices:
+Point the app at a [Kora sync server](https://korajs.dev/guide/production-server):
 
+<!-- docs-check: continue -->
 ```typescript
-const app = createApp({
+const syncedApp = createApp({
   schema,
-  sync: { url: 'wss://my-server.com/kora' },
+  sync: { url: 'wss://sync.example.com/kora-sync', autoConnect: true },
 })
 ```
 
-Conflicts are resolved automatically. No distributed systems code required.
+Writes still land locally first and upload when a connection exists; concurrent edits merge per
+field the same way on every device.
 
 ## React Integration
 
-Install `@korajs/react` or import from `korajs/react`:
+Install `@korajs/react@beta`, then import from it or from `korajs/react`:
 
 ```tsx
 import { KoraProvider, useQuery, useMutation } from 'korajs/react'
@@ -61,7 +64,7 @@ import { KoraProvider, useQuery, useMutation } from 'korajs/react'
 import { KoraProvider, useQuery, useMutation } from 'korajs/vue'
 ```
 
-Requires `vue` and `@korajs/vue` as peer dependencies.
+Requires `vue` and `@korajs/vue` (peer dependencies).
 
 ## Svelte Integration
 
@@ -70,14 +73,14 @@ import { createQueryStore, useQuery, useMutation } from 'korajs/svelte'
 import KoraProvider from '@korajs/svelte/KoraProvider.svelte'
 ```
 
-Requires `svelte` and `@korajs/svelte` as peer dependencies. Wrap your app with `<KoraProvider app={kora}>` (see `@korajs/svelte` README).
+Requires `svelte` and `@korajs/svelte` (peer dependencies). Wrap your app with `<KoraProvider app={kora}>` (see the `@korajs/svelte` README).
 
 ## Packages
 
-`@korajs/core` | `@korajs/store` | `@korajs/merge` | `@korajs/sync` | `@korajs/server` | `@korajs/react` | `@korajs/vue` | `@korajs/svelte` | `@korajs/devtools` | `@korajs/cli`
+`@korajs/core` | `@korajs/store` | `@korajs/merge` | `@korajs/sync` | `@korajs/server` | `@korajs/auth` | `@korajs/react` | `@korajs/vue` | `@korajs/svelte` | `@korajs/tauri` | `@korajs/devtools` | `@korajs/cli` | `@korajs/test` | `create-kora-app`
 
 ## License
 
 MIT
 
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.
+Documentation: [korajs.dev](https://korajs.dev).

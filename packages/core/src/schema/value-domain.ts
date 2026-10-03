@@ -197,7 +197,7 @@ export function operationValueViolation(
 
 /**
  * The sync wire's binary form of a top-level value (`{ __kora_bytes__: <base64> }`, what
- * beta.13 sends a `Uint8Array` as). A json or object field value of exactly that shape
+ * beta.12 sends a `Uint8Array` as). A json or object field value of exactly that shape
  * would be read back as bytes, so it is refused.
  */
 export const WIRE_BYTES_KEY = '__kora_bytes__'

@@ -30,7 +30,7 @@ import { KoraProvider, useQuery } from 'korajs/vue'
 
 ## KoraProvider
 
-Context provider that makes the Kora app available to all composables. Must wrap any component that uses Kora hooks.
+Context provider that makes the Kora app available to all composables. Must wrap any component that uses Kora composables. It renders `fallback` until `app.ready` resolves (and an error message if initialization fails), so composables never see an unready app. (`installKora(vueApp, app)` and `useKoraApp()` remain for older code but do not provide the reactive context.)
 
 ### Props
 
@@ -45,11 +45,14 @@ Context provider that makes the Kora app available to all composables. Must wrap
 
 ### Example
 
+<!-- docs-check: standalone -->
 ```typescript
-import { createApp as createKoraApp } from 'korajs'
+import { createApp as createKoraApp, defineSchema, t } from 'korajs'
 import { createApp, h } from 'vue'
 import { KoraProvider } from '@korajs/vue'
+import App from './App.vue'
 
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 const kora = createKoraApp({ schema })
 
 createApp({
@@ -63,6 +66,7 @@ createApp({
 
 Returns a reactive array of records matching a query. Re-evaluates when the local store or sync updates the result set.
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useQuery<T = CollectionRecord>(
   query: MaybeRefOrGetter<QueryBuilder<T> | null | undefined>,
@@ -70,8 +74,11 @@ function useQuery<T = CollectionRecord>(
     enabled?: MaybeRefOrGetter<boolean>
     onError?: (error: Error) => void
   },
-): Readonly<ShallowRef<readonly T[]>>
+): DeepReadonly<ShallowRef<readonly T[]>>
 ```
+
+The value is `[]` until the query's first result arrives (`useQueryState` reports it as
+`ready: false`).
 
 The query and `enabled` can be plain values, refs or getters. Pass a **getter** to follow props or refs: the composable re-subscribes when the query's descriptor changes, releases the previous subscription, and keeps showing the previous rows until the new query answers. A getter that returns `null` disables the query.
 
@@ -120,14 +127,24 @@ const { data: todos, error } = useQueryState(() => app.todos.where({ completed: 
 
 Wraps a collection mutation with optimistic update hooks and loading/error state.
 
+<!-- docs-check: skip signature -->
 ```typescript
-function useMutation<TData, TArgs extends unknown[]>(
+function useMutation<TData, TArgs extends unknown[], TContext = void>(
   mutationFn: (...args: TArgs) => Promise<TData>,
-  options?: UseMutationOptions<TData, TArgs>,
+  options?: {
+    onMutate?: (...args: TArgs) => TContext | Promise<TContext>
+    onRollback?: (context: TContext, ...args: TArgs) => void | Promise<void>
+    onSuccess?: (data: TData, ...args: TArgs) => void
+    onError?: (error: Error, ...args: TArgs) => void
+    onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
+  },
 ): UseMutationResult<TData, TArgs>
 ```
 
-Returns `mutate`, `mutateAsync`, `isLoading` (ref), `error` (ref), and `reset`.
+Returns `mutate` (fire and forget; failures go to `error` and `onError`), `mutateAsync`
+(rejects on failure), `isLoading` (ref), `error` (ref) and `reset`. `onRollback` receives what
+`onMutate` returned when the mutation fails, to undo optimistic UI state. The local write itself is
+atomic: a failed write leaves nothing behind.
 
 ---
 
@@ -152,7 +169,7 @@ const status = useSyncStatus()
 ## useApp() / useCollection()
 
 - `useApp()`: returns the `KoraAppLike` instance from context.
-- `useCollection(name)`: typed collection accessor from the store.
+- `useCollection(name)`: the store's collection accessor (`insert`, `update`, `delete`, `findById`, `where`).
 
 ---
 
@@ -160,14 +177,19 @@ const status = useSyncStatus()
 
 Binds a schema `t.richtext()` field to a shared Yjs document for editor integration.
 
+<!-- docs-check: skip signature -->
 ```typescript
 function useRichText(
   collectionName: string,
   recordId: string,
   fieldName: string,
-  options?: UseRichTextOptions,
+  options?: { user?: AwarenessUser; useDocChannel?: boolean },
 ): UseRichTextResult
 ```
+
+The result holds the Yjs `doc` and `text` to bind to an editor, `undo`/`redo` with
+`canUndo`/`canRedo`, `ready`, `error`, remote `cursors` and `setCursor(anchor, head)`. Edits are
+written to the record as rich-text updates and merge character by character.
 
 ---
 
@@ -185,7 +207,7 @@ const collaborators = useCollaborators()
 ```
 
 - `usePresence(user)`: publishes local presence; clears on unmount.
-- `useCollaborators()`: readonly ref of remote peers' awareness states.
+- `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). Presence is relayed only between sessions with the same download scope.
 
 ---
 

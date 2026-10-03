@@ -336,8 +336,8 @@ export interface KoraConfig {
 /** {@link KoraConfig.experimental}. */
 export interface ExperimentalOptions {
 	/**
-	 * Use the beta.13 pairwise merge pipeline instead of the W7 per-field fold.
-	 * Available for ONE beta (beta.14) to compare behaviour; removed afterwards.
+	 * Use the beta.12 pairwise merge pipeline instead of the W7 per-field fold.
+	 * Available for ONE beta (beta.13) to compare behaviour; removed afterwards.
 	 * Switching it on an existing database re-materializes every row on open.
 	 * Defaults to false.
 	 */

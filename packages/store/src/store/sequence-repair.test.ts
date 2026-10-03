@@ -303,7 +303,7 @@ describe('sequence uniqueness repair (W6)', () => {
 		const path = nextDbPath()
 		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(path), nodeId: 'node-1' })
 		await store.open()
-		await store.collection('todos').insert({ title: 'beta.14 write' }) // seq 1, version 2
+		await store.collection('todos').insert({ title: 'protocol-2 write' }) // seq 1, version 2
 		const [v2] = await store.getAllOperations()
 		await store.close()
 		if (!v2) throw new Error('missing op')

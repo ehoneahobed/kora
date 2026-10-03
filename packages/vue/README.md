@@ -1,17 +1,18 @@
 # @korajs/vue
 
-Vue 3 composables for [Kora.js](https://github.com/ehoneahobed/kora) offline-first applications.
+Vue 3 composables for [Kora.js](https://korajs.dev) offline-first applications.
 
 ## Install
 
 ```bash
-pnpm add korajs @korajs/vue
+pnpm add korajs@beta @korajs/vue@beta
 ```
 
 ## Setup
 
 Create the Kora app once at module scope, connect sync after `ready`, then wrap your tree with providers (matches the CLI `vue-tailwind-sync` template):
 
+<!-- docs-check: skip template excerpt: imports the project's own auth and schema modules -->
 ```typescript
 import { createKoraAuthSync } from '@korajs/auth'
 import { AuthProvider } from '@korajs/auth/vue'
@@ -25,7 +26,7 @@ import koraWorkerUrl from './kora-worker.ts?worker&url'
 
 const kora = createKoraApp({
   schema,
-  sync: { url: 'ws://localhost:3000/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
+  sync: { url: 'ws://localhost:3001/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
   store: { workerUrl: koraWorkerUrl },
 })
 

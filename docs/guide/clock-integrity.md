@@ -33,7 +33,15 @@ The measured skew is also fed into the store's HLC as a reference offset, so a d
 
 ## What your app gets with zero work
 
-The sync status now includes everything you need:
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { useSyncStatus } from '@korajs/react'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const app = createApp({ schema, sync: { url: 'wss://sync.example.com/kora-sync' } })
+-->
+
+The sync status includes everything you need (`useSyncStatus()` in React, `app.sync.getStatus()`
+anywhere):
 
 ```ts
 const status = useSyncStatus()
@@ -50,7 +58,7 @@ That's the entire end-user experience: no dialogs, no decisions they can't evalu
 For custom handling, subscribe to the event:
 
 ```ts
-app.events?.on('sync:clock-skew', (event) => {
+app.events.on('sync:clock-skew', (event) => {
   // event.skewMs     serverTime - localTime in ms
   // event.severity   'info' | 'slow-warning' | 'fast-blocked'
   // event.source     'handshake' | 'server-reject'
@@ -82,7 +90,7 @@ Stores that implement the sync contract by hand simply omit `rebaseUnsyncedOpera
 
 ## Timestamp encoding
 
-HLC timestamps serialize to a string that must sort lexicographically in exactly the same order as `HybridLogicalClock.compare`: a zero-padded 15-digit wall time, a zero-padded 5-digit logical counter, and the node id (`000001712188800000:00042:node-abc` style). Stored `_version` and `_field_versions` columns and the operation log rely on that property for every LWW comparison, so both components are hard-bounded:
+HLC timestamps serialize to a string that must sort lexicographically in exactly the same order as `HybridLogicalClock.compare`: a zero-padded 15-digit wall time, a zero-padded 5-digit logical counter, and the node id (`000001712188800000:00042:node-abc` style). Stored version columns, fold states and the operation log rely on that property for every last-write-wins comparison, so both components are hard-bounded:
 
 - **The logical counter is capped at 99,999** (`MAX_LOGICAL`, exported from `@korajs/core`). When an increment would exceed the cap, reachable when the physical clock is frozen behind the HLC (drift-freeze after a corrected fast clock) and every write increments the counter, the clock **carries into wall time** instead: wall time advances by 1ms and the counter resets to 0. Monotonicity and serialized ordering are both preserved. `receive()` rejects remote timestamps with non-integer or negative fields or a logical counter beyond the cap (`InvalidTimestampError`, code `INVALID_TIMESTAMP_FIELDS`) before adopting any state, and the sync server rejects such operations at ingest.
 - **Wall time has a 15-digit horizon** (10^15 ms, roughly the year 33658). `serialize()` throws on values at or beyond it. Unreachable by honest clocks, this only guards against hand-built timestamps that would silently overflow the padded slot and corrupt lexicographic ordering.

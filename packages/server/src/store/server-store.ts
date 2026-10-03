@@ -117,7 +117,7 @@ export type SequenceHolderVerdict =
  * `'conflict'` when any of them was stored after the enforcement epoch and the writer
  * reserves its sequence numbers; `'legacy'` (accepted, with a warning) when all of
  * them predate the epoch, or when the writer is a legacy client (RT-37: Kora <=
- * beta.13 could give two concurrent transactions one number, and refusing the second
+ * beta.12 could give two concurrent transactions one number, and refusing the second
  * would drop a write the user made); `'free'` when there are none. Holders with the
  * operation's own id are the caller's duplicate case.
  */
@@ -137,7 +137,7 @@ export function judgeSequenceHolders(
 			return { verdict: 'conflict', holderId: enforced.id }
 		}
 		console.warn(
-			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.13), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
+			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.12), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
 		)
 		return { verdict: 'legacy', holderIds, legacyWriter: true }
 	}
@@ -366,7 +366,7 @@ export interface ApplyRemoteOptions {
 	/**
 	 * The writer does not reserve its sequence numbers inside the write transaction
 	 * (a client that did not advertise the `sequenceReservation` handshake capability,
-	 * Kora <= beta.13; RT-37). A different operation already holding the
+	 * Kora <= beta.12; RT-37). A different operation already holding the
 	 * `(nodeId, sequenceNumber)` then does not refuse this one: both are stored as a
 	 * legacy pair (each keeps its own delivery sequence, so both are delivered) instead
 	 * of throwing {@link SequenceConflictError}. Default false: enforce.

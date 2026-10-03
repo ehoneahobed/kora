@@ -5,7 +5,7 @@ description: "@korajs/svelte API reference: Kora stores and helpers for reactive
 
 # Svelte API Reference
 
-`@korajs/svelte` provides Svelte stores, composables, and components for offline-first UIs. Works with Svelte 4 store subscriptions and Svelte 5 runes/snippets.
+`@korajs/svelte` provides Svelte stores, helpers and components for offline-first UIs. The stores and helpers work with Svelte 4 and 5; the `.svelte` components (`KoraProvider`, `KoraQuery`, `KoraRichText`, `KoraStoreProvider`) use runes and snippets and need Svelte 5.
 
 ```typescript
 import {
@@ -69,6 +69,7 @@ Root layout component that waits for `app.ready`, sets Kora context, and renders
 
 Returns a Svelte `Readable` store of query results. Subscribe with `$store` or `store.subscribe()`.
 
+<!-- docs-check: skip signature -->
 ```typescript
 function createQueryStore<T = CollectionRecord>(
   query: QueryBuilder<T> | Readable<QueryBuilder<T> | null | undefined>,
@@ -125,13 +126,16 @@ Same inputs; the store holds `{ data, error, ready }`. `error` clears when resul
 
 ## KoraQuery
 
-Snippet component for queries whose **descriptor** changes at runtime (reactive filters).
+Component for queries whose **descriptor** changes at runtime (reactive filters). Props: `query`,
+`enabled` (default `true`) and a `children` snippet that receives the rows.
 
 ```svelte
-<KoraQuery query={app.todos.where({ completed: showDone })} let:data>
-  {#each data as todo}
-    <p>{todo.title}</p>
-  {/each}
+<KoraQuery query={app.todos.where({ completed: showDone })}>
+  {#snippet children(data)}
+    {#each data as todo}
+      <p>{todo.title}</p>
+    {/each}
+  {/snippet}
 </KoraQuery>
 ```
 
@@ -139,7 +143,10 @@ Snippet component for queries whose **descriptor** changes at runtime (reactive 
 
 ## createMutation() / useMutation()
 
-Mutation controller with optimistic hooks. Returns `mutate`, `mutateAsync`, `subscribeLoading`, `subscribeError`, and `reset`.
+Mutation controller with the same options as the other bindings (`onMutate`, `onRollback`,
+`onSuccess`, `onError`, `onSettled`). Returns `mutate` (fire and forget), `mutateAsync`,
+`subscribeLoading(fn)`, `subscribeError(fn)` (each calls `fn` at once and on every change, and
+returns an unsubscribe function) and `reset`.
 
 ---
 
@@ -217,6 +224,7 @@ See [Auth API](./auth.md).
 | `@korajs/svelte/KoraProvider.svelte` | Source (Vite) or precompiled JS (`dist/components/`) |
 | `@korajs/svelte/KoraQuery.svelte` | Reactive query snippet component |
 | `@korajs/svelte/KoraRichText.svelte` | Richtext binding component |
+| `@korajs/svelte/KoraStoreProvider.svelte` | Provider for an explicit `Store` (and sync engine) instead of an app |
 
 ---
 

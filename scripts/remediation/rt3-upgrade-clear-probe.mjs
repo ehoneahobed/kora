@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
  * Red-team round 3 probe (RT-83): a beta.13 device that cleared fields with
- * `undefined` upgrades to beta.14 on the same database.
+ * `undefined` upgrades to protocol 2 on the same database.
  *
  * beta.13 applied `update(id, { assignee: undefined })` to the row (NULL), but its op
- * log is JSON, so the logged operation has no `assignee`. beta.14's one-time fold
+ * log is JSON, so the logged operation has no `assignee`. protocol 2's one-time fold
  * materialization rebuilds rows from the log. Two phases per case:
  *
  * 1. local: the row before and after the upgrade (no sync);
- * 2. sync (round 4): the beta.13 device writes through a beta.14 server (protocol 1),
- *    upgrades on the same database, reconnects as beta.14; a fresh beta.14 peer joins.
+ * 2. sync (round 4): the beta.13 device writes through a protocol-2 server (protocol 1),
+ *    upgrades on the same database, reconnects with protocol 2; a fresh protocol-2 peer joins.
  *    The upgraded device, the peer and the server must hold one row.
  *
  * Prints one JSON line per case and phase; exit 1 when anything differs.

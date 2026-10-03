@@ -1,22 +1,24 @@
 # @korajs/store
 
-Local storage engine for Kora.js. Supports SQLite WASM with OPFS persistence, IndexedDB fallback, and native SQLite for server-side use. Provides CRUD operations, reactive queries, and subscriptions.
+The local data layer of Kora.js: SQLite WASM on OPFS (in a worker), an IndexedDB fallback, native
+SQLite for Node.js, the operation log, the per-field fold that materializes records, reactive
+queries, transactions, sequences and blob storage.
 
-> Most developers don't install this directly. Use [`korajs`](https://www.npmjs.com/package/korajs) instead.
+> Most apps do not install this directly: `createApp()` from
+> [`korajs`](https://www.npmjs.com/package/korajs) creates and opens the store, and you use it
+> through `app.<collection>`.
 
 ## Install
 
 ```bash
-pnpm add @korajs/store
+pnpm add @korajs/store@beta
 ```
 
-## Usage
+## Usage through createApp
 
-### Create a Store
-
+<!-- docs-check: standalone -->
 ```typescript
-import { createStore } from '@korajs/store'
-import { defineSchema, t } from '@korajs/core'
+import { createApp, defineSchema, t } from 'korajs'
 
 const schema = defineSchema({
   version: 1,
@@ -31,45 +33,35 @@ const schema = defineSchema({
   },
 })
 
-const store = await createStore({ schema, adapter: 'sqlite-wasm' })
-```
+const app = createApp({ schema })
+await app.ready
 
-### Insert and Query
+await app.todos.insert({ title: 'Ship Kora v1' })
+const active = await app.todos.where({ completed: false }).orderBy('createdAt', 'desc').limit(10).exec()
 
-```typescript
-await store.insert('todos', { title: 'Ship Kora v1' })
-
-const active = await store.query('todos', {
-  where: { completed: false },
-  orderBy: { createdAt: 'desc' },
-  limit: 10,
+const unsubscribe = app.todos.where({ completed: false }).subscribe((todos) => {
+  // Called with the current results, then whenever they change
+  console.log(todos.length)
 })
 ```
 
-### Reactive Subscriptions
+## Storage adapters
 
-```typescript
-const unsubscribe = store.subscribe(
-  { collection: 'todos', where: { completed: false }, orderBy: { createdAt: 'asc' } },
-  (todos) => {
-    // Called immediately with current data, then on every change
-    console.log(todos)
-  }
-)
-```
-
-## Storage Adapters
-
-| Adapter | Environment | Persistence |
+| Adapter | Entry point | Environment |
 |---------|-------------|-------------|
-| `sqlite-wasm` | Browser (default) | OPFS |
-| `indexeddb` | Browser (fallback) | IndexedDB |
-| `sqlite-native` | Node.js / Electron | Filesystem |
+| `sqlite-wasm` | `@korajs/store/sqlite-wasm` | Browsers with OPFS (default) |
+| `indexeddb` | `@korajs/store/indexeddb` | Browsers without usable OPFS |
+| `better-sqlite3` | `@korajs/store/better-sqlite3` | Node.js, Electron |
 
-The adapter is selected automatically based on environment. SQLite WASM runs in a Web Worker to avoid blocking the main thread.
+`createApp` picks one automatically. Kora never runs on non-durable storage silently: when nothing
+durable can open it emits `store:durability-lost` and refuses writes with `StorageDurabilityError`.
+`FilesystemBlobStore` lives in `@korajs/store/blob-fs` so browser bundles never include `node:fs`.
+
+## Documentation
+
+[Storage Configuration](https://korajs.dev/guide/storage-configuration) and the
+[Store API reference](https://korajs.dev/api/store).
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.
