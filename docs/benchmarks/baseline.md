@@ -29,7 +29,7 @@ pnpm benchmark:gates
 
 **Subscription fan-out:** a write re-runs and diffs every live query on the written collection, one after another. With 1,000 queries spread over 20 collections a write re-runs 50 of them and stays inside a frame. With all 1,000 queries on the written collection the full re-run takes about 20 to 40 ms in node (about 20 µs per query), so it is gated at its own ceiling and does not meet the one-frame target. Deduplicate identical live queries (the framework bindings' `QueryStoreCache` does) and avoid hundreds of distinct live queries on one hot collection.
 
-Node measurements on the 2-core review container (October 2026, under load from parallel builds): check per mutation 0.21 to 0.30 ms; mutation to notification p50 1.2 to 3.1 ms, p95 4.4 to 7.7 ms; worst-case full re-run p50 20 to 38 ms; IndexedDB snapshot persist 10.8 ms.
+Node measurements on the 2-core review container (October 2026, under load from parallel builds): check per mutation 0.18 to 0.30 ms; mutation to notification p50 1.2 to 3.1 ms, p95 4.4 to 8.4 ms; worst-case full re-run p50 20 to 38 ms; IndexedDB snapshot persist 10.8 to 17.3 ms.
 
 ## Store in a real browser (`benchmarks/browser/store-browser-bench.mjs`)
 
@@ -42,26 +42,24 @@ PW_CHROMIUM_PATH=/path/to/chromium pnpm --filter @korajs/store test:benchmarks:b
 
 It prints every measurement and exits 1 when a gate fails. It does not install a browser.
 
-First measurements (headless Chromium 141, 2-core review container with load average 10 to 37 from parallel builds, so absolute numbers are pessimistic; two runs):
+First measurements, headless Chromium 141 on the 2-core review container (October 2026). Runs 1 and 2 ran under load average 10 to 37 from parallel builds; run 3 under load average about 4.
 
-| Measurement | Run 1 | Run 2 | Target |
-|---|---|---|---|
-| OPFS open | 799 ms | 1,644 ms | -- |
-| OPFS insert 10,000 (one transaction) | 8,826 ms | 11,399 ms | &lt; 2 s |
-| OPFS single insert (app path, own transaction) | 91 ms | 98 ms | -- |
-| OPFS query 1,000 rows WHERE | 128 ms | 68 ms | &lt; 50 ms |
-| OPFS reactive notification p95 | 150 ms | 320 ms | &lt; 16 ms |
-| OPFS 1,000 subscriptions: check per mutation | 0.23 ms | 0.30 ms | &lt; 1 ms |
-| OPFS 1,000 subscriptions: mutation to notification p95 | 253 ms | 297 ms | &lt; 16 ms |
-| IndexedDB 1,000 rows: persist snapshot | 169 ms | 105 ms | -- |
-| IndexedDB 10,000 rows: persist snapshot | 892 ms | 4,171 ms | -- |
-| IndexedDB 10,000 rows: persist after one more write | 1,126 ms | 1,894 ms | -- |
+| Measurement | Run 1 | Run 2 | Run 3 | Target |
+|---|---|---|---|---|
+| OPFS open | 799 ms | 1,644 ms | 815 ms | -- |
+| OPFS insert 10,000 (one transaction) | 8,826 ms | 11,399 ms | 8,931 ms | &lt; 2 s |
+| OPFS single insert (app path, own transaction) | 91 ms | 98 ms | 47 ms | -- |
+| OPFS query 1,000 rows WHERE | 128 ms | 68 ms | 80 ms | &lt; 50 ms |
+| OPFS reactive notification p95 | 150 ms | 320 ms | 133 ms | &lt; 16 ms |
+| OPFS 1,000 subscriptions: check per mutation | 0.23 ms | 0.30 ms | 0.20 ms | &lt; 1 ms |
+| OPFS 1,000 subscriptions: mutation to notification p95 | 253 ms | 297 ms | 124 ms | &lt; 16 ms |
+| IndexedDB 1,000 rows: persist snapshot | 169 ms | 105 ms | 149 ms | -- |
+| IndexedDB 10,000 rows: persist snapshot | 892 ms | 4,171 ms | 834 ms | -- |
+| IndexedDB 10,000 rows: persist after one more write | 1,126 ms | 1,894 ms | 794 ms | -- |
 
-Only the subscription check met its target there. Each local insert is six worker round trips (begin, a read, three writes, commit) and one OPFS commit, and a raw one-row `opfs-sahpool` transaction alone took 12 to 38 ms on that host. Every IndexedDB snapshot rewrites the whole database, so its cost grows with the database, not with the write. Record a baseline on CI hardware before making this gate blocking.
+Only the subscription check meets its target on that host. Each local insert is six worker round trips (begin, a read, three writes, commit) plus one OPFS commit, and a raw one-row `opfs-sahpool` transaction alone took 11 to 38 ms there, so the reactive and fan-out latencies are dominated by the write itself. Every IndexedDB snapshot rewrites the whole database, so its cost grows with the database, not with the write. Record a baseline on CI hardware before making this gate blocking.
 
-**Journal mode (NEW-STORE-11):** `PRAGMA journal_mode = WAL` returns `delete` on `opfs-sahpool` (WAL needs shared memory, which that VFS does not implement). Kora no longer issues it; OPFS databases run with `delete`. On that host a one-row transaction cost delete 19 to 38 ms, truncate 12 to 24 ms, persist 14 ms, too noisy to justify a change; re-measure on quiet hardware before switching modes (`persist` and `truncate` keep the journal file, which holds a pool slot permanently).
-
-**WASM / OPFS note:** CI exercises `SqliteWasmAdapter` + `MockWorkerBridge` (in-process SQLite). Real browser OPFS + worker latency is higher; record manual numbers when profiling templates (Chrome Performance, `kora doctor`).
+**Journal mode (NEW-STORE-11):** `PRAGMA journal_mode = WAL` returns `delete` on `opfs-sahpool` (WAL needs shared memory, which that VFS does not implement). Kora no longer issues it; OPFS databases run with `delete`. One-row transaction cost on that host: delete 16 to 38 ms, truncate 11 to 24 ms, persist 11 to 14 ms. `truncate` or `persist` look 20 to 30% cheaper, but the numbers are noisy and both keep the journal file, which permanently holds an OPFS pool slot per database; re-measure on quiet hardware before switching.
 
 ## Merge (`@korajs/merge`)
 
