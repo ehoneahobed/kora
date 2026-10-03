@@ -21,6 +21,30 @@ const server = createProductionServer({
 const url = await server.start()
 ```
 
+## Static files and the offline app shell
+
+The server serves `staticDir` (default `./dist`) the way an offline-first app needs:
+
+| Request | Response |
+|---|---|
+| Content-hashed file (`assets/index-DrBNyszg.js`) | `Cache-Control: public, max-age=31536000, immutable` |
+| Anything else (`index.html`, `sw.js`, `manifest.webmanifest`, the unhashed `assets/sqlite3.wasm`) | `Cache-Control: no-cache`, revalidated with `ETag` / `Last-Modified` and answered `304` when unchanged |
+| Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when present; otherwise each file is compressed once and cached in memory |
+| A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
+| Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
+
+Media types include `.webmanifest` (`application/manifest+json`), `.wasm` and `.mjs`.
+Only `GET` and `HEAD` are served; paths cannot escape `staticDir`.
+
+The scaffolded templates add a service worker (`public/sw.js` generated at build time by
+`korajsServiceWorker()` in `vite.config.ts`) that precaches this shell, so the app
+opens with no network at all after one online visit.
+
+**At scale**, put a CDN in front of the static files. The headers above are CDN-safe:
+hashed assets can be cached at the edge forever, and the shell, service worker and
+manifest revalidate on every request. Never let a CDN cache the sync endpoint
+(`/kora-sync`) or the auth routes (`/auth/*`).
+
 ## Trusted data-plane access for background jobs
 
 The handle carries a `kora` context: `apply`, `query`, and `findById`. It is the
