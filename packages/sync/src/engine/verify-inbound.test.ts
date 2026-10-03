@@ -72,15 +72,51 @@ describe('verifyInboundOperation: version-1 ids (RT-64)', () => {
 		expect((await verifyInboundOperation(decoded, { encrypted: false })).ok).toBe(true)
 	})
 
-	test('operations of kora: nodes (server-derived ids, scope entries) are not checked', async () => {
-		const serverOp = {
-			...(await v1Op({ nodeId: 'kora:server:d:1' })),
+	test('server-derived operations and scope entries (no declared version) are not checked', async () => {
+		const { hashVersion: _none, ...derived } = {
+			...(await v1Op({ nodeId: 'kora:server:d:1', causalDeps: ['parent'] })),
 			id: 'keyed-derived-id',
-			hashVersion: 1 as const,
+			hashVersion: undefined,
 		}
-		expect(await verifyInboundOperation(serverOp, { encrypted: false })).toEqual({
+		for (const absentVersion of ['skip', 'verify-ids'] as const) {
+			expect(await verifyInboundOperation(derived, { encrypted: false, absentVersion })).toEqual({
+				ok: true,
+				verified: false,
+			})
+		}
+		const scopeEntry = {
+			...(await v1Op({ nodeId: 'kora:scope-entry', sequenceNumber: 0 })),
+			id: 'scope-entry-abc',
+		}
+		expect(
+			await verifyInboundOperation(scopeEntry, { encrypted: false, absentVersion: 'verify-ids' }),
+		).toEqual({ ok: true, verified: false })
+	})
+
+	test('a server route write (kora:server: node, declared hash version) is verified', async () => {
+		const base = await v1Op({ nodeId: 'kora:server:d:1' })
+		const route = { ...base, hashVersion: 2 as const }
+		const honest = { ...route, id: await computeOperationId(route, 2) }
+		expect(await verifyInboundOperation(honest, { encrypted: false })).toEqual({
 			ok: true,
-			verified: false,
+			verified: true,
 		})
+		expect(
+			await verifyInboundOperation({ ...honest, id: 'chosen-id' }, { encrypted: false }),
+		).toMatchObject({ ok: false, code: 'INVALID_OPERATION_ID' })
+		expect(
+			(
+				await verifyInboundOperation(
+					{ ...honest, data: { title: 'altered' } },
+					{ encrypted: false },
+				)
+			).ok,
+		).toBe(false)
+		// A declared version 1 on a reserved node is verified too.
+		const v1 = { ...base, hashVersion: 1 as const }
+		expect((await verifyInboundOperation(v1, { encrypted: false })).ok).toBe(true)
+		expect((await verifyInboundOperation({ ...v1, id: 'keyed' }, { encrypted: false })).ok).toBe(
+			false,
+		)
 	})
 })

@@ -5,6 +5,26 @@ import { INVALID_OPERATION_ID } from '../protocol/protocol-version'
 /** Prefix of node ids reserved for Kora itself (server-authored and server-synthesized). */
 const RESERVED_NODE_PREFIX = 'kora:'
 
+/** Node of server-synthesized scope-entry operations (ids derived from the trigger op). */
+const SCOPE_ENTRY_NODE_ID = 'kora:scope-entry'
+
+/**
+ * Whether an operation's id is exempt from content verification: it is not a content
+ * hash by construction. Only two kinds of operation qualify, both on Kora's reserved
+ * nodes, which no device can claim:
+ * - scope entries (`kora:scope-entry`): the id names the triggering operation, and the
+ *   data is the record's current row;
+ * - server-derived operations (cascades, set-nulls, constraint corrections) of a
+ *   `kora:server:` node: the id is a keyed HMAC (RT-64) and they declare no hash version.
+ *
+ * A reserved-node operation that declares a hash version (a server route write, built
+ * with `createOperation`) claims a content-addressed id and is verified like any other.
+ */
+function isExemptFromIdVerification(op: Operation): boolean {
+	if (!op.nodeId.startsWith(RESERVED_NODE_PREFIX)) return false
+	return op.nodeId === SCOPE_ENTRY_NODE_ID || op.hashVersion === undefined
+}
+
 /** Outcome of {@link verifyInboundOperation}. */
 export type InboundVerification =
 	| {
@@ -42,9 +62,9 @@ export type AbsentHashVersionPolicy =
  * chosen rather than computed (squatting an id the server derives).
  *
  * Rules:
- * - Operations of reserved nodes (`kora:` prefix: the server's own `kora:server:` nodes,
- *   whose derived ids are keyed and not content hashes, and synthesized scope entries)
- *   are not checked.
+ * - Scope entries and server-derived operations (reserved `kora:` nodes, no declared hash
+ *   version: keyed HMAC ids) are not checked. A reserved-node operation that declares a
+ *   hash version (a server route write) is checked like any other.
  * - An operation that arrived in an encryption envelope is always checked, against
  *   the hash version it declares (bound into the envelope's authenticated data).
  * - A plaintext operation declaring hash version 2 or 1 is checked against that version.
@@ -65,7 +85,7 @@ export async function verifyInboundOperation(
 	op: Operation,
 	context: { encrypted: boolean; absentVersion?: AbsentHashVersionPolicy },
 ): Promise<InboundVerification> {
-	if (op.nodeId.startsWith(RESERVED_NODE_PREFIX)) return { ok: true, verified: false }
+	if (isExemptFromIdVerification(op)) return { ok: true, verified: false }
 	const declared = op.hashVersion
 	if (declared !== undefined && declared !== 1 && declared !== 2) {
 		return {
