@@ -7,8 +7,13 @@
  */
 import { fc, test } from '@fast-check/vitest'
 import { describe, expect } from 'vitest'
+import type { WrappedKeyRecord } from '../encryption/key-record'
 import type { SerializedOperation, SyncMessage } from './messages'
-import { JsonMessageSerializer, ProtobufMessageSerializer } from './serializer'
+import {
+	JsonMessageSerializer,
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
+} from './serializer'
 
 const json = new JsonMessageSerializer()
 const proto = new ProtobufMessageSerializer()
@@ -29,6 +34,44 @@ const jsonRecord = fc.dictionary(fc.string({ maxLength: 16 }), fc.jsonValue({ ma
 const scopeMap = fc.dictionary(id, jsonRecord, { maxKeys: 3 })
 const hlc = fc.record({ wallTime: fc.nat(), logical: fc.nat({ max: 1000 }), nodeId: id })
 const envelopeField = fc.record({ iv: fc.base64String(), ct: fc.base64String() })
+const keyRecord: fc.Arbitrary<WrappedKeyRecord> = fc.record(
+	{
+		format: fc.constant(1 as const),
+		keyring: id,
+		revision: fc.integer({ min: 1, max: 1000 }),
+		currentVersion: fc.integer({ min: 1, max: 10 }),
+		kdf: fc.record({
+			name: fc.constant('PBKDF2' as const),
+			hash: fc.constant('SHA-256' as const),
+			iterations: fc.integer({ min: 1, max: 1_000_000 }),
+			salt: fc.base64String(),
+		}),
+		keys: fc.array(
+			fc.record({
+				keyVersion: fc.integer({ min: 1, max: 10 }),
+				keyId: id,
+				iv: fc.base64String(),
+				wrappedKey: fc.base64String(),
+			}),
+			{ minLength: 1, maxLength: 3 },
+		),
+		recovery: fc.record({
+			alg: fc.constant('ECDH-P256+AES-GCM' as const),
+			publicKey: fc.record({ x: id, y: id }),
+			keys: fc.array(
+				fc.record({
+					keyVersion: fc.integer({ min: 1, max: 10 }),
+					keyId: id,
+					ephemeralPublicKey: fc.record({ x: id, y: id }),
+					iv: fc.base64String(),
+					wrappedKey: fc.base64String(),
+				}),
+				{ maxLength: 2 },
+			),
+		}),
+	},
+	{ requiredKeys: ['format', 'keyring', 'revision', 'currentVersion', 'kdf', 'keys'] },
+)
 
 const operation: fc.Arbitrary<SerializedOperation> = fc.record(
 	{
@@ -230,6 +273,42 @@ const arbitraries: Record<SyncMessage['type'], fc.Arbitrary<SyncMessage>> = {
 		bytes: fc.base64String(),
 	}),
 	heartbeat: fc.record({ type: fc.constant('heartbeat' as const), messageId: id }),
+	// ENC-1 key distribution. NegotiatedMessageSerializer sends these as JSON on every
+	// wire format, but a transport that uses the protobuf serializer explicitly must still
+	// carry them losslessly (their bodies travel in the extension field).
+	'encryption-key-request': fc.record({
+		type: fc.constant('encryption-key-request' as const),
+		messageId: id,
+		requestId: id,
+		keyring: id,
+	}),
+	'encryption-key-put': fc.record({
+		type: fc.constant('encryption-key-put' as const),
+		messageId: id,
+		requestId: id,
+		keyring: id,
+		record: keyRecord,
+		expectedRevision: fc.nat(),
+	}),
+	'encryption-key-response': fc.record(
+		{
+			type: fc.constant('encryption-key-response' as const),
+			messageId: id,
+			requestId: id,
+			keyring: id,
+			status: fc.constantFrom(
+				'ok' as const,
+				'conflict' as const,
+				'forbidden' as const,
+				'invalid' as const,
+				'unsupported' as const,
+				'throttled' as const,
+			),
+			record: fc.option(keyRecord, { nil: null }),
+			message: fc.string(),
+		},
+		{ requiredKeys: ['type', 'messageId', 'keyring', 'status', 'record'] },
+	),
 }
 
 describe('SYNC-9: protobuf round trip equals the JSON wire for every message type', () => {
@@ -247,6 +326,44 @@ describe('SYNC-9: protobuf round trip equals the JSON wire for every message typ
 			expect(proto.decode(buffer as ArrayBuffer)).toEqual(viaJson(message))
 		},
 	)
+})
+
+describe('ENC-1 key messages on the protobuf wire', () => {
+	test('a put without its record is refused, not decoded with an invented one', () => {
+		// Encode a valid put, then strip the record from the extension: the decoder must
+		// refuse the message rather than hand the engine a put with no record.
+		const message: SyncMessage = {
+			type: 'encryption-key-put',
+			messageId: 'm',
+			requestId: 'r',
+			keyring: 'default',
+			expectedRevision: 0,
+			record: {
+				format: 1,
+				keyring: 'default',
+				revision: 1,
+				currentVersion: 1,
+				kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: 1, salt: 'AAAA' },
+				keys: [{ keyVersion: 1, keyId: 'k', iv: 'AA', wrappedKey: 'AA' }],
+			},
+		}
+		const bytes = proto.encode(message)
+		const tampered = Buffer.from(bytes).toString('latin1').replace('"record":', '"rekord":')
+		expect(() => proto.decode(new Uint8Array(Buffer.from(tampered, 'latin1')))).toThrow(
+			/invalid message structure/,
+		)
+	})
+
+	test('NegotiatedMessageSerializer still sends key messages as JSON text on protobuf', () => {
+		const negotiated = new NegotiatedMessageSerializer('protobuf')
+		const encoded = negotiated.encode({
+			type: 'encryption-key-request',
+			messageId: 'm',
+			requestId: 'r',
+			keyring: 'default',
+		})
+		expect(typeof encoded).toBe('string')
+	})
 })
 
 describe('protobuf extension field (49)', () => {

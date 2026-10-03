@@ -780,9 +780,10 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 		case 'encryption-key-request':
 		case 'encryption-key-put':
 		case 'encryption-key-response':
-			// Key distribution is JSON on every wire format (ENC-1): NegotiatedMessageSerializer
-			// sends it as a JSON text frame, never through the protobuf envelope.
-			throw new SyncError('Encryption key messages travel as JSON', { type: message.type })
+			// NegotiatedMessageSerializer sends key distribution as a JSON text frame on every
+			// wire format (ENC-1). A transport that uses this serializer explicitly still gets
+			// it losslessly: the body travels in the extension field (49), like awareness.
+			return { type: message.type, messageId: message.messageId }
 	}
 }
 
@@ -949,6 +950,33 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 				recordId: '',
 				field: '',
 				update: '',
+			}
+		// Key-distribution bodies travel in the extension field (49); these are skeletons the
+		// extension completes (applyResidualFields validates the result).
+		case 'encryption-key-request':
+			return {
+				type: 'encryption-key-request',
+				messageId: envelope.messageId,
+				requestId: '',
+				keyring: '',
+			}
+		case 'encryption-key-put':
+			// `record` has no meaningful default; the extension always sets it, and a put
+			// without one fails the structural check in applyResidualFields.
+			return {
+				type: 'encryption-key-put',
+				messageId: envelope.messageId,
+				requestId: '',
+				keyring: '',
+				expectedRevision: 0,
+			} as SyncMessage
+		case 'encryption-key-response':
+			return {
+				type: 'encryption-key-response',
+				messageId: envelope.messageId,
+				keyring: '',
+				status: 'invalid',
+				record: null,
 			}
 		default:
 			throw new SyncError('Failed to decode sync message: unknown protobuf type', {
