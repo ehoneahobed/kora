@@ -3,8 +3,12 @@ import { QueryStoreCache } from '@korajs/store'
 import { getContext, setContext } from 'svelte'
 import type { KoraAppLike, KoraContextValue } from './types'
 
-const koraContextKey = Symbol('korajs-context')
-const koraAppContextKey = Symbol('korajs-app')
+// Registered (Symbol.for) keys: the .svelte components are compiled from src/ by the app
+// (the "svelte" export condition) while helpers such as getCollection come from dist/, so
+// two copies of this module exist in every app. Module-local Symbol() keys made the
+// provider's context invisible to the helpers ("Kora context missing").
+const koraContextKey = Symbol.for('@korajs/svelte:context')
+const koraAppContextKey = Symbol.for('@korajs/svelte:app')
 
 export function setKoraContext(value: KoraContextValue): void {
 	setContext(koraContextKey, value)
