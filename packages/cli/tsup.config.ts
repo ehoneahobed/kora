@@ -1,9 +1,15 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-	entry: ['src/index.ts', 'src/bin.ts', 'src/create.ts'],
+	entry: {
+		index: 'src/index.ts',
+		bin: 'src/bin.ts',
+		create: 'src/create.ts',
+		// Build-time Vite plugin for scaffolded apps (offline app shell, NEW-DX-3).
+		vite: 'src/vite/service-worker.ts',
+	},
 	format: ['esm', 'cjs'],
-	dts: { entry: ['src/index.ts'] },
+	dts: { entry: { index: 'src/index.ts', vite: 'src/vite/service-worker.ts' } },
 	sourcemap: true,
 	clean: true,
 	external: [

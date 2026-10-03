@@ -36,9 +36,10 @@ The server serves `staticDir` (default `./dist`) the way an offline-first app ne
 Media types include `.webmanifest` (`application/manifest+json`), `.wasm` and `.mjs`.
 Only `GET` and `HEAD` are served; paths cannot escape `staticDir`.
 
-The scaffolded templates add a service worker (`public/sw.js` generated at build time by
-`korajsServiceWorker()` in `vite.config.ts`) that precaches this shell, so the app
-opens with no network at all after one online visit.
+The scaffolded templates add a service worker (`sw.js`, generated into `dist/` at build
+time by `koraServiceWorker()` from `@korajs/cli/vite`) that precaches this shell, so the
+app opens with no network at all after one online visit. See
+[Offline patterns](./offline-patterns.md#opening-the-app-offline-the-app-shell).
 
 **At scale**, put a CDN in front of the static files. The headers above are CDN-safe:
 hashed assets can be cached at the edge forever, and the shell, service worker and
