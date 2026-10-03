@@ -207,7 +207,7 @@ const collaborators = useCollaborators()
 ```
 
 - `usePresence(user)`: publishes local presence; clears on unmount.
-- `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). Presence is relayed only to peers that can read the record it refers to.
+- `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). Presence is relayed only between sessions with the same download scope.
 
 ---
 

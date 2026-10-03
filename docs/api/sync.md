@@ -207,7 +207,7 @@ see [Sync Encryption](/guide/sync-encryption). Exports for custom setups:
 presence: `setLocalState(state | null)`, `getLocalState()`, `getStates()`,
 `on('change', listener)`, `off`, `destroy()`. A state is
 `{ user: { name, color, avatar? }, cursor?: { collection, recordId, field, anchor, head } }`.
-Presence is not persisted and is relayed only to sessions that can read the record. With an
+Presence is not persisted and is relayed only between sessions with the same download scope. With an
 emitter, changes emit `awareness:updated`.
 
 ```typescript

@@ -190,8 +190,9 @@ lists them all.
 ## Awareness relay
 
 `AwarenessRelay` forwards presence between sessions without storing it (`addClient`, `hasClient`,
-`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `KoraSyncServer` runs one and relays an
-update only to sessions that may read the record it refers to. See [Presence](/guide/presence).
+`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `KoraSyncServer` runs one per server and
+relays an update only between sessions that completed a handshake and share the same download scope
+(presence partition). See [Presence](/guide/presence).
 
 ## Logging
 
