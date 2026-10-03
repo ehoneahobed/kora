@@ -2,6 +2,7 @@ import type { CollectionDefinition, FieldDescriptor } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
 import { QueryError } from '../errors'
 import { lwwVersionWhereClause } from '../lww/row-version'
+import { encodeStoredFilterValue } from '../serialization/serializer'
 import type { QueryDescriptor, WhereOperators } from '../types'
 
 /**
@@ -294,9 +295,8 @@ function buildOperatorCondition(
 	descriptor: FieldDescriptor | undefined,
 	params: unknown[],
 ): string {
-	// Serialize boolean values to 0/1 for SQL comparison
-	const sqlValue =
-		descriptor?.kind === 'boolean' && typeof value === 'boolean' ? (value ? 1 : 0) : value
+	// Serialize boolean values to 0/1 and raw strings to their stored form (RT-65)
+	const sqlValue = toSqlFilterValue(value, descriptor)
 
 	const column = quoteIdent(fieldName)
 
@@ -334,15 +334,18 @@ function buildOperatorCondition(
 			}
 			const placeholders = sqlValue.map(() => '?')
 			for (const item of sqlValue) {
-				params.push(
-					descriptor?.kind === 'boolean' && typeof item === 'boolean' ? (item ? 1 : 0) : item,
-				)
+				params.push(toSqlFilterValue(item, descriptor))
 			}
 			return `${column} IN (${placeholders.join(', ')})`
 		}
 		default:
 			throw new QueryError(`Unknown operator "${operator}"`, { operator })
 	}
+}
+
+function toSqlFilterValue(value: unknown, descriptor: FieldDescriptor | undefined): unknown {
+	if (descriptor?.kind === 'boolean' && typeof value === 'boolean') return value ? 1 : 0
+	return encodeStoredFilterValue(value, descriptor)
 }
 
 function validateFieldName(fieldName: string, fields: Record<string, FieldDescriptor>): void {

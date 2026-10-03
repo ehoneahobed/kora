@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@korajs/merge'
+import type { SideEffectOp } from '@korajs/merge'
 import type { ApplyResult } from '@korajs/sync'
 import { enforceCrossRecordRules } from '../constraints/constraint-authority'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
@@ -29,6 +30,13 @@ export interface ApplyServerOperationResult {
 	appliedOperations: Operation[]
 	/** Rejection reason when the operation was not applied */
 	rejection?: OperationRejection
+	/**
+	 * Side effects of an applied delete that were NOT derived because
+	 * {@link ApplyServerOperationOptions.isAuthoredSideEffect} claimed them (RT-69). The
+	 * caller must derive each one with {@link deriveServerSideEffects} unless the
+	 * author's own copy is stored.
+	 */
+	deferredSideEffects?: SideEffectOp[]
 }
 
 /**
@@ -76,6 +84,15 @@ export interface ApplyServerOperationOptions {
 	legacySequenceWriter?: boolean
 	/** See `ApplyRemoteOptions.onLegacySequencePair`; for the primary operation. */
 	onLegacySequencePair?: ApplyRemoteOptions['onLegacySequencePair']
+	/**
+	 * True for a referential side effect of this delete that the writer authored itself
+	 * (its own cascade or set-null, later in the same upload, RT-69). Such an effect is
+	 * not derived now but returned in `deferredSideEffects`, so the log stores one copy
+	 * per child instead of the author's and the server's. Effects it does not claim (a
+	 * child the author did not know, a legacy client that authors no cascades) are
+	 * derived as before.
+	 */
+	isAuthoredSideEffect?: (effect: SideEffectOp) => boolean
 }
 
 /**
@@ -187,27 +204,20 @@ export async function applyServerOperation(
 		}
 
 		const appliedOperations: Operation[] = [op]
-
+		const deferred: SideEffectOp[] = []
+		const derive: SideEffectOp[] = []
 		for (const effect of referential.sideEffectOps) {
-			// Allocate each side-effect's sequence number individually. On a store
-			// that reserves atomically (Postgres), this keeps a concurrent conditional
-			// apply from being handed the same server sequence number; on a serialized
-			// store, each allocation reads the version vector the prior apply advanced.
-			const sideOp = await createServerSideEffectOperation(
-				store,
-				op,
-				effect,
-				op.schemaVersion,
-				nextServerSequenceNumber(store),
-			)
-			const sideResult = await store.applyRemoteOperation(sideOp)
-			if (sideResult === 'applied') {
-				appliedOperations.push(sideOp)
-			}
+			if (options.isAuthoredSideEffect?.(effect)) deferred.push(effect)
+			else derive.push(effect)
 		}
+		appliedOperations.push(...(await deriveServerSideEffects(store, op, derive)))
 		appliedOperations.push(...(await enforceAfterCommit(store, op)))
 
-		return { result: 'applied', appliedOperations }
+		return {
+			result: 'applied',
+			appliedOperations,
+			...(deferred.length > 0 ? { deferredSideEffects: deferred } : {}),
+		}
 	}
 
 	let result: Awaited<ReturnType<ServerStore['applyRemoteOperation']>>
@@ -220,6 +230,63 @@ export async function applyServerOperation(
 	}
 	if (result !== 'applied') return { result, appliedOperations: [] }
 	return { result, appliedOperations: [op, ...(await enforceAfterCommit(store, op))] }
+}
+
+/**
+ * Store the server's own copy of referential side effects (cascade delete, set-null)
+ * of the applied delete `parentOp`: deterministic ids and timestamps (see
+ * {@link createServerSideEffectOperation}), so a retry or another instance writes the
+ * same operations.
+ *
+ * @param store - The server store
+ * @param parentOp - The applied delete
+ * @param effects - Its side effects to derive
+ * @returns The side-effect operations the store applied (to relay)
+ */
+export async function deriveServerSideEffects(
+	store: ServerStore,
+	parentOp: Operation,
+	effects: readonly SideEffectOp[],
+): Promise<Operation[]> {
+	const applied: Operation[] = []
+	for (const effect of effects) {
+		// Allocate each side-effect's sequence number individually. On a store
+		// that reserves atomically (Postgres), this keeps a concurrent conditional
+		// apply from being handed the same server sequence number; on a serialized
+		// store, each allocation reads the version vector the prior apply advanced.
+		const sideOp = await createServerSideEffectOperation(
+			store,
+			parentOp,
+			effect,
+			parentOp.schemaVersion,
+			nextServerSequenceNumber(store),
+		)
+		const sideResult = await store.applyRemoteOperation(sideOp)
+		if (sideResult === 'applied') applied.push(sideOp)
+	}
+	return applied
+}
+
+/**
+ * Whether `op` (an operation of the delete's author) is the author's own copy of the
+ * side effect `effect` of the delete `parentId`: same record, causally after the
+ * delete, with the same effect (a delete for a cascade; for a set-null, an update
+ * writing null to every field the effect nulls). An encrypted update cannot be read,
+ * so it never counts as a set-null copy.
+ */
+export function isAuthoredCopyOfSideEffect(
+	op: Operation,
+	parentId: string,
+	effect: SideEffectOp,
+): boolean {
+	if (op.collection !== effect.collection || op.recordId !== effect.recordId) return false
+	if (!op.causalDeps.includes(parentId)) return false
+	if (effect.type === 'delete') return op.type === 'delete'
+	if (op.type !== 'update' || op.encrypted !== undefined || !op.data) return false
+	const data = op.data
+	return Object.entries(effect.data ?? {}).every(
+		([field, value]) => value === null && field in data && data[field] === null,
+	)
 }
 
 /**

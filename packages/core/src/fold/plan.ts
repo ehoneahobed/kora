@@ -3,9 +3,9 @@ import { planField } from './field-kind'
 import { FOLD_STATE_VERSION, type FieldState, type FoldState } from './types'
 
 /**
- * FNV-1a over UTF-16 code units: a stable, dependency-free text fingerprint. Must
- * stay identical to the server's (`@korajs/server` `record-fold.ts`), so a client
- * and a server agree on whether a plan changed.
+ * FNV-1a over UTF-16 code units: a stable, dependency-free text fingerprint. The
+ * server stores use this module's definition too (`@korajs/server` `record-fold.ts`
+ * re-exports it), so a client and a server agree on whether a plan changed.
  */
 function hashText(text: string): string {
 	let hash = 0x811c9dc5

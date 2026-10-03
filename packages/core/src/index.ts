@@ -158,6 +158,16 @@ export {
 	isServerNodeId,
 } from './fold/authority'
 export { toMergeTrace } from './fold/trace'
+
+// === Lossless stored text (RT-65) ===
+export {
+	STORED_TEXT_ESCAPE,
+	decodeStoredJsonValue,
+	decodeStoredText,
+	encodeStoredJsonValue,
+	encodeStoredText,
+	needsStoredTextEncoding,
+} from './text/stored-text'
 export { deriveSideEffectOpId } from './fold/side-effect-id'
 export { FoldConfigurationError, FoldStateError } from './fold/errors'
 export { FOLD_STATE_VERSION } from './fold/types'

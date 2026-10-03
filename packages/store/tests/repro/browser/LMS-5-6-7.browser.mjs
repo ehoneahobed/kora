@@ -851,6 +851,41 @@ const scenarios = {
 		await R.evaluate(() => H.close('r'))
 		await ctx.close()
 	},
+	async 'RT-65'() {
+		// The client SQLite store keeps every JS string (NUL, lone surrogates, U+FFFF) in
+		// raw-string, enum, array and object columns and in the op log, on the real WASM
+		// paths: OPFS SAH pool and the IndexedDB fallback, across a close and reopen.
+		const ctx = await browser.newContext()
+		const P = await tab(ctx)
+		for (const [label, opts] of [
+			['OPFS', {}],
+			['IndexedDB', { indexeddb: true }],
+		]) {
+			const r = await P.evaluate(
+				([db, o]) => H.rt65RoundTrip(db, o),
+				[`rt65_${label.toLowerCase()}`, opts],
+			)
+			check(
+				'RT-65',
+				`${label}: every string round-trips through rows after a reopen`,
+				r.errors.length === 0 && r.read.length === 5 && r.read.every((x) => x.ok),
+				J(r.errors.length ? r.errors : r.read),
+			)
+			check(
+				'RT-65',
+				`${label}: equality and $in filters find every poisoned string`,
+				r.filtered.length === 5 && r.filtered.every(Boolean),
+				J(r.filtered),
+			)
+			check(
+				'RT-65',
+				`${label}: the op log keeps every string`,
+				r.ops.length === 5 && r.ops.every(Boolean),
+				J(r.ops),
+			)
+		}
+		await ctx.close()
+	},
 	async 'LMS-MIG'() {
 		// Upgrade path: a database written by 1.0.0-beta.12 (one origin-wide 'kora-opfs'
 		// pool) survives the first open under per-database pools.
