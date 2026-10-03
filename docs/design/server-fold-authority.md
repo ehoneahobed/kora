@@ -23,11 +23,21 @@ Postgres serializes the read-merge-write through the delivery-counter row lock t
 every append already holds until commit (and `FOR UPDATE` on the state row). The fold
 orders writes by HLC stamps compared in JavaScript, never by a database collation.
 
-Server fold options: the Yjs richtext merger, no traces, and
-`authoritativeNodeIds` = the store's node id plus configured extras
-(`ServerStore.getAuthoritativeNodeIds()`). `KoraSyncServer.authoritativeNodeIds`
-returns that list and every session advertises exactly it in the handshake (one
-source of truth; there is no separate server option). Stores persist `hash_version`
+Server fold options: the Yjs richtext merger, no traces, and the authority set:
+every node id in the reserved `kora:server:` namespace (the prefix rule) plus the
+explicit legacy ids. Every server-authored operation's node id is
+`kora:server:<deploymentId>:<instanceId>` (RT-62): the deployment id is persisted in
+`kora_server_meta` on first start and shared by every instance of the database; the
+instance id is persisted (SQLite) or drawn per start from a database counter
+(Postgres, unless configured), so no two instances share a node id or its sequence
+numbers. At the first start of beta.14 the store records every node id whose
+operations hold authority class 1 in a stored fold state (decisions folded under an
+earlier, per-process server id), plus a configured plain `nodeId`, as legacy
+authoritative ids; the fold plan fingerprint covers them. `KoraSyncServer.authoritativeNodeIds`
+(`ServerStore.getAuthoritativeNodeIds()`) lists this instance's id, the other
+`kora:server:` ids with history and the legacy ids; every session advertises exactly
+it in the handshake and refuses a device presenting any of them, or any `kora:` id
+(RT-61). Stores persist `hash_version`
 (CORE-1) and the encryption envelope (`encrypted`, protocol v2) with each operation.
 
 Envelope operations (end-to-end encryption) are folded like any other, over their
@@ -49,14 +59,20 @@ integrity scan:
   lock, so a live write on another instance is never overwritten by a stale re-fold).
 - Idempotent and resumable: staleness is derived from the tables at every start; a
   restart on an up-to-date database does one aggregate read.
-- Unclean log (quarantined rows): rows materialized before the fold are kept and the
-  skip is logged with `console.error`; such a record folds from its remaining log on
-  its next write. `getFoldMigrationReport()` reports what ran.
+- Unclean log (quarantined rows): a record that owns a quarantined operation (from
+  `operations_quarantine.row_json`) has an incomplete log and is never re-folded from
+  it (RT-70). Its base is its stored fold state, or `createSnapshotState` of its kept
+  row (fields stamped at least at the quarantined operations' newest HLC); its
+  remaining operations, and every later write, merge onto that base. Records with a
+  complete log fold from it. `getFoldMigrationReport().skippedUnclean` counts the
+  kept records; the count is logged with `console.error`.
 
 ## Side effects (cascade, set-null)
 
-Server-generated effects of a delete get `deriveSideEffectOpId(parentOpId,
-"server/relation:<relation>:<cascade|set-null>", targetRecordId)` and the timestamp
+Server-generated effects of a delete get `deriveServerOpId(store, parentOpId,
+"server/relation:<relation>:<cascade|set-null>", targetRecordId)` (HMAC-SHA-256 keyed
+with the deployment's persisted secret, RT-64: every instance derives the same id,
+no client can predict it and store an operation under it first) and the timestamp
 right after the parent's (`timestampAfter`: same wall time, next logical tick, server
 node). Every instance, session or retry that generates the same effect produces the
 same id, and the log stores it once. A causally later write (re-pointing the child)
