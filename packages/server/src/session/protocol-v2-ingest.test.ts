@@ -107,12 +107,12 @@ describe('protocol v2 handshake', () => {
 		const response = c.messages.find((m) => m.type === 'handshake-response')
 		if (response?.type !== 'handshake-response') throw new Error('no response')
 		expect(response.protocolVersion).toBe(2)
-		// The store's own kora:server: node id, then the configured legacy id (RT-62).
-		expect(response.authoritativeNodeIds?.[0]?.startsWith('kora:server:')).toBe(true)
-		expect(response.authoritativeNodeIds?.slice(1)).toEqual(['server-1'])
+		// Only explicit ids: the configured legacy id (RT-62). The store's own
+		// kora:server: id is authoritative by prefix and not listed (RT-75).
+		expect(response.authoritativeNodeIds).toEqual(['server-1'])
 	})
 
-	test('the handshake sends exactly the node ids the store folds with', async () => {
+	test('the handshake sends exactly the explicit node ids the store folds with', async () => {
 		const { login, store } = await setup({}, schemaV1, ['srv-a', 'srv-b'])
 		expect(store.getAuthoritativeNodeIds()).toEqual([
 			store.getNodeId(),
@@ -122,8 +122,9 @@ describe('protocol v2 handshake', () => {
 		])
 		const c = await login('dev-a')
 		const response = c.messages.find((m) => m.type === 'handshake-response')
+		// The kora:server: ids are authoritative by prefix on every replica (RT-75).
 		expect(response?.type === 'handshake-response' && response.authoritativeNodeIds).toEqual(
-			store.getAuthoritativeNodeIds(),
+			store.getAuthoritativeNodeIds().filter((id) => !id.startsWith('kora:server:')),
 		)
 	})
 

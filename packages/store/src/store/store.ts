@@ -9,6 +9,7 @@ import {
 	foldPlanFingerprints,
 	generateUUIDv7,
 	isReservedNodeId,
+	isServerNodeId,
 	mismatchedFoldFields,
 	quoteIdent,
 	replayOperationsForRecord,
@@ -40,6 +41,7 @@ import {
 	FOLD_TABLES_DDL,
 	RecordFolder,
 	isCompacted,
+	migrateProvisionalTable,
 } from '../fold/record-folder'
 import {
 	type KeptRecords,
@@ -326,6 +328,8 @@ export class Store implements OperationLog {
 	private readonly folder: RecordFolder | null
 	/** True once every row of the database is a materialization of its fold state. */
 	private foldActive = false
+	/** Relations whose field end-to-end encryption seals from the server (RT-74). */
+	private sealedRelations: ReadonlySet<string> = new Set()
 
 	constructor(config: StoreConfig) {
 		this.materialization = config.materialization ?? 'fold'
@@ -353,6 +357,7 @@ export class Store implements OperationLog {
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
+		await migrateProvisionalTable(this.adapter)
 		this.foldActive = false
 
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
@@ -1193,6 +1198,7 @@ export class Store implements OperationLog {
 	 * complete history and stops being approximate (RT-68). Also retires the
 	 * provisional cascades of remote deletes (RT-69): the server's own copies were
 	 * delivered by now, and any it did not derive must not stay applied locally.
+	 * Durable effects (sealed relations the server cannot cascade, RT-74) are kept.
 	 *
 	 * @returns How many snapshots were dropped
 	 */
@@ -1204,8 +1210,9 @@ export class Store implements OperationLog {
 		let settled = 0
 		const touched = new Set<string>()
 		await this.adapter.transaction(async (tx) => {
-			for (const { collection, recordId } of await folder.listProvisionalRecords(tx)) {
-				await folder.deleteProvisional(tx, collection, recordId, null)
+			const retirable = { retirableOnly: true }
+			for (const { collection, recordId } of await folder.listProvisionalRecords(tx, retirable)) {
+				await folder.deleteProvisional(tx, collection, recordId, null, retirable)
 				await folder.refoldInTx(tx, collection, recordId)
 				touched.add(collection)
 			}
@@ -1229,6 +1236,10 @@ export class Store implements OperationLog {
 	 * sequenced or queued for upload. The server derives and relays its own copy;
 	 * when it arrives (same parent, same record) the provisional effect is retired.
 	 *
+	 * An effect marked `durable` (RT-74) is one the server cannot derive (a relation
+	 * whose field end-to-end encryption seals): it is kept at catch-up and retired only
+	 * by a real copy, so each device cascades for itself.
+	 *
 	 * @param parent - The remote delete
 	 * @param effects - Its side effects, as the referential check derived them
 	 */
@@ -1241,6 +1252,7 @@ export class Store implements OperationLog {
 			data: Record<string, unknown> | null
 			previousData: Record<string, unknown> | null
 			ruleId: string
+			durable?: boolean
 		}>,
 	): Promise<number> {
 		this.ensureOpen()
@@ -1254,10 +1266,10 @@ export class Store implements OperationLog {
 			now: () => parent.timestamp.wallTime,
 		})
 		clock.advanceTo(parent.timestamp)
-		const built: Operation[] = []
+		const built: Array<{ op: Operation; durable: boolean }> = []
 		for (const effect of effects) {
 			if (!this.schema.collections[effect.collection]) continue
-			built.push({
+			const op: Operation = {
 				id: await deriveSideEffectOpId(parent.id, `provisional/${effect.ruleId}`, effect.recordId),
 				nodeId: PROVISIONAL_NODE_ID,
 				type: effect.type,
@@ -1269,11 +1281,12 @@ export class Store implements OperationLog {
 				sequenceNumber: 0,
 				causalDeps: [parent.id],
 				schemaVersion: this.schema.version,
-			})
+			}
+			built.push({ op, durable: effect.durable === true })
 		}
 		await this.adapter.transaction(async (tx) => {
-			for (const op of built) {
-				await folder.applyProvisionalInTx(tx, op, parent.id)
+			for (const { op, durable } of built) {
+				await folder.applyProvisionalInTx(tx, op, parent.id, durable)
 				touched.add(op.collection)
 				applied += 1
 			}
@@ -1283,27 +1296,55 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Node ids whose writes win `merge('server-authoritative')` fields (the server's,
-	 * from the sync handshake). Persisted; when the set changes, records of
-	 * collections with such fields are re-folded so every replica agrees.
+	 * Declare the relations the sync server cannot cascade because end-to-end
+	 * encryption seals their field (it is not in the child collection's
+	 * `cleartextFields`), RT-74. Their effects of a remote delete are applied as durable
+	 * provisional effects (kept at catch-up), and the device that deleted a parent
+	 * authors the cascade of a child it learns of later. Set by the app wiring when
+	 * sync encryption is enabled; empty otherwise.
 	 *
-	 * @param nodeIds - The server's authoritative node ids
+	 * @param relationNames - Names of the sealed relations
+	 */
+	setSealedRelations(relationNames: Iterable<string>): void {
+		this.sealedRelations = new Set(relationNames)
+	}
+
+	/** Whether the server cannot cascade this relation (see {@link setSealedRelations}). */
+	isRelationSealed(relationName: string): boolean {
+		return this.sealedRelations.has(relationName)
+	}
+
+	/**
+	 * Node ids whose writes win `merge('server-authoritative')` fields (the server's,
+	 * from the sync handshake). Every `kora:server:` id is authoritative by prefix, so
+	 * only explicit ids (legacy server node ids, configured extras) are kept: the device
+	 * persists the UNION of every explicit id it has learned and never drops one (RT-75).
+	 * Handshakes differ per server instance (each lists what it knows), so a list that
+	 * omits an id is not a revocation. Records of collections with such fields are
+	 * re-folded only when the explicit set grows.
+	 *
+	 * @param nodeIds - The server's authoritative node ids (one handshake's list)
 	 */
 	async setAuthoritativeNodeIds(nodeIds: readonly string[]): Promise<void> {
 		this.ensureOpen()
-		const next = [...new Set(nodeIds)].sort()
 		const folder = this.folder
-		if (!folder) {
-			await saveAuthoritativeNodeIds(this.adapter, next)
-			return
-		}
-		const previous = [...folder.getAuthoritativeNodeIds()].sort()
 		const persisted = await loadAuthoritativeNodeIds(this.adapter)
-		if (JSON.stringify(next) === JSON.stringify(previous) && persisted !== null) return
+		const known = new Set(
+			[...(persisted ?? []), ...(folder ? folder.getAuthoritativeNodeIds() : [])].filter(
+				(id) => !isServerNodeId(id),
+			),
+		)
+		const learned = [...new Set(nodeIds)].filter((id) => !isServerNodeId(id) && !known.has(id))
+		const next = [...known, ...learned].sort()
+		const stored = persisted === null ? null : [...persisted].sort()
+		if (stored === null || JSON.stringify(stored) !== JSON.stringify(next)) {
+			// One persisted list (`sync_authoritative_node_ids`) serves the fold and the
+			// sync engine's verification exemptions, so they can never disagree.
+			await saveAuthoritativeNodeIds(this.adapter, next)
+		}
+		if (!folder) return
 		folder.setAuthoritativeNodeIds(next)
-		// One persisted list (`sync_authoritative_node_ids`) serves the fold and the
-		// sync engine's verification exemptions, so they can never disagree.
-		await saveAuthoritativeNodeIds(this.adapter, next)
+		if (learned.length === 0) return
 		const fold = this.activeFold()
 		if (!fold) return
 		for (const collection of Object.keys(this.schema.collections)) {
@@ -1949,7 +1990,8 @@ export class Store implements OperationLog {
 
 	/**
 	 * Persist the node ids the sync server named authoritative (protocol v2). Same as
-	 * {@link setAuthoritativeNodeIds}: the fold re-folds affected records on a change.
+	 * {@link setAuthoritativeNodeIds}: merged into the union of learned explicit ids,
+	 * and the fold re-folds affected records only when that set grows.
 	 */
 	async saveAuthoritativeNodeIds(nodeIds: string[]): Promise<void> {
 		await this.setAuthoritativeNodeIds(nodeIds)

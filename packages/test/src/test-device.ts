@@ -30,6 +30,7 @@ import {
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
 	createSyncEngineChunkPort,
+	sealedRelationNames,
 	wireAuditPersistence,
 	wireBlobUpload,
 } from 'korajs/testing'
@@ -235,6 +236,8 @@ export class TestDevice {
 			emitter: this.emitter,
 		})
 		this.store.setLocalMutationHandler(this.applyPipeline)
+		// Like createApp: relations sealed by end-to-end encryption are cascaded by devices.
+		this.store.setSealedRelations(sealedRelationNames(this.schema, this.encryption?.config))
 		// Match production wiring (createApp): merge/constraint traces persist to
 		// `_kora_audit_traces`. Without this, harness devices emit merge events
 		// but the durable audit trail every real app has stays empty — a fidelity

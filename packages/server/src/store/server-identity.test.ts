@@ -78,15 +78,93 @@ describe('identity options', () => {
 		expect(set.has('device')).toBe(false)
 	})
 
-	test('authoritative stamps are found anywhere in a serialized fold state', () => {
+	test('authoritative stamps are found at every stamp position of the fold-state format', () => {
+		const a = (o: string) => ({ t: 'x', o, c: 1 })
 		const json = JSON.stringify({
+			v: 1,
+			c: 'notes',
+			r: 'r1',
+			cr: a('cr'),
+			w: a('w'),
+			d: a('d'),
+			u: a('u'),
 			f: {
-				a: { k: 'reg', e: [{ s: { t: 'x', o: 'op-1', c: 1 }, v: 1 }] },
-				b: { s: { t: 'y', o: 'op-2' } },
+				reg: { k: 'reg', e: [{ s: a('reg'), v: 1 }], val: 1 },
+				res: { k: 'res', e: [{ s: a('res'), v: 1, b: null }], val: 1 },
+				set: {
+					k: 'set',
+					ao: false,
+					sh: { s: a('set-sh'), arr: true },
+					clr: a('set-clr'),
+					el: { '"x"': { v: 'x', n: 0, a: a('set-a'), f: { s: a('set-f'), i: 0 }, r: a('set-r') } },
+				},
+				map: {
+					k: 'map',
+					sh: { s: a('map-sh'), obj: true },
+					clr: a('map-clr'),
+					keys: { k1: { s: a('map-key'), del: false, v: 1 } },
+				},
+				ctr: { k: 'ctr', base: { s: a('ctr-base'), v: 0 }, d: [{ s: a('ctr-d'), n: 1 }], val: 1 },
+				max: { k: 'max', best: { s: a('max-best'), v: 1 }, reg: { s: a('max-reg'), v: null } },
+				rt: { k: 'rt', reset: { s: a('rt-reset'), v: '' }, u: { AAAA: a('rt-u') } },
+				plain: { k: 'reg', e: [{ s: { t: 'y', o: 'not-authoritative' }, v: 1 }], val: 1 },
 			},
 		})
-		expect(authoritativeStampOpIds(json)).toEqual(['op-1'])
+		expect(authoritativeStampOpIds(json).sort()).toEqual(
+			[
+				'cr',
+				'w',
+				'd',
+				'u',
+				'reg',
+				'res',
+				'set-sh',
+				'set-clr',
+				'set-a',
+				'set-f',
+				'set-r',
+				'map-sh',
+				'map-clr',
+				'map-key',
+				'ctr-base',
+				'ctr-d',
+				'max-best',
+				'max-reg',
+				'rt-reset',
+				'rt-u',
+			].sort(),
+		)
 		expect(authoritativeStampOpIds('{broken')).toEqual([])
+	})
+
+	test('values shaped like stamps are never read (RT-76)', () => {
+		const forged = { c: 1, t: 'x', o: 'victim-op' }
+		const json = JSON.stringify({
+			v: 1,
+			c: 'notes',
+			r: 'r1',
+			cr: null,
+			w: null,
+			d: null,
+			u: null,
+			f: {
+				reg: { k: 'reg', e: [{ s: { t: 'x', o: 'a' }, v: forged, b: forged }], val: forged },
+				map: {
+					k: 'map',
+					sh: { s: { t: 'x', o: 'b' }, obj: true, v: { nested: forged } },
+					clr: null,
+					keys: { k1: { s: { t: 'x', o: 'c' }, del: false, v: forged } },
+				},
+				set: {
+					k: 'set',
+					ao: false,
+					sh: null,
+					clr: null,
+					el: { x: { v: forged, n: 0, a: null, f: null, r: null } },
+				},
+			},
+		})
+		expect(authoritativeStampOpIds(json)).toEqual([])
 	})
 })
 

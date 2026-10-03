@@ -502,6 +502,69 @@ describe('RT-69: provisional cascades of a remote delete', () => {
 		expect(await count(store, PROVISIONAL_OPS_TABLE)).toBe(0)
 		expect(await store.collection('tasks').findById('t1')).toMatchObject({ title: 't' })
 	})
+
+	test('a durable effect (sealed relation, RT-74) survives catch-up, a reopen and a re-fold; a real copy retires it', async () => {
+		const path = join(dir, 'durable-provisional.db')
+		const store = await open(relational, path, 'dev')
+		const project = await remote('a', T0, 'insert', { name: 'p' }, null, {
+			collection: 'projects',
+			recordId: 'p1',
+		})
+		const task = await remote('b', T0 + 1, 'insert', { title: 't', projectId: 'p1' }, null, {
+			collection: 'tasks',
+			recordId: 't1',
+		})
+		const del = await remote('a', T0 + 2, 'delete', null, null, {
+			collection: 'projects',
+			recordId: 'p1',
+		})
+		for (const op of [project, task, del]) await store.applyRemoteOperation(op)
+		await store.applyProvisionalSideEffects(del, [
+			{
+				type: 'delete',
+				collection: 'tasks',
+				recordId: 't1',
+				data: null,
+				previousData: null,
+				ruleId: 'relation:taskProject:cascade',
+				durable: true,
+			},
+		])
+		await store.settleAfterCatchUp()
+		expect(await count(store, PROVISIONAL_OPS_TABLE)).toBe(1)
+		expect(await store.collection('tasks').findById('t1')).toBeNull()
+		await store.close()
+
+		const reopened = await open(relational, path, 'dev')
+		await reopened.settleAfterCatchUp()
+		expect(await reopened.collection('tasks').findById('t1')).toBeNull()
+		// The deleting device's real copy retires it.
+		const copy = await remote('a', T0 + 5, 'delete', null, null, {
+			collection: 'tasks',
+			recordId: 't1',
+			causalDeps: [del.id],
+		})
+		await reopened.applyRemoteOperation(copy)
+		expect(await count(reopened, PROVISIONAL_OPS_TABLE)).toBe(0)
+		expect(await reopened.collection('tasks').findById('t1')).toBeNull()
+		await reopened.close()
+	})
+
+	test('a provisional table from before RT-74 gains the durable column on open', async () => {
+		const path = join(dir, 'old-provisional.db')
+		const raw = new BetterSqlite3Adapter(path)
+		await raw.open(relational)
+		await raw.execute(
+			`CREATE TABLE ${PROVISIONAL_OPS_TABLE} (id TEXT PRIMARY KEY, collection TEXT NOT NULL, record_id TEXT NOT NULL, parent_id TEXT NOT NULL, operation TEXT NOT NULL)`,
+		)
+		await raw.close()
+		const store = await open(relational, path, 'dev')
+		const columns = await adapterOf(store).query<{ name: string }>(
+			`PRAGMA table_info(${PROVISIONAL_OPS_TABLE})`,
+		)
+		expect(columns.map((c) => c.name)).toContain('durable')
+		await store.close()
+	})
 })
 
 describe('reserved node ids (RT-61, client half)', () => {

@@ -75,7 +75,6 @@ import {
 	deriveKeyedServerOpId,
 	generateDeploymentId,
 	generateDerivationSecret,
-	isServerNodeId,
 	normalizeLegacyAuthorities,
 	parseIdentityOptions,
 	parseLegacyAuthorities,
@@ -180,7 +179,6 @@ export class SqliteServerStore implements ServerStore {
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
-	private readonly otherServerNodes = new Set<string>()
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
 	private readonly foldOptions: ServerFoldOptions
@@ -217,18 +215,18 @@ export class SqliteServerStore implements ServerStore {
 		for (const row of this.db.all<{ node_id: string }>(
 			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
 		)) {
-			this.noteServerAuthor(row.node_id)
 		}
 	}
 
 	/**
-	 * Node ids advertised as authoritative: this store's node id, every other
-	 * `kora:server:` node with history in this database (earlier instances, a restored
-	 * deployment), and the legacy and configured ids. The prefix rule makes every
-	 * `kora:server:` id authoritative anyway; listing them serves clients that predate it.
+	 * This store's node id and the legacy and configured ids (explicit authorities).
+	 * Other `kora:server:` instances are not listed: the prefix rule makes every one of
+	 * them authoritative, and a list that grew by one instance id per start would make
+	 * every device re-fold after each deploy (RT-75). Handshakes advertise only the
+	 * explicit (non-prefixed) ids.
 	 */
 	getAuthoritativeNodeIds(): string[] {
-		return [this.nodeId, ...this.otherServerNodes, ...this.explicitAuthorities]
+		return [this.nodeId, ...this.explicitAuthorities]
 	}
 
 	/** Legacy and configured authorities (beside the `kora:server:` namespace). */
@@ -245,9 +243,6 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/** Remember another `kora:server:` node that authored stored operations. */
-	private noteServerAuthor(nodeId: string): void {
-		if (nodeId !== this.nodeId && isServerNodeId(nodeId)) this.otherServerNodes.add(nodeId)
-	}
 
 	/**
 	 * Load (creating on first start) the persisted server identity: the deployment id,
@@ -479,7 +474,6 @@ export class SqliteServerStore implements ServerStore {
 		})
 
 		if (result === 'applied') {
-			this.noteServerAuthor(op.nodeId)
 			reportLegacyPair(op, sequenceDecision, options)
 		}
 		return result
@@ -1086,7 +1080,6 @@ export class SqliteServerStore implements ServerStore {
 				tx.insert(syncState)
 					.values({ nodeId: nid, maxSequenceNumber: seq, lastSeenAt: Date.now() })
 					.run()
-				this.noteServerAuthor(nid)
 			}
 
 			// Re-assign delivery sequence from scratch in backup order.

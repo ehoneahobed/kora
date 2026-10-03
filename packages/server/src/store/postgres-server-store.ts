@@ -75,7 +75,6 @@ import {
 	deriveKeyedServerOpId,
 	generateDeploymentId,
 	generateDerivationSecret,
-	isServerNodeId,
 	normalizeLegacyAuthorities,
 	parseIdentityOptions,
 	parseLegacyAuthorities,
@@ -208,7 +207,6 @@ export class PostgresServerStore implements ServerStore {
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private explicitAuthorities: string[] = []
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
-	private readonly otherServerNodes = new Set<string>()
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
 	private readonly db: PostgresJsDatabase
@@ -277,13 +275,14 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * Node ids advertised as authoritative: this instance's node id, every other
-	 * `kora:server:` node with history in the database (other instances of the
-	 * deployment), and the legacy and configured ids. The prefix rule makes every
-	 * `kora:server:` id authoritative anyway; listing them serves clients that predate it.
+	 * This store's node id and the legacy and configured ids (explicit authorities).
+	 * Other `kora:server:` instances are not listed: the prefix rule makes every one of
+	 * them authoritative, and a list that grew by one instance id per start would make
+	 * every device re-fold after each deploy (RT-75). Handshakes advertise only the
+	 * explicit (non-prefixed) ids.
 	 */
 	getAuthoritativeNodeIds(): string[] {
-		return [this.nodeId, ...this.otherServerNodes, ...this.explicitAuthorities]
+		return [this.nodeId, ...this.explicitAuthorities]
 	}
 
 	/** Legacy and configured authorities (beside the `kora:server:` namespace). */
@@ -310,9 +309,6 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/** Remember another `kora:server:` node that authored stored operations. */
-	private noteServerAuthor(nodeId: string): void {
-		if (nodeId !== this.loadedNodeId && isServerNodeId(nodeId)) this.otherServerNodes.add(nodeId)
-	}
 
 	/**
 	 * Load (creating on first start) the persisted server identity under an advisory
@@ -586,7 +582,6 @@ export class PostgresServerStore implements ServerStore {
 		if (op.sequenceNumber > currentMax) {
 			this.versionVector.set(op.nodeId, op.sequenceNumber)
 		}
-		this.noteServerAuthor(op.nodeId)
 
 		reportLegacyPair(op, sequenceDecision, options)
 		return 'applied'
@@ -610,7 +605,6 @@ export class PostgresServerStore implements ServerStore {
 			const seq = Number(row.maxSequenceNumber)
 			vector.set(row.nodeId, seq)
 			if (seq > (this.versionVector.get(row.nodeId) ?? 0)) this.versionVector.set(row.nodeId, seq)
-			this.noteServerAuthor(row.nodeId)
 		}
 		return vector
 	}
@@ -2227,7 +2221,6 @@ export class PostgresServerStore implements ServerStore {
 
 		for (const row of rows) {
 			this.versionVector.set(row.nodeId, row.maxSequenceNumber)
-			this.noteServerAuthor(row.nodeId)
 		}
 	}
 

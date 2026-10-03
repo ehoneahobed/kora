@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { applyOperationTransforms } from '@korajs/core'
+import { applyOperationTransforms, isServerNodeId } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -2119,7 +2119,7 @@ export class ClientSession {
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
 			protocolVersion: SYNC_PROTOCOL_VERSION,
-			authoritativeNodeIds: this.serverAuthoritativeNodeIds(),
+			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
 		}
 		this.issuedNodeToken = null
 		this.sendToClient(response)
@@ -2996,6 +2996,16 @@ export class ClientSession {
 		if (nodeId === this.store.getNodeId()) return true
 		if (this.serverAuthoritativeNodeIds().includes(nodeId)) return true
 		return this.store.getAuthoritativeNodeIds?.().includes(nodeId) ?? false
+	}
+
+	/**
+	 * The authoritative ids a handshake advertises (RT-75): only explicit ones (legacy
+	 * server node ids, configured extras). Every `kora:server:` id is authoritative by
+	 * prefix on every replica, and listing instance ids would make the list differ per
+	 * instance and per start, which devices would have to treat as news.
+	 */
+	private advertisedAuthoritativeNodeIds(): string[] {
+		return [...new Set(this.serverAuthoritativeNodeIds())].filter((id) => !isServerNodeId(id))
 	}
 
 	/** Node ids this server authors operations under (protocol v2 handshake response). */
