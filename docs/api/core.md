@@ -380,7 +380,7 @@ describes the semantics per field type; these functions expose it for tools and 
 | `toMergeTrace(trace)` | Converts a fold trace to the DevTools `MergeTrace`. |
 
 `FoldOptions`: `exclude` (operation ids or a predicate to leave out), `richtext`
-(`mergeRichtextUpdates` from `@korajs/merge`, needed to materialize concurrent rich-text edits),
+(`mergeYjsUpdates` from `@korajs/store`, needed to materialize concurrent rich-text edits),
 `traces` (`'none' | 'conflicts' | 'all'`), `authoritativeNodeIds` and
 `revokedAuthoritativeNodeIds` (server authority for `merge('server-authoritative')`).
 
