@@ -75,8 +75,7 @@ export interface StateMachineInput {
 }
 
 export interface CollectionInput {
-	// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
-	fields: Record<string, FieldBuilder<any, any, any>>
+	fields: Record<string, FieldBuilder>
 	indexes?: string[]
 	constraints?: ConstraintInput[]
 	resolve?: Record<string, CustomResolver>

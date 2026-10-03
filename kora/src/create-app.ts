@@ -10,6 +10,7 @@ import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
 import { createCollectionAccessor } from './collection-accessor'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
+import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
 import { createStorageApi, wireStoragePersistence } from './storage-accessor'
@@ -37,7 +38,10 @@ import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
  * Wires together store, merge engine, event emitter, and optionally sync
  * into a single developer-facing `KoraApp` object. Collection accessors
  * are always available through `app.collections`. Non-reserved names also retain
- * the convenient direct form (for example, `app.todos`).
+ * the convenient direct form (for example, `app.todos`). A collection named after a
+ * framework property (`ready`, `events`, `sync`, `storage`, ... see
+ * `RESERVED_APP_PROPERTIES`) is only reachable as `app.collections.<name>`; createApp
+ * warns about it in development.
  */
 export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
 export function createApp(config: KoraConfig): KoraApp
@@ -252,6 +256,7 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))
+	warnShadowedCollections(Object.keys(config.schema.collections), reservedProperties)
 	for (const collectionName of Object.keys(config.schema.collections)) {
 		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {

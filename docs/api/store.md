@@ -22,7 +22,13 @@ await app.todos.insert({ title: 'Hello' })
 
 ## Collection methods
 
-Every collection defined in your schema is accessible as a property on the app instance. Each collection provides the following methods.
+Every collection defined in your schema is accessible as a property on the app instance, and always as `app.collections.<name>`. Each collection provides the following methods. With a schema from `defineSchema()`, every method is typed from the schema (see [Type inference](/api/core#type-inference)).
+
+Every method throws `AppNotReadyError` when called before `app.ready` resolves (`findById` included: it rejects rather than resolving `null`, which would look like a missing record). Inside `<KoraProvider app={app}>` the app is ready before children render.
+
+### Reserved collection names {#reserved-names}
+
+These names belong to the app object itself: `ready`, `events`, `on`, `collections`, `sync`, `sequences`, `blobs`, `storage`, `getStore`, `getSyncEngine`, `getQueryStoreCache`, `storeInfo`, `close`, `transaction`, `mutation`, `exportBackup`, `importBackup`, `replayTo`, `exportAudit` (exported as `RESERVED_APP_PROPERTIES`). A collection with one of these names works normally but is not available as `app.<name>` (that is the framework API). Reach it as `app.collections.<name>`, and as `tx.<name>` inside transactions. `createApp()` logs a warning in development builds when the schema uses one; with a typed schema, `app.<name>.insert(...)` is also a type error.
 
 ### .insert(data)
 

@@ -3,6 +3,8 @@
 
 // === createApp factory ===
 export { createApp } from './create-app'
+export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
+export type { ReservedAppProperty } from './reserved-app-properties'
 
 // === App types ===
 export type {
@@ -22,10 +24,28 @@ export type {
 	SequenceAccessor,
 	TransactionCollectionProxy,
 	TransactionProxy,
-	TypedCollectionAccessor,
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
+
+// === Schema-typed API (collections, queries, transactions) ===
+export type {
+	CollectionInsertOf,
+	CollectionRecordOf,
+	CollectionUpdateOf,
+	IncludeMap,
+	Pluralize,
+	RecordOf,
+	Singularize,
+	TypedCollectionAccessor,
+	TypedCollectionOf,
+	TypedCollections,
+	TypedQueryBuilder,
+	TypedTransactionCollection,
+	TypedTransactionProxy,
+	TypedWhere,
+	WhereOperatorsFor,
+} from './typed-api'
 
 export type { ReplaySnapshot } from '@korajs/store'
 export type {
@@ -55,11 +75,16 @@ export type {
 	Constraint,
 	FieldDescriptor,
 	FieldKindToType,
+	FieldMap,
 	HLCTimestamp,
+	InferFieldInput,
 	InferFieldType,
+	InferInsert,
 	InferInsertInput,
 	InferRecord,
+	InferUpdate,
 	InferUpdateInput,
+	RichtextInput,
 	KoraEvent,
 	KoraEventEmitter,
 	KoraEventListener,
