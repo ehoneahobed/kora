@@ -18,7 +18,12 @@ import { stampFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { encodeRichtextFieldsForOpData } from '../serialization/op-data-encoding'
-import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
+import {
+	deserializeRecord,
+	serializeOperation,
+	serializeRecord,
+	toRichtextReadShape,
+} from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import type { CollectionRecord, RawCollectionRow } from '../types'
 import { toAtRestWriteData } from './secret-write'
@@ -131,7 +136,8 @@ export async function writeInsertInTx(
 		operation,
 		record: {
 			id: insert.recordId,
-			...insert.data,
+			// A richtext value written as a string returns as the bytes reads return.
+			...toRichtextReadShape(insert.data, definition.fields),
 			createdAt: operation.timestamp.wallTime,
 			updatedAt: operation.timestamp.wallTime,
 		},
