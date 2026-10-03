@@ -1586,14 +1586,14 @@
    "severity": "P1",
    "workstream": "W11",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "tsc": "kora/tests/repro/types/DX-1.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FieldBuilder carries a type-only '~field' brand (kind, required, auto, output, input), so required/optional/defaulted/auto builders are structurally distinct. InferRecord: required T, optional/defaulted T|null, auto timestamp number; InferInsertInput: required keys required, optional omittable (null refused, as at runtime), auto keys absent; InferUpdateInput: nullable fields accept null, number/timestamp/array accept op.* sentinels. Value domain: t.timestamp is number ms (Date refused, as validateRecord does), richtext reads Uint8Array and writes string|Uint8Array|ArrayBuffer. infer.test.ts rewritten with expectTypeOf equality and @ts-expect-error negatives."
   },
   {
    "id": "DX-2",
@@ -1601,14 +1601,14 @@
    "severity": "P2",
    "workstream": "W11",
    "phase": 4,
-   "status": "open",
+   "status": "in_progress",
    "tests": [
     {
      "tsc": "kora/tests/repro/types/DX-2.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Types landed: where() typed per field with operators (comparisons only on number/string), orderBy keyof record incl. id/createdAt/updatedAt, include() limited to schema relations and returning the row augmented with the singular parent (| null) or plural children, typed transaction proxy (TypedTransactionProxy<S>), t.object/t.array carry inner types, default(value) typed by the field. TypedQueryBuilder extends the store QueryBuilder so useQuery & co accept it. Probe's useCollection case now uses createKoraHooks<typeof app>() from korajs/react (the only way a hook can know the schema); it stays red until the React bindings branch adds createKoraHooks (contract: derive from App['collections'])."
   },
   {
    "id": "DX-3",
@@ -1631,14 +1631,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-4.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "collection-accessor findById throws AppNotReadyError before ready like insert/update/delete/where; create-app.test.ts case inverted."
   },
   {
    "id": "DX-5",
@@ -1706,14 +1706,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "createApp warns once in development (silent when NODE_ENV=production) naming every collection shadowed by an app property and pointing to app.collections.<name> / tx.<name>. RESERVED_APP_PROPERTIES exported and unit-tested against the real app object; listed in docs/api/store.md#reserved-names."
   },
   {
    "id": "NEW-DX-1",

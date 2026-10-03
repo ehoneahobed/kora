@@ -169,7 +169,7 @@ t.enum(['low', 'medium', 'high']).default('medium')  // Defaults to 'medium'
 
 ### t.timestamp()
 
-Defines a timestamp field. Stored as `INTEGER` (milliseconds since epoch) in SQLite.
+Defines a timestamp field. Stored as `INTEGER` (milliseconds since epoch) in SQLite. Its TypeScript type is `number`: write whole milliseconds (`Date.now()`, `date.getTime()`). A `Date` object is not accepted (a type error, and refused at runtime); a fraction is refused, not rounded. (A `Date` nested inside a `t.json()` or `t.object()` value is different: it is stored as its ISO string, so declare such members as `string`.)
 
 ```typescript
 t.timestamp()                 // Required timestamp field
@@ -192,17 +192,17 @@ t.array(t.number()).default([])  // Array of numbers, defaults to empty
 
 ### t.richtext()
 
-Defines a rich text field backed by a Yjs `Y.Text` CRDT. Stored as `BLOB` (Yjs state vector) in SQLite. Supports character-level collaborative editing with automatic merge.
+Defines a rich text field backed by a Yjs `Y.Text` CRDT. Stored as `BLOB` (Yjs state vector) in SQLite. Supports character-level collaborative editing with automatic merge. Writes accept a string or Yjs update bytes (`RichtextInput = string | Uint8Array | ArrayBuffer`); reads (`findById`, queries) return the Yjs update bytes (`Uint8Array`). Edit it collaboratively with `useRichText`.
 
 ```typescript
 t.richtext()                  // Rich text field
 ```
 
-Rich text fields cannot use `.default()` or `.optional()` modifiers. They are always initialized as empty `Y.Text` documents.
+Like other fields, a required `t.richtext()` must be provided on insert (a string is fine); use `.optional()` to create records without one, or `.default(text)` to start from a fixed text.
 
 ### Field modifiers
 
-All type builders (except `t.richtext()`) support these chainable modifiers:
+All type builders support these chainable modifiers:
 
 | Modifier | Description |
 |----------|-------------|
@@ -262,6 +262,39 @@ const schema = defineSchema({
 ::: tip
 Schema-level merge strategies replace Tier 3 custom resolvers for common patterns like counters, max/min, and append-only lists. Use `.merge()` when a built-in strategy fits; use Tier 3 `resolve` functions for complex domain logic.
 :::
+
+### Type inference {#type-inference}
+
+`defineSchema()` keeps the exact builder types, and `createApp({ schema })` turns them into typed collections. No code generation is needed.
+
+| Field | Record (read) type | `insert()` | `update()` |
+|-------|--------------------|------------|------------|
+| `t.string()` (required) | `string` | required | `string` |
+| `.optional()` | `T \| null` | may be omitted (`null` is refused: omit the key) | `T \| null` |
+| `.default(v)` | `T \| null` | may be omitted | `T \| null` |
+| `t.timestamp().auto()` | `number` | cannot be set | cannot be set |
+| other `.auto()` | `T \| null` | cannot be set | cannot be set |
+| `t.enum([...])` | literal union | | |
+| `t.array(item)` | `Item[]` (item type kept, e.g. `('a' \| 'b')[]`) | | also `op.append/remove` |
+| `t.object({...})` | the nested shape (`{ theme: string }`) | | |
+| `t.json<T>()` | `T` | | |
+| `t.number()` / `t.timestamp()` | `number` | | also `op.increment/max/min` |
+| `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
+
+Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted field reads as `T | null` because `update(id, { field: null })` can clear it.
+
+`.default(value)` is typed by the field: `t.number().default('x')` is a type error.
+
+The inferred types are exported for your own code:
+
+```typescript
+import type { CollectionRecordOf, CollectionInsertOf, InferRecord } from 'korajs'
+
+type Todo = CollectionRecordOf<typeof app, 'todos'>
+type NewTodo = CollectionInsertOf<typeof app, 'todos'>
+```
+
+Queries are typed too: `where()` accepts only the collection's fields (plus `id`, `createdAt`, `updatedAt`) with values of the field's type or operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`; comparisons only on numbers and strings), `orderBy()` accepts only those keys, and `include()` accepts only relations declared in the schema and adds the related record (`project: Project | null`) or records (`todos: Todo[]`) to each row. `app.transaction(async (tx) => ...)` gives `tx` one typed accessor per collection.
 
 ---
 
