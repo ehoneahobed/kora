@@ -7,12 +7,14 @@ description: "@korajs/core API reference: defineSchema, field builders, atomic o
 
 `@korajs/core` is the foundation of every Kora.js application. It defines the schema system, the
 operation model, the hybrid logical clock, the per-field merge (the fold) and the shared types. It
-depends on no other `@korajs` package. Everything on this page is also exported by the `korajs`
-meta-package.
+depends on no other `@korajs` package. The `korajs` meta-package re-exports the everyday part
+(`defineSchema`, `t`, `migrate`, `op`, `HybridLogicalClock`, `generateUUIDv7`, `createOperation`,
+`KoraError`, `AppNotReadyError` and the schema and operation types); import everything else from
+`@korajs/core`.
 
 ```typescript
 import { defineSchema, t, op, migrate, HybridLogicalClock, KoraError } from '@korajs/core'
-// The same names are exported by 'korajs'.
+// These names are also exported by 'korajs'.
 ```
 
 <!-- docs-check-prelude

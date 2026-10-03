@@ -252,6 +252,7 @@ export default defineConfig({
 					{ text: 'DevTools', link: '/api/devtools' },
 					{ text: 'Test', link: '/api/test' },
 					{ text: 'CLI', link: '/api/cli' },
+					{ text: 'Error Codes', link: '/api/errors' },
 				],
 			},
 			{
