@@ -2118,9 +2118,19 @@ export class SyncEngine {
 		nodeId: string,
 		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
 	): Promise<number> {
-		const queuedIds = this.outboundQueue
+		// A database a beta.12 (or older) client synced has no acknowledged prefix yet (its
+		// one-time re-upload restarts at 0 and queues its whole history), but that server
+		// acknowledged the node through the persisted vector entry: operations at or below
+		// it are on the server under this node, and a copy under the new node would apply
+		// them twice (an increment counted twice; RT-90). They are not re-authored, and the
+		// refused node's prefix moves up to that entry so they no longer count as unsynced.
+		const ackedFloor = Math.max(this.ownAckedThrough, this.lastAckedServerVector.get(nodeId) ?? 0)
+		const unsent = this.outboundQueue
 			.getAll()
 			.filter((op) => op.nodeId === nodeId && !this.outboundQueue.wasSent(op.id))
+		const queuedIds = unsent.filter((op) => op.sequenceNumber > ackedFloor).map((op) => op.id)
+		const acknowledgedIds = unsent
+			.filter((op) => op.sequenceNumber <= ackedFloor)
 			.map((op) => op.id)
 		const ids = new Set(queuedIds)
 		let staying = this.outboundQueue.countMatching(
@@ -2129,12 +2139,12 @@ export class SyncEngine {
 		// Own operations above the acknowledged prefix that were never read into the
 		// queue (the unscanned tail) are unsynced too.
 		const localSeq = this.store.getVersionVector().get(nodeId) ?? 0
-		if (localSeq > this.ownAckedThrough) {
-			const above = await this.store.getOperationRange(nodeId, this.ownAckedThrough + 1, localSeq)
+		if (localSeq > ackedFloor) {
+			const above = await this.store.getOperationRange(nodeId, ackedFloor + 1, localSeq)
 			const candidates = above.filter(
 				(op) =>
 					op.nodeId === nodeId &&
-					op.sequenceNumber > this.ownAckedThrough &&
+					op.sequenceNumber > ackedFloor &&
 					!this.isOwnOperationResolved(op) &&
 					!this.outboundQueue.has(op.id),
 			)
@@ -2146,7 +2156,10 @@ export class SyncEngine {
 			}
 		}
 		const result = await rotate([...ids])
-		await this.outboundQueue.replace(queuedIds, result.operations)
+		await this.outboundQueue.replace([...queuedIds, ...acknowledgedIds], result.operations)
+		if (ackedFloor > this.ownAckedThrough) {
+			await this.syncState?.saveOwnAckedThrough?.(nodeId, ackedFloor)
+		}
 		await this.afterIdentityChange()
 		await this.bindFreshNode()
 		this.emitter?.emit({
@@ -2680,7 +2693,21 @@ export class SyncEngine {
 		}
 		this.hasInFlightDeliveryBatch = false
 
+		const streaming = this.state === 'streaming'
 		await this.recordReceivedBatch(msg, isDeliveryBatch, fullyApplied, received, operations)
+		// A protocol-1 server (beta.12 and older) derives no cascades, so no server copy
+		// ever confirms the provisional effects of a remote delete (RT-69). A streaming
+		// device settles them at the end of every fully applied batch, exactly as at a
+		// catch-up; otherwise it kept them until its next reconnect while every device that
+		// received the same delete during a catch-up did not (RT-91).
+		if (
+			streaming &&
+			this.serverProtocolVersion < SYNC_PROTOCOL_VERSION &&
+			msg.isFinal &&
+			(!isDeliveryBatch || fullyApplied)
+		) {
+			await this.settleAfterCatchUp()
+		}
 		this.notifyStatusChange()
 	}
 

@@ -138,7 +138,10 @@ export async function verifyInboundOperation(
 				ok: true,
 				verified: true,
 				matchedVersion: 1,
-				declarable: !match.usedSchema,
+				// Not declarable: a receiver without the schema cannot repeat a nested rebuild,
+				// and a Date-form match never bound the Date's value (RT-88), so the stored
+				// copy must not claim a verified version.
+				declarable: !match.usedSchema && match.usedDateForm !== true,
 				...(match.usedPrevious ? { restoredData: restoreUndefinedFromPrevious(op) } : {}),
 			}
 		}
@@ -174,6 +177,11 @@ export interface OperationIdMatch {
 	usedPrevious: boolean
 	/** Declared nested members restored (needs the schema). */
 	usedSchema: boolean
+	/**
+	 * Strings in `Date#toISOString()` form hashed as `{}` (RT-88): beta.12 hashed a Date as
+	 * `{}`, so such an id never covered the Date's value.
+	 */
+	usedDateForm?: boolean
 }
 
 /**
@@ -182,7 +190,7 @@ export interface OperationIdMatch {
  * Version 2 is checked as is: its canonical form is the JSON form (an `undefined`
  * member is absent, RT-72), so what was hashed is what arrives.
  *
- * Version 1 (beta.13 and earlier) hashed the in-memory value with `canonicalize`,
+ * Version 1 (beta.12 and older) hashed the in-memory value with `canonicalize`,
  * which writes an `undefined` object member as `"key":null`; the op log and the wire
  * are JSON, so the member is gone on arrival. The forms beta.13 actually produced are
  * rebuilt where they are recoverable:
@@ -190,7 +198,10 @@ export interface OperationIdMatch {
  *   `previousData` key absent from `data` was an `undefined` value in `data`
  *   (`update(id, { assignee: undefined })`);
  * - an object field (needs the schema): declared nested members absent from the value
- *   (`{ a: 1, b: undefined }`), recursively for declared nested objects.
+ *   (`{ a: 1, b: undefined }`), recursively for declared nested objects;
+ * - a `Date` inside a json value (RT-88): `canonicalize` walks `Object.keys`, so it
+ *   hashed as `{}`, while the JSON log and wire hold its `toISOString()` string. Strings
+ *   in exactly that form are tried as `{}` (see {@link dateFormCandidates}).
  * Each form is also tried with the other form of its binary values (bytes, or the
  * canonical `{ $koraBytes }` form a JSON round trip produces).
  *
@@ -217,6 +228,12 @@ export async function matchOperationId(
 			if (nested !== null) {
 				candidates.push({ data: nested, kind: { ...candidate.kind, usedSchema: true } })
 			}
+		}
+	}
+	// beta.12 (and older) hashed a Date inside a json value as `{}` (RT-88).
+	for (const candidate of [...candidates]) {
+		for (const data of dateFormCandidates(candidate.data)) {
+			candidates.push({ data, kind: { ...candidate.kind, usedDateForm: true } })
 		}
 	}
 	for (const candidate of candidates) {
@@ -298,6 +315,76 @@ function fillNested(value: unknown, descriptor: FieldDescriptor): unknown {
 		}
 	}
 	return changed ? out : value
+}
+
+/** `Date#toISOString()` output, including its extended-year form. */
+const ISO_DATE_STRING = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+
+/**
+ * Most ISO strings per operation whose every Date/string combination is tried; above
+ * it only "all of them were Dates" is tried (bounds the hashing work to 2^6 - 1).
+ */
+const MAX_DATE_FORM_STRINGS = 6
+
+/**
+ * The data with strings in `Date#toISOString()` form replaced by `{}`: how beta.12 (and
+ * older) hashed a `Date` held in a json value (RT-88). Which of the strings were Dates
+ * is unknown, so every non-empty subset is returned (all of them only, above
+ * {@link MAX_DATE_FORM_STRINGS}). Empty when the data holds no such string.
+ *
+ * The stored data keeps the string, which is what beta.12 wrote to its row and applied.
+ * Such an id never covered the Date's value (beta.12's hash did not either), so a match
+ * through this rebuild is not declarable: the server stores the operation without a
+ * declared hash version, as it stored every unverifiable protocol-1 id.
+ */
+function dateFormCandidates(data: Operation['data']): Array<Operation['data']> {
+	if (data === null) return []
+	const paths: Array<Array<string | number>> = []
+	const collect = (value: unknown, path: Array<string | number>): void => {
+		if (typeof value === 'string') {
+			if (ISO_DATE_STRING.test(value)) paths.push(path)
+			return
+		}
+		if (Array.isArray(value)) {
+			value.forEach((item, index) => collect(item, [...path, index]))
+			return
+		}
+		if (value !== null && typeof value === 'object' && !(value instanceof Uint8Array)) {
+			for (const [key, item] of Object.entries(value)) collect(item, [...path, key])
+		}
+	}
+	for (const [field, value] of Object.entries(data)) collect(value, [field])
+	if (paths.length === 0) return []
+	const subsets: Array<Array<Array<string | number>>> = []
+	if (paths.length > MAX_DATE_FORM_STRINGS) {
+		subsets.push(paths)
+	} else {
+		for (let mask = 1; mask < 1 << paths.length; mask++) {
+			subsets.push(paths.filter((_path, index) => (mask & (1 << index)) !== 0))
+		}
+	}
+	return subsets.map((subset) => {
+		let out: unknown = data
+		for (const path of subset) out = replaceAt(out, path, {})
+		return out as Operation['data']
+	})
+}
+
+/** A copy of `value` with the member at `path` replaced (copy on write). */
+function replaceAt(
+	value: unknown,
+	path: ReadonlyArray<string | number>,
+	replacement: unknown,
+): unknown {
+	const [head, ...rest] = path
+	if (head === undefined) return replacement
+	if (Array.isArray(value)) {
+		const copy = [...value]
+		copy[head as number] = replaceAt(copy[head as number], rest, replacement)
+		return copy
+	}
+	const record = value as Record<string, unknown>
+	return { ...record, [head]: replaceAt(record[head as string], rest, replacement) }
 }
 
 interface Converted {

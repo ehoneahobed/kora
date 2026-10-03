@@ -1054,3 +1054,49 @@ describe('RT-53: a parked adoption is retried when its backoff runs out', () => 
 		}
 	})
 })
+
+describe('RT-90: a node only a beta.12 server acknowledged', () => {
+	test('NODE_ID_CLAIMED re-authors only what that server never acknowledged', async () => {
+		// A beta.12 database: the server acknowledged through 2 (persisted vector entry),
+		// no acknowledged prefix under this release's contract, op 3 written offline.
+		const log = [op(1), op(2), op(3)]
+		const rotated: Operation = {
+			...op(3),
+			id: 'rotated-3',
+			nodeId: 'fresh-node',
+			sequenceNumber: 1,
+		}
+		const rotate = vi.fn(async () => ({ nodeId: 'fresh-node', operations: [rotated] }))
+		const p = persistence({
+			nodes: [{ nodeId: NODE, accepted: false, held: false, refusedCycle: null }],
+		})
+		await p.state.saveLastAckedServerVector(new Map([[NODE, 2]]))
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			server.send({
+				type: 'error',
+				messageId: 'claimed',
+				code: 'NODE_ID_CLAIMED',
+				message: 'history with no recorded owner',
+				retriable: false,
+			} as SyncMessage)
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore(log, { rotateNodeId: rotate }),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+			emitter: emitter as never,
+		})
+		await engine.start().catch(() => {})
+		await tick()
+		await tick()
+		// Ops 1 and 2 are stored on the server under the old node: a copy under the new
+		// node would apply them twice.
+		expect(rotate).toHaveBeenCalledWith([op(3).id])
+		expect(p.prefixes.get(NODE)).toBe(2)
+		await engine.stop()
+	})
+})

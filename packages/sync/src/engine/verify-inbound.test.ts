@@ -231,3 +231,48 @@ describe('verifyInboundOperation: beta.13 hashes of undefined members (RT-71)', 
 		})
 	})
 })
+
+describe('verifyInboundOperation: beta.12 hashes of Date values in json (RT-88)', () => {
+	/** A beta.12 write: the id over the Date, the data after the JSON log and wire. */
+	async function dateOp(data: Record<string, unknown>): Promise<Operation> {
+		const op = await v1Op({ data })
+		return JSON.parse(JSON.stringify(op)) as Operation
+	}
+
+	test('a Date member, a top-level Date and Dates in arrays verify as version 1', async () => {
+		for (const data of [
+			{ title: 'x', extra: { when: new Date(1_700_000_000_000) } },
+			{ title: 'x', extra: new Date(-62_198_755_200_000) },
+			{ title: 'x', extra: [new Date(0), 'plain', { at: new Date(8.64e15) }] },
+		]) {
+			const op = await dateOp(data)
+			expect(await operationIdMatches(op)).toBe(true)
+			// Accepted, but never declared: the id did not bind the Date's value.
+			expect(
+				await verifyInboundOperation(op, { encrypted: false, absentVersion: 'verify-ids' }),
+			).toMatchObject({ ok: true, verified: true, matchedVersion: 1, declarable: false })
+		}
+	})
+
+	test('a Date next to a genuine ISO string verifies (every combination is tried)', async () => {
+		const op = await dateOp({
+			title: '2023-11-14T22:13:20.000Z',
+			extra: { a: new Date(5), b: '1970-01-01T00:00:00.000Z' },
+		})
+		expect(await operationIdMatches(op)).toBe(true)
+	})
+
+	test('the rebuild still binds everything but the Date values', async () => {
+		const op = await dateOp({ title: 'x', extra: { when: new Date(1_700_000_000_000) } })
+		const retitled = { ...op, data: { title: 'y', extra: { when: '2023-11-14T22:13:20.000Z' } } }
+		expect(await operationIdMatches(retitled)).toBe(false)
+		const notADate = { ...op, data: { title: 'x', extra: { when: 'yesterday' } } }
+		expect(await operationIdMatches(notADate)).toBe(false)
+		// beta.12 hashed every Date as {}: its id never covered which instant it held.
+		const otherInstant = {
+			...op,
+			data: { title: 'x', extra: { when: '2024-01-01T00:00:00.000Z' } },
+		}
+		expect(await operationIdMatches(otherInstant)).toBe(true)
+	})
+})

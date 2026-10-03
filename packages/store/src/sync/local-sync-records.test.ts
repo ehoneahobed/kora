@@ -94,18 +94,29 @@ describe('local node registry (RT-38, RT-40)', () => {
 		expect(nodes[0]?.held).toBe(false)
 	})
 
-	test('a node with sync history from an earlier release registers as accepted', async () => {
+	test('a node a claims-aware server accepted before the registry existed registers as accepted', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
 		await adapter.open(schema)
 		await adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'old')")
-		await adapter.execute(
-			"INSERT INTO _kora_meta (key, value) VALUES ('last_acked_server_vector', '{\"old\":4}')",
-		)
+		await saveOwnAckedThrough(adapter, 'old', 4)
 		await registerLocalNode(adapter, 'old')
 		await registerLocalNode(adapter, 'other')
 		const nodes = await listLocalNodes(adapter)
 		expect(nodes.find((n) => n.nodeId === 'old')?.accepted).toBe(true)
 		expect(nodes.find((n) => n.nodeId === 'other')?.accepted).toBe(false)
+		await adapter.close()
+	})
+
+	test('a node only a beta.12 (or older) server accepted is not accepted (RT-90)', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		await adapter.open(schema)
+		await adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'old')")
+		// beta.12 kept the server's acknowledged vector, but its server recorded no claims.
+		await adapter.execute(
+			"INSERT INTO _kora_meta (key, value) VALUES ('last_acked_server_vector', '{\"old\":4}')",
+		)
+		await registerLocalNode(adapter, 'old')
+		expect((await listLocalNodes(adapter)).find((n) => n.nodeId === 'old')?.accepted).toBe(false)
 		await adapter.close()
 	})
 
