@@ -1,5 +1,5 @@
 import type { Operation, SchemaDefinition } from '@korajs/core'
-import { KoraError, quoteIdent } from '@korajs/core'
+import { KoraError, encodeStoredText, quoteIdent } from '@korajs/core'
 import type { WriteEnv, WriteScope } from '../mutations/write-context'
 import { writeDeleteInTx, writeUpdateInTx } from '../mutations/write-ops'
 import type { Transaction } from '../types'
@@ -207,7 +207,8 @@ export class RelationEnforcer {
 
 		const countRows = await tx.query<{ cnt: number }>(
 			`SELECT COUNT(*) as cnt FROM ${quoteIdent(sourceCollection)} WHERE ${quoteIdent(foreignKeyField)} = ? AND _deleted = 0`,
-			[deletedRecordId],
+			// The foreign key column holds the stored-text form (RT-65).
+			[encodeStoredText(deletedRecordId)],
 		)
 		const count = countRows[0]?.cnt ?? 0
 
@@ -232,7 +233,8 @@ export class RelationEnforcer {
 	): Promise<string[]> {
 		const rows = await tx.query<{ id: string }>(
 			`SELECT id FROM ${quoteIdent(incoming.sourceCollection)} WHERE ${quoteIdent(incoming.foreignKeyField)} = ? AND _deleted = 0 ORDER BY id`,
-			[deletedRecordId],
+			// The foreign key column holds the stored-text form (RT-65).
+			[encodeStoredText(deletedRecordId)],
 		)
 		return rows.map((row) => row.id)
 	}

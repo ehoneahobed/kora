@@ -1,5 +1,5 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
+import { encodeStoredText, quoteIdent } from '@korajs/core'
 import { deserializeRecord } from '../serialization/serializer'
 import type { SubscriptionManager } from '../subscription/subscription-manager'
 import type {
@@ -301,7 +301,10 @@ export class QueryBuilder<T = CollectionRecord> {
 		const fkField = relation.field
 		const placeholders = primaryIds.map(() => '?').join(', ')
 		const sql = `SELECT * FROM ${quoteIdent(relatedCollection)} WHERE ${quoteIdent(fkField)} IN (${placeholders}) AND _deleted = 0`
-		const rows = await this.adapter.query<RawCollectionRow>(sql, primaryIds)
+		const rows = await this.adapter.query<RawCollectionRow>(
+			sql,
+			primaryIds.map((id) => encodeStoredText(id)),
+		)
 		const relatedRecords = rows.map((row) => deserializeRecord(row, relatedDef.fields))
 
 		// Group by FK

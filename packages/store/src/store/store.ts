@@ -80,6 +80,7 @@ import {
 	serializeOperation,
 	serializeRecord,
 } from '../serialization/serializer'
+import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
 import { SubscriptionManager } from '../subscription/subscription-manager'
 import {
 	type AdoptionSchedule,
@@ -372,6 +373,9 @@ export class Store implements OperationLog {
 		// The terminal rejections an earlier release kept only in the app's list become
 		// durable markers (RT-36).
 		await seedTerminalRejectionsOnce(this.adapter)
+		// Raw-string columns use the lossless stored-text codec (RT-65); rows written
+		// before it get their U+FFFF re-encoded once, before anything reads them.
+		await ensureStoredTextCodec(this.adapter, this.schema)
 		if (this.isolation === 'per-tab' && !this.configNodeId) {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
 			// writes only after this tab is gone (RT-40).

@@ -1,6 +1,7 @@
 import { defineSchema, generateFullDDL, t } from '../../../../../core/dist/index.js'
 import { IndexedDbAdapter } from '../../../../dist/adapters/indexeddb.js'
 import * as sqliteWasm from '../../../../dist/adapters/sqlite-wasm.js'
+import { Store } from '../../../../dist/index.js'
 
 const { SqliteWasmAdapter } = sqliteWasm
 
@@ -13,6 +14,22 @@ const badSchema = defineSchema({
 	version: 1,
 	collections: { sqlite_bad: { fields: { title: t.string() } } },
 })
+// RT-65: every field kind that stores strings, for the lossless round-trip check.
+const textSchema = defineSchema({
+	version: 1,
+	collections: {
+		notes: {
+			fields: {
+				title: t.string(),
+				kind: t.enum(['a', 'b', 'plain']).default('plain'),
+				tags: t.array(t.string()).default([]),
+				meta: t.object({ label: t.string() }).optional(),
+			},
+		},
+	},
+})
+// Strings SQL text cannot hold as is: NUL, lone surrogates (high and low), the escape.
+const POISON = ['pasted\u0000text', 'cut emoji \ud83d', '\ude00 low', 'escape \uffff0', 'ok 😀']
 const events = []
 const emitter = { emit: (e) => events.push(e), on: () => () => {} }
 const adapters = new Map()
@@ -288,6 +305,64 @@ window.H = {
 			sql: 'INSERT INTO notes (id, title, _created_at, _updated_at) VALUES (?, ?, ?, ?)',
 			params: [crypto.randomUUID(), title, Date.now(), Date.now()],
 		})
+	},
+	/**
+	 * RT-65: open a real Store (SQLite WASM on OPFS, or the IndexedDB fallback), write
+	 * every poisoned string into every string-holding field kind, close, reopen, and
+	 * read the values back through findById, equality and $in filters, and the op log.
+	 */
+	async rt65RoundTrip(dbName, opts = {}) {
+		const A = opts.indexeddb ? IndexedDbAdapter : SqliteWasmAdapter
+		const mk = () =>
+			new A({
+				dbName,
+				workerUrl: '/kora-worker.js',
+				emitter,
+				...(opts.indexeddb ? { persistenceDebounceMs: 0 } : {}),
+			})
+		const out = { written: [], read: [], filtered: [], ops: [], errors: [] }
+		try {
+			const first = mk()
+			let store = new Store({ schema: textSchema, adapter: first, dbName })
+			await store.open()
+			const notes = store.collection('notes')
+			for (const s of POISON) {
+				const rec = await notes.insert({
+					title: s,
+					kind: 'b',
+					tags: [s, 'x'],
+					meta: { label: s },
+				})
+				out.written.push(String(rec.id))
+			}
+			if (opts.indexeddb) await first.flushPersistence()
+			await store.close()
+			store = new Store({ schema: textSchema, adapter: mk(), dbName })
+			await store.open()
+			const again = store.collection('notes')
+			for (let i = 0; i < POISON.length; i++) {
+				const rec = await again.findById(out.written[i])
+				out.read.push({
+					expected: POISON[i],
+					ok:
+						rec?.title === POISON[i] &&
+						rec?.kind === 'b' &&
+						rec?.tags?.[0] === POISON[i] &&
+						rec?.meta?.label === POISON[i],
+				})
+				const eq = await again.where({ title: POISON[i] }).exec()
+				const inn = await again.where({ title: { $in: [POISON[i]] } }).exec()
+				out.filtered.push(eq.length === 1 && inn.length === 1 && eq[0]?.id === out.written[i])
+			}
+			const ops = await store.getAllOperations()
+			out.ops = POISON.map((s) =>
+				ops.some((op) => op.data?.title === s && op.data?.tags?.[0] === s),
+			)
+			await store.close()
+		} catch (e) {
+			out.errors.push(String(e?.stack ?? e))
+		}
+		return out
 	},
 	legacyKill(key) {
 		this.legacy[key]?.w.terminate()

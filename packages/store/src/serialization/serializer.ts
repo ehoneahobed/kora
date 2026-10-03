@@ -1,4 +1,4 @@
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, decodeStoredText, encodeStoredText } from '@korajs/core'
 import type { CollectionDefinition, FieldDescriptor, Operation } from '@korajs/core'
 import type { CollectionRecord, OperationRow, RawCollectionRow } from '../types'
 import { decodeRichtext, encodeRichtext } from './richtext-serializer'
@@ -237,8 +237,43 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 			// (tagged { $koraBytes }) — encodeRichtext accepts every form.
 			return encodeRichtext(value as Parameters<typeof encodeRichtext>[0])
 		default:
-			return value
+			// Raw string columns: SQLite binds strings as UTF-8, which cannot hold a lone
+			// surrogate (stored as U+FFFD) and SQLite WASM reads TEXT up to a NUL. The
+			// shared stored-text codec keeps every JS string (RT-65); JSON columns above
+			// need none (JSON.stringify escapes both).
+			return typeof value === 'string' && isRawTextKind(descriptor.kind)
+				? encodeStoredText(value)
+				: value
 	}
+}
+
+/**
+ * Field kinds whose column holds the raw string (the stored-text codec applies). Not
+ * `enum`: its column has a `CHECK (col IN (...))` of the schema's literal values, so it
+ * must hold them verbatim (an enum value SQL text cannot express is already refused by
+ * the DDL).
+ */
+const RAW_TEXT_KINDS: ReadonlySet<string> = new Set(['string', 'secret'])
+
+/** True for a field kind stored as a raw string, encoded with the stored-text codec. */
+export function isRawTextKind(kind: string): boolean {
+	return RAW_TEXT_KINDS.has(kind)
+}
+
+/**
+ * Encode a filter value compared against a field's column: a raw-string field stores
+ * the encoded form, and the codec is injective, so equality and `IN` stay exact.
+ *
+ * @param value - The value from the developer's `where`
+ * @param descriptor - The field's descriptor, when the field is known
+ */
+export function encodeStoredFilterValue(
+	value: unknown,
+	descriptor: FieldDescriptor | undefined,
+): unknown {
+	return typeof value === 'string' && descriptor !== undefined && isRawTextKind(descriptor.kind)
+		? encodeStoredText(value)
+		: value
 }
 
 function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
@@ -260,6 +295,8 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 		case 'richtext':
 			return decodeRichtext(value)
 		default:
-			return value
+			return typeof value === 'string' && isRawTextKind(descriptor.kind)
+				? decodeStoredText(value)
+				: value
 	}
 }

@@ -15,11 +15,11 @@
  * materialize; they stay exported from core for legacy comparison only.
  */
 import {
-	FOLD_STATE_VERSION,
 	FoldStateError,
 	HybridLogicalClock,
 	createFoldState,
 	deserializeFoldState,
+	foldPlanFingerprint,
 	foldRecord,
 	getFoldFieldVersions,
 	isFoldStateLive,
@@ -130,42 +130,12 @@ export function serverFoldPlanFingerprint(
 
 /**
  * Fingerprint of how `schema` folds each field: field kind, merge strategy and custom
- * resolver (its source text), plus {@link FOLD_STATE_VERSION}. Stored fold states built
- * under a different fingerprint are re-materialized from the log at startup, because
- * the per-field kind or a resolver's output would differ.
+ * resolver (its source text), plus `FOLD_STATE_VERSION`. Stored fold states built
+ * under a different fingerprint are re-materialized from the log at startup. This is
+ * the core definition (`@korajs/core` `foldPlanFingerprint`), re-exported so clients
+ * and the server can never disagree on whether a plan changed.
  */
-export function foldPlanFingerprint(schema: SchemaDefinition): string {
-	const parts: string[] = [`fold-v${FOLD_STATE_VERSION}`]
-	for (const name of Object.keys(schema.collections).sort()) {
-		const collection = schema.collections[name]
-		if (!collection) continue
-		const fields = Object.keys(collection.fields)
-			.sort()
-			.map((field) => {
-				const descriptor = collection.fields[field]
-				const resolver = collection.resolvers?.[field]
-				return `${field}:${descriptor?.kind ?? ''}:${descriptor?.mergeStrategy ?? ''}:${
-					resolver ? hashText(String(resolver)) : ''
-				}`
-			})
-		const resolverOnly = Object.keys(collection.resolvers ?? {})
-			.filter((field) => !(field in collection.fields))
-			.sort()
-			.map((field) => `${field}:resolver:${hashText(String(collection.resolvers?.[field]))}`)
-		parts.push(`${name}(${[...fields, ...resolverOnly].join(',')})`)
-	}
-	return parts.join('|')
-}
-
-/** FNV-1a over UTF-16 code units: a stable, dependency-free text fingerprint. */
-function hashText(text: string): string {
-	let hash = 0x811c9dc5
-	for (let i = 0; i < text.length; i++) {
-		hash ^= text.charCodeAt(i)
-		hash = Math.imul(hash, 0x01000193) >>> 0
-	}
-	return hash.toString(16).padStart(8, '0')
-}
+export { foldPlanFingerprint }
 
 /**
  * Parse a stored fold state, or null when it is unreadable (unknown format version,

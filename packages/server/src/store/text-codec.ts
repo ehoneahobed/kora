@@ -32,105 +32,40 @@
  * lone surrogates (well-formed JSON.stringify), so they need no codec.
  */
 
+import {
+	STORED_TEXT_ESCAPE,
+	decodeStoredJsonValue,
+	decodeStoredText,
+	encodeStoredJsonValue,
+	encodeStoredText,
+	needsStoredTextEncoding,
+} from '@korajs/core'
 import type { FieldDescriptor } from '@korajs/core'
 import { deserializeFieldValue, serializeFieldValue } from './materialization'
 
+// The codec itself is core's (`@korajs/core` stored-text), shared with the client
+// stores, so a value escapes identically on every device and server.
+
 /** The escape introducer: U+FFFF, a noncharacter. */
-export const PG_TEXT_ESCAPE = '\uffff'
+export const PG_TEXT_ESCAPE = STORED_TEXT_ESCAPE
 
 /** `kora_server_meta` key prefix marking a table whose legacy U+FFFF rows were re-encoded. */
 export const PG_TEXT_CODEC_MIGRATION_KEY = 'pg_text_codec_v1:'
 
-// NUL, the escape, or any surrogate (paired ones are filtered in the loop).
-// biome-ignore lint/suspicious/noControlCharactersInRegex: U+0000 is exactly what the codec escapes (RT-65)
-const NEEDS_ENCODING = /[\u0000\uffff\ud800-\udfff]/
-
 /** True when `s` contains a code unit Postgres cannot store as is. */
-export function needsPgTextEncoding(s: string): boolean {
-	return NEEDS_ENCODING.test(s)
-}
+export const needsPgTextEncoding: (s: string) => boolean = needsStoredTextEncoding
 
 /** Encode a JS string for a Postgres TEXT (or JSONB string) value. */
-export function encodePgText(s: string): string {
-	if (!NEEDS_ENCODING.test(s)) return s
-	let out = ''
-	for (let i = 0; i < s.length; i++) {
-		const code = s.charCodeAt(i)
-		if (code === 0) {
-			out += `${PG_TEXT_ESCAPE}0`
-		} else if (code === 0xffff) {
-			out += `${PG_TEXT_ESCAPE}F`
-		} else if (code >= 0xd800 && code <= 0xdbff) {
-			const next = s.charCodeAt(i + 1)
-			if (next >= 0xdc00 && next <= 0xdfff) {
-				out += s.slice(i, i + 2)
-				i++
-			} else {
-				out += `${PG_TEXT_ESCAPE}s${code.toString(16)}`
-			}
-		} else if (code >= 0xdc00 && code <= 0xdfff) {
-			out += `${PG_TEXT_ESCAPE}s${code.toString(16)}`
-		} else {
-			out += s.charAt(i)
-		}
-	}
-	return out
-}
+export const encodePgText: (s: string) => string = encodeStoredText
 
 /** Decode a string written by {@link encodePgText}. */
-export function decodePgText(s: string): string {
-	if (!s.includes(PG_TEXT_ESCAPE)) return s
-	let out = ''
-	for (let i = 0; i < s.length; i++) {
-		const char = s[i]
-		if (char !== PG_TEXT_ESCAPE) {
-			out += char
-			continue
-		}
-		const tag = s[i + 1]
-		if (tag === '0') {
-			out += '\u0000'
-			i += 1
-		} else if (tag === 'F') {
-			out += PG_TEXT_ESCAPE
-			i += 1
-		} else if (tag === 's') {
-			const hex = s.slice(i + 2, i + 6)
-			const code = Number.parseInt(hex, 16)
-			if (hex.length === 4 && Number.isInteger(code) && code >= 0xd800 && code <= 0xdfff) {
-				out += String.fromCharCode(code)
-				i += 5
-			} else {
-				// Not written by the codec (a legacy row the migration did not reach): keep it.
-				out += char
-			}
-		} else {
-			out += char
-		}
-	}
-	return out
-}
+export const decodePgText: (s: string) => string = decodeStoredText
 
 /** Encode every string (and object key) inside a JSON value. */
-export function encodePgJsonValue(value: unknown): unknown {
-	return mapStrings(value, encodePgText)
-}
+export const encodePgJsonValue: (value: unknown) => unknown = encodeStoredJsonValue
 
 /** Decode every string (and object key) inside a JSON value. */
-export function decodePgJsonValue(value: unknown): unknown {
-	return mapStrings(value, decodePgText)
-}
-
-function mapStrings(value: unknown, map: (s: string) => string): unknown {
-	if (typeof value === 'string') return map(value)
-	if (Array.isArray(value)) return value.map((member) => mapStrings(member, map))
-	if (value !== null && typeof value === 'object' && !ArrayBuffer.isView(value)) {
-		const out: Record<string, unknown> = {}
-		for (const [key, member] of Object.entries(value)) out[map(key)] = mapStrings(member, map)
-		return out
-	}
-	return value
-}
+export const decodePgJsonValue: (value: unknown) => unknown = decodeStoredJsonValue
 
 /**
  * The one-time statements re-encoding rows written before the codec: every U+FFFF in
