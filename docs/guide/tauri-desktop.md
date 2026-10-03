@@ -41,7 +41,6 @@ Then:
 
 ```bash
 cd my-desktop-app
-pnpm install
 pnpm dev
 ```
 
@@ -55,7 +54,12 @@ Once the native window opens, you have a working offline-first app with sync rea
 my-desktop-app/
   src/
     schema.ts          # Schema entry point
-    main.tsx           # Kora app entry (sync enabled)
+    main.tsx           # React entry
+    AppShell.tsx       # First-launch setup, then the Kora app (sync when a URL is set)
+    SetupScreen.tsx    # Sync server URL entry
+    sync-config.ts     # Stored sync URL
+    auth.ts            # Desktop auth client
+    updater.ts         # Update check on launch
     App.tsx            # React UI
     modules/
       todos/
@@ -73,6 +77,7 @@ my-desktop-app/
       lib.rs           # Plugin registration
   server.ts            # Sync server
   dev.ts               # Dev orchestrator (starts sync + Tauri)
+  .github/workflows/release-desktop.yml  # Cross-platform release builds
   kora.config.ts       # Kora configuration
   package.json
   vite.config.ts
@@ -91,10 +96,12 @@ On the web, Kora runs SQLite compiled to WebAssembly inside a Web Worker. In a T
 
 The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically, no configuration needed:
 
-```typescript
-import { createApp } from 'korajs'
-import schema from './schema'
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } } })
+-->
 
+```typescript
 // Kora detects Tauri and uses native SQLite automatically
 const app = createApp({ schema })
 ```
@@ -104,7 +111,9 @@ const app = createApp({ schema })
 Your React components, hooks, and schema are identical to a web Kora app. The only difference is the storage layer underneath:
 
 ```tsx
-import { KoraProvider, useQuery, useMutation } from '@korajs/react'
+import { useMutation, useQuery } from '@korajs/react'
+
+const app = createApp({ schema })
 
 function TodoList() {
   const todos = useQuery(app.todos.where({ completed: false }))
@@ -113,7 +122,8 @@ function TodoList() {
   // Identical to web: works offline, syncs when connected
   return (
     <ul>
-      {todos.map(todo => <li key={todo.id}>{todo.title}</li>)}
+      {todos.map((todo) => <li key={todo.id}>{todo.title}</li>)}
+      <button onClick={() => addTodo.mutate({ title: 'New todo' })}>Add</button>
     </ul>
   )
 }
@@ -121,21 +131,26 @@ function TodoList() {
 
 ### Built-In Sync
 
-The Tauri template comes with sync **enabled by default**. When you run `pnpm dev`, both the desktop app and a local sync server start together. The app connects to the server automatically.
+`pnpm dev` starts the desktop app and a local sync server together. The app (`src/AppShell.tsx`)
+creates the Kora app with sync when it has a sync URL (from `VITE_SYNC_URL` or the first-launch
+setup screen) and connects once `app.ready` resolves:
 
+<!-- docs-check: skip excerpt of the template's AppShell component -->
 ```typescript
-// src/main.tsx - sync is configured out of the box
-const syncUrl = import.meta.env.VITE_SYNC_URL || 'ws://localhost:3001/kora-sync'
-
-const app = createApp({
+createApp({
   schema,
-  sync: { url: syncUrl },
+  ...(syncUrl
+    ? { sync: { url: syncUrl, authClient: createKoraAuthSync({ authClient, schema }) } }
+    : {}),
+  devtools: import.meta.env.DEV,
 })
-
-app.ready.then(() => app.sync?.connect())
 ```
 
-To test sync locally, open two instances of the app (run `pnpm dev:app` in a second terminal). Changes in one window appear in the other instantly.
+As in the web sync templates, sync is bound to the signed-in user: until someone signs in, the app
+works locally and sync waits (`auth-required`). Configure auth on the server (`KORA_AUTH_SECRET`,
+see [Authentication](#authentication)), or pass `anonymous: 'allow'` to `createKoraAuthSync` for a
+shared-data demo. Then open a second instance (`pnpm dev:app` in another terminal) to watch changes
+sync.
 
 ## Development
 
@@ -243,42 +258,58 @@ export const authClient = createKoraAuth({
 
 For production apps, pass a secure desktop credential store:
 
+<!-- docs-check: continue -->
 ```typescript
-import { createKoraAuth } from '@korajs/auth'
+import type { AuthKeyValueStorage } from '@korajs/auth'
 
-export const authClient = createKoraAuth({
+// An adapter over a Tauri secure-storage plugin (getItem, setItem, removeItem; sync or async)
+declare const tauriSecureStore: AuthKeyValueStorage
+
+export const secureAuthClient = createKoraAuth({
   serverUrl: 'https://acme-corp.example.com',
   credentialStore: tauriSecureStore,
 })
 ```
 
-Pass the auth token into sync when creating the Kora app:
+Bind it to sync when creating the Kora app:
 
+<!-- docs-check: continue -->
 ```typescript
 import { createKoraAuthSync } from '@korajs/auth'
+import { createApp, defineSchema, t } from 'korajs'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
 const app = createApp({
   schema,
   sync: {
     url: 'wss://acme-corp.example.com/kora-sync',
-    authClient: createKoraAuthSync({ authClient, schema }),
+    authClient: createKoraAuthSync({ authClient: secureAuthClient, schema }),
   },
 })
 ```
 
-On the server, wire `authRoutes.toSyncAuthProvider()` through `syncOptions.auth`:
+On the server, mount the auth routes and pass the auth server's sync provider:
 
+<!-- docs-check: standalone -->
 ```typescript
+import { createKoraAuthServer, createSqliteUserStore } from '@korajs/auth/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+
+const auth = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET,
+  userStore: await createSqliteUserStore({ filename: './kora-auth.db' }),
+})
+
 const server = createProductionServer({
-  store,
+  store: createSqliteServerStore({ filename: './kora-server.db' }),
   syncPath: '/kora-sync',
-  syncOptions: {
-    auth: authRoutes.toSyncAuthProvider(),
-  },
+  httpRoutes: [{ path: '/auth', handle: auth.handleRequest }],
+  syncOptions: { auth: auth.auth },
 })
 ```
 
-Email/password auth, OAuth sign-in, account linking, session refresh, MFA, org membership, and RBAC apply to desktop and web clients the same way. Passkeys require WebAuthn support in the operating system WebView, so call `isPasskeySupported()` before showing passkey UI. For OAuth, desktop apps need an app-specific redirect strategy such as a loopback callback, custom URL scheme, or hosted sign-in handoff, then should complete the flow with `POST /auth/oauth/:provider/callback`.
+Email/password auth, OAuth sign-in, account linking, session refresh, MFA, org membership, and RBAC apply to desktop and web clients the same way. Passkeys require WebAuthn support in the operating system WebView, so call `isPasskeySupported()` before showing passkey UI. For OAuth, desktop apps need an app-specific redirect strategy such as a loopback callback, custom URL scheme, or hosted sign-in handoff: create the URL with `authClient.getOAuthAuthorizationUrl(provider, { redirect: false })`, open it in the system browser, and finish with `authClient.completeOAuthSignIn(provider, { code, state })`.
 
 ## Deploying for Multi-Device Sync
 
@@ -360,7 +391,9 @@ import {
   createProductionServer,
   createSqliteServerStore,
 } from '@korajs/server'
-import schema from './src/schema'
+import { defineSchema, t } from 'korajs'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
 const store = process.env.DATABASE_URL
   ? await createPostgresServerStore({ connectionString: process.env.DATABASE_URL })
@@ -427,7 +460,7 @@ The included GitHub Actions workflow (`.github/workflows/release-desktop.yml`) b
 
 ### How it works
 
-On each app launch, the updater checks the endpoint for a newer version. If found, it downloads and installs the update. The app restarts with the new version. If the network is unavailable, the check is silently skipped; the app works fully offline.
+On each launch (`src/updater.ts`), the app checks the endpoint once. If a newer version exists, it downloads and installs it; the new version runs from the next start. The check is skipped silently while the updater is not configured (empty `pubkey` and `endpoints` in `tauri.conf.json`, the template default) or the network is unavailable, so the app works fully offline.
 
 ## CI/CD for Desktop Releases
 
