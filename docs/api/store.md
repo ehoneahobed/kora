@@ -1,538 +1,222 @@
 ---
 title: Store API
-description: "@korajs/store API reference: storage adapters, collections, CRUD, the query builder, reactive subscriptions, and multi-tab coordination."
+description: "@korajs/store API reference: collections, the query builder, reactive subscriptions, transactions, sequences, storage adapters, blobs and store errors."
 ---
 
 # Store API Reference
 
-`@korajs/store` provides the local storage layer and the collection API that developers interact with for all data operations. It manages persistence (SQLite WASM, IndexedDB), reactive queries, and operation creation.
+`@korajs/store` is the local data layer: persistence (SQLite WASM on OPFS, IndexedDB, native
+SQLite), the record fold, reactive queries and the operation log. `createApp()` creates and opens
+the store; you use it through the app.
 
-You do not typically instantiate a `Store` directly. Instead, `createApp()` creates and configures one for you. The collection methods documented here are accessed through the app instance.
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        completed: t.boolean().default(false),
+        assignee: t.string().optional(),
+        projectId: t.string().optional(),
+        createdAt: t.timestamp().auto(),
+      },
+    },
+    projects: { fields: { name: t.string() } },
+    orders: { fields: { total: t.number() } },
+    lineItems: { fields: { orderId: t.string(), product: t.string(), qty: t.number() } },
+  },
+  relations: {
+    todoBelongsToProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'set-null' },
+  },
+})
+const app = createApp({ schema })
+declare const id: string
+-->
 
 ```typescript
-import { createApp, defineSchema, t } from 'korajs'
-
-const app = createApp({ schema })
-
-// Collection methods are accessed through app.<collectionName>
-await app.todos.insert({ title: 'Hello' })
+await app.ready
+const todo = await app.todos.insert({ title: 'Hello' })
 ```
 
 ---
 
-## Collection methods
+## Collections
 
-Every collection defined in your schema is accessible as a property on the app instance, and always as `app.collections.<name>`. Each collection provides the following methods. With a schema from `defineSchema()`, every method is typed from the schema (see [Type inference](/api/core#type-inference)).
+Every schema collection is available as `app.<name>` and always as `app.collections.<name>`. With a
+schema from `defineSchema()` every method is typed (see [Type inference](/api/core#type-inference)).
+Every method rejects with `AppNotReadyError` (`APP_NOT_READY`) before `app.ready` resolves; inside
+`<KoraProvider app={app}>` the app is ready before children render.
 
-Every method throws `AppNotReadyError` when called before `app.ready` resolves (`findById` included: it rejects rather than resolving `null`, which would look like a missing record). Inside `<KoraProvider app={app}>` the app is ready before children render.
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `insert(data)` | `Promise<Record>` | Validates, applies defaults and `t.timestamp().auto()`, generates a UUID v7 `id`, writes the record and its operation in one transaction. |
+| `update(id, data)` | `Promise<Record>` | Writes only the fields that change (an unchanged value is not a write). Accepts [atomic ops](/api/core#atomic-ops). Throws `RecordNotFoundError` for a missing or deleted record. |
+| `delete(id)` | `Promise<void>` | Deletes the record (relations apply their `onDelete`). Throws `RecordNotFoundError` when it does not exist. |
+| `findById(id)` | `Promise<Record \| null>` | The record, or `null`. |
+| `where(filter)` | `QueryBuilder` | Starts a query (see below). |
+
+Records also carry `createdAt` and `updatedAt` (milliseconds): the insert time and the last write
+time, readable and queryable even when the schema does not declare them (a schema field of the same
+name wins). The names are exported as `VIRTUAL_TIMESTAMP_FIELDS`.
+
+Writes are refused before anything is stored when a value is outside its field's domain
+(`SchemaValidationError`), the serialized operation exceeds `maxOperationBytes` (256 KiB by
+default, `OperationTooLargeError`), a state machine forbids the transition
+(`InvalidStateTransitionError`), or the database cannot be made durable
+(`StorageDurabilityError`).
 
 ### Reserved collection names {#reserved-names}
 
-These names belong to the app object itself: `ready`, `events`, `on`, `collections`, `sync`, `sequences`, `blobs`, `storage`, `getStore`, `getSyncEngine`, `getQueryStoreCache`, `storeInfo`, `close`, `transaction`, `mutation`, `exportBackup`, `importBackup`, `replayTo`, `exportAudit` (exported as `RESERVED_APP_PROPERTIES`). A collection with one of these names works normally but is not available as `app.<name>` (that is the framework API). Reach it as `app.collections.<name>`, and as `tx.<name>` inside transactions. `createApp()` logs a warning in development builds when the schema uses one; with a typed schema, `app.<name>.insert(...)` is also a type error.
-
-### .insert(data)
-
-Inserts a new record into the collection. Returns the full record including generated fields (`id`, auto-fields).
-
-```typescript
-insert(data: Partial<CollectionRecord>): Promise<CollectionRecord>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `data` | `Partial<CollectionRecord>` | Field values for the new record. Fields with `.default()` or `.auto()` modifiers can be omitted. |
-
-**Returns:** `Promise<CollectionRecord>` -- The inserted record with all fields populated, including the generated `id` (UUID v7) and any auto/default values.
-
-```typescript
-const todo = await app.todos.insert({
-  title: 'Ship Kora v1',
-  // completed defaults to false (from schema)
-  // createdAt set automatically (t.timestamp().auto())
-})
-
-console.log(todo)
-// {
-//   id: '0190a6e0-7b3c-7def-8a12-4b5c6d7e8f90',
-//   title: 'Ship Kora v1',
-//   completed: false,
-//   createdAt: 1712188800000
-// }
-```
-
-### .update(id, data)
-
-Updates an existing record. Only the specified fields are changed. An operation is created containing only the changed fields and their previous values (enabling 3-way merge).
-
-```typescript
-update(id: string, data: Partial<CollectionRecord>): Promise<CollectionRecord>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | `string` | The record ID to update. |
-| `data` | `Partial<CollectionRecord>` | Fields to change. Only include fields that are changing. |
-
-**Returns:** `Promise<CollectionRecord>` -- The updated record with all fields.
-
-```typescript
-const updated = await app.todos.update('0190a6e0-7b3c-7def-8a12-4b5c6d7e8f90', {
-  completed: true,
-})
-```
-
-### .delete(id)
-
-Deletes a record from the collection. Creates a delete operation that propagates to other devices via sync.
-
-```typescript
-delete(id: string): Promise<void>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | `string` | The record ID to delete. |
-
-```typescript
-await app.todos.delete('0190a6e0-7b3c-7def-8a12-4b5c6d7e8f90')
-```
-
-### .findById(id)
-
-Retrieves a single record by its ID. Returns `null` if not found.
-
-```typescript
-findById(id: string): Promise<CollectionRecord | null>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | `string` | The record ID to look up. |
-
-**Returns:** `Promise<CollectionRecord | null>` -- The record, or `null` if it does not exist.
-
-```typescript
-const todo = await app.todos.findById('0190a6e0-7b3c-7def-8a12-4b5c6d7e8f90')
-
-if (todo) {
-  console.log(todo.title)
-}
-```
+These names belong to the app object: `ready`, `events`, `on`, `collections`, `sync`,
+`encryption`, `sequences`, `blobs`, `storage`, `getStore`, `getSyncEngine`, `getQueryStoreCache`,
+`storeInfo`, `close`, `transaction`, `mutation`, `exportBackup`, `importBackup`, `replayTo`,
+`exportAudit` (exported as `RESERVED_APP_PROPERTIES`). A collection with one of these names works,
+but only as `app.collections.<name>` (and `tx.<name>` in transactions). `createApp()` warns in
+development, and with a typed schema `app.<name>.insert(...)` is a type error.
 
 ---
 
 ## Query builder
 
-The query builder provides a chainable API for constructing queries. Start with `.where()` on a collection and chain additional methods. Terminate with `.exec()` to run the query or `.subscribe()` to reactively watch results.
+Queries are immutable builders: every method returns a new builder, and the methods can be chained
+in any order before `exec()`, `count()` or `subscribe()`.
 
-### .where(filter)
-
-Begins a query with a filter condition. Fields in the filter object are matched with equality by default.
-
-```typescript
-where(filter: Partial<CollectionRecord>): QueryBuilder
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `filter` | `Partial<CollectionRecord>` | Key-value pairs to match against. All conditions are AND-ed. |
-
-```typescript
-const active = app.todos.where({ completed: false })
-const assigned = app.todos.where({ assignee: 'alice', completed: false })
-```
-
-### .orderBy(field, direction?)
-
-Sorts results by a field.
+| Method | Description |
+|--------|-------------|
+| `where(filter)` | Field equality, or operators `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`. Conditions are AND-ed; calling `where` again adds conditions (a repeated field replaces the earlier condition). |
+| `orderBy(field, direction = 'asc')` | Any schema field, `id`, `createdAt` or `updatedAt`. Any direction other than `'asc'`/`'desc'` throws `QueryError`. |
+| `limit(n)` / `offset(n)` | Non-negative safe integers (otherwise `QueryError`), bound as SQL parameters. |
+| `include(...targets)` | Adds related records (see below). |
+| `exec()` | `Promise<Record[]>`. |
+| `count()` | `Promise<number>`. |
+| `subscribe(callback, { onError? })` | Live results; returns an unsubscribe function. |
 
 ```typescript
-orderBy(field: string, direction?: 'asc' | 'desc'): QueryBuilder
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `field` | `string` | -- | Field name to sort by. Any schema field, `id`, or the record metadata fields `createdAt` / `updatedAt`. |
-| `direction` | `'asc' \| 'desc'` | `'asc'` | Sort direction. Any other value throws `QueryError`; it is never placed into SQL. |
-
-```typescript
-app.todos.where({ completed: false }).orderBy('createdAt', 'desc')
-```
-
-`createdAt` and `updatedAt` are available on every record and work in both `.where()` and `.orderBy()` (they read the record's insert and last-write times). If your schema declares a field with one of those names, the query uses your field instead. The names are exported as `VIRTUAL_TIMESTAMP_FIELDS` from `@korajs/store`.
-
-```typescript
-const startOfDay = new Date().setHours(0, 0, 0, 0)
-const changedToday = await app.todos.where({ updatedAt: { $gte: startOfDay } }).exec()
-```
-
-### .limit(n)
-
-Limits the number of results returned.
-
-```typescript
-limit(n: number): QueryBuilder
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `n` | `number` | Maximum number of records to return. Must be a non-negative safe integer, otherwise `QueryError` is thrown. It is passed to SQLite as a bound parameter. |
-
-```typescript
-app.todos.where({ completed: false }).orderBy('createdAt').limit(10)
-```
-
-### .offset(n)
-
-Skips the first `n` results. Useful for pagination in combination with `.limit()`.
-
-```typescript
-offset(n: number): QueryBuilder
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `n` | `number` | Number of records to skip. Must be a non-negative safe integer, otherwise `QueryError` is thrown. Works with or without `.limit()`. |
-
-```typescript
-// Page 2 of 10 results per page
-app.todos.where({ completed: false }).orderBy('createdAt').limit(10).offset(10)
-```
-
-### .include(relation)
-
-Includes related records in the query results by following a relation defined in the schema.
-
-```typescript
-include(relation: string): QueryBuilder
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `relation` | `string` | Name of a relation target collection to include. |
-
-```typescript
-const todosWithProject = await app.todos
-  .where({ completed: false })
-  .include('project')
-  .exec()
-
-// Each todo now has a `project` property with the related record
-console.log(todosWithProject[0].project.name)
-```
-
-### .count()
-
-Returns the number of records matching the query instead of the records themselves.
-
-```typescript
-count(): Promise<number>
-```
-
-```typescript
-const activeCount = await app.todos.where({ completed: false }).count()
-console.log(activeCount) // 42
-```
-
-### .exec()
-
-Executes the query and returns the matching records as an array.
-
-```typescript
-exec(): Promise<CollectionRecord[]>
-```
-
-```typescript
-const todos = await app.todos
-  .where({ completed: false })
+const page = await app.todos
+  .where({ completed: false, assignee: { $in: ['alice', 'bob'] } })
   .orderBy('createdAt', 'desc')
   .limit(10)
+  .offset(10)
   .exec()
+
+const startOfDay = new Date().setHours(0, 0, 0, 0)
+const changedToday = await app.todos.where({ updatedAt: { $gte: startOfDay } }).count()
 ```
 
-### .subscribe(callback)
+### include()
 
-Subscribes to live query results. The callback is called immediately with the current results, and again whenever the result set changes due to local mutations or incoming sync operations.
+A target names a relation's other collection, in plural or singular form:
+
+- For a relation **from** this collection (many-to-one, one-to-one), each row gets the singular
+  property holding the parent or `null`: `todos.include('project')` (or `'projects'`) adds
+  `project`.
+- For a relation **to** this collection (one-to-many), each row gets the plural property holding
+  the children: `projects.include('todos')` adds `todos`.
+
+An unknown target throws `QueryError`. Related records are fetched in one batch per target.
 
 ```typescript
-subscribe(
-  callback: (results: CollectionRecord[]) => void,
-  options?: { onError?: (failure: QuerySubscriptionError) => void },
-): () => void
+const withProject = await app.todos.where({ completed: false }).include('project').exec()
+withProject[0]?.project?.name
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `callback` | `(results: CollectionRecord[]) => void` | Function called with the current result set on every change. |
-| `options.onError` | `(failure: QuerySubscriptionError) => void` | Called when the query fails, instead of the failure becoming an unhandled rejection. `failure` has `error`, `phase` (`'initial'`, `'refresh'` or `'callback'`), `collection` and `queryId`. |
+### subscribe()
 
-**Returns:** `() => void` -- An unsubscribe function. Call it to stop receiving updates.
+The callback runs immediately with the current results and again whenever the results change,
+after local writes or applied sync operations. Re-evaluation is batched in a microtask, and results
+are compared value by value (arrays, objects and rich text included), so a write that leaves the
+results equal does not call it.
 
-The callback runs only when the results actually changed. Results are compared value by value for every field kind, so a write elsewhere in the collection that leaves this result set equal (including array, object and rich-text fields) does not call it again.
-
-If a query fails, the subscription stays registered and keeps its last results. The failure goes to `onError` and is emitted as a `query:error` event (without `onError` it is also logged). The next successful run is always delivered, even if its results equal the previous ones, so UI bindings can leave their error state. `QueryStore.getError()` exposes the same state to framework bindings.
+If a query fails, the subscription stays registered and keeps its last results; the failure goes
+to `onError` (`{ error, phase: 'initial' | 'refresh' | 'callback', collection, queryId }`) and the
+`query:error` event (and is logged when there is no `onError`). The next successful run is always
+delivered. Always call the returned function when you stop listening; the framework hooks do this
+for you.
 
 ```typescript
 const unsubscribe = app.todos
   .where({ completed: false })
   .orderBy('createdAt')
-  .subscribe((todos) => {
-    console.log('Active todos:', todos.length)
-  })
-
-// Later: stop watching
+  .subscribe(
+    (todos) => console.log(todos.length),
+    { onError: (failure) => console.error(failure.error) },
+  )
 unsubscribe()
-```
-
-::: warning
-Always call the unsubscribe function when you no longer need updates (e.g., when a component unmounts). Failing to unsubscribe causes memory leaks. If you are using React, prefer the `useQuery` hook which handles unsubscription automatically.
-:::
-
----
-
-## Query builder chaining
-
-Methods can be chained in any order before the terminal `.exec()`, `.count()`, or `.subscribe()`. All of the following are equivalent:
-
-```typescript
-// Order 1
-await app.todos.where({ completed: false }).orderBy('createdAt').limit(5).exec()
-
-// Order 2
-await app.todos.where({ completed: false }).limit(5).orderBy('createdAt').exec()
-```
-
-A full chaining example:
-
-```typescript
-const recentActive = await app.todos
-  .where({ completed: false })
-  .orderBy('createdAt', 'desc')
-  .limit(20)
-  .offset(0)
-  .include('project')
-  .exec()
 ```
 
 ---
 
 ## Transactions
 
-Transactions execute multiple mutations atomically. Either all operations succeed, or none do. Use transactions when you need to update multiple records or collections as a single unit.
-
-### app.transaction(fn)
-
-Executes a function within a transaction context. The transaction is committed when the function completes, or rolled back if it throws.
-
-```typescript
-transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `fn` | `(tx: TransactionProxy) => Promise<void>` | Function that performs mutations using the transaction proxy. |
-
-**Returns:** `Promise<Operation[]>` -- The operations created by the transaction.
+`app.transaction(fn)` writes several records atomically: every write is validated when called
+(errors surface at the call site, and `insert` returns its id at once), then all of them commit in
+one storage transaction with one `transactionId` and a contiguous block of sequence numbers. If
+`fn` throws, nothing is written. Subscribers are notified once, after the commit.
 
 ```typescript
-const ops = await app.transaction(async (tx) => {
+const operations = await app.transaction(async (tx) => {
   const order = await tx.orders.insert({ total: 99.99 })
   await tx.lineItems.insert({ orderId: order.id, product: 'Widget', qty: 2 })
-  await tx.lineItems.insert({ orderId: order.id, product: 'Gadget', qty: 1 })
 })
-// All three inserts succeed or fail together
-```
 
-The transaction proxy (`tx`) provides the same collection accessors as the app (`tx.orders`, `tx.todos`, etc.), but mutations are buffered and only applied when the function completes successfully.
-
-### app.mutation(name, fn)
-
-A named transaction, identical to `app.transaction()` but with a name that appears in DevTools for easier debugging.
-
-```typescript
-mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | `string` | A descriptive name for this mutation (visible in DevTools). |
-| `fn` | `(tx: TransactionProxy) => Promise<void>` | Function that performs mutations using the transaction proxy. |
-
-```typescript
 await app.mutation('create-order', async (tx) => {
-  const order = await tx.orders.insert({ total: 150 })
-  await tx.lineItems.insert({ orderId: order.id, product: 'Widget', qty: 3 })
+  await tx.orders.insert({ total: 150 })
 })
 ```
 
-### TransactionProxy
-
-The transaction proxy exposes collection accessors with the same API as the app-level accessors:
-
-| Method | Description |
-|--------|-------------|
-| `tx.<collection>.insert(data)` | Insert a record within the transaction. |
-| `tx.<collection>.update(id, data)` | Update a record within the transaction. |
-| `tx.<collection>.delete(id)` | Delete a record within the transaction. |
-| `tx.<collection>.findById(id)` | Read a record (sees uncommitted writes from this transaction). |
-
-::: tip
-Queries (`.where()`, `.exec()`) are not available inside transactions. Use `findById()` to look up records you need during the transaction.
-:::
+`tx.<collection>` has `insert`, `update`, `delete` and `findById` (which sees the transaction's own
+uncommitted writes); there are no queries inside a transaction. `app.mutation(name, fn)` is a
+transaction whose operations carry `mutationName` for DevTools. Both resolve to the created
+operations.
 
 ---
 
 ## Sequences
 
-Sequences generate ordered, formatted identifiers (invoice numbers, order codes, receipt IDs). They are offline-safe: each device maintains its own counter that increments monotonically.
+`app.sequences` produces formatted counters (receipt and invoice numbers) offline. Each device keeps
+its own counter per `(name, scope)`, so two devices can produce the same counter value: include
+`{node4}` or `{node8}` in the format when values must be unique across devices.
 
-### app.sequences.next(name, config?)
+| Method | Description |
+|--------|-------------|
+| `next(name, { format?, scope?, startAt? })` | `Promise<string>`: increments atomically and formats. Default format: the name, a hyphen and `{seq:4}` (`order-0001`); `startAt` defaults to 1. |
+| `current(name, { scope? })` | `Promise<number>`: the counter without incrementing (0 when unused). |
+| `reset(name, { scope?, to? })` | Sets the counter to `to` (default 0); the next value is `to + 1`. |
 
-Generates the next value in a named sequence.
-
-```typescript
-next(name: string, config?: SequenceConfig): Promise<string>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | `string` | Sequence name. Different names maintain independent counters. |
-| `config` | `SequenceConfig` | Optional. Format and scope options. |
-
-#### SequenceConfig
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `format` | `string` | `'{name}-{seq:4}'` | Format template. See format tokens below. |
-| `scope` | `string` | `undefined` | Scope key. Different scopes maintain independent counters for the same sequence name. |
-
-#### Format tokens
-
-| Token | Description | Example output |
-|-------|-------------|----------------|
-| `{seq}` | Counter without padding | `1`, `42`, `100` |
-| `{seq:N}` | Counter zero-padded to N digits | `{seq:4}` → `0001` |
-| `{date}` | Current date as `YYYYMMDD` | `20260508` |
-| `{node4}` | First 4 chars of node ID | `a1b2` |
-| `{node8}` | First 8 chars of node ID | `a1b2c3d4` |
+| Token | Output |
+|-------|--------|
+| `{seq}` | counter zero-padded to 4 digits (`0042`) |
+| `{seq:N}` | counter zero-padded to N digits |
+| `{date}` | `YYYYMMDD` (UTC) |
+| `{node4}` / `{node8}` | first 4 / 8 characters of this device's node id |
 
 ```typescript
-// Default format: name + zero-padded counter
-await app.sequences.next('order')        // 'order-0001'
-await app.sequences.next('order')        // 'order-0002'
-
-// Custom format
-await app.sequences.next('receipt', {
-  format: 'REC-{seq:6}',
-})                                        // 'REC-000001'
-
-// Scoped sequences (independent counters per scope)
-await app.sequences.next('receipt', { scope: 'store-A' })  // 'receipt-0001'
-await app.sequences.next('receipt', { scope: 'store-B' })  // 'receipt-0001'
-await app.sequences.next('receipt', { scope: 'store-A' })  // 'receipt-0002'
-```
-
-### app.sequences.current(name, config?)
-
-Returns the current counter value without incrementing it. Returns `0` for unused sequences.
-
-```typescript
-current(name: string, config?: { scope?: string }): Promise<number>
-```
-
-```typescript
-const count = await app.sequences.current('order')  // 0 (never used)
-await app.sequences.next('order')
-await app.sequences.next('order')
-const count2 = await app.sequences.current('order') // 2
-```
-
-### app.sequences.reset(name, config?)
-
-Resets a sequence counter. The next call to `.next()` starts from 1 (or from the specified value).
-
-```typescript
-reset(name: string, config?: { scope?: string; to?: number }): Promise<void>
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `config.scope` | `string` | `undefined` | Only reset the counter for this scope. |
-| `config.to` | `number` | `0` | Reset the counter to this value. |
-
-```typescript
-await app.sequences.reset('order')          // Next .next() returns 'order-0001'
-await app.sequences.reset('order', { to: 100 })  // Next .next() returns 'order-0101'
+await app.sequences.next('order') // 'order-0001' (unique on this device only)
+await app.sequences.next('receipt', { scope: 'store-1', format: 'R-{date}-{node4}-{seq}' })
+// 'R-20261003-a1b2-0001' (unique across devices)
 ```
 
 ---
 
-## State Machine Validation
+## State machine validation
 
-The store validates state machine transitions during local mutations, preventing invalid transitions before operations are created. State machines are defined in the schema with a set of allowed transitions between states.
+Local writes enforce state machines (see [State Machines](/guide/state-machines)). The helpers are
+exported for custom write paths:
 
-### validateStateTransition(collectionName, recordId, stateMachine, currentState, newState)
-
-Validates whether a state transition is allowed by the state machine definition. Called during update operations to enforce transition rules.
-
+<!-- docs-check: skip signature -->
 ```typescript
 function validateStateTransition(
   collectionName: string,
   recordId: string,
   stateMachine: StateMachineDefinition,
-  currentState: string | null,
+  currentState: string | null,   // null for an insert (always valid)
   newState: string,
 ): { valid: boolean; allowedStates: string[] }
-```
+// Invalid with onInvalidTransition 'reject': throws InvalidStateTransitionError.
+// Invalid with 'last-valid-state': returns { valid: false }.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `collectionName` | `string` | Name of the collection (for error messages). |
-| `recordId` | `string` | The record being mutated (for error messages). |
-| `stateMachine` | `StateMachineDefinition` | The state machine definition with transitions and `onInvalidTransition` policy. |
-| `currentState` | `string \| null` | The current state field value. `null` for inserts. |
-| `newState` | `string` | The new state value being set. |
-
-**Returns:** `{ valid: boolean; allowedStates: string[] }` -- Whether the transition is valid, plus the list of allowed target states from the current state.
-
-**Behavior:**
-
-| Scenario | Result |
-|----------|--------|
-| Insert (`currentState` is `null`) | Always valid. Schema validation ensures the value is a valid enum. |
-| Same-state transition | Always valid (idempotent). |
-| Valid transition | Returns `{ valid: true }` with allowed states. |
-| Invalid transition, mode `'reject'` | Throws `InvalidStateTransitionError`. |
-| Invalid transition, mode `'last-valid-state'` | Returns `{ valid: false }` so the caller can suppress the field update. |
-
-```typescript
-import { validateStateTransition } from '@korajs/store'
-
-const result = validateStateTransition(
-  'orders',
-  'order-123',
-  {
-    field: 'status',
-    onInvalidTransition: 'reject',
-    transitions: {
-      pending: ['shipped', 'cancelled'],
-      shipped: ['delivered'],
-      cancelled: [],
-      delivered: [],
-    },
-  },
-  'pending',
-  'shipped',
-)
-// result.valid === true
-// result.allowedStates === ['shipped', 'cancelled']
-```
-
-### validateUpdateStateMachine(collectionName, recordId, collectionDef, currentRecord, updateData)
-
-Higher-level validation that checks whether an update data object contains a change to the state machine field, and if so, validates the transition. This is the function called internally by the store during `.update()` operations.
-
-```typescript
 function validateUpdateStateMachine(
   collectionName: string,
   recordId: string,
@@ -540,395 +224,137 @@ function validateUpdateStateMachine(
   currentRecord: Record<string, unknown>,
   updateData: Record<string, unknown>,
 ): Record<string, unknown>
+// Returns updateData, without the state field when the transition is invalid
+// and the mode is 'last-valid-state'.
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `collectionName` | `string` | Name of the collection. |
-| `recordId` | `string` | The record being updated. |
-| `collectionDef` | `CollectionDefinition` | The collection definition from the schema. |
-| `currentRecord` | `Record<string, unknown>` | The current record data (must include the state field). |
-| `updateData` | `Record<string, unknown>` | The partial update data. |
-
-**Returns:** `Record<string, unknown>` -- The update data, potentially with the state field removed if the transition is invalid and the mode is `'last-valid-state'`.
-
-**Behavior:**
-
-- If the collection has no state machine, returns `updateData` unchanged.
-- If the state field is not in the update data, returns `updateData` unchanged.
-- If the transition is valid, returns `updateData` unchanged.
-- If the transition is invalid and mode is `'reject'`, throws `InvalidStateTransitionError`.
-- If the transition is invalid and mode is `'last-valid-state'`, returns a copy of `updateData` with the state field removed (silently suppresses the invalid change).
-
-```typescript
-import { validateUpdateStateMachine } from '@korajs/store'
-
-const filteredData = validateUpdateStateMachine(
-  'orders',
-  'order-123',
-  schema.collections.orders,
-  { id: 'order-123', status: 'delivered', total: 99 },
-  { status: 'pending', total: 150 },  // 'delivered' -> 'pending' is invalid
-)
-// With 'last-valid-state' mode: filteredData === { total: 150 }
-// (status change silently removed; total update preserved)
-```
-
-### InvalidStateTransitionError
-
-Error thrown when a local mutation attempts an invalid state transition (when the state machine's `onInvalidTransition` mode is `'reject'`). Extends `KoraError` with full context for debugging.
-
-```typescript
-class InvalidStateTransitionError extends KoraError {
-  readonly collection: string
-  readonly recordId: string
-  readonly field: string
-  readonly fromState: string
-  readonly toState: string
-  readonly allowedStates: string[]
-}
-```
-
-The error message includes the collection, field, current state, attempted state, and allowed transitions:
-
-```
-Invalid state transition in collection "orders": cannot transition field "status"
-from "delivered" to "pending". Allowed transitions from "delivered": (none -- terminal state)
-```
-
-The error code is `'INVALID_STATE_TRANSITION'`.
+`InvalidStateTransitionError` (`INVALID_STATE_TRANSITION`) has `collection`, `recordId`, `field`,
+`fromState`, `toState` and `allowedStates`.
 
 ---
 
-## Subscription Bloom Filter
+## App storage helpers
 
-The `SubscriptionBloomFilter` is an internal optimization used by the `SubscriptionManager` to reduce the cost of checking which subscriptions are affected by a mutation. It is mostly transparent to application developers, but understanding it can help when reasoning about performance characteristics.
-
-### How it works
-
-When the store has many active subscriptions (e.g., 1,000+), every mutation must check whether each subscription's result set might have changed. The bloom filter provides a fast O(k) pre-check:
-
-- If the filter returns `false` for a collection/field combination, the subscription is **definitely not affected** and can be skipped entirely.
-- If the filter returns `true`, the subscription **might be affected** and requires the full precise check.
-
-This reduces the per-mutation subscription check cost from O(n) to approximately O(1) for unrelated mutations, where n is the number of active subscriptions.
-
-### SubscriptionBloomFilter
-
-```typescript
-class SubscriptionBloomFilter {
-  constructor(expectedItems: number, falsePositiveRate?: number)
-
-  /** Add a collection (and optional field) to the filter */
-  add(collection: string, field?: string): void
-
-  /** Check if a collection (and optional field) might be in the filter */
-  mightContain(collection: string, field?: string): boolean
-
-  /** Reset the filter, clearing all bits */
-  clear(): void
-
-  /** Estimate the current false positive rate */
-  estimatedFalsePositiveRate(): number
-}
-```
-
-| Constructor Parameter | Type | Default | Description |
-|-----------------------|------|---------|-------------|
-| `expectedItems` | `number` | -- | Expected number of subscription keys. |
-| `falsePositiveRate` | `number` | `0.01` | Desired false positive rate (0 to 1). |
-
-The filter uses FNV-1a hashing with Kirsch-Mitzenmacker double hashing to derive multiple hash functions from two base hashes. Bit count and hash count are computed optimally based on the expected items and desired false positive rate.
-
-```typescript
-const filter = new SubscriptionBloomFilter(100, 0.01)
-filter.add('todos')
-filter.add('todos', 'completed')
-
-filter.mightContain('todos')              // true (definitely added)
-filter.mightContain('projects')           // false (definitely not added)
-filter.mightContain('todos', 'completed') // true (definitely added)
-filter.mightContain('todos', 'title')     // false (probably not added)
-```
-
-::: tip
-You do not need to interact with the bloom filter directly. The `SubscriptionManager` creates and manages it automatically. It activates when the number of subscriptions exceeds the threshold where bloom filter pre-checking provides a performance benefit.
-:::
+| Member | Description |
+|--------|-------------|
+| `app.storeInfo()` | `{ baseName, databaseName, authUserId, persistence, durable, isolationState }`, without reading records. |
+| `app.storage.listDatabases()` / `app.storage.deleteDatabase(name, { force? })` | Manage this origin's local databases. See [Storage Configuration](/guide/storage-configuration#managing-local-databases). |
+| `app.exportBackup()` / `app.importBackup()` | See [Backup and Restore](/guide/backup-restore). |
 
 ---
 
-## StorageAdapter
+## Storage adapters
 
-The `StorageAdapter` interface defines the contract for storage backends. Kora ships with three implementations. You do not typically implement this yourself unless building a custom storage backend.
+`createApp()` picks and opens the adapter; see
+[Storage Configuration](/guide/storage-configuration) for selection, durability, multi-tab
+behaviour and the `store` options. The adapters ship as separate entry points so a browser bundle
+never includes Node code:
 
+| Adapter id | Import | Class | Environment |
+|------------|--------|-------|-------------|
+| `'sqlite-wasm'` | `@korajs/store/sqlite-wasm` | `SqliteWasmAdapter` | Browser with OPFS (SQLite in a worker, `opfs-sahpool` VFS) |
+| `'indexeddb'` | `@korajs/store/indexeddb` | `IndexedDbAdapter` | Browser without usable OPFS |
+| `'better-sqlite3'` | `@korajs/store/better-sqlite3` | `BetterSqlite3Adapter` | Node.js, Electron |
+| `'tauri-sqlite'` | `@korajs/tauri` | | Tauri apps |
+
+Without `store.adapter`, Kora uses `tauri-sqlite` in Tauri, `better-sqlite3` in Node.js,
+`sqlite-wasm` in browsers with OPFS and `indexeddb` otherwise. A browser that cannot acquire OPFS
+at open falls back to IndexedDB (`store:storage-fallback`). When nothing durable can open, Kora
+emits `store:durability-lost` and refuses writes with `StorageDurabilityError`; it never runs in
+memory silently (`store: { allowNonDurable: true }` accepts that explicitly).
+
+A custom adapter implements `StorageAdapter`:
+
+<!-- docs-check: skip signature -->
 ```typescript
 interface StorageAdapter {
-  /** Open or create the database. */
   open(schema: SchemaDefinition): Promise<void>
-
-  /** Close the database and release resources. */
   close(): Promise<void>
-
-  /** Execute a write query (INSERT, UPDATE, DELETE) within a transaction. */
   execute(sql: string, params?: unknown[]): Promise<void>
-
-  /** Execute a read query (SELECT). */
   query<T>(sql: string, params?: unknown[]): Promise<T[]>
-
-  /** Execute multiple operations atomically. */
   transaction(fn: (tx: Transaction) => Promise<void>): Promise<void>
-
-  /** Apply a schema migration. */
   migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
-
-  /** Optional post-open storage state for adapters that can degrade at runtime. */
+  /** Post-open state of adapters that can degrade at runtime. */
   getStorageOpenState?(): StorageOpenState | null
-}
-
-interface Transaction {
-  execute(sql: string, params?: unknown[]): Promise<void>
-  query<T>(sql: string, params?: unknown[]): Promise<T[]>
+  /** Resolves once earlier commits are durable; required for adapters that persist asynchronously. */
+  ensureDurable?(): Promise<void>
 }
 ```
 
-### Built-in adapters
+### StoreConfig
 
-Each adapter is a class that implements `StorageAdapter`. Adapters ship as separate subpath entry points so that a browser bundle never pulls in Node-only code (and vice versa).
+The `Store` constructor's configuration, built by `createApp()`. You need it only when using
+`Store` directly (tests, custom runtimes).
 
-| Adapter | Import | Class | Environment | Notes |
-|---------|--------|-------|-------------|-------|
-| SQLite WASM + OPFS | `@korajs/store/sqlite-wasm` | `SqliteWasmAdapter` | Browser | Primary adapter. Runs SQLite in a Web Worker with OPFS persistence. Best performance. |
-| IndexedDB | `@korajs/store/indexeddb` | `IndexedDbAdapter` | Browser | Durable fallback adapter. Selected when OPFS is absent and used by `createApp()` when OPFS SyncAccessHandle cannot be acquired at runtime. |
-| Native SQLite | `@korajs/store/better-sqlite3` | `BetterSqlite3Adapter` | Node.js, Electron | Uses `better-sqlite3` for server-side and desktop applications. |
+| Field | Description |
+|-------|-------------|
+| `schema`, `adapter` | Required. `adapter` is a `StorageAdapter` instance. |
+| `dbName` | Database name (default `'kora-db'`). |
+| `isolation` | `'shared'` (one node id per database) or `'per-tab'`. |
+| `nodeId` | Fixed node id (otherwise loaded or generated). |
+| `emitter` | `KoraEventEmitter` for operation, merge, query and storage events. |
+| `secretKeyProvider` | Key for encrypted `t.secret()` fields. |
+| `operationTransforms` | Schema transforms applied at fold time (pass the sync engine's list). |
+| `maxOperationBytes` | Largest local operation (default 256 KiB, the server default). |
+| `materialization` | `'fold'` (default) or `'legacy'` (the 1.0.0-beta.12 merge, for comparison only; removed in a later release). |
+| `localMutationHandler`, `onQuerySubscribed` | Hooks used by `createApp()`. |
 
-The Tauri desktop adapter (`tauri-sqlite`) is provided by the separate `@korajs/tauri` package, not by `@korajs/store`.
+---
 
-### Selecting an adapter
+## Blobs
 
-At the application level, `createApp()` selects and configures an adapter for you. You can override the choice through the `store` option:
+A `t.blob()` field stores a content-addressed `BlobRef`; the bytes live in a blob store and move
+between devices over the sync connection, once per content hash.
+
+`app.blobs`:
+
+| Method | Description |
+|--------|-------------|
+| `put(bytes, { mimeType?, filename? })` | Stores the bytes and prepares them for transfer. Returns `{ ref, manifest }`; put `ref` in the record. |
+| `get(hash)` / `has(hash)` / `delete(hash)` | Local bytes. |
+| `pull(refOrManifest)` | Fetches the missing chunks over the live sync connection and verifies them. |
+| `gc({ dryRun? })` | Deletes local bytes no live record references. |
+| `store` | The underlying `ContentAddressedBlobStore`. |
 
 ```typescript
-const app = createApp({
-  schema,
-  store: {
-    adapter: 'sqlite-wasm',  // or 'indexeddb', 'better-sqlite3'
-    name: 'my-app-db',       // Database name (OPFS file name / IndexedDB name)
-  },
+const avatarSchema = defineSchema({
+  version: 1,
+  collections: { users: { fields: { name: t.string(), avatar: t.blob().optional() } } },
 })
+const avatarApp = createApp({ schema: avatarSchema })
+await avatarApp.ready
+
+const { ref } = await avatarApp.blobs.put(new Uint8Array([1, 2, 3]), { mimeType: 'image/png' })
+await avatarApp.users.insert({ name: 'Ada', avatar: ref })
 ```
 
-If no adapter is specified, Kora selects the best available adapter for the current environment:
+Every backend implements `ContentAddressedBlobStore` (`put`, `get`, `has`, `delete`, `size`,
+`list`). Reads are integrity-checked: bytes that do not hash to their key throw
+`BlobIntegrityError` (with `expectedHash` and `actualHash`).
 
-1. In browsers: `sqlite-wasm` when the OPFS API is present, otherwise the hand-written `indexeddb` adapter.
-2. In Node.js: `better-sqlite3`.
+| Class | Import | Persistence |
+|-------|--------|-------------|
+| `MemoryBlobStore` | `@korajs/store` | memory (tests) |
+| `OpfsBlobStore`, `createOpfsBlobStore(rootDirName = 'kora-blobs')` | `@korajs/store` | browser OPFS |
+| `FilesystemBlobStore(dir)` | `@korajs/store/blob-fs` | Node.js filesystem, sharded by hash prefix, atomic writes |
 
-Adapter selection starts up front, based on which APIs the runtime exposes. `createApp()` also checks the SQLite WASM adapter after open: if OPFS SyncAccessHandle cannot be acquired and the worker reports a non-persistent open, Kora closes it and opens the durable IndexedDB adapter instead. This emits `store:storage-fallback`. `store:opfs-unavailable` is reserved for the last-resort case where IndexedDB also cannot open and the store is running in memory.
+The server side of blob transfer is configured on the sync server; see
+[Production Server](/guide/production-server).
 
 ---
 
-## StoreConfig
+## Errors
 
-`StoreConfig` is the low-level configuration consumed by the `Store` constructor (exported from `@korajs/store`). `createApp()` builds one of these from its higher-level `store` option, so most applications never construct it directly.
+| Error | Code | Cause |
+|-------|------|-------|
+| `QueryError` | `QUERY_ERROR` | Invalid query (unknown include target, bad `orderBy` direction, bad `limit`). |
+| `RecordNotFoundError` | `RECORD_NOT_FOUND` | `update` or `delete` of a missing record. |
+| `StorageDurabilityError` | `STORAGE_DURABILITY_LOST` | No durable storage; writes are refused. |
+| `StorageInUseError` | `STORAGE_IN_USE` | Deleting a database that is open in some tab or worker; close it everywhere and retry. |
+| `UnsyncedDataError` | `UNSYNCED_DATA` | Deleting a database with unsynced writes (without `force`). |
+| `StorageBackendMismatchError` | `STORAGE_BACKEND_MISMATCH` | The database's data lives in a backend this runtime cannot read (for example OPFS is unavailable now); Kora refuses to start an empty copy. |
+| `PersistenceError` | `PERSISTENCE_ERROR` | IndexedDB persistence failed. |
+| `InvalidStateTransitionError` | `INVALID_STATE_TRANSITION` | A local write the state machine forbids. |
 
-Unlike the `createApp` `store` option (where `adapter` is an identifier string such as `'sqlite-wasm'`), `StoreConfig.adapter` is a concrete `StorageAdapter` instance and is required.
-
-```typescript
-interface StoreConfig {
-  /** Schema definition for the store. */
-  schema: SchemaDefinition
-
-  /** A concrete storage adapter instance (not an identifier string). */
-  adapter: StorageAdapter
-
-  /** Database name used for per-tab node id keys. Defaults to 'kora-db'. */
-  dbName?: string
-
-  /**
-   * 'shared' (default): one node id per database in _kora_meta.
-   * 'per-tab': a unique node id per browser tab, via sessionStorage.
-   */
-  isolation?: StoreIsolation  // 'shared' | 'per-tab'
-
-  /** Optional node ID. If omitted, one is generated or loaded from the database. */
-  nodeId?: string
-
-  /** Optional event emitter. When provided, local mutations and storage diagnostics are emitted here. */
-  emitter?: KoraEventEmitter
-
-  /** Routes local mutations through a unified apply pipeline when provided. */
-  localMutationHandler?: LocalMutationHandler
-
-  /** Called when a reactive query subscription is registered (for sync query subsets). */
-  onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
-
-  /**
-   * Supplies the key used to encrypt encrypted secret fields at write time.
-   * Required only when the schema declares encrypted secret fields.
-   */
-  secretKeyProvider?: SecretKeyProvider
-}
-```
-
-`StoreIsolation` is exported as `type StoreIsolation = 'shared' | 'per-tab'`.
-
----
-
-## Blob storage
-
-`blob` fields do not carry their bytes in the operation log; they carry a small content-addressed `BlobRef` (hash, size, optional MIME type and filename). The bytes themselves live in a blob store keyed by the SHA-256 hash of the content, so identical content is stored once (dedup) and never re-synced to a peer that already holds that hash.
-
-### ContentAddressedBlobStore
-
-All blob backends implement this interface. Reads are integrity-checked: the returned bytes are verified to hash to the requested key, and a mismatch throws `BlobIntegrityError` rather than returning corrupt data.
-
-```typescript
-interface ContentAddressedBlobStore {
-  /** Store bytes and return their content-addressed reference. Storing content that already exists is a no-op that returns the same reference (dedup). */
-  put(bytes: Uint8Array, metadata?: BlobRefMetadata): Promise<BlobRef>
-
-  /** Retrieve the bytes for a hash, or null if absent. Throws BlobIntegrityError on a hash mismatch. */
-  get(hash: string): Promise<Uint8Array | null>
-
-  /** Whether the store holds content for the given hash. */
-  has(hash: string): Promise<boolean>
-
-  /** Remove the content for a hash. Returns whether anything was removed. */
-  delete(hash: string): Promise<boolean>
-
-  /** Number of distinct blobs held. */
-  size(): Promise<number>
-
-  /** List the hashes of every blob currently held (order unspecified). Used by garbage collection. */
-  list(): Promise<string[]>
-}
-```
-
-`BlobRef` and `BlobRefMetadata` come from `@korajs/core`:
-
-```typescript
-interface BlobRef {
-  hash: string          // hex-encoded SHA-256 of the bytes (the content address)
-  size: number          // size of the bytes
-  mimeType?: string
-  filename?: string
-  manifestHash?: string // present when the blob was stored for chunked transfer
-}
-
-interface BlobRefMetadata {
-  mimeType?: string
-  filename?: string
-}
-```
-
-### Implementations
-
-| Class | Import | Environment | Persistence |
-|-------|--------|-------------|-------------|
-| `MemoryBlobStore` | `@korajs/store` | Any | In-memory (non-persistent). Reference backend for tests. |
-| `OpfsBlobStore` | `@korajs/store` | Browser | Persistent, backed by the Origin Private File System. |
-| `FilesystemBlobStore` | `@korajs/store/blob-fs` | Node.js | Persistent, backed by the filesystem. |
-
-`MemoryBlobStore`, `OpfsBlobStore`, and `BlobIntegrityError` are exported from the package root (`@korajs/store`). `FilesystemBlobStore` is exported from the `@korajs/store/blob-fs` subpath only, which keeps its `node:fs` dependency out of browser bundles.
-
-### FilesystemBlobStore (Node.js)
-
-```typescript
-import { FilesystemBlobStore } from '@korajs/store/blob-fs'
-
-const blobs = new FilesystemBlobStore('/var/data/kora-blobs')
-
-const ref = await blobs.put(bytes, { mimeType: 'image/png', filename: 'avatar.png' })
-// ref: { hash, size, mimeType?, filename? }
-
-const back = await blobs.get(ref.hash)   // Uint8Array | null
-await blobs.has(ref.hash)                // boolean
-await blobs.delete(ref.hash)             // boolean
-await blobs.size()                       // number
-await blobs.list()                       // string[] of hashes
-```
-
-```typescript
-class FilesystemBlobStore implements ContentAddressedBlobStore {
-  constructor(dir: string)
-}
-```
-
-The constructor takes a single directory path. Blobs are stored at `<dir>/<hash[0:2]>/<hash>`, sharded by hash prefix so no single directory holds millions of entries. Writes are atomic (write to a temp file, then rename), so a crash mid-write cannot leave a half-written blob under a valid hash.
-
-### OpfsBlobStore (browser)
-
-```typescript
-import { OpfsBlobStore, createOpfsBlobStore, createOpfsBlobDirectory } from '@korajs/store'
-
-// Backed by real OPFS. rootDirName defaults to 'kora-blobs'.
-const blobs = await createOpfsBlobStore()
-```
-
-`OpfsBlobStore` is constructed from an `OpfsBlobDirectory`. In a browser, `createOpfsBlobStore(rootDirName = 'kora-blobs')` returns an `OpfsBlobStore` backed by real OPFS. `createOpfsBlobDirectory` and the `OpfsBlobDirectory` type are also exported for supplying a custom directory backend. Blobs are sharded by hash prefix, deduplicated, and integrity-verified on read, and they survive reloads.
-
-### BlobIntegrityError
-
-```typescript
-class BlobIntegrityError extends Error {
-  readonly expectedHash: string
-  readonly actualHash: string
-}
-```
-
-Thrown by `get()` when the bytes stored under a hash do not actually hash to that value (corruption or tampering).
-
----
-
-## Storage diagnostics
-
-Storage adapters can emit diagnostic events through the `KoraEventEmitter` passed to them (via `StoreConfig.emitter`, or the `emitter` option of an adapter's options such as `SqliteWasmAdapterOptions`). These surface conditions that would otherwise fail silently. The event types are defined in `@korajs/core`.
-
-### store:storage-fallback
-
-Emitted by `createApp()` when OPFS persistence was requested but could not be acquired, and Kora recovered by opening the durable IndexedDB adapter instead. This event is informational: data still survives reloads.
-
-```typescript
-{
-  type: 'store:storage-fallback'
-  dbName: string
-  from: 'opfs' | 'sqlite-wasm'
-  to: 'indexeddb'
-  reason: 'lock-conflict' | 'timeout' | 'unsupported'
-  message: string
-}
-```
-
-### store:opfs-unavailable
-
-Emitted only when OPFS persistence was requested, IndexedDB fallback could not open, and the store fell back to a NON-PERSISTENT in-memory database. Anything written in the session is lost on reload. The event is emitted instead of failing silently so the data-loss condition is observable.
-
-```typescript
-{
-  type: 'store:opfs-unavailable'
-  dbName: string
-  reason: 'lock-conflict' | 'timeout' | 'unsupported'
-  message: string
-}
-```
-
-| `reason` | Meaning |
-|----------|---------|
-| `'lock-conflict'` | Another runtime on this origin already holds the OPFS pool for this database. |
-| `'timeout'` | The VFS install did not complete in time (common in headless CI). |
-| `'unsupported'` | The runtime has no usable OPFS. |
-
-### Other storage events
-
-- `store:db-name-collision`: emitted by the SQLite WASM adapter when another runtime on this origin was already using this database name, so this runtime attached to it as a follower and now shares that database.
-- `store:quota-exceeded`: emitted by the IndexedDB adapter when a write fails because the storage quota was exceeded.
-
-To receive any of these, pass an emitter when constructing the adapter:
-
-```typescript
-import { SqliteWasmAdapter } from '@korajs/store/sqlite-wasm'
-
-const adapter = new SqliteWasmAdapter({
-  workerUrl: '/sqlite-wasm-worker.js',
-  emitter,  // KoraEventEmitter; storage diagnostics are emitted here
-})
-```
+The [Error Codes reference](/api/errors#store) lists every store code, including the worker and
+adapter errors.
