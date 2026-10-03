@@ -188,6 +188,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			collection: 'todos',
 			message: 'Stored unverified.',
 		},
+		'sync:forged-duplicate': {
+			type: 'sync:forged-duplicate',
+			nodeId: 'node-a',
+			operationId: 'op-1',
+			collection: 'todos',
+			message: 'Refused.',
+		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
 		'sync:suspended': { type: 'sync:suspended', reason: 'auth-required' },
 		'sync:apply-blocked': {
