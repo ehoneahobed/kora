@@ -3030,6 +3030,66 @@
    ],
    "pr": null,
    "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not caught by rounds 1-2; made a permanent divergence by the RT-71 fix (server stores the beta.13 update with the cleared fields null). Locations: store/src/store/store.ts:1055 ensureMaterialization (mode 'log' rebuilds every row from the log), store/src/fold/rematerialize.ts, beta.13 op log (JSON.stringify drops undefined members; previousData keeps the key), sync/src/engine/verify-inbound.ts restoreUndefinedFromPrevious (the rule exists, used by the server only). Confirmed against the real beta.13 build (33bca46) with scripts/remediation/rt3-upgrade-clear-probe.mjs: update(id, { assignee: undefined, title }) and update(id, { assignee: undefined }) both revert to the old value after the upgrade; a nested undefined member does not. The device holds the server's copy's id already, so the server's null never reaches it. Repro packages/store/tests/repro/RT-83.test.ts (beta.13 database shape built with materialization 'legacy' and the JSON beta.13 logged). Required fix: when folding an undeclared (version-1) update of a local legacy node, apply the same rebuild the server applies (every previousData key absent from data is a clear), or rewrite such ops in the log once at the upgrade (same id: null and undefined hash identically under version 1); add an upgrade test from a real beta.13 database. FIXED (Phase 3 round 4, root-cause redesign, 2026-10-03, branch worktree-agent-af8fad6cada9c5f74, commit 44f11ed). core canonicalizeLegacyOperation (a version-1 update's previousData key absent from data is a clear -> null, also for null data) is applied by mergeOp, so the server, peers and a device re-folding its own beta.13 log at the upgrade fold the same body; sync verify-inbound restoreUndefinedFromPrevious delegates to it. The server refuses (INVALID_OPERATION_ID) a version-1 update whose id verifies only WITHOUT that clear (no Kora client writes it), so authorization and the fold always see one body. Real beta.13 build (33bca46): scripts/remediation/rt3-upgrade-clear-probe.mjs extended with a sync phase (beta.13 writes synced, and offline then uploaded after the upgrade; a fresh beta.14 peer joins): all 3 cases same locally and converged (upgraded device, peer, server) in both sync modes. Repro RT-83 passes."
+  },
+  {
+   "id": "RT-84",
+   "title": "An honest re-upload of an operation the server stored through a schema transform is refused FORGED_DUPLICATE (terminal): the stored copy has transformed data and no hashVersion, so the RT-77 identity check never matches; the device then re-folds without its own write while the server and every peer keep it",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-84.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Regression of the RT-77 fix (commit fca23ce) combined with transformForServerSchema. Locations: server/src/session/client-session.ts:2844-2861 (transformForServerSchema stores the TRANSFORMED op under the original id and strips hashVersion), :2431-2440 (duplicate path: refuseForgedDuplicate when !isSameStoredOperation), server/src/session/duplicate-identity.ts:35-41 (upload.hashVersion 2 !== stored version 1 -> false; otherwise contentKey compares the transformed data/schemaVersion with the original). Triggers: any re-upload of an own op the server stored transformed: an acknowledgment lost after the batch committed (the device re-sends its unacked queue every session; the server's vector is never trusted as an ack, RT-12), and an app upgrade with unacked old-schema ops. Effect: FORGED_DUPLICATE is non-retriable and not in NON_TERMINAL_REJECTION_CODES, so the device records a terminal marker and Store.recordTerminalRejections re-folds the record WITHOUT the write ('the server never stored these operations'); the server and peers keep it; the device holds the id, so it never applies the server's copy: permanent divergence and a write lost on its author. Both a beta.14 writer (hash v2) and a beta.13 writer (protocol 1) are refused. By code reading, a second trigger: a beta.13 protocol-1 encrypted payload (ciphertext inside data, re-encrypted with a fresh IV per upload) accepted by a server without required encryption or with allowPlaintextMigration is refused FORGED_DUPLICATE on every re-upload. Repro packages/server/tests/repro/RT-84.test.ts (memory store; same code path on every store). Required fix: compare a duplicate against what the client SENT, not what the server stored after rewriting it: persist the as-uploaded identity (or its content key) beside a transformed copy, or compare a transformed stored copy on (id, node, sequence, type, collection, recordId, timestamp) only; never treat a body the server itself rewrote (transform, restored legacy data, protocol-1 ciphertext) as evidence of forgery."
+  },
+  {
+   "id": "RT-85",
+   "title": "A server schema transform that drops a field from an update's data now clears that field on the server and on every peer: the transformed copy is stored without hashVersion, and mergeOp folds every undeclared update with canonicalizeLegacyOperation (a previousData key absent from data is a clear)",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-85.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Regression of the round-4 canonical body (commit 44f11ed: canonicalizeLegacyOperation applied in mergeOp) combined with transformForServerSchema stripping hashVersion. Locations: core/src/fold/fold.ts:398, core/src/operations/canonical-body.ts:260-270 (any op without hashVersion 2 and no envelope is 'legacy'), server/src/session/client-session.ts:2844-2861. The OperationTransform contract (core/src/migration/operation-transform.ts) and docs speak of rewriting data only; a transform that stops older clients from writing a field (delete data.score) leaves score in previousData, and every replica folds the stored copy as score: null. Before round 4 the copy did not touch score. Repro packages/server/tests/repro/RT-85.test.ts. Required fix: apply the legacy clear rule only to genuine beta.13 bodies (mark them at ingest, e.g. a 'legacy' body flag or hashVersion 1 declared by the server only when the id verified WITH the restore), never to server-transformed copies; or have transformForServerSchema drop from previousData every key the transform removed from data."
+  },
+  {
+   "id": "RT-86",
+   "title": "A local write larger than the server's maxOperationBytes (default 256 KiB) is accepted by the API and then wedges the device's upload stream for good: the server answers with a session-level OPERATION_TOO_LARGE error and stops acknowledging the batch, the device re-sends it every session, and no later write of that device reaches the server or a peer",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-86.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression (no client-side size check exists; the server path is older). Locations: server/src/session/client-session.ts:2560-2569 (validateOperationSize -> sendError('OPERATION_TOO_LARGE', ..., false) and canAdvanceAck = false, not a per-op operation-rejected), server/src/session/session-operation-limits.ts:4 (DEFAULT_MAX_OPERATION_BYTES 256 KiB); store/sync: no size check before the write is accepted. Repro packages/test/tests/repro/RT-86.test.ts: a 300 KiB string field, then a small insert; after three reconnects the peer has neither, and A has no rejection recorded (the app is told nothing about which write is at fault). Required fix: refuse the oversized operation terminally and per operation (operation-rejected OPERATION_TOO_LARGE, retriable false, ack advances past it), and/or refuse it in the local API before it is written (the limit advertised in the handshake), so one write can never block every later one."
+  },
+  {
+   "id": "RT-87",
+   "title": "A t.timestamp() value the API accepts does not fit the Postgres server store's BIGINT column: a fractional timestamp is refused UNSTORABLE_VALUE and the record vanishes from the writing device; one beyond the BIGINT range (1e20) fails the batch unmapped and wedges the device's upload stream",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-87.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 4, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 4). Not a round-4 regression. Locations: core/src/schema/validation.ts (timestamp: any finite number), server/src/store/materialization.ts fieldTypeToSql ('timestamp' -> BIGINT on Postgres), server/src/store/postgres-server-store.ts:160-187 (PG_UNSTORABLE_VALUE_CODES = 22021, 22P05, 22P02: a fractional value fails 22P02 and is refused terminally; 1e20 fails 22003 numeric_value_out_of_range, not mapped, so the batch fails and is re-sent every session). Memory and SQLite server stores and every client store hold both values. Repro packages/test/tests/repro/RT-87.test.ts (KORA_PG_TEST_URL): fractional -> A shows only the next write, rejection UNSTORABLE_VALUE; 1e20 -> B receives nothing, A has no rejection. Required fix: define the timestamp domain once and enforce it where the value is written (validateFieldValue: a safe integer, or round in the canonical body), so every store holds every accepted value; map every Postgres value refusal (SQLSTATE class 22) to a per-operation terminal refusal, never a failed batch."
   }
  ],
  "rejectedProposalPins": {
