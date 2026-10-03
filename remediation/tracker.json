@@ -1612,14 +1612,14 @@
    "severity": "P2",
    "workstream": "W11",
    "phase": 4,
-   "status": "in_progress",
+   "status": "fixed",
    "tests": [
     {
      "tsc": "kora/tests/repro/types/DX-2.ts"
     }
    ],
    "pr": null,
-   "notes": "Types landed: where() typed per field with operators (comparisons only on number/string), orderBy keyof record incl. id/createdAt/updatedAt, include() limited to schema relations and returning the row augmented with the singular parent (| null) or plural children, typed transaction proxy (TypedTransactionProxy<S>), t.object/t.array carry inner types, default(value) typed by the field. TypedQueryBuilder extends the store QueryBuilder so useQuery & co accept it. Probe's useCollection case now uses createKoraHooks<typeof app>() from korajs/react (the only way a hook can know the schema); it stays red until the React bindings branch adds createKoraHooks (contract: derive from App['collections'])."
+   "notes": "Types landed: where() typed per field with operators (comparisons only on number/string), orderBy keyof record incl. id/createdAt/updatedAt, include() limited to schema relations and returning the row augmented with the singular parent (| null) or plural children, typed transaction proxy (TypedTransactionProxy<S>), t.object/t.array carry inner types, default(value) typed by the field. TypedQueryBuilder extends the store QueryBuilder so useQuery & co accept it. Probe's useCollection case now uses createKoraHooks<typeof app>() from korajs/react (the only way a hook can know the schema); it stays red until the React bindings branch adds createKoraHooks (contract: derive from App['collections']). VERIFIED FIXED (Phase 4 integration, 2026-10-03, branch worktree-agent-a59f71e9346b34bbf): korajs/react re-exports createKoraHooks (kora/src/react.ts); tsc probes DX-1 and DX-2 compile clean (check.mjs --tsc). Flagship template react-tailwind-sync moved to the typed path (src/kora.ts: createKoraHooks<typeof app>(); todos module typed by typeof app.todos), verified by scaffold + tsc --noEmit with a negative probe + vite build; pinned by cli template-manifests and create-flow tests."
   },
   {
    "id": "DX-3",

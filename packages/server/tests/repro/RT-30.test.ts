@@ -6,27 +6,29 @@
  * also keyed off DATABASE_URL (unlike every other Postgres test, KORA_PG_TEST_URL) and
  * reused one schema, so a second run found the first run's rows.
  *
- * Needs no database: postgres.js connects lazily, so loading the driver and building the
- * store must succeed against an address nothing listens on.
+ * Needs no database: pointed at an address nothing listens on, the driver must load and
+ * reach the network. Since RT-88 createPostgresServerStore awaits startup, so it rejects
+ * with SERVER_STORE_UNAVAILABLE whose cause is the driver's ECONNREFUSED (before RT-30 it
+ * was "requires the postgres package": the driver never loaded).
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, test } from 'vitest'
-import {
-	PostgresServerStore,
-	createPostgresServerStore,
-} from '../../src/store/postgres-server-store'
+import { createPostgresServerStore } from '../../src/store/postgres-server-store'
 
 describe('RT-30: Postgres tests run under vitest', () => {
 	test('createPostgresServerStore loads the postgres driver inside the vitest runner', async () => {
-		const store = await createPostgresServerStore({
+		const failure = await createPostgresServerStore({
 			connectionString: 'postgres://kora:kora@127.0.0.1:1/kora_rt30',
 			nodeId: 'rt30',
-		})
-		expect(store).toBeInstanceOf(PostgresServerStore)
-		// The driver is live: the first query reaches the network (and nothing listens there).
-		await expect(store.getOperationCount()).rejects.toMatchObject({ code: 'ECONNREFUSED' })
-		await store.close().catch(() => {})
+		}).then(
+			() => null,
+			(error: unknown) => error,
+		)
+		// The driver is live: startup reached the network (and nothing listens there).
+		expect(failure).toMatchObject({ code: 'SERVER_STORE_UNAVAILABLE' })
+		expect((failure as { cause?: unknown }).cause).toMatchObject({ code: 'ECONNREFUSED' })
+		expect(String((failure as Error).message)).not.toMatch(/requires the "postgres" package/)
 	})
 
 	test('the parity suite runs on KORA_PG_TEST_URL, one fresh schema per store', () => {
