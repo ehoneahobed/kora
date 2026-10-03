@@ -375,7 +375,7 @@ Sent by the client to initiate sync.
 | `versionVector` | `Record<string, number>` | Client's current version vector |
 | `schemaVersion` | `number` | Client schema version |
 | `authToken` | `string?` | Optional auth token |
-| `supportedWireFormats` | `WireFormat[]?` | `['json', 'protobuf']` |
+| `supportedWireFormats` | `WireFormat[]?` | `['json']`. Protobuf is never advertised (SYNC-9); the server ignores the offer and reports the format its transport frames with. |
 | `lastDeliverySequence` | `number?` | Client's persisted [delivery watermark](../guide/sync-configuration.md#delivery-guarantees-server-to-client). When present, the server resumes the gap-free server-to-client stream from just after it. Omitted (or 0) on first sync. |
 
 ### `HandshakeResponseMessage`
@@ -652,7 +652,7 @@ const serializer = new JsonMessageSerializer()
 
 ### `ProtobufMessageSerializer`
 
-Encodes messages as compact binary protobuf using `protobufjs/minimal`. Decodes `Uint8Array` / `ArrayBuffer` payloads.
+Encodes messages as compact binary protobuf using `protobufjs/minimal`. Decodes `Uint8Array` / `ArrayBuffer` payloads. Lossless for every message type: members without a native protobuf field ride in envelope field 49 (`extJson`). It is not negotiated; configure it explicitly on both ends of a transport.
 
 ```typescript
 const serializer = new ProtobufMessageSerializer()

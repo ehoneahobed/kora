@@ -801,7 +801,10 @@ export class SyncEngine {
 				versionVector: versionVectorToWire(localVector),
 				schemaVersion: this.config.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
 				authToken,
-				supportedWireFormats: ['json', 'protobuf'],
+				// JSON only (SYNC-9): the transports frame with their own serializer, so a
+				// negotiated protobuf switch would never reach the wire. Protobuf stays an
+				// explicit, both-ends transport choice.
+				supportedWireFormats: ['json'],
 				...(this.config.scopeMap ? { syncScope: this.config.scopeMap } : {}),
 				...(this.config.scopeExit ? { scopeExitPolicy: this.config.scopeExit } : {}),
 				...(activeQuerySubsets.length > 0 ? { syncQueries: activeQuerySubsets } : {}),
