@@ -8,6 +8,7 @@ export { PACKAGE_MANAGERS, TEMPLATES, TEMPLATE_INFO } from './types'
 // === Errors ===
 export {
 	CliError,
+	DeployPlatformUnavailableError,
 	DevServerError,
 	InvalidProjectError,
 	ProjectExistsError,
@@ -29,7 +30,9 @@ export { generateTypes } from './commands/generate/type-generator'
 export { deployCommand } from './commands/deploy/deploy-command'
 export {
 	DEPLOY_PLATFORMS,
+	IMPLEMENTED_DEPLOY_PLATFORMS,
 	isDeployPlatform,
+	isImplementedDeployPlatform,
 	type ContextAwareDeployAdapter,
 	type BuildArtifacts,
 	type DeployAdapter,

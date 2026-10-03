@@ -882,7 +882,7 @@ describe('SyncEngine handshake', () => {
 		expect(firstMsg?.nodeId).toBe('node-a')
 		expect(firstMsg?.versionVector).toEqual({ 'node-a': 5, 'node-b': 3 })
 		expect(firstMsg?.schemaVersion).toBe(2)
-		expect(firstMsg?.supportedWireFormats).toEqual(['json', 'protobuf'])
+		expect(firstMsg?.supportedWireFormats).toEqual(['json'])
 	})
 
 	test('negotiates selected wire format from handshake response', async () => {
@@ -927,7 +927,8 @@ describe('SyncEngine handshake', () => {
 		await engine.start()
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
-		expect(serverMsgs[0]?.supportedWireFormats).toContain('protobuf')
+		// SYNC-9: protobuf is never advertised, the transports frame with their own serializer.
+		expect(serverMsgs[0]?.supportedWireFormats).toEqual(['json'])
 	})
 
 	test('sends auth token when auth is provided', async () => {

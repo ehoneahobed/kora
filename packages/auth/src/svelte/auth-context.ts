@@ -2,7 +2,9 @@ import { getContext, setContext } from 'svelte'
 import { type AuthSession, createAuthSession } from '../bindings/create-auth-session'
 import type { AuthClient, AuthState } from '../client/auth-client'
 
-const authContextKey = Symbol('korajs-auth-context')
+// Registered key: AuthProvider.svelte is compiled from src/ while useAuth comes from dist/,
+// so two copies of this module exist in an app and must share the key.
+const authContextKey = Symbol.for('@korajs/auth:svelte-auth-context')
 
 export interface AuthContextValue {
 	client: AuthClient

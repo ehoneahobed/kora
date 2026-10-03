@@ -21,6 +21,51 @@ When your app performs a mutation (insert, update, delete), Kora does three thin
 
 There is no "offline mode" to enable. The app is always offline-capable.
 
+## Opening the App Offline: the App Shell
+
+Kora keeps your **data** on the device, but the browser also needs the app's **interface**
+(HTML, JavaScript, CSS, the SQLite WASM) to open with no network. Every web template
+created by `create-kora-app` ships a service worker for that, generated at build time by
+the `koraServiceWorker()` Vite plugin:
+
+```typescript
+// vite.config.ts
+import { koraServiceWorker } from '@korajs/cli/vite'
+
+export default defineConfig({
+  plugins: [react(), crossOriginIsolation(), sqliteWasmHotfix(), koraServiceWorker()],
+})
+```
+
+- **Production builds only.** `vite build` writes `dist/sw.js` and registers it from
+  `index.html`. In `vite dev` nothing is registered, and any stale Kora worker on the dev
+  origin is removed.
+- **Precache:** the built shell and every hashed asset, the sqlite WASM, the OPFS proxy and
+  your `public/` files, in a cache versioned by their content (`kora-shell-<version>`).
+  Old versions are deleted when a new one activates.
+- **Navigations** are network first (4 s timeout) with the cached shell as the fallback, so
+  online users always get the latest deploy and offline users still get the app.
+- **Hashed assets** are cache first; everything else is network first with a cache
+  fallback (an unhashed `sqlite3.wasm` is never served stale next to new JavaScript).
+- **Never cached:** the sync endpoint (`/kora-sync`), auth routes (`/auth`), and
+  `/__kora`, `/health`. Change the list with `koraServiceWorker({ bypass: [...] })`.
+- **Updates:** a new deploy installs in the background and waits. The page shows "A new
+  version is available. Reload"; only when the user accepts does it activate and reload, so
+  one page never mixes old and new assets. To use your own UI, pass
+  `koraServiceWorker({ updatePrompt: false })` and handle the event:
+
+```typescript
+window.addEventListener('kora:update-available', (event) => {
+  event.preventDefault() // also suppresses the built-in prompt when updatePrompt is true
+  showMyToast({ onReload: () => (event as CustomEvent).detail.update() })
+})
+```
+
+The production server's static headers are designed to work with it (see
+[Production server](./production-server.md#static-files-and-the-offline-app-shell)).
+The `tauri-react` template has no service worker: its interface is embedded in the
+desktop binary and always opens offline.
+
 ## Optimistic Mutations
 
 All mutations in Kora are optimistic. When you call `app.todos.insert(...)`, the record appears in the local store and in any reactive queries immediately, before the operation syncs to the server.

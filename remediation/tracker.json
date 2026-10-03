@@ -636,14 +636,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "SYNC-9.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit 78ba24e). Decision: make protobuf correct AND stop negotiating it. ProtobufMessageSerializer is lossless for every message type: members without a native slot (syncQueries, deltaCursor, supportedSchemaMin/Max, supportsHeartbeat, heartbeatIntervalMs, cursor, totalBatches, syncScope, the awareness/Yjs bodies, and any future field) ride in envelope field 49 extJson ({set, unset}), computed by decoding the native bytes, so decode(encode(m)) equals the JSON wire by construction; awareness-update and yjs-doc-update could not be decoded at all before. Negotiation removed: the sync engine advertises supportedWireFormats ['json'] only; the server reports the format its transport frames with (framingWireFormat) and no longer calls setWireFormat on the server-wide shared serializer (which flipped every session's format at once). Tests: repro SYNC-9; sync protocol/protobuf-lossless.test.ts (fast-check over all 12 message types incl. Phase 2/3 fields, 200 runs each, plus the ArrayBuffer path); inverted sync-engine.test.ts and client-session.test.ts expectations."
   },
   {
    "id": "SYNC-10",
@@ -932,11 +932,14 @@
    "severity": "P3",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-SRV-1.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "VERIFIED FIXED by the Phase 3 fold (SRV-7, RT-84): MemoryServerStore.applyRemoteOperation merges the one new op into the record's stored fold state (mergeIntoRecord, O(fields touched)); the REFOLD_REQUIRED fallback and previewOperation read only that record's recordOps; rebuildMaterializedRecord (the O(log) scan) no longer exists. Pinned by the deterministic acceptance test server/tests/repro/NEW-SRV-1.test.ts (commit c8939a0, branch worktree-agent-ad402b32a39fa07d9): the fold functions are wrapped and, with 2,000 ops of OTHER records in the log, every op handed to the fold during 20 writes and a preview belongs to the written record."
   },
   {
    "id": "NEW-SRV-2",
@@ -1040,7 +1043,7 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "LMS-13.test.ts",
@@ -1048,7 +1051,7 @@
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit 6d15792). New server/src/server/static-files.ts used by createProductionServer: ETag (per representation) + Last-Modified and 304 on If-None-Match / If-Modified-Since; brotli/gzip for compressible types (a pre-compressed .br/.gz sibling when present, else compressed once into a bounded in-memory cache) with Vary: Accept-Encoding; Cache-Control public, max-age=31536000, immutable ONLY for content-hashed names (last -/. token of 8+ [A-Za-z0-9_] with an uppercase letter or digit: never sqlite3.wasm, sqlite3-opfs-async-proxy.js, index.html, sw.js or the manifest), no-cache otherwise; 404 (no-store) for missing files under /assets/ and for non-navigation requests, SPA fallback only for Accept: text/html or Sec-Fetch-Mode: navigate; MIME table incl. .webmanifest (application/manifest+json), .mjs, .wasm, with charsets; GET/HEAD only (405); decoded paths cannot escape staticDir. Tests: repro LMS-13 (correct behaviour, all green), server src/server/static-files.test.ts (28). Docs: guide/production-server.md (static files, CDN at scale)."
   },
   {
    "id": "STORE-1",
@@ -1699,14 +1702,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-8.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit f040250). Decision: label and refuse (no Docker artifacts-only adapter in beta.13: the generated Dockerfile is only exercised through the Fly/Railway/AWS flows). Prompt labels 'Render (coming soon)' and 'Docker (self-hosted, coming soon)' (Kora Cloud already was); IMPLEMENTED_DEPLOY_PLATFORMS + isImplementedDeployPlatform; any other platform (flag, stored state or prompt pick) throws DeployPlatformUnavailableError before any Dockerfile or deploy state is written, naming the working platforms and the self-host path. Tests: repro DX-8; deploy-command.test.ts (render/docker/kora-cloud refused up front in --confirm mode and from the interactive prompt, nothing written)."
   },
   {
    "id": "DX-9",
@@ -1744,11 +1747,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-DX-2.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit 78ba24e). Decision: delete. DynamicProtobufSerializer (sync/src/protocol/dynamic-serializer.ts, 643 lines, never exported or imported, could not encode an envelope) removed; docs updated. Repro sync/tests/repro/NEW-DX-2.test.ts: the module is gone and every class implementing MessageSerializer in the sync package is exported from its entry."
   },
   {
    "id": "NEW-DX-3",
@@ -1756,14 +1762,14 @@
    "severity": "P1",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "browser": "NEW-DX-3"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit 1de1757). In-house Vite plugin koraServiceWorker() exported as @korajs/cli/vite (no vite-plugin-pwa/Workbox: a ~150-line worker with Kora-specific rules; templates already devDepend on @korajs/cli). Build only: walks dist after the bundle (closeBundle order post, after the template's sqlite copy) and writes dist/sw.js precaching the shell (index.html, hashed assets, hashed sqlite WASM, OPFS proxy, public files; unhashed byte-identical copies deduped) into kora-shell-<content version>; activate deletes other kora-shell-* caches and claims. Navigations network-first with a 4 s timeout, falling back to the cached shell; content-hashed files cache-first; everything else network-first with cache fallback (an unhashed sqlite3.wasm is never served cache-first); /kora-sync, /auth, /__kora, /health never handled. Update flow: install never skips waiting; the injected registration shows a reload prompt (or dispatches cancelable kora:update-available with detail.update()); only an accepted update posts KORA_SW_SKIP_WAITING and reloads on controllerchange; hourly and on-visibility update checks. Dev: nothing registered, stale Kora workers unregistered. All 12 web templates add it last in plugins; tauri-react embeds its frontend in the binary (offline by construction, no worker). Repro server/tests/repro/browser/NEW-DX-3.offline-shell.mjs now scaffolds react-basic with the built CLI, builds it with Vite and checks in real Chromium (12 checks): online load, precache contents, sync/auth never cached, offline reload with the server STOPPED, local data readable, offline cold start in a new tab, offline write, new build -> prompt -> accepted update reloads into v2 with the old cache dropped and local data intact. Unit: cli src/vite/service-worker.test.ts. Docs: guide/offline-patterns.md (app shell), guide/production-server.md. Also verified across ALL 12 web templates (scaffolded from packed local packages with pnpm 12, installed, built, served by createProductionServer, real Chromium: render, write, offline reload with the server stopped shows the data); that run found and fixed (commits ea83043, 613ddb1, 6e523f7, 4438a1b) pnpm 11+ install failure (ERR_PNPM_IGNORED_BUILDS), untyped VITE_AUTH_URL breaking tsc in react-sync/react-tailwind-sync/tauri-react, svelte constant_assignment compile error (Biome useConst), missing tsx devDependency for kora dev in 4 templates, unpublished @lucide/svelte ^0.468.0, @korajs/svelte and @korajs/auth tarballs missing the sources their .svelte entries import, and Svelte context Symbol() keys split between src/ and dist/ copies (\"Kora context missing\" in every Svelte app)."
   },
   {
    "id": "NEW-DX-4",
@@ -2240,11 +2246,14 @@
    "severity": "P3",
    "workstream": "W10",
    "phase": 4,
-   "status": "open",
-   "tests": [],
-   "acceptance": "Write a repro when the workstream starts.",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-30.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": "Found during RT-27 Postgres verification."
+   "notes": "Found during RT-27 Postgres verification. FIXED (Phase 4, 2026-10-03, branch worktree-agent-ad402b32a39fa07d9, commit 61749cb). Root cause: loadPostgresDeps used new Function('specifier','return import(specifier)'), which escapes vitest's module runner (no dynamic-import callback in its VM) and hid the real error behind \"requires the postgres package\". Now a real import() of non-literal specifiers (bundlers still never resolve the optional peer; checked in the tsup ESM and CJS output) that keeps the cause in the message. server-store-parity.test.ts runs its live block on KORA_PG_TEST_URL (DATABASE_URL still accepted) with a fresh schema per store via search_path, dropped afterwards, so reruns never see earlier rows. Repro server/tests/repro/RT-30.test.ts needs no database (postgres.js connects lazily: the store builds and its first query reaches the network). Not run against a live Postgres in this session (no credentials for the local cluster). The same Function-import pattern remains in auth postgres-user-store.ts and postgres-oauth-store.ts and in cli migration-runner.ts (not on vitest paths today)."
   },
   {
    "id": "RT-31",

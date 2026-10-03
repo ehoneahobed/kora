@@ -63,8 +63,8 @@
   },
   "files": [
     "dist",
-    "src/svelte/AuthProvider.svelte",
-    "src/svelte/OrgProvider.svelte"
+    "src",
+    "!src/**/*.test.ts"
   ],
   "scripts": {
     "build": "tsup",

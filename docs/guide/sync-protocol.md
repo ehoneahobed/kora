@@ -74,6 +74,18 @@ Envelope (`SyncEnvelope`, static serializer):
 | 46 | `authoritativeNodeIds` | repeated string | handshake-response |
 | 47 | `protocolVersion` | uint32 | handshake, handshake-response |
 | 48 | `revokedAuthoritativeNodeIds` | repeated string | handshake-response |
+| 49 | `extJson` | string (JSON `{ set?, unset? }`) | any message |
+
+Field 49 makes the protobuf wire lossless for every message type (SYNC-9): the encoder
+writes each member with a native slot natively, then carries every member the native
+slots did not reproduce exactly (for example `syncQueries`, `deltaCursor`,
+`supportedSchemaMin/Max`, and the awareness and Yjs message bodies) in `extJson`. A
+protobuf round trip therefore decodes to exactly what the JSON wire decodes to.
+
+Protobuf is **not negotiated**. Clients advertise `supportedWireFormats: ['json']`, and the
+server's `selectedWireFormat` reports the format its transport actually frames with
+(JSON unless the server was built with a protobuf serializer). Use
+`ProtobufMessageSerializer` only as an explicit choice on both ends of a transport.
 
 Operation (`SyncOperation`, nested in envelope field 11):
 
@@ -86,9 +98,8 @@ Operation (`SyncOperation`, nested in envelope field 11):
 
 Older decoders skip fields 14-16 and 46-47 as unknown fields. `atomicOps`,
 `transactionId`, `mutationName` and `fieldVersions` still ride in the data JSON; an
-operation without data now carries `atomicOps` there too. The schema-driven
-`DynamicProtobufSerializer` (unused) carries the three operation fields in the data JSON
-(`__kora_hash_version__`, `__kora_fold_state__`, `__kora_encrypted__`).
+operation without data now carries `atomicOps` there too. (The unused schema-driven
+`DynamicProtobufSerializer` was removed in 1.0.0-beta.13, NEW-DX-2.)
 
 ## Compatibility matrix
 

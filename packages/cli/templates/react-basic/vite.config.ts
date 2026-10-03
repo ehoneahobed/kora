@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { koraServiceWorker } from '@korajs/cli/vite'
 import react from '@vitejs/plugin-react'
 import type { Plugin } from 'vite'
 import { defineConfig } from 'vite'
@@ -70,8 +71,10 @@ function sqliteWasmHotfix(): Plugin {
 	}
 }
 
+// koraServiceWorker() (build only, keep it last): precaches the built app shell so the
+// app opens offline, with a "new version available" reload prompt. See @korajs/cli/vite.
 export default defineConfig({
-	plugins: [react(), crossOriginIsolation(), sqliteWasmHotfix()],
+	plugins: [react(), crossOriginIsolation(), sqliteWasmHotfix(), koraServiceWorker()],
 	worker: {
 		format: 'es',
 	},

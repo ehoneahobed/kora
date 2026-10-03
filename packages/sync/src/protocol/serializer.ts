@@ -353,16 +353,34 @@ function withFieldVersions(raw: unknown): { fieldVersions?: Record<string, HLCTi
 /**
  * Protobuf-based serializer for sync messages.
  */
+/**
+ * Protobuf message serializer.
+ *
+ * Lossless by construction (SYNC-9): fields with a native protobuf slot are written there;
+ * every other top-level member of the message (fields added after the native mapping,
+ * and the bodies of the JSON-shaped awareness and Yjs messages) travels in the `extJson`
+ * envelope field (49). Decoding therefore yields exactly what the JSON wire would, for
+ * every message type, which a property test over every message type pins.
+ *
+ * It is not negotiated: the sync engine advertises `['json']` only and the server
+ * reports the format its transport actually frames with. Use it explicitly, on both
+ * ends of a transport, or not at all.
+ */
 export class ProtobufMessageSerializer implements MessageSerializer {
 	encode(message: SyncMessage): Uint8Array {
 		const envelope = toProtoEnvelope(message)
-		return encodeEnvelope(envelope)
+		const native = encodeEnvelope(envelope)
+		// Decode what the native slots carried and ship everything they lost (or invented,
+		// such as a defaulted field the message never had) in the extension field.
+		const ext = residualFields(message, fromProtoEnvelope(decodeEnvelope(native)))
+		if (ext === undefined) return native
+		return encodeEnvelope({ ...envelope, extJson: JSON.stringify(ext) })
 	}
 
 	decode(data: string | Uint8Array | ArrayBuffer): SyncMessage {
 		const bytes = toBytes(data)
 		const envelope = decodeEnvelope(bytes)
-		return fromProtoEnvelope(envelope)
+		return applyResidualFields(fromProtoEnvelope(envelope), envelope.extJson)
 	}
 
 	encodeOperation(op: Operation): SerializedOperation {
@@ -521,6 +539,86 @@ interface ProtoEnvelope {
 	protocolVersion?: number
 	/** Field 48 (repeated): revoked explicit authoritative node ids (handshake-response, RT-81). */
 	revokedAuthoritativeNodeIds?: string[]
+	/**
+	 * Field 49: JSON `{ set?: {...}, unset?: [...] }` of the top-level message members the
+	 * native fields do not carry losslessly (SYNC-9). Absent when the native fields suffice.
+	 */
+	extJson?: string
+}
+
+interface ResidualFields {
+	set?: Record<string, unknown>
+	unset?: string[]
+}
+
+/**
+ * The difference between a message as the JSON wire carries it and what the native
+ * protobuf fields decoded to: members to set, and members the decoder invented.
+ */
+function residualFields(message: SyncMessage, decoded: SyncMessage): ResidualFields | undefined {
+	const want = JSON.parse(JSON.stringify(message)) as Record<string, unknown>
+	const got = JSON.parse(JSON.stringify(decoded)) as Record<string, unknown>
+	const set: Record<string, unknown> = {}
+	const unset: string[] = []
+	for (const [key, value] of Object.entries(want)) {
+		if (!(key in got) || stableStringify(got[key]) !== stableStringify(value)) set[key] = value
+	}
+	for (const key of Object.keys(got)) {
+		if (!(key in want)) unset.push(key)
+	}
+	const hasSet = Object.keys(set).length > 0
+	if (!hasSet && unset.length === 0) return undefined
+	return { ...(hasSet ? { set } : {}), ...(unset.length > 0 ? { unset } : {}) }
+}
+
+function applyResidualFields(message: SyncMessage, extJson: string | undefined): SyncMessage {
+	if (extJson === undefined || extJson.length === 0) return message
+	let ext: unknown
+	try {
+		ext = JSON.parse(extJson)
+	} catch {
+		throw new SyncError('Failed to decode sync message: invalid protobuf extension JSON', {
+			length: extJson.length,
+		})
+	}
+	if (typeof ext !== 'object' || ext === null || Array.isArray(ext)) {
+		throw new SyncError('Failed to decode sync message: protobuf extension is not an object', {
+			type: message.type,
+		})
+	}
+	const out: Record<string, unknown> = { ...message }
+	const { set, unset } = ext as { set?: unknown; unset?: unknown }
+	if (Array.isArray(unset)) {
+		for (const key of unset) if (typeof key === 'string') delete out[key]
+	}
+	if (typeof set === 'object' && set !== null && !Array.isArray(set)) {
+		for (const [key, value] of Object.entries(set)) {
+			// The extension may never change what kind of message this is.
+			if (key === 'type') continue
+			out[key] = value
+		}
+	}
+	if (!isSyncMessage(out)) {
+		throw new SyncError('Failed to decode sync message: invalid message structure', {
+			receivedType: message.type,
+		})
+	}
+	return out
+}
+
+/** JSON with object keys sorted, so equal values compare equal whatever their key order. */
+function stableStringify(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+	if (typeof value === 'object' && value !== null) {
+		const entries = Object.keys(value)
+			.sort()
+			.map(
+				(key) =>
+					`${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`,
+			)
+		return `{${entries.join(',')}}`
+	}
+	return JSON.stringify(value) ?? 'null'
 }
 
 function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
@@ -840,6 +938,18 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 			}
 		case 'heartbeat':
 			return { type: 'heartbeat', messageId: envelope.messageId }
+		case 'awareness-update':
+			// The body travels in the extension field (49); these are its empty defaults.
+			return { type: 'awareness-update', messageId: envelope.messageId, clientId: 0, states: {} }
+		case 'yjs-doc-update':
+			return {
+				type: 'yjs-doc-update',
+				messageId: envelope.messageId,
+				collection: '',
+				recordId: '',
+				field: '',
+				update: '',
+			}
 		default:
 			throw new SyncError('Failed to decode sync message: unknown protobuf type', {
 				type: envelope.type,
@@ -1104,6 +1214,8 @@ function encodeEnvelope(envelope: ProtoEnvelope): Uint8Array {
 	if (envelope.protocolVersion !== undefined) writer.uint32(376).uint32(envelope.protocolVersion)
 	// Field 48 (repeated string, wiretype 2): 48 << 3 | 2 = 386.
 	for (const nodeId of envelope.revokedAuthoritativeNodeIds ?? []) writer.uint32(386).string(nodeId)
+	// Field 49 (string, wiretype 2): 49 << 3 | 2 = 394.
+	if (envelope.extJson) writer.uint32(394).string(envelope.extJson)
 	return writer.finish()
 }
 
@@ -1263,6 +1375,9 @@ function decodeEnvelope(bytes: Uint8Array): ProtoEnvelope {
 					...(envelope.revokedAuthoritativeNodeIds ?? []),
 					reader.string(),
 				]
+				break
+			case 49:
+				envelope.extJson = reader.string()
 				break
 			default:
 				reader.skipType(tag & 7)

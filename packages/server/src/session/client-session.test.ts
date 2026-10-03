@@ -140,7 +140,9 @@ describe('ClientSession', () => {
 				// of its operations (RT-45).
 				expect(response.versionVector).toEqual({ 'node-a': 5, 'client-1': 0 })
 				expect(response.nodeId).toBe(store.getNodeId())
-				expect(response.selectedWireFormat).toBe('protobuf')
+				// SYNC-9: the server reports the format its transport frames with (JSON by
+				// default), never the client's offer.
+				expect(response.selectedWireFormat).toBe('json')
 			}
 		})
 

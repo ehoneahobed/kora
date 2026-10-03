@@ -33,6 +33,7 @@ import {
 	NegotiatedMessageSerializer,
 	PLAINTEXT_REJECTED,
 	PROTOCOL_V1_DEPRECATED,
+	ProtobufMessageSerializer,
 	SCHEMA_MISMATCH_PREFIX,
 	SYNC_PROTOCOL_VERSION,
 	type SyncQuerySubset,
@@ -2097,8 +2098,10 @@ export class ClientSession {
 			}
 		}
 
-		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
-		this.setSerializerWireFormat(selectedWireFormat)
+		// Report the format the transport actually frames with, never one the client merely
+		// offered (SYNC-9). The serializer is shared by every session on the server, so a
+		// per-session switch would flip the wire format of every other session too.
+		const selectedWireFormat = framingWireFormat(this.serializer)
 
 		if (!isClientSchemaVersionSupported(msg.schemaVersion, this.supportedSchemaVersions)) {
 			const { min, max } = this.supportedSchemaVersions
@@ -4049,12 +4052,6 @@ export class ClientSession {
 		this.sendToClient(rejectedMsg)
 	}
 
-	private setSerializerWireFormat(format: WireFormat): void {
-		if (typeof this.serializer.setWireFormat === 'function') {
-			this.serializer.setWireFormat(format)
-		}
-	}
-
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
@@ -4076,11 +4073,13 @@ function recordCacheKey(collection: string, recordId: string): string {
  */
 type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEntry?: boolean }
 
-function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
-	if (supportedWireFormats?.includes('protobuf')) {
-		return 'protobuf'
-	}
-
+/**
+ * The wire format a serializer frames messages with: its own report when it has one, protobuf
+ * for the fixed protobuf serializer, and JSON otherwise.
+ */
+function framingWireFormat(serializer: MessageSerializer): WireFormat {
+	if (typeof serializer.getWireFormat === 'function') return serializer.getWireFormat()
+	if (serializer instanceof ProtobufMessageSerializer) return 'protobuf'
 	return 'json'
 }
 

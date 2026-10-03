@@ -363,6 +363,62 @@ describe('deployCommand', () => {
 		).rejects.toThrow(/Missing app name in --confirm mode/)
 	})
 
+	test.each(['render', 'docker', 'kora-cloud'])(
+		'refuses coming-soon platform %s before writing anything (DX-8)',
+		async (platform) => {
+			const { deployCommand } = await import('./deploy-command')
+			await expect(
+				(deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+					asRunContext({
+						args: {
+							_: [],
+							platform,
+							app: 'my-app',
+							region: 'iad',
+							reset: false,
+							confirm: true,
+							prod: false,
+						},
+						rawArgs: [],
+						cmd: deployCommand,
+					}),
+				),
+			).rejects.toThrow(/coming soon[\s\S]*fly, railway, aws-ecs, aws-lightsail/)
+			expect(mockWriteDockerfileArtifact).not.toHaveBeenCalled()
+			expect(mockWriteDeployState).not.toHaveBeenCalled()
+		},
+	)
+
+	test('an interactive pick of a coming-soon platform is refused too (DX-8)', async () => {
+		mockCreatePromptClient.mockReturnValue({
+			text: vi.fn(),
+			select: vi.fn().mockResolvedValue('render'),
+			confirm: vi.fn(),
+			intro: vi.fn(),
+			outro: vi.fn(),
+		})
+		const original = process.stdout.isTTY
+		const originalIn = process.stdin.isTTY
+		Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true })
+		Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true })
+		try {
+			const { deployCommand } = await import('./deploy-command')
+			await expect(
+				(deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+					asRunContext({
+						args: { _: [], reset: false, confirm: false, prod: false },
+						rawArgs: [],
+						cmd: deployCommand,
+					}),
+				),
+			).rejects.toThrow(/coming soon/)
+			expect(mockWriteDockerfileArtifact).not.toHaveBeenCalled()
+		} finally {
+			Object.defineProperty(process.stdout, 'isTTY', { value: original, configurable: true })
+			Object.defineProperty(process.stdin, 'isTTY', { value: originalIn, configurable: true })
+		}
+	})
+
 	test('rollback uses adapter with saved state context', async () => {
 		mockReadDeployState.mockResolvedValue({
 			platform: 'fly',

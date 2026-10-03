@@ -11,6 +11,24 @@ export class CliError extends KoraError {
 }
 
 /**
+ * Thrown when `kora deploy` targets a platform whose adapter is not implemented yet
+ * (DX-8). Raised before any artifact or deploy state is written.
+ */
+export class DeployPlatformUnavailableError extends KoraError {
+	constructor(
+		public readonly platform: string,
+		public readonly available: readonly string[],
+	) {
+		super(
+			`Deploying to "${platform}" is coming soon and not available yet. Choose one of: ${available.join(', ')}. To self-host, run the production server (\`pnpm build && pnpm start\`) in any Node 20+ environment.`,
+			'DEPLOY_PLATFORM_UNAVAILABLE',
+			{ platform, available },
+		)
+		this.name = 'DeployPlatformUnavailableError'
+	}
+}
+
+/**
  * Thrown when the target project directory already exists.
  */
 export class ProjectExistsError extends KoraError {
