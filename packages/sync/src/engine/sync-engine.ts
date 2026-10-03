@@ -329,7 +329,7 @@ export class SyncEngine {
 	 * loaded from persistence on start. See {@link SyncEngine.getAuthoritativeNodeIds}.
 	 */
 	private authoritativeNodeIds: string[] | null = null
-	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
+	/** Protocol version of the server in the current session (1 for a beta.12-era server). */
 	private serverProtocolVersion = 1
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
@@ -2695,18 +2695,15 @@ export class SyncEngine {
 
 		const streaming = this.state === 'streaming'
 		await this.recordReceivedBatch(msg, isDeliveryBatch, fullyApplied, received, operations)
-		// A protocol-1 server (beta.12 and older) derives no cascades, so no server copy
-		// ever confirms the provisional effects of a remote delete (RT-69). A streaming
-		// device settles them at the end of every fully applied batch, exactly as at a
-		// catch-up; otherwise it kept them until its next reconnect while every device that
-		// received the same delete during a catch-up did not (RT-91).
-		if (
-			streaming &&
-			this.serverProtocolVersion < SYNC_PROTOCOL_VERSION &&
-			msg.isFinal &&
-			(!isDeliveryBatch || fullyApplied)
-		) {
-			await this.settleAfterCatchUp()
+		// A streaming device is caught up again at the end of every fully applied final
+		// batch, so it settles the provisional effects of remote deletes (RT-69) there too,
+		// exactly as at a catch-up. A server copy that confirms an effect is stored with
+		// its delete and arrives with it; an effect no copy confirms (a protocol-1 server,
+		// beta.12 and older, derives no cascades, RT-91; a delete this server derived
+		// nothing for, RT-92) was otherwise kept until the next reconnect, while every
+		// device that received the same delete during a catch-up dropped it.
+		if (streaming && msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
+			await this.settleAfterCatchUp({ provisionalOnly: true })
 		}
 		this.notifyStatusChange()
 	}
@@ -2840,7 +2837,7 @@ export class SyncEngine {
 			)
 		}
 
-		// A beta.13 clear the id proves (delivered by a beta.13 server, which stored the
+		// A beta.12 clear the id proves (delivered by a beta.12 (or older) server, which stored the
 		// body without it) is made explicit before the body is stored (RT-85): the fold
 		// folds bodies as written.
 		op = await canonicalizeProvenLegacyClear(op)
@@ -2936,10 +2933,10 @@ export class SyncEngine {
 	 * (RT-68). A failure is reported, never fatal: both are retried on the next
 	 * catch-up.
 	 */
-	private async settleAfterCatchUp(): Promise<void> {
+	private async settleAfterCatchUp(options?: { provisionalOnly?: boolean }): Promise<void> {
 		if (!this.store.settleAfterCatchUp) return
 		try {
-			await this.store.settleAfterCatchUp()
+			await this.store.settleAfterCatchUp(options)
 		} catch (error) {
 			this.emitter?.emit({
 				type: 'store:persistence-error',

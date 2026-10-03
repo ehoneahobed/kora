@@ -403,6 +403,9 @@ describe('RT-68: row snapshots', () => {
 		await adapter.execute(
 			`INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('fold_snapshot_resync', 'pending')`,
 		)
+		// A stream batch that is not the end of a resync settles no snapshot (RT-91).
+		expect(await store.settleAfterCatchUp({ provisionalOnly: true })).toBe(0)
+		expect(await store.getSnapshotRecords()).toHaveLength(1)
 		expect(await store.settleAfterCatchUp()).toBe(1)
 		expect(await store.getSnapshotRecords()).toEqual([])
 		expect(await store.collection('items').findById('rec-1')).toMatchObject({ score: 1 })
