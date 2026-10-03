@@ -138,7 +138,25 @@ export {
 	mergeOp,
 } from './fold/fold'
 export { deserializeFoldState, serializeFoldState } from './fold/serialize'
-export { createSnapshotState, type FoldSnapshotInput } from './fold/snapshot'
+export {
+	adaptFoldState,
+	createSnapshotState,
+	type AdaptedFoldState,
+	type FoldSnapshotInput,
+	type FoldSnapshotOptions,
+} from './fold/snapshot'
+export {
+	foldPlanFingerprint,
+	foldPlanFingerprints,
+	mismatchedFoldFields,
+} from './fold/plan'
+export {
+	RESERVED_NODE_ID_PREFIX,
+	SERVER_NODE_ID_PREFIX,
+	isAuthoritativeNodeId,
+	isReservedNodeId,
+	isServerNodeId,
+} from './fold/authority'
 export { toMergeTrace } from './fold/trace'
 export { deriveSideEffectOpId } from './fold/side-effect-id'
 export { FoldConfigurationError, FoldStateError } from './fold/errors'
