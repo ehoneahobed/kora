@@ -5,11 +5,12 @@ description: "Adjudicate untrusted client operations before they become authorit
 
 # Server-side operation validation
 
-By default every operation a client syncs is trusted: it materializes on the
-server and fans out to other clients. That is the right default when every client
-is one of your own users writing their own data. It is the wrong default the
-moment a client is untrusted: a public form, an anonymous submission, a
-multi-tenant boundary where one tenant must not be able to write another's data.
+The sync server always enforces authentication, server-granted scopes, node ownership, the value
+domain, operation size, rate limits and cross-record constraints (see
+[Authentication](/guide/authentication)). Beyond that, every operation a client syncs is accepted:
+it materializes on the server and fans out to other clients. That is the right default when every
+client is one of your own users writing their own data. Add your own policy when a client is
+untrusted: a public form, an anonymous submission, a business rule such as an approval workflow.
 
 `validateOperation` lets the server adjudicate each untrusted operation before it
 becomes authoritative. You own the policy; the framework owns running it at the
@@ -19,7 +20,19 @@ right point and routing its decision so nothing diverges and nothing is lost.
 
 Pass `validateOperation` in `syncOptions` (or directly to `KoraSyncServer`). It
 runs at sync ingestion, after HLC ordering and the built-in guards (timestamp,
-rate, size), and before the operation is materialized.
+rate, size), and before the operation is materialized. It receives the operation
+and `{ auth, kora }`: the session's `AuthContext` (`null` when anonymous) and the
+trusted data plane (`kora.findById`, `kora.query`, `kora.apply`,
+`kora.applyConditional`), the same one routes get as `request.kora`. With
+[schema transforms](/guide/schema-design#devices-on-older-versions-transforms-at-fold-time),
+the operation is its view for the server's schema version.
+
+<!-- docs-check-prelude
+import { SqliteServerStore } from '@korajs/server'
+declare const store: SqliteServerStore
+declare const url: string
+declare function showRejection(collection: string, recordId: string, message: string): void
+-->
 
 ```typescript
 import { createProductionServer } from '@korajs/server'
@@ -31,7 +44,7 @@ const server = createProductionServer({
       // Anonymous connections have ctx.auth === null.
       if (op.collection === 'submissions') {
         const form = await ctx.kora.findById('forms', (op.data as { formId: string }).formId)
-        if (!form || form.closedAt < Date.now()) {
+        if (!form || Number(form.closedAt) < Date.now()) {
           return { action: 'reject', code: 'WINDOW_CLOSED', message: 'This form is closed' }
         }
         return { action: 'accept' }
@@ -63,7 +76,7 @@ where resubmitting the identical operation might later succeed.
 
 A rejected operation is not silently lost and not retried forever. On the client,
 Kora diverts it out of the pending outbound queue into a durable rejected store
-and emits a `sync:operation-rejected` event. Since beta.14 the submitter's record
+and emits a `sync:operation-rejected` event. Since beta.13 the submitter's record
 is re-folded without the refused operation, so its view matches the server and every
 other device (an inserted record that was refused disappears; a refused edit is
 undone, while concurrent accepted edits stay). The operation itself is kept in the
@@ -71,11 +84,17 @@ rejected store and the local log, so the app can show the reason and let the use
 edit and resubmit. (Writes you discard from a held node with `discardHeld` are not
 rolled back: they only stop uploading.)
 
+<!-- docs-check: continue -->
 ```typescript
+import { createApp, defineSchema, t } from 'korajs'
+
+const schema = defineSchema({ version: 1, collections: { submissions: { fields: { formId: t.string() } } } })
 const app = createApp({ schema, sync: { url } })
 
 // React to rejections as they happen.
-app.sync?.subscribeStatus(() => {}) // status also reflects the drop in pending count
+app.on('sync:operation-rejected', (event) => {
+  console.warn(event.code, event.message, event.retriable)
+})
 
 // Or read the durable list (survives a page refresh) and reconcile.
 const rejected = await app.sync?.getRejectedOperations()
@@ -102,13 +121,14 @@ syncs their own. The validator reads the raw submission, and on success authors 
 NEW server-side operation into the owner-visible `formResponses` collection, then
 ignores the raw one:
 
+<!-- docs-check: skip a validateOperation option shown out of its server config -->
 ```typescript
 validateOperation: async (op, ctx) => {
   if (op.collection !== 'submissions') return { action: 'accept' }
 
   const data = op.data as { formId: string; answers: unknown }
   const form = await ctx.kora.findById('forms', data.formId)
-  if (!form || form.closedAt < Date.now()) {
+  if (!form || Number(form.closedAt) < Date.now()) {
     return { action: 'reject', code: 'WINDOW_CLOSED', message: 'This form is closed' }
   }
 
