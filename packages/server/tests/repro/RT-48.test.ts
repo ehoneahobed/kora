@@ -19,7 +19,7 @@ import { createServerTransportPair } from '../../src/transport/memory-server-tra
  * reports W:1 at its next handshake; `collectDeltaOperations` asks
  * `getOperationRange(W, 2, max)`, which can never return Y@(W, 1). Before Phase 2 the
  * pair could only come from beta.12 history (pre-epoch); since RT-37 the server keeps
- * creating new pairs for every beta.13 writer, so mixed fleets diverge permanently on
+ * creating new pairs for every beta.12 writer, so mixed fleets diverge permanently on
  * the vector clients. The live relay only covers a peer that happens to be connected.
  *
  * Asserts the CORRECT behaviour (fails today on every store): the vector client gets Y.
@@ -126,8 +126,8 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 				m.type === 'operation-batch' ? (m.operations as Operation[]).map((op) => op.id) : [],
 			)
 
-		const writer = await login('beta13-device', { lastDeliverySequence: 0 })
-		const x = makeOp('beta13-device', 1, 'x')
+		const writer = await login('beta12-device', { lastDeliverySequence: 0 })
+		const x = makeOp('beta12-device', 1, 'x')
 		writer.send({
 			type: 'operation-batch',
 			messageId: 'b1',
@@ -143,8 +143,8 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 		first.close()
 		await tick()
 
-		// Offline meanwhile: the beta.13 writer's concurrent transaction lands as a pair.
-		const y = makeOp('beta13-device', 1, 'y')
+		// Offline meanwhile: the beta.12 writer's concurrent transaction lands as a pair.
+		const y = makeOp('beta12-device', 1, 'y')
 		writer.send({
 			type: 'operation-batch',
 			messageId: 'b2',
@@ -153,12 +153,12 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 			batchIndex: 0,
 		} as SyncMessage)
 		await tick(60)
-		expect((await store.getOperationRange('beta13-device', 1, 1)).map((o) => o.id).sort()).toEqual(
+		expect((await store.getOperationRange('beta12-device', 1, 1)).map((o) => o.id).sort()).toEqual(
 			[x.id, y.id].sort(),
 		)
 
 		// The vector client reconnects reporting what it holds.
-		const again = await login('beta12-peer', { versionVector: { 'beta13-device': 1 } })
+		const again = await login('beta12-peer', { versionVector: { 'beta12-device': 1 } })
 		await tick(100)
 		expect(delivered(again.messages)).toContain(y.id)
 	})

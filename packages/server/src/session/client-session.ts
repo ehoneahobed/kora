@@ -1768,7 +1768,20 @@ export class ClientSession {
 		if (await store.claimNode(nodeId, owner)) return issued
 		if (!store.getNodeClaimOwner || !store.replaceNodeClaim) return { ok: false }
 		const current = await store.getNodeClaimOwner(nodeId)
-		if (current === null) return { ok: false }
+		if (current === null) {
+			// History with no claim row: written before node claims existed (a database a
+			// beta.12 or older server wrote; RT-91). Such an anonymous device is a legacy
+			// anonymous claim exactly like the shared `kora:anonymous` owner below: adopted
+			// only with allowLegacyAnonymousClaims, provisionally, with a token for clients
+			// that can keep one. The release and the claim are separate steps, so of two
+			// concurrent claimants one wins and the other is refused (and rotates).
+			if (!this.allowLegacyAnonymousClaims || !store.releaseNodeClaim) return { ok: false }
+			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
+			if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
+			if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			this.warnLegacyAnonymousClaim(nodeId)
+			return issued
+		}
 		const pending = parsePendingOwner(current)
 		let legacy = false
 		if (pending) {
@@ -1785,20 +1798,23 @@ export class ClientSession {
 			return { ok: false }
 		}
 		if (!(await store.replaceNodeClaim(nodeId, current, owner))) return { ok: false }
-		if (legacy) {
-			this.logger?.log({
-				timestamp: Date.now(),
-				level: 'warn',
-				event: 'session.legacy_anonymous_claim',
-				sessionId: this.sessionId,
-				nodeId,
-				details: {
-					message:
-						'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
-				},
-			})
-		}
+		if (legacy) this.warnLegacyAnonymousClaim(nodeId)
 		return issued
+	}
+
+	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
+	private warnLegacyAnonymousClaim(nodeId: string): void {
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.legacy_anonymous_claim',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				message:
+					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+			},
+		})
 	}
 
 	/**

@@ -227,12 +227,16 @@ Older decoders skip unknown fields. The unused `DynamicProtobufSerializer` was r
 
 ## Compatibility
 
-Upgrade sync servers first, then clients. Checked with
-`node scripts/remediation/protocol-v2-compat.mjs <protocol-1 build>` (run against the protocol-1
-build 33bca46) plus the unit and integration suites.
+Upgrade sync servers first, then clients. Verified against the last published release,
+1.0.0-beta.12 (tag `v1.0.0-beta.12`), with
+`node scripts/remediation/compat-beta12.mjs <beta12-build>` (clients and servers both ways,
+databases upgraded in place, mixed fleets under chaos; results in
+`remediation/evidence/compat-beta12.md`) and
+`node scripts/remediation/protocol-v2-compat.mjs <beta12-build>`, plus the unit and integration
+suites.
 
 | Client | Server | Result |
 |---|---|---|
 | protocol 2 | protocol 2 | Full protocol 2: ids verified on both sides, encrypted operations stored opaquely. |
-| protocol 1 (beta.12) | protocol 2 | Accepted for this release with a deprecation warning. Its version-1 operations are stored and relayed; protocol-2 clients converge with it. Its encrypted payloads (per-device keys) are refused by protocol-2 clients with encryption on. The beta.13 security rules apply to it too: the server grants scopes, the node must be claimable, and an HTTP long-poll client must be upgraded. |
+| protocol 1 (beta.12) | protocol 2 | Accepted for this release with a deprecation warning. Its version-1 ids are verified where beta.12's hash form can be rebuilt (`undefined` members, binary values, a `Date` inside a json value, which beta.12 hashed as `{}`) and the rest are stored and relayed unverified for its own node; protocol-2 clients converge with it. Until it upgrades, the beta.12 client itself keeps beta.12 merge semantics for concurrent edits (its first open of beta.13 re-folds every record). Its encrypted payloads (per-device keys) are refused by protocol-2 clients with encryption on. The beta.13 security rules apply to it too: the server grants scopes, the node must be claimable, and an HTTP long-poll client must be upgraded. |
 | protocol 2 | protocol 1 | Plaintext sync converges, but an old server drops `hashVersion` (relayed operations are treated as version 1) and `op.encrypted` (encrypted sync does not work: receivers quarantine). There is no key service (`KEY_SERVICE_UNSUPPORTED`). Do not run this way: upgrade the server first. |

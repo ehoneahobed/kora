@@ -190,7 +190,7 @@ describe('operationSchemaView (transforms at fold time, RT-84)', () => {
 
 describe('canonicalizeProvenLegacyClear (RT-85)', () => {
 	async function legacyUpdate(): Promise<Operation> {
-		// beta.13: update(id, { assignee: undefined, title: 'y' }) hashed assignee as null.
+		// beta.12: update(id, { assignee: undefined, title: 'y' }) hashed assignee as null.
 		const timestamp = { wallTime: 1000, logical: 0, nodeId: 'b13' }
 		const base = {
 			nodeId: 'b13',

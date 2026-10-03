@@ -404,10 +404,32 @@ younger than `anonymousClaimTtlMs` (default 24 hours). A device that is refused
 under it (event `sync:node-id-rotated`), so no write is lost.
 
 `allowLegacyAnonymousClaims` (default `true` in 1.0.0-beta.13, `false` from the next
-release) keeps clients without token support working: nodes held by the pre-release
-shared anonymous owner, and provisional claims that expired unconfirmed, are
-re-issued with a `session.legacy_anonymous_claim` warning in the log. Set it to
-`false` once every client is on beta.13 or later.
+release) keeps clients without token support working: nodes whose history predates
+node claims (every node of a database a beta.12 or older server wrote), nodes held by
+the pre-release shared anonymous owner, and provisional claims that expired
+unconfirmed, are re-issued with a `session.legacy_anonymous_claim` warning in the log.
+Set it to `false` once every client is on beta.13 or later. With `MixedAuthProvider`,
+a node with pre-claims history may also be a signed-in user's beta.12 device, which an
+anonymous device can then take (as it could on beta.12); set the option to `false` if
+that matters more than keeping anonymous beta.12 devices syncing.
+
+### Upgrading a beta.12 server database with authentication
+
+beta.12 and older servers recorded no node claims, so after the upgrade every node id
+in the database has history and no owner. A signed-in device is never handed such a
+node automatically (it could be another user's device), so its handshake is refused
+`NODE_ID_CLAIMED`:
+
+- A beta.13 client moves to a fresh node id and uploads its writes the old server
+  never acknowledged under it; what that server acknowledged stays under the old node
+  (the server already holds it). Nothing is lost and nothing is applied twice. Upgrade
+  clients when you upgrade the server.
+- A beta.12 client cannot change its node id: it keeps reconnecting and its unsynced
+  writes stay on the device until an administrator calls
+  `server.releaseNodeClaim(nodeId)` for that node (the next principal to connect with
+  it claims it). To keep beta.12 clients syncing through the upgrade, release their
+  node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
+  reconnect, accepting that the first principal to present a released node id gets it.
 
 A signed-in user's device whose node already has history from before node claims existed is
 refused with `NODE_ID_CLAIMED` until an administrator calls `server.releaseNodeClaim(nodeId)` on

@@ -168,7 +168,8 @@ function fieldPlanFor(
  * (RT-27) restates the record's current values, each produced at its own version
  * (`op.fieldVersions`): the field is stamped at exactly that version (tie-broken by
  * the entry's id), so it lands where its original writer did, never later. Raising
- * it to the entry's own timestamp (which a beta.12 server sets to the record's
+ * it to the entry's own timestamp (which a server of the unreleased Phase 1 build
+ * (33bca46) sets to the record's
  * newest write) would let the restated value beat a device's concurrent edit that
  * is newer than the field's real version (RT-67).
  *

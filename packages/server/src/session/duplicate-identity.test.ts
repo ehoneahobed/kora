@@ -49,10 +49,10 @@ describe('isSameStoredOperation (RT-77)', () => {
 		expect(isSameStoredOperation({ ...stored, id: 'other' }, stored)).toBe(false)
 	})
 
-	test('version 1: the fields a beta.13 id covers; a renumbered own op and restored nulls match', async () => {
+	test('version 1: the fields a beta.12 id covers; a renumbered own op and restored nulls match', async () => {
 		const base = await op({ previousData: { title: 'x', assignee: 'bob' } })
 		const { hashVersion: _v, ...legacy } = base
-		// The server stored the beta.13 clear with the field null and declared version 1.
+		// The server stored the beta.12 clear with the field null and declared version 1.
 		const stored: Operation = { ...legacy, data: { title: 'y', assignee: null }, hashVersion: 1 }
 		expect(isSameStoredOperation(legacy, stored)).toBe(true)
 		expect(isSameStoredOperation({ ...legacy, sequenceNumber: 9 }, stored)).toBe(true)

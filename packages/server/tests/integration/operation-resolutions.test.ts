@@ -552,16 +552,16 @@ describe.each(kinds)('operation resolutions: sessions (%s store)', (kind) => {
 	test('a version-vector client receives the second op of a legacy pair it straddles (RT-48)', async () => {
 		const store = await openStore(kind)
 		const { login } = await startServer(store)
-		const writer = await login('beta13', { sequenceReservation: false })
-		const x = makeOp('beta13', 1, 'x')
+		const writer = await login('beta12', { sequenceReservation: false })
+		const x = makeOp('beta12', 1, 'x')
 		writer.send(batch([x]))
 		await acked(writer, 1)
-		const y = makeOp('beta13', 1, 'y')
+		const y = makeOp('beta12', 1, 'y')
 		writer.send(batch([y]))
 		await acked(writer, 2)
 		const vectorClient = await login('beta12', {
 			lastDeliverySequence: undefined,
-			versionVector: { beta13: 1 },
+			versionVector: { beta12: 1 },
 		})
 		const delivered = vectorClient.messages.flatMap((m) =>
 			m.type === 'operation-batch' ? (m.operations as Operation[]).map((op) => op.id) : [],

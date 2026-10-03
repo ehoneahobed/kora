@@ -71,11 +71,11 @@ describe('terminal rejections (RT-36)', () => {
 		const insert =
 			'INSERT INTO _kora_sync_rejected (operation_id, collection, record_id, code, message, retriable, rejected_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
 		await adapter.execute(insert, ['refused', 'todos', 'r1', 'FORBIDDEN', 'no', 0, 1])
-		await adapter.execute(insert, ['beta13-pair', 'todos', 'r2', 'SEQUENCE_CONFLICT', 'dup', 0, 1])
+		await adapter.execute(insert, ['beta12-pair', 'todos', 'r2', 'SEQUENCE_CONFLICT', 'dup', 0, 1])
 		await adapter.execute(insert, ['transient', 'todos', 'r3', 'BUSY', 'later', 1, 1])
 		await seedTerminalRejectionsOnce(adapter)
 		expect([
-			...(await findTerminalRejections(adapter, ['refused', 'beta13-pair', 'transient'])),
+			...(await findTerminalRejections(adapter, ['refused', 'beta12-pair', 'transient'])),
 		]).toEqual(['refused'])
 		// The marker survives the app clearing its list, and seeding runs only once.
 		await adapter.execute('DELETE FROM _kora_sync_rejected')
@@ -94,18 +94,29 @@ describe('local node registry (RT-38, RT-40)', () => {
 		expect(nodes[0]?.held).toBe(false)
 	})
 
-	test('a node with sync history from an earlier release registers as accepted', async () => {
+	test('a node a claims-aware server accepted before the registry existed registers as accepted', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
 		await adapter.open(schema)
 		await adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'old')")
-		await adapter.execute(
-			"INSERT INTO _kora_meta (key, value) VALUES ('last_acked_server_vector', '{\"old\":4}')",
-		)
+		await saveOwnAckedThrough(adapter, 'old', 4)
 		await registerLocalNode(adapter, 'old')
 		await registerLocalNode(adapter, 'other')
 		const nodes = await listLocalNodes(adapter)
 		expect(nodes.find((n) => n.nodeId === 'old')?.accepted).toBe(true)
 		expect(nodes.find((n) => n.nodeId === 'other')?.accepted).toBe(false)
+		await adapter.close()
+	})
+
+	test('a node only a beta.12 (or older) server accepted is not accepted (RT-92)', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		await adapter.open(schema)
+		await adapter.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'old')")
+		// beta.12 kept the server's acknowledged vector, but its server recorded no claims.
+		await adapter.execute(
+			"INSERT INTO _kora_meta (key, value) VALUES ('last_acked_server_vector', '{\"old\":4}')",
+		)
+		await registerLocalNode(adapter, 'old')
+		expect((await listLocalNodes(adapter)).find((n) => n.nodeId === 'old')?.accepted).toBe(false)
 		await adapter.close()
 	})
 

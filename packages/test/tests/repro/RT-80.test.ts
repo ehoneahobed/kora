@@ -7,7 +7,7 @@
  * and the version-2 id covers `"data":{}`. The store's op log reads an empty data
  * object back as `null` (`deserializeOperation`: `Object.keys(rest).length > 0 ? rest :
  * null`), and that is what is uploaded. The server's hash over `null` differs. The field
- * is not cleared anywhere (beta.13 cleared it, and the server now stores a beta.13
+ * is not cleared anywhere (beta.12 cleared it, and the server now stores a beta.12
  * client's same call as a clear, RT-71), and the developer gets a terminal integrity
  * rejection for a no-op. Not a round-2 regression (same at 07e4f45); the round-2
  * register said top-level `undefined` in an update passes.

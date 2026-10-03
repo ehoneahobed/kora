@@ -1,20 +1,23 @@
 #!/usr/bin/env node
 /**
- * Red-team round 3 probe (RT-83): a beta.13 device that cleared fields with
- * `undefined` upgrades to protocol 2 on the same database.
+ * Red-team round 3 probe (RT-83): a beta.12 (or older) device that cleared fields with
+ * `undefined` upgrades to beta.13 on the same database.
  *
- * beta.13 applied `update(id, { assignee: undefined })` to the row (NULL), but its op
- * log is JSON, so the logged operation has no `assignee`. protocol 2's one-time fold
+ * beta.12 applied `update(id, { assignee: undefined })` to the row (NULL), but its op
+ * log is JSON, so the logged operation has no `assignee`. beta.13's one-time fold
  * materialization rebuilds rows from the log. Two phases per case:
  *
  * 1. local: the row before and after the upgrade (no sync);
- * 2. sync (round 4): the beta.13 device writes through a protocol-2 server (protocol 1),
- *    upgrades on the same database, reconnects with protocol 2; a fresh protocol-2 peer joins.
+ * 2. sync (round 4): the beta.12 device writes through a beta.13 server (protocol 1),
+ *    upgrades on the same database, reconnects as beta.13; a fresh beta.13 peer joins.
  *    The upgraded device, the peer and the server must hold one row.
  *
  * Prints one JSON line per case and phase; exit 1 when anything differs.
  *
- * Usage: node scripts/remediation/rt3-upgrade-clear-probe.mjs <path-to-beta13-build>
+ * Run it against the last published release, 1.0.0-beta.12 (tag v1.0.0-beta.12;
+ * compat-beta12.mjs says how to build it).
+ *
+ * Usage: node scripts/remediation/rt3-upgrade-clear-probe.mjs <path-to-beta12-build>
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -22,14 +25,14 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = resolve(fileURLToPath(import.meta.url), '../../..')
-const b13 = process.argv[2]
-if (!b13) {
-	console.error('usage: rt3-upgrade-clear-probe.mjs <path-to-beta13-build>')
+const b12 = process.argv[2]
+if (!b12) {
+	console.error('usage: rt3-upgrade-clear-probe.mjs <path-to-beta12-build>')
 	process.exit(2)
 }
 const v2 = await import(join(here, 'kora/dist/index.js'))
 const v2server = await import(join(here, 'packages/server/dist/index.js'))
-const old = await import(join(b13, 'kora/dist/index.js'))
+const old = await import(join(b12, 'kora/dist/index.js'))
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function schemaOf(kora) {
@@ -116,8 +119,8 @@ for (const c of cases) {
 		const url = `ws://127.0.0.1:${port}`
 		const apps = []
 		try {
-			// beta.13 writes: either synced as it goes (protocol 1), or offline (the upgraded
-			// device uploads its beta.13 log).
+			// beta.12 writes: either synced as it goes (protocol 1), or offline (the upgraded
+			// device uploads its beta.12 log).
 			const legacy = old.createApp({
 				schema: schemaOf(old),
 				store: { adapter: 'better-sqlite3', name },
@@ -167,7 +170,7 @@ for (const c of cases) {
 					converged,
 					rejected,
 					quarantined: quarantined.length,
-					beta13: pick(before),
+					beta12: pick(before),
 					...(converged
 						? {}
 						: { upgraded: pick(upgradedRow), peer: pick(peerRow), server: pick(serverRow) }),

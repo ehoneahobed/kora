@@ -69,7 +69,7 @@ function rejectionCodes(messages: Array<{ type: string }>): string[] {
 describe('RT-84: an honest re-upload of a server-transformed operation is refused as forged', () => {
 	for (const [label, hashVersion, protocolVersion] of [
 		['protocol-2 writer (hash version 2)', 2, 2],
-		['beta.13 writer (hash version 1, protocol 1)', 1, undefined],
+		['beta.12 writer (hash version 1, protocol 1)', 1, undefined],
 	] as const) {
 		test(`${label}: a lost ack, then the same op again`, async () => {
 			const { server, login } = await createHarness(schemaV2, null, {

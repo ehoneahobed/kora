@@ -1265,13 +1265,19 @@ export class Store implements OperationLog {
 	 * provisional cascades of remote deletes (RT-69): the server's own copies were
 	 * delivered by now, and any it did not derive must not stay applied locally.
 	 *
+	 * With `provisionalOnly` only the provisional cascades are retired (RT-93: a stream
+	 * batch from a server that derives no cascades, which is not the end of a resync).
+	 *
+	 * @param options - `provisionalOnly`: leave row snapshots for the next catch-up
 	 * @returns How many snapshots were dropped
 	 */
-	async settleAfterCatchUp(): Promise<number> {
+	async settleAfterCatchUp(options: { provisionalOnly?: boolean } = {}): Promise<number> {
 		this.ensureOpen()
 		const folder = this.activeFold()
 		if (!folder) return 0
-		const pending = (await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
+		const pending =
+			options.provisionalOnly !== true &&
+			(await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
 		let settled = 0
 		const touched = new Set<string>()
 		await this.adapter.transaction(async (tx) => {

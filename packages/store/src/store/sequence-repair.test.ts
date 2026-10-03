@@ -320,7 +320,7 @@ describe('sequence uniqueness repair (W6)', () => {
 				type: 'insert',
 				collection: 'todos',
 				recordId: `old-${i}`,
-				data: { title: 'beta.13 write', n: 0 },
+				data: { title: 'beta.12 write', n: 0 },
 				sequenceNumber: 1,
 			})
 			if (candidate.id < v2.id) v1 = candidate

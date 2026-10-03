@@ -17,7 +17,7 @@ import type { KoraSyncServerConfig } from '../../src/types'
  * transports.
  *
  * RT-37: a client without the `sequenceReservation` handshake capability (Kora <=
- * beta.13) may legitimately put two operations under one (node, sequence). Its pair is
+ * beta.12) may legitimately put two operations under one (node, sequence). Its pair is
  * stored and delivered to every other device; a capable client is still refused.
  *
  * RT-39: operations the server already stores (the upgrade re-upload) do not consume
@@ -180,9 +180,9 @@ describe.each(kinds)('RT-37: legacy sequence pairs (%s store)', (kind) => {
 		// A peer streaming live before the pair arrives.
 		const live = await login('peer-live', { lastDeliverySequence: 0 } as Partial<SyncMessage>)
 
-		const legacy = await login('beta13-device', { lastDeliverySequence: 0 } as Partial<SyncMessage>)
-		const x = makeOp('beta13-device', 1, 'x')
-		const y = makeOp('beta13-device', 1, 'y')
+		const legacy = await login('beta12-device', { lastDeliverySequence: 0 } as Partial<SyncMessage>)
+		const x = makeOp('beta12-device', 1, 'x')
+		const y = makeOp('beta12-device', 1, 'y')
 		legacy.send(batch([x, y]))
 		await acked(legacy, 1)
 
@@ -193,7 +193,7 @@ describe.each(kinds)('RT-37: legacy sequence pairs (%s store)', (kind) => {
 		expect(ack?.lastSequenceNumber).toBe(1)
 		const event = logs.find((entry) => entry.event === 'session.legacy_sequence_pair')
 		expect(event).toMatchObject({
-			nodeId: 'beta13-device',
+			nodeId: 'beta12-device',
 			details: { operationId: y.id, holderIds: [x.id], legacyWriter: true },
 		})
 
@@ -212,7 +212,7 @@ describe.each(kinds)('RT-37: legacy sequence pairs (%s store)', (kind) => {
 		)
 
 		// The device, once upgraded (capable), re-uploads both: duplicates, no conflict.
-		const upgraded = await login('beta13-device', {
+		const upgraded = await login('beta12-device', {
 			lastDeliverySequence: 0,
 			sequenceReservation: true,
 		} as Partial<SyncMessage>)

@@ -1,8 +1,8 @@
 /**
- * RT-83 repro (Phase 3 red team round 3, 2026-10-03): upgrading a beta.13 database to
- * protocol 2 brings back every field the user cleared with `undefined`.
+ * RT-83 repro (Phase 3 red team round 3, 2026-10-03): upgrading a beta.12 (or older) database to
+ * beta.13 brings back every field the user cleared with `undefined`.
  *
- * beta.13 applied `update(id, { assignee: undefined })` to the row (NULL) and logged
+ * beta.12 applied `update(id, { assignee: undefined })` to the row (NULL) and logged
  * the operation as JSON, which drops the member: the log holds `data` without
  * `assignee` (or `null` data), `previousData: { assignee: 'bob' }`, no hash version.
  * protocol 2's one-time fold materialization (`ensureMaterialization`, mode 'log') rebuilds
@@ -11,10 +11,10 @@
  * device already holds that id, so it never re-applies the server's copy: the upgraded
  * device diverges from the server and every peer for good.
  *
- * Confirmed against the real beta.13 build (33bca46) with
+ * Confirmed against the unreleased Phase 1 build (33bca46) with
  * `scripts/remediation/rt3-upgrade-clear-probe.mjs` (both top-level cases revert; the
- * nested-member case keeps its value). This repro builds the beta.13 database shape with
- * the legacy materialization mode and the logged JSON beta.13 wrote.
+ * nested-member case keeps its value). This repro builds the beta.12 database shape with
+ * the legacy materialization mode and the logged JSON beta.12 wrote.
  *
  * Asserts the CORRECT behaviour (fails at 97981a7): the cleared field stays cleared
  * after the upgrade.
@@ -38,10 +38,10 @@ const schema = defineSchema({
 const dir = mkdtempSync(join(tmpdir(), 'rt-83-'))
 afterAll(() => rmSync(dir, { recursive: true, force: true }))
 
-describe('RT-83: a beta.13 undefined-clear is lost by the upgrade re-fold', () => {
-	test('a field cleared with undefined under beta.13 stays cleared after the upgrade', async () => {
+describe('RT-83: a beta.12 undefined-clear is lost by the upgrade re-fold', () => {
+	test('a field cleared with undefined under beta.12 stays cleared after the upgrade', async () => {
 		const file = join(dir, 'app.db')
-		// beta.13: rows are written directly (no fold).
+		// beta.12: rows are written directly (no fold).
 		const legacy = new Store({
 			schema,
 			adapter: new BetterSqlite3Adapter(file),
@@ -53,8 +53,8 @@ describe('RT-83: a beta.13 undefined-clear is lost by the upgrade re-fold', () =
 		const id = String(row.id)
 		await legacy.collection('notes').update(id, { assignee: null, title: 'y' })
 		expect(await legacy.collection('notes').findById(id)).toMatchObject({ assignee: null })
-		// The op log as beta.13 wrote it: JSON.stringify dropped the undefined member, and
-		// beta.13 declared no hash version.
+		// The op log as beta.12 wrote it: JSON.stringify dropped the undefined member, and
+		// beta.12 declared no hash version.
 		const adapter = (legacy as unknown as { adapter: BetterSqlite3Adapter }).adapter
 		await adapter.execute(
 			`UPDATE _kora_ops_notes SET data = ? WHERE type = 'update' AND record_id = ?`,

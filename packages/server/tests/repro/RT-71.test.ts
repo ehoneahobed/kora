@@ -1,18 +1,18 @@
 /**
  * RT-71 repro (Phase 3 red team round 2, 2026-10-03): the strict version-1 id check
- * (RT-64 fix) refuses legitimate writes of beta.13 (protocol 1) clients.
+ * (RT-64 fix) refuses legitimate writes of beta.12 (protocol 1) clients.
  *
- * A beta.13 client hashes an operation with `canonicalize`, which writes an object
+ * A beta.12 (or older) client hashes an operation with `canonicalize`, which writes an object
  * member whose value is `undefined` as `"key":null`. Its update path keeps such
  * members (`validateRecord` copies `undefined` for updates, e.g.
  * `update(id, { assignee: undefined })`), and object fields keep nested `undefined`
  * members (`{ a: 1, b: undefined }`). The op log and the wire are JSON, so the member
  * is gone by the time the server sees the operation; the server recomputes the
  * version-1 hash without it, the id does not match, and the write is refused
- * INVALID_OPERATION_ID (terminal). The beta.13 client keeps the value locally, so it
+ * INVALID_OPERATION_ID (terminal). The beta.12 client keeps the value locally, so it
  * diverges for good; no peer ever sees the write.
  *
- * Confirmed end to end against the real beta.13 build (33bca46) with
+ * Confirmed end to end against the unreleased Phase 1 build (33bca46) with
  * `scripts/remediation/rt-legacy-id-probe.mjs`: 3 of 4 ordinary write shapes refused.
  *
  * Asserts the CORRECT behaviour (fails at 4d6c8a7): the write is stored.
@@ -36,7 +36,7 @@ const schema = defineSchema({
 	},
 })
 
-/** What a beta.13 client uploads: id over the in-memory data, data after a JSON round trip. */
+/** What a beta.12 (or older) client uploads: id over the in-memory data, data after a JSON round trip. */
 function legacyOp(nodeId: string, seq: number, partial: Partial<Operation>): Operation {
 	const built = withContentId({
 		id: '',
@@ -55,7 +55,7 @@ function legacyOp(nodeId: string, seq: number, partial: Partial<Operation>): Ope
 	return JSON.parse(JSON.stringify(built)) as Operation
 }
 
-describe('RT-71: strict version-1 verification refuses legitimate beta.13 writes', () => {
+describe('RT-71: strict version-1 verification refuses legitimate beta.12 writes', () => {
 	test.each([
 		['insert with a nested undefined member', { title: 'x', meta: { a: 1, b: undefined } }],
 		['update clearing a field with undefined', { title: 'y', assignee: undefined }],

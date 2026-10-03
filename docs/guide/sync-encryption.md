@@ -256,6 +256,8 @@ In beta.12, `createApp` derived the key from the passphrase with a random salt i
 
 New data is encrypted under the user's keyring from the first beta.13 handshake on.
 
+Encrypted beta.12 (protocol 1) clients cannot sync with a server of this release: their uploads are refused terminally (`PLAINTEXT_REJECTED` when the server requires encryption, `SCHEMA_VALIDATION_ERROR` otherwise; `allowPlaintextMigration` admits plaintext only, never protocol-1 ciphertext), as a schema-aware beta.12 server already refused them. Writes refused that way stay on the device after it upgrades; they are not uploaded again.
+
 ## Performance Considerations
 
 - **Key derivation is slow by design**: PBKDF2 with 600,000 iterations takes roughly 200-500 ms depending on the device. It runs when a device opens the keyring with a passphrase (first unlock, a passphrase change, recovery), not on every start when keys are cached, and never per operation.
