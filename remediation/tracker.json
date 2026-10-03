@@ -1242,7 +1242,7 @@
    ],
    "pr": null,
    "notes": "Subscription diff compares per field kind (scalars by value; array/object/json/blob/richtext and included relations structurally). Error channel: subscribe(cb, { onError }), `query:error` event (queryId, collection, phase initial|refresh|callback, code, message), QueryStore.getError() for React/Vue. No unhandled rejection on the initial run, refresh failures and throwing callbacks reported (logged when no onError), first success after a failure always delivered, runs numbered so an older slow run never overwrites a newer result.",
-   "acceptanceTest": "packages/store/src/subscription/subscription-manager.test.ts (STORE-12 block) + result-equality.test.ts + reactivity/query-store.test.ts + tests/integration/reactive-queries.test.ts (query:error)"
+   "acceptanceTest": "packages/store/src/subscription/subscription-manager.test.ts (STORE-12 block) + result-equality.test.ts + reactivity/query-store.test.ts + tests/integration/reactive-queries.test.ts (query:error) Consumer side (Phase 4 W12, bindings): React useQuery throws QueryStore.getError() to the nearest error boundary (throwOnError: false opts out) and useQueryState returns { data, error, ready }; Vue useQueryState and Svelte createQueryStateStore expose the error, useQuery/createQueryStore report it to onError or console.error. The error channel is read structurally, so the bindings work before and after the store-side channel lands. The store-side fix (structural diff, query:error, .catch) belongs to the store workstream."
   },
   {
    "id": "STORE-13",
@@ -1653,14 +1653,14 @@
    "severity": "P3",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-5.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 4 (W12). useController returns a stable get/peek plus a version; useMutation, useSyncStatus and useRichText key subscribe on (get, version) and memoize getSnapshot and callbacks; useMutation's result is memoized on isLoading/error, useRichText's on the snapshot. Controllers created by a render that never commits (StrictMode first pass, interrupted transitions) are reaped. Sync status snapshots are structurally shared (stabilizeSyncStatus), so the live-engine path no longer returns a new object per read. Tests: react/src/hooks/render-stability.test.ts (render counts, no tearing under startTransition, StrictMode), use-controller.test.ts, the use-rich-text.test.ts StrictMode case, sync-status-controller.test.ts."
   },
   {
    "id": "DX-6",
@@ -1668,14 +1668,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-6.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 4 (W12). useQuery, useMutation and useSyncStatus pass a getServerSnapshot (empty rows / idle / offline). createApp is inert where there is no window (kora/src/ssr.ts): no adapter, no sync, app.ready rejects (handled) with ServerRenderingAppError; opt out with ssr: false or an explicit store.adapter 'better-sqlite3'. Tests: react/src/hooks/ssr.test.ts (renderToString, node env), hydration.test.ts (hydrateRoot without mismatch), kora/src/ssr.test.ts. Guide: docs/guide/nextjs-app-router.md."
   },
   {
    "id": "DX-7",
@@ -1683,14 +1683,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-7.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 4 (W12). Vue useQuery/useQueryState accept MaybeRefOrGetter for the query and enabled (toValue in the watch source; the previous cache entry is released on a descriptor change). Svelte createQueryStore/createQueryStateStore accept a Readable of the query and of enabled. Tests: vue/src/composables/use-query-reactive.test.ts, svelte/src/stores/query-store-reactive.test.ts."
   },
   {
    "id": "DX-8",
@@ -1728,11 +1728,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
-   "tests": [],
-   "acceptance": "No dedicated repro yet: write one when the workstream starts (plan section 4, W0 acceptance checks).",
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "NEW-DX-1.test.ts"
+    }
+   ],
    "pr": null,
-   "notes": ""
+   "notes": "Phase 4 (W12). useCollaborators passes getServerSnapshot (shared empty list) and resets its snapshot on resubscribe. Repro packages/react/tests/repro/NEW-DX-1.test.ts (renderToString with presence)."
   },
   {
    "id": "NEW-DX-2",

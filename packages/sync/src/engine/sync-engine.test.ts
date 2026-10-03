@@ -1433,6 +1433,25 @@ describe('SyncEngine status', () => {
 		expect(status.lastSyncedAt).not.toBeNull()
 	})
 
+	test('reports the server protocol and flags a protocol-1 server as deprecated', async () => {
+		const { client, server } = createMemoryTransportPair()
+		// This responder answers without protocolVersion: a protocol-1 (pre-beta.13) server.
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+		expect(engine.getStatus().serverProtocolVersion).toBeNull()
+		expect(engine.getStatus().protocolDeprecated).toBe(false)
+
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getStatus().status).toBe('synced'))
+
+		expect(engine.getStatus().serverProtocolVersion).toBe(1)
+		expect(engine.getStatus().protocolDeprecated).toBe(true)
+	})
+
 	test('reports error after error state', async () => {
 		const { client, server } = createMemoryTransportPair()
 		setupServerResponder(server, { accept: false })

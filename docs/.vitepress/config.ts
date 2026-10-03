@@ -215,6 +215,7 @@ export default defineConfig({
 					{ text: 'Production Server', link: '/guide/production-server' },
 					{ text: 'Schema Design', link: '/guide/schema-design' },
 					{ text: 'React Hooks', link: '/guide/react-hooks' },
+					{ text: 'Server Rendering & Next.js', link: '/guide/nextjs-app-router' },
 					{ text: 'Offline Patterns', link: '/guide/offline-patterns' },
 					{ text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
 					{ text: 'Clock Integrity', link: '/guide/clock-integrity' },

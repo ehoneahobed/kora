@@ -331,6 +331,8 @@ export class SyncEngine {
 	private authoritativeNodeIds: string[] | null = null
 	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
 	private serverProtocolVersion = 1
+	/** Whether any server answered a handshake (serverProtocolVersion is then real). */
+	private serverProtocolKnown = false
 	private lastAckedServerVector: VersionVector = new Map()
 	private cachedUnsyncedCount = 0
 	private lastSyncedAt: number | null = null
@@ -1033,6 +1035,9 @@ export class SyncEngine {
 			heldOperations: this.computeHeldCount(),
 			heldNodes: this.heldNodeInfos.map((node) => ({ ...node })),
 			localDurability: this.durabilityDegraded ? ('degraded' as const) : ('durable' as const),
+			serverProtocolVersion: this.serverProtocolKnown ? this.serverProtocolVersion : null,
+			protocolDeprecated:
+				this.serverProtocolKnown && this.serverProtocolVersion < SYNC_PROTOCOL_VERSION,
 			clockSkewMs: this.clockSkewMs,
 			inFlightUploadOperations: this.inFlightUploadCount(),
 			hasInFlightDeliveryBatch: this.hasInFlightDeliveryBatch,
@@ -1846,6 +1851,7 @@ export class SyncEngine {
 		}
 
 		this.serverProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		this.serverProtocolKnown = true
 		if (Array.isArray(msg.authoritativeNodeIds)) {
 			// The union of every explicit id learned, never a replacement (RT-75): each
 			// server instance lists what it knows, and `kora:server:` ids are

@@ -5,6 +5,7 @@
 export { createApp } from './create-app'
 export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 export type { ReservedAppProperty } from './reserved-app-properties'
+export { ServerRenderingAppError } from './ssr'
 
 // === App types ===
 export type {
