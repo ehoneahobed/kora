@@ -1,6 +1,6 @@
 /**
  * RT-80 repro (Phase 3 red team round 3, 2026-10-03): `update(id, { field: undefined })`
- * on a beta.14 device produces an operation that its own server refuses
+ * on a protocol-2 device produces an operation that its own server refuses
  * `INVALID_OPERATION_ID` (terminal), reported as "altered after it was created".
  *
  * `createOperation` strips `undefined` members (RT-72), so the update's data is `{}`

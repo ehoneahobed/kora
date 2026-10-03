@@ -1,5 +1,5 @@
 /**
- * RT-72 repro (Phase 3 red team round 2, 2026-10-03): a beta.14 device's insert whose
+ * RT-72 repro (Phase 3 red team round 2, 2026-10-03): a protocol-2 device's insert whose
  * object field holds an `undefined` member is refused by the server and the record
  * vanishes from the writing device.
  *

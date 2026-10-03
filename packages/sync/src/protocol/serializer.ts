@@ -120,7 +120,7 @@ function deserializeWireRecord(
 /**
  * A top-level op-data value in the wire's binary form: an object whose ONLY member is
  * `__kora_bytes__` (a base64 string), as `serializeWireValue` writes a `Uint8Array`
- * (beta.13 richtext). Any other object is data and is returned as is.
+ * (beta.12 richtext). Any other object is data and is returned as is.
  *
  * Two earlier rules corrupted json and object values and are gone (value domain, RT-86):
  * an object that merely CONTAINED `__kora_bytes__` lost its other members, and an object

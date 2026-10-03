@@ -1,11 +1,11 @@
 /**
  * RT-83 repro (Phase 3 red team round 3, 2026-10-03): upgrading a beta.13 database to
- * beta.14 brings back every field the user cleared with `undefined`.
+ * protocol 2 brings back every field the user cleared with `undefined`.
  *
  * beta.13 applied `update(id, { assignee: undefined })` to the row (NULL) and logged
  * the operation as JSON, which drops the member: the log holds `data` without
  * `assignee` (or `null` data), `previousData: { assignee: 'bob' }`, no hash version.
- * beta.14's one-time fold materialization (`ensureMaterialization`, mode 'log') rebuilds
+ * protocol 2's one-time fold materialization (`ensureMaterialization`, mode 'log') rebuilds
  * every row from the log, so the clear is lost and `assignee` is 'bob' again. The
  * server, since the RT-71 fix, stores the same operation with `assignee: null`; the
  * device already holds that id, so it never re-applies the server's copy: the upgraded
@@ -62,7 +62,7 @@ describe('RT-83: a beta.13 undefined-clear is lost by the upgrade re-fold', () =
 		)
 		await legacy.close()
 
-		// beta.14 opens the same database.
+		// The protocol-2 build opens the same database.
 		const upgraded = new Store({ schema, adapter: new BetterSqlite3Adapter(file), nodeId: 'dev' })
 		await upgraded.open()
 		try {

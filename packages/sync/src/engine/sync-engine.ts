@@ -362,7 +362,7 @@ export class SyncEngine {
 	 * loaded from persistence on start. See {@link SyncEngine.getAuthoritativeNodeIds}.
 	 */
 	private authoritativeNodeIds: string[] | null = null
-	/** Protocol version of the server in the current session (1 for a beta.13-era server). */
+	/** Protocol version of the server in the current session (1 for a beta.12-era server). */
 	private serverProtocolVersion = 1
 	/** Whether any server answered a handshake (serverProtocolVersion is then real). */
 	private serverProtocolKnown = false
@@ -3050,7 +3050,7 @@ export class SyncEngine {
 			)
 		}
 
-		// A beta.13 clear the id proves (delivered by a beta.13 server, which stored the
+		// A beta.12 clear the id proves (delivered by a beta.12 server, which stored the
 		// body without it) is made explicit before the body is stored (RT-85): the fold
 		// folds bodies as written.
 		op = await canonicalizeProvenLegacyClear(op)

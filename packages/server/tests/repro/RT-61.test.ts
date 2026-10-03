@@ -97,7 +97,7 @@ describe('RT-61: a device claims the server node id', () => {
 		// Alice, legitimately, learns the server's node id from the handshake.
 		const alice = await login(server, 'alice-node')
 		expect(alice.response?.accepted).toBe(true)
-		// beta.14 (RT-62): the store authors under `kora:server:<deployment>:<instance>`;
+		// Since RT-62 the store authors under `kora:server:<deployment>:<instance>`;
 		// the configured 'server-1' is a legacy server id, still advertised. Both are
 		// the server's, and neither has history yet. Since RT-75 only explicit ids are
 		// advertised: the kora:server: id is authoritative (and reserved) by its prefix.

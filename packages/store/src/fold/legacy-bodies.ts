@@ -17,16 +17,16 @@ export interface CanonicalizedLegacyBody {
 }
 
 /**
- * Make every genuine beta.13 clear in the operation log explicit, once per database
+ * Make every genuine beta.12 clear in the operation log explicit, once per database
  * (RT-83, RT-85).
  *
- * beta.13 applied `update(id, { field: undefined })` as a clear, hashed the member as
+ * beta.12 applied `update(id, { field: undefined })` as a clear, hashed the member as
  * `null`, and logged JSON without it. Every later replica folds a stored body as
  * written (the fold has no legacy rule: a body a schema transform rewrote must never be
  * read as a clear), so the clear is written into the logged body here, where its
  * provenance is known:
  * - this device's own operations that declare no hash version were written by its
- *   beta.13 self (beta.14 always declares version 2): a `previousData` key absent from
+ *   beta.12 self (beta.13 always declares version 2): a `previousData` key absent from
  *   `data` is always such a clear;
  * - any other node's undeclared update is rewritten only when its id PROVES the clear
  *   (`canonicalizeProvenLegacyClear`), as on inbound delivery.

@@ -14,8 +14,8 @@ export interface ServerMetricsSnapshot {
 	duplicateOperationsReceived: number
 	rejectedOperations: number
 	/**
-	 * Operations from protocol-1 (beta.13) clients stored with an id that could not be
-	 * verified (RT-71). Non-zero only while beta.13 clients write `undefined` members.
+	 * Operations from protocol-1 (beta.12) clients stored with an id that could not be
+	 * verified (RT-71). Non-zero only while beta.12 clients write `undefined` members.
 	 */
 	unverifiedLegacyOperations: number
 	/** Uploads refused for reusing a stored operation id with other content (RT-77). */

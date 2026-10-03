@@ -8,8 +8,8 @@
  * - the sequence-reservation capability on every handshake (RT-37);
  * - `authoritativeNodeIds` and server-authored `foldState` (W7).
  *
- * A handshake without `protocolVersion` is version 1 (Kora <= beta.13). Servers accept
- * version-1 clients for one release (beta.14) with a deprecation warning.
+ * A handshake without `protocolVersion` is version 1 (Kora <= beta.12). Servers accept
+ * version-1 clients for one release (beta.13) with a deprecation warning.
  */
 export const SYNC_PROTOCOL_VERSION = 2
 

@@ -168,7 +168,7 @@ function fieldPlanFor(
  * (RT-27) restates the record's current values, each produced at its own version
  * (`op.fieldVersions`): the field is stamped at exactly that version (tie-broken by
  * the entry's id), so it lands where its original writer did, never later. Raising
- * it to the entry's own timestamp (which a beta.13 server sets to the record's
+ * it to the entry's own timestamp (which a beta.12 server sets to the record's
  * newest write) would let the restated value beat a device's concurrent edit that
  * is newer than the field's real version (RT-67).
  *
@@ -401,7 +401,7 @@ export function mergeOp(
 	// Transforms at fold time (RT-84, RT-85): the operation is stored exactly as its
 	// author wrote it, and folded as the schema reads it. A transform that drops the
 	// operation leaves it out of the fold, like an excluded one.
-	// The beta.13 clear rule is NOT applied here: a genuine beta.13 body is made
+	// The beta.12 clear rule is NOT applied here: a genuine beta.12 body is made
 	// canonical once, where its provenance is known (server ingest, a device's own
 	// log at the upgrade), so a body a transform or anything else rewrote is never
 	// mistaken for one (RT-85).

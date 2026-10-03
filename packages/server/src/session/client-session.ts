@@ -734,7 +734,7 @@ export class ClientSession {
 	 * The client advertised the `sequenceReservation` handshake capability (RT-37): it
 	 * reserves sequence numbers in-transaction, so a second operation under a held
 	 * (node, sequence) is refused with SEQUENCE_CONFLICT. False for a legacy client
-	 * (Kora <= beta.13), whose duplicate pairs are stored instead.
+	 * (Kora <= beta.12), whose duplicate pairs are stored instead.
 	 */
 	private sequenceReservation = false
 	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
@@ -744,9 +744,9 @@ export class ClientSession {
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
-	/** Uploads whose data is stored as the beta.13 writer held it (RT-71). */
+	/** Uploads whose data is stored as the beta.12 writer held it (RT-71). */
 	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
-	/** Operations accepted with an unverified legacy (beta.13) id (RT-71). */
+	/** Operations accepted with an unverified legacy (beta.12) id (RT-71). */
 	private unverifiedLegacyOperations = 0
 	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
@@ -1438,7 +1438,7 @@ export class ClientSession {
 
 	/**
 	 * True when the client did not advertise the `sequenceReservation` capability
-	 * (RT-37): a legacy client (Kora <= beta.13) that may give two operations one
+	 * (RT-37): a legacy client (Kora <= beta.12) that may give two operations one
 	 * sequence number. Such a pair is stored and delivered, never refused with
 	 * SEQUENCE_CONFLICT. Meaningful once the handshake was accepted.
 	 */
@@ -2150,7 +2150,7 @@ export class ClientSession {
 		// in advance (SRV-5): an unscoped session may see every operation, so it gets the
 		// whole vector; a scoped one gets the nodes a metadata pre-pass finds visible.
 		// Clients of this release count pending from their own acks (RT-28) and would not
-		// need the pre-pass, but beta.13 clients count every node ahead of this vector as
+		// need the pre-pass, but beta.12 clients count every node ahead of this vector as
 		// pending (and `kora compact` uses the persisted peer entries), so it stays. It
 		// starts at the resumed watermark (SYNC-11), so a reconnect scans only new ops.
 		const visibleNodes = new Set<string>([msg.nodeId])
@@ -2691,7 +2691,7 @@ export class ClientSession {
 			}
 
 			// Transforms at fold time (RT-84): the operation is stored exactly as uploaded
-			// (plus the hash version the server verified, and a beta.13 clear made explicit,
+			// (plus the hash version the server verified, and a beta.12 clear made explicit,
 			// both identical under its id), never as a transformed rewrite under its id.
 			// Authorization, validators and constraint checks judge its view in the server
 			// schema; every store folds that same view.
@@ -3049,9 +3049,9 @@ export class ClientSession {
 				this.restoredLegacyData.set(op, integrity.restoredData)
 			}
 			// Every replica folds a version-1 update in its canonical body: a previousData key
-			// absent from data is a clear (core canonicalizeLegacyOperation). beta.13 only
+			// absent from data is a clear (core canonicalizeLegacyOperation). beta.12 only
 			// ever produced that shape from `undefined` members, whose id covers the clear;
-			// an id that verifies WITHOUT the clear names a body no beta.13 wrote, and storing
+			// an id that verifies WITHOUT the clear names a body no beta.12 wrote, and storing
 			// it would let authorization judge one body while every fold applies another.
 			if (
 				integrity.ok &&
@@ -3065,10 +3065,10 @@ export class ClientSession {
 				}
 			}
 			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
-				// RT-71: a beta.13 (protocol 1) client hashed `undefined` members as `null`;
+				// RT-71: a beta.12 (protocol 1) client hashed `undefined` members as `null`;
 				// the JSON it uploaded no longer holds them, so the id cannot always be
 				// rebuilt. The operation is stored unverified (no declared version), as every
-				// beta.13 operation was before RT-64. This skips no protection RT-64 needs:
+				// beta.12 operation was before RT-64. This skips no protection RT-64 needs:
 				// the ids the server derives are keyed (HMAC), so no client can predict and
 				// pre-store one, and a protocol-2 session never reaches this branch.
 				this.reportUnverifiedLegacyOperation(op)
@@ -3091,7 +3091,7 @@ export class ClientSession {
 
 	/**
 	 * Whether an undeclared version-1 id that does not verify is accepted unverified
-	 * (RT-71): only from a protocol-1 session (Kora <= beta.13), and only for the
+	 * (RT-71): only from a protocol-1 session (Kora <= beta.12), and only for the
 	 * session's own node.
 	 */
 	private acceptsUnverifiedLegacyId(op: Operation): boolean {
@@ -3101,7 +3101,7 @@ export class ClientSession {
 	/** Log, count and emit an operation accepted with an unverified legacy id (RT-71). */
 	private reportUnverifiedLegacyOperation(op: Operation): void {
 		this.unverifiedLegacyOperations++
-		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.13 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
+		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.12 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -3133,7 +3133,7 @@ export class ClientSession {
 	private declareVerifiedHashVersion(op: Operation): Operation {
 		if (op.hashVersion !== undefined) return op
 		const matched = this.matchedHashVersions.get(op)
-		// A beta.13 update that cleared fields with `undefined` is stored with those fields
+		// A beta.12 update that cleared fields with `undefined` is stored with those fields
 		// `null` (RT-71): what the writer applied, and the same version-1 hash.
 		const restored = this.restoredLegacyData.get(op)
 		const content = restored === undefined ? op : { ...op, data: restored }
@@ -3183,12 +3183,12 @@ export class ClientSession {
 	}
 
 	/**
-	 * A protocol-1 client (Kora <= beta.13) is served for one release (beta.14) with a
+	 * A protocol-1 client (Kora <= beta.12) is served for one release (beta.13) with a
 	 * deprecation warning: its operation ids are version-1 hashes and its encrypted
 	 * payloads have no envelope binding.
 	 */
 	private warnLegacyProtocol(nodeId: string): void {
-		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.13) are accepted in beta.14 only and will be refused by the next release. Upgrade the client.`
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are accepted in beta.13 only and will be refused by the next release. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -4010,7 +4010,7 @@ export class ClientSession {
 				holderIds: pair.holderIds,
 				legacyWriter: pair.legacyWriter,
 				message: pair.legacyWriter
-					? 'A client without the sequenceReservation capability (Kora <= beta.13) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
+					? 'A client without the sequenceReservation capability (Kora <= beta.12) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
 					: 'An operation shares its sequence number with one stored before sequence enforcement (Kora <= beta.12). Both are stored.',
 			},
 		})

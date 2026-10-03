@@ -1084,7 +1084,7 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Write every genuine beta.13 clear of the op log into its logged body, once per
+	 * Write every genuine beta.12 clear of the op log into its logged body, once per
 	 * database (RT-83, RT-85): the fold folds bodies as written, so the clear must be in
 	 * the body. Records already materialized by the fold are re-folded.
 	 */

@@ -426,7 +426,7 @@ export class SqliteServerStore implements ServerStore {
 
 		this.migrateTextCodec(schema)
 
-		// beta.13 clears stored by an earlier server, made explicit once (RT-85); their
+		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their
 		// records are re-folded by the re-materialization below.
 		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
@@ -1519,7 +1519,7 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Write the beta.13 clears the ids prove into the stored bodies, once per database
+	 * Write the beta.12 clears the ids prove into the stored bodies, once per database
 	 * (RT-85, see `provenLegacyClears`), and mark their records' fold states stale.
 	 */
 	private async canonicalizeLegacyBodies(): Promise<void> {

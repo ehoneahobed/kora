@@ -6,7 +6,7 @@
  * Usage: node scripts/remediation/rt3-legacy-probe.mjs <path-to-beta13-build>
  * Prints one JSON line per case: whether the beta.13 client's write was refused, how
  * the server stored it (`hashVersion` 1 = verified, absent = stored unverified, RT-71),
- * and whether a beta.14 peer converged to the beta.13 client's row.
+ * and whether a protocol-2 peer converged to the beta.13 client's row.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
