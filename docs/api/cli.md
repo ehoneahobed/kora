@@ -1,181 +1,73 @@
 ---
 title: CLI Reference
-description: "Kora CLI reference: create, dev, migrate, generate, doctor, deploy, backup, status, logs, and compact commands."
+description: "Kora CLI reference: create, dev, migrate, generate, doctor, status, logs, backup, compact, deploy, studio and agents-md."
 ---
 
 # CLI Reference
 
-The Kora CLI provides commands for creating, developing, and managing Kora.js applications. It includes project scaffolding, a development server, schema migration tools, and type generation.
-
-## Installation
-
-The CLI is included when you install `kora` or can be installed standalone:
+The `kora` command scaffolds, runs and operates Kora apps. Projects created with
+`create-kora-app` have `@korajs/cli` as a dev dependency, so `kora` is available in their package
+scripts (`pnpm dev` runs `kora dev`). To install it elsewhere:
 
 ```bash
-# Included with kora
-pnpm add kora
-
-# Or install standalone
 pnpm add -D @korajs/cli@beta
 ```
 
+Run `kora <command> --help` for the options of any command.
+
 ---
 
-## kora create
-
-Scaffolds a new Kora.js application from a template.
-
-### Usage
+## create
 
 ```bash
-npx create-kora-app [name] [options]
-```
-
-Or if the CLI is installed:
-
-```bash
+npx create-kora-app@beta [name] [options]
+# or, with the CLI installed:
 kora create [name] [options]
 ```
 
-### Arguments
+`create-kora-app` is the same command. Without options it asks for the platform, framework,
+styling, sync, database and package manager. Templates are bundled in the CLI, so scaffolding works
+offline.
 
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `name` | No | Project directory name. If omitted, you will be prompted. |
+| Option | Description |
+|--------|-------------|
+| `--template <id>` | Skip the questions and use a template (below). |
+| `--platform web\|desktop-tauri` | `desktop-tauri` uses the `tauri-react` template. |
+| `--framework react\|vue\|svelte` | UI framework (`solid` is listed but not available yet). |
+| `--tailwind` / `--no-tailwind` | Tailwind CSS or plain CSS. |
+| `--sync` / `--no-sync` | Include a sync server. |
+| `--db sqlite\|postgres` | Database of the sync server. |
+| `--db-provider <name>` | For Postgres: `local`, `supabase`, `neon`, `railway`, `vercel-postgres`, `custom`. |
+| `--auth none` | Only `none` is accepted today (`email-password` and `oauth` are listed but refused). |
+| `--pm pnpm\|npm\|yarn\|bun` | Package manager. |
+| `--yes`, `-y` | Accept the defaults: `react-tailwind-sync` and the detected package manager. |
+| `--skip-install` | Do not install dependencies. |
 
-### Options
+| Templates | |
+|-----------|---|
+| React | `react-basic`, `react-sync`, `react-tailwind`, `react-tailwind-sync` |
+| Vue | `vue-basic`, `vue-sync`, `vue-tailwind`, `vue-tailwind-sync` |
+| Svelte | `svelte-basic`, `svelte-sync`, `svelte-tailwind`, `svelte-tailwind-sync` |
+| Desktop | `tauri-react` |
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--template` | `string` | -- | Template to use. Skips the template selection prompt. |
-| `--pm` | `string` | -- | Package manager (`pnpm`, `npm`, `yarn`, `bun`). Skips the package manager prompt. |
-| `--yes`, `-y` | `boolean` | `false` | Accept all defaults (recommended template + auto-detected package manager). |
-| `--tailwind` / `--no-tailwind` | `boolean` | -- | Use Tailwind CSS or plain CSS. Skips styling prompt. |
-| `--sync` / `--no-sync` | `boolean` | -- | Include sync server or not. Skips sync prompt. |
-| `--skip-install` | `boolean` | `false` | Skip installing dependencies. |
-
-### Templates
-
-| Template | Styling | Sync | Description |
-|----------|---------|------|-------------|
-| `react-tailwind-sync` | Tailwind CSS | Yes | **Recommended.** Polished dark-themed UI with real-time sync. |
-| `react-tailwind` | Tailwind CSS | No | Tailwind CSS with local-only storage. |
-| `react-sync` | Plain CSS | Yes | Clean CSS with sync server. |
-| `react-basic` | Plain CSS | No | Minimal setup with local-only storage. |
-
-All templates include DevTools enabled by default, SQLite WASM persistence, and a todo app with stats, filters, and a polished UI.
-
-### Interactive flow
-
-When run without options, the CLI prompts for configuration:
-
-```
-$ npx create-kora-app my-app
-
-  Kora.js - Offline-first application framework
-
-  ? Select a template:
-    > React + Tailwind (with sync)    (Recommended)
-      React + Tailwind (local-only)
-      React + CSS (with sync)
-      React + CSS (local-only)
-
-  ? Package manager:
-    > pnpm
-      npm
-      yarn
-      bun
-
-  Creating my-app...
-  Installing dependencies...
-
-  Done! Next steps:
-    cd my-app
-    pnpm dev
-```
-
-### Non-interactive usage
-
-```bash
-# Use a specific template
-npx create-kora-app my-app --template react-tailwind-sync --pm pnpm
-
-# Accept all defaults (react-tailwind-sync + detected package manager)
-npx create-kora-app my-app --yes
-
-# Mix flags: Tailwind without sync
-npx create-kora-app my-app --tailwind --no-sync --pm npm
-```
-
-### Generated project structure
-
-```
-my-app/
-  src/
-    schema.ts           # Schema entry point
-    main.tsx            # Application entry point
-    App.tsx             # Example UI
-    modules/
-      todos/
-        todo.schema.ts     # Collection definition
-        todo.queries.ts    # Query builders
-        todo.mutations.ts  # Mutation helpers
-        useTodos.ts        # React hook for the feature
-    kora-worker.ts      # SQLite WASM worker entry
-  server.ts             # (sync templates) sync server entry point
-  kora/
-    generated/
-      types.ts          # Auto-generated TypeScript types
-    migrations/         # Schema migration files
-  package.json
-  tsconfig.json
-  vite.config.ts
-  kora.config.ts        # Kora configuration
-```
+Every template is a todo app with DevTools enabled in development. Sync templates add `server.ts`
+(a `createProductionServer` that also mounts `@korajs/auth` routes when `KORA_AUTH_SECRET` is set,
+and Google OAuth when its variables are set) and `.env.example`. A project
+contains `src/schema.ts`, `src/main.*`, the feature module under `src/modules/todos/`,
+`src/kora-worker.ts` (the SQLite WASM worker), `kora.config.ts`, `AGENTS.md` and `README.md`.
+[Getting Started](/getting-started) walks through the first run.
 
 ---
 
-## kora dev
-
-Starts the full development environment with hot reloading, sync server, and DevTools.
-
-### Usage
+## dev
 
 ```bash
-kora dev [options]
+kora dev [--port 5173] [--sync-port 3001] [--no-sync] [--no-watch]
 ```
 
-### Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--port` | `number` | `5173` | Vite dev server port. |
-| `--sync-port` | `number` | `3001` | Sync server port (if sync is configured). |
-| `--no-sync` | `boolean` | `false` | Disable the sync server even if configured. |
-| `--no-watch` | `boolean` | `false` | Disable schema file watching. |
-
-### What it starts
-
-1. **Vite dev server** -- Serves your application with hot module replacement (HMR).
-2. **Kora sync server** -- Starts automatically if `sync` is configured in `kora.config.ts`. Not started for local-only apps.
-3. **Schema watcher** -- Watches your schema file for changes and automatically regenerates TypeScript types.
-
-### Example
-
-```bash
-$ kora dev
-
-  Kora.js Dev Server
-
-  App:      http://localhost:5173
-  Sync:     ws://localhost:3001
-
-  Watching schema for changes...
-```
-
-### Configuration file
-
-The `kora dev` command reads from `kora.config.ts` in the project root:
+Starts Vite and, when sync is enabled, the sync server: the project's `server.ts` (run with `tsx`),
+or a managed server from `kora.config.ts` (`dev.sync.store`: `memory`, `sqlite` or `postgres`) when
+there is no `server.ts`. It also watches the schema and regenerates `kora/generated/types.ts`.
 
 ```typescript
 // kora.config.ts
@@ -185,369 +77,145 @@ export default defineConfig({
   schema: './src/schema.ts',
   dev: {
     port: 5173,
-    sync: {
-      enabled: true,
-      port: 3001,
-      store: { type: 'sqlite', filename: './kora-dev.db' },
-    },
-    watch: {
-      enabled: true,
-      debounceMs: 300,
-    },
+    sync: { enabled: true, port: 3001, store: { type: 'sqlite', filename: './kora-dev.db' } },
+    watch: { enabled: true, debounceMs: 300 },
   },
 })
 ```
 
 ---
 
-## kora migrate
-
-Detects schema changes, generates migration files, and applies migrations to the local store.
-
-### Usage
+## migrate
 
 ```bash
-kora migrate [options]
+kora migrate [--dry-run] [--apply] [--schema <path>] [--db <sqlite path>] [--output-dir kora/migrations] [--force]
 ```
 
-### Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--dry-run` | `boolean` | `false` | Show what would change without generating or applying migrations. |
-| `--apply` | `boolean` | `false` | Apply the migration immediately without prompting. |
-| `--schema` | `string` | Auto-detected | Path to schema file. |
-| `--db` | `string` | From config/default | SQLite path to use for `--apply`. |
-| `--output-dir` | `string` | `kora/migrations` | Migration output directory. |
-| `--force` | `boolean` | `false` | Skip breaking-change confirmation prompts. |
-
-### Workflow
-
-The `migrate` command compares the current schema version with the previous version and generates a migration file describing the changes.
+Compares the schema with its last snapshot (`kora/schema.snapshot.json`; the first run only
+creates the snapshot) and lists the changes:
 
 ```
-$ kora migrate
-
-  Detected schema change: v1 -> v2
-
-  Changes:
-    + todos.priority (enum: low, medium, high, default: medium)
-    ~ todos.tags (string -> array<string>)
-    - todos.legacyField (removed)
-
-  Generated migration: kora/migrations/002-add-priority-change-tags.ts
-
-  ? Apply migration to local store? (y/n)
+Detected schema change: v1 → v2
+Changes:
+  + todos.priority
+  ~ todos.tags
 ```
 
-### Change types
+It then writes, under `kora/migrations/`:
 
-| Symbol | Meaning |
-|--------|---------|
-| `+` | New field added to a collection. |
-| `~` | Existing field type or configuration changed. |
-| `-` | Field removed from a collection. |
-| `++` | New collection added. |
-| `--` | Collection removed. |
+- `NNN-vA-to-vB.ts`: the generated `up` and `down` SQL statements, a `summary` and
+  `containsBreakingChanges`
+- `NNN-vA-to-vB.transforms.ts`: an `OperationTransform` stub for servers that accept clients on the
+  older version
+- `NNN-vA-to-vB.json`: the manifest `--apply` uses
 
-### Generated migration file
+Removing a field or changing its type is breaking: the command asks for confirmation (or needs
+`--force`; without a terminal it fails). `--dry-run` writes nothing. `--apply` runs the pending
+migrations against the configured databases: a SQLite file (`--db`, or the config) and Postgres
+when `kora.config.ts` sets `dev.sync.store` to Postgres (its `connectionString`, or `DATABASE_URL`).
 
-```typescript
-// kora/migrations/002-add-priority-change-tags.ts
-import { defineMigration } from 'korajs'
-
-export default defineMigration({
-  version: 2,
-  description: 'Add priority field, change tags to array',
-
-  up: {
-    // Automatically generated SQL
-    sql: [
-      `ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT 'medium' CHECK(priority IN ('low','medium','high'))`,
-      `ALTER TABLE todos ADD COLUMN tags_new TEXT DEFAULT '[]'`,
-      // Data migration handled below
-    ],
-
-    // Optional: transform existing data
-    transform: async (tx) => {
-      const rows = await tx.query('SELECT id, tags FROM todos')
-      for (const row of rows) {
-        const tagsArray = row.tags ? [row.tags] : []
-        await tx.execute(
-          'UPDATE todos SET tags_new = ? WHERE id = ?',
-          [JSON.stringify(tagsArray), row.id]
-        )
-      }
-    },
-  },
-
-  down: {
-    sql: [
-      `ALTER TABLE todos DROP COLUMN priority`,
-    ],
-  },
-})
-```
-
-### Dry run
-
-```bash
-$ kora migrate --dry-run
-
-  Detected schema change: v1 -> v2
-
-  Changes:
-    + todos.priority (enum: low, medium, high, default: medium)
-
-  Would generate: kora/migrations/002-add-priority.ts
-  No changes applied (dry run).
-```
+Devices do not use these files: an app's local database migrates when it opens, from the
+`migrations` you declare in `defineSchema()` with `migrate()` (see
+[Schema Design](/guide/schema-design#migrations)).
 
 ---
 
-## kora generate
-
-Generates TypeScript types and other artifacts from your schema.
-
-### Usage
+## generate
 
 ```bash
-kora generate <subcommand> [options]
+kora generate types [--schema <path>] [--output kora/generated/types.ts]
+kora generate hooks [--schema <path>] [--output kora/generated/hooks] [--types ../types]
 ```
 
-### Subcommands
-
-#### kora generate types
-
-Generates TypeScript type definitions from the current schema. These types provide full autocomplete and type checking for collection operations.
-
-```bash
-kora generate types [options]
-```
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--output` | `string` | `'kora/generated/types.ts'` | Output file path. |
-| `--schema` | `string` | `'./src/schema.ts'` | Path to the schema file. |
-
-```bash
-$ kora generate types
-
-  Generated TypeScript types from schema v1
-  Output: kora/generated/types.ts
-```
-
-#### Generated output
-
-For a schema with a `todos` collection, the generated file contains:
-
-```typescript
-// kora/generated/types.ts
-// Auto-generated by Kora CLI. Do not edit manually.
-
-export interface Todo {
-  id: string
-  title: string
-  completed: boolean
-  assignee: string | null
-  tags: string[]
-  notes: unknown          // Rich text (Yjs Y.Text)
-  priority: 'low' | 'medium' | 'high'
-  dueDate: number | null
-  createdAt: number
-}
-
-export interface TodoInsert {
-  title: string
-  completed?: boolean
-  assignee?: string | null
-  tags?: string[]
-  priority?: 'low' | 'medium' | 'high'
-  dueDate?: number | null
-  // createdAt is auto-set, not included
-}
-
-export interface TodoUpdate {
-  title?: string
-  completed?: boolean
-  assignee?: string | null
-  tags?: string[]
-  priority?: 'low' | 'medium' | 'high'
-  dueDate?: number | null
-}
-
-// Collection type map used internally by Kora
-export interface KoraCollections {
-  todos: {
-    record: Todo
-    insert: TodoInsert
-    update: TodoUpdate
-  }
-}
-```
-
-::: tip
-When using `kora dev`, types are regenerated automatically whenever your schema file changes. You only need to run `kora generate types` manually when not using the dev server.
-:::
+`types` writes `<Collection>Record`, `<Collection>InsertInput` and `<Collection>UpdateInput`
+interfaces per collection (for example `TodosRecord`). They are optional: `createApp({ schema })`
+already infers every collection type from `defineSchema()`. `hooks` writes per-collection React hook
+stubs.
 
 ---
 
-## kora deploy
-
-Deploys your Kora application to a cloud platform. Handles Dockerfile generation, server bundling, client building, and platform-specific configuration in a single command.
-
-::: tip Looking for a step-by-step walkthrough?
-See the [Deployment guide](/guide/deployment) for a beginner-friendly tutorial that covers everything from installing the Fly CLI to verifying sync works.
-:::
-
-### Usage
+## doctor
 
 ```bash
-kora deploy [options]
+kora doctor [--url http://localhost:3001] [--skip-network]
+```
+
+Checks the project root, `kora.config`, the schema, the SQLite WASM worker, dependency versions
+and, unless `--skip-network`, the sync server and its schema version. Exits non-zero when a check
+fails.
+
+---
+
+## Operating a server
+
+These commands talk to a running production server's operational endpoints. Tokens default to
+`KORA_ADMIN_TOKEN` (and `KORA_BACKUP_TOKEN` for backups).
+
+| Command | Description |
+|---------|-------------|
+| `kora status [--url] [--watch] [--token]` | Server status: connections, operations, schema version. `--watch` refreshes live. |
+| `kora logs [--url] [--follow] [--level info\|warn\|error] [--token]` | Streams server events. |
+| `kora backup create [--url] [--out file.kora] [--token]` | Downloads a backup. |
+| `kora backup restore --file <path> [--url] [--merge] [--token]` | Restores one (replaces data unless `--merge`). |
+| `kora backup info --file <path>` | Shows a backup's manifest. |
+
+See [Backup and Restore](/guide/backup-restore) and [Production Server](/guide/production-server).
+
+---
+
+## compact
+
+```bash
+kora compact --db <local sqlite path> [--schema <path>] [--strategy after-ack|after-days|never] [--days 30]
+# defaults: --strategy after-ack, --days 30
+```
+
+Compacts a local SQLite database's operation log once the server has acknowledged the operations.
+
+---
+
+## deploy
+
+```bash
+kora deploy [--platform fly|railway|aws-ecs|aws-lightsail] [--app <name>] [--region iad] [--prod] [--confirm] [--reset]
 kora deploy status
 kora deploy logs
-kora deploy rollback [deployment-id]
+kora deploy rollback [id]
 ```
 
-### Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--platform` | string | *(prompted)* | Target platform: `fly`, `railway`, `aws-ecs`, `aws-lightsail`. Coming soon: `render`, `docker`, `kora-cloud` |
-| `--app` | string | *(directory name)* | Application name on the platform |
-| `--region` | string | `iad` | Deployment region (e.g., `iad`, `lhr`, `syd`, `nrt`) |
-| `--prod` | boolean | `false` | Deploy to production environment |
-| `--confirm` | boolean | `false` | Non-interactive mode: fails fast on missing data |
-| `--reset` | boolean | `false` | Delete all deploy state and generated artifacts |
-
-### Subcommands
-
-#### `kora deploy status`
-
-Shows the current deployment health, platform, app name, region, live URL, and sync URL.
-
-#### `kora deploy logs`
-
-Fetches recent logs from the deployed application.
-
-#### `kora deploy rollback [id]`
-
-Reverts the deployment to a previous version. If no `id` is provided, rolls back to the last known deployment.
-
-### Deployment Flow
-
-When you run `kora deploy`, the following steps execute in order:
-
-1. **Artifact generation**: Creates `Dockerfile`, `.dockerignore` in `.kora/deploy/`
-2. **CLI detection**: Verifies the platform CLI is installed (e.g., `flyctl`)
-3. **Authentication**: Checks login state, prompts if needed
-4. **Provisioning**: Creates the app on the platform (idempotent, skips if exists)
-5. **Server bundle**: Bundles `server.ts` into a single `server-bundled.js` using esbuild
-6. **Client build**: Runs `vite build` to produce static assets in `.kora/deploy/dist/`
-7. **Platform config**: Generates `fly.toml` or `railway.json`
-8. **Deploy**: Pushes to the platform and returns live URLs
-
-### Deploy State
-
-State is persisted in `.kora/deploy/deploy.json`. On subsequent deploys, stored values (platform, app name, region) are reused automatically.
-
-Reset with:
-
-```bash
-kora deploy --reset
-```
-
-### Examples
-
-```bash
-# Interactive first deploy
-kora deploy
-
-# Non-interactive (CI/CD)
-kora deploy --platform=fly --app=my-kora-app --region=iad --confirm
-
-# Deploy to AWS Lightsail
-kora deploy --platform=aws-lightsail --app=my-app --region=us-east-1 --confirm
-
-# Deploy to AWS ECS Fargate
-kora deploy --platform=aws-ecs --app=my-app --region=us-east-1 --confirm
-
-# Production deploy
-kora deploy --prod --confirm
-
-# Check status after deployment
-kora deploy status
-
-# View logs
-kora deploy logs
-
-# Rollback
-kora deploy rollback
-```
-
-### Prerequisites
+Generates a Dockerfile, bundles `server.ts`, builds the client with Vite, provisions the app and
+deploys it. `--confirm` is non-interactive (for CI) and fails on missing data. State is kept in
+`.kora/deploy/` (add it to `.gitignore`); `--reset` deletes it. `render`, `docker` and `kora-cloud`
+are listed but not implemented. The project needs a `server.ts` (or `src/server.ts`) and Vite. The
+[Deployment guide](/guide/deployment) walks through a first deploy.
 
 | Platform | Requirement |
 |----------|-------------|
-| Fly.io | Install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly auth login` |
-| Railway | Install [@railway/cli](https://docs.railway.com/guides/cli), run `railway login` |
-| AWS ECS | Install [Docker Desktop](https://www.docker.com/get-started/) (must be running), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), run `aws configure` |
-| AWS Lightsail | Install [Docker Desktop](https://www.docker.com/get-started/) (must be running), [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), [lightsailctl plugin](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software), run `aws configure` |
-| Render | *Coming soon* |
-| Docker (self-hosted) | *Coming soon* |
-| Kora Cloud | *Coming soon* |
-
-### Project Requirements
-
-Your project must have:
-- A `package.json` with any `@korajs/*` dependency
-- A server entry file: `server.ts`, `server.js`, `src/server.ts`, or `src/server.js`
-- `vite` installed as a dev dependency (for client builds)
-
-::: tip
-The deploy command stores all generated artifacts in `.kora/deploy/`. Add this to your `.gitignore`:
-```
-.kora/deploy/
-```
-:::
+| Fly.io | `flyctl`, `fly auth login` |
+| Railway | `@railway/cli`, `railway login` |
+| AWS ECS, AWS Lightsail | Docker running, AWS CLI with `aws configure` (Lightsail also needs `lightsailctl`) |
 
 ---
 
-## Global options
-
-These options are available on all commands:
-
-| Option | Description |
-|--------|-------------|
-| `--help` | Show help for the command. |
-| `--version` | Show the CLI version. |
-| `--cwd <path>` | Set the working directory. Defaults to the current directory. |
-| `--verbose` | Enable verbose logging output. |
+## studio
 
 ```bash
-kora --version
-kora migrate --help
-kora dev --cwd ./my-project
+kora studio --db path/to/kora.db                       # file mode: inspect a database (read only)
+kora studio --lab [--devices 3] [--schema ./src/schema.ts]  # an interactive multi-device sync lab
+kora studio --connect wss://host/kora-sync --schema ./src/schema.ts [--token ...]  # live read-only replica
 ```
 
+Shows records with each field's last writer, operation history, the causal graph, the merge audit
+trail and sync state, on `--port` (default 4321). See [Kora Studio](/studio). File mode needs
+`better-sqlite3`; lab mode needs `@korajs/test` and `@korajs/server`.
 
-## kora studio
+---
 
-The visual window into Kora's data plane. Three modes:
+## agents-md
 
 ```bash
-# FILE mode: read-only inspection of any Kora database
-kora studio --db path/to/kora.db
-
-# LAB mode: interactive multi-device sync laboratory
-kora studio --lab [--devices 3] [--schema ./kora/schema.ts]
-
-# SPECTATOR mode: live read-only replica of a production sync server
-kora studio --connect wss://your-server.com/kora --schema ./kora/schema.ts [--token …]
+kora agents-md [--framework react|vue|svelte] [--force]
 ```
 
-Shows records with per-field last writers, full operation history, a causal
-DAG, time travel, the merge audit trail, and sync state, live. See the
-[Kora Studio guide](/studio) for the full walkthrough. Requires
-`better-sqlite3` (file mode), plus `@korajs/test` and `@korajs/server` for
-lab mode, and the Kora runtime packages for spectator mode.
+Writes an `AGENTS.md` with Kora's rules for AI coding agents into the project (see
+[AI Agents](/guide/ai-agents)). `--force` overwrites an existing file.
