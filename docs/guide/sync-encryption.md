@@ -28,6 +28,7 @@ The server needs metadata to route operations, deduplicate by content-addressed 
 
 A server can only evaluate sync scopes on values it can read. List the scope keys per collection; they travel in cleartext beside the envelope (and stay inside the ciphertext as well, which is the authoritative copy):
 
+<!-- docs-check: skip fragment of the sync.encryption config -->
 ```typescript
 encryption: {
   enabled: true,
@@ -42,6 +43,7 @@ Values listed here are visible to the server. List only scope keys and the forei
 
 The sync server enforces a relation's `onDelete` policy (`cascade`, `set-null`, `restrict`) for every device: it is the only replica that sees every child, including children created concurrently on devices that the deleting device has never heard of. It can do that only when it can read the foreign key. So, with encryption enabled, the foreign-key field of every relation whose `onDelete` is `cascade`, `set-null` or `restrict` **must** be listed in `cleartextFields`. `createApp` refuses a configuration that seals one, at startup, with a `SealedRelationFieldError` (`code: 'SEALED_RELATION_FIELD'`) naming the relation, the field and the fix:
 
+<!-- docs-check: skip fragment of the sync.encryption config -->
 ```typescript
 relations: {
   todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'cascade' },
@@ -62,10 +64,18 @@ With the foreign key in cleartext, cascades behave exactly as without encryption
 
 Add `encryption` to your sync config:
 
-```typescript
-import { createApp } from 'korajs'
-import schema from './schema'
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const authClient = createKoraAuthSync({ authClient: createKoraAuth({ serverUrl: 'https://api.example.com' }), schema })
+declare const passphrase: string
+declare const newPassphrase: string
+declare const currentPassphrase: string
+declare function showUnlockPrompt(code: string | undefined): void
+-->
 
+```typescript
 const app = createApp({
   schema,
   sync: {
@@ -83,6 +93,7 @@ Until the keyring is unlocked, sync is paused (`sync:suspended` with reason `enc
 
 You can also pass the passphrase (or an async provider of it) in the config. The keyring is then opened automatically at the first sync handshake:
 
+<!-- docs-check: skip fragment of the sync.encryption config -->
 ```typescript
 encryption: {
   enabled: true,
@@ -134,6 +145,7 @@ Cached data keys and the key-encryption key are stored as **non-extractable** `C
 | `locked` | No keys. `code` says why: `NO_PASSPHRASE`, `AWAITING_SERVER` (a passphrase was given; the record arrives with the next handshake), `LOCKED_BY_APP`, `PASSPHRASE_REQUIRED` (another device changed the passphrase and this device needs a key it does not hold yet). |
 | `error` | `WRONG_PASSPHRASE`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED`. Sync stays paused until `unlock()` succeeds. |
 
+<!-- docs-check: continue -->
 ```typescript
 app.encryption?.onStatusChange((status) => {
   if (status.state !== 'unlocked') showUnlockPrompt(status.code)
@@ -150,6 +162,7 @@ Once unlocked, the keyring needs no server: a device keeps encrypting and decryp
 
 Both need a live sync connection (they write the key record with compare-and-set):
 
+<!-- docs-check: continue -->
 ```typescript
 // A new data key for new operations. Old versions stay in the record, so history
 // still decrypts on every device, including devices that join later.
@@ -169,10 +182,11 @@ await app.encryption?.changePassphrase(newPassphrase, { currentPassphrase })
 
 To offer recovery, create a recovery key while the keyring is unlocked and show it to the user once:
 
+<!-- docs-check: continue -->
 ```typescript
 const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk1-..."; store it offline
 // ...later, on any device, after the passphrase was lost:
-await app.encryption?.recover(recoveryKey, newPassphrase)
+if (recoveryKey) await app.encryption?.recover(recoveryKey, newPassphrase)
 ```
 
 Every key version is also wrapped to the recovery key's public half (ECDH P-256 + AES-GCM), so any unlocked device keeps recovery current across rotations without knowing the recovery key. The recovery key itself is never sent to the server. Calling `enableRecovery()` again replaces it.
@@ -225,6 +239,7 @@ With encryption enabled, an inbound operation without an envelope is **refused**
 
 To migrate an existing plaintext app to encryption, open a migration window:
 
+<!-- docs-check: skip fragment of the sync.encryption config -->
 ```typescript
 encryption: { enabled: true, key: passphrase, allowPlaintextMigration: true }
 ```

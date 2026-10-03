@@ -284,7 +284,7 @@ How deletes are enforced:
 - **With end-to-end encryption**, the foreign key of every `cascade`, `set-null` or `restrict`
   relation must be listed in `cleartextFields`, or `createApp` refuses to start
   (`SealedRelationFieldError`, `SEALED_RELATION_FIELD`). Use `onDelete: 'no-action'` for a
-  relation whose key must stay sealed. See [Sync Encryption](/guide/sync-encryption#relations).
+  relation whose key must stay sealed. See [Sync Encryption](/guide/sync-encryption#foreign-keys-of-enforced-relations-must-be-cleartext).
 
 Load related records with `include()`:
 
