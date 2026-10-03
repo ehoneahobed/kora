@@ -367,6 +367,8 @@ export class SyncEngine {
 	private readonly memoryQuarantine = new Map<string, QuarantinedOperation>()
 	private outboundRetryAttempt = 0
 	private outboundRetryTimer: ReturnType<typeof setTimeout> | null = null
+	/** {@link pushOperation} calls not yet enqueued; the streaming flush waits for 0. */
+	private pendingPushes = 0
 	private reconnecting = false
 	private schemaBlocked = false
 	private clockBlocked = false
@@ -951,23 +953,33 @@ export class SyncEngine {
 	 * kept as a silent local fork.
 	 */
 	async pushOperation(op: Operation): Promise<void> {
-		if (!(await this.operationAllowedForUpload(op))) {
-			await this.recordOutOfUplinkScope(op)
-			// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
-			await this.withOwnTracking(async () => {
-				this.trackOwnOperation(op, false)
-				await this.advanceOwnPrefixLocked()
-			})
-			return
-		}
+		// A committed write publishes all of its operations synchronously (a delete and
+		// its cascades, a transaction). The streaming flush waits until every push that
+		// started is enqueued, so the commit block uploads in one batch: the server then
+		// sees a delete's authored cascades with the delete and does not derive a second
+		// copy of each (RT-69).
+		this.pendingPushes += 1
+		try {
+			if (!(await this.operationAllowedForUpload(op))) {
+				await this.recordOutOfUplinkScope(op)
+				// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
+				await this.withOwnTracking(async () => {
+					this.trackOwnOperation(op, false)
+					await this.advanceOwnPrefixLocked()
+				})
+				return
+			}
 
-		await this.withOwnTracking(async () => {
-			await this.outboundQueue.enqueue(op)
-			this.trackOwnOperation(op, true)
-		})
-		await this.refreshPendingCount()
-		if (this.state === 'streaming') {
-			this.flushQueue()
+			await this.withOwnTracking(async () => {
+				await this.outboundQueue.enqueue(op)
+				this.trackOwnOperation(op, true)
+			})
+			await this.refreshPendingCount()
+		} finally {
+			this.pendingPushes -= 1
+			if (this.pendingPushes === 0 && this.state === 'streaming') {
+				this.flushQueue()
+			}
 		}
 	}
 

@@ -9,6 +9,7 @@ import type {
 import { applyOperationTransforms } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
+import type { SideEffectOp } from '@korajs/merge'
 import type {
 	AwarenessUpdateMessage,
 	BlobChunkPushMessage,
@@ -44,7 +45,12 @@ import {
 	wireToVersionVector,
 } from '@korajs/sync'
 import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
-import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
+import {
+	RESTRICTED_REJECTION_CODE,
+	applyServerOperation,
+	deriveServerSideEffects,
+	isAuthoredCopyOfSideEffect,
+} from '../apply/apply-server-operation'
 import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-validation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
@@ -506,6 +512,14 @@ export interface ClientSessionOptions {
 	 * (envelope operations always opaquely).
 	 */
 	encryption?: { required: boolean; allowPlaintextMigration?: boolean }
+}
+
+/** A side effect of an applied delete whose server copy waits for the author's own (RT-69). */
+interface DeferredSideEffect {
+	parent: Operation
+	effect: SideEffectOp
+	/** Ids of the author's operations in the batch that are copies of this effect. */
+	copyIds: string[]
 }
 
 /**
@@ -2372,6 +2386,12 @@ export class ClientSession {
 			}
 		}
 
+		// The author's own cascades / set-nulls of a delete in this batch (RT-69): the
+		// server does not derive a second copy of an effect the author uploads itself.
+		const authoredCopies = this.indexAuthoredSideEffectCopies(operations)
+		const deferredEffects: DeferredSideEffect[] = []
+		const storedInBatch = new Set<string>()
+
 		for (const op of operations) {
 			if (!canAdvanceAck) {
 				continue
@@ -2395,6 +2415,7 @@ export class ClientSession {
 			// Already stored (found by the batch lookup): a duplicate ack, free of charge.
 			if (this.isStoredDuplicate(op, stored)) {
 				await this.noteStoredElsewhere(op, stored)
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2473,6 +2494,7 @@ export class ClientSession {
 				(!this.store.findStoredOperations && (await this.isStoredOperation(op, stored)))
 			) {
 				await this.noteStoredElsewhere(op, stored)
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 				continue
@@ -2612,7 +2634,17 @@ export class ClientSession {
 				// produce two operations under one sequence: store the pair (RT-37).
 				legacySequenceWriter: !this.sequenceReservation,
 				onLegacySequencePair: (pair) => this.recordLegacySequencePair(pair),
+				isAuthoredSideEffect: (effect) =>
+					(authoredCopies.get(serverOp.id) ?? []).some((copy) =>
+						isAuthoredCopyOfSideEffect(copy, serverOp.id, effect),
+					),
 			})
+			for (const effect of applyResult.deferredSideEffects ?? []) {
+				const copyIds = (authoredCopies.get(serverOp.id) ?? [])
+					.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverOp.id, effect))
+					.map((copy) => copy.id)
+				deferredEffects.push({ parent: serverOp, effect, copyIds })
+			}
 			if (applyResult.rejection) {
 				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
 				// resubmits it under the same id, so it is never remembered as refused.
@@ -2643,13 +2675,20 @@ export class ClientSession {
 			}
 			if (applyResult.result === 'applied') {
 				applied.push(...applyResult.appliedOperations)
+				storedInBatch.add(op.id)
 				uniqueOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			} else {
+				storedInBatch.add(op.id)
 				duplicateOperations += 1
 				acknowledgedThrough = op.sequenceNumber
 			}
 		}
+
+		// Derive the server's copy of every deferred effect whose authored copy did not
+		// end up stored (refused, rate-limited, or not reached in this batch): the
+		// referential effect of an applied delete is never left undone (RT-69).
+		applied.push(...(await this.deriveUncoveredSideEffects(deferredEffects, storedInBatch)))
 
 		if (operations.length > 0) {
 			this.emitter?.emit({
@@ -2675,6 +2714,67 @@ export class ClientSession {
 		// Relay only newly applied operations to other sessions
 		if (applied.length > 0) {
 			this.onRelay?.(this.sessionId, applied)
+		}
+	}
+
+	/**
+	 * For each delete of this session's node in an upload batch, the batch's later
+	 * operations of the same node that name it as a causal parent: candidates for the
+	 * author's own copies of its cascades and set-nulls (RT-69). Indexed by the delete's
+	 * id, in the server's schema (field names as the server derives effects).
+	 */
+	private indexAuthoredSideEffectCopies(operations: Operation[]): Map<string, Operation[]> {
+		const copies = new Map<string, Operation[]>()
+		const deletes = new Set<string>()
+		for (const op of operations) {
+			if (op.nodeId !== this.clientNodeId) continue
+			const parents = op.causalDeps.filter((dep) => deletes.has(dep))
+			if (parents.length > 0) {
+				const transformed = this.transformForServerSchema(op)
+				if (transformed !== null) {
+					for (const parent of parents) {
+						copies.set(parent, [...(copies.get(parent) ?? []), transformed])
+					}
+				}
+			}
+			if (op.type === 'delete') deletes.add(op.id)
+		}
+		return copies
+	}
+
+	/**
+	 * Derive the server's copy of each deferred side effect unless one of the author's
+	 * copies is stored (applied or already held). A store with the batch lookup is asked
+	 * again, so a copy stored by a concurrent session counts too.
+	 */
+	private async deriveUncoveredSideEffects(
+		deferred: DeferredSideEffect[],
+		storedInBatch: Set<string>,
+	): Promise<Operation[]> {
+		if (deferred.length === 0) return []
+		const unresolved = [
+			...new Set(deferred.flatMap((d) => d.copyIds).filter((id) => !storedInBatch.has(id))),
+		]
+		const storedElsewhere: Map<string, unknown> =
+			unresolved.length > 0 ? await this.findStoredOperationIds(unresolved) : new Map()
+		const derived: Operation[] = []
+		for (const { parent, effect, copyIds } of deferred) {
+			if (copyIds.some((id) => storedInBatch.has(id) || storedElsewhere.has(id))) continue
+			derived.push(...(await deriveServerSideEffects(this.store, parent, [effect])))
+		}
+		return derived
+	}
+
+	/** {@link ServerStore.findStoredOperations} by id; empty without it or on a failed read. */
+	private async findStoredOperationIds(ids: string[]): Promise<Map<string, unknown>> {
+		if (!this.store.findStoredOperations) return new Map()
+		try {
+			return await this.store.findStoredOperations(ids)
+		} catch (error) {
+			console.warn(
+				`[kora] findStoredOperations failed; deriving the server's side effects: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return new Map()
 		}
 	}
 

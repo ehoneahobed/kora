@@ -1196,6 +1196,39 @@ describe('SyncEngine streaming', () => {
 		expect(opBatch?.operations[0]?.id).toBe('new-op')
 	})
 
+	test("a commit block's operations, pushed together, upload in one batch (RT-69)", async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore({ getNodeId: () => 'node-1' }),
+			config: { url: 'ws://test' },
+		})
+
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		expect(engine.getState()).toBe('streaming')
+		client.clearSentMessages()
+
+		// A delete and its cascades are published synchronously after one commit.
+		const parent = makeOp('parent-delete', 10)
+		const pushes = [
+			engine.pushOperation(parent),
+			engine.pushOperation(makeOp('cascade-1', 11, 'node-1', [parent.id])),
+			engine.pushOperation(makeOp('cascade-2', 12, 'node-1', [parent.id])),
+		]
+		await Promise.all(pushes)
+		await settleUpload()
+
+		const batches = client
+			.getSentMessages()
+			.filter((m) => m.type === 'operation-batch') as OperationBatchMessage[]
+		expect(batches.map((b) => b.operations.map((op) => op.id))).toEqual([
+			['parent-delete', 'cascade-1', 'cascade-2'],
+		])
+	})
+
 	test('incoming ops during streaming are applied to store', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const applyFn = vi.fn(async (_op: Operation) => 'applied' as const)
