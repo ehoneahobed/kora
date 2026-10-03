@@ -67,8 +67,9 @@ export interface FoldMigrationReport {
 	/** Records re-folded and rewritten. */
 	records: number
 	/**
-	 * Records left with their pre-fold rows because the log has quarantined rows (see
-	 * `ServerLogIntegrityReport`); they fold from their remaining log on their next write.
+	 * Records that own quarantined operations (see `ServerLogIntegrityReport`): their log
+	 * is incomplete, so their pre-fold rows were kept as a snapshot base with the
+	 * remaining operations folded onto it (RT-70), never re-folded from the log alone.
 	 */
 	skippedUnclean: number
 	/** True when the fold plan (field kinds, strategies, resolvers) changed: every record was re-folded. */

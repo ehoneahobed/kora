@@ -45,6 +45,7 @@ import {
 } from '@korajs/sync'
 import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
 import { RESTRICTED_REJECTION_CODE, applyServerOperation } from '../apply/apply-server-operation'
+import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-validation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
@@ -1779,6 +1780,15 @@ export class ClientSession {
 			this.close('reserved node id')
 			return
 		}
+		if (!isStorableIdentifier(msg.nodeId)) {
+			this.sendError(
+				'INVALID_NODE_ID',
+				'The node id holds U+0000 or an unpaired UTF-16 surrogate. Use a generated device node id.',
+				false,
+			)
+			this.close('malformed node id')
+			return
+		}
 		// The server's own node ids, current and legacy (published in the handshake's
 		// `authoritativeNodeIds`), are never a device's: a device presenting one would
 		// author `merge('server-authoritative')` writes as the server (RT-61).
@@ -2349,8 +2359,10 @@ export class ClientSession {
 		if (operations.length > 0) {
 			if (this.rateLimiter.allow(BATCH_LOOKUP_RATE_COST)) {
 				lookupCredit = BATCH_LOOKUP_RATE_COST
-				stored = await this.findStoredOperations(operations)
-				resolved = await this.findResolutions(operations, stored)
+				// Identifiers a store cannot hold are refused in the loop, never looked up (RT-65).
+				const lookupable = operations.filter((op) => operationIdentifiersStorable(op))
+				stored = await this.findStoredOperations(lookupable)
+				resolved = await this.findResolutions(lookupable, stored)
 			} else {
 				this.rateLimitedOperations += operations.length
 				this.sendRateLimited()
@@ -2360,6 +2372,21 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+
+			// An identifier holding U+0000 or a lone surrogate cannot be stored or looked up
+			// (Postgres refuses it). Refused terminally without touching the store, so it
+			// never fails the session (RT-65); nothing is recorded under such an id.
+			if (!operationIdentifiersStorable(op)) {
+				this.sendOperationRejected(
+					op,
+					INVALID_IDENTIFIER_CODE,
+					`Operation "${String(op.id)}" has an identifier holding U+0000 or an unpaired UTF-16 surrogate. Identifiers must be well-formed strings.`,
+					false,
+				)
+				rejectedOperations += 1
+				acknowledgedThrough = op.sequenceNumber
 				continue
 			}
 
@@ -3603,4 +3630,15 @@ function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
 	}
 
 	return 'json'
+}
+
+/** True when every identifier of `op` can be stored and looked up by every store (RT-65). */
+function operationIdentifiersStorable(op: Operation): boolean {
+	return (
+		isStorableIdentifier(op.id) &&
+		isStorableIdentifier(op.nodeId) &&
+		isStorableIdentifier(op.collection) &&
+		isStorableIdentifier(op.recordId) &&
+		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
+	)
 }

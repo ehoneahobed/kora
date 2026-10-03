@@ -40,6 +40,29 @@ export class SequenceConflictError extends KoraError {
 	}
 }
 
+/** Rejection code for an operation holding a value the store cannot represent. */
+export const UNSTORABLE_VALUE_CODE = 'UNSTORABLE_VALUE'
+
+/**
+ * Thrown by a store when an operation carries a value the database cannot represent
+ * (RT-65). Nothing was written. Not retriable: the same bytes always fail, so the
+ * session refuses the operation terminally instead of failing the connection (which
+ * made the device re-send it forever and blocked every later write of that device).
+ */
+export class UnstorableValueError extends KoraError {
+	constructor(
+		readonly operation: Pick<Operation, 'id' | 'collection' | 'recordId'>,
+		detail: string,
+	) {
+		super(
+			`Operation "${operation.id}" on ${operation.collection}/${operation.recordId} holds a value this server's database cannot store (${detail}). It is refused; nothing was written.`,
+			UNSTORABLE_VALUE_CODE,
+			{ operationId: operation.id, collection: operation.collection, recordId: operation.recordId },
+		)
+		this.name = 'UnstorableValueError'
+	}
+}
+
 /**
  * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
  * sequence in the log when this release first opened the store. Operations stored at

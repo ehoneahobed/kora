@@ -504,7 +504,7 @@ describe('re-materialization migration (W7 step 7)', () => {
 		}
 	}, 60_000)
 
-	test('SQLite: with quarantined log rows the pre-fold rows are kept and the skip is reported', async () => {
+	test('SQLite: a record with quarantined log rows keeps its pre-fold row as its base (RT-70)', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'kora-fold-q-'))
 		const filename = join(dir, 'server.db')
 		try {
@@ -530,9 +530,13 @@ describe('re-materialization migration (W7 step 7)', () => {
 				const store = createSqliteServerStore({ filename, nodeId: 'server' })
 				expect(store.getLogIntegrityReport().totalQuarantined).toBe(1)
 				await store.setSchema(migrationSchema)
-				expect(store.getFoldMigrationReport().skippedUnclean).toBe(10)
+				// Only the record owning the quarantined row is kept; the other nine have a
+				// complete log and are folded from it.
+				expect(store.getFoldMigrationReport()).toMatchObject({ skippedUnclean: 1, records: 10 })
 				expect((await store.findRecord('lists', 'l-0001'))?.tags).toEqual(['legacy'])
-				// The next write folds the record from its remaining log.
+				expect((await store.findRecord('lists', 'l-0002'))?.tags).toEqual(foldedTags(ops, 'l-0002'))
+				// The next write folds onto the kept row (RT-70: never from the incomplete log,
+				// which would drop what the quarantined operation contributed).
 				await store.applyRemoteOperation({
 					...(ops[0] as Operation),
 					id: 'after',
@@ -545,7 +549,7 @@ describe('re-materialization migration (W7 step 7)', () => {
 				})
 				const row = await store.findRecord('lists', 'l-0001')
 				expect(row?.name).toBe('renamed')
-				expect(row?.tags).toEqual(foldedTags(ops, 'l-0001'))
+				expect(row?.tags).toEqual(['legacy'])
 				await store.close()
 			} finally {
 				console.error = original

@@ -9,7 +9,12 @@ import {
 	type UplinkAuthorizationResult,
 } from '../scopes/server-scope-filter'
 import type { ApplyRemoteOptions, MaterializedRecord, ServerStore } from '../store/server-store'
-import { SEQUENCE_CONFLICT_CODE, SequenceConflictError } from '../store/server-store'
+import {
+	SEQUENCE_CONFLICT_CODE,
+	SequenceConflictError,
+	UNSTORABLE_VALUE_CODE,
+	UnstorableValueError,
+} from '../store/server-store'
 import { validateIngestedOperation } from './ingest-validation'
 import { type OperationRejection, isRetriableRejection } from './rejection-taxonomy'
 import {
@@ -286,6 +291,9 @@ function applyPrimary(
 function authorizationRejection(error: unknown): OperationRejection | null {
 	if (error instanceof SequenceConflictError) {
 		return { code: SEQUENCE_CONFLICT_CODE, message: error.message, retriable: false }
+	}
+	if (error instanceof UnstorableValueError) {
+		return { code: UNSTORABLE_VALUE_CODE, message: error.message, retriable: false }
 	}
 	if (!(error instanceof UplinkAuthorizationError)) return null
 	return { code: error.rejectionCode, message: error.message, retriable: false }

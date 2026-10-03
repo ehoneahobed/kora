@@ -31,6 +31,15 @@ import {
 	validateFieldName,
 } from './materialization'
 import {
+	type KeptRow,
+	type QuarantineScope,
+	buildQuarantineScope,
+	emptyQuarantineScope,
+	isQuarantineAffected,
+	quarantineKey,
+	rebuildFromSnapshot,
+} from './quarantine-base'
+import {
 	EMPTY_FOLD_SCHEMA,
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
@@ -95,6 +104,14 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import {
+	PG_TEXT_CODEC_MIGRATION_KEY,
+	deserializeSqliteFieldValue,
+	encodePgText,
+	isPgRawTextKind,
+	serializeSqliteFieldValue,
+	sqliteTextCodecMigrationSql,
+} from './text-codec'
 
 /** Index every (node, sequence) the log holds more than once (RT-48). */
 const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
@@ -164,6 +181,8 @@ export class SqliteServerStore implements ServerStore {
 	private readonly explicitAuthorities: string[]
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	private readonly otherServerNodes = new Set<string>()
+	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
+	private quarantine: QuarantineScope = emptyQuarantineScope()
 	private readonly foldOptions: ServerFoldOptions
 	private foldMigration: FoldMigrationReport = {
 		ran: false,
@@ -342,6 +361,8 @@ export class SqliteServerStore implements ServerStore {
 				this.db.run(sql.raw(stmt))
 			}
 		}
+
+		this.migrateTextCodec(schema)
 
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
 		this.foldMigration = this.rematerialize()
@@ -885,7 +906,7 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
-		const whereClause = this.buildWhereClause(where ?? {}, false)
+		const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
 		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`
 		const rows = this.db.all<{ cnt: number }>(query)
 		return rows[0]?.cnt ?? 0
@@ -977,6 +998,52 @@ export class SqliteServerStore implements ServerStore {
 		const state = refoldRecord(ops, this.schema ?? EMPTY_FOLD_SCHEMA, this.foldOptions)
 		const lastKnown = state ? projectFoldState(state, this.foldOptions) : null
 		return { ...(lastKnown?.values ?? {}), id: recordId }
+	}
+
+	/**
+	 * The fold state of a record that owns quarantined operations (RT-70): its stored
+	 * state, or its kept row as a snapshot base, with every remaining operation of the
+	 * record merged on top (`rebuildFromSnapshot`). Nothing is written.
+	 */
+	private rebuildAffected(
+		txOrDb: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		stored: FoldState | null,
+	): FoldState | null {
+		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
+		const collectionDef = schema.collections[collection]
+		const raw = collectionDef
+			? txOrDb.all<Record<string, unknown>>(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+				)[0]
+			: undefined
+		let row: KeptRow | null = null
+		if (raw && collectionDef) {
+			const record = this.deserializeRow(raw, collectionDef)
+			const values: Record<string, unknown> = {}
+			for (const field of Object.keys(collectionDef.fields)) {
+				if (record[field] !== undefined) values[field] = record[field]
+			}
+			row = {
+				values,
+				createdAt: Number(raw._created_at ?? 0),
+				updatedAt: Number(raw._updated_at ?? 0),
+				deleted: Number(raw._deleted) === 1,
+			}
+		}
+		return rebuildFromSnapshot(
+			{
+				collection,
+				recordId,
+				stored,
+				row,
+				ops: this.readRecordOperations(txOrDb, collection, recordId, 0),
+				quarantinedLatest: this.quarantine.latest.get(quarantineKey(collection, recordId)),
+			},
+			schema,
+			this.foldOptions,
+		)
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -1088,10 +1155,13 @@ export class SqliteServerStore implements ServerStore {
 		const parsed = stored ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
 		let state: FoldState | null | typeof REFOLD_REQUIRED
-		if (!stored && !last) {
-			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
-		} else if (parsed && covered === prior && stored?.covered_op_id === last?.id) {
+		if (parsed && covered === prior && stored?.covered_op_id === (last?.id ?? '')) {
 			state = mergeIntoFoldState(parsed, [op], schema, this.foldOptions)
+		} else if (isQuarantineAffected(this.quarantine, op.collection, op.recordId)) {
+			// Incomplete log (RT-70): fold onto the kept row, never from the log alone.
+			state = this.rebuildAffected(tx, op.collection, op.recordId, parsed)
+		} else if (!stored && !last) {
+			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
 		} else if (
 			parsed &&
 			covered > 0 &&
@@ -1155,11 +1225,13 @@ export class SqliteServerStore implements ServerStore {
 			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
 				parsed &&
-				last &&
-				Number(stored?.covered_seq) === Number(last.d) &&
-				stored?.covered_op_id === last.id
+				Number(stored?.covered_seq) === Number(last?.d ?? 0) &&
+				stored?.covered_op_id === (last?.id ?? '')
 			) {
 				return parsed
+			}
+			if (isQuarantineAffected(this.quarantine, collection, recordId)) {
+				return this.rebuildAffected(txOrDb, collection, recordId, parsed)
 			}
 		}
 		const ops = this.readRecordOperations(txOrDb, collection, recordId, 0)
@@ -1255,7 +1327,7 @@ export class SqliteServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializeFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor ? serializeSqliteFieldValue(recordData[f] ?? null, descriptor) : null
 			}),
 			createdAt,
 			updatedAt,
@@ -1297,6 +1369,29 @@ export class SqliteServerStore implements ServerStore {
 	 *   A plan change first marks every stored state stale (one statement), then
 	 *   records the new fingerprint, so it is resumable too.
 	 */
+	/**
+	 * One-time migration of each collection table to the lossless text encoding (RT-65):
+	 * rows written before it whose raw-string columns contain U+FFFF (the escape
+	 * introducer) are re-encoded, so the decoder returns them unchanged.
+	 */
+	private migrateTextCodec(schema: SchemaDefinition): void {
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			const key = `${PG_TEXT_CODEC_MIGRATION_KEY}${name}`
+			this.db.transaction((tx) => {
+				if (tx.all(sql`SELECT 1 AS one FROM kora_server_meta WHERE key = ${key}`).length > 0) return
+				const textColumns = Object.entries(collection.fields)
+					.filter(([, descriptor]) => isPgRawTextKind(descriptor.kind))
+					.map(([field]) => quoteIdent(field))
+				for (const statement of sqliteTextCodecMigrationSql(quoteIdent(name), textColumns)) {
+					tx.run(sql.raw(statement))
+				}
+				tx.run(
+					sql`INSERT OR IGNORE INTO kora_server_meta (key, value) VALUES (${key}, ${String(Date.now())})`,
+				)
+			})
+		}
+	}
+
 	private rematerialize(): FoldMigrationReport {
 		const schema = this.schema
 		const report: FoldMigrationReport = {
@@ -1346,10 +1441,8 @@ export class SqliteServerStore implements ServerStore {
 				cursor = page[page.length - 1]?.record_id ?? cursor
 				this.db.transaction((tx) => {
 					for (const candidate of page) {
-						if (!clean && candidate.covered === null && Number(candidate.has_row) === 1) {
-							report.skippedUnclean++
-							continue
-						}
+						const affected =
+							!clean && isQuarantineAffected(this.quarantine, collection, candidate.record_id)
 						const rows = tx
 							.select()
 							.from(operations)
@@ -1369,23 +1462,63 @@ export class SqliteServerStore implements ServerStore {
 							}
 						}
 						const ops = rows.map((row) => this.deserializeOperation(row))
-						this.writeFoldedRecord(
-							tx,
-							collection,
-							candidate.record_id,
-							refoldRecord(ops, schema, this.foldOptions),
-							covered,
-							coveredOpId,
-						)
+						if (affected) {
+							// Incomplete log (RT-70): the kept row is the base, never the log alone.
+							const stored = tx.all<{ state: string }>(
+								sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${candidate.record_id}`,
+							)[0]
+							this.writeFoldedRecord(
+								tx,
+								collection,
+								candidate.record_id,
+								this.rebuildAffected(
+									tx,
+									collection,
+									candidate.record_id,
+									parseStoredFoldState(stored?.state, collection, candidate.record_id),
+								),
+								covered,
+								coveredOpId,
+							)
+							report.skippedUnclean++
+						} else {
+							this.writeFoldedRecord(
+								tx,
+								collection,
+								candidate.record_id,
+								refoldRecord(ops, schema, this.foldOptions),
+								covered,
+								coveredOpId,
+							)
+						}
 						report.records++
 					}
 				})
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
+			// Affected records with no remaining operation at all (every one quarantined,
+			// the insert included): the kept row is their whole history.
+			if (!clean) {
+				this.db.transaction((tx) => {
+					const orphans = tx.all<{ id: string }>(
+						sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(collection))} c
+							WHERE NOT EXISTS (SELECT 1 FROM kora_fold_state f WHERE f.collection = ${collection} AND f.record_id = c.id)
+							AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.collection = ${collection} AND o.record_id = c.id)`,
+					)
+					for (const { id } of orphans) {
+						if (!isQuarantineAffected(this.quarantine, collection, id)) continue
+						const state = this.rebuildAffected(tx, collection, id, null)
+						if (!state) continue
+						this.writeFoldedRecord(tx, collection, id, state, 0, '')
+						report.skippedUnclean++
+						report.records++
+					}
+				})
+			}
 		}
 		if (report.skippedUnclean > 0) {
 			console.error(
-				`[kora] Fold re-materialization skipped ${report.skippedUnclean} record(s): the operation log has ${this.logIntegrity.totalQuarantined} quarantined row(s) (see operations_quarantine). Their rows keep their pre-fold values until their next write. Repair or release the quarantined rows, then restart to re-materialize.`,
+				`[kora] Fold re-materialization: ${report.skippedUnclean} record(s) own quarantined operations (${this.logIntegrity.totalQuarantined} quarantined row(s), see operations_quarantine). Their log is incomplete, so their pre-fold rows were kept as the base their remaining and later operations fold onto. Repair or release the quarantined rows to restore their exact history.`,
 			)
 		}
 		return report
@@ -1399,6 +1532,7 @@ export class SqliteServerStore implements ServerStore {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
+			this.schema?.collections[collection],
 		)
 
 		const parts: SQL[] = [
@@ -1421,7 +1555,11 @@ export class SqliteServerStore implements ServerStore {
 		return sql.join(parts, sql.raw(''))
 	}
 
-	private buildWhereClause(where: Record<string, unknown>, includeDeleted: boolean): SQL {
+	private buildWhereClause(
+		where: Record<string, unknown>,
+		includeDeleted: boolean,
+		collectionDef?: { fields: Record<string, import('@korajs/core').FieldDescriptor> },
+	): SQL {
 		const conditions: SQL[] = []
 
 		if (!includeDeleted) {
@@ -1429,7 +1567,11 @@ export class SqliteServerStore implements ServerStore {
 		}
 
 		for (const [key, value] of Object.entries(where)) {
-			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${value}`)
+			// Raw-string columns hold the lossless encoding (RT-65): filter on it too.
+			const kind = collectionDef?.fields[key]?.kind
+			const param =
+				kind && isPgRawTextKind(kind) && typeof value === 'string' ? encodePgText(value) : value
+			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${param}`)
 		}
 
 		if (conditions.length === 0) {
@@ -1451,7 +1593,7 @@ export class SqliteServerStore implements ServerStore {
 
 		for (const [fieldName, descriptor] of Object.entries(collectionDef.fields)) {
 			if (fieldName in row) {
-				record[fieldName] = deserializeFieldValue(row[fieldName], descriptor)
+				record[fieldName] = deserializeSqliteFieldValue(row[fieldName], descriptor)
 			}
 		}
 
@@ -1713,6 +1855,11 @@ export class SqliteServerStore implements ServerStore {
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		this.backfillSequencePairs()
 		this.logIntegrity = this.scanLogIntegrityOnce()
+		this.quarantine = buildQuarantineScope(
+			this.db
+				.all<{ row_json: string }>(sql`SELECT row_json FROM operations_quarantine`)
+				.map((row) => row.row_json),
+		)
 	}
 
 	/**

@@ -31,6 +31,15 @@ import {
 	validateFieldName,
 } from './materialization'
 import {
+	type KeptRow,
+	type QuarantineScope,
+	buildQuarantineScope,
+	emptyQuarantineScope,
+	isQuarantineAffected,
+	quarantineKey,
+	rebuildFromSnapshot,
+} from './quarantine-base'
+import {
 	EMPTY_FOLD_SCHEMA,
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
@@ -93,10 +102,20 @@ import {
 	SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES,
 	SequenceConflictError,
 	type SequenceHolderVerdict,
+	UnstorableValueError,
 	judgeSequenceHolders,
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import {
+	PG_TEXT_CODEC_MIGRATION_KEY,
+	deserializePgFieldValue,
+	encodePgText,
+	isPgJsonbKind,
+	isPgRawTextKind,
+	pgTextCodecMigrationSql,
+	serializePgFieldValue,
+} from './text-codec'
 
 /** Thrown inside an append transaction to roll it back when the operation is a duplicate. */
 class DuplicateOperationRollback extends Error {
@@ -135,6 +154,36 @@ function isUniqueViolation(error: unknown): boolean {
 	return error instanceof Error && codeOf(error.cause) === PG_UNIQUE_VIOLATION
 }
 
+/**
+ * SQLSTATEs of values Postgres cannot represent: 22021 (character not in repertoire,
+ * a NUL in TEXT), 22P05 (untranslatable character, `\u0000` in JSONB), 22P02 (invalid
+ * text representation, an unpaired surrogate escape in JSONB).
+ */
+const PG_UNSTORABLE_VALUE_CODES = new Set(['22021', '22P05', '22P02'])
+
+/**
+ * Map a Postgres refusal of a value to {@link UnstorableValueError} (non-retriable).
+ * The lossless text encoding keeps ordinary strings from reaching this; it is the
+ * safety net that keeps any remaining unrepresentable value from failing the session.
+ */
+function unstorableValueOr(error: unknown, op: Operation): unknown {
+	const codeOf = (value: unknown): unknown =>
+		value && typeof value === 'object' && 'code' in value
+			? (value as { code: unknown }).code
+			: undefined
+	const code = codeOf(error) ?? (error instanceof Error ? codeOf(error.cause) : undefined)
+	if (typeof code === 'string' && PG_UNSTORABLE_VALUE_CODES.has(code)) {
+		const message =
+			error instanceof Error
+				? error.cause instanceof Error
+					? error.cause.message
+					: error.message
+				: String(error)
+		return new UnstorableValueError(op, `SQLSTATE ${code}: ${message}`)
+	}
+	return error
+}
+
 /** One record's re-folded state, for {@link PostgresServerStore}'s batched migration writes. */
 interface FoldedRecordWrite {
 	recordId: string
@@ -160,6 +209,8 @@ export class PostgresServerStore implements ServerStore {
 	private explicitAuthorities: string[] = []
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	private readonly otherServerNodes = new Set<string>()
+	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
+	private quarantine: QuarantineScope = emptyQuarantineScope()
 	private readonly db: PostgresJsDatabase
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
@@ -418,6 +469,8 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
+		await this.migrateTextCodec(schema)
+
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
 		this.foldMigration = await this.rematerialize()
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
@@ -437,6 +490,35 @@ export class PostgresServerStore implements ServerStore {
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
+		}
+	}
+
+	/**
+	 * One-time migration of each collection table to the lossless text encoding (RT-65):
+	 * rows written before it that contain U+FFFF (the escape introducer) are re-encoded,
+	 * so the decoder returns them unchanged. Per table, under an advisory lock, recorded
+	 * in `kora_server_meta`.
+	 */
+	private async migrateTextCodec(schema: SchemaDefinition): Promise<void> {
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			const key = `${PG_TEXT_CODEC_MIGRATION_KEY}${name}`
+			await this.db.transaction(async (tx) => {
+				await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:text-codec', 0))`)
+				const done = (await tx.execute(
+					sql`SELECT 1 AS one FROM kora_server_meta WHERE key = ${key}`,
+				)) as unknown as unknown[]
+				if (done.length > 0) return
+				const fields = Object.entries(collection.fields)
+				const statements = pgTextCodecMigrationSql(
+					quoteIdent(name),
+					fields.filter(([, d]) => isPgRawTextKind(d.kind)).map(([f]) => quoteIdent(f)),
+					fields.filter(([, d]) => isPgJsonbKind(d.kind)).map(([f]) => quoteIdent(f)),
+				)
+				for (const statement of statements) await tx.execute(sql.raw(statement))
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(Date.now())}) ON CONFLICT (key) DO NOTHING`,
+				)
+			})
 		}
 	}
 
@@ -495,7 +577,7 @@ export class PostgresServerStore implements ServerStore {
 			})
 		} catch (error) {
 			if (error instanceof DuplicateOperationRollback) return 'duplicate'
-			throw error
+			throw unstorableValueOr(error, op)
 		}
 
 		// Keep this instance's cached vector current for its synchronous readers. The
@@ -628,79 +710,85 @@ export class PostgresServerStore implements ServerStore {
 		>
 		const lockKey = `kora:${input.target.collection}:${input.target.id}`
 
-		const result = await this.db.transaction(async (tx) => {
-			// Serialize this target across every server instance sharing the database.
-			// hashtextextended maps the key to the bigint pg_advisory_xact_lock expects;
-			// the lock releases automatically when the transaction ends.
-			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`)
-			// Also take the delivery-counter row lock now (every append takes it until
-			// commit), so the reads below, including the authorization reads of the
-			// built operations, see every earlier commit and no append can commit
-			// between them and this transaction's writes. Lock order (advisory, then
-			// counter) matches every other path, so this cannot deadlock.
-			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+		let attempted: Operation | null = null
+		const result = await this.db
+			.transaction(async (tx) => {
+				// Serialize this target across every server instance sharing the database.
+				// hashtextextended maps the key to the bigint pg_advisory_xact_lock expects;
+				// the lock releases automatically when the transaction ends.
+				await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`)
+				// Also take the delivery-counter row lock now (every append takes it until
+				// commit), so the reads below, including the authorization reads of the
+				// built operations, see every earlier commit and no append can commit
+				// between them and this transaction's writes. Lock order (advisory, then
+				// counter) matches every other path, so this cannot deadlock.
+				await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 
-			// Idempotency: if the key record already exists (from an earlier attempt),
-			// this set is already committed. Checked under the lock so a retry racing a
-			// first attempt on another instance still resolves to at-most-once.
-			if (input.idempotencyKey) {
-				const existing = (await tx.execute(
-					sql`SELECT 1 FROM ${sql.raw(quoteIdent(input.idempotencyKey.collection))} WHERE id = ${input.idempotencyKey.id} AND _deleted = 0 LIMIT 1`,
-				)) as unknown as unknown[]
-				if (existing.length > 0) {
-					return { admitted: true, idempotent: true, applied: [] as Operation[] }
+				// Idempotency: if the key record already exists (from an earlier attempt),
+				// this set is already committed. Checked under the lock so a retry racing a
+				// first attempt on another instance still resolves to at-most-once.
+				if (input.idempotencyKey) {
+					const existing = (await tx.execute(
+						sql`SELECT 1 FROM ${sql.raw(quoteIdent(input.idempotencyKey.collection))} WHERE id = ${input.idempotencyKey.id} AND _deleted = 0 LIMIT 1`,
+					)) as unknown as unknown[]
+					if (existing.length > 0) {
+						return { admitted: true, idempotent: true, applied: [] as Operation[] }
+					}
 				}
-			}
 
-			const rows = (await tx.execute(
-				sql`SELECT * FROM ${sql.raw(quoteIdent(input.target.collection))} WHERE id = ${input.target.id} AND _deleted = 0`,
-			)) as unknown as Record<string, unknown>[]
-			const current =
-				rows.length > 0
-					? this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
-					: null
+				const rows = (await tx.execute(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(input.target.collection))} WHERE id = ${input.target.id} AND _deleted = 0`,
+				)) as unknown as Record<string, unknown>[]
+				const current =
+					rows.length > 0
+						? this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
+						: null
 
-			if (!input.admit(current)) {
-				return { admitted: false, idempotent: false, applied: [] as Operation[] }
-			}
+				if (!input.admit(current)) {
+					return { admitted: false, idempotent: false, applied: [] as Operation[] }
+				}
 
-			// Seed a clock past the target record's latest committed operation so the
-			// operations built next sort strictly after every prior write to it. Under
-			// the advisory lock this makes last-write-wins materialization agree with the
-			// serialized commit order, so a same-millisecond commit on another instance
-			// cannot cause the counter to be undercounted (which would admit past a cap).
-			const clock = new HybridLogicalClock(this.nodeId, this.timeSource)
-			const latest = await this.latestOperationTimestamp(
-				tx,
-				input.target.collection,
-				input.target.id,
-			)
-			if (latest) {
-				clock.advanceTo(latest)
-			}
+				// Seed a clock past the target record's latest committed operation so the
+				// operations built next sort strictly after every prior write to it. Under
+				// the advisory lock this makes last-write-wins materialization agree with the
+				// serialized commit order, so a same-millisecond commit on another instance
+				// cannot cause the counter to be undercounted (which would admit past a cap).
+				const clock = new HybridLogicalClock(this.nodeId, this.timeSource)
+				const latest = await this.latestOperationTimestamp(
+					tx,
+					input.target.collection,
+					input.target.id,
+				)
+				if (latest) {
+					clock.advanceTo(latest)
+				}
 
-			const ops = await input.buildOperations(current, {
-				clock,
-				readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
+				const ops = await input.buildOperations(current, {
+					clock,
+					readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
+				})
+				const now = Date.now()
+				for (const op of ops) {
+					const deliverySeq = await this.nextDeliverySeq(tx)
+					const materialized = this.schema?.collections[op.collection] !== undefined
+					const pre = materialized
+						? await this.readScopeValues(tx, op.collection, op.recordId, false)
+						: null
+					// A built operation is new by construction (fresh id, reserved sequence); a
+					// duplicate would mean it is already committed, so it is not written twice.
+					attempted = op
+					if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
+					await this.advanceSyncState(tx, op, now)
+					if (materialized) {
+						await this.mergeIntoRecord(tx, op, deliverySeq)
+						await this.writeScopeSnapshot(tx, op, pre)
+					}
+				}
+				return { admitted: true, idempotent: false, applied: ops }
 			})
-			const now = Date.now()
-			for (const op of ops) {
-				const deliverySeq = await this.nextDeliverySeq(tx)
-				const materialized = this.schema?.collections[op.collection] !== undefined
-				const pre = materialized
-					? await this.readScopeValues(tx, op.collection, op.recordId, false)
-					: null
-				// A built operation is new by construction (fresh id, reserved sequence); a
-				// duplicate would mean it is already committed, so it is not written twice.
-				if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
-				await this.advanceSyncState(tx, op, now)
-				if (materialized) {
-					await this.mergeIntoRecord(tx, op, deliverySeq)
-					await this.writeScopeSnapshot(tx, op, pre)
-				}
-			}
-			return { admitted: true, idempotent: false, applied: ops }
-		})
+			.catch((error: unknown) => {
+				throw attempted ? unstorableValueOr(error, attempted) : error
+			})
 
 		// Advance the in-memory version vector cache after commit.
 		for (const op of result.applied) {
@@ -1045,7 +1133,14 @@ export class PostgresServerStore implements ServerStore {
 				(op_id, node_id, sequence_number, outcome, code, message, resolved_at)
 				VALUES (${resolution.operationId}, ${resolution.nodeId}, ${resolution.sequenceNumber},
 					${resolution.outcome}, ${resolution.code},
-					${resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null}, ${Date.now()})
+					${
+						// A human-readable message: an unstorable code unit is replaced (RT-65).
+						resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH).replace(
+							// biome-ignore lint/suspicious/noControlCharactersInRegex: U+0000 is what Postgres TEXT refuses (RT-65)
+							/\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
+							'\ufffd',
+						) ?? null
+					}, ${Date.now()})
 				ON CONFLICT (op_id) DO NOTHING`,
 		)
 	}
@@ -1217,7 +1312,7 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
-		const whereClause = this.buildWhereClause(where ?? {}, false)
+		const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
 		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`
 		const rows = (await this.db.execute(query)) as unknown as Array<{ cnt: number | string }>
 		const cnt = rows[0]?.cnt
@@ -1495,10 +1590,13 @@ export class PostgresServerStore implements ServerStore {
 		const parsed = stored ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
 		let state: FoldState | null | typeof REFOLD_REQUIRED
-		if (!stored && !last) {
-			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
-		} else if (parsed && covered === prior && stored?.covered_op_id === last?.id) {
+		if (parsed && covered === prior && stored?.covered_op_id === (last?.id ?? '')) {
 			state = mergeIntoFoldState(parsed, [op], schema, this.foldOptions)
+		} else if (isQuarantineAffected(this.quarantine, op.collection, op.recordId)) {
+			// Incomplete log (RT-70): fold onto the kept row, never from the log alone.
+			state = await this.rebuildAffected(tx, op.collection, op.recordId, parsed)
+		} else if (!stored && !last) {
+			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
 		} else if (
 			parsed &&
 			covered > 0 &&
@@ -1530,6 +1628,54 @@ export class PostgresServerStore implements ServerStore {
 			)
 		}
 		await this.writeFoldedRecord(tx, op.collection, op.recordId, state, deliverySeq, op.id)
+	}
+
+	/**
+	 * The fold state of a record that owns quarantined operations (RT-70): its stored
+	 * state, or its kept row as a snapshot base, with every remaining operation of the
+	 * record merged on top (`rebuildFromSnapshot`). Nothing is written.
+	 */
+	private async rebuildAffected(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+		stored: FoldState | null,
+	): Promise<FoldState | null> {
+		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
+		const collectionDef = schema.collections[collection]
+		const raw = collectionDef
+			? (
+					(await txOrDb.execute(
+						sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+					)) as unknown as Record<string, unknown>[]
+				)[0]
+			: undefined
+		let row: KeptRow | null = null
+		if (raw && collectionDef) {
+			const record = this.deserializeRow(raw, collectionDef)
+			const values: Record<string, unknown> = {}
+			for (const field of Object.keys(collectionDef.fields)) {
+				if (record[field] !== undefined) values[field] = record[field]
+			}
+			row = {
+				values,
+				createdAt: Number(raw._created_at ?? 0),
+				updatedAt: Number(raw._updated_at ?? 0),
+				deleted: Number(raw._deleted) === 1,
+			}
+		}
+		return rebuildFromSnapshot(
+			{
+				collection,
+				recordId,
+				stored,
+				row,
+				ops: await this.readRecordOperations(txOrDb, collection, recordId, 0),
+				quarantinedLatest: this.quarantine.latest.get(quarantineKey(collection, recordId)),
+			},
+			schema,
+			this.foldOptions,
+		)
 	}
 
 	/** True when the record's operation at delivery sequence `seq` has id `opId`. */
@@ -1578,11 +1724,13 @@ export class PostgresServerStore implements ServerStore {
 			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
 				parsed &&
-				stored?.last_id &&
-				Number(stored.covered_seq) === Number(stored.last_seq) &&
-				stored.covered_op_id === stored.last_id
+				Number(stored?.covered_seq) === Number(stored?.last_seq ?? 0) &&
+				stored?.covered_op_id === (stored?.last_id ?? '')
 			) {
 				return parsed
+			}
+			if (isQuarantineAffected(this.quarantine, collection, recordId)) {
+				return this.rebuildAffected(txOrDb, collection, recordId, parsed)
 			}
 		}
 		const ops = await this.readRecordOperations(txOrDb, collection, recordId, 0)
@@ -1676,7 +1824,7 @@ export class PostgresServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializeFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor ? serializePgFieldValue(recordData[f] ?? null, descriptor) : null
 			}),
 			createdAt,
 			updatedAt,
@@ -1749,7 +1897,7 @@ export class PostgresServerStore implements ServerStore {
 				entry.recordId,
 				...fieldNames.map((field) => {
 					const descriptor = collectionDef.fields[field]
-					return descriptor ? serializeFieldValue(row.values[field] ?? null, descriptor) : null
+					return descriptor ? serializePgFieldValue(row.values[field] ?? null, descriptor) : null
 				}),
 				row.createdAt,
 				row.updatedAt,
@@ -1790,8 +1938,8 @@ export class PostgresServerStore implements ServerStore {
 	 * Re-materialization migration (W7 step 7), run by setSchema and after a
 	 * replace-mode restore: every record whose fold state is missing, stale or built
 	 * under a different fold plan is re-folded from its log; nothing else is touched.
-	 * See the SQLite store's `rematerialize` for the rules (clean log only for rows
-	 * materialized before the fold; idempotent; resumable).
+	 * See the SQLite store's `rematerialize` for the rules (a record owning quarantined
+	 * operations folds onto its kept row, RT-70; idempotent; resumable).
 	 *
 	 * Postgres specifics: records are paged in batches of
 	 * {@link FOLD_MIGRATION_BATCH} through the (collection, record_id, delivery_seq)
@@ -1861,11 +2009,7 @@ export class PostgresServerStore implements ServerStore {
 						Number(row.covered) !== Number(row.max_seq) ||
 						!row.covered_exists,
 				)
-				const targets: string[] = []
-				for (const row of stale) {
-					if (!clean && row.covered === null && row.has_row) report.skippedUnclean++
-					else targets.push(row.record_id)
-				}
+				const targets = stale.map((row) => row.record_id)
 				if (targets.length > 0) {
 					await this.db.transaction(async (tx) => {
 						// Serialize with every append (see the method comment).
@@ -1896,16 +2040,29 @@ export class PostgresServerStore implements ServerStore {
 									coveredOpId = row.id
 								}
 							}
-							batch.push({
-								recordId,
-								state: refoldRecord(
+							let state: FoldState | null
+							if (!clean && isQuarantineAffected(this.quarantine, collection, recordId)) {
+								// Incomplete log (RT-70): the kept row is the base, never the log alone.
+								const storedState = (
+									(await tx.execute(
+										sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+									)) as unknown as { state: string }[]
+								)[0]
+								state = await this.rebuildAffected(
+									tx,
+									collection,
+									recordId,
+									parseStoredFoldState(storedState?.state, collection, recordId),
+								)
+								report.skippedUnclean++
+							} else {
+								state = refoldRecord(
 									recordRows.map((row) => this.deserializeOperation(row)),
 									schema,
 									this.foldOptions,
-								),
-								coveredSeq: covered,
-								coveredOpId,
-							})
+								)
+							}
+							batch.push({ recordId, state, coveredSeq: covered, coveredOpId })
 							report.records++
 						}
 						await this.writeFoldedRecords(tx, collection, batch)
@@ -1913,10 +2070,32 @@ export class PostgresServerStore implements ServerStore {
 				}
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
+			// Affected records with no remaining operation at all (every one quarantined,
+			// the insert included): the kept row is their whole history.
+			if (!clean) {
+				await this.db.transaction(async (tx) => {
+					await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+					const orphans = (await tx.execute(
+						sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(collection))} c
+							WHERE NOT EXISTS (SELECT 1 FROM kora_fold_state f WHERE f.collection = ${collection} AND f.record_id = c.id)
+							AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.collection = ${collection} AND o.record_id = c.id)`,
+					)) as unknown as { id: string }[]
+					const batch: FoldedRecordWrite[] = []
+					for (const { id } of orphans) {
+						if (!isQuarantineAffected(this.quarantine, collection, id)) continue
+						const state = await this.rebuildAffected(tx, collection, id, null)
+						if (!state) continue
+						batch.push({ recordId: id, state, coveredSeq: 0, coveredOpId: '' })
+						report.skippedUnclean++
+						report.records++
+					}
+					if (batch.length > 0) await this.writeFoldedRecords(tx, collection, batch)
+				})
+			}
 		}
 		if (report.skippedUnclean > 0) {
 			console.error(
-				`[kora] Fold re-materialization skipped ${report.skippedUnclean} record(s): the operation log has ${this.logIntegrity.totalQuarantined} quarantined row(s) (see operations_quarantine). Their rows keep their pre-fold values until their next write. Repair or release the quarantined rows, then restart to re-materialize.`,
+				`[kora] Fold re-materialization: ${report.skippedUnclean} record(s) own quarantined operations (${this.logIntegrity.totalQuarantined} quarantined row(s), see operations_quarantine). Their log is incomplete, so their pre-fold rows were kept as the base their remaining and later operations fold onto. Repair or release the quarantined rows to restore their exact history.`,
 			)
 		}
 		return report
@@ -1930,6 +2109,7 @@ export class PostgresServerStore implements ServerStore {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
+			this.schema?.collections[collection],
 		)
 
 		const parts: SQL[] = [
@@ -1952,7 +2132,11 @@ export class PostgresServerStore implements ServerStore {
 		return sql.join(parts, sql.raw(''))
 	}
 
-	private buildWhereClause(where: Record<string, unknown>, includeDeleted: boolean): SQL {
+	private buildWhereClause(
+		where: Record<string, unknown>,
+		includeDeleted: boolean,
+		collectionDef?: { fields: Record<string, import('@korajs/core').FieldDescriptor> },
+	): SQL {
 		const conditions: SQL[] = []
 
 		if (!includeDeleted) {
@@ -1960,7 +2144,11 @@ export class PostgresServerStore implements ServerStore {
 		}
 
 		for (const [key, value] of Object.entries(where)) {
-			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${value}`)
+			// Raw-string columns hold the lossless encoding (RT-65): filter on it too.
+			const kind = collectionDef?.fields[key]?.kind
+			const param =
+				kind && isPgRawTextKind(kind) && typeof value === 'string' ? encodePgText(value) : value
+			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${param}`)
 		}
 
 		if (conditions.length === 0) {
@@ -1982,7 +2170,7 @@ export class PostgresServerStore implements ServerStore {
 
 		for (const [fieldName, descriptor] of Object.entries(collectionDef.fields)) {
 			if (fieldName in row) {
-				record[fieldName] = deserializeFieldValue(row[fieldName], descriptor)
+				record[fieldName] = deserializePgFieldValue(row[fieldName], descriptor)
 			}
 		}
 
@@ -2021,6 +2209,13 @@ export class PostgresServerStore implements ServerStore {
 		await this.ensureTables()
 		await this.loadIdentity()
 		this.logIntegrity = await this.scanLogIntegrityOnce()
+		this.quarantine = buildQuarantineScope(
+			(
+				(await this.db.execute(sql`SELECT row_json FROM operations_quarantine`)) as unknown as {
+					row_json: string
+				}[]
+			).map((row) => row.row_json),
+		)
 
 		// Hydrate in-memory version vector cache
 		const rows = await this.db
