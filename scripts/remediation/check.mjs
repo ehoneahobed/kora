@@ -303,7 +303,7 @@ const phaseNames = [
 	'Phase 0: safety net',
 	'Phase 1: trust boundary + P0 stopgaps (beta.13)',
 	'Phase 2: no silent loss',
-	'Phase 3: one fold + durability (beta.14)',
+	'Phase 3: one fold + durability (beta.13)',
 	'Phase 4: encryption, scale, types, DX (RC)',
 ]
 for (let ph = 0; ph <= 4; ph++) {

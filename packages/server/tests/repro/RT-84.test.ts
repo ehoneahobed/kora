@@ -6,7 +6,7 @@
  * the transformed data and schema version, and strips its `hashVersion` (the stored copy
  * is "version 1, unverified"). The RT-77 duplicate check (`isSameStoredOperation`) then
  * compares the upload against that stored copy:
- * - an upload declaring `hashVersion: 2` (every beta.14 writer) never equals a stored
+ * - an upload declaring `hashVersion: 2` (every beta.13 writer) never equals a stored
  *   copy without one (`upload.hashVersion !== storedVersion`);
  * - an upload without a declared version differs in `data` (the transform rewrote it).
  * Either way the device's own, unaltered operation is refused as tampering, non-retriably.
@@ -68,8 +68,8 @@ function rejectionCodes(messages: Array<{ type: string }>): string[] {
 
 describe('RT-84: an honest re-upload of a server-transformed operation is refused as forged', () => {
 	for (const [label, hashVersion, protocolVersion] of [
-		['beta.14 writer (hash version 2)', 2, 2],
-		['beta.13 writer (hash version 1, protocol 1)', 1, undefined],
+		['beta.13 writer (hash version 2)', 2, 2],
+		['beta.12 writer (hash version 1, protocol 1)', 1, undefined],
 	] as const) {
 		test(`${label}: a lost ack, then the same op again`, async () => {
 			const { server, login } = await createHarness(schemaV2, null, {

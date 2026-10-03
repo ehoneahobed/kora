@@ -6,7 +6,7 @@
  * operation above it is unsynced whether or not it was ever read into the queue. Own
  * operations that are not queued but not acknowledged exist in normal operation:
  *
- * - a device upgraded from beta.13 has no prefix yet; its whole history is pending
+ * - a device upgraded from beta.12 has no prefix yet; its whole history is pending
  *   the one-time re-upload (which RT-39 stretches over hours), queue empty;
  * - `pushOperation` is not awaited: an op committed just before the tab died is in
  *   the log but not the queue (the next start finds it by scanning above the prefix);

@@ -233,7 +233,7 @@ describe('RecordFolder through the Store', () => {
 		expect((await store.collection('todos').findById('p-2'))?.title).toBe('p2')
 	})
 
-	test('re-materialization repairs a beta.13 (legacy) database on first open', async () => {
+	test('re-materialization repairs a beta.12 (legacy) database on first open', async () => {
 		const path = join(dir, 'legacy.db')
 		const legacy = await open(path, 'legacy')
 		const insert = await remote('a', T0, 'insert', { title: 'x', tags: ['urgent'], score: 0 })

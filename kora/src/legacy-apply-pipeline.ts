@@ -36,7 +36,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { ApplyContext } from './apply-pipeline'
 
 /*
- * The beta.13 pairwise apply pipeline, kept for ONE beta behind
+ * The beta.12 pairwise apply pipeline, kept for ONE beta behind
  * `experimental.legacyMerge` so CI can compare it with the W7 fold
  * (apply-pipeline.ts). Do not extend it: it is removed in the next beta.
  */
@@ -63,7 +63,7 @@ export interface LegacyApplyPipelineDeps {
 }
 
 /**
- * The beta.13 pairwise apply pipeline (`experimental.legacyMerge`, one beta only).
+ * The beta.12 pairwise apply pipeline (`experimental.legacyMerge`, one beta only).
  */
 export class LegacyApplyPipeline implements LocalMutationHandler {
 	private readonly relationLookupMap: ReturnType<typeof buildMergeRelationLookup>

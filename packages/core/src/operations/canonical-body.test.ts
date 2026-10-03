@@ -127,7 +127,7 @@ describe('createOperation hashes and carries the canonical body', () => {
 		).rejects.toThrow(NonCanonicalValueError)
 	})
 
-	test('version 1 keeps the beta.13 form (undefined hashes as null)', async () => {
+	test('version 1 keeps the beta.12 form (undefined hashes as null)', async () => {
 		const base = {
 			...input({}),
 			timestamp: { wallTime: 1, logical: 0, nodeId: 'device-a' },
@@ -151,7 +151,7 @@ describe('canonicalizeLegacyOperation (RT-71, RT-83)', () => {
 			previousData: { title: 'x', assignee: 'bob' },
 		}
 		expect(canonicalizeLegacyOperation(op).data).toEqual({ title: 'y', assignee: null })
-		// beta.13 logged an update of only undefined members with null data.
+		// beta.12 logged an update of only undefined members with null data.
 		expect(
 			canonicalizeLegacyOperation({ ...op, data: null, previousData: { assignee: 'bob' } }).data,
 		).toEqual({ assignee: null })

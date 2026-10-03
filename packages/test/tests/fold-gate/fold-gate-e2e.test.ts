@@ -127,7 +127,7 @@ describe('W7 convergence gate through real devices', () => {
 		Math.max(300_000, SEEDS * 4_000),
 	)
 
-	test('the gate rejects the beta.13 pairwise pipeline (it has teeth)', async () => {
+	test('the gate rejects the beta.12 pairwise pipeline (it has teeth)', async () => {
 		const results = await runSeeds(SEED_BASE, 25, 25, (seed) =>
 			runWorkload(seed, { legacyMerge: true }),
 		)

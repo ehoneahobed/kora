@@ -71,11 +71,11 @@ describe('terminal rejections (RT-36)', () => {
 		const insert =
 			'INSERT INTO _kora_sync_rejected (operation_id, collection, record_id, code, message, retriable, rejected_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
 		await adapter.execute(insert, ['refused', 'todos', 'r1', 'FORBIDDEN', 'no', 0, 1])
-		await adapter.execute(insert, ['beta13-pair', 'todos', 'r2', 'SEQUENCE_CONFLICT', 'dup', 0, 1])
+		await adapter.execute(insert, ['beta12-pair', 'todos', 'r2', 'SEQUENCE_CONFLICT', 'dup', 0, 1])
 		await adapter.execute(insert, ['transient', 'todos', 'r3', 'BUSY', 'later', 1, 1])
 		await seedTerminalRejectionsOnce(adapter)
 		expect([
-			...(await findTerminalRejections(adapter, ['refused', 'beta13-pair', 'transient'])),
+			...(await findTerminalRejections(adapter, ['refused', 'beta12-pair', 'transient'])),
 		]).toEqual(['refused'])
 		// The marker survives the app clearing its list, and seeding runs only once.
 		await adapter.execute('DELETE FROM _kora_sync_rejected')

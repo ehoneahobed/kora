@@ -202,7 +202,7 @@ async function repairDuplicates(
 	const losers: LoggedIdentity[] = []
 	for (const group of groups.values()) {
 		if (group.length < 2) continue
-		// A version-2 operation (beta.14+) keeps its place: renumbering would re-hash it
+		// A version-2 operation (beta.13+) keeps its place: renumbering would re-hash it
 		// under a new id, and if the server already stored it under the old id the new
 		// copy would be stored as a second write (an atomic increment applied twice). A
 		// version-1 loser keeps its id, which the server deduplicates (RT-31). Ties by id.

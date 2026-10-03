@@ -30,7 +30,7 @@ explicit legacy ids. Every server-authored operation's node id is
 `kora_server_meta` on first start and shared by every instance of the database; the
 instance id is persisted (SQLite) or drawn per start from a database counter
 (Postgres, unless configured), so no two instances share a node id or its sequence
-numbers. At the first start of beta.14 the store records every node id whose
+numbers. At the first start of beta.13 the store records every node id whose
 operations hold authority class 1 in a stored fold state (decisions folded under an
 earlier, per-process server id), plus a configured plain `nodeId`, as legacy
 authoritative ids; the fold plan fingerprint covers them. `KoraSyncServer.authoritativeNodeIds`

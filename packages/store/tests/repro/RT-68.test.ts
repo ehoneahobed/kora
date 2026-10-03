@@ -97,7 +97,7 @@ describe('RT-68: a row-only snapshot converges after a full resync', () => {
 		)
 		expect(expected).toEqual({ stock: 14, tags: ['x', 'z', 'y'] })
 
-		// A beta.13 device: legacy materialization, then a pre-W7 compaction of the
+		// A beta.12 (or older) device: legacy materialization, then a pre-W7 compaction of the
 		// acknowledged history.
 		const path = join(dir, 'device.db')
 		const legacy = new Store({

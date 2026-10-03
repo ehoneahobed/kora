@@ -1,9 +1,9 @@
 ---
 title: Sync Protocol v2
-description: "The Kora.js sync protocol v2 (beta.14): content-hash v2 operation ids, the encryption envelope, verification rules, protobuf field numbers and compatibility."
+description: "The Kora.js sync protocol v2 (beta.13): content-hash v2 operation ids, the encryption envelope, verification rules, protobuf field numbers and compatibility."
 ---
 
-# Sync Protocol v2 (beta.14)
+# Sync Protocol v2 (beta.13)
 
 Protocol v2 is the single wire bump of decision D2 in the remediation plan. It carries
 every wire break of the Phase 3 programme in one compatibility window:
@@ -26,13 +26,13 @@ The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2),
 
 | Message | Field | Meaning |
 |---|---|---|
-| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora <= beta.13). |
+| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora <= beta.12). |
 | `handshake` | `sequenceReservation` | Always `true` from a protocol-2 client. |
-| `handshake-response` | `protocolVersion` | `2`. Absent: a beta.13-era server. |
-| `handshake-response` | `authoritativeNodeIds` | The server's node ids (`ServerStore.getAuthoritativeNodeIds()`, `KoraSyncServer.authoritativeNodeIds`): this instance's `kora:server:<deploymentId>:<instanceId>` id, which authors route writes, side effects and constraint corrections, the other `kora:server:` ids with stored operations, and the legacy ids (server node ids from before beta.14, found in the log at the upgrade, and configured extras). Every `kora:server:` node id is authoritative whether listed or not (the prefix rule); the list carries the legacy ids, and serves clients that predate the rule. No device may hand-shake with any of these ids (`INVALID_NODE_ID`, not retriable). Their writes win `merge('server-authoritative')` fields on every replica. The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`, one meta key shared with the store's fold) and re-folds affected records when they change. Under end-to-end encryption, a plaintext operation from these nodes touching only cleartext fields is accepted. `kora:scope-entry` is not listed: scope entries carry the server's fold state and are joined, not folded as writes. |
+| `handshake-response` | `protocolVersion` | `2`. Absent: a beta.12-era server. |
+| `handshake-response` | `authoritativeNodeIds` | The server's node ids (`ServerStore.getAuthoritativeNodeIds()`, `KoraSyncServer.authoritativeNodeIds`): this instance's `kora:server:<deploymentId>:<instanceId>` id, which authors route writes, side effects and constraint corrections, the other `kora:server:` ids with stored operations, and the legacy ids (server node ids from before beta.13, found in the log at the upgrade, and configured extras). Every `kora:server:` node id is authoritative whether listed or not (the prefix rule); the list carries the legacy ids, and serves clients that predate the rule. No device may hand-shake with any of these ids (`INVALID_NODE_ID`, not retriable). Their writes win `merge('server-authoritative')` fields on every replica. The client persists them (`SyncStatePersistence.saveAuthoritativeNodeIds`, one meta key shared with the store's fold) and re-folds affected records when they change. Under end-to-end encryption, a plaintext operation from these nodes touching only cleartext fields is accepted. `kora:scope-entry` is not listed: scope entries carry the server's fold state and are joined, not folded as writes. |
 | `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit authoritative ids the deployment revoked (store option `revokedAuthoritativeNodeIds`, RT-81). Absent when there is none. A client removes them from the union of explicit authorities it keeps, persists them as revoked so no later handshake (an instance with a stale configuration) brings them back, and re-folds the records of collections with server-authoritative fields. The server keeps every explicit id it ever held authoritative, revoked ones included, and refuses each at handshake as a device node id (`INVALID_NODE_ID`). |
 
-A protocol-1 client is accepted for beta.14 only: the server logs
+A protocol-1 client is accepted for beta.13 only: the server logs
 `session.protocol_deprecated` (warn) and emits `sync:protocol-deprecated`.
 
 ## Operation fields
@@ -48,11 +48,11 @@ A protocol-1 client is accepted for beta.14 only: the server logs
 | Where | What | On mismatch |
 |---|---|---|
 | Server ingest (`ClientSession.handleOperationBatch`) | Plaintext ops declaring `hashVersion: 2`, on the op **as uploaded**, after the authorization, timestamp and size checks and before the operation validator, the reference checks and any schema transform. An unknown declared version fails closed. Envelope ops are not verifiable by the server (it lacks the plaintext). | Non-retriable `operation-rejected` `INVALID_OPERATION_ID`; never stored or relayed. |
-| Schema transforms (beta.14, RT-84) | Run at fold time, never on a stored operation: the server stores every op exactly as uploaded (all hashed fields, `hashVersion`, envelope) and judges and folds its view (`operationSchemaView`); devices do the same. Envelope ops are transformed only after decryption, on devices. | n/a |
+| Schema transforms (beta.13, RT-84) | Run at fold time, never on a stored operation: the server stores every op exactly as uploaded (all hashed fields, `hashVersion`, envelope) and judges and folds its view (`operationSchemaView`); devices do the same. Envelope ops are transformed only after decryption, on devices. | n/a |
 | Client (`packages/sync/src/engine/verify-inbound.ts`) | After decryption, before transforms and apply: envelope ops always (against their declared version, which the AAD binds); plaintext ops declaring `hashVersion: 2`. Version-1 ops and reserved `kora:` system nodes are not checked. | Quarantined (`_kora_unapplied_ops`, code `INVALID_OPERATION_ID`), `sync:apply-failed`; never released by the quarantine replay. |
 | Client decryption (encryption enabled) | Envelope present and authenticates. | `DECRYPT_FAILED` quarantine (`PLAINTEXT_REJECTED`, `LEGACY_ENCRYPTED_PAYLOAD`, `KEY_ID_MISMATCH` in the error context). `allowPlaintextMigration` passes plaintext through. |
 
-Version-1 operations stored before beta.14 keep `hashVersion: 1` (absent) and are never
+Version-1 operations stored before beta.13 keep `hashVersion: 1` (absent) and are never
 verified against version-2 rules. Local rewrites before an op is shared (clock rebase,
 node rotation, `SEQUENCE_CONFLICT` renumbering, legacy sequence repair) re-hash a
 version-2 op with its own version, remapping causal deps first. A renumbered
@@ -92,11 +92,14 @@ operation without data now carries `atomicOps` there too. The schema-driven
 
 ## Compatibility matrix
 
-Run with `node scripts/remediation/protocol-v2-compat.mjs <beta13-build>` against a real
-33bca46 build, plus the unit and integration suites.
+Verified against the last published release, 1.0.0-beta.12 (tag v1.0.0-beta.12), with
+`node scripts/remediation/compat-beta12.mjs <beta12-build>` (the full matrix, including
+database upgrades and mixed fleets under chaos; results in
+`remediation/evidence/compat-beta12.md`) and `protocol-v2-compat.mjs`, plus the unit and
+integration suites.
 
 | Client | Server | Result |
 |---|---|---|
 | v2 | v2 | Full v2: ids verified on both sides, envelope stored opaquely. |
-| beta.13 (protocol 1) | v2 | Accepted with a deprecation warning; its version-1 ops are stored and relayed unverified; v2 clients converge with it. Its protocol-1 encrypted payloads are refused by v2 clients with encryption enabled. |
-| v2 | beta.13 | Plaintext sync converges (inserts and updates both ways). The old server drops `hashVersion`, so relayed ops are treated as version 1 (not verified by clients). It also drops `op.encrypted`: encrypted sync does not work through a beta.13 server (the receiver quarantines the op as plaintext; nothing is applied wrongly). Upgrade the server first. |
+| beta.12 (protocol 1) | v2 | Accepted with a deprecation warning. Its version-1 ids are verified where beta.12's hash form can be rebuilt (`undefined` members, binary values) and stored declaring version 1; a `Date` inside a json value (which beta.12 hashed as `{}`) is accepted through that form but not declared, since its id never covered the instant; the rest are stored and relayed unverified for its own node. v2 clients converge with it; the beta.12 client itself keeps beta.12 merge semantics for concurrent edits until it upgrades (its first open re-folds every record). Its protocol-1 encrypted payloads are refused (see [encryption](./sync-encryption.md)). |
+| v2 | beta.12 | Plaintext sync converges (inserts and updates both ways). The old server drops `hashVersion`, so relayed ops are treated as version 1 (not verified by clients). It also drops `op.encrypted`: encrypted sync does not work through a beta.12 (or older) server (the receiver quarantines the op as plaintext; nothing is applied wrongly). Upgrade the server first. |

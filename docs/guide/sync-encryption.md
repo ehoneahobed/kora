@@ -9,7 +9,7 @@ Kora supports end-to-end encryption for sync. When enabled, operation data is en
 
 ## What Gets Encrypted
 
-Since protocol v2 (beta.14) an operation's `data`, `previousData` and atomic ops (`increment` amounts and similar) travel only as ciphertext, inside the operation's encryption envelope (`op.encrypted`). On the wire `data` is `null`, or holds only the cleartext scope fields you list (see below). Metadata stays in cleartext:
+Since protocol v2 (beta.13) an operation's `data`, `previousData` and atomic ops (`increment` amounts and similar) travel only as ciphertext, inside the operation's encryption envelope (`op.encrypted`). On the wire `data` is `null`, or holds only the cleartext scope fields you list (see below). Metadata stays in cleartext:
 
 | Encrypted (in `op.encrypted`) | Not Encrypted |
 |-----------|---------------|
@@ -191,7 +191,7 @@ encryptor.addKey(newKey)
 
 ## Plaintext and Older Payloads
 
-With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. One exception: the server's own operations (from a node the handshake names authoritative: cascades and set-nulls of a deleted parent, constraint corrections, route writes) are accepted in plaintext when they touch only the collection's `cleartextFields` (a delete carries no fields). The server holds no key, so it cannot seal them, and they carry nothing the server cannot already read. A server write to a sealed field is still refused. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.13, not bound to their operation) are refused the same way.
+With encryption enabled, an inbound operation without an envelope is **refused** and quarantined: anyone who can reach the sync server could have written it, so applying it would let the server inject unauthenticated writes. One exception: the server's own operations (from a node the handshake names authoritative: cascades and set-nulls of a deleted parent, constraint corrections, route writes) are accepted in plaintext when they touch only the collection's `cleartextFields` (a delete carries no fields). The server holds no key, so it cannot seal them, and they carry nothing the server cannot already read. A server write to a sealed field is still refused. Protocol-1 payloads (ciphertext inside `data`, written by Kora <= beta.12, not bound to their operation) are refused the same way.
 
 To migrate an existing plaintext app to encryption, open a migration window:
 
@@ -270,5 +270,5 @@ With this setup:
 - **All clients must share keys**: Every device that needs to decrypt operations must have the correct key version registered. Key distribution is the application's responsibility.
 - **Key material is per device until Phase 4 (ENC-1)**: `createApp` derives the key with a random salt per process, so two devices with the same passphrase do not yet derive the same key. Decryption then fails with `KEY_ID_MISMATCH` (the envelope's `keyId` names the material) and the operation is quarantined, not lost. Until shared key material ships, construct the encryptor with a shared salt (`SyncEncryptor.create(config, salt)`) or `SyncEncryptor.fromKeys`.
 - **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
-- **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (beta.14 or later on the server).
+- **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (beta.13 or later on the server).
 - **Server-side rules see only cleartext fields**: referential policies (cascade, set-null, restrict) are enforced on the server, so their foreign keys must be cleartext (see above; a sealed one is refused at startup). A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.

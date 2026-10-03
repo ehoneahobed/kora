@@ -31,7 +31,7 @@ export class NonCanonicalValueError extends KoraError {
  * | Value                                   | Canonical form                                  |
  * |-----------------------------------------|-------------------------------------------------|
  * | `undefined` member of an insert's data  | absent                                          |
- * | `undefined` member of an update's data  | `null`: the field is CLEARED (beta.13 meaning)  |
+ * | `undefined` member of an update's data  | `null`: the field is CLEARED (beta.12 meaning)  |
  * | `undefined` member of an update's `previousData` | `null` (the field held no value)       |
  * | `undefined` member inside an object value | absent (as JSON drops it); a `t.json()` field refuses it at validation |
  * | `undefined` array element               | `null` (as JSON writes it)                      |
@@ -120,7 +120,7 @@ function canonicalTopLevel(
 	for (const [key, member] of Object.entries(record)) {
 		if (member === undefined) {
 			changed = true
-			// In an update, `field: undefined` is a clear (as beta.13 applied it); the
+			// In an update, `field: undefined` is a clear (as beta.12 applied it); the
 			// canonical form says so explicitly. Elsewhere it is simply absent.
 			if (undefinedIsNull) out[key] = null
 			continue
@@ -249,7 +249,7 @@ function describe(value: unknown): string {
 }
 
 /**
- * A legacy update in its canonical body when its id PROVES the beta.13 clear (RT-85):
+ * A legacy update in its canonical body when its id PROVES the beta.12 clear (RT-85):
  * the id is the content hash of the body with every `previousData` key absent from
  * `data` restored as `null` (version 1, or version 2 with a lost declaration), and not
  * of the body as it is. Such an id can only come from a writer that hashed the clear,
@@ -276,15 +276,15 @@ export async function canonicalizeProvenLegacyClear<T extends Operation>(op: T):
 }
 
 /**
- * The canonical body of a legacy (version-1, beta.13) update (RT-71, RT-83): every
- * `previousData` key absent from `data` is a clear, restored as `null`. beta.13 wrote
+ * The canonical body of a legacy (version-1, beta.12) update (RT-71, RT-83): every
+ * `previousData` key absent from `data` is a clear, restored as `null`. beta.12 wrote
  * `previousData[key]` for every key it validated, so such a key held `undefined` in
- * `data`: beta.13 hashed it as `null`, applied it as a cleared field, and its JSON log
+ * `data`: beta.12 hashed it as `null`, applied it as a cleared field, and its JSON log
  * and upload dropped it. `null` and `undefined` hash identically under version 1, so
  * the id is unchanged.
  *
- * Applied ONCE, where a genuine beta.13 body is identified (RT-85), never at fold time:
- * the server's ingest of a protocol-1 upload, a device's own beta.13 log at the
+ * Applied ONCE, where a genuine beta.12 body is identified (RT-85), never at fold time:
+ * the server's ingest of a protocol-1 upload, a device's own beta.12 log at the
  * upgrade, and any body whose id proves the clear
  * ({@link canonicalizeProvenLegacyClear}). The result is stored, so the server, peers
  * and the upgraded writer fold the same body. A no-op

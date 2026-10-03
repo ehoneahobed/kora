@@ -103,7 +103,7 @@ Effort is engineer-days for one engineer who knows the codebase, including tests
 Phase 0  Safety net + advisory                         4 to 6 eng-days    W0, D6
 Phase 1  Trust boundary + P0 stopgaps (beta.13)        25 to 33           W1, W2, S1
 Phase 2  No silent loss                                34 to 45           W3, W4, W5, W6, W8a (OPFS), SRV-4 (moved up)
-Phase 3  One fold + durability (beta.14, protocol v2)  33 to 46           W8b (repair first), W7, W9 envelope
+Phase 3  One fold + durability (beta.13, protocol v2)  33 to 46           W8b (repair first), W7, W9 envelope
 Phase 4  Encryption, scale, types, DX (RC)             22 to 31           W9 rest, W10 rest, W11, W12
                                                        ---------
                                                Total   118 to 161
@@ -122,7 +122,7 @@ Phase 4  Encryption, scale, types, DX (RC)             22 to 31           W9 res
 **Release cadence:**
 - Each phase ends in a beta with its repro tests green.
 - Phase 1 ends in beta.13: a security and P0-stopgap release. Ship it as soon as it is done.
-- Phase 3 ends in beta.14 (protocol v2).
+- Phase 3 ends in beta.13 (protocol v2).
 - Phase 4 ends in the RC.
 
 ---

@@ -105,7 +105,7 @@ export interface HandshakeMessage {
 	 * the same local transaction that writes the operation, so it never puts two
 	 * different operations under one `(nodeId, sequenceNumber)`. Only for such a client
 	 * does the server refuse a second, different operation under a held sequence
-	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.13, which could give
+	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.12, which could give
 	 * two concurrent transactions one number) is served as legacy: such a pair is
 	 * stored, both operations are delivered, and a warning is logged. Old servers
 	 * ignore it. Protobuf field 45.
@@ -113,7 +113,7 @@ export interface HandshakeMessage {
 	sequenceReservation?: boolean
 	/**
 	 * Sync protocol version the client speaks (`SYNC_PROTOCOL_VERSION`). Absent means 1
-	 * (Kora <= beta.13). A protocol-2 client sends hash-version-2 operation ids, the
+	 * (Kora <= beta.12). A protocol-2 client sends hash-version-2 operation ids, the
 	 * encryption envelope v2 and always `sequenceReservation`. Protobuf field 47.
 	 */
 	protocolVersion?: number
@@ -190,7 +190,7 @@ export interface HandshakeResponseMessage {
 	 */
 	heartbeatIntervalMs?: number
 	/**
-	 * Sync protocol version the server speaks. Absent means 1 (a beta.13-era server).
+	 * Sync protocol version the server speaks. Absent means 1 (a beta.12-era server).
 	 * Protobuf field 47.
 	 */
 	protocolVersion?: number

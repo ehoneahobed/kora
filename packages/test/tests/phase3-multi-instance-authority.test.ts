@@ -135,7 +135,7 @@ describe.skipIf(!PG_URL)('authority across Postgres instances (prefix rule)', ()
 			expect(device.getSyncEngine()?.getAuthoritativeNodeIds() ?? []).not.toContain(nodeB)
 			expect(await device.getSyncEngine()?.getQuarantinedOperations()).toEqual([])
 
-			// A legacy server id (history from before beta.14) stays authoritative: its
+			// A legacy server id (history from before beta.13) stays authoritative: its
 			// write beats a later device write on every replica.
 			const legacy = await storeA.applyRemoteOperation({
 				id: 'legacy-server-write',

@@ -10,7 +10,7 @@
  *
  * Asserts the CORRECT behaviour (fails at 959b791 with KORA_PG_TEST_URL).
  *
- * Adapted to the beta.14 design (RT-62 fix): the configured id is a legacy server id;
+ * Adapted to the beta.13 design (RT-62 fix): the configured id is a legacy server id;
  * each instance authors under its own `kora:server:<deployment>:<instance>` id (one
  * deployment persisted in the database, a distinct instance per process), so route
  * writes on both instances succeed, both are server-authoritative, and a device's

@@ -86,7 +86,7 @@ A backup also carries the device's **compacted history**. Compaction folds opera
 the server acknowledged into per-record base states and removes them from the log; the
 backup holds those base states (and the compacted sequence prefixes), so restoring a
 compacted device's backup on another device keeps every record and field, in merge and
-replace mode, with or without a connection. Backups written by beta.13 carry no base
+replace mode, with or without a connection. Backups written by beta.12 carry no base
 states: their records are rebuilt on top of the backup's rows instead (see
 `store.getSnapshotRecords()` in the conflict-resolution guide).
 
@@ -95,9 +95,9 @@ The result reports failures instead of throwing for a file it cannot restore:
 `BACKUP_SCHEMA_NEWER` for a backup written by a newer schema version, or
 `BACKUP_FORMAT_OUTDATED`).
 
-### Backups made before beta.14
+### Backups made before beta.13
 
-Backups written by Kora 1.0.0-beta.13 and earlier use format version 1, whose restore
+Backups written by Kora 1.0.0-beta.12 and earlier use format version 1, whose restore
 corrupted operation timestamps and copied the exporting device's identity. They are refused
 with `errorCode: 'BACKUP_FORMAT_OUTDATED'`. Convert them once, then import the result:
 

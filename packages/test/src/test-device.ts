@@ -89,7 +89,7 @@ export interface TestDeviceOptions {
 	 */
 	reconnectable?: boolean
 	/**
-	 * Run the device on the beta.13 pairwise pipeline (`experimental.legacyMerge`)
+	 * Run the device on the beta.12 pairwise pipeline (`experimental.legacyMerge`)
 	 * instead of the W7 fold. Used by the comparison harness.
 	 */
 	legacyMerge?: boolean

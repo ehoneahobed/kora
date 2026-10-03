@@ -63,7 +63,7 @@ where resubmitting the identical operation might later succeed.
 
 A rejected operation is not silently lost and not retried forever. On the client,
 Kora diverts it out of the pending outbound queue into a durable rejected store
-and emits a `sync:operation-rejected` event. Since beta.14 the submitter's record
+and emits a `sync:operation-rejected` event. Since beta.13 the submitter's record
 is re-folded without the refused operation, so its view matches the server and every
 other device (an inserted record that was refused disappears; a refused edit is
 undone, while concurrent accepted edits stay). The operation itself is kept in the

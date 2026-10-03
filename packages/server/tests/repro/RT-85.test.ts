@@ -94,7 +94,7 @@ describe('RT-85: a transform that drops a field from an update clears it everywh
 		await sendAndAwaitAck(v1, [update])
 		const row = await store.findRecord('notes', 'note-1')
 		expect(row?.title).toBe('b')
-		// Fails: score is null (the transformed copy is folded as a beta.13 clear).
+		// Fails: score is null (the transformed copy is folded as a beta.12 clear).
 		expect(row?.score).toBe(5)
 		await server.stop()
 	})

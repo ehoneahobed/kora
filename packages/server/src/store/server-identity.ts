@@ -77,7 +77,7 @@ export class ServerIdentityError extends KoraError {
 /** Identity options every server store accepts. */
 export interface ServerIdentityOptions {
 	/**
-	 * Deprecated. A plain id (for example one set before beta.14) is no longer the id the
+	 * Deprecated. A plain id (for example one set before beta.13) is no longer the id the
 	 * server authors under: it is recorded as a legacy authoritative id, so operations
 	 * already stored under it keep their authority, and no device may use it. An id in
 	 * the `kora:server:` namespace is used verbatim (it must then be unique per instance).
@@ -108,7 +108,7 @@ export interface ServerIdentityOptions {
 export interface ConfiguredIdentity {
 	/** A `kora:server:` node id configured verbatim, or null. */
 	verbatimNodeId: string | null
-	/** A configured plain node id (the id the server authored under before beta.14), or null. */
+	/** A configured plain node id (the id the server authored under before beta.13), or null. */
 	legacyNodeId: string | null
 	/** A configured instance id, or null. */
 	instanceId: string | null

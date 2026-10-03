@@ -35,7 +35,7 @@ const TERMINAL_SEED_META_KEY = 'terminal_rejections_seeded_v1'
  * its content, so a later upload of it may be accepted.
  *
  * - `SEQUENCE_CONFLICT`: the device's sequence number collided with an operation the
- *   server holds (a lost local tail, RT-35, or a beta.13 duplicate pair, RT-37); the
+ *   server holds (a lost local tail, RT-35, or a beta.12 duplicate pair, RT-37); the
  *   operation is renumbered and uploaded again.
  * - `NODE_ID_MISMATCH`: uploaded on another node's session.
  * - `OUT_OF_UPLINK_SCOPE`: judged by the client against the scope it had then.
@@ -225,7 +225,7 @@ export async function findTerminalRejections(
 /**
  * Seed terminal markers once from `_kora_sync_rejected`, the list earlier releases kept
  * (and the app may have cleared since). Rows whose code is not terminal are skipped:
- * in particular a beta.13 device's `SEQUENCE_CONFLICT` rejections (RT-37) stay eligible
+ * in particular a beta.12 (or older) device's `SEQUENCE_CONFLICT` rejections (RT-37) stay eligible
  * for the one-time re-upload, which is how those writes reach the server.
  */
 export async function seedTerminalRejectionsOnce(adapter: StorageAdapter): Promise<void> {

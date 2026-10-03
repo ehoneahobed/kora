@@ -214,7 +214,7 @@ describe('SQLite: persisted identity (RT-62)', () => {
 		const dir = mkdtempSync(join(tmpdir(), 'kora-identity-'))
 		const filename = join(dir, 'server.db')
 		try {
-			// The database as beta.14-dev left it: decisions by a random server node id
+			// The database as beta.13-dev left it: decisions by a random server node id
 			// ('old-server-node'), folded with authority class 1.
 			const before = createSqliteServerStore({
 				filename,

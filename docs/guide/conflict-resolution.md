@@ -7,7 +7,7 @@ description: "How Kora.js resolves concurrent edits: the three-tier merge engine
 
 When multiple devices modify the same data concurrently, Kora resolves conflicts through three tiers of rules. Each tier adds more control, and most apps never need to go beyond Tier 1.
 
-Since beta.14 every replica (each device, the sync server, a restored backup) computes a record the same way: its operations are **folded** into a per-field merge state that is itself a CRDT. The result depends only on *which* operations a replica holds, never on the order they arrived in, so replicas that hold the same operations hold the same record. See [One fold, everywhere](#one-fold-everywhere) for the exact rules and what changed from beta.13.
+Since beta.13 every replica (each device, the sync server, a restored backup) computes a record the same way: its operations are **folded** into a per-field merge state that is itself a CRDT. The result depends only on *which* operations a replica holds, never on the order they arrived in, so replicas that hold the same operations hold the same record. See [One fold, everywhere](#one-fold-everywhere) for the exact rules and what changed from beta.12.
 
 ## Overview
 
@@ -514,7 +514,7 @@ The rules, per field:
   device joins it, so counters, richtext, resolvers and arrays keep their concurrent
   local edits instead of being overwritten.
 
-### What changed from beta.13
+### What changed from beta.12
 
 Each change fixes a case where devices or the server could disagree forever:
 
@@ -531,9 +531,9 @@ Each change fixes a case where devices or the server could disagree forever:
 9. An update whose insert never arrived does not create a row.
 10. A scope entry joins the server's fold state (all field kinds), not per-field LWW.
 
-On the first open with beta.14 the store **re-materializes** every record from its log
+On the first open with beta.13 the store **re-materializes** every record from its log
 (emitting `store:rematerialized`), which also repairs devices that diverged under
-earlier betas. A database whose log was compacted before beta.14 uses its current rows
+earlier betas. A database whose log was compacted before beta.13 uses its current rows
 as the starting point ("row snapshots"); a record that owns quarantined log rows (see
 `store.verifyLogIntegrity()`) keeps its row exactly as it is, and every other record is
 rebuilt normally. A row snapshot cannot tell whether an older concurrent write is
@@ -542,7 +542,7 @@ older write (a counter delta, an array add) is not folded on that device. The st
 therefore asks the sync server for a full resync once, and drops each snapshot when
 the record's history is back (or when the record's server fold state arrives in a
 scope entry); `store.getSnapshotRecords()` lists the records still on one. For one
-beta, `createApp({ experimental: { legacyMerge: true } })` runs the beta.13 pipeline
+beta, `createApp({ experimental: { legacyMerge: true } })` runs the beta.12 pipeline
 instead, for comparison.
 
 **Changing how a field merges.** Changing a field's merge kind in a new schema version

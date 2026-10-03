@@ -123,7 +123,7 @@ export interface StoreConfig {
 	/**
 	 * How rows are materialized. `'fold'` (default, W7): every write merges into the
 	 * record's per-field CRDT fold state, which re-materializes the row. `'legacy'`:
-	 * the beta.13 per-field LWW write paths (used by `experimental.legacyMerge` for
+	 * the beta.12 per-field LWW write paths (used by `experimental.legacyMerge` for
 	 * one beta, to compare). Switching modes on an existing database re-materializes
 	 * it on open.
 	 */

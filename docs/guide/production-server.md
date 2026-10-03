@@ -68,7 +68,7 @@ await request.kora.apply({ collection: 'todos', type: 'update', recordId, data }
 ```
 
 This is deliberate: one meaning of `undefined` everywhere (device API, route writes,
-beta.13 clients), so a write means the same thing on every path. Route writes are also
+beta.12 (and older) clients), so a write means the same thing on every path. Route writes are also
 held to the [value domain](./schema-design.md#value-domain): a value outside it (a
 `Date` in a `t.timestamp()` field, a fractional timestamp, a value of an undeclared enum
 member) is refused with `SCHEMA_VALIDATION_ERROR` and nothing is written.
@@ -247,10 +247,32 @@ younger than `anonymousClaimTtlMs` (default 24 hours). A device that is refused
 under it (event `sync:node-id-rotated`), so no write is lost.
 
 `allowLegacyAnonymousClaims` (default `true` in 1.0.0-beta.13, `false` from the next
-release) keeps clients without token support working: nodes held by the pre-release
-shared anonymous owner, and provisional claims that expired unconfirmed, are
-re-issued with a `session.legacy_anonymous_claim` warning in the log. Set it to
-`false` once every client is on beta.13 or later.
+release) keeps clients without token support working: nodes whose history predates
+node claims (every node of a database a beta.12 or older server wrote), nodes held by
+the pre-release shared anonymous owner, and provisional claims that expired
+unconfirmed, are re-issued with a `session.legacy_anonymous_claim` warning in the log.
+Set it to `false` once every client is on beta.13 or later. With `MixedAuthProvider`,
+a node with pre-claims history may also be a signed-in user's beta.12 device, which an
+anonymous device can then take (as it could on beta.12); set the option to `false` if
+that matters more than keeping anonymous beta.12 devices syncing.
+
+### Upgrading a beta.12 server database with authentication
+
+beta.12 and older servers recorded no node claims, so after the upgrade every node id
+in the database has history and no owner. A signed-in device is never handed such a
+node automatically (it could be another user's device), so its handshake is refused
+`NODE_ID_CLAIMED`:
+
+- A beta.13 client moves to a fresh node id and uploads its writes the old server
+  never acknowledged under it; what that server acknowledged stays under the old node
+  (the server already holds it). Nothing is lost and nothing is applied twice. Upgrade
+  clients when you upgrade the server.
+- A beta.12 client cannot change its node id: it keeps reconnecting and its unsynced
+  writes stay on the device until an administrator calls
+  `server.releaseNodeClaim(nodeId)` for that node (the next principal to connect with
+  it claims it). To keep beta.12 clients syncing through the upgrade, release their
+  node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
+  reconnect, accepting that the first principal to present a released node id gets it.
 
 ## Gap-free delivery and the delivery-sequence migration
 
@@ -260,5 +282,5 @@ Two operator notes:
 
 - **First startup after upgrading runs a one-time migration.** Each store adds a `delivery_seq` column and backfills existing operations. This is automatic and idempotent. On a very large Postgres operation log the backfill is a single ordered pass under an advisory lock; it runs once and subsequent startups skip it.
 - **Operation scope snapshots and blob owners (beta.13).** Each store adds a nullable `scope_snapshot` column to `operations` and a `blob_owners` table. Download visibility of a historical operation is judged on the record's scope values when that operation was applied, so an ownership transfer does not disclose the earlier history to the new owner, and scope-exit retractions come from the server's own rows. Existing operations are backfilled from the log when the schema is set (one replay per record); operations of collections outside the schema keep the previous behavior. Blob uploads made before the upgrade have no recorded owner: their existing references keep working, and a new reference to such bytes needs the writer to upload them again.
-- **Operation log integrity check (beta.14).** On the first start of this release the SQLite and Postgres stores read every stored operation once (keyset pages; Postgres under an advisory lock) and move rows that cannot be read back into an operation (malformed JSON, an out-of-range timestamp) to an `operations_quarantine` table, verbatim, so no materialization ever folds them. A warning is logged when rows move; `store.getLogIntegrityReport()` returns the result. Later starts skip the scan.
+- **Operation log integrity check (beta.13).** On the first start of this release the SQLite and Postgres stores read every stored operation once (keyset pages; Postgres under an advisory lock) and move rows that cannot be read back into an operation (malformed JSON, an out-of-range timestamp) to an `operations_quarantine` table, verbatim, so no materialization ever folds them. A warning is logged when rows move; `store.getLogIntegrityReport()` returns the result. Later starts skip the scan.
 - **Postgres serializes delivery-sequence assignment through one counter row** so delivery order matches commit order across instances. This is a deliberate correctness-over-throughput choice and is not a bottleneck for typical sync workloads. If you run a single Postgres at very high sustained write rates and measure contention on it, that is the place to look first.

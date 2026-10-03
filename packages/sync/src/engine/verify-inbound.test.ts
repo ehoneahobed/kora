@@ -125,7 +125,7 @@ describe('verifyInboundOperation: version-1 ids (RT-64)', () => {
 	})
 })
 
-describe('verifyInboundOperation: beta.13 hashes of undefined members (RT-71)', () => {
+describe('verifyInboundOperation: beta.12 hashes of undefined members (RT-71)', () => {
 	const schema = defineSchema({
 		version: 1,
 		collections: {
@@ -139,7 +139,7 @@ describe('verifyInboundOperation: beta.13 hashes of undefined members (RT-71)', 
 		},
 	}) as unknown as SchemaDefinition
 
-	/** A beta.13 upload: id over the in-memory data, content after a JSON round trip. */
+	/** A beta.12 upload: id over the in-memory data, content after a JSON round trip. */
 	async function legacyUpload(partial: Partial<Operation>): Promise<Operation> {
 		return JSON.parse(JSON.stringify(await v1Op(partial))) as Operation
 	}
