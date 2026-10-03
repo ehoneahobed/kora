@@ -691,6 +691,8 @@ export class ClientSession {
 	/** Protocol version the client declared in its handshake (1 when absent). */
 	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
 	private readonly authoritativeNodeIds: readonly string[] | null
+	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
+	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
 	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
 	private invalidOperationIds = 0
@@ -2741,12 +2743,15 @@ export class ClientSession {
 				return null
 			}
 			// Every plaintext id is verified, version 1 included (RT-64): an operation that
-			// declares no version is checked as a version-1 hash, so omitting `hashVersion`
-			// skips nothing and no client can store an operation under an id it chose.
+			// declares no version must carry its version-1 (or version-2) content hash, so
+			// omitting `hashVersion` skips nothing and no client stores an op under a chosen id.
 			const integrity = await verifyInboundOperation(op, {
 				encrypted: false,
-				absentVersion: 'verify-v1',
+				absentVersion: 'verify-ids',
 			})
+			if (integrity.ok && integrity.matchedVersion !== undefined) {
+				this.matchedHashVersions.set(op, integrity.matchedVersion)
+			}
 			if (!integrity.ok) {
 				return {
 					code: INVALID_OPERATION_ID,
@@ -2761,20 +2766,15 @@ export class ClientSession {
 	}
 
 	/**
-	 * The operation as the server stores it: a plaintext id this server verified as a
-	 * version-1 hash declares `hashVersion: 1`, so receivers verify it too (RT-64). An
-	 * absent version is left only on ids nobody could verify (protocol-1 encrypted
-	 * payloads, envelopes keep their own declaration, server-side transforms).
+	 * The operation as the server stores it: an undeclared plaintext id this server
+	 * verified declares the version it matched (1, or 2 when the declaration was lost),
+	 * so receivers verify it too (RT-64). An absent version is left only on ids nobody
+	 * could verify (protocol-1 encrypted payloads, server-side transforms).
 	 */
 	private declareVerifiedHashVersion(op: Operation): Operation {
-		if (op.hashVersion !== undefined || op.encrypted !== undefined) return op
-		if (
-			SyncEncryptor.isEncryptedPayload(op.data) ||
-			SyncEncryptor.isEncryptedPayload(op.previousData)
-		) {
-			return op
-		}
-		return { ...op, hashVersion: 1 }
+		if (op.hashVersion !== undefined) return op
+		const matched = this.matchedHashVersions.get(op)
+		return matched === undefined ? op : { ...op, hashVersion: matched }
 	}
 
 	/**

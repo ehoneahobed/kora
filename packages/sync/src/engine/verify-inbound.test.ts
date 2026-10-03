@@ -44,12 +44,21 @@ describe('verifyInboundOperation: version-1 ids (RT-64)', () => {
 			verified: false,
 		})
 		expect(
-			(await verifyInboundOperation(forged, { encrypted: false, absentVersion: 'verify-v1' })).ok,
+			(await verifyInboundOperation(forged, { encrypted: false, absentVersion: 'verify-ids' })).ok,
 		).toBe(false)
 		const honest = await v1Op()
 		expect(
-			await verifyInboundOperation(honest, { encrypted: false, absentVersion: 'verify-v1' }),
-		).toEqual({ ok: true, verified: true })
+			await verifyInboundOperation(honest, { encrypted: false, absentVersion: 'verify-ids' }),
+		).toEqual({ ok: true, verified: true, matchedVersion: 1 })
+		// A version-2 id whose declaration was lost still verifies (as version 2).
+		const v2 = { ...honest, hashVersion: 2 as const }
+		const { hashVersion: _lost, ...undeclared } = { ...v2, id: await computeOperationId(v2, 2) }
+		expect(
+			await verifyInboundOperation(undeclared as Operation, {
+				encrypted: false,
+				absentVersion: 'verify-ids',
+			}),
+		).toEqual({ ok: true, verified: true, matchedVersion: 2 })
 	})
 
 	test('a version-1 id over bytes verifies in either binary form', async () => {

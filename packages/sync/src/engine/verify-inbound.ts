@@ -11,6 +11,11 @@ export type InboundVerification =
 			ok: true
 			/** Whether the id was checked (false: not content-addressed, or not declared). */
 			verified: boolean
+			/**
+			 * The hash version the id matched, when it declared none (`'verify-ids'`): 1, or 2
+			 * for a version-2 id whose declaration was lost on the way.
+			 */
+			matchedVersion?: 1 | 2
 	  }
 	| { ok: false; code: typeof INVALID_OPERATION_ID; message: string }
 
@@ -23,8 +28,11 @@ export type AbsentHashVersionPolicy =
 	 * (which rewrites data under the original id), or a protocol-1 encrypted payload.
 	 */
 	| 'skip'
-	/** Checked as a version-1 id (the server, on upload: omitting the version skips nothing). */
-	| 'verify-v1'
+	/**
+	 * Checked (the server, on upload: omitting the version skips nothing): the id must be
+	 * the operation's version-1 or version-2 content hash.
+	 */
+	| 'verify-ids'
 
 /**
  * Verify a delivered (or uploaded) operation's content-addressed id (CORE-1, RT-64).
@@ -44,7 +52,8 @@ export type AbsentHashVersionPolicy =
  *   binary values are accepted in either of their two forms (bytes, or the canonical
  *   `{ $koraBytes }` form a JSON round trip produces), since a version-1 hash was
  *   computed over whichever form the writer held.
- * - A plaintext operation declaring no version follows `absentVersion`.
+ * - A plaintext operation declaring no version follows `absentVersion`: skipped, or
+ *   accepted when its id is its version-1 or version-2 content hash.
  * - An unknown declared version fails closed.
  *
  * @param op - The operation, decrypted
@@ -72,7 +81,14 @@ export async function verifyInboundOperation(
 	) {
 		return { ok: true, verified: false }
 	}
-	if (await operationIdMatches(op)) return { ok: true, verified: true }
+	if (declared === undefined && !context.encrypted) {
+		if (await operationIdMatches(op)) return { ok: true, verified: true, matchedVersion: 1 }
+		if (await verifyOperationId({ ...op, hashVersion: 2 })) {
+			return { ok: true, verified: true, matchedVersion: 2 }
+		}
+	} else if (await operationIdMatches(op)) {
+		return { ok: true, verified: true }
+	}
 	return {
 		ok: false,
 		code: INVALID_OPERATION_ID,
