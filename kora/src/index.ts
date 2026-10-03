@@ -3,6 +3,7 @@
 
 // === createApp factory ===
 export { createApp } from './create-app'
+export { ServerRenderingAppError } from './ssr'
 
 // === App types ===
 export type {

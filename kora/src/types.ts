@@ -273,6 +273,15 @@ export interface KoraConfig {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: Extract<KoraEvent, { type: `sync:${string}` }>) => void
+	/**
+	 * Server-rendering behaviour (DX-6). By default an app created where there is no
+	 * `window` (a Next.js / Remix server render) stays inert: it opens no database and
+	 * starts no sync, `app.ready` rejects with `ServerRenderingAppError`, and
+	 * `<KoraProvider app={app}>` renders its fallback. Pass `false` in a Node.js program
+	 * that wants a real database (or set `store.adapter: 'better-sqlite3'`, which implies
+	 * it); `true` keeps the app inert without a `window` even with that adapter.
+	 */
+	ssr?: boolean
 	/** Switches for behaviour that is being phased in or out. */
 	experimental?: ExperimentalOptions
 }
@@ -307,6 +316,15 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: KoraSyncEvent) => void
+	/**
+	 * Server-rendering behaviour (DX-6). By default an app created where there is no
+	 * `window` (a Next.js / Remix server render) stays inert: it opens no database and
+	 * starts no sync, `app.ready` rejects with `ServerRenderingAppError`, and
+	 * `<KoraProvider app={app}>` renders its fallback. Pass `false` in a Node.js program
+	 * that wants a real database (or set `store.adapter: 'better-sqlite3'`, which implies
+	 * it); `true` keeps the app inert without a `window` even with that adapter.
+	 */
+	ssr?: boolean
 	/** Switches for behaviour that is being phased in or out. */
 	experimental?: ExperimentalOptions
 }

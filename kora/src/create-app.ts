@@ -12,6 +12,7 @@ import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
+import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
 import { createStorageApi } from './storage-accessor'
 import { createSyncControl } from './sync-control'
 import {
@@ -38,6 +39,10 @@ import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
  * into a single developer-facing `KoraApp` object. Collection accessors
  * are always available through `app.collections`. Non-reserved names also retain
  * the convenient direct form (for example, `app.todos`).
+ *
+ * During a server render (no `window`, see {@link KoraConfig.ssr}) the app is inert:
+ * it opens no storage and starts no sync, and `app.ready` rejects with
+ * `ServerRenderingAppError` (handled, so it never surfaces as an unhandled rejection).
  */
 export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
 export function createApp(config: KoraConfig): KoraApp
@@ -79,21 +84,31 @@ export function createApp<const S extends SchemaInput>(
 		removeOnlineListener: null,
 	}
 
-	const devtools = setupDevtools(config, emitter)
+	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
+	// database (or start sync) in the server process.
+	const inert = isServerRenderingInert(config)
+	const devtools = inert
+		? { instrumenter: null, destroyOverlay: null }
+		: setupDevtools(config, emitter)
 	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
 
-	const ready = initializeApp(config, emitter, mergeEngine).then((init) => {
-		store = init.store
-		applyPipeline = init.applyPipeline
-		unsubscribeSync = init.unsubscribeSync
-		unsubscribeAudit = init.unsubscribeAudit
-		unsubscribeLocalOperations = init.unsubscribeLocalOperations
-		blobApi = createBlobApi(init.blobStore, init.blobChunkProvider, config.blob?.chunkSize, () =>
-			enumerateLiveBlobRefs(init.store, config.schema),
-		)
-		currentStoreInfo = init.storeInfo
-		wireSyncLifecycleAfterReady(config, emitter, syncState, init)
-	})
+	const ready = inert
+		? inertReady()
+		: initializeApp(config, emitter, mergeEngine).then((init) => {
+				store = init.store
+				applyPipeline = init.applyPipeline
+				unsubscribeSync = init.unsubscribeSync
+				unsubscribeAudit = init.unsubscribeAudit
+				unsubscribeLocalOperations = init.unsubscribeLocalOperations
+				blobApi = createBlobApi(
+					init.blobStore,
+					init.blobChunkProvider,
+					config.blob?.chunkSize,
+					() => enumerateLiveBlobRefs(init.store, config.schema),
+				)
+				currentStoreInfo = init.storeInfo
+				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+			})
 
 	const getStore = (): Store | null => store
 	const requireBlobApi = (): BlobApi => {
@@ -176,6 +191,11 @@ export function createApp<const S extends SchemaInput>(
 			return executeTransaction(fn, name)
 		},
 		async close() {
+			if (inert) {
+				queryStoreCache.clear()
+				emitter.clear()
+				return
+			}
 			await ready
 			syncState.intentionalDisconnect = true
 			teardownSyncLifecycle(syncState)
@@ -250,4 +270,15 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	return app
+}
+
+/**
+ * `app.ready` of an inert (server-rendered) app: rejected with a clear error for
+ * anyone who awaits it, but marked handled so a module-scope app that nobody awaits
+ * never crashes the server with an unhandled rejection.
+ */
+function inertReady(): Promise<void> {
+	const ready = Promise.reject(new ServerRenderingAppError())
+	ready.catch(() => {})
+	return ready
 }
