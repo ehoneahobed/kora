@@ -2816,23 +2816,30 @@ async function loadPostgresDeps(): Promise<{
 	postgresClient: (connectionString: string) => unknown
 	drizzleFn: (client: unknown) => PostgresJsDatabase
 }> {
+	// `postgres` is an optional peer: imported only when this backend is used. The
+	// specifiers come from an array so no bundler resolves them at build time (an app
+	// without `postgres` must still bundle), and the import is a real `import()` so it runs
+	// inside vitest's module runner too. A `new Function('return import(x)')` wrapper did
+	// neither reliably: it escaped vitest's VM (RT-30) and hid the real error.
+	const [postgresSpecifier, drizzleSpecifier] = POSTGRES_DRIVER_SPECIFIERS
+	let postgresMod: { default: (cs: string) => unknown }
+	let drizzleMod: { drizzle: (client: unknown) => PostgresJsDatabase }
 	try {
-		const dynamicImport = new Function('specifier', 'return import(specifier)') as (
-			specifier: string,
-		) => Promise<unknown>
-
-		const postgresMod = (await dynamicImport('postgres')) as { default: (cs: string) => unknown }
-		const drizzleMod = (await dynamicImport('drizzle-orm/postgres-js')) as {
-			drizzle: (client: unknown) => PostgresJsDatabase
-		}
-
-		return {
-			postgresClient: postgresMod.default,
-			drizzleFn: drizzleMod.drizzle,
-		}
-	} catch {
+		postgresMod = (await import(/* @vite-ignore */ postgresSpecifier)) as typeof postgresMod
+		drizzleMod = (await import(/* @vite-ignore */ drizzleSpecifier)) as typeof drizzleMod
+	} catch (error) {
 		throw new Error(
-			'PostgreSQL backend requires the "postgres" package. Install it in your project dependencies.',
+			`PostgreSQL backend requires the "postgres" package. Install it in your project dependencies. (${error instanceof Error ? error.message : String(error)})`,
 		)
 	}
+	return {
+		postgresClient: postgresMod.default,
+		drizzleFn: drizzleMod.drizzle,
+	}
 }
+
+/** Optional driver modules, loaded on first use of the Postgres backend. */
+const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
+	'postgres',
+	'drizzle-orm/postgres-js',
+]
