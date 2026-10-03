@@ -23,6 +23,7 @@ import {
 	resolveMonorepoTargetDirectory,
 } from './environment-detection'
 import { isSupportedWebFramework } from './options'
+import { writePnpmWorkspaceSettings } from './pnpm-workspace'
 import {
 	type CreateFlags,
 	resolveCreatePreferencesFlow,
@@ -226,6 +227,10 @@ export const createCommand = defineCommand({
 				db: selection.db,
 				dbProvider: selection.dbProvider,
 			})
+			if (pm === 'pnpm') {
+				// pnpm 11+ fails the install on unapproved build scripts (esbuild, better-sqlite3).
+				await writePnpmWorkspaceSettings(targetDir)
+			}
 			if (!useDefaults && editorDetection.editor !== 'unknown') {
 				const shouldApplyEditorPreset = await prompts.confirm(
 					`Detected ${formatEditor(editorDetection.editor)}. Add workspace recommendations for ${formatEditor(editorDetection.editor)}?`,

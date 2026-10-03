@@ -152,7 +152,8 @@ describe('bundled templates', () => {
 		(template) => {
 			const config = readFileSync(join(templatesDir, template, 'vite.config.ts'), 'utf8')
 			expect(config).toContain("import { koraServiceWorker } from '@korajs/cli/vite'")
-			expect(config).toMatch(/plugins: \[[^\]]*koraServiceWorker\(\)\]/)
+			// Last in the plugin list, so it runs after the sqlite WASM copy step.
+			expect(config).toMatch(/plugins: \[[^\]]*koraServiceWorker\(\),?\s*\]/)
 			const manifest = readFileSync(join(templatesDir, template, 'package.json.hbs'), 'utf8')
 			expect(manifest).toContain('"@korajs/cli"')
 		},
