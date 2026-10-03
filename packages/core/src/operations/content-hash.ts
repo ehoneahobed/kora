@@ -1,6 +1,6 @@
 import { HybridLogicalClock } from '../clock/hlc'
 import type { AtomicOp, HLCTimestamp, OperationInput } from '../types'
-import { bytesToBase64 } from './op-data-binary'
+import { canonicalizeOperationBody } from './canonical-body'
 
 /**
  * Content-hash versions for operation ids.
@@ -83,17 +83,19 @@ function v1HashInput(
 }
 
 function v2HashInput(op: HashableOperation, timestamp: string): Record<string, unknown> {
+	// The canonical body (core canonical-body.ts) is what is hashed: the same function
+	// produced the body the op log and the wire carry, so the hashed content and the
+	// stored content are one by construction (RT-72, RT-79, RT-80).
+	const body = canonicalizeOperationBody(op)
 	const atomicOps =
-		op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0
-			? canonicalBinary(op.atomicOps)
-			: null
+		body.atomicOps !== undefined && Object.keys(body.atomicOps).length > 0 ? body.atomicOps : null
 	return {
 		hashVersion: 2,
 		type: op.type,
 		collection: op.collection,
 		recordId: op.recordId,
-		data: canonicalBinary(op.data),
-		previousData: canonicalBinary(op.previousData),
+		data: body.data,
+		previousData: body.previousData,
 		timestamp,
 		nodeId: op.nodeId,
 		sequenceNumber: op.sequenceNumber,
@@ -103,32 +105,6 @@ function v2HashInput(op: HashableOperation, timestamp: string): Record<string, u
 		schemaVersion: op.schemaVersion,
 		atomicOps,
 	}
-}
-
-/**
- * The version-2 canonical form of a value: what survives a JSON round trip, so an op
- * hashed before and after one has one id.
- * - Binary values hash in their canonical op-log form (`{ $koraBytes: base64 }`).
- * - An object member whose value is `undefined` is absent (RT-72): JSON drops it, so
- *   the receiver never sees it. (Version 1, beta.13, hashed it as `null`; that form is
- *   kept for version 1 only.)
- * - An `undefined` array element is `null`, as JSON writes it.
- */
-function canonicalBinary(value: unknown): unknown {
-	if (value instanceof Uint8Array) return { $koraBytes: bytesToBase64(value) }
-	if (value instanceof ArrayBuffer) return { $koraBytes: bytesToBase64(new Uint8Array(value)) }
-	if (Array.isArray(value)) {
-		return value.map((item) => (item === undefined ? null : canonicalBinary(item)))
-	}
-	if (typeof value === 'object' && value !== null) {
-		const out: Record<string, unknown> = {}
-		for (const [key, member] of Object.entries(value)) {
-			if (member === undefined) continue
-			out[key] = canonicalBinary(member)
-		}
-		return out
-	}
-	return value
 }
 
 async function sha256Hex(canonical: string): Promise<string> {

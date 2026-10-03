@@ -80,6 +80,7 @@
  * Delete vs update is unchanged: the later of the newest delete and the newest
  * write decides; a revived record shows every field's merged value.
  */
+import { canonicalizeLegacyOperation } from '../operations/canonical-body'
 import type { CollectionDefinition, HLCTimestamp, Operation, SchemaDefinition } from '../types'
 import { isAuthoritativeNodeId } from './authority'
 import { FoldConfigurationError, FoldStateError } from './errors'
@@ -386,11 +387,15 @@ function isAlive(state: FoldState): boolean {
  */
 export function mergeOp(
 	state: FoldState,
-	op: Operation,
+	input: Operation,
 	schema: SchemaDefinition,
 	options: FoldOptions = {},
 ): MergeOpResult {
-	if (isExcluded(op, options.exclude)) return { state, traces: [], changed: false }
+	if (isExcluded(input, options.exclude)) return { state, traces: [], changed: false }
+	// Every replica folds a legacy (version-1, beta.13) update in its canonical form: a
+	// previousData key absent from data is a clear (RT-71, RT-83). The server stores it
+	// so; a device's own beta.13 log does not, and the one-time upgrade re-fold reads it.
+	const op = canonicalizeLegacyOperation(input)
 	if (op.collection !== state.c || op.recordId !== state.r) {
 		throw new FoldStateError(
 			`Operation ${op.id} targets ${op.collection}/${op.recordId} but the fold state is for ${state.c}/${state.r}.`,

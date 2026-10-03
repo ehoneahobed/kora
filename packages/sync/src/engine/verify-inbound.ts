@@ -1,4 +1,10 @@
-import { base64ToBytes, bytesToBase64, isKoraBytesValue, verifyOperationId } from '@korajs/core'
+import {
+	base64ToBytes,
+	bytesToBase64,
+	canonicalizeLegacyOperation,
+	isKoraBytesValue,
+	verifyOperationId,
+} from '@korajs/core'
 import type { FieldDescriptor, Operation, SchemaDefinition } from '@korajs/core'
 import { INVALID_OPERATION_ID } from '../protocol/protocol-version'
 
@@ -243,13 +249,8 @@ export async function matchOperationId(
  * @returns The restored data, or `op.data` unchanged
  */
 export function restoreUndefinedFromPrevious(op: Operation): Operation['data'] {
-	const data = op.data
-	if (op.type !== 'update' || data === null || op.previousData === null) return data
-	const missing = Object.keys(op.previousData).filter((key) => !(key in data))
-	if (missing.length === 0) return data
-	const out: Record<string, unknown> = { ...data }
-	for (const key of missing) out[key] = null
-	return out
+	// One rule for every replica: core's legacy canonical body (RT-71, RT-83).
+	return canonicalizeLegacyOperation({ ...op, hashVersion: undefined }).data
 }
 
 /**

@@ -183,7 +183,10 @@ export function deserializeOperation(row: OperationRow): Operation {
 			[HASH_VERSION_KEY]: _h,
 			...rest
 		} = parsed
-		data = Object.keys(rest).length > 0 ? rest : null
+		// An insert or update always carries data, possibly `{}` (an insert of only
+		// optional fields): its id covers `{}`, so `{}` is read back, never `null`. Only a
+		// delete's payload is metadata alone (RT-80).
+		data = row.type !== 'delete' || Object.keys(rest).length > 0 ? rest : null
 	}
 
 	return {

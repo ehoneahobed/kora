@@ -582,7 +582,8 @@ export class DynamicProtobufSerializer implements MessageSerializer {
 						__kora_encrypted__: _e,
 						...rest
 					} = parsed
-					data = hasData && Object.keys(rest).length > 0 ? rest : null
+					// `hasData`: `{}` stays `{}` (the op's id covers it).
+					data = hasData ? rest : null
 				}
 			} catch {
 				// Fall back: data stays null

@@ -36,6 +36,9 @@ function op(overrides: Partial<Operation>): Operation {
 		sequenceNumber: seq,
 		causalDeps: [],
 		schemaVersion: 1,
+		// Version 2: previousData is only a hint. (A version-1 update whose previousData names
+		// a field its data lacks is a clear of that field, core canonicalizeLegacyOperation.)
+		hashVersion: 2,
 		...overrides,
 	}
 }

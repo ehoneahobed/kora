@@ -931,7 +931,8 @@ function deserializeProtoOperation(operation: ProtoOperation): SerializedOperati
 			__kora_field_versions__: _f,
 			...rest
 		} = parsed
-		data = operation.hasData && Object.keys(rest).length > 0 ? rest : null
+		// `hasData` says whether the op carried data: `{}` stays `{}` (its id covers it).
+		data = operation.hasData ? rest : null
 	}
 
 	return {
