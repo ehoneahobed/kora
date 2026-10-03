@@ -5,9 +5,10 @@
 > in this repository already contain them, so publishing the advisory and pushing this branch
 > publicly should happen together with the release.
 
-**Packages:** `@korajs/server`, `@korajs/auth`, `@korajs/sync`, `korajs` (all versions up to and including 1.0.0-beta.12)
+**Packages:** `@korajs/server`, `@korajs/auth`, `@korajs/sync`, `@korajs/store`, `korajs` (all versions up to and including 1.0.0-beta.12)
 **Severity:** Critical, for deployments that serve more than one user or tenant from one sync server.
-**Fixed in:** 1.0.0-beta.13 (pending)
+**Affected:** 1.0.0-beta.12 and earlier
+**Fixed in:** 1.0.0-beta.13
 
 ## Summary
 
@@ -23,6 +24,8 @@ Additional high-severity issues fixed in the same release:
 - OAuth account linking was vulnerable to cross-site request forgery.
 - Organization invitations could be claimed by any user.
 - Offline users were signed out and their sessions destroyed when a token refresh failed for network reasons.
+- With end-to-end sync encryption enabled, ciphertext was not bound to its operation and plaintext operations were accepted, so whoever could reach the sync server could inject unauthenticated writes. (Encrypted data was also never readable on another device; 1.0.0-beta.13 replaces the scheme with a per-user keyring.)
+- The local store spliced `orderBy` direction and `limit`/`offset` values into SQL (only reachable when an app passes untrusted input to them).
 
 ## Am I affected?
 
@@ -34,7 +37,7 @@ Single-user, local-only apps (no `sync` configured) are not affected by the serv
 
 ## What to do
 
-1. Upgrade all `@korajs/*` packages and `korajs` to 1.0.0-beta.13 or later.
+1. Upgrade all `@korajs/*` packages and `korajs` to 1.0.0-beta.13 or later, sync servers first, then clients. The full migration table is in the 1.0.0-beta.13 release notes.
 2. **Breaking change:** sync scopes are now granted only by the server.
    - If you used `@korajs/auth`, configure `resolveScopes` (or rely on the default `userId` derivation) as described in the migration guide.
    - A client handshake can now only narrow its scope.
