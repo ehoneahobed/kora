@@ -126,3 +126,81 @@ Every finding has a repro under `tests/repro/` that fails at 4d6c8a7. Each is tr
 - `FOLD_STATE_INVALID` quarantine replay when the re-fold fails again.
 - Real Chromium beyond the `check.mjs --all` browser suites.
 - Performance of the RT-70 rebuild and of re-folds on large databases, beyond the release-gate benchmarks.
+
+# Round 3 (2026-10-03)
+
+Independent adversarial review of `fix/phase3-one-fold` at 97981a7, covering the round-2 fixes (`git log 07e4f45..ffe0893`):
+- deep stripping of `undefined` members before version-2 hashing and validation (RT-72);
+- version-1 verification that rebuilds beta.13's hash forms, cleared fields stored as `null`, and unverified acceptance of protocol-1 ops for their own node (RT-71);
+- the server's duplicate-delete re-check (RT-73);
+- durable provisional cascades for sealed relations, and author-side cascades for late-known children (RT-74);
+- the client's union of explicit authoritative ids, with servers advertising explicit ids only (RT-75);
+- the stamp-position-only legacy authority scan (RT-76), and merge import skipping server ops.
+
+Method:
+- Executable repros against:
+  - the real `KoraSyncServer` and `ClientSession` (memory, SQLite and Postgres 16 stores);
+  - `TestDevice` networks (real SQLite store and `SyncEngine`), including encrypted networks with sealed relations and server validators;
+  - `Store`.
+- A real beta.13 build (33bca46, rebuilt into a private temp dir) against this tree, with four scripts:
+  - `rt-legacy-id-probe.mjs`;
+  - `protocol-v2-compat.mjs`;
+  - `rt3-legacy-probe.mjs` (new): six more write shapes;
+  - `rt3-upgrade-clear-probe.mjs` (new): beta.14 opens a beta.13 database.
+- The pre-fix tree (07e4f45) was built separately to tell regressions from older defects.
+- Own Postgres 16 (`initdb -E UTF8 --locale=C.UTF-8`, port 54409).
+- Gates rerun (results below).
+
+Every finding has a repro under `tests/repro/` that fails at 97981a7. Each is tracked as RT-77..RT-83 (status open, phase 3).
+
+| ID | Sev | Finding | Location | Required fix | Repro |
+|---|---|---|---|---|---|
+| RT-77 | P1 (security) | Regression of the RT-73 fix. The duplicate-delete re-check derives the referential effects of the UPLOADED op, not of the stored delete. `isStoredDuplicate` matches on id and node only (own node: any sequence; another node: the same sequence). It runs before `checkUploadIntegrity`, so the body is never compared or verified. A device re-sends the id of any stored op it knows (its own, or a delivered op of another node) as `type: 'delete'`, with any collection and record id. The server then derives server-authored cascade deletes and set-nulls for every child of that LIVE record that the device's uplink scopes allow, and relays them. No validator runs (duplicates skip it), and the rate limiter is not charged. In the repro, the app's validator refuses every delete by the attacker. Both comments of a live post are deleted anyway, on memory and on Postgres. | `server/src/session/client-session.ts:2425-2440, 2772-2792, 3466-3471`; `server/src/apply/apply-server-operation.ts:252-283` | Re-check only the stored delete: load the stored op (by id and node) and use its content. Ack a duplicate whose body differs from the stored op without any effect, or refuse it. | `packages/server/tests/repro/RT-77.test.ts` |
+| RT-78 | P2 (data loss) | Regression of the RT-74 fix. The setting is end-to-end encryption with a sealed relation. `cascadeLateChildOfOwnDelete` runs after every applied remote op, so the deleting device authors the late cascade right after applying a late child's insert. That is before the same batch moves the child to a live project. The copy is stamped now, so it beats the move everywhere. In the repro, B had moved the todo to project Q and shows it there. When A reconnects, the todo is deleted on A and on B. Without encryption, the server's cascade-late correction reads the folded child and the todo survives (control test). | `kora/src/apply-pipeline.ts:135-138, 211-256` | Judge late children on the folded state after the delivered batch (or at catch-up), and cascade only if the child still references the deleted parent. Never stamp the copy after a move it did not see: stamp it like the receivers' effect, right after the delete. | `packages/test/tests/repro/RT-78.test.ts` |
+| RT-79 | P1 (not a round-2 regression) | Same class and outcome as RT-72. A `Date` inside a `t.json()` value passes validation. The version-2 canonical form walks `Object.entries(date)`, which is empty, so the id covers `{}`. The op log and the wire carry the ISO string. The server refuses the insert `INVALID_OPERATION_ID` (terminal), and the record vanishes from the writing device. The round-2 rule "the hashed content is exactly the JSON content" holds only for `undefined`. `Map` and `Set` are accepted too, and silently become `{}`. Same at 07e4f45. | `core/src/operations/content-hash.ts:117-132`; `core/src/schema/validation.ts`; `core/src/operations/strip-undefined.ts` | Hash the JSON round trip of op data (binary kept in its canonical form), or refuse non-plain objects in json and object values at validation. | `packages/test/tests/repro/RT-79.test.ts` |
+| RT-80 | P3 | `update(id, { field: undefined })` with only `undefined` members is refused `INVALID_OPERATION_ID` ("altered after it was created"). The stripped data `{}` is hashed, but the store's op log reads an empty data object back as `null`. No replica clears the field. A beta.13 client's same call clears it, and the server stores that as a clear (RT-71). Same at 07e4f45. The round-2 register said top-level `undefined` in an update passes. | `core/src/operations/operation.ts` (`normalizeOperationInput`); `store/src/serialization/serializer.ts:186`; `store/src/mutations/write-ops.ts:165-189` | Decide what the call means: clear (as beta.13 did) or ignore. If ignored, drop the key from `previousData` and write no op. Never hash a data shape the log does not round-trip. | `packages/test/tests/repro/RT-80.test.ts` |
+| RT-81 | P3 | The authority union (RT-75) has no revocation, and the server forgets what it advertised. Devices keep every explicit id for good. The handshake refuses only ids the server lists now, and an id with no history can be claimed. An operator may remove a configured `authoritativeNodeIds` extra, to revoke it or on one instance of several. A device can then hand-shake with that id. Its server-authoritative writes win on every device that learned the id, but are ordinary writes on the server. | `store/src/store/store.ts` (`setAuthoritativeNodeIds`); `sync/src/engine/sync-engine.ts:1840-1853`; `server/src/session/client-session.ts:2994-2999` | Persist every id the deployment ever advertised, and refuse it at handshake for good. Give operators an explicit, versioned revocation instead of a union only. | `packages/server/tests/repro/RT-81.test.ts` |
+| RT-82 | P2 | Regression of the RT-74 fix. The setting is end-to-end encryption with a sealed relation. A receiver's cascade is a durable provisional effect, and only the deleting device's real copy retires it. If the server refuses that copy, nothing ever retires the effect. The server refuses it when the deleting user has no write grant on another user's child, or when a validator refuses it. The deleting device excludes its refused copy and shows the child, and the server keeps it. The receivers keep it deleted, across reconnects. In round 2, before the RT-74 fix, replicas agreed. | `kora/src/apply-pipeline.ts:181-197`; `store/src/store/store.ts` (`settleAfterCatchUp`); `RecordFolder` provisional retirement | Make a terminal refusal of the copy reach the receivers (a relayed marker or an authored retraction), or retire durable effects when the server reports the delete resolved. | `packages/test/tests/repro/RT-82.test.ts` |
+| RT-83 | P1 | Upgrading a beta.13 database to beta.14 brings back every field the user cleared with `undefined`. beta.13 wrote NULL to the row but logged JSON without the member. beta.14's one-time fold materialization rebuilds rows from the log. The server stores the same op with the field `null` (RT-71). The upgraded device already holds that id, so it never applies the server's copy and diverges from the server and every peer for good. Confirmed with the real beta.13 build: `update(id, { assignee: undefined, title })` and `update(id, { assignee: undefined })` both revert; nested members do not. | `store/src/store/store.ts:1055` (`ensureMaterialization`); `store/src/fold/rematerialize.ts`; `sync/src/engine/verify-inbound.ts` (`restoreUndefinedFromPrevious`, server only) | Apply the server's rebuild when folding a local undeclared (version-1) update: every `previousData` key absent from `data` is a clear. Or rewrite those log rows once at the upgrade (same version-1 id). Add an upgrade test from a real beta.13 database. | `packages/store/tests/repro/RT-83.test.ts`; `scripts/remediation/rt3-upgrade-clear-probe.mjs` |
+
+## What held up (round 3)
+
+- **Version-1 verification against the real beta.13 build.**
+  - `rt-legacy-id-probe.mjs`: all 6 cases accepted and converged with a beta.14 peer.
+  - `rt3-legacy-probe.mjs` adds six shapes: increment plus `undefined` in one update; only `undefined`; `null`; a json field set to `undefined`; an array field cleared with `undefined` plus increment; nested `undefined` on insert and update. All were accepted and converged.
+  - `protocol-v2-compat.mjs` passes both scenarios.
+  - Cleared fields stored as `null` give one result on beta.13 and beta.14 peers. The only divergence is the writer's own upgrade (RT-83).
+- **Undefined stripping on beta.14 writers.**
+  - Consistent on every replica: nested `undefined` in inserts and updates; `-0`; `Map`, which becomes `{}` everywhere (noted under RT-79).
+  - Refused at validation: NaN, Infinity, functions, `toJSON` objects, sparse arrays and `undefined` array elements.
+  - Only `Date` (RT-79) and the update with only `undefined` members (RT-80) break.
+- **Unverified protocol-1 acceptance.** It is limited to the session's own node, and a protocol-2 session never reaches it. Server-derived ids are HMAC-keyed on every built-in store; on Postgres, derivation waits for the loaded secret. Clients skip undeclared ids, consistently with the server. A downgraded device gains nothing it cannot write directly:
+  - restoring `previousData` keys as `null` is the same as writing `null`;
+  - colliding with another node's future op needs that op's exact content and HLC;
+  - a stored id of another node is a no-op duplicate on the apply path.
+  RT-77 needs no downgrade.
+- **beta.13 encrypted clients** are refused `PLAINTEXT_REJECTED` by a beta.14 server that requires encryption. The beta.14 notes document this (envelope v1 is unreadable); not a finding.
+- **The RT-73 re-check on the honest path.** `stored-delete-effects` and `legacy-undefined-members` pass on Postgres 16. Derived ids are keyed and deterministic, so concurrent retries on two instances store one copy (by code reading).
+- **A peer's concurrent move vs a receiver's durable cascade (sealed).** The durable effect gives way to a later move by a device that had not seen the delete, and the receivers agree while the deleting device is away. RT-78 then deletes the child when that device returns.
+- **The authority union.**
+  - It is persisted once, and `kora:server:` ids are never stored.
+  - A growth re-fold runs in one transaction from the log.
+  - A record written between the listing and the re-fold is already folded with the new set.
+- **Gates.**
+  - `check.mjs --all` ran with Postgres 16, real Chromium and `LMS_OPS=20000`. Result: 162/193 fixed, 0 errors, 0 warnings. No regression and no guard failure, and every new repro fails as owned.
+  - `chaos:nightly` passed: 10 clients × 1,000 ops under 10% drop and 5% duplicate, plus the no-silent-loss invariants (11/11).
+  - `test:release-gate` passed: production path, sync reconnect, real-path chaos and the benchmark gates.
+  - The fold gate on 400 new seeds (seed base 1310001) passed all four tests: every field kind; server-authoritative writes with the server converging; end to end encrypted; and the beta.13 pipeline is still rejected. The fold-vs-legacy check (40 seeds) also passed.
+
+## Not filed (round 3, P3 or below)
+
+- Two devices that both deleted a parent without knowing a late child each author a late cascade copy (two copies per child). Harmless.
+- A merge-mode backup import can still carry operations of an explicit authority the importing device has not learned yet. They become authoritative locally once the id is learned. They are local only and never uploaded.
+
+## Not attacked (round 3)
+
+- A real two-instance Postgres race between the duplicate-delete re-check and a new child insert (by code reading only).
+- HTTP long-poll transport specifics, and DevTools traces.
+- Key rotation across `keyVersion`, and shared key distribution (Phase 4).
+- An interrupted `importBackup`, and real Chromium beyond the `check.mjs --all` browser suites.
+- Third-party `ServerStore` implementations without `deriveServerOperationId` (unkeyed derivation, documented).

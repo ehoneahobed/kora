@@ -2925,6 +2925,111 @@
    ],
    "pr": null,
    "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Locations: server/src/store/server-identity.ts:210-233 (authoritativeStampOpIds walks the whole state JSON, values included), sqlite-server-store.ts:280-298 and postgres-server-store.ts:359-391 (scan at the first start of this release). Reach: only databases that already hold fold states at their first beta.14 start (a pre-release fold build); new and beta.13 databases have none when the scan runs. The repro clears the scan marker to simulate one. Required fix: deserialize each state and collect only stamp positions (cr/w/d/u and each field kind's stamp members), never values; optionally intersect with node ids that never hand-shook as devices (node claims). Repro packages/server/tests/repro/RT-76.test.ts. FIXED (Phase 3 round 3, 2026-10-03, commit f3ddd91). authoritativeStampOpIds reads stamps only from stamp positions of the fold-state format (cr/w/d/u; reg/res entries; set sh/clr/element a/f/r; map sh/clr/keys; ctr base/deltas; max/min best/reg; rt reset/updates), never values; the format version is not enforced (pre-release states). Tests: repro RT-76; server-identity.test.ts (every stamp position; stamp-shaped values ignored)."
+  },
+  {
+   "id": "RT-77",
+   "title": "A forged 'duplicate' delete makes the server cascade a live record: the RT-73 re-check derives the referential effects of the UPLOADED op's collection/record, and the duplicate test matches on (node, id) only (own node: any sequence; other node: same sequence), before integrity checks, validators and rate charging",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-77.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-73 fix (commit 8df53b8). Locations: server/src/session/client-session.ts:2425-2440 (the duplicate path calls resumeStoredDeleteEffects(op) whenever the UPLOADED op says type 'delete'), :3466-3471 (isStoredDuplicate: id + node only; own node any sequence; content never compared; runs before checkUploadIntegrity at :2561), :2772-2792 (resumeStoredDeleteEffects uses the uploaded op), server/src/apply/apply-server-operation.ts:252-283 (undoneSideEffectsOfStoredDelete evaluates checkReferentialIntegrityOnDelete for op.collection/op.recordId; only authorizeUplinkWrite, no validator). A device re-sends the id of any stored op it knows (its own, any sequence; or a delivered op of another node, with that node id and sequence) as type 'delete' with any collection/recordId: the server derives server-authored (kora:server:) cascade deletes / set-nulls of every child of a LIVE record that the device's uplink scopes allow and relays them to every device, bypassing validateOperation and the rate limiter (a duplicate is free). The derived ops are stamped right after the forged op's timestamp, so the id of any op newer than the children works. Repro packages/server/tests/repro/RT-77.test.ts (memory, and Postgres 16 with KORA_REPRO_STORE=postgres; the server has a validator refusing every delete by the attacker). Required fix: on the duplicate path re-check only the STORED delete: load the stored operation (by id and node) and use its content, never the uploaded body; ack a duplicate whose body differs from the stored one without any effect (or refuse it)."
+  },
+  {
+   "id": "RT-78",
+   "title": "Under end-to-end encryption with a sealed relation, the deleting device's late cascade (RT-74 fix) deletes a child that was already moved to a live parent: cascadeLateChildOfOwnDelete judges the child right after applying its insert, before the same batch's move, and its delete (stamped now) wins on every device",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-78.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-74 fix (commit f3ddd91). Location: kora/src/apply-pipeline.ts:135-138 (runs after every applied remote op) and :211-256 (reads the materialized child after that one op; authors a real delete / set-null with extraCausalDeps = own delete, stamped by the local HLC, i.e. after every op it has seen). Repro: A (deaf to batches) deletes project P; B had inserted a todo under P and moved it to Q; B shows the todo under Q; when A reconnects it applies the insert, authors the cascade, then applies the move; the todo is gone on A and B. Control without encryption (server cascade-late correction on the folded state): the todo survives under Q. Data loss of a live record on every device. Required fix: judge late children on the folded state after the delivered batch (or at catch-up), author the cascade only if the child still references the deleted parent then, and never stamp it later than a move it did not see (e.g. stamp it like the receivers' provisional effect, right after the delete)."
+  },
+  {
+   "id": "RT-79",
+   "title": "A Date inside a t.json() value is hashed as {} (the version-2 canonical form walks Object.entries) but stored and uploaded as its ISO string: the server refuses the insert INVALID_OPERATION_ID and the record vanishes from the writing device",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-79.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not a round-2 regression (same at 07e4f45); same class and outcome as RT-72 (P1). Locations: core/src/operations/content-hash.ts:117-132 (canonicalBinary: any object via Object.entries; a Date has none), core/src/schema/validation.ts (json values: the JSON-serializable check accepts a Date; a custom toJSON is refused as a function member), core/src/operations/strip-undefined.ts (non-plain objects untouched), op log and wire = JSON.stringify (ISO string). Repro packages/test/tests/repro/RT-79.test.ts. Required fix: hash exactly the JSON form (normalize op data to its JSON round trip before the id, keeping binary in its canonical form), or refuse non-plain objects (Date, Map, Set, class instances) in json/object values at validation with a clear error. Map and Set are accepted today and silently become {} on every replica."
+  },
+  {
+   "id": "RT-80",
+   "title": "update(id, { field: undefined }) on a beta.14 device is refused INVALID_OPERATION_ID by its own server: the stripped data {} is hashed, the op log reads it back as null, and a no-op write is reported as tampering",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-80.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not a round-2 regression (same at 07e4f45); the round-2 register said top-level undefined in an update passes. Locations: core/src/operations/operation.ts normalizeOperationInput (data {} after stripping), store/src/serialization/serializer.ts:186 (deserializeOperation: empty data read back as null), store/src/mutations/write-ops.ts:165-189 (previousData keeps the undefined field's key). The field is not cleared on any replica, while a beta.13 client's same call clears it (and the server stores it as a clear, RT-71): the API means different things per version. Repro packages/test/tests/repro/RT-80.test.ts. Required fix: decide the meaning (clear, as beta.13, or ignore); if ignored, drop the key from previousData too and write no op when nothing is left; never hash a data shape the op log does not round-trip ({} vs null)."
+  },
+  {
+   "id": "RT-81",
+   "title": "The device-side authority union has no revocation: an explicit authoritative id a server once advertised stays authoritative on devices for good, and once no server lists it any more a device may hand-shake with it (the handshake refuses only currently listed ids) and its writes then win server-authoritative fields on every device, but not on the server",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-81.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Consequence of the RT-75 fix (commit f3ddd91). Locations: store/src/store/store.ts setAuthoritativeNodeIds (union, never dropped), sync/src/engine/sync-engine.ts:1840-1853 (union), server/src/session/client-session.ts:2994-2999 (isServerAuthorNodeId: current lists only) and the claim rule (an id with no stored history is claimable). Reach: an operator removes a configured authoritativeNodeIds extra (or a legacy id that never authored anything), for example to revoke it, or one instance of several listed it. The forged node's server-authoritative writes are authoritative on every device that learned the id and ordinary on the server: permanent divergence plus authority on devices. Repro packages/server/tests/repro/RT-81.test.ts. Required fix: persist every id the deployment ever advertised (server side) and refuse it at handshake for good; give operators an explicit revocation (a signed or versioned authority list that devices replace, rather than union)."
+  },
+  {
+   "id": "RT-82",
+   "title": "Under end-to-end encryption with a sealed relation, a refused cascade copy leaves every receiver's durable provisional effect in place for good: the deleting device excludes its refused copy and shows the child, the server keeps it, receivers keep it deleted, and nothing retires the effect",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-82.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Regression of the RT-74 fix (commit f3ddd91): before it, the receiver's provisional effect was retired at catch-up (RT-74), so replicas agreed on the child (alive); before RT-69 the receiver's own copy was accepted. Locations: kora/src/apply-pipeline.ts:181-197 (durable provisional effect for a sealed relation), store/src/store/store.ts settleAfterCatchUp (keeps durable effects) and RecordFolder (only a real copy naming the delete in causalDeps retires one). Reach: any refusal of the deleting device's copy: a write grant the deleting user lacks on another user's child (shared parent, per-user children), a validator, a rate-limit turned terminal. Repro packages/test/tests/repro/RT-82.test.ts (validator: only a todo's creator deletes it): A deletes the shared project; its copy of B's todo is refused; A shows the todo, B does not, across reconnects. Required fix: a terminal refusal of the copy must reach the receivers (e.g. the server relays a 'refused copy' marker, or the deleting device authors a retraction), or receivers retire a durable effect when the server reports the parent's delete fully resolved; alternatively apply sealed cascades only from real copies and accept the transient orphan."
+  },
+  {
+   "id": "RT-83",
+   "title": "Upgrading a beta.13 database to beta.14 brings back every field the user cleared with undefined: the one-time fold materialization rebuilds rows from the JSON op log, where beta.13's cleared members are absent; the server stores the same op as a clear (RT-71), so the upgraded device also diverges from every peer for good",
+   "severity": "P1",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-83.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 3, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 3). Not caught by rounds 1-2; made a permanent divergence by the RT-71 fix (server stores the beta.13 update with the cleared fields null). Locations: store/src/store/store.ts:1055 ensureMaterialization (mode 'log' rebuilds every row from the log), store/src/fold/rematerialize.ts, beta.13 op log (JSON.stringify drops undefined members; previousData keeps the key), sync/src/engine/verify-inbound.ts restoreUndefinedFromPrevious (the rule exists, used by the server only). Confirmed against the real beta.13 build (33bca46) with scripts/remediation/rt3-upgrade-clear-probe.mjs: update(id, { assignee: undefined, title }) and update(id, { assignee: undefined }) both revert to the old value after the upgrade; a nested undefined member does not. The device holds the server's copy's id already, so the server's null never reaches it. Repro packages/store/tests/repro/RT-83.test.ts (beta.13 database shape built with materialization 'legacy' and the JSON beta.13 logged). Required fix: when folding an undeclared (version-1) update of a local legacy node, apply the same rebuild the server applies (every previousData key absent from data is a clear), or rewrite such ops in the log once at the upgrade (same id: null and undefined hash identically under version 1); add an upgrade test from a real beta.13 database."
   }
  ],
  "rejectedProposalPins": {
