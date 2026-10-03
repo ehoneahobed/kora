@@ -21,6 +21,7 @@ describe('getEventCategory', () => {
 			'sync:apply-recovered': 'sync',
 			'sync:apply-abandoned': 'sync',
 			'sync:clock-skew': 'sync',
+			'encryption:status': 'sync',
 			'sync:node-id-rotated': 'sync',
 			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',

@@ -249,6 +249,10 @@ export function createSampleEvent<T extends KoraEventType>(
 				retryCount: 1,
 			},
 		},
+		'encryption:status': {
+			type: 'encryption:status',
+			status: { state: 'locked', keyring: 'default', keyVersion: null, code: 'NO_PASSPHRASE' },
+		},
 		'sync:clock-skew': {
 			type: 'sync:clock-skew',
 			skewMs: -120_000,
