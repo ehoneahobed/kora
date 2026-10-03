@@ -5,7 +5,12 @@ import {
 	isFoldStateLive,
 	materialize,
 } from '@korajs/core'
-import type { CollectionDefinition, Operation, SchemaDefinition } from '@korajs/core'
+import type {
+	CollectionDefinition,
+	Operation,
+	OperationTransform,
+	SchemaDefinition,
+} from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import { mergeYjsUpdates } from '../fold/record-folder'
 import { decodeRichtextFieldsFromOpData } from '../serialization/op-data-encoding'
@@ -101,6 +106,7 @@ export function buildReplaySnapshot(
 	allOps: Operation[],
 	targetOperationId: string,
 	aliases: ReadonlyMap<string, string> = new Map(),
+	transforms: readonly OperationTransform[] = [],
 ): ReplaySnapshot {
 	const operationsApplied = collectCausalClosure(allOps, targetOperationId, aliases)
 	const targetOperation = operationsApplied.find((op) => op.id === targetOperationId)
@@ -110,7 +116,7 @@ export function buildReplaySnapshot(
 		})
 	}
 
-	const memory = foldIntoMemory(operationsApplied, schema)
+	const memory = foldIntoMemory(operationsApplied, schema, transforms)
 
 	const collections = materializeCollections(schema, memory)
 
@@ -138,7 +144,11 @@ export function buildReplaySnapshot(
  * materializes it (the cut may hold concurrent branches: the fold, not the
  * application order, decides).
  */
-function foldIntoMemory(ops: readonly Operation[], schema: SchemaDefinition): ReplayMemoryState {
+function foldIntoMemory(
+	ops: readonly Operation[],
+	schema: SchemaDefinition,
+	transforms: readonly OperationTransform[],
+): ReplayMemoryState {
 	const byRecord = new Map<string, Operation[]>()
 	for (const op of ops) {
 		if (!schema.collections[op.collection]) continue
@@ -151,7 +161,11 @@ function foldIntoMemory(ops: readonly Operation[], schema: SchemaDefinition): Re
 	for (const recordOps of byRecord.values()) {
 		const first = recordOps[0] as Operation
 		const definition = schema.collections[first.collection] as CollectionDefinition
-		const folded = foldRecord(recordOps, schema, { richtext: mergeYjsUpdates }).state
+		// The live store folds with the schema transforms (RT-84): so does time travel.
+		const folded = foldRecord(recordOps, schema, {
+			richtext: mergeYjsUpdates,
+			...(transforms.length > 0 ? { transforms } : {}),
+		}).state
 		if (folded === null || folded.cr === null || folded.u === null) continue
 		const values = materialize({ ...folded, d: null }, { richtext: mergeYjsUpdates }) ?? {}
 		let colMap = state.get(first.collection)

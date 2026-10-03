@@ -44,6 +44,11 @@ export interface WriteEnv {
 	 * re-materialization): the row is then written directly, as in beta.13.
 	 */
 	readonly fold?: RecordFolder
+	/**
+	 * Largest operation a local write may produce (RT-86), the server's
+	 * `maxOperationBytes`. Default `DEFAULT_MAX_OPERATION_BYTES` (256 KiB).
+	 */
+	readonly maxOperationBytes?: number
 }
 
 /**

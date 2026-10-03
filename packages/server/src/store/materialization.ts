@@ -230,6 +230,10 @@ export function deserializeFieldValue(value: unknown, descriptor: FieldDescripto
 			return typeof value === 'string' ? JSON.parse(value) : value
 		case 'boolean':
 			return value === 1 || value === true
+		case 'timestamp':
+			// A Postgres BIGINT column is read back as a string (or a bigint); the value
+			// domain keeps timestamps safe integers, so the number is exact (RT-87).
+			return typeof value === 'string' || typeof value === 'bigint' ? Number(value) : value
 		default:
 			return value
 	}

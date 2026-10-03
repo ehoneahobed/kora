@@ -167,10 +167,13 @@ export interface KoraSyncServerConfig {
 	 */
 	supportedSchemaVersions?: { min: number; max: number }
 	/**
-	 * Transform accepted legacy client operations into the server schema version
-	 * before validation and materialization. Required when
-	 * `supportedSchemaVersions.min` is lower than `schemaVersion` and operation
-	 * shapes changed across versions.
+	 * Schema transforms from older client schema versions to the server schema version.
+	 * Required when `supportedSchemaVersions.min` is lower than `schemaVersion` and
+	 * operation shapes changed across versions. They run at fold time (RT-84): every
+	 * operation is stored and delivered exactly as uploaded; authorization, validators
+	 * and the store's fold use its transformed view. The server hands this list to its
+	 * store (`setOperationTransforms`); pass it to `store.setSchema` too to fold with it
+	 * from the first start. Transforms must be pure and deterministic.
 	 */
 	operationTransforms?: OperationTransform[]
 	/** WebSocket path (standalone mode). Defaults to '/'. */

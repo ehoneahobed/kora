@@ -96,7 +96,15 @@ export async function initializeApp(
 			nodeId: authNodeId,
 			isolation: authNodeId ? 'shared' : config.store?.isolation,
 			materialization: config.experimental?.legacyMerge === true ? 'legacy' : 'fold',
+			...(config.store?.maxOperationBytes !== undefined
+				? { maxOperationBytes: config.store.maxOperationBytes }
+				: {}),
 			...(secretKeyProvider ? { secretKeyProvider } : {}),
+			// The store folds every operation through the schema transforms (transforms at
+			// fold time, RT-84): the same list the sync engine judges views with.
+			...(config.sync?.operationTransforms
+				? { operationTransforms: config.sync.operationTransforms }
+				: {}),
 			...(config.sync
 				? { onQuerySubscribed: createSyncQuerySubscriptionHook(() => syncEngine) }
 				: {}),

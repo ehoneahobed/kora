@@ -1,4 +1,5 @@
 import type { MergeTrace } from '../events/events'
+import type { OperationTransform } from '../migration/operation-transform'
 import type { AtomicOp, HLCTimestamp, Operation } from '../types'
 
 /**
@@ -247,6 +248,15 @@ export interface FoldOptions {
 	 * within a class the later write wins. Every replica must fold with the same set.
 	 */
 	authoritativeNodeIds?: ReadonlySet<string>
+	/**
+	 * Schema transforms applied at fold time (RT-84): an operation authored under another
+	 * schema version is merged as `operationSchemaView(op, schema.version, transforms)`
+	 * reads it. Stored operations are never rewritten. Transforms must be pure and
+	 * deterministic, and every replica of a deployment must fold with the same ones (they
+	 * are part of the fold plan fingerprint). Without transforms an operation folds as
+	 * written.
+	 */
+	transforms?: readonly OperationTransform[]
 }
 
 /**

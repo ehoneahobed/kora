@@ -1,3 +1,5 @@
+import type { OperationTransform } from '../migration/operation-transform'
+import { operationTransformsFingerprint } from '../migration/operation-view'
 import type { CollectionDefinition, SchemaDefinition } from '../types'
 import { planField } from './field-kind'
 import { FOLD_STATE_VERSION, type FieldState, type FoldState } from './types'
@@ -48,15 +50,25 @@ export function collectionFoldPlanFingerprint(
  * added or edited), stored fold states may hold fields of another kind and must be
  * re-folded. The same definition as the server stores' `fold_plan_fingerprint`.
  *
+ * Schema transforms (RT-84) are part of the plan when any is registered: an operation
+ * of another schema version folds as its transformed view, so changing a transform or
+ * the target version re-folds. Without transforms the fingerprint is unchanged.
+ *
  * @param schema - The schema
+ * @param transforms - The schema transforms the replica folds with
  */
-export function foldPlanFingerprint(schema: SchemaDefinition): string {
+export function foldPlanFingerprint(
+	schema: SchemaDefinition,
+	transforms?: readonly OperationTransform[],
+): string {
 	const parts: string[] = [`fold-v${FOLD_STATE_VERSION}`]
 	for (const name of Object.keys(schema.collections).sort()) {
 		const collection = schema.collections[name]
 		if (!collection) continue
 		parts.push(collectionFoldPlanFingerprint(name, collection))
 	}
+	const xf = operationTransformsFingerprint(schema.version, transforms)
+	if (xf !== '') parts.push(xf)
 	return parts.join('|')
 }
 
@@ -65,14 +77,20 @@ export function foldPlanFingerprint(schema: SchemaDefinition): string {
  * re-plans (only their records need re-folding).
  *
  * @param schema - The schema
+ * @param transforms - The schema transforms the replica folds with (see {@link foldPlanFingerprint})
  * @returns Collection name -> fingerprint (format version included)
  */
-export function foldPlanFingerprints(schema: SchemaDefinition): Record<string, string> {
+export function foldPlanFingerprints(
+	schema: SchemaDefinition,
+	transforms?: readonly OperationTransform[],
+): Record<string, string> {
 	const out: Record<string, string> = {}
+	const xf = operationTransformsFingerprint(schema.version, transforms)
 	for (const name of Object.keys(schema.collections).sort()) {
 		const collection = schema.collections[name]
 		if (!collection) continue
-		out[name] = `fold-v${FOLD_STATE_VERSION}|${collectionFoldPlanFingerprint(name, collection)}`
+		out[name] =
+			`fold-v${FOLD_STATE_VERSION}|${collectionFoldPlanFingerprint(name, collection)}${xf !== '' ? `|${xf}` : ''}`
 	}
 	return out
 }

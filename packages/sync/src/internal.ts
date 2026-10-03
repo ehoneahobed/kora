@@ -10,6 +10,7 @@ export {
 } from './scopes/scope-snapshot'
 export { scopeViewKey } from './scopes/scope-view-key'
 export {
+	operationIdMatches,
 	restoreUndefinedFromPrevious,
 	verifyInboundOperation,
 	type InboundVerification,

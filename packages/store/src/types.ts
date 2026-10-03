@@ -2,6 +2,7 @@ import type {
 	HLCTimestamp,
 	KoraEventEmitter,
 	Operation,
+	OperationTransform,
 	SchemaDefinition,
 	SecretKeyProvider,
 } from '@korajs/core'
@@ -127,6 +128,22 @@ export interface StoreConfig {
 	 * it on open.
 	 */
 	materialization?: 'fold' | 'legacy'
+	/**
+	 * Schema transforms applied at fold time (RT-84): an operation authored under an
+	 * older schema version is stored exactly as written and folded as
+	 * `operationSchemaView(op, schema.version, transforms)` reads it. Pass the same list
+	 * as the sync engine's `operationTransforms` (`createApp` does). Transforms must be
+	 * pure and deterministic; they are part of the fold plan fingerprint, so changing
+	 * them re-folds once.
+	 */
+	operationTransforms?: readonly OperationTransform[]
+	/**
+	 * Largest serialized operation a local write may produce, in bytes (RT-86). Set it to
+	 * the sync server's `maxOperationBytes`. A write over it is refused with
+	 * `OperationTooLargeError` and nothing is written. Default 256 KiB, the server's
+	 * default.
+	 */
+	maxOperationBytes?: number
 }
 
 /**

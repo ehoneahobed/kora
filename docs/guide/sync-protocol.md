@@ -48,7 +48,7 @@ A protocol-1 client is accepted for beta.14 only: the server logs
 | Where | What | On mismatch |
 |---|---|---|
 | Server ingest (`ClientSession.handleOperationBatch`) | Plaintext ops declaring `hashVersion: 2`, on the op **as uploaded**, after the authorization, timestamp and size checks and before the operation validator, the reference checks and any schema transform. An unknown declared version fails closed. Envelope ops are not verifiable by the server (it lacks the plaintext). | Non-retriable `operation-rejected` `INVALID_OPERATION_ID`; never stored or relayed. |
-| Server transform | `transformForServerSchema` rewrites data under the original id, so the stored copy drops `hashVersion` (version 1). Envelope ops are never transformed. | n/a |
+| Schema transforms (beta.14, RT-84) | Run at fold time, never on a stored operation: the server stores every op exactly as uploaded (all hashed fields, `hashVersion`, envelope) and judges and folds its view (`operationSchemaView`); devices do the same. Envelope ops are transformed only after decryption, on devices. | n/a |
 | Client (`packages/sync/src/engine/verify-inbound.ts`) | After decryption, before transforms and apply: envelope ops always (against their declared version, which the AAD binds); plaintext ops declaring `hashVersion: 2`. Version-1 ops and reserved `kora:` system nodes are not checked. | Quarantined (`_kora_unapplied_ops`, code `INVALID_OPERATION_ID`), `sync:apply-failed`; never released by the quarantine replay. |
 | Client decryption (encryption enabled) | Envelope present and authenticates. | `DECRYPT_FAILED` quarantine (`PLAINTEXT_REJECTED`, `LEGACY_ENCRYPTED_PAYLOAD`, `KEY_ID_MISMATCH` in the error context). `allowPlaintextMigration` passes plaintext through. |
 

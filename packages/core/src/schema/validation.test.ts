@@ -159,7 +159,7 @@ describe('validateRecord', () => {
 			const col = simpleTodosCollection()
 			if (!col) return
 			expect(() => validateRecord('items', col, { name: 'test', count: 'abc' }, 'insert')).toThrow(
-				/must be a number/,
+				/must be a finite number/,
 			)
 		})
 
@@ -168,7 +168,7 @@ describe('validateRecord', () => {
 			if (!col) return
 			expect(() =>
 				validateRecord('items', col, { name: 'test', count: Number.NaN }, 'insert'),
-			).toThrow(/must be a number/)
+			).toThrow(/must be a finite number/)
 		})
 
 		test('rejects non-boolean for boolean field', () => {

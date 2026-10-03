@@ -12,7 +12,9 @@
  * Two more sweeps (Phase 3 seams): with server-authored writes to the
  * merge('server-authoritative') field (devices AND the server's own row must equal
  * the reference fold, folded with the handshake's authoritative node ids), and the
- * same end-to-end encrypted (no operation may be quarantined).
+ * same end-to-end encrypted (no operation may be quarantined). A fourth sweep runs
+ * mixed schema versions: v1 operations are stored as written everywhere and folded
+ * through the schema transforms (transforms at fold time, RT-84).
  *
  * KORA_FOLD_E2E_SEEDS / KORA_FOLD_E2E_SEED_BASE widen or move the sweep (nightly).
  */
@@ -92,6 +94,34 @@ describe('W7 convergence gate through real devices', () => {
 						: failureOf(result),
 				)
 				.filter((failure) => failure !== null)
+			expect(failures.slice(0, 2)).toEqual([])
+		},
+		Math.max(300_000, SEEDS * 4_000),
+	)
+
+	test(
+		`${SEEDS} seeds with mixed schema versions: transforms at fold time, v1 operations stored as written`,
+		async () => {
+			const results = await runSeeds(SEED_BASE, SEEDS, PARALLEL, (seed) =>
+				runWorkload(seed, { schemaTransforms: true }),
+			)
+			const failures = results
+				.map((result) => {
+					const failure = failureOf(result)
+					if (failure) return failure
+					if (result.quarantined.length > 0) return `quarantined: ${result.quarantined.join('; ')}`
+					const { body: _body, ...oracle } = result.oracle ?? {}
+					if (JSON.stringify(result.server) !== JSON.stringify(result.oracle ? oracle : null)) {
+						return `server != reference fold: seed=${result.seed} server=${JSON.stringify(result.server)} oracle=${JSON.stringify(oracle)}\n${result.log.join('\n')}`
+					}
+					return null
+				})
+				.filter((failure) => failure !== null)
+			// The v1 device created the record on every seed: its operations were folded.
+			const v1Wrote = results.filter((r) =>
+				r.operations.some((operation) => operation.schemaVersion === 1),
+			)
+			expect(v1Wrote.length).toBe(results.length)
 			expect(failures.slice(0, 2)).toEqual([])
 		},
 		Math.max(300_000, SEEDS * 4_000),

@@ -1,9 +1,13 @@
 import type { AtomicOp, CollectionDefinition, Operation } from '@korajs/core'
 import {
+	DEFAULT_MAX_OPERATION_BYTES,
 	KoraError,
+	OperationTooLargeError,
+	assertResolvedFieldValue,
 	createOperation,
 	generateUUIDv7,
 	isAtomicOp,
+	measureOperationBytes,
 	quoteIdent,
 	resolveAtomicOp,
 	toAtomicOp,
@@ -169,6 +173,11 @@ export async function writeUpdateInTx(
 		previousData[key] = currentRecord[key]
 		if (isAtomicOp(value)) {
 			resolved[key] = resolveAtomicOp(currentRecord[key], value)
+			// The resolved value must be in the field's domain like any written value
+			// (RT-87): `op.increment(0.5)` on a timestamp, an increment past the largest
+			// finite number.
+			const descriptor = definition.fields[key]
+			if (descriptor) assertResolvedFieldValue(collection, key, descriptor, resolved[key])
 			atomicOps[key] = toAtomicOp(value)
 		} else {
 			resolved[key] = value
@@ -330,6 +339,14 @@ async function buildLocalOperation(
 		},
 		env.clock,
 	)
+	// Every operation must fit the server's maxOperationBytes (RT-86): refused here, in
+	// the write's transaction (nothing is written), rather than accepted and then refused
+	// by the server.
+	const maxBytes = env.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
+	const bytes = measureOperationBytes(operation)
+	if (bytes > maxBytes) {
+		throw new OperationTooLargeError(input.collection, input.recordId, bytes, maxBytes)
+	}
 	scope.causal.record(input.collection, operation.id)
 	return operation
 }

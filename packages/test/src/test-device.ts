@@ -70,8 +70,10 @@ export interface TestDeviceOptions {
 	tmpDir: string
 	/** Client handshake schema version. Defaults to `schema.version`. */
 	syncSchemaVersion?: number
-	/** Transforms applied to inbound operations before local apply. */
+	/** Schema transforms: the store folds every operation's view (transforms at fold time). */
 	operationTransforms?: OperationTransform[]
+	/** The store's local `maxOperationBytes` (RT-86). Default: the store default (256 KiB). */
+	maxOperationBytes?: number
 	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
 	scopeExit?: 'retain' | 'retract'
 	/**
@@ -223,6 +225,12 @@ export class TestDevice {
 			adapter: this.adapter,
 			emitter: this.emitter,
 			materialization: options.legacyMerge === true ? 'legacy' : 'fold',
+			...(options.operationTransforms && options.operationTransforms.length > 0
+				? { operationTransforms: options.operationTransforms }
+				: {}),
+			...(options.maxOperationBytes !== undefined
+				? { maxOperationBytes: options.maxOperationBytes }
+				: {}),
 		})
 	}
 

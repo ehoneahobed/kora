@@ -3,6 +3,7 @@ import type {
 	FoldState,
 	HLCTimestamp,
 	Operation,
+	OperationTransform,
 	RecordFieldVersions,
 	SchemaDefinition,
 	TimeSource,
@@ -16,6 +17,7 @@ import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	SERVER_LOG_QUARANTINE_DDL,
@@ -94,6 +96,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ServerSchemaOptions,
 	ServerStore,
 } from './server-store'
 import {
@@ -158,11 +161,19 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * SQLSTATEs of values Postgres cannot represent: 22021 (character not in repertoire,
- * a NUL in TEXT), 22P05 (untranslatable character, `\u0000` in JSONB), 22P02 (invalid
- * text representation, an unpaired surrogate escape in JSONB).
+ * Whether a SQLSTATE is a refusal of the DATA (RT-87), never of the server's state:
+ * class 22 (data exception: 22021 NUL in TEXT, 22P05 / 22P02 in JSONB, 22003 numeric
+ * out of range, 22007 / 22008 datetime, ...) and class 23 (integrity constraint
+ * violation: 23514 an enum CHECK, 23502 NOT NULL, ...) except 23505. A unique violation
+ * is the signal of a concurrent writer (another instance inserted the same row first):
+ * it is transient and retried, never a reason to refuse the operation for good.
+ * Such an operation is refused terminally and per operation (UNSTORABLE_VALUE): the ack
+ * moves past it and the device's later writes go on.
  */
-const PG_UNSTORABLE_VALUE_CODES = new Set(['22021', '22P05', '22P02'])
+function isUnstorableValueCode(code: string): boolean {
+	if (code.startsWith('22')) return true
+	return code.startsWith('23') && code !== PG_UNIQUE_VIOLATION
+}
 
 /**
  * Map a Postgres refusal of a value to {@link UnstorableValueError} (non-retriable).
@@ -175,7 +186,7 @@ function unstorableValueOr(error: unknown, op: Operation): unknown {
 			? (value as { code: unknown }).code
 			: undefined
 	const code = codeOf(error) ?? (error instanceof Error ? codeOf(error.cause) : undefined)
-	if (typeof code === 'string' && PG_UNSTORABLE_VALUE_CODES.has(code)) {
+	if (typeof code === 'string' && isUnstorableValueCode(code)) {
 		const message =
 			error instanceof Error
 				? error.cause instanceof Error
@@ -248,6 +259,8 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private readonly timeSource: TimeSource
 	private foldOptions: ServerFoldOptions = serverFoldOptions([])
+	/** Schema transforms the fold applies (transforms at fold time, RT-84). */
+	private operationTransforms: readonly OperationTransform[] = []
 	private foldMigration: FoldMigrationReport = {
 		ran: false,
 		records: 0,
@@ -439,7 +452,7 @@ export class PostgresServerStore implements ServerStore {
 		this.derivationSecret = identity.secret
 		this.explicitAuthorities = identity.history.explicitAuthorities
 		this.authorityHistory = identity.history
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities)
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 	}
 
 	/** What the last startup re-materialization did (W7 step 7). */
@@ -473,10 +486,28 @@ export class PostgresServerStore implements ServerStore {
 		return this.schema
 	}
 
-	async setSchema(schema: SchemaDefinition): Promise<void> {
+	getOperationTransforms(): readonly OperationTransform[] {
+		return this.operationTransforms
+	}
+
+	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		this.operationTransforms = [...transforms]
+		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		// The fold plan fingerprint includes the transforms: when they changed, every
+		// record is re-folded from its log, once (RT-84).
+		if (this.schema) this.foldMigration = await this.rematerialize()
+	}
+
+	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		await this.ready
 		this.schema = schema
+		if (options.operationTransforms !== undefined) {
+			this.operationTransforms = [...options.operationTransforms]
+			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+		}
 
 		// Generate and execute DDL for all collection tables
 		const ddlStatements = generateAllCollectionDDL(schema, 'postgres')
@@ -506,6 +537,9 @@ export class PostgresServerStore implements ServerStore {
 
 		await this.migrateTextCodec(schema)
 
+		// beta.13 clears stored by an earlier server, made explicit once (RT-85); their
+		// records are re-folded by the re-materialization below.
+		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
 		this.foldMigration = await this.rematerialize()
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
@@ -1983,6 +2017,44 @@ export class PostgresServerStore implements ServerStore {
 	 * stale re-fold (NEW-SRV-5), it either committed before the batch (and is folded)
 	 * or commits after it (and is merged into the batch's state).
 	 */
+	/**
+	 * Write the beta.13 clears the ids prove into the stored bodies, once per database
+	 * (RT-85, see `provenLegacyClears`), and mark their records' fold states stale.
+	 * Idempotent: concurrent first starts write the same bodies.
+	 */
+	private async canonicalizeLegacyBodies(): Promise<void> {
+		const done = (await this.db.execute(
+			sql`SELECT 1 AS one FROM kora_server_meta WHERE key = ${LEGACY_BODIES_META_KEY}`,
+		)) as unknown as unknown[]
+		if (done.length > 0) return
+		const rows = await this.db
+			.select()
+			.from(pgOperations)
+			.where(
+				and(
+					eq(pgOperations.type, 'update'),
+					sql`${pgOperations.hashVersion} IS NULL`,
+					sql`${pgOperations.previousData} IS NOT NULL`,
+				),
+			)
+		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
+		await this.db.transaction(async (tx) => {
+			for (const op of changed) {
+				await tx
+					.update(pgOperations)
+					.set({ data: JSON.stringify(op.data) })
+					.where(eq(pgOperations.id, op.id))
+				await tx.execute(
+					sql`UPDATE kora_fold_state SET covered_seq = -1 WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+				)
+			}
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${LEGACY_BODIES_META_KEY}, ${String(changed.length)})
+					ON CONFLICT (key) DO NOTHING`,
+			)
+		})
+	}
+
 	private async rematerialize(): Promise<FoldMigrationReport> {
 		const schema = this.schema
 		const report: FoldMigrationReport = {
@@ -1993,7 +2065,11 @@ export class PostgresServerStore implements ServerStore {
 		}
 		if (!schema) return { ...report, ran: false }
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const fingerprint = serverFoldPlanFingerprint(schema, this.explicitAuthorities)
+		const fingerprint = serverFoldPlanFingerprint(
+			schema,
+			this.explicitAuthorities,
+			this.operationTransforms,
+		)
 		await this.db.transaction(async (tx) => {
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:fold-plan', 0))`)
 			const stored = (

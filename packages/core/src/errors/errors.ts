@@ -47,6 +47,27 @@ export class OperationError extends KoraError {
 }
 
 /**
+ * Thrown by the local write path when an operation would exceed `maxOperationBytes`
+ * (RT-86): the server refuses such an operation, so the write is refused before it is
+ * accepted, with nothing written.
+ */
+export class OperationTooLargeError extends KoraError {
+	constructor(
+		public readonly collection: string,
+		public readonly recordId: string,
+		public readonly bytes: number,
+		public readonly maxBytes: number,
+	) {
+		super(
+			`A write to ${collection}/${recordId} would produce an operation of ${bytes} bytes, more than the ${maxBytes}-byte limit (maxOperationBytes). Nothing was written. Store large content as a blob (t.blob()) or split it across records.`,
+			'OPERATION_TOO_LARGE',
+			{ collection, recordId, bytes, maxBytes },
+		)
+		this.name = 'OperationTooLargeError'
+	}
+}
+
+/**
  * Thrown when a merge conflict cannot be automatically resolved.
  */
 export class MergeConflictError extends KoraError {

@@ -25,12 +25,14 @@ import {
 	isFoldStateLive,
 	materialize,
 	mergeOp,
+	operationSchemaView,
 	serializeFoldState,
 } from '@korajs/core'
 import type {
 	FoldOptions,
 	FoldState,
 	Operation,
+	OperationTransform,
 	RecordFieldVersions,
 	SchemaDefinition,
 } from '@korajs/core'
@@ -104,26 +106,52 @@ export function mergeRichtextUpdatesForServer(updates: Uint8Array[]): Uint8Array
  * the `kora:server:` namespace (the prefix rule, RT-62) plus `explicitAuthorities`
  * (legacy server node ids and configured extras).
  */
-export function serverFoldOptions(explicitAuthorities: readonly string[]): ServerFoldOptions {
+export function serverFoldOptions(
+	explicitAuthorities: readonly string[],
+	transforms: readonly OperationTransform[] = [],
+): ServerFoldOptions {
 	return {
 		richtext: mergeRichtextUpdatesForServer,
 		traces: 'none',
 		authoritativeNodeIds: new ServerAuthoritySet(explicitAuthorities),
+		...(transforms.length > 0 ? { transforms } : {}),
 	}
 }
 
 /**
- * Fold plan fingerprint of the server: the schema's plan plus the explicit authorities
- * (the prefix rule is constant). A change in the explicit authorities re-folds every
+ * The operation as the server's schema reads it (transforms at fold time, RT-84): what
+ * authorization, validators, constraint checks and scope filters judge. The store keeps
+ * the operation exactly as uploaded and folds this same view. Null when no transform
+ * path exists or a transform drops it.
+ *
+ * @param store - Anything that knows the server schema and transforms
+ * @param op - The operation as stored or uploaded
+ */
+export function serverOperationView(
+	store: {
+		getSchema(): SchemaDefinition | null
+		getOperationTransforms?(): readonly OperationTransform[]
+	},
+	op: Operation,
+): Operation | null {
+	const schema = store.getSchema()
+	if (schema === null) return op
+	return operationSchemaView(op, schema.version, store.getOperationTransforms?.())
+}
+
+/**
+ * Fold plan fingerprint of the server: the schema's plan (with its schema transforms,
+ * RT-84) plus the explicit authorities (the prefix rule is constant). A change in the explicit authorities re-folds every
  * record, so a stored fold state never keeps (or lacks) an authority class the current
  * authority set would not give.
  */
 export function serverFoldPlanFingerprint(
 	schema: SchemaDefinition,
 	explicitAuthorities: readonly string[],
+	transforms: readonly OperationTransform[] = [],
 ): string {
 	const explicit = normalizeLegacyAuthorities(explicitAuthorities)
-	return `${foldPlanFingerprint(schema)}|auth:${SERVER_NODE_PREFIX}*${
+	return `${foldPlanFingerprint(schema, transforms)}|auth:${SERVER_NODE_PREFIX}*${
 		explicit.length > 0 ? `,${explicit.join(',')}` : ''
 	}`
 }
