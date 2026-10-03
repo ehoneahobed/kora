@@ -50,3 +50,79 @@ Method:
 - `unassignedWrites: 'assign-to-first-user'` combined with migrations' backfill ops.
 - An interrupted `importBackup`.
 - Performance gates beyond `test:release-gate`.
+
+# Round 2 (2026-10-03)
+
+Independent adversarial review of `fix/phase3-one-fold` at 4d6c8a7, covering the round-1 fixes (`git log 827adc9..4d6c8a7`). Scope:
+- server identity and the `kora:server:` prefix authority;
+- legacy authoritative ids;
+- keyed server-derived ids and version-1 verification;
+- the stored-text codec on server and client stores;
+- RT-63: fold-plan re-fold and the `FOLD_STATE_INVALID` quarantine;
+- RT-66: backups with fold state;
+- RT-67: per-field stamping;
+- RT-68: snapshots and settling;
+- RT-69: provisional cascades and server-side deferral;
+- RT-70: quarantine-based rebuild.
+
+Method:
+- Executable repros against:
+  - the real `KoraSyncServer` and `ClientSession` (memory, SQLite and Postgres 16 stores);
+  - `TestDevice` networks (real SQLite store and `SyncEngine`, including encrypted networks);
+  - `Store`.
+- A real beta.13 build (33bca46) over WebSockets against this tree's server (`scripts/remediation/rt-legacy-id-probe.mjs`).
+- Own Postgres 16 (`initdb -E UTF8 --locale=C.UTF-8`, port 54407).
+- Gates rerun (results below).
+
+Every finding has a repro under `tests/repro/` that fails at 4d6c8a7. Each is tracked as RT-71..RT-76 (status open, phase 3).
+
+| ID | Sev | Finding | Location | Required fix | Repro |
+|---|---|---|---|---|---|
+| RT-71 | P1 | The strict version-1 id check (RT-64 fix) refuses legitimate beta.13 writes. beta.13 hashes an `undefined` object member as `"key":null`. The op log and the wire are JSON, so the member is gone when the server recomputes the hash. `update(id, { assignee: undefined })` and object values with an `undefined` member are refused `INVALID_OPERATION_ID` (terminal). The beta.13 client keeps the value; no peer ever sees it. Against the real beta.13 build, 3 of 4 ordinary write shapes were refused. Increments, numbers (`1e21`, `-0`, `5e-324`), unicode, key order, timestamps and arrays verify. Memory and Postgres stores behave the same. | `server/src/session/client-session.ts:2846-2852`; `sync/src/engine/verify-inbound.ts:123-144`; beta.13 `canonicalize` and `validateRecord` | Accept the beta.13 hash form by rebuilding the `undefined` members (for an update, every `previousData` key absent from `data`; for objects, the declared nested fields). Or accept an unverifiable version-1 id from a protocol-1 session as unverified (derived ids are keyed now), and dedup client ops by `(nodeId, id)`. | `packages/server/tests/repro/RT-71.test.ts`; `scripts/remediation/rt-legacy-id-probe.mjs` |
+| RT-72 | P1 (not a round-2 regression) | A beta.14 device's insert whose object field holds an `undefined` member (`{ a: 1, b: undefined }`) is refused `INVALID_OPERATION_ID`, and the record vanishes from the writing device. The version-2 hash covers `"b":null`; the uploaded JSON has no `b`. Top-level `undefined`, and nested `undefined` in an update, are normalized elsewhere and pass. | `core/src/operations/content-hash.ts:141-160`; `core/src/schema/validation.ts` (nested members checked only when present) | Strip `undefined` members deeply before hashing (`createOperation`, `validateRecord`), so the hashed content is the JSON content. Treat an `undefined` member as absent in version-2 canonicalization. | `packages/test/tests/repro/RT-72.test.ts` |
+| RT-73 | P2 | A cascade the server deferred to the end of an upload batch (RT-69 residual, fb5dcae) is lost if the batch fails after the delete committed. The deferred list lives only in memory. The retried delete is a stored duplicate, so it derives nothing. If the author's copy is then refused on the retry (no write grant on another user's child, a validator, an invalid id), the child stays an orphan of a deleted parent, on the server and on every device. In the control run without the transient failure, the child is deleted. | `server/src/apply/apply-server-operation.ts:207-220`; `server/src/session/client-session.ts:2392, 2636-2647, 2691` | Make the deferral durable or self-healing. Either record pending effects in the delete's transaction (an outbox plus a startup sweep), or have a duplicate delete re-check its effects and derive any that no stored copy covers. | `packages/server/tests/repro/RT-73.test.ts` |
+| RT-74 | P2 | Under end-to-end encryption with the relation field sealed, the server cannot cascade; the sync-encryption guide says "each device cascades for itself". Since RT-69, a device applies a remote delete's cascades only provisionally, and `settleAfterCatchUp` retires every pending provisional effect. If the deleting device never saw the child, nobody makes the cascade durable. On B the child disappears, then comes back after the next reconnect and stays. Before the RT-69 fix, B authored a durable copy. | `kora/src/apply-pipeline.ts:172-186`; `store/src/store/store.ts:1199-1213`; `docs/guide/sync-encryption.md:254` | When the server cannot derive the effect, author the receiving device's cascade as a real operation with a deterministic id (`deriveSideEffectOpId(parent, rule, target)`, identical on every device, so copies dedupe). Or never retire a provisional effect the server is known not to derive. | `packages/test/tests/repro/RT-74.test.ts` |
+| RT-75 | P2 | Devices replace their authoritative ids with each handshake's list; the union the RT-62 fix required is not implemented. The list differs per instance: its own `kora:server:<d>:<i>` (new on every Postgres start), the `kora:server:` ids it loaded from `sync_state` (one more per start that wrote), and the legacy ids it loaded at its start. So every reconnect after a deploy, or to another instance, re-folds every record of every collection with a server-authoritative field. In the repro, 50 records were re-folded 100 times, for ids that are authoritative by prefix anyway. An explicit authority that an instance does not list is also dropped: a legacy server's approval flips to a later device write on that device. | `store/src/store/store.ts:1292-1318`; `store/src/fold/record-folder.ts:149`; `sync/src/engine/sync-engine.ts:1778-1782, 1840-1843`; `server/src/store/postgres-server-store.ts:2228-2231` | Persist the union of learned explicit ids. Compare only explicit (non-`kora:server:`) ids, and re-fold only when the explicit set grows. | `packages/store/tests/repro/RT-75.test.ts` |
+| RT-76 | P3 | The one-time legacy authority scan walks the whole fold-state JSON, values included. A json value holding `{ c: 1, t, o: <op id> }` makes the named op's node a server authority: its writes win server-authoritative fields, and its own handshake is then refused. Only databases that already hold fold states at their first beta.14 start (from a pre-release fold build) are exposed. | `server/src/store/server-identity.ts:210-233`; `sqlite-server-store.ts:280`; `postgres-server-store.ts:359` | Deserialize each state and collect only stamp positions, never values. | `packages/server/tests/repro/RT-76.test.ts` |
+
+## What held up (round 2)
+
+- **The prefix authority.**
+  - `kora:server:` is checked case-sensitively, by `startsWith`, on every replica.
+  - No layer normalizes node ids: Postgres runs `C.UTF-8`, and node ids do not go through the stored-text codec. Case variants and look-alike prefixes are ordinary device ids everywhere.
+  - The handshake refuses `kora:` ids, the store's id and every advertised id; uploads are re-checked per op (`checkUploadIntegrity`).
+  - A device cannot make a scope entry restate a value under a server stamp: `fieldVersions` and `foldState` are stripped from uploads, and an op's `timestamp.nodeId` must be the session node.
+- **Identity under concurrency.**
+  - The deployment id, the derivation secret and the Postgres instance counter are created under one advisory transaction lock (`setOnce` plus `UPDATE ... RETURNING`). Concurrent first starts share one secret and draw distinct instance ids.
+  - The secret is read only into the store. It is not in backups, devtools events, logs or handshakes.
+  - Server-derived ids are HMAC-keyed and identical across instances.
+- **Version-1 verification for ordinary values (beta.13 build).** Verified: increments (`atomicOps`), floats, `1e21`, `-0`, `5e-324`, supplementary-plane and line-separator characters, nested key order, timestamps, and arrays with duplicates. Only `undefined` members fail (RT-71).
+- **The stored-text codec.**
+  - It is injective and round-trips.
+  - Equality, `$in`, relation lookups and the server's `buildWhereClause` bind the encoded form on both sides.
+  - Record ids are not encoded on either side, so FK lookups agree.
+  - Every row deserializer the app reaches decodes. JSON columns and op data need no codec.
+  - The Postgres and SQLite one-time migrations run per table, with a marker (and an advisory lock on Postgres), so concurrent starts do not double-encode.
+- **The fold gate on 400 new seeds** (seed base 990001) passed all four tests: every field kind; server-authoritative writes with the server converging; end to end encrypted; and the beta.13 pipeline is still rejected.
+- **RT-69 deferral, normal path.** Rate-limited and refused author copies are derived after the batch. RT-73 needs a failure after the delete committed.
+- **Provisional cascades without encryption.** When the deleting device later receives a child it did not know, it authors the cascade itself. B's provisional effect is retired by the author's copy (through the causal dependency), and the state converges.
+- **Gates.**
+  - `check.mjs --all` ran with Postgres 16, real Chromium and `LMS_OPS=20000`. Result: 156/180 fixed, no regression, no guard failure. The only errors were this round's new repros, before they were mapped.
+  - `chaos:nightly` passed: 10 clients × 1,000 ops under 10% drop and 5% duplicate, plus the no-silent-loss invariants (11/11).
+  - `test:release-gate` passed: production path, sync reconnect, real-path chaos and the benchmark gates.
+
+## Not filed (P3 or below, by code reading)
+
+- Range filters and `orderBy` on encoded strings put strings containing U+0000, a lone surrogate or U+FFFF after all ordinary text. The codec doc only promises unchanged ordering for ordinary text.
+- A beta.13 backup's rows hold raw U+FFFF. A replace restore inserts them verbatim into a migrated database, so a value containing U+FFFF followed by `0`, `F` or `s` decodes differently. The backup `records:` sections carry the encoded form.
+- A merge-mode backup import applies the file's operations through the remote-apply path, including operations under a `kora:server:` node. A crafted file can therefore make a value authoritative on the importing device only; it is never uploaded.
+- Two Postgres instances fold with different authority sets when only one has extra `authoritativeNodeIds` configured, or a plain `nodeId` added. The fold-plan fingerprint is checked only at startup.
+
+## Not attacked (round 2)
+
+- HTTP long-poll transport specifics, and DevTools traces of fold decisions.
+- Key rotation across `keyVersion`, and shared key distribution (Phase 4).
+- An interrupted `importBackup`, and a merge-mode import while sync is running (snapshot settling without a real full resync).
+- `FOLD_STATE_INVALID` quarantine replay when the re-fold fails again.
+- Real Chromium beyond the `check.mjs --all` browser suites.
+- Performance of the RT-70 rebuild and of re-folds on large databases, beyond the release-gate benchmarks.

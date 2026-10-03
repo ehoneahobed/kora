@@ -2835,6 +2835,96 @@
    ],
    "pr": null,
    "notes": "Phase 3 red-team review, 2026-10-02 (remediation/evidence/redteam-phase3.md). Locations: server/src/store/sqlite-server-store.ts:1214-1217 (skippedUnclean leaves no fold state); the next apply takes the 'no state' path and re-folds from the log (Postgres the same). The console message promises the rows 'keep their pre-fold values until their next write'; that next write is what drops them, and new devices then enter scope without the record. Required fix: on the unclean path build the record's base from its kept row and fold later writes onto it (with RT-68's caveats), or refuse writes to records with quarantined history until an operator repairs them. Repro packages/server/tests/repro/RT-70.test.ts (SQLite). Fixed (commit b53ab47): records that own quarantined rows (from operations_quarantine.row_json; an unreadable collection/record widens the scope) are never re-folded from their incomplete log: the startup migration, the next write and reads rebuild them from the stored fold state or a createSnapshotState base of the kept row (fields stamped at least at the quarantined ops' newest HLC) with the remaining ops merged on top; records whose every op was quarantined get a state too; complete records fold from their log. SQLite and Postgres. Inverted the fold-materialization test that encoded the bug. Tests: tests/integration/quarantine-base.test.ts."
+  },
+  {
+   "id": "RT-71",
+   "title": "The strict version-1 id check (RT-64 fix) refuses legitimate writes of beta.13 (protocol 1) clients: beta.13 hashes an undefined object member as \"key\":null, but the op log and the wire are JSON, so the member is gone when the server recomputes the hash; update(id, { field: undefined }) and object values with an undefined member are refused INVALID_OPERATION_ID and the beta.13 client diverges for good",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-71.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of the RT-64 fix (commit 371cf12). Locations: server/src/session/client-session.ts:2846-2852 (every plaintext upload without hashVersion verified with absentVersion 'verify-ids'), sync/src/engine/verify-inbound.ts:123-144 (operationIdMatches: only the binary-form variants are tried), beta.13 core content-hash canonicalize (undefined member -> \"key\":null) with beta.13 validateRecord copying undefined for updates and nested object members. Confirmed against the real beta.13 build (33bca46) over WebSockets with scripts/remediation/rt-legacy-id-probe.mjs: 3 of 4 ordinary write shapes refused (insert with { a: 1, b: undefined } in an object field; update(id, { assignee: undefined, title }); update(id, { meta: { a: 2, b: undefined } })); increments, numbers (1e21, -0, 5e-324), unicode, key order, timestamps and arrays all verified. The refusal is terminal; beta.13 keeps the value locally, no peer ever sees the write. Postgres store the same (KORA_REPRO_STORE=postgres). Required fix: accept the beta.13 hash form when verifying version 1: rebuild the undefined members (for an update every previousData key absent from data, since beta.13 writes previousData[key] for every validated key; declared nested fields of object values), or, since server-derived ids are now keyed (RT-64), accept an unverifiable version-1 id from a protocol-1 session as unverified (no hashVersion) and dedup client ops by (nodeId, id). Repro packages/server/tests/repro/RT-71.test.ts."
+  },
+  {
+   "id": "RT-72",
+   "title": "A beta.14 device's insert whose object field holds an undefined member ({ a: 1, b: undefined }) is refused INVALID_OPERATION_ID and the record vanishes from the writing device: the version-2 hash covers \"b\":null, the uploaded JSON has no b",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-72.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Not a round-2 regression: present since protocol v2 verifies declared version-2 ids. Locations: core/src/operations/content-hash.ts:141-160 (canonicalize writes an undefined object member as null), core/src/schema/validation.ts (an object value with an undefined declared member passes; only present members are type-checked), store op log and wire (JSON.stringify drops the member). The server recomputes the hash over what it received, refuses the insert terminally, and the device excludes it from its fold: the user's record disappears with only a rejection event. A form building { a, b: input || undefined } is enough. Top-level undefined (insert and update) and nested undefined in an update are normalized elsewhere and pass. Required fix: one canonical form for hashing and storage: strip undefined object members (deeply) from data/previousData/atomicOps before the id is computed (createOperation) and in validateRecord, so the hashed content is exactly the JSON content; and make canonicalize treat an undefined member as absent for version 2. Repro packages/test/tests/repro/RT-72.test.ts."
+  },
+  {
+   "id": "RT-73",
+   "title": "A cascade the server deferred to the end of an upload batch (RT-69 residual fix) is lost for good when the batch fails after the delete committed: the deferred list is in memory, the retried delete is a stored duplicate that derives nothing, and a refused author copy leaves the child an orphan of a deleted parent",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-73.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of commit fb5dcae. Locations: server/src/apply/apply-server-operation.ts:207-220 (effects the author claims are returned in deferredSideEffects, not derived), server/src/session/client-session.ts:2390-2393, 2636-2647, 2688-2691 (deferred list kept in memory and derived after the loop), the duplicate path (isStoredDuplicate -> continue, no effect re-check). Any exception after the delete committed (database error, failover, process restart during a deploy) drops the list; the client re-sends the batch; the delete is a duplicate; when the author's copy is refused on the retry (no write grant on another user's child, a validator, an invalid id) no copy of the cascade is ever stored. Control (no transient failure): the child is deleted. Before fb5dcae the effect was derived right after the delete committed. Required fix: make the deferral durable or self-healing: record pending effects in the delete's transaction (an outbox the session drains, and a startup sweep), or on a duplicate delete re-check its referential effects and derive any not covered by a stored copy. Repro packages/server/tests/repro/RT-73.test.ts."
+  },
+  {
+   "id": "RT-74",
+   "title": "Under end-to-end encryption a remote delete's cascade the server cannot derive (relation field sealed) is retired at the next catch-up: the child the user saw deleted comes back, an orphan of a deleted parent, because settleAfterCatchUp drops every provisional effect and nobody makes it durable",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-74.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Regression of the RT-69 fix (commit 581f87f). Locations: kora/src/apply-pipeline.ts:172-186 (cascades of a REMOTE delete applied only as provisional effects), store/src/store/store.ts:1199-1213 (settleAfterCatchUp retires every pending provisional effect: 'an effect the server did not derive does not stay applied locally'), docs/guide/sync-encryption.md:254 ('cascades and set-nulls run on the server only when the relation's field is listed in cleartextFields; otherwise each device cascades for itself'). Repro: encrypted network, projectId sealed; B adds a child A never receives (A goes away after uploading its delete of the project); B applies the cascade provisionally, then after a reconnect the child is back for good. Before the RT-69 fix B authored a durable copy. Required fix: when the server cannot derive the effect (encryption without the relation field in cleartextFields, or any relation the server does not cascade), author the receiving device's cascade as a real operation with a deterministic id (deriveSideEffectOpId(parent, rule, target), identical on every device, so copies dedupe to one), or never retire a provisional effect the server is known not to derive. Repro packages/test/tests/repro/RT-74.test.ts."
+  },
+  {
+   "id": "RT-75",
+   "title": "Devices replace their authoritative node ids with each handshake's list instead of keeping the union: every reconnect after a Postgres restart or to another instance re-folds every record of every collection with a server-authoritative field, and an explicit (legacy or configured) authority an instance does not list is dropped, so the legacy server's decision loses to a later device write on that device",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-75.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). The RT-62 required fix says devices union, never drop, the ids they learn; the tracker attributes that to the client half; it is not implemented. Locations: store/src/store/store.ts:1292-1318 (setAuthoritativeNodeIds: next = the handshake's set, re-folds every authoritative collection when it differs), store/src/fold/record-folder.ts:149 (replaces the set), sync/src/engine/sync-engine.ts:1778-1782 and 1840-1843 (passes and persists the handshake list as is). The handshake list is per instance: its own kora:server:<d>:<i> id (a new one per Postgres start unless instanceId is configured), the other kora:server: ids that instance noted, and the legacy ids it loaded at its own start. Repro (store level): 50 records, lists differing only in kora:server: ids -> 100 re-folds (expected 0: those ids are authoritative by prefix); an explicit 'legacy-server' approval flips to the later device write when a handshake omits the id. Aggravating (by code reading): Postgres hydrates every kora:server: node of sync_state into otherServerNodes (postgres-server-store.ts:2228-2231) and advertises all of them, so the list grows by one id per instance start that wrote anything and never shrinks; every handshake after a deploy carries a list the device has not seen. Required fix: persist the union of learned explicit ids (never drop), compare only explicit (non kora:server:) ids, and re-fold only when the explicit set grows. Repro packages/store/tests/repro/RT-75.test.ts."
+  },
+  {
+   "id": "RT-76",
+   "title": "The one-time legacy authority scan reads authority stamps out of device-written values: a json value holding { c: 1, t, o: <op id> } makes the named op's node a server authority (its writes win server-authoritative fields; its own handshake is refused for good)",
+   "severity": "P3",
+   "workstream": "W9",
+   "phase": 3,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-76.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 3 red team round 2, 2026-10-03 (remediation/evidence/redteam-phase3.md, Round 2). Locations: server/src/store/server-identity.ts:210-233 (authoritativeStampOpIds walks the whole state JSON, values included), sqlite-server-store.ts:280-298 and postgres-server-store.ts:359-391 (scan at the first start of this release). Reach: only databases that already hold fold states at their first beta.14 start (a pre-release fold build); new and beta.13 databases have none when the scan runs. The repro clears the scan marker to simulate one. Required fix: deserialize each state and collect only stamp positions (cr/w/d/u and each field kind's stamp members), never values; optionally intersect with node ids that never hand-shook as devices (node claims). Repro packages/server/tests/repro/RT-76.test.ts."
   }
  ],
  "rejectedProposalPins": {
