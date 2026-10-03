@@ -76,6 +76,10 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		await admin.end()
 	})
 	beforeEach(async () => {
+		// Hermetic: the server meta (deployment identity, legacy authorities, fold plan
+		// fingerprint) and fold states of an earlier run must not leak into this one.
+		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
+		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
 		await dropAll(admin, lmsSchema)
 		await admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE')
 	})
@@ -107,7 +111,10 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		// still re-reads the entire log and rewrites every row.
 		const warm = counted()
 		clients.push(warm.sql)
-		const store2 = new PostgresServerStore(drizzle(warm.sql), 'srv-2')
+		// A restart of the same server: the same configured node id. (Since RT-62 a
+		// configured plain id is a legacy authority; a NEW one changes the authority set,
+		// and the fold plan fingerprint covers it, so every record is re-folded.)
+		const store2 = new PostgresServerStore(drizzle(warm.sql), 'srv-1')
 		await store2.getOperationCount()
 		warm.reset()
 		t0 = performance.now()
