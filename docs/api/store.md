@@ -85,7 +85,7 @@ in any order before `exec()`, `count()` or `subscribe()`.
 
 | Method | Description |
 |--------|-------------|
-| `where(filter)` | Field equality, or operators `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`. Conditions are AND-ed; calling `where` again adds conditions (a repeated field replaces the earlier condition). |
+| `where(filter)` | Field equality, or operators `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`. Conditions are AND-ed; calling `where` again adds conditions (a repeated field replaces the earlier condition). A value of `undefined` adds no condition (`where({ projectId: selected })` with nothing selected lists everything, and does not replace an earlier condition); `null` matches missing values (`IS NULL`; `$ne: null` is `IS NOT NULL`, and `$ne: v` also excludes rows where the field is null). `NaN`/`Infinity` and `undefined` inside `$in` throw `QueryError`. |
 | `orderBy(field, direction = 'asc')` | Any schema field, `id`, `createdAt` or `updatedAt`. Any direction other than `'asc'`/`'desc'` throws `QueryError`. |
 | `limit(n)` / `offset(n)` | Non-negative safe integers (otherwise `QueryError`), bound as SQL parameters. |
 | `include(...targets)` | Adds related records (see below). |
@@ -101,6 +101,8 @@ const page = await app.todos
   .offset(10)
   .exec()
 
+// Two equal queries share one live result set: React, Vue and Svelte bindings and the
+// store's query cache all identify a query by the same canonical key (`queryKey`).
 const startOfDay = new Date().setHours(0, 0, 0, 0)
 const changedToday = await app.todos.where({ updatedAt: { $gte: startOfDay } }).count()
 ```

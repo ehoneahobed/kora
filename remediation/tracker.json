@@ -3327,14 +3327,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-102.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor. FIX (beta.13 RC): packages/store/src/query/query-key.ts: normalizeWhere (applied in QueryBuilder's constructor and where(), before merging) defines the semantics: undefined = no condition (field or operator dropped; does not override an earlier condition), null = IS NULL, NaN/Infinity and undefined $in elements refused (QueryError). queryKey(descriptor) is the one canonical key (sorted where keys, typed encodings for Date/bytes/-0/NaN, nothing dropped) used by QueryStoreCache and the React, Vue and Svelte bindings. Tests: query-key.test.ts; repro updated to assert the defined semantics (undefined shares the store with where({}) and returns the same rows; null is a different query and store; NaN throws)."
   },
   {
    "id": "RT-103",

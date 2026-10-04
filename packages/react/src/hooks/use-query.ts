@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
-import { assertQueryReady } from '@korajs/store'
+import { assertQueryReady, queryKey } from '@korajs/store'
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 import type { UseQueryOptions, UseQueryStateResult } from '../types'
@@ -47,7 +47,7 @@ function useQuerySubscription<T>(
 ): QuerySubscription<T> {
 	const { queryStoreCache } = useKoraContext()
 	const enabled = options?.enabled !== false
-	const descriptorKey = JSON.stringify(query.getDescriptor())
+	const descriptorKey = queryKey(query.getDescriptor())
 	const queryRef = useRef(query)
 	queryRef.current = query
 	const lastSnapshotRef = useRef<readonly T[]>(EMPTY_ARRAY as readonly T[])

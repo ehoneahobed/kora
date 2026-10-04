@@ -11,6 +11,12 @@
  * `null` collide the same way.)
  *
  * Asserts CORRECT behaviour: queries that return different rows never share a store.
+ *
+ * Fix (beta.13 RC): `undefined` means "no condition" everywhere (normalizeWhere, applied
+ * in QueryBuilder.where), `null` means IS NULL, non-finite numbers are refused, and one
+ * canonical key (queryKey) is used by the store cache and every binding. The control
+ * below therefore asserts the defined semantics: `where({ projectId: undefined })` IS
+ * `where({})` (same rows, same store), while `null` is a different query.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -39,16 +45,24 @@ describe('RT-102: query cache key ignores undefined where values', () => {
 		const all = app.todos.where({}) as unknown as QueryBuilder<unknown>
 		const selected: string | undefined = undefined
 		const filtered = app.todos.where({ projectId: selected }) as unknown as QueryBuilder<unknown>
+		const none = app.todos.where({ projectId: null }) as unknown as QueryBuilder<unknown>
 		const allRows = await all.exec()
-		const filteredRows = await filtered.exec().catch(() => 'error')
-		// Control: the runtime treats them as different queries.
-		expect(filteredRows).not.toEqual(allRows)
+		// Defined semantics: undefined adds no condition; null matches missing values.
+		expect(await filtered.exec()).toEqual(allRows)
+		expect(await none.exec()).not.toEqual(allRows)
+		expect(() => app.todos.where({ projectId: Number.NaN as unknown as string })).toThrow(
+			/finite/,
+		)
 
 		const cache = app.getQueryStoreCache()
 		const a = cache.getOrCreate(all)
 		const b = cache.getOrCreate(filtered)
-		expect(b).not.toBe(a)
-
+		const c = cache.getOrCreate(none)
+		// Same query, same store; different rows, different store.
+		expect(b).toBe(a)
+		expect(c).not.toBe(a)
+		cache.release(none)
+		cache.release(filtered)
 		cache.release(all)
 		cache.release(filtered)
 		await app.close()

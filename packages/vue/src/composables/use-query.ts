@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
-import { assertQueryReady } from '@korajs/store'
+import { assertQueryReady, queryKey } from '@korajs/store'
 import {
 	type DeepReadonly,
 	type MaybeRefOrGetter,
@@ -46,7 +46,7 @@ function useQuerySubscription<T>(
 		() => {
 			const enabled = toValue(options?.enabled) !== false
 			const current = enabled ? toValue(query) : null
-			return current ? JSON.stringify(current.getDescriptor()) : null
+			return current ? queryKey(current.getDescriptor()) : null
 		},
 		(key, _previous, onCleanup) => {
 			const current = key ? toValue(query) : null

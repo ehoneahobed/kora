@@ -15,6 +15,7 @@ import type {
 	WhereClause,
 } from '../types'
 import { pluralize, singularize } from './pluralize'
+import { normalizeWhere } from './query-key'
 import { buildCountQuery, buildSelectQuery } from './sql-builder'
 
 const RESULTS_EQUAL_CACHE = new WeakMap<CollectionDefinition, ResultsEqual>()
@@ -48,19 +49,23 @@ export class QueryBuilder<T = CollectionRecord> {
 	) {
 		this.descriptor = {
 			collection: collectionName,
-			where: { ...initialWhere },
+			where: normalizeWhere(initialWhere),
 			orderBy: [],
 		}
 	}
 
 	/**
 	 * Add WHERE conditions (AND semantics, merged with existing conditions).
+	 *
+	 * A field whose value is `undefined` adds no condition (it does not remove an
+	 * earlier one); `null` matches missing values (`IS NULL`). Non-finite numbers are
+	 * refused. See {@link normalizeWhere} (RT-102).
 	 */
 	where(conditions: WhereClause): QueryBuilder<T> {
 		const clone = this.clone()
 		clone.descriptor = {
 			...clone.descriptor,
-			where: { ...clone.descriptor.where, ...conditions },
+			where: { ...clone.descriptor.where, ...normalizeWhere(conditions) },
 		}
 		return clone
 	}
