@@ -3222,14 +3222,14 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-95.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:349-365 (rotate wraps to record.recovery.publicKey of whatever record was last adopted), keyring.ts:657-760 (adoptLocked checks structure, KDF floor and kept versions only), key-record.ts:131-159 (recovery block is structural only). Repro packages/sync/tests/repro/RT-95.test.ts: the server's own ECDH key unwraps the rotated key and decrypts a sealed op ('secret after-rotation'). Required fix: authenticate the recovery public key with the passphrase KEK (e.g. a KEK-keyed MAC or an AES-GCM wrap whose AAD binds the recovery public key, written by enableRecovery and checked on every adopt), and never wrap a data key to a recovery key that does not verify; a device must also refuse a record whose recovery key changed without that proof. Same class: any record field a device acts on (kdf params, recovery) must be bound to the passphrase holder."
+   "notes": "FIXED (key record format 2). The passphrase KEK opens a random per-ring master key; data keys are wrapped under an HKDF-derived wrapping key and an HKDF-derived MAC key authenticates every field of the record (HMAC-SHA256 over canonical JSON: ring id, revision, kdf, master wrap, every data-key wrap, recovery block). Devices act only on records they authenticated (held master key or passphrase); a recovery block, version or KDF change without the MAC is refused (KEY_RECORD_INVALID) and the held keys stay. The recovery key wraps the master key (not data keys), and only rewraps of an authenticated recovery public key are ever written. Recovery keys carry a ring anchor (kora-rk2-<d>.<anchor>, HMAC fingerprint of the ring's first data key): recover() refuses a substitute ring the server wrapped to the public recovery key. sync/src/encryption/key-record.ts, keyring-crypto.ts, keyring.ts; tests keyring-authentication.test.ts. Repro rewritten to the format-2 attacker chain (recovery block -> master -> data key); it fails when MACs are not verified. Red team: Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:349-365 (rotate wraps to record.recovery.publicKey of whatever record was last adopted), keyring.ts:657-760 (adoptLocked checks structure, KDF floor and kept versions only), key-record.ts:131-159 (recovery block is structural only). Repro packages/sync/tests/repro/RT-95.test.ts: the server's own ECDH key unwraps the rotated key and decrypts a sealed op ('secret after-rotation'). Required fix: authenticate the recovery public key with the passphrase KEK (e.g. a KEK-keyed MAC or an AES-GCM wrap whose AAD binds the recovery public key, written by enableRecovery and checked on every adopt), and never wrap a data key to a recovery key that does not verify; a device must also refuse a record whose recovery key changed without that proof. Same class: any record field a device acts on (kdf params, recovery) must be bound to the passphrase holder."
   },
   {
    "id": "RT-96",
@@ -3237,14 +3237,14 @@
    "severity": "P2",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-96.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:683-701 (pin compares key versions/ids only; a different salt silently drops the KEK), keyring.ts:247 (adoptPushed), key-record.ts isKeyRecordSuccessor (server rule only). Repro packages/sync/tests/repro/RT-96.test.ts. Required fix: pin the highest accepted revision (persisted in the key cache) and refuse lower ones with KEY_RECORD_ROLLBACK; authenticate the record (kdf, recovery, revision) under the KEK so a substituted revision at the same number is detected too. A new device cannot detect a rollback it never saw (document)."
+   "notes": "FIXED. Devices pin the ring id and the highest revision they accepted (persisted with the cached record; lock() keeps it) and refuse a lower one (KEY_RECORD_ROLLBACK): keys kept, the pinned record written back with compare-and-set at the next session (or merged when the older revision has keys the pin lacks). A different body under the pinned revision does not authenticate and is refused. Server successor rule: revision grows, ring id and every key version kept. A passphrase change creates a new master key, so the old passphrase opens no later revision. A new device cannot detect a rollback it never saw (documented in docs/guide/sync-encryption.md). Repro test 2 rewritten to the format-2 chain (leaked passphrase -> master -> data key) and asserts the rotation happened. Red team: Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:683-701 (pin compares key versions/ids only; a different salt silently drops the KEK), keyring.ts:247 (adoptPushed), key-record.ts isKeyRecordSuccessor (server rule only). Repro packages/sync/tests/repro/RT-96.test.ts. Required fix: pin the highest accepted revision (persisted in the key cache) and refuse lower ones with KEY_RECORD_ROLLBACK; authenticate the record (kdf, recovery, revision) under the KEK so a substituted revision at the same number is detected too. A new device cannot detect a rollback it never saw (document)."
   },
   {
    "id": "RT-97",
@@ -3252,14 +3252,14 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-97.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:337 (const kek = requireKek(...) read once, outside the compare-and-set loop), keyring.ts:373 (adoptConflictLocked adopts the new-salt record and drops this.kek, the loop keeps the stale local), keyring.ts:697-700. The server cannot tell (it never opens wraps). Repro packages/sync/tests/repro/RT-97.test.ts: a fresh device with the current passphrase is locked WRONG_PASSPHRASE and cannot decrypt the rotating device's op; the passphrase-changing device locks the same way on the push. Required fix: re-read the KEK (requireKek) inside the loop after every conflict adopt, and verify before put that the KEK opens the record's current version under the record's own salt (refuse to wrap under a KEK whose salt differs from record.kdf.salt). Same audit for enableRecovery (it fails loudly today, no corruption)."
+   "notes": "FIXED. rotate(), changePassphrase() and enableRecovery() re-read the pinned record, master key and (for recovery) the KEK of that record's own salt on every compare-and-set attempt; a conflict adopts and authenticates the server's record first, and a newer record this device cannot authenticate (passphrase changed elsewhere) stops the write with PASSPHRASE_REQUIRED. Data keys are wrapped under the master key, never a KEK, so a stale KEK cannot wrap anything into a new-salt record. Property test: concurrent rotation, passphrase change and recovery set-up on two devices leave every version readable with the current passphrase. Red team: Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:337 (const kek = requireKek(...) read once, outside the compare-and-set loop), keyring.ts:373 (adoptConflictLocked adopts the new-salt record and drops this.kek, the loop keeps the stale local), keyring.ts:697-700. The server cannot tell (it never opens wraps). Repro packages/sync/tests/repro/RT-97.test.ts: a fresh device with the current passphrase is locked WRONG_PASSPHRASE and cannot decrypt the rotating device's op; the passphrase-changing device locks the same way on the push. Required fix: re-read the KEK (requireKek) inside the loop after every conflict adopt, and verify before put that the KEK opens the record's current version under the record's own salt (refuse to wrap under a KEK whose salt differs from record.kdf.salt). Same audit for enableRecovery (it fails loudly today, no corruption)."
   },
   {
    "id": "RT-98",
@@ -3357,14 +3357,14 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-104.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:219-221 and 606-654 (no record -> createOrRestoreLocked; a device without a cached record creates a new data key), keyring.ts:683-695 (old devices refuse the new record, no way out), docs/guide/sync-encryption.md 'Server Requirements' (exportBackup covers operations only; 'the next device that still holds it uploads its copy again, so nothing is lost while one device has synced'). Repro packages/sync/tests/repro/RT-104.test.ts. Required fix: never create a first key record for an owner that already has encrypted history: the server answers a fetch with 'lost' (it knows the owner has envelope ops, or keeps a tombstone/fingerprint of every record it ever stored) and refuses a create (expectedRevision 0) while a device with the old record has not re-uploaded; the client then stays locked with KEY_RECORD_MISSING instead of creating. Include kora_encryption_keys in exportBackup/importBackup. Give operators/apps a documented resolution for a forked keyring."
+   "notes": "FIXED. The key service answers a fetch with no record with knownKeyIds (key ids of the owner's stored encrypted operations; ServerStore.getEncryptedKeyIds on memory, SQLite, Postgres). A device holding the ring re-uploads it unchanged (same revision and MAC, so every pin accepts it); a new device with encrypted history reported stays locked KEY_RECORD_MISSING (retryable, passphrase kept) instead of creating a ring. app.encryption.startNewKeyring() is the explicit way out; a device holding keys of two rings merges them (other ring's keys re-wrapped into the server's ring as new versions, same key ids; decryption selects keys by key id). Server exportBackup includes key records (encryption_keys section) and importBackup restores missing ones in both modes (never replaces a held record; malformed -> BACKUP_INVALID_KEY_RECORD). Guide section \"Lost Key Records and Forked Keyrings\". Red team: Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:219-221 and 606-654 (no record -> createOrRestoreLocked; a device without a cached record creates a new data key), keyring.ts:683-695 (old devices refuse the new record, no way out), docs/guide/sync-encryption.md 'Server Requirements' (exportBackup covers operations only; 'the next device that still holds it uploads its copy again, so nothing is lost while one device has synced'). Repro packages/sync/tests/repro/RT-104.test.ts. Required fix: never create a first key record for an owner that already has encrypted history: the server answers a fetch with 'lost' (it knows the owner has envelope ops, or keeps a tombstone/fingerprint of every record it ever stored) and refuses a create (expectedRevision 0) while a device with the old record has not re-uploaded; the client then stays locked with KEY_RECORD_MISSING instead of creating. Include kora_encryption_keys in exportBackup/importBackup. Give operators/apps a documented resolution for a forked keyring."
   }
  ],
  "rejectedProposalPins": {
