@@ -3260,6 +3260,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:337 (const kek = requireKek(...) read once, outside the compare-and-set loop), keyring.ts:373 (adoptConflictLocked adopts the new-salt record and drops this.kek, the loop keeps the stale local), keyring.ts:697-700. The server cannot tell (it never opens wraps). Repro packages/sync/tests/repro/RT-97.test.ts: a fresh device with the current passphrase is locked WRONG_PASSPHRASE and cannot decrypt the rotating device's op; the passphrase-changing device locks the same way on the push. Required fix: re-read the KEK (requireKek) inside the loop after every conflict adopt, and verify before put that the KEK opens the record's current version under the record's own salt (refuse to wrap under a KEK whose salt differs from record.kdf.salt). Same audit for enableRecovery (it fails loudly today, no corruption)."
+  },
+  {
+   "id": "RT-98",
+   "title": "Row changes the syncing tab makes without a new operation (terminal-rejection re-fold, scope retraction/narrowing, provisional cascade settling, authority re-fold) never reach other tabs' live queries: the local operation bus carries only operation:created/applied, so other tabs keep showing the old rows until an unrelated write",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-98.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to."
   }
  ],
  "rejectedProposalPins": {
