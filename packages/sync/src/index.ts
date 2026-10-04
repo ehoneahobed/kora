@@ -259,7 +259,9 @@ export type { CachedKeyring, KeyCache } from './encryption/key-cache'
 export {
 	DEFAULT_KEYRING,
 	KEY_RECORD_FORMAT,
+	MAX_KDF_ITERATIONS,
 	MAX_KEY_RECORD_BYTES,
+	isKeyId,
 	isKeyRecordSuccessor,
 	isValidKeyringName,
 	validateKeyRecord,
@@ -268,9 +270,9 @@ export type {
 	KeyRecordKdf,
 	KeyRecordRecovery,
 	KeyRecordValidation,
-	RecoveryWrappedDataKey,
 	WrappedDataKey,
 	WrappedKeyRecord,
+	WrappedMasterKey,
 } from './encryption/key-record'
 export { KeyUnwrapError } from './encryption/keyring-crypto'
 export { isEncryptionKeyMessage } from './encryption/key-messages'

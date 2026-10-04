@@ -415,6 +415,14 @@ export interface EncryptionControl {
 		recoveryKey: string,
 		newPassphrase: string,
 	): Promise<import('@korajs/sync').EncryptionStatus>
+	/**
+	 * Last resort for `KEY_RECORD_MISSING` (the server lost the key record and no device
+	 * that holds the keyring will reconnect): start a new keyring. Data encrypted under
+	 * the lost one stays unreadable unless a device holding it reconnects later (it then
+	 * merges both). Needs a passphrase (`key` or `unlock()`); runs at the next handshake.
+	 * Rejects with `KEY_RECORD_EXISTS` when the server holds a record.
+	 */
+	startNewKeyring(): Promise<import('@korajs/sync').EncryptionStatus>
 }
 
 /**

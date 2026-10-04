@@ -227,6 +227,14 @@ export class SyncEncryptor {
 		}
 	}
 
+	/** The key registered under an explicit key id (keyring keys), if any. */
+	private keyById(keyId: string): VersionedKey | undefined {
+		for (const key of this.keys.values()) {
+			if (key.keyId === keyId) return key
+		}
+		return undefined
+	}
+
 	/**
 	 * Get the current encryption key version number.
 	 */
@@ -430,7 +438,10 @@ export class SyncEncryptor {
 				{ operationId: operation.id },
 			)
 		}
-		const key = this.keys.get(envelope.keyVersion)
+		// Keyring keys are found by key id: after two forked rings are merged (RT-104) one
+		// ring holds keys that sealed operations under another ring's version numbers. The
+		// envelope's own keyVersion is still what the AAD binds.
+		const key = this.keyById(envelope.keyId) ?? this.keys.get(envelope.keyVersion)
 		if (!key) {
 			throw new DecryptionError(
 				`No encryption key available for version ${envelope.keyVersion} (key id ${envelope.keyId}). This operation was encrypted with a key that is not registered. If you rotated keys, ensure all previous key versions are provided.`,
@@ -442,7 +453,7 @@ export class SyncEncryptor {
 				},
 			)
 		}
-		const localKeyId = await this.getKeyId(envelope.keyVersion)
+		const localKeyId = key.keyId ?? (await this.getKeyId(envelope.keyVersion))
 		if (localKeyId !== envelope.keyId) {
 			throw new DecryptionError(
 				`Operation ${operation.id} was encrypted with key material "${envelope.keyId}" (version ${envelope.keyVersion}), but this device holds "${localKeyId}". The devices hold different keys: they must open the same keyring (the same user and keyring name) on the same sync server.`,

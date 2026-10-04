@@ -16,7 +16,12 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
-import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import {
+	KEY_ID_SAMPLE_ROWS,
+	envelopeColumn,
+	envelopeKeyIds,
+	parseEnvelopeColumn,
+} from './envelope-column'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -90,6 +95,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationResolutionOutcome,
@@ -1043,6 +1049,36 @@ export class SqliteServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		return owner === undefined
+			? this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+				)
+			: this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+				)
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		const rows =
+			nodeOwner === null
+				? this.db.all<{ encrypted: string | null }>(
+						sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+				: this.db.all<{ encrypted: string | null }>(
+						sql`SELECT o.encrypted AS encrypted FROM node_claims c
+							JOIN operations o ON o.node_id = c.node_id
+							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+		return envelopeKeyIds(
+			rows.map((row) => row.encrypted),
+			limit,
+		)
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false
@@ -1183,7 +1219,7 @@ export class SqliteServerStore implements ServerStore {
 		const deserialized = rows.map((row) => this.deserializeOperation(row))
 		const vv = this.getVersionVector()
 
-		return buildServerBackup(this.nodeId, deserialized, vv)
+		return buildServerBackup(this.nodeId, deserialized, vv, await this.listEncryptionKeyRecords())
 	}
 
 	async importBackup(
@@ -1192,8 +1228,12 @@ export class SqliteServerStore implements ServerStore {
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations: ops, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes: the key table is not part of the log, and a held record is kept.
+		await restoreBackupKeyRecords(this, keyRecords)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))

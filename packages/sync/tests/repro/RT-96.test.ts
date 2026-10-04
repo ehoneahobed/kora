@@ -22,7 +22,9 @@ import { EncryptionKeyring } from '../../src/encryption/keyring'
 import {
 	deriveKeyEncryptionKey,
 	fromBase64,
+	importMasterKey,
 	unwrapDataKey,
+	unwrapMasterKey,
 } from '../../src/encryption/keyring-crypto'
 
 const ITERATIONS = 1000
@@ -95,12 +97,18 @@ describe('RT-96: a device accepts a rolled-back key record revision', () => {
 			fromBase64(record.kdf.salt),
 			record.kdf.iterations,
 		)
+		// The device re-uploaded its pin and rotated: the new version exists.
+		expect(record.currentVersion).toBeGreaterThan(1)
+		// Format 2: the passphrase KEK opens the ring's master key, which wraps every data key.
 		const opened =
 			record.currentVersion > 1 && newest
-				? await unwrapDataKey(newest, attackerKek, record.keyring).then(
-						() => true,
-						() => false,
-					)
+				? await unwrapMasterKey(record.master, attackerKek, record.keyring, record.ringId)
+						.then(importMasterKey)
+						.then((master) => unwrapDataKey(newest, master.wrapKey, record.keyring))
+						.then(
+							() => true,
+							() => false,
+						)
 				: false
 		expect(opened).toBe(false)
 	})

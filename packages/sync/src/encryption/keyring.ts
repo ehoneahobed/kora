@@ -3,22 +3,39 @@ import type { CachedKeyring, KeyCache } from './key-cache'
 import { MemoryKeyCache } from './key-cache'
 import { DEFAULT_PBKDF2_ITERATIONS } from './key-derivation'
 import type { WrappedDataKey, WrappedKeyRecord } from './key-record'
-import { DEFAULT_KEYRING, KEY_RECORD_FORMAT, validateKeyRecord } from './key-record'
+import {
+	DEFAULT_KEYRING,
+	KEY_RECORD_FORMAT,
+	canonicalJson,
+	isKeyId,
+	validateKeyRecord,
+} from './key-record'
+import type { MasterKeys } from './keyring-crypto'
 import {
 	KEK_SALT_BYTES,
 	KeyUnwrapError,
+	bytesEqual,
+	dataKeyAnchor,
 	deriveKeyEncryptionKey,
 	fromBase64,
 	generateDataKey,
+	generateMasterKey,
 	generateRecoveryKeyPair,
+	importMasterKey,
 	newKeyId,
+	newRingId,
+	parseRecoveryKey,
 	randomBytes,
+	sealRecord,
 	toBase64,
 	toNonExtractable,
 	unwrapDataKey,
-	unwrapWithRecovery,
+	unwrapMasterKey,
+	unwrapMasterWithRecovery,
+	verifyRecordMac,
 	wrapDataKey,
-	wrapForRecovery,
+	wrapMasterForRecovery,
+	wrapMasterKey,
 } from './keyring-crypto'
 import type { EncryptorOptions } from './sync-encryptor'
 import { SyncEncryptor } from './sync-encryptor'
@@ -27,7 +44,7 @@ import type { VersionedKey } from './types'
 /** Lock state of an encryption keyring. */
 export type EncryptionLockState = 'locked' | 'unlocking' | 'unlocked' | 'error'
 
-/** Why a keyring is locked or in error. */
+/** Why a keyring is locked or in error (or, while unlocked, what needs attention). */
 export type EncryptionStatusCode =
 	| 'NO_PASSPHRASE'
 	| 'AWAITING_SERVER'
@@ -36,6 +53,8 @@ export type EncryptionStatusCode =
 	| 'PASSPHRASE_REQUIRED'
 	| 'KEY_RECORD_INVALID'
 	| 'KEY_RECORD_ROLLBACK'
+	| 'KEY_RECORD_MISSING'
+	| 'KEY_RING_FORK'
 	| 'KEY_SERVICE_FORBIDDEN'
 	| 'KEY_SERVICE_UNSUPPORTED'
 	| 'RECOVERY_FAILED'
@@ -52,7 +71,11 @@ export interface EncryptionStatus {
 	availableVersions: number[]
 	/** Where unlocked keys are kept between starts. */
 	cache: KeyCache['kind']
-	/** Set while locked or in error. */
+	/**
+	 * Set while locked or in error. While `unlocked`, `PASSPHRASE_REQUIRED` means the
+	 * passphrase changed on another device: this device keeps working with the keys it
+	 * holds, and needs the current passphrase for key management.
+	 */
 	code?: EncryptionStatusCode
 	message?: string
 }
@@ -62,6 +85,12 @@ export interface KeyServiceReply {
 	/** 'conflict': the write lost a compare-and-set; `record` is the current one. */
 	status: 'ok' | 'conflict'
 	record: WrappedKeyRecord | null
+	/**
+	 * With no record: key ids the server's stored operations of this owner are encrypted
+	 * with (a sample). Non-empty means encrypted history exists, so the record was lost
+	 * and a device that holds the ring must re-upload it; nobody may start a new ring.
+	 */
+	knownKeyIds?: string[]
 }
 
 /** How a keyring reaches the server's key service (the sync connection). */
@@ -103,21 +132,35 @@ export class EncryptionKeyError extends SyncError {
 /** Failed unlocks before the client-side backoff starts. */
 const FREE_UNLOCK_ATTEMPTS = 3
 const MAX_UNLOCK_BACKOFF_MS = 60_000
-/** Compare-and-set retries of one key-record write. */
-const MAX_WRITE_ATTEMPTS = 3
+/** Compare-and-set retries of one key-record write (and nested adopt/merge rounds). */
+const MAX_WRITE_ATTEMPTS = 4
+
+/** A record this device authenticated: the master keys that verify it, and its KEK if known. */
+interface OpenedRing {
+	master: MasterKeys
+	/** The KEK of the record's own salt, when this device derived (or holds) it. */
+	kek: CryptoKey | null
+}
 
 /**
- * A device's view of one encryption keyring (ENC-1, decision D4b): the server-stored,
- * passphrase-wrapped data keys, opened locally.
+ * A device's view of one encryption keyring (ENC-1, decision D4b; record format 2): the
+ * server-stored, passphrase-wrapped ring, opened and authenticated locally.
  *
  * - **Shared key material.** Every device of a user opens the same record, so every
  *   device holds the same data keys and decrypts everything.
+ * - **Authenticated record.** The record carries an HMAC under a key derived from the
+ *   ring's master key; a device acts only on records it verified (RT-95). The server
+ *   can store, withhold or replay records, nothing more.
+ * - **Forward only.** A device pins the ring id and highest revision it accepted and
+ *   refuses a lower revision (`KEY_RECORD_ROLLBACK`, RT-96), keeping its keys and
+ *   re-uploading its newer record when connected.
+ * - **Writes re-read.** Every compare-and-set retry adopts the server's current record
+ *   first and wraps under that record's master key only (RT-97).
+ * - **Lost records.** A device holding the ring re-uploads it unchanged; a new device
+ *   that finds no record but encrypted history waits (`KEY_RECORD_MISSING`); two rings
+ *   that exist anyway are merged by the first device holding both (RT-104).
  * - **Offline.** Once unlocked, keys are cached (non-extractable) and the keyring needs
  *   no server; a cached record also lets `unlock()` work offline.
- * - **Locked is explicit.** Without a passphrase or cached keys the keyring is
- *   `locked`; sync does not run, local reads and writes do.
- * - **Rotation, passphrase change, recovery** write a new record revision with
- *   compare-and-set; history stays readable because versions are never dropped.
  */
 export class EncryptionKeyring {
 	readonly name: string
@@ -126,11 +169,15 @@ export class EncryptionKeyring {
 	private readonly kdfIterations: number
 	private readonly encryptorOptions: EncryptorOptions
 	private loadedPrincipal: string | null | undefined = undefined
+	/** The last record this device authenticated and accepted: the pin. */
 	private record: WrappedKeyRecord | null = null
+	/** Keys derived from the pinned record's master key. */
+	private master: MasterKeys | null = null
 	private kek: CryptoKey | null = null
 	/** Salt (base64) the KEK was derived with. */
 	private kekSalt: string | null = null
-	private readonly dataKeys = new Map<number, { keyId: string; key: CryptoKey }>()
+	/** Held data keys by key id. Invariant: every held key id is in `record`. */
+	private readonly dataKeys = new Map<string, CryptoKey>()
 	private encryptor: SyncEncryptor | null = null
 	private status: EncryptionStatus
 	private readonly listeners = new Set<(status: EncryptionStatus) => void>()
@@ -138,6 +185,12 @@ export class EncryptionKeyring {
 	private pendingPassphrase: string | null = null
 	/** A recovery requested while offline, run at the next handshake. */
 	private pendingRecovery: { recoveryKey: string; newPassphrase: string } | null = null
+	/** The configured passphrase that failed for a salt (not retried for that salt). */
+	private failedSource: { salt: string; passphrase: string } | null = null
+	/** The current lock is a server-side condition a later session can clear (no user action). */
+	private retryable = false
+	/** startNewKeyring() was called: a missing record with encrypted history may be replaced. */
+	private allowNewRing = false
 	private failedUnlocks = 0
 	private nextUnlockAt = 0
 	private mutex: Promise<unknown> = Promise.resolve()
@@ -164,6 +217,20 @@ export class EncryptionKeyring {
 	/** Current status. */
 	getStatus(): EncryptionStatus {
 		return this.status
+	}
+
+	/** Whether this device holds the data key with this key id. */
+	holdsKeyId(keyId: string): boolean {
+		return this.dataKeys.has(keyId)
+	}
+
+	/**
+	 * Whether the current lock is a server-side condition (a rolled-back, missing,
+	 * malformed or forked record) that a later sync session can clear without the user:
+	 * sync should reconnect with backoff rather than wait for `unlock()`.
+	 */
+	isRetryableLock(): boolean {
+		return this.retryable && this.status.state !== 'unlocked'
 	}
 
 	/** Subscribe to status changes. Returns an unsubscribe function. */
@@ -193,9 +260,11 @@ export class EncryptionKeyring {
 
 	/**
 	 * Open the keyring against the server's record during a sync handshake: fetch it,
-	 * create it on a user's first device, adopt new versions, or detect a rollback.
+	 * create it on a user's first device, adopt a newer revision, re-upload a lost or
+	 * rolled-back one, or merge a forked ring.
 	 *
-	 * @returns 'ready' when unlocked, 'locked' when a passphrase is needed (or wrong)
+	 * @returns 'ready' when unlocked, 'locked' when a passphrase is needed (or wrong), or
+	 *   when the server's record must change first ({@link isRetryableLock})
 	 * @throws When the key service fails (the session is retried later)
 	 */
 	synchronize(channel: KeyServiceChannel, principal: string | null): Promise<'ready' | 'locked'> {
@@ -218,9 +287,9 @@ export class EncryptionKeyring {
 			try {
 				const reply = await channel.fetch(this.name)
 				if (reply.record === null) {
-					return await this.createOrRestoreLocked(channel)
+					return await this.createOrRestoreLocked(channel, reply.knownKeyIds ?? [])
 				}
-				return await this.adoptLocked(reply.record, null)
+				return await this.adoptLocked(reply.record, null, channel)
 			} catch (error) {
 				// Permanent refusals: retrying the session would not change them.
 				if (
@@ -230,7 +299,7 @@ export class EncryptionKeyring {
 					this.lockWith('error', error.keyCode, error.message)
 					return 'locked'
 				}
-				if (this.encryptor === null) {
+				if (this.encryptor === null && this.status.state === 'unlocking') {
 					this.setStatus(this.makeStatus('locked', 'AWAITING_SERVER', errorMessage(error)))
 				}
 				throw error
@@ -239,13 +308,15 @@ export class EncryptionKeyring {
 	}
 
 	/**
-	 * Adopt a record the server pushed (another device rotated keys or changed the
-	 * passphrase).
+	 * Adopt a record the server pushed (another device rotated keys, changed the
+	 * passphrase or set up recovery). Without a connection to write to, a rollback or a
+	 * fork is reported and resolved at the next handshake.
 	 *
-	 * @returns 'ready' when still unlocked, 'locked' when the passphrase is needed
+	 * @returns 'ready' when still unlocked, 'locked' when the passphrase is needed or the
+	 *   record was refused
 	 */
 	adoptPushed(record: WrappedKeyRecord): Promise<'ready' | 'locked'> {
-		return this.exclusive(() => this.adoptLocked(record, null))
+		return this.exclusive(() => this.adoptLocked(record, null, null))
 	}
 
 	/**
@@ -257,7 +328,7 @@ export class EncryptionKeyring {
 	 * This is a usability guard, not a security boundary: whoever holds the record can
 	 * try passphrases offline, so passphrase strength and PBKDF2 are the protection.
 	 *
-	 * @throws {EncryptionKeyError} WRONG_PASSPHRASE, UNLOCK_THROTTLED
+	 * @throws {EncryptionKeyError} WRONG_PASSPHRASE, UNLOCK_THROTTLED, KEY_RECORD_MISSING
 	 */
 	unlock(passphrase: string, channel: KeyServiceChannel | null): Promise<EncryptionStatus> {
 		return this.exclusive(async () => {
@@ -277,13 +348,14 @@ export class EncryptionKeyring {
 			let record = this.record
 			if (channel) {
 				const reply = await channel.fetch(this.name)
-				record = reply.record ?? record
-				if (reply.record === null && this.record === null) {
+				if (reply.record === null) {
+					// Kept for the next handshake when the record is missing (KEY_RECORD_MISSING).
 					this.pendingPassphrase = passphrase
-					const outcome = await this.createOrRestoreLocked(channel)
+					const outcome = await this.createOrRestoreLocked(channel, reply.knownKeyIds ?? [])
 					if (outcome !== 'ready') throw this.statusError()
 					return this.status
 				}
+				record = reply.record
 			}
 			if (record === null) {
 				// No record known yet: open it at the next handshake.
@@ -298,7 +370,7 @@ export class EncryptionKeyring {
 				return this.status
 			}
 			this.pendingPassphrase = passphrase
-			const outcome = await this.adoptLocked(record, passphrase)
+			const outcome = await this.adoptLocked(record, passphrase, channel)
 			if (outcome !== 'ready') {
 				this.pendingPassphrase = null
 				throw this.statusError()
@@ -308,9 +380,10 @@ export class EncryptionKeyring {
 	}
 
 	/**
-	 * Lock: forget the data keys and the KEK on this device (cache included). Sync stops
-	 * until `unlock()`; local data stays readable (it is not encrypted at rest by this
-	 * layer). The configured passphrase is not used again until `unlock()`.
+	 * Lock: forget the data keys, the master keys and the KEK on this device (cache
+	 * included). Sync stops until `unlock()`; local data stays readable (it is not
+	 * encrypted at rest by this layer). The pinned record is kept (it is the rollback
+	 * floor). The configured passphrase is not used again until `unlock()`.
 	 */
 	lock(): Promise<EncryptionStatus> {
 		return this.exclusive(async () => {
@@ -319,7 +392,7 @@ export class EncryptionKeyring {
 			this.dropKeys()
 			const record = this.record
 			if (record) {
-				await this.cache.save(this.cacheId(), { record, kek: null, keys: [] })
+				await this.cache.save(this.cacheId(), { record, kek: null, master: null, keys: [] })
 			} else {
 				await this.cache.clear(this.cacheId())
 			}
@@ -330,56 +403,49 @@ export class EncryptionKeyring {
 
 	/**
 	 * Rotate: create a new data key version. New operations use it; old versions stay
-	 * in the record so history decrypts. Needs the server (compare-and-set).
+	 * in the record so history decrypts. Needs the server (compare-and-set). Each retry
+	 * adopts the server's current record first and wraps under ITS master key only.
 	 */
 	rotate(channel: KeyServiceChannel): Promise<EncryptionStatus> {
 		return this.exclusive(async () => {
-			const kek = this.requireKek('rotate the key')
 			for (let attempt = 0; ; attempt++) {
 				const record = this.requireRecord()
+				const master = this.requireMaster('rotate the key')
 				const dataKey = await generateDataKey()
 				const keyVersion = record.currentVersion + 1
 				const keyId = newKeyId()
-				const wrapped = await wrapDataKey(dataKey, kek, this.name, keyVersion, keyId)
-				const next: WrappedKeyRecord = {
-					...record,
-					revision: record.revision + 1,
-					currentVersion: keyVersion,
-					keys: [...record.keys, wrapped],
-					...(record.recovery
-						? {
-								recovery: {
-									...record.recovery,
-									keys: [
-										...record.recovery.keys,
-										await wrapForRecovery(
-											dataKey,
-											record.recovery.publicKey,
-											this.name,
-											keyVersion,
-											keyId,
-										),
-									],
-								},
-							}
-						: {}),
-				}
+				const next = await sealRecord(
+					{
+						...record,
+						revision: record.revision + 1,
+						currentVersion: keyVersion,
+						keys: [
+							...record.keys,
+							await wrapDataKey(dataKey, master.wrapKey, this.name, keyVersion, keyId),
+						],
+					},
+					master.macKey,
+				)
 				const reply = await channel.put(this.name, next, record.revision)
 				if (reply.status === 'ok') {
-					this.dataKeys.set(keyVersion, { keyId, key: await toNonExtractable(dataKey) })
+					this.dataKeys.set(keyId, await toNonExtractable(dataKey))
 					await this.commitLocked(next)
 					return this.status
 				}
-				await this.adoptConflictLocked(reply, attempt)
+				await this.followConflictLocked(reply, attempt, null, channel)
 			}
 		})
 	}
 
 	/**
-	 * Change the passphrase: re-wrap every data key version under a KEK derived from
-	 * the new passphrase and a new salt. No operation is re-encrypted. Other devices
-	 * keep working with their cached data keys; a device that later needs a key it
-	 * does not hold asks for the new passphrase.
+	 * Change the passphrase: a NEW master key, sealed under a KEK derived from the new
+	 * passphrase and a new salt, re-wraps every data key version (and the recovery wrap,
+	 * if any). No operation is re-encrypted. The old passphrase, and the old master key
+	 * it opens, can neither open nor authenticate any later record. Other devices keep
+	 * working with their cached data keys (status `PASSPHRASE_REQUIRED` while unlocked);
+	 * they need the new passphrase for a key they do not hold and for key management.
+	 * After a suspected leak, also `rotate()`: data keys the old passphrase could open
+	 * stay what they were.
 	 *
 	 * @param newPassphrase - The new passphrase
 	 * @param channel - The key service
@@ -398,80 +464,137 @@ export class EncryptionKeyring {
 			}
 			for (let attempt = 0; ; attempt++) {
 				const record = this.requireRecord()
-				const kek =
+				const master =
 					currentPassphrase !== undefined
-						? await this.kekFor(record, currentPassphrase)
-						: this.requireKek('change the passphrase')
+						? (await this.openWithPassphrase(record, currentPassphrase)).master
+						: this.requireMaster('change the passphrase')
+				const raw = generateMasterKey()
 				const salt = randomBytes(KEK_SALT_BYTES)
-				const newKek = await deriveKeyEncryptionKey(newPassphrase, salt, this.kdfIterations)
-				const keys: WrappedDataKey[] = []
-				for (const entry of record.keys) {
-					const dataKey = await unwrapDataKey(entry, kek, this.name, true)
-					keys.push(await wrapDataKey(dataKey, newKek, this.name, entry.keyVersion, entry.keyId))
-				}
-				const next: WrappedKeyRecord = {
-					...record,
-					revision: record.revision + 1,
-					kdf: {
-						name: 'PBKDF2',
-						hash: 'SHA-256',
-						iterations: this.kdfIterations,
-						salt: toBase64(salt),
-					},
-					keys,
+				let next: WrappedKeyRecord
+				let newMaster: MasterKeys
+				let newKek: CryptoKey
+				try {
+					newMaster = await importMasterKey(raw)
+					newKek = await deriveKeyEncryptionKey(newPassphrase, salt, this.kdfIterations)
+					const keys: WrappedDataKey[] = []
+					for (const entry of record.keys) {
+						const dataKey = await unwrapDataKey(entry, master.wrapKey, this.name, true)
+						keys.push(
+							await wrapDataKey(
+								dataKey,
+								newMaster.wrapKey,
+								this.name,
+								entry.keyVersion,
+								entry.keyId,
+							),
+						)
+					}
+					const { recovery: previousRecovery, ...rest } = record
+					next = await sealRecord(
+						{
+							...rest,
+							revision: record.revision + 1,
+							kdf: {
+								name: 'PBKDF2',
+								hash: 'SHA-256',
+								iterations: this.kdfIterations,
+								salt: toBase64(salt),
+							},
+							master: await wrapMasterKey(raw, newKek, this.name, record.ringId),
+							keys,
+							// The recovery public key was authenticated with the record; the new
+							// master key is wrapped to it, so the recovery key keeps working.
+							...(previousRecovery
+								? {
+										recovery: await wrapMasterForRecovery(
+											raw,
+											previousRecovery.publicKey,
+											this.name,
+											record.ringId,
+										),
+									}
+								: {}),
+						},
+						newMaster.macKey,
+					)
+				} finally {
+					raw.fill(0)
 				}
 				const reply = await channel.put(this.name, next, record.revision)
 				if (reply.status === 'ok') {
+					this.master = newMaster
 					this.kek = newKek
 					this.kekSalt = next.kdf.salt
+					this.failedSource = null
 					await this.commitLocked(next)
 					return this.status
 				}
-				await this.adoptConflictLocked(reply, attempt)
+				await this.followConflictLocked(reply, attempt, currentPassphrase ?? null, channel)
 			}
 		})
 	}
 
 	/**
-	 * Set up (or replace) the recovery key: every data key version is also wrapped to a
+	 * Set up (or replace) the recovery key: the ring's master key is also wrapped to a
 	 * new recovery public key, and the private half is returned ONCE. Store it offline;
 	 * it recovers the data after a lost passphrase. Without it, a lost passphrase means
-	 * the encrypted data is unrecoverable.
+	 * the encrypted data is unrecoverable. Needs the passphrase key of the CURRENT
+	 * record (the recovery block is authenticated with the record, so only a holder of
+	 * the master key can add or replace it).
 	 *
-	 * @returns The recovery key (`kora-rk1-...`)
+	 * @returns The recovery key (`kora-rk2-<key>.<anchor>`)
 	 */
 	enableRecovery(channel: KeyServiceChannel): Promise<string> {
 		return this.exclusive(async () => {
-			const kek = this.requireKek('set up a recovery key')
 			for (let attempt = 0; ; attempt++) {
 				const record = this.requireRecord()
-				const { publicKey, recoveryKey } = await generateRecoveryKeyPair()
-				const recoveryKeys = []
-				for (const entry of record.keys) {
-					const dataKey = await unwrapDataKey(entry, kek, this.name, true)
-					recoveryKeys.push(
-						await wrapForRecovery(dataKey, publicKey, this.name, entry.keyVersion, entry.keyId),
-					)
+				const master = this.requireMaster('set up a recovery key')
+				const kek = this.requireKek(record, 'set up a recovery key')
+				const raw = await unwrapMasterKey(record.master, kek, this.name, record.ringId).catch(
+					(error: unknown) => {
+						throw new EncryptionKeyError(
+							'This device cannot open the current key record with its passphrase key. Unlock with the current passphrase, then try again.',
+							{ code: 'PASSPHRASE_REQUIRED', cause: errorMessage(error) },
+						)
+					},
+				)
+				let anchor: Uint8Array
+				try {
+					anchor = await this.ringAnchor(record, master)
+				} catch (error) {
+					raw.fill(0)
+					throw error
 				}
-				const next: WrappedKeyRecord = {
-					...record,
-					revision: record.revision + 1,
-					recovery: { alg: 'ECDH-P256+AES-GCM', publicKey, keys: recoveryKeys },
+				const { publicKey, recoveryKey } = await generateRecoveryKeyPair(anchor)
+				let next: WrappedKeyRecord
+				try {
+					next = await sealRecord(
+						{
+							...record,
+							revision: record.revision + 1,
+							recovery: await wrapMasterForRecovery(raw, publicKey, this.name, record.ringId),
+						},
+						master.macKey,
+					)
+				} finally {
+					raw.fill(0)
 				}
 				const reply = await channel.put(this.name, next, record.revision)
 				if (reply.status === 'ok') {
 					await this.commitLocked(next)
 					return recoveryKey
 				}
-				await this.adoptConflictLocked(reply, attempt)
+				await this.followConflictLocked(reply, attempt, null, channel)
 			}
 		})
 	}
 
 	/**
-	 * Recover after a lost passphrase: open every data key with the recovery key and
-	 * re-wrap them under a new passphrase. Unlocks this device. Without a channel (sync
-	 * not connected) the recovery runs at the next handshake.
+	 * Recover after a lost passphrase: open the ring's master key with the recovery key,
+	 * verify the whole record with it, and seal the master key under a new passphrase.
+	 * Unlocks this device. Without a channel (sync not connected) the recovery runs at
+	 * the next handshake. Devices that hold the ring keep working without a prompt (the
+	 * master key is unchanged).
 	 */
 	recover(
 		recoveryKey: string,
@@ -499,6 +622,44 @@ export class EncryptionKeyring {
 		})
 	}
 
+	/**
+	 * Last resort after the server lost the key record and no device that holds the ring
+	 * will come back (`KEY_RECORD_MISSING`): allow this device to create a new ring.
+	 * Operations encrypted under the lost ring stay unreadable on this device. If a device
+	 * holding the old ring reconnects later, it merges both rings and the history becomes
+	 * readable again. Without a channel (sync is not connected: a missing record ends the
+	 * session) the ring is created at the next handshake.
+	 *
+	 * @throws {EncryptionKeyError} KEY_RECORD_EXISTS when the server has a record (unlock it)
+	 */
+	startNewKeyring(channel: KeyServiceChannel | null): Promise<EncryptionStatus> {
+		return this.exclusive(async () => {
+			this.allowNewRing = true
+			if (channel === null) {
+				this.retryable = false
+				this.setStatus(
+					this.makeStatus(
+						'locked',
+						'AWAITING_SERVER',
+						'A new keyring is created when the sync server is reached (unless it holds a record).',
+					),
+				)
+				return this.status
+			}
+			const reply = await channel.fetch(this.name)
+			if (reply.record !== null) {
+				this.allowNewRing = false
+				throw new EncryptionKeyError(
+					'The sync server holds a key record for this keyring: unlock it with the passphrase instead.',
+					{ code: 'KEY_RECORD_EXISTS' },
+				)
+			}
+			const outcome = await this.createOrRestoreLocked(channel, reply.knownKeyIds ?? [])
+			if (outcome !== 'ready') throw this.statusError()
+			return this.status
+		})
+	}
+
 	private async recoverLocked(
 		recoveryKey: string,
 		newPassphrase: string,
@@ -520,42 +681,65 @@ export class EncryptionKeyring {
 					{ code: 'NO_RECOVERY_KEY' },
 				)
 			}
-			const salt = randomBytes(KEK_SALT_BYTES)
-			const newKek = await deriveKeyEncryptionKey(newPassphrase, salt, this.kdfIterations)
-			const keys: WrappedDataKey[] = []
-			const opened = new Map<number, { keyId: string; key: CryptoKey }>()
-			for (const entry of record.keys) {
-				const wrap = recovery.keys.find(
-					(candidate) =>
-						candidate.keyVersion === entry.keyVersion && candidate.keyId === entry.keyId,
+			const pinned = this.record
+			if (pinned && pinned.ringId === record.ringId && record.revision < pinned.revision) {
+				throw new EncryptionKeyError(
+					`The server served revision ${record.revision} of the key record, older than revision ${pinned.revision} this device accepted. Recovery is refused on a rolled-back record.`,
+					{ code: 'KEY_RECORD_ROLLBACK' },
 				)
-				if (!wrap) {
+			}
+			const raw = await unwrapMasterWithRecovery(recovery, recoveryKey, this.name, record.ringId)
+			const salt = randomBytes(KEK_SALT_BYTES)
+			let master: MasterKeys
+			let newKek: CryptoKey
+			let masterWrap: WrappedKeyRecord['master']
+			try {
+				master = await importMasterKey(raw)
+				if (!(await verifyRecordMac(record, master.macKey))) {
 					throw new EncryptionKeyError(
-						`Key version ${entry.keyVersion} has no recovery wrap; it cannot be recovered.`,
-						{ code: 'RECOVERY_INCOMPLETE', keyVersion: entry.keyVersion },
+						'The key record does not authenticate under the recovered master key: it was modified by someone without the keys. Recovery is refused.',
+						{ code: 'KEY_RECORD_INVALID' },
 					)
 				}
-				const dataKey = await unwrapWithRecovery(wrap, recoveryKey, recovery.publicKey, this.name)
-				keys.push(await wrapDataKey(dataKey, newKek, this.name, entry.keyVersion, entry.keyId))
-				opened.set(entry.keyVersion, { keyId: entry.keyId, key: await toNonExtractable(dataKey) })
+				// The recovery PUBLIC key is no secret: anyone can wrap a master key of their own
+				// to it and seal a record under that master. Only the user's own ring holds the
+				// data key the recovery key's anchor fingerprints.
+				if (!(await this.holdsAnchor(record, master, parseRecoveryKey(recoveryKey).anchor))) {
+					throw new EncryptionKeyError(
+						'The key record opens with this recovery key but is not the keyring the recovery key was made for: it lacks the data key the recovery key is anchored to (the server substituted another keyring). Recovery is refused.',
+						{ code: 'KEY_RECORD_INVALID' },
+					)
+				}
+				newKek = await deriveKeyEncryptionKey(newPassphrase, salt, this.kdfIterations)
+				masterWrap = await wrapMasterKey(raw, newKek, this.name, record.ringId)
+			} finally {
+				raw.fill(0)
 			}
-			const next: WrappedKeyRecord = {
-				...record,
-				revision: record.revision + 1,
-				kdf: {
-					name: 'PBKDF2',
-					hash: 'SHA-256',
-					iterations: this.kdfIterations,
-					salt: toBase64(salt),
+			const opened = await this.openDataKeys(record, master)
+			const absorbed = await this.absorbHeldKeys(record, master)
+			const next = await sealRecord(
+				{
+					...record,
+					revision: this.nextRevision(record),
+					kdf: {
+						name: 'PBKDF2',
+						hash: 'SHA-256',
+						iterations: this.kdfIterations,
+						salt: toBase64(salt),
+					},
+					master: masterWrap,
+					keys: [...record.keys, ...absorbed],
+					currentVersion: record.currentVersion + absorbed.length,
 				},
-				keys,
-			}
+				master.macKey,
+			)
 			const put = await channel.put(this.name, next, record.revision)
 			if (put.status === 'ok') {
 				this.lockedByApp = false
+				this.master = master
 				this.kek = newKek
 				this.kekSalt = next.kdf.salt
-				for (const [version, key] of opened) this.dataKeys.set(version, key)
+				for (const [keyId, key] of opened) this.dataKeys.set(keyId, key)
 				await this.commitLocked(next)
 				return this.status
 			}
@@ -569,6 +753,8 @@ export class EncryptionKeyring {
 		if (this.loadedPrincipal === principal) return this.status
 		this.dropKeys()
 		this.record = null
+		this.failedSource = null
+		this.allowNewRing = false
 		// A passphrase given before the first load (unlock() at start-up) is kept; one given
 		// for another principal is not.
 		if (this.loadedPrincipal !== undefined) this.pendingPassphrase = null
@@ -580,13 +766,17 @@ export class EncryptionKeyring {
 			cached = null
 		}
 		if (cached && validateKeyRecord(cached.record, this.name).ok) {
-			this.record = cached.record
-			this.kek = cached.kek
-			this.kekSalt = cached.kek ? cached.record.kdf.salt : null
+			const record = cached.record
+			this.record = record
+			const known = new Set(record.keys.map((key) => key.keyId))
 			for (const entry of cached.keys) {
-				this.dataKeys.set(entry.keyVersion, { keyId: entry.keyId, key: entry.key })
+				if (known.has(entry.keyId)) this.dataKeys.set(entry.keyId, entry.key)
 			}
-			if (this.dataKeys.has(cached.record.currentVersion)) {
+			const current = record.keys.find((key) => key.keyVersion === record.currentVersion)
+			if (cached.master && current && this.dataKeys.has(current.keyId)) {
+				this.master = cached.master
+				this.kek = cached.kek
+				this.kekSalt = cached.kek ? record.kdf.salt : null
 				this.rebuildEncryptor()
 				this.setStatus(this.makeStatus('unlocked'))
 				return this.status
@@ -603,15 +793,35 @@ export class EncryptionKeyring {
 		return this.status
 	}
 
-	/** No record on the server: restore the one this device knows, or create the first. */
-	private async createOrRestoreLocked(channel: KeyServiceChannel): Promise<'ready' | 'locked'> {
+	/**
+	 * No record on the server. A device that holds a ring re-uploads it unchanged (same
+	 * revision and MAC, so every device's pin still accepts it). A device without one
+	 * creates the first ring, unless the server reports encrypted history: then the
+	 * record was lost, and it waits for a device that holds the ring.
+	 */
+	private async createOrRestoreLocked(
+		channel: KeyServiceChannel,
+		knownKeyIds: string[],
+	): Promise<'ready' | 'locked'> {
 		if (this.record !== null) {
-			// The server lost the record (a restore without key records). Re-upload the copy
-			// this device holds: the wraps are what they were, and no history is lost.
-			const restored: WrappedKeyRecord = { ...this.record, revision: 1 }
+			const restored = this.record
 			const reply = await channel.put(this.name, restored, 0)
-			return this.adoptLocked(reply.status === 'ok' ? restored : reply.record, null)
+			return this.adoptLocked(reply.status === 'ok' ? restored : reply.record, null, channel)
 		}
+		const history = knownKeyIds.filter((keyId) => isKeyId(keyId))
+		if (history.length > 0 && !this.allowNewRing) {
+			this.holdFor(
+				'locked',
+				'KEY_RECORD_MISSING',
+				`The sync server has no key record for keyring "${this.name}", but it stores operations encrypted with it: the record was lost (for example a server restored without its key table). Waiting for a device that holds the keyring to reconnect and re-upload it. If no such device exists, startNewKeyring() starts a new keyring; the old history then stays unreadable.`,
+			)
+			return 'locked'
+		}
+		return this.createRingLocked(channel)
+	}
+
+	/** Create a brand-new ring (the user's first device). */
+	private async createRingLocked(channel: KeyServiceChannel): Promise<'ready' | 'locked'> {
 		const passphrase = await this.availablePassphrase()
 		if (passphrase === null) {
 			this.lockWith(
@@ -621,163 +831,533 @@ export class EncryptionKeyring {
 			)
 			return 'locked'
 		}
+		const ringId = newRingId()
 		const salt = randomBytes(KEK_SALT_BYTES)
 		const kek = await deriveKeyEncryptionKey(passphrase, salt, this.kdfIterations)
+		const raw = generateMasterKey()
+		let master: MasterKeys
+		let masterWrap: WrappedKeyRecord['master']
+		try {
+			master = await importMasterKey(raw)
+			masterWrap = await wrapMasterKey(raw, kek, this.name, ringId)
+		} finally {
+			raw.fill(0)
+		}
 		const dataKey = await generateDataKey()
 		const keyId = newKeyId()
-		const record: WrappedKeyRecord = {
-			format: KEY_RECORD_FORMAT,
-			keyring: this.name,
-			revision: 1,
-			currentVersion: 1,
-			kdf: {
-				name: 'PBKDF2',
-				hash: 'SHA-256',
-				iterations: this.kdfIterations,
-				salt: toBase64(salt),
+		const record = await sealRecord(
+			{
+				format: KEY_RECORD_FORMAT,
+				keyring: this.name,
+				ringId,
+				revision: 1,
+				currentVersion: 1,
+				kdf: {
+					name: 'PBKDF2',
+					hash: 'SHA-256',
+					iterations: this.kdfIterations,
+					salt: toBase64(salt),
+				},
+				master: masterWrap,
+				keys: [await wrapDataKey(dataKey, master.wrapKey, this.name, 1, keyId)],
 			},
-			keys: [await wrapDataKey(dataKey, kek, this.name, 1, keyId)],
-		}
+			master.macKey,
+		)
 		const reply = await channel.put(this.name, record, 0)
 		if (reply.status === 'ok') {
 			// Only the confirmed record is used: a key that lost the creation race would
 			// fork the user's data into a key no other device has.
+			this.allowNewRing = false
+			this.master = master
 			this.kek = kek
 			this.kekSalt = record.kdf.salt
-			this.dataKeys.set(1, { keyId, key: await toNonExtractable(dataKey) })
+			this.dataKeys.set(keyId, await toNonExtractable(dataKey))
 			this.pendingPassphrase = null
 			await this.commitLocked(record)
 			return 'ready'
 		}
+		if (reply.record === null) {
+			throw new EncryptionKeyError('The key service refused the first record without a reason.', {
+				code: 'KEY_RECORD_CONFLICT',
+			})
+		}
 		// Another device created the record first: open that one.
-		return this.adoptLocked(reply.record, passphrase)
+		return this.adoptLocked(reply.record, passphrase, channel)
 	}
 
-	/** Accept a server record and open every version this device lacks. */
+	/**
+	 * Accept a server record, after authenticating it.
+	 *
+	 * - Lower revision of the pinned ring: refused (rollback); re-upload the pin.
+	 * - Authenticated by the held master key, or by the passphrase (explicit, else the
+	 *   configured one): forward when it keeps every key this device holds, else merge.
+	 * - Not authenticated: nothing is adopted. A device that holds every key of a newer
+	 *   revision of its ring keeps working (the passphrase changed elsewhere); otherwise
+	 *   it needs the passphrase.
+	 */
 	private async adoptLocked(
 		incoming: WrappedKeyRecord | null,
 		passphrase: string | null,
+		channel: KeyServiceChannel | null,
+		depth = 0,
 	): Promise<'ready' | 'locked'> {
 		if (incoming === null) {
-			this.lockWith('error', 'KEY_RECORD_INVALID', 'The key service returned no record.')
-			return 'locked'
+			return this.refuseRecord('KEY_RECORD_INVALID', 'The key service returned no record.')
 		}
 		const validation = validateKeyRecord(incoming, this.name)
 		if (!validation.ok) {
-			this.lockWith(
-				'error',
+			return this.refuseRecord(
 				'KEY_RECORD_INVALID',
 				`The server's key record is malformed (${validation.reason}).`,
 			)
-			return 'locked'
 		}
 		if (incoming.kdf.iterations < this.kdfIterations) {
 			// A server must not be able to make devices derive a weaker KEK.
-			this.lockWith(
-				'error',
+			return this.refuseRecord(
 				'KEY_RECORD_INVALID',
 				`The server's key record uses ${incoming.kdf.iterations} PBKDF2 iterations, below this app's minimum of ${this.kdfIterations}.`,
 			)
-			return 'locked'
 		}
-		if (this.record !== null) {
-			// Rollback pin: a record must keep every version this device has accepted.
-			const ids = new Map(incoming.keys.map((key) => [key.keyVersion, key.keyId]))
-			for (const key of this.record.keys) {
-				if (ids.get(key.keyVersion) !== key.keyId) {
-					this.lockWith(
-						'error',
-						'KEY_RECORD_ROLLBACK',
-						`The server's key record lacks key version ${key.keyVersion} (${key.keyId}), which this device accepted earlier. It was rolled back or replaced; sync is stopped so nothing is encrypted under a key other devices do not have.`,
-					)
-					return 'locked'
+		const pinned = this.record
+		const explicit = passphrase !== null
+		if (pinned !== null && incoming.ringId === pinned.ringId) {
+			if (incoming.revision < pinned.revision) {
+				return this.rollbackLocked(incoming, passphrase, channel, depth)
+			}
+			if (
+				!explicit &&
+				incoming.revision === pinned.revision &&
+				canonicalJson(incoming) === canonicalJson(pinned) &&
+				this.master !== null &&
+				this.encryptor !== null
+			) {
+				if (this.status.state !== 'unlocked' || this.status.code !== undefined) {
+					this.retryable = false
+					this.setStatus(this.makeStatus('unlocked'))
 				}
+				return 'ready'
 			}
 		}
-		if (this.kekSalt !== null && this.kekSalt !== incoming.kdf.salt) {
-			// The passphrase changed on another device: the cached KEK no longer opens wraps.
-			this.kek = null
-			this.kekSalt = null
+
+		let opened = await this.authenticateHeld(incoming)
+		let sourceFailed = false
+		if (opened === null || explicit) {
+			const source = passphrase ?? (await this.sourcePassphraseFor(incoming))
+			if (source !== null) {
+				try {
+					opened = await this.openWithPassphrase(incoming, source)
+				} catch (error) {
+					if (!(error instanceof EncryptionKeyError)) throw error
+					if (error.keyCode === 'KEY_RECORD_INVALID') {
+						return this.refuseRecord('KEY_RECORD_INVALID', error.message)
+					}
+					if (explicit) {
+						this.noteFailedUnlock()
+						// A mistyped unlock() on an unlocked device changes nothing.
+						if (this.encryptor !== null) throw error
+						this.lockWith('error', 'WRONG_PASSPHRASE', error.message)
+						return 'locked'
+					}
+					this.failedSource = { salt: incoming.kdf.salt, passphrase: source }
+					sourceFailed = true
+				}
+			} else if (this.failedSource?.salt === incoming.kdf.salt) {
+				sourceFailed = true
+			}
 		}
-		const missing = incoming.keys.filter((key) => !this.dataKeys.has(key.keyVersion))
-		const explicit = passphrase !== null
-		let kek = this.kek
-		if (explicit || (missing.length > 0 && kek === null)) {
-			const source = passphrase ?? (await this.availablePassphrase())
-			if (source === null) {
-				this.lockWith(
-					'locked',
-					this.record === null ? 'NO_PASSPHRASE' : 'PASSPHRASE_REQUIRED',
-					'Enter the encryption passphrase to open the key record.',
+		if (opened === null) return this.unverifiableLocked(incoming, sourceFailed)
+		return this.acceptLocked(incoming, opened, passphrase, channel, depth)
+	}
+
+	/** An authenticated record: move forward to it, or merge it with the held ring. */
+	private async acceptLocked(
+		incoming: WrappedKeyRecord,
+		opened: OpenedRing,
+		passphrase: string | null,
+		channel: KeyServiceChannel | null,
+		depth: number,
+	): Promise<'ready' | 'locked'> {
+		const incomingIds = new Set(incoming.keys.map((key) => key.keyId))
+		const uncovered = [...this.dataKeys.keys()].some((keyId) => !incomingIds.has(keyId))
+		if (uncovered) {
+			// Another ring (the server lost the record and a device created a new one), or a
+			// diverged revision: it lacks keys this device holds. Merge, never drop them.
+			if (channel === null) {
+				this.holdFor(
+					'error',
+					'KEY_RING_FORK',
+					'The server holds a key ring that lacks keys this device holds. Both rings are merged at the next sync session.',
 				)
 				return 'locked'
 			}
-			try {
-				kek = await this.kekFor(incoming, source)
-			} catch (error) {
-				if (error instanceof EncryptionKeyError && error.keyCode === 'WRONG_PASSPHRASE') {
-					this.noteFailedUnlock()
-					// A mistyped unlock() on an unlocked device changes nothing.
-					if (explicit && this.encryptor !== null) throw error
-					this.lockWith('error', 'WRONG_PASSPHRASE', error.message)
-					return 'locked'
-				}
-				throw error
-			}
+			return this.mergeLocked(incoming, opened, passphrase, channel, depth)
 		}
-		if (missing.length > 0) {
-			if (kek === null) {
-				this.lockWith('locked', 'PASSPHRASE_REQUIRED', 'Enter the encryption passphrase.')
-				return 'locked'
-			}
-			const opened = new Map<number, { keyId: string; key: CryptoKey }>()
-			try {
-				for (const entry of missing) {
-					opened.set(entry.keyVersion, {
-						keyId: entry.keyId,
-						key: await unwrapDataKey(entry, kek, this.name),
-					})
-				}
-			} catch (error) {
-				if (error instanceof KeyUnwrapError) {
-					this.noteFailedUnlock()
-					this.lockWith('error', 'WRONG_PASSPHRASE', error.message)
-					return 'locked'
-				}
-				throw error
-			}
-			for (const [version, key] of opened) this.dataKeys.set(version, key)
+		let keys: Map<string, CryptoKey>
+		try {
+			keys = await this.openDataKeys(incoming, opened.master)
+		} catch (error) {
+			return this.refuseRecord(
+				'KEY_RECORD_INVALID',
+				`An authenticated key record holds a data-key wrap its master key does not open (${errorMessage(error)}).`,
+			)
 		}
-		if (kek !== null) {
-			this.kek = kek
+		for (const [keyId, key] of keys) this.dataKeys.set(keyId, key)
+		this.master = opened.master
+		if (opened.kek !== null) {
+			this.kek = opened.kek
 			this.kekSalt = incoming.kdf.salt
+		} else if (this.kekSalt !== incoming.kdf.salt) {
+			this.kek = null
+			this.kekSalt = null
 		}
-		this.failedUnlocks = 0
-		this.nextUnlockAt = 0
+		if (passphrase !== null) {
+			this.failedUnlocks = 0
+			this.nextUnlockAt = 0
+		}
 		this.pendingPassphrase = null
 		await this.commitLocked(incoming)
 		return 'ready'
 	}
 
-	private async adoptConflictLocked(reply: KeyServiceReply, attempt: number): Promise<void> {
+	/** A lower revision of the pinned ring: refuse it, keep the keys, re-upload the pin. */
+	private async rollbackLocked(
+		incoming: WrappedKeyRecord,
+		passphrase: string | null,
+		channel: KeyServiceChannel | null,
+		depth: number,
+	): Promise<'ready' | 'locked'> {
+		const pinned = this.record as WrappedKeyRecord
+		this.holdFor(
+			'error',
+			'KEY_RECORD_ROLLBACK',
+			`The server served revision ${incoming.revision} of the key record, older than revision ${pinned.revision} this device accepted (a rollback, or a server restored from an old backup). It is refused; this device keeps its keys${channel ? ' and re-uploads its newer record' : ' and re-uploads its newer record at the next sync session'}.`,
+		)
+		if (channel === null || depth >= MAX_WRITE_ATTEMPTS) return 'locked'
+		const pinnedVersions = new Map(pinned.keys.map((key) => [key.keyVersion, key.keyId]))
+		const subset = incoming.keys.every((key) => pinnedVersions.get(key.keyVersion) === key.keyId)
+		if (subset) {
+			// The pin keeps everything the older revision has: put it back as it is.
+			const reply = await channel.put(this.name, pinned, incoming.revision)
+			return this.adoptLocked(
+				reply.status === 'ok' ? pinned : reply.record,
+				passphrase,
+				channel,
+				depth + 1,
+			)
+		}
+		// The older revision has keys this device lacks (the ring diverged after a
+		// restore): merge both into a revision above either, once it is authenticated.
+		let opened = await this.authenticateHeld(incoming)
+		if (opened === null) {
+			const source = passphrase ?? (await this.sourcePassphraseFor(incoming))
+			if (source !== null) {
+				opened = await this.openWithPassphrase(incoming, source).catch(() => null)
+			}
+		}
+		if (opened === null) return 'locked'
+		return this.mergeLocked(incoming, opened, passphrase, channel, depth)
+	}
+
+	/** A record this device cannot authenticate: adopt nothing. */
+	private unverifiableLocked(
+		incoming: WrappedKeyRecord,
+		sourceFailed: boolean,
+	): 'ready' | 'locked' {
+		const pinned = this.record
+		if (
+			pinned !== null &&
+			this.encryptor !== null &&
+			incoming.ringId === pinned.ringId &&
+			incoming.revision === pinned.revision
+		) {
+			// Another body under the revision this device accepted, and it does not
+			// authenticate: tampered. The held keys are unaffected.
+			return this.refuseRecord(
+				'KEY_RECORD_INVALID',
+				`The server's key record differs from revision ${pinned.revision} this device accepted and does not authenticate. It is refused.`,
+			)
+		}
+		if (
+			pinned !== null &&
+			this.encryptor !== null &&
+			incoming.ringId === pinned.ringId &&
+			incoming.revision > pinned.revision &&
+			incoming.keys.every((key) => this.dataKeys.has(key.keyId))
+		) {
+			// The passphrase changed on another device (new master key), or the server forged
+			// a record: either way nothing in it is used. The held keys are the ring's keys.
+			this.retryable = false
+			this.setStatus(
+				this.makeStatus(
+					'unlocked',
+					'PASSPHRASE_REQUIRED',
+					'The key record changed on another device (passphrase change). This device keeps using the keys it holds; enter the current passphrase to rotate keys, change the passphrase or set up recovery here.',
+				),
+			)
+			return 'ready'
+		}
+		if (sourceFailed) {
+			this.lockWith(
+				'error',
+				'WRONG_PASSPHRASE',
+				`The configured passphrase does not open keyring "${this.name}". Check the passphrase.`,
+			)
+			return 'locked'
+		}
+		if (pinned !== null && incoming.ringId !== pinned.ringId) {
+			this.lockWith(
+				'locked',
+				'KEY_RING_FORK',
+				'The server holds another key ring for this keyring (it lost the record and another device created a new one). Enter the passphrase: both rings are merged and every operation stays readable.',
+			)
+			return 'locked'
+		}
+		this.lockWith(
+			'locked',
+			pinned === null ? 'NO_PASSPHRASE' : 'PASSPHRASE_REQUIRED',
+			'Enter the encryption passphrase to open the key record.',
+		)
+		return 'locked'
+	}
+
+	/**
+	 * Merge the held ring into `base` (the server's current record, which survives: the
+	 * server only accepts append-only successors of what it stores). Keys this device
+	 * holds that `base` lacks are appended as new versions; operations keep naming them
+	 * by key id. The result has a higher revision than both and is written with
+	 * compare-and-set; a lost race adopts (or merges) the winner.
+	 */
+	private async mergeLocked(
+		base: WrappedKeyRecord,
+		opened: OpenedRing,
+		passphrase: string | null,
+		channel: KeyServiceChannel,
+		depth: number,
+	): Promise<'ready' | 'locked'> {
+		if (depth >= MAX_WRITE_ATTEMPTS) throw conflictError()
+		const absorbed = await this.absorbHeldKeys(base, opened.master)
+		const keys = await this.openDataKeys(base, opened.master)
+		const merged = await sealRecord(
+			{
+				...base,
+				revision: this.nextRevision(base),
+				keys: [...base.keys, ...absorbed],
+				currentVersion: base.currentVersion + absorbed.length,
+			},
+			opened.master.macKey,
+		)
+		const reply = await channel.put(this.name, merged, base.revision)
+		if (reply.status !== 'ok') return this.adoptLocked(reply.record, passphrase, channel, depth + 1)
+		for (const [keyId, key] of keys) this.dataKeys.set(keyId, key)
+		this.master = opened.master
+		if (opened.kek !== null) {
+			this.kek = opened.kek
+			this.kekSalt = merged.kdf.salt
+		} else if (this.kekSalt !== merged.kdf.salt) {
+			this.kek = null
+			this.kekSalt = null
+		}
+		this.pendingPassphrase = null
+		await this.commitLocked(merged)
+		return 'ready'
+	}
+
+	/**
+	 * Re-wrap the held data keys `base` lacks under `target` (appended after base's
+	 * highest version). They are extracted from the pinned record with the held master.
+	 */
+	private async absorbHeldKeys(
+		base: WrappedKeyRecord,
+		target: MasterKeys,
+	): Promise<WrappedDataKey[]> {
+		const baseIds = new Set(base.keys.map((key) => key.keyId))
+		const pinned = this.record
+		const missing = (pinned?.keys ?? []).filter(
+			(key) => this.dataKeys.has(key.keyId) && !baseIds.has(key.keyId),
+		)
+		if (missing.length === 0) return []
+		const held = this.master
+		if (pinned === null || held === null) {
+			throw new EncryptionKeyError(
+				'This device holds keys of another ring but not its master key; unlock it with the passphrase first.',
+				{ code: 'KEY_RING_FORK' },
+			)
+		}
+		const out: WrappedDataKey[] = []
+		let version = base.currentVersion
+		for (const entry of [...missing].sort((a, b) => a.keyVersion - b.keyVersion)) {
+			const dataKey = await unwrapDataKey(entry, held.wrapKey, this.name, true)
+			version++
+			out.push(await wrapDataKey(dataKey, target.wrapKey, this.name, version, entry.keyId))
+		}
+		return out
+	}
+
+	/** Open every data key of `record` this device does not hold yet. */
+	private async openDataKeys(
+		record: WrappedKeyRecord,
+		master: MasterKeys,
+	): Promise<Map<string, CryptoKey>> {
+		const opened = new Map<string, CryptoKey>()
+		for (const entry of record.keys) {
+			if (this.dataKeys.has(entry.keyId)) continue
+			opened.set(entry.keyId, await unwrapDataKey(entry, master.wrapKey, this.name))
+		}
+		return opened
+	}
+
+	/**
+	 * The anchor a new recovery key carries: the fingerprint of the ring's lowest key
+	 * version. Data keys are never removed or re-keyed (a passphrase change, recovery or
+	 * merge re-wraps them under the same key id), so the anchor stays valid for the ring.
+	 */
+	private async ringAnchor(record: WrappedKeyRecord, master: MasterKeys): Promise<Uint8Array> {
+		const first = [...record.keys].sort((a, b) => a.keyVersion - b.keyVersion)[0]
+		if (first === undefined) {
+			throw new EncryptionKeyError('The key record holds no data key.', {
+				code: 'KEY_RECORD_INVALID',
+			})
+		}
+		const dataKey = await unwrapDataKey(first, master.wrapKey, this.name, true)
+		return dataKeyAnchor(dataKey, this.name, first.keyId)
+	}
+
+	/** Whether `record` holds the data key a recovery key's anchor fingerprints. */
+	private async holdsAnchor(
+		record: WrappedKeyRecord,
+		master: MasterKeys,
+		anchor: Uint8Array,
+	): Promise<boolean> {
+		for (const entry of record.keys) {
+			let dataKey: CryptoKey
+			try {
+				dataKey = await unwrapDataKey(entry, master.wrapKey, this.name, true)
+			} catch {
+				continue
+			}
+			if (bytesEqual(await dataKeyAnchor(dataKey, this.name, entry.keyId), anchor)) return true
+		}
+		return false
+	}
+
+	/** The next revision after `base`, above the pinned one when it is the same ring. */
+	private nextRevision(base: WrappedKeyRecord): number {
+		const pinned = this.record
+		const floor = pinned !== null && pinned.ringId === base.ringId ? pinned.revision : 0
+		return Math.max(base.revision, floor) + 1
+	}
+
+	/** Authenticate a record with the held master key (no passphrase needed). */
+	private async authenticateHeld(record: WrappedKeyRecord): Promise<OpenedRing | null> {
+		if (this.master === null) return null
+		if (!(await verifyRecordMac(record, this.master.macKey))) return null
+		return {
+			master: this.master,
+			kek: this.kek !== null && this.kekSalt === record.kdf.salt ? this.kek : null,
+		}
+	}
+
+	/**
+	 * Open and authenticate a record with a passphrase.
+	 *
+	 * @throws {EncryptionKeyError} WRONG_PASSPHRASE, or KEY_RECORD_INVALID when the master
+	 *   key opens but the record does not authenticate under it (tampered)
+	 */
+	private async openWithPassphrase(
+		record: WrappedKeyRecord,
+		passphrase: string,
+	): Promise<OpenedRing> {
+		const kek = await deriveKeyEncryptionKey(
+			passphrase,
+			fromBase64(record.kdf.salt),
+			record.kdf.iterations,
+		)
+		let raw: Uint8Array
+		try {
+			raw = await unwrapMasterKey(record.master, kek, this.name, record.ringId)
+		} catch (error) {
+			throw new EncryptionKeyError(errorMessage(error), { code: 'WRONG_PASSPHRASE' })
+		}
+		let master: MasterKeys
+		try {
+			master = await importMasterKey(raw)
+		} finally {
+			raw.fill(0)
+		}
+		if (!(await verifyRecordMac(record, master.macKey))) {
+			throw new EncryptionKeyError(
+				"The server's key record does not authenticate under its master key: it was modified by someone without the keys (wraps swapped, a recovery key or version injected). It is refused.",
+				{ code: 'KEY_RECORD_INVALID' },
+			)
+		}
+		return { master, kek }
+	}
+
+	/** The configured or pending passphrase, unless it already failed for this salt. */
+	private async sourcePassphraseFor(record: WrappedKeyRecord): Promise<string | null> {
+		const source = await this.availablePassphrase()
+		if (source === null) return null
+		const failed = this.failedSource
+		if (failed !== null && failed.salt === record.kdf.salt && failed.passphrase === source) {
+			return null
+		}
+		return source
+	}
+
+	private async followConflictLocked(
+		reply: KeyServiceReply,
+		attempt: number,
+		passphrase: string | null,
+		channel: KeyServiceChannel,
+	): Promise<void> {
 		if (attempt + 1 >= MAX_WRITE_ATTEMPTS) throw conflictError()
-		const outcome = await this.adoptLocked(reply.record, null)
+		const current = reply.record
+		if (current === null) {
+			throw new EncryptionKeyError(
+				'The sync server lost the key record during the write. Reconnect: a device holding it re-uploads it.',
+				{ code: 'KEY_RECORD_MISSING' },
+			)
+		}
+		const outcome = await this.adoptLocked(current, passphrase, channel)
 		if (outcome !== 'ready') throw this.statusError()
+		const pinned = this.record
+		if (
+			pinned === null ||
+			(pinned.ringId === current.ringId && pinned.revision < current.revision)
+		) {
+			// Nothing in the newer record could be authenticated: never write over it with
+			// keys of an older master key.
+			throw new EncryptionKeyError(
+				'The key record changed on another device (its passphrase changed) and this device cannot authenticate the new one. Unlock with the current passphrase, then try again.',
+				{ code: 'PASSPHRASE_REQUIRED' },
+			)
+		}
 	}
 
 	private async commitLocked(record: WrappedKeyRecord): Promise<void> {
+		const known = new Set(record.keys.map((key) => key.keyId))
+		for (const keyId of this.dataKeys.keys()) {
+			if (!known.has(keyId)) {
+				// Every path that adopts a record first absorbs the held keys it lacks.
+				throw new EncryptionKeyError(
+					`Internal error: key ${keyId} would be dropped by revision ${record.revision}.`,
+					{ code: 'KEY_RECORD_INVARIANT' },
+				)
+			}
+		}
 		this.record = record
+		this.retryable = false
 		this.rebuildEncryptor()
 		this.setStatus(this.makeStatus('unlocked'))
 		try {
 			await this.cache.save(this.cacheId(), {
 				record,
 				kek: this.kek,
-				keys: [...this.dataKeys].map(([keyVersion, entry]) => ({
-					keyVersion,
-					keyId: entry.keyId,
-					key: entry.key,
-				})),
+				master: this.master,
+				keys: record.keys.flatMap((entry) => {
+					const key = this.dataKeys.get(entry.keyId)
+					return key ? [{ keyVersion: entry.keyVersion, keyId: entry.keyId, key }] : []
+				}),
 			})
 		} catch {
 			// The cache is a convenience: the keyring works for this session without it.
@@ -785,35 +1365,17 @@ export class EncryptionKeyring {
 	}
 
 	private rebuildEncryptor(): void {
-		const versions: VersionedKey[] = [...this.dataKeys].map(([version, entry]) => ({
-			version,
-			key: entry.key,
-			keyId: entry.keyId,
-		}))
-		if (versions.length === 0 || this.record === null) {
+		const record = this.record
+		const versions: VersionedKey[] = []
+		for (const entry of record?.keys ?? []) {
+			const key = this.dataKeys.get(entry.keyId)
+			if (key) versions.push({ version: entry.keyVersion, key, keyId: entry.keyId })
+		}
+		if (versions.length === 0 || record === null || this.master === null) {
 			this.encryptor = null
 			return
 		}
 		this.encryptor = SyncEncryptor.fromKeys(versions, this.encryptorOptions)
-	}
-
-	private async kekFor(record: WrappedKeyRecord, passphrase: string): Promise<CryptoKey> {
-		const kek = await deriveKeyEncryptionKey(
-			passphrase,
-			fromBase64(record.kdf.salt),
-			record.kdf.iterations,
-		)
-		const current = record.keys.find((key) => key.keyVersion === record.currentVersion)
-		if (current) {
-			try {
-				await unwrapDataKey(current, kek, this.name)
-			} catch (error) {
-				throw new EncryptionKeyError(error instanceof Error ? error.message : 'Wrong passphrase.', {
-					code: 'WRONG_PASSPHRASE',
-				})
-			}
-		}
-		return kek
 	}
 
 	private async availablePassphrase(): Promise<string | null> {
@@ -826,10 +1388,20 @@ export class EncryptionKeyring {
 		return value.length > 0 ? value : null
 	}
 
-	private requireKek(action: string): CryptoKey {
-		if (this.kek === null || this.encryptor === null) {
+	private requireMaster(action: string): MasterKeys {
+		if (this.master === null || this.encryptor === null) {
+			throw new EncryptionKeyError(`Unlock the keyring with the passphrase to ${action}.`, {
+				code: 'PASSPHRASE_REQUIRED',
+			})
+		}
+		return this.master
+	}
+
+	/** The KEK of `record`'s own salt (never one derived for another record's salt). */
+	private requireKek(record: WrappedKeyRecord, action: string): CryptoKey {
+		if (this.kek === null || this.kekSalt !== record.kdf.salt || this.encryptor === null) {
 			throw new EncryptionKeyError(
-				`Unlock the keyring with the passphrase to ${action}: this device holds the data keys but not the passphrase key (it changed on another device, or the keyring is locked).`,
+				`Unlock the keyring with the passphrase to ${action}: this device holds the data keys but not the key of the current passphrase (it changed on another device, or the keyring is locked).`,
 				{ code: 'PASSPHRASE_REQUIRED' },
 			)
 		}
@@ -856,26 +1428,39 @@ export class EncryptionKeyring {
 
 	private dropKeys(): void {
 		this.dataKeys.clear()
+		this.master = null
 		this.kek = null
 		this.kekSalt = null
 		this.encryptor = null
 	}
 
+	/** A record refused for what the server sent: the held keys stay, nothing is adopted. */
+	private refuseRecord(code: EncryptionStatusCode, message: string): 'locked' {
+		this.holdFor('error', code, message)
+		return 'locked'
+	}
+
+	/** A server-side condition: keys kept, a later session (or a push) can clear it. */
+	private holdFor(state: 'locked' | 'error', code: EncryptionStatusCode, message: string): void {
+		this.retryable = true
+		this.setStatus(this.makeStatus(state, code, message))
+	}
+
 	private lockWith(state: 'locked' | 'error', code: EncryptionStatusCode, message: string): void {
+		this.retryable = false
 		this.dropKeysIfUnusable(code)
 		this.setStatus(this.makeStatus(state, code, message))
 	}
 
-	/** Errors about the record keep nothing usable; a wrong passphrase keeps held keys. */
+	/** Locks that need the user stop encrypting; records refused keep held keys. */
 	private dropKeysIfUnusable(code: EncryptionStatusCode): void {
 		if (
-			code === 'KEY_RECORD_ROLLBACK' ||
-			code === 'KEY_RECORD_INVALID' ||
 			code === 'LOCKED_BY_APP' ||
 			code === 'KEY_SERVICE_FORBIDDEN' ||
 			code === 'KEY_SERVICE_UNSUPPORTED' ||
 			code === 'PASSPHRASE_REQUIRED' ||
-			code === 'WRONG_PASSPHRASE'
+			code === 'WRONG_PASSPHRASE' ||
+			code === 'KEY_RING_FORK'
 		) {
 			this.encryptor = null
 		}
@@ -898,12 +1483,17 @@ export class EncryptionKeyring {
 	): EncryptionStatus {
 		const unlocked = state === 'unlocked' && this.encryptor !== null
 		const keyVersion = unlocked ? (this.encryptor?.getCurrentKeyVersion() ?? null) : null
+		const record = this.record
+		const held = (record?.keys ?? []).filter((key) => this.dataKeys.has(key.keyId))
 		return {
 			state,
 			keyring: this.name,
 			keyVersion,
-			keyId: keyVersion !== null ? (this.dataKeys.get(keyVersion)?.keyId ?? null) : null,
-			availableVersions: unlocked ? [...this.dataKeys.keys()].sort((a, b) => a - b) : [],
+			keyId:
+				keyVersion !== null
+					? (held.find((key) => key.keyVersion === keyVersion)?.keyId ?? null)
+					: null,
+			availableVersions: unlocked ? held.map((key) => key.keyVersion).sort((a, b) => a - b) : [],
 			cache: this.cache.kind,
 			...(code ? { code } : {}),
 			...(message ? { message } : {}),
@@ -917,6 +1507,7 @@ export class EncryptionKeyring {
 			previous?.state === status.state &&
 			previous.code === status.code &&
 			previous.keyVersion === status.keyVersion &&
+			previous.keyId === status.keyId &&
 			previous.availableVersions?.length === status.availableVersions.length
 		) {
 			return

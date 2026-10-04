@@ -385,6 +385,15 @@ export interface ServerSchemaOptions {
 	operationTransforms?: readonly OperationTransform[]
 }
 
+/** One stored end-to-end key record (opaque JSON) and its owner, as backups carry it. */
+export interface EncryptionKeyRecordRow {
+	owner: string
+	keyring: string
+	revision: number
+	/** The record's JSON, exactly as stored. */
+	record: string
+}
+
 /**
  * Server-side store interface. Extends SyncStore with lifecycle,
  * introspection, and materialization methods needed by the sync server.
@@ -530,6 +539,24 @@ export interface ServerStore extends SyncStore {
 		revision: number,
 		expectedRevision: number,
 	): Promise<boolean>
+	/**
+	 * Stored key records: every one (for `exportBackup`; RT-104: a server restored from
+	 * its backup must still hold the records its encrypted history needs), or one owner's
+	 * (the key service tells another keyring's history from a lost record with it).
+	 * Optional.
+	 */
+	listEncryptionKeyRecords?(owner?: string): Promise<EncryptionKeyRecordRow[]>
+	/**
+	 * Key ids named by stored encrypted operations (their envelope's `keyId`), a sample
+	 * of at most `limit` distinct ids (RT-104). `nodeOwner` restricts it to operations of
+	 * nodes claimed by that principal (see {@link claimNode}); null means every node (a
+	 * server without authentication, whose clients share one keyring). The key service
+	 * reports them when an owner has no key record, so a new device can tell a lost
+	 * record (encrypted history exists) from a first one. Optional; without it a new
+	 * device cannot tell, and a fork it creates is merged later by a device holding the
+	 * old ring.
+	 */
+	getEncryptedKeyIds?(nodeOwner: string | null, limit: number): Promise<string[]>
 	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server

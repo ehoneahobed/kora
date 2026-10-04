@@ -24,6 +24,18 @@ export function userKeyOwner(userId: string): string {
 	return `u:${userId}`
 }
 
+/** Maximum key ids reported with a missing record (RT-104). */
+const KNOWN_KEY_IDS_LIMIT = 16
+
+/**
+ * The node-claim owner whose operations belong to a key owner: the user id of `u:<id>`,
+ * or null (every node) for the shared anonymous owner.
+ */
+function nodeOwnerOf(owner: string): string | null {
+	if (owner === ANONYMOUS_KEY_OWNER) return null
+	return owner.startsWith('u:') ? owner.slice(2) : owner
+}
+
 /** Outcome of one key-service message. */
 export interface KeyServiceOutcome {
 	response: EncryptionKeyResponseMessage
@@ -43,12 +55,17 @@ export interface KeyServiceOutcome {
  * - **Compare-and-set.** A write names the revision it replaces; a concurrent write
  *   loses with `conflict` and the current record, so two devices that both create a
  *   first key converge on one.
- * - **History is append-only.** A write must keep every key version (same key id), so
- *   no device can make old operations unreadable for the others.
+ * - **History is append-only.** A write must raise the revision, keep the ring id and
+ *   every key version (same key id), so no device can make old operations unreadable
+ *   for the others. A first write (or a re-upload after the record was lost) keeps the
+ *   revision it carries, since devices refuse revisions below the one they accepted.
+ * - **Lost records are visible.** A fetch with no record reports key ids of the owner's
+ *   stored encrypted operations, so a new device waits for one holding the ring.
  *
- * It cannot check that wraps open (only the passphrase holder can), so a principal can
- * still overwrite its own record with garbage wraps of the same key ids; devices that
- * cached the keys keep working and refuse records missing versions they hold.
+ * It cannot check the record MAC or that wraps open (only a holder of the ring's master
+ * key can): devices authenticate every record themselves and act on nothing else. A
+ * principal can still overwrite its own record with garbage; devices refuse it and
+ * keep their keys.
  */
 export class EncryptionKeyService {
 	constructor(private readonly store: ServerStore) {}
@@ -108,7 +125,11 @@ export class EncryptionKeyService {
 		}
 		const current = await this.read(owner, message.keyring)
 		if (message.type === 'encryption-key-request') {
-			return reply('ok', current)
+			const outcome = reply('ok', current)
+			if (current === null) {
+				outcome.response.knownKeyIds = await this.knownKeyIds(owner, message.keyring)
+			}
+			return outcome
 		}
 
 		const json = JSON.stringify(message.record)
@@ -142,6 +163,39 @@ export class EncryptionKeyService {
 		}
 		const accepted = JSON.parse(json) as WrappedKeyRecord
 		return { ...reply('ok', accepted), written: accepted }
+	}
+
+	/**
+	 * Key ids of the owner's stored encrypted operations (a sample). Reported only while
+	 * no record exists: then non-empty means the record was lost, and a new device must
+	 * wait for one that holds the ring instead of starting another (RT-104).
+	 */
+	private async knownKeyIds(owner: string, keyring: string): Promise<string[]> {
+		if (typeof this.store.getEncryptedKeyIds !== 'function') return []
+		try {
+			// Operations name their key, not their keyring. Key ids held by the owner's OTHER
+			// keyrings are not this keyring's history: without excluding them, the first
+			// device of a second keyring would wait for a record that never existed.
+			const sampled = await this.store.getEncryptedKeyIds(
+				nodeOwnerOf(owner),
+				KNOWN_KEY_IDS_LIMIT * 4,
+			)
+			if (sampled.length === 0) return []
+			const others = new Set<string>()
+			for (const row of (await this.store.listEncryptionKeyRecords?.(owner)) ?? []) {
+				if (row.owner !== owner || row.keyring === keyring) continue
+				try {
+					const record = JSON.parse(row.record) as WrappedKeyRecord
+					for (const key of record.keys ?? []) others.add(key.keyId)
+				} catch {
+					// An unreadable record names no key.
+				}
+			}
+			return sampled.filter((keyId) => !others.has(keyId)).slice(0, KNOWN_KEY_IDS_LIMIT)
+		} catch {
+			// Advisory only: a device that creates a ring anyway is merged later.
+			return []
+		}
 	}
 
 	private async read(owner: string, keyring: string): Promise<WrappedKeyRecord | null> {

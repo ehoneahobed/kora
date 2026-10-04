@@ -16,7 +16,12 @@ import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-or
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
-import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import {
+	KEY_ID_SAMPLE_ROWS,
+	envelopeColumn,
+	envelopeKeyIds,
+	parseEnvelopeColumn,
+} from './envelope-column'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -92,6 +97,7 @@ import type {
 	ConditionalApplyInput,
 	ConditionalApplyResult,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationResolutionOutcome,
@@ -1410,7 +1416,12 @@ export class PostgresServerStore implements ServerStore {
 		const rows = await this.db.select().from(pgOperations).orderBy(asc(pgOperations.deliverySeq))
 		const operations = rows.map((row) => this.deserializeOperation(row))
 
-		return buildServerBackup(this.nodeId, operations, this.versionVector)
+		return buildServerBackup(
+			this.nodeId,
+			operations,
+			this.versionVector,
+			await this.listEncryptionKeyRecords(),
+		)
 	}
 
 	async importBackup(
@@ -1420,8 +1431,12 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes: the key table is not part of the log, and a held record is kept.
+		await restoreBackupKeyRecords(this, keyRecords)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
@@ -1565,6 +1580,47 @@ export class PostgresServerStore implements ServerStore {
 							RETURNING owner`,
 				)) as unknown as { owner: string }[]
 		return rows.length > 0
+	}
+
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			owner === undefined
+				? sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`
+				: sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+		)) as unknown as Array<{
+			owner: string
+			keyring: string
+			revision: number | string
+			record: string
+		}>
+		// BIGINT columns may come back as strings.
+		return rows.map((row) => ({
+			owner: row.owner,
+			keyring: row.keyring,
+			revision: Number(row.revision),
+			record: row.record,
+		}))
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (nodeOwner === null
+			? await this.db.execute(
+					sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+				)
+			: await this.db.execute(
+					sql`SELECT o.encrypted AS encrypted FROM node_claims c
+							JOIN operations o ON o.node_id = c.node_id
+							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+				)) as unknown as { encrypted: string | null }[]
+		return envelopeKeyIds(
+			rows.map((row) => row.encrypted),
+			limit,
+		)
 	}
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {

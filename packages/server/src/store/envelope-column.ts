@@ -36,3 +36,31 @@ export function parseEnvelopeColumn(
 	}
 	return parsed as EncryptedOperationEnvelope
 }
+
+/**
+ * Distinct envelope key ids of stored `encrypted` column values (RT-104), at most
+ * `limit`. An unreadable value is skipped here: this is a sample for the key service,
+ * and the startup log-integrity scan quarantines such rows.
+ *
+ * @param values - Stored column values
+ * @param limit - Maximum number of key ids
+ */
+export function envelopeKeyIds(
+	values: ReadonlyArray<string | null | undefined>,
+	limit: number,
+): string[] {
+	const ids = new Set<string>()
+	for (const value of values) {
+		if (ids.size >= limit) break
+		try {
+			const envelope = parseEnvelopeColumn(value)
+			if (envelope) ids.add(envelope.keyId)
+		} catch {
+			// Not a readable envelope: not evidence of a key either way.
+		}
+	}
+	return [...ids]
+}
+
+/** Rows sampled per key-id query: every ring that sealed history shows up in its first rows. */
+export const KEY_ID_SAMPLE_ROWS = 512

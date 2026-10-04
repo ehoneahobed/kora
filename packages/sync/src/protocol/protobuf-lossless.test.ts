@@ -36,8 +36,9 @@ const hlc = fc.record({ wallTime: fc.nat(), logical: fc.nat({ max: 1000 }), node
 const envelopeField = fc.record({ iv: fc.base64String(), ct: fc.base64String() })
 const keyRecord: fc.Arbitrary<WrappedKeyRecord> = fc.record(
 	{
-		format: fc.constant(1 as const),
+		format: fc.constant(2 as const),
 		keyring: id,
+		ringId: id,
 		revision: fc.integer({ min: 1, max: 1000 }),
 		currentVersion: fc.integer({ min: 1, max: 10 }),
 		kdf: fc.record({
@@ -46,6 +47,7 @@ const keyRecord: fc.Arbitrary<WrappedKeyRecord> = fc.record(
 			iterations: fc.integer({ min: 1, max: 1_000_000 }),
 			salt: fc.base64String(),
 		}),
+		master: fc.record({ iv: fc.base64String(), wrappedKey: fc.base64String() }),
 		keys: fc.array(
 			fc.record({
 				keyVersion: fc.integer({ min: 1, max: 10 }),
@@ -56,21 +58,27 @@ const keyRecord: fc.Arbitrary<WrappedKeyRecord> = fc.record(
 			{ minLength: 1, maxLength: 3 },
 		),
 		recovery: fc.record({
-			alg: fc.constant('ECDH-P256+AES-GCM' as const),
+			alg: fc.constant('ECDH-P256+HKDF-SHA256+AES-GCM' as const),
 			publicKey: fc.record({ x: id, y: id }),
-			keys: fc.array(
-				fc.record({
-					keyVersion: fc.integer({ min: 1, max: 10 }),
-					keyId: id,
-					ephemeralPublicKey: fc.record({ x: id, y: id }),
-					iv: fc.base64String(),
-					wrappedKey: fc.base64String(),
-				}),
-				{ maxLength: 2 },
-			),
+			ephemeralPublicKey: fc.record({ x: id, y: id }),
+			iv: fc.base64String(),
+			wrappedKey: fc.base64String(),
 		}),
+		mac: fc.base64String(),
 	},
-	{ requiredKeys: ['format', 'keyring', 'revision', 'currentVersion', 'kdf', 'keys'] },
+	{
+		requiredKeys: [
+			'format',
+			'keyring',
+			'ringId',
+			'revision',
+			'currentVersion',
+			'kdf',
+			'master',
+			'keys',
+			'mac',
+		],
+	},
 )
 
 const operation: fc.Arbitrary<SerializedOperation> = fc.record(
@@ -339,12 +347,15 @@ describe('ENC-1 key messages on the protobuf wire', () => {
 			keyring: 'default',
 			expectedRevision: 0,
 			record: {
-				format: 1,
+				format: 2,
 				keyring: 'default',
+				ringId: 'r',
 				revision: 1,
 				currentVersion: 1,
 				kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: 1, salt: 'AAAA' },
+				master: { iv: 'AA', wrappedKey: 'AA' },
 				keys: [{ keyVersion: 1, keyId: 'k', iv: 'AA', wrappedKey: 'AA' }],
+				mac: 'AA',
 			},
 		}
 		const bytes = proto.encode(message)

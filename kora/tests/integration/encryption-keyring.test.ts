@@ -246,17 +246,71 @@ describe('ENC-1: shared key material through createApp', () => {
 	}, 20000)
 })
 
+describe('RT-96 / RT-104: a server that rolls back or loses the key record', () => {
+	type KeyRecords = Map<string, { record: string; revision: number }>
+	const keyRecords = (): KeyRecords =>
+		(serverStore as unknown as { encryptionKeyRecords: KeyRecords }).encryptionKeyRecords
+
+	test('a new device waits for the lost record (not stuck); an old device re-uploads it', async () => {
+		const a1 = device('a1', { key: 'pw' })
+		await connected(a1)
+		const row = await notes(a1).insert({ body: 'history' })
+		await until(() => stored(row.id).length > 0, 'upload')
+		await a1.sync?.disconnect()
+
+		// The server is restored without its key table.
+		keyRecords().clear()
+		const a2 = device('a2', { key: 'pw' })
+		await a2.ready
+		await a2.sync?.connect()
+		await until(() => a2.encryption?.getStatus().code === 'KEY_RECORD_MISSING', 'waiting')
+		// Waiting is a server condition: sync keeps retrying, no unlock() is needed.
+		expect(a2.getSyncEngine()?.isEncryptionLocked()).toBe(false)
+		expect(keyRecords().size).toBe(0)
+
+		await connected(a1)
+		expect(keyRecords().size).toBe(1)
+		await a2.sync?.retryNow()
+		await until(async () => (await notes(a2).findById(row.id))?.body === 'history', 'history on a2')
+		expect(a2.encryption?.getStatus()).toMatchObject({ state: 'unlocked' })
+		expect(a2.encryption?.getStatus().keyId).toBe(a1.encryption?.getStatus().keyId)
+	}, 20000)
+
+	test('a rolled-back record is refused and the device puts its newer revision back', async () => {
+		const a1 = device('a1', { key: 'pw' })
+		await connected(a1)
+		const [entry] = [...keyRecords().entries()]
+		if (!entry) throw new Error('no record')
+		const [key, before] = entry
+		await a1.encryption?.rotateKey()
+		const rotated = keyRecords().get(key)
+		expect(rotated?.revision).toBe(2)
+		await a1.sync?.disconnect()
+
+		keyRecords().set(key, before)
+		const statuses: Array<string | undefined> = []
+		a1.encryption?.onStatusChange((status) => statuses.push(status.code))
+		await connected(a1)
+		expect(statuses).toContain('KEY_RECORD_ROLLBACK')
+		expect(keyRecords().get(key)).toEqual(rotated)
+		expect(a1.encryption?.getStatus()).toMatchObject({ state: 'unlocked', keyVersion: 2 })
+	}, 20000)
+})
+
 describe('ENC-1: key records are per authenticated user', () => {
 	const B64_12 = 'AAAAAAAAAAAAAAAA'
 	const record = (salt: string) => ({
-		format: 1 as const,
+		format: 2 as const,
 		keyring: 'default',
+		ringId: `r-${'0'.repeat(32)}`,
 		revision: 1,
 		currentVersion: 1,
 		kdf: { name: 'PBKDF2' as const, hash: 'SHA-256' as const, iterations: 1000, salt },
+		master: { iv: B64_12, wrappedKey: 'A'.repeat(64) },
 		keys: [
 			{ keyVersion: 1, keyId: `k2-${'a'.repeat(32)}`, iv: B64_12, wrappedKey: 'A'.repeat(64) },
 		],
+		mac: `${'A'.repeat(43)}=`,
 	})
 
 	async function session(token: string) {

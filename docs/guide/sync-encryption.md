@@ -105,23 +105,43 @@ The provider is called when a device has no unlocked keys yet (first start, afte
 
 ## How Keys Work
 
-Every user has a **keyring**: random 256-bit AES-GCM data keys, one per key version. The sync server stores the keyring only in wrapped form. Each data key is wrapped (AES-256-GCM key wrap) by a key-encryption key derived from the user's passphrase:
+Every user has a **keyring**: random 256-bit AES-GCM data keys, one per key version, held together by a random **master key** (the ring's secret). The sync server stores the keyring as one **key record** (format 2), in wrapped form only:
+
+```text
+passphrase --PBKDF2-SHA256(salt)--> key-encryption key (KEK)
+KEK --AES-256-GCM--> master key
+recovery public key --ECDH P-256 + HKDF + AES-GCM--> master key       (optional)
+master key --HKDF "data-key-wrap"--> wrapping key --AES-256-GCM--> data key v1, v2, ...
+master key --HKDF "record-mac"--> MAC key --HMAC-SHA256--> mac over the whole record
+```
 
 | Parameter | Value |
 |-----------|-------|
 | Key derivation | PBKDF2-SHA256, 600,000 iterations (OWASP) |
-| Salt | 32 random bytes per user, stored on the server next to the wrapped keys |
-| Data keys | Random 256-bit AES-GCM keys, one per key version |
-| Key wrap | AES-256-GCM, additional data binds keyring, key version and key id |
+| Salt | 32 random bytes, new with every passphrase, stored in the record |
+| Master key | 32 random bytes per ring; a new one with every passphrase change |
+| Data keys | Random 256-bit AES-GCM keys, one per key version, each with a random key id |
+| Key wraps | AES-256-GCM; additional data binds keyring, ring id, key version and key id |
+| Record MAC | HMAC-SHA256 over every other field of the record (canonical JSON) |
 
-The server stores exactly one record per user and keyring: `{ salt, KDF parameters, wrapped keys, key ids, key versions, revision }`. It never sees the passphrase, the derived key or a data key, and it cannot unwrap anything.
+The record is `{ format, keyring, ringId, revision, currentVersion, kdf, master, keys, recovery?, mac }`. The server never sees the passphrase, the KEK, the master key or a data key, and it cannot unwrap anything.
+
+### What the server can and cannot do to the record
+
+The MAC is keyed from the master key, so **only a holder of the ring** (someone who knows the passphrase or the recovery key, or a device that opened the ring) can write a record that devices accept. A device acts only on records it authenticated: it refuses a record whose MAC does not verify (`KEY_RECORD_INVALID`) and keeps working with the keys it holds. The server therefore cannot add or swap a recovery key, inject, drop or relabel a key version, lower the KDF cost, or serve another body under a revision a device accepted.
+
+What a server (or anyone who controls its database) **can** still do:
+
+- **Withhold or replay records.** Every device pins the ring id and the highest revision it accepted, persisted with its cached keys (a `lock()` keeps the pin). It refuses a lower revision (`KEY_RECORD_ROLLBACK`), keeps its keys, and writes its newer record back at the next sync session. A device that has never seen the newer revision (a fresh install) cannot tell it was rolled back: after a passphrase change, the old passphrase then opens that old revision on a new device. Rotate after a passphrase leak (see below), and treat the server operator as able to replay old records.
+- **Try passphrases offline** against a record it holds (see "Wrong passphrases").
+- **Refuse service or lose the record** (see "Lost key records").
 
 At each sync handshake the device fetches the record **before any operation is exchanged**, and then:
 
-- On the user's first device (no record yet) it generates the first data key, wraps it, and stores the record. If two first devices race, the server's compare-and-set lets one win and the other opens the winner's record, so a user never ends up with two keys.
-- On every other device it derives the key-encryption key from the passphrase, unwraps the data keys and caches them locally.
+- On the user's first device (no record, and no encrypted history on the server) it creates the ring (master key, first data key) and stores the record. If two first devices race, the server's compare-and-set lets one win and the other opens the winner's record, so a user never ends up with two rings.
+- On every other device it derives the KEK from the passphrase, opens the master key, verifies the record's MAC, unwraps the data keys and caches them locally.
 
-Every device of a user therefore holds the same data keys and decrypts everything the others wrote, including history written before it joined.
+Every device of a user therefore holds the same data keys and decrypts everything the others wrote, including history written before it joined. Operations name their data key by key id, so a device decrypts them whatever version number the key has in the record.
 
 ### Where unlocked keys are kept
 
@@ -132,7 +152,7 @@ Every device of a user therefore holds the same data keys and decrypts everythin
 | `'memory'` | Memory | Locked until `key` or `unlock()` |
 | `'none'` | Nothing beyond the running keyring | Locked until `key` or `unlock()` |
 
-Cached data keys and the key-encryption key are stored as **non-extractable** `CryptoKey`s: script running in the page can use them, but cannot read their bytes. Anyone who controls the page (an XSS bug, a malicious extension) can still decrypt while the app runs, as with any web E2E scheme. The cache also keeps the wrapped record, so with a persistent cache `unlock(passphrase)` works offline on a device that has synced once.
+Cached data keys, the master key's derived keys and the KEK are stored as **non-extractable** `CryptoKey`s: script running in the page can use them, but cannot read their bytes. Anyone who controls the page (an XSS bug, a malicious extension) can still decrypt while the app runs, as with any web E2E scheme. The cache also keeps the last authenticated record (the rollback pin), so with a persistent cache `unlock(passphrase)` works offline on a device that has synced once.
 
 ### Lock state
 
@@ -140,10 +160,12 @@ Cached data keys and the key-encryption key are stored as **non-extractable** `C
 
 | `state` | Meaning |
 |---|---|
-| `unlocked` | Keys are available; sync runs. `keyVersion`, `keyId` and `availableVersions` are set. |
+| `unlocked` | Keys are available; sync runs. `keyVersion`, `keyId` and `availableVersions` are set. With `code: 'PASSPHRASE_REQUIRED'` the passphrase changed on another device: this device keeps encrypting with the keys it holds, and needs the current passphrase for key management. |
 | `unlocking` | The record is being fetched or opened. |
-| `locked` | No keys. `code` says why: `NO_PASSPHRASE`, `AWAITING_SERVER` (a passphrase was given; the record arrives with the next handshake), `LOCKED_BY_APP`, `PASSPHRASE_REQUIRED` (another device changed the passphrase and this device needs a key it does not hold yet). |
-| `error` | `WRONG_PASSPHRASE`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED`. Sync stays paused until `unlock()` succeeds. |
+| `locked` | No usable keys. `code` says why: `NO_PASSPHRASE`, `AWAITING_SERVER` (a passphrase was given; the record arrives with the next handshake), `LOCKED_BY_APP`, `PASSPHRASE_REQUIRED` (another device changed the passphrase and this device needs a key it does not hold yet), `KEY_RECORD_MISSING` (the server lost the record; see below), `KEY_RING_FORK` (the server holds another ring; enter the passphrase to merge). |
+| `error` | `WRONG_PASSPHRASE`, `KEY_RECORD_INVALID` (the server's record does not authenticate or is malformed), `KEY_RECORD_ROLLBACK` (an older revision than this device accepted), `KEY_RING_FORK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED`. |
+
+`KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_RECORD_MISSING` and `KEY_RING_FORK` are conditions of the server's record, not of the user: a device that holds keys keeps them, sync reconnects with backoff, and the next session re-uploads, merges or opens the record without user action where it can. The other codes pause sync until `unlock()` succeeds.
 
 <!-- docs-check: continue -->
 ```typescript
@@ -168,28 +190,48 @@ Both need a live sync connection (they write the key record with compare-and-set
 // still decrypts on every device, including devices that join later.
 await app.encryption?.rotateKey()
 
-// Re-wrap every key version under a new passphrase. No operation is re-encrypted.
+// A new master key under a new passphrase; every data key is re-wrapped under it.
+// No operation is re-encrypted.
 await app.encryption?.changePassphrase(newPassphrase, { currentPassphrase })
 ```
 
 - **Rotation.** The server pushes the new record to the user's other connected devices before any operation sealed under the new version reaches them. A device that receives such an operation without the push (another server instance) fetches the record once and replays it. Rotation limits what a leaked data key exposes from now on; it does not re-encrypt old operations.
-- **Passphrase change.** Other devices keep working with the data keys they hold. A device that later needs a key it does not hold (for example after a rotation following the passphrase change) asks for the new passphrase (`PASSPHRASE_REQUIRED`). A device that only knows the old passphrase cannot open the keyring any more (`WRONG_PASSPHRASE`).
-- A record never loses a key version: the server refuses writes that drop or relabel one, and a device refuses a record missing a version it already accepted (`KEY_RECORD_ROLLBACK`).
+- **Passphrase change.** The ring gets a new master key, sealed under the new passphrase: the old passphrase (and the old master key it opened) can neither open nor authenticate any later record. Other devices keep working with the data keys they hold (`unlocked` with `PASSPHRASE_REQUIRED`). A device that later needs a key it does not hold (for example after a rotation following the passphrase change) asks for the new passphrase. **After a suspected leak, change the passphrase and then rotate**: the data keys the old passphrase could open stay what they were, and only a rotation gives new operations a key the leaked passphrase never reached.
+- **Concurrent key management.** Every compare-and-set retry adopts and authenticates the server's current record first and writes under that record's own master key, so a rotation that races a passphrase change on another device never wraps a key under the old passphrase. A device that cannot authenticate the newer record (the passphrase changed elsewhere) stops with `PASSPHRASE_REQUIRED` instead of writing.
+- A record never loses a key version: the server refuses writes that lower the revision, change the ring id, or drop or relabel a version, and a device refuses a record that lacks a key it holds.
 
 ## Lost Passphrase and the Recovery Key
 
 **Without a recovery key, a lost passphrase means the encrypted data cannot be recovered**, by you or by the server operator. Devices that are still unlocked keep working (and can set a new passphrase with `changePassphrase`), but once no device holds the keys, the data on the server is unreadable. This is inherent to end-to-end encryption.
 
-To offer recovery, create a recovery key while the keyring is unlocked and show it to the user once:
+To offer recovery, create a recovery key while the keyring is unlocked with the **current** passphrase and show it to the user once:
 
 <!-- docs-check: continue -->
 ```typescript
-const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk1-..."; store it offline
+const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk2-<key>.<anchor>"; store it offline
 // ...later, on any device, after the passphrase was lost:
 if (recoveryKey) await app.encryption?.recover(recoveryKey, newPassphrase)
 ```
 
-Every key version is also wrapped to the recovery key's public half (ECDH P-256 + AES-GCM), so any unlocked device keeps recovery current across rotations without knowing the recovery key. The recovery key itself is never sent to the server. Calling `enableRecovery()` again replaces it.
+The ring's master key is also wrapped to the recovery key's public half (ephemeral-static ECDH P-256, HKDF-SHA256, AES-256-GCM). Rotation needs no change to it (data keys hang off the master key), and a passphrase change re-wraps the new master key to the same public key, so the recovery key stays valid. The recovery key itself is never sent to the server. Calling `enableRecovery()` again replaces it.
+
+A recovery key also carries a **ring anchor**: a fingerprint of the ring's first data key. The recovery public key is stored on the server, so anyone could wrap a master key of their own to it and offer a whole substitute ring; `recover()` refuses a record that does not hold the anchored data key (`KEY_RECORD_INVALID`), so a recovering device never adopts keys the server chose. Recovery verifies the record's MAC under the recovered master key, keeps the master key (devices holding the ring keep managing it without a prompt), and seals it under the new passphrase.
+
+## Lost Key Records and Forked Keyrings
+
+A server that loses a key record (a database restored without its key table, an operator error) still stores the operations encrypted under it. With no record, the key service reports the key ids of the owner's stored encrypted operations (minus those held by the owner's other keyrings, so the first device of a second keyring is not mistaken for a loss), and:
+
+- **A device that holds the ring** uploads its record again, unchanged (same revision and MAC), so every device's pin accepts it.
+- **A new device** (fresh install, passphrase typed) does not start a new ring while that history exists: it stays `locked` with `KEY_RECORD_MISSING` and keeps the passphrase, until a device holding the ring reconnects and re-uploads it. It then opens the ring as usual.
+- If no device holding the ring will ever return, the user can start over explicitly. History encrypted under the lost ring stays unreadable:
+
+<!-- docs-check: continue -->
+```typescript
+// Only for KEY_RECORD_MISSING: rejects with KEY_RECORD_EXISTS when the server holds a record.
+await app.encryption?.startNewKeyring()
+```
+
+If two rings exist anyway (`startNewKeyring()` was used and an old device returns later, or a server without the history report let a new device create one), the first device that holds keys of both **merges** them: the server's ring survives, the other ring's data keys are re-wrapped into it as new versions (they keep their key ids, so every operation stays readable), and the result is written with compare-and-set. A device that holds keys the server's ring lacks never drops them; without the passphrase it reports `KEY_RING_FORK` until `unlock()`. A recovery key made for the ring that was merged into the other one stops opening it: call `enableRecovery()` again after a merge.
 
 ## Who Can Read a Key Record
 
@@ -200,8 +242,9 @@ Every key version is also wrapped to the recovery key's public half (ECDH P-256 
 ## Server Requirements
 
 - The key service ships in `@korajs/server` 1.0.0-beta.13 and needs protocol v2. Against an older server the keyring reports `KEY_SERVICE_UNSUPPORTED`.
-- The memory, SQLite and Postgres server stores persist key records (table `kora_encryption_keys`). A custom `ServerStore` implements `getEncryptionKeyRecord` and `putEncryptionKeyRecord` (compare-and-set); without them the server answers `unsupported` rather than keeping records in memory, which would give users a new key after every restart.
-- Back up `kora_encryption_keys` with the rest of the database; the server store's `exportBackup()` covers operations only. If the server loses a record, the next device that still holds it uploads its copy again, so nothing is lost while one device has synced.
+- The memory, SQLite and Postgres server stores persist key records (table `kora_encryption_keys`). A custom `ServerStore` implements `getEncryptionKeyRecord` and `putEncryptionKeyRecord` (compare-and-set); without them the server answers `unsupported` rather than keeping records in memory, which would give users a new key after every restart. It should also implement `getEncryptedKeyIds` (the history report that keeps a new device from starting a second ring) and `listEncryptionKeyRecords` (backups).
+- The server store's `exportBackup()` includes the key records (section `encryption_keys`), and `importBackup()` restores the ones the store lacks, in both modes; it never replaces a record the store holds. A backup with a malformed key record is refused whole (`BACKUP_INVALID_KEY_RECORD`). If you back up the database by other means, include `kora_encryption_keys`.
+- The server validates a record's structure and the write rule (revision grows, ring id and every key version kept) but cannot check the MAC; devices do.
 
 ## Encryption Algorithm
 
@@ -227,7 +270,7 @@ The envelope (protocol v2) looks like this on the wire:
 }
 ```
 
-`keyVersion` selects the data key. `keyId` is the key version's random id from the key record (never derived from key material), so a device holding a different keyring reports `KEY_ID_MISMATCH` instead of a bare authentication failure; such an operation is quarantined, not lost, and decrypts once the right keys are available.
+`keyId` selects the data key: it is the key's random id from the key record (never derived from key material), and it stays the same when a merged ring gives the key another version number. `keyVersion` is the version the writer used (bound into the additional data). A device that does not hold the key fetches the record once; a device holding a different keyring reports `KEY_ID_MISMATCH` instead of a bare authentication failure. Such an operation is quarantined, not lost, and decrypts once the right keys are available.
 
 ## Low-Level API
 
@@ -269,7 +312,7 @@ Encrypted beta.12 (protocol 1) clients cannot sync with a server of this release
 
 ## Error Handling
 
-- **`EncryptionKeyError`** (from `app.encryption` calls): `context.code` names the reason (`WRONG_PASSPHRASE`, `UNLOCK_THROTTLED`, `PASSPHRASE_REQUIRED`, `KEY_RECORD_CONFLICT`, `KEY_SERVICE_OFFLINE`, `KEY_SERVICE_UNSUPPORTED`, `NO_RECOVERY_KEY`, ...).
+- **`EncryptionKeyError`** (from `app.encryption` calls): `context.code` names the reason (`WRONG_PASSPHRASE`, `UNLOCK_THROTTLED`, `PASSPHRASE_REQUIRED`, `KEY_RECORD_CONFLICT`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_RECORD_MISSING`, `KEY_RECORD_EXISTS`, `KEY_SERVICE_OFFLINE`, `KEY_SERVICE_UNSUPPORTED`, `NO_RECOVERY_KEY`, ...). `recover()` rejects a malformed or foreign recovery key with `WRONG_RECOVERY_KEY`.
 - **`DecryptionError`** on an inbound operation does not end the session: the operation is quarantined (`DECRYPT_FAILED`, `sync:apply-failed`) and retried when new keys arrive. Common causes: an operation from another keyring (`KEY_ID_MISMATCH`), tampered ciphertext, a key version this device does not hold yet, a plaintext operation (`PLAINTEXT_REJECTED`).
 - **`EncryptionError`** when sealing fails (no `crypto.subtle`). Nothing is sent; the batch stays queued.
 
@@ -281,6 +324,7 @@ All errors carry context fields (`operationId`, `keyVersion`, `keyId`, `code`) t
 - **Key loss is data loss** unless a recovery key was set up (see above).
 - **Local data is not encrypted** by this feature; protect the device.
 - **Key management needs the server**: rotation, passphrase changes and recovery write the key record. Everyday encryption, decryption and `unlock()` with a cached record work offline.
+- **Rollback detection needs history**: a device refuses key-record revisions older than one it accepted, but a new device trusts the newest revision the server shows it. A server that kept an old revision can serve it to a new device, where the passphrase of that revision opens it.
 - **Encrypted operations are not schema-transformed by the server**: the server cannot read them, so a client on an older schema version transforms them after decryption.
 - **Server stores persist the envelope**: memory, SQLite and Postgres server stores keep `op.encrypted` verbatim (1.0.0-beta.13 or later on the server).
 - **Server-side rules see only cleartext fields**: referential policies (cascade, set-null, restrict) are enforced on the server, so their foreign keys must be cleartext (see above; a sealed one is refused at startup). A server scope entry (the synthesized insert that brings a record into a device's scope) cannot restate sealed values, so an encrypted device quarantines it; with encryption, sync whole scopes from the start rather than relying on scope changes.

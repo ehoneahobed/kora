@@ -109,7 +109,17 @@ describe('EncryptionKeyring: shared key material (ENC-1)', () => {
 		expect(stored).not.toContain('a very secret passphrase')
 		const record = [...server.records.values()][0] as WrappedKeyRecord
 		expect(Object.keys(record).sort()).toEqual(
-			['currentVersion', 'format', 'kdf', 'keyring', 'keys', 'revision'].sort(),
+			[
+				'currentVersion',
+				'format',
+				'kdf',
+				'keyring',
+				'keys',
+				'mac',
+				'master',
+				'revision',
+				'ringId',
+			].sort(),
 		)
 		expect(Object.keys(record.keys[0] ?? {}).sort()).toEqual(
 			['iv', 'keyId', 'keyVersion', 'wrappedKey'].sort(),
@@ -302,7 +312,7 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await a.synchronize(server.channel('u:alice'), 'alice')
 		const v1 = await seal(a, op('v1'))
 		const recoveryKey = await a.enableRecovery(server.channel('u:alice'))
-		expect(recoveryKey).toMatch(/^kora-rk1-[A-Za-z0-9_-]{43}$/)
+		expect(recoveryKey).toMatch(/^kora-rk2-[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{22}$/)
 		await a.rotate(server.channel('u:alice')) // recovery wraps follow rotation
 		const v2 = await seal(a, op('v2'))
 
@@ -310,7 +320,7 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await fresh.load('alice')
 		await expect(
 			fresh.recover(
-				'kora-rk1-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+				'kora-rk2-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA',
 				'n',
 				server.channel('u:alice'),
 			),
@@ -327,23 +337,35 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await device('lost').synchronize(server.channel('u:alice'), 'alice')
 		const k = device()
 		await k.load('alice')
-		await expect(k.recover('kora-rk1-x', 'n', server.channel('u:alice'))).rejects.toMatchObject({
+		await expect(k.recover('kora-rk2-x', 'n', server.channel('u:alice'))).rejects.toMatchObject({
 			context: expect.objectContaining({ code: 'NO_RECOVERY_KEY' }),
 		})
 	})
 })
 
 describe('EncryptionKeyring: a hostile or broken server', () => {
-	test('a rolled-back record (a version this device accepted is gone) stops the keyring', async () => {
+	test('a rolled-back record is refused, the keys stay, and the newer record is re-uploaded', async () => {
 		const server = new FakeKeyServer()
 		const a = device('p')
 		await a.synchronize(server.channel('u:alice'), 'alice')
 		const before = server.records.get('u:alice/default') as WrappedKeyRecord
 		await a.rotate(server.channel('u:alice'))
-		server.records.set('u:alice/default', before)
-		expect(await a.synchronize(server.channel('u:alice'), 'alice')).toBe('locked')
+		const pinned = server.records.get('u:alice/default') as WrappedKeyRecord
+		const codes: Array<string | undefined> = []
+		a.onStatusChange((status) => codes.push(status.code))
+
+		// Pushed (no connection to write to): refused and reported, keys kept.
+		expect(await a.adoptPushed(before)).toBe('locked')
 		expect(a.getStatus()).toMatchObject({ state: 'error', code: 'KEY_RECORD_ROLLBACK' })
-		expect(a.getEncryptor()).toBeNull()
+		expect(a.isRetryableLock()).toBe(true)
+		expect(a.getEncryptor()?.getCurrentKeyVersion()).toBe(2)
+
+		// The next session re-uploads the pinned revision over the old one.
+		server.records.set('u:alice/default', before)
+		expect(await a.synchronize(server.channel('u:alice'), 'alice')).toBe('ready')
+		expect(server.records.get('u:alice/default')).toEqual(pinned)
+		expect(a.getStatus()).toMatchObject({ state: 'unlocked', keyVersion: 2 })
+		expect(codes).toContain('KEY_RECORD_ROLLBACK')
 	})
 
 	test('a record with weaker KDF parameters than the app minimum is refused', async () => {
@@ -372,7 +394,9 @@ describe('EncryptionKeyring: a hostile or broken server', () => {
 		})
 		const b = device('p')
 		expect(await b.synchronize(server.channel('u:alice'), 'alice')).toBe('locked')
-		expect(b.getStatus().code).toBe('WRONG_PASSPHRASE')
+		// The record MAC fails before any wrap is used.
+		expect(b.getStatus().code).toBe('KEY_RECORD_INVALID')
+		expect(b.getEncryptor()).toBeNull()
 	})
 
 	test('a server that lost the record gets the device copy back (no new key is forked)', async () => {

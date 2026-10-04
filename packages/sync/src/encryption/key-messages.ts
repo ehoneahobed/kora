@@ -51,6 +51,12 @@ export interface EncryptionKeyResponseMessage {
 	record: WrappedKeyRecord | null
 	/** Human-readable reason for a refusal. */
 	message?: string
+	/**
+	 * With `record: null`: key ids the server's stored operations of this owner are
+	 * encrypted with (a sample, RT-104). Non-empty means encrypted history exists, so
+	 * the record was lost: a new device waits for one that holds the ring.
+	 */
+	knownKeyIds?: string[]
 }
 
 /** Every key-distribution message. */
@@ -100,6 +106,9 @@ export function isEncryptionKeyMessage(value: unknown): value is EncryptionKeyMe
 				(msg.requestId === undefined || typeof msg.requestId === 'string') &&
 				typeof msg.status === 'string' &&
 				STATUSES.has(msg.status) &&
+				(msg.knownKeyIds === undefined ||
+					(Array.isArray(msg.knownKeyIds) &&
+						msg.knownKeyIds.every((keyId) => typeof keyId === 'string'))) &&
 				(msg.record === null || (typeof msg.record === 'object' && msg.record !== undefined))
 			)
 		default:
