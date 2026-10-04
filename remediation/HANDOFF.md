@@ -37,7 +37,7 @@ Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for refe
 - DONE (branch `wip/phase4/migrate-rebuild`): `kora migrate` rebuild checked against the Phase 3 fold with an executable scenario (two devices, concurrent edits, compacted history, add+remove field on the server and both device databases, continued sync, fresh device; Postgres). Fold state, bases, snapshots, the log and every `_kora_*` table were never touched and records converged (a field change re-folds every record), but the rebuild dropped client `_version` / `_field_versions` (blank for good after an index-only migration), `REFERENCES`, store indexes, the server `_deleted` index, and could not run on Postgres: RT-105, fixed (catalog-driven `--kora:evolve-table` step). Found alongside: server stores materialized a field added with a default as NULL for older records while devices read the default: RT-106, fixed.
 - RT-104 residuals: a brand-new device cannot detect an older key-record revision it never saw (documented); the "encrypted history exists" signal samples stored ops.
 - RT-101 residual: in-place field type changes unsupported; Postgres column types never change.
-- DX-3 shows "looks fixed": set to fixed after the final documentation pass.
+- DONE (branch `wip/phase4/docs-final`): final documentation pass; DX-3 set to fixed; `docs/guide/upgrading-to-beta13.md` added; CLAUDE.md reconciled with the source.
 
 ## Next steps
 

@@ -1,6 +1,8 @@
 # Design: Structured, Secret, and Binary Field Types
 
 Status: state-of-the-art target (no phasing; each type is built to its complete form)
+
+> Design record. The field types shipped; their merge semantics were superseded in 1.0.0-beta.13 by the per-field CRDT fold in `@korajs/core` (arrays are element multisets merged per occurrence, objects merge per top-level key with nested values replaced whole, resolvers fold once per write in HLC order). Section 1 describes the pre-fold pairwise engine of the time. Current behaviour: `docs/guide/conflict-resolution.md` and `docs/guide/schema-design.md`.
 Scope: `@korajs/core` field system, with changes across `@korajs/merge`, `@korajs/store`, `@korajs/sync`, `@korajs/devtools`
 Bar: these three field types are a differentiating moat. The structured-data CRDT and the content-addressed blob channel are the parts a large engineering org evaluating offline-first frameworks would judge us on. They are built complete, correct, and property-tested, not stubbed.
 

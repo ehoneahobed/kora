@@ -1627,14 +1627,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "DX-3.test.ts"
     }
    ],
    "pr": null,
-   "notes": ""
+   "notes": "FIXED (Phase 4, 2026-10-04, branch wip/phase4/docs-final). Final documentation pass over every page under docs/ (guides, api, design), the root README and every package README against the source of Phases 1-4. Getting Started runs as written against a scaffolded app (scripts/docs/check-getting-started.mjs); useRichText is (collectionName, recordId, fieldName, options?); no page claims useQuery has no loading state (first render is []; useQueryState); every snippet meant to sync sets autoConnect: true (or calls connect()); README names v1.0.0-beta.13. CI typechecks the documentation's ts/tsx blocks against the built packages (scripts/docs/check-code-blocks.mjs, `pnpm docs:check-code`, ci.yml): 57 files, 327 checked units, 7 skipped (each with a written reason); API signature listings are checked against the real exports with the new `<!-- docs-check: signature <module> -->` marker (the real function or class must be assignable to the documented signature; documented interfaces must accept the real type). Fixed on the way: the encryption-locked SyncStatus was missing from every status list; createKoraHooks bound; auth Permission type; error-code reference (KEY_RECORD_MISSING, KEY_RING_FORK, WRONG_RECOVERY_KEY, FORGED_DUPLICATE, BACKUP_INVALID_KEY_RECORD, retriable validator rejections); server backups carry key records; the 13 template AGENTS.md files and `kora agents-md` (no-loading-state claim, add-wins arrays, sync without autoConnect, kora migrate); llms.txt summary (protobuf wire format); HTTP long-poll needs a handleHttpRequest endpoint. New: docs/guide/upgrading-to-beta13.md. CLAUDE.md reconciled with the source (fold, trust boundary, JSON wire, rollback journal on OPFS instead of WAL, drift reporting, hooks). The DX-3 README check accepts the version being cut (package.json is bumped by bump-beta.mjs at release)."
   },
   {
    "id": "DX-4",

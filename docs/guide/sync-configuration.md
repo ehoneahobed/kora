@@ -45,7 +45,7 @@ configured.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `url` | (required) | Sync server URL: `wss://` (or `ws://` locally) for WebSocket, `https://` for HTTP. |
-| `transport` | `'websocket'` | `'http'` for HTTP long-polling where WebSockets are blocked. |
+| `transport` | `'websocket'` | `'http'` for HTTP long-polling where WebSockets are blocked. `createProductionServer` serves WebSocket sync only: map an HTTP endpoint to `KoraSyncServer.handleHttpRequest` (with the `authorization` and `x-kora-session` headers, as in [Upgrading to beta.13](/guide/upgrading-to-beta13#an-http-long-poll-endpoint)). |
 | `autoConnect` | `false` | Connect after `app.ready`. |
 | `auth` | | `async (options?) => ({ token })`, called before every connection attempt; with `{ forceRefresh: true }` after the server ended a session as expired or revoked. |
 | `authClient` | | A binding from `createKoraAuthSync({ authClient, schema })` (`@korajs/auth`); overrides `auth`. |

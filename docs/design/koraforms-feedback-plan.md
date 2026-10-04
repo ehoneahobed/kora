@@ -1,5 +1,7 @@
 # KoraForms Feedback: Plan and Design Notes
 
+> Historical record (written against 1.0.0-beta.1). Several mechanisms it names had been replaced by 1.0.0-beta.13 (server-granted scopes, the per-field fold, the dedicated-worker leader instead of the SharedWorker bridge); the published guides describe current behaviour.
+
 Source: KoraForms team feedback against Kora.js `1.0.0-beta.1`. Treated as the
 external-proof loop, not a backlog dump. This document is the durable reference
 so we do not lose the thread as work proceeds.
