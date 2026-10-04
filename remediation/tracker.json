@@ -3290,6 +3290,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them)."
+  },
+  {
+   "id": "RT-100",
+   "title": "After include(), where() and orderBy() accept the included relation property (e.g. where({ project: null }), orderBy('project')), which the runtime refuses with QueryError 'Unknown field'",
+   "severity": "P3",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/RT-100.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string)."
   }
  ],
  "rejectedProposalPins": {

@@ -45,7 +45,11 @@ const BROWSER_SUITES = [
 	'packages/store/tests/repro/browser/LMS-5-6-7.browser.mjs',
 	'packages/server/tests/repro/browser/NEW-DX-3.offline-shell.mjs',
 ]
-const TSC_PROBES = ['kora/tests/repro/types/DX-1.ts', 'kora/tests/repro/types/DX-2.ts']
+const TSC_PROBES = [
+	'kora/tests/repro/types/DX-1.ts',
+	'kora/tests/repro/types/DX-2.ts',
+	'kora/tests/repro/types/RT-100.ts',
+]
 
 // ---------------------------------------------------------------- run suites
 const results = new Map() // key -> { status: 'passed'|'failed'|'skipped', kind: 'node'|'browser'|'tsc', file, title, msg }
