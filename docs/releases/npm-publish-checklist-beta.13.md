@@ -30,16 +30,14 @@ Throughout, `SHA` is the full commit id of the merge on private `main` from step
 
 ## (a) Merge into private `main`
 
-1. **Stop the private repository's CI from publishing on its own.** Its `release` workflow runs on
-   every push to `main`; with no pending changesets it runs `pnpm release` (`changeset publish`),
-   which would publish beta.13 from CI before your gates run if `kora-private` has an `NPM_TOKEN`
-   secret (and fail noisily if not). Disable `release` and `canary` in `kora-private` first
-   (Actions, select the workflow, "Disable workflow"; or
-   `gh workflow disable release -R ehoneahobed/kora-private` and the same for `canary`). Delete
-   the stale `changeset-release/main` branch there (a "Version Packages" commit from an earlier
-   run; never merge it).
-2. Merge the release pull request (`wip/phase4/release-prep`, which contains `fix/phase4-rc`, into
-   `main`; it supersedes PR #4) after CI is green. Note the merge commit:
+1. **The private repository cannot publish on its own.** The `release` and `canary` workflows carry
+   `if: github.repository == 'ehoneahobed/kora'`, so in `kora-private` (and in any fork) their jobs
+   are skipped on a push to `main`; only the public repository ever runs `changeset publish`. As a
+   belt-and-braces step you may still disable both workflows in `kora-private` (Actions, select the
+   workflow, "Disable workflow"). Delete the stale `changeset-release/main` branch there (a
+   "Version Packages" commit from an earlier run; never merge it).
+2. Merge the release pull request (PR #4, `fix/phase4-rc`, which now contains the release prep, into
+   `main`) after CI is green. Note the merge commit:
 
    ```bash
    git fetch private

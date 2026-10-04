@@ -57,7 +57,7 @@ Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for refe
 
 Follow `docs/releases/npm-publish-checklist-beta.13.md` exactly, in one sitting:
 
-1. Maintainer: disable the `release` and `canary` workflows in `kora-private` (its `release` workflow would run `changeset publish` on the merge), delete its stale `changeset-release/main` branch, then merge `wip/phase4/release-prep` into private `main` (supersedes PR #4).
+1. Maintainer: delete the stale `changeset-release/main` branch in `kora-private`, then merge PR #4 (`fix/phase4-rc`, which now includes the release prep) into private `main`. The `release` and `canary` workflows only run in the public repo (`if: github.repository == 'ehoneahobed/kora'`), so the merge cannot publish from the private copy.
 2. On the maintainer machine at that merge commit: `pnpm install --frozen-lockfile`, `pnpm test:pre-release` (optional `KORA_PG_TEST_URL`; installs Playwright Chromium), `pnpm release:dry-run`.
 3. `npm whoami`, `pnpm -r publish --tag beta --no-git-checks`, verify every package and dist-tag, smoke-test outside the monorepo.
 4. Only then: fast-forward public `origin` `main` to the merge commit, tag `v1.0.0-beta.13`, publish the GitHub Security Advisory (request a CVE) and the GitHub release.
