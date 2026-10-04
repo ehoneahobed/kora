@@ -167,6 +167,7 @@ import type {
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import { relaxValueDomainConstraints } from './relax-constraints'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
 	SEQ_CONFLICTS_TABLE,
@@ -387,6 +388,10 @@ export class Store implements OperationLog {
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		this.foldActive = false
 
+		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
+		// NOT NULL constraints that cannot evolve with the schema: rebuild them once without
+		// (RT-101). Validation is the single authority for the value domain.
+		await relaxValueDomainConstraints(this.adapter, this.schema)
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 

@@ -310,17 +310,10 @@ function columnDefinition(fieldName: string, descriptor: FieldDescriptor): strin
 	const sqlType = mapFieldType(descriptor)
 	const parts = [quoteIdentifier(fieldName), sqlType]
 
-	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
-		parts.push('NOT NULL')
-	}
-
+	// Requiredness and enum membership are enforced by validation only (RT-101): no
+	// NOT NULL or CHECK constraints a later schema could not evolve.
 	if (descriptor.defaultValue !== undefined) {
 		parts.push(`DEFAULT ${sqlLiteral(descriptor.defaultValue)}`)
-	}
-
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		const values = descriptor.enumValues.map((value) => sqlLiteral(value)).join(', ')
-		parts.push(`CHECK (${quoteIdentifier(fieldName)} IN (${values}))`)
 	}
 
 	return parts.join(' ')

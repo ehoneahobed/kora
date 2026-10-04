@@ -10,6 +10,11 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
+import {
+	type SqliteQueryFn,
+	readSqliteTableCatalog,
+	sqliteConstraintRelaxationStatements,
+} from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
@@ -429,6 +434,9 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// beta.12 tables carry enum CHECKs a schema upgrade cannot change: rebuild them
+		// once without (RT-101); the value domain is enforced at ingest only.
+		await this.relaxValueDomainConstraints(schema)
 		this.migrateTextCodec(schema)
 
 		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their
@@ -452,6 +460,29 @@ export class SqliteServerStore implements ServerStore {
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
 			)
 		}
+	}
+
+	/**
+	 * One-time migration (RT-101): rebuild collection tables that still carry an enum
+	 * `CHECK` (or `NOT NULL` on a schema field), in one transaction, keeping rows, indexes
+	 * and triggers. Idempotent (a relaxed table is left alone) and resumable (an
+	 * interrupted rebuild rolls back and runs again at the next start).
+	 */
+	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
+		const query: SqliteQueryFn = async (text) => this.db.all<Record<string, unknown>>(sql.raw(text))
+		const plans: string[][] = []
+		for (const collection of Object.keys(schema.collections)) {
+			const catalog = await readSqliteTableCatalog(query, collection)
+			if (!catalog) continue
+			const statements = sqliteConstraintRelaxationStatements(catalog)
+			if (statements.length > 0) plans.push(statements)
+		}
+		if (plans.length === 0) return
+		this.db.transaction((tx) => {
+			for (const statements of plans) {
+				for (const statement of statements) tx.run(sql.raw(statement))
+			}
+		})
 	}
 
 	/**

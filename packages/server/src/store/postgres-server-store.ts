@@ -15,6 +15,7 @@ import {
 	assertOperationTransformCoverage,
 	quoteIdent,
 } from '@korajs/core'
+import { isKoraInternalColumn, isPostgresEnumCheckDefinition } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -497,6 +498,64 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
+	 * One-time migration (RT-101): drop the enum `CHECK` constraints (and any `NOT NULL`
+	 * on a schema field) that beta.12 and earlier DDL put on collection tables, in one
+	 * transaction. Only single-column `col = ANY (ARRAY[...])` checks (Kora's enum shape)
+	 * on non-internal columns are dropped; checks added by hand are kept. Idempotent and
+	 * resumable: a later start finds nothing to drop.
+	 */
+	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
+		const names = Object.keys(schema.collections)
+		if (names.length === 0) return
+		const tableList = sql.join(
+			names.map((name) => sql`${name}`),
+			sql`, `,
+		)
+		await this.db.transaction(async (tx) => {
+			const checks = (await tx.execute(
+				sql`SELECT rel.relname AS table_name, con.conname AS name, pg_get_constraintdef(con.oid) AS definition, (SELECT array_agg(att.attname::text) FROM pg_attribute att WHERE att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)) AS columns
+					FROM pg_constraint con
+					JOIN pg_class rel ON rel.oid = con.conrelid
+					JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+					WHERE con.contype = 'c' AND nsp.nspname = current_schema() AND rel.relname IN (${tableList})`,
+			)) as unknown as Array<{
+				table_name: string
+				name: string
+				definition: string
+				columns: string[] | null
+			}>
+			for (const check of checks) {
+				const columns = check.columns ?? []
+				const column = columns[0]
+				if (columns.length !== 1 || column === undefined || isKoraInternalColumn(column)) continue
+				if (!isPostgresEnumCheckDefinition(check.definition)) continue
+				await tx.execute(
+					sql.raw(
+						`ALTER TABLE ${quoteIdent(check.table_name)} DROP CONSTRAINT IF EXISTS ${quoteIdent(check.name)}`,
+					),
+				)
+			}
+			const notNull = (await tx.execute(
+				sql`SELECT rel.relname AS table_name, att.attname AS column_name
+					FROM pg_attribute att
+					JOIN pg_class rel ON rel.oid = att.attrelid
+					JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+					WHERE att.attnotnull AND att.attnum > 0 AND NOT att.attisdropped
+						AND nsp.nspname = current_schema() AND rel.relname IN (${tableList})`,
+			)) as unknown as Array<{ table_name: string; column_name: string }>
+			for (const row of notNull) {
+				if (isKoraInternalColumn(row.column_name)) continue
+				if (!(row.column_name in (schema.collections[row.table_name]?.fields ?? {}))) continue
+				await tx.execute(
+					sql.raw(
+						`ALTER TABLE ${quoteIdent(row.table_name)} ALTER COLUMN ${quoteIdent(row.column_name)} DROP NOT NULL`,
+					),
+				)
+			}
+		})
+	}
+
+	/**
 	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
 	 * log has no transform path to `version` (RT-103): those operations would fold as
 	 * absent, silently erasing them from their records.
@@ -572,6 +631,9 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
+		// beta.12 tables carry enum CHECKs a schema upgrade cannot change: drop them once
+		// (RT-101); the value domain is enforced at ingest only.
+		await this.relaxValueDomainConstraints(schema)
 		await this.migrateTextCodec(schema)
 
 		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their

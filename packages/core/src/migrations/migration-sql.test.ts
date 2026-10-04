@@ -22,16 +22,14 @@ describe('migrationStepsToSQL', () => {
 		expect(sql).toEqual(['ALTER TABLE "products" ADD COLUMN "price" REAL DEFAULT 0'])
 	})
 
-	test('addField with enum and CHECK constraint', () => {
+	test('addField with enum: no CHECK constraint (RT-101)', () => {
 		const steps = migrate().addField(
 			'todos',
 			'priority',
 			t.enum(['low', 'medium', 'high']).default('medium'),
 		).steps
 		const sql = migrationStepsToSQL(steps)
-		expect(sql).toEqual([
-			"ALTER TABLE \"todos\" ADD COLUMN \"priority\" TEXT DEFAULT 'medium' CHECK (\"priority\" IN ('low', 'medium', 'high'))",
-		])
+		expect(sql).toEqual(['ALTER TABLE "todos" ADD COLUMN "priority" TEXT DEFAULT \'medium\''])
 	})
 
 	test('addField with timestamp', () => {

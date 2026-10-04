@@ -277,9 +277,9 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 
 /**
  * Field kinds whose column holds the raw string (the stored-text codec applies). Not
- * `enum`: its column has a `CHECK (col IN (...))` of the schema's literal values, so it
- * must hold them verbatim (an enum value SQL text cannot express is already refused by
- * the DDL).
+ * `enum`: its column holds the schema's literal values verbatim; an enum value SQL text
+ * cannot store exactly (U+0000, U+FFFF, a lone surrogate) is refused by `t.enum()` itself
+ * (the table no longer has a `CHECK`, RT-101).
  */
 const RAW_TEXT_KINDS: ReadonlySet<string> = new Set(['string', 'secret'])
 
