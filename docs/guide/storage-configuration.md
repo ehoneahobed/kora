@@ -370,7 +370,7 @@ The server stores are interchangeable: they implement the same `ServerStore` int
 :::
 
 ::: warning
-Switching storage backends does not migrate data. If you have existing data in SQLite, it won't automatically appear in PostgreSQL. For new projects, choose your production backend early. For existing projects, you would need to export operations from the old store and import them into the new one.
+Switching storage backends does not migrate data. If you have existing data in SQLite, it won't automatically appear in PostgreSQL. For new projects, choose your production backend early. For existing projects, export a backup from the old store (`await oldStore.exportBackup()`, or `kora backup create`) and import it into the new one (`importBackup(data, false)`, or `kora backup restore`): operations and encryption key records move, and the new store re-folds every record.
 :::
 
 ## Related guides

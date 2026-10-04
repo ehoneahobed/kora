@@ -23,7 +23,7 @@ Application code does not call this package: `createApp()` and the sync server w
 
 ## Constraints
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/merge @korajs/core -->
 ```typescript
 function checkConstraints(
   mergedRecord: Record<string, unknown>,
@@ -65,7 +65,7 @@ deterministic corrections) is described in
 
 ## Referential integrity
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/merge @korajs/core -->
 ```typescript
 function buildMergeRelationLookup(schema: SchemaDefinition): Map<string, MergeIncomingRelation[]>
 // target collection -> relations that point at it: { relationName, sourceCollection, foreignKeyField, onDelete }
@@ -95,7 +95,7 @@ new child are listed in [Conflict Resolution](/guide/conflict-resolution#relatio
 
 ## Rich text
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/merge @korajs/core -->
 ```typescript
 type RichtextValue = string | Uint8Array | ArrayBuffer | KoraBytesValue | null | undefined
 

@@ -17,6 +17,15 @@
  *                                         same page and check them as one module (tutorials).
  *   <!-- docs-check: standalone -->      check this block without the page prelude (a setup
  *                                         block that defines what the prelude declares).
+ *   <!-- docs-check: signature <module> [<module> ...] -->
+ *                                         an API signature listing: every bodiless top-level
+ *                                         `function` in the block is checked against the real
+ *                                         export of the first module (the real function must be
+ *                                         assignable to the documented signature, so a missing,
+ *                                         reordered or retyped parameter, or a wrong return type,
+ *                                         fails). Type names the block uses are imported from the
+ *                                         listed modules; interfaces and types it declares itself
+ *                                         are taken as written.
  * A page-level hidden prelude declares what the page's snippets assume (an `app`, a schema):
  *   <!-- docs-check-prelude
  *   import { createApp } from 'korajs'
@@ -113,13 +122,17 @@ function extractUnits(file) {
 			pendingMarker = { kind: 'skip', arg: 'tutorial edit' }
 			continue
 		}
-		const marker = trimmed.match(/^<!--\s*docs-check:\s*(skip|continue|file|standalone)\b(.*?)-->$/)
+		const marker = trimmed.match(
+			/^<!--\s*docs-check:\s*(skip|continue|file|standalone|signature)\b(.*?)-->$/,
+		)
 		if (marker) {
 			const arg = marker[2].trim()
-			if ((marker[1] === 'skip' || marker[1] === 'file') && arg === '') {
-				problems.push(
-					`${file}:${i + 1}: a ${marker[1]} marker needs ${marker[1] === 'skip' ? 'a reason' : 'a path'}`,
-				)
+			if (
+				(marker[1] === 'skip' || marker[1] === 'file' || marker[1] === 'signature') &&
+				arg === ''
+			) {
+				const needs = { skip: 'a reason', file: 'a path', signature: 'a module' }[marker[1]]
+				problems.push(`${file}:${i + 1}: a ${marker[1]} marker needs ${needs}`)
 			}
 			pendingMarker = { kind: marker[1], arg }
 			continue
@@ -155,10 +168,12 @@ function extractUnits(file) {
 			continue
 		}
 		const path = marked?.kind === 'file' ? marked.arg : null
-		const unitPrelude = marked?.kind === 'standalone' ? '' : prelude
+		const signature = marked?.kind === 'signature' ? marked.arg.split(/\s+/) : null
+		const unitPrelude = marked?.kind === 'standalone' || signature ? '' : prelude
 		units.push({
 			file,
 			path,
+			signature,
 			tsx: lang === 'tsx',
 			prelude: unitPrelude,
 			segments: [{ startLine, code }],
@@ -270,6 +285,7 @@ mkdirSync(outDir, { recursive: true })
 const files = docFiles()
 const allProblems = []
 const sources = new Map() // generated file -> mapping info
+const signatureUnits = [] // generated after the compiler options exist (they need module exports)
 let unitCount = 0
 let skippedCount = 0
 for (const file of files) {
@@ -278,6 +294,10 @@ for (const file of files) {
 	skippedCount += skipped
 	units.forEach((unit, index) => {
 		unitCount++
+		if (unit.signature) {
+			signatureUnits.push({ unit, name: join(outDir, slug(file), `__signature_${index + 1}.ts`) })
+			return
+		}
 		// One directory per page, so `import ... from './schema'` finds the block marked
 		// <!-- docs-check: file schema.ts --> on the same page.
 		const name = unit.path
@@ -401,6 +421,123 @@ writeFileSync(
 		].map((m) => `declare module '${m}'`),
 	].join('\n'),
 )
+
+/** Exported names of each module a signature block names, read from the built declarations. */
+function moduleExports(modules) {
+	const probe = join(outDir, '__exports_probe.ts')
+	writeFileSync(
+		probe,
+		modules.map((m, i) => `import * as __m${i} from '${m}'\nexport { __m${i} }`).join('\n'),
+	)
+	const probeProgram = ts.createProgram([envFile, probe], options)
+	const checker = probeProgram.getTypeChecker()
+	const source = probeProgram.getSourceFile(probe)
+	const out = new Map()
+	for (const statement of source?.statements ?? []) {
+		if (!ts.isImportDeclaration(statement)) continue
+		const specifier = statement.moduleSpecifier.text
+		const symbol = checker.getSymbolAtLocation(statement.moduleSpecifier)
+		out.set(specifier, new Set(symbol ? checker.getExportsOfModule(symbol).map((e) => e.name) : []))
+	}
+	rmSync(probe, { force: true })
+	return out
+}
+
+/**
+ * Turns a signature listing into a checkable module, keeping every line where it was: each
+ * bodiless `function f(...)` becomes `declare function __doc_f(...)`, followed on its last line
+ * by `const __check_f: typeof __doc_f = __real_f` (the real export, imported above the block).
+ */
+function signatureModule(code, modules, exportsByModule) {
+	const source = ts.createSourceFile('sig.ts', code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
+	const functions = new Map() // name -> last declaration end
+	const edits = [] // [position, deleteLength, insert]
+	const ownTypes = new Set()
+	const shapes = new Map() // documented interface or type name -> declaration end
+	for (const statement of source.statements) {
+		if (ts.isFunctionDeclaration(statement) && statement.name && !statement.body) {
+			const name = statement.name.text
+			edits.push([statement.getStart(source), 0, 'declare '])
+			edits.push([statement.name.getStart(source), name.length, `__doc_${name}`])
+			functions.set(name, statement.getEnd())
+		} else if (ts.isClassDeclaration(statement) && statement.name) {
+			// A documented class: the real constructor must fit the documented one.
+			const name = statement.name.text
+			edits.push([statement.getStart(source), 0, 'declare '])
+			edits.push([statement.name.getStart(source), name.length, `__doc_${name}`])
+			functions.set(name, statement.getEnd())
+		} else if (
+			(ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) &&
+			statement.name
+		) {
+			// A documented shape: a value of the real type must fit it (the docs may list a
+			// subset of the members, never a member the real type lacks or types differently).
+			const name = statement.name.text
+			ownTypes.add(name)
+			if (!statement.typeParameters) shapes.set(name, statement.getEnd())
+		}
+	}
+	for (const [name, end] of functions) {
+		edits.push([end, 0, `; const __check_${name}: typeof __doc_${name} = __real_${name}`])
+	}
+	const realShapes = [...shapes.keys()].filter((name) =>
+		modules.some((m) => exportsByModule.get(m)?.has(name)),
+	)
+	for (const name of realShapes) {
+		edits.push([
+			shapes.get(name),
+			0,
+			`; declare const __real_value_${name}: __Real_${name}; const __check_shape_${name}: ${name} = __real_value_${name}`,
+		])
+	}
+	let text = code
+	for (const [pos, del, insert] of edits.sort((a, b) => b[0] - a[0])) {
+		text = text.slice(0, pos) + insert + text.slice(pos + del)
+	}
+	const imports = []
+	const [first] = modules
+	const firstExports = exportsByModule.get(first) ?? new Set()
+	const realImports = [...functions.keys()].map((name) => `${name} as __real_${name}`)
+	if (realImports.length > 0) imports.push(`import { ${realImports.join(', ')} } from '${first}'`)
+	const used = new Set(code.match(/[A-Za-z_$][\w$]*/g) ?? [])
+	const taken = new Set()
+	for (const module of modules) {
+		const names = [...(exportsByModule.get(module) ?? [])].filter(
+			(name) => used.has(name) && !ownTypes.has(name) && !taken.has(name),
+		)
+		for (const name of names) taken.add(name)
+		if (names.length > 0) imports.push(`import type { ${names.join(', ')} } from '${module}'`)
+	}
+	for (const name of realShapes) {
+		const module = modules.find((m) => exportsByModule.get(m)?.has(name))
+		imports.push(`import type { ${name} as __Real_${name} } from '${module}'`)
+	}
+	const missing = [...functions.keys()].filter((name) => !firstExports.has(name))
+	return { header: imports.join('\n'), body: text, missing }
+}
+
+if (signatureUnits.length > 0) {
+	const modules = [...new Set(signatureUnits.flatMap(({ unit }) => unit.signature))]
+	const exportsByModule = moduleExports(modules)
+	for (const { unit, name } of signatureUnits) {
+		const [seg] = unit.segments
+		const { header, body, missing } = signatureModule(seg.code, unit.signature, exportsByModule)
+		for (const fn of missing) {
+			allProblems.push(
+				`${unit.file}:${seg.startLine}: \`${fn}\` is not exported by ${unit.signature[0]}`,
+			)
+		}
+		mkdirSync(dirname(name), { recursive: true })
+		const headerLines = header ? header.split('\n').length : 0
+		const text = `${header ? `${header}\n` : ''}${body}\nexport {}\n`
+		writeFileSync(name, text)
+		sources.set(name, {
+			file: unit.file,
+			map: [[headerLines, seg.startLine, body.split('\n').length]],
+			hasPrelude: false,
+		})
+	}
+}
 
 const program = ts.createProgram([envFile, ...sources.keys()], options)
 const diagnostics = ts.getPreEmitDiagnostics(program)

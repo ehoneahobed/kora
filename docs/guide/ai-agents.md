@@ -108,7 +108,7 @@ If your instinct comes from REST plus a client cache, here is the mapping.
 
 ## Conflict handling
 
-Concurrent edits converge automatically: last-write-wins per field, an element set for arrays (concurrent additions and removals both apply), per-key merging for objects, and character-level CRDT for `t.richtext()` fields. When a field needs domain-specific merging, declare it in the schema: `.merge('counter')` for an inventory quantity (or use `op.increment`), `.merge('max')`/`'min'`, or a collection-level `resolve: { field: (local, remote, base) => ... }`. Rules across records (unique, capacity) are `constraints`, enforced by the sync server. Do not write your own merge or sync code. See [Conflict Resolution](/guide/conflict-resolution) for the model.
+Concurrent edits converge automatically: last-write-wins per field, an element multiset for arrays (concurrent additions and removals both apply, duplicates are kept), per-key merging for objects, and character-level CRDT for `t.richtext()` fields. When a field needs domain-specific merging, declare it in the schema: `.merge('counter')` for an inventory quantity (or use `op.increment`), `.merge('max')`/`'min'`, or a collection-level `resolve: { field: (local, remote, base) => ... }`. Rules across records (unique, capacity) are `constraints`, enforced by the sync server. Do not write your own merge or sync code. See [Conflict Resolution](/guide/conflict-resolution) for the model.
 
 ## Verifying you did it right
 

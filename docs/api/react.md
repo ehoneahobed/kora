@@ -111,7 +111,7 @@ Returns a reactive array of records matching a query. The component re-renders a
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useQuery<T = CollectionRecord>(
   query: QueryBuilder<T>,
@@ -198,7 +198,7 @@ function TodosWithProjects() {
 
 Like `useQuery`, but returns the query's error instead of throwing it, and whether the first result has arrived.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useQueryState<T = CollectionRecord>(
   query: QueryBuilder<T>,
@@ -224,7 +224,7 @@ Returns a mutation object for performing write operations. Writes are local firs
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useMutation<TData, TArgs extends unknown[], TContext = void>(
   fn: (...args: TArgs) => Promise<TData>,
@@ -362,7 +362,7 @@ Returns the current sync connection status and metadata. Re-renders only when th
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useSyncStatus(): SyncStatusInfo
 ```
@@ -445,9 +445,9 @@ function SyncIndicator() {
 
 Creates hooks typed for your app, so components get schema-checked collection names, inserts, updates and query rows without passing generics around. Call it once next to `createApp`; nothing runs at call time.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
-function createKoraHooks<TApp>(): {
+function createKoraHooks<TApp extends KoraAppLike>(): {
   useApp: () => TApp
   useCollection: <N extends AppCollectionName<TApp>>(name: N) => AppCollections<TApp>[N]
   useQuery: typeof useQuery
@@ -534,7 +534,7 @@ Returns the store's collection accessor for a collection name. This plain hook i
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useCollection(name: string): CollectionAccessor
 ```
@@ -583,7 +583,7 @@ Provides binding helpers for rich text fields backed by Yjs CRDTs. Returns the Y
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useRichText(
   collection: string,
@@ -660,7 +660,7 @@ Automatically clears presence on unmount.
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function usePresence(
   user: { name: string; color: string; avatar?: string } | null,
@@ -717,7 +717,7 @@ Returns all currently connected collaborators' awareness states. Excludes the lo
 
 ### Signature
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useCollaborators(): AwarenessState[]
 ```
@@ -728,7 +728,7 @@ function useCollaborators(): AwarenessState[]
 
 #### AwarenessState
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 interface AwarenessState {
   /** User identity information */

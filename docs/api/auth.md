@@ -154,7 +154,7 @@ stable device id and a non-extractable ECDSA P-256 key pair and presents the pub
 sign-in. `createKoraAuth()` does this for you. Runtimes without IndexedDB (React Native) must pass a
 `keyStore` backed by the platform's secure storage.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function generateDeviceKeyPair(): Promise<CryptoKeyPair>
 function exportPublicKeyJwk(keyPair: CryptoKeyPair): Promise<JsonWebKey>
@@ -202,7 +202,7 @@ Properties: `activeOrgId`, `activeOrg`, `activeRole`. Methods: `createOrg({ name
 
 ### Client (`@korajs/auth`)
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function isPasskeySupported(): boolean
 function isPlatformAuthenticatorAvailable(): Promise<boolean>
@@ -238,7 +238,7 @@ Both throw `PasskeyUnsupportedError` (`PASSKEY_UNSUPPORTED`) without WebAuthn an
 
 ### Server (`@korajs/auth/server`)
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/auth/server @korajs/auth -->
 ```typescript
 function generateRegistrationOptions(params: {
   rpId: string; rpName: string; userId: string; userName: string; userDisplayName: string
@@ -275,7 +275,7 @@ These helpers protect data **on the device** (tokens, local secrets). End-to-end
 synced operations is configured with `sync.encryption` instead; see
 [Sync Encryption](/guide/sync-encryption).
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function generateEncryptionKey(): Promise<CryptoKey>   // AES-256-GCM
 function encryptData(key: CryptoKey, plaintext: Uint8Array): Promise<{ ciphertext: Uint8Array; iv: Uint8Array }>
@@ -475,16 +475,18 @@ token revocations. Custom stores implement `UserStore` (`createUser`, `findByEma
 
 ### `TokenManager`
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/auth/server @korajs/auth -->
 ```typescript
-new TokenManager({
-  secret: string | string[],          // index 0 signs; all verify (rotation)
-  accessTokenLifetime?: number,       // ms, default 15 minutes
-  refreshTokenLifetime?: number,      // ms, default 90 days
-  deviceCredentialLifetime?: number,  // ms, default 90 days
-  revocationStore?: TokenRevocationStore,
-  refreshReuseGraceMs?: number,       // default 30 s, 0 disables
-})
+class TokenManager {
+  constructor(options: {
+    secret: string | string[]          // index 0 signs; all verify (rotation)
+    accessTokenLifetime?: number       // ms, default 15 minutes
+    refreshTokenLifetime?: number      // ms, default 90 days
+    deviceCredentialLifetime?: number  // ms, default 90 days
+    revocationStore?: TokenRevocationStore
+    refreshReuseGraceMs?: number       // default 30 s, 0 disables
+  })
+}
 ```
 
 Methods: `issueTokens`, `issueAccessToken(userId, deviceId, options?)`,
@@ -618,7 +620,7 @@ relaxes this for development; refused targets throw `WebhookTargetError`). Each 
 
 ## Types
 
-<!-- docs-check: skip type listing -->
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 interface AuthUser { id: string; email: string; name: string | null }
 interface AuthTokens { accessToken: string; refreshToken: string }
@@ -638,7 +640,7 @@ interface TokenPayload {
 
 type OrgRole = 'owner' | 'admin' | 'member' | 'viewer' | 'billing'
 type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired'
-type Permission = string                 // 'resource:action'
+type Permission = `${string}:${string}`  // 'resource:action'
 type SyncScopes = Record<string, ScopeFilter>
 interface ScopeContext { userId: string; orgId: string; role: string; permissions: Permission[] }
 type CollectionScopeResolver = (ctx: ScopeContext) => ScopeFilter | null

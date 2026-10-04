@@ -105,13 +105,16 @@ devices. Edit it with [`useRichText`](/guide/react-hooks#userichtext).
 
 `.merge(strategy)` on a field replaces its default rule:
 
-<!-- docs-check: skip field definitions out of context -->
 ```ts
-quantity: t.number().merge('counter'),
-highScore: t.number().merge('max'),
-lowestBid: t.number().merge('min'),
-auditLog: t.array(t.string()).merge('append-only'),
-approval: t.enum(['pending', 'approved', 'rejected']).merge('server-authoritative'),
+import { t } from 'korajs'
+
+const fields = {
+  quantity: t.number().merge('counter'),
+  highScore: t.number().merge('max'),
+  lowestBid: t.number().merge('min'),
+  auditLog: t.array(t.string()).merge('append-only'),
+  approval: t.enum(['pending', 'approved', 'rejected']).merge('server-authoritative'),
+}
 ```
 
 | Strategy | Rule | Use for |

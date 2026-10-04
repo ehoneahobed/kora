@@ -105,6 +105,7 @@ const tokenApp = createApp({
   sync: {
     url: 'wss://sync.example.com/kora-sync',
     auth: async (options) => ({ token: await getAccessToken(options) }),
+    autoConnect: true,
   },
 })
 ```

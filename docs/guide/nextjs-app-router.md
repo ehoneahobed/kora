@@ -38,7 +38,7 @@ import schema from './schema'
 export const app = createApp({
   schema,
   store: { workerUrl: '/kora-worker.js' }, // see "The SQLite worker" below
-  sync: { url: process.env.NEXT_PUBLIC_KORA_SYNC_URL ?? 'ws://localhost:3001' },
+  sync: { url: process.env.NEXT_PUBLIC_KORA_SYNC_URL ?? 'ws://localhost:3001', autoConnect: true },
 })
 
 // Typed hooks: collection names, inserts and rows are checked against the schema.
