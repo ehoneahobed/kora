@@ -101,5 +101,7 @@ export interface TemplateContext {
 	projectName: string
 	packageManager: PackageManager
 	koraVersion: string
+	/** `@korajs/tauri` version for the desktop template (its own version line). */
+	tauriVersion?: string
 	dbProvider?: string
 }

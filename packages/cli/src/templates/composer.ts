@@ -3,6 +3,7 @@ import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/pro
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { TemplateContext, TemplateName } from '../types'
+import { KORA_TAURI_TEMPLATE_VERSION } from './tauri-version'
 
 export type TemplateLayerCategory = 'base' | 'ui' | 'style' | 'sync' | 'db' | 'auth'
 
@@ -194,6 +195,7 @@ export async function composeTemplateLayers(
 		projectName: context.projectName,
 		packageManager: context.packageManager,
 		koraVersion: context.koraVersion,
+		tauriVersion: context.tauriVersion ?? KORA_TAURI_TEMPLATE_VERSION,
 		dbProvider: context.dbProvider ?? 'none',
 	}
 

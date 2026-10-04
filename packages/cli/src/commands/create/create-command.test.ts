@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { ProjectExistsError } from '../../errors'
+import { KORA_TAURI_TEMPLATE_VERSION } from '../../templates/tauri-version'
 import { directoryExists } from '../../utils/fs-helpers'
 import { createCommand, deriveKoraTemplateVersion } from './create-command'
 import { applySyncProviderPreset } from './sync-provider-preset'
@@ -109,6 +110,25 @@ describe('create command flow', () => {
 		const pkg = await readFile(join(targetDir, 'package.json'), 'utf-8')
 		expect(pkg).toContain('2.3.4')
 		expect(pkg).not.toContain('{{koraVersion}}')
+	})
+
+	test('tauri template pins @korajs/tauri to its own version line, not koraVersion', async () => {
+		const targetDir = join(tempDir.path, 'tauri-version-test')
+		await scaffoldTemplate('tauri-react', targetDir, {
+			projectName: 'tauri-version-test',
+			packageManager: 'npm',
+			koraVersion: '1.0.0-beta.13',
+		})
+
+		const pkg = JSON.parse(await readFile(join(targetDir, 'package.json'), 'utf-8')) as {
+			dependencies: Record<string, string>
+		}
+		const tauriManifest = JSON.parse(
+			await readFile(new URL('../../../../tauri/package.json', import.meta.url), 'utf-8'),
+		) as { version: string }
+		expect(KORA_TAURI_TEMPLATE_VERSION).toBe(tauriManifest.version)
+		expect(pkg.dependencies['@korajs/tauri']).toBe(tauriManifest.version)
+		expect(pkg.dependencies.korajs).toBe('1.0.0-beta.13')
 	})
 
 	test('pins prerelease Kora template dependencies exactly', () => {

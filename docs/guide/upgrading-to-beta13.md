@@ -10,7 +10,7 @@ It is **breaking by design**: beta.12 let a client of a multi-user sync server r
 other users' data, could silently lose writes, could leave devices and the server disagreeing
 about a record forever, and its end-to-end encryption never worked across devices. This page
 takes an app from beta.12 to beta.13 step by step. The complete list of changes is in the
-[release notes](https://github.com/ehoneahobed/kora/blob/main/remediation/BETA13-RELEASE-NOTES.md).
+[release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md).
 
 **Order: servers first, then clients.** A beta.13 server accepts beta.12 clients for this
 release (with a deprecation warning and the exceptions below). A beta.13 client against a beta.12
