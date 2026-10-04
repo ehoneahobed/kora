@@ -106,14 +106,18 @@ describe('RT-98: re-folds in the syncing tab do not refresh other tabs', () => {
 		const todosB = (tabB as unknown as { todos: Todos }).todos
 
 		let seenOnB: Row[] = []
+		// Every id B's live query ever showed: with the fix, the write can appear and
+		// disappear between two polls.
+		const everOnB = new Set<string>()
 		const stop = todosB.where({}).subscribe((rows) => {
 			seenOnB = rows
+			for (const row of rows) everOnB.add(row.id)
 		})
 		await tabA.sync?.connect()
 		const refused = await todosA.insert({ title: 'forbidden' })
 		// B's live query first shows the local write (bus: operation:created).
-		for (let i = 0; i < 40 && seenOnB.length === 0; i++) await tick()
-		expect(seenOnB.map((r) => r.id)).toContain(refused.id)
+		for (let i = 0; i < 40 && everOnB.size === 0; i++) await tick()
+		expect([...everOnB]).toContain(refused.id)
 
 		// The server refuses it; tab A re-folds the record away.
 		for (let i = 0; i < 60 && (await todosA.findById(refused.id)) !== null; i++) await tick()

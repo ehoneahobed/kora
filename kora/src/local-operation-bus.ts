@@ -1,7 +1,8 @@
 import type { KoraEventEmitter, Operation } from '@korajs/core'
-import type { Store } from '@korajs/store'
+import type { RecordsChange, Store } from '@korajs/store'
 
 const MESSAGE_TYPE = 'kora-local-operation'
+const CHANGE_MESSAGE_TYPE = 'kora-records-changed'
 
 interface LocalOperationMessage {
 	type: typeof MESSAGE_TYPE
@@ -9,22 +10,34 @@ interface LocalOperationMessage {
 	operation: Operation
 }
 
+interface RecordsChangedMessage {
+	type: typeof CHANGE_MESSAGE_TYPE
+	originId: string
+	collection: string
+	ids: string[] | null
+}
+
 /**
  * Keeps same-origin app instances backed by the same local database reactive.
  *
  * The storage leader/follower path makes all tabs read and write one durable
- * database. A write committed in tab A, however, only invalidates tab A's in-memory
- * subscriptions unless the other tabs are told that a committed operation exists.
- * This bus carries that notification for local writes (`operation:created`) AND
- * for remote operations applied by sync (`operation:applied`): a tab that is not
- * syncing still sees what the syncing tab received (STORE-10). Receivers do not
- * reapply the operation; they only ask their Store to advance in-memory
- * watermarks and refetch affected queries.
+ * database. A change committed in tab A, however, only invalidates tab A's in-memory
+ * subscriptions unless the other tabs are told about it.
+ *
+ * Every broadcast comes from ONE source (RT-98): the Store's committed-change funnel
+ * (`store.onRecordsChanged`), which every subscription invalidation the Store makes
+ * passes through. Local writes and remote applies (STORE-10) travel as their operation
+ * (receivers also advance in-memory watermarks); changes made without an operation
+ * (re-folds after a terminal rejection, scope retraction and narrowing, provisional
+ * cascade settling, authority re-folds, rematerialization, backup restore, held or
+ * discarded writes) travel as "records changed (collection, ids)". No invalidation
+ * path can refresh this tab without refreshing the others. Receivers never reapply
+ * anything; they only re-run their affected live queries.
  */
 export function wireLocalOperationBus(
 	dbName: string,
 	store: Store,
-	emitter: KoraEventEmitter,
+	_emitter: KoraEventEmitter,
 ): () => void {
 	if (typeof BroadcastChannel === 'undefined') {
 		return () => {}
@@ -33,29 +46,39 @@ export function wireLocalOperationBus(
 	const originId = createOriginId()
 	const channel = new BroadcastChannel(`kora-local-ops-${dbName}`)
 
-	const onMessage = (event: MessageEvent<LocalOperationMessage>): void => {
+	const onMessage = (event: MessageEvent<LocalOperationMessage | RecordsChangedMessage>): void => {
 		const message = event.data
-		if (
-			message?.type !== MESSAGE_TYPE ||
-			message.originId === originId ||
-			!isOperationLike(message.operation)
-		) {
+		if (!message || message.originId === originId) return
+		if (message.type === CHANGE_MESSAGE_TYPE) {
+			if (typeof message.collection === 'string') store.notifyExternalChange(message.collection)
 			return
 		}
+		if (message.type !== MESSAGE_TYPE || !isOperationLike(message.operation)) return
 		store.notifyExternalOperation(message.operation)
 	}
 
 	channel.addEventListener('message', onMessage)
-	const broadcast = (operation: Operation): void => {
-		const message: LocalOperationMessage = { type: MESSAGE_TYPE, originId, operation }
+	const unsubscribeChanges = store.onRecordsChanged((change: RecordsChange) => {
+		if (change.operation) {
+			const message: LocalOperationMessage = {
+				type: MESSAGE_TYPE,
+				originId,
+				operation: change.operation,
+			}
+			channel.postMessage(message)
+			return
+		}
+		const message: RecordsChangedMessage = {
+			type: CHANGE_MESSAGE_TYPE,
+			originId,
+			collection: change.collection,
+			ids: change.ids ? [...change.ids] : null,
+		}
 		channel.postMessage(message)
-	}
-	const unsubscribeCreated = emitter.on('operation:created', (event) => broadcast(event.operation))
-	const unsubscribeApplied = emitter.on('operation:applied', (event) => broadcast(event.operation))
+	})
 
 	return () => {
-		unsubscribeCreated()
-		unsubscribeApplied()
+		unsubscribeChanges()
 		channel.removeEventListener('message', onMessage)
 		channel.close()
 	}

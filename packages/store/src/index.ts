@@ -108,6 +108,8 @@ export {
 // === Subscription ===
 export { SubscriptionManager } from './subscription/subscription-manager'
 export type {
+	RecordsChange,
+	RecordsChangeListener,
 	RegisterOptions,
 	SubscriptionManagerOptions,
 	SubscriptionStats,

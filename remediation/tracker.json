@@ -3267,14 +3267,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-98.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to. FIX (beta.13 RC): SubscriptionManager.recordsChanged is the single funnel for every invalidation the store makes (notify carries the operation; invalidate carries collection + ids when known); Store.onRecordsChanged exposes it and the cross-tab bus (kora/src/local-operation-bus.ts) broadcasts ONLY from it: changes with an operation as the operation (receivers advance watermarks), all others as 'records changed (collection, ids)'. Receivers use notifyExternalOperation / notifyExternalChange (invalidateFromPeer: never re-broadcast). Changes made while opening, before the bus is wired (rematerialization, fold-plan re-folds), are replayed to the first listener. Tests: kora/src/local-operation-bus.test.ts (a scope retraction reaches the other tab; funnel contract incl. no echo). Repro adjusted to record every id tab B ever showed (with the fix the refused row can appear and vanish between two polls)."
   },
   {
    "id": "RT-99",
