@@ -3350,6 +3350,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). core/src/fold/fold.ts:409-410 (null view folds as nothing), core/src/migration/operation-view.ts:55-60 (an empty list folds as written, a partial list returns null), server/src/store/record-fold.ts:130-139, fold plan fingerprint includes transforms (re-fold on change). docs/guide/schema-design.md asks to keep transforms 'as long as operations of its source version can exist', which is forever for an append-only log, and nothing enforces it. Repro packages/server/tests/repro/RT-103.test.ts (SQLite server store; the v1 record is null after the restart). Devices: by code reading the same null view at a re-fold drops the op from their records too. Required fix: at setSchema/open, refuse (OperationTransformError naming the versions) a transform set that has no path from a schema version present in the stored log to the current one; and treat a null view of a STORED op as quarantine/keep-as-written, never as an absent op (a transform returning null deliberately is a separate, explicit decision that should be logged)."
+  },
+  {
+   "id": "RT-104",
+   "title": "After the server loses a key record (restore from the server's own backup, which covers operations only), a NEW device that reconnects first creates a fresh keyring: every device holding the old keys then stops syncing for good with KEY_RECORD_ROLLBACK and the new device can never decrypt the user's history (the guide promises the old record is re-uploaded)",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-104.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:219-221 and 606-654 (no record -> createOrRestoreLocked; a device without a cached record creates a new data key), keyring.ts:683-695 (old devices refuse the new record, no way out), docs/guide/sync-encryption.md 'Server Requirements' (exportBackup covers operations only; 'the next device that still holds it uploads its copy again, so nothing is lost while one device has synced'). Repro packages/sync/tests/repro/RT-104.test.ts. Required fix: never create a first key record for an owner that already has encrypted history: the server answers a fetch with 'lost' (it knows the owner has envelope ops, or keeps a tombstone/fingerprint of every record it ever stored) and refuses a create (expectedRevision 0) while a device with the old record has not re-uploaded; the client then stays locked with KEY_RECORD_MISSING instead of creating. Include kora_encryption_keys in exportBackup/importBackup. Give operators/apps a documented resolution for a forked keyring."
   }
  ],
  "rejectedProposalPins": {
