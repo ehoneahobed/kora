@@ -16,7 +16,12 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
-import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import {
+	KEY_ID_SAMPLE_ROWS,
+	envelopeColumn,
+	envelopeKeyIds,
+	parseEnvelopeColumn,
+} from './envelope-column'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -1041,6 +1046,25 @@ export class SqliteServerStore implements ServerStore {
 				RETURNING owner`,
 		)
 		return rows.length > 0
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		const rows =
+			nodeOwner === null
+				? this.db.all<{ encrypted: string | null }>(
+						sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+				: this.db.all<{ encrypted: string | null }>(
+						sql`SELECT o.encrypted AS encrypted FROM node_claims c
+							JOIN operations o ON o.node_id = c.node_id
+							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+		return envelopeKeyIds(
+			rows.map((row) => row.encrypted),
+			limit,
+		)
 	}
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {

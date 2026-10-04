@@ -531,6 +531,17 @@ export interface ServerStore extends SyncStore {
 		expectedRevision: number,
 	): Promise<boolean>
 	/**
+	 * Key ids named by stored encrypted operations (their envelope's `keyId`), a sample
+	 * of at most `limit` distinct ids (RT-104). `nodeOwner` restricts it to operations of
+	 * nodes claimed by that principal (see {@link claimNode}); null means every node (a
+	 * server without authentication, whose clients share one keyring). The key service
+	 * reports them when an owner has no key record, so a new device can tell a lost
+	 * record (encrypted history exists) from a first one. Optional; without it a new
+	 * device cannot tell, and a fork it creates is merged later by a device holding the
+	 * old ring.
+	 */
+	getEncryptedKeyIds?(nodeOwner: string | null, limit: number): Promise<string[]>
+	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server
 	 * keeps ownership in memory (lost on restart, not shared between instances).

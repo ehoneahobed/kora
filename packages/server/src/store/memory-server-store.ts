@@ -800,6 +800,19 @@ export class MemoryServerStore implements ServerStore {
 		return true
 	}
 
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		const ids = new Set<string>()
+		for (const op of this.operations) {
+			if (ids.size >= limit) break
+			const keyId = op.encrypted?.keyId
+			if (typeof keyId !== 'string') continue
+			if (nodeOwner !== null && this.nodeOwners.get(op.nodeId) !== nodeOwner) continue
+			ids.add(keyId)
+		}
+		return [...ids]
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false

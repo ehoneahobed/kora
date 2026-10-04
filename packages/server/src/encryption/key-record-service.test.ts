@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Operation } from '@korajs/core'
 import type { EncryptionKeyPutMessage, WrappedKeyRecord } from '@korajs/sync'
 import { afterEach, describe, expect, test } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
@@ -12,19 +13,50 @@ const B64_12 = 'AAAAAAAAAAAAAAAA'
 const B64_32 = `${'A'.repeat(43)}=`
 const B64_48 = 'A'.repeat(64)
 
-function record(revision: number, versions = 1): WrappedKeyRecord {
+const RING = `r-${'0'.repeat(32)}`
+
+function record(revision: number, versions = 1, ringId = RING): WrappedKeyRecord {
 	return {
-		format: 1,
+		format: 2,
 		keyring: 'default',
+		ringId,
 		revision,
 		currentVersion: versions,
 		kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: 600_000, salt: B64_32 },
+		master: { iv: B64_12, wrappedKey: B64_48 },
 		keys: Array.from({ length: versions }, (_, i) => ({
 			keyVersion: i + 1,
 			keyId: `k2-${String(i + 1).repeat(32)}`,
 			iv: B64_12,
 			wrappedKey: B64_48,
 		})),
+		mac: B64_32,
+	}
+}
+
+let opSequence = 0
+function sealedOp(nodeId: string, keyId: string): Operation {
+	opSequence++
+	return {
+		id: `op-${opSequence}`,
+		nodeId,
+		type: 'insert',
+		collection: 'notes',
+		recordId: `rec-${opSequence}`,
+		data: null,
+		previousData: null,
+		timestamp: { wallTime: 1_700_000_000_000 + opSequence, logical: 0, nodeId },
+		sequenceNumber: opSequence,
+		causalDeps: [],
+		schemaVersion: 1,
+		encrypted: {
+			v: 2,
+			alg: 'aes-256-gcm',
+			keyId,
+			keyVersion: 1,
+			data: { iv: 'aXY=', ct: 'Y3Q=' },
+			previousData: { iv: 'aXY=', ct: 'bnVsbA==' },
+		},
 	}
 }
 
@@ -97,6 +129,45 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 		const dropped = await service.handle(owner, put(record(2, 1), 1))
 		expect(dropped.response.status).toBe('invalid')
 		expect(dropped.response.message).toMatch(/key version 2 must be kept/)
+	})
+
+	test('revisions only grow and the ring id never changes; a first write keeps its revision', async () => {
+		const service = new EncryptionKeyService(await makeStore())
+		const owner = userKeyOwner('alice')
+		// A device re-uploading a lost record keeps the revision every device pinned.
+		expect((await service.handle(owner, put(record(5), 0))).response.status).toBe('ok')
+		expect((await service.handle(owner, put(record(5), 5))).response.status).toBe('invalid')
+		const otherRing = record(6, 1, `r-${'1'.repeat(32)}`)
+		expect((await service.handle(owner, put(otherRing, 5))).response.message).toMatch(/ringId/)
+		// A merge or a healed rollback may jump revisions.
+		expect((await service.handle(owner, put(record(9, 2), 5))).response.status).toBe('ok')
+		// Format 1 records are not accepted.
+		const legacy = { ...record(10, 2), format: 1 } as unknown as WrappedKeyRecord
+		expect((await service.handle(owner, put(legacy, 9))).response.status).toBe('invalid')
+	})
+
+	test('with no record, a fetch reports the key ids of the owner encrypted history (RT-104)', async () => {
+		const store = await makeStore()
+		const service = new EncryptionKeyService(store)
+		const alice = userKeyOwner('alice')
+		expect((await service.handle(alice, fetch)).response.knownKeyIds).toEqual([])
+		expect(await store.claimNode?.('alice-phone', 'alice')).toBe(true)
+		expect(await store.claimNode?.('bob-phone', 'bob')).toBe(true)
+		await store.applyRemoteOperation(sealedOp('alice-phone', `k2-${'a'.repeat(32)}`))
+		await store.applyRemoteOperation(sealedOp('alice-phone', `k2-${'a'.repeat(32)}`))
+		await store.applyRemoteOperation(sealedOp('bob-phone', `k2-${'b'.repeat(32)}`))
+		expect((await service.handle(alice, fetch)).response.knownKeyIds).toEqual([
+			`k2-${'a'.repeat(32)}`,
+		])
+		expect((await service.handle(userKeyOwner('bob'), fetch)).response.knownKeyIds).toEqual([
+			`k2-${'b'.repeat(32)}`,
+		])
+		expect(
+			[...((await service.handle(ANONYMOUS_KEY_OWNER, fetch)).response.knownKeyIds ?? [])].sort(),
+		).toEqual([`k2-${'a'.repeat(32)}`, `k2-${'b'.repeat(32)}`])
+		// Once a record exists nothing is reported.
+		await service.handle(alice, put(record(1), 0))
+		expect((await service.handle(alice, fetch)).response.knownKeyIds).toBeUndefined()
 	})
 
 	test('refuses anonymous principals, bad keyrings and malformed records', async () => {
