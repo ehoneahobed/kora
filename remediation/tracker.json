@@ -3282,14 +3282,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-99.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them). FIX (beta.13 RC): static-files.ts derives the ETag from a SHA-256 of the file bytes, computed once per file version (cache keyed by path; version = dev, ino, size, mtime, ctime) and validated by the digest; revalidated (no-cache) files send no Last-Modified and ignore If-Modified-Since; the compressed-body cache is keyed by the digest (and content read after a change is never cached under the old digest); a pre-compressed sibling is used only when it decompresses to the current digest (normalised mtimes make 'not older' meaningless). Tests: static-files.test.ts (content-digest ETag 304, IMS only for hashed files, stale sibling ignored, redeploy into a new directory with normalised mtimes served by a restarted server is 200, same build 304)."
   },
   {
    "id": "RT-100",

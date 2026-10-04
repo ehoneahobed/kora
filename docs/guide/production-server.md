@@ -147,10 +147,17 @@ The server serves `staticDir` (default `./dist`) the way an offline-first app ne
 | Request | Response |
 |---|---|
 | Content-hashed file (`assets/index-DrBNyszg.js`) | `Cache-Control: public, max-age=31536000, immutable` |
-| Anything else (`index.html`, `sw.js`, `manifest.webmanifest`, the unhashed `assets/sqlite3.wasm`) | `Cache-Control: no-cache`, revalidated with `ETag` / `Last-Modified` and answered `304` when unchanged |
-| Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when present; otherwise each file is compressed once and cached in memory |
+| Anything else (`index.html`, `sw.js`, `manifest.webmanifest`, the unhashed `assets/sqlite3.wasm`) | `Cache-Control: no-cache`, revalidated with the `ETag` and answered `304` only when the content is unchanged |
+| Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when it decompresses to the file's current bytes; otherwise each file version is compressed once and cached in memory |
 | A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
 | Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
+
+Validators come from the content, never from file metadata alone: the `ETag` is a SHA-256 of
+the file's bytes (computed once per file version and cached by path, size, mtime, inode and
+ctime). Revalidated files send no `Last-Modified` and ignore `If-Modified-Since`, because
+`index.html` and `sw.js` usually keep their size across deploys and reproducible or container
+builds normalise modification times; a redeploy is therefore always seen. Content-hashed files
+also send `Last-Modified`.
 
 Media types include `.webmanifest` (`application/manifest+json`), `.wasm` and `.mjs`.
 Only `GET` and `HEAD` are served; paths cannot escape `staticDir`.

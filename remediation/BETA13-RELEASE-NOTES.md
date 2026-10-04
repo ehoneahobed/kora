@@ -96,7 +96,7 @@ Every replica now computes a record with one deterministic per-field CRDT fold (
 ## Tooling and offline app shell
 
 - **Scaffolded apps open offline** (NEW-DX-3). The `koraServiceWorker()` Vite plugin (`@korajs/cli/vite`, used by the templates) precaches the app shell and the SQLite WASM files at build time; navigations fall back to the cached shell, sync and auth endpoints are never cached, and updates wait for the user's consent.
-- **The production static server is correct** (NEW-SRV-8): ETag / Last-Modified with 304s, brotli/gzip, immutable caching only for content-hashed names, real 404s for missing assets (SPA fallback only for navigations), and correct MIME types including `.webmanifest` and `.wasm`.
+- **The production static server is correct** (NEW-SRV-8, RT-99): content-derived ETags (a SHA-256 of the bytes, so a redeploy with unchanged sizes and normalised mtimes is never answered 304; revalidated files ignore `If-Modified-Since`; compressed bodies are cached per content hash and pre-compressed siblings are used only when they hold the current bytes), brotli/gzip, immutable caching only for content-hashed names, real 404s for missing assets (SPA fallback only for navigations), and correct MIME types including `.webmanifest` and `.wasm`.
 - **`kora deploy` offers only working platforms** (DX-8): Render and Docker are labelled "coming soon" and refused before anything is written.
 - **Postgres tests run under vitest** (RT-30), and the store benchmarks measure the real browser path (STORE-16). The browser worker no longer claims WAL on OPFS (NEW-STORE-11).
 

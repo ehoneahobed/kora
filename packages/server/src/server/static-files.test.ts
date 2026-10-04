@@ -59,7 +59,10 @@ describe('createStaticFileHandler', () => {
 		writeFileSync(join(dir, 'docs', 'index.html'), '<h1>docs</h1>')
 		writeFileSync(join(dir, 'assets', 'app-AbCd1234.js'), big)
 		writeFileSync(join(dir, 'assets', 'pre-AbCd1234.js'), big)
-		writeFileSync(join(dir, 'assets', 'pre-AbCd1234.js.gz'), gzipSync('PRECOMPRESSED'))
+		writeFileSync(join(dir, 'assets', 'pre-AbCd1234.js.gz'), gzipSync(big, { level: 1 }))
+		writeFileSync(join(dir, 'assets', 'stale-AbCd1234.js'), big)
+		// A sibling left over from another build: it does not decompress to the file.
+		writeFileSync(join(dir, 'assets', 'stale-AbCd1234.js.gz'), gzipSync('PRECOMPRESSED'))
 		writeFileSync(join(dir, 'secret.txt'), 'outside?')
 		const old = new Date('2026-01-01T00:00:00Z')
 		utimesSync(join(dir, 'index.html'), old, old)
@@ -104,11 +107,29 @@ describe('createStaticFileHandler', () => {
 		}
 	})
 
-	test('If-Modified-Since yields 304', async () => {
-		const r = await fetch(`${base}/`)
+	test('If-Modified-Since yields 304 for content-hashed files only (RT-99)', async () => {
+		const r = await fetch(`${base}/assets/app-AbCd1234.js`)
 		const lm = r.headers.get('last-modified') ?? ''
-		expect(lm).toContain('2026')
-		const r2 = await fetch(`${base}/`, { headers: { 'if-modified-since': lm } })
+		expect(lm).not.toBe('')
+		const r2 = await fetch(`${base}/assets/app-AbCd1234.js`, {
+			headers: { 'if-modified-since': lm },
+		})
+		expect(r2.status).toBe(304)
+		// A revalidated file's mtime is not a validator: no Last-Modified, and
+		// If-Modified-Since alone never yields 304.
+		const shell = await fetch(`${base}/`)
+		expect(shell.headers.get('last-modified')).toBeNull()
+		const shell2 = await fetch(`${base}/`, {
+			headers: { 'if-modified-since': new Date('2030-01-01T00:00:00Z').toUTCString() },
+		})
+		expect(shell2.status).toBe(200)
+	})
+
+	test('ETags are content digests: If-None-Match with the same ETag yields 304', async () => {
+		const r = await fetch(`${base}/`)
+		const etag = r.headers.get('etag') ?? ''
+		expect(etag).toMatch(/^"[A-Za-z0-9_-]{43}"$/)
+		const r2 = await fetch(`${base}/`, { headers: { 'if-none-match': etag } })
 		expect(r2.status).toBe(304)
 	})
 
@@ -131,11 +152,20 @@ describe('createStaticFileHandler', () => {
 		expect(await id.text()).toBe(big)
 	})
 
-	test('a pre-compressed sibling is served when present', async () => {
+	test('a pre-compressed sibling is served when it holds the file', async () => {
 		const r = await fetch(`${base}/assets/pre-AbCd1234.js`, {
 			headers: { 'accept-encoding': 'gzip' },
 		})
-		expect(await r.text()).toBe('PRECOMPRESSED')
+		expect(Number(r.headers.get('content-length'))).toBe(gzipSync(big, { level: 1 }).length)
+		expect(await r.text()).toBe(big)
+	})
+
+	test('a pre-compressed sibling of other content is ignored (RT-99)', async () => {
+		const r = await fetch(`${base}/assets/stale-AbCd1234.js`, {
+			headers: { 'accept-encoding': 'gzip' },
+		})
+		expect(r.headers.get('content-encoding')).toBe('gzip')
+		expect(await r.text()).toBe(big)
 	})
 
 	test('HEAD sends headers only, other methods are refused', async () => {
@@ -145,5 +175,64 @@ describe('createStaticFileHandler', () => {
 		const post = await fetch(`${base}/index.html`, { method: 'POST' })
 		expect(post.status).toBe(405)
 		expect(post.headers.get('allow')).toBe('GET, HEAD')
+	})
+})
+
+describe('redeploys with normalised mtimes (RT-99)', () => {
+	const fixed = new Date('1980-01-01T00:00:00Z')
+
+	function build(root: string, hash: string): void {
+		mkdirSync(join(root, 'assets'), { recursive: true })
+		// Same length in every build: only the referenced chunk hash differs.
+		writeFileSync(join(root, 'index.html'), `<script src="/assets/index-${hash}.js"></script>`)
+		writeFileSync(join(root, 'sw.js'), `const VERSION = "${hash}${hash}"\n`)
+		for (const name of ['index.html', 'sw.js']) utimesSync(join(root, name), fixed, fixed)
+	}
+
+	async function serveOnce(root: string, run: (base: string) => Promise<void>): Promise<void> {
+		const handle = createStaticFileHandler(root)
+		const srv = createServer((req, res) => {
+			void handle(req, res, new URL(req.url ?? '/', 'http://x').pathname)
+		})
+		await new Promise<void>((done) => srv.listen(0, '127.0.0.1', () => done()))
+		try {
+			await run(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)
+		} finally {
+			await new Promise<void>((done) => srv.close(() => done()))
+		}
+	}
+
+	test('a new build directory served by a restarted server is never 304', async () => {
+		const parent = mkdtempSync(join(tmpdir(), 'kora-redeploy-'))
+		const v1 = join(parent, 'v1')
+		const v2 = join(parent, 'v2')
+		build(v1, 'AAAAAAAA')
+		build(v2, 'BBBBBBBB')
+		const etags: Record<string, string> = {}
+		await serveOnce(v1, async (base) => {
+			for (const name of ['index.html', 'sw.js']) {
+				etags[name] = (await fetch(`${base}/${name}`)).headers.get('etag') ?? ''
+			}
+		})
+		await serveOnce(v2, async (base) => {
+			for (const name of ['index.html', 'sw.js']) {
+				const r = await fetch(`${base}/${name}`, {
+					headers: {
+						'if-none-match': etags[name] ?? '',
+						'if-modified-since': fixed.toUTCString(),
+					},
+				})
+				expect(r.status).toBe(200)
+				expect(await r.text()).toContain('BBBBBBBB')
+			}
+		})
+		// The same build served again revalidates with 304 (the digest is stable).
+		await serveOnce(v1, async (base) => {
+			const r = await fetch(`${base}/index.html`, {
+				headers: { 'if-none-match': etags['index.html'] ?? '' },
+			})
+			expect(r.status).toBe(304)
+		})
+		rmSync(parent, { recursive: true, force: true })
 	})
 })
