@@ -85,3 +85,108 @@ Run on a 2-core machine, Postgres 16 on port 54440, real Chromium, the real beta
 | `compat-beta12.mjs` (12 seeds per server build, memory/SQLite/Postgres) | First run 22/24: `chaos/current-server/seed-4` and `seed-7` threw `WebSocket connection timed out` from an un-caught `connect()` in the harness; both passed on rerun. A rerun of seed 4 then failed `chaos/b12-server/seed-4` twice: once the same connect timeout, once a convergence timeout with all three current replicas in phase `blocked`, no rejection, apply failure or sync error event, and one unhandled `Cannot send message: WebSocket is not connected` (the beta.12 build's known crash path). Every other row passed, including every upgrade, shape and encryption row. Not filed: nondeterministic, current clients through a beta.12 server is the configuration the release notes say not to run, and 10 s localhost connect timeouts point at event-loop starvation on this machine. Worth one investigation on CI hardware (what leaves a current client in state `error` without retrying). |
 | `compat-beta12-browser.mjs` | 2/2 (SQLite WASM/OPFS, IndexedDB) |
 | `rt-legacy-id-probe`, `rt3-legacy-probe`, `rt3-upgrade-clear-probe`, `protocol-v2-compat` (beta.12) | all accepted and converged, nothing rejected or quarantined |
+
+## Final verification (post-RC fixes, 2026-10-04)
+
+Independent adversarial round over the fixes after the RC red team (`85b307f..9c0a2e1`:
+key record format 2, recovery anchor `kora-rk2-`, ring merge, `startNewKeyring`, key
+records in server backups, records-changed funnel, content-derived static validators,
+include typing, value-domain evolution, one query key, transform retirement refusal,
+`kora migrate --kora:evolve-table`, server default for added fields), plus a release
+smoke. Branch `wip/phase4/verify-final` (on `private`). No production code was changed.
+
+Method: executable repros against the real `EncryptionKeyring` (WebCrypto) with a
+scriptable key service, `PostgresServerStore` on an own Postgres 16 (port 54440,
+`initdb -E UTF8 --locale=C.UTF-8`, data under /tmp), the generated service worker run in
+a fake `ServiceWorkerGlobalScope`, and real Chromium against an app scaffolded with the
+built CLI and installed from the packed tarballs.
+
+### Findings
+
+| ID | Sev | Finding | Location | Required fix | Repro |
+|---|---|---|---|---|---|
+| RT-107 | P2 (security) | "Change the passphrase, then rotate" does not contain a leaked passphrase against the sync server. (1) Every device other than the one that changed the passphrase still holds the OLD master key, and the server decides what it forwards: it seals a successor revision under the old master (opened with the leaked passphrase from the old record it kept) that adds its own data key, the device authenticates it with the held master and encrypts every new operation under the attacker's key. (2) The recovery anchor fingerprints the ring's FIRST data key, which the old passphrase opens: a ring under an attacker master wrapped to the (public) recovery key and re-wrapping that key passes `holdsAnchor`, and the recovered device encrypts under the attacker's key. Needs the old passphrase plus the server; contradicts the guide's leak advice. | `sync/src/encryption/keyring.ts:898-970` (adopt via held master), `691-707`, `1226-1241`; `keyring-crypto.ts:364`; `docs/guide/sync-encryption.md:224` | (1) is inherent to a shared-secret ring: correct the guide and the `changePassphrase` JSDoc (after a leak, lock and re-unlock every device with the new passphrase, or start a new keyring); optionally stop adopting key-adding records under a held master once a newer unauthenticatable revision was seen. (2) Anchor recovery to a secret only the recovery-key holder has (an HMAC commitment keyed by a secret in the recovery key), not to a data key. | `packages/sync/tests/repro/RT-107.test.ts` (2 tests) |
+| RT-108 | P2 | Value-domain relaxation on Postgres misses a beta.12 single-value enum CHECK: Postgres stores `IN ('x')` as `CHECK ((col = 'x'::text))`, which `isPostgresEnumCheckDefinition` (only `= ANY (ARRAY[...])`) does not match. After adding a value to a one-value enum ("start with `active`, add `archived` later"), the upgraded Postgres server still refuses the new value (RT-101 persists for this shape; the CLI's relax directive uses the same planner). | `core/src/schema/constraint-relaxation.ts:166-170, 263-277`; `server/src/store/postgres-server-store.ts:514-530` | Recognise the single-column equality form too, ideally by matching the schema's enum columns rather than the definition's shape; add the case to `value-domain-evolution.test.ts` and the directive tests. | `packages/server/tests/repro/RT-108.test.ts` (needs `KORA_PG_TEST_URL`) |
+| RT-109 | P2 | Offline shell after a deploy: the old worker stays active and the new one waits for consent, but navigations are network-first, so an online reload already runs the NEW build (while the prompt says an update is available), and a later OFFLINE reload of the same tab runs the OLD build from the old cache against the database the new build opened and migrated. The store opens a newer-schema database silently (`stored >= target` returns). Verified in Chromium on a scaffolded app: v1 -> deploy v2 (schema version 2) -> online reload shows v2 with `{active, waiting}` -> offline reload shows v1, which writes schema-1 operations into the schema-2 database; with a `renameField` migration the old build fails at `ready` (RC probe), so the app does not open offline until online again. Confirms the RC "suspected" item. | `cli/src/vite/service-worker.ts:298-309`; `store/src/migrations/run-migrations.ts:45-50` | One build per active worker (serve the network document only when it is this worker's version, else the precached shell; or activate the new worker once a page of its build runs); refuse, with an event, a database whose stored schema version is newer than the code's. | `packages/cli/tests/repro/RT-109.test.ts`; browser script `packages/cli/tests/repro/RT-109-browser.mjs` (manual) |
+
+Nothing at P0 or P1 was found.
+
+### Release smoke
+
+- `pnpm pack` of every publishable package (kora + 14 under `packages/`): every tarball
+  holds its `dist` (ESM, CJS, maps) and type declarations (`.d.ts` and `.d.cts`) for every
+  declared entry point; `@korajs/auth` and `@korajs/svelte` also ship `src` without tests;
+  `@korajs/cli` ships `templates/`. Nothing secret or internal: no `tests/repro`, no
+  `remediation`, no `.env` (templates carry only `.env.example` with empty secrets), no
+  keys or tokens (scanned for private-key, AWS, GitHub and npm token patterns). One stray
+  test file: `@korajs/tauri` ships `plugin/tests/integration.rs` (harmless). Versions are
+  still `1.0.0-beta.12` (create-kora-app `0.1.25-beta.11`, tauri `0.4.3-beta.11`): the
+  release bump is still to run.
+- Scaffold: `create-kora-app myapp --yes --pm pnpm --skip-install` (built CLI; template
+  react-tailwind-sync) writes `pnpm-workspace.yaml` with `onlyBuiltDependencies` and
+  `allowBuilds`. Installed with pnpm 12.8.1 from the packed tarballs (overrides in
+  `pnpm-workspace.yaml`), `pnpm build` (tsc + vite) passes and emits `sw.js`. Served by
+  the template's own `server.ts` (production server): in Chromium the page is controlled
+  by the worker on first load, a todo written online and one written offline both survive
+  offline reloads (shell and data come up with the network off). Cross-device sync was not
+  exercised: the template's sync waits for a signed-in user (`KORA_AUTH_SECRET` unset, so
+  `/auth` is 404 and writes stay held, as documented). The template has no test script,
+  so there were no app tests to run. Note: with `--yes` and no `--pm`, a direct `node`
+  run picks npm and writes no `pnpm-workspace.yaml`; a later `pnpm install` on pnpm 11+
+  then fails `ERR_PNPM_IGNORED_BUILDS` (the `pnpm` field of `package.json` is no longer
+  read). `pnpm create kora-app` detects pnpm and is fine.
+
+### What held up
+
+- **Key record format 2.** The MAC (HMAC under a master-derived key) covers every field, so
+  a server cannot add or swap a recovery key, relabel or drop a version, or change KDF
+  parameters (iterations are also floored and capped at 10,000,000) without the passphrase
+  or a held master. A forged successor under an unknown master is refused (or, for a
+  device holding every key, ignored with `PASSPHRASE_REQUIRED`). Rollback: a lower revision
+  of the pinned ring is refused and the pin re-uploaded; recovery also refuses a rolled-back
+  record. `changePassphrase` creates a new master, so the old passphrase opens no later
+  record on a device that learned of the change.
+- **Ring merge and `startNewKeyring`.** A foreign ring is merged only after it authenticates
+  (held master or passphrase); held keys are re-wrapped into the server's ring under the
+  same key ids, never dropped (`commitLocked` invariant). `startNewKeyring` refuses when the
+  server holds a record (`KEY_RECORD_EXISTS`) and only lets this device create a ring the
+  server cannot read; a server that lies "missing" can fork or deny service, not read.
+- **Cross-user isolation.** The key owner comes only from the session (`u:<userId>`, `*`
+  without auth, none for anonymous principals of a mixed provider); messages cannot name a
+  user; pushes go only to sessions of the same owner; compare-and-set is one statement on
+  SQLite and Postgres. Backup restore inserts key records only where none exists
+  (`ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`) and refuses a malformed section whole.
+  The `knownKeyIds` report is filtered to the owner's nodes.
+- **Static validators.** ETags are SHA-256 of content, cached by dev/inode/size/mtime/ctime;
+  revalidated files never send `Last-Modified` and ignore `If-Modified-Since`;
+  precompressed siblings are used only when they decompress to the current digest;
+  compressed bodies are keyed by digest; a file replaced between hash and compress is not
+  cached under the old digest. Live server: `index.html` and `sw.js` are `no-cache` with
+  content ETags.
+- **Value-domain evolution (SQLite, multi-value Postgres).** The client and server SQLite
+  rebuild keeps columns, defaults, primary and foreign keys, `UNIQUE`, indexes and
+  triggers in one transaction with foreign keys off; Postgres drops only one-column enum
+  checks and `NOT NULL` on schema fields, keeping hand-written checks. `kora migrate`
+  checks `PRAGMA foreign_key_check` before committing, runs Postgres on one connection,
+  refuses to drop Kora columns and refuses legacy SQLite-only rebuilds on Postgres.
+- **Transform retirement.** Coverage is checked against `SELECT DISTINCT schema_version` of
+  the whole log (no sampling) on every store; the session refuses an upload with no view
+  (`SCHEMA_TRANSFORM_UNAVAILABLE`) instead of folding it as absent.
+- **Scaffold.** Offline first out of the box (see above).
+
+### Not attacked
+
+- Records-changed funnel (RT-98), include typing (RT-100) and the one query key (RT-102)
+  beyond reading their diffs and the checker's runs; Vue and Svelte bindings.
+- `kora migrate --kora:evolve-table` kind changes (`ALTER COLUMN TYPE`) on real data: the
+  server re-folds every record when the fold fingerprint changes, so the column projection
+  is transient; an interrupted Postgres migration (DDL is transactional, not exercised).
+- Server default for added fields against scope filters on a live multi-device run (read
+  only: `materializedFieldValue` on all three stores).
+- Static server under concurrent in-place file rewrites (a hash-then-stream race at deploy
+  time; content-length from the earlier stat).
+- Real-device Android, Safari; DevTools; `kora deploy`.
+
+### Gates (this round)
+
+GATES_PLACEHOLDER
