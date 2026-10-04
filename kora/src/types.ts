@@ -406,7 +406,9 @@ export interface EncryptionControl {
 	 * contain a LEAKED passphrase: devices that still hold only the old master key can be
 	 * fed records forged with it. After a leak, also `rotateKey()`, `enableRecovery()`
 	 * again, and re-unlock every other device with the new passphrase (`lock()` then
-	 * `unlock(newPassphrase)`). See the sync encryption guide.
+	 * `unlock(newPassphrase)`; never type the old one again, and update any configured
+	 * `key`). A device that cannot be re-unlocked stays exposed. See the sync encryption
+	 * guide.
 	 */
 	changePassphrase(
 		newPassphrase: string,

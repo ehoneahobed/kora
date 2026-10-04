@@ -186,6 +186,14 @@ export class EncryptionKeyring {
 	 * them is refused (RT-107).
 	 */
 	private readonly retiredMasters = new Set<string>()
+	/**
+	 * Ids of master keys this device held when the server served a newer revision of the
+	 * same ring that they do not authenticate (most likely a passphrase change made
+	 * elsewhere). A record authenticated only by one of them is not adopted without an
+	 * explicit `unlock(passphrase)`: after a genuine change, no later genuine record is
+	 * authenticated by the old master key (RT-107).
+	 */
+	private readonly supersededMasters = new Set<string>()
 	private encryptor: SyncEncryptor | null = null
 	private status: EncryptionStatus
 	private readonly listeners = new Set<(status: EncryptionStatus) => void>()
@@ -406,6 +414,7 @@ export class EncryptionKeyring {
 					master: null,
 					keys: [],
 					retiredMasters: [...this.retiredMasters],
+					supersededMasters: [...this.supersededMasters],
 				})
 			} else {
 				await this.cache.clear(this.cacheId())
@@ -459,7 +468,9 @@ export class EncryptionKeyring {
 	 * one) refuses every record authenticated only by the old master key, however it is
 	 * opened. Other devices keep working with their cached data keys (status
 	 * `PASSPHRASE_REQUIRED` while unlocked); they need the new passphrase for a key they
-	 * do not hold and for key management.
+	 * do not hold and for key management. A device that was served the new record but
+	 * could not read it no longer adopts, without an explicit `unlock()`, a record that
+	 * only its old master key authenticates.
 	 *
 	 * **A passphrase change alone does not contain a leaked passphrase.** The ring is a
 	 * shared secret: a device that still holds only the OLD master key cannot tell a
@@ -468,8 +479,9 @@ export class EncryptionKeyring {
 	 * leak: change the passphrase, `rotate()`, call `enableRecovery()` again (a recovery
 	 * key made before the change can be steered to a ring the old passphrase built) and
 	 * re-unlock EVERY other device with the new passphrase (`lock()`, then
-	 * `unlock(newPassphrase)`, and update any configured `key`). A device that is not
-	 * re-unlocked, or an old recovery key that is still used, remains exposed.
+	 * `unlock(newPassphrase)`, and update any configured `key`; never type the old
+	 * passphrase again: an explicit unlock with it is the user's decision). A device that
+	 * is not re-unlocked, or an old recovery key that is still used, remains exposed.
 	 *
 	 * @param newPassphrase - The new passphrase
 	 * @param channel - The key service
@@ -810,6 +822,7 @@ export class EncryptionKeyring {
 		this.dropKeys()
 		this.record = null
 		this.retiredMasters.clear()
+		this.supersededMasters.clear()
 		this.failedSource = null
 		this.allowNewRing = false
 		// A passphrase given before the first load (unlock() at start-up) is kept; one given
@@ -827,6 +840,9 @@ export class EncryptionKeyring {
 			this.record = record
 			for (const id of [...(cached.retiredMasters ?? []), ...(record.retiredMasters ?? [])]) {
 				if (isMasterId(id)) this.retiredMasters.add(id)
+			}
+			for (const id of cached.supersededMasters ?? []) {
+				if (isMasterId(id)) this.supersededMasters.add(id)
 			}
 			const known = new Set(record.keys.map((key) => key.keyId))
 			for (const entry of cached.keys) {
@@ -1033,6 +1049,7 @@ export class EncryptionKeyring {
 		}
 		if (opened === null) return this.unverifiableLocked(incoming, sourceFailed)
 		if (this.isRetiredMaster(incoming, opened.master)) return this.refuseRetired()
+		if (this.isSupersededMaster(opened.master, explicit)) return this.refuseSuperseded()
 		return this.acceptLocked(incoming, opened, passphrase, channel, depth)
 	}
 
@@ -1123,6 +1140,9 @@ export class EncryptionKeyring {
 		}
 		if (opened === null) return 'locked'
 		if (this.isRetiredMaster(incoming, opened.master)) return this.refuseRetired()
+		if (this.isSupersededMaster(opened.master, passphrase !== null)) {
+			return this.refuseSuperseded()
+		}
 		return this.mergeLocked(incoming, opened, passphrase, channel, depth)
 	}
 
@@ -1137,12 +1157,49 @@ export class EncryptionKeyring {
 		)
 	}
 
+	/**
+	 * A record authenticated only by a master key this device held when the server served
+	 * a newer revision of the ring that the key does not authenticate (RT-107).
+	 */
+	private refuseSuperseded(): 'locked' {
+		return this.refuseRecord(
+			'KEY_RECORD_INVALID',
+			"The server's key record is authenticated only by this device's previous master key, after the server served a newer revision that key does not open (the passphrase changed on another device). It is not adopted automatically: unlock with the current passphrase.",
+		)
+	}
+
+	/**
+	 * Whether `master` was superseded on this device. An explicit `unlock(passphrase)` is
+	 * the user's decision and clears the mark (a server that served a junk revision can
+	 * delay, never lock out, a device).
+	 */
+	private isSupersededMaster(master: MasterKeys, explicit: boolean): boolean {
+		if (!this.supersededMasters.has(master.id)) return false
+		if (!explicit) return true
+		this.supersededMasters.delete(master.id)
+		return false
+	}
+
 	/** A record this device cannot authenticate: adopt nothing. */
-	private unverifiableLocked(
+	private async unverifiableLocked(
 		incoming: WrappedKeyRecord,
 		sourceFailed: boolean,
-	): 'ready' | 'locked' {
+	): Promise<'ready' | 'locked'> {
 		const pinned = this.record
+		if (
+			this.master !== null &&
+			pinned !== null &&
+			incoming.ringId === pinned.ringId &&
+			incoming.revision > pinned.revision &&
+			!this.supersededMasters.has(this.master.id)
+		) {
+			// A newer revision of this ring that the held master key does not authenticate:
+			// a passphrase change elsewhere (or a forgery). After a genuine change, no later
+			// genuine record is authenticated by the held key, so a record that only it
+			// authenticates is never adopted automatically again, even after a restart.
+			this.supersededMasters.add(this.master.id)
+			await this.saveCacheLocked(pinned)
+		}
 		if (
 			pinned !== null &&
 			this.encryptor !== null &&
@@ -1427,10 +1484,16 @@ export class EncryptionKeyring {
 		this.retryable = false
 		this.rebuildEncryptor()
 		this.setStatus(this.makeStatus('unlocked'))
+		await this.saveCacheLocked(record)
+	}
+
+	/** Persist the pinned record, the held keys and the master marks (RT-107). */
+	private async saveCacheLocked(record: WrappedKeyRecord): Promise<void> {
 		try {
 			await this.cache.save(this.cacheId(), {
 				record,
 				retiredMasters: [...this.retiredMasters],
+				supersededMasters: [...this.supersededMasters],
 				kek: this.kek,
 				master: this.master,
 				keys: record.keys.flatMap((entry) => {
