@@ -373,6 +373,17 @@ describe('RT-104: a lost key record', () => {
 		expect(await read(fresh, history)).toBe('history')
 	})
 
+	test('startNewKeyring() while disconnected runs at the next handshake', async () => {
+		const server = new KeyServer()
+		await device('p').synchronize(server.channel(), 'alice')
+		server.record = null
+		const fresh = device('p')
+		expect(await fresh.synchronize(server.channel(), 'alice')).toBe('locked')
+		expect((await fresh.startNewKeyring(null)).code).toBe('AWAITING_SERVER')
+		expect(await fresh.synchronize(server.channel(), 'alice')).toBe('ready')
+		expect(server.record).not.toBeNull()
+	})
+
 	test('startNewKeyring() refuses while a record exists', async () => {
 		const server = new KeyServer()
 		await device('p').synchronize(server.channel(), 'alice')
