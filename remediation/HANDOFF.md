@@ -47,6 +47,7 @@ Backups on `private` as `wip/phase4/<branch>` (do not merge unless the line is f
 
 ## Next steps
 
+0. **Final RC red team done (2026-10-04): see `remediation/evidence/redteam-rc.md`.** RT-95..RT-104 are open (P1: RT-95, RT-97, RT-101, RT-104; P2: RT-96, RT-98, RT-99, RT-102, RT-103; P3: RT-100); fix them by root cause before the release.
 1. **Final release-candidate red team** over all of Phase 4 (encryption key ring, types, runtime DX, tooling, the beta.12 compatibility fixes RT-90..RT-94) and the late Phase 3 changes (transforms at fold time, value domain); fix its findings by root cause, with repros in the tracker.
 2. Final documentation pass for anything changed after the audit; then set DX-3 to fixed.
 3. Re-run the gate, commit `STATUS.md`, push to `private`, update the Project docs, open the PR.

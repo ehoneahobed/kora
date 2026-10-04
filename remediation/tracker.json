@@ -3215,6 +3215,156 @@
    ],
    "pr": null,
    "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. No beta.12 component needed; found by the mixed-fleet chaos matrix (compat-beta12.mjs chaos/current-server, seed 6 of 8: the device that wrote the child kept a provisional delete from a stale device's second delete of the project; the server had stamped its late cascade right after the child's insert, the child's later edits won, and it derived nothing for the second delete). Repro packages/test/tests/repro/RT-94.test.ts (the effect is left unconfirmed by withholding the server-derived operations from the streaming device; protocol 2). Location: sync/src/engine/sync-engine.ts recordReceivedBatch. FIXED: a streaming device is caught up after every fully applied final batch and settles provisional effects there (Store.settleAfterCatchUp({ provisionalOnly: true }): row snapshots still settle only at the end of a resync; unit test in store/src/fold/phase3-fold-fixes.test.ts). A server copy is stored with its delete and relayed with it, so confirmed effects are unaffected; one split across a batch boundary shows the child until the next batch. Open question for the cascade owner (not changed here): whether the server should derive a cascade for a delete of an already-deleted parent whose child was revived after the first delete (all replicas now agree the child stays)."
+  },
+  {
+   "id": "RT-95",
+   "title": "The recovery public key in the key record is not authenticated: a malicious sync server swaps in its own (push, fetch, or the conflict reply of rotate's compare-and-set) and every later rotate() wraps the new data key to it, so the server reads all operations sealed under that version",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-95.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:349-365 (rotate wraps to record.recovery.publicKey of whatever record was last adopted), keyring.ts:657-760 (adoptLocked checks structure, KDF floor and kept versions only), key-record.ts:131-159 (recovery block is structural only). Repro packages/sync/tests/repro/RT-95.test.ts: the server's own ECDH key unwraps the rotated key and decrypts a sealed op ('secret after-rotation'). Required fix: authenticate the recovery public key with the passphrase KEK (e.g. a KEK-keyed MAC or an AES-GCM wrap whose AAD binds the recovery public key, written by enableRecovery and checked on every adopt), and never wrap a data key to a recovery key that does not verify; a device must also refuse a record whose recovery key changed without that proof. Same class: any record field a device acts on (kdf params, recovery) must be bound to the passphrase holder."
+  },
+  {
+   "id": "RT-96",
+   "title": "A device accepts an older revision of its key record (the rollback pin checks key versions only, never revision): after a passphrase change the server re-serves the old-passphrase revision, the device drops its KEK, only the old (leaked) passphrase unlocks, and the next rotation wraps the new data key under it; the same rollback strips or restores a recovery key",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-96.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:683-701 (pin compares key versions/ids only; a different salt silently drops the KEK), keyring.ts:247 (adoptPushed), key-record.ts isKeyRecordSuccessor (server rule only). Repro packages/sync/tests/repro/RT-96.test.ts. Required fix: pin the highest accepted revision (persisted in the key cache) and refuse lower ones with KEY_RECORD_ROLLBACK; authenticate the record (kdf, recovery, revision) under the KEK so a substituted revision at the same number is detected too. A new device cannot detect a rollback it never saw (document)."
+  },
+  {
+   "id": "RT-97",
+   "title": "A rotation that races a passphrase change on another device wraps the new data key under the stale (old-passphrase) KEK into the record with the new salt; every device with the current passphrase then fails WRONG_PASSPHRASE and operations sealed under the new version are readable only on the rotating device",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-97.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:337 (const kek = requireKek(...) read once, outside the compare-and-set loop), keyring.ts:373 (adoptConflictLocked adopts the new-salt record and drops this.kek, the loop keeps the stale local), keyring.ts:697-700. The server cannot tell (it never opens wraps). Repro packages/sync/tests/repro/RT-97.test.ts: a fresh device with the current passphrase is locked WRONG_PASSPHRASE and cannot decrypt the rotating device's op; the passphrase-changing device locks the same way on the push. Required fix: re-read the KEK (requireKek) inside the loop after every conflict adopt, and verify before put that the KEK opens the record's current version under the record's own salt (refuse to wrap under a KEK whose salt differs from record.kdf.salt). Same audit for enableRecovery (it fails loudly today, no corruption)."
+  },
+  {
+   "id": "RT-98",
+   "title": "Row changes the syncing tab makes without a new operation (terminal-rejection re-fold, scope retraction/narrowing, provisional cascade settling, authority re-fold) never reach other tabs' live queries: the local operation bus carries only operation:created/applied, so other tabs keep showing the old rows until an unrelated write",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-98.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to."
+  },
+  {
+   "id": "RT-99",
+   "title": "The production static server derives ETag, Last-Modified and its compressed-body cache from size and mtime only: a redeployed index.html or sw.js with the same size and a normalised mtime is answered 304 (old shell pointing at deleted chunks; the service worker update is never seen), and a server left running serves the old compressed body",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-99.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them)."
+  },
+  {
+   "id": "RT-100",
+   "title": "After include(), where() and orderBy() accept the included relation property (e.g. where({ project: null }), orderBy('project')), which the runtime refuses with QueryError 'Unknown field'",
+   "severity": "P3",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/RT-100.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string)."
+  },
+  {
+   "id": "RT-101",
+   "title": "Value domain gap: an enum value added by a schema upgrade is valid on every replica, but existing tables keep the old CHECK (col IN (...)): an upgraded device's own write of it throws (SQLite CHECK) and the upgraded server refuses a fresh device's write terminally (UNSTORABLE_VALUE, undone on its author); no migration step can change an enum's values",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-101.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). Not a Phase 4 regression (beta.12 has the same DDL). core/src/schema/sql-gen.ts:248,294 (client CHECK), server/src/store/materialization.ts:79-80 and :92-99 (CREATE IF NOT EXISTS + ADD COLUMN only), core/src/migrations/migration-sql.ts (steps: addField/removeField/renameField/addIndex/removeIndex/backfill; nothing for enum values), postgres-server-store.ts:173-176 and sqlite-server-store.ts:171-173 (23514 / SQLITE_CONSTRAINT_CHECK -> UNSTORABLE_VALUE). Repro kora/tests/repro/RT-101.test.ts (device: CHECK constraint failed: priority; SQLite server: sync:operation-rejected UNSTORABLE_VALUE). Postgres the same by code (23514). Required fix: enforce enum membership in the value domain (validateRecord) only, not in DDL (drop the CHECK, or rebuild it from the current schema on open: SQLite table rebuild, Postgres ALTER TABLE DROP/ADD CONSTRAINT), on client and server stores; or add an explicit migration step that rebuilds the constraint and refuse a schema whose enum values changed without it. Also decide what a REMOVED enum value means for existing rows and old-schema ops (transform or keep accepting)."
+  },
+  {
+   "id": "RT-102",
+   "title": "The query-store cache and useQuery's re-subscribe key are JSON.stringify(descriptor), which drops undefined (and folds NaN into null): where({ projectId: undefined }) shares one QueryStore with where({}) although the runtime returns different rows, so one of two mounted components renders the other's results",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-102.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor."
+  },
+  {
+   "id": "RT-103",
+   "title": "Retiring an old schema transform (registering v2->v3 but no longer v1->v2) silently erases every v1 operation from the server's records at the next start: the fingerprint change re-folds everything, operationSchemaView returns null for ops with no path, and mergeOp folds null as nothing (no error, log or quarantine); removing the whole list instead keeps them",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-103.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). core/src/fold/fold.ts:409-410 (null view folds as nothing), core/src/migration/operation-view.ts:55-60 (an empty list folds as written, a partial list returns null), server/src/store/record-fold.ts:130-139, fold plan fingerprint includes transforms (re-fold on change). docs/guide/schema-design.md asks to keep transforms 'as long as operations of its source version can exist', which is forever for an append-only log, and nothing enforces it. Repro packages/server/tests/repro/RT-103.test.ts (SQLite server store; the v1 record is null after the restart). Devices: by code reading the same null view at a re-fold drops the op from their records too. Required fix: at setSchema/open, refuse (OperationTransformError naming the versions) a transform set that has no path from a schema version present in the stored log to the current one; and treat a null view of a STORED op as quarantine/keep-as-written, never as an absent op (a transform returning null deliberately is a separate, explicit decision that should be logged)."
+  },
+  {
+   "id": "RT-104",
+   "title": "After the server loses a key record (restore from the server's own backup, which covers operations only), a NEW device that reconnects first creates a fresh keyring: every device holding the old keys then stops syncing for good with KEY_RECORD_ROLLBACK and the new device can never decrypt the user's history (the guide promises the old record is re-uploaded)",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-104.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:219-221 and 606-654 (no record -> createOrRestoreLocked; a device without a cached record creates a new data key), keyring.ts:683-695 (old devices refuse the new record, no way out), docs/guide/sync-encryption.md 'Server Requirements' (exportBackup covers operations only; 'the next device that still holds it uploads its copy again, so nothing is lost while one device has synced'). Repro packages/sync/tests/repro/RT-104.test.ts. Required fix: never create a first key record for an owner that already has encrypted history: the server answers a fetch with 'lost' (it knows the owner has envelope ops, or keeps a tombstone/fingerprint of every record it ever stored) and refuses a create (expectedRevision 0) while a device with the old record has not re-uploaded; the client then stays locked with KEY_RECORD_MISSING instead of creating. Include kora_encryption_keys in exportBackup/importBackup. Give operators/apps a documented resolution for a forked keyring."
   }
  ],
  "rejectedProposalPins": {
