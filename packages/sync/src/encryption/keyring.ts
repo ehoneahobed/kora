@@ -3,7 +3,13 @@ import type { CachedKeyring, KeyCache } from './key-cache'
 import { MemoryKeyCache } from './key-cache'
 import { DEFAULT_PBKDF2_ITERATIONS } from './key-derivation'
 import type { WrappedDataKey, WrappedKeyRecord } from './key-record'
-import { DEFAULT_KEYRING, KEY_RECORD_FORMAT, isKeyId, validateKeyRecord } from './key-record'
+import {
+	DEFAULT_KEYRING,
+	KEY_RECORD_FORMAT,
+	canonicalJson,
+	isKeyId,
+	validateKeyRecord,
+} from './key-record'
 import type { MasterKeys } from './keyring-crypto'
 import {
 	KEK_SALT_BYTES,
@@ -889,7 +895,7 @@ export class EncryptionKeyring {
 			if (
 				!explicit &&
 				incoming.revision === pinned.revision &&
-				incoming.mac === pinned.mac &&
+				canonicalJson(incoming) === canonicalJson(pinned) &&
 				this.master !== null &&
 				this.encryptor !== null
 			) {
@@ -1026,6 +1032,19 @@ export class EncryptionKeyring {
 		sourceFailed: boolean,
 	): 'ready' | 'locked' {
 		const pinned = this.record
+		if (
+			pinned !== null &&
+			this.encryptor !== null &&
+			incoming.ringId === pinned.ringId &&
+			incoming.revision === pinned.revision
+		) {
+			// Another body under the revision this device accepted, and it does not
+			// authenticate: tampered. The held keys are unaffected.
+			return this.refuseRecord(
+				'KEY_RECORD_INVALID',
+				`The server's key record differs from revision ${pinned.revision} this device accepted and does not authenticate. It is refused.`,
+			)
+		}
 		if (
 			pinned !== null &&
 			this.encryptor !== null &&
