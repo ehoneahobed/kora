@@ -18,9 +18,9 @@ Update this file at every milestone. A fresh session should read it first, then 
 | 1 Trust boundary | done, 3 red-team rounds | yes (PR #1) |
 | 2 No silent loss | done, 3 red-team rounds | yes (PR #2) |
 | 3 One fold, durability, protocol v2 | done, 4 red-team rounds | yes (PR #3) |
-| 4 Encryption, types, DX, docs, beta.12 compatibility | done on `fix/phase4-rc`; final RC red team run (RT-95..RT-104) and all ten fixed; final gate running | no |
+| 4 Encryption, types, DX, docs, beta.12 compatibility | done on `fix/phase4-rc`: final RC red team (RT-95..RT-104) fixed, migrate rebuild (RT-105, RT-106) fixed, final docs pass (DX-3) merged; final gate in progress | no |
 
-## Phase 4 release-candidate line (`fix/phase4-rc`, pushed to `private`, head 66eae5d)
+## Phase 4 release-candidate line (`fix/phase4-rc`, pushed to `private`, head 6c28473)
 
 - Phase 4 integration: ENC-1 key ring (D4b), W11 types (DX-1, DX-2), W12 runtime DX, tooling (NEW-DX-3 offline app shell, NEW-SRV-8 static server, DX-8, SYNC-9, NEW-DX-2, NEW-SRV-1, RT-30), RT-88, RT-89.
 - Documentation audit (DX-3) and the beta.13 renumbering.
@@ -28,24 +28,26 @@ Update this file at every milestone. A fresh session should read it first, then 
 - Final RC red team findings RT-95..RT-104 (merge 85b307f) and their fixes:
   - RT-95/96/97/104 (merge from `wip/phase4/worktree-agent-a3a77c4ad29039205`, head 3e3e759): key record format 2 (authenticated, forward-only by revision), recovery key anchored to the keyring (`kora-rk2-`), ring merge for rotation racing a passphrase change, `app.encryption.startNewKeyring()`, key records in server backups.
   - RT-98..RT-103 (merge from `wip/phase4/worktree-agent-a7ac0400012aa60c1`, head cdba4eb): one records-changed funnel to the cross-tab bus, content-derived static validators, include() typing, value domain enforced at write time with beta.12 enum CHECK / NOT NULL relaxed once (client and server), `kora migrate` relax step, one query key, refusing transforms that cannot read the stored log.
+- RT-105/RT-106 (merge from `wip/phase4/migrate-rebuild`, head a924106): `kora migrate` uses a `--kora:evolve-table` step that keeps Kora's internal columns, foreign keys and indexes and works on Postgres; server stores write the schema default for fields added later.
+- Final documentation pass (merge from `wip/phase4/docs-final`, head dd8faa9): every page audited against the code, `pnpm docs:check-code` (327 blocks, signature checks against real exports), CLAUDE.md reconciled with the source, `docs/guide/upgrading-to-beta13.md`; DX-3 fixed.
+- Test hygiene: RT-97 property test with a fixed seed; hang-guard timeouts for the CLI suite and the studio lab setup (timeouts under load, not product bugs).
 - Release documents: `remediation/BETA13-RELEASE-NOTES.md` (single note for Phases 1 to 4), `remediation/SECURITY-ADVISORY-DRAFT.md` (affected beta.12 and earlier, fixed in 1.0.0-beta.13).
 
 Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for reference): `worktree-agent-a53967623c7acbe52` (ENC-1), `worktree-agent-a95db974394a6531a` (runtime DX), `worktree-agent-ab1bb0a2a25664912` (tooling), `worktree-agent-ae1a9425c3ef70940` (types), plus the two RC fix branches above (merged).
 
-## Open follow-ups noted by the last fix engineers (not yet tracked)
+## Open follow-ups (none block the release)
 
-- DONE (branch `wip/phase4/migrate-rebuild`): `kora migrate` rebuild checked against the Phase 3 fold with an executable scenario (two devices, concurrent edits, compacted history, add+remove field on the server and both device databases, continued sync, fresh device; Postgres). Fold state, bases, snapshots, the log and every `_kora_*` table were never touched and records converged (a field change re-folds every record), but the rebuild dropped client `_version` / `_field_versions` (blank for good after an index-only migration), `REFERENCES`, store indexes, the server `_deleted` index, and could not run on Postgres: RT-105, fixed (catalog-driven `--kora:evolve-table` step). Found alongside: server stores materialized a field added with a default as NULL for older records while devices read the default: RT-106, fixed.
 - RT-104 residuals: a brand-new device cannot detect an older key-record revision it never saw (documented); the "encrypted history exists" signal samples stored ops.
 - RT-101 residual: in-place field type changes unsupported; Postgres column types never change.
-- DONE (branch `wip/phase4/docs-final`): final documentation pass; DX-3 set to fixed; `docs/guide/upgrading-to-beta13.md` added; CLAUDE.md reconciled with the source.
+- Optional performance: the OPFS database uses SQLite's default DELETE journal (documented). A Phase 4 runtime track measured TRUNCATE at 9-15 ms per commit vs 15-17 ms; it was not integrated. Browser insert of 10,000 rows takes 7.5-9.3 s against a 2 s target (reported, not gated).
+- Android background freeze of a leader tab is verified only with simulated events; a real-device run is pending.
 
 ## Next steps
 
-1. Final gate on head 66eae5d (running at last update): build, biome, typecheck, root test, `check.mjs --all` with PG16 + Chromium + `LMS_OPS=20000`, e2e, chaos, beta.12 compat scripts.
-2. Investigate the `kora migrate` rebuild follow-up above.
-3. Final documentation pass (every guide and API page matches the code); set DX-3 fixed.
-4. Commit `STATUS.md`, push, update Project docs, open the PR into private main.
-5. Release: publish 1.0.0-beta.13 together with the advisory.
+1. Final gate on head 6c28473: build, biome, typecheck, root test, `check.mjs --all` with PG16 + Chromium + `LMS_OPS=20000`, e2e. Last full run before the CLI timeout fix: everything green except CLI tests timing out under load (215/216 fixed, 0 errors on the previous run).
+2. Commit `STATUS.md`, push, update the Project docs, open the PR from `fix/phase4-rc` into private main.
+3. Maintainer decision: optional final verification red team over the post-RC fixes (RT-95..RT-106).
+4. Release: run the version bump to 1.0.0-beta.13, publish, then publish the advisory and push the history to the public repo together.
 
 ## Working rules
 
