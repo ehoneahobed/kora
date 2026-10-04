@@ -3365,6 +3365,21 @@
    ],
    "pr": null,
    "notes": "FIXED. The key service answers a fetch with no record with knownKeyIds (key ids of the owner's stored encrypted operations; ServerStore.getEncryptedKeyIds on memory, SQLite, Postgres). A device holding the ring re-uploads it unchanged (same revision and MAC, so every pin accepts it); a new device with encrypted history reported stays locked KEY_RECORD_MISSING (retryable, passphrase kept) instead of creating a ring. app.encryption.startNewKeyring() is the explicit way out; a device holding keys of two rings merges them (other ring's keys re-wrapped into the server's ring as new versions, same key ids; decryption selects keys by key id). Server exportBackup includes key records (encryption_keys section) and importBackup restores missing ones in both modes (never replaces a held record; malformed -> BACKUP_INVALID_KEY_RECORD). Guide section \"Lost Key Records and Forked Keyrings\". Red team: Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:219-221 and 606-654 (no record -> createOrRestoreLocked; a device without a cached record creates a new data key), keyring.ts:683-695 (old devices refuse the new record, no way out), docs/guide/sync-encryption.md 'Server Requirements' (exportBackup covers operations only; 'the next device that still holds it uploads its copy again, so nothing is lost while one device has synced'). Repro packages/sync/tests/repro/RT-104.test.ts. Required fix: never create a first key record for an owner that already has encrypted history: the server answers a fetch with 'lost' (it knows the owner has envelope ops, or keeps a tombstone/fingerprint of every record it ever stored) and refuses a create (expectedRevision 0) while a device with the old record has not re-uploaded; the client then stays locked with KEY_RECORD_MISSING instead of creating. Include kora_encryption_keys in exportBackup/importBackup. Give operators/apps a documented resolution for a forked keyring."
+  },
+  {
+   "id": "RT-105",
+   "title": "`kora migrate` table rebuild (field add/remove, index-only change) re-creates the collection table from a fixed SQLite statement list: on a SQLite client store (--db) it drops `_version` / `_field_versions` (re-added empty at the next open; after an index-only migration nothing re-materializes them), the relation's REFERENCES clause and every store index; on the SQLite server store it drops idx_<table>__deleted; on a Postgres server store the SQLite DDL (INTEGER/REAL/TEXT/BLOB, strftime) cannot migrate a table holding real millisecond timestamps (integer out of range) and turns an empty table's BIGINT/DOUBLE PRECISION/JSONB columns into INTEGER/REAL/TEXT",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "in_progress",
+   "tests": [
+    {
+     "file": "RT-105.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Phase 4 follow-up from remediation/HANDOFF.md (kora migrate rebuild vs the Phase 3 fold state). Repro packages/cli/tests/repro/RT-105.test.ts: two devices with concurrent edits and compacted history, the server and both device databases migrated v1 -> v2 (remove an enum field, add a defaulted and an optional field) with generateMigration + runMigration (what `kora migrate --apply` runs), then continued sync and a fresh device; plus an index-only migration, an indexed-field removal with a failing statement (rollback), and Postgres (KORA_PG_TEST_URL). Fold state, bases, snapshots, compacted-through, the log, the outbound queue and every other _kora_* table were never touched (separate tables), and a field add/remove changes the fold plan fingerprint, so every record re-folds at the next open and rows/fold states converged: the loss was the internal columns, constraints and indexes (cli/src/commands/migrate/migration-generator.ts generateRebuildStatements). The runner's single transaction and foreign key handling were already correct."
   }
  ],
  "rejectedProposalPins": {
