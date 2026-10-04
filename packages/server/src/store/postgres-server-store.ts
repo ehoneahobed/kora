@@ -60,6 +60,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
@@ -2045,7 +2046,9 @@ export class PostgresServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializePgFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor
+					? serializePgFieldValue(materializedFieldValue(recordData, f, descriptor), descriptor)
+					: null
 			}),
 			createdAt,
 			updatedAt,
@@ -2118,7 +2121,12 @@ export class PostgresServerStore implements ServerStore {
 				entry.recordId,
 				...fieldNames.map((field) => {
 					const descriptor = collectionDef.fields[field]
-					return descriptor ? serializePgFieldValue(row.values[field] ?? null, descriptor) : null
+					return descriptor
+						? serializePgFieldValue(
+								materializedFieldValue(row.values, field, descriptor),
+								descriptor,
+							)
+						: null
 				}),
 				row.createdAt,
 				row.updatedAt,

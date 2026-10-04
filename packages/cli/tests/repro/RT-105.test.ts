@@ -289,9 +289,12 @@ describe('RT-105: kora migrate keeps every internal column, constraint, table an
 			body: row.body,
 			tags: row.tags,
 			stock: row.stock,
+			// n2 predates `status`: the default on every replica, the server included (RT-106).
+			status: row.status,
 			due: row.due,
 		})
 		expect(serverRows.map(pick)).toEqual(stateA.map(pick))
+		expect(stateA.map((row) => row.status)).toEqual(['done', 'open'])
 		await a.close()
 		await b.close()
 		await c.close()
