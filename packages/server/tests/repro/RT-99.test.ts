@@ -40,32 +40,41 @@ async function serve(root: string): Promise<string> {
 }
 
 describe('RT-99: static validators ignore content', () => {
-	test.each(['index.html', 'sw.js'])('a redeployed %s with the same size and mtime is not 304', async (name) => {
-		dir = mkdtempSync(join(tmpdir(), 'rt99-'))
-		const file = join(dir, name)
-		const fixed = new Date('2026-01-01T00:00:00Z')
-		// Same length, different hashed reference: what every deploy does to these files.
-		const v1 = name === 'sw.js' ? 'const VERSION = "0123456789abcdef"\n' : '<script src="/assets/index-AAAAAAAA.js"></script>'
-		const v2 = name === 'sw.js' ? 'const VERSION = "fedcba9876543210"\n' : '<script src="/assets/index-BBBBBBBB.js"></script>'
-		writeFileSync(file, v1)
-		utimesSync(file, fixed, fixed)
-		const base = await serve(dir)
+	test.each(['index.html', 'sw.js'])(
+		'a redeployed %s with the same size and mtime is not 304',
+		async (name) => {
+			dir = mkdtempSync(join(tmpdir(), 'rt99-'))
+			const file = join(dir, name)
+			const fixed = new Date('2026-01-01T00:00:00Z')
+			// Same length, different hashed reference: what every deploy does to these files.
+			const v1 =
+				name === 'sw.js'
+					? 'const VERSION = "0123456789abcdef"\n'
+					: '<script src="/assets/index-AAAAAAAA.js"></script>'
+			const v2 =
+				name === 'sw.js'
+					? 'const VERSION = "fedcba9876543210"\n'
+					: '<script src="/assets/index-BBBBBBBB.js"></script>'
+			writeFileSync(file, v1)
+			utimesSync(file, fixed, fixed)
+			const base = await serve(dir)
 
-		const first = await fetch(`${base}/${name}`)
-		const etag = first.headers.get('etag') ?? ''
-		const lastModified = first.headers.get('last-modified') ?? ''
-		expect(await first.text()).toBe(v1)
+			const first = await fetch(`${base}/${name}`)
+			const etag = first.headers.get('etag') ?? ''
+			const lastModified = first.headers.get('last-modified') ?? ''
+			expect(await first.text()).toBe(v1)
 
-		// Deploy: new content, normalised mtime.
-		writeFileSync(file, v2)
-		utimesSync(file, fixed, fixed)
+			// Deploy: new content, normalised mtime.
+			writeFileSync(file, v2)
+			utimesSync(file, fixed, fixed)
 
-		const revalidate = await fetch(`${base}/${name}`, {
-			headers: { 'if-none-match': etag, 'if-modified-since': lastModified },
-		})
-		expect(revalidate.status).toBe(200)
-		expect(await revalidate.text()).toBe(v2)
-	})
+			const revalidate = await fetch(`${base}/${name}`, {
+				headers: { 'if-none-match': etag, 'if-modified-since': lastModified },
+			})
+			expect(revalidate.status).toBe(200)
+			expect(await revalidate.text()).toBe(v2)
+		},
+	)
 
 	test('the in-memory compressed body is not served for replaced content', async () => {
 		// A server left running while the build directory is replaced in place (rsync, a

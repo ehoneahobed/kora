@@ -66,16 +66,25 @@ describe('RT-104: a lost key record is re-created by whichever device connects f
 	test('a new device reconnecting first does not fork the keyring', async () => {
 		const server = new KeyServer()
 		const passphrase = 'correct horse battery staple'
-		const old = new EncryptionKeyring({ passphrase, kdfIterations: ITERATIONS, cache: new MemoryKeyCache() })
+		const old = new EncryptionKeyring({
+			passphrase,
+			kdfIterations: ITERATIONS,
+			cache: new MemoryKeyCache(),
+		})
 		expect(await old.synchronize(server.channel(), 'alice')).toBe('ready')
-		const history = await (old.getEncryptor() as NonNullable<ReturnType<typeof old.getEncryptor>>)
-			.encryptOperation(op('history'))
+		const history = await (
+			old.getEncryptor() as NonNullable<ReturnType<typeof old.getEncryptor>>
+		).encryptOperation(op('history'))
 
 		// Disaster recovery: the server is restored from its backup (operations only).
 		server.record = null
 
 		// A new phone signs in first.
-		const fresh = new EncryptionKeyring({ passphrase, kdfIterations: ITERATIONS, cache: new MemoryKeyCache() })
+		const fresh = new EncryptionKeyring({
+			passphrase,
+			kdfIterations: ITERATIONS,
+			cache: new MemoryKeyCache(),
+		})
 		await fresh.synchronize(server.channel(), 'alice')
 		// Then the old laptop reconnects.
 		const outcome = await old.synchronize(server.channel(), 'alice')

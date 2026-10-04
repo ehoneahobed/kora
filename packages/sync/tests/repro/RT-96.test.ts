@@ -19,7 +19,11 @@ import { MemoryKeyCache } from '../../src/encryption/key-cache'
 import type { WrappedKeyRecord } from '../../src/encryption/key-record'
 import type { KeyServiceChannel, KeyServiceReply } from '../../src/encryption/keyring'
 import { EncryptionKeyring } from '../../src/encryption/keyring'
-import { deriveKeyEncryptionKey, fromBase64, unwrapDataKey } from '../../src/encryption/keyring-crypto'
+import {
+	deriveKeyEncryptionKey,
+	fromBase64,
+	unwrapDataKey,
+} from '../../src/encryption/keyring-crypto'
 
 const ITERATIONS = 1000
 

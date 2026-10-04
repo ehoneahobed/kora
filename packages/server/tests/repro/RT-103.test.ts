@@ -32,12 +32,9 @@ const v1ToV2: OperationTransform = {
 	fromVersion: 1,
 	toVersion: 2,
 	transform: (op) => {
-		const data = op.data ? { ...op.data } : null
-		if (data && 'name' in data) {
-			data.title = data.name
-			delete data.name
-		}
-		return { ...op, data, schemaVersion: 2 }
+		if (!op.data || !('name' in op.data)) return { ...op, schemaVersion: 2 }
+		const { name, ...rest } = op.data
+		return { ...op, data: { ...rest, title: name }, schemaVersion: 2 }
 	},
 }
 const v2ToV3: OperationTransform = {

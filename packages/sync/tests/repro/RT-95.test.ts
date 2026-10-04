@@ -14,7 +14,6 @@
  */
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { SyncEncryptor } from '../../src/encryption/sync-encryptor'
 import { MemoryKeyCache } from '../../src/encryption/key-cache'
 import type { WrappedKeyRecord } from '../../src/encryption/key-record'
 import type { KeyServiceChannel, KeyServiceReply } from '../../src/encryption/keyring'
@@ -24,6 +23,7 @@ import {
 	toNonExtractable,
 	unwrapWithRecovery,
 } from '../../src/encryption/keyring-crypto'
+import { SyncEncryptor } from '../../src/encryption/sync-encryptor'
 
 const ITERATIONS = 1000
 

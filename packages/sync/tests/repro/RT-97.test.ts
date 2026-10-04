@@ -63,7 +63,11 @@ function op(id: string): Operation {
 }
 
 function device(passphrase: string): EncryptionKeyring {
-	return new EncryptionKeyring({ passphrase, kdfIterations: ITERATIONS, cache: new MemoryKeyCache() })
+	return new EncryptionKeyring({
+		passphrase,
+		kdfIterations: ITERATIONS,
+		cache: new MemoryKeyCache(),
+	})
 }
 
 describe('RT-97: rotation racing a passphrase change wraps under the stale KEK', () => {
@@ -88,8 +92,9 @@ describe('RT-97: rotation racing a passphrase change wraps under the stale KEK',
 		const outcome = await c.synchronize(server.channel(), 'alice')
 		expect(c.getStatus().code).toBeUndefined()
 		expect(outcome).toBe('ready')
-		const plain = await (c.getEncryptor() as NonNullable<ReturnType<typeof c.getEncryptor>>)
-			.decryptOperation(sealed)
+		const plain = await (
+			c.getEncryptor() as NonNullable<ReturnType<typeof c.getEncryptor>>
+		).decryptOperation(sealed)
 		expect((plain.data as { body: string }).body).toBe('secret rotated')
 	})
 })
