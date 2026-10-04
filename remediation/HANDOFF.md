@@ -18,7 +18,7 @@ Update this file at every milestone. A fresh session should read it first, then 
 | 1 Trust boundary | done, 3 red-team rounds | yes (PR #1) |
 | 2 No silent loss | done, 3 red-team rounds | yes (PR #2) |
 | 3 One fold, durability, protocol v2 | done, 4 red-team rounds | yes (PR #3) |
-| 4 Encryption, types, DX, docs, beta.12 compatibility | done on `fix/phase4-rc`: final RC red team (RT-95..RT-104) fixed, migrate rebuild (RT-105, RT-106) fixed, final docs pass (DX-3) merged; final gate in progress | no |
+| 4 Encryption, types, DX, docs, beta.12 compatibility | done on `fix/phase4-rc`: final RC red team (RT-95..RT-104) fixed, migrate rebuild (RT-105, RT-106) fixed, final docs pass (DX-3) merged; final gate green (216/216) | no (PR open) |
 
 ## Phase 4 release-candidate line (`fix/phase4-rc`, pushed to `private`, head 6c28473)
 
@@ -44,8 +44,8 @@ Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for refe
 
 ## Next steps
 
-1. Final gate on head 6c28473: build, biome, typecheck, root test, `check.mjs --all` with PG16 + Chromium + `LMS_OPS=20000`, e2e. Last full run before the CLI timeout fix: everything green except CLI tests timing out under load (215/216 fixed, 0 errors on the previous run).
-2. Commit `STATUS.md`, push, update the Project docs, open the PR from `fix/phase4-rc` into private main.
+1. Done: final gate on 6c28473 is green: build, biome, typecheck, root test 30/30, `check.mjs --all` (PG16, Chromium, `LMS_OPS=20000`) 216/216 fixed, 0 errors, 0 warnings, e2e 11/11. `STATUS.md` committed; PR from `fix/phase4-rc` into private main opened.
+2. Maintainer: review and merge the Phase 4 PR.
 3. Maintainer decision: optional final verification red team over the post-RC fixes (RT-95..RT-106).
 4. Release: run the version bump to 1.0.0-beta.13, publish, then publish the advisory and push the history to the public repo together.
 
