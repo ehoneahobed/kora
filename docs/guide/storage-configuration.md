@@ -48,6 +48,18 @@ and refuses writes with `StorageDurabilityError` (`STORAGE_DURABILITY_LOST`). Sh
 in-memory storage knowingly.
 :::
 
+### A database a newer build migrated
+
+A deployed app's `schema.version` only goes up. When a build opens a local database whose stored
+schema version is **newer** than its own (a newer build of the app already migrated it, for example
+an old build served from a stale cache), the store refuses to open it before changing anything in
+it, not even its own additive DDL: `app.ready` rejects with `SchemaVersionAheadError`
+(`SCHEMA_VERSION_AHEAD`, with `storedVersion` and `codeVersion`) and the blocking
+`store:schema-ahead` event is emitted. Running the older code would write operations of the old
+schema into the new database, or fail part-way through. Show a blocking state ("a newer version of
+this app was installed; reload while online") and let the newer build run. The offline app shell
+already keeps one build per active service worker, so this is a safety net, not a normal path.
+
 ### Multi-tab Durability
 
 Multi-tab durability uses one dedicated worker owned by a leader tab. Other tabs relay SQLite requests to that leader over browser cross-tab messaging, and a follower is promoted if the leader tab closes. A leader that hangs or is frozen (a background tab on mobile) is detected and replaced, so it no longer blocks other tabs; requests to it fail with `LeaderUnresponsiveError` instead of waiting forever, and closing a tab hands off cleanly.

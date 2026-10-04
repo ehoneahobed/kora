@@ -355,6 +355,7 @@ The server side of blob transfer is configured on the sync server; see
 | `QueryError` | `QUERY_ERROR` | Invalid query (unknown include target, bad `orderBy` direction, bad `limit`). |
 | `RecordNotFoundError` | `RECORD_NOT_FOUND` | `update` or `delete` of a missing record. |
 | `StorageDurabilityError` | `STORAGE_DURABILITY_LOST` | No durable storage; writes are refused. |
+| `SchemaVersionAheadError` | `SCHEMA_VERSION_AHEAD` | The database's stored schema version is newer than the code's (a newer build migrated it); the store refused to open it and changed nothing. |
 | `StorageInUseError` | `STORAGE_IN_USE` | Deleting a database that is open in some tab or worker; close it everywhere and retry. |
 | `UnsyncedDataError` | `UNSYNCED_DATA` | Deleting a database with unsynced writes (without `force`). |
 | `StorageBackendMismatchError` | `STORAGE_BACKEND_MISMATCH` | The database's data lives in a backend this runtime cannot read (for example OPFS is unavailable now); Kora refuses to start an empty copy. |

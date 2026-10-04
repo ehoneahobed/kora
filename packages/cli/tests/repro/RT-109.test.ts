@@ -37,10 +37,15 @@ function loadWorker(version: string, shells: Map<string, string>, network: () =>
 		}
 		return cache
 	}
+	// A Response as the worker uses it: an HTML document with its content type and text.
 	const response = (body: string) => ({
 		ok: true,
 		type: 'basic',
 		body,
+		headers: {
+			get: (name: string) => (name.toLowerCase() === 'content-type' ? 'text/html' : null),
+		},
+		text: async () => body,
 		clone: () => response(body),
 	})
 	const scope = {
@@ -124,16 +129,19 @@ function loadWorker(version: string, shells: Map<string, string>, network: () =>
 
 describe('RT-109: the active (old) worker runs whichever build the network has', () => {
 	test('online navigation after a deploy is the new build; offline is the old one', async () => {
-		let deployed = '<html>build v2</html>'
+		// Every built page carries the shell marker the plugin injects.
+		const page = (build: string) =>
+			`<html><head><meta name="kora-shell" content="1"></head>${build}</html>`
+		let deployed = page('build v1')
 		let online = true
 		// Worker v1 installed and active, its cache holds the v1 shell.
-		const v1 = loadWorker('v1', new Map([['/index.html', '<html>build v1</html>']]), () =>
+		const v1 = loadWorker('v1', new Map([['/index.html', page('build v1')]]), () =>
 			online ? deployed : null,
 		)
 		await v1.install()
 
 		// v2 is deployed; the v2 worker is waiting for the user's consent (not activated).
-		deployed = '<html>build v2</html>'
+		deployed = page('build v2')
 		const onlineShell = await v1.navigate()
 		online = false
 		const offlineShell = await v1.navigate()

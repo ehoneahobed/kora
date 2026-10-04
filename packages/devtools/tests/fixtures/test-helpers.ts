@@ -449,6 +449,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			to: 'opfs',
 			message: 'Moved to its own OPFS pool',
 		},
+		'store:schema-ahead': {
+			type: 'store:schema-ahead',
+			dbName: 'kora-db',
+			storedVersion: 2,
+			codeVersion: 1,
+			message: 'The database was migrated by a newer build',
+		},
 		'replay:completed': {
 			type: 'replay:completed',
 			targetOperationId: 'op-target',

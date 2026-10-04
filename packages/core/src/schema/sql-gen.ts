@@ -144,6 +144,14 @@ export function legacyCollectionIndexName(collection: string, field: string): st
 }
 
 /**
+ * Prefix of the `generateFullDDL` statement `--kora:schema-ceiling <version>` (RT-109).
+ * It is a SQL comment, so executing it does nothing; Kora's storage adapters read the
+ * database's stored schema version there and refuse to run the rest of the DDL against a
+ * database a newer build already migrated.
+ */
+export const SCHEMA_CEILING_DIRECTIVE = '--kora:schema-ceiling'
+
+/**
  * Generate the full DDL for all collections plus metadata tables.
  *
  * @param schema - The complete schema definition
@@ -159,6 +167,10 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 			'  value TEXT NOT NULL\n' +
 			')',
 	)
+	// A SQL comment (a no-op for any executor): Kora's storage adapters refuse here, before
+	// any other DDL touches it, a database whose stored schema version is newer than this
+	// schema's (a newer build already migrated it, RT-109).
+	statements.push(`${SCHEMA_CEILING_DIRECTIVE} ${schema.version}`)
 
 	// Version vector table
 	statements.push(

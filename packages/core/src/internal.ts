@@ -9,6 +9,7 @@ export {
 	collectionIndexName,
 	enumCheckConstraint,
 	legacyCollectionIndexName,
+	SCHEMA_CEILING_DIRECTIVE,
 	sqlDefaultLiteral,
 	sqlStringLiteral,
 } from './schema/sql-gen'

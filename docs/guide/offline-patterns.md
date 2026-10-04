@@ -51,15 +51,29 @@ export default defineConfig({
 - **Precache:** the built shell and every hashed asset, the sqlite WASM, the OPFS proxy and
   your `public/` files, in a cache versioned by their content (`kora-shell-<version>`).
   Old versions are deleted when a new one activates.
-- **Navigations** are network first (4 s timeout, `navigationTimeoutMs`) with the cached shell as the fallback, so
-  online users always get the latest deploy and offline users still get the app.
-- **Hashed assets** are cache first; everything else is network first with a cache
-  fallback (an unhashed `sqlite3.wasm` is never served stale next to new JavaScript).
+- **One build per active worker.** While a worker is active, the tab runs that worker's
+  build, online and offline alike, until the user accepts an update (or every tab of the
+  app is closed: the waiting worker then takes over at the next start). Without this, an
+  online reload would run the new deploy and a later offline reload the old build, against
+  a database the new build already migrated.
+- **Navigations** are network first (4 s timeout, `navigationTimeoutMs`). A page of a Kora
+  build (the plugin marks every built page with `<meta name="kora-shell">`) that is not
+  byte-identical to one of the active worker's own pages belongs to a newer deploy: the
+  worker serves its own copy of that page (or its shell, for client-side routes) instead.
+  Other documents (server-rendered pages, file downloads) pass through. Offline, or after
+  the timeout, the worker's own copy or shell is served.
+- **The build's own files** (everything precached, including the unhashed `sqlite3.wasm`
+  and `public/` files) are cache first, so the active build never mixes in a newer
+  deploy's bytes. Other hashed assets are cache first; everything else (API calls, for
+  example) is network first with a cache fallback.
 - **Never cached:** the sync endpoint (`/kora-sync`), auth routes (`/auth`), and
   `/__kora`, `/health`. Change the list with `koraServiceWorker({ bypass: [...] })`.
 - **Updates:** a new deploy installs in the background and waits. The page shows "A new
-  version is available. Reload"; only when the user accepts does it activate and reload, so
-  one page never mixes old and new assets. To use your own UI, pass
+  version is available. Reload"; only when the user accepts does it activate and reload (into
+  the new build), so one page never mixes old and new assets and an older build never runs
+  after a newer one migrated the database. If an older build is ever opened against such a
+  database anyway, the store refuses it (`store:schema-ahead`, see
+  [Storage configuration](./storage-configuration.md#a-database-a-newer-build-migrated)). To use your own UI, pass
   `koraServiceWorker({ updatePrompt: false })` and handle the event:
 
 <!-- docs-check-prelude
