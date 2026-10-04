@@ -2,7 +2,7 @@
 
 Update this file at every milestone. A fresh session should read it first, then `remediation/STATUS.md` on branch `fix/phase4-rc`.
 
-**Last updated:** 2026-10-04
+**Last updated:** 2026-10-04 (release prepared)
 
 ## Release facts (from the maintainer)
 
@@ -10,6 +10,17 @@ Update this file at every milestone. A fresh session should read it first, then 
 - Phases 1 to 4 all ship together as **1.0.0-beta.13**. There is no beta.14. Commit 33bca46 (the Phase 1 merge) was never released.
 - The only old clients and servers in the field are beta.12 and older. Compatibility tests must target beta.12.
 - Security-sensitive work stays in the private repo `ehoneahobed/kora-private` (remote `private`) until beta.13 ships with the advisory. Never push to the public `origin`.
+
+## Release status: PREPARED (not published)
+
+1.0.0-beta.13 is prepared on branch `wip/phase4/release-prep` (on `private`), which is `fix/phase4-rc` (52977ce, final gate green 219/219) plus the release-prep commits:
+
+- 338493c: `pnpm beta:bump` (13 linked packages 1.0.0-beta.13, `create-kora-app` 0.1.25-beta.12, `@korajs/tauri` 0.4.3-beta.12); the tauri-react template now pins `@korajs/tauri` to its own version (`KORA_TAURI_TEMPLATE_VERSION`, rewritten by `bump-beta.mjs`); README and upgrade guide link the public notes.
+- ecc19d1: changesets consumed (summary changeset `beta13-security-release` plus `phase2-round2-client` and `next-beta-scope-hardening` listed in `pre.json`); `## 1.0.0-beta.13` CHANGELOG entries for every published package. changesets/action sees 0 pending changesets, so a push to `main` runs `pnpm release` (`changeset publish`, skips versions already on npm).
+- 38f695b: public release notes `docs/releases/v1.0.0-beta.13.md` and the maintainer runbook `docs/releases/npm-publish-checklist-beta.13.md`.
+- 0afef7b: publish-ready advisory (`remediation/SECURITY-ADVISORY-DRAFT.md`, public copy `docs/releases/security-advisory-beta13.md`; `docs/releases/` is excluded from the docs site build).
+
+Checked on the release-prep head: `pnpm release:dry-run` 15 packages, exact versions, no `workspace:` ranges, no tests/repro/remediation in tarballs; biome, typecheck, build, `pnpm docs:check-code`, DX-3 repro, `korajs` (199) and `@korajs/cli` (390) tests green.
 
 ## Where things are
 
@@ -44,10 +55,13 @@ Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for refe
 
 ## Next steps
 
-1. Done: final gate on 6c28473 is green: build, biome, typecheck, root test 30/30, `check.mjs --all` (PG16, Chromium, `LMS_OPS=20000`) 216/216 fixed, 0 errors, 0 warnings, e2e 11/11. `STATUS.md` committed; PR from `fix/phase4-rc` into private main opened.
-2. Maintainer: review and merge the Phase 4 PR.
-3. Maintainer decision: optional final verification red team over the post-RC fixes (RT-95..RT-106).
-4. Release: run the version bump to 1.0.0-beta.13, publish, then publish the advisory and push the history to the public repo together.
+Follow `docs/releases/npm-publish-checklist-beta.13.md` exactly, in one sitting:
+
+1. Maintainer: disable the `release` and `canary` workflows in `kora-private` (its `release` workflow would run `changeset publish` on the merge), delete its stale `changeset-release/main` branch, then merge `wip/phase4/release-prep` into private `main` (supersedes PR #4).
+2. On the maintainer machine at that merge commit: `pnpm install --frozen-lockfile`, `pnpm test:pre-release` (optional `KORA_PG_TEST_URL`; installs Playwright Chromium), `pnpm release:dry-run`.
+3. `npm whoami`, `pnpm -r publish --tag beta --no-git-checks`, verify every package and dist-tag, smoke-test outside the monorepo.
+4. Only then: fast-forward public `origin` `main` to the merge commit, tag `v1.0.0-beta.13`, publish the GitHub Security Advisory (request a CVE) and the GitHub release.
+5. Decide on the unpatched 0.x `latest` line (deprecate or leave; runbook step f.3).
 
 ## Working rules
 
