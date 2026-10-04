@@ -36,6 +36,7 @@ export {
 	QueryError,
 	RecordNotFoundError,
 	RequestAbortedError,
+	SchemaVersionAheadError,
 	StorageBackendMismatchError,
 	StorageDurabilityError,
 	StorageInUseError,

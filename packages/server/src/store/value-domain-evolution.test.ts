@@ -9,6 +9,7 @@ import {
 	defineSchema,
 	t,
 } from '@korajs/core'
+import { planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import Database from 'better-sqlite3'
 import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
@@ -194,6 +195,70 @@ describe('server stores relax beta.12 value-domain constraints (RT-101)', () => 
 				expect(await removed.findRecord('todos', urgent.recordId)).toMatchObject({
 					priority: 'urgent',
 				})
+			} finally {
+				await client.end()
+				await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
+				await admin.end()
+			}
+		},
+	)
+
+	test.skipIf(!process.env.KORA_PG_TEST_URL)(
+		'Postgres: enum checks are matched structurally in every normalized form (RT-108)',
+		async () => {
+			const schemaName = `kora_rt108_forms_${process.pid}`
+			const admin = postgres(process.env.KORA_PG_TEST_URL as string, {
+				max: 1,
+				onnotice: () => {},
+			})
+			await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
+			await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+			const client = postgres(process.env.KORA_PG_TEST_URL as string, {
+				max: 1,
+				onnotice: () => {},
+				connection: { search_path: schemaName },
+			})
+			try {
+				await client.unsafe(
+					`CREATE TABLE forms (id TEXT PRIMARY KEY, one TEXT, vc VARCHAR(20), vm VARCHAR, ch CHAR(1), "Mixed" TEXT, nv TEXT, kind TEXT, label TEXT, _deleted INTEGER CHECK (_deleted IN (0, 1)))`,
+				)
+				// beta.12 enum checks of every shape a column type produces...
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("one" IN ('active'))`)
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("vc" IN ('a'))`)
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("vm" IN ('a', 'b'))`)
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("ch" IN ('y'))`)
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("Mixed" IN ('it''s'))`)
+				await client.unsafe(`ALTER TABLE forms ADD CHECK ("nv" IN ('p', 'q')) NOT VALID`)
+				// ...and checks an operator added by hand on non-enum fields (kept).
+				await client.unsafe(
+					`ALTER TABLE forms ADD CONSTRAINT forms_kind_hand CHECK ("kind" = 'fixed')`,
+				)
+				await client.unsafe(
+					`ALTER TABLE forms ADD CONSTRAINT forms_label_hand CHECK ("label" <> 'x')`,
+				)
+				const query = async (text: string) =>
+					(await client.unsafe(text)) as unknown as Array<Record<string, unknown>>
+				const fields = ['one', 'vc', 'vm', 'ch', 'Mixed', 'nv', 'kind', 'label']
+				const enums = ['one', 'vc', 'vm', 'ch', 'Mixed', 'nv']
+				const statements = await planPostgresConstraintRelaxation(
+					query,
+					{ forms: fields },
+					{ forms: enums },
+				)
+				expect(statements).toHaveLength(6)
+				for (const statement of statements) await client.unsafe(statement)
+				const left = await client.unsafe(
+					`SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE contype = 'c' AND conrelid = 'forms'::regclass ORDER BY conname`,
+				)
+				expect(left.map((row) => row.conname)).toEqual([
+					'forms__deleted_check',
+					'forms_kind_hand',
+					'forms_label_hand',
+				])
+				// Idempotent.
+				expect(
+					await planPostgresConstraintRelaxation(query, { forms: fields }, { forms: enums }),
+				).toEqual([])
 			} finally {
 				await client.end()
 				await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)

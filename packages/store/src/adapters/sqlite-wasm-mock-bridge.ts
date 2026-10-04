@@ -3,6 +3,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Database as BetterSqlite3Database } from 'better-sqlite3'
 import type BetterSqlite3 from 'better-sqlite3'
+import {
+	STORED_SCHEMA_VERSION_SQL,
+	parseSchemaCeiling,
+	schemaAheadMessage,
+	storedSchemaVersion,
+} from '../migrations/schema-ceiling'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 
 type BetterSqlite3Constructor = (filename: string) => BetterSqlite3Database
@@ -92,6 +98,19 @@ export class MockWorkerBridge implements WorkerBridge {
 		// in memory, where SQLite reports `memory` whatever is requested.
 		database.pragma('foreign_keys = ON')
 		for (const sql of ddlStatements) {
+			const ceiling = parseSchemaCeiling(sql)
+			if (ceiling !== null) {
+				// A database a newer build migrated gets none of this build's DDL (RT-109).
+				const stored = storedSchemaVersion(
+					database.prepare(STORED_SCHEMA_VERSION_SQL).all() as Array<{ value: unknown }>,
+				)
+				if (stored > ceiling) {
+					database.close()
+					this.db = null
+					throw new Error(schemaAheadMessage(stored, ceiling))
+				}
+				continue
+			}
 			if (sql.startsWith('--kora:safe-alter')) {
 				try {
 					database.exec(sql.replace('--kora:safe-alter\n', ''))

@@ -164,3 +164,157 @@ describe('bundled templates', () => {
 		expect(config).not.toContain('koraServiceWorker')
 	})
 })
+
+/**
+ * The generated worker run in a minimal ServiceWorkerGlobalScope: one build per active
+ * worker (RT-109).
+ */
+describe('generated worker: one build per active worker (RT-109)', () => {
+	interface FakeResponse {
+		ok: boolean
+		type: string
+		body: string
+		headers: { get(name: string): string | null }
+		text(): Promise<string>
+		clone(): FakeResponse
+	}
+	const respond = (body: string, contentType: string): FakeResponse => ({
+		ok: true,
+		type: 'basic',
+		body,
+		headers: { get: (name) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+		text: async () => body,
+		clone: () => respond(body, contentType),
+	})
+	const typeOf = (path: string): string =>
+		path.endsWith('.html') || !path.includes('.') ? 'text/html' : 'application/octet-stream'
+	const page = (build: string, name = 'index') =>
+		`<html><head><meta name="kora-shell" content="1"></head>${name} ${build}</html>`
+
+	function worker(precached: Record<string, string>, network: Record<string, string> | null) {
+		type Handler = (event: unknown) => void
+		const handlers = new Map<string, Handler>()
+		const cache = new Map<string, string>()
+		const cacheApi = {
+			match: async (req: string | { url: string }) => {
+				const path = typeof req === 'string' ? req : new URL(req.url).pathname
+				const body = cache.get(path)
+				return body === undefined ? undefined : respond(body, typeOf(path))
+			},
+			put: async () => undefined,
+			addAll: async (requests: Array<{ url: string }>) => {
+				for (const r of requests) {
+					const path = new URL(r.url).pathname
+					cache.set(path, precached[path] ?? '')
+				}
+			},
+		}
+		const source = serviceWorkerSource({
+			version: 'v1',
+			precache: Object.keys(precached),
+			shellUrl: '/index.html',
+			bypass: [...DEFAULT_SW_BYPASS],
+			navigationTimeoutMs: 4000,
+		})
+		const fetchFn = async (req: { url: string }) => {
+			const path = new URL(req.url).pathname
+			const body = network?.[path]
+			if (network === null || body === undefined) throw new TypeError('Failed to fetch')
+			return respond(body, typeOf(path))
+		}
+		class FakeRequest {
+			url: string
+			constructor(url: string) {
+				this.url = new URL(url, 'https://app.test').href
+			}
+		}
+		new Function('self', 'caches', 'fetch', 'Request', 'URL', 'Response', source)(
+			{
+				location: { origin: 'https://app.test' },
+				addEventListener: (type: string, handler: Handler) => handlers.set(type, handler),
+				skipWaiting: () => undefined,
+				clients: { claim: async () => undefined },
+			},
+			{ open: async () => cacheApi, keys: async () => [], delete: async () => true },
+			fetchFn,
+			FakeRequest,
+			URL,
+			{ error: () => respond('', 'error') },
+		)
+		return {
+			async install(): Promise<void> {
+				let done: unknown = undefined
+				handlers.get('install')?.({
+					waitUntil: (p: Promise<unknown>) => {
+						done = p
+					},
+				})
+				await done
+			},
+			async get(path: string, mode: 'navigate' | 'no-cors' = 'no-cors'): Promise<string> {
+				let result: Promise<FakeResponse | undefined> = Promise.resolve(undefined)
+				handlers.get('fetch')?.({
+					request: { method: 'GET', mode, url: `https://app.test${path}` },
+					respondWith: (p: Promise<FakeResponse>) => {
+						result = p
+					},
+				})
+				return (await result)?.body ?? '<not handled>'
+			},
+		}
+	}
+
+	const v1Files = {
+		'/index.html': page('v1'),
+		'/admin.html': page('v1', 'admin'),
+		'/assets/sqlite3.wasm': 'wasm v1',
+		'/assets/app-Ab12Cd34.js': 'js v1',
+	}
+
+	test('after a newer deploy, navigations and build files stay this build, online and offline', async () => {
+		const sw = worker(v1Files, {
+			'/': page('v2'),
+			'/index.html': page('v2'),
+			'/todos/42': page('v2'),
+			'/admin.html': page('v2', 'admin'),
+			'/assets/sqlite3.wasm': 'wasm v2',
+		})
+		await sw.install()
+		expect(await sw.get('/', 'navigate')).toBe(page('v1'))
+		expect(await sw.get('/todos/42', 'navigate')).toBe(page('v1'))
+		expect(await sw.get('/admin.html', 'navigate')).toBe(page('v1', 'admin'))
+		// The unhashed files of the build are this build's bytes too.
+		expect(await sw.get('/assets/sqlite3.wasm')).toBe('wasm v1')
+		const offline = worker(v1Files, null)
+		await offline.install()
+		expect(await offline.get('/', 'navigate')).toBe(page('v1'))
+		expect(await offline.get('/admin.html', 'navigate')).toBe(page('v1', 'admin'))
+	})
+
+	test('the same build, server-rendered pages and non-HTML navigations come from the network', async () => {
+		const sw = worker(v1Files, {
+			'/': page('v1'),
+			'/report': '<html>server-rendered report</html>',
+			'/export.csv': 'a,b',
+			'/api/items': '[]',
+		})
+		await sw.install()
+		expect(await sw.get('/', 'navigate')).toBe(page('v1'))
+		expect(await sw.get('/report', 'navigate')).toBe('<html>server-rendered report</html>')
+		expect(await sw.get('/export.csv', 'navigate')).toBe('a,b')
+		expect(await sw.get('/api/items')).toBe('[]')
+	})
+
+	test('the plugin marks built pages (not dev pages) for the worker', () => {
+		const plugin = koraServiceWorker()
+		plugin.configResolved({ root: '/x', base: '/', command: 'build', build: { outDir: 'dist' } })
+		expect(plugin.transformIndexHtml('<html></html>').tags).toContainEqual(
+			expect.objectContaining({ tag: 'meta', attrs: { name: 'kora-shell', content: '1' } }),
+		)
+		const dev = koraServiceWorker()
+		dev.configResolved({ root: '/x', base: '/', command: 'serve', build: { outDir: 'dist' } })
+		expect(dev.transformIndexHtml('<html></html>').tags.some((tag) => tag.tag === 'meta')).toBe(
+			false,
+		)
+	})
+})

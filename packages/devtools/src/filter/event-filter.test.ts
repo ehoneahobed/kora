@@ -55,6 +55,7 @@ describe('getEventCategory', () => {
 			'store:db-name-collision': 'connection',
 			'store:storage-blocked': 'connection',
 			'store:storage-migrated': 'connection',
+			'store:schema-ahead': 'connection',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',

@@ -3,8 +3,11 @@
 // buildable. PW_CHROMIUM_PATH=/opt/pw-browsers/chromium; port 3001 free. The script edits
 // src/App.tsx and src/schema.ts and restores them.
 // Deploy v1, open it (SW v1 installs), deploy v2 (schema version 2 + new title), reload
-// online without accepting the update, then reload offline.
-// Bug: the online reload prints v2 (prompt still shown), the offline reload prints v1.
+// online without accepting the update, then reload offline; then accept the update.
+// Bug (beta.13 RC): the online reload ran v2 (prompt still shown) and the offline reload
+// v1, against the database v2 had migrated.
+// Correct: v1 online and offline until the update is accepted; then v2 online and offline.
+// Prints each step and `RT-109 browser: PASS` (exit 0) or `FAIL` (exit 1).
 import { execSync, spawn } from 'node:child_process'
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -35,59 +38,81 @@ const browser = await chromium.launch({ executablePath: process.env.PW_CHROMIUM_
 const context = await browser.newContext()
 const page = await context.newPage()
 const title = () => page.locator('h1').first().textContent()
+const failures = []
+const expectStep = (label, actual, expected) => {
+	const ok = actual === expected
+	console.log(`${ok ? 'ok  ' : 'FAIL'} ${label}: ${JSON.stringify(actual)}`)
+	if (!ok) failures.push(`${label}: expected ${JSON.stringify(expected)}`)
+}
+const input = 'input[placeholder="What needs to be done?"]'
+const add = async (text) => {
+	await page.fill(input, text)
+	await page.press(input, 'Enter')
+	await page.waitForSelector(`text=${text}`, { timeout: 15000 })
+}
+const registration = () =>
+	page.evaluate(async () => {
+		const r = await navigator.serviceWorker.getRegistration()
+		return { active: !!r?.active, waiting: !!r?.waiting }
+	})
 try {
 	await page.goto(url, { waitUntil: 'load' })
 	await page.waitForSelector('h1')
 	await page.evaluate(() => navigator.serviceWorker.ready)
 	await page.reload({ waitUntil: 'load' })
 	await page.waitForSelector('h1')
-	console.log(
-		'v1 online:',
-		await title(),
-		'controlled:',
-		await page.evaluate(() => !!navigator.serviceWorker.controller),
-	)
+	expectStep('v1 online', await title(), 'My Tasks v1')
+	expectStep('controlled', await page.evaluate(() => !!navigator.serviceWorker.controller), true)
+	await add('made by v1')
 
-	// Deploy v2: new title and schema version 2 (a new optional field).
+	// Deploy v2: new title and schema version 2.
 	writeFileSync(appTsx, origApp.replace('>My Tasks<', '>My Tasks v2<'))
 	writeFileSync(schemaTs, origSchema.replace('version: 1', 'version: 2'))
 	sh('pnpm build')
 	await page.reload({ waitUntil: 'load' })
 	await page.waitForSelector('h1')
-	await page.waitForTimeout(3000)
-	const prompt = await page.locator('#kora-update-prompt').count()
-	console.log(
-		'after deploy, online reload (update NOT accepted):',
-		await title(),
-		'prompt shown:',
-		prompt,
-	)
-	await page.fill('input[placeholder="What needs to be done?"]', 'made by v2')
-	await page.press('input[placeholder="What needs to be done?"]', 'Enter')
-	await page.waitForSelector('text=made by v2')
-	const regState = await page.evaluate(async () => {
-		const r = await navigator.serviceWorker.getRegistration()
-		return { active: !!r?.active, waiting: !!r?.waiting }
-	})
-	console.log('registration:', JSON.stringify(regState))
+	await page.waitForSelector('#kora-update-prompt', { timeout: 30000 }).catch(() => undefined)
+	expectStep('after deploy, online reload (update NOT accepted)', await title(), 'My Tasks v1')
+	expectStep('update prompt shown', await page.locator('#kora-update-prompt').count(), 1)
+	expectStep('registration', JSON.stringify(await registration()), '{"active":true,"waiting":true}')
+	await add('made online before accepting')
 
 	await context.setOffline(true)
 	await page.reload({ waitUntil: 'load' })
 	await page.waitForSelector('h1', { timeout: 30000 })
-	await page.waitForTimeout(2000)
-	console.log(
-		'offline reload:',
-		await title(),
-		'sees v2 todo:',
-		await page.locator('text=made by v2').count(),
-	)
-	await page.fill('input[placeholder="What needs to be done?"]', 'made by v1 offline')
-	await page.press('input[placeholder="What needs to be done?"]', 'Enter')
-	await page.waitForTimeout(1500)
-	console.log('v1 offline write shown:', await page.locator('text=made by v1 offline').count())
-	const errors = await page.evaluate(() => document.body.innerText.slice(0, 300))
-	console.log('offline page text:', JSON.stringify(errors))
+	expectStep('offline reload (update NOT accepted)', await title(), 'My Tasks v1')
+	await add('made by v1 offline')
+
+	// Accept the update online: the new worker activates and the page reloads into v2.
+	await context.setOffline(false)
+	await page.reload({ waitUntil: 'load' })
+	await page.waitForSelector('#kora-update-prompt button', { timeout: 30000 })
+	await Promise.all([
+		page.waitForEvent('load', { timeout: 30000 }),
+		page.click('#kora-update-prompt button'),
+	])
+	await page.waitForSelector('h1')
+	await page
+		.waitForFunction(() => document.querySelector('h1')?.textContent === 'My Tasks v2', undefined, {
+			timeout: 30000,
+		})
+		.catch(() => undefined)
+	expectStep('after accepting the update', await title(), 'My Tasks v2')
+	await page.waitForSelector('text=made by v1 offline', { timeout: 15000 }).catch(() => undefined)
+	expectStep('v2 sees the v1 writes', await page.locator('text=made by v1 offline').count(), 1)
+
+	await context.setOffline(true)
+	await page.reload({ waitUntil: 'load' })
+	await page.waitForSelector('h1', { timeout: 30000 })
+	expectStep('offline reload after the update', await title(), 'My Tasks v2')
+	await add('made by v2 offline')
+	const after = await page.evaluate(async () => {
+		const r = await navigator.serviceWorker.getRegistration()
+		return { active: !!r?.active, waiting: !!r?.waiting }
+	})
+	console.log('registration after update:', JSON.stringify(after))
 } catch (e) {
+	failures.push(`error: ${e.message}`)
 	console.log('ERROR', e.message)
 } finally {
 	await browser.close()
@@ -95,3 +120,7 @@ try {
 	writeFileSync(appTsx, origApp)
 	writeFileSync(schemaTs, origSchema)
 }
+console.log(
+	failures.length === 0 ? 'RT-109 browser: PASS' : `RT-109 browser: FAIL\n${failures.join('\n')}`,
+)
+process.exit(failures.length === 0 ? 0 : 1)

@@ -16,6 +16,19 @@ export interface CachedKeyring {
 	/** Derived from the ring's master key; null while locked. */
 	master?: MasterKeys | null
 	keys: Array<{ keyVersion: number; keyId: string; key: CryptoKey }>
+	/**
+	 * Ids of master keys a passphrase change retired, from every record this device
+	 * authenticated (RT-107). Kept when locked: records authenticated only by one of them
+	 * stay refused across restarts.
+	 */
+	retiredMasters?: string[]
+	/**
+	 * Ids of master keys this device held when the server served a NEWER revision of the
+	 * same ring that they do not authenticate (a passphrase change this device could not
+	 * read yet). Records authenticated only by one of them are not adopted automatically;
+	 * an explicit `unlock(passphrase)` decides (RT-107).
+	 */
+	supersededMasters?: string[]
 }
 
 /** Where a device keeps unlocked keyrings between app starts. */

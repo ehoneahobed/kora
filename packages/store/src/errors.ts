@@ -75,6 +75,30 @@ export class StorageDurabilityError extends KoraError {
 }
 
 /**
+ * Thrown when the store opens a database a NEWER build of the app already migrated: its
+ * stored schema version is above this code's `schema.version` (RT-109). Running older
+ * code against it would write operations of the old schema into the new one, or fail
+ * part-way, so the store refuses before changing anything and emits `store:schema-ahead`.
+ *
+ * Fix: run the newer build (reload while online, or accept the app's update prompt).
+ * Never lower `schema.version` in a deployed app.
+ */
+export class SchemaVersionAheadError extends KoraError {
+	constructor(
+		public readonly dbName: string,
+		public readonly storedVersion: number,
+		public readonly codeVersion: number,
+	) {
+		super(
+			`Database "${dbName}" is at schema version ${storedVersion}, newer than this build's schema version ${codeVersion}: a newer build of the app already migrated it. It was not opened and nothing in it changed. Run the newer build (reload while online, or accept the update); never lower schema.version in a deployed app.`,
+			'SCHEMA_VERSION_AHEAD',
+			{ dbName, storedVersion, codeVersion },
+		)
+		this.name = 'SchemaVersionAheadError'
+	}
+}
+
+/**
  * Thrown when an operation is attempted on a store that has not been opened.
  */
 export class StoreNotOpenError extends KoraError {

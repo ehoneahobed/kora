@@ -121,6 +121,10 @@ async function renameColumn(
 		`SELECT name FROM pragma_table_info(${sqlText(collection)})`,
 	)
 	const names = new Set(columns.map((column) => column.name))
+	// A database created at (or past) this version: the open's DDL already made `to` and
+	// there is no `from` to carry over (a fresh install of a schema whose history has
+	// renames). Nothing to rename.
+	if (!names.has(from) && names.has(to)) return
 	if (names.has(from) && names.has(to)) {
 		const indexes = await tx.query<{ name: string; sql: string }>(
 			`SELECT m.name AS name, m.sql AS sql FROM sqlite_master m WHERE m.type = 'index' AND m.tbl_name = ${sqlText(collection)} AND m.sql IS NOT NULL AND EXISTS (SELECT 1 FROM pragma_index_info(m.name) i WHERE i.name = ${sqlText(to)})`,

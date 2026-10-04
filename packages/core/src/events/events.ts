@@ -376,6 +376,22 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * BLOCKING. The local database was already migrated by a NEWER build of the app
+			 * (its stored schema version is above this code's `schema.version`), for example
+			 * an old build served offline after an update ran (RT-109). The store refuses to
+			 * open it (`SchemaVersionAheadError`, `app.ready` rejects) and changes nothing in
+			 * it. Apps should ask the user to reload online so the newer build runs.
+			 */
+			type: 'store:schema-ahead'
+			dbName: string
+			/** The schema version stored in the database */
+			storedVersion: number
+			/** This code's `schema.version` */
+			codeVersion: number
+			message: string
+	  }
+	| {
+			/**
 			 * A preferred storage backend could not provide durable storage, so Kora
 			 * promoted the app to another durable backend before user code observed the
 			 * store. This is informational: data still survives reloads.

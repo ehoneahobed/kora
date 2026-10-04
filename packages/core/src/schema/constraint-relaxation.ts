@@ -156,16 +156,169 @@ function foreignKeyActions(fk: SqliteForeignKeyInfo): string {
 	return out
 }
 
+/** A `CHECK` that restricts one column to a list of string literals (an enum check). */
+export interface EnumCheckShape {
+	/** The column, unquoted */
+	column: string
+	/** The allowed values, unquoted */
+	values: string[]
+	/** The check also allows NULL (`... OR col IS NULL`) */
+	allowsNull: boolean
+}
+
+/** Keywords that never belong to a cast's type name. */
+const EXPRESSION_KEYWORDS: ReadonlySet<string> = new Set([
+	'AND',
+	'ANY',
+	'ARRAY',
+	'IN',
+	'IS',
+	'NOT',
+	'NULL',
+	'OR',
+	'VALID',
+])
+
+function tokenizeCheck(definition: string): string[] | null {
+	const tokens: string[] = []
+	const pattern =
+		/\s+|'(?:[^']|'')*'|"(?:[^"]|"")+"|::|[A-Za-z_][A-Za-z0-9_$]*|[0-9]+|<>|!=|<=|>=|[()[\],=<>]|./gy
+	for (let match = pattern.exec(definition); match !== null; match = pattern.exec(definition)) {
+		if (match[0] === '') return null
+		if (!/^\s+$/.test(match[0])) tokens.push(match[0])
+		if (pattern.lastIndex >= definition.length) break
+	}
+	return tokens
+}
+
+function isWord(token: string | undefined): token is string {
+	return token !== undefined && /^[A-Za-z_][A-Za-z0-9_$]*$/.test(token)
+}
+
+/** Drop `::type` casts (`::text`, `::character varying`, `::text[]`, `::varchar(20)`). */
+function dropCasts(tokens: string[]): string[] {
+	const out: string[] = []
+	let i = 0
+	while (i < tokens.length) {
+		if (tokens[i] !== '::') {
+			out.push(tokens[i] as string)
+			i++
+			continue
+		}
+		i++
+		let words = 0
+		while (
+			(isWord(tokens[i]) && !EXPRESSION_KEYWORDS.has((tokens[i] as string).toUpperCase())) ||
+			/^"/.test(tokens[i] ?? '')
+		) {
+			i++
+			words++
+		}
+		if (words === 0) return ['::invalid']
+		if (tokens[i] === '(' && /^[0-9]+$/.test(tokens[i + 1] ?? '')) {
+			let j = i + 1
+			while (/^[0-9]+$/.test(tokens[j] ?? '') || tokens[j] === ',') j++
+			if (tokens[j] === ')') i = j + 1
+		}
+		while (tokens[i] === '[' && tokens[i + 1] === ']') i += 2
+	}
+	return out
+}
+
+function unquoteIdentifier(token: string): string | null {
+	if (/^"(?:[^"]|"")+"$/.test(token)) return token.slice(1, -1).replaceAll('""', '"')
+	if (isWord(token) && !EXPRESSION_KEYWORDS.has(token.toUpperCase())) return token
+	return null
+}
+
+function unquoteLiteral(token: string | undefined): string | null {
+	if (token === undefined || !/^'(?:[^']|'')*'$/.test(token)) return null
+	return token.slice(1, -1).replaceAll("''", "'")
+}
+
 /**
- * Whether a Postgres `CHECK` constraint definition (`pg_get_constraintdef`) is a Kora enum
- * check: one column compared to a literal list. Postgres stores `col IN ('a', 'b')` as
- * `CHECK ((col = ANY (ARRAY['a'::text, 'b'::text])))`. Other checks (added by hand) are
- * left alone.
+ * Parse a `CHECK` constraint definition as an enum check, structurally: one column
+ * compared to string literals, in any form Postgres normalizes `col IN (...)` to
+ * (`col = ANY (ARRAY[...])`, the single-value `col = 'x'`, casts such as
+ * `(col)::text = ANY ((ARRAY['x'::character varying])::text[])`), a disjunction of
+ * equalities (`col = 'a' OR col = 'b'`), the SQLite source form `col IN ('a', 'b')`, an
+ * optional `OR col IS NULL`, and a trailing `NOT VALID`. Anything else (another operator,
+ * a function call, two columns, `AND`, `NOT`) is not an enum check and returns null.
+ *
+ * @param definition - The constraint definition (`pg_get_constraintdef`, or SQLite DDL)
+ * @returns The column and values, or null when the check has another shape
+ */
+export function parseEnumCheckDefinition(definition: string): EnumCheckShape | null {
+	const raw = tokenizeCheck(definition.trim())
+	if (raw === null || raw[0]?.toUpperCase() !== 'CHECK') return null
+	let tokens = dropCasts(raw.slice(1)).filter((token) => token !== '(' && token !== ')')
+	const upper = (index: number): string => (tokens[index] ?? '').toUpperCase()
+	if (upper(tokens.length - 2) === 'NOT' && upper(tokens.length - 1) === 'VALID') {
+		tokens = tokens.slice(0, -2)
+	}
+	let column: string | null = null
+	const values: string[] = []
+	let allowsNull = false
+	let i = 0
+	const readLiteral = (): boolean => {
+		const value = unquoteLiteral(tokens[i])
+		if (value === null) return false
+		values.push(value)
+		i++
+		return true
+	}
+	const readList = (): boolean => {
+		if (!readLiteral()) return false
+		while (tokens[i] === ',') {
+			i++
+			if (!readLiteral()) return false
+		}
+		return true
+	}
+	for (;;) {
+		const name = unquoteIdentifier(tokens[i] ?? '')
+		if (name === null || (column !== null && name !== column)) return null
+		column = name
+		i++
+		if (tokens[i] === '=' && upper(i + 1) === 'ANY' && upper(i + 2) === 'ARRAY') {
+			if (tokens[i + 3] !== '[') return null
+			i += 4
+			if (!readList() || tokens[i] !== ']') return null
+			i++
+		} else if (tokens[i] === '=') {
+			i++
+			if (!readLiteral()) return null
+		} else if (upper(i) === 'IN') {
+			i++
+			if (!readList()) return null
+		} else if (upper(i) === 'IS' && upper(i + 1) === 'NULL') {
+			allowsNull = true
+			i += 2
+		} else {
+			return null
+		}
+		if (i === tokens.length) break
+		if (upper(i) !== 'OR') return null
+		i++
+	}
+	if (column === null || values.length === 0) return null
+	return { column, values, allowsNull }
+}
+
+/**
+ * Whether a Postgres `CHECK` constraint definition (`pg_get_constraintdef`) has the shape
+ * of a Kora enum check (see {@link parseEnumCheckDefinition}). Other checks (added by hand)
+ * are left alone.
  *
  * @param definition - The constraint definition text
  */
 export function isPostgresEnumCheckDefinition(definition: string): boolean {
-	return /^CHECK\s*\(\(*\s*(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?:\)?::text)?\s*=\s*ANY\s*\(\s*(?:\(\s*)?ARRAY\[/i.test(
+	return parseEnumCheckDefinition(definition) !== null
+}
+
+/** The `col = ANY (ARRAY[...])` form only: what every multi-value beta.12 enum check became. */
+function isAnyArrayCheck(definition: string): boolean {
+	return /^CHECK\s*\(\(*\s*(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?:\)?::[A-Za-z ]+)?\s*=\s*ANY\s*\(/i.test(
 		definition.trim(),
 	)
 }
@@ -264,13 +417,23 @@ export async function planSqliteConstraintRelaxation(
  * checks of any other shape (added by hand) are kept. Reads the catalog of the current
  * schema through `query`, so run it and the statements in one transaction.
  *
+ * A check is matched structurally against the schema (RT-108): it is parsed as an enum
+ * check ({@link parseEnumCheckDefinition}, every form Postgres normalizes `IN (...)` to,
+ * including the single-value `col = 'x'`) and dropped when its one column is an enum field
+ * of the table (`enumFieldsByTable`; without it, any schema field), or when it restricts
+ * any other non-internal column to two or more literals (the multi-value shape every
+ * beta.12 enum check had).
+ *
  * @param query - Runs a SELECT and returns rows
  * @param fieldsByTable - Collection table name to its schema field names
+ * @param enumFieldsByTable - Collection table name to its enum field names (before and
+ *   after the change); when a table is missing, every schema field counts as one
  * @returns The statements, or `[]` when nothing is left to relax (idempotent)
  */
 export async function planPostgresConstraintRelaxation(
 	query: SqliteQueryFn,
 	fieldsByTable: Readonly<Record<string, readonly string[]>>,
+	enumFieldsByTable: Readonly<Record<string, readonly string[]>> = {},
 ): Promise<string[]> {
 	const tables = Object.keys(fieldsByTable)
 	if (tables.length === 0) return []
@@ -289,7 +452,11 @@ export async function planPostgresConstraintRelaxation(
 		const columns = Array.isArray(check.columns) ? check.columns.map(String) : []
 		const column = columns[0]
 		if (columns.length !== 1 || column === undefined || isKoraInternalColumn(column)) continue
-		if (!isPostgresEnumCheckDefinition(String(check.definition))) continue
+		const shape = parseEnumCheckDefinition(String(check.definition))
+		if (shape === null || shape.column !== column) continue
+		const table = String(check.table_name)
+		const enumColumns = enumFieldsByTable[table] ?? fieldsByTable[table] ?? []
+		if (!enumColumns.includes(column) && !isAnyArrayCheck(String(check.definition))) continue
 		statements.push(
 			`ALTER TABLE ${quoteIdent(String(check.table_name))} DROP CONSTRAINT IF EXISTS ${quoteIdent(String(check.name))}`,
 		)

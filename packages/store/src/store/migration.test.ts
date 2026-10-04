@@ -176,6 +176,25 @@ describe('Store schema migrations', () => {
 		await store2.close()
 	})
 
+	test('a fresh install of a schema whose history has a rename opens (nothing to rename)', async () => {
+		const schemaV2 = defineSchema({
+			version: 2,
+			collections: { products: { fields: { name: t.string(), costPrice: t.number() } } },
+			migrations: { 2: migrate().renameField('products', 'cost', 'costPrice') },
+		})
+		const adapter = new BetterSqlite3Adapter(nextDbPath())
+		const store = new Store({ schema: schemaV2, adapter, nodeId: 'node-1' })
+		await store.open()
+		await store.collection('products').insert({ name: 'Widget', costPrice: 2 })
+		const products = await store.collection('products').where({}).exec()
+		expect(products[0]?.costPrice).toBe(2)
+		const rows = await adapter.query<{ value: string }>(
+			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
+		)
+		expect(rows[0]?.value).toBe('2')
+		await store.close()
+	})
+
 	test('migration renames an optional, defaulted and indexed column (open pre-added it)', async () => {
 		const dbPath = nextDbPath()
 		const schemaV1 = defineSchema({
@@ -613,8 +632,10 @@ describe('Store schema migrations: atomic versions and syncing backfills (STORE-
 		await expect(first.open()).rejects.toThrow('crash')
 		await first.close().catch(() => {})
 
+		// Probed with the target schema: an adapter refuses a database newer than its
+		// schema (RT-109), and this one is at v2.
 		const probe = new BetterSqlite3Adapter(path)
-		await probe.open(v1)
+		await probe.open(schema)
 		const version = await probe.query<{ value: string }>(
 			"SELECT value FROM _kora_meta WHERE key = 'schema_version'",
 		)

@@ -1,5 +1,5 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
-import { buildScopeMap, hasSchemaSyncRules, isCollectionSyncScoped } from '@korajs/core'
+import { KoraError, buildScopeMap, hasSchemaSyncRules, isCollectionSyncScoped } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type {
@@ -138,7 +138,10 @@ export async function initializeApp(
 				reason: fallbackReason,
 				message: `OPFS persistence is unavailable (${fallbackReason}) for database "${dbName}"; Kora is using durable IndexedDB instead.`,
 			})
-		} catch {
+		} catch (error) {
+			// A durable copy a newer build migrated is refused, never replaced by memory
+			// storage (RT-109): the store already emitted store:schema-ahead.
+			if (error instanceof KoraError && error.code === 'SCHEMA_VERSION_AHEAD') throw error
 			effectiveAdapterType = 'sqlite-wasm'
 			adapter = await createAdapter(
 				'sqlite-wasm',

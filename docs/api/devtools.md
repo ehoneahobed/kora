@@ -95,6 +95,7 @@ off()
 | `store:opfs-unavailable` | `dbName`, `reason`, `message` | OPFS could not be used and the store is not durable (emitted with `store:durability-lost`) | yes |
 | `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
 | `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
+| `store:schema-ahead` | `dbName`, `storedVersion`, `codeVersion`, `message` | the database was migrated by a newer build; the store refused to open it (`SchemaVersionAheadError`) | yes |
 | `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
 | `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |
 | `store:quota-exceeded` | `dbName`, `message` | a write exceeded the storage quota | yes |

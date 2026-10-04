@@ -109,6 +109,14 @@ export interface WrappedKeyRecord {
 	/** Every key version ever created. Never shrinks: old history must stay readable. */
 	keys: WrappedDataKey[]
 	recovery?: KeyRecordRecovery
+	/**
+	 * Ids (`m-` and 32 hex digits) of master keys a passphrase change retired (RT-107).
+	 * Append-only. A device that authenticated a record listing them refuses every later
+	 * record authenticated only by one of them, however it was opened (held master key,
+	 * a stale configured passphrase, the old passphrase typed again). Absent until the
+	 * first passphrase change.
+	 */
+	retiredMasters?: string[]
 	/** Base64 HMAC-SHA256 of every other field (see {@link keyRecordMacInput}). */
 	mac: string
 }
@@ -126,6 +134,7 @@ const RECORD_FIELDS: ReadonlySet<string> = new Set([
 	'master',
 	'keys',
 	'recovery',
+	'retiredMasters',
 	'mac',
 ])
 
@@ -187,6 +196,15 @@ export function validateKeyRecord(value: unknown, keyring: string): KeyRecordVal
 			return fail('recovery wrap is malformed')
 		}
 	}
+	if (value.retiredMasters !== undefined) {
+		const retired = value.retiredMasters
+		if (!Array.isArray(retired) || retired.length > MAX_KEY_VERSIONS) {
+			return fail(`retiredMasters must be an array of at most ${MAX_KEY_VERSIONS} ids`)
+		}
+		if (!retired.every((id) => isMasterId(id)) || new Set(retired).size !== retired.length) {
+			return fail('retiredMasters must hold distinct master ids')
+		}
+	}
 	if (!isBase64(value.mac, 32, 32)) return fail('mac must be 32 base64 bytes')
 	return { ok: true }
 }
@@ -216,6 +234,10 @@ export function isKeyRecordSuccessor(
 		if (nextIds.get(key.keyVersion) !== key.keyId) {
 			return fail(`key version ${key.keyVersion} must be kept`)
 		}
+	}
+	const nextRetired = new Set(next.retiredMasters ?? [])
+	for (const id of previous.retiredMasters ?? []) {
+		if (!nextRetired.has(id)) return fail(`retired master ${id} must be kept`)
 	}
 	return { ok: true }
 }
@@ -312,6 +334,11 @@ export function isValidKeyringName(value: unknown): value is string {
 /** Whether a value is a key id (`k2-` and 32 hex digits). */
 export function isKeyId(value: unknown): value is string {
 	return typeof value === 'string' && /^k2-[0-9a-f]{32}$/.test(value)
+}
+
+/** Whether a value is a master id (`m-` and 32 hex digits). */
+export function isMasterId(value: unknown): value is string {
+	return typeof value === 'string' && /^m-[0-9a-f]{32}$/.test(value)
 }
 
 function fail(reason: string): KeyRecordValidation {

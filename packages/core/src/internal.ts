@@ -9,12 +9,14 @@ export {
 	collectionIndexName,
 	enumCheckConstraint,
 	legacyCollectionIndexName,
+	SCHEMA_CEILING_DIRECTIVE,
 	sqlDefaultLiteral,
 	sqlStringLiteral,
 } from './schema/sql-gen'
 export {
 	isKoraInternalColumn,
 	isPostgresEnumCheckDefinition,
+	parseEnumCheckDefinition,
 	planPostgresConstraintRelaxation,
 	planSqliteConstraintRelaxation,
 	readSqliteTableCatalog,
@@ -22,6 +24,7 @@ export {
 	sqliteTableNeedsRelaxation,
 } from './schema/constraint-relaxation'
 export type {
+	EnumCheckShape,
 	SqliteColumnInfo,
 	SqliteForeignKeyInfo,
 	SqliteQueryFn,

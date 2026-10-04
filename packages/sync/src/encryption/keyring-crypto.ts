@@ -21,7 +21,9 @@ import {
  *   master key --HKDF-SHA256 "data-key-wrap"--> wrapping key (AES-256-GCM)
  *   master key --HKDF-SHA256 "record-mac"--> MAC key (HMAC-SHA256)
  *   wrapping key --AES-GCM wrap (AAD: keyring, version, keyId)--> data key v1, v2, ...
- *   lowest data key --HMAC-SHA256 "recovery-anchor"--> anchor (16 bytes, in the recovery key)
+ *   master key --HKDF-SHA256 "master-id"--> master id (names a master a passphrase change retires)
+ *   recovery anchor key (a data key created WITH the recovery key) --HMAC-SHA256 over
+ *     (keyring, ring id, key id, recovery public key)--> anchor (16 bytes, in the recovery key)
  *
  * Raw master-key bytes exist only inside the calls that create, re-wrap or open the
  * master key, and are zeroed afterwards. What a device keeps is the two derived keys
@@ -44,13 +46,14 @@ export const KEK_SALT_BYTES = 32
 export const MASTER_KEY_BYTES = 32
 
 const GCM_IV_BYTES = 12
-const RECOVERY_KEY_PREFIX = 'kora-rk2-'
-/** Bytes of a recovery key's ring anchor (see {@link dataKeyAnchor}). */
+const RECOVERY_KEY_PREFIX = 'kora-rk3-'
+/** Bytes of a recovery key's ring anchor (see {@link recoveryAnchor}). */
 const RECOVERY_ANCHOR_BYTES = 16
 const HKDF_DATA_KEY_WRAP = 'kora/key-record/2/data-key-wrap'
 const HKDF_RECORD_MAC = 'kora/key-record/2/record-mac'
+const HKDF_MASTER_ID = 'kora/key-record/2/master-id'
 const HKDF_RECOVERY_WRAP = 'kora/key-record/2/recovery-wrap'
-const RECOVERY_ANCHOR_INFO = 'kora/key-record/2/recovery-anchor'
+const RECOVERY_ANCHOR_INFO = 'kora/key-record/2/recovery-anchor/3'
 
 /** The keys a device derives from (and keeps instead of) a ring's master key. */
 export interface MasterKeys {
@@ -58,6 +61,12 @@ export interface MasterKeys {
 	wrapKey: CryptoKey
 	/** Authenticates the whole key record. */
 	macKey: CryptoKey
+	/**
+	 * Public name of the master key (`m-` and 32 hex digits, an HKDF output of the master
+	 * key): what a record's `retiredMasters` lists after a passphrase change. Reveals
+	 * nothing about the key; only a holder of the master key can compute it.
+	 */
+	id: string
 }
 
 function subtle(): SubtleCrypto {
@@ -138,14 +147,17 @@ export function generateMasterKey(): Uint8Array {
  * distinct info strings).
  */
 export async function importMasterKey(raw: Uint8Array): Promise<MasterKeys> {
-	const base = await subtle().importKey('raw', buffer(raw), 'HKDF', false, ['deriveKey'])
+	const base = await subtle().importKey('raw', buffer(raw), 'HKDF', false, [
+		'deriveKey',
+		'deriveBits',
+	])
 	const hkdf = (info: string): HkdfParams => ({
 		name: 'HKDF',
 		hash: 'SHA-256',
 		salt: new ArrayBuffer(0),
 		info: buffer(new TextEncoder().encode(info)),
 	})
-	const [wrapKey, macKey] = await Promise.all([
+	const [wrapKey, macKey, idBits] = await Promise.all([
 		subtle().deriveKey(hkdf(HKDF_DATA_KEY_WRAP), base, { name: 'AES-GCM', length: 256 }, false, [
 			'wrapKey',
 			'unwrapKey',
@@ -157,8 +169,9 @@ export async function importMasterKey(raw: Uint8Array): Promise<MasterKeys> {
 			false,
 			['sign', 'verify'],
 		),
+		subtle().deriveBits(hkdf(HKDF_MASTER_ID), base, 128),
 	])
-	return { wrapKey, macKey }
+	return { wrapKey, macKey, id: `m-${hex(new Uint8Array(idBits))}` }
 }
 
 /** Seal the master key under the passphrase KEK. */
@@ -318,27 +331,13 @@ export async function verifyRecordMac(
 }
 
 /**
- * A new recovery key pair. The public half goes in the record; the user gets the
- * private scalar together with the ring anchor (`kora-rk2-<d>.<anchor>`).
- *
- * The anchor ties the recovery key to the ring it was made for. Anyone who knows the
- * recovery PUBLIC key (the server stores it) can wrap a master key of their own to it,
- * so opening a master key with the recovery key proves nothing about whose ring it is.
- * The anchor is a fingerprint of one of the ring's data keys ({@link dataKeyAnchor}):
- * only a ring that really holds that data key matches it, and nobody without the key
- * can build one that does.
- *
- * @param anchor - The ring anchor ({@link dataKeyAnchor}); random when omitted (tests)
+ * A new recovery key pair: the public half goes in the record, the private scalar `d`
+ * into the recovery key ({@link formatRecoveryKey}) together with the ring anchor.
  */
-export async function generateRecoveryKeyPair(
-	anchor: Uint8Array = randomBytes(RECOVERY_ANCHOR_BYTES),
-): Promise<{
+export async function createRecoveryKeyPair(): Promise<{
 	publicKey: { x: string; y: string }
-	recoveryKey: string
+	d: string
 }> {
-	if (anchor.length !== RECOVERY_ANCHOR_BYTES) {
-		throw new SyncError('A recovery key anchor is 16 bytes.', { code: 'RECOVERY_KEY_EXPORT' })
-	}
 	const pair = (await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
 		'deriveBits',
 	])) as CryptoKeyPair
@@ -346,25 +345,56 @@ export async function generateRecoveryKeyPair(
 	if (typeof jwk.d !== 'string' || typeof jwk.x !== 'string' || typeof jwk.y !== 'string') {
 		throw new SyncError('Failed to export the recovery key.', { code: 'RECOVERY_KEY_EXPORT' })
 	}
-	return {
-		publicKey: { x: jwk.x, y: jwk.y },
-		recoveryKey: `${RECOVERY_KEY_PREFIX}${jwk.d}.${toBase64Url(anchor)}`,
+	return { publicKey: { x: jwk.x, y: jwk.y }, d: jwk.d }
+}
+
+/** The recovery key string the user stores: `kora-rk3-<d>.<anchor>`. */
+export function formatRecoveryKey(d: string, anchor: Uint8Array): string {
+	if (anchor.length !== RECOVERY_ANCHOR_BYTES) {
+		throw new SyncError('A recovery key anchor is 16 bytes.', { code: 'RECOVERY_KEY_EXPORT' })
 	}
+	return `${RECOVERY_KEY_PREFIX}${d}.${toBase64Url(anchor)}`
 }
 
 /**
- * The ring anchor of a data key: the first 16 bytes of HMAC-SHA256 keyed with the raw
- * data key over the keyring and key id. Reveals nothing about the key; matching it
- * requires the key itself.
+ * A new recovery key pair with a given (or, for tests, random) anchor.
+ *
+ * @param anchor - The ring anchor ({@link recoveryAnchor}); random when omitted
+ */
+export async function generateRecoveryKeyPair(
+	anchor: Uint8Array = randomBytes(RECOVERY_ANCHOR_BYTES),
+): Promise<{
+	publicKey: { x: string; y: string }
+	recoveryKey: string
+}> {
+	const { publicKey, d } = await createRecoveryKeyPair()
+	return { publicKey, recoveryKey: formatRecoveryKey(d, anchor) }
+}
+
+/**
+ * The ring anchor of a recovery key (RT-107): the first 16 bytes of HMAC-SHA256 keyed
+ * with the raw bytes of the ring's recovery ANCHOR KEY over the keyring, the ring id,
+ * the anchor key's id and the recovery public key.
+ *
+ * Anyone can wrap a master key of their own to the (public) recovery key, so opening a
+ * master key with the recovery key proves nothing about whose ring it is. The anchor key
+ * is a data key created in the same write as the recovery key, under the ring's current
+ * master key: no earlier passphrase or master key ever opened it, so neither the server
+ * nor a holder of an OLDER (leaked) passphrase can build a ring that matches the anchor.
+ * The tag reveals nothing about the key; matching it requires the key itself.
  *
  * @param dataKey - An extractable data key
  * @param keyring - Keyring name
+ * @param ringId - Ring id
  * @param keyId - The data key's key id
+ * @param publicKey - The recovery public key the anchor belongs to
  */
-export async function dataKeyAnchor(
+export async function recoveryAnchor(
 	dataKey: CryptoKey,
 	keyring: string,
+	ringId: string,
 	keyId: string,
+	publicKey: { x: string; y: string },
 ): Promise<Uint8Array> {
 	const raw = new Uint8Array(await subtle().exportKey('raw', dataKey))
 	try {
@@ -375,11 +405,15 @@ export async function dataKeyAnchor(
 			false,
 			['sign'],
 		)
-		const tag = await subtle().sign(
-			'HMAC',
-			hmac,
-			buffer(new TextEncoder().encode(JSON.stringify([RECOVERY_ANCHOR_INFO, keyring, keyId]))),
-		)
+		const input = JSON.stringify([
+			RECOVERY_ANCHOR_INFO,
+			keyring,
+			ringId,
+			keyId,
+			publicKey.x,
+			publicKey.y,
+		])
+		const tag = await subtle().sign('HMAC', hmac, buffer(new TextEncoder().encode(input)))
 		return new Uint8Array(tag).slice(0, RECOVERY_ANCHOR_BYTES)
 	} finally {
 		raw.fill(0)
@@ -389,10 +423,20 @@ export async function dataKeyAnchor(
 /**
  * Split a recovery key into its private scalar and ring anchor.
  *
- * @throws {KeyUnwrapError} WRONG_RECOVERY_KEY when it is not a `kora-rk2-` recovery key
+ * @throws {KeyUnwrapError} WRONG_RECOVERY_KEY when it is not a `kora-rk3-` recovery key.
+ *   Keys of the beta.13 release candidates (`kora-rk1-`, `kora-rk2-`) are refused with
+ *   `reason: 'RECOVERY_KEY_RETIRED'`: a `kora-rk2-` anchor is the ring's first data key,
+ *   which an older (possibly leaked) passphrase opens (RT-107).
  */
 export function parseRecoveryKey(recoveryKey: string): { d: string; anchor: Uint8Array } {
-	const match = /^kora-rk2-([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]{22})$/.exec(recoveryKey.trim())
+	const trimmed = recoveryKey.trim()
+	if (/^kora-rk[12]-/.test(trimmed)) {
+		throw new KeyUnwrapError(
+			'This recovery key comes from a 1.0.0-beta.13 release candidate and is no longer accepted: its anchor can be matched by a keyring built with an older passphrase. Call enableRecovery() again on a device unlocked with the current passphrase and store the new "kora-rk3-" key.',
+			{ code: 'WRONG_RECOVERY_KEY', reason: 'RECOVERY_KEY_RETIRED' },
+		)
+	}
+	const match = /^kora-rk3-([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]{22})$/.exec(trimmed)
 	if (match === null) {
 		throw new KeyUnwrapError(
 			`A recovery key has the form "${RECOVERY_KEY_PREFIX}<key>.<anchor>", as enableRecovery() returned it.`,

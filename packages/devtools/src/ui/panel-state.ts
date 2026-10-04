@@ -290,6 +290,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `store ${event.resource} ${event.state === 'waiting' ? 'blocked by another holder' : 'unblocked'}`
 		case 'store:storage-migrated':
 			return `store migrated ${event.from} → ${event.to}`
+		case 'store:schema-ahead':
+			return `store refused: database at schema v${event.storedVersion}, code at v${event.codeVersion}`
 		case 'replay:completed':
 			return `replay ${event.operationsApplied} ops`
 	}

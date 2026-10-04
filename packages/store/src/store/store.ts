@@ -33,7 +33,7 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
-import { OptimisticLockError, StoreNotOpenError } from '../errors'
+import { OptimisticLockError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
@@ -66,6 +66,11 @@ import {
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import { runSchemaMigrations } from '../migrations/run-migrations'
+import {
+	STORED_SCHEMA_VERSION_SQL,
+	parseSchemaAhead,
+	storedSchemaVersion,
+} from '../migrations/schema-ceiling'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -381,7 +386,26 @@ export class Store implements OperationLog {
 	 * restore the sequence number and version vector, and create Collection instances.
 	 */
 	async open(): Promise<void> {
-		await this.adapter.open(this.schema)
+		try {
+			await this.adapter.open(this.schema)
+		} catch (error) {
+			const ahead =
+				error instanceof SchemaVersionAheadError
+					? { stored: error.storedVersion, code: error.codeVersion }
+					: parseSchemaAhead(error)
+			if (ahead !== null) throw this.schemaAhead(ahead.stored)
+			throw error
+		}
+		// A database a newer build already migrated is refused before anything here writes
+		// to it (RT-109). The DDL executors refuse it before their DDL; this also covers
+		// adapters that restore their data after it (the IndexedDB fallback).
+		const stored = storedSchemaVersion(
+			await this.adapter.query<{ value: unknown }>(STORED_SCHEMA_VERSION_SQL),
+		)
+		if (stored > this.schema.version) {
+			await this.adapter.close().catch(() => undefined)
+			throw this.schemaAhead(stored)
+		}
 		await this.adapter.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
@@ -3142,6 +3166,19 @@ export class Store implements OperationLog {
 			dbName: this.dbName,
 			message: error instanceof Error ? error.message : String(error),
 		})
+	}
+
+	/** Report a database a newer build migrated (`store:schema-ahead`) and build the error. */
+	private schemaAhead(storedVersion: number): SchemaVersionAheadError {
+		const error = new SchemaVersionAheadError(this.dbName, storedVersion, this.schema.version)
+		this.emitter?.emit({
+			type: 'store:schema-ahead',
+			dbName: this.dbName,
+			storedVersion,
+			codeVersion: this.schema.version,
+			message: error.message,
+		})
+		return error
 	}
 
 	/**

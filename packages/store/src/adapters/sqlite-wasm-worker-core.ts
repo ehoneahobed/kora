@@ -12,6 +12,12 @@
  * the real-browser suite.
  */
 
+import {
+	STORED_SCHEMA_VERSION_SQL,
+	parseSchemaCeiling,
+	schemaAheadMessage,
+	storedSchemaVersion,
+} from '../migrations/schema-ceiling'
 import { opfsPoolLockName, opfsPoolNameFor, opfsPoolPath } from './opfs-names'
 import {
 	type BlockingReporter,
@@ -330,6 +336,21 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 
 	function applyDdl(target: SqliteDb, ddlStatements: string[]): void {
 		for (const sql of ddlStatements) {
+			const ceiling = parseSchemaCeiling(sql)
+			if (ceiling !== null) {
+				// A database a newer build migrated gets none of this build's DDL (RT-109).
+				const rows: Array<{ value: unknown }> = []
+				target.exec({
+					sql: STORED_SCHEMA_VERSION_SQL,
+					rowMode: 'object',
+					callback: (row: Record<string, unknown>) => {
+						rows.push({ value: row.value })
+					},
+				})
+				const stored = storedSchemaVersion(rows)
+				if (stored > ceiling) throw new Error(schemaAheadMessage(stored, ceiling))
+				continue
+			}
 			if (sql.startsWith('--kora:safe-alter')) {
 				try {
 					target.exec({ sql: sql.replace('--kora:safe-alter\n', '') })

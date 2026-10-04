@@ -63,6 +63,7 @@ describe('relax-value-domain migration directive (RT-101)', () => {
 		const directive = formatRelaxValueDomainDirective({
 			table: 'todos',
 			fields: ['priority', 'title'],
+			enums: ['priority'],
 		})
 		expect(generated.up).toEqual([directive])
 		expect(generated.down).toEqual([directive])
@@ -178,7 +179,88 @@ describe('relax-value-domain migration directive (RT-101)', () => {
 		})
 	})
 
+	test('the directive names the enum fields of both schemas and round-trips (RT-108)', () => {
+		const before = defineSchema({
+			version: 1,
+			collections: { projects: { fields: { status: t.enum(['active']).default('active') } } },
+		})
+		const after = defineSchema({
+			version: 2,
+			collections: {
+				projects: { fields: { status: t.enum(['active', 'archived']).default('active') } },
+			},
+		})
+		const generated = generateMigration(before, after, diffSchemas(before, after))
+		const target = { table: 'projects', fields: ['status'], enums: ['status'] }
+		expect(generated.up).toEqual([formatRelaxValueDomainDirective(target)])
+		expect(parseRelaxValueDomainDirective(formatRelaxValueDomainDirective(target))).toEqual(target)
+		// A release-candidate directive (no `enums`) still parses.
+		expect(
+			parseRelaxValueDomainDirective(
+				formatRelaxValueDomainDirective({ table: 'projects', fields: ['status'] }),
+			),
+		).toEqual({ table: 'projects', fields: ['status'] })
+		expect(() =>
+			parseRelaxValueDomainDirective(
+				`${RELAX_VALUE_DOMAIN_DIRECTIVE} {"table":"p","fields":["s"],"enums":[1]}`,
+			),
+		).toThrow(/Malformed migration directive/)
+	})
+
 	const pgUrl = process.env.KORA_PG_TEST_URL
+	test.skipIf(!pgUrl)(
+		'--apply on Postgres drops a single-value enum CHECK, with and without `enums` (RT-108)',
+		async () => {
+			const requireFromServer = createRequire(resolve(__dirname, '../../../../server/package.json'))
+			const postgres = requireFromServer('postgres') as (
+				url: string,
+				options?: { max?: number; onnotice?: () => void },
+			) => {
+				unsafe(query: string): Promise<Array<Record<string, unknown>>>
+				end(): Promise<void>
+			}
+			const admin = postgres(pgUrl ?? '', { max: 1, onnotice: () => {} })
+			const cases = [
+				{ suffix: 'enums', enums: ['status'] as string[] | undefined },
+				{ suffix: 'legacy', enums: undefined },
+			]
+			try {
+				for (const { suffix, enums } of cases) {
+					const table = `rt108_cli_${suffix}_${process.pid}`
+					const id = `rt108-${suffix}-${process.pid}`
+					await admin.unsafe(`DROP TABLE IF EXISTS "${table}"`)
+					await admin.unsafe(`DELETE FROM _kora_migrations WHERE id = '${id}'`).catch(() => {})
+					// beta.12 DDL for t.enum(['active']); Postgres stores it as `status = 'active'`.
+					await admin.unsafe(
+						`CREATE TABLE "${table}" (id TEXT PRIMARY KEY NOT NULL, "status" TEXT DEFAULT 'active' CHECK ("status" IN ('active')), "kind" TEXT CONSTRAINT "${table}_kind_hand" CHECK ("kind" <> 'x'))`,
+					)
+					const directive = formatRelaxValueDomainDirective({
+						table,
+						fields: ['kind', 'status'],
+						...(enums ? { enums } : {}),
+					})
+					await runMigration({
+						postgresConnectionString: pgUrl,
+						migrationId: id,
+						fromVersion: 1,
+						toVersion: 2,
+						upStatements: [directive],
+						postgresClientFactory: (url) => postgres(url, { max: 1 }),
+					})
+					await admin.unsafe(`INSERT INTO "${table}" (id, status) VALUES ('p1', 'archived')`)
+					// The check added by hand is kept.
+					await expect(
+						admin.unsafe(`INSERT INTO "${table}" (id, kind) VALUES ('p2', 'x')`),
+					).rejects.toThrow(/check constraint/i)
+					await admin.unsafe(`DROP TABLE IF EXISTS "${table}"`)
+					await admin.unsafe(`DELETE FROM _kora_migrations WHERE id = '${id}'`).catch(() => {})
+				}
+			} finally {
+				await admin.end()
+			}
+		},
+	)
+
 	test.skipIf(!pgUrl)('--apply on Postgres drops the enum CHECK and NOT NULL', async () => {
 		const requireFromServer = createRequire(resolve(__dirname, '../../../../server/package.json'))
 		const postgres = requireFromServer('postgres') as (

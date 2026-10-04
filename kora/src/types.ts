@@ -400,14 +400,24 @@ export interface EncryptionControl {
 	lock(): Promise<import('@korajs/sync').EncryptionStatus>
 	/** Create a new key version for new operations; old versions stay readable. Online only. */
 	rotateKey(): Promise<import('@korajs/sync').EncryptionStatus>
-	/** Re-wrap every key version under a new passphrase (no data re-encrypted). Online only. */
+	/**
+	 * Re-wrap every key version under a new master key and passphrase (no data
+	 * re-encrypted); the old master key is retired. Online only. This alone does not
+	 * contain a LEAKED passphrase: devices that still hold only the old master key can be
+	 * fed records forged with it. After a leak, also `rotateKey()`, `enableRecovery()`
+	 * again, and re-unlock every other device with the new passphrase (`lock()` then
+	 * `unlock(newPassphrase)`; never type the old one again, and update any configured
+	 * `key`). A device that cannot be re-unlocked stays exposed. See the sync encryption
+	 * guide.
+	 */
 	changePassphrase(
 		newPassphrase: string,
 		options?: { currentPassphrase?: string },
 	): Promise<import('@korajs/sync').EncryptionStatus>
 	/**
 	 * Create (or replace) the recovery key and return it ONCE. Store it offline: it is
-	 * the only way back after a lost passphrase. Online only.
+	 * the only way back after a lost passphrase. Online only. Also creates a new key
+	 * version (the recovery key's anchor), like `rotateKey()`. Returns `kora-rk3-...`.
 	 */
 	enableRecovery(): Promise<string>
 	/** Recover after a lost passphrase with the recovery key, setting a new passphrase. */
