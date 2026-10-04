@@ -3275,6 +3275,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to."
+  },
+  {
+   "id": "RT-99",
+   "title": "The production static server derives ETag, Last-Modified and its compressed-body cache from size and mtime only: a redeployed index.html or sw.js with the same size and a normalised mtime is answered 304 (old shell pointing at deleted chunks; the service worker update is never seen), and a server left running serves the old compressed body",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-99.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them)."
   }
  ],
  "rejectedProposalPins": {
