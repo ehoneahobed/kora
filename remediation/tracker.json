@@ -3410,6 +3410,21 @@
    ],
    "pr": null,
    "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). Attacker: the server operator who learned the old passphrase (the case the guide's 'After a suspected leak, change the passphrase and then rotate' addresses). (1) sync/src/encryption/keyring.ts:898-970 (adoptLocked -> authenticateHeld with the held old master) accepts a revision sealed under the OLD master that adds a key: every device except the one that changed the passphrase still holds M1, and the server chooses what it forwards. Inherent for a shared-secret ring; required fix: correct docs/guide/sync-encryption.md:224 and the changePassphrase JSDoc (keyring.ts:441-447): after a leak every device must be locked and re-unlocked with the new passphrase (its held master then no longer authenticates M1 records) or a new keyring started; optionally enforce it (a device that sees a record it cannot authenticate with a higher revision of its ring stops adopting records that add keys under its held master until unlocked with the current passphrase). (2) keyring.ts:691-707 and 1226-1241 (holdsAnchor) with keyring-crypto.ts:364 (dataKeyAnchor of the FIRST data key): the anchor is derivable by anyone who held a past passphrase, so recovery adopts an attacker master wrapped to the public recovery key and the recovered device encrypts under the attacker's key. Required fix: anchor recovery to a secret only the recovery-key holder has (the recovery key carries a secret s; the record carries an HMAC_s commitment to the ring id and master key that enableRecovery writes and passphrase change / recovery re-derive), not to a data key. Repro packages/sync/tests/repro/RT-107.test.ts (2 tests). If (1) is accepted as inherent, split it into a docs item and turn its test into an observation."
+  },
+  {
+   "id": "RT-108",
+   "title": "Postgres value-domain relaxation misses a beta.12 single-value enum CHECK: Postgres stores IN ('x') as CHECK ((col = 'x'::text)), which isPostgresEnumCheckDefinition does not match, so after adding an enum value the upgraded server still cannot store it (RT-101 persists for single-value enums on Postgres servers and in `kora migrate` relax directives)",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-108.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). core/src/schema/constraint-relaxation.ts:166-170 (isPostgresEnumCheckDefinition only matches `= ANY (ARRAY[...])`), used by planPostgresConstraintRelaxation (core/src/schema/constraint-relaxation.ts:263-277) from postgres-server-store.ts:514-530 and the CLI's expandRelaxValueDomainForPostgres. Verified on PG16: CHECK (\"p\" IN ('only')) -> pg_get_constraintdef `CHECK ((p = 'only'::text))`. Required fix: also recognise the single-column equality form `CHECK ((col = 'literal'::text))` (and `(col)::text = ...`), ideally by comparing against the schema's own enum column names rather than by shape; add the case to value-domain-evolution.test.ts and the CLI directive tests. Repro packages/server/tests/repro/RT-108.test.ts (needs KORA_PG_TEST_URL)."
   }
  ],
  "rejectedProposalPins": {
