@@ -118,6 +118,9 @@ A target names a relation's other collection, in plural or singular form:
   the children: `projects.include('todos')` adds `todos`.
 
 An unknown target throws `QueryError`. Related records are fetched in one batch per target.
+The included property exists on the result rows only: `where` and `orderBy` after `include()`
+still take the collection's own fields (the typed API refuses the relation property at
+compile time).
 
 ```typescript
 const withProject = await app.todos.where({ completed: false }).include('project').exec()

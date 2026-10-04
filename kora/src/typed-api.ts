@@ -162,16 +162,20 @@ type UnionToIntersection<U> = (U extends unknown ? (u: U) => void : never) exten
  *
  * @typeParam R - The row type results have (the record plus any included relations)
  * @typeParam Inc - The `include()` targets this collection has (see {@link IncludeMap})
+ * @typeParam Base - The collection's own record: what `where` and `orderBy` accept. An
+ *   included relation is a property of the result rows only, never a filterable or
+ *   sortable column (RT-100).
  */
-export interface TypedQueryBuilder<R, Inc = Record<never, never>> extends QueryBuilder<R> {
+export interface TypedQueryBuilder<R, Inc = Record<never, never>, Base = R>
+	extends QueryBuilder<R> {
 	/** Add WHERE conditions (AND semantics, merged with existing conditions). */
-	where(conditions: TypedWhere<R>): TypedQueryBuilder<R, Inc>
+	where(conditions: TypedWhere<Base>): TypedQueryBuilder<R, Inc, Base>
 	/** Sort by a field of the record (including `id`, `createdAt` and `updatedAt`). */
-	orderBy(field: keyof R & string, direction?: OrderByDirection): TypedQueryBuilder<R, Inc>
+	orderBy(field: keyof Base & string, direction?: OrderByDirection): TypedQueryBuilder<R, Inc, Base>
 	/** Limit the number of results. */
-	limit(n: number): TypedQueryBuilder<R, Inc>
+	limit(n: number): TypedQueryBuilder<R, Inc, Base>
 	/** Skip the first `n` results. */
-	offset(n: number): TypedQueryBuilder<R, Inc>
+	offset(n: number): TypedQueryBuilder<R, Inc, Base>
 	/**
 	 * Include related records, following the schema's relations. Each row gains the
 	 * relation's property: the parent record (or `null`) for a many-to-one relation, the
@@ -179,7 +183,7 @@ export interface TypedQueryBuilder<R, Inc = Record<never, never>> extends QueryB
 	 */
 	include<T extends keyof Inc & string>(
 		...targets: T[]
-	): TypedQueryBuilder<R & UnionToIntersection<Inc[T]>, Inc>
+	): TypedQueryBuilder<R & UnionToIntersection<Inc[T]>, Inc, Base>
 }
 
 // === Collections ===

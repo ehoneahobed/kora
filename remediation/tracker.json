@@ -3297,14 +3297,14 @@
    "severity": "P3",
    "workstream": "W11",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "tsc": "kora/tests/repro/types/RT-100.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string). FIX (beta.13 RC): TypedQueryBuilder<R, Inc, Base = R> keeps the filterable/sortable record (Base) separate from the row type: where(TypedWhere<Base>), orderBy(keyof Base & string); include() widens R only. Probe passes (0 errors); tests/typecheck/typed-api.test-d.ts asserts where/orderBy on own fields after include() and refuses the relation property."
   },
   {
    "id": "RT-101",
