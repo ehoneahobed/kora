@@ -180,7 +180,14 @@ The tag push triggers nothing (all workflows are branch-filtered).
 2. **GitHub release**: Releases, "Draft a new release", tag `v1.0.0-beta.13`, title
    "Kora.js 1.0.0-beta.13 (security release)", body from [v1.0.0-beta.13.md](./v1.0.0-beta.13.md),
    tick "Set as a pre-release", link the advisory.
-3. **Docs**: confirm the `docs` workflow deployed and the site shows "Upgrading to beta.13"; if it
+3. **The 0.x `latest` line is affected and unpatched** (`npm install korajs` still installs
+   `0.6.1`). Decide, and do it right after the advisory: either deprecate the affected versions so
+   every install warns, for example
+   `npm deprecate 'korajs@<1.0.0-beta.13' "Security advisory GHSA-…: upgrade to korajs@beta (1.0.0-beta.13)"`
+   and the same for `@korajs/server`, `@korajs/auth`, `@korajs/sync` and `@korajs/store`; or leave
+   `latest` alone and rely on the advisory (Dependabot/`npm audit` will flag every affected
+   version). Do not move `latest` to a beta without deciding that deliberately.
+4. **Docs**: confirm the `docs` workflow deployed and the site shows "Upgrading to beta.13"; if it
    did not run, trigger it with "Run workflow" (`workflow_dispatch`). The README already points at
    the release notes, the advisory and the upgrade guide.
 

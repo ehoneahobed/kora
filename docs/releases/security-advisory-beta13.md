@@ -1,10 +1,7 @@
-<!--
-Publish-ready text for the GitHub Security Advisory of the 1.0.0-beta.13 release.
-Identical public copy: docs/releases/security-advisory-beta13.md (outside the docs site build;
-public only when the repository goes public, which happens after the npm publish).
-Publish order and GitHub form fields: docs/releases/npm-publish-checklist-beta.13.md, step (f).
-Before publishing: replace GHSA-TBD with the advisory id, confirm the CVSS vector, confirm the credits.
--->
+---
+title: "Security advisory: Kora.js 1.0.0-beta.12 and earlier"
+description: "Multi-tenant authorization, authentication and data-integrity vulnerabilities in the Kora.js sync server, auth and client packages up to 1.0.0-beta.12, fixed in 1.0.0-beta.13."
+---
 
 # Multi-tenant authorization bypass and related vulnerabilities in the Kora.js sync stack
 
