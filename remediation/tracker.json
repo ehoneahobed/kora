@@ -3305,6 +3305,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string)."
+  },
+  {
+   "id": "RT-101",
+   "title": "Value domain gap: an enum value added by a schema upgrade is valid on every replica, but existing tables keep the old CHECK (col IN (...)): an upgraded device's own write of it throws (SQLite CHECK) and the upgraded server refuses a fresh device's write terminally (UNSTORABLE_VALUE, undone on its author); no migration step can change an enum's values",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-101.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). Not a Phase 4 regression (beta.12 has the same DDL). core/src/schema/sql-gen.ts:248,294 (client CHECK), server/src/store/materialization.ts:79-80 and :92-99 (CREATE IF NOT EXISTS + ADD COLUMN only), core/src/migrations/migration-sql.ts (steps: addField/removeField/renameField/addIndex/removeIndex/backfill; nothing for enum values), postgres-server-store.ts:173-176 and sqlite-server-store.ts:171-173 (23514 / SQLITE_CONSTRAINT_CHECK -> UNSTORABLE_VALUE). Repro kora/tests/repro/RT-101.test.ts (device: CHECK constraint failed: priority; SQLite server: sync:operation-rejected UNSTORABLE_VALUE). Postgres the same by code (23514). Required fix: enforce enum membership in the value domain (validateRecord) only, not in DDL (drop the CHECK, or rebuild it from the current schema on open: SQLite table rebuild, Postgres ALTER TABLE DROP/ADD CONSTRAINT), on client and server stores; or add an explicit migration step that rebuilds the constraint and refuse a schema whose enum values changed without it. Also decide what a REMOVED enum value means for existing rows and old-schema ops (transform or keep accepting)."
   }
  ],
  "rejectedProposalPins": {
