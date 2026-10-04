@@ -1,5 +1,8 @@
 import type { Operation } from '@korajs/core'
+import { KoraError } from '@korajs/core'
+import { validateKeyRecord } from '@korajs/sync'
 import { assertBackupOperationsIngestible } from '../apply/ingest-validation'
+import type { EncryptionKeyRecordRow, ServerStore } from './server-store'
 import { SequenceConflictError } from './server-store'
 
 /**
@@ -9,7 +12,11 @@ import { SequenceConflictError } from './server-store'
  *   manifest — metadata (version, nodeId, operationCount, checksum)
  *   version_vector — nodeId → maxSequenceNumber
  *   operations — NDJSON of full Operation objects
+ *   encryption_keys — JSON array of the stored end-to-end key records (optional; RT-104)
  *   checksum — SHA-256 of all content sections
+ *
+ * A reader that predates `encryption_keys` ignores it. Without it, a server restored
+ * from its backup would hold encrypted history but no key record to open it with.
  */
 
 const BACKUP_VERSION = 1
@@ -88,6 +95,7 @@ export async function buildServerBackup(
 	nodeId: string,
 	operations: Operation[],
 	versionVector: Map<string, number>,
+	keyRecords: EncryptionKeyRecordRow[] = [],
 ): Promise<Uint8Array> {
 	const sections: Uint8Array[] = []
 	let allContentForChecksum = new Uint8Array(0)
@@ -112,6 +120,11 @@ export async function buildServerBackup(
 	const opLines = `${operations.map((op) => JSON.stringify(op)).join('\n')}\n`
 	addSection('operations', encodeSection('operations', new TextEncoder().encode(opLines)))
 
+	// End-to-end key records (opaque: the server cannot open them)
+	if (keyRecords.length > 0) {
+		addSection('encryption_keys', encodeJsonSection('encryption_keys', keyRecords))
+	}
+
 	// Checksum
 	const checksumHex = await computeSha256(allContentForChecksum)
 
@@ -124,6 +137,7 @@ export async function buildServerBackup(
 		operationCount: operations.length,
 		collections: [] as string[],
 		includesRecords: false,
+		encryptionKeyRecordCount: keyRecords.length,
 		checksum: checksumHex,
 	}
 
@@ -143,11 +157,12 @@ export async function buildServerBackup(
 }
 
 /**
- * Parse a backup and return the operations and version vector.
+ * Parse a backup and return the operations, version vector and key records.
  */
 export function parseServerBackup(data: Uint8Array): {
 	operations: Operation[]
 	versionVector: Map<string, number>
+	keyRecords: EncryptionKeyRecordRow[]
 } {
 	const sections = parseSections(data)
 
@@ -175,8 +190,71 @@ export function parseServerBackup(data: Uint8Array): {
 	// Every ingest path validates against server time (SYNC-7): a backup whose
 	// operations are far-future or malformed is refused whole, before anything changes.
 	assertBackupOperationsIngestible(operations)
+	const keyRecords = parseKeyRecords(parseJsonSection<unknown>(sections, 'encryption_keys'))
 
-	return { operations, versionVector }
+	return { operations, versionVector, keyRecords }
+}
+
+/** Validate the `encryption_keys` section: a malformed entry refuses the whole backup. */
+function parseKeyRecords(value: unknown): EncryptionKeyRecordRow[] {
+	if (value === null || value === undefined) return []
+	const refuse = (reason: string): never => {
+		throw new KoraError(
+			`Backup rejected: its encryption key records are malformed (${reason}).`,
+			'BACKUP_INVALID_KEY_RECORD',
+			{ reason },
+		)
+	}
+	if (!Array.isArray(value)) return refuse('not an array')
+	return value.map((entry: unknown, index): EncryptionKeyRecordRow => {
+		if (typeof entry !== 'object' || entry === null) return refuse(`entry ${index}`)
+		const { owner, keyring, revision, record } = entry as Record<string, unknown>
+		if (typeof owner !== 'string' || typeof keyring !== 'string' || typeof record !== 'string') {
+			return refuse(`entry ${index} fields`)
+		}
+		let parsed: unknown
+		try {
+			parsed = JSON.parse(record)
+		} catch {
+			return refuse(`entry ${index} record is not JSON`)
+		}
+		const validation = validateKeyRecord(parsed, keyring)
+		if (!validation.ok) return refuse(`entry ${index}: ${validation.reason}`)
+		if ((parsed as { revision: unknown }).revision !== revision) {
+			return refuse(`entry ${index} revision does not match its record`)
+		}
+		return { owner, keyring, revision: revision as number, record }
+	})
+}
+
+/**
+ * Restore backed-up key records (RT-104) that the store lacks. A record the store holds
+ * is never replaced, whatever its revision: it is at least as new as the backup's copy
+ * of the same ring (devices only move a ring forward), and a different ring there was
+ * created after the loss and is merged by the devices holding both. Runs in both restore
+ * modes: the key table is not part of the operation log.
+ *
+ * @returns The number of records restored
+ */
+export async function restoreBackupKeyRecords(
+	store: Pick<ServerStore, 'putEncryptionKeyRecord'>,
+	keyRecords: EncryptionKeyRecordRow[],
+): Promise<number> {
+	if (keyRecords.length === 0) return 0
+	if (typeof store.putEncryptionKeyRecord !== 'function') {
+		console.warn(
+			`[kora] Backup restore: ${String(keyRecords.length)} encryption key record(s) were not restored: this store has no key table.`,
+		)
+		return 0
+	}
+	let restored = 0
+	for (const row of keyRecords) {
+		// expectedRevision 0: insert only where no record exists.
+		if (await store.putEncryptionKeyRecord(row.owner, row.keyring, row.record, row.revision, 0)) {
+			restored++
+		}
+	}
+	return restored
 }
 
 /**

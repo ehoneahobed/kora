@@ -385,6 +385,15 @@ export interface ServerSchemaOptions {
 	operationTransforms?: readonly OperationTransform[]
 }
 
+/** One stored end-to-end key record (opaque JSON) and its owner, as backups carry it. */
+export interface EncryptionKeyRecordRow {
+	owner: string
+	keyring: string
+	revision: number
+	/** The record's JSON, exactly as stored. */
+	record: string
+}
+
 /**
  * Server-side store interface. Extends SyncStore with lifecycle,
  * introspection, and materialization methods needed by the sync server.
@@ -530,6 +539,11 @@ export interface ServerStore extends SyncStore {
 		revision: number,
 		expectedRevision: number,
 	): Promise<boolean>
+	/**
+	 * Every stored key record, for `exportBackup` (RT-104: a server restored from its
+	 * backup must still hold the records its encrypted history needs). Optional.
+	 */
+	listEncryptionKeyRecords?(): Promise<EncryptionKeyRecordRow[]>
 	/**
 	 * Key ids named by stored encrypted operations (their envelope's `keyId`), a sample
 	 * of at most `limit` distinct ids (RT-104). `nodeOwner` restricts it to operations of

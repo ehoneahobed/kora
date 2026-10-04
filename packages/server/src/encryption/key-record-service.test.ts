@@ -179,6 +179,46 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 		const bad = { ...record(1), kdf: { name: 'none' } } as unknown as WrappedKeyRecord
 		expect((await service.handle(userKeyOwner('a'), put(bad, 0))).response.status).toBe('invalid')
 	})
+
+	test('the server backup carries key records; a restore fills only missing ones (RT-104)', async () => {
+		const source = await makeStore()
+		const sourceService = new EncryptionKeyService(source)
+		const alice = userKeyOwner('alice')
+		const bob = userKeyOwner('bob')
+		await sourceService.handle(alice, put(record(3, 2), 0))
+		await sourceService.handle(bob, put(record(1), 0))
+		const backup = await source.exportBackup()
+
+		// Disaster recovery onto an empty server: every record comes back unchanged.
+		const target = await makeStore()
+		const targetService = new EncryptionKeyService(target)
+		await target.importBackup(backup)
+		expect((await targetService.handle(alice, fetch)).response.record).toEqual(record(3, 2))
+		expect((await targetService.handle(bob, fetch)).response.record).toEqual(record(1))
+
+		// A record the server holds is never replaced by the backup's (older) copy.
+		await targetService.handle(alice, put(record(4, 3), 3))
+		await target.importBackup(backup, true)
+		await target.importBackup(backup)
+		expect((await targetService.handle(alice, fetch)).response.record?.revision).toBe(4)
+	})
+})
+
+test('a backup with a malformed key record is refused whole (RT-104)', async () => {
+	const store = new MemoryServerStore()
+	await new EncryptionKeyService(store).handle(userKeyOwner('alice'), put(record(1), 0))
+	const backup = await store.exportBackup()
+	// Byte-level, same length, so the section framing stays intact: the format becomes 9.
+	const needle = new TextEncoder().encode('\\"format\\":2')
+	const tampered = new Uint8Array(backup)
+	const at = tampered.findIndex((_, i) => needle.every((byte, j) => tampered[i + j] === byte))
+	expect(at).toBeGreaterThanOrEqual(0)
+	tampered[at + needle.length - 1] = '9'.charCodeAt(0)
+	const target = new MemoryServerStore()
+	await expect(target.importBackup(tampered)).rejects.toMatchObject({
+		code: 'BACKUP_INVALID_KEY_RECORD',
+	})
+	expect(await target.getEncryptionKeyRecord('u:alice', 'default')).toBeNull()
 })
 
 test('a store without key-record support answers unsupported (never memory-only keys)', async () => {

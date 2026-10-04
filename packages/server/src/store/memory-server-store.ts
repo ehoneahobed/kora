@@ -37,6 +37,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationScopeSnapshot,
@@ -132,7 +133,7 @@ export class MemoryServerStore implements ServerStore {
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
 	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
-	private readonly encryptionKeyRecords = new Map<string, { record: string; revision: number }>()
+	private readonly encryptionKeyRecords = new Map<string, EncryptionKeyRecordRow>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -796,8 +797,13 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		const key = keyRecordKey(owner, keyring)
 		if ((this.encryptionKeyRecords.get(key)?.revision ?? 0) !== expectedRevision) return false
-		this.encryptionKeyRecords.set(key, { record, revision })
+		this.encryptionKeyRecords.set(key, { owner, keyring, record, revision })
 		return true
+	}
+
+	async listEncryptionKeyRecords(): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		return [...this.encryptionKeyRecords.values()].map((row) => ({ ...row }))
 	}
 
 	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
@@ -898,7 +904,12 @@ export class MemoryServerStore implements ServerStore {
 	async exportBackup(): Promise<Uint8Array> {
 		this.assertOpen()
 		const { buildServerBackup } = await import('./server-backup')
-		return buildServerBackup(this.nodeId, this.operations, this.versionVector)
+		return buildServerBackup(
+			this.nodeId,
+			this.operations,
+			this.versionVector,
+			await this.listEncryptionKeyRecords(),
+		)
 	}
 
 	async importBackup(
@@ -906,8 +917,12 @@ export class MemoryServerStore implements ServerStore {
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes: the key table is not part of the log, and a held record is kept.
+		await restoreBackupKeyRecords(this, keyRecords)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))

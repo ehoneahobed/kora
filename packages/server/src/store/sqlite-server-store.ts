@@ -95,6 +95,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationResolutionOutcome,
@@ -1048,6 +1049,13 @@ export class SqliteServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
+	async listEncryptionKeyRecords(): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		return this.db.all<EncryptionKeyRecordRow>(
+			sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+		)
+	}
+
 	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
 		this.assertOpen()
 		const rows =
@@ -1207,7 +1215,7 @@ export class SqliteServerStore implements ServerStore {
 		const deserialized = rows.map((row) => this.deserializeOperation(row))
 		const vv = this.getVersionVector()
 
-		return buildServerBackup(this.nodeId, deserialized, vv)
+		return buildServerBackup(this.nodeId, deserialized, vv, await this.listEncryptionKeyRecords())
 	}
 
 	async importBackup(
@@ -1216,8 +1224,12 @@ export class SqliteServerStore implements ServerStore {
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations: ops, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes: the key table is not part of the log, and a held record is kept.
+		await restoreBackupKeyRecords(this, keyRecords)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
