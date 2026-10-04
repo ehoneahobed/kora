@@ -1,5 +1,28 @@
 # kora
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** Security, data-safety and convergence release. `createApp` speaks sync protocol v2,
+  applies server-to-client operations through a gap-free delivery watermark, quarantines operations
+  it cannot apply yet instead of dropping them, and undoes permanently refused writes on their
+  author (`sync:operation-rejected`).
+- Writes are bound to the signed-in user; writes made before the user was known are held
+  (`app.sync.assignHeld` / `discardHeld`, `status.heldOperations`).
+- End-to-end encryption works across a user's devices: `app.encryption` (`unlock`, `lock`,
+  `getStatus`, rotation, passphrase change, recovery key, `startNewKeyring`).
+- The first open re-materializes every record with the deterministic fold (`store:rematerialized`);
+  `experimental.legacyMerge` compares against the beta.12 pipeline for this release only.
+- Records, inputs, `where`, `orderBy`, `include` and transactions are typed from the schema.
+- `createApp` is inert without `window` (`ServerRenderingAppError` on `app.ready`); `findById`
+  before `ready` throws `AppNotReadyError`; `app.storage` never deletes a database with unsynced
+  writes and requests persistence in the background; `korajs` re-exports only the everyday core
+  API.
+- Security fixes are described in the [security advisory](https://github.com/ehoneahobed/kora/blob/main/docs/releases/security-advisory-beta13.md).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

@@ -1,5 +1,25 @@
 # @korajs/auth
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking. Security:** the default sync provider derives scopes from verified identity
+  (`scopeValues`, `resolveScopes`) instead of the client's handshake; one `authenticateAccess`
+  check guards every route; device and user revocation take effect immediately across instances;
+  refresh rotation is atomic and safe across tabs.
+- OAuth state is bound to the browser and purpose (linking starts at
+  `POST /auth/oauth/:provider/link/start`); invitations require the verified invited email; MFA is
+  enforced at sign-in (`MfaRequiredError`, `verifyMfa`); reset tokens are never disclosed; sign-in
+  timing and rate limiting no longer reveal accounts; webhooks are signed `t=…,v1=…` and refuse
+  private targets; passkeys require user verification.
+- Offline users stay signed in (`authenticated-offline`); network failures never destroy tokens.
+- Persistent user and revocation stores are required in production (`allowInMemory` to opt out);
+  custom `TokenRevocationStore` and `OrgStore` implementations have new methods.
+- Security fixes are described in the [security advisory](https://github.com/ehoneahobed/kora/blob/main/docs/releases/security-advisory-beta13.md).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

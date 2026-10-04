@@ -1,5 +1,13 @@
 # @korajs/tauri
 
+## 0.4.3-beta.12
+
+### Patch Changes
+
+- Released alongside Kora 1.0.0-beta.13; no API changes.
+- Updated dependencies
+  - @korajs/core@1.0.0-beta.13
+
 ## 0.4.3-beta.8
 
 ### Patch Changes

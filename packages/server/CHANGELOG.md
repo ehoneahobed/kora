@@ -1,5 +1,32 @@
 # @korajs/server
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking. Security:** nothing is accepted before the authenticated handshake
+  (`HANDSHAKE_REQUIRED`); scopes are granted by the server and a client can only narrow them
+  (`SCOPE_REQUIRED`); writes are authorized against the stored and resulting record, never
+  client-sent `previousData`; operations must come from the session's own, per-user claimed node
+  (`NODE_ID_MISMATCH`, `NODE_ID_CLAIMED`); uploaded ids are verified (`INVALID_OPERATION_ID`,
+  `FORGED_DUPLICATE`); no client can act as the server (`INVALID_NODE_ID`); rich text, presence,
+  blobs and foreign keys are isolated per tenant; history is visible per operation scope;
+  revocation ends live sessions on every instance.
+- Every stored operation carries a delivery sequence; first sync streams with backpressure;
+  unreadable rows are quarantined; records are materialized with the core fold, and fields added
+  later read their schema default.
+- Protocol-1 (beta.12) clients are accepted for this release, with a deprecation warning.
+- Encryption key service (`kora_encryption_keys`), optional `encryption: { required: true }`, key
+  records in backups.
+- Bounded sessions: message, batch, operation and body size limits, heartbeats, `maxConnections`,
+  per-user rate limits; `X-Forwarded-For` is trusted only through `trustProxy`.
+- One-time migration on first start (Postgres sequence columns to `BIGINT`, new tables, scope
+  backfill, log-integrity scan, full fold); `ServerStoreUnavailableError` for an unreachable
+  Postgres.
+- Security fixes are described in the [security advisory](https://github.com/ehoneahobed/kora/blob/main/docs/releases/security-advisory-beta13.md).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

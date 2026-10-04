@@ -1,5 +1,14 @@
 # @korajs/test
 
+## 1.0.0-beta.13
+
+### Minor Changes
+
+- Test devices and networks use the deterministic fold, protocol v2 and the server's scope grants;
+  the `legacyMerge` option compares against the beta.12 merge.
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.11
 
 ### Minor Changes

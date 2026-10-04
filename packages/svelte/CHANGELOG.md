@@ -1,5 +1,14 @@
 # @korajs/svelte
 
+## 1.0.0-beta.13
+
+### Minor Changes
+
+- Query stores accept a readable query and follow it; queries share the canonical `queryKey` and
+  report errors.
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

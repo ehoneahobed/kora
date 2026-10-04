@@ -1,5 +1,28 @@
 # @korajs/core
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** One deterministic per-field CRDT fold (`foldRecord`, `mergeOp`) used by every
+  replica: arrays are multisets, objects merge per top-level key, resolvers run once per write in
+  HLC order, `counter`/`max`/`min`/`append-only` fold over every write, and an update equal to its
+  own `previousData` is not a write.
+- Content-hash version 2 operation ids (`hashVersion`) covering `previousData`, `sequenceNumber`,
+  `causalDeps` and `schemaVersion`; one canonical operation body (`NON_CANONICAL_VALUE` for values
+  with no JSON form).
+- One value domain enforced at write time (integer-millisecond timestamps, finite numbers, json
+  depth, no `__proto__`); enum membership and requiredness are enforced by validation, and
+  `t.enum()` refuses values SQLite cannot store exactly.
+- Schema transforms run at fold time (`operationSchemaView`); stored operations are never
+  rewritten.
+- The HLC reports drift instead of blocking writes, and `receive()` validates remote timestamps
+  (`InvalidTimestampError`, `RemoteClockDriftError`).
+- Records and inputs are typed from the schema (required, optional, defaulted and auto fields).
+- New events for storage, sync, encryption and query errors (see `KoraEvent`).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

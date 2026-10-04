@@ -1,5 +1,17 @@
 # @korajs/merge
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** Per-field merging moved to the deterministic fold in `@korajs/core`;
+  `@korajs/merge` keeps the cross-record constraint and referential checks, which the sync server
+  now decides.
+- `MergeEngine` and `addWinsSet` are deprecated: they back only
+  `createApp({ experimental: { legacyMerge: true } })` for this release and will be removed.
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.9
 
 ### Patch Changes
