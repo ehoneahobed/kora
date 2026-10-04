@@ -3395,6 +3395,51 @@
    ],
    "pr": null,
    "notes": "Found while checking `kora migrate` against the fold (RT-105): after the v1 -> v2 migration that added `status: t.string().default('open')`, devices A, B and a fresh device C all read 'open' for a v1 record, the server null. A record whose operations predate the field has no fold state for it; the client RecordFolder.materializeRow writes only the fields the fold holds, so the column keeps the value it was created or added with (the default), while the server stores wrote `values[field] ?? null` for every schema field (sqlite-server-store upsertMaterializedRecord, postgres-server-store upsert and batch re-materialization, memory-server-store writeRecord). Independent of the CLI: the server's own setSchema re-materialization writes the NULL. Repro packages/server/tests/repro/RT-106.test.ts (memory, SQLite restart and fresh v2 server, Postgres with KORA_PG_TEST_URL); end to end in packages/cli/tests/repro/RT-105.test.ts (server rows equal device rows including `status`). FIX (beta.13 RC): server record-fold.ts materializedFieldValue (the fold's value, else the field's schema default, else null) used by every server row write: sqlite-server-store upsertMaterializedRecord, postgres-server-store upsert and batch re-materialization, memory-server-store writeRecord (which now also lists every schema field, null when unset, like the SQL stores). Scope snapshots are unchanged: a field they do not hold falls back to the current row (RT-20), which now holds the default."
+  },
+  {
+   "id": "RT-107",
+   "title": "A leaked (since-changed) passphrase is not contained against the sync server: devices still holding the old master key adopt a server-forged successor record under it and encrypt new operations under the attacker's data key; and recovery accepts an attacker ring that re-wraps the first data key (the recovery anchor), which the old passphrase opens",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-107.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). Attacker: the server operator who learned the old passphrase (the case the guide's 'After a suspected leak, change the passphrase and then rotate' addresses). (1) sync/src/encryption/keyring.ts:898-970 (adoptLocked -> authenticateHeld with the held old master) accepts a revision sealed under the OLD master that adds a key: every device except the one that changed the passphrase still holds M1, and the server chooses what it forwards. Inherent for a shared-secret ring; required fix: correct docs/guide/sync-encryption.md:224 and the changePassphrase JSDoc (keyring.ts:441-447): after a leak every device must be locked and re-unlocked with the new passphrase (its held master then no longer authenticates M1 records) or a new keyring started; optionally enforce it (a device that sees a record it cannot authenticate with a higher revision of its ring stops adopting records that add keys under its held master until unlocked with the current passphrase). (2) keyring.ts:691-707 and 1226-1241 (holdsAnchor) with keyring-crypto.ts:364 (dataKeyAnchor of the FIRST data key): the anchor is derivable by anyone who held a past passphrase, so recovery adopts an attacker master wrapped to the public recovery key and the recovered device encrypts under the attacker's key. Required fix: anchor recovery to a secret only the recovery-key holder has (the recovery key carries a secret s; the record carries an HMAC_s commitment to the ring id and master key that enableRecovery writes and passphrase change / recovery re-derive), not to a data key. Repro packages/sync/tests/repro/RT-107.test.ts (2 tests). If (1) is accepted as inherent, split it into a docs item and turn its test into an observation."
+  },
+  {
+   "id": "RT-108",
+   "title": "Postgres value-domain relaxation misses a beta.12 single-value enum CHECK: Postgres stores IN ('x') as CHECK ((col = 'x'::text)), which isPostgresEnumCheckDefinition does not match, so after adding an enum value the upgraded server still cannot store it (RT-101 persists for single-value enums on Postgres servers and in `kora migrate` relax directives)",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-108.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). core/src/schema/constraint-relaxation.ts:166-170 (isPostgresEnumCheckDefinition only matches `= ANY (ARRAY[...])`), used by planPostgresConstraintRelaxation (core/src/schema/constraint-relaxation.ts:263-277) from postgres-server-store.ts:514-530 and the CLI's expandRelaxValueDomainForPostgres. Verified on PG16: CHECK (\"p\" IN ('only')) -> pg_get_constraintdef `CHECK ((p = 'only'::text))`. Required fix: also recognise the single-column equality form `CHECK ((col = 'literal'::text))` (and `(col)::text = ...`), ideally by comparing against the schema's own enum column names rather than by shape; add the case to value-domain-evolution.test.ts and the CLI directive tests. Repro packages/server/tests/repro/RT-108.test.ts (needs KORA_PG_TEST_URL)."
+  },
+  {
+   "id": "RT-109",
+   "title": "Offline app shell: after a deploy the old worker stays active and the new one waits for consent, but navigations are network-first, so an online reload runs the NEW build (prompt still saying an update is available) and a later offline reload runs the OLD build from the old cache against the database the new build already migrated; the store opens a newer-schema database silently",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-109.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification; confirms the RC 'suspected, needs a browser repro' item). cli/src/vite/service-worker.ts:298-309 (navigate: network first, then the cached SHELL of THIS worker's version) and 260-262/364-410 (update waits for KORA_SW_SKIP_WAITING); store/src/migrations/run-migrations.ts:45-50 (stored >= target returns without a word). Verified in Chromium on a create-kora-app react-tailwind-sync scaffold built from the packed tarballs: v1 online -> deploy v2 (title + schema version 2) -> online reload shows v2 with the prompt and registration {active, waiting} -> offline reload shows v1, which opens the schema-2 database and writes schema-1 operations; with a renameField migration the old build fails at ready (RC probe), so the app does not open offline until online again. Required fix: one build per active worker: the navigation handler serves the network document only when it belongs to this worker's version (e.g. compare a version marker/ETag recorded at install, else serve the precached shell and let the update flow take over), or skip waiting once a page of the new build is running; and the store must refuse (clear error event, not a silent open) a database whose stored schema version is newer than the code's. Repro packages/cli/tests/repro/RT-109.test.ts (generated worker in a fake scope); browser script packages/cli/tests/repro/RT-109-browser.mjs (manual, needs a scaffolded app)."
   }
  ],
  "rejectedProposalPins": {
