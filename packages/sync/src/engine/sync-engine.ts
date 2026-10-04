@@ -1855,10 +1855,11 @@ export class SyncEngine {
 	 */
 	private maybeRefreshKeyring(op: Operation): void {
 		const keyring = this.keyring
-		const version = op.encrypted?.keyVersion
-		if (!keyring || version === undefined || this.keyRefreshInFlight) return
-		const held = keyring.getStatus().availableVersions
-		if (held.length === 0 || version <= Math.max(...held)) return
+		const keyId = op.encrypted?.keyId
+		if (!keyring || keyId === undefined || this.keyRefreshInFlight) return
+		// By key id, not version: after a forked ring is merged (RT-104), an operation can
+		// name a key under a version number this device already uses for another key.
+		if (keyring.getEncryptor() === null || keyring.holdsKeyId(keyId)) return
 		const channel = this.getKeyServiceChannel()
 		if (!channel) return
 		this.keyRefreshInFlight = true
@@ -1883,8 +1884,20 @@ export class SyncEngine {
 			})
 	}
 
-	/** End the session because the keyring is locked; no reconnect until unlocked. */
+	/**
+	 * End the session because the keyring is locked; no reconnect until unlocked. A lock
+	 * caused by the server's record (rolled back, lost, malformed, forked: RT-96, RT-104)
+	 * needs no user action, so the session ends without pausing and the reconnection
+	 * loop retries with backoff; the next handshake re-uploads, merges or opens it.
+	 */
 	private pauseForLockedKeyring(): void {
+		if (this.keyring?.isRetryableLock()) {
+			const status = this.keyring.getStatus()
+			this.abandonSession(
+				`End-to-end encryption: ${status.code ?? 'key record'} (${status.message ?? 'retrying'})`,
+			)
+			return
+		}
 		this.encryptionLocked = true
 		this.emitter?.emit({ type: 'sync:suspended', reason: 'encryption-locked' })
 		this.abandonSession('End-to-end encryption is locked')
@@ -5120,7 +5133,17 @@ function resolveOperationTransforms(
 /** Map a key-service response to the keyring's reply, or the error it stands for. */
 function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply {
 	if (message.status === 'ok' || message.status === 'conflict') {
-		return { status: message.status, record: message.record }
+		return {
+			status: message.status,
+			record: message.record,
+			...(Array.isArray(message.knownKeyIds)
+				? {
+						knownKeyIds: message.knownKeyIds.filter(
+							(keyId): keyId is string => typeof keyId === 'string',
+						),
+					}
+				: {}),
+		}
 	}
 	const codes: Record<Exclude<EncryptionKeyResponseStatus, 'ok' | 'conflict'>, string> = {
 		forbidden: 'KEY_SERVICE_FORBIDDEN',

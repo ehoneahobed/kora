@@ -1,14 +1,20 @@
 import type { WrappedKeyRecord } from './key-record'
+import type { MasterKeys } from './keyring-crypto'
 
 /**
- * What a device keeps of an unlocked keyring: the last key record it accepted (also
- * the rollback pin), the passphrase KEK when known, and every data key it opened. Keys
- * are NON-EXTRACTABLE CryptoKeys: script on the page can use them while it runs, but
- * cannot read their bytes.
+ * What a device keeps of an unlocked keyring: the last key record it authenticated and
+ * accepted (also the pin: its ring id and revision are the floor for every later
+ * record), the passphrase KEK when known, the keys derived from the ring's master key
+ * (to authenticate later records and wrap new data keys), and every data key it
+ * opened. Keys are NON-EXTRACTABLE CryptoKeys: script on the page can use them while it
+ * runs, but cannot read their bytes. A locked keyring keeps the record (the pin) and
+ * nothing else.
  */
 export interface CachedKeyring {
 	record: WrappedKeyRecord
 	kek: CryptoKey | null
+	/** Derived from the ring's master key; null while locked. */
+	master?: MasterKeys | null
 	keys: Array<{ keyVersion: number; keyId: string; key: CryptoKey }>
 }
 

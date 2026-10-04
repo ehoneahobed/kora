@@ -1,17 +1,31 @@
 import { SyncError } from '@korajs/core'
-import type { RecoveryWrappedDataKey, WrappedDataKey } from './key-record'
-import { wrapAdditionalData } from './key-record'
+import type {
+	KeyRecordRecovery,
+	WrappedDataKey,
+	WrappedKeyRecord,
+	WrappedMasterKey,
+} from './key-record'
+import {
+	RECOVERY_ALGORITHM,
+	keyRecordMacInput,
+	masterWrapAdditionalData,
+	wrapAdditionalData,
+} from './key-record'
 
 /**
- * WebCrypto primitives of the key hierarchy (ENC-1, D4b):
+ * WebCrypto primitives of the key hierarchy (ENC-1, D4b, record format 2):
  *
  *   passphrase --PBKDF2-SHA256(salt, iterations)--> KEK (AES-256-GCM, non-extractable)
- *   KEK --AES-GCM wrap (AAD = keyring, version, keyId)--> data key v1, v2, ...
- *   recovery public key --ECDH P-256 + AES-GCM wrap--> data key v1, v2, ... (optional)
+ *   KEK --AES-GCM (AAD: keyring, ring)--> master key (32 random bytes)
+ *   recovery public key --ECDH P-256, HKDF-SHA256, AES-GCM--> master key (optional)
+ *   master key --HKDF-SHA256 "data-key-wrap"--> wrapping key (AES-256-GCM)
+ *   master key --HKDF-SHA256 "record-mac"--> MAC key (HMAC-SHA256)
+ *   wrapping key --AES-GCM wrap (AAD: keyring, version, keyId)--> data key v1, v2, ...
  *
- * Data keys are random 256-bit AES-GCM keys. They are extractable only for the moment
- * they are wrapped (creation, rotation, passphrase change, recovery set-up); the copy
- * a device keeps and encrypts with is always imported non-extractable.
+ * Raw master-key bytes exist only inside the calls that create, re-wrap or open the
+ * master key, and are zeroed afterwards. What a device keeps is the two derived keys
+ * ({@link MasterKeys}), both non-extractable. Data keys are extractable only for the
+ * moment they are wrapped; the copy a device encrypts with is non-extractable.
  */
 
 /** Thrown when a key record cannot be opened with the given passphrase or recovery key. */
@@ -25,8 +39,22 @@ export class KeyUnwrapError extends SyncError {
 /** PBKDF2 salt length (bytes). */
 export const KEK_SALT_BYTES = 32
 
+/** Master key length (bytes). */
+export const MASTER_KEY_BYTES = 32
+
 const GCM_IV_BYTES = 12
 const RECOVERY_KEY_PREFIX = 'kora-rk1-'
+const HKDF_DATA_KEY_WRAP = 'kora/key-record/2/data-key-wrap'
+const HKDF_RECORD_MAC = 'kora/key-record/2/record-mac'
+const HKDF_RECOVERY_WRAP = 'kora/key-record/2/recovery-wrap'
+
+/** The keys a device derives from (and keeps instead of) a ring's master key. */
+export interface MasterKeys {
+	/** Wraps and unwraps the ring's data keys. */
+	wrapKey: CryptoKey
+	/** Authenticates the whole key record. */
+	macKey: CryptoKey
+}
 
 function subtle(): SubtleCrypto {
 	const api = globalThis.crypto?.subtle
@@ -39,19 +67,32 @@ function subtle(): SubtleCrypto {
 	return api
 }
 
+function buffer(bytes: Uint8Array): ArrayBuffer {
+	return bytes as unknown as ArrayBuffer
+}
+
 /** Cryptographically random bytes. */
 export function randomBytes(length: number): Uint8Array {
 	return globalThis.crypto.getRandomValues(new Uint8Array(length))
 }
 
+function hex(bytes: Uint8Array): string {
+	return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 /** A fresh random key id (`k2-` and 32 hex digits). Names a key; reveals nothing about it. */
 export function newKeyId(): string {
-	return `k2-${Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, '0')).join('')}`
+	return `k2-${hex(randomBytes(16))}`
+}
+
+/** A fresh random ring id (`r-` and 32 hex digits). */
+export function newRingId(): string {
+	return `r-${hex(randomBytes(16))}`
 }
 
 /**
  * Derive the key-encryption key from a passphrase. Non-extractable; usable only to
- * wrap and unwrap data keys.
+ * seal and open the ring's master key.
  *
  * @param passphrase - The user's passphrase (non-empty)
  * @param salt - The record's random salt
@@ -69,85 +110,157 @@ export async function deriveKeyEncryptionKey(
 	}
 	const base = await subtle().importKey(
 		'raw',
-		new TextEncoder().encode(passphrase) as unknown as ArrayBuffer,
+		buffer(new TextEncoder().encode(passphrase)),
 		'PBKDF2',
 		false,
 		['deriveKey'],
 	)
 	return subtle().deriveKey(
-		{ name: 'PBKDF2', salt: salt as unknown as ArrayBuffer, iterations, hash: 'SHA-256' },
+		{ name: 'PBKDF2', salt: buffer(salt), iterations, hash: 'SHA-256' },
 		base,
 		{ name: 'AES-GCM', length: 256 },
 		false,
-		['wrapKey', 'unwrapKey'],
+		['encrypt', 'decrypt'],
 	)
 }
 
-/** A new random data key, extractable so it can be wrapped (then discarded). */
-export async function generateDataKey(): Promise<CryptoKey> {
-	return subtle().generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
+/** New random master-key bytes. The caller zeroes them once wrapped and imported. */
+export function generateMasterKey(): Uint8Array {
+	return randomBytes(MASTER_KEY_BYTES)
 }
 
 /**
- * Wrap a data key with the passphrase KEK.
+ * Derive the non-extractable wrapping and MAC keys of a master key (HKDF-SHA256 with
+ * distinct info strings).
+ */
+export async function importMasterKey(raw: Uint8Array): Promise<MasterKeys> {
+	const base = await subtle().importKey('raw', buffer(raw), 'HKDF', false, ['deriveKey'])
+	const hkdf = (info: string): HkdfParams => ({
+		name: 'HKDF',
+		hash: 'SHA-256',
+		salt: new ArrayBuffer(0),
+		info: buffer(new TextEncoder().encode(info)),
+	})
+	const [wrapKey, macKey] = await Promise.all([
+		subtle().deriveKey(hkdf(HKDF_DATA_KEY_WRAP), base, { name: 'AES-GCM', length: 256 }, false, [
+			'wrapKey',
+			'unwrapKey',
+		]),
+		subtle().deriveKey(
+			hkdf(HKDF_RECORD_MAC),
+			base,
+			{ name: 'HMAC', hash: 'SHA-256', length: 256 },
+			false,
+			['sign', 'verify'],
+		),
+	])
+	return { wrapKey, macKey }
+}
+
+/** Seal the master key under the passphrase KEK. */
+export async function wrapMasterKey(
+	raw: Uint8Array,
+	kek: CryptoKey,
+	keyring: string,
+	ringId: string,
+): Promise<WrappedMasterKey> {
+	const iv = randomBytes(GCM_IV_BYTES)
+	const sealed = await subtle().encrypt(
+		{
+			name: 'AES-GCM',
+			iv: buffer(iv),
+			additionalData: buffer(masterWrapAdditionalData(keyring, ringId, 'passphrase')),
+		},
+		kek,
+		buffer(raw),
+	)
+	return { iv: toBase64(iv), wrappedKey: toBase64(new Uint8Array(sealed)) }
+}
+
+/**
+ * Open the master key with the passphrase KEK. The returned bytes must be zeroed by
+ * the caller once imported (or re-wrapped).
+ *
+ * @throws {KeyUnwrapError} WRONG_PASSPHRASE when the wrap does not authenticate
+ */
+export async function unwrapMasterKey(
+	wrap: WrappedMasterKey,
+	kek: CryptoKey,
+	keyring: string,
+	ringId: string,
+): Promise<Uint8Array> {
+	try {
+		const raw = await subtle().decrypt(
+			{
+				name: 'AES-GCM',
+				iv: buffer(fromBase64(wrap.iv)),
+				additionalData: buffer(masterWrapAdditionalData(keyring, ringId, 'passphrase')),
+			},
+			kek,
+			buffer(fromBase64(wrap.wrappedKey)),
+		)
+		return new Uint8Array(raw)
+	} catch (cause) {
+		throw new KeyUnwrapError(
+			`The passphrase does not open keyring "${keyring}". Check the passphrase.`,
+			{
+				code: 'WRONG_PASSPHRASE',
+				cause: cause instanceof Error ? cause.message : String(cause),
+			},
+		)
+	}
+}
+
+/**
+ * Wrap a data key with the ring's wrapping key.
  *
  * @param dataKey - An extractable data key
- * @param kek - The passphrase KEK
+ * @param wrapKey - The master key's wrapping key
  * @param keyring - Keyring name (bound as AAD)
  * @param keyVersion - Key version (bound as AAD)
  * @param keyId - Key id (bound as AAD)
  */
 export async function wrapDataKey(
 	dataKey: CryptoKey,
-	kek: CryptoKey,
+	wrapKey: CryptoKey,
 	keyring: string,
 	keyVersion: number,
 	keyId: string,
 ): Promise<WrappedDataKey> {
 	const iv = randomBytes(GCM_IV_BYTES)
-	const wrapped = await subtle().wrapKey('raw', dataKey, kek, {
+	const wrapped = await subtle().wrapKey('raw', dataKey, wrapKey, {
 		name: 'AES-GCM',
-		iv: iv as unknown as ArrayBuffer,
-		additionalData: wrapAdditionalData(
-			keyring,
-			keyVersion,
-			keyId,
-			'passphrase',
-		) as unknown as ArrayBuffer,
+		iv: buffer(iv),
+		additionalData: buffer(wrapAdditionalData(keyring, keyVersion, keyId)),
 	})
 	return { keyVersion, keyId, iv: toBase64(iv), wrappedKey: toBase64(new Uint8Array(wrapped)) }
 }
 
 /**
- * Unwrap a data key with the passphrase KEK. A wrong passphrase (or a tampered wrap,
- * or a wrap relabelled to another version) fails authentication.
+ * Unwrap a data key with the ring's wrapping key. A tampered wrap, or one relabelled to
+ * another version, fails authentication.
  *
  * @param entry - The wrapped key
- * @param kek - The passphrase KEK
+ * @param wrapKey - The master key's wrapping key
  * @param keyring - Keyring name
  * @param extractable - True only to re-wrap it right away; the kept copy is non-extractable
- * @throws {KeyUnwrapError} When the wrap does not authenticate under this KEK
+ * @throws {KeyUnwrapError} When the wrap does not authenticate under this key
  */
 export async function unwrapDataKey(
 	entry: WrappedDataKey,
-	kek: CryptoKey,
+	wrapKey: CryptoKey,
 	keyring: string,
 	extractable = false,
 ): Promise<CryptoKey> {
 	try {
 		return await subtle().unwrapKey(
 			'raw',
-			fromBase64(entry.wrappedKey) as unknown as ArrayBuffer,
-			kek,
+			buffer(fromBase64(entry.wrappedKey)),
+			wrapKey,
 			{
 				name: 'AES-GCM',
-				iv: fromBase64(entry.iv) as unknown as ArrayBuffer,
-				additionalData: wrapAdditionalData(
-					keyring,
-					entry.keyVersion,
-					entry.keyId,
-					'passphrase',
-				) as unknown as ArrayBuffer,
+				iv: buffer(fromBase64(entry.iv)),
+				additionalData: buffer(wrapAdditionalData(keyring, entry.keyVersion, entry.keyId)),
 			},
 			{ name: 'AES-GCM', length: 256 },
 			extractable,
@@ -155,13 +268,48 @@ export async function unwrapDataKey(
 		)
 	} catch (cause) {
 		throw new KeyUnwrapError(
-			`The passphrase does not open key version ${entry.keyVersion} of keyring "${keyring}". Check the passphrase.`,
+			`Key version ${entry.keyVersion} of keyring "${keyring}" does not open under this ring's master key.`,
 			{
-				code: 'WRONG_PASSPHRASE',
+				code: 'KEY_UNWRAP_FAILED',
 				keyVersion: entry.keyVersion,
 				cause: cause instanceof Error ? cause.message : String(cause),
 			},
 		)
+	}
+}
+
+/** The record's MAC (base64 HMAC-SHA256) under a master key's MAC key. */
+export async function computeRecordMac(
+	record: Omit<WrappedKeyRecord, 'mac'> | WrappedKeyRecord,
+	macKey: CryptoKey,
+): Promise<string> {
+	const mac = await subtle().sign('HMAC', macKey, buffer(keyRecordMacInput(record)))
+	return toBase64(new Uint8Array(mac))
+}
+
+/** A copy of `record` with its MAC computed under `macKey`. */
+export async function sealRecord(
+	record: Omit<WrappedKeyRecord, 'mac'> | WrappedKeyRecord,
+	macKey: CryptoKey,
+): Promise<WrappedKeyRecord> {
+	const { mac: _old, ...body } = record as WrappedKeyRecord
+	return { ...body, mac: await computeRecordMac(body, macKey) } as WrappedKeyRecord
+}
+
+/** Whether the record's MAC verifies under `macKey` (constant-time, WebCrypto verify). */
+export async function verifyRecordMac(
+	record: WrappedKeyRecord,
+	macKey: CryptoKey,
+): Promise<boolean> {
+	try {
+		return await subtle().verify(
+			'HMAC',
+			macKey,
+			buffer(fromBase64(record.mac)),
+			buffer(keyRecordMacInput(record)),
+		)
+	} catch {
+		return false
 	}
 }
 
@@ -171,7 +319,7 @@ export async function generateRecoveryKeyPair(): Promise<{
 	recoveryKey: string
 }> {
 	const pair = (await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
-		'deriveKey',
+		'deriveBits',
 	])) as CryptoKeyPair
 	const jwk = await subtle().exportKey('jwk', pair.privateKey)
 	if (typeof jwk.d !== 'string' || typeof jwk.x !== 'string' || typeof jwk.y !== 'string') {
@@ -181,61 +329,103 @@ export async function generateRecoveryKeyPair(): Promise<{
 }
 
 /**
- * Wrap a data key for the recovery public key (ephemeral-static ECDH P-256, then
- * AES-GCM with the same AAD binding as the passphrase wrap). Needs only the public
- * key, so any unlocked device can keep recovery current across rotations.
+ * HKDF-SHA256 over the ECDH shared secret, with both public keys in the info, to the
+ * AES-GCM key of a recovery wrap (never the raw shared secret as a key).
  */
-export async function wrapForRecovery(
-	dataKey: CryptoKey,
-	recoveryPublicKey: { x: string; y: string },
-	keyring: string,
-	keyVersion: number,
-	keyId: string,
-): Promise<RecoveryWrappedDataKey> {
-	const recipient = await importPoint(recoveryPublicKey)
-	const ephemeral = (await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
-		'deriveKey',
-	])) as CryptoKeyPair
-	const wrappingKey = await subtle().deriveKey(
-		{ name: 'ECDH', public: recipient },
-		ephemeral.privateKey,
-		{ name: 'AES-GCM', length: 256 },
-		false,
-		['wrapKey'],
+async function recoveryWrappingKey(
+	privateKey: CryptoKey,
+	peer: CryptoKey,
+	ephemeral: { x: string; y: string },
+	recipient: { x: string; y: string },
+	usage: 'encrypt' | 'decrypt',
+): Promise<CryptoKey> {
+	const secret = new Uint8Array(
+		await subtle().deriveBits({ name: 'ECDH', public: peer }, privateKey, 256),
 	)
-	const iv = randomBytes(GCM_IV_BYTES)
-	const wrapped = await subtle().wrapKey('raw', dataKey, wrappingKey, {
-		name: 'AES-GCM',
-		iv: iv as unknown as ArrayBuffer,
-		additionalData: wrapAdditionalData(
-			keyring,
-			keyVersion,
-			keyId,
-			'recovery',
-		) as unknown as ArrayBuffer,
-	})
-	const ephemeralJwk = await subtle().exportKey('jwk', ephemeral.publicKey)
-	return {
-		keyVersion,
-		keyId,
-		ephemeralPublicKey: { x: String(ephemeralJwk.x), y: String(ephemeralJwk.y) },
-		iv: toBase64(iv),
-		wrappedKey: toBase64(new Uint8Array(wrapped)),
+	try {
+		const base = await subtle().importKey('raw', buffer(secret), 'HKDF', false, ['deriveKey'])
+		return await subtle().deriveKey(
+			{
+				name: 'HKDF',
+				hash: 'SHA-256',
+				salt: new ArrayBuffer(0),
+				info: buffer(
+					new TextEncoder().encode(
+						JSON.stringify([
+							HKDF_RECOVERY_WRAP,
+							ephemeral.x,
+							ephemeral.y,
+							recipient.x,
+							recipient.y,
+						]),
+					),
+				),
+			},
+			base,
+			{ name: 'AES-GCM', length: 256 },
+			false,
+			[usage],
+		)
+	} finally {
+		secret.fill(0)
 	}
 }
 
 /**
- * Unwrap a data key with the recovery key (extractable, for re-wrapping under a new
- * passphrase).
- *
- * @throws {KeyUnwrapError} When the recovery key is malformed or does not open the wrap
+ * Wrap the master key for the recovery public key (ephemeral-static ECDH P-256).
+ * Needs only the public key.
  */
-export async function unwrapWithRecovery(
-	entry: RecoveryWrappedDataKey,
-	recoveryKey: string,
+export async function wrapMasterForRecovery(
+	raw: Uint8Array,
 	recoveryPublicKey: { x: string; y: string },
 	keyring: string,
-): Promise<CryptoKey> {
+	ringId: string,
+): Promise<KeyRecordRecovery> {
+	const recipient = await importPoint(recoveryPublicKey)
+	const ephemeral = (await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, [
+		'deriveBits',
+	])) as CryptoKeyPair
+	const ephemeralJwk = await subtle().exportKey('jwk', ephemeral.publicKey)
+	const ephemeralPublicKey = { x: String(ephemeralJwk.x), y: String(ephemeralJwk.y) }
+	const key = await recoveryWrappingKey(
+		ephemeral.privateKey,
+		recipient,
+		ephemeralPublicKey,
+		recoveryPublicKey,
+		'encrypt',
+	)
+	const iv = randomBytes(GCM_IV_BYTES)
+	const sealed = await subtle().encrypt(
+		{
+			name: 'AES-GCM',
+			iv: buffer(iv),
+			additionalData: buffer(
+				masterWrapAdditionalData(keyring, ringId, 'recovery', recoveryPublicKey),
+			),
+		},
+		key,
+		buffer(raw),
+	)
+	return {
+		alg: RECOVERY_ALGORITHM,
+		publicKey: { x: recoveryPublicKey.x, y: recoveryPublicKey.y },
+		ephemeralPublicKey,
+		iv: toBase64(iv),
+		wrappedKey: toBase64(new Uint8Array(sealed)),
+	}
+}
+
+/**
+ * Open the master key with the recovery key. The caller zeroes the returned bytes.
+ *
+ * @throws {KeyUnwrapError} WRONG_RECOVERY_KEY when the key is malformed or does not open it
+ */
+export async function unwrapMasterWithRecovery(
+	recovery: KeyRecordRecovery,
+	recoveryKey: string,
+	keyring: string,
+	ringId: string,
+): Promise<Uint8Array> {
 	const trimmed = recoveryKey.trim()
 	if (!trimmed.startsWith(RECOVERY_KEY_PREFIX)) {
 		throw new KeyUnwrapError(`A recovery key starts with "${RECOVERY_KEY_PREFIX}".`, {
@@ -248,51 +438,46 @@ export async function unwrapWithRecovery(
 			{
 				kty: 'EC',
 				crv: 'P-256',
-				x: recoveryPublicKey.x,
-				y: recoveryPublicKey.y,
+				x: recovery.publicKey.x,
+				y: recovery.publicKey.y,
 				d: trimmed.slice(RECOVERY_KEY_PREFIX.length),
 				ext: false,
 			},
 			{ name: 'ECDH', namedCurve: 'P-256' },
 			false,
-			['deriveKey'],
+			['deriveBits'],
 		)
-		const ephemeral = await importPoint(entry.ephemeralPublicKey)
-		const unwrappingKey = await subtle().deriveKey(
-			{ name: 'ECDH', public: ephemeral },
+		const ephemeral = await importPoint(recovery.ephemeralPublicKey)
+		const key = await recoveryWrappingKey(
 			privateKey,
-			{ name: 'AES-GCM', length: 256 },
-			false,
-			['unwrapKey'],
+			ephemeral,
+			recovery.ephemeralPublicKey,
+			recovery.publicKey,
+			'decrypt',
 		)
-		return await subtle().unwrapKey(
-			'raw',
-			fromBase64(entry.wrappedKey) as unknown as ArrayBuffer,
-			unwrappingKey,
+		const raw = await subtle().decrypt(
 			{
 				name: 'AES-GCM',
-				iv: fromBase64(entry.iv) as unknown as ArrayBuffer,
-				additionalData: wrapAdditionalData(
-					keyring,
-					entry.keyVersion,
-					entry.keyId,
-					'recovery',
-				) as unknown as ArrayBuffer,
+				iv: buffer(fromBase64(recovery.iv)),
+				additionalData: buffer(
+					masterWrapAdditionalData(keyring, ringId, 'recovery', recovery.publicKey),
+				),
 			},
-			{ name: 'AES-GCM', length: 256 },
-			true,
-			['encrypt', 'decrypt'],
+			key,
+			buffer(fromBase64(recovery.wrappedKey)),
 		)
+		return new Uint8Array(raw)
 	} catch (cause) {
-		throw new KeyUnwrapError(
-			`The recovery key does not open key version ${entry.keyVersion} of keyring "${keyring}".`,
-			{
-				code: 'WRONG_RECOVERY_KEY',
-				keyVersion: entry.keyVersion,
-				cause: cause instanceof Error ? cause.message : String(cause),
-			},
-		)
+		throw new KeyUnwrapError(`The recovery key does not open keyring "${keyring}".`, {
+			code: 'WRONG_RECOVERY_KEY',
+			cause: cause instanceof Error ? cause.message : String(cause),
+		})
 	}
+}
+
+/** A new random data key, extractable so it can be wrapped (then discarded). */
+export async function generateDataKey(): Promise<CryptoKey> {
+	return subtle().generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
 }
 
 /**
