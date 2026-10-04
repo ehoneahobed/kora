@@ -404,7 +404,8 @@ The returned object keeps its identity while the status is unchanged, and so do 
 | `'synced'` | Every local operation is acknowledged and the active view is complete. |
 | `'offline'` | No connection to the server (or sync is not configured). The app keeps working locally. |
 | `'auth-required'` | Sync is suspended until a user signs in (or the credential is refreshed). |
-| `'clock-error'` | This device's clock is too far ahead of the server; writes are blocked until it is fixed. |
+| `'encryption-locked'` | End-to-end encryption is on and the keyring is locked: sync pauses until `app.encryption.unlock(passphrase)`. Local reads and writes go on. |
+| `'clock-error'` | This device's clock is too far ahead of the server: sync pauses until it is fixed. Local writes go on and queue. |
 | `'schema-mismatch'` | The server does not accept this client's schema version; upgrade the app. |
 | `'error'` | A sync error occurred. Operations stay queued and retry. |
 

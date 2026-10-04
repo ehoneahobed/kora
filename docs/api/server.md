@@ -104,6 +104,8 @@ Every store implements `ServerStore`:
 | `materializeCollection(collection)` | Every record (from the log when no schema is set). |
 | `applyRemoteOperation(op, options?)` | Ingest path used by the sync server. |
 | `getMaxDeliverySequence()`, `getOperationsAfterDelivery(after, limit)` | The delivery sequence behind gap-free downloads. |
+| `exportBackup()`, `importBackup(data, merge?)` | The operation log plus the users' encryption key records (`merge: false` replaces the log, `true` merges into it); an import restores only key records the store lacks. Used by `/__kora/backup/*` and `kora backup`. |
+| `getEncryptionKeyRecord`, `putEncryptionKeyRecord`, `getEncryptedKeyIds`, `listEncryptionKeyRecords` | The key service's storage (compare-and-set). A custom store without the first two makes the key service answer `unsupported`; see [Sync Encryption](/guide/sync-encryption#server-requirements). |
 
 Server writes go through the same fold as devices; never write materialized tables directly. Use
 the route context instead.

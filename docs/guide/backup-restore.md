@@ -187,6 +187,13 @@ Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `
 (`operationalAuth.backupToken` / `adminToken`). Imported operations go through the same ingest
 validation as uploads.
 
+A server backup also carries the users' end-to-end encryption key records (section
+`encryption_keys`, wrapped keyrings only). A restore adds the key records the server lacks, in
+both modes, and never replaces one it holds; a backup with a malformed key record is refused whole
+(`BACKUP_INVALID_KEY_RECORD`). If you back up the server database by other means, include the
+`kora_encryption_keys` table: without it, encrypted history waits for a device that holds the
+keyring (see [Sync Encryption](/guide/sync-encryption#lost-key-records-and-forked-keyrings)).
+
 After a server is restored from an older backup, connected devices notice that the server holds
 fewer of their operations than it had acknowledged and re-upload them
 (`sync:local-node`, `server-behind`), and devices whose delivery watermark is now ahead of the

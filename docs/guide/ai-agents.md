@@ -64,7 +64,7 @@ const unsubscribe = app.todos
   })
 ```
 
-In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, and `error`. Sync state comes from `useSyncStatus().status`, which is one of `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch` or `auth-required`.
+In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, and `error`. Sync state comes from `useSyncStatus().status`, which is one of `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch`, `auth-required` or `encryption-locked`.
 
 ```tsx
 import { createKoraHooks } from '@korajs/react'

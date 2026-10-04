@@ -220,7 +220,7 @@ See [Sync Protocol](/guide/sync-protocol#delivery-watermark) for the mechanics.
 
 `app.sync.getStatus()`, `app.sync.subscribeStatus(listener)` and `useSyncStatus()` return the same
 `SyncStatusInfo`: `status` (`connected`, `reconnecting`, `syncing`, `synced`, `offline`,
-`clock-error`, `error`, `schema-mismatch`, `auth-required`), `phase`, `pendingOperations`,
+`clock-error`, `error`, `schema-mismatch`, `auth-required`, `encryption-locked`), `phase`, `pendingOperations`,
 `heldOperations` and `heldNodes`, `localDurability`, `serverProtocolVersion` and
 `protocolDeprecated`, `clockSkewMs`, `initialSync` progress, `deliveryWatermark` and
 `serverFrontier`, and `blockedFailure`. See [React Hooks](/guide/react-hooks#usesyncstatus) for

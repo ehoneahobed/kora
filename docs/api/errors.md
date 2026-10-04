@@ -89,9 +89,10 @@ Thrown by `app.sync` methods or reported in `sync:*` events and `status.reason`.
 | `OUT_OF_UPLINK_SCOPE` | `sync:operation-rejected` | A local write on a synced collection is outside what this session may upload. It is kept locally and in `getRejectedOperations()`. | Write only records the user's grant covers, or widen the grant on the server. |
 | `SCOPE_RETRACTED` | `sync:scope-retracted` | A record left this device's sync scope; its unsynced operations are set aside. | Review them with `getRejectedOperations()`. |
 | `ENCRYPTION_LOCKED` | `EncryptionKeyError` | Sync with encryption enabled before the keyring was unlocked. | `app.encryption.unlock(passphrase)`. |
-| Keyring status codes | `app.encryption.getStatus().code`, `encryption:status` | `NO_PASSPHRASE`, `AWAITING_SERVER`, `LOCKED_BY_APP`, `WRONG_PASSPHRASE`, `PASSPHRASE_REQUIRED`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED` | See [Sync Encryption](/guide/sync-encryption#error-handling). |
+| Keyring status codes | `app.encryption.getStatus().code`, `encryption:status` | `NO_PASSPHRASE`, `AWAITING_SERVER`, `LOCKED_BY_APP`, `WRONG_PASSPHRASE`, `PASSPHRASE_REQUIRED`, `KEY_RECORD_INVALID`, `KEY_RECORD_ROLLBACK`, `KEY_RECORD_MISSING`, `KEY_RING_FORK`, `KEY_SERVICE_FORBIDDEN`, `KEY_SERVICE_UNSUPPORTED`, `RECOVERY_FAILED` | See [Sync Encryption](/guide/sync-encryption#error-handling). |
 | `UPLOAD_NOT_DURABLE`, `DURABILITY_DEGRADED` | `store:persistence-error`, `sync:durability-degraded` | Local writes could not be made durable before upload; after repeated failures uploads continue so the server holds a durable copy. | Free storage; stay online until `sync:durability-restored`. |
 | `NODE_REGISTRY_FAILED`, `NODE_ROTATION_FAILED`, `CLOCK_REBASE_FAILED`, `ADOPTION_SCHEDULE_FAILED`, `ACCEPTED_SCOPE_SAVE_FAILED`, `SETTLE_AFTER_CATCH_UP_FAILED` | `store:persistence-error` | A sync bookkeeping write failed; the step is retried at the next session. | Check storage health if it repeats. |
+| `WRONG_RECOVERY_KEY` | `KeyUnwrapError` from `app.encryption.recover()` | The recovery key is malformed, belongs to another ring, or is a release-candidate `kora-rk1-` key. | Use the `kora-rk2-` key of this ring; after a merge or with an old key, call `enableRecovery()` again from a device that is unlocked. |
 | `SEALED_RELATION_FIELD` | `SealedRelationFieldError` | The encryption config encrypts a foreign key of an enforced relation, which the server must read. | List the field in `encryption.cleartextFields`. |
 | `INVALID_SCOPE`, `SCOPE_VIOLATION` | `InvalidScopeError`, `ScopeViolationError` | A malformed scope map, or a write outside the scope (custom engines). | Fix the scope map. |
 | `DECRYPTION_ERROR`, `ENCRYPTION_ERROR`, `KEY_DERIVATION_ERROR`, `KEY_UNWRAP_ERROR`, `ENCRYPTION_KEY_ERROR` | encryption classes | Low-level encryption failures (wrong key, tampered data, invalid configuration such as `INVALID_CONFIG`). | See the message and [Sync Encryption](/guide/sync-encryption). |
@@ -112,7 +113,9 @@ retried.
 ### Refused operations
 
 Sent per operation; the device keeps it in `app.sync.getRejectedOperations()` and emits
-`sync:operation-rejected` with `{ code, message, retriable }`. Only `RATE_LIMIT` is retriable.
+`sync:operation-rejected` with `{ code, message, retriable }`. Of the server's own codes only
+`RATE_LIMIT` is retriable; a `validateOperation` rejection may set `retriable` itself, and a
+validator that throws is reported as a retriable `VALIDATION_ERROR`.
 
 | Code | Cause | Fix |
 |------|-------|-----|
@@ -125,6 +128,7 @@ Sent per operation; the device keeps it in `app.sync.getRejectedOperations()` an
 | `RATE_LIMIT` | More than `maxOpsPerMinute` per connection (or `maxOpsPerMinutePerUser`). | Retried automatically after the window. |
 | `INVALID_TIMESTAMP` | Stamped more than 60 s ahead of server time. | Fix the device clock; queued writes are re-stamped automatically. |
 | `INVALID_OPERATION_ID` | The id is not the content hash of the operation. | A bug or tampering; the operation is never stored. |
+| `FORGED_DUPLICATE` | The upload reuses the id of a stored operation but differs from it in a hashed field. Nothing is applied; the server logs it and emits `sync:forged-duplicate`. | A bug or tampering. |
 | `INVALID_OPERATION`, `INVALID_SEQUENCE_NUMBER`, `INVALID_NODE_ID`, `INVALID_IDENTIFIER`, `MISSING_RECORD_ID`, `UNKNOWN_COLLECTION`, `UNSTORABLE_VALUE` | Malformed operation. | Upgrade the client; check custom transports. |
 | `NODE_ID_MISMATCH` | The operation's node is not the session's node. | None; the device re-sends under its own node. |
 | `SEQUENCE_CONFLICT` | The server holds a different operation under this node and sequence number. | None; the device moves to a fresh node id and re-sends. |
@@ -161,6 +165,7 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 |------|-------|-------|-----|
 | `INVALID_SERVER_IDENTITY` | `ServerIdentityError` | An invalid `nodeId`, `instanceId` or authoritative node list. | See [Server identity](/guide/production-server#server-identity). |
 | `BACKUP_INVALID_OPERATION` | `BackupValidationError` | A backup import contains an operation that fails ingest validation. | Restore a backup made by Kora. |
+| `BACKUP_INVALID_KEY_RECORD` | `KoraError` | A server backup's encryption key records (`encryption_keys`) are malformed; nothing is imported. | Restore an unmodified backup made by `exportBackup()`. |
 | `SCOPE_REQUIRED`, `INVALID_SCOPE_PREDICATE`, `SCOPE_PREDICATE_LIMIT` | `ScopeRequiredError`, `InvalidScopePredicateError`, `ScopePredicateLimitError` | Thrown while resolving a session grant (see Session errors). | |
 | `IN_MEMORY_AUTH_STORE` | `InMemoryAuthStoreError` (`@korajs/auth/server`) | `createKoraAuthServer` with in-memory user or revocation stores under `NODE_ENV=production`. | Use `createSqliteUserStore` / `createPostgresUserStore`, or `allowInMemory: true` deliberately. |
 

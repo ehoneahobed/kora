@@ -68,7 +68,7 @@ await addTodo.mutateAsync({ title: 'x' })     // resolves with the result; throw
 const status = useSyncStatus()                // status.status, status.pendingOperations
 \`\`\`
 
-Rules: always render \`mutation.error\` somewhere. Keep \`<StrictMode>\` in place; the hooks are StrictMode-safe. \`useQuery\` returns data synchronously from the local store, so do not add loading spinners for local reads.`,
+Rules: always render \`mutation.error\` somewhere. Keep \`<StrictMode>\` in place; the hooks are StrictMode-safe. \`useQuery\` reads the local store: no network, no spinner. Its very first render returns \`[]\` before the local query has run; use \`useQueryState\` when you must tell "loading" from "no rows".`,
 	vue: `## Vue bindings
 
 \`\`\`ts
@@ -81,7 +81,7 @@ addTodo.mutate({ title: 'x' })                // fire-and-forget; errors land in
 const status = useSyncStatus()                // status.status, status.pendingOperations
 \`\`\`
 
-Rules: surface the mutation's error state in the UI. \`useQuery\` reads synchronously from the local store, so avoid loading spinners for local data. The Kora context comes from \`KoraProvider\`, wired in your app entry (for example \`src/main.ts\`).`,
+Rules: surface the mutation's error state in the UI. \`useQuery\` reads the local store (no network, no spinner); the ref holds \`[]\` until the first local result. The Kora context comes from \`KoraProvider\`, wired in your app entry (for example \`src/main.ts\`).`,
 	svelte: `## Svelte bindings
 
 Kora's Svelte bindings from \`@korajs/svelte\` expose \`useCollection\`, \`useQuery\`, \`useMutation\`, and \`useSyncStatus\`, wired through the provider set up in your app entry.
@@ -96,7 +96,7 @@ addTodo.mutate({ title: 'x' })                // fire-and-forget; errors land in
 const status = useSyncStatus()                // readable store; read $status.status in markup
 \`\`\`
 
-Rules: queries are reactive stores that read synchronously from the local database, so avoid loading spinners for local reads. Mutations expose an \`error\` state that must be surfaced in the UI.`,
+Rules: queries are reactive stores over the local database (no network, no spinner; \`[]\` until the first local result). Mutations expose an \`error\` state that must be surfaced in the UI.`,
 }
 
 /**
@@ -125,9 +125,9 @@ This project uses **Kora.js**, an offline-first application framework. All appli
 2. **Never fetch application data over HTTP.** Do not add REST or GraphQL calls for app data, and do not talk to the sync server directly. Read and write through Kora collections only; sync happens automatically in the background.
 3. **Await readiness before direct collection access.** Outside the UI bindings, \`await app.ready\` before calling \`app.<collection>\` methods. The framework bindings handle this for you inside components.
 4. **Offline must keep working.** Any feature you add must function with the network off. Never gate a read or write on connectivity. If you are checking \`navigator.onLine\` before a data operation, you are doing it wrong.
-5. **Surface mutation errors.** Fire-and-forget \`mutate\` calls fold errors into the mutation state. Always render the mutation's \`error\`, or handle the promise from the \`mutateAsync\` variant. Silent failure is the worst failure.
+5. **Surface mutation errors.** Fire-and-forget \`mutate\` calls put errors into the mutation state. Always render the mutation's \`error\`, or handle the promise from the \`mutateAsync\` variant. Silent failure is the worst failure.
 6. **Do not add a state library for server or app data.** Kora's reactive queries are the store. Do not reach for react-query, SWR, Redux, Zustand, or similar for data that lives in a collection. Local UI state (form inputs, toggles) can use your framework's normal state tools.
-7. **Do not add loading spinners for local reads.** \`useQuery\` returns data synchronously from the local store, so there is no loading state to wait on for local data.
+7. **Do not add network-style loading states for local reads.** \`useQuery\` reads the local database, which answers within a frame; its very first render returns an empty result. Use \`useQueryState\` only where "loading" and "no rows" must look different.
 
 ## Data API cheat sheet
 
@@ -165,15 +165,15 @@ export default defineSchema({
 })
 \`\`\`
 
-If you change collection shapes, increment \`version\` and run \`npx kora migrate\`.
+If you change a collection's shape, increment \`version\` and add a \`migrations\` entry for it (\`migrate().addField(...)\`): each device migrates its local database on its next open. \`npx kora migrate\` generates the matching migration for server databases and a transform stub for clients still on the older version.
 
 ## Conflict handling
 
-Concurrent edits merge automatically: last-write-wins per field, add-wins for arrays, and character-level CRDT for \`t.richtext()\` fields. When a field needs domain-specific merging (counters, quantities), add a \`resolve\` function in the schema rather than writing sync logic by hand. Never write your own conflict or merge code.
+Concurrent edits merge automatically: last-write-wins per field, arrays as multisets that keep every device's additions and removals, objects per top-level key, and character-level CRDT for \`t.richtext()\` fields. When a field needs domain-specific merging (counters, quantities), add a \`resolve\` function in the schema rather than writing sync logic by hand. Never write your own conflict or merge code.
 
 ## Sync and auth
 
-Enable sync by adding one line to \`createApp\`: \`createApp({ schema, sync: { url } })\`. When the app is offline, writes queue locally and sync when connectivity returns. If the project uses \`@korajs/auth\`, pass its client as \`createApp({ schema, sync: { url, authClient } })\`. Local writes work without sign-in; sync requires the server to accept the connection.
+Enable sync with one option on \`createApp\`: \`createApp({ schema, sync: { url, autoConnect: true } })\` (without \`autoConnect\`, call \`await app.sync?.connect()\` after \`app.ready\`). When the app is offline, writes queue locally and sync when connectivity returns. If the project uses \`@korajs/auth\`, pass its binding as \`createApp({ schema, sync: { url, authClient: createKoraAuthSync({ authClient, schema }) } })\`; the server grants what each user may sync. Local writes work without sign-in; sync requires the server to accept the connection.
 
 ${FRAMEWORK_BINDINGS[framework]}
 
@@ -181,7 +181,7 @@ ${FRAMEWORK_BINDINGS[framework]}
 
 - \`npx kora dev\` runs the dev environment (app server, local sync server when configured, schema watcher).
 - \`npx kora doctor\` diagnoses a broken setup.
-- \`npx kora migrate\` applies a schema change to the local store.
+- \`npx kora migrate\` generates a migration from a schema change (\`--apply\` runs it against a SQLite or Postgres database).
 - In a running app, the DevTools overlay (Ctrl+Shift+K, Cmd+Shift+K on macOS) inspects operations, merges, and sync status.
 `
 }

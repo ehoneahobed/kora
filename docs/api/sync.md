@@ -46,7 +46,8 @@ if (result?.outcome === 'blocked') console.warn(result.failure.code)
 ### Status types
 
 `SyncStatus` (developer view): `'connected'`, `'reconnecting'`, `'syncing'`, `'synced'`,
-`'offline'`, `'clock-error'`, `'error'`, `'schema-mismatch'`, `'auth-required'` (`SYNC_STATUSES`).
+`'offline'`, `'clock-error'`, `'error'`, `'schema-mismatch'`, `'auth-required'`,
+`'encryption-locked'` (`SYNC_STATUSES`).
 `SyncState` (engine state): `'disconnected'`, `'connecting'`, `'handshaking'`, `'syncing'`,
 `'streaming'`, `'error'` (`SYNC_STATES`).
 

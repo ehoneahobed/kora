@@ -164,6 +164,7 @@ function SyncIndicator() {
 | `'synced'` | All local operations acknowledged by the server |
 | `'offline'` | No connection to the sync server |
 | `'auth-required'` | Sync waits for a sign-in or a fresh credential |
+| `'encryption-locked'` | Sync waits for `app.encryption.unlock()` (end-to-end encryption) |
 | `'clock-error'` | Device clock is too far ahead of the server to sync safely |
 | `'error'` | Connection failed (will retry automatically) |
 | `'schema-mismatch'` | Client and server schema versions are incompatible |

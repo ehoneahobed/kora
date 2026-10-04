@@ -74,7 +74,7 @@ function emitLlmsArtifacts(srcDir: string, outDir: string): void {
 		'',
 		'> Kora.js is an offline-first JavaScript application framework. Apps store data locally in SQLite (WASM + OPFS in the browser, native SQLite in Node), get reactive queries and automatic conflict resolution, and sync across devices through a self-hosted server. Offline is the default state: every code path works without a network. Scaffold with `npx create-kora-app my-app`.',
 		'',
-		'Key facts: TypeScript-first with full type inference from schema to queries. Packages are published on npm under the @korajs scope plus the `korajs` meta-package. Conflict resolution is a three-tier merge engine (LWW/CRDT auto-merge, declarative constraints, custom resolvers). Sync uses hybrid logical clocks, version vectors, and a protobuf wire format, and resumes after disconnects. MIT licensed.',
+		'Key facts: TypeScript-first with full type inference from schema to queries. Packages are published on npm under the @korajs scope plus the `korajs` meta-package. Every replica merges a record with the same deterministic per-field CRDT fold (last-write-wins registers, array multisets, per-key objects, counters, Yjs rich text, custom resolvers); cross-record constraints are enforced by the sync server. Sync (protocol v2, JSON on the wire) uses hybrid logical clocks, version vectors for uploads and a gap-free delivery watermark for downloads, and resumes after disconnects. Sync scopes are granted by the server. MIT licensed.',
 		'',
 		'The links below point directly at raw markdown files. The same pages rendered as HTML live at the same paths without the .md extension.',
 		'',

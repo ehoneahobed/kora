@@ -12,7 +12,7 @@ This is a **Kora.js** application: an offline-first app where all data lives in 
 2. **Never fetch application data over HTTP.** Do not add REST or GraphQL calls for app data, and do not talk to the sync server directly. Read and write through Kora collections only; sync happens automatically in the background.
 3. **Await readiness before direct collection access.** Outside the UI bindings, `await app.ready` before calling `app.<collection>` methods. The bindings handle this for you inside components.
 4. **Offline must keep working.** Any feature you add must function with the network off. Never gate a write or a read on connectivity. If you find yourself checking `navigator.onLine` before a data operation, you are doing it wrong.
-5. **Surface mutation errors.** Fire-and-forget mutate calls swallow errors into the mutation state. Always render the mutation's `error` in the UI or handle the promise from the async variant. Silent failure is the worst failure.
+5. **Surface mutation errors.** Fire-and-forget mutate calls put errors into the mutation state. Always render the mutation's `error` in the UI or handle the promise from the async variant. Silent failure is the worst failure.
 6. **Do not touch `src/kora-worker.ts`.** It wires the SQLite WASM binary URL for both dev and production builds. Changing it breaks production builds in ways that only show up after deploy.
 7. **Do not add a state management library for server or app data.** Kora's reactive queries are the store. Local UI state (form inputs, toggles) can use the framework's normal state tools.
 
@@ -52,12 +52,12 @@ export default defineSchema({
 })
 ```
 
-If you bump collections in a way that changes shapes, increment `version` and run `npx kora migrate`.
+If you change a collection's shape, increment `version` and add a `migrations` entry for it (`migrate().addField(...)`): each device migrates its local database on its next open. `npx kora migrate` generates the matching migration for server databases and a transform stub for clients still on the older version.
 
 ## Project conventions
 
 - Feature code lives in `src/modules/<feature>/` with the pattern: `<feature>.schema.ts` (collection definition, imported into `src/schema.ts`), `<feature>.queries.ts` (query builders), `<feature>.mutations.ts` (mutation functions taking a collection accessor).
-- Conflict handling is declarative. Concurrent edits merge automatically (last-write-wins per field, add-wins for arrays). If a field needs domain-specific merging (counters, quantities), add a `resolve` function in the schema rather than writing sync logic.
+- Conflict handling is declarative. Concurrent edits merge automatically (last-write-wins per field, arrays as multisets that keep every device's additions and removals, objects per top-level key). If a field needs domain-specific merging (counters, quantities), add a `resolve` function in the schema rather than writing sync logic.
 - `kora.config.ts` controls the dev environment (ports, sync server, schema watcher).
 
 ## Commands
@@ -79,11 +79,11 @@ Import the hooks from `src/kora.ts`, where `createKoraHooks<typeof app>()` binds
 import { useCollection, useMutation, useQuery, useSyncStatus } from './kora'
 
 const todos = useCollection('todos')
-const rows = useQuery(orderedTodos(todos))            // reactive, no loading state for local data
+const rows = useQuery(orderedTodos(todos))            // reactive; [] on the very first render
 const addTodo = useMutation((data) => todos.insert(data))
 addTodo.mutate({ title: 'x' })                        // fire-and-forget; errors land in addTodo.error
 await addTodo.mutateAsync({ title: 'x' })             // throws on failure; use when you need the error
 const status = useSyncStatus()                        // status.status, status.pendingOperations
 ```
 
-Rules: always render `mutation.error` somewhere. The app must work under React StrictMode (the framework's hooks are StrictMode-safe; keep `<StrictMode>` in `src/main.tsx`). `useQuery` returns data synchronously from the local store, so do not add loading spinners for local reads.
+Rules: always render `mutation.error` somewhere. The app must work under React StrictMode (the framework's hooks are StrictMode-safe; keep `<StrictMode>` in `src/main.tsx`). `useQuery` reads the local store: no network, no spinner. Its very first render returns `[]` before the local query has run; use `useQueryState` when you must tell "loading" from "no rows".
