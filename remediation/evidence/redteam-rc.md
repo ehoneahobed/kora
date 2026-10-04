@@ -189,4 +189,14 @@ Nothing at P0 or P1 was found.
 
 ### Gates (this round)
 
-GATES_PLACEHOLDER
+Run at `9c0a2e1` plus the new repros, Postgres 16 on port 54440, real Chromium, the real
+beta.12 build (`git archive v1.0.0-beta.12`, built in a private temp dir).
+
+| Check | Result |
+|---|---|
+| `check.mjs --all` (Postgres, Chromium, `LMS_OPS=20000`) | 216/218 fixed, 0 errors, 0 warnings (run before RT-108/RT-109 were mapped; RT-107 0/2 as owned). No regression, no guard failure, no unmapped failure; browser suites LMS-5-6-7 (51 checks) and NEW-DX-3 (12 checks) pass; tsc probes DX-1, DX-2, RT-100 clean. |
+| `check.mjs --only packages/server` (Postgres) and `--only packages/cli` | RT-108 0/1 and RT-109 0/1 as owned; every other server and CLI repro still passes. |
+| `pnpm chaos:nightly` | pass (chaos 1/1, invariants 11/11) |
+| `pnpm test:release-gate` | pass (production path, sync reconnect, real-path chaos, benchmark gates) |
+| `compat-beta12.mjs` (seeds 1-4, memory/SQLite/Postgres) | 25/26. `chaos/b12-server/seed-3` failed `WebSocket connection timed out` (the harness's un-caught `connect()`, current clients through a beta.12 server), failed once more on rerun and passed on the second rerun: the nondeterministic row the RC round already reported. Every upgrade, shape and encryption row passed. |
+| Scaffold from packed tarballs (pnpm 12.8.1, Chromium) | install, `tsc && vite build` pass; offline reload with data and offline writes pass. |
