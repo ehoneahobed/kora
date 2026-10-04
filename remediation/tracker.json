@@ -3417,14 +3417,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-108.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). core/src/schema/constraint-relaxation.ts:166-170 (isPostgresEnumCheckDefinition only matches `= ANY (ARRAY[...])`), used by planPostgresConstraintRelaxation (core/src/schema/constraint-relaxation.ts:263-277) from postgres-server-store.ts:514-530 and the CLI's expandRelaxValueDomainForPostgres. Verified on PG16: CHECK (\"p\" IN ('only')) -> pg_get_constraintdef `CHECK ((p = 'only'::text))`. Required fix: also recognise the single-column equality form `CHECK ((col = 'literal'::text))` (and `(col)::text = ...`), ideally by comparing against the schema's own enum column names rather than by shape; add the case to value-domain-evolution.test.ts and the CLI directive tests. Repro packages/server/tests/repro/RT-108.test.ts (needs KORA_PG_TEST_URL)."
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). core/src/schema/constraint-relaxation.ts:166-170 (isPostgresEnumCheckDefinition only matches `= ANY (ARRAY[...])`), used by planPostgresConstraintRelaxation (core/src/schema/constraint-relaxation.ts:263-277) from postgres-server-store.ts:514-530 and the CLI's expandRelaxValueDomainForPostgres. Verified on PG16: CHECK (\"p\" IN ('only')) -> pg_get_constraintdef `CHECK ((p = 'only'::text))`. Required fix: also recognise the single-column equality form `CHECK ((col = 'literal'::text))` (and `(col)::text = ...`), ideally by comparing against the schema's own enum column names rather than by shape; add the case to value-domain-evolution.test.ts and the CLI directive tests. Repro packages/server/tests/repro/RT-108.test.ts (needs KORA_PG_TEST_URL). FIX (beta.13 final verification): core parseEnumCheckDefinition parses a CHECK structurally as one column against string literals in every form Postgres normalizes IN (...) to (= ANY (ARRAY[...]), the single-value `col = 'x'`, casts such as (col)::text and ::character varying[], OR-ed equalities, OR col IS NULL, NOT VALID); planPostgresConstraintRelaxation drops such a check when its column is an enum field (server: the current schema's enum fields; `kora migrate`: the directive's new `enums`, the enum fields of both schema versions; a release-candidate directive without `enums` counts every field), and keeps the beta.12 multi-value = ANY (ARRAY) rule for other columns. Hand-written checks of any other shape stay. Residual: on the server (current schema only), a one-value enum turned into a plain string in the same upgrade keeps its check; `kora migrate` covers that case. Tests: core constraint-relaxation.test.ts (parser forms), server value-domain-evolution.test.ts (PG16, every column type), cli value-domain-directive.test.ts (directive enums, PG --apply with and without enums). Repro packages/server/tests/repro/RT-108.test.ts passes on PG16."
   },
   {
    "id": "RT-109",
