@@ -1049,11 +1049,15 @@ export class SqliteServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
-	async listEncryptionKeyRecords(): Promise<EncryptionKeyRecordRow[]> {
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
 		this.assertOpen()
-		return this.db.all<EncryptionKeyRecordRow>(
-			sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
-		)
+		return owner === undefined
+			? this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+				)
+			: this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+				)
 	}
 
 	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {

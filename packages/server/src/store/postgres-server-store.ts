@@ -1582,11 +1582,13 @@ export class PostgresServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
-	async listEncryptionKeyRecords(): Promise<EncryptionKeyRecordRow[]> {
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
 		this.assertOpen()
 		await this.ready
 		const rows = (await this.db.execute(
-			sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+			owner === undefined
+				? sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`
+				: sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
 		)) as unknown as Array<{
 			owner: string
 			keyring: string

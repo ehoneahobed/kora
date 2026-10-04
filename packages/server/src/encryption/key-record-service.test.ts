@@ -170,6 +170,25 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 		expect((await service.handle(alice, fetch)).response.knownKeyIds).toBeUndefined()
 	})
 
+	test('history of the owner other keyrings is not reported as a lost record', async () => {
+		const store = await makeStore()
+		const service = new EncryptionKeyService(store)
+		const alice = userKeyOwner('alice')
+		expect(await store.claimNode?.('alice-phone', 'alice')).toBe(true)
+		const otherRecord = { ...record(1), keyring: 'other' }
+		const other = { ...put(otherRecord, 0), keyring: 'other' }
+		expect((await service.handle(alice, other)).response.status).toBe('ok')
+		const otherKey = otherRecord.keys[0]?.keyId as string
+		await store.applyRemoteOperation(sealedOp('alice-phone', otherKey))
+		// Only the other keyring's history: the first device of "default" may create it.
+		expect((await service.handle(alice, fetch)).response.knownKeyIds).toEqual([])
+		// History under a key no record names: "default" was lost.
+		await store.applyRemoteOperation(sealedOp('alice-phone', `k2-${'a'.repeat(32)}`))
+		expect((await service.handle(alice, fetch)).response.knownKeyIds).toEqual([
+			`k2-${'a'.repeat(32)}`,
+		])
+	})
+
 	test('refuses anonymous principals, bad keyrings and malformed records', async () => {
 		const service = new EncryptionKeyService(await makeStore())
 		expect((await service.handle(null, fetch)).response.status).toBe('forbidden')

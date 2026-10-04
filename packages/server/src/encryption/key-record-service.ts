@@ -127,7 +127,7 @@ export class EncryptionKeyService {
 		if (message.type === 'encryption-key-request') {
 			const outcome = reply('ok', current)
 			if (current === null) {
-				outcome.response.knownKeyIds = await this.knownKeyIds(owner)
+				outcome.response.knownKeyIds = await this.knownKeyIds(owner, message.keyring)
 			}
 			return outcome
 		}
@@ -170,10 +170,28 @@ export class EncryptionKeyService {
 	 * no record exists: then non-empty means the record was lost, and a new device must
 	 * wait for one that holds the ring instead of starting another (RT-104).
 	 */
-	private async knownKeyIds(owner: string): Promise<string[]> {
+	private async knownKeyIds(owner: string, keyring: string): Promise<string[]> {
 		if (typeof this.store.getEncryptedKeyIds !== 'function') return []
 		try {
-			return await this.store.getEncryptedKeyIds(nodeOwnerOf(owner), KNOWN_KEY_IDS_LIMIT)
+			// Operations name their key, not their keyring. Key ids held by the owner's OTHER
+			// keyrings are not this keyring's history: without excluding them, the first
+			// device of a second keyring would wait for a record that never existed.
+			const sampled = await this.store.getEncryptedKeyIds(
+				nodeOwnerOf(owner),
+				KNOWN_KEY_IDS_LIMIT * 4,
+			)
+			if (sampled.length === 0) return []
+			const others = new Set<string>()
+			for (const row of (await this.store.listEncryptionKeyRecords?.(owner)) ?? []) {
+				if (row.owner !== owner || row.keyring === keyring) continue
+				try {
+					const record = JSON.parse(row.record) as WrappedKeyRecord
+					for (const key of record.keys ?? []) others.add(key.keyId)
+				} catch {
+					// An unreadable record names no key.
+				}
+			}
+			return sampled.filter((keyId) => !others.has(keyId)).slice(0, KNOWN_KEY_IDS_LIMIT)
 		} catch {
 			// Advisory only: a device that creates a ring anyway is merged later.
 			return []

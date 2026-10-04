@@ -801,9 +801,11 @@ export class MemoryServerStore implements ServerStore {
 		return true
 	}
 
-	async listEncryptionKeyRecords(): Promise<EncryptionKeyRecordRow[]> {
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
 		this.assertOpen()
-		return [...this.encryptionKeyRecords.values()].map((row) => ({ ...row }))
+		return [...this.encryptionKeyRecords.values()]
+			.filter((row) => owner === undefined || row.owner === owner)
+			.map((row) => ({ ...row }))
 	}
 
 	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {

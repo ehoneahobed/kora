@@ -219,7 +219,7 @@ A recovery key also carries a **ring anchor**: a fingerprint of the ring's first
 
 ## Lost Key Records and Forked Keyrings
 
-A server that loses a key record (a database restored without its key table, an operator error) still stores the operations encrypted under it. With no record, the key service reports the key ids of the owner's stored encrypted operations, and:
+A server that loses a key record (a database restored without its key table, an operator error) still stores the operations encrypted under it. With no record, the key service reports the key ids of the owner's stored encrypted operations (minus those held by the owner's other keyrings, so the first device of a second keyring is not mistaken for a loss), and:
 
 - **A device that holds the ring** uploads its record again, unchanged (same revision and MAC), so every device's pin accepts it.
 - **A new device** (fresh install, passphrase typed) does not start a new ring while that history exists: it stays `locked` with `KEY_RECORD_MISSING` and keeps the passphrase, until a device holding the ring reconnects and re-uploads it. It then opens the ring as usual.

@@ -540,10 +540,12 @@ export interface ServerStore extends SyncStore {
 		expectedRevision: number,
 	): Promise<boolean>
 	/**
-	 * Every stored key record, for `exportBackup` (RT-104: a server restored from its
-	 * backup must still hold the records its encrypted history needs). Optional.
+	 * Stored key records: every one (for `exportBackup`; RT-104: a server restored from
+	 * its backup must still hold the records its encrypted history needs), or one owner's
+	 * (the key service tells another keyring's history from a lost record with it).
+	 * Optional.
 	 */
-	listEncryptionKeyRecords?(): Promise<EncryptionKeyRecordRow[]>
+	listEncryptionKeyRecords?(owner?: string): Promise<EncryptionKeyRecordRow[]>
 	/**
 	 * Key ids named by stored encrypted operations (their envelope's `keyId`), a sample
 	 * of at most `limit` distinct ids (RT-104). `nodeOwner` restricts it to operations of
