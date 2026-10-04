@@ -210,7 +210,7 @@ await app.sequences.next('receipt', { scope: 'store-1', format: 'R-{date}-{node4
 Local writes enforce state machines (see [State Machines](/guide/state-machines)). The helpers are
 exported for custom write paths:
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/store @korajs/core -->
 ```typescript
 function validateStateTransition(
   collectionName: string,
@@ -270,7 +270,7 @@ memory silently (`store: { allowNonDurable: true }` accepts that explicitly).
 
 A custom adapter implements `StorageAdapter`:
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/store @korajs/core -->
 ```typescript
 interface StorageAdapter {
   open(schema: SchemaDefinition): Promise<void>

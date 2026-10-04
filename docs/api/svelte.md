@@ -69,7 +69,7 @@ Root layout component that waits for `app.ready`, sets Kora context, and renders
 
 Returns a Svelte `Readable` store of query results. Subscribe with `$store` or `store.subscribe()`.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/svelte @korajs/store svelte/store -->
 ```typescript
 function createQueryStore<T = CollectionRecord>(
   query: QueryBuilder<T> | Readable<QueryBuilder<T> | null | undefined>,

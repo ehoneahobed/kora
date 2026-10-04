@@ -66,7 +66,16 @@ my-app/
 
 `src/main.tsx` creates the app once and hands it to React:
 
-<!-- docs-check: skip excerpt of the scaffolded src/main.tsx (imports App and the worker URL) -->
+<!-- docs-check-prelude
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { KoraProvider } from '@korajs/react'
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+declare const koraWorkerUrl: string
+declare function App(): JSX.Element
+-->
+
 ```tsx
 const app = createApp({
   schema,
@@ -82,6 +91,8 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 ```
+
+<!-- docs-check-prelude -->
 
 SQLite runs in a Web Worker, persisted with OPFS, so storage never blocks the UI. `workerUrl` is
 the worker that `src/kora-worker.ts` builds. When OPFS is not available Kora falls back to durable
@@ -302,6 +313,8 @@ See [Deployment](/guide/deployment).
 
 ## What's next
 
+- [Upgrading to beta.13](/guide/upgrading-to-beta13): moving an existing 1.0.0-beta.12 app and
+  server to this release
 - [Schema Design](/guide/schema-design): field types, the value domain, relations, migrations
 - [Conflict Resolution](/guide/conflict-resolution): exactly how concurrent edits merge
 - [Offline Patterns](/guide/offline-patterns): sync status, pending writes, the app shell

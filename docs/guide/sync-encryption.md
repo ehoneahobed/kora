@@ -28,13 +28,19 @@ The server needs metadata to route operations, deduplicate by content-addressed 
 
 A server can only evaluate sync scopes on values it can read. List the scope keys per collection; they travel in cleartext beside the envelope (and stay inside the ciphertext as well, which is the authoritative copy):
 
-<!-- docs-check: skip fragment of the sync.encryption config -->
+<!-- docs-check-prelude
+import type { SyncEncryptionConfig } from '@korajs/sync'
+declare const passphrase: string
+declare function getEncryptionPassphrase(): Promise<string>
+-->
+
 ```typescript
-encryption: {
+const encryption: SyncEncryptionConfig = {
   enabled: true,
   key: passphrase,
   cleartextFields: { todos: ['ownerId'] },
 }
+// createApp({ schema, sync: { url, authClient, encryption } })
 ```
 
 Values listed here are visible to the server. List only scope keys and the foreign keys below.
@@ -43,17 +49,34 @@ Values listed here are visible to the server. List only scope keys and the forei
 
 The sync server enforces a relation's `onDelete` policy (`cascade`, `set-null`, `restrict`) for every device: it is the only replica that sees every child, including children created concurrently on devices that the deleting device has never heard of. It can do that only when it can read the foreign key. So, with encryption enabled, the foreign-key field of every relation whose `onDelete` is `cascade`, `set-null` or `restrict` **must** be listed in `cleartextFields`. `createApp` refuses a configuration that seals one, at startup, with a `SealedRelationFieldError` (`code: 'SEALED_RELATION_FIELD'`) naming the relation, the field and the fix:
 
-<!-- docs-check: skip fragment of the sync.encryption config -->
+<!-- docs-check: standalone -->
 ```typescript
-relations: {
-  todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'cascade' },
-},
-// ...
-encryption: {
-  enabled: true,
-  key: passphrase,
-  cleartextFields: { todos: ['ownerId', 'projectId'] }, // projectId: the server cascades
-}
+import { createApp, defineSchema, t } from 'korajs'
+
+declare const passphrase: string
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    projects: { fields: { name: t.string(), ownerId: t.string() } },
+    todos: { fields: { title: t.string(), ownerId: t.string(), projectId: t.string() } },
+  },
+  relations: {
+    todoProject: { from: 'todos', to: 'projects', type: 'many-to-one', field: 'projectId', onDelete: 'cascade' },
+  },
+})
+
+const app = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora',
+    encryption: {
+      enabled: true,
+      key: passphrase,
+      cleartextFields: { todos: ['ownerId', 'projectId'], projects: ['ownerId'] }, // projectId: the server cascades
+    },
+  },
+})
 ```
 
 The server then learns which project each todo belongs to, and nothing else about the todo. If that is not acceptable, use `onDelete: 'no-action'` for the relation (its foreign key may stay sealed) and delete the children in your own code.
@@ -73,6 +96,8 @@ declare const passphrase: string
 declare const newPassphrase: string
 declare const currentPassphrase: string
 declare function showUnlockPrompt(code: string | undefined): void
+import type { SyncEncryptionConfig } from '@korajs/sync'
+declare function getEncryptionPassphrase(): Promise<string>
 -->
 
 ```typescript
@@ -93,9 +118,9 @@ Until the keyring is unlocked, sync is paused (`sync:suspended` with reason `enc
 
 You can also pass the passphrase (or an async provider of it) in the config. The keyring is then opened automatically at the first sync handshake:
 
-<!-- docs-check: skip fragment of the sync.encryption config -->
+<!-- docs-check: continue -->
 ```typescript
-encryption: {
+const encryptionWithProvider: SyncEncryptionConfig = {
   enabled: true,
   key: async () => await getEncryptionPassphrase(), // called only when the keyring needs it
 }
@@ -282,9 +307,8 @@ With encryption enabled, an inbound operation without an envelope is **refused**
 
 To migrate an existing plaintext app to encryption, open a migration window:
 
-<!-- docs-check: skip fragment of the sync.encryption config -->
 ```typescript
-encryption: { enabled: true, key: passphrase, allowPlaintextMigration: true }
+const migrationWindow: SyncEncryptionConfig = { enabled: true, key: passphrase, allowPlaintextMigration: true }
 ```
 
 During the window, plaintext operations are applied as before. Close it once every device has upgraded and re-synced. A server can enforce the same rule for uploads with `createKoraServer({ encryption: { required: true } })` (`PLAINTEXT_REJECTED`, with the same `allowPlaintextMigration` escape hatch).

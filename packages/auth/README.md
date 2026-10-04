@@ -105,6 +105,7 @@ const app = createApp({
   sync: {
     url: 'ws://localhost:3001/kora-sync',
     authClient: createKoraAuthSync({ authClient, schema }),
+    autoConnect: true,
   },
 })
 ```

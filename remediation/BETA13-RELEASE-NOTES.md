@@ -110,6 +110,8 @@ Every replica now computes a record with one deterministic per-field CRDT fold (
 
 ## Breaking changes and how to migrate
 
+Step-by-step guide with the code change for each item: `docs/guide/upgrading-to-beta13.md` (published as "Upgrading to beta.13").
+
 **Upgrade order: servers first, then clients.** A beta.13 server accepts beta.12 clients for this release (with the exceptions in the table). A beta.13 client against a beta.12 server syncs plaintext only, without verification or encryption: do not run that way.
 
 | Change | What to do |

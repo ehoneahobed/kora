@@ -126,13 +126,15 @@ Ctrl+Shift+K, Cmd+Shift+K on macOS). In Node and server renders only the instrum
 
 ## Instrumenter
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/devtools @korajs/core -->
 ```typescript
-new Instrumenter(emitter: KoraEventEmitter, config?: {
-  bufferSize?: number      // default 10000
-  bridgeEnabled?: boolean  // default true: post events through a MessageBridge
-  channelName?: string     // default 'kora-devtools'
-})
+class Instrumenter {
+  constructor(emitter: KoraEventEmitter, config?: {
+    bufferSize?: number      // default 10000
+    bridgeEnabled?: boolean  // default true: post events through a MessageBridge
+    channelName?: string     // default 'kora-devtools'
+  })
+}
 ```
 
 Methods: `getBuffer()`, `getBridge()`, `pause()`, `resume()`, `isPaused()`, `destroy()`. Events

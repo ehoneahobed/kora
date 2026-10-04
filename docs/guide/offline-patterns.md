@@ -28,7 +28,14 @@ Kora keeps your **data** on the device, but the browser also needs the app's **i
 created by `create-kora-app` ships a service worker for that, generated at build time by
 the `koraServiceWorker()` Vite plugin:
 
-<!-- docs-check: skip excerpt of the scaffolded vite.config.ts (its other plugins are defined there) -->
+<!-- docs-check-prelude
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+// Defined in the scaffolded vite.config.ts.
+declare function crossOriginIsolation(): unknown
+declare function sqliteWasmHotfix(): unknown
+-->
+
 ```typescript
 // vite.config.ts
 import { koraServiceWorker } from '@korajs/cli/vite'
@@ -164,6 +171,7 @@ function SyncIndicator() {
 | `'synced'` | All local operations acknowledged by the server |
 | `'offline'` | No connection to the sync server |
 | `'auth-required'` | Sync waits for a sign-in or a fresh credential |
+| `'encryption-locked'` | Sync waits for `app.encryption.unlock()` (end-to-end encryption) |
 | `'clock-error'` | Device clock is too far ahead of the server to sync safely |
 | `'error'` | Connection failed (will retry automatically) |
 | `'schema-mismatch'` | Client and server schema versions are incompatible |

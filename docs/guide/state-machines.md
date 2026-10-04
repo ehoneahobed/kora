@@ -111,17 +111,27 @@ The error includes the collection name, record ID, field name, current state, at
 
 Silently ignores the invalid transition. The state field keeps its current value, and the rest of the update (other fields) is applied normally.
 
-<!-- docs-check: skip fragment of a collection definition -->
 ```typescript
-stateMachine: {
-  field: 'status',
-  transitions: {
-    draft: ['submitted', 'cancelled'],
-    submitted: ['approved', 'cancelled'],
-    // ...
+const lenient = defineSchema({
+  version: 1,
+  collections: {
+    orders: {
+      fields: {
+        status: t.enum(['draft', 'submitted', 'approved', 'cancelled']).default('draft'),
+      },
+      stateMachine: {
+        field: 'status',
+        transitions: {
+          draft: ['submitted', 'cancelled'],
+          submitted: ['approved', 'cancelled'],
+          approved: [],
+          cancelled: [],
+        },
+        onInvalidTransition: 'last-valid-state',
+      },
+    },
   },
-  onInvalidTransition: 'last-valid-state',
-}
+})
 ```
 
 Use this when you want the system to be lenient: for example, when users might attempt impossible transitions due to stale UI state, and you prefer to silently preserve the current state rather than show an error.
@@ -199,8 +209,10 @@ Every replica agrees, but the history `shipped -> cancelled` is not in the map. 
 
 A complete order lifecycle with terminal states:
 
-<!-- docs-check: skip schema shown on its own; the usage below runs against an equivalent app -->
+<!-- docs-check: standalone -->
 ```typescript
+import { defineSchema, t } from 'korajs'
+
 export default defineSchema({
   version: 1,
   collections: {

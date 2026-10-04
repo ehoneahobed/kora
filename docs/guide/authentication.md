@@ -321,6 +321,7 @@ const manualApp = createApp({
         : await authClient.getAccessToken()
       return { token: token ?? '' }
     },
+    autoConnect: true,
   },
 })
 ```

@@ -46,7 +46,8 @@ if (result?.outcome === 'blocked') console.warn(result.failure.code)
 ### Status types
 
 `SyncStatus` (developer view): `'connected'`, `'reconnecting'`, `'syncing'`, `'synced'`,
-`'offline'`, `'clock-error'`, `'error'`, `'schema-mismatch'`, `'auth-required'` (`SYNC_STATUSES`).
+`'offline'`, `'clock-error'`, `'error'`, `'schema-mismatch'`, `'auth-required'`,
+`'encryption-locked'` (`SYNC_STATUSES`).
 `SyncState` (engine state): `'disconnected'`, `'connecting'`, `'handshaking'`, `'syncing'`,
 `'streaming'`, `'error'` (`SYNC_STATES`).
 
@@ -74,21 +75,23 @@ if (result?.outcome === 'blocked') console.warn(result.failure.code)
 
 The engine behind `app.sync`, for runtimes that do not use `createApp` (custom stores, tests).
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/sync @korajs/core -->
 ```typescript
-new SyncEngine({
-  transport: SyncTransport,
-  store: SyncStore,                 // the local store's sync surface
-  config: SyncConfig,               // the same object as createApp's `sync`
-  serializer?: MessageSerializer,   // default: JSON
-  emitter?: KoraEventEmitter,
-  queueStorage?: QueueStorage,      // persists the outbound queue
-  rejectedStorage?: RejectedOperationStorage,
-  syncState?: SyncStatePersistence, // persists the delivery watermark
-  keyring?: EncryptionKeyring,      // end-to-end encryption
-  encryptor?: SyncEncryptor,        // low-level alternative to keyring
-  metricsConfig?: MetricsCollectorConfig,
-})
+class SyncEngine {
+  constructor(options: {
+    transport: SyncTransport
+    store: SyncStore                 // the local store's sync surface
+    config: SyncConfig               // the same object as createApp's `sync`
+    serializer?: MessageSerializer   // default: JSON
+    emitter?: KoraEventEmitter
+    queueStorage?: QueueStorage      // persists the outbound queue
+    rejectedStorage?: RejectedOperationStorage
+    syncState?: SyncStatePersistence // persists the delivery watermark
+    keyring?: EncryptionKeyring      // end-to-end encryption
+    encryptor?: SyncEncryptor        // low-level alternative to keyring
+    metricsConfig?: { rttWindowSize?: number; bandwidthWindowSize?: number; diagnosticsInterval?: number }
+  })
+}
 ```
 
 Main methods: `start()`, `stop()`, `destroy()`, `reconnect()`, `retryNow()`, `pushOperation(op)`,
@@ -107,7 +110,7 @@ watermark and is retried or quarantined, never skipped.
 
 ## Transports
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/sync @korajs/core -->
 ```typescript
 interface SyncTransport {
   connect(url: string, options?: { authToken?: string; headers?: Record<string, string> }): Promise<void>
@@ -166,7 +169,7 @@ protobuf envelope, but no Kora server or client negotiates protobuf today (the s
 
 ## Scope filtering
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/sync @korajs/core -->
 ```typescript
 type SyncScopeMap = Record<string, Record<string, unknown>>   // collection -> field filters
 

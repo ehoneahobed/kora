@@ -121,9 +121,10 @@ syncs their own. The validator reads the raw submission, and on success authors 
 NEW server-side operation into the owner-visible `formResponses` collection, then
 ignores the raw one:
 
-<!-- docs-check: skip a validateOperation option shown out of its server config -->
 ```typescript
-validateOperation: async (op, ctx) => {
+import type { OperationValidator } from '@korajs/server'
+
+const validateOperation: OperationValidator = async (op, ctx) => {
   if (op.collection !== 'submissions') return { action: 'accept' }
 
   const data = op.data as { formId: string; answers: unknown }
@@ -143,6 +144,7 @@ validateOperation: async (op, ctx) => {
   // The server has taken responsibility; the raw submission need not materialize.
   return { action: 'ignore' }
 }
+// createProductionServer({ store, syncOptions: { validateOperation } })
 ```
 
 The owner subscribes to `formResponses` and sees validated responses only. A

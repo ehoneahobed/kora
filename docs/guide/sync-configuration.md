@@ -45,7 +45,7 @@ configured.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `url` | (required) | Sync server URL: `wss://` (or `ws://` locally) for WebSocket, `https://` for HTTP. |
-| `transport` | `'websocket'` | `'http'` for HTTP long-polling where WebSockets are blocked. |
+| `transport` | `'websocket'` | `'http'` for HTTP long-polling where WebSockets are blocked. `createProductionServer` serves WebSocket sync only: map an HTTP endpoint to `KoraSyncServer.handleHttpRequest` (with the `authorization` and `x-kora-session` headers, as in [Upgrading to beta.13](/guide/upgrading-to-beta13#an-http-long-poll-endpoint)). |
 | `autoConnect` | `false` | Connect after `app.ready`. |
 | `auth` | | `async (options?) => ({ token })`, called before every connection attempt; with `{ forceRefresh: true }` after the server ended a session as expired or revoked. |
 | `authClient` | | A binding from `createKoraAuthSync({ authClient, schema })` (`@korajs/auth`); overrides `auth`. |
@@ -105,6 +105,7 @@ const tokenApp = createApp({
   sync: {
     url: 'wss://sync.example.com/kora-sync',
     auth: async (options) => ({ token: await getAccessToken(options) }),
+    autoConnect: true,
   },
 })
 ```
@@ -220,7 +221,7 @@ See [Sync Protocol](/guide/sync-protocol#delivery-watermark) for the mechanics.
 
 `app.sync.getStatus()`, `app.sync.subscribeStatus(listener)` and `useSyncStatus()` return the same
 `SyncStatusInfo`: `status` (`connected`, `reconnecting`, `syncing`, `synced`, `offline`,
-`clock-error`, `error`, `schema-mismatch`, `auth-required`), `phase`, `pendingOperations`,
+`clock-error`, `error`, `schema-mismatch`, `auth-required`, `encryption-locked`), `phase`, `pendingOperations`,
 `heldOperations` and `heldNodes`, `localDurability`, `serverProtocolVersion` and
 `protocolDeprecated`, `clockSkewMs`, `initialSync` progress, `deliveryWatermark` and
 `serverFrontier`, and `blockedFailure`. See [React Hooks](/guide/react-hooks#usesyncstatus) for

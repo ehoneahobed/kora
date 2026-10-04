@@ -250,6 +250,8 @@ function SyncIndicator() {
       return <span>Reconnecting</span>
     case 'auth-required':
       return <span>Sign in to sync</span>
+    case 'encryption-locked':
+      return <span>Unlock to sync</span>
     default:
       return <span>{status}</span>
   }
@@ -258,7 +260,7 @@ function SyncIndicator() {
 
 | Field | Description |
 |-------|-------------|
-| `status` | `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch` or `auth-required` |
+| `status` | `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch`, `auth-required` or `encryption-locked` |
 | `phase`, `reason` | Finer state (`uploading`, `receiving`, `blocked`, ...) and why |
 | `reconnecting` | True while the engine is re-establishing a session |
 | `pendingOperations` | Local writes the server has not acknowledged yet |

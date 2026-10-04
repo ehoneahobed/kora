@@ -41,7 +41,7 @@ declare const id: string
 Validates a schema and returns it with its exact builder types, so `createApp({ schema })`
 produces typed collections without code generation.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinition<T>
 ```
@@ -168,8 +168,8 @@ merge behaviour.
 | `'lww'` | any | last write wins (`lww`) |
 | `'counter'` | `t.number()` | base value plus every concurrent delta (`schema-counter`) |
 | `'max'` / `'min'` | `t.number()`, `t.timestamp()` | extremum of every write (`schema-max`, `schema-min`) |
-| `'union'` | `t.array()` | element set, the array default (`lww-element-set`) |
-| `'append-only'` | `t.array()` | element set that ignores removals (`schema-append-only`); on other kinds it is last write wins |
+| `'union'` | `t.array()` | element multiset merged per occurrence (duplicates kept), the array default (`lww-element-set`) |
+| `'append-only'` | `t.array()` | element multiset that ignores removals (`schema-append-only`); on other kinds it is last write wins |
 | `'server-authoritative'` | any | writes by the sync server beat every device write regardless of time (`schema-server-authoritative`) |
 
 ```typescript
@@ -258,14 +258,16 @@ should combine this way, including plain `update(id, { quantity: 7 })` writes.
 The clock that orders every operation (Kulkarni et al.). You rarely need it directly: the store
 creates operations with its own clock.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-new HybridLogicalClock(
-  nodeId: string,
-  timeSource?: TimeSource,                  // { now(): number }, default Date
-  onDriftWarning?: (driftMs: number) => void,
-  onDriftError?: (driftMs: number) => void,
-)
+class HybridLogicalClock {
+  constructor(
+    nodeId: string,
+    timeSource?: TimeSource,                  // { now(): number }, default Date
+    onDriftWarning?: (driftMs: number) => void,
+    onDriftError?: (driftMs: number) => void,
+  )
+}
 ```
 
 | Member | Description |
@@ -298,7 +300,7 @@ so (`sync:clock-skew`) and its unsynced writes are re-stamped (`sync:clock-rebas
 
 ## generateUUIDv7()
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function generateUUIDv7(): string
 function isValidUUIDv7(value: string): boolean
@@ -344,7 +346,7 @@ interface Operation {
 - **Canonical values.** `createOperation` canonicalizes `data` once (sorted keys, the value
   domain of the schema), and the id covers exactly what is stored and sent.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function createOperation(
   input: OperationInput,
@@ -543,7 +545,7 @@ result.valid // true
 
 ## quoteIdent()
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function quoteIdent(name: string): string
 ```
@@ -559,7 +561,7 @@ keywords (`order`) are safe in generated DDL on SQLite and Postgres. `quoteIdent
 A `t.blob()` field stores a small content-addressed `BlobRef`; the bytes live in a blob store and
 are transferred out of band, once per content hash.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function hashBlob(bytes: Uint8Array): Promise<string>    // hex SHA-256
 function createBlobRef(bytes: Uint8Array, metadata?: { mimeType?: string; filename?: string }): Promise<BlobRef>
@@ -604,7 +606,7 @@ interface MergeTrace {
 
 Every Kora error extends `KoraError` with a machine-readable `code` and a `context` object.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 class KoraError extends Error {
   constructor(message: string, code: string, context?: Record<string, unknown>)
@@ -639,7 +641,7 @@ try {
 
 ## generateProtoDefinitions()
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function generateProtoDefinitions(schema: SchemaDefinition): {
   proto: string                          // proto3 text

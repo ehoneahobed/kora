@@ -568,15 +568,22 @@ node --import tsx server.ts   # Start the production server
 
 In your app code, point sync to the server:
 
-<!-- docs-check: skip fragment of the app's main module -->
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+-->
+
 ```typescript
 const app = createApp({
   schema,
   sync: {
     url: 'wss://your-domain.com/kora-sync',
+    autoConnect: true, // or `await app.sync?.connect()` after `app.ready`
   },
 })
 ```
+
+<!-- docs-check-prelude -->
 
 ### Storage backends
 

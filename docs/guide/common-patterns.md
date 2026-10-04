@@ -32,6 +32,14 @@ declare function showToast(message: string): void
 declare function FormCard(props: { form: { id: string; title: string }; responseCount: number }): JSX.Element
 declare function TodoItem(props: { todo: { id: string; title: string } }): JSX.Element
 declare function ResponseCard(props: { response: { id: string } }): JSX.Element
+import { createKoraAuth } from '@korajs/auth'
+import type { UserStore } from '@korajs/auth/server'
+import type { ServerStore } from '@korajs/server'
+declare const userStore: UserStore
+declare const store: ServerStore
+declare const syncUrl: string
+const authClient = createKoraAuth({ serverUrl: 'https://api.example.com' })
+declare function verifyToken(token: string): Promise<{ id: string; orgId: string } | null>
 -->
 
 ---
@@ -49,7 +57,6 @@ Kora supports this with `MixedAuthProvider` on the server and anonymous sync on 
 
 Use `MixedAuthProvider` to accept both authenticated and anonymous connections. Anonymous users are restricted to specific collections via scopes:
 
-<!-- docs-check: skip server snippet; userStore and store come from your server setup -->
 ```typescript
 import { KoraSyncServer, MixedAuthProvider } from '@korajs/server'
 import { createKoraAuthServer } from '@korajs/auth/server'
@@ -72,7 +79,6 @@ const syncServer = new KoraSyncServer({ store, auth })
 A signed-out device connects without a token and gets the anonymous grant. With
 `createKoraAuthSync`, opt in with `anonymous: 'allow'` (the default suspends sync until sign-in):
 
-<!-- docs-check: skip client snippet; authClient and syncUrl come from your app -->
 ```typescript
 import { createKoraAuthSync } from '@korajs/auth'
 
@@ -296,7 +302,6 @@ errors never sign anyone out. `sync:auth-failed` means the server refused even a
 (the device or user was revoked, the account deleted); sync is then suspended
 (`status: 'auth-required'`) and the app should ask the user to sign in again:
 
-<!-- docs-check: skip authClient comes from your app -->
 ```typescript
 app.on('sync:auth-failed', ({ reason }) => {
   console.warn('Sync credential refused:', reason)
@@ -310,12 +315,12 @@ app.on('sync:auth-failed', ({ reason }) => {
 
 When you need server-side data access (for API endpoints, webhooks, reports, or OG meta tags), use materialized collections:
 
-<!-- docs-check: skip server snippet using an express app -->
 ```typescript
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 import { defineSchema, t } from '@korajs/core'
 
 // 1. Define your schema
-const schema = defineSchema({
+const formsSchema = defineSchema({
   version: 1,
   collections: {
     forms: {
@@ -326,29 +331,39 @@ const schema = defineSchema({
       },
       indexes: ['slug', 'status'],
     },
+    responses: { fields: { formId: t.string(), data: t.string() }, indexes: ['formId'] },
   },
 })
 
 // 2. Enable materialization on the store
-await store.setSchema(schema)
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+await store.setSchema(formsSchema)
 
 // 3. Query from your API endpoints
-app.get('/api/forms/:slug', async (req, res) => {
-  const [form] = await store.queryCollection('forms', {
-    where: { slug: req.params.slug, status: 'published' },
-    limit: 1,
-  })
-
-  if (!form) return res.status(404).json({ error: 'Not found' })
-  res.json(form)
-})
-
-// Count responses for a form
-app.get('/api/forms/:id/stats', async (req, res) => {
-  const count = await store.countCollection('responses', {
-    formId: req.params.id,
-  })
-  res.json({ responseCount: count })
+const server = createProductionServer({
+  store,
+  httpRoutes: [
+    {
+      path: '/api/forms',
+      async handle(request) {
+        const slug = request.path.slice('/api/forms/'.length)
+        const [form] = await store.queryCollection('forms', {
+          where: { slug, status: 'published' },
+          limit: 1,
+        })
+        return form ? { status: 200, body: form } : { status: 404, body: { error: 'Not found' } }
+      },
+    },
+    {
+      // Count responses for a form
+      path: '/api/stats',
+      async handle(request) {
+        const formId = request.path.slice('/api/stats/'.length)
+        const count = await store.countCollection('responses', { formId })
+        return { status: 200, body: { responseCount: count } }
+      },
+    },
+  ],
 })
 ```
 
@@ -365,8 +380,9 @@ server's validation; see [Production Server](/guide/production-server).
 
 For apps where different users see different data, use sync scopes to restrict what each user syncs:
 
-<!-- docs-check: skip server snippet; verifyToken is yours -->
 ```typescript
+import { TokenAuthProvider } from '@korajs/server'
+
 // Server: each user only syncs their own data
 const auth = new TokenAuthProvider({
   validate: async (token) => {

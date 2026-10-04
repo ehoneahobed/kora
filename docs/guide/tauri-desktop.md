@@ -285,6 +285,7 @@ const app = createApp({
   sync: {
     url: 'wss://acme-corp.example.com/kora-sync',
     authClient: createKoraAuthSync({ authClient: secureAuthClient, schema }),
+    autoConnect: true,
   },
 })
 ```

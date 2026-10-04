@@ -81,7 +81,7 @@ Merge decisions are recorded in the device's audit trail as in an app.
 
 ## Convergence assertions
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/test @korajs/core -->
 ```typescript
 function expectConverged(devices: TestDevice[], schema: SchemaDefinition): Promise<void>
 function expectConvergedEventually(

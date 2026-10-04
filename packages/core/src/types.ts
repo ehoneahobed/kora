@@ -31,7 +31,12 @@ export interface AtomicOp {
  * Operations are IMMUTABLE and CONTENT-ADDRESSED.
  */
 export interface Operation {
-	/** SHA-256 hash of (type + collection + recordId + data + timestamp + nodeId). Content-addressed. */
+	/**
+	 * Content-addressed SHA-256 hash of the operation's canonical body. Which fields it
+	 * covers depends on `hashVersion` (version 2, the default for new operations, adds
+	 * previousData, sequenceNumber, causalDeps and schemaVersion to version 1's fields).
+	 * Verify with `verifyOperationId`.
+	 */
 	id: string
 	/** UUID v7 of the originating device. Time-sortable. */
 	nodeId: string

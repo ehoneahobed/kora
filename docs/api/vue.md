@@ -66,7 +66,7 @@ createApp({
 
 Returns a reactive array of records matching a query. Re-evaluates when the local store or sync updates the result set.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/vue @korajs/store @korajs/sync vue -->
 ```typescript
 function useQuery<T = CollectionRecord>(
   query: MaybeRefOrGetter<QueryBuilder<T> | null | undefined>,
@@ -127,7 +127,7 @@ const { data: todos, error } = useQueryState(() => app.todos.where({ completed: 
 
 Wraps a collection mutation with optimistic update hooks and loading/error state.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/vue @korajs/store @korajs/sync vue -->
 ```typescript
 function useMutation<TData, TArgs extends unknown[], TContext = void>(
   mutationFn: (...args: TArgs) => Promise<TData>,
@@ -177,7 +177,7 @@ const status = useSyncStatus()
 
 Binds a schema `t.richtext()` field to a shared Yjs document for editor integration.
 
-<!-- docs-check: skip signature -->
+<!-- docs-check: signature @korajs/vue @korajs/store @korajs/sync vue -->
 ```typescript
 function useRichText(
   collectionName: string,
