@@ -54,6 +54,8 @@ cd my-app
 npm run dev
 ```
 
+Upgrading an app from 1.0.0-beta.12? Read [Upgrading to beta.13](/guide/upgrading-to-beta13) first: the release is breaking, and servers upgrade before clients.
+
 Your data layer is just a schema. Everything else is inferred:
 
 <!-- docs-check-prelude

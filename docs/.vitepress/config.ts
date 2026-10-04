@@ -206,6 +206,7 @@ export default defineConfig({
 				items: [
 					{ text: 'Getting Started', link: '/getting-started' },
 					{ text: 'Kora for AI Agents', link: '/guide/ai-agents' },
+					{ text: 'Upgrading to beta.13', link: '/guide/upgrading-to-beta13' },
 				],
 			},
 			{

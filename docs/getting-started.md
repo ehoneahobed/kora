@@ -313,6 +313,8 @@ See [Deployment](/guide/deployment).
 
 ## What's next
 
+- [Upgrading to beta.13](/guide/upgrading-to-beta13): moving an existing 1.0.0-beta.12 app and
+  server to this release
 - [Schema Design](/guide/schema-design): field types, the value domain, relations, migrations
 - [Conflict Resolution](/guide/conflict-resolution): exactly how concurrent edits merge
 - [Offline Patterns](/guide/offline-patterns): sync status, pending writes, the app shell
