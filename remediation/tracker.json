@@ -3215,6 +3215,36 @@
    ],
    "pr": null,
    "notes": "Phase 4 beta.12 compatibility, 2026-10-03 (remediation/evidence/compat-beta12.md). Found against the real published 1.0.0-beta.12 (tag v1.0.0-beta.12 = 91c6350) with scripts/remediation/compat-beta12.mjs; the legacy paths had been built and probed against the never-released Phase 1 build 33bca46. No beta.12 component needed; found by the mixed-fleet chaos matrix (compat-beta12.mjs chaos/current-server, seed 6 of 8: the device that wrote the child kept a provisional delete from a stale device's second delete of the project; the server had stamped its late cascade right after the child's insert, the child's later edits won, and it derived nothing for the second delete). Repro packages/test/tests/repro/RT-94.test.ts (the effect is left unconfirmed by withholding the server-derived operations from the streaming device; protocol 2). Location: sync/src/engine/sync-engine.ts recordReceivedBatch. FIXED: a streaming device is caught up after every fully applied final batch and settles provisional effects there (Store.settleAfterCatchUp({ provisionalOnly: true }): row snapshots still settle only at the end of a resync; unit test in store/src/fold/phase3-fold-fixes.test.ts). A server copy is stored with its delete and relayed with it, so confirmed effects are unaffected; one split across a batch boundary shows the child until the next batch. Open question for the cascade owner (not changed here): whether the server should derive a cascade for a delete of an already-deleted parent whose child was revived after the first delete (all replicas now agree the child stays)."
+  },
+  {
+   "id": "RT-95",
+   "title": "The recovery public key in the key record is not authenticated: a malicious sync server swaps in its own (push, fetch, or the conflict reply of rotate's compare-and-set) and every later rotate() wraps the new data key to it, so the server reads all operations sealed under that version",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-95.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:349-365 (rotate wraps to record.recovery.publicKey of whatever record was last adopted), keyring.ts:657-760 (adoptLocked checks structure, KDF floor and kept versions only), key-record.ts:131-159 (recovery block is structural only). Repro packages/sync/tests/repro/RT-95.test.ts: the server's own ECDH key unwraps the rotated key and decrypts a sealed op ('secret after-rotation'). Required fix: authenticate the recovery public key with the passphrase KEK (e.g. a KEK-keyed MAC or an AES-GCM wrap whose AAD binds the recovery public key, written by enableRecovery and checked on every adopt), and never wrap a data key to a recovery key that does not verify; a device must also refuse a record whose recovery key changed without that proof. Same class: any record field a device acts on (kdf params, recovery) must be bound to the passphrase holder."
+  },
+  {
+   "id": "RT-96",
+   "title": "A device accepts an older revision of its key record (the rollback pin checks key versions only, never revision): after a passphrase change the server re-serves the old-passphrase revision, the device drops its KEK, only the old (leaked) passphrase unlocks, and the next rotation wraps the new data key under it; the same rollback strips or restores a recovery key",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-96.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:683-701 (pin compares key versions/ids only; a different salt silently drops the KEK), keyring.ts:247 (adoptPushed), key-record.ts isKeyRecordSuccessor (server rule only). Repro packages/sync/tests/repro/RT-96.test.ts. Required fix: pin the highest accepted revision (persisted in the key cache) and refuse lower ones with KEY_RECORD_ROLLBACK; authenticate the record (kdf, recovery, revision) under the KEK so a substituted revision at the same number is detected too. A new device cannot detect a rollback it never saw (document)."
   }
  ],
  "rejectedProposalPins": {
