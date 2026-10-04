@@ -3395,6 +3395,21 @@
    ],
    "pr": null,
    "notes": "Found while checking `kora migrate` against the fold (RT-105): after the v1 -> v2 migration that added `status: t.string().default('open')`, devices A, B and a fresh device C all read 'open' for a v1 record, the server null. A record whose operations predate the field has no fold state for it; the client RecordFolder.materializeRow writes only the fields the fold holds, so the column keeps the value it was created or added with (the default), while the server stores wrote `values[field] ?? null` for every schema field (sqlite-server-store upsertMaterializedRecord, postgres-server-store upsert and batch re-materialization, memory-server-store writeRecord). Independent of the CLI: the server's own setSchema re-materialization writes the NULL. Repro packages/server/tests/repro/RT-106.test.ts (memory, SQLite restart and fresh v2 server, Postgres with KORA_PG_TEST_URL); end to end in packages/cli/tests/repro/RT-105.test.ts (server rows equal device rows including `status`). FIX (beta.13 RC): server record-fold.ts materializedFieldValue (the fold's value, else the field's schema default, else null) used by every server row write: sqlite-server-store upsertMaterializedRecord, postgres-server-store upsert and batch re-materialization, memory-server-store writeRecord (which now also lists every schema field, null when unset, like the SQL stores). Scope snapshots are unchanged: a field they do not hold falls back to the current row (RT-20), which now holds the default."
+  },
+  {
+   "id": "RT-107",
+   "title": "A leaked (since-changed) passphrase is not contained against the sync server: devices still holding the old master key adopt a server-forged successor record under it and encrypt new operations under the attacker's data key; and recovery accepts an attacker ring that re-wraps the first data key (the recovery anchor), which the old passphrase opens",
+   "severity": "P2",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-107.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final verification round (remediation/evidence/redteam-rc.md, Final verification). Attacker: the server operator who learned the old passphrase (the case the guide's 'After a suspected leak, change the passphrase and then rotate' addresses). (1) sync/src/encryption/keyring.ts:898-970 (adoptLocked -> authenticateHeld with the held old master) accepts a revision sealed under the OLD master that adds a key: every device except the one that changed the passphrase still holds M1, and the server chooses what it forwards. Inherent for a shared-secret ring; required fix: correct docs/guide/sync-encryption.md:224 and the changePassphrase JSDoc (keyring.ts:441-447): after a leak every device must be locked and re-unlocked with the new passphrase (its held master then no longer authenticates M1 records) or a new keyring started; optionally enforce it (a device that sees a record it cannot authenticate with a higher revision of its ring stops adopting records that add keys under its held master until unlocked with the current passphrase). (2) keyring.ts:691-707 and 1226-1241 (holdsAnchor) with keyring-crypto.ts:364 (dataKeyAnchor of the FIRST data key): the anchor is derivable by anyone who held a past passphrase, so recovery adopts an attacker master wrapped to the public recovery key and the recovered device encrypts under the attacker's key. Required fix: anchor recovery to a secret only the recovery-key holder has (the recovery key carries a secret s; the record carries an HMAC_s commitment to the ring id and master key that enableRecovery writes and passphrase change / recovery re-derive), not to a data key. Repro packages/sync/tests/repro/RT-107.test.ts (2 tests). If (1) is accepted as inherent, split it into a docs item and turn its test into an observation."
   }
  ],
  "rejectedProposalPins": {
