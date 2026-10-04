@@ -16,6 +16,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	projectFoldState,
 	refoldRecord,
@@ -1040,9 +1041,15 @@ export class MemoryServerStore implements ServerStore {
 			if (existing) existing._deleted = 1
 			return
 		}
+		const values: Record<string, unknown> = { ...row.values }
+		for (const [field, descriptor] of Object.entries(
+			this.schema?.collections[collection]?.fields ?? {},
+		)) {
+			values[field] = materializedFieldValue(row.values, field, descriptor)
+		}
 		collectionMap.set(recordId, {
 			id: recordId,
-			...row.values,
+			...values,
 			_created_at: row.createdAt,
 			_updated_at: row.updatedAt,
 			_deleted: row.deleted ? 1 : 0,

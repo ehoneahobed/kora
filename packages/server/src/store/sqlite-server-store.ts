@@ -55,6 +55,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
@@ -1539,7 +1540,9 @@ export class SqliteServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializeSqliteFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor
+					? serializeSqliteFieldValue(materializedFieldValue(recordData, f, descriptor), descriptor)
+					: null
 			}),
 			createdAt,
 			updatedAt,

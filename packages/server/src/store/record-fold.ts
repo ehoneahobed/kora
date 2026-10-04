@@ -29,6 +29,7 @@ import {
 	serializeFoldState,
 } from '@korajs/core'
 import type {
+	FieldDescriptor,
 	FoldOptions,
 	FoldState,
 	Operation,
@@ -265,6 +266,26 @@ export function projectFoldState(state: FoldState, options: ServerFoldOptions): 
 	const createdAt = HybridLogicalClock.deserialize(state.cr.t).wallTime
 	const updatedAt = state.u ? HybridLogicalClock.deserialize(state.u.t).wallTime : createdAt
 	return { values, createdAt, updatedAt, deleted: !live }
+}
+
+/**
+ * The value a materialized row holds for a schema field (RT-106): the fold's value, or,
+ * for a field the fold never wrote (every operation of the record predates the field),
+ * the schema default. That is what every device's row holds: the client store writes
+ * only the fields its fold holds, so such a column keeps the value it was created or
+ * added with.
+ *
+ * @param values - The projected values ({@link projectFoldState})
+ * @param field - The schema field
+ * @param descriptor - Its descriptor in the current schema
+ */
+export function materializedFieldValue(
+	values: Readonly<Record<string, unknown>>,
+	field: string,
+	descriptor: FieldDescriptor,
+): unknown {
+	if (field in values) return values[field] ?? null
+	return descriptor.defaultValue ?? null
 }
 
 /**

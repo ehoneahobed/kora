@@ -494,7 +494,7 @@ Operations are immutable and content-addressed, so a transform never rewrites on
 
 ### Rollbacks and the CLI
 
-`kora migrate` diffs the schema against its last snapshot (`kora/schema.snapshot.json`) and writes the migration artifacts to `kora/migrations` (`--dry-run` previews, `--apply` applies them to a configured SQLite database).
+`kora migrate` diffs the schema against its last snapshot (`kora/schema.snapshot.json`) and writes the migration artifacts to `kora/migrations` (`--dry-run` previews, `--apply` applies them to the configured SQLite and Postgres databases, changing only the fields and indexes the schema changed: Kora's own columns, foreign keys, other indexes, the operation log and the fold state are kept; see [CLI](/api/cli#migrate)).
 Most steps have an automatic inverse (`addField`/`removeField`, `addIndex`/`removeIndex`,
 `renameField` swapped); `removeField` without a descriptor and `backfill` need an explicit
 `.down(rollback => ...)`. Adding an optional or defaulted field is always safe; removing a field
