@@ -128,8 +128,10 @@ function isBreakingChange(change: SchemaChange): boolean {
 	if (change.type === 'field-changed') {
 		if (change.before.kind !== change.after.kind) return true
 		if (change.before.itemKind !== change.after.itemKind) return true
-		if (serializeEnum(change.before.enumValues) !== serializeEnum(change.after.enumValues))
-			return true
+		// Adding enum values only widens the value domain (RT-101); removing one refuses
+		// writes of it from then on.
+		const kept = new Set(change.after.enumValues ?? [])
+		if ((change.before.enumValues ?? []).some((value) => !kept.has(value))) return true
 		if (change.before.required !== change.after.required && change.after.required) return true
 		return false
 	}

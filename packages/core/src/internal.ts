@@ -15,6 +15,8 @@ export {
 export {
 	isKoraInternalColumn,
 	isPostgresEnumCheckDefinition,
+	planPostgresConstraintRelaxation,
+	planSqliteConstraintRelaxation,
 	readSqliteTableCatalog,
 	sqliteConstraintRelaxationStatements,
 	sqliteTableNeedsRelaxation,

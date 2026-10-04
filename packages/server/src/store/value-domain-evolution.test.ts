@@ -167,7 +167,7 @@ describe('server stores relax beta.12 value-domain constraints (RT-101)', () => 
 				await client.unsafe(`ALTER TABLE todos ADD CHECK ("priority" IN ('low', 'high'))`)
 				await client.unsafe('ALTER TABLE todos ALTER COLUMN title SET NOT NULL')
 				await client.unsafe(
-					`ALTER TABLE todos ADD CONSTRAINT todos_title_hand CHECK (length(title) < 1000)`,
+					'ALTER TABLE todos ADD CONSTRAINT todos_title_hand CHECK (length(title) < 1000)',
 				)
 
 				const upgraded = new PostgresServerStore(drizzlePg(client), 'server-1')

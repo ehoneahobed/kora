@@ -50,9 +50,7 @@ describe('RT-102: query cache key ignores undefined where values', () => {
 		// Defined semantics: undefined adds no condition; null matches missing values.
 		expect(await filtered.exec()).toEqual(allRows)
 		expect(await none.exec()).not.toEqual(allRows)
-		expect(() => app.todos.where({ projectId: Number.NaN as unknown as string })).toThrow(
-			/finite/,
-		)
+		expect(() => app.todos.where({ projectId: Number.NaN as unknown as string })).toThrow(/finite/)
 
 		const cache = app.getQueryStoreCache()
 		const a = cache.getOrCreate(all)

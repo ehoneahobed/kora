@@ -159,9 +159,7 @@ describe('schema evolution of the value domain (RT-101)', () => {
 			priority: 'urgent',
 		})
 		// New writes of the removed value are refused by validation.
-		await expect(after.todos.insert({ title: 'x', priority: 'urgent' })).rejects.toThrow(
-			/priority/,
-		)
+		await expect(after.todos.insert({ title: 'x', priority: 'urgent' })).rejects.toThrow(/priority/)
 		await expect(after.todos.update(old.id, { priority: 'urgent' })).rejects.toThrow(/priority/)
 		await after.app.close()
 

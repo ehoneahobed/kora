@@ -10,11 +10,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
-import {
-	type SqliteQueryFn,
-	readSqliteTableCatalog,
-	sqliteConstraintRelaxationStatements,
-} from '@korajs/core/internal'
+import { type SqliteQueryFn, planSqliteConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
@@ -470,18 +466,10 @@ export class SqliteServerStore implements ServerStore {
 	 */
 	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
 		const query: SqliteQueryFn = async (text) => this.db.all<Record<string, unknown>>(sql.raw(text))
-		const plans: string[][] = []
-		for (const collection of Object.keys(schema.collections)) {
-			const catalog = await readSqliteTableCatalog(query, collection)
-			if (!catalog) continue
-			const statements = sqliteConstraintRelaxationStatements(catalog)
-			if (statements.length > 0) plans.push(statements)
-		}
-		if (plans.length === 0) return
+		const statements = await planSqliteConstraintRelaxation(query, Object.keys(schema.collections))
+		if (statements.length === 0) return
 		this.db.transaction((tx) => {
-			for (const statements of plans) {
-				for (const statement of statements) tx.run(sql.raw(statement))
-			}
+			for (const statement of statements) tx.run(sql.raw(statement))
 		})
 	}
 

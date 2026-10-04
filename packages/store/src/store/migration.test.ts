@@ -176,6 +176,61 @@ describe('Store schema migrations', () => {
 		await store2.close()
 	})
 
+	test('migration renames an optional, defaulted and indexed column (open pre-added it)', async () => {
+		const dbPath = nextDbPath()
+		const schemaV1 = defineSchema({
+			version: 1,
+			collections: {
+				products: {
+					fields: { name: t.string(), sku: t.string().optional(), tier: t.string().default('a') },
+				},
+			},
+		})
+		const store1 = new Store({
+			schema: schemaV1,
+			adapter: new BetterSqlite3Adapter(dbPath),
+			nodeId: 'node-1',
+		})
+		await store1.open()
+		await store1.collection('products').insert({ name: 'Widget', sku: 'W-1', tier: 'b' })
+		await store1.close()
+
+		const schemaV2 = defineSchema({
+			version: 2,
+			collections: {
+				products: {
+					fields: {
+						name: t.string(),
+						code: t.string().optional(),
+						level: t.string().default('a'),
+					},
+					indexes: ['code'],
+				},
+			},
+			migrations: {
+				2: migrate()
+					.renameField('products', 'sku', 'code')
+					.renameField('products', 'tier', 'level'),
+			},
+		})
+		const adapter2 = new BetterSqlite3Adapter(dbPath)
+		const store2 = new Store({ schema: schemaV2, adapter: adapter2, nodeId: 'node-1' })
+		await store2.open()
+		const products = await store2.collection('products').where({}).exec()
+		expect(products).toHaveLength(1)
+		expect(products[0]).toMatchObject({ code: 'W-1', level: 'b' })
+		const columns = await adapter2.query<{ name: string }>(
+			"SELECT name FROM pragma_table_info('products')",
+		)
+		expect(columns.map((c) => c.name)).not.toContain('sku')
+		const indexed = await adapter2.query<{ n: number }>(
+			"SELECT COUNT(*) AS n FROM sqlite_master m WHERE m.type = 'index' AND m.tbl_name = 'products' AND EXISTS (SELECT 1 FROM pragma_index_info(m.name) i WHERE i.name = 'code')",
+		)
+		expect(indexed).toEqual([{ n: 1 }])
+		expect(await store2.collection('products').where({ code: 'W-1' }).count()).toBe(1)
+		await store2.close()
+	})
+
 	test('migration adds an index', async () => {
 		const dbPath = nextDbPath()
 

@@ -235,3 +235,82 @@ export async function readSqliteTableCatalog(
 		dependents: dependents.map((row) => String(row.sql)),
 	}
 }
+
+/**
+ * Every statement that relaxes the given SQLite tables (one rebuild per table that still
+ * carries a value-domain constraint; tables that do not exist or need nothing are
+ * skipped). Run them in one transaction; see {@link sqliteConstraintRelaxationStatements}.
+ *
+ * @param query - Runs a SELECT/PRAGMA and returns rows (inside the caller's transaction)
+ * @param tables - The collection tables to check
+ * @returns The statements, or `[]` when every table is already relaxed (idempotent)
+ */
+export async function planSqliteConstraintRelaxation(
+	query: SqliteQueryFn,
+	tables: readonly string[],
+): Promise<string[]> {
+	const statements: string[] = []
+	for (const table of tables) {
+		const catalog = await readSqliteTableCatalog(query, table)
+		if (catalog) statements.push(...sqliteConstraintRelaxationStatements(catalog))
+	}
+	return statements
+}
+
+/**
+ * The `ALTER TABLE` statements that relax Postgres collection tables: drop every Kora enum
+ * `CHECK` (one column compared to a literal list, see {@link isPostgresEnumCheckDefinition})
+ * and every `NOT NULL` on a schema field. Kora's own columns, multi-column checks and
+ * checks of any other shape (added by hand) are kept. Reads the catalog of the current
+ * schema through `query`, so run it and the statements in one transaction.
+ *
+ * @param query - Runs a SELECT and returns rows
+ * @param fieldsByTable - Collection table name to its schema field names
+ * @returns The statements, or `[]` when nothing is left to relax (idempotent)
+ */
+export async function planPostgresConstraintRelaxation(
+	query: SqliteQueryFn,
+	fieldsByTable: Readonly<Record<string, readonly string[]>>,
+): Promise<string[]> {
+	const tables = Object.keys(fieldsByTable)
+	if (tables.length === 0) return []
+	const tableList = tables.map(sqlText).join(', ')
+	const statements: string[] = []
+	const checks = await query(
+		`SELECT rel.relname::text AS table_name, con.conname::text AS name, pg_get_constraintdef(con.oid) AS definition,
+			(SELECT array_agg(att.attname::text) FROM pg_attribute att WHERE att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)) AS columns
+		FROM pg_constraint con
+		JOIN pg_class rel ON rel.oid = con.conrelid
+		JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+		WHERE con.contype = 'c' AND nsp.nspname = current_schema() AND rel.relname IN (${tableList})
+		ORDER BY rel.relname, con.conname`,
+	)
+	for (const check of checks) {
+		const columns = Array.isArray(check.columns) ? check.columns.map(String) : []
+		const column = columns[0]
+		if (columns.length !== 1 || column === undefined || isKoraInternalColumn(column)) continue
+		if (!isPostgresEnumCheckDefinition(String(check.definition))) continue
+		statements.push(
+			`ALTER TABLE ${quoteIdent(String(check.table_name))} DROP CONSTRAINT IF EXISTS ${quoteIdent(String(check.name))}`,
+		)
+	}
+	const notNull = await query(
+		`SELECT rel.relname::text AS table_name, att.attname::text AS column_name
+		FROM pg_attribute att
+		JOIN pg_class rel ON rel.oid = att.attrelid
+		JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+		WHERE att.attnotnull AND att.attnum > 0 AND NOT att.attisdropped
+			AND rel.relkind = 'r' AND nsp.nspname = current_schema() AND rel.relname IN (${tableList})
+		ORDER BY rel.relname, att.attnum`,
+	)
+	for (const row of notNull) {
+		const table = String(row.table_name)
+		const column = String(row.column_name)
+		if (isKoraInternalColumn(column)) continue
+		if (!(fieldsByTable[table] ?? []).includes(column)) continue
+		statements.push(
+			`ALTER TABLE ${quoteIdent(table)} ALTER COLUMN ${quoteIdent(column)} DROP NOT NULL`,
+		)
+	}
+	return statements
+}

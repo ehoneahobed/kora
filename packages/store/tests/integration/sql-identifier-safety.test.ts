@@ -68,12 +68,12 @@ describe('SQL literal safety in DDL (SEC-9b)', () => {
 				`SELECT status, mood, tags FROM notes WHERE id = 'raw'`,
 			)
 			expect(rows[0]).toEqual({ status: "don't know", mood: "it's fine", tags: '["o\'k"]' })
-			// The enum CHECK still rejects values outside the declared set.
+			// Values outside the declared set are refused by validation (the table carries no
+			// CHECK, so a schema upgrade can add values: RT-101).
 			await expect(
-				adapter.execute(
-					`INSERT INTO notes (id, title, mood, _created_at, _updated_at) VALUES ('bad', 'b', 'its fine', 0, 0)`,
-				),
-			).rejects.toThrow()
+				store.collection('notes').insert({ title: 'b', mood: 'its fine' }),
+			).rejects.toThrow(/mood/)
+			expect(await adapter.query(`SELECT id FROM notes WHERE mood = 'its fine'`)).toEqual([])
 		} finally {
 			await store.close()
 		}

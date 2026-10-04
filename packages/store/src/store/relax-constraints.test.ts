@@ -3,9 +3,9 @@ import { defineSchema, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { IndexedDbAdapter } from '../adapters/indexeddb-adapter'
-import { deleteFromIndexedDB } from '../adapters/sqlite-wasm-persistence'
 import { SqliteWasmAdapter } from '../adapters/sqlite-wasm-adapter'
 import { MockWorkerBridge } from '../adapters/sqlite-wasm-mock-bridge'
+import { deleteFromIndexedDB } from '../adapters/sqlite-wasm-persistence'
 import type { StorageAdapter, Transaction } from '../types'
 import { relaxValueDomainConstraints } from './relax-constraints'
 
@@ -57,9 +57,7 @@ async function makeLegacy(adapter: StorageAdapter): Promise<void> {
 		await tx.execute(LEGACY_TODOS)
 		await tx.execute('CREATE INDEX "idx_5_todos_priority" ON "todos" ("priority")')
 		await tx.execute('CREATE INDEX "idx_5_todos_projectId" ON "todos" ("projectId")')
-		await tx.execute(
-			`CREATE TRIGGER "todos_audit" AFTER DELETE ON "todos" BEGIN SELECT 1; END`,
-		)
+		await tx.execute(`CREATE TRIGGER "todos_audit" AFTER DELETE ON "todos" BEGIN SELECT 1; END`)
 		await tx.execute(
 			"INSERT INTO projects (id, name, _created_at, _updated_at) VALUES ('p1', 'P', 1, 1)",
 		)
@@ -154,6 +152,36 @@ describe('relaxValueDomainConstraints (RT-101)', () => {
 		// Foreign keys are enforced again afterwards.
 		expect(await adapter.query('PRAGMA foreign_keys')).toEqual([{ foreign_keys: 1 }])
 	})
+
+	test.each(adapters)(
+		'%s: rebuilding a referenced (parent) table keeps the rows that reference it',
+		async (_, make) => {
+			const adapter = make()
+			open = adapter
+			await adapter.open(schema)
+			// beta.12 also put NOT NULL on the parent's required field.
+			await adapter.execute('DROP TABLE "projects"')
+			await adapter.execute(
+				`CREATE TABLE "projects" (\n  id TEXT PRIMARY KEY NOT NULL,\n  "name" TEXT NOT NULL,\n  _created_at INTEGER NOT NULL,\n  _updated_at INTEGER NOT NULL,\n  _version TEXT NOT NULL DEFAULT '',\n  _field_versions TEXT NOT NULL DEFAULT '{}',\n  _deleted INTEGER NOT NULL DEFAULT 0\n)`,
+			)
+			await makeLegacy(adapter)
+			expect(await tableSql(adapter, 'projects')).toMatch(/"name" TEXT NOT NULL/)
+
+			expect((await relaxValueDomainConstraints(adapter, schema)).sort()).toEqual([
+				'projects',
+				'todos',
+			])
+			expect(await adapter.query('SELECT id, projectId FROM todos ORDER BY id')).toEqual([
+				{ id: 't1', projectId: 'p1' },
+				{ id: 't2', projectId: null },
+			])
+			expect(await adapter.query('SELECT id FROM projects')).toEqual([{ id: 'p1' }])
+			expect(await adapter.query('PRAGMA foreign_key_check')).toEqual([])
+			expect(await tableSql(adapter, 'projects')).not.toMatch(/"name" TEXT NOT NULL/)
+			expect(await tableSql(adapter, 'todos')).toMatch(/REFERENCES "projects"\(/)
+			expect(await adapter.query('PRAGMA foreign_keys')).toEqual([{ foreign_keys: 1 }])
+		},
+	)
 
 	test('tables created by the current DDL carry no value-domain constraints', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
