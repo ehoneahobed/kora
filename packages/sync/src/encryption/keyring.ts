@@ -8,6 +8,7 @@ import {
 	KEY_RECORD_FORMAT,
 	canonicalJson,
 	isKeyId,
+	isMasterId,
 	validateKeyRecord,
 } from './key-record'
 import type { MasterKeys } from './keyring-crypto'
@@ -15,17 +16,18 @@ import {
 	KEK_SALT_BYTES,
 	KeyUnwrapError,
 	bytesEqual,
-	dataKeyAnchor,
+	createRecoveryKeyPair,
 	deriveKeyEncryptionKey,
+	formatRecoveryKey,
 	fromBase64,
 	generateDataKey,
 	generateMasterKey,
-	generateRecoveryKeyPair,
 	importMasterKey,
 	newKeyId,
 	newRingId,
 	parseRecoveryKey,
 	randomBytes,
+	recoveryAnchor,
 	sealRecord,
 	toBase64,
 	toNonExtractable,
@@ -178,6 +180,12 @@ export class EncryptionKeyring {
 	private kekSalt: string | null = null
 	/** Held data keys by key id. Invariant: every held key id is in `record`. */
 	private readonly dataKeys = new Map<string, CryptoKey>()
+	/**
+	 * Ids of master keys a passphrase change retired, from every record this device
+	 * authenticated (persisted with the cache): a record authenticated only by one of
+	 * them is refused (RT-107).
+	 */
+	private readonly retiredMasters = new Set<string>()
 	private encryptor: SyncEncryptor | null = null
 	private status: EncryptionStatus
 	private readonly listeners = new Set<(status: EncryptionStatus) => void>()
@@ -392,7 +400,13 @@ export class EncryptionKeyring {
 			this.dropKeys()
 			const record = this.record
 			if (record) {
-				await this.cache.save(this.cacheId(), { record, kek: null, master: null, keys: [] })
+				await this.cache.save(this.cacheId(), {
+					record,
+					kek: null,
+					master: null,
+					keys: [],
+					retiredMasters: [...this.retiredMasters],
+				})
 			} else {
 				await this.cache.clear(this.cacheId())
 			}
@@ -440,12 +454,22 @@ export class EncryptionKeyring {
 	/**
 	 * Change the passphrase: a NEW master key, sealed under a KEK derived from the new
 	 * passphrase and a new salt, re-wraps every data key version (and the recovery wrap,
-	 * if any). No operation is re-encrypted. The old passphrase, and the old master key
-	 * it opens, can neither open nor authenticate any later record. Other devices keep
-	 * working with their cached data keys (status `PASSPHRASE_REQUIRED` while unlocked);
-	 * they need the new passphrase for a key they do not hold and for key management.
-	 * After a suspected leak, also `rotate()`: data keys the old passphrase could open
-	 * stay what they were.
+	 * if any). No operation is re-encrypted. The record lists the old master key as
+	 * retired (`retiredMasters`): a device that authenticated this record (or a later
+	 * one) refuses every record authenticated only by the old master key, however it is
+	 * opened. Other devices keep working with their cached data keys (status
+	 * `PASSPHRASE_REQUIRED` while unlocked); they need the new passphrase for a key they
+	 * do not hold and for key management.
+	 *
+	 * **A passphrase change alone does not contain a leaked passphrase.** The ring is a
+	 * shared secret: a device that still holds only the OLD master key cannot tell a
+	 * record the server forged under it (with a data key of the attacker's) from a
+	 * genuine one, and the server decides which records it forwards. After a suspected
+	 * leak: change the passphrase, `rotate()`, call `enableRecovery()` again (a recovery
+	 * key made before the change can be steered to a ring the old passphrase built) and
+	 * re-unlock EVERY other device with the new passphrase (`lock()`, then
+	 * `unlock(newPassphrase)`, and update any configured `key`). A device that is not
+	 * re-unlocked, or an old recovery key that is still used, remains exposed.
 	 *
 	 * @param newPassphrase - The new passphrase
 	 * @param channel - The key service
@@ -502,6 +526,9 @@ export class EncryptionKeyring {
 							},
 							master: await wrapMasterKey(raw, newKek, this.name, record.ringId),
 							keys,
+							// Authenticated under the NEW master: a device that accepts this record
+							// never again accepts one authenticated only by the old one (RT-107).
+							retiredMasters: [...new Set([...(record.retiredMasters ?? []), master.id])],
 							// The recovery public key was authenticated with the record; the new
 							// master key is wrapped to it, so the recovery key keeps working.
 							...(previousRecovery
@@ -542,7 +569,12 @@ export class EncryptionKeyring {
 	 * record (the recovery block is authenticated with the record, so only a holder of
 	 * the master key can add or replace it).
 	 *
-	 * @returns The recovery key (`kora-rk2-<key>.<anchor>`)
+	 * The same write adds a new data key version (a rotation) that anchors the recovery
+	 * key to this ring: `recover()` accepts only a ring holding that key, which no older
+	 * passphrase ever opened (RT-107). After a suspected passphrase leak, call this again
+	 * once the passphrase was changed, and destroy the previous recovery key.
+	 *
+	 * @returns The recovery key (`kora-rk3-<key>.<anchor>`)
 	 */
 	enableRecovery(channel: KeyServiceChannel): Promise<string> {
 		return this.exclusive(async () => {
@@ -558,20 +590,30 @@ export class EncryptionKeyring {
 						)
 					},
 				)
-				let anchor: Uint8Array
-				try {
-					anchor = await this.ringAnchor(record, master)
-				} catch (error) {
-					raw.fill(0)
-					throw error
-				}
-				const { publicKey, recoveryKey } = await generateRecoveryKeyPair(anchor)
+				// The anchor key: a new data key version created in this write under the
+				// current master key only. No earlier passphrase or master key ever opened it,
+				// so nobody holding an older (leaked) passphrase can build a ring the recovery
+				// key accepts (RT-107). It also becomes the key new operations use.
+				const anchorKey = await generateDataKey()
+				const keyVersion = record.currentVersion + 1
+				const keyId = newKeyId()
 				let next: WrappedKeyRecord
+				let recoveryKey: string
 				try {
+					const { publicKey, d } = await createRecoveryKeyPair()
+					recoveryKey = formatRecoveryKey(
+						d,
+						await recoveryAnchor(anchorKey, this.name, record.ringId, keyId, publicKey),
+					)
 					next = await sealRecord(
 						{
 							...record,
 							revision: record.revision + 1,
+							currentVersion: keyVersion,
+							keys: [
+								...record.keys,
+								await wrapDataKey(anchorKey, master.wrapKey, this.name, keyVersion, keyId),
+							],
 							recovery: await wrapMasterForRecovery(raw, publicKey, this.name, record.ringId),
 						},
 						master.macKey,
@@ -581,6 +623,7 @@ export class EncryptionKeyring {
 				}
 				const reply = await channel.put(this.name, next, record.revision)
 				if (reply.status === 'ok') {
+					this.dataKeys.set(keyId, await toNonExtractable(anchorKey))
 					await this.commitLocked(next)
 					return recoveryKey
 				}
@@ -701,10 +744,23 @@ export class EncryptionKeyring {
 						{ code: 'KEY_RECORD_INVALID' },
 					)
 				}
+				if (this.isRetiredMaster(record, master)) {
+					throw new EncryptionKeyError(
+						'The key record is authenticated by a master key a passphrase change retired. Recovery is refused.',
+						{ code: 'KEY_RECORD_INVALID' },
+					)
+				}
 				// The recovery PUBLIC key is no secret: anyone can wrap a master key of their own
 				// to it and seal a record under that master. Only the user's own ring holds the
-				// data key the recovery key's anchor fingerprints.
-				if (!(await this.holdsAnchor(record, master, parseRecoveryKey(recoveryKey).anchor))) {
+				// anchor key created with the recovery key, which no older passphrase opened.
+				if (
+					!(await this.holdsAnchor(
+						record,
+						master,
+						recovery.publicKey,
+						parseRecoveryKey(recoveryKey).anchor,
+					))
+				) {
 					throw new EncryptionKeyError(
 						'The key record opens with this recovery key but is not the keyring the recovery key was made for: it lacks the data key the recovery key is anchored to (the server substituted another keyring). Recovery is refused.',
 						{ code: 'KEY_RECORD_INVALID' },
@@ -753,6 +809,7 @@ export class EncryptionKeyring {
 		if (this.loadedPrincipal === principal) return this.status
 		this.dropKeys()
 		this.record = null
+		this.retiredMasters.clear()
 		this.failedSource = null
 		this.allowNewRing = false
 		// A passphrase given before the first load (unlock() at start-up) is kept; one given
@@ -768,12 +825,21 @@ export class EncryptionKeyring {
 		if (cached && validateKeyRecord(cached.record, this.name).ok) {
 			const record = cached.record
 			this.record = record
+			for (const id of [...(cached.retiredMasters ?? []), ...(record.retiredMasters ?? [])]) {
+				if (isMasterId(id)) this.retiredMasters.add(id)
+			}
 			const known = new Set(record.keys.map((key) => key.keyId))
 			for (const entry of cached.keys) {
 				if (known.has(entry.keyId)) this.dataKeys.set(entry.keyId, entry.key)
 			}
 			const current = record.keys.find((key) => key.keyVersion === record.currentVersion)
-			if (cached.master && current && this.dataKeys.has(current.keyId)) {
+			// A release-candidate cache keeps master keys without an id: unlock again.
+			if (
+				cached.master &&
+				typeof cached.master.id === 'string' &&
+				current &&
+				this.dataKeys.has(current.keyId)
+			) {
 				this.master = cached.master
 				this.kek = cached.kek
 				this.kekSalt = cached.kek ? record.kdf.salt : null
@@ -966,6 +1032,7 @@ export class EncryptionKeyring {
 			}
 		}
 		if (opened === null) return this.unverifiableLocked(incoming, sourceFailed)
+		if (this.isRetiredMaster(incoming, opened.master)) return this.refuseRetired()
 		return this.acceptLocked(incoming, opened, passphrase, channel, depth)
 	}
 
@@ -1055,7 +1122,19 @@ export class EncryptionKeyring {
 			}
 		}
 		if (opened === null) return 'locked'
+		if (this.isRetiredMaster(incoming, opened.master)) return this.refuseRetired()
 		return this.mergeLocked(incoming, opened, passphrase, channel, depth)
+	}
+
+	/**
+	 * A record authenticated only by a master key a passphrase change retired: whoever
+	 * wrote it knew an OLD passphrase (or master key), not the current one (RT-107).
+	 */
+	private refuseRetired(): 'locked' {
+		return this.refuseRecord(
+			'KEY_RECORD_INVALID',
+			"The server's key record is authenticated only by a master key that a passphrase change retired: it was written with an old passphrase. It is refused; this device keeps its keys.",
+		)
 	}
 
 	/** A record this device cannot authenticate: adopt nothing. */
@@ -1207,25 +1286,14 @@ export class EncryptionKeyring {
 	}
 
 	/**
-	 * The anchor a new recovery key carries: the fingerprint of the ring's lowest key
-	 * version. Data keys are never removed or re-keyed (a passphrase change, recovery or
-	 * merge re-wraps them under the same key id), so the anchor stays valid for the ring.
+	 * Whether `record` holds the anchor key of a recovery key: data keys are never removed
+	 * or re-keyed (a passphrase change, recovery or merge re-wraps them under the same key
+	 * id), so the anchor stays valid for the ring.
 	 */
-	private async ringAnchor(record: WrappedKeyRecord, master: MasterKeys): Promise<Uint8Array> {
-		const first = [...record.keys].sort((a, b) => a.keyVersion - b.keyVersion)[0]
-		if (first === undefined) {
-			throw new EncryptionKeyError('The key record holds no data key.', {
-				code: 'KEY_RECORD_INVALID',
-			})
-		}
-		const dataKey = await unwrapDataKey(first, master.wrapKey, this.name, true)
-		return dataKeyAnchor(dataKey, this.name, first.keyId)
-	}
-
-	/** Whether `record` holds the data key a recovery key's anchor fingerprints. */
 	private async holdsAnchor(
 		record: WrappedKeyRecord,
 		master: MasterKeys,
+		publicKey: { x: string; y: string },
 		anchor: Uint8Array,
 	): Promise<boolean> {
 		for (const entry of record.keys) {
@@ -1235,9 +1303,18 @@ export class EncryptionKeyring {
 			} catch {
 				continue
 			}
-			if (bytesEqual(await dataKeyAnchor(dataKey, this.name, entry.keyId), anchor)) return true
+			const tag = await recoveryAnchor(dataKey, this.name, record.ringId, entry.keyId, publicKey)
+			if (bytesEqual(tag, anchor)) return true
 		}
 		return false
+	}
+
+	/**
+	 * Whether `master` (which authenticated `record`) is a master key a passphrase change
+	 * retired: listed in `record` itself or in any record this device authenticated.
+	 */
+	private isRetiredMaster(record: WrappedKeyRecord, master: MasterKeys): boolean {
+		return this.retiredMasters.has(master.id) || (record.retiredMasters ?? []).includes(master.id)
 	}
 
 	/** The next revision after `base`, above the pinned one when it is the same ring. */
@@ -1346,12 +1423,14 @@ export class EncryptionKeyring {
 			}
 		}
 		this.record = record
+		for (const id of record.retiredMasters ?? []) this.retiredMasters.add(id)
 		this.retryable = false
 		this.rebuildEncryptor()
 		this.setStatus(this.makeStatus('unlocked'))
 		try {
 			await this.cache.save(this.cacheId(), {
 				record,
+				retiredMasters: [...this.retiredMasters],
 				kek: this.kek,
 				master: this.master,
 				keys: record.keys.flatMap((entry) => {

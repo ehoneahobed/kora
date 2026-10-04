@@ -138,6 +138,7 @@ KEK --AES-256-GCM--> master key
 recovery public key --ECDH P-256 + HKDF + AES-GCM--> master key       (optional)
 master key --HKDF "data-key-wrap"--> wrapping key --AES-256-GCM--> data key v1, v2, ...
 master key --HKDF "record-mac"--> MAC key --HMAC-SHA256--> mac over the whole record
+master key --HKDF "master-id"--> master id (listed in retiredMasters after a passphrase change)
 ```
 
 | Parameter | Value |
@@ -149,7 +150,7 @@ master key --HKDF "record-mac"--> MAC key --HMAC-SHA256--> mac over the whole re
 | Key wraps | AES-256-GCM; additional data binds keyring, ring id, key version and key id |
 | Record MAC | HMAC-SHA256 over every other field of the record (canonical JSON) |
 
-The record is `{ format, keyring, ringId, revision, currentVersion, kdf, master, keys, recovery?, mac }`. The server never sees the passphrase, the KEK, the master key or a data key, and it cannot unwrap anything.
+The record is `{ format, keyring, ringId, revision, currentVersion, kdf, master, keys, recovery?, retiredMasters?, mac }`. `retiredMasters` names (by an HKDF fingerprint, not the key) the master keys earlier passphrase changes retired. The server never sees the passphrase, the KEK, the master key or a data key, and it cannot unwrap anything.
 
 ### What the server can and cannot do to the record
 
@@ -221,7 +222,12 @@ await app.encryption?.changePassphrase(newPassphrase, { currentPassphrase })
 ```
 
 - **Rotation.** The server pushes the new record to the user's other connected devices before any operation sealed under the new version reaches them. A device that receives such an operation without the push (another server instance) fetches the record once and replays it. Rotation limits what a leaked data key exposes from now on; it does not re-encrypt old operations.
-- **Passphrase change.** The ring gets a new master key, sealed under the new passphrase: the old passphrase (and the old master key it opened) can neither open nor authenticate any later record. Other devices keep working with the data keys they hold (`unlocked` with `PASSPHRASE_REQUIRED`). A device that later needs a key it does not hold (for example after a rotation following the passphrase change) asks for the new passphrase. **After a suspected leak, change the passphrase and then rotate**: the data keys the old passphrase could open stay what they were, and only a rotation gives new operations a key the leaked passphrase never reached.
+- **Passphrase change.** The ring gets a new master key, sealed under the new passphrase, and the record lists the old master key in `retiredMasters`. Other devices keep working with the data keys they hold (`unlocked` with `PASSPHRASE_REQUIRED`). A device that later needs a key it does not hold (for example after a rotation following the passphrase change) asks for the new passphrase. A device that has accepted the new record (or any later one) refuses every record authenticated only by a retired master key, whichever way it was opened: its held keys, a stale configured `key`, or the old passphrase typed again (`KEY_RECORD_INVALID`; the list survives restarts with the key cache).
+- **A passphrase change alone does not contain a leaked passphrase.** The keyring is a shared secret. Whoever knows the old passphrase and controls the sync server opens the old master key from the old record the server kept. A device that still holds only that old master key (it has not accepted a record written after the change) has no secret the attacker lacks: the server can withhold the new record and serve it a successor sealed under the old master key that adds a data key of the attacker's, and the device would encrypt new operations with it. No protocol change can let that device tell the forgery from a genuine record. **After a suspected leak:**
+  1. On one device, `changePassphrase(newPassphrase)`, then `rotateKey()` (only a rotation gives new operations a key the leaked passphrase never reached; old operations stay readable by whoever holds the old keys).
+  2. Call `enableRecovery()` again if you use a recovery key, and destroy the previous one (see below).
+  3. Re-unlock **every** other device with the new passphrase: `await app.encryption?.lock()` then `await app.encryption?.unlock(newPassphrase)`, and update any configured `encryption.key`. Until a device has done so, treat what it writes as readable by the leaker.
+  4. If a device cannot be re-unlocked (lost, unreachable), the only complete remedy is a new keyring for the user's data, which this release does not automate.
 - **Concurrent key management.** Every compare-and-set retry adopts and authenticates the server's current record first and writes under that record's own master key, so a rotation that races a passphrase change on another device never wraps a key under the old passphrase. A device that cannot authenticate the newer record (the passphrase changed elsewhere) stops with `PASSPHRASE_REQUIRED` instead of writing.
 - A record never loses a key version: the server refuses writes that lower the revision, change the ring id, or drop or relabel a version, and a device refuses a record that lacks a key it holds.
 
@@ -233,14 +239,16 @@ To offer recovery, create a recovery key while the keyring is unlocked with the 
 
 <!-- docs-check: continue -->
 ```typescript
-const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk2-<key>.<anchor>"; store it offline
+const recoveryKey = await app.encryption?.enableRecovery() // "kora-rk3-<key>.<anchor>"; store it offline
 // ...later, on any device, after the passphrase was lost:
 if (recoveryKey) await app.encryption?.recover(recoveryKey, newPassphrase)
 ```
 
 The ring's master key is also wrapped to the recovery key's public half (ephemeral-static ECDH P-256, HKDF-SHA256, AES-256-GCM). Rotation needs no change to it (data keys hang off the master key), and a passphrase change re-wraps the new master key to the same public key, so the recovery key stays valid. The recovery key itself is never sent to the server. Calling `enableRecovery()` again replaces it.
 
-A recovery key also carries a **ring anchor**: a fingerprint of the ring's first data key. The recovery public key is stored on the server, so anyone could wrap a master key of their own to it and offer a whole substitute ring; `recover()` refuses a record that does not hold the anchored data key (`KEY_RECORD_INVALID`), so a recovering device never adopts keys the server chose. Recovery verifies the record's MAC under the recovered master key, keeps the master key (devices holding the ring keep managing it without a prompt), and seals it under the new passphrase.
+A recovery key also carries a **ring anchor**. The recovery public key is stored on the server, so anyone could wrap a master key of their own to it and offer a whole substitute ring. `enableRecovery()` therefore creates a new data key version in the same write (a rotation: new operations use it) and anchors the recovery key to it: the anchor is an HMAC keyed by that data key over the keyring, ring id, key id and recovery public key. `recover()` refuses a record that does not hold the anchor key (`KEY_RECORD_INVALID`). No passphrase older than the one in use when the recovery key was made ever opened the anchor key, so neither the server nor someone holding an older (leaked) passphrase can build a ring the recovery key accepts. Recovery verifies the record's MAC under the recovered master key, refuses a record authenticated by a retired master key, keeps the master key (devices holding the ring keep managing it without a prompt), and seals it under the new passphrase.
+
+A recovery key made **before** a passphrase leak is anchored to a key the leaked passphrase opens: the leaker (with the server) can steer it to a ring of their own. After a leak, call `enableRecovery()` again once the passphrase is changed (that replaces the recovery public key, so the old recovery key no longer opens the genuine record) and destroy the old recovery key. `kora-rk2-` keys of the release candidates anchored the ring's first data key and are refused (`WRONG_RECOVERY_KEY`, `context.reason: 'RECOVERY_KEY_RETIRED'`): call `enableRecovery()` again.
 
 ## Lost Key Records and Forked Keyrings
 

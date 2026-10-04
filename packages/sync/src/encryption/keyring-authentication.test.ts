@@ -210,8 +210,9 @@ describe('RT-95: every field of the record is authenticated', () => {
 		const injected = clone(record)
 		const own = injected.keys[0]
 		if (!own) throw new Error('fixture')
-		injected.keys.push({ ...own, keyVersion: 2, keyId: `k2-${'f'.repeat(32)}` })
-		injected.currentVersion = 2
+		// (enableRecovery added version 2, the recovery anchor key.)
+		injected.keys.push({ ...own, keyVersion: 3, keyId: `k2-${'f'.repeat(32)}` })
+		injected.currentVersion = 3
 		server.record = injected
 		const lost = device()
 		await lost.load('alice')
@@ -279,7 +280,8 @@ describe('RT-95: every field of the record is authenticated', () => {
 		const second = device()
 		await second.load('alice')
 		await second.recover(recoveryKey, 'four', server.channel())
-		expect(second.getStatus().availableVersions).toEqual([1, 2])
+		// v2: the recovery anchor key enableRecovery() created; v3: the rotation.
+		expect(second.getStatus().availableVersions).toEqual([1, 2, 3])
 	})
 
 	test('recovery keeps the master key: devices holding the ring keep managing it', async () => {
@@ -294,7 +296,7 @@ describe('RT-95: every field of the record is authenticated', () => {
 		expect(a.getStatus().code).toBeUndefined()
 		await a.rotate(server.channel())
 		expect(await b.adoptPushed(clone(server.record as WrappedKeyRecord))).toBe('ready')
-		expect(b.getStatus().availableVersions).toEqual([1, 2])
+		expect(b.getStatus().availableVersions).toEqual([1, 2, 3])
 	})
 })
 

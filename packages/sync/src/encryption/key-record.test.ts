@@ -33,6 +33,9 @@ function record(overrides: Partial<WrappedKeyRecord> = {}): WrappedKeyRecord {
 describe('validateKeyRecord', () => {
 	test('accepts a well-formed record', () => {
 		expect(validateKeyRecord(record(), 'default')).toEqual({ ok: true })
+		expect(
+			validateKeyRecord(record({ retiredMasters: [`m-${'0'.repeat(32)}`] }), 'default'),
+		).toEqual({ ok: true })
 	})
 
 	test.each([
@@ -55,6 +58,12 @@ describe('validateKeyRecord', () => {
 			'a format-1 recovery block',
 			{ recovery: { alg: 'ECDH-P256+AES-GCM', publicKey: { x: 'a', y: 'b' }, keys: [] } },
 		],
+		['a malformed retired master id', { retiredMasters: ['m-xyz'] }],
+		[
+			'a duplicate retired master id',
+			{ retiredMasters: [`m-${'a'.repeat(32)}`, `m-${'a'.repeat(32)}`] },
+		],
+		['retiredMasters that is not an array', { retiredMasters: 'm-1' }],
 	])('refuses %s', (_label, overrides) => {
 		expect(validateKeyRecord(record(overrides as Partial<WrappedKeyRecord>), 'default').ok).toBe(
 			false,
