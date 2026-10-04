@@ -3380,6 +3380,21 @@
    ],
    "pr": null,
    "notes": "Phase 4 follow-up from remediation/HANDOFF.md (kora migrate rebuild vs the Phase 3 fold state). Repro packages/cli/tests/repro/RT-105.test.ts: two devices with concurrent edits and compacted history, the server and both device databases migrated v1 -> v2 (remove an enum field, add a defaulted and an optional field) with generateMigration + runMigration (what `kora migrate --apply` runs), then continued sync and a fresh device; plus an index-only migration, an indexed-field removal with a failing statement (rollback), and Postgres (KORA_PG_TEST_URL). Fold state, bases, snapshots, compacted-through, the log, the outbound queue and every other _kora_* table were never touched (separate tables), and a field add/remove changes the fold plan fingerprint, so every record re-folds at the next open and rows/fold states converged: the loss was the internal columns, constraints and indexes (cli/src/commands/migrate/migration-generator.ts generateRebuildStatements). The runner's single transaction and foreign key handling were already correct."
+  },
+  {
+   "id": "RT-106",
+   "title": "After a schema upgrade adds a field with a default, the server stores (memory, SQLite, Postgres) materialize records written before it with the field NULL / absent while every device materializes the default: server queries disagree with devices, and a scope on the new field (RT-20 falls back to the current row) never delivers those records to a new device",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "in_progress",
+   "tests": [
+    {
+     "file": "RT-106.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Found while checking `kora migrate` against the fold (RT-105): after the v1 -> v2 migration that added `status: t.string().default('open')`, devices A, B and a fresh device C all read 'open' for a v1 record, the server null. A record whose operations predate the field has no fold state for it; the client RecordFolder.materializeRow writes only the fields the fold holds, so the column keeps the value it was created or added with (the default), while the server stores wrote `values[field] ?? null` for every schema field (sqlite-server-store upsertMaterializedRecord, postgres-server-store upsert and batch re-materialization, memory-server-store writeRecord). Independent of the CLI: the server's own setSchema re-materialization writes the NULL. Repro packages/server/tests/repro/RT-106.test.ts (memory, SQLite restart and fresh v2 server, Postgres with KORA_PG_TEST_URL); end to end in packages/cli/tests/repro/RT-105.test.ts (server rows equal device rows including `status`)."
   }
  ],
  "rejectedProposalPins": {
