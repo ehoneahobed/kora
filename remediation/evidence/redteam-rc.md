@@ -73,4 +73,15 @@ Method:
 
 ## Gates (this round)
 
-GATES_PLACEHOLDER
+Run on a 2-core machine, Postgres 16 on port 54440, real Chromium, the real beta.12 build.
+
+| Check | Result |
+|---|---|
+| `check.mjs --all` (Postgres, Chromium, `LMS_OPS=20000`), before RT-99..RT-104 existed | 203/211 fixed, 0 errors, 1 warning (DX-3 "looks fixed", as before). No regression, no guard failure; RT-95..RT-98 fail as owned. |
+| `check.mjs --all`, final (every new repro and the RT-100 tsc probe mapped) | CHECK2_PLACEHOLDER |
+| Fold gate, 400 new seeds (`KORA_FOLD_E2E_SEED_BASE=2210001`) plus fold-vs-legacy 40 seeds | pass (6/6) |
+| `pnpm chaos:nightly` | pass (chaos 1/1, invariants 11/11) |
+| `pnpm test:release-gate` | pass (production path, sync reconnect, real-path chaos, benchmark gates) |
+| `compat-beta12.mjs` (12 seeds per server build, memory/SQLite/Postgres) | First run 22/24: `chaos/current-server/seed-4` and `seed-7` threw `WebSocket connection timed out` from an un-caught `connect()` in the harness; both passed on rerun. A rerun of seed 4 then failed `chaos/b12-server/seed-4` twice: once the same connect timeout, once a convergence timeout with all three current replicas in phase `blocked`, no rejection, apply failure or sync error event, and one unhandled `Cannot send message: WebSocket is not connected` (the beta.12 build's known crash path). Every other row passed, including every upgrade, shape and encryption row. Not filed: nondeterministic, current clients through a beta.12 server is the configuration the release notes say not to run, and 10 s localhost connect timeouts point at event-loop starvation on this machine. Worth one investigation on CI hardware (what leaves a current client in state `error` without retrying). |
+| `compat-beta12-browser.mjs` | 2/2 (SQLite WASM/OPFS, IndexedDB) |
+| `rt-legacy-id-probe`, `rt3-legacy-probe`, `rt3-upgrade-clear-probe`, `protocol-v2-compat` (beta.12) | all accepted and converged, nothing rejected or quarantined |
