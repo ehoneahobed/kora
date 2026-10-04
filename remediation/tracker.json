@@ -3320,6 +3320,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). Not a Phase 4 regression (beta.12 has the same DDL). core/src/schema/sql-gen.ts:248,294 (client CHECK), server/src/store/materialization.ts:79-80 and :92-99 (CREATE IF NOT EXISTS + ADD COLUMN only), core/src/migrations/migration-sql.ts (steps: addField/removeField/renameField/addIndex/removeIndex/backfill; nothing for enum values), postgres-server-store.ts:173-176 and sqlite-server-store.ts:171-173 (23514 / SQLITE_CONSTRAINT_CHECK -> UNSTORABLE_VALUE). Repro kora/tests/repro/RT-101.test.ts (device: CHECK constraint failed: priority; SQLite server: sync:operation-rejected UNSTORABLE_VALUE). Postgres the same by code (23514). Required fix: enforce enum membership in the value domain (validateRecord) only, not in DDL (drop the CHECK, or rebuild it from the current schema on open: SQLite table rebuild, Postgres ALTER TABLE DROP/ADD CONSTRAINT), on client and server stores; or add an explicit migration step that rebuilds the constraint and refuse a schema whose enum values changed without it. Also decide what a REMOVED enum value means for existing rows and old-schema ops (transform or keep accepting)."
+  },
+  {
+   "id": "RT-102",
+   "title": "The query-store cache and useQuery's re-subscribe key are JSON.stringify(descriptor), which drops undefined (and folds NaN into null): where({ projectId: undefined }) shares one QueryStore with where({}) although the runtime returns different rows, so one of two mounted components renders the other's results",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-102.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor."
   }
  ],
  "rejectedProposalPins": {
