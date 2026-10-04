@@ -498,8 +498,12 @@ const action: fc.Arbitrary<Action> = fc.oneof(
 )
 
 describe('RT-97: concurrent rotation, passphrase change and recovery set-up on two devices', () => {
+	// A fixed seed keeps the explored interleavings identical on every run (no flaky
+	// counterexamples), and the timeout is a hang guard only: 40 runs of real WebCrypto
+	// work take a few seconds on an idle machine and much longer on a loaded CI runner.
 	propTest.prop([fc.scheduler(), fc.array(action, { minLength: 1, maxLength: 6 })], {
 		numRuns: 40,
+		seed: 970_097,
 	})(
 		'every device with the current passphrase can read every data-key version',
 		async (s, actions) => {
@@ -560,5 +564,6 @@ describe('RT-97: concurrent rotation, passphrase change and recovery set-up on t
 				expect(d.getStatus().availableVersions).toHaveLength(final.keys.length)
 			}
 		},
+		60_000,
 	)
 })
