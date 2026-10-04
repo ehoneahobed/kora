@@ -78,7 +78,7 @@ Run on a 2-core machine, Postgres 16 on port 54440, real Chromium, the real beta
 | Check | Result |
 |---|---|
 | `check.mjs --all` (Postgres, Chromium, `LMS_OPS=20000`), before RT-99..RT-104 existed | 203/211 fixed, 0 errors, 1 warning (DX-3 "looks fixed", as before). No regression, no guard failure; RT-95..RT-98 fail as owned. |
-| `check.mjs --all`, final (every new repro and the RT-100 tsc probe mapped) | CHECK2_PLACEHOLDER |
+| `check.mjs --all`, final (every new repro and the RT-100 tsc probe mapped) | 203/214 fixed, 0 errors, 1 warning (DX-3). RT-95..RT-104 fail as owned (RT-100: 2 tsc errors); no regression, no guard failure, no unmapped failure. Browser suites: LMS-5-6-7 and NEW-DX-3 as before. |
 | Fold gate, 400 new seeds (`KORA_FOLD_E2E_SEED_BASE=2210001`) plus fold-vs-legacy 40 seeds | pass (6/6) |
 | `pnpm chaos:nightly` | pass (chaos 1/1, invariants 11/11) |
 | `pnpm test:release-gate` | pass (production path, sync reconnect, real-path chaos, benchmark gates) |
