@@ -7,6 +7,7 @@ import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { generateMigration } from './migration-generator'
 import { runMigration } from './migration-runner'
 import { diffSchemas } from './schema-differ'
+import { parseEvolveTableDirective } from './table-evolution-directive'
 import {
 	RELAX_VALUE_DOMAIN_DIRECTIVE,
 	formatRelaxValueDomainDirective,
@@ -85,9 +86,11 @@ describe('relax-value-domain migration directive (RT-101)', () => {
 		})
 		const generated = generateMigration(v2, v3, diffSchemas(v2, v3))
 		expect(generated.containsBreakingChanges).toBe(true)
-		const copy = generated.up.find((statement) => statement.startsWith('INSERT INTO'))
-		expect(copy).toBeDefined()
-		expect(copy).not.toMatch(/CASE WHEN/)
+		// Rows keep the removed enum value: the table change only adds `note` (RT-105), it
+		// never rewrites the values of a field whose kind is unchanged.
+		const evolve = generated.up.map(parseEvolveTableDirective).find((target) => target !== null)
+		expect(evolve).toMatchObject({ table: 'todos', drop: [], change: {} })
+		expect(Object.keys(evolve?.add ?? {})).toEqual(['note'])
 	})
 
 	test('parse round-trips and refuses a malformed directive', () => {
