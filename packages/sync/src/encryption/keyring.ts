@@ -186,6 +186,8 @@ export class EncryptionKeyring {
 	private failedSource: { salt: string; passphrase: string } | null = null
 	/** The current lock is a server-side condition a later session can clear (no user action). */
 	private retryable = false
+	/** startNewKeyring() was called: a missing record with encrypted history may be replaced. */
+	private allowNewRing = false
 	private failedUnlocks = 0
 	private nextUnlockAt = 0
 	private mutex: Promise<unknown> = Promise.resolve()
@@ -612,28 +614,37 @@ export class EncryptionKeyring {
 
 	/**
 	 * Last resort after the server lost the key record and no device that holds the ring
-	 * will come back (`KEY_RECORD_MISSING`): create a new ring. Operations encrypted under
-	 * the lost ring stay unreadable on this device. If a device holding the old ring
-	 * reconnects later, it merges both rings and the history becomes readable again.
+	 * will come back (`KEY_RECORD_MISSING`): allow this device to create a new ring.
+	 * Operations encrypted under the lost ring stay unreadable on this device. If a device
+	 * holding the old ring reconnects later, it merges both rings and the history becomes
+	 * readable again. Without a channel (sync is not connected: a missing record ends the
+	 * session) the ring is created at the next handshake.
 	 *
 	 * @throws {EncryptionKeyError} KEY_RECORD_EXISTS when the server has a record (unlock it)
 	 */
-	startNewKeyring(channel: KeyServiceChannel): Promise<EncryptionStatus> {
+	startNewKeyring(channel: KeyServiceChannel | null): Promise<EncryptionStatus> {
 		return this.exclusive(async () => {
+			this.allowNewRing = true
+			if (channel === null) {
+				this.retryable = false
+				this.setStatus(
+					this.makeStatus(
+						'locked',
+						'AWAITING_SERVER',
+						'A new keyring is created when the sync server is reached (unless it holds a record).',
+					),
+				)
+				return this.status
+			}
 			const reply = await channel.fetch(this.name)
 			if (reply.record !== null) {
+				this.allowNewRing = false
 				throw new EncryptionKeyError(
 					'The sync server holds a key record for this keyring: unlock it with the passphrase instead.',
 					{ code: 'KEY_RECORD_EXISTS' },
 				)
 			}
-			if (this.record !== null) {
-				// This device holds a ring: re-upload it instead of starting another.
-				const outcome = await this.createOrRestoreLocked(channel, [])
-				if (outcome !== 'ready') throw this.statusError()
-				return this.status
-			}
-			const outcome = await this.createRingLocked(channel)
+			const outcome = await this.createOrRestoreLocked(channel, reply.knownKeyIds ?? [])
 			if (outcome !== 'ready') throw this.statusError()
 			return this.status
 		})
@@ -724,6 +735,7 @@ export class EncryptionKeyring {
 		this.dropKeys()
 		this.record = null
 		this.failedSource = null
+		this.allowNewRing = false
 		// A passphrase given before the first load (unlock() at start-up) is kept; one given
 		// for another principal is not.
 		if (this.loadedPrincipal !== undefined) this.pendingPassphrase = null
@@ -778,7 +790,7 @@ export class EncryptionKeyring {
 			return this.adoptLocked(reply.status === 'ok' ? restored : reply.record, null, channel)
 		}
 		const history = knownKeyIds.filter((keyId) => isKeyId(keyId))
-		if (history.length > 0) {
+		if (history.length > 0 && !this.allowNewRing) {
 			this.holdFor(
 				'locked',
 				'KEY_RECORD_MISSING',
@@ -836,6 +848,7 @@ export class EncryptionKeyring {
 		if (reply.status === 'ok') {
 			// Only the confirmed record is used: a key that lost the creation race would
 			// fork the user's data into a key no other device has.
+			this.allowNewRing = false
 			this.master = master
 			this.kek = kek
 			this.kekSalt = record.kdf.salt

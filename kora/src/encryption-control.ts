@@ -140,6 +140,13 @@ export function createEncryptionControl(
 			await resumeSync()
 			return status
 		},
+		async startNewKeyring(): Promise<EncryptionStatus> {
+			await ready
+			// A missing record ends the session, so this usually runs at the next handshake.
+			const status = await keyring.startNewKeyring(state.syncEngine?.getKeyServiceChannel() ?? null)
+			await resumeSync()
+			return status
+		},
 	}
 }
 
@@ -180,5 +187,6 @@ export function createInertEncryptionControl(
 		changePassphrase: () => refuse(),
 		enableRecovery: () => refuse(),
 		recover: () => refuse(),
+		startNewKeyring: () => refuse(),
 	}
 }
