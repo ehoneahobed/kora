@@ -35,6 +35,12 @@ follower tabs proxy their reads and writes to the leader over a `BroadcastChanne
 configure anything. All tabs see one consistent database, and a hung or closed leader is replaced
 by a follower.
 
+Live queries stay current in every tab. Each committed change to a collection's rows is
+announced to the other tabs on the same database: local writes, operations sync applied in
+the syncing tab, and changes made without a new operation (a write the server refused being
+undone, records leaving the user's sync scope, cascades settling, a re-materialization, a
+backup restore). The other tabs re-run their affected queries; they never reapply anything.
+
 When a tab attaches as a follower, Kora emits a `store:db-name-collision`
 diagnostic. For multi-tab of one app this is expected and informational.
 

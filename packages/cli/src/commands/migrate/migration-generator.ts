@@ -2,6 +2,7 @@ import { generateSQL } from '@korajs/core'
 import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@korajs/core'
 import type { SchemaDiff } from './schema-differ'
 import { getChangedCollections } from './schema-differ'
+import { formatRelaxValueDomainDirective } from './value-domain-directive'
 
 export interface GeneratedMigration {
 	up: string[]
@@ -58,6 +59,25 @@ export function generateMigration(
 		const currentDef = current.collections[collection]
 		if (!previousDef || !currentDef) continue
 
+		// A change to a field's value domain only (enum values, requiredness, default) needs
+		// no new table shape: the value domain is enforced by validation on every replica
+		// (RT-101). What it needs is the removal of the constraints beta.12 and earlier DDL
+		// restated it with (an enum CHECK, NOT NULL), which a table cannot evolve. The
+		// directive is expanded by `kora migrate --apply` against the live catalog of each
+		// backend, in the migration's transaction (with its history row), and is a no-op on
+		// tables that are already relaxed.
+		const valueDomainOnly = diff.changes.every(
+			(change) =>
+				change.collection !== collection ||
+				(change.type === 'field-changed' && isValueDomainChange(change.before, change.after)),
+		)
+		if (valueDomainOnly) {
+			const directive = relaxValueDomainDirective(collection, previousDef, currentDef)
+			up.push(directive)
+			down.push(directive)
+			continue
+		}
+
 		validateRebuildSafety(collection, previousDef, currentDef)
 
 		up.push(...generateRebuildStatements(collection, previousDef, currentDef))
@@ -112,6 +132,25 @@ function generateRebuildStatements(
 	}
 
 	return statements
+}
+
+/**
+ * Whether a field change touches only its value domain (same kind, item kind and auto
+ * flag; enum values, requiredness or default differ).
+ */
+function isValueDomainChange(before: FieldDescriptor, after: FieldDescriptor): boolean {
+	return (
+		before.kind === after.kind && before.itemKind === after.itemKind && before.auto === after.auto
+	)
+}
+
+function relaxValueDomainDirective(
+	collection: string,
+	from: CollectionDefinition,
+	to: CollectionDefinition,
+): string {
+	const fields = [...new Set([...Object.keys(from.fields), ...Object.keys(to.fields)])].sort()
+	return formatRelaxValueDomainDirective({ table: collection, fields })
 }
 
 function validateRebuildSafety(
@@ -190,12 +229,9 @@ function projectionForFieldTransform(
 ): string {
 	const sourceColumn = quoteIdentifier(column)
 	if (source.kind === target.kind && source.itemKind === target.itemKind) {
-		if (target.kind === 'enum' && target.enumValues && target.enumValues.length > 0) {
-			const allowed = target.enumValues.map((value) => sqlLiteral(value)).join(', ')
-			const fallback =
-				target.defaultValue !== undefined ? sqlLiteral(target.defaultValue) : sourceColumn
-			return `CASE WHEN ${sourceColumn} IN (${allowed}) THEN ${sourceColumn} ELSE ${fallback} END`
-		}
+		// Same kind: rows keep their value. An enum value a later schema removed stays on the
+		// rows that hold it (they are folds of the operation log, which keeps it too); the
+		// value domain refuses new writes of it (RT-101).
 		return sourceColumn
 	}
 
@@ -310,17 +346,10 @@ function columnDefinition(fieldName: string, descriptor: FieldDescriptor): strin
 	const sqlType = mapFieldType(descriptor)
 	const parts = [quoteIdentifier(fieldName), sqlType]
 
-	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
-		parts.push('NOT NULL')
-	}
-
+	// Requiredness and enum membership are enforced by validation only (RT-101): no
+	// NOT NULL or CHECK constraints a later schema could not evolve.
 	if (descriptor.defaultValue !== undefined) {
 		parts.push(`DEFAULT ${sqlLiteral(descriptor.defaultValue)}`)
-	}
-
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		const values = descriptor.enumValues.map((value) => sqlLiteral(value)).join(', ')
-		parts.push(`CHECK (${quoteIdentifier(fieldName)} IN (${values}))`)
 	}
 
 	return parts.join(' ')

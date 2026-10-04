@@ -12,6 +12,21 @@ export {
 	sqlDefaultLiteral,
 	sqlStringLiteral,
 } from './schema/sql-gen'
+export {
+	isKoraInternalColumn,
+	isPostgresEnumCheckDefinition,
+	planPostgresConstraintRelaxation,
+	planSqliteConstraintRelaxation,
+	readSqliteTableCatalog,
+	sqliteConstraintRelaxationStatements,
+	sqliteTableNeedsRelaxation,
+} from './schema/constraint-relaxation'
+export type {
+	SqliteColumnInfo,
+	SqliteForeignKeyInfo,
+	SqliteQueryFn,
+	SqliteTableCatalog,
+} from './schema/constraint-relaxation'
 export { compareStamps, stampOf } from './fold/stamp'
 export { planField } from './fold/field-kind'
 export type { FieldPlan } from './fold/field-kind'

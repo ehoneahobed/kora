@@ -3267,14 +3267,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-98.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/local-operation-bus.ts:52-53 (only operation:created and operation:applied are broadcast); store/src/store/store.ts invalidate-only paths: settleAfterCatchUp (1299), applyProvisionalSideEffects (1359), setAuthoritativeNodeIds (1424), refoldRecordsOf (1457), applyScopeRetraction (1507), and the paths at 2991/3016. Repro kora/tests/repro/RT-98.test.ts: two apps on one better-sqlite3 file (real BroadcastChannel); the server refuses tab A's insert, tab A and tab B's findById return null, tab B's live query keeps the refused todo. With scopes the same path keeps records the user lost access to on screen in other tabs. Required fix: broadcast a collection invalidation (collection names, no payload) from Store whenever it invalidates subscriptions without an operation, and have receivers call subscriptionManager.invalidate; or route every Store invalidate through one hook the bus listens to. FIX (beta.13 RC): SubscriptionManager.recordsChanged is the single funnel for every invalidation the store makes (notify carries the operation; invalidate carries collection + ids when known); Store.onRecordsChanged exposes it and the cross-tab bus (kora/src/local-operation-bus.ts) broadcasts ONLY from it: changes with an operation as the operation (receivers advance watermarks), all others as 'records changed (collection, ids)'. Receivers use notifyExternalOperation / notifyExternalChange (invalidateFromPeer: never re-broadcast). Changes made while opening, before the bus is wired (rematerialization, fold-plan re-folds), are replayed to the first listener. Tests: kora/src/local-operation-bus.test.ts (a scope retraction reaches the other tab; funnel contract incl. no echo). Repro adjusted to record every id tab B ever showed (with the fix the refused row can appear and vanish between two polls)."
   },
   {
    "id": "RT-99",
@@ -3282,14 +3282,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-99.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). server/src/server/static-files.ts:245 (baseTag = size-mtime), :311-327 (isNotModified on that tag or the mtime), :278 (compressed cache key size+mtime). index.html and sw.js keep their byte length across deploys (fixed-length content hashes and VERSION); reproducible/container builds normalise mtimes (SOURCE_DATE_EPOCH, Nix, Bazel, fixed-date archive extraction). Repro packages/server/tests/repro/RT-99.test.ts (3 cases). Required fix: content-derived validators for revalidated (no-cache) files: hash the bytes (cache the digest keyed by path+size+mtime+ino+ctime and re-hash when any changes), use it as the ETag and in the compressed-body cache key; do not answer If-Modified-Since alone with 304 for no-cache files whose mtime cannot be trusted (or drop Last-Modified for them). FIX (beta.13 RC): static-files.ts derives the ETag from a SHA-256 of the file bytes, computed once per file version (cache keyed by path; version = dev, ino, size, mtime, ctime) and validated by the digest; revalidated (no-cache) files send no Last-Modified and ignore If-Modified-Since; the compressed-body cache is keyed by the digest (and content read after a change is never cached under the old digest); a pre-compressed sibling is used only when it decompresses to the current digest (normalised mtimes make 'not older' meaningless). Tests: static-files.test.ts (content-digest ETag 304, IMS only for hashed files, stale sibling ignored, redeploy into a new directory with normalised mtimes served by a restarted server is 200, same build 304)."
   },
   {
    "id": "RT-100",
@@ -3297,14 +3297,14 @@
    "severity": "P3",
    "workstream": "W11",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "tsc": "kora/tests/repro/types/RT-100.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). kora/src/typed-api.ts:177-183 (include returns TypedQueryBuilder<R & Inc[T], Inc>, so TypedWhere<R> and keyof R widen to the relation property); store/src/query/sql-builder.ts:419-434 (validateFieldName). Probe kora/tests/repro/types/RT-100.ts (added to TSC_PROBES): 2 unused @ts-expect-error. Auto fields in insert/update and id in update are correctly refused (lines kept as guards). Required fix: keep the filterable/sortable record type separate from the row type, e.g. TypedQueryBuilder<Row, Inc, Base = R> with where(TypedWhere<Base>) and orderBy(keyof Base & string). FIX (beta.13 RC): TypedQueryBuilder<R, Inc, Base = R> keeps the filterable/sortable record (Base) separate from the row type: where(TypedWhere<Base>), orderBy(keyof Base & string); include() widens R only. Probe passes (0 errors); tests/typecheck/typed-api.test-d.ts asserts where/orderBy on own fields after include() and refuses the relation property."
   },
   {
    "id": "RT-101",
@@ -3312,14 +3312,14 @@
    "severity": "P1",
    "workstream": "W9",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-101.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). Not a Phase 4 regression (beta.12 has the same DDL). core/src/schema/sql-gen.ts:248,294 (client CHECK), server/src/store/materialization.ts:79-80 and :92-99 (CREATE IF NOT EXISTS + ADD COLUMN only), core/src/migrations/migration-sql.ts (steps: addField/removeField/renameField/addIndex/removeIndex/backfill; nothing for enum values), postgres-server-store.ts:173-176 and sqlite-server-store.ts:171-173 (23514 / SQLITE_CONSTRAINT_CHECK -> UNSTORABLE_VALUE). Repro kora/tests/repro/RT-101.test.ts (device: CHECK constraint failed: priority; SQLite server: sync:operation-rejected UNSTORABLE_VALUE). Postgres the same by code (23514). Required fix: enforce enum membership in the value domain (validateRecord) only, not in DDL (drop the CHECK, or rebuild it from the current schema on open: SQLite table rebuild, Postgres ALTER TABLE DROP/ADD CONSTRAINT), on client and server stores; or add an explicit migration step that rebuilds the constraint and refuse a schema whose enum values changed without it. Also decide what a REMOVED enum value means for existing rows and old-schema ops (transform or keep accepting)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). Not a Phase 4 regression (beta.12 has the same DDL). core/src/schema/sql-gen.ts:248,294 (client CHECK), server/src/store/materialization.ts:79-80 and :92-99 (CREATE IF NOT EXISTS + ADD COLUMN only), core/src/migrations/migration-sql.ts (steps: addField/removeField/renameField/addIndex/removeIndex/backfill; nothing for enum values), postgres-server-store.ts:173-176 and sqlite-server-store.ts:171-173 (23514 / SQLITE_CONSTRAINT_CHECK -> UNSTORABLE_VALUE). Repro kora/tests/repro/RT-101.test.ts (device: CHECK constraint failed: priority; SQLite server: sync:operation-rejected UNSTORABLE_VALUE). Postgres the same by code (23514). Required fix: enforce enum membership in the value domain (validateRecord) only, not in DDL (drop the CHECK, or rebuild it from the current schema on open: SQLite table rebuild, Postgres ALTER TABLE DROP/ADD CONSTRAINT), on client and server stores; or add an explicit migration step that rebuilds the constraint and refuse a schema whose enum values changed without it. Also decide what a REMOVED enum value means for existing rows and old-schema ops (transform or keep accepting). FIX (beta.13 RC): enum membership and requiredness are value-domain rules enforced by validation only (validateRecord on every write and server ingest); no DDL restates them: core generateSQL/addField, server generateCollectionDDL and the CLI rebuild emit no enum CHECK and no NOT NULL on schema fields (Kora's own columns keep theirs). Existing tables are relaxed once, idempotently, in one transaction: core/src/schema/constraint-relaxation.ts (SQLite table rebuild from the live catalog keeping rows, types, defaults, PK, FKs, UNIQUE, indexes, triggers; Postgres planPostgresConstraintRelaxation drops single-column enum-shaped CHECKs and NOT NULL on schema fields, hand-written checks kept); client Store.open (better-sqlite3, SQLite WASM/OPFS, IndexedDB; foreign keys off around the rebuild), SqliteServerStore/PostgresServerStore.setSchema. Relaxation is version-independent (a relaxed table is valid under every schema version, also for an older build), so it is not tied to the stored schema version; it runs before migrations, so backfills can write new values. Removed enum value: rows and ops keep it (read back as written), new writes refused; a backfill moves them. CLI: kora migrate emits a '--kora:relax-value-domain {table, fields}' directive for value-domain-only changes (no rebuild); --apply expands it per backend from the catalog inside the migration transaction with the _kora_migrations row (SQLite with foreign keys off and a foreign_key_check before commit); adding enum values is not breaking; the CLI rebuild keeps removed enum values (no CASE rewrite). Also fixed: kora migrate --apply on Postgres used a pooled postgres.js client (UNSAFE_TRANSACTION on BEGIN), now max: 1. t.enum() refuses values SQLite cannot store exactly. Audit: DDL DEFAULT is only used to backfill ADD COLUMN (inserts write every field), schema UNIQUE constraints are merge-level (no DDL); a field kind change is not a supported in-place step (removeField + addField). Tests: kora/tests/integration/schema-evolution.test.ts (add/remove enum value, required<->optional on legacy tables), store src/store/relax-constraints.test.ts (all three client adapters, parent table rebuild keeps referencing rows, interrupted rebuild resumable), core constraint-relaxation.test.ts, server src/store/value-domain-evolution.test.ts (SQLite and Postgres), cli value-domain-directive.test.ts (generator, SQLite and Postgres apply)."
   },
   {
    "id": "RT-102",
@@ -3327,14 +3327,14 @@
    "severity": "P2",
    "workstream": "W12",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-102.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). store/src/reactivity/query-store-cache.ts:62 (getKey), react/src/hooks/use-query.ts:51 (descriptorKey); the same key pattern in the Vue/Svelte bindings should be checked. store/src/query/sql-builder.ts:299-321 binds the undefined value ('\"projectId\" = ?'), so the two queries differ at runtime. Repro kora/tests/repro/RT-102.test.ts (control: exec results differ; the cache returns the same store). Required fix: normalise the where clause once in QueryBuilder.where (decide what undefined means: drop the condition, or IS NULL, and refuse NaN), so the descriptor, the SQL and the key agree; derive the key from that canonical descriptor. FIX (beta.13 RC): packages/store/src/query/query-key.ts: normalizeWhere (applied in QueryBuilder's constructor and where(), before merging) defines the semantics: undefined = no condition (field or operator dropped; does not override an earlier condition), null = IS NULL, NaN/Infinity and undefined $in elements refused (QueryError). queryKey(descriptor) is the one canonical key (sorted where keys, typed encodings for Date/bytes/-0/NaN, nothing dropped) used by QueryStoreCache and the React, Vue and Svelte bindings. Tests: query-key.test.ts; repro updated to assert the defined semantics (undefined shares the store with where({}) and returns the same rows; null is a different query and store; NaN throws)."
   },
   {
    "id": "RT-103",
@@ -3342,14 +3342,14 @@
    "severity": "P2",
    "workstream": "W7",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-103.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). core/src/fold/fold.ts:409-410 (null view folds as nothing), core/src/migration/operation-view.ts:55-60 (an empty list folds as written, a partial list returns null), server/src/store/record-fold.ts:130-139, fold plan fingerprint includes transforms (re-fold on change). docs/guide/schema-design.md asks to keep transforms 'as long as operations of its source version can exist', which is forever for an append-only log, and nothing enforces it. Repro packages/server/tests/repro/RT-103.test.ts (SQLite server store; the v1 record is null after the restart). Devices: by code reading the same null view at a re-fold drops the op from their records too. Required fix: at setSchema/open, refuse (OperationTransformError naming the versions) a transform set that has no path from a schema version present in the stored log to the current one; and treat a null view of a STORED op as quarantine/keep-as-written, never as an absent op (a transform returning null deliberately is a separate, explicit decision that should be logged)."
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). core/src/fold/fold.ts:409-410 (null view folds as nothing), core/src/migration/operation-view.ts:55-60 (an empty list folds as written, a partial list returns null), server/src/store/record-fold.ts:130-139, fold plan fingerprint includes transforms (re-fold on change). docs/guide/schema-design.md asks to keep transforms 'as long as operations of its source version can exist', which is forever for an append-only log, and nothing enforces it. Repro packages/server/tests/repro/RT-103.test.ts (SQLite server store; the v1 record is null after the restart). Devices: by code reading the same null view at a re-fold drops the op from their records too. Required fix: at setSchema/open, refuse (OperationTransformError naming the versions) a transform set that has no path from a schema version present in the stored log to the current one; and treat a null view of a STORED op as quarantine/keep-as-written, never as an absent op (a transform returning null deliberately is a separate, explicit decision that should be logged). FIX (beta.13 RC): core missingTransformPaths / assertOperationTransformCoverage (operation-view.ts) mirror the transform path; every server store (memory, SQLite, Postgres) checks the DISTINCT schema versions of its operations in setSchema and setOperationTransforms BEFORE changing any state, and KoraSyncServer.start() surfaces it; the client Store checks its _kora_ops_* tables (older versions only; newer ones are parked) at open, so app.ready rejects. Error: OperationTransformCoverageError, code OPERATION_TRANSFORM_MISSING, naming the versions, the missing step and the fix (keep the transform, or register none: operations then fold as written). No squash/compaction tool in beta.13 (documented in schema-design.md: a transform cannot yet be removed safely). Tests: core operation-view.test.ts (coverage), server src/store/transform-coverage.test.ts (SQLite, memory, KoraSyncServer.start, Postgres with KORA_PG_TEST_URL), store src/store/transform-coverage.test.ts. The fold's null view stays 'absent' only for a transform that deliberately returns null."
   },
   {
    "id": "RT-104",

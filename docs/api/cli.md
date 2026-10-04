@@ -109,6 +109,14 @@ It then writes, under `kora/migrations/`:
   older version
 - `NNN-vA-to-vB.json`: the manifest `--apply` uses
 
+A change to a field's value domain only (enum values, required/optional, default) produces no
+table rebuild: the migration holds a `--kora:relax-value-domain {"table": ..., "fields": [...]}`
+directive, which `--apply` expands against each backend's catalog inside the migration's
+transaction (SQLite: rebuild the table without the enum `CHECK` / `NOT NULL` that beta.12 DDL
+created; Postgres: drop them), and which does nothing on a table that has none. Adding enum
+values or making a field optional is not breaking; removing an enum value is (rows keep it, new
+writes of it are refused).
+
 Removing a field or changing its type is breaking: the command asks for confirmation (or needs
 `--force`; without a terminal it fails). `--dry-run` writes nothing. `--apply` runs the pending
 migrations against the configured databases: a SQLite file (`--db`, or the config) and Postgres

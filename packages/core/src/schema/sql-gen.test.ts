@@ -21,7 +21,8 @@ describe('generateSQL', () => {
 		const createTable = stmts[0]
 		expect(createTable).toContain('CREATE TABLE IF NOT EXISTS "todos"')
 		expect(createTable).toContain('id TEXT PRIMARY KEY NOT NULL')
-		expect(createTable).toContain('"title" TEXT NOT NULL')
+		// Requiredness is a value-domain rule, enforced by validation only (RT-101).
+		expect(createTable).toMatch(/"title" TEXT,/)
 		expect(createTable).toContain('_created_at INTEGER NOT NULL')
 		expect(createTable).toContain('_updated_at INTEGER NOT NULL')
 		expect(createTable).toContain("_version TEXT NOT NULL DEFAULT ''")
@@ -35,22 +36,24 @@ describe('generateSQL', () => {
 		const stmts = generateSQL('todos', todos)
 		const createTable = stmts[0] ?? ''
 
-		expect(createTable).toContain('"title" TEXT NOT NULL') // string
+		expect(createTable).toMatch(/"title" TEXT,/) // string (no NOT NULL, RT-101)
 		expect(createTable).toContain('"completed" INTEGER DEFAULT 0') // boolean with default(false)
 		expect(createTable).toContain('"assignee" TEXT') // optional string
 		expect(createTable).toContain('"tags" TEXT DEFAULT') // array with default
-		expect(createTable).toContain('"notes" BLOB NOT NULL') // richtext (required)
+		expect(createTable).toMatch(/"notes" BLOB,/) // richtext (required: validation only)
 		expect(createTable).toContain('"due_date" INTEGER') // optional timestamp
 	})
 
-	test('generates CHECK constraint for enum fields', () => {
+	test('generates no value-domain constraints for enum or required fields (RT-101)', () => {
 		const schema = defineSchema(FULL_SCHEMA)
 		const todos = schema.collections.todos
 		if (!todos) return
-		const stmts = generateSQL('todos', todos)
-		const createTable = stmts[0] ?? ''
+		const ddl = generateSQL('todos', todos).join('\n')
 
-		expect(createTable).toContain("CHECK (\"priority\" IN ('low', 'medium', 'high'))")
+		expect(ddl).not.toMatch(/CHECK/i)
+		expect(ddl).toContain(`"priority" TEXT DEFAULT 'medium'`)
+		// Kora's own columns keep their constraints.
+		expect(ddl).toContain('_deleted INTEGER NOT NULL DEFAULT 0')
 	})
 
 	test('generates CREATE INDEX statements', () => {
@@ -213,7 +216,7 @@ describe('SQL literals in DDL (SEC-9b)', () => {
 		expect(sqlDefaultLiteral(null)).toBe('NULL')
 	})
 
-	test('defaults and enum CHECKs with quotes cannot break out of the literal', () => {
+	test('defaults (and the enum CHECK helper) with quotes cannot break out of the literal', () => {
 		const schema = defineSchema({
 			version: 1,
 			collections: {
@@ -229,7 +232,7 @@ describe('SQL literals in DDL (SEC-9b)', () => {
 		if (!notes) throw new Error('missing collection')
 		const create = generateSQL('notes', notes)[0] ?? ''
 		expect(create).toContain(`DEFAULT 'x''); DROP TABLE notes; --'`)
-		expect(create).toContain(`CHECK ("mood" IN ('it''s fine', 'ok'))`)
+		expect(create).toContain(`"mood" TEXT DEFAULT 'it''s fine'`)
 		expect(enumCheckConstraint('m', ["a'b"])).toBe(`CHECK ("m" IN ('a''b'))`)
 	})
 })

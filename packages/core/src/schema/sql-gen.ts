@@ -231,21 +231,18 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 	return statements
 }
 
+/**
+ * A schema field's column: its type and default only. Requiredness and enum membership
+ * are value-domain rules, enforced by validation at write time on every replica; they
+ * are never restated as `NOT NULL` / `CHECK` constraints, which a table cannot evolve
+ * when the schema does (RT-101: an added enum value, a field made optional).
+ */
 function columnDefinition(fieldName: string, descriptor: FieldDescriptor): string {
 	const sqlType = mapFieldType(descriptor)
 	const parts = [quoteIdent(fieldName), sqlType]
 
-	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
-		parts.push('NOT NULL')
-	}
-
 	if (descriptor.defaultValue !== undefined) {
 		parts.push(`DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`)
-	}
-
-	// CHECK constraint for enum fields
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		parts.push(enumCheckConstraint(fieldName, descriptor.enumValues))
 	}
 
 	return parts.join(' ')
@@ -285,7 +282,8 @@ export function sqlDefaultLiteral(value: unknown): string {
 
 /**
  * Render the `CHECK (col IN (...))` constraint of an enum field, each value
- * quoted with `sqlStringLiteral` (SEC-9b).
+ * quoted with `sqlStringLiteral` (SEC-9b). No longer emitted by Kora's DDL (RT-101:
+ * enum membership is enforced by validation only); kept for tooling and tests.
  *
  * @param fieldName - The enum column
  * @param values - The enum's allowed values

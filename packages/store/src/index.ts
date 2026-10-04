@@ -85,6 +85,7 @@ export type { CollectionAccessor } from './store/store'
 
 // === Query ===
 export { QueryBuilder } from './query/query-builder'
+export { normalizeWhere, queryKey } from './query/query-key'
 export { VIRTUAL_TIMESTAMP_FIELDS, VIRTUAL_TIMESTAMP_FIELD_NAMES } from './query/sql-builder'
 export type { VirtualTimestampField } from './query/sql-builder'
 export type { QueryErrorPhase, QuerySubscriptionError, SubscribeOptions } from './types'
@@ -108,6 +109,8 @@ export {
 // === Subscription ===
 export { SubscriptionManager } from './subscription/subscription-manager'
 export type {
+	RecordsChange,
+	RecordsChangeListener,
 	RegisterOptions,
 	SubscriptionManagerOptions,
 	SubscriptionStats,

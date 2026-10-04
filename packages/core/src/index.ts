@@ -311,7 +311,10 @@ export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence
 export type { OperationTransform } from './migration/operation-transform'
 export { applyOperationTransforms } from './migration/apply-operation-transforms'
 export {
+	OperationTransformCoverageError,
 	OperationTransformError,
+	assertOperationTransformCoverage,
+	missingTransformPaths,
 	operationSchemaView,
 	operationTransformsFingerprint,
 } from './migration/operation-view'

@@ -167,7 +167,7 @@ and nothing is written. The server refuses such an operation on its own
 | Field type | Accepted values | Client SQLite / IndexedDB | Server SQLite | Server Postgres | Wire |
 |---|---|---|---|---|---|
 | `t.string()` | any string, including U+0000 and lone surrogates | TEXT / string | TEXT (lossless text codec) | TEXT (lossless text codec) | JSON string |
-| `t.enum()` | one of the declared values | TEXT / string | TEXT + CHECK | TEXT + CHECK | JSON string |
+| `t.enum()` | one of the declared values | TEXT / string | TEXT | TEXT | JSON string |
 | `t.number()` | a finite double (`NaN` and `±Infinity` refused; `-0` becomes `0`) | REAL / number | REAL | DOUBLE PRECISION | JSON number |
 | `t.boolean()` | `true` / `false` | INTEGER 0/1 / boolean | INTEGER | INTEGER | JSON boolean |
 | `t.timestamp()` | integer milliseconds in `[-8.64e15, 8.64e15]` (fractions refused) | INTEGER / number | INTEGER | BIGINT | JSON number |
@@ -434,6 +434,29 @@ step. When the app opens a database at an older version:
 - Backfill updates pass the same checks as any update (value domain, state machines): a backfill
   that makes a transition the state machine forbids fails the migration.
 
+### Changing a field's value domain
+
+Adding or removing enum values, or making a field optional or required, changes which values a
+write may hold, not the table. The value domain is enforced by validation on every replica
+(local writes, and the sync server for every uploaded operation); tables carry no `CHECK` or
+`NOT NULL` for schema fields, so a new schema version needs no structural step for it:
+
+- **Added enum value, field made optional:** accepted everywhere as soon as the replica runs
+  the new schema.
+- **Removed enum value:** rows and operations that hold it keep it and read it back as written
+  (other fields of those rows stay writable); new writes of it are refused
+  (`SchemaValidationError`). Add a `backfill` to move old rows to a current value.
+- **Field made required:** new writes need a value (or get the default); existing nulls stay
+  until a `backfill` fills them.
+
+Databases created by beta.12 and earlier restated enum values and requiredness as table
+constraints, which refused values a later schema allowed. On the first open (client: SQLite,
+SQLite WASM/OPFS, IndexedDB) or start (server: SQLite, Postgres) of this release, those
+constraints are removed once, in one transaction (SQLite rebuilds the table keeping rows,
+indexes, triggers and foreign keys; Postgres drops the enum `CHECK` and `NOT NULL` on schema
+fields; checks you added by hand are kept). It is idempotent: a later open finds nothing to do.
+`kora migrate` emits the same step for a value-domain change (see below).
+
 ### Devices on older versions: transforms at fold time
 
 A sync server can accept clients of several schema versions (`supportedSchemaVersions`). An
@@ -454,8 +477,17 @@ Operations are immutable and content-addressed, so a transform never rewrites on
 - **Pure and deterministic.** A transform may rewrite only `data`, `previousData`, `atomicOps`
   and `schemaVersion`, with JSON values, and must return the same result on every replica (no
   clock, randomness or I/O). Changing an operation's id, node, type, collection, record or
-  timestamp is refused (`SCHEMA_TRANSFORM_INVALID`). Keep a transform registered for as long as
-  operations of its source version can exist.
+  timestamp is refused (`SCHEMA_TRANSFORM_INVALID`).
+- **Never retire a transform.** The operation log is append-only, so operations of a source
+  version exist for as long as the data does, and a transform must stay registered with them.
+  A server store (`setSchema`, `setOperationTransforms`, `KoraSyncServer.start()`) and a local
+  database (`app.ready`) refuse to start when a schema version in their log has no transform
+  path to the current version, with `OperationTransformCoverageError`
+  (`OPERATION_TRANSFORM_MISSING`) naming the versions and the missing step. Starting anyway
+  would fold those operations as absent and silently erase them from their records. To fix it,
+  register the retired transform again. Registering no transforms at all is also accepted
+  (every operation then folds as written). This release has no compaction that folds old
+  operations into snapshots, so a transform cannot yet be removed safely.
 - **Older clients** receive newer operations as written; with no transform path to their version
   they quarantine them and replay them after upgrading. Encrypted operations are opaque to the
   server, which folds their cleartext fields as written; devices transform them after decryption.

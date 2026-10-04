@@ -6,7 +6,7 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 // SEC-9b: one DDL literal generator for client and server tables.
-import { enumCheckConstraint, sqlDefaultLiteral } from '@korajs/core/internal'
+import { sqlDefaultLiteral } from '@korajs/core/internal'
 
 // Legacy comparison only (W7 Stage B2): the server stores no longer materialize with
 // the pre-fold replay. Every store merges operations into a per-record fold state
@@ -75,10 +75,9 @@ export function generateCollectionDDL(
 		if (descriptor.defaultValue !== undefined) {
 			colDef += ` DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`
 		}
-		if (descriptor.kind === 'enum' && descriptor.enumValues) {
-			// SEC-9b: the shared generator quotes every value (embedded quotes doubled).
-			colDef += ` ${enumCheckConstraint(fieldName, descriptor.enumValues)}`
-		}
+		// No enum CHECK and no NOT NULL: the value domain is enforced at ingest only, so a
+		// schema upgrade (an added enum value, a field made optional) never meets a stale
+		// table constraint (RT-101).
 		columns.push(colDef)
 	}
 

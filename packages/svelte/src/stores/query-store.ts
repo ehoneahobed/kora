@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder, QueryStore, QueryStoreCache } from '@korajs/store'
-import { assertQueryReady } from '@korajs/store'
+import { assertQueryReady, queryKey } from '@korajs/store'
 import { type Readable, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
 import type { QueryState, UseQueryOptions } from '../types'
@@ -59,7 +59,7 @@ function followQuery<T>(
 	}
 
 	const apply = (): void => {
-		const key = enabled && current ? JSON.stringify(current.getDescriptor()) : null
+		const key = enabled && current ? queryKey(current.getDescriptor()) : null
 		if (key === activeKey) return
 		release?.()
 		release = null

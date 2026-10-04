@@ -2,6 +2,7 @@ import {
 	CausalTracker,
 	HybridLogicalClock,
 	KoraError,
+	assertOperationTransformCoverage,
 	createVersionVector,
 	deriveSideEffectOpId,
 	deserializeFoldState,
@@ -85,7 +86,10 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
-import { SubscriptionManager } from '../subscription/subscription-manager'
+import {
+	type RecordsChangeListener,
+	SubscriptionManager,
+} from '../subscription/subscription-manager'
 import {
 	type AdoptionSchedule,
 	type LocalNodeRecord,
@@ -163,6 +167,7 @@ import type {
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import { relaxValueDomainConstraints } from './relax-constraints'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
 	SEQ_CONFLICTS_TABLE,
@@ -383,6 +388,10 @@ export class Store implements OperationLog {
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		this.foldActive = false
 
+		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
+		// NOT NULL constraints that cannot evolve with the schema: rebuild them once without
+		// (RT-101). Validation is the single authority for the value domain.
+		await relaxValueDomainConstraints(this.adapter, this.schema)
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
@@ -424,6 +433,9 @@ export class Store implements OperationLog {
 		// Run schema migrations if needed. Backfills write operations through the local
 		// write path, so the node id and clock must exist first (STORE-13).
 		try {
+			// Transforms that cannot read the stored log would fold those operations as
+			// absent and erase them from their records: refuse to open instead (RT-103).
+			await this.assertTransformCoverage()
 			await this.runMigrationsIfNeeded()
 			await this.ensureLegacyBodiesCanonical()
 			await this.ensureMaterialization()
@@ -1156,6 +1168,12 @@ export class Store implements OperationLog {
 		)
 		this.foldActive = true
 		if (result.snapshots > 0) await this.requestSnapshotResync()
+		if (result.changedRows > 0) {
+			// Other tabs on this database hear about it once the bus is wired (RT-98).
+			for (const collection of Object.keys(this.schema.collections)) {
+				this.subscriptionManager.invalidate(collection)
+			}
+		}
 		if (result.records > 0) {
 			this.emitter?.emit({
 				type: 'store:rematerialized',
@@ -1169,6 +1187,32 @@ export class Store implements OperationLog {
 						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
 			})
 		}
+	}
+
+	/**
+	 * Refuse to open when a schema version in the local operation log has no transform
+	 * path to the current schema (RT-103). Operations of a NEWER schema (authored by an
+	 * upgraded peer) are not checked: they are kept aside until this device upgrades.
+	 */
+	private async assertTransformCoverage(): Promise<void> {
+		const transforms = this.operationTransforms
+		if (transforms === undefined || transforms.length === 0) return
+		const versions = new Set<number>()
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ v: number }>(
+				`SELECT DISTINCT schema_version AS v FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			for (const row of rows) {
+				const version = Number(row.v)
+				if (version < this.schema.version) versions.add(version)
+			}
+		}
+		assertOperationTransformCoverage(
+			versions,
+			this.schema.version,
+			transforms,
+			`local database "${this.dbName}"`,
+		)
 	}
 
 	/**
@@ -1209,6 +1253,7 @@ export class Store implements OperationLog {
 				changed,
 			)
 			if (result.snapshots > 0) await this.requestSnapshotResync()
+			for (const collection of changed) this.subscriptionManager.invalidate(collection)
 			this.emitter?.emit({
 				type: 'store:rematerialized',
 				dbName: this.dbName,
@@ -1454,7 +1499,9 @@ export class Store implements OperationLog {
 				for (const recordId of records) await fold.refoldInTx(tx, collection, recordId)
 			}
 		})
-		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
+		for (const [collection, records] of touched) {
+			this.subscriptionManager.invalidate(collection, [...records])
+		}
 	}
 
 	/**
@@ -1504,7 +1551,7 @@ export class Store implements OperationLog {
 				[collection, recordId],
 			)
 		})
-		this.subscriptionManager.invalidate(collection)
+		this.subscriptionManager.invalidate(collection, [recordId])
 	}
 
 	/** Hide all live rows that no longer match a newly accepted server scope. */
@@ -1914,7 +1961,32 @@ export class Store implements OperationLog {
 			return
 		}
 		this.recordOperationSequence(operation)
-		this.subscriptionManager.notify(operation.collection, operation)
+		this.subscriptionManager.invalidateFromPeer(operation.collection)
+	}
+
+	/**
+	 * Notify this store that another same-origin runtime changed rows of a collection
+	 * in the shared local database without an operation this tab can see (a re-fold,
+	 * a scope retraction, a restore; RT-98). Only re-runs the affected live queries.
+	 *
+	 * @param collection - The collection whose rows changed
+	 */
+	notifyExternalChange(collection: string): void {
+		this.ensureOpen()
+		if (!this.schema.collections[collection]) return
+		this.subscriptionManager.invalidateFromPeer(collection)
+	}
+
+	/**
+	 * Listen to every committed change this store makes to collection rows: local
+	 * writes, remote applies, and changes without a new operation (re-folds, scope
+	 * retraction, cascade settling, rematerialization, restore). The cross-tab bus
+	 * relays these to other tabs on the same database (RT-98).
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRecordsChanged(listener: RecordsChangeListener): () => void {
+		return this.subscriptionManager.onRecordsChanged(listener)
 	}
 
 	/**
@@ -2988,7 +3060,8 @@ export class Store implements OperationLog {
 				for (const recordId of ids) await folder.refoldInTx(tx, collection, recordId)
 			}
 		})
-		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
+		for (const [collection, ids] of touched)
+			this.subscriptionManager.invalidate(collection, [...ids])
 	}
 
 	/**

@@ -9,7 +9,13 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	KoraError,
+	assertOperationTransformCoverage,
+	quoteIdent,
+} from '@korajs/core'
+import { planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -497,6 +503,49 @@ export class PostgresServerStore implements ServerStore {
 		return this.schema
 	}
 
+	/**
+	 * One-time migration (RT-101): drop the enum `CHECK` constraints (and any `NOT NULL`
+	 * on a schema field) that beta.12 and earlier DDL put on collection tables, in one
+	 * transaction. Only single-column `col = ANY (ARRAY[...])` checks (Kora's enum shape)
+	 * on non-internal columns are dropped; checks added by hand are kept. Idempotent and
+	 * resumable: a later start finds nothing to drop.
+	 */
+	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
+		const fieldsByTable: Record<string, string[]> = {}
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			fieldsByTable[name] = Object.keys(collection.fields)
+		}
+		await this.db.transaction(async (tx) => {
+			const statements = await planPostgresConstraintRelaxation(
+				async (text) =>
+					(await tx.execute(sql.raw(text))) as unknown as Array<Record<string, unknown>>,
+				fieldsByTable,
+			)
+			for (const statement of statements) await tx.execute(sql.raw(statement))
+		})
+	}
+
+	/**
+	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
+	 * log has no transform path to `version` (RT-103): those operations would fold as
+	 * absent, silently erasing them from their records.
+	 */
+	private async assertTransformCoverage(
+		version: number,
+		transforms: readonly OperationTransform[],
+	): Promise<void> {
+		if (transforms.length === 0) return
+		const rows = (await this.db.execute(
+			sql`SELECT DISTINCT schema_version AS v FROM operations`,
+		)) as unknown as { v: number | string }[]
+		assertOperationTransformCoverage(
+			rows.map((row) => Number(row.v)),
+			version,
+			transforms,
+			'Postgres server store',
+		)
+	}
+
 	getOperationTransforms(): readonly OperationTransform[] {
 		return this.operationTransforms
 	}
@@ -504,6 +553,7 @@ export class PostgresServerStore implements ServerStore {
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		if (this.schema) await this.assertTransformCoverage(this.schema.version, transforms)
 		this.operationTransforms = [...transforms]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every
@@ -514,6 +564,11 @@ export class PostgresServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		await this.assertTransformCoverage(
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -546,6 +601,9 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
+		// beta.12 tables carry enum CHECKs a schema upgrade cannot change: drop them once
+		// (RT-101); the value domain is enforced at ingest only.
+		await this.relaxValueDomainConstraints(schema)
 		await this.migrateTextCodec(schema)
 
 		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their

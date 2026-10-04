@@ -75,6 +75,25 @@ export interface SubscriptionManagerOptions {
 }
 
 /**
+ * A committed change to the rows of one collection that can affect query results
+ * (RT-98). Every invalidation the store makes produces one: local writes and remote
+ * applies (with the operation), and changes made without a new operation (rejection
+ * re-folds, scope retraction, cascade settling, rematerialization, backup restore,
+ * held/discarded writes).
+ */
+export interface RecordsChange {
+	/** Collection whose rows changed */
+	readonly collection: string
+	/** Changed record ids, or null when unknown (treat the whole collection as changed) */
+	readonly ids: readonly string[] | null
+	/** The operation that caused the change, when there is one */
+	readonly operation?: Operation
+}
+
+/** Listener for {@link RecordsChange}s made by this runtime (not those relayed from peers). */
+export type RecordsChangeListener = (change: RecordsChange) => void
+
+/**
  * Performance statistics for monitoring subscription checking efficiency.
  */
 export interface SubscriptionStats {
@@ -116,6 +135,13 @@ export class SubscriptionManager {
 	private flushScheduled = false
 	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 	private readonly onQueryError?: (failure: QuerySubscriptionError) => void
+	private readonly changeListeners = new Set<RecordsChangeListener>()
+	/**
+	 * Collections changed before the first change listener attached (a store's open:
+	 * rematerialization, migration backfills). Replayed to that listener, so other tabs
+	 * hear about changes made while this tab was still opening. Bounded by the schema.
+	 */
+	private unheardCollections: Set<string> | null = new Set()
 
 	// Bloom filter state
 	private bloomFilter: SubscriptionBloomFilter | null = null
@@ -296,14 +322,66 @@ export class SubscriptionManager {
 	 * Notify the manager that a mutation occurred on a collection.
 	 * Schedules a microtask flush to batch multiple mutations in the same tick.
 	 */
-	notify(collection: string, _operation: Operation): void {
-		this.invalidate(collection)
+	notify(collection: string, operation: Operation): void {
+		this.recordsChanged({ collection, ids: [operation.recordId], operation })
 	}
 
-	/** Invalidate a collection after a local-view change that has no domain operation. */
-	invalidate(collection: string): void {
+	/**
+	 * Invalidate a collection after a local-view change that has no domain operation
+	 * (a re-fold, a retraction, a restore). Pass the record ids when known.
+	 */
+	invalidate(collection: string, ids: readonly string[] | null = null): void {
+		this.recordsChanged({ collection, ids })
+	}
+
+	/**
+	 * The single entry point for a committed change made by this runtime (RT-98): it
+	 * schedules the affected queries and tells every change listener (the cross-tab
+	 * bus), so no invalidation path can reach this tab's queries without reaching the
+	 * other tabs' too.
+	 */
+	recordsChanged(change: RecordsChange): void {
+		this.pendingCollections.add(change.collection)
+		this.scheduleFlush()
+		if (this.unheardCollections) this.unheardCollections.add(change.collection)
+		for (const listener of this.changeListeners) {
+			try {
+				listener(change)
+			} catch (error) {
+				// A failing listener must not stop this tab's queries or other listeners.
+				console.error('[kora] records-change listener failed', error)
+			}
+		}
+	}
+
+	/**
+	 * Invalidate a collection for a change another runtime made to the shared
+	 * database. Not relayed to change listeners (the peer already broadcast it).
+	 */
+	invalidateFromPeer(collection: string): void {
 		this.pendingCollections.add(collection)
 		this.scheduleFlush()
+	}
+
+	/**
+	 * Listen to every committed change this runtime makes.
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRecordsChanged(listener: RecordsChangeListener): () => void {
+		this.changeListeners.add(listener)
+		const unheard = this.unheardCollections
+		this.unheardCollections = null
+		for (const collection of unheard ?? []) {
+			try {
+				listener({ collection, ids: null })
+			} catch (error) {
+				console.error('[kora] records-change listener failed', error)
+			}
+		}
+		return () => {
+			this.changeListeners.delete(listener)
+		}
 	}
 
 	/**

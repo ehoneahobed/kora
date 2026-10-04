@@ -162,6 +162,19 @@ export async function queries(): Promise<void> {
 	await app.todos.where({}).include('projects').exec()
 	// @ts-expect-error unknown relation in include()
 	app.todos.where({}).include('nope')
+	// After include(), where/orderBy still take the record's own fields (RT-100)...
+	const filtered = await app.todos
+		.where({})
+		.include('project')
+		.where({ title: 'x' })
+		.orderBy('title')
+		.exec()
+	expectTypeOf(filtered[0]?.project).toEqualTypeOf<Project | null | undefined>()
+	// ...and never the included relation.
+	// @ts-expect-error an included relation is not a filterable field
+	app.todos.where({}).include('project').where({ project: null })
+	// @ts-expect-error an included relation is not a sort key
+	app.todos.where({}).include('project').orderBy('project')
 
 	const withTodos = await app.projects.where({}).include('todos').exec()
 	expectTypeOf(withTodos[0]?.todos).toEqualTypeOf<Todo[] | undefined>()

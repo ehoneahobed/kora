@@ -127,3 +127,88 @@ export function operationTransformsFingerprint(
 		.sort()
 	return `xf@v${targetSchemaVersion}(${parts.join(',')})`
 }
+
+/**
+ * Thrown when stored operations have a schema version the registered transforms cannot
+ * read (RT-103): starting would fold those operations as absent and silently erase them
+ * from every record they belong to.
+ */
+export class OperationTransformCoverageError extends KoraError {
+	constructor(
+		message: string,
+		public readonly versions: readonly number[],
+		public readonly targetSchemaVersion: number,
+		context: Record<string, unknown> = {},
+	) {
+		super(message, 'OPERATION_TRANSFORM_MISSING', {
+			...context,
+			versions: [...versions],
+			targetSchemaVersion,
+			fix: `Keep a transform path registered from every schema version in the operation log to v${targetSchemaVersion} (a transform must stay registered as long as operations of its source version exist, and the log is append-only), or register no transforms at all (operations then fold as written).`,
+		})
+		this.name = 'OperationTransformCoverageError'
+	}
+}
+
+/**
+ * The stored schema versions the transforms have no path from (RT-103). Mirrors the
+ * path {@link operationSchemaView} follows (`fromVersion` to `toVersion`, at most 32
+ * steps). An empty transform list reads everything (operations fold as written).
+ *
+ * @param storedVersions - Distinct schema versions of the stored operations
+ * @param targetSchemaVersion - The replica's schema version
+ * @param transforms - The registered transforms
+ * @returns Each version with no path and the version whose transform is missing, ascending
+ */
+export function missingTransformPaths(
+	storedVersions: Iterable<number>,
+	targetSchemaVersion: number,
+	transforms: readonly OperationTransform[] | undefined,
+): Array<{ version: number; missingFrom: number }> {
+	if (transforms === undefined || transforms.length === 0) return []
+	const missing: Array<{ version: number; missingFrom: number }> = []
+	for (const version of new Set(storedVersions)) {
+		if (version === targetSchemaVersion) continue
+		let current = version
+		let reached = false
+		for (let step = 0; step < 32; step++) {
+			if (current === targetSchemaVersion) {
+				reached = true
+				break
+			}
+			const next = transforms.find((candidate) => candidate.fromVersion === current)
+			if (!next) break
+			current = next.toVersion
+		}
+		if (!reached) missing.push({ version, missingFrom: current })
+	}
+	return missing.sort((a, b) => a.version - b.version)
+}
+
+/**
+ * Refuse to start a replica whose transforms cannot read operations it stores (RT-103).
+ *
+ * @param storedVersions - Distinct schema versions of the stored operations
+ * @param targetSchemaVersion - The replica's schema version
+ * @param transforms - The registered transforms
+ * @param replica - Names the replica in the message ("server store", "local database")
+ * @throws {OperationTransformCoverageError} When a stored version has no path
+ */
+export function assertOperationTransformCoverage(
+	storedVersions: Iterable<number>,
+	targetSchemaVersion: number,
+	transforms: readonly OperationTransform[] | undefined,
+	replica: string,
+): void {
+	const missing = missingTransformPaths(storedVersions, targetSchemaVersion, transforms)
+	if (missing.length === 0) return
+	const versions = missing.map((entry) => entry.version)
+	const steps = [...new Set(missing.map((entry) => entry.missingFrom))]
+	const plural = versions.length > 1
+	throw new OperationTransformCoverageError(
+		`The ${replica} holds operations of schema version${plural ? 's' : ''} ${versions.map((v) => `v${v}`).join(', ')}, but the registered operationTransforms have no path from ${plural ? 'them' : 'it'} to the current schema v${targetSchemaVersion} (no transform from ${steps.map((v) => `v${v}`).join(', ')}). Starting would silently drop those operations from their records, so it is refused. Keep the retired transform(s) registered: a transform may be removed only after every operation of its source version has been folded into snapshots by an explicit compaction.`,
+		versions,
+		targetSchemaVersion,
+		{ replica, missingFrom: steps },
+	)
+}

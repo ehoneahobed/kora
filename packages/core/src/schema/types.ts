@@ -1,4 +1,5 @@
 import { SchemaValidationError } from '../errors/errors'
+import { encodeStoredText } from '../text/stored-text'
 import type {
 	BlobRef,
 	FieldDescriptor,
@@ -182,6 +183,25 @@ export class FieldBuilder<
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
 			transitions: null,
+		}
+	}
+}
+
+/**
+ * Enum values are stored verbatim (an enum column is not raw text with the stored-text
+ * codec), so every value must be text SQLite stores and reads back exactly: no U+0000
+ * (SQLite WASM reads TEXT up to a NUL), no lone surrogate (UTF-8 cannot hold one) and no
+ * U+FFFF (the stored-text codec's escape). The table's `CHECK` used to refuse such values
+ * at write time; with the value domain enforced by validation only (RT-101) the schema
+ * refuses them up front.
+ */
+function assertStorableEnumValues(values: readonly string[]): void {
+	for (const value of values) {
+		if (typeof value !== 'string' || encodeStoredText(value) !== value) {
+			throw new SchemaValidationError(
+				`Enum value ${JSON.stringify(value)} cannot be stored: enum values must be well-formed strings without U+0000 or U+FFFF.`,
+				{ value: String(value) },
+			)
 		}
 	}
 }
@@ -715,6 +735,7 @@ export const t = {
 
 	/** An enum field whose value is one of `values`. */
 	enum<const V extends readonly string[]>(values: V): EnumFieldBuilder<V, true, false> {
+		assertStorableEnumValues(values)
 		return new EnumFieldBuilder(values, true, undefined, false)
 	},
 

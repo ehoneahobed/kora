@@ -1,8 +1,15 @@
-import { createReadStream } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { type Stats, createReadStream } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, join, resolve, sep } from 'node:path'
-import { brotliCompress, gzip, constants as zlibConstants } from 'node:zlib'
+import {
+	brotliCompress,
+	brotliDecompress,
+	gunzip,
+	gzip,
+	constants as zlibConstants,
+} from 'node:zlib'
 
 /**
  * Static file serving for the production server (NEW-SRV-8).
@@ -12,9 +19,15 @@ import { brotliCompress, gzip, constants as zlibConstants } from 'node:zlib'
  *   `name-[hash].ext`). Everything else, including `index.html`, the service worker, the
  *   web manifest and Kora's own UNHASHED `assets/sqlite3.wasm`, is `no-cache`: always
  *   revalidated, so a sqlite upgrade can never pair new JavaScript with stale WASM.
- * - Strong validators (`ETag`, `Last-Modified`) and `304 Not Modified`.
+ * - Strong, content-derived validators (RT-99): the `ETag` is a SHA-256 of the file's
+ *   bytes, computed once per file version (cached by path, size, mtime, inode and ctime,
+ *   re-hashed when any of them changes), so a redeploy that keeps a file's size and
+ *   modification time (fixed-length hashes in `index.html`/`sw.js`, reproducible builds
+ *   with normalised mtimes) is never answered `304`. Revalidated (`no-cache`) files carry
+ *   no `Last-Modified` and ignore `If-Modified-Since`, since an mtime cannot be trusted.
  * - Brotli or gzip for compressible types: a pre-compressed `file.br` / `file.gz` sibling
- *   when the build emitted one, otherwise compressed once and cached in memory.
+ *   when the build emitted one and it decompresses to the file's current bytes, otherwise
+ *   compressed once per content hash and cached in memory.
  * - A 404 for a missing file. The SPA fallback (`index.html`) answers navigations only
  *   (`Accept: text/html` or `Sec-Fetch-Mode: navigate`) and never a path under
  *   `/assets/`, so a stale tab asking for an old hashed chunk gets a 404, not HTML
@@ -137,6 +150,20 @@ interface CachedBody {
 	size: number
 }
 
+interface CachedDigest {
+	/** Identity of the file version the digest was computed for. */
+	version: string
+	digest: string
+}
+
+/** Everything that changes when a file is rewritten or replaced (ctime cannot be set). */
+function fileVersionKey(stats: Stats): string {
+	return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`
+}
+
+/** Most file versions whose digests are remembered (one entry per served path). */
+const DIGEST_CACHE_MAX_ENTRIES = 4096
+
 /** A request handler that serves files from one directory. */
 export type StaticFileHandler = (
 	req: IncomingMessage,
@@ -154,6 +181,35 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 	const root = resolve(staticDir)
 	const compressed = new Map<string, CachedBody>()
 	let compressedBytes = 0
+	const digests = new Map<string, CachedDigest>()
+	/** Pre-compressed siblings verified against a source digest: `sibling path -> version|digest`. */
+	const verifiedSiblings = new Map<string, string>()
+
+	/**
+	 * SHA-256 (base64url) of a file's bytes, computed once per file version. The cache key
+	 * only decides when to re-hash; the validator itself is always the content digest.
+	 */
+	async function contentDigest(path: string, stats: Stats): Promise<string> {
+		const version = fileVersionKey(stats)
+		const cached = digests.get(path)
+		if (cached && cached.version === version) return cached.digest
+		const hash = createHash('sha256')
+		await new Promise<void>((done, fail) => {
+			const stream = createReadStream(path)
+			stream.on('data', (chunk) => hash.update(chunk))
+			stream.on('end', () => done())
+			stream.on('error', fail)
+		})
+		const digest = hash.digest('base64url')
+		// Re-insert so the map's order is least-recently-computed first.
+		digests.delete(path)
+		if (digests.size >= DIGEST_CACHE_MAX_ENTRIES) {
+			const oldest = digests.keys().next().value
+			if (oldest !== undefined) digests.delete(oldest)
+		}
+		digests.set(path, { version, digest })
+		return digest
+	}
 
 	function remember(key: string, body: Buffer): void {
 		if (body.length > COMPRESSED_CACHE_MAX_BYTES / 4) return
@@ -166,7 +222,7 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		compressedBytes += body.length
 	}
 
-	async function fileStat(path: string): Promise<import('node:fs').Stats | null> {
+	async function fileStat(path: string): Promise<Stats | null> {
 		try {
 			return await stat(path)
 		} catch {
@@ -188,9 +244,7 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		return candidate
 	}
 
-	async function locate(
-		pathname: string,
-	): Promise<{ path: string; stats: import('node:fs').Stats } | null> {
+	async function locate(pathname: string): Promise<{ path: string; stats: Stats } | null> {
 		const filePath = toFilePath(pathname)
 		if (filePath === null) return null
 		const stats = await fileStat(filePath)
@@ -227,28 +281,43 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		const { path, stats } = found
 		const ext = extname(path).toLowerCase()
 		const fileName = basename(path)
+		const cacheControl = cacheControlFor(fileName)
+		const revalidated = cacheControl === REVALIDATE_CACHE_CONTROL
 		const headers: Record<string, string | number> = {
 			'Content-Type': STATIC_MIME_TYPES[ext] ?? 'application/octet-stream',
-			'Cache-Control': cacheControlFor(fileName),
-			'Last-Modified': stats.mtime.toUTCString(),
+			'Cache-Control': cacheControl,
 			'X-Content-Type-Options': 'nosniff',
 		}
-		const baseTag = `${stats.size.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}`
+		// A revalidated file's mtime says nothing about its content (reproducible builds
+		// normalise it), so it is never a validator for one (RT-99).
+		if (!revalidated) headers['Last-Modified'] = stats.mtime.toUTCString()
+		let digest: string
+		try {
+			digest = await contentDigest(path, stats)
+		} catch {
+			// Removed or replaced between stat and read: let the client retry.
+			res.writeHead(404, {
+				'Content-Type': 'text/plain; charset=utf-8',
+				'Cache-Control': 'no-store',
+			})
+			res.end(method === 'HEAD' ? undefined : 'Not Found')
+			return
+		}
 
 		const compressible = COMPRESSIBLE_EXTENSIONS.has(ext) && stats.size >= MIN_COMPRESS_BYTES
 		const encoding = compressible ? negotiateEncoding(headerValue(req, 'accept-encoding')) : null
 		if (compressible) headers.Vary = 'Accept-Encoding'
-		const etag = `"${baseTag}${encoding ? `-${encoding === 'br' ? 'br' : 'gz'}` : ''}"`
+		const etag = `"${digest}${encoding ? `-${encoding === 'br' ? 'br' : 'gz'}` : ''}"`
 		headers.ETag = etag
 
-		if (isNotModified(req, etag, stats.mtime)) {
+		if (isNotModified(req, etag, revalidated ? null : stats.mtime)) {
 			res.writeHead(304, headers)
 			res.end()
 			return
 		}
 
 		if (encoding) {
-			const body = await compressedBody(path, stats, encoding)
+			const body = await compressedBody(path, digest, encoding)
 			headers['Content-Encoding'] = encoding
 			headers['Content-Length'] = body.length
 			res.writeHead(200, headers)
@@ -265,45 +334,73 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		createReadStream(path).pipe(res)
 	}
 
-	async function compressedBody(
-		path: string,
-		stats: import('node:fs').Stats,
-		encoding: Encoding,
-	): Promise<Buffer> {
-		// A pre-compressed sibling the build emitted wins, when it is not older than the file.
+	async function compressedBody(path: string, digest: string, encoding: Encoding): Promise<Buffer> {
+		// A pre-compressed sibling the build emitted wins when it holds exactly the file's
+		// current bytes (checked once per sibling version and source digest: with
+		// normalised mtimes, "not older than the file" proves nothing).
 		const sibling = `${path}${encoding === 'br' ? '.br' : '.gz'}`
 		const siblingStats = await fileStat(sibling)
-		if (siblingStats?.isFile() && siblingStats.mtimeMs >= stats.mtimeMs) {
-			return readFile(sibling)
+		if (siblingStats?.isFile()) {
+			const siblingKey = `${fileVersionKey(siblingStats)}|${digest}`
+			const body = await readFile(sibling).catch(() => null)
+			if (body) {
+				if (verifiedSiblings.get(sibling) === siblingKey) return body
+				const decoded = await decompress(body, encoding).catch(() => null)
+				if (decoded && createHash('sha256').update(decoded).digest('base64url') === digest) {
+					verifiedSiblings.set(sibling, siblingKey)
+					return body
+				}
+			}
 		}
-		const key = `${encoding}\0${path}\0${stats.size}\0${stats.mtimeMs}`
+		// Keyed by the content digest: replaced content never reuses another version's body.
+		const key = `${encoding}\0${path}\0${digest}`
 		const cached = compressed.get(key)
 		if (cached) return cached.body
 		const raw = await readFile(path)
-		const body = await new Promise<Buffer>((done, fail) => {
-			const callback = (error: Error | null, result: Buffer): void => {
-				if (error) fail(error)
-				else done(result)
-			}
-			if (encoding === 'br') {
-				brotliCompress(
-					raw,
-					{
-						params: {
-							// Quality 5: close to 9 in size at a fraction of the CPU, for a one-time compress.
-							[zlibConstants.BROTLI_PARAM_QUALITY]: 5,
-							[zlibConstants.BROTLI_PARAM_SIZE_HINT]: raw.length,
-						},
-					},
-					callback,
-				)
-			} else {
-				gzip(raw, { level: 6 }, callback)
-			}
-		})
+		if (createHash('sha256').update(raw).digest('base64url') !== digest) {
+			// Changed since it was hashed: compress what was read, but do not cache it under
+			// the old digest.
+			return compress(raw, encoding)
+		}
+		const body = await compress(raw, encoding)
 		remember(key, body)
 		return body
 	}
+}
+
+function compress(raw: Buffer, encoding: Encoding): Promise<Buffer> {
+	return new Promise<Buffer>((done, fail) => {
+		const callback = (error: Error | null, result: Buffer): void => {
+			if (error) fail(error)
+			else done(result)
+		}
+		if (encoding === 'br') {
+			brotliCompress(
+				raw,
+				{
+					params: {
+						// Quality 5: close to 9 in size at a fraction of the CPU, for a one-time compress.
+						[zlibConstants.BROTLI_PARAM_QUALITY]: 5,
+						[zlibConstants.BROTLI_PARAM_SIZE_HINT]: raw.length,
+					},
+				},
+				callback,
+			)
+		} else {
+			gzip(raw, { level: 6 }, callback)
+		}
+	})
+}
+
+function decompress(body: Buffer, encoding: Encoding): Promise<Buffer> {
+	return new Promise<Buffer>((done, fail) => {
+		const callback = (error: Error | null, result: Buffer): void => {
+			if (error) fail(error)
+			else done(result)
+		}
+		if (encoding === 'br') brotliDecompress(body, callback)
+		else gunzip(body, callback)
+	})
 }
 
 function headerValue(req: IncomingMessage, name: string): string | undefined {
@@ -318,7 +415,11 @@ function isNavigation(req: IncomingMessage): boolean {
 	return /(^|[,\s])text\/html\b/i.test(accept)
 }
 
-function isNotModified(req: IncomingMessage, etag: string, mtime: Date): boolean {
+/**
+ * Conditional GET. `mtime` is null for files whose modification time is not a trusted
+ * validator (revalidated files): then only `If-None-Match` can produce a 304.
+ */
+function isNotModified(req: IncomingMessage, etag: string, mtime: Date | null): boolean {
 	const ifNoneMatch = headerValue(req, 'if-none-match')
 	if (ifNoneMatch !== undefined) {
 		// If-None-Match takes precedence over If-Modified-Since (RFC 9110 13.2.2).
@@ -327,7 +428,7 @@ function isNotModified(req: IncomingMessage, etag: string, mtime: Date): boolean
 		return ifNoneMatch.split(',').some((tag) => strip(tag) === etag)
 	}
 	const ifModifiedSince = headerValue(req, 'if-modified-since')
-	if (ifModifiedSince !== undefined) {
+	if (ifModifiedSince !== undefined && mtime !== null) {
 		const since = Date.parse(ifModifiedSince)
 		// HTTP dates have one-second precision.
 		if (Number.isFinite(since)) return Math.floor(mtime.getTime() / 1000) * 1000 <= since

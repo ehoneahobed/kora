@@ -135,9 +135,18 @@ describe('server value domain (RT-86, RT-87)', () => {
 	}
 
 	test('SQLite: a value the database refuses is UNSTORABLE_VALUE (the safety net)', async () => {
-		const store = new SqliteServerStore(drizzleSqlite(new Database(':memory:')), 'server-1')
+		const sqlite = new Database(':memory:')
+		const store = new SqliteServerStore(drizzleSqlite(sqlite), 'server-1')
 		await store.setSchema(schema)
-		const bad = await note('dev', { title: 'h', kind: 'c' })
+		// Kora's DDL has no value-domain constraints any more (RT-101); a constraint added by
+		// hand stands in for a value the database refuses.
+		sqlite.exec(`BEGIN;
+			CREATE TABLE notes_guarded AS SELECT * FROM notes WHERE 0;
+			DROP TABLE notes;
+			CREATE TABLE notes (id TEXT PRIMARY KEY NOT NULL, "title" TEXT CHECK ("title" <> 'h'), "due" INTEGER, "kind" TEXT, _created_at INTEGER NOT NULL DEFAULT 0, _updated_at INTEGER NOT NULL DEFAULT 0, _deleted INTEGER NOT NULL DEFAULT 0);
+			DROP TABLE notes_guarded;
+			COMMIT;`)
+		const bad = await note('dev', { title: 'h', kind: 'a' })
 		await expect(store.applyRemoteOperation(bad)).rejects.toBeInstanceOf(UnstorableValueError)
 		// Nothing was written: the store takes the next operation.
 		const next = await note('dev', { title: 'next' })
@@ -163,11 +172,17 @@ describe('server value domain (RT-86, RT-87)', () => {
 			try {
 				const store = new PostgresServerStore(drizzlePg(client), 'server-1')
 				await store.setSchema(schema as SchemaDefinition)
+				// Kora's DDL has no value-domain constraints any more (RT-101): a hand-added check
+				// stands in for 23514, and survives the next start (only enum checks are relaxed).
+				await client.unsafe(
+					`ALTER TABLE notes ADD CONSTRAINT notes_hand_check CHECK (title <> 'c')`,
+				)
+				await store.setSchema(schema as SchemaDefinition)
 				// 22003 numeric out of range (BIGINT), 22P02 invalid text (fraction), 23514 check.
 				for (const data of [
 					{ title: 'a', due: 1e20 },
 					{ title: 'b', due: 1.5 },
-					{ title: 'c', kind: 'c' },
+					{ title: 'c', kind: 'a' },
 				]) {
 					await expect(store.applyRemoteOperation(await note('dev', data))).rejects.toBeInstanceOf(
 						UnstorableValueError,

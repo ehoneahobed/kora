@@ -1,5 +1,5 @@
 import { quoteIdent } from '../schema/quote-ident'
-import { collectionIndexName, enumCheckConstraint, sqlDefaultLiteral } from '../schema/sql-gen'
+import { collectionIndexName, sqlDefaultLiteral } from '../schema/sql-gen'
 import type { FieldDescriptor } from '../types'
 import type { MigrationDefinition, MigrationStep } from './migration-builder'
 import { generateRollbackSteps } from './migration-rollback'
@@ -94,10 +94,8 @@ function addFieldSQL(collection: string, field: string, descriptor: FieldDescrip
 		parts.push(`DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`)
 	}
 
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		parts.push(enumCheckConstraint(field, descriptor.enumValues))
-	}
-
+	// No CHECK for enums and no NOT NULL: the value domain is enforced by validation only
+	// (RT-101).
 	return parts.join(' ')
 }
 

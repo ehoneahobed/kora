@@ -10,7 +10,7 @@ Bar: these three field types are a differentiating moat. The structured-data CRD
 
 - `FieldKind` (core `types.ts`): `string | number | boolean | timestamp | richtext | enum | array`.
 - Merge dispatch (`merge/engine/field-merger.ts`, `autoMerge`): scalar kinds resolve by LWW, `array` by add-wins set, `richtext` by Yjs CRDT. `autoMerge` receives `baseValue`, `localValue`, `remoteValue`, and both operations' HLC timestamps, so a 3-way convergent merge has everything it needs.
-- Storage maps kinds to SQL columns: string→TEXT, number→REAL, boolean→INTEGER, enum→TEXT+CHECK, timestamp→INTEGER, array→TEXT (JSON), richtext→BLOB (Yjs state).
+- Storage maps kinds to SQL columns: string→TEXT, number→REAL, boolean→INTEGER, enum→TEXT (membership enforced by validation, no CHECK), timestamp→INTEGER, array→TEXT (JSON), richtext→BLOB (Yjs state).
 - Binary already crosses the whole system: `richtext` values are `Uint8Array`, tagged as canonical JSON in `op.data`, and travel over the protobuf wire as bytes. "A field kind whose value is binary" is a solved plumbing pattern.
 - Crypto already exists in `@korajs/auth` (`generateEncryptionKey`, `encryptData`, `decryptData`, key derivation, an `operation-encryptor` for end-to-end operation encryption). `@korajs/core` cannot depend on `@korajs/auth`, so field-level crypto primitives move into core.
 
