@@ -22,7 +22,7 @@ Update this file at every milestone. A fresh session should read it first, then 
 
 ## Phase 4 release-candidate line
 
-Merged (on top of `fix/phase4-rc` at ded97e3, in the worktree branch `worktree-agent-a9a1523ce3fc60de7`; not pushed yet):
+Merged into `fix/phase4-rc` and pushed to `private` (head 6dcb5e2 plus this update):
 - The Phase 4 integration line: ENC-1 key ring (D4b), W11 types (DX-1, DX-2), W12 runtime DX (STORE-11, STORE-12, NEW-STORE-4, DX-4..DX-9, NEW-DX-1, SEC-7, SEC-9b, NEW-STORE-11, STORE-16), tooling (NEW-DX-3 offline app shell, NEW-SRV-8 static server, DX-8, SYNC-9, NEW-DX-2, NEW-SRV-1, RT-30), RT-88 and RT-89.
 - The documentation audit (DX-3) and the beta.13 release renumbering.
 - **The beta.12 compatibility track** (merge c956952, from local branch `worktree-agent-a87b3402ab69d1db7` through a7f04d0; the `private` wip copy stops at 60dc837 without the RT-90..RT-94 renumbering): RT-90 Date-in-json version-1 ids, RT-91 legacy anonymous claims on beta.12 server databases, RT-92 local node registry seeding, RT-93/RT-94 provisional cascades settling while streaming; `scripts/remediation/compat-beta12.mjs`, `compat-beta12-browser.mjs`, `remediation/evidence/compat-beta12.md`. All code conflicts were comment wording; both lines' behaviour is kept.
