@@ -12,7 +12,21 @@ import type { WrappedKeyRecord } from './key-record'
 import { isKeyRecordSuccessor, validateKeyRecord } from './key-record'
 import type { KeyServiceChannel, KeyServiceReply } from './keyring'
 import { EncryptionKeyError, EncryptionKeyring } from './keyring'
-import { generateMasterKey, generateRecoveryKeyPair, wrapMasterForRecovery } from './keyring-crypto'
+import {
+	KEK_SALT_BYTES,
+	deriveKeyEncryptionKey,
+	generateDataKey,
+	generateMasterKey,
+	generateRecoveryKeyPair,
+	importMasterKey,
+	newKeyId,
+	randomBytes,
+	sealRecord,
+	toBase64,
+	wrapDataKey,
+	wrapMasterForRecovery,
+	wrapMasterKey,
+} from './keyring-crypto'
 
 const ITERATIONS = 1000
 const OWNER = 'u:alice'
@@ -204,6 +218,68 @@ describe('RT-95: every field of the record is authenticated', () => {
 		await expect(lost.recover(recoveryKey, 'new', server.channel())).rejects.toMatchObject({
 			context: expect.objectContaining({ code: 'KEY_RECORD_INVALID' }),
 		})
+	})
+
+	test('recovery refuses a substituted ring wrapped to the (public) recovery key', async () => {
+		const server = new KeyServer()
+		const a = device('forgotten')
+		await a.synchronize(server.channel(), 'alice')
+		const recoveryKey = await a.enableRecovery(server.channel())
+		const genuine = server.record as WrappedKeyRecord
+		const recoveryPublicKey = genuine.recovery?.publicKey
+		if (!recoveryPublicKey) throw new Error('fixture')
+		// The server builds a whole ring of its own (master and data key it knows), same ring
+		// id and a higher revision, and wraps its master key to the user's recovery PUBLIC key.
+		const raw = generateMasterKey()
+		const master = await importMasterKey(raw)
+		const salt = randomBytes(KEK_SALT_BYTES)
+		const kek = await deriveKeyEncryptionKey('server', salt, ITERATIONS)
+		const dataKey = await generateDataKey()
+		const keyId = newKeyId()
+		const substituted = await sealRecord(
+			{
+				format: 2,
+				keyring: genuine.keyring,
+				ringId: genuine.ringId,
+				revision: genuine.revision + 1,
+				currentVersion: 1,
+				kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: ITERATIONS, salt: toBase64(salt) },
+				master: await wrapMasterKey(raw, kek, genuine.keyring, genuine.ringId),
+				keys: [await wrapDataKey(dataKey, master.wrapKey, genuine.keyring, 1, keyId)],
+				recovery: await wrapMasterForRecovery(
+					raw,
+					recoveryPublicKey,
+					genuine.keyring,
+					genuine.ringId,
+				),
+			},
+			master.macKey,
+		)
+		server.record = substituted
+		const lost = device()
+		await lost.load('alice')
+		await expect(lost.recover(recoveryKey, 'new', server.channel())).rejects.toMatchObject({
+			context: expect.objectContaining({ code: 'KEY_RECORD_INVALID' }),
+		})
+		// Nothing was written and no key of the server's ring is used.
+		expect(server.record).toEqual(substituted)
+		expect(lost.getEncryptor()).toBeNull()
+	})
+
+	test('a recovery key stays anchored across rotation, passphrase change and recovery', async () => {
+		const server = new KeyServer()
+		const a = device('one')
+		await a.synchronize(server.channel(), 'alice')
+		const recoveryKey = await a.enableRecovery(server.channel())
+		await a.rotate(server.channel())
+		await a.changePassphrase('two', server.channel())
+		const first = device()
+		await first.load('alice')
+		await first.recover(recoveryKey, 'three', server.channel())
+		const second = device()
+		await second.load('alice')
+		await second.recover(recoveryKey, 'four', server.channel())
+		expect(second.getStatus().availableVersions).toEqual([1, 2])
 	})
 
 	test('recovery keeps the master key: devices holding the ring keep managing it', async () => {

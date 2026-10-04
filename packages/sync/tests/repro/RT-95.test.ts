@@ -8,8 +8,13 @@
  * under that version. The guide says the server "never sees ... a data key, and it cannot
  * unwrap anything".
  *
+ * Since record format 2 the recovery key opens the ring's master key (which wraps every
+ * data key), so the attack is: the server puts a recovery block for ITS key into the
+ * record and waits for a device to wrap the real master key (or a data key) to it. The
+ * steal below follows that chain: recovery block -> master key -> current data key.
+ *
  * Asserts CORRECT behaviour: a recovery key the passphrase holder never set up is refused
- * (the device locks with an error, or never wraps a data key to it), so the server never
+ * (the device locks with an error, or never wraps a key to it), so the server never
  * obtains a data key.
  */
 import type { Operation } from '@korajs/core'
@@ -19,9 +24,12 @@ import type { WrappedKeyRecord } from '../../src/encryption/key-record'
 import type { KeyServiceChannel, KeyServiceReply } from '../../src/encryption/keyring'
 import { EncryptionKeyring } from '../../src/encryption/keyring'
 import {
+	generateMasterKey,
 	generateRecoveryKeyPair,
-	toNonExtractable,
-	unwrapWithRecovery,
+	importMasterKey,
+	unwrapDataKey,
+	unwrapMasterWithRecovery,
+	wrapMasterForRecovery,
 } from '../../src/encryption/keyring-crypto'
 import { SyncEncryptor } from '../../src/encryption/sync-encryptor'
 
@@ -73,23 +81,45 @@ function op(id: string): Operation {
 	}
 }
 
+type Attacker = Awaited<ReturnType<typeof generateRecoveryKeyPair>>
+
+/**
+ * The server's recovery block: it cannot open the real master key, so it wraps bytes of
+ * its own to its own public key, hoping a device re-wraps the real one to that key.
+ */
+async function forgedRecovery(
+	record: WrappedKeyRecord,
+	attacker: Attacker,
+): Promise<NonNullable<WrappedKeyRecord['recovery']>> {
+	return wrapMasterForRecovery(
+		generateMasterKey(),
+		attacker.publicKey,
+		record.keyring,
+		record.ringId,
+	)
+}
+
 /** What the server can read with its own recovery private key, or null. */
 async function serverSteals(
 	record: WrappedKeyRecord,
-	attacker: { recoveryKey: string; publicKey: { x: string; y: string } },
+	attacker: Attacker,
 	sealed: Operation,
 ): Promise<string | null> {
-	const wrap = record.recovery?.keys.find((k) => k.keyVersion === record.currentVersion)
-	if (!wrap) return null
+	const recovery = record.recovery
+	const current = record.keys.find((k) => k.keyVersion === record.currentVersion)
+	if (!recovery || !current) return null
+	if (recovery.publicKey.x !== attacker.publicKey.x) return null
 	try {
-		const dataKey = await unwrapWithRecovery(
-			wrap,
+		const raw = await unwrapMasterWithRecovery(
+			recovery,
 			attacker.recoveryKey,
-			attacker.publicKey,
 			record.keyring,
+			record.ringId,
 		)
+		const master = await importMasterKey(raw)
+		const dataKey = await unwrapDataKey(current, master.wrapKey, record.keyring)
 		const stolen = SyncEncryptor.fromKeys([
-			{ version: wrap.keyVersion, keyId: wrap.keyId, key: await toNonExtractable(dataKey) },
+			{ version: current.keyVersion, keyId: current.keyId, key: dataKey },
 		])
 		const plain = await stolen.decryptOperation(sealed)
 		return String((plain.data as { body: string }).body)
@@ -99,7 +129,7 @@ async function serverSteals(
 }
 
 describe('RT-95: unauthenticated recovery public key lets the server obtain data keys', () => {
-	test('a recovery key injected through a push is never used to wrap a new data key', async () => {
+	test('a recovery key injected through a push is never used to wrap a key', async () => {
 		const server = new MaliciousKeyServer()
 		const device = new EncryptionKeyring({
 			passphrase: 'correct horse',
@@ -108,21 +138,54 @@ describe('RT-95: unauthenticated recovery public key lets the server obtain data
 		})
 		expect(await device.synchronize(server.channel(), 'alice')).toBe('ready')
 
-		// The server adds a recovery block with ITS public key (no wraps needed yet).
+		// The server pushes a record with a recovery block for ITS public key, but keeps
+		// storing the honest record so the device's next write succeeds.
 		const attacker = await generateRecoveryKeyPair()
 		const current = server.record as WrappedKeyRecord
 		const forged: WrappedKeyRecord = {
 			...clone(current),
 			revision: current.revision + 1,
-			recovery: { alg: 'ECDH-P256+AES-GCM', publicKey: attacker.publicKey, keys: [] },
+			recovery: await forgedRecovery(current, attacker),
 		}
-		server.record = clone(forged)
 		await device.adoptPushed(clone(forged))
 
-		// Routine rotation on the honest device.
+		// Routine key management on the honest device.
 		await device.rotate(server.channel()).catch(() => undefined)
+		await device.changePassphrase('battery staple', server.channel()).catch(() => undefined)
 		const encryptor = device.getEncryptor()
 		const sealed = encryptor ? await encryptor.encryptOperation(op('after-rotation')) : null
+
+		const stolen =
+			sealed && server.record ? await serverSteals(server.record, attacker, sealed) : null
+		expect(stolen).toBeNull()
+	})
+
+	test('a recovery key served on fetch to a device that opens the record is refused', async () => {
+		const server = new MaliciousKeyServer()
+		const first = new EncryptionKeyring({
+			passphrase: 'correct horse',
+			kdfIterations: ITERATIONS,
+			cache: new MemoryKeyCache(),
+		})
+		expect(await first.synchronize(server.channel(), 'alice')).toBe('ready')
+		const attacker = await generateRecoveryKeyPair()
+		const current = server.record as WrappedKeyRecord
+		server.record = {
+			...clone(current),
+			revision: current.revision + 1,
+			recovery: await forgedRecovery(current, attacker),
+		}
+		// A new device with the passphrase opens the forged record, then manages keys.
+		const second = new EncryptionKeyring({
+			passphrase: 'correct horse',
+			kdfIterations: ITERATIONS,
+			cache: new MemoryKeyCache(),
+		})
+		await second.synchronize(server.channel(), 'alice')
+		await second.rotate(server.channel()).catch(() => undefined)
+		await second.changePassphrase('battery staple', server.channel()).catch(() => undefined)
+		const encryptor = second.getEncryptor() ?? first.getEncryptor()
+		const sealed = encryptor ? await encryptor.encryptOperation(op('after-fetch')) : null
 
 		const stolen =
 			sealed && server.record ? await serverSteals(server.record, attacker, sealed) : null
@@ -142,13 +205,17 @@ describe('RT-95: unauthenticated recovery public key lets the server obtain data
 
 		const attacker = await generateRecoveryKeyPair()
 		const current = server.record as WrappedKeyRecord
-		// Same versions, recovery public key replaced (old recovery wraps dropped).
+		// Same versions, recovery public key replaced.
 		server.forceConflictWith = {
 			...clone(current),
 			revision: current.revision + 1,
-			recovery: { alg: 'ECDH-P256+AES-GCM', publicKey: attacker.publicKey, keys: [] },
+			recovery: await forgedRecovery(current, attacker),
 		}
 		await device.rotate(server.channel()).catch(() => undefined)
+		// The server restores the honest record so the next writes go through.
+		server.record = clone(current)
+		await device.rotate(server.channel()).catch(() => undefined)
+		await device.changePassphrase('battery staple', server.channel()).catch(() => undefined)
 		const encryptor = device.getEncryptor()
 		const sealed = encryptor ? await encryptor.encryptOperation(op('after-conflict')) : null
 

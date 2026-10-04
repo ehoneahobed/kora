@@ -14,6 +14,8 @@ import type { MasterKeys } from './keyring-crypto'
 import {
 	KEK_SALT_BYTES,
 	KeyUnwrapError,
+	bytesEqual,
+	dataKeyAnchor,
 	deriveKeyEncryptionKey,
 	fromBase64,
 	generateDataKey,
@@ -22,6 +24,7 @@ import {
 	importMasterKey,
 	newKeyId,
 	newRingId,
+	parseRecoveryKey,
 	randomBytes,
 	sealRecord,
 	toBase64,
@@ -539,7 +542,7 @@ export class EncryptionKeyring {
 	 * record (the recovery block is authenticated with the record, so only a holder of
 	 * the master key can add or replace it).
 	 *
-	 * @returns The recovery key (`kora-rk1-...`)
+	 * @returns The recovery key (`kora-rk2-<key>.<anchor>`)
 	 */
 	enableRecovery(channel: KeyServiceChannel): Promise<string> {
 		return this.exclusive(async () => {
@@ -555,7 +558,14 @@ export class EncryptionKeyring {
 						)
 					},
 				)
-				const { publicKey, recoveryKey } = await generateRecoveryKeyPair()
+				let anchor: Uint8Array
+				try {
+					anchor = await this.ringAnchor(record, master)
+				} catch (error) {
+					raw.fill(0)
+					throw error
+				}
+				const { publicKey, recoveryKey } = await generateRecoveryKeyPair(anchor)
 				let next: WrappedKeyRecord
 				try {
 					next = await sealRecord(
@@ -688,6 +698,15 @@ export class EncryptionKeyring {
 				if (!(await verifyRecordMac(record, master.macKey))) {
 					throw new EncryptionKeyError(
 						'The key record does not authenticate under the recovered master key: it was modified by someone without the keys. Recovery is refused.',
+						{ code: 'KEY_RECORD_INVALID' },
+					)
+				}
+				// The recovery PUBLIC key is no secret: anyone can wrap a master key of their own
+				// to it and seal a record under that master. Only the user's own ring holds the
+				// data key the recovery key's anchor fingerprints.
+				if (!(await this.holdsAnchor(record, master, parseRecoveryKey(recoveryKey).anchor))) {
+					throw new EncryptionKeyError(
+						'The key record opens with this recovery key but is not the keyring the recovery key was made for: it lacks the data key the recovery key is anchored to (the server substituted another keyring). Recovery is refused.',
 						{ code: 'KEY_RECORD_INVALID' },
 					)
 				}
@@ -1185,6 +1204,40 @@ export class EncryptionKeyring {
 			opened.set(entry.keyId, await unwrapDataKey(entry, master.wrapKey, this.name))
 		}
 		return opened
+	}
+
+	/**
+	 * The anchor a new recovery key carries: the fingerprint of the ring's lowest key
+	 * version. Data keys are never removed or re-keyed (a passphrase change, recovery or
+	 * merge re-wraps them under the same key id), so the anchor stays valid for the ring.
+	 */
+	private async ringAnchor(record: WrappedKeyRecord, master: MasterKeys): Promise<Uint8Array> {
+		const first = [...record.keys].sort((a, b) => a.keyVersion - b.keyVersion)[0]
+		if (first === undefined) {
+			throw new EncryptionKeyError('The key record holds no data key.', {
+				code: 'KEY_RECORD_INVALID',
+			})
+		}
+		const dataKey = await unwrapDataKey(first, master.wrapKey, this.name, true)
+		return dataKeyAnchor(dataKey, this.name, first.keyId)
+	}
+
+	/** Whether `record` holds the data key a recovery key's anchor fingerprints. */
+	private async holdsAnchor(
+		record: WrappedKeyRecord,
+		master: MasterKeys,
+		anchor: Uint8Array,
+	): Promise<boolean> {
+		for (const entry of record.keys) {
+			let dataKey: CryptoKey
+			try {
+				dataKey = await unwrapDataKey(entry, master.wrapKey, this.name, true)
+			} catch {
+				continue
+			}
+			if (bytesEqual(await dataKeyAnchor(dataKey, this.name, entry.keyId), anchor)) return true
+		}
+		return false
 	}
 
 	/** The next revision after `base`, above the pinned one when it is the same ring. */

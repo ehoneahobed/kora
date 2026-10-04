@@ -312,7 +312,7 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await a.synchronize(server.channel('u:alice'), 'alice')
 		const v1 = await seal(a, op('v1'))
 		const recoveryKey = await a.enableRecovery(server.channel('u:alice'))
-		expect(recoveryKey).toMatch(/^kora-rk1-[A-Za-z0-9_-]{43}$/)
+		expect(recoveryKey).toMatch(/^kora-rk2-[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{22}$/)
 		await a.rotate(server.channel('u:alice')) // recovery wraps follow rotation
 		const v2 = await seal(a, op('v2'))
 
@@ -320,7 +320,7 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await fresh.load('alice')
 		await expect(
 			fresh.recover(
-				'kora-rk1-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+				'kora-rk2-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA',
 				'n',
 				server.channel('u:alice'),
 			),
@@ -337,7 +337,7 @@ describe('EncryptionKeyring: rotation, passphrase change, recovery', () => {
 		await device('lost').synchronize(server.channel('u:alice'), 'alice')
 		const k = device()
 		await k.load('alice')
-		await expect(k.recover('kora-rk1-x', 'n', server.channel('u:alice'))).rejects.toMatchObject({
+		await expect(k.recover('kora-rk2-x', 'n', server.channel('u:alice'))).rejects.toMatchObject({
 			context: expect.objectContaining({ code: 'NO_RECOVERY_KEY' }),
 		})
 	})
