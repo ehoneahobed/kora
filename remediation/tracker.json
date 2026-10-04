@@ -3245,6 +3245,21 @@
    ],
    "pr": null,
    "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:683-701 (pin compares key versions/ids only; a different salt silently drops the KEK), keyring.ts:247 (adoptPushed), key-record.ts isKeyRecordSuccessor (server rule only). Repro packages/sync/tests/repro/RT-96.test.ts. Required fix: pin the highest accepted revision (persisted in the key cache) and refuse lower ones with KEY_RECORD_ROLLBACK; authenticate the record (kdf, recovery, revision) under the KEK so a substituted revision at the same number is detected too. A new device cannot detect a rollback it never saw (document)."
+  },
+  {
+   "id": "RT-97",
+   "title": "A rotation that races a passphrase change on another device wraps the new data key under the stale (old-passphrase) KEK into the record with the new salt; every device with the current passphrase then fails WRONG_PASSPHRASE and operations sealed under the new version are readable only on the rotating device",
+   "severity": "P1",
+   "workstream": "W9",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-97.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Final RC red team (remediation/evidence/redteam-rc.md). sync/src/encryption/keyring.ts:337 (const kek = requireKek(...) read once, outside the compare-and-set loop), keyring.ts:373 (adoptConflictLocked adopts the new-salt record and drops this.kek, the loop keeps the stale local), keyring.ts:697-700. The server cannot tell (it never opens wraps). Repro packages/sync/tests/repro/RT-97.test.ts: a fresh device with the current passphrase is locked WRONG_PASSPHRASE and cannot decrypt the rotating device's op; the passphrase-changing device locks the same way on the push. Required fix: re-read the KEK (requireKek) inside the loop after every conflict adopt, and verify before put that the KEK opens the record's current version under the record's own salt (refuse to wrap under a KEK whose salt differs from record.kdf.salt). Same audit for enableRecovery (it fails loudly today, no corruption)."
   }
  ],
  "rejectedProposalPins": {
