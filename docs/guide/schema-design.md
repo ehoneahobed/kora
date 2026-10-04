@@ -454,8 +454,17 @@ Operations are immutable and content-addressed, so a transform never rewrites on
 - **Pure and deterministic.** A transform may rewrite only `data`, `previousData`, `atomicOps`
   and `schemaVersion`, with JSON values, and must return the same result on every replica (no
   clock, randomness or I/O). Changing an operation's id, node, type, collection, record or
-  timestamp is refused (`SCHEMA_TRANSFORM_INVALID`). Keep a transform registered for as long as
-  operations of its source version can exist.
+  timestamp is refused (`SCHEMA_TRANSFORM_INVALID`).
+- **Never retire a transform.** The operation log is append-only, so operations of a source
+  version exist for as long as the data does, and a transform must stay registered with them.
+  A server store (`setSchema`, `setOperationTransforms`, `KoraSyncServer.start()`) and a local
+  database (`app.ready`) refuse to start when a schema version in their log has no transform
+  path to the current version, with `OperationTransformCoverageError`
+  (`OPERATION_TRANSFORM_MISSING`) naming the versions and the missing step. Starting anyway
+  would fold those operations as absent and silently erase them from their records. To fix it,
+  register the retired transform again. Registering no transforms at all is also accepted
+  (every operation then folds as written). This release has no compaction that folds old
+  operations into snapshots, so a transform cannot yet be removed safely.
 - **Older clients** receive newer operations as written; with no transform path to their version
   they quarantine them and replay them after upgrading. Encrypted operations are opaque to the
   server, which folds their cleartext fields as written; devices transform them after decryption.

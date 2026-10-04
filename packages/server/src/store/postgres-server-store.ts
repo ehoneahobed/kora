@@ -9,7 +9,12 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	KoraError,
+	assertOperationTransformCoverage,
+	quoteIdent,
+} from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -491,6 +496,27 @@ export class PostgresServerStore implements ServerStore {
 		return this.schema
 	}
 
+	/**
+	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
+	 * log has no transform path to `version` (RT-103): those operations would fold as
+	 * absent, silently erasing them from their records.
+	 */
+	private async assertTransformCoverage(
+		version: number,
+		transforms: readonly OperationTransform[],
+	): Promise<void> {
+		if (transforms.length === 0) return
+		const rows = (await this.db.execute(
+			sql`SELECT DISTINCT schema_version AS v FROM operations`,
+		)) as unknown as { v: number | string }[]
+		assertOperationTransformCoverage(
+			rows.map((row) => Number(row.v)),
+			version,
+			transforms,
+			'Postgres server store',
+		)
+	}
+
 	getOperationTransforms(): readonly OperationTransform[] {
 		return this.operationTransforms
 	}
@@ -498,6 +524,7 @@ export class PostgresServerStore implements ServerStore {
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		if (this.schema) await this.assertTransformCoverage(this.schema.version, transforms)
 		this.operationTransforms = [...transforms]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every
@@ -508,6 +535,11 @@ export class PostgresServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		await this.assertTransformCoverage(
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]

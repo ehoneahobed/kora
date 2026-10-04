@@ -7,7 +7,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
@@ -227,6 +227,13 @@ export class MemoryServerStore implements ServerStore {
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		assertOperationTransformCoverage(
+			this.operations.map((op) => op.schemaVersion),
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+			'memory server store',
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -257,6 +264,14 @@ export class MemoryServerStore implements ServerStore {
 
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
+		if (this.schema) {
+			assertOperationTransformCoverage(
+				this.operations.map((op) => op.schemaVersion),
+				this.schema.version,
+				transforms,
+				'memory server store',
+			)
+		}
 		const before = this.schema
 			? serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
 			: null

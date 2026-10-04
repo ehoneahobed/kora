@@ -9,7 +9,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
+import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
@@ -397,6 +397,11 @@ export class SqliteServerStore implements ServerStore {
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		this.assertTransformCoverage(
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -449,12 +454,34 @@ export class SqliteServerStore implements ServerStore {
 		}
 	}
 
+	/**
+	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
+	 * log has no transform path to `version` (RT-103): those operations would fold as
+	 * absent, silently erasing them from their records.
+	 */
+	private assertTransformCoverage(
+		version: number,
+		transforms: readonly OperationTransform[],
+	): void {
+		if (transforms.length === 0) return
+		const rows = this.db.all<{ v: number }>(
+			sql`SELECT DISTINCT schema_version AS v FROM operations`,
+		)
+		assertOperationTransformCoverage(
+			rows.map((row) => Number(row.v)),
+			version,
+			transforms,
+			'SQLite server store',
+		)
+	}
+
 	getOperationTransforms(): readonly OperationTransform[] {
 		return this.operationTransforms
 	}
 
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
+		if (this.schema) this.assertTransformCoverage(this.schema.version, transforms)
 		this.operationTransforms = [...transforms]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every

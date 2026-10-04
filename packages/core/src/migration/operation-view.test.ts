@@ -10,7 +10,10 @@ import { t } from '../schema/types'
 import type { Operation } from '../types'
 import type { OperationTransform } from './operation-transform'
 import {
+	OperationTransformCoverageError,
 	OperationTransformError,
+	assertOperationTransformCoverage,
+	missingTransformPaths,
 	operationSchemaView,
 	operationTransformsFingerprint,
 } from './operation-view'
@@ -231,5 +234,49 @@ describe('canonicalizeProvenLegacyClear (RT-85)', () => {
 			1000,
 		)
 		expect(await canonicalizeProvenLegacyClear(v2)).toBe(v2)
+	})
+})
+
+describe('transform coverage (RT-103)', () => {
+	const step = (fromVersion: number, toVersion: number): OperationTransform => ({
+		fromVersion,
+		toVersion,
+		transform: (op) => ({ ...op, schemaVersion: toVersion }),
+	})
+
+	test('every stored version needs a path to the target', () => {
+		expect(missingTransformPaths([1, 2, 3], 3, [step(1, 2), step(2, 3)])).toEqual([])
+		expect(missingTransformPaths([1, 2, 3], 3, [step(2, 3)])).toEqual([
+			{ version: 1, missingFrom: 1 },
+		])
+		expect(missingTransformPaths([1, 3], 4, [step(1, 2), step(3, 4)])).toEqual([
+			{ version: 1, missingFrom: 2 },
+		])
+	})
+
+	test('no transforms: operations fold as written, nothing is missing', () => {
+		expect(missingTransformPaths([1, 7], 3, [])).toEqual([])
+		expect(missingTransformPaths([1, 7], 3, undefined)).toEqual([])
+	})
+
+	test('a newer stored version without a path is missing too', () => {
+		expect(missingTransformPaths([4], 3, [step(1, 2), step(2, 3)])).toEqual([
+			{ version: 4, missingFrom: 4 },
+		])
+	})
+
+	test('the refusal names the versions and the fix', () => {
+		let error: unknown = null
+		try {
+			assertOperationTransformCoverage([1, 2], 3, [step(2, 3)], 'test store')
+		} catch (caught) {
+			error = caught
+		}
+		expect(error).toBeInstanceOf(OperationTransformCoverageError)
+		const coverage = error as OperationTransformCoverageError
+		expect(coverage.code).toBe('OPERATION_TRANSFORM_MISSING')
+		expect(coverage.versions).toEqual([1])
+		expect(coverage.message).toContain('test store holds operations of schema version v1')
+		expect(String(coverage.context?.fix)).toContain('Keep a transform path')
 	})
 })

@@ -2,6 +2,7 @@ import {
 	CausalTracker,
 	HybridLogicalClock,
 	KoraError,
+	assertOperationTransformCoverage,
 	createVersionVector,
 	deriveSideEffectOpId,
 	deserializeFoldState,
@@ -427,6 +428,9 @@ export class Store implements OperationLog {
 		// Run schema migrations if needed. Backfills write operations through the local
 		// write path, so the node id and clock must exist first (STORE-13).
 		try {
+			// Transforms that cannot read the stored log would fold those operations as
+			// absent and erase them from their records: refuse to open instead (RT-103).
+			await this.assertTransformCoverage()
 			await this.runMigrationsIfNeeded()
 			await this.ensureLegacyBodiesCanonical()
 			await this.ensureMaterialization()
@@ -1178,6 +1182,32 @@ export class Store implements OperationLog {
 						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
 			})
 		}
+	}
+
+	/**
+	 * Refuse to open when a schema version in the local operation log has no transform
+	 * path to the current schema (RT-103). Operations of a NEWER schema (authored by an
+	 * upgraded peer) are not checked: they are kept aside until this device upgrades.
+	 */
+	private async assertTransformCoverage(): Promise<void> {
+		const transforms = this.operationTransforms
+		if (transforms === undefined || transforms.length === 0) return
+		const versions = new Set<number>()
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ v: number }>(
+				`SELECT DISTINCT schema_version AS v FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			for (const row of rows) {
+				const version = Number(row.v)
+				if (version < this.schema.version) versions.add(version)
+			}
+		}
+		assertOperationTransformCoverage(
+			versions,
+			this.schema.version,
+			transforms,
+			`local database "${this.dbName}"`,
+		)
 	}
 
 	/**
