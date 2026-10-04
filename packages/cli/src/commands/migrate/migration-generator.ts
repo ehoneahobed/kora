@@ -151,7 +151,10 @@ function relaxValueDomainDirective(
 	to: CollectionDefinition,
 ): string {
 	const fields = [...new Set([...Object.keys(from.fields), ...Object.keys(to.fields)])].sort()
-	return formatRelaxValueDomainDirective({ table: collection, fields })
+	const enums = fields.filter(
+		(field) => from.fields[field]?.kind === 'enum' || to.fields[field]?.kind === 'enum',
+	)
+	return formatRelaxValueDomainDirective({ table: collection, fields, enums })
 }
 
 function validateRebuildSafety(

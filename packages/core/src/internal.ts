@@ -15,6 +15,7 @@ export {
 export {
 	isKoraInternalColumn,
 	isPostgresEnumCheckDefinition,
+	parseEnumCheckDefinition,
 	planPostgresConstraintRelaxation,
 	planSqliteConstraintRelaxation,
 	readSqliteTableCatalog,
@@ -22,6 +23,7 @@ export {
 	sqliteTableNeedsRelaxation,
 } from './schema/constraint-relaxation'
 export type {
+	EnumCheckShape,
 	SqliteColumnInfo,
 	SqliteForeignKeyInfo,
 	SqliteQueryFn,

@@ -4,6 +4,7 @@ import {
 	type SqliteTableCatalog,
 	isKoraInternalColumn,
 	isPostgresEnumCheckDefinition,
+	parseEnumCheckDefinition,
 	sqliteConstraintRelaxationStatements,
 	sqliteTableNeedsRelaxation,
 } from './constraint-relaxation'
@@ -89,6 +90,51 @@ describe('constraint relaxation (RT-101)', () => {
 		)
 		expect(isPostgresEnumCheckDefinition('CHECK ((length(title) < 1000))')).toBe(false)
 		expect(isPostgresEnumCheckDefinition("CHECK ((title <> 'c'::text))")).toBe(false)
+	})
+
+	// The definitions below are what PostgreSQL 16's pg_get_constraintdef returns for the
+	// commented source (RT-108), plus SQLite's verbatim source form.
+	test.each([
+		// CHECK ("status" IN ('active')) on text: the single-value form
+		["CHECK ((status = 'active'::text))", 'status', ['active'], false],
+		["CHECK ((a = ANY (ARRAY['x'::text, 'y'::text])))", 'a', ['x', 'y'], false],
+		// on varchar
+		["CHECK (((b)::text = 'x'::text))", 'b', ['x'], false],
+		[
+			"CHECK (((b)::text = ANY ((ARRAY['x'::character varying, 'y'::character varying])::text[])))",
+			'b',
+			['x', 'y'],
+			false,
+		],
+		[`CHECK (("MixCase" = 'it''s'::text))`, 'MixCase', ["it's"], false],
+		[
+			"CHECK (((e)::text = ANY ((ARRAY['p'::character varying, 'q'::character varying])::text[]))) NOT VALID",
+			'e',
+			['p', 'q'],
+			false,
+		],
+		["CHECK (((g = 'x'::text) OR (g = 'y'::text)))", 'g', ['x', 'y'], false],
+		["CHECK (((h = ANY (ARRAY['x'::text, 'y'::text])) OR (h IS NULL)))", 'h', ['x', 'y'], true],
+		[`CHECK ("status" IN ('a', 'b'))`, 'status', ['a', 'b'], false],
+		["CHECK (((c)::bpchar = 'x'::bpchar))", 'c', ['x'], false],
+		["CHECK (((v)::character varying(20) = 'x'::character varying(20)))", 'v', ['x'], false],
+	])('parses the enum check %s', (definition, column, values, allowsNull) => {
+		expect(parseEnumCheckDefinition(definition)).toEqual({ column, values, allowsNull })
+	})
+
+	test.each([
+		"CHECK ((c <> 'x'::text))", // NOT IN ('x')
+		'CHECK ((length(c) < 5))',
+		"CHECK ((lower(c) = 'x'::text))",
+		"CHECK (((a = 'x'::text) OR (b = 'y'::text)))",
+		"CHECK (((a = 'x'::text) AND (a <> 'y'::text)))",
+		"CHECK ((NOT (a = 'x'::text)))",
+		'CHECK ((a = b))',
+		'CHECK ((a IS NULL))',
+		'CHECK ((a = 1))',
+		"UNIQUE (a = 'x')",
+	])('does not parse %s as an enum check', (definition) => {
+		expect(parseEnumCheckDefinition(definition)).toBeNull()
 	})
 
 	test('t.enum() refuses values SQLite cannot store verbatim', () => {

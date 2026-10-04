@@ -507,20 +507,27 @@ export class PostgresServerStore implements ServerStore {
 	/**
 	 * One-time migration (RT-101): drop the enum `CHECK` constraints (and any `NOT NULL`
 	 * on a schema field) that beta.12 and earlier DDL put on collection tables, in one
-	 * transaction. Only single-column `col = ANY (ARRAY[...])` checks (Kora's enum shape)
-	 * on non-internal columns are dropped; checks added by hand are kept. Idempotent and
-	 * resumable: a later start finds nothing to drop.
+	 * transaction. A check is dropped when it parses as an enum check (one column against
+	 * string literals, in every form Postgres normalizes `IN (...)` to, the single-value
+	 * `col = 'x'` included, RT-108) on an enum field of the schema, or as the multi-value
+	 * `= ANY (ARRAY[...])` shape on another non-internal column; checks added by hand are
+	 * kept. Idempotent and resumable: a later start finds nothing to drop.
 	 */
 	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
 		const fieldsByTable: Record<string, string[]> = {}
+		const enumFieldsByTable: Record<string, string[]> = {}
 		for (const [name, collection] of Object.entries(schema.collections)) {
 			fieldsByTable[name] = Object.keys(collection.fields)
+			enumFieldsByTable[name] = Object.entries(collection.fields)
+				.filter(([, descriptor]) => descriptor.kind === 'enum')
+				.map(([field]) => field)
 		}
 		await this.db.transaction(async (tx) => {
 			const statements = await planPostgresConstraintRelaxation(
 				async (text) =>
 					(await tx.execute(sql.raw(text))) as unknown as Array<Record<string, unknown>>,
 				fieldsByTable,
+				enumFieldsByTable,
 			)
 			for (const statement of statements) await tx.execute(sql.raw(statement))
 		})
