@@ -23,6 +23,11 @@
 
 See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
 
+### Patch Changes
+
+- `op.*` helpers are typed by operation and operand: numeric helpers only on number and timestamp fields, `op.append`/`op.remove` only on arrays with the element type (`NumericAtomicOpSentinel`, `ArrayAtomicOpSentinel`).
+- Relaxing beta.12 enum checks only touches enum-shaped checks on the schema's enum fields; every other CHECK constraint is preserved.
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

@@ -27,6 +27,12 @@
 
 See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
 
+### Patch Changes
+
+- Backup restore applies a newer revision of an encryption key record (replace mode takes the backup's record; merge mode advances an older record of the same ring) instead of keeping a stale one.
+- The static file server serves a file, directory index or pre-compressed sibling only when its real path is inside the real `staticDir`; symlinks that escape it return 404.
+- SQLite server stores keep hand-written CHECK constraints when relaxing beta.12 enum checks.
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

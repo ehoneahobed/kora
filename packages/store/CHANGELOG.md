@@ -25,6 +25,10 @@
 
 See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
 
+### Patch Changes
+
+- Client stores keep hand-written CHECK constraints when relaxing beta.12 enum checks.
+
 ## 1.0.0-beta.12
 
 ### Minor Changes
