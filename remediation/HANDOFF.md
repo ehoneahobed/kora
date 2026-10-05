@@ -53,6 +53,16 @@ Backups on `private` as `wip/phase4/<branch>` (integrated already; keep for refe
 - Optional performance: the OPFS database uses SQLite's default DELETE journal (documented). A Phase 4 runtime track measured TRUNCATE at 9-15 ms per commit vs 15-17 ms; it was not integrated. Browser insert of 10,000 rows takes 7.5-9.3 s against a 2 s target (reported, not gated).
 - Android background freeze of a leader tab is verified only with simulated events; a real-device run is pending.
 
+## PR #4 review (Codex, 2026-10-05)
+
+Four automated review comments, each reproduced with a failing test, then fixed (branch `wip/phase4/codex-review`, merged into `fix/phase4-rc` at de5ad2b; replies posted on the PR):
+- RT-110 (P1): backup restore now applies a newer revision of an encryption key record instead of keeping a stale one (memory, SQLite, Postgres).
+- RT-111 (P2): relaxing beta.12 enum checks keeps hand-written CHECK constraints (client adapters, SQLite server, `kora migrate` rebuild).
+- RT-112 (P2): the static server serves files only when their real path is inside the real `staticDir` (symlink escapes return 404).
+- RT-113 (P2): `op.*` helpers are typed by operation and operand.
+
+Gate on 2164373: build, biome, typecheck, root test 30/30, `check.mjs --all` 223/223 fixed, 0 errors, 0 warnings, e2e 11/11.
+
 ## Next steps
 
 Follow `docs/releases/npm-publish-checklist-beta.13.md` exactly, in one sitting:
