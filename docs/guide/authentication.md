@@ -411,7 +411,7 @@ records which principal claimed each node id. A signed-in device keeps its node 
 user's node is refused, and a device whose node has history from before claims existed is refused
 with `NODE_ID_CLAIMED`. A device that uses `createKoraAuthSync` (every sync template) cannot move
 to another node id, because its node id is its signed-in device id: after upgrading a beta.12
-server, bind each such node to its device's owner once, before clients reconnect (script in
+server, bind each such node to its device's owner with the one-time script, with the server stopped (procedure in
 [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication)).
 Other devices refused their node move to a fresh node id and re-send their unsynced writes under
 it (`sync:node-id-rotated`). Anonymous devices prove their node with a secret node token.

@@ -499,7 +499,8 @@ if (matched === 0) throw new Error('No node matches an auth device: is this the 
 console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
 ```
 
-With Postgres (`DATABASE_URL` in the templates):
+With Postgres (`DATABASE_URL` in the templates; the `NOTICE ... already exists, skipping` lines
+it prints are harmless):
 
 <!-- docs-check: standalone -->
 ```ts
@@ -507,7 +508,7 @@ import { createPostgresUserStore } from '@korajs/auth/server'
 import { createPostgresServerStore } from '@korajs/server'
 
 const connectionString = process.env.DATABASE_URL
-if (!connectionString) throw new Error('Set DATABASE_URL to your production database')
+if (!connectionString) throw new Error("Set DATABASE_URL to your sync server's database")
 const users = await createPostgresUserStore({ connectionString })
 const store = await createPostgresServerStore({ connectionString })
 
@@ -536,8 +537,10 @@ With a custom user store, construct it as your server does. Revoked devices are 
 they stay signed out (auth enforces revocation), and if the user signs in again on that
 browser, the device id comes back and syncs. Another user who presents a bound node id is
 still refused `NODE_ID_CLAIMED`. On a browser that two users shared on beta.12, the node is
-bound to the device's first owner, and the other user's unsynced writes on it stay held on
-the device.
+bound to the device's first owner. The other user can no longer sign in on that browser
+(`DEVICE_OWNERSHIP_CONFLICT`), and their unsynced writes on it upload under the first owner's
+account when that owner next signs in there. If that matters, have those users sync before
+the upgrade.
 
 **Apps with token auth (`sync.auth`):**
 
