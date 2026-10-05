@@ -15,11 +15,14 @@ import type {
 	BlobChunkPushMessage,
 	BlobChunkRequestMessage,
 	BlobChunkResponseMessage,
+	EncryptionKeyPutMessage,
+	EncryptionKeyRequestMessage,
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
 	SyncMessage,
 	WireFormat,
+	WrappedKeyRecord,
 	YjsDocUpdateMessage,
 } from '@korajs/sync'
 import { SyncEncryptor, decodeBlobChunkBytes } from '@korajs/sync'
@@ -30,6 +33,7 @@ import {
 	NegotiatedMessageSerializer,
 	PLAINTEXT_REJECTED,
 	PROTOCOL_V1_DEPRECATED,
+	ProtobufMessageSerializer,
 	SCHEMA_MISMATCH_PREFIX,
 	SYNC_PROTOCOL_VERSION,
 	type SyncQuerySubset,
@@ -60,6 +64,8 @@ import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-v
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
+import type { EncryptionKeyService } from '../encryption/key-record-service'
+import { ANONYMOUS_KEY_OWNER, userKeyOwner } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import type { BlobAccessIndex } from '../richtext/blob-access-index'
 import {
@@ -419,6 +425,17 @@ export interface ClientSessionOptions {
 	onBlobChunkRequest?: BlobChunkRequestCallback
 	/** Called when this session receives a blob chunk response to route back */
 	onBlobChunkResponse?: BlobChunkResponseCallback
+	/** The key service storing wrapped encryption key records (ENC-1). */
+	encryptionKeys?: EncryptionKeyService
+	/** Called after this session wrote a key record, to push it to the owner's other sessions. */
+	onEncryptionKeyWritten?: (
+		sessionId: string,
+		owner: string,
+		keyring: string,
+		record: WrappedKeyRecord,
+	) => void
+	/** Key-service messages allowed per session per minute. Defaults to 60. */
+	maxKeyRequestsPerMinute?: number
 	/** Persist a client-uploaded blob chunk centrally (keyed by content hash) */
 	persistBlobChunk?: PersistBlobChunk
 	/**
@@ -689,6 +706,10 @@ export class ClientSession {
 	private readonly onYjsDocUpdate: YjsDocRelayCallback | null
 	private readonly onBlobChunkRequest: BlobChunkRequestCallback | null
 	private readonly onBlobChunkResponse: BlobChunkResponseCallback | null
+	private readonly encryptionKeys: EncryptionKeyService | null
+	private readonly onEncryptionKeyWritten: ClientSessionOptions['onEncryptionKeyWritten'] | null
+	/** Budget of key-service messages (each may cost a store read and write). */
+	private readonly keyRateLimiter: SessionRateLimiter
 	private readonly persistBlobChunk: PersistBlobChunk | null
 	private readonly onClose: ((sessionId: string) => void) | null
 	private readonly onReady: ((sessionId: string) => void) | null
@@ -713,7 +734,7 @@ export class ClientSession {
 	 * The client advertised the `sequenceReservation` handshake capability (RT-37): it
 	 * reserves sequence numbers in-transaction, so a second operation under a held
 	 * (node, sequence) is refused with SEQUENCE_CONFLICT. False for a legacy client
-	 * (Kora <= beta.13), whose duplicate pairs are stored instead.
+	 * (Kora <= beta.12), whose duplicate pairs are stored instead.
 	 */
 	private sequenceReservation = false
 	/** Legacy duplicate pairs this session stored (RT-37), for diagnostics. */
@@ -723,9 +744,9 @@ export class ClientSession {
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
-	/** Uploads whose data is stored as the beta.13 writer held it (RT-71). */
+	/** Uploads whose data is stored as the beta.12 writer held it (RT-71). */
 	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
-	/** Operations accepted with an unverified legacy (beta.13) id (RT-71). */
+	/** Operations accepted with an unverified legacy (beta.12) id (RT-71). */
 	private unverifiedLegacyOperations = 0
 	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
@@ -756,6 +777,9 @@ export class ClientSession {
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
 		this.onBlobChunkRequest = options.onBlobChunkRequest ?? null
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
+		this.encryptionKeys = options.encryptionKeys ?? null
+		this.onEncryptionKeyWritten = options.onEncryptionKeyWritten ?? null
+		this.keyRateLimiter = new SessionRateLimiter(options.maxKeyRequestsPerMinute ?? 60)
 		this.persistBlobChunk = options.persistBlobChunk ?? null
 		this.onClose = options.onClose ?? null
 		this.onReady = options.onReady ?? null
@@ -1414,7 +1438,7 @@ export class ClientSession {
 
 	/**
 	 * True when the client did not advertise the `sequenceReservation` capability
-	 * (RT-37): a legacy client (Kora <= beta.13) that may give two operations one
+	 * (RT-37): a legacy client (Kora <= beta.12) that may give two operations one
 	 * sequence number. Such a pair is stored and delivered, never refused with
 	 * SEQUENCE_CONFLICT. Meaningful once the handshake was accepted.
 	 */
@@ -1566,6 +1590,69 @@ export class ClientSession {
 			case 'blob-chunk-push':
 				await this.handleBlobChunkPush(message)
 				break
+			case 'encryption-key-request':
+			case 'encryption-key-put':
+				await this.handleEncryptionKeyMessage(message)
+				break
+			case 'encryption-key-response':
+				// Server -> client only.
+				break
+		}
+	}
+
+	/**
+	 * The owner of this session's encryption key records (ENC-1), or null when it may
+	 * hold none: the authenticated user, or on a server without auth the one shared
+	 * anonymous owner. An anonymous principal of a mixed provider has no stable
+	 * identity, so it holds no keys.
+	 */
+	getEncryptionKeyOwner(): string | null {
+		if (this.state !== 'syncing' && this.state !== 'streaming') return null
+		if (!this.auth || this.auth instanceof NoAuthProvider) return ANONYMOUS_KEY_OWNER
+		if (!this.principal || this.principal.anonymous === true) return null
+		return userKeyOwner(this.principal.userId)
+	}
+
+	/** Push a key record another session of the same owner wrote (rotation, new passphrase). */
+	pushEncryptionKeyRecord(keyring: string, record: WrappedKeyRecord): void {
+		if (this.state !== 'syncing' && this.state !== 'streaming') return
+		this.sendToClient({
+			type: 'encryption-key-response',
+			messageId: generateUUIDv7(),
+			keyring,
+			status: 'ok',
+			record,
+		})
+	}
+
+	private async handleEncryptionKeyMessage(
+		message: EncryptionKeyRequestMessage | EncryptionKeyPutMessage,
+	): Promise<void> {
+		const refuse = (status: 'unsupported' | 'throttled', text: string): void => {
+			this.sendToClient({
+				type: 'encryption-key-response',
+				messageId: generateUUIDv7(),
+				requestId: message.requestId,
+				keyring: message.keyring,
+				status,
+				record: null,
+				message: text,
+			})
+		}
+		if (!this.encryptionKeys) {
+			refuse('unsupported', 'This sync server does not serve encryption keys.')
+			return
+		}
+		if (!this.keyRateLimiter.allow(1)) {
+			refuse('throttled', 'Too many encryption key requests; retry later.')
+			return
+		}
+		const owner = this.getEncryptionKeyOwner()
+		const outcome = await this.encryptionKeys.handle(owner, message)
+		if (this.state === 'closed') return
+		this.sendToClient(outcome.response)
+		if (outcome.written && owner !== null) {
+			this.onEncryptionKeyWritten?.(this.sessionId, owner, message.keyring, outcome.written)
 		}
 	}
 
@@ -1681,7 +1768,20 @@ export class ClientSession {
 		if (await store.claimNode(nodeId, owner)) return issued
 		if (!store.getNodeClaimOwner || !store.replaceNodeClaim) return { ok: false }
 		const current = await store.getNodeClaimOwner(nodeId)
-		if (current === null) return { ok: false }
+		if (current === null) {
+			// History with no claim row: written before node claims existed (a database a
+			// beta.12 or older server wrote; RT-91). Such an anonymous device is a legacy
+			// anonymous claim exactly like the shared `kora:anonymous` owner below: adopted
+			// only with allowLegacyAnonymousClaims, provisionally, with a token for clients
+			// that can keep one. The release and the claim are separate steps, so of two
+			// concurrent claimants one wins and the other is refused (and rotates).
+			if (!this.allowLegacyAnonymousClaims || !store.releaseNodeClaim) return { ok: false }
+			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
+			if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
+			if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			this.warnLegacyAnonymousClaim(nodeId)
+			return issued
+		}
 		const pending = parsePendingOwner(current)
 		let legacy = false
 		if (pending) {
@@ -1698,20 +1798,23 @@ export class ClientSession {
 			return { ok: false }
 		}
 		if (!(await store.replaceNodeClaim(nodeId, current, owner))) return { ok: false }
-		if (legacy) {
-			this.logger?.log({
-				timestamp: Date.now(),
-				level: 'warn',
-				event: 'session.legacy_anonymous_claim',
-				sessionId: this.sessionId,
-				nodeId,
-				details: {
-					message:
-						'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
-				},
-			})
-		}
+		if (legacy) this.warnLegacyAnonymousClaim(nodeId)
 		return issued
+	}
+
+	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
+	private warnLegacyAnonymousClaim(nodeId: string): void {
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.legacy_anonymous_claim',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				message:
+					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+			},
+		})
 	}
 
 	/**
@@ -1953,6 +2056,18 @@ export class ClientSession {
 					uplinkScopes: resolvedUplinkScopes,
 				}
 			}
+		} else if (this.authContext) {
+			// The grant resolved to "unscoped" (RT-89: a claims-only grant on a schemaless
+			// server). The provider's raw grant must not stay on the context: it names no
+			// collection, so the upload and delivery checks, which read the context, would
+			// refuse every operation the handshake just accepted.
+			const {
+				scopes: _scopes,
+				downlinkScopes: _down,
+				uplinkScopes: _up,
+				...rest
+			} = this.authContext
+			this.authContext = rest
 		}
 
 		// Judge the provider's own grant: with `authenticated`, the resolved map is never
@@ -2011,8 +2126,10 @@ export class ClientSession {
 			}
 		}
 
-		const selectedWireFormat = selectWireFormat(msg.supportedWireFormats)
-		this.setSerializerWireFormat(selectedWireFormat)
+		// Report the format the transport actually frames with, never one the client merely
+		// offered (SYNC-9). The serializer is shared by every session on the server, so a
+		// per-session switch would flip the wire format of every other session too.
+		const selectedWireFormat = framingWireFormat(this.serializer)
 
 		if (!isClientSchemaVersionSupported(msg.schemaVersion, this.supportedSchemaVersions)) {
 			const { min, max } = this.supportedSchemaVersions
@@ -2061,7 +2178,7 @@ export class ClientSession {
 		// in advance (SRV-5): an unscoped session may see every operation, so it gets the
 		// whole vector; a scoped one gets the nodes a metadata pre-pass finds visible.
 		// Clients of this release count pending from their own acks (RT-28) and would not
-		// need the pre-pass, but beta.13 clients count every node ahead of this vector as
+		// need the pre-pass, but beta.12 clients count every node ahead of this vector as
 		// pending (and `kora compact` uses the persisted peer entries), so it stays. It
 		// starts at the resumed watermark (SYNC-11), so a reconnect scans only new ops.
 		const visibleNodes = new Set<string>([msg.nodeId])
@@ -2602,7 +2719,7 @@ export class ClientSession {
 			}
 
 			// Transforms at fold time (RT-84): the operation is stored exactly as uploaded
-			// (plus the hash version the server verified, and a beta.13 clear made explicit,
+			// (plus the hash version the server verified, and a beta.12 clear made explicit,
 			// both identical under its id), never as a transformed rewrite under its id.
 			// Authorization, validators and constraint checks judge its view in the server
 			// schema; every store folds that same view.
@@ -2960,9 +3077,9 @@ export class ClientSession {
 				this.restoredLegacyData.set(op, integrity.restoredData)
 			}
 			// Every replica folds a version-1 update in its canonical body: a previousData key
-			// absent from data is a clear (core canonicalizeLegacyOperation). beta.13 only
+			// absent from data is a clear (core canonicalizeLegacyOperation). beta.12 only
 			// ever produced that shape from `undefined` members, whose id covers the clear;
-			// an id that verifies WITHOUT the clear names a body no beta.13 wrote, and storing
+			// an id that verifies WITHOUT the clear names a body no beta.12 wrote, and storing
 			// it would let authorization judge one body while every fold applies another.
 			if (
 				integrity.ok &&
@@ -2976,10 +3093,10 @@ export class ClientSession {
 				}
 			}
 			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
-				// RT-71: a beta.13 (protocol 1) client hashed `undefined` members as `null`;
+				// RT-71: a beta.12 (protocol 1) client hashed `undefined` members as `null`;
 				// the JSON it uploaded no longer holds them, so the id cannot always be
 				// rebuilt. The operation is stored unverified (no declared version), as every
-				// beta.13 operation was before RT-64. This skips no protection RT-64 needs:
+				// beta.12 operation was before RT-64. This skips no protection RT-64 needs:
 				// the ids the server derives are keyed (HMAC), so no client can predict and
 				// pre-store one, and a protocol-2 session never reaches this branch.
 				this.reportUnverifiedLegacyOperation(op)
@@ -3002,7 +3119,7 @@ export class ClientSession {
 
 	/**
 	 * Whether an undeclared version-1 id that does not verify is accepted unverified
-	 * (RT-71): only from a protocol-1 session (Kora <= beta.13), and only for the
+	 * (RT-71): only from a protocol-1 session (Kora <= beta.12), and only for the
 	 * session's own node.
 	 */
 	private acceptsUnverifiedLegacyId(op: Operation): boolean {
@@ -3012,7 +3129,7 @@ export class ClientSession {
 	/** Log, count and emit an operation accepted with an unverified legacy id (RT-71). */
 	private reportUnverifiedLegacyOperation(op: Operation): void {
 		this.unverifiedLegacyOperations++
-		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.13 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
+		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.12 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -3044,7 +3161,7 @@ export class ClientSession {
 	private declareVerifiedHashVersion(op: Operation): Operation {
 		if (op.hashVersion !== undefined) return op
 		const matched = this.matchedHashVersions.get(op)
-		// A beta.13 update that cleared fields with `undefined` is stored with those fields
+		// A beta.12 update that cleared fields with `undefined` is stored with those fields
 		// `null` (RT-71): what the writer applied, and the same version-1 hash.
 		const restored = this.restoredLegacyData.get(op)
 		const content = restored === undefined ? op : { ...op, data: restored }
@@ -3094,12 +3211,12 @@ export class ClientSession {
 	}
 
 	/**
-	 * A protocol-1 client (Kora <= beta.13) is served for one release (beta.14) with a
+	 * A protocol-1 client (Kora <= beta.12) is served for one release (beta.13) with a
 	 * deprecation warning: its operation ids are version-1 hashes and its encrypted
 	 * payloads have no envelope binding.
 	 */
 	private warnLegacyProtocol(nodeId: string): void {
-		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.13) are accepted in beta.14 only and will be refused by the next release. Upgrade the client.`
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are accepted in beta.13 only and will be refused by the next release. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -3921,7 +4038,7 @@ export class ClientSession {
 				holderIds: pair.holderIds,
 				legacyWriter: pair.legacyWriter,
 				message: pair.legacyWriter
-					? 'A client without the sequenceReservation capability (Kora <= beta.13) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
+					? 'A client without the sequenceReservation capability (Kora <= beta.12) uploaded a second operation under a held sequence number. Both are stored and delivered. Upgrade the client.'
 					: 'An operation shares its sequence number with one stored before sequence enforcement (Kora <= beta.12). Both are stored.',
 			},
 		})
@@ -3963,12 +4080,6 @@ export class ClientSession {
 		this.sendToClient(rejectedMsg)
 	}
 
-	private setSerializerWireFormat(format: WireFormat): void {
-		if (typeof this.serializer.setWireFormat === 'function') {
-			this.serializer.setWireFormat(format)
-		}
-	}
-
 	private handleTransportClose(): void {
 		if (this.state === 'closed') return
 		this.state = 'closed'
@@ -3990,11 +4101,13 @@ function recordCacheKey(collection: string, recordId: string): string {
  */
 type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEntry?: boolean }
 
-function selectWireFormat(supportedWireFormats?: WireFormat[]): WireFormat {
-	if (supportedWireFormats?.includes('protobuf')) {
-		return 'protobuf'
-	}
-
+/**
+ * The wire format a serializer frames messages with: its own report when it has one, protobuf
+ * for the fixed protobuf serializer, and JSON otherwise.
+ */
+function framingWireFormat(serializer: MessageSerializer): WireFormat {
+	if (typeof serializer.getWireFormat === 'function') return serializer.getWireFormat()
+	if (serializer instanceof ProtobufMessageSerializer) return 'protobuf'
 	return 'json'
 }
 

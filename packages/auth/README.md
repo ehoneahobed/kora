@@ -6,25 +6,29 @@ Offline-first authentication for Kora.js applications.
 
 `@korajs/auth` provides a complete authentication system designed for offline-first applications. It includes:
 
-- **Client-side auth management** -- token storage, session restoration, sign-up/sign-in/sign-out
-- **React hooks** -- `useAuth()`, `useCurrentUser()`, `useAuthStatus()`, `useOrg()`, `usePermission()`
-- **Server-side auth routes** -- email/password authentication with JWT tokens
-- **Device identity** -- ECDSA P-256 key pairs for proof-of-possession
-- **Token management** -- access/refresh token lifecycle with rotation and revocation detection
-- **Session management** -- server-side sessions with idle timeout, max limits, and MFA awareness
-- **Multi-factor authentication** -- TOTP (authenticator apps) with recovery codes
-- **Organizations and RBAC** -- multi-tenant orgs with role hierarchy and permission checks
-- **Passkeys (WebAuthn)** -- passwordless authentication with platform authenticators
-- **Encrypted token storage** -- AES-256-GCM encryption for sensitive environments
-- **End-to-end encryption** -- encrypt operation data before sync with `OperationEncryptor`
-- **Sync auth binding** -- `createKoraAuthSync()` wires tokens, JWT scopes, and device node ids to `createApp`
+- **Client-side auth management**: token storage, session restoration, sign-up/sign-in/sign-out
+- **React hooks**: `useAuth()`, `useCurrentUser()`, `useAuthStatus()`, `useOrg()`, `usePermission()`
+- **Server-side auth routes**: email/password authentication with JWT tokens
+- **Device identity**: ECDSA P-256 key pairs for proof-of-possession
+- **Token management**: access/refresh token lifecycle with rotation and revocation detection
+- **Session management**: server-side sessions with idle timeout, max limits, and MFA awareness
+- **Multi-factor authentication**: TOTP (authenticator apps) with recovery codes
+- **Organizations and RBAC**: multi-tenant orgs with role hierarchy and permission checks
+- **Passkeys (WebAuthn)**: passwordless authentication with platform authenticators
+- **Encrypted token storage**: AES-256-GCM encryption for sensitive environments
+- **Local encryption helpers**: AES-256-GCM keys, PBKDF2 key derivation and auto-lock (end-to-end encryption of synced data is `sync.encryption` in `korajs`)
+- **Sync auth binding**: `createKoraAuthSync()` binds sync to the signed-in user: per-user writes, token refresh, suspension while signed out, and scope hints
 
 The client APIs work in browser, Tauri desktop WebView, and mobile JavaScript environments. For desktop apps, run auth routes on your remote sync/auth server and point `AuthClient.serverUrl` at that server. Email/password auth, token refresh, sync authorization, MFA, organizations, and RBAC work across web and desktop clients. Passkeys should be feature-detected because WebAuthn support depends on the operating system WebView.
 
 For production desktop and mobile apps, pass a custom token storage adapter backed by the platform credential store and attach a stable device identity:
 
+<!-- docs-check: standalone -->
 ```typescript
-import { createKoraAuth } from '@korajs/auth'
+import { createKoraAuth, type AuthKeyValueStorage, type DeviceKeyStore } from '@korajs/auth'
+
+declare const secureStore: AuthKeyValueStorage // Keychain, Keystore, a Tauri secure-storage plugin
+declare const deviceKeyStore: DeviceKeyStore
 
 const authClient = createKoraAuth({
   serverUrl: 'https://acme.example.com',
@@ -38,20 +42,21 @@ const authClient = createKoraAuth({
 ## Installation
 
 ```bash
-pnpm add @korajs/auth
+pnpm add @korajs/auth@beta
 ```
 
 ## Quick Start
 
 ### Client-side (React)
 
+<!-- docs-check: file auth-client.tsx -->
 ```tsx
 import { createKoraAuth } from '@korajs/auth'
 import { AuthProvider, useAuth } from '@korajs/auth/react'
 
-const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+export const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
 
-function App() {
+export function App() {
   return (
     <AuthProvider client={authClient}>
       <MyApp />
@@ -90,37 +95,47 @@ function MyApp() {
 
 ```tsx
 import { createKoraAuthSync } from '@korajs/auth'
-import { createApp } from 'korajs'
+import { createApp, defineSchema, t } from 'korajs'
+import { authClient } from './auth-client'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
 const app = createApp({
   schema,
   sync: {
     url: 'ws://localhost:3001/kora-sync',
     authClient: createKoraAuthSync({ authClient, schema }),
+    autoConnect: true,
   },
 })
 ```
 
+Sync waits while nobody is signed in (`anonymous: 'allow'` syncs anonymously instead), and every
+local write belongs to the user who made it.
+
 ### Server-side
 
+<!-- docs-check: standalone -->
 ```typescript
 import {
   createKoraAuthServer,
   createSqliteOAuthStores,
+  createSqliteUserStore,
   googleProvider,
 } from '@korajs/auth/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
-const oauthStores = await createSqliteOAuthStores({
-  filename: './auth.db',
-})
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+const oauthStores = await createSqliteOAuthStores({ filename: './auth.db' })
 
 const auth = createKoraAuthServer({
-  jwtSecret: process.env.KORA_AUTH_SECRET!,
+  jwtSecret: process.env.KORA_AUTH_SECRET, // required in production
+  userStore, // production refuses in-memory stores
   oauth: {
     providers: [
       googleProvider({
-        clientId: process.env.GOOGLE_CLIENT_ID!,
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+        clientId: process.env.GOOGLE_CLIENT_ID ?? '',
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET,
         redirectUri: 'https://app.example.com/auth/oauth/google/callback',
       }),
     ],
@@ -129,24 +144,12 @@ const auth = createKoraAuthServer({
   },
 })
 
-// Wire into your HTTP server:
-app.all('/auth/*', async (req, res) => {
-  const result = await auth.handleRequest({
-    method: req.method,
-    path: req.path,
-    body: req.body,
-    headers: req.headers,
-    query: req.query,
-    ip: req.ip,
-  })
-  res.status(result.status).json(result.body)
+const server = createProductionServer({
+  store: createSqliteServerStore({ filename: './kora-server.db' }),
+  httpRoutes: [{ path: '/auth', handle: auth.handleRequest }],
+  syncOptions: { auth: auth.auth }, // verified identity and server-granted scopes
 })
-
-// Bridge to Kora sync server:
-const syncServer = new KoraSyncServer({
-  store,
-  auth: auth.auth,
-})
+await server.start()
 ```
 
 ## Exports
@@ -169,8 +172,8 @@ const syncServer = new KoraSyncServer({
 | `createPasskeyCredential` | Register a new passkey |
 | `authenticateWithPasskey` | Sign in with a passkey |
 | `encryptData` / `decryptData` | AES-256-GCM data encryption |
-| `OperationEncryptor` | E2E encryption for sync operations |
-| `AutoLockManager` | Auto-lock encryption keys after idle timeout |
+| `deriveEncryptionKey` / `generateEncryptionKey` | Local AES-256-GCM keys |
+| `AutoLockManager` | Lock after an idle timeout |
 
 ### `@korajs/auth/react`
 
@@ -191,8 +194,8 @@ const syncServer = new KoraSyncServer({
 | `createKoraAuthServer` | Quickstart server factory with auth routes and sync provider |
 | `BuiltInAuthRoutes` | HTTP route handlers for all auth operations |
 | `TokenManager` | JWT issuing, validation, refresh rotation, revocation |
+| `createSqliteUserStore` / `createPostgresUserStore` | Durable users and token revocations |
 | `InMemoryUserStore` | Dev/test user store |
-| `InMemoryTokenRevocationStore` | Dev/test token revocation store |
 | `OAuthManager` / provider helpers | OAuth authorization code flow and provider configs |
 | `InMemoryLinkedIdentityStore` | Dev/test OAuth account-linking store |
 | `createSqliteOAuthStores` / `createPostgresOAuthStores` | Durable OAuth state and linked identity stores |
@@ -210,13 +213,15 @@ const syncServer = new KoraSyncServer({
 
 - Passwords hashed with PBKDF2-SHA512 (600,000 iterations, 32-byte salt)
 - JWT tokens signed with HMAC-SHA256 with constant-time comparison
-- Refresh token rotation with replay detection and device-level revocation
+- Atomic refresh token rotation with reuse detection per token family
 - Device keys use ECDSA P-256 with non-extractable private keys (Web Crypto)
 - TOTP uses SHA-1 HMAC per RFC 6238 with 30-second time steps
-- Access tokens expire in 15 minutes (configurable), refresh tokens in 7 days
+- Access tokens expire in 15 minutes and refresh tokens in 90 days (configurable)
+- Revocation (sign-out, device, password change, admin) applies to every route and ends live sync sessions
+- Sign-in is rate limited per account and per IP; MFA at sign-in with TOTP (replay protection and lockout)
 - Session idle timeout with sliding window and configurable max concurrent sessions
 - Passkeys use WebAuthn L2 with platform authenticator support
-- Encrypted token store uses AES-256-GCM with PBKDF2-derived keys
+- The encrypted token store uses AES-256-GCM with a key you provide (generated or PBKDF2-derived)
 
 ## Architecture
 
@@ -241,7 +246,7 @@ Client                                 Server
 
 ## Documentation
 
-See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication) and [Auth API Reference](https://ehoneahobed.github.io/kora/api/auth) for complete documentation.
+See the [Authentication Guide](https://korajs.dev/guide/authentication) and the [Auth API Reference](https://korajs.dev/api/auth).
 
 ## License
 

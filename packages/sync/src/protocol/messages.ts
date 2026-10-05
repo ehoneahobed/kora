@@ -4,6 +4,8 @@ import type {
 	HLCTimestamp,
 	OperationType,
 } from '@korajs/core'
+import type { EncryptionKeyMessage } from '../encryption/key-messages'
+import { isEncryptionKeyMessage } from '../encryption/key-messages'
 import type { SyncQuerySubset } from '../scopes/query-subset'
 
 export type WireFormat = 'json' | 'protobuf'
@@ -105,7 +107,7 @@ export interface HandshakeMessage {
 	 * the same local transaction that writes the operation, so it never puts two
 	 * different operations under one `(nodeId, sequenceNumber)`. Only for such a client
 	 * does the server refuse a second, different operation under a held sequence
-	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.13, which could give
+	 * (`SEQUENCE_CONFLICT`). A client that omits it (Kora <= beta.12, which could give
 	 * two concurrent transactions one number) is served as legacy: such a pair is
 	 * stored, both operations are delivered, and a warning is logged. Old servers
 	 * ignore it. Protobuf field 45.
@@ -113,7 +115,7 @@ export interface HandshakeMessage {
 	sequenceReservation?: boolean
 	/**
 	 * Sync protocol version the client speaks (`SYNC_PROTOCOL_VERSION`). Absent means 1
-	 * (Kora <= beta.13). A protocol-2 client sends hash-version-2 operation ids, the
+	 * (Kora <= beta.12). A protocol-2 client sends hash-version-2 operation ids, the
 	 * encryption envelope v2 and always `sequenceReservation`. Protobuf field 47.
 	 */
 	protocolVersion?: number
@@ -190,16 +192,17 @@ export interface HandshakeResponseMessage {
 	 */
 	heartbeatIntervalMs?: number
 	/**
-	 * Sync protocol version the server speaks. Absent means 1 (a beta.13-era server).
+	 * Sync protocol version the server speaks. Absent means 1 (a beta.12-era server).
 	 * Protobuf field 47.
 	 */
 	protocolVersion?: number
 	/**
-	 * Node ids whose operations are authored by the server itself (its own node id and
-	 * the reserved scope-entry node). Only operations from these nodes may carry
-	 * server-authored metadata (`fieldVersions`, `foldState`); the client persists the
-	 * list (`SyncStatePersistence.saveAuthoritativeNodeIds`). Absent from older
-	 * servers. Protobuf field 46 (repeated).
+	 * Explicit authoritative node ids (RT-75): legacy server node ids from before protocol
+	 * 2 and extras configured on the server store. Every `kora:server:` node id is
+	 * authoritative by its prefix and is not listed. Only operations of authoritative
+	 * nodes may carry server-authored metadata (`fieldVersions`, `foldState`); the client
+	 * keeps the union of every id it learns (`SyncStatePersistence.saveAuthoritativeNodeIds`).
+	 * Absent from older servers. Protobuf field 46 (repeated).
 	 */
 	authoritativeNodeIds?: string[]
 	/**
@@ -430,6 +433,7 @@ export type SyncMessage =
 	| BlobChunkResponseMessage
 	| BlobChunkPushMessage
 	| HeartbeatMessage
+	| EncryptionKeyMessage
 
 // --- Type Guards ---
 
@@ -465,6 +469,10 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isBlobChunkPushMessage(value)
 		case 'heartbeat':
 			return true
+		case 'encryption-key-request':
+		case 'encryption-key-put':
+		case 'encryption-key-response':
+			return isEncryptionKeyMessage(value)
 		default:
 			return false
 	}

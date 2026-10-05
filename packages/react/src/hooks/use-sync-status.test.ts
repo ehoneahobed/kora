@@ -51,7 +51,10 @@ function createMockSyncEngine(initialStatus?: Partial<SyncStatusInfo>): {
 	return { syncEngine, setStatus }
 }
 
-function createMockEmitter(): KoraEventEmitter & { emitSyncEvent(): void } {
+function createMockEmitter(): KoraEventEmitter & {
+	emitSyncEvent(): void
+	emitEvent(event: { type: string } & Record<string, unknown>): void
+} {
 	const handlers = new Map<string, Set<(event: unknown) => void>>()
 	return {
 		on(type: string, handler: (event: unknown) => void) {
@@ -68,7 +71,13 @@ function createMockEmitter(): KoraEventEmitter & { emitSyncEvent(): void } {
 				handler({ type: 'sync:sent', operations: [], batchSize: 0 })
 			}
 		},
-	} as KoraEventEmitter & { emitSyncEvent(): void }
+		emitEvent(event: { type: string } & Record<string, unknown>) {
+			for (const handler of handlers.get(event.type) ?? []) handler(event)
+		},
+	} as KoraEventEmitter & {
+		emitSyncEvent(): void
+		emitEvent(event: { type: string } & Record<string, unknown>): void
+	}
 }
 
 function SyncStatusDisplay(): ReturnType<typeof createElement> {
@@ -197,6 +206,50 @@ describe('useSyncStatus', () => {
 			expect(screen.getByTestId('status').textContent).toBe('synced')
 		})
 		expect(screen.getByTestId('pending').textContent).toBe('1')
+	})
+
+	it('shows a locked encryption keyring (sync:suspended encryption-locked) as its own state', async () => {
+		const store = createMockStore()
+		const { syncEngine, setStatus } = createMockSyncEngine({ status: 'offline' })
+		const events = createMockEmitter()
+		const app: KoraAppLike = {
+			ready: Promise.resolve(),
+			getStore: () => store,
+			getSyncEngine: () => syncEngine,
+			events,
+		}
+		function LockAware(): ReturnType<typeof createElement> {
+			const status = useSyncStatus()
+			return createElement(
+				'span',
+				{ 'data-testid': 'lock' },
+				`${status.status}/${status.phase ?? '-'}/${status.reason ?? '-'}`,
+			)
+		}
+		render(createElement(KoraProvider, { app }, createElement(LockAware)))
+		await waitFor(() => expect(screen.getByTestId('lock').textContent).toBe('offline/-/-'))
+
+		// What SyncEngine.getStatus() reports while the keyring is locked (ENC-1).
+		setStatus({
+			status: 'encryption-locked',
+			phase: 'suspended',
+			reason: 'encryption-locked',
+			reconnecting: false,
+			pendingOperations: 2,
+			lastSyncedAt: null,
+			lastSuccessfulPush: null,
+			lastSuccessfulPull: null,
+			conflicts: 0,
+			clockSkewMs: null,
+		})
+		await act(async () => {
+			events.emitEvent({ type: 'sync:suspended', reason: 'encryption-locked' })
+		})
+		await waitFor(() =>
+			expect(screen.getByTestId('lock').textContent).toBe(
+				'encryption-locked/suspended/encryption-locked',
+			),
+		)
 	})
 
 	it('returns stable reference when status unchanged', () => {

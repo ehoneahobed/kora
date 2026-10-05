@@ -4,55 +4,46 @@ Browser DevTools extension for Kora.js. Inspect operations, trace conflict resol
 
 ## Install
 
+`korajs` already depends on `@korajs/devtools`; apps only turn it on. Install it directly to use
+the building blocks (`Instrumenter`, `EventBuffer`, the panel renderer) in your own tooling:
+
 ```bash
-pnpm add -D @korajs/devtools
+pnpm add -D @korajs/devtools@beta
 ```
 
 ## Enable
 
-Add `devtools: true` to your app config:
-
+<!-- docs-check: standalone -->
 ```typescript
-import { createApp } from 'korajs'
+import { createApp, defineSchema, t } from 'korajs'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 
 const app = createApp({
   schema,
-  devtools: process.env.NODE_ENV === 'development',
+  devtools: import.meta.env.DEV,
 })
 ```
 
-When enabled, the Kora DevTools panel appears in your browser's developer tools.
+With `devtools: true`, Kora records instrumentation events and:
+
+- mounts an in-page overlay, toggled with `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS);
+- forwards events to the browser extension. The extension is not published to a store yet: build
+  it with `pnpm --filter @korajs/devtools build` in the Kora repository and load
+  `packages/devtools/dist/extension` as an unpacked extension in a Chromium browser.
 
 ## Panels
 
-### Sync Timeline
-Horizontal timeline of operations and sync events, color-coded by type. Click any event to inspect it. Causal arrows show dependencies between operations.
+- **Timeline**: recorded events in order, color-coded by type.
+- **Conflicts**: every merge conflict with its strategy, tier, inputs and result.
+- **Operations**: operations created on this device and applied from sync, with payload, node,
+  sequence number and causal dependencies.
+- **Network**: connection state and quality, operations sent and received, last sync, and a
+  version vector derived from the recorded operations.
 
-### Conflict Inspector
-Table of all merge events, filterable by collection, tier, and strategy. Expand any row to see the full `MergeTrace` -- input values, base value, resolved output, and which tier handled it.
-
-### Operation Log
-Searchable list of all operations. Click an operation to view its full payload, causal dependencies, and the database state at that point in time.
-
-### Network Status
-Real-time connection quality indicator, pending operation count, bandwidth graph, and last sync timestamp.
-
-## Instrumentation Events
-
-The DevTools extension listens for events emitted by the Kora runtime:
-
-- `operation:created` / `operation:applied`
-- `merge:started` / `merge:completed` / `merge:conflict`
-- `sync:connected` / `sync:disconnected` / `sync:sent` / `sync:received`
-- `query:subscribed` / `query:invalidated` / `query:executed`
-- `connection:quality`
-
-## Keyboard Shortcut
-
-In development mode, press `Ctrl+Shift+K` (or `Cmd+Shift+K` on macOS) to toggle the embedded DevTools overlay.
+The panels show events recorded since the page loaded. The complete event catalog is in the
+[DevTools API reference](https://korajs.dev/api/devtools#events).
 
 ## License
 
 MIT
-
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.

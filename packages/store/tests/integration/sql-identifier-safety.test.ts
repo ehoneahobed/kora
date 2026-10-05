@@ -37,3 +37,45 @@ describe('SQL identifier safety', () => {
 		await roundTrip('UserProfiles', 'firstName')
 	})
 })
+
+describe('SQL literal safety in DDL (SEC-9b)', () => {
+	test('quoted defaults and enum values open, apply and enforce on real SQLite', async () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				notes: {
+					fields: {
+						title: t.string(),
+						status: t.string().default("don't know"),
+						mood: t.enum(["it's fine", 'ok']).default("it's fine"),
+						tags: t.array(t.string()).default(["o'k"]),
+					},
+				},
+			},
+		})
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'node-lit' })
+		await store.open()
+		try {
+			const rec = await store.collection('notes').insert({ title: 'a' })
+			expect(rec.status).toBe("don't know")
+			expect(rec.mood).toBe("it's fine")
+			// The DB-level defaults are the declared values too (rows written by SQL).
+			await adapter.execute(
+				`INSERT INTO notes (id, title, _created_at, _updated_at) VALUES ('raw', 'r', 0, 0)`,
+			)
+			const rows = await adapter.query<Record<string, unknown>>(
+				`SELECT status, mood, tags FROM notes WHERE id = 'raw'`,
+			)
+			expect(rows[0]).toEqual({ status: "don't know", mood: "it's fine", tags: '["o\'k"]' })
+			// Values outside the declared set are refused by validation (the table carries no
+			// CHECK, so a schema upgrade can add values: RT-101).
+			await expect(
+				store.collection('notes').insert({ title: 'b', mood: 'its fine' }),
+			).rejects.toThrow(/mood/)
+			expect(await adapter.query(`SELECT id FROM notes WHERE mood = 'its fine'`)).toEqual([])
+		} finally {
+			await store.close()
+		}
+	})
+})

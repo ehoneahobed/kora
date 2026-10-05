@@ -165,6 +165,19 @@ export function createSampleEvent<T extends KoraEventType>(
 			duration: 2.5,
 			resultCount: 10,
 		},
+		'query:error': {
+			type: 'query:error',
+			queryId: 'q-001',
+			collection: 'todos',
+			phase: 'refresh',
+			code: 'QUERY_ERROR',
+			message: 'boom',
+		},
+		'storage:persistence': {
+			type: 'storage:persistence',
+			state: 'checked',
+			persisted: false,
+		},
 		'connection:quality': { type: 'connection:quality', quality: 'good' },
 		'sync:schema-mismatch': {
 			type: 'sync:schema-mismatch',
@@ -248,6 +261,10 @@ export function createSampleEvent<T extends KoraEventType>(
 				firstSeenAt: 1000,
 				retryCount: 1,
 			},
+		},
+		'encryption:status': {
+			type: 'encryption:status',
+			status: { state: 'locked', keyring: 'default', keyVersion: null, code: 'NO_PASSPHRASE' },
 		},
 		'sync:clock-skew': {
 			type: 'sync:clock-skew',
@@ -431,6 +448,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			from: 'legacy-opfs-pool',
 			to: 'opfs',
 			message: 'Moved to its own OPFS pool',
+		},
+		'store:schema-ahead': {
+			type: 'store:schema-ahead',
+			dbName: 'kora-db',
+			storedVersion: 2,
+			codeVersion: 1,
+			message: 'The database was migrated by a newer build',
 		},
 		'replay:completed': {
 			type: 'replay:completed',

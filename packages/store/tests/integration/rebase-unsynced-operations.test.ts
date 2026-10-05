@@ -191,7 +191,7 @@ describe('Integration: rebaseUnsyncedOperations', () => {
 	})
 
 	test('legacy: materialized row is left alone when its current version came from a non-rebased op', async () => {
-		// The beta.13 paths left the row alone. Under the W7 fold the row is always the
+		// The beta.12 paths left the row alone. Under the W7 fold the row is always the
 		// fold of the (rebased) log: see the next test.
 		await store.close()
 		adapter = new BetterSqlite3Adapter(':memory:')

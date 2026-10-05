@@ -81,7 +81,7 @@ describe('createApp', () => {
 		})
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
-		expect(await todos.findById('missing')).toBeNull()
+		await expect(todos.findById('missing')).rejects.toThrow(/app\.ready/)
 		expect(() => todos.where({ completed: false })).toThrow(/app\.ready/)
 		await app.ready
 		await expect(todos.where({ completed: false }).exec()).resolves.toEqual([])
@@ -356,7 +356,8 @@ describe('createApp', () => {
 	})
 
 	test('auto-detects adapter in Node.js environment', async () => {
-		app = createApp({ schema })
+		// ssr: false: a Node.js program, not a server render (which stays inert, DX-6).
+		app = createApp({ schema, ssr: false })
 		await app.ready
 
 		// In Node.js, auto-detection should pick better-sqlite3
@@ -484,6 +485,8 @@ describe('createApp', () => {
 		try {
 			app = createApp({
 				schema,
+				// A simulated browser client without a window object: not a server render.
+				ssr: false,
 				store: { adapter: 'sqlite-wasm', workerUrl: '/worker.js', name: dbName },
 			})
 			app.events.on('store:storage-fallback', (event) => events.push(event))
@@ -496,6 +499,8 @@ describe('createApp', () => {
 
 			app = createApp({
 				schema,
+				// A simulated browser client without a window object: not a server render.
+				ssr: false,
 				store: { adapter: 'sqlite-wasm', workerUrl: '/worker.js', name: dbName },
 			})
 			await app.ready

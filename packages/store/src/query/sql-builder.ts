@@ -40,17 +40,27 @@ export function buildSelectQuery(
 	if (descriptor.orderBy.length > 0) {
 		const orderParts = descriptor.orderBy.map((o) => {
 			validateFieldName(o.field, fields)
-			return `${quoteIdent(o.field)} ${o.direction.toUpperCase()}`
+			// SEC-7: the direction is whitelisted to a fixed keyword, never spliced from
+			// the caller's string (a runtime value cast to the type is untrusted input).
+			return `${quoteIdent(resolveColumnName(o.field, fields))} ${sqlSortDirection(o.direction, o.field)}`
 		})
 		parts.push(`ORDER BY ${orderParts.join(', ')}`)
 	}
 
-	if (descriptor.limit !== undefined) {
-		parts.push(`LIMIT ${descriptor.limit}`)
+	// SEC-7: LIMIT / OFFSET are bound as parameters after a safe-integer check, so a
+	// value that only claims to be a number can never become SQL text.
+	const limit = descriptor.limit !== undefined ? assertQueryCount(descriptor.limit, 'limit') : null
+	const offset =
+		descriptor.offset !== undefined ? assertQueryCount(descriptor.offset, 'offset') : null
+	if (limit !== null) {
+		parts.push('LIMIT ?')
+		params.push(limit)
 	}
-
-	if (descriptor.offset !== undefined) {
-		parts.push(`OFFSET ${descriptor.offset}`)
+	if (offset !== null) {
+		// SQLite accepts OFFSET only after LIMIT; LIMIT -1 means "no limit".
+		if (limit === null) parts.push('LIMIT -1')
+		parts.push('OFFSET ?')
+		params.push(offset)
 	}
 
 	return { sql: parts.join(' '), params }
@@ -264,6 +274,7 @@ function buildWhereClauseParts(
 	for (const [fieldName, value] of Object.entries(where)) {
 		validateFieldName(fieldName, fields)
 		const descriptor = fields[fieldName]
+		const column = resolveColumnName(fieldName, fields)
 
 		if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
 			// Operator object: { $gt: 5, $lt: 10 }
@@ -276,11 +287,11 @@ function buildWhereClauseParts(
 						validOperators: [...VALID_OPERATORS],
 					})
 				}
-				conditions.push(buildOperatorCondition(fieldName, op, opValue, descriptor, params))
+				conditions.push(buildOperatorCondition(fieldName, column, op, opValue, descriptor, params))
 			}
 		} else {
 			// Shorthand: { completed: false } means { completed: { $eq: false } }
-			conditions.push(buildOperatorCondition(fieldName, '$eq', value, descriptor, params))
+			conditions.push(buildOperatorCondition(fieldName, column, '$eq', value, descriptor, params))
 		}
 	}
 
@@ -290,6 +301,7 @@ function buildWhereClauseParts(
 
 function buildOperatorCondition(
 	fieldName: string,
+	columnName: string,
 	operator: string,
 	value: unknown,
 	descriptor: FieldDescriptor | undefined,
@@ -298,7 +310,7 @@ function buildOperatorCondition(
 	// Serialize boolean values to 0/1 and raw strings to their stored form (RT-65)
 	const sqlValue = toSqlFilterValue(value, descriptor)
 
-	const column = quoteIdent(fieldName)
+	const column = quoteIdent(columnName)
 
 	switch (operator) {
 		case '$eq':
@@ -348,13 +360,68 @@ function toSqlFilterValue(value: unknown, descriptor: FieldDescriptor | undefine
 	return encodeStoredFilterValue(value, descriptor)
 }
 
+/**
+ * Record metadata exposed on every record under a camelCase name and backed by a
+ * system column (STORE-11): `where({ updatedAt: { $gt: t } })` and
+ * `orderBy('createdAt', 'desc')` filter and sort on these columns. A schema field
+ * declared with the same name wins and its own column is used instead.
+ */
+export const VIRTUAL_TIMESTAMP_FIELDS = Object.freeze({
+	createdAt: '_created_at',
+	updatedAt: '_updated_at',
+} as const)
+
+/** Name of a virtual record-metadata field usable in `where` and `orderBy`. */
+export type VirtualTimestampField = keyof typeof VIRTUAL_TIMESTAMP_FIELDS
+
+/** Every virtual record-metadata field name, for typing `where` / `orderBy` keys. */
+export const VIRTUAL_TIMESTAMP_FIELD_NAMES: readonly VirtualTimestampField[] = Object.freeze([
+	'createdAt',
+	'updatedAt',
+] as const)
+
+const SORT_DIRECTIONS: Readonly<Record<string, 'ASC' | 'DESC'>> = Object.freeze({
+	asc: 'ASC',
+	desc: 'DESC',
+})
+
+/** Map a query field name to the column it reads (STORE-11 virtual fields). */
+function resolveColumnName(fieldName: string, fields: Record<string, FieldDescriptor>): string {
+	if (Object.hasOwn(fields, fieldName)) return fieldName
+	if (fieldName === 'createdAt' || fieldName === 'updatedAt') {
+		return VIRTUAL_TIMESTAMP_FIELDS[fieldName]
+	}
+	return fieldName
+}
+
+function sqlSortDirection(direction: unknown, field: string): 'ASC' | 'DESC' {
+	const key = typeof direction === 'string' ? direction.toLowerCase() : ''
+	const keyword = Object.hasOwn(SORT_DIRECTIONS, key) ? SORT_DIRECTIONS[key] : undefined
+	if (keyword === undefined) {
+		throw new QueryError(`Invalid sort direction for field "${field}". Use 'asc' or 'desc'.`, {
+			field,
+			direction: typeof direction === 'string' ? direction.slice(0, 64) : typeof direction,
+		})
+	}
+	return keyword
+}
+
+function assertQueryCount(value: unknown, clause: 'limit' | 'offset'): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+		throw new QueryError(
+			`Invalid ${clause}: expected a non-negative safe integer. Pass a whole number, for example .${clause}(10).`,
+			{ clause, received: typeof value === 'number' ? value : typeof value },
+		)
+	}
+	return value
+}
+
 function validateFieldName(fieldName: string, fields: Record<string, FieldDescriptor>): void {
 	// Allow schema fields plus metadata fields that map to query-able columns
 	const allowedFields = new Set([
 		...Object.keys(fields),
 		'id',
-		'createdAt',
-		'updatedAt',
+		...VIRTUAL_TIMESTAMP_FIELD_NAMES,
 		'_created_at',
 		'_updated_at',
 	])

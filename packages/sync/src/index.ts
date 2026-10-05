@@ -239,6 +239,51 @@ export {
 	generateSalt,
 } from './encryption/key-derivation'
 
+// Shared key material (ENC-1): the server-stored, passphrase-wrapped keyring.
+export { EncryptionKeyring, EncryptionKeyError } from './encryption/keyring'
+export type {
+	EncryptionKeyringOptions,
+	EncryptionLockState,
+	EncryptionStatus,
+	EncryptionStatusCode,
+	KeyServiceChannel,
+	KeyServiceReply,
+} from './encryption/keyring'
+export {
+	IndexedDbKeyCache,
+	MemoryKeyCache,
+	NoKeyCache,
+	createKeyCache,
+} from './encryption/key-cache'
+export type { CachedKeyring, KeyCache } from './encryption/key-cache'
+export {
+	DEFAULT_KEYRING,
+	KEY_RECORD_FORMAT,
+	MAX_KDF_ITERATIONS,
+	MAX_KEY_RECORD_BYTES,
+	isKeyId,
+	isKeyRecordSuccessor,
+	isValidKeyringName,
+	validateKeyRecord,
+} from './encryption/key-record'
+export type {
+	KeyRecordKdf,
+	KeyRecordRecovery,
+	KeyRecordValidation,
+	WrappedDataKey,
+	WrappedKeyRecord,
+	WrappedMasterKey,
+} from './encryption/key-record'
+export { KeyUnwrapError } from './encryption/keyring-crypto'
+export { isEncryptionKeyMessage } from './encryption/key-messages'
+export type {
+	EncryptionKeyMessage,
+	EncryptionKeyPutMessage,
+	EncryptionKeyRequestMessage,
+	EncryptionKeyResponseMessage,
+	EncryptionKeyResponseStatus,
+} from './encryption/key-messages'
+
 export {
 	createSyncStatusController,
 	OFFLINE_SYNC_STATUS,

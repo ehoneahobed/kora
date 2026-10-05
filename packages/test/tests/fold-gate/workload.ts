@@ -283,10 +283,10 @@ export function normalizeRecord(
  * Run one seeded workload through real devices and return every replica's view.
  *
  * @param seed - The seed
- * @param options - `legacyMerge` runs the devices on the beta.13 pipeline
+ * @param options - `legacyMerge` runs the devices on the beta.12 pipeline
  */
 export interface WorkloadOptions {
-	/** Devices run the beta.13 pairwise pipeline. */
+	/** Devices run the beta.12 pairwise pipeline. */
 	legacyMerge?: boolean
 	/** Exactly these fields (default: a seeded subset). */
 	onlyFields?: readonly GateField[]

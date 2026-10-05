@@ -217,20 +217,20 @@ function contract(getKind: () => Kind): void {
 		const store = await kind.open()
 		const x = op(12)
 		await store.applyRemoteOperation(x)
-		// What a beta.13 instance inserts: no seq_unique column in its INSERT (default 0).
+		// What a beta.12 (or older) instance inserts: no seq_unique column in its INSERT (default 0).
 		await kind.exec(
 			`INSERT INTO operations (id, node_id, type, collection, record_id, data, previous_data, wall_time, logical, timestamp_node_id, sequence_number, causal_deps, schema_version, received_at, delivery_seq)
-			 VALUES ('beta13-dup', 'device-1', 'insert', 'todos', 'rec-b13', '{"title":"b"}', NULL, 1, 0, 'device-1', 12, '[]', 1, 1, 100000)`,
+			 VALUES ('beta12-dup', 'device-1', 'insert', 'todos', 'rec-b13', '{"title":"b"}', NULL, 1, 0, 'device-1', 12, '[]', 1, 1, 100000)`,
 		)
 		const ids = (await store.getOperationRange('device-1', 12, 12)).map((o) => o.id).sort()
-		expect(ids).toEqual(['beta13-dup', x.id].sort())
+		expect(ids).toEqual(['beta12-dup', x.id].sort())
 		await store.close()
 	})
 }
 
 /**
  * RT-37: a client that does not advertise the sequence-reservation capability (Kora
- * <= beta.13) may put two different operations under one (node, sequence). Such a
+ * <= beta.12) may put two different operations under one (node, sequence). Such a
  * writer's second operation is stored as a legacy pair, never refused; a
  * sequence-reserving writer is still refused, and both operations are delivered.
  */

@@ -20,7 +20,7 @@ export interface ResequenceResult {
  * were rewritten locally before it was ever shared (clock rebase, node rotation,
  * SEQUENCE_CONFLICT renumbering). Uses the operation's own hash version: a version-2
  * operation (protocol v2) gets a version-2 id over all its semantic fields, and a
- * version-1 operation (written before beta.14) keeps the version-1 hash, so neither
+ * version-1 operation (written before beta.13) keeps the version-1 hash, so neither
  * fails id verification on its receivers.
  *
  * @param op - The operation with its new content (its `id` is ignored)

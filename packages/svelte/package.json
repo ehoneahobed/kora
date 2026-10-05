@@ -1,6 +1,6 @@
 {
   "name": "@korajs/svelte",
-  "version": "1.0.0-beta.12",
+  "version": "1.0.0-beta.13",
   "description": "Kora.js Svelte bindings for offline-first applications",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -38,10 +38,8 @@
   },
   "files": [
     "dist",
-    "src/components/KoraQuery.svelte",
-    "src/components/KoraRichText.svelte",
-    "src/components/KoraProvider.svelte",
-    "src/components/KoraStoreProvider.svelte"
+    "src",
+    "!src/**/*.test.ts"
   ],
   "scripts": {
     "build": "tsup && node scripts/build-components.mjs",

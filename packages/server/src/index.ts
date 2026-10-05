@@ -146,5 +146,8 @@ export { AwarenessRelay } from './awareness/awareness-relay'
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'
 export { createProductionServer } from './server/production-server'
-export { createPostgresServerStore } from './store/postgres-server-store'
+export {
+	ServerStoreUnavailableError,
+	createPostgresServerStore,
+} from './store/postgres-server-store'
 export { createSqliteServerStore } from './store/sqlite-server-store'

@@ -21,6 +21,7 @@ describe('getEventCategory', () => {
 			'sync:apply-recovered': 'sync',
 			'sync:apply-abandoned': 'sync',
 			'sync:clock-skew': 'sync',
+			'encryption:status': 'sync',
 			'sync:node-id-rotated': 'sync',
 			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',
@@ -54,10 +55,13 @@ describe('getEventCategory', () => {
 			'store:db-name-collision': 'connection',
 			'store:storage-blocked': 'connection',
 			'store:storage-migrated': 'connection',
+			'store:schema-ahead': 'connection',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',
 			'query:executed': 'query',
+			'query:error': 'query',
+			'storage:persistence': 'connection',
 			'connection:quality': 'connection',
 		}
 

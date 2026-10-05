@@ -64,9 +64,16 @@ describe('DX-3 docs match the API', () => {
 		expect(/autoConnect: true|sync\??\.connect\(\)/.test(snippet.slice(0, 800))).toBe(true)
 	})
 
-	test('README status line names the current package version', () => {
+	test('README status line names the current package version (or the release being cut)', () => {
+		// The README names the release it documents. Between releases the package.json
+		// versions still hold the last published beta until `scripts/release/bump-beta.mjs`
+		// advances them at release time, so the release in preparation (the next beta) is
+		// also current; anything else (an older release, a skipped number) is stale.
 		const version = JSON.parse(read('kora/package.json')).version as string
+		const beta = version.match(/^(\d+\.\d+\.\d+)-beta\.(\d+)$/)
+		const accepted = [version]
+		if (beta) accepted.push(`${beta[1]}-beta.${Number(beta[2]) + 1}`)
 		const status = read('README.md').match(/\*\*Public beta \(v([^)]+)\)/)?.[1]
-		expect(status).toBe(version)
+		expect(accepted).toContain(status)
 	})
 })

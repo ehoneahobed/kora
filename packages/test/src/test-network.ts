@@ -32,7 +32,7 @@ export interface TestNetworkOptions {
 	blobStorage?: boolean
 	/** Adjudicate untrusted client operations on the server before materialization. */
 	validateOperation?: import('@korajs/server').OperationValidator
-	/** Devices use the beta.13 pairwise pipeline (`experimental.legacyMerge`). */
+	/** Devices use the beta.12 pairwise pipeline (`experimental.legacyMerge`). */
 	legacyMerge?: boolean
 	/**
 	 * The server's store (SQLite, Postgres). Defaults to a fresh memory store. The

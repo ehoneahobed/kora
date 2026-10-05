@@ -2,6 +2,7 @@ import { defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { generateMigration } from './migration-generator'
 import { diffSchemas } from './schema-differ'
+import { parseEvolveTableDirective } from './table-evolution-directive'
 
 describe('generateMigration', () => {
 	test('generates collection create/drop statements', () => {
@@ -36,12 +37,13 @@ describe('generateMigration', () => {
 		).toBe(true)
 	})
 
-	test('generates rebuild statements for changed collection', () => {
+	test('a changed collection becomes relax + evolve-table directives, never a re-created table', () => {
 		const previous = defineSchema({
 			version: 1,
 			collections: {
 				todos: {
-					fields: { title: t.string() },
+					fields: { title: t.string(), done: t.string().optional(), old: t.string().optional() },
+					indexes: ['old'],
 				},
 			},
 		})
@@ -52,51 +54,52 @@ describe('generateMigration', () => {
 				todos: {
 					fields: {
 						title: t.string(),
+						done: t.boolean().optional(),
 						completed: t.boolean().default(false),
 					},
-				},
-			},
-		})
-
-		const diff = diffSchemas(previous, current)
-		const generated = generateMigration(previous, current, diff)
-
-		expect(
-			generated.up.some((statement) => statement.includes('CREATE TABLE "_kora_mig_todos_new"')),
-		).toBe(true)
-		expect(
-			generated.up.some((statement) =>
-				statement.includes('ALTER TABLE "_kora_mig_todos_new" RENAME TO "todos"'),
-			),
-		).toBe(true)
-	})
-
-	test('adds conversion SQL for string-to-boolean field change', () => {
-		const previous = defineSchema({
-			version: 1,
-			collections: {
-				todos: {
-					fields: { done: t.string().optional() },
-				},
-			},
-		})
-
-		const current = defineSchema({
-			version: 2,
-			collections: {
-				todos: {
-					fields: { done: t.boolean().optional() },
+					indexes: ['title'],
 				},
 			},
 		})
 
 		const generated = generateMigration(previous, current, diffSchemas(previous, current))
-		const insertStatement = generated.up.find((statement) =>
-			statement.startsWith('INSERT INTO "_kora_mig_todos_new"'),
-		)
+		expect(generated.up).toHaveLength(2)
+		expect(generated.up[0]).toMatch(/^--kora:relax-value-domain /)
+		expect(parseEvolveTableDirective(generated.up[1] as string)).toEqual({
+			table: 'todos',
+			add: { completed: { kind: 'boolean', default: false } },
+			drop: ['old'],
+			change: { done: { from: { kind: 'string' }, to: { kind: 'boolean' } } },
+			addIndexes: ['title'],
+			removeIndexes: ['old'],
+		})
+		expect(generated.up.join('\n')).not.toMatch(/CREATE TABLE|DROP TABLE/)
+		// The inverse undoes it, in order (relax, then evolve back).
+		expect(generated.down[0]).toMatch(/^--kora:relax-value-domain /)
+		expect(parseEvolveTableDirective(generated.down[1] as string)).toMatchObject({
+			add: { old: { kind: 'string' } },
+			drop: ['completed'],
+			addIndexes: ['old'],
+			removeIndexes: ['title'],
+		})
+	})
 
-		expect(insertStatement).toContain('LOWER(TRIM(CAST("done" AS TEXT)))')
-		expect(insertStatement).toContain("IN ('1','true','t','yes','y','on')")
+	test('the inverse of several changes keeps each change in its own statement order', () => {
+		const previous = defineSchema({
+			version: 1,
+			collections: { gone: { fields: { name: t.string() }, indexes: ['name'] } },
+		})
+		const current = defineSchema({
+			version: 2,
+			collections: { added: { fields: { name: t.string() } } },
+		})
+		const generated = generateMigration(previous, current, diffSchemas(previous, current))
+		const recreate = generated.down.findIndex((statement) =>
+			statement.startsWith('CREATE TABLE IF NOT EXISTS "gone"'),
+		)
+		const index = generated.down.findIndex((statement) => statement.includes('ON "gone" ("name")'))
+		expect(recreate).toBeGreaterThanOrEqual(0)
+		expect(index).toBeGreaterThan(recreate)
 	})
 
 	test('rejects unsafe required lossy type changes', () => {

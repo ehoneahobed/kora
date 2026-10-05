@@ -5,7 +5,7 @@ import { canonicalizeOperationBody } from './canonical-body'
 /**
  * Content-hash versions for operation ids.
  *
- * - **1** (Kora <= beta.13): hashes type, collection, recordId,
+ * - **1** (Kora <= beta.12): hashes type, collection, recordId,
  *   data, timestamp, nodeId and atomicOps. previousData, sequenceNumber,
  *   causalDeps and schemaVersion are NOT covered (CORE-1).
  * - **2**: additionally hashes previousData, sequenceNumber, causalDeps (as a
@@ -14,7 +14,7 @@ import { canonicalizeOperationBody } from './canonical-body'
  */
 export type OperationHashVersion = 1 | 2
 
-/** Hash version new operations get: 2 since protocol v2 (beta.14). */
+/** Hash version new operations get: 2 since protocol v2 (beta.13). */
 export const DEFAULT_OPERATION_HASH_VERSION: OperationHashVersion = 2
 
 /** The operation fields a content hash can cover. */

@@ -58,8 +58,14 @@ export async function runSchemaMigrations(ctx: MigrationRunContext): Promise<Ope
 		const committed: Operation[] = []
 		const causal = new CausalScope(ctx.causalTracker, false)
 		await ctx.adapter.transaction(async (tx) => {
-			for (const sql of migrationStepsToSQL(steps)) {
-				await executeStructural(tx, sql)
+			for (const step of steps) {
+				if (step.type === 'renameField') {
+					await renameColumn(tx, step.collection, step.from, step.to)
+					continue
+				}
+				for (const sql of migrationStepsToSQL([step])) {
+					await executeStructural(tx, sql)
+				}
 			}
 			const backfills = steps.filter((step): step is BackfillStep => step.type === 'backfill')
 			if (backfills.length > 0) {
@@ -94,6 +100,51 @@ async function executeStructural(tx: Transaction, sql: string): Promise<void> {
 		const message = error instanceof Error ? error.message : String(error)
 		if (!message.includes('duplicate column name')) throw error
 	}
+}
+
+/**
+ * A `renameField` step. The adapter's open has already run the target schema's DDL, whose
+ * `--kora:safe-alter` adds the renamed field's column (empty, or holding its default) and
+ * creates the target schema's indexes on it; a plain `RENAME COLUMN` would then fail
+ * "duplicate column name" and leave the values in the old column. The pre-added column is
+ * dropped first (with the indexes on it, recreated afterwards), so the rename keeps the
+ * values and the source column's constraints. Runs inside the version's transaction.
+ */
+async function renameColumn(
+	tx: Transaction,
+	collection: string,
+	from: string,
+	to: string,
+): Promise<void> {
+	const table = quoteIdent(collection)
+	const columns = await tx.query<{ name: string }>(
+		`SELECT name FROM pragma_table_info(${sqlText(collection)})`,
+	)
+	const names = new Set(columns.map((column) => column.name))
+	// A database created at (or past) this version: the open's DDL already made `to` and
+	// there is no `from` to carry over (a fresh install of a schema whose history has
+	// renames). Nothing to rename.
+	if (!names.has(from) && names.has(to)) return
+	if (names.has(from) && names.has(to)) {
+		const indexes = await tx.query<{ name: string; sql: string }>(
+			`SELECT m.name AS name, m.sql AS sql FROM sqlite_master m WHERE m.type = 'index' AND m.tbl_name = ${sqlText(collection)} AND m.sql IS NOT NULL AND EXISTS (SELECT 1 FROM pragma_index_info(m.name) i WHERE i.name = ${sqlText(to)})`,
+		)
+		for (const index of indexes) await tx.execute(`DROP INDEX ${quoteIdent(index.name)}`)
+		await tx.execute(`ALTER TABLE ${table} DROP COLUMN ${quoteIdent(to)}`)
+		await tx.execute(`ALTER TABLE ${table} RENAME COLUMN ${quoteIdent(from)} TO ${quoteIdent(to)}`)
+		for (const index of indexes) {
+			await tx.execute(index.sql.replace(/^CREATE INDEX /i, 'CREATE INDEX IF NOT EXISTS '))
+		}
+		return
+	}
+	await executeStructural(
+		tx,
+		`ALTER TABLE ${table} RENAME COLUMN ${quoteIdent(from)} TO ${quoteIdent(to)}`,
+	)
+}
+
+function sqlText(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`
 }
 
 async function runBackfill(

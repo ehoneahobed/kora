@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { koraServiceWorker } from '@korajs/cli/vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 import tailwindcss from '@tailwindcss/vite'
 import type { Plugin } from 'vite'
@@ -57,8 +58,16 @@ function sqliteWasmHotfix(): Plugin {
 	}
 }
 
+// koraServiceWorker() (build only, keep it last): precaches the built app shell so the
+// app opens offline, with a "new version available" reload prompt. See @korajs/cli/vite.
 export default defineConfig({
-	plugins: [svelte(), tailwindcss(), crossOriginIsolation(), sqliteWasmHotfix()],
+	plugins: [
+		svelte(),
+		tailwindcss(),
+		crossOriginIsolation(),
+		sqliteWasmHotfix(),
+		koraServiceWorker(),
+	],
 	worker: {
 		format: 'es',
 	},

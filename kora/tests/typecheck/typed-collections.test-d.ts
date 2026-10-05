@@ -25,7 +25,7 @@ async function typedCollections(): Promise<void> {
 	const namespaced = await app.collections.todos.insert({ title: 'Namespaced todo' })
 	const _title: string = inserted.title
 	const _namespacedTitle: string = namespaced.title
-	const _completed: boolean = inserted.completed
+	const _completed: boolean | null = inserted.completed
 
 	await app.todos.update(inserted.id, { completed: true })
 

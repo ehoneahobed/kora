@@ -1,5 +1,16 @@
 # create-kora-app
 
+## 0.1.25-beta.12
+
+### Patch Changes
+
+- Scaffolds with `@korajs/cli@1.0.0-beta.13` (offline app shell, typed templates, a desktop
+  template that installs).
+- Updated dependencies
+  - @korajs/cli@1.0.0-beta.13
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 0.1.25-beta.8
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 import type { MetaRow, StorageAdapter, Transaction } from '../types'
 import { OWN_ACKED_THROUGH_META_KEY } from './sync-durability'
-import { LAST_ACKED_SERVER_VECTOR_META_KEY, NODE_TOKEN_META_KEY, nodeTokenKey } from './sync-state'
+import { NODE_TOKEN_META_KEY, nodeTokenKey } from './sync-state'
 
 /**
  * Durable sync bookkeeping that belongs to the device, not to the app (Phase 2 RT-36,
@@ -35,7 +35,7 @@ const TERMINAL_SEED_META_KEY = 'terminal_rejections_seeded_v1'
  * its content, so a later upload of it may be accepted.
  *
  * - `SEQUENCE_CONFLICT`: the device's sequence number collided with an operation the
- *   server holds (a lost local tail, RT-35, or a beta.13 duplicate pair, RT-37); the
+ *   server holds (a lost local tail, RT-35, or a beta.12 duplicate pair, RT-37); the
  *   operation is renumbered and uploaded again.
  * - `NODE_ID_MISMATCH`: uploaded on another node's session.
  * - `OUT_OF_UPLINK_SCOPE`: judged by the client against the scope it had then.
@@ -225,7 +225,7 @@ export async function findTerminalRejections(
 /**
  * Seed terminal markers once from `_kora_sync_rejected`, the list earlier releases kept
  * (and the app may have cleared since). Rows whose code is not terminal are skipped:
- * in particular a beta.13 device's `SEQUENCE_CONFLICT` rejections (RT-37) stay eligible
+ * in particular a pre-release device's `SEQUENCE_CONFLICT` rejections (RT-37) stay eligible
  * for the one-time re-upload, which is how those writes reach the server.
  */
 export async function seedTerminalRejectionsOnce(adapter: StorageAdapter): Promise<void> {
@@ -285,9 +285,14 @@ function parsePrincipalList(value: string | null): string[] {
 
 /**
  * Register a node id this database authors operations under. A node registered for the
- * first time that already has sync history here (a database from an earlier release)
- * is recorded as accepted, so a later refusal holds its writes instead of re-authoring
- * them under another principal (RT-38).
+ * first time that a claims-aware server already accepted here (a database from a build
+ * with node claims) is recorded as accepted, so a later refusal holds its writes
+ * instead of re-authoring them under another principal (RT-38).
+ *
+ * Sync history alone is not that evidence (RT-92): beta.12 and older servers recorded
+ * no node claims, so a node only they accepted belongs to nobody on an upgraded server.
+ * It registers as not accepted, and a refusal re-authors its never-sent writes under a
+ * fresh node (RT-21) instead of holding them for an owner that does not exist.
  */
 export async function registerLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
 	await ensureLocalSyncRecordTables(adapter)
@@ -303,15 +308,16 @@ export async function registerLocalNode(adapter: StorageAdapter, nodeId: string)
 	)
 }
 
+/**
+ * Whether a claims-aware server accepted `nodeId` on this database before the registry
+ * existed: a node token it issued (anonymous claims), or the acknowledged-prefix record
+ * builds with node claims keep. beta.12's `last_acked_server_vector` does not count: its
+ * server recorded no claims (RT-92).
+ */
 async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<boolean> {
 	const rows = await adapter.query<MetaRow & { key: string }>(
-		'SELECT key, value FROM _kora_meta WHERE key IN (?, ?, ?, ?)',
-		[
-			NODE_TOKEN_META_KEY,
-			nodeTokenKey(nodeId),
-			LAST_ACKED_SERVER_VECTOR_META_KEY,
-			OWN_ACKED_THROUGH_META_KEY,
-		],
+		'SELECT key, value FROM _kora_meta WHERE key IN (?, ?, ?)',
+		[NODE_TOKEN_META_KEY, nodeTokenKey(nodeId), OWN_ACKED_THROUGH_META_KEY],
 	)
 	const nodeIdRows = await adapter.query<MetaRow>(
 		"SELECT value FROM _kora_meta WHERE key = 'node_id'",
@@ -325,10 +331,7 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 		}
 		try {
 			const parsed = JSON.parse(row.value) as Record<string, unknown>
-			if (row.key === LAST_ACKED_SERVER_VECTOR_META_KEY) {
-				const own = parsed[nodeId]
-				if (typeof own === 'number' && own > 0) return true
-			} else if (row.key === OWN_ACKED_THROUGH_META_KEY) {
+			if (row.key === OWN_ACKED_THROUGH_META_KEY) {
 				if (parsed.nodeId === nodeId && typeof parsed.sequence === 'number' && parsed.sequence > 0)
 					return true
 			}

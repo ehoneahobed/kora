@@ -12,7 +12,25 @@ import type * as Y from 'yjs'
 
 export type KoraAppLike = CoreKoraAppLike<Store, SyncEngine, QueryStoreCache>
 export type KoraContextValue = CoreKoraContextValue<Store, SyncEngine, QueryStoreCache>
-export type UseQueryOptions = CoreUseQueryOptions
+/** Options for {@link useQuery} and {@link useQueryState}. */
+export interface UseQueryOptions extends CoreUseQueryOptions {
+	/**
+	 * When true (default), `useQuery` throws a failed query to the nearest error
+	 * boundary. When false it keeps returning the last good rows; read the error with
+	 * `useQueryState`. Ignored by `useQueryState`, which always returns the error.
+	 */
+	throwOnError?: boolean
+}
+
+/** Result of `useQueryState`. */
+export interface UseQueryStateResult<T> {
+	/** The current rows (the last good rows while `error` is set). */
+	data: readonly T[]
+	/** The query's failure, or null. Cleared when results flow again. */
+	error: Error | null
+	/** False until the first result for the current query arrived (always false on the server). */
+	ready: boolean
+}
 export type UseMutationOptions<
 	TData,
 	TArgs extends unknown[],

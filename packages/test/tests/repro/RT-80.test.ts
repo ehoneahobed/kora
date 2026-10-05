@@ -1,13 +1,13 @@
 /**
  * RT-80 repro (Phase 3 red team round 3, 2026-10-03): `update(id, { field: undefined })`
- * on a beta.14 device produces an operation that its own server refuses
+ * on a protocol-2 device produces an operation that its own server refuses
  * `INVALID_OPERATION_ID` (terminal), reported as "altered after it was created".
  *
  * `createOperation` strips `undefined` members (RT-72), so the update's data is `{}`
  * and the version-2 id covers `"data":{}`. The store's op log reads an empty data
  * object back as `null` (`deserializeOperation`: `Object.keys(rest).length > 0 ? rest :
  * null`), and that is what is uploaded. The server's hash over `null` differs. The field
- * is not cleared anywhere (beta.13 cleared it, and the server now stores a beta.13
+ * is not cleared anywhere (beta.12 cleared it, and the server now stores a beta.12
  * client's same call as a clear, RT-71), and the developer gets a terminal integrity
  * rejection for a no-op. Not a round-2 regression (same at 07e4f45); the round-2
  * register said top-level `undefined` in an update passes.

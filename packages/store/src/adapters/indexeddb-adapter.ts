@@ -1,5 +1,11 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
-import { AdapterError, PersistenceError, StorageBackendMismatchError } from '../errors'
+import {
+	AdapterError,
+	PersistenceError,
+	SchemaVersionAheadError,
+	StorageBackendMismatchError,
+} from '../errors'
+import { STORED_SCHEMA_VERSION_SQL, storedSchemaVersion } from '../migrations/schema-ceiling'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { type DatabaseDump, exportDump, restoreDumpStatements } from './database-dump'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
@@ -135,6 +141,17 @@ export class IndexedDbAdapter implements StorageAdapter {
 		// opening must never rewrite the leader's live database (STORE-6).
 		if (this.inner.isLeader()) {
 			await this.restoreIfFresh()
+		}
+		// A snapshot a newer build migrated (RT-109): refuse it before anything writes, and
+		// without the snapshot a close() would write (the in-memory copy ran this build's
+		// DDL before the restore).
+		const stored = storedSchemaVersion(
+			await this.inner.query<{ value: unknown }>(STORED_SCHEMA_VERSION_SQL),
+		)
+		if (stored > schema.version) {
+			this.scheduler.dispose()
+			await this.inner.close().catch(() => undefined)
+			throw new SchemaVersionAheadError(this.dbName, stored, schema.version)
 		}
 		if (tracksBackend) {
 			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' }).catch((error: unknown) =>

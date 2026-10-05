@@ -52,8 +52,8 @@ export type KoraEvent =
 	| {
 			/**
 			 * A sync peer speaks an older, deprecated protocol version (protocol v2): a
-			 * server emits it for a protocol-1 client (Kora <= beta.13), accepted in
-			 * beta.14 only. `message` says what to upgrade.
+			 * server emits it for a protocol-1 client (Kora <= beta.12), accepted in
+			 * beta.13 only. `message` says what to upgrade.
 			 */
 			type: 'sync:protocol-deprecated'
 			nodeId: string
@@ -63,8 +63,8 @@ export type KoraEvent =
 	  }
 	| {
 			/**
-			 * A server stored a protocol-1 (Kora <= beta.13) client's operation whose
-			 * version-1 id it could not verify (RT-71: beta.13 hashed `undefined` members
+			 * A server stored a protocol-1 (Kora <= beta.12) client's operation whose
+			 * version-1 id it could not verify (RT-71: beta.12 hashed `undefined` members
 			 * as `null`, which the JSON upload no longer holds). Counted in metrics.
 			 */
 			type: 'sync:unverified-legacy-operation'
@@ -94,6 +94,21 @@ export type KoraEvent =
 	| { type: 'sync:apply-retrying'; failure: SyncApplyFailureEvent }
 	| { type: 'sync:apply-recovered'; failure: SyncApplyFailureEvent }
 	| { type: 'sync:apply-abandoned'; failure: SyncApplyFailureEvent }
+	| {
+			/**
+			 * End-to-end encryption keyring status changed (ENC-1): locked (no passphrase,
+			 * a wrong one, or a key record that must not be used), unlocking, unlocked.
+			 * While not unlocked, sync is paused; local reads and writes continue.
+			 */
+			type: 'encryption:status'
+			status: {
+				state: 'locked' | 'unlocking' | 'unlocked' | 'error'
+				keyring: string
+				keyVersion: number | null
+				code?: string
+				message?: string
+			}
+	  }
 	| {
 			type: 'sync:clock-skew'
 			/** serverTime - localTime in ms. Negative = this device's clock is fast. */
@@ -228,6 +243,33 @@ export type KoraEvent =
 	| { type: 'query:subscribed'; queryId: string; collection: string }
 	| { type: 'query:invalidated'; queryId: string; trigger: Operation }
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
+	| {
+			/**
+			 * A reactive query subscription failed (STORE-12). `phase` is `initial` (the
+			 * first run), `refresh` (a re-run after a write) or `callback` (the
+			 * subscriber's callback threw). The subscription stays registered and keeps
+			 * its last results; the subscriber's `onError` receives the same failure.
+			 */
+			type: 'query:error'
+			queryId: string
+			collection: string
+			phase: 'initial' | 'refresh' | 'callback'
+			code: string
+			message: string
+	  }
+	| {
+			/**
+			 * Durable-storage (`navigator.storage.persist`) state (NEW-STORE-4).
+			 * `checked`: the boot-time `persisted()` read, which never prompts.
+			 * `requested`: the outcome of an explicit `app.storage.persistence.request()`.
+			 * `unsupported`: the runtime has no StorageManager persistence API.
+			 * `error`: the check or request threw (`message` says why).
+			 */
+			type: 'storage:persistence'
+			state: 'checked' | 'requested' | 'unsupported' | 'error'
+			persisted: boolean
+			message?: string
+	  }
 	| { type: 'connection:quality'; quality: ConnectionQuality }
 	| { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
 	| {
@@ -330,6 +372,22 @@ export type KoraEvent =
 			 * means the runtime has no usable OPFS.
 			 */
 			reason: 'lock-conflict' | 'timeout' | 'unsupported'
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING. The local database was already migrated by a NEWER build of the app
+			 * (its stored schema version is above this code's `schema.version`), for example
+			 * an old build served offline after an update ran (RT-109). The store refuses to
+			 * open it (`SchemaVersionAheadError`, `app.ready` rejects) and changes nothing in
+			 * it. Apps should ask the user to reload online so the newer build runs.
+			 */
+			type: 'store:schema-ahead'
+			dbName: string
+			/** The schema version stored in the database */
+			storedVersion: number
+			/** This code's `schema.version` */
+			codeVersion: number
 			message: string
 	  }
 	| {

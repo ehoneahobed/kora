@@ -1,5 +1,5 @@
-import type { CollectionAccessor } from 'korajs'
+import type { Todos } from '../../kora'
 
-export function orderedTodos(todos: CollectionAccessor) {
+export function orderedTodos(todos: Todos) {
 	return todos.where({}).orderBy('createdAt', 'desc')
 }

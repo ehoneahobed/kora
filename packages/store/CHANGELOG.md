@@ -1,5 +1,34 @@
 # @korajs/store
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** One write path reserves sequence numbers inside the commit (single writes,
+  transactions, cascades); duplicate sequence numbers from beta.12 are repaired on first open.
+- No silent in-memory fallback: without durable storage, writes are refused
+  (`StorageDurabilityError`, `store:durability-lost`) unless `allowNonDurable` is set.
+- Each OPFS database has its own `opfs-sahpool` pool under a Web Lock and uses SQLite's rollback
+  journal; a hung or frozen leader tab is replaced; every change reaches other tabs' live queries.
+- Records are materialized with the core fold and re-materialized once on upgrade
+  (`store:rematerialized`); stores refuse to open when a logged schema version has no transform
+  path (`OPERATION_TRANSFORM_MISSING`) or the database is newer than the code
+  (`SchemaVersionAheadError`).
+- Queries are injection-safe (whitelisted `orderBy` direction, bound `limit`/`offset`, quoted DDL
+  literals); `where` treats `undefined` as no condition, `null` as `IS NULL` and refuses
+  `NaN`/`Infinity`; one canonical `queryKey`; reactive queries diff results and report errors
+  (`subscribe(cb, { onError })`, `query:error`).
+- beta.12 enum `CHECK` / `NOT NULL` constraints are relaxed once; backup format 2 restores exactly
+  (`convertBackupV1` for older backups); `OperationTooLargeError` is thrown before anything is
+  written.
+- Security fixes are described in the [security advisory](https://github.com/ehoneahobed/kora/blob/main/docs/releases/security-advisory-beta13.md).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
+### Patch Changes
+
+- Client stores keep hand-written CHECK constraints when relaxing beta.12 enum checks.
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

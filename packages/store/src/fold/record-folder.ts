@@ -67,7 +67,7 @@ const KEPT_REJECTION_CODES: readonly string[] = ['HELD_DISCARDED']
 export const FOLD_MATERIALIZATION_META_KEY = 'fold_materialization'
 /** Value of {@link FOLD_MATERIALIZATION_META_KEY} once rows are materializations of the current fold. */
 export const FOLD_MATERIALIZATION_CURRENT = `fold-v${FOLD_STATE_VERSION}`
-/** Value of {@link FOLD_MATERIALIZATION_META_KEY} while the legacy (beta.13) paths write rows. */
+/** Value of {@link FOLD_MATERIALIZATION_META_KEY} while the legacy (beta.12) paths write rows. */
 export const FOLD_MATERIALIZATION_LEGACY = 'legacy'
 
 /** DDL for the fold tables. Idempotent. */

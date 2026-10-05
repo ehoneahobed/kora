@@ -13,13 +13,168 @@ one validated pipeline instead of poking at the store directly.
 
 ```typescript
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import { defineSchema, t } from 'korajs'
+
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+await store.setSchema(schema)
 
 const server = createProductionServer({
-  store: createSqliteServerStore({ filename: './kora-server.db' }),
+  store,
+  port: Number(process.env.PORT) || 3001,
+  staticDir: './dist',
+  syncPath: '/kora-sync',
+  syncOptions: { schemaVersion: schema.version },
+  operationalAuth: {
+    adminToken: process.env.KORA_ADMIN_TOKEN,
+    metricsToken: process.env.KORA_METRICS_TOKEN,
+    backupToken: process.env.KORA_BACKUP_TOKEN,
+  },
 })
 
 const url = await server.start()
 ```
+
+`store.setSchema(schema)` lets the server validate operations, materialize collections, enforce
+relations and constraints and fold `merge` strategies; without it the server only stores and
+relays operations. Add `auth` to `syncOptions` for any multi-user deployment (see
+[Authentication](/guide/authentication)): without an auth provider every connection is accepted.
+
+## Server options
+
+`createProductionServer(config)`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `store` | (required) | A server store: `createSqliteServerStore`, `createPostgresServerStore` or `MemoryServerStore`. |
+| `port` | `PORT` env, else `3001` | Port to listen on (`0` picks a free one; `start()` returns the URL). |
+| `staticDir` | `'./dist'` | Built client to serve. |
+| `syncPath` | `'/kora-sync'` | WebSocket sync endpoint. |
+| `syncOptions` | | Everything the sync server accepts (below). |
+| `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane). |
+| `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). An omitted token leaves its endpoints **public**: set at least `adminToken` and `backupToken` in production. |
+| `trustProxy` | none | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list); `request.ip` uses it. |
+| `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
+| `maxBackupBytes` | 256 MiB | Largest backup import. |
+| `crossOriginEmbedderPolicy` | `'credentialless'` | COEP header for the served app. |
+
+`syncOptions` (also the config of `createKoraServer` / `KoraSyncServer`):
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `auth` | none | Auth provider (`createKoraAuthServer().auth`, `TokenAuthProvider`, `MixedAuthProvider`, ...). |
+| `validateOperation` | | Your policy for each incoming operation ([Server-side Validation](/guide/server-side-validation)). |
+| `schemaVersion`, `supportedSchemaVersions`, `operationTransforms` | from the store's schema | Accepted client schema versions and the transforms between them. |
+| `encryption` | | `{ required: true }` refuses plaintext uploads (`PLAINTEXT_REJECTED`) unless `allowPlaintextMigration`. |
+| `maxConnections` | 10,000 | Concurrent sessions; one more gets a retriable `MAX_CONNECTIONS`. |
+| `maxMessageBytes` | 32 MiB | Largest WebSocket message. |
+| `maxOpsPerBatch` | 1000 | Largest upload batch (`BATCH_TOO_LARGE`). |
+| `maxOperationBytes` | 256 KiB | Largest operation (`OPERATION_TOO_LARGE`, per operation). |
+| `maxOpsPerMinute` | 600 | Per device node (`RATE_LIMIT`, retriable). |
+| `maxOpsPerMinutePerUser` | 4 x `maxOpsPerMinute` | Per authenticated user across their devices; `0` disables. |
+| `blobLimits` | | Chunk size (1 MiB), bytes per session (256 MiB), pending requests, requests per minute (6000). |
+| `heartbeatIntervalMs` | 25 s | WebSocket ping interval; two missed pings end the session. |
+| `appHeartbeatIntervalMs` | 25 s | Application `heartbeat` messages for browsers. |
+| `handshakeTimeoutMs` | 10 s | Time a connection has to hand-shake. |
+| `maxBufferedBytes` | 32 MiB | Unsent bytes before a slow consumer is disconnected. |
+| `deliveryHighWaterBytes` | 1 MiB | Queued bytes above which a client's delivery stream pauses. |
+| `perMessageDeflate` | on | Compress messages of 1 KiB or more. |
+| `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
+| `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |
+| `allowLegacyAnonymousClaims` | `true` | See [Anonymous devices](#anonymous-devices-and-node-claims). |
+| `anonymousClaimTtlMs` | 24 h | |
+| `resolveBlobChunk`, `persistBlobChunk` | | Central blob storage (below). |
+| `batchSize`, `relayRetransmitIntervalMs`, `deliveryPollIntervalMs` | 100, 2 s, 2 s | Delivery tuning. |
+| `logger`, `metricsCollector`, `emitter`, `enableDashboard` | | Observability. |
+
+## Server identity
+
+Every server store authors its own writes (route mutations, cascades and set-nulls, constraint
+corrections) under the node id `kora:server:<deploymentId>:<instanceId>`:
+
+- The **deployment id** and a derivation secret are created on first start and stored in the
+  database (`kora_server_meta`), shared by every instance that uses it. Server-derived operation ids
+  (cascades, corrections) are keyed with that secret, so every instance derives the same id and no
+  client can predict one.
+- The **instance id**: SQLite persists one (one database, one process). Postgres draws a fresh one
+  from a database counter at every start; set `instanceId` per instance for a stable one, and never
+  give two running instances the same id.
+- Every `kora:server:` node id is authoritative for `merge('server-authoritative')` fields on every
+  replica. Node ids that wrote such fields before the upgrade are recorded once as legacy
+  authoritative ids and advertised in the handshake, so earlier server decisions keep winning.
+  Add ids with the store option `authoritativeNodeIds` (a back-office service) and revoke them,
+  permanently, with `revokedAuthoritativeNodeIds`; removing an id from the list does not revoke it.
+- No device can act as the server: a handshake with a `kora:` node id, the server's node id or any
+  authoritative id is refused with `INVALID_NODE_ID`. The old store option `nodeId` is deprecated:
+  a value is kept as a legacy authoritative id, not used for authoring.
+
+## Postgres
+
+`createPostgresServerStore({ connectionString })` (install the `postgres` package) is the store for
+production and for more than one instance:
+
+- Use a **UTF8** database (the default). Strings are stored losslessly: U+0000 and unpaired
+  surrogates, which Postgres `TEXT` and `JSONB` cannot hold, are escaped in materialized rows; an
+  identifier holding them is refused (`INVALID_IDENTIFIER`), and any value the database still
+  refuses is a per-operation `UNSTORABLE_VALUE` rejection, never a dropped session.
+- **First start of 1.0.0-beta.13** runs one-time migrations: sequence columns become `BIGINT`
+  (an exclusive table rewrite, once: schedule it), new tables (`operation_resolutions`,
+  `sequence_pairs`, the fold state, `kora_server_meta`, `kora_encryption_keys`, `blob_owners`,
+  `node_claims`) are created, operation scope snapshots are computed, every record is re-folded
+  once in 500-record transactions (safe during a rolling deploy), and the log-integrity scan runs.
+  Later starts re-fold only records whose fold state is missing or stale (a warm restart at 20k
+  operations re-materializes nothing).
+- Version vectors are read from the database, so they are correct across instances; duplicates
+  are refused atomically; delivery sequences are assigned through one counter row, so delivery
+  order matches commit order across instances.
+- A Postgres error of class 22 or 23 (other than a unique violation) refuses that one operation
+  (`UNSTORABLE_VALUE`); it never blocks the device's later writes.
+
+## Operation log integrity
+
+On their first start of this release the SQLite and Postgres stores read every stored operation
+once and move rows that cannot be read back into an operation (malformed JSON, an out-of-range
+timestamp) to an `operations_quarantine` table, verbatim, so no fold ever reads them. A warning is
+logged; `store.getLogIntegrityReport()` returns the result. A record that owns quarantined
+operations keeps its pre-fold row as the base its remaining and later writes fold onto. Later
+starts skip the scan.
+
+## Static files and the offline app shell
+
+The server serves `staticDir` (default `./dist`) the way an offline-first app needs:
+
+| Request | Response |
+|---|---|
+| Content-hashed file (`assets/index-DrBNyszg.js`) | `Cache-Control: public, max-age=31536000, immutable` |
+| Anything else (`index.html`, `sw.js`, `manifest.webmanifest`, the unhashed `assets/sqlite3.wasm`) | `Cache-Control: no-cache`, revalidated with the `ETag` and answered `304` only when the content is unchanged |
+| Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when it decompresses to the file's current bytes; otherwise each file version is compressed once and cached in memory |
+| A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
+| Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
+
+Validators come from the content, never from file metadata alone: the `ETag` is a SHA-256 of
+the file's bytes (computed once per file version and cached by path, size, mtime, inode and
+ctime). Revalidated files send no `Last-Modified` and ignore `If-Modified-Since`, because
+`index.html` and `sw.js` usually keep their size across deploys and reproducible or container
+builds normalise modification times; a redeploy is therefore always seen. Content-hashed files
+also send `Last-Modified`.
+
+Media types include `.webmanifest` (`application/manifest+json`), `.wasm` and `.mjs`.
+Only `GET` and `HEAD` are served; paths cannot escape `staticDir`, lexically (`..`, encoded
+separators) or through a symbolic link: every file, directory `index.html` and pre-compressed
+sibling is served only when its real path is inside the real path of `staticDir`, and an escape
+answers `404`, like a missing file. Links that stay inside `staticDir` keep working, and
+`staticDir` may itself be a link (an atomic `current -> releases/N` deploy is followed per request).
+
+The scaffolded templates add a service worker (`sw.js`, generated into `dist/` at build
+time by `koraServiceWorker()` from `@korajs/cli/vite`) that precaches this shell, so the
+app opens with no network at all after one online visit. See
+[Offline patterns](./offline-patterns.md#opening-the-app-offline-the-app-shell).
+
+**At scale**, put a CDN in front of the static files. The headers above are CDN-safe:
+hashed assets can be cached at the edge forever, and the shell, service worker and
+manifest revalidate on every request. Never let a CDN cache the sync endpoint
+(`/kora-sync`) or the auth routes (`/auth/*`).
 
 ## Trusted data-plane access for background jobs
 
@@ -29,6 +184,16 @@ and an HTTP handler share one code path and one set of guarantees. Every mutatio
 runs through Tier 2 constraints, referential integrity, materialization, and
 fan-out to connected clients, which is exactly what writing to the store directly
 would skip.
+
+<!-- docs-check-prelude
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import type { ProductionHttpRouteContext } from '@korajs/server'
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const server = createProductionServer({ store })
+declare const request: { kora: ProductionHttpRouteContext }
+declare const body: { title?: string; notes?: string }
+declare const recordId: string
+-->
 
 ```typescript
 // A nightly job that closes stale invitations. No HTTP request involved.
@@ -56,6 +221,7 @@ for (const invite of stale) {
 does on a device (an update's `field: undefined` is written as `null`). A route that
 forwards optional request fields therefore clears every field the request omitted:
 
+<!-- docs-check: continue -->
 ```typescript
 // Clears `notes` whenever the request body has no `notes`:
 await request.kora.apply({ collection: 'todos', type: 'update', recordId, data: { notes: body.notes } })
@@ -68,7 +234,7 @@ await request.kora.apply({ collection: 'todos', type: 'update', recordId, data }
 ```
 
 This is deliberate: one meaning of `undefined` everywhere (device API, route writes,
-beta.13 clients), so a write means the same thing on every path. Route writes are also
+beta.12 clients), so a write means the same thing on every path. Route writes are also
 held to the [value domain](./schema-design.md#value-domain): a value outside it (a
 `Date` in a `t.timestamp()` field, a fractional timestamp, a value of an undeclared enum
 member) is refused with `SCHEMA_VALIDATION_ERROR` and nothing is written.
@@ -87,11 +253,11 @@ Two payload guards are enforced per connected client at sync ingest. Set them
 once at the server level through `syncOptions` and every session inherits them:
 
 ```typescript
-const server = createProductionServer({
+const limited = createProductionServer({
   store,
   syncOptions: {
     maxOperationBytes: 256 * 1024, // reject any single operation larger than 256 KiB
-    maxOpsPerMinute: 600,          // sliding-window cap per client
+    maxOpsPerMinute: 600, // per device node, fixed one-minute window
   },
 })
 ```
@@ -119,19 +285,19 @@ server with a central blob store. `toServerBlobCallbacks` turns any
 `resolveBlobChunk` / `persistBlobChunk` pair the sync server needs:
 
 ```typescript
-import { createProductionServer } from '@korajs/server'
-import { FilesystemBlobStore, toServerBlobCallbacks, collectBlobGarbage } from '@korajs/store'
+import { collectBlobGarbage, toServerBlobCallbacks } from '@korajs/store'
+import { FilesystemBlobStore } from '@korajs/store/blob-fs'
 
 const blobStore = new FilesystemBlobStore('/var/kora/blobs')
 
-const server = createProductionServer({
+const blobServer = createProductionServer({
   store,
   syncOptions: {
     ...toServerBlobCallbacks(blobStore),
   },
 })
 
-await server.start()
+await blobServer.start()
 ```
 
 Because blobs are content-addressed and stored out of band, deleting the record
@@ -139,10 +305,11 @@ that referenced a blob does not reclaim its bytes. `getLiveBlobRefs()` returns
 every reference still reachable from a live record, which is precisely the live
 set a mark-and-sweep collector needs. Run it on a schedule:
 
+<!-- docs-check: continue -->
 ```typescript
 // Reclaim orphaned blob bytes once an hour.
 setInterval(async () => {
-  const liveRefs = await server.getLiveBlobRefs()
+  const liveRefs = await blobServer.getLiveBlobRefs()
   const result = await collectBlobGarbage(blobStore, liveRefs)
   console.log(`blob gc: reclaimed ${result.collected} objects, kept ${result.live}`)
 }, 60 * 60 * 1000)
@@ -201,7 +368,8 @@ revocation. Every `KoraSyncServer` therefore re-validates its own live sessions 
 its auth provider every `sessionRevalidationIntervalMs` (default 30 seconds, also
 driven by the delivery poll tick), and ends the ones whose credential is no longer
 accepted with a retriable `AUTH_REVOKED`. A provider error ends nothing; the next pass
-retries. Call `server.revalidateSessions()` to run a pass immediately.
+retries. On a `KoraSyncServer`, `revalidateSessions()` runs a pass immediately and
+`terminateSessions({ userId, deviceId })` ends matching sessions at once.
 
 The same pass re-resolves each session's sync scopes from the fresh authentication.
 When a principal's download or upload scope changed (removed from a team, a role
@@ -216,12 +384,12 @@ after that operation was applied (so a new owner never receives the history writ
 while the record belonged to someone else). When an operation moves an existing
 record INTO a session's scope (an ownership transfer, a team change), the server
 sends that session a server-built **scope-entry** operation just before it: an
-`insert` carrying the record's current values, from the system node
-`kora:scope-entry` (sequence 0, deterministic id per triggering operation), stamped
-with the record's newest timestamp so it never overrides a field the client wrote
-more recently. Clients apply it like any insert (merging per field when they already
-hold a stale copy), so the new owner's devices, live or freshly signed in, see the
-complete record and can edit it.
+`insert` carrying the record's current values and its **fold state**
+(`foldState`), from the system node `kora:scope-entry` (sequence 0, deterministic id
+per triggering operation). Devices join the fold state with their own, so counters,
+rich text, resolvers and arrays keep a device's concurrent edits; each restated field
+keeps exactly its own version, so it never overrides a newer local edit. The new
+owner's devices, live or freshly signed in, see the complete record and can edit it.
 
 The previous owner's devices see the record leave: with `scopeExit: 'retract'` it is
 hidden from their view; with the default `'retain'` they keep the last copy they had
@@ -247,18 +415,44 @@ younger than `anonymousClaimTtlMs` (default 24 hours). A device that is refused
 under it (event `sync:node-id-rotated`), so no write is lost.
 
 `allowLegacyAnonymousClaims` (default `true` in 1.0.0-beta.13, `false` from the next
-release) keeps clients without token support working: nodes held by the pre-release
-shared anonymous owner, and provisional claims that expired unconfirmed, are
-re-issued with a `session.legacy_anonymous_claim` warning in the log. Set it to
-`false` once every client is on beta.13 or later.
+release) keeps clients without token support working: nodes whose history predates
+node claims (every node of a database a beta.12 or older server wrote), nodes held by
+the pre-release shared anonymous owner, and provisional claims that expired
+unconfirmed, are re-issued with a `session.legacy_anonymous_claim` warning in the log.
+Set it to `false` once every client is on beta.13 or later. With `MixedAuthProvider`,
+a node with pre-claims history may also be a signed-in user's beta.12 device, which an
+anonymous device can then take (as it could on beta.12); set the option to `false` if
+that matters more than keeping anonymous beta.12 devices syncing.
+
+### Upgrading a beta.12 server database with authentication
+
+beta.12 and older servers recorded no node claims, so after the upgrade every node id
+in the database has history and no owner. A signed-in device is never handed such a
+node automatically (it could be another user's device), so its handshake is refused
+`NODE_ID_CLAIMED`:
+
+- A beta.13 client moves to a fresh node id and uploads its writes the old server
+  never acknowledged under it; what that server acknowledged stays under the old node
+  (the server already holds it). Nothing is lost and nothing is applied twice. Upgrade
+  clients when you upgrade the server.
+- A beta.12 client cannot change its node id: it keeps reconnecting and its unsynced
+  writes stay on the device until an administrator calls
+  `server.releaseNodeClaim(nodeId)` for that node (the next principal to connect with
+  it claims it). To keep beta.12 clients syncing through the upgrade, release their
+  node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
+  reconnect, accepting that the first principal to present a released node id gets it.
+
+A signed-in user's device whose node already has history from before node claims existed is
+refused with `NODE_ID_CLAIMED` until an administrator calls `server.releaseNodeClaim(nodeId)` on
+the `KoraSyncServer`.
 
 ## Gap-free delivery and the delivery-sequence migration
 
-The server guarantees that once an operation is in its log, it reaches every client whose scope includes it and is never silently skipped, across dropped messages, reconnects, client restarts, and scoped sync. This is driven by a server-assigned delivery sequence and a per-client delivery watermark, and it needs no configuration. The guarantee and its client-side behavior are described in [Sync configuration: delivery guarantees](./sync-configuration.md#delivery-guarantees-server-to-client), and the store methods and wire fields in the [server](../api/server.md#delivery-sequence-gap-free-server-to-client-sync) and [sync](../api/sync.md#protocol-messages) API references.
+The server guarantees that once an operation is in its log, it reaches every client whose scope includes it and is never silently skipped, across dropped messages, reconnects, client restarts, and scoped sync. This is driven by a server-assigned delivery sequence and a per-client delivery watermark, and it needs no configuration. The guarantee and its client-side behavior are described in [Sync configuration: delivery guarantees](./sync-configuration.md#delivery-guarantees), and the wire fields in [Sync Protocol](./sync-protocol.md#delivery-watermark).
 
 Two operator notes:
 
 - **First startup after upgrading runs a one-time migration.** Each store adds a `delivery_seq` column and backfills existing operations. This is automatic and idempotent. On a very large Postgres operation log the backfill is a single ordered pass under an advisory lock; it runs once and subsequent startups skip it.
 - **Operation scope snapshots and blob owners (beta.13).** Each store adds a nullable `scope_snapshot` column to `operations` and a `blob_owners` table. Download visibility of a historical operation is judged on the record's scope values when that operation was applied, so an ownership transfer does not disclose the earlier history to the new owner, and scope-exit retractions come from the server's own rows. Existing operations are backfilled from the log when the schema is set (one replay per record); operations of collections outside the schema keep the previous behavior. Blob uploads made before the upgrade have no recorded owner: their existing references keep working, and a new reference to such bytes needs the writer to upload them again.
-- **Operation log integrity check (beta.14).** On the first start of this release the SQLite and Postgres stores read every stored operation once (keyset pages; Postgres under an advisory lock) and move rows that cannot be read back into an operation (malformed JSON, an out-of-range timestamp) to an `operations_quarantine` table, verbatim, so no materialization ever folds them. A warning is logged when rows move; `store.getLogIntegrityReport()` returns the result. Later starts skip the scan.
+- **Operation log integrity check.** See [Operation log integrity](#operation-log-integrity).
 - **Postgres serializes delivery-sequence assignment through one counter row** so delivery order matches commit order across instances. This is a deliberate correctness-over-throughput choice and is not a bottleneck for typical sync workloads. If you run a single Postgres at very high sustained write rates and measure contention on it, that is the place to look first.

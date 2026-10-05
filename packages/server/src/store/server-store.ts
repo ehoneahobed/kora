@@ -117,7 +117,7 @@ export type SequenceHolderVerdict =
  * `'conflict'` when any of them was stored after the enforcement epoch and the writer
  * reserves its sequence numbers; `'legacy'` (accepted, with a warning) when all of
  * them predate the epoch, or when the writer is a legacy client (RT-37: Kora <=
- * beta.13 could give two concurrent transactions one number, and refusing the second
+ * beta.12 could give two concurrent transactions one number, and refusing the second
  * would drop a write the user made); `'free'` when there are none. Holders with the
  * operation's own id are the caller's duplicate case.
  */
@@ -137,7 +137,7 @@ export function judgeSequenceHolders(
 			return { verdict: 'conflict', holderId: enforced.id }
 		}
 		console.warn(
-			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.13), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
+			`[kora] Operation "${op.id}" shares sequence ${String(op.sequenceNumber)} of node "${op.nodeId}" with operation(s) ${list}. The client does not reserve sequence numbers (no sequenceReservation capability: Kora <= beta.12), so this is a legacy duplicate pair: both are stored and delivered. Upgrade the client.`,
 		)
 		return { verdict: 'legacy', holderIds, legacyWriter: true }
 	}
@@ -366,7 +366,7 @@ export interface ApplyRemoteOptions {
 	/**
 	 * The writer does not reserve its sequence numbers inside the write transaction
 	 * (a client that did not advertise the `sequenceReservation` handshake capability,
-	 * Kora <= beta.13; RT-37). A different operation already holding the
+	 * Kora <= beta.12; RT-37). A different operation already holding the
 	 * `(nodeId, sequenceNumber)` then does not refuse this one: both are stored as a
 	 * legacy pair (each keeps its own delivery sequence, so both are delivered) instead
 	 * of throwing {@link SequenceConflictError}. Default false: enforce.
@@ -383,6 +383,15 @@ export interface ApplyRemoteOptions {
 export interface ServerSchemaOptions {
 	/** Schema transforms the store folds with (transforms at fold time, RT-84). */
 	operationTransforms?: readonly OperationTransform[]
+}
+
+/** One stored end-to-end key record (opaque JSON) and its owner, as backups carry it. */
+export interface EncryptionKeyRecordRow {
+	owner: string
+	keyring: string
+	revision: number
+	/** The record's JSON, exactly as stored. */
+	record: string
 }
 
 /**
@@ -510,6 +519,44 @@ export interface ServerStore extends SyncStore {
 	 * confirm or re-issue an anonymous device's provisional claim; never creates one.
 	 */
 	replaceNodeClaim?(nodeId: string, expectedOwner: string, newOwner: string): Promise<boolean>
+	/**
+	 * The wrapped encryption key record (JSON) of one owner's keyring, or null (ENC-1).
+	 * The record holds only salt, KDF parameters and wrapped keys: never a usable key.
+	 * Optional for custom stores; without it the server answers key requests with
+	 * `unsupported` (it never keeps key records in memory only, which would fork a
+	 * user's keys after a restart).
+	 */
+	getEncryptionKeyRecord?(owner: string, keyring: string): Promise<string | null>
+	/**
+	 * Write a key record with compare-and-set: store `record` at `revision` only when the
+	 * stored revision is `expectedRevision` (0: no record yet). Returns false when
+	 * another write won. Must be atomic per (owner, keyring) across server instances.
+	 */
+	putEncryptionKeyRecord?(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean>
+	/**
+	 * Stored key records: every one (for `exportBackup`; RT-104: a server restored from
+	 * its backup must still hold the records its encrypted history needs), or one owner's
+	 * (the key service tells another keyring's history from a lost record with it).
+	 * Optional.
+	 */
+	listEncryptionKeyRecords?(owner?: string): Promise<EncryptionKeyRecordRow[]>
+	/**
+	 * Key ids named by stored encrypted operations (their envelope's `keyId`), a sample
+	 * of at most `limit` distinct ids (RT-104). `nodeOwner` restricts it to operations of
+	 * nodes claimed by that principal (see {@link claimNode}); null means every node (a
+	 * server without authentication, whose clients share one keyring). The key service
+	 * reports them when an owner has no key record, so a new device can tell a lost
+	 * record (encrypted history exists) from a first one. Optional; without it a new
+	 * device cannot tell, and a fork it creates is merged later by a device holding the
+	 * old ring.
+	 */
+	getEncryptedKeyIds?(nodeOwner: string | null, limit: number): Promise<string[]>
 	/**
 	 * Record that `owner` holds the bytes behind a blob content hash (it pushed them,
 	 * proving possession) (RT-11). Idempotent. Optional; without it the sync server

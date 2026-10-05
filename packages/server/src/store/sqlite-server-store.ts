@@ -9,14 +9,20 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
+import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
+import { type SqliteQueryFn, planSqliteConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
-import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import {
+	KEY_ID_SAMPLE_ROWS,
+	envelopeColumn,
+	envelopeKeyIds,
+	parseEnvelopeColumn,
+} from './envelope-column'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -49,6 +55,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
@@ -90,6 +97,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationResolutionOutcome,
@@ -397,6 +405,11 @@ export class SqliteServerStore implements ServerStore {
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		this.assertTransformCoverage(
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -424,9 +437,12 @@ export class SqliteServerStore implements ServerStore {
 			}
 		}
 
+		// beta.12 tables carry enum CHECKs a schema upgrade cannot change: rebuild them
+		// once without (RT-101); the value domain is enforced at ingest only.
+		await this.relaxValueDomainConstraints(schema)
 		this.migrateTextCodec(schema)
 
-		// beta.13 clears stored by an earlier server, made explicit once (RT-85); their
+		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their
 		// records are re-folded by the re-materialization below.
 		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
@@ -449,12 +465,61 @@ export class SqliteServerStore implements ServerStore {
 		}
 	}
 
+	/**
+	 * One-time migration (RT-101): rebuild collection tables that still carry an enum
+	 * `CHECK` (or `NOT NULL` on a schema field), in one transaction, keeping rows, indexes
+	 * and triggers. Idempotent (a relaxed table is left alone) and resumable (an
+	 * interrupted rebuild rolls back and runs again at the next start).
+	 */
+	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
+		const query: SqliteQueryFn = async (text) => this.db.all<Record<string, unknown>>(sql.raw(text))
+		// Only enum checks on the schema's enum fields are Kora's; a CHECK added by hand
+		// is kept through the rebuild and never triggers one (RT-111).
+		const enumColumnsByTable: Record<string, string[]> = {}
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			enumColumnsByTable[name] = Object.entries(collection.fields)
+				.filter(([, descriptor]) => descriptor.kind === 'enum')
+				.map(([field]) => field)
+		}
+		const statements = await planSqliteConstraintRelaxation(
+			query,
+			Object.keys(schema.collections),
+			enumColumnsByTable,
+		)
+		if (statements.length === 0) return
+		this.db.transaction((tx) => {
+			for (const statement of statements) tx.run(sql.raw(statement))
+		})
+	}
+
+	/**
+	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
+	 * log has no transform path to `version` (RT-103): those operations would fold as
+	 * absent, silently erasing them from their records.
+	 */
+	private assertTransformCoverage(
+		version: number,
+		transforms: readonly OperationTransform[],
+	): void {
+		if (transforms.length === 0) return
+		const rows = this.db.all<{ v: number }>(
+			sql`SELECT DISTINCT schema_version AS v FROM operations`,
+		)
+		assertOperationTransformCoverage(
+			rows.map((row) => Number(row.v)),
+			version,
+			transforms,
+			'SQLite server store',
+		)
+	}
+
 	getOperationTransforms(): readonly OperationTransform[] {
 		return this.operationTransforms
 	}
 
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
+		if (this.schema) this.assertTransformCoverage(this.schema.version, transforms)
 		this.operationTransforms = [...transforms]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every
@@ -1009,6 +1074,70 @@ export class SqliteServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		const rows = this.db.all<{ record: string }>(
+			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+		)
+		return rows[0]?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		const now = Date.now()
+		// Compare-and-set on the revision; better-sqlite3 runs it synchronously, and the
+		// primary key makes a concurrent first write from another process fail.
+		if (expectedRevision === 0) {
+			const rows = this.db.all<{ owner: string }>(
+				sql`INSERT OR IGNORE INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+					VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now}) RETURNING owner`,
+			)
+			return rows.length > 0
+		}
+		const rows = this.db.all<{ owner: string }>(
+			sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+				WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+				RETURNING owner`,
+		)
+		return rows.length > 0
+	}
+
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		return owner === undefined
+			? this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+				)
+			: this.db.all<EncryptionKeyRecordRow>(
+					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+				)
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		const rows =
+			nodeOwner === null
+				? this.db.all<{ encrypted: string | null }>(
+						sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+				: this.db.all<{ encrypted: string | null }>(
+						sql`SELECT o.encrypted AS encrypted FROM node_claims c
+							JOIN operations o ON o.node_id = c.node_id
+							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+					)
+		return envelopeKeyIds(
+			rows.map((row) => row.encrypted),
+			limit,
+		)
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false
@@ -1149,7 +1278,7 @@ export class SqliteServerStore implements ServerStore {
 		const deserialized = rows.map((row) => this.deserializeOperation(row))
 		const vv = this.getVersionVector()
 
-		return buildServerBackup(this.nodeId, deserialized, vv)
+		return buildServerBackup(this.nodeId, deserialized, vv, await this.listEncryptionKeyRecords())
 	}
 
 	async importBackup(
@@ -1158,8 +1287,12 @@ export class SqliteServerStore implements ServerStore {
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations: ops, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes reconcile the key table (not part of the log), record by record (RT-110).
+		await restoreBackupKeyRecords(this, keyRecords, merge === true)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
@@ -1419,7 +1552,9 @@ export class SqliteServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializeSqliteFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor
+					? serializeSqliteFieldValue(materializedFieldValue(recordData, f, descriptor), descriptor)
+					: null
 			}),
 			createdAt,
 			updatedAt,
@@ -1485,7 +1620,7 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Write the beta.13 clears the ids prove into the stored bodies, once per database
+	 * Write the beta.12 clears the ids prove into the stored bodies, once per database
 	 * (RT-85, see `provenLegacyClears`), and mark their records' fold states stale.
 	 */
 	private async canonicalizeLegacyBodies(): Promise<void> {
@@ -1904,6 +2039,19 @@ export class SqliteServerStore implements ServerStore {
 			CREATE TABLE IF NOT EXISTS kora_server_meta (
 				key TEXT PRIMARY KEY,
 				value TEXT NOT NULL
+			)
+		`)
+
+		// Wrapped end-to-end encryption key records (ENC-1, D4b): salt, KDF parameters and
+		// wrapped keys per (owner, keyring). Never a usable key.
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_encryption_keys (
+				owner TEXT NOT NULL,
+				keyring TEXT NOT NULL,
+				revision INTEGER NOT NULL,
+				record TEXT NOT NULL,
+				updated_at INTEGER NOT NULL,
+				PRIMARY KEY (owner, keyring)
 			)
 		`)
 

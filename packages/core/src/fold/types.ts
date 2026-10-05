@@ -224,7 +224,7 @@ export interface FoldOptions {
 	exclude?: ReadonlySet<string> | ((op: Operation) => boolean)
 	/**
 	 * Merges richtext Yjs updates. Required to materialize a richtext field with
-	 * more than one live update (pass `mergeRichtextUpdates` from `@korajs/merge`).
+	 * more than one live update (pass `mergeYjsUpdates` from `@korajs/store`).
 	 * Core has no Yjs dependency, so it cannot supply one itself.
 	 */
 	richtext?: RichtextUpdateMerger

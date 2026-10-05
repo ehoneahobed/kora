@@ -1,5 +1,7 @@
 import type { KoraEventEmitter, KoraEventType } from '@korajs/core'
-import type { SyncStatusInfo } from '../types'
+import type { HeldNodeInfo, SyncStatusInfo } from '../types'
+
+const NO_HELD_NODES: HeldNodeInfo[] = Object.freeze([]) as unknown as HeldNodeInfo[]
 
 /** Default status when sync is not configured or the engine is unavailable. */
 export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
@@ -11,6 +13,11 @@ export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	lastSuccessfulPush: null,
 	lastSuccessfulPull: null,
 	conflicts: 0,
+	heldOperations: 0,
+	heldNodes: NO_HELD_NODES,
+	localDurability: 'durable',
+	serverProtocolVersion: null,
+	protocolDeprecated: false,
 	clockSkewMs: null,
 	inFlightUploadOperations: 0,
 	hasInFlightDeliveryBatch: false,
@@ -21,6 +28,49 @@ export const OFFLINE_SYNC_STATUS: SyncStatusInfo = Object.freeze({
 	serverFrontier: null,
 	blockedFailure: null,
 })
+
+/**
+ * Returns `next` with every value unchanged since `previous` carried over by
+ * reference, and the optional Phase 2/3 fields defaulted, so UI bindings see the
+ * same object (and the same nested `heldNodes`, `initialSync`, `blockedFailure`)
+ * until something actually changes (DX-5). Returns `previous` itself when nothing did.
+ */
+export function stabilizeSyncStatus(
+	next: SyncStatusInfo,
+	previous: SyncStatusInfo | null,
+): SyncStatusInfo {
+	const normalized: SyncStatusInfo = {
+		...next,
+		heldOperations: next.heldOperations ?? 0,
+		heldNodes: next.heldNodes && next.heldNodes.length > 0 ? next.heldNodes : NO_HELD_NODES,
+		localDurability: next.localDurability ?? 'durable',
+		serverProtocolVersion: next.serverProtocolVersion ?? null,
+		protocolDeprecated: next.protocolDeprecated ?? false,
+	}
+	if (previous === null) return Object.freeze(normalized)
+
+	const nextRecord = normalized as unknown as Record<string, unknown>
+	const prevRecord = previous as unknown as Record<string, unknown>
+	let changed = Object.keys(prevRecord).some((key) => !(key in nextRecord))
+	const merged: Record<string, unknown> = {}
+	for (const [key, value] of Object.entries(nextRecord)) {
+		const before = prevRecord[key]
+		if (key in prevRecord && (value === before || sameJson(value, before))) {
+			merged[key] = before
+		} else {
+			merged[key] = value
+			changed = true
+		}
+	}
+	return changed ? (Object.freeze(merged) as unknown as SyncStatusInfo) : previous
+}
+
+function sameJson(a: unknown, b: unknown): boolean {
+	if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
+		return false
+	}
+	return JSON.stringify(a) === JSON.stringify(b)
+}
 
 const SYNC_STATUS_EVENT_TYPES = [
 	'sync:connected',
@@ -66,7 +116,6 @@ export function createSyncStatusController(
 ): SyncStatusController {
 	const useLiveSnapshot = options.subscribeSyncStatus === null && options.events === null
 	let snapshot = OFFLINE_SYNC_STATUS
-	let serialized = JSON.stringify(OFFLINE_SYNC_STATUS)
 	const listeners = new Set<() => void>()
 	let cleanup: (() => void) | null = null
 
@@ -81,12 +130,11 @@ export function createSyncStatusController(
 	}
 
 	const setSnapshot = (next: SyncStatusInfo): void => {
-		const nextSerialized = JSON.stringify(next)
-		if (nextSerialized === serialized) {
+		const stable = stabilizeSyncStatus(next, snapshot)
+		if (stable === snapshot) {
 			return
 		}
-		serialized = nextSerialized
-		snapshot = next
+		snapshot = stable
 		notify()
 	}
 
@@ -130,8 +178,10 @@ export function createSyncStatusController(
 	return {
 		getSnapshot(): SyncStatusInfo {
 			if (useLiveSnapshot) {
+				// The engine builds a new object per call: keep the previous one while equal,
+				// or useSyncExternalStore would see a change on every read and loop.
 				const engine = resolveEngine()
-				return engine ? engine.getStatus() : OFFLINE_SYNC_STATUS
+				snapshot = stabilizeSyncStatus(engine ? engine.getStatus() : OFFLINE_SYNC_STATUS, snapshot)
 			}
 			return snapshot
 		},

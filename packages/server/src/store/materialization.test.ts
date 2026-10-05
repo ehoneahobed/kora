@@ -165,10 +165,12 @@ describe('generateCollectionDDL', () => {
 		expect(createTable).toContain('_created_at BIGINT NOT NULL DEFAULT 0')
 	})
 
-	test('generates enum CHECK constraints', () => {
-		const ddl = generateCollectionDDL('forms', formsCollection, 'sqlite')
-		const createTable = ddl[0] as string
-		expect(createTable).toContain("CHECK (\"status\" IN ('draft', 'published', 'archived'))")
+	test('generates no value-domain constraints (RT-101: validation is the authority)', () => {
+		for (const dialect of ['sqlite', 'postgres'] as const) {
+			const ddl = generateCollectionDDL('forms', formsCollection, dialect).join('\n')
+			expect(ddl).not.toMatch(/CHECK/i)
+			expect(ddl).not.toMatch(/"status" TEXT[^,\n]*NOT NULL/)
+		}
 	})
 })
 

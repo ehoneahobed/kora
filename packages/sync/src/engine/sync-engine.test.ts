@@ -882,7 +882,7 @@ describe('SyncEngine handshake', () => {
 		expect(firstMsg?.nodeId).toBe('node-a')
 		expect(firstMsg?.versionVector).toEqual({ 'node-a': 5, 'node-b': 3 })
 		expect(firstMsg?.schemaVersion).toBe(2)
-		expect(firstMsg?.supportedWireFormats).toEqual(['json', 'protobuf'])
+		expect(firstMsg?.supportedWireFormats).toEqual(['json'])
 	})
 
 	test('negotiates selected wire format from handshake response', async () => {
@@ -927,7 +927,8 @@ describe('SyncEngine handshake', () => {
 		await engine.start()
 		await new Promise((resolve) => setTimeout(resolve, 10))
 
-		expect(serverMsgs[0]?.supportedWireFormats).toContain('protobuf')
+		// SYNC-9: protobuf is never advertised, the transports frame with their own serializer.
+		expect(serverMsgs[0]?.supportedWireFormats).toEqual(['json'])
 	})
 
 	test('sends auth token when auth is provided', async () => {
@@ -1431,6 +1432,25 @@ describe('SyncEngine status', () => {
 		const status = engine.getStatus()
 		expect(status.status).toBe('synced')
 		expect(status.lastSyncedAt).not.toBeNull()
+	})
+
+	test('reports the server protocol and flags a protocol-1 server as deprecated', async () => {
+		const { client, server } = createMemoryTransportPair()
+		// This responder answers without protocolVersion: a protocol-1 (pre-beta.13) server.
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+		expect(engine.getStatus().serverProtocolVersion).toBeNull()
+		expect(engine.getStatus().protocolDeprecated).toBe(false)
+
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getStatus().status).toBe('synced'))
+
+		expect(engine.getStatus().serverProtocolVersion).toBe(1)
+		expect(engine.getStatus().protocolDeprecated).toBe(true)
 	})
 
 	test('reports error after error state', async () => {
@@ -2261,6 +2281,31 @@ describe('SyncEngine upload selection (S1 stopgap)', () => {
 				code: 'OUT_OF_UPLINK_SCOPE',
 			}),
 		)
+	})
+
+	test('RT-89: without a scope map, a schema-synced collection the grant omits is surfaced', async () => {
+		const { client } = createMemoryTransportPair()
+		const emitter = createMockEmitter()
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test', syncedCollections: ['notes'] },
+			emitter,
+		})
+		// What the handshake leaves when the server's grant names another collection only.
+		;(engine as unknown as { activeUplinkScope: Record<string, unknown> }).activeUplinkScope = {
+			other: {},
+		}
+
+		await engine.pushOperation({ ...makeOp('note-1', 1), collection: 'notes' })
+		await engine.pushOperation({ ...makeOp('draft-1', 2), collection: 'drafts' })
+
+		expect(engine.getOutboundQueue().totalPending).toBe(0)
+		const rejected = await engine.getRejectedOperations()
+		// The synced collection is refused visibly; the schema's local-only one stays quiet.
+		expect(rejected.map((r) => [r.operationId, r.code])).toEqual([
+			['note-1', 'OUT_OF_UPLINK_SCOPE'],
+		])
 	})
 
 	test('an op on a local-only collection (absent from every scope) stays local without a rejection', async () => {

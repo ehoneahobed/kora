@@ -17,7 +17,7 @@ const schema = defineSchema({
 const dir = mkdtempSync(join(tmpdir(), 'legacy-bodies-'))
 afterAll(() => rmSync(dir, { recursive: true, force: true }))
 
-/** A beta.13 peer's `update(id, { assignee: undefined, title })`, as its JSON log holds it. */
+/** A beta.12 (or older) peer's `update(id, { assignee: undefined, title })`, as its JSON log holds it. */
 async function peerClear(recordId: string, proven: boolean): Promise<Operation> {
 	const timestamp = { wallTime: Date.now() + 1000, logical: 0, nodeId: 'peer' }
 	const base = {
@@ -31,7 +31,7 @@ async function peerClear(recordId: string, proven: boolean): Promise<Operation> 
 		causalDeps: [],
 		schemaVersion: 1,
 	}
-	// The id covers the clear (beta.13 hashed `undefined` as null) only for a genuine body.
+	// The id covers the clear (beta.12 hashed `undefined` as null) only for a genuine body.
 	const id = await computeOperationId(
 		{ ...base, data: proven ? { title: 'y', assignee: null } : { title: 'z', other: 1 } },
 		1,
@@ -39,8 +39,8 @@ async function peerClear(recordId: string, proven: boolean): Promise<Operation> 
 	return { ...base, id, data: { title: proven ? 'y' : 'z' } }
 }
 
-describe('canonicalizeLegacyLogBodies (RT-83, RT-85): the beta.13 clear made explicit once', () => {
-	test('own beta.13 clears and proven peer clears are written into the log; others are not', async () => {
+describe('canonicalizeLegacyLogBodies (RT-83, RT-85): the beta.12 clear made explicit once', () => {
+	test('own beta.12 clears and proven peer clears are written into the log; others are not', async () => {
 		const file = join(dir, 'app.db')
 		const legacy = new Store({
 			schema,
@@ -57,7 +57,7 @@ describe('canonicalizeLegacyLogBodies (RT-83, RT-85): the beta.13 clear made exp
 		await legacy.applyRemoteOperation(await peerClear(proven, true))
 		await legacy.applyRemoteOperation(await peerClear(unproven, false))
 		const adapter = (legacy as unknown as { adapter: BetterSqlite3Adapter }).adapter
-		// The own update as beta.13 logged it: the member is gone, no hash version.
+		// The own update as beta.12 logged it: the member is gone, no hash version.
 		await adapter.execute(
 			`UPDATE _kora_ops_notes SET data = ? WHERE type = 'update' AND node_id = 'dev'`,
 			[JSON.stringify({ title: 'y' })],

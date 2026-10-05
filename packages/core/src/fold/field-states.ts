@@ -681,7 +681,7 @@ function materializeRichtext(
 			{
 				field,
 				updates: live.length,
-				fix: 'Pass { richtext: mergeRichtextUpdates } (from @korajs/merge) in the fold options.',
+				fix: 'Pass { richtext: mergeYjsUpdates } (from @korajs/store) in the fold options.',
 			},
 		)
 	}

@@ -5,7 +5,7 @@ description: "@korajs/svelte API reference: Kora stores and helpers for reactive
 
 # Svelte API Reference
 
-`@korajs/svelte` provides Svelte stores, composables, and components for offline-first UIs. Works with Svelte 4 store subscriptions and Svelte 5 runes/snippets.
+`@korajs/svelte` provides Svelte stores, helpers and components for offline-first UIs. The stores and helpers work with Svelte 4 and 5; the `.svelte` components (`KoraProvider`, `KoraQuery`, `KoraRichText`, `KoraStoreProvider`) use runes and snippets and need Svelte 5.
 
 ```typescript
 import {
@@ -69,41 +69,73 @@ Root layout component that waits for `app.ready`, sets Kora context, and renders
 
 Returns a Svelte `Readable` store of query results. Subscribe with `$store` or `store.subscribe()`.
 
+<!-- docs-check: signature @korajs/svelte @korajs/store svelte/store -->
 ```typescript
-function createQueryStore<T extends CollectionRecord>(
-  query: QueryBuilder<T>,
-  options?: UseQueryOptions,
-): Readable<T[]>
+function createQueryStore<T = CollectionRecord>(
+  query: QueryBuilder<T> | Readable<QueryBuilder<T> | null | undefined>,
+  options?: {
+    enabled?: boolean | Readable<boolean>
+    onError?: (error: Error) => void
+  },
+): Readable<readonly T[]>
 ```
 
 `useQuery` is an alias for `createQueryStore`.
+
+The query and `enabled` can be plain values or readable stores. Pass a store of the query (for example a `derived` of your filter) and the rows follow it: the store re-subscribes when the query's descriptor changes, releases the previous subscription, and keeps the previous rows until the new query answers. A store value of `null` disables the query.
+
+A query that fails (for example a `where` or `orderBy` on an unknown field) is reported to `onError`, or logged with `console.error` when there is no handler. Use `createQueryStateStore` to render the error.
 
 ### Example
 
 ```svelte
 <script lang="ts">
+  import { derived, writable } from 'svelte/store'
   import { getApp, createQueryStore } from '@korajs/svelte'
 
   const app = getApp()
-  const todos = createQueryStore(app.todos.where({ completed: false }))
+  const showDone = writable(false)
+  const todos = createQueryStore(
+    derived(showDone, (done) => app.todos.where({ completed: done })),
+  )
 </script>
 
+<label><input type="checkbox" bind:checked={$showDone} /> Show done</label>
 {#each $todos as todo}
   <p>{todo.title}</p>
 {/each}
+```
+
+### createQueryStateStore() / useQueryState()
+
+Same inputs; the store holds `{ data, error, ready }`. `error` clears when results flow again, and `data` keeps the last good rows meanwhile.
+
+```svelte
+<script lang="ts">
+  const state = createQueryStateStore(app.todos.where({ completed: false }))
+</script>
+
+{#if $state.error}
+  <p role="alert">{$state.error.message}</p>
+{:else}
+  {#each $state.data as todo}<p>{todo.title}</p>{/each}
+{/if}
 ```
 
 ---
 
 ## KoraQuery
 
-Snippet component for queries whose **descriptor** changes at runtime (reactive filters).
+Component for queries whose **descriptor** changes at runtime (reactive filters). Props: `query`,
+`enabled` (default `true`) and a `children` snippet that receives the rows.
 
 ```svelte
-<KoraQuery query={app.todos.where({ completed: showDone })} let:data>
-  {#each data as todo}
-    <p>{todo.title}</p>
-  {/each}
+<KoraQuery query={app.todos.where({ completed: showDone })}>
+  {#snippet children(data)}
+    {#each data as todo}
+      <p>{todo.title}</p>
+    {/each}
+  {/snippet}
 </KoraQuery>
 ```
 
@@ -111,13 +143,16 @@ Snippet component for queries whose **descriptor** changes at runtime (reactive 
 
 ## createMutation() / useMutation()
 
-Mutation controller with optimistic hooks. Returns `mutate`, `mutateAsync`, `subscribeLoading`, `subscribeError`, and `reset`.
+Mutation controller with the same options as the other bindings (`onMutate`, `onRollback`,
+`onSuccess`, `onError`, `onSettled`). Returns `mutate` (fire and forget), `mutateAsync`,
+`subscribeLoading(fn)`, `subscribeError(fn)` (each calls `fn` at once and on every change, and
+returns an unsubscribe function) and `reset`.
 
 ---
 
 ## createSyncStatusStore() / useSyncStatus()
 
-Readable store of `SyncStatusInfo`.
+Readable store of `SyncStatusInfo`. It updates only when the status changes, and also reports `heldOperations` / `heldNodes`, `localDurability` and `serverProtocolVersion` / `protocolDeprecated` (see the [React reference](/api/react#usesyncstatus) for their meaning).
 
 ```svelte
 <script lang="ts">
@@ -189,6 +224,7 @@ See [Auth API](./auth.md).
 | `@korajs/svelte/KoraProvider.svelte` | Source (Vite) or precompiled JS (`dist/components/`) |
 | `@korajs/svelte/KoraQuery.svelte` | Reactive query snippet component |
 | `@korajs/svelte/KoraRichText.svelte` | Richtext binding component |
+| `@korajs/svelte/KoraStoreProvider.svelte` | Provider for an explicit `Store` (and sync engine) instead of an app |
 
 ---
 

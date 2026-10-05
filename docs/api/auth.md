@@ -1,398 +1,219 @@
 ---
 title: Auth API
-description: "@korajs/auth API reference: auth client, sessions, MFA, passkeys, organizations, RBAC, and React, Vue, and Svelte auth bindings."
+description: "@korajs/auth API reference: auth client, sync binding, device identity, passkeys, local encryption, React/Vue/Svelte bindings, the auth server, sessions, MFA, organizations, RBAC and OAuth."
 ---
 
 # Auth API Reference
 
-`@korajs/auth` provides authentication, authorization, encryption, and identity management for Kora.js applications.
+`@korajs/auth` provides authentication, authorization and identity for Kora.js apps. The
+[Authentication guide](/guide/authentication) explains how the pieces fit together; this page lists
+the API.
 
-The package exposes three entry points:
+| Entry point | Contents |
+|-------------|----------|
+| `@korajs/auth` | Auth client, sync binding, device identity, token storage, passkeys (client), local encryption |
+| `@korajs/auth/server` | Auth server, routes, tokens, user stores, sessions, MFA, organizations, RBAC, OAuth, admin |
+| `@korajs/auth/react` | `AuthProvider`, `OrgProvider` and hooks |
+| `@korajs/auth/vue` | `AuthProvider`, `OrgProvider` and composables |
+| `@korajs/auth/svelte` | `initAuthProvider`, `initOrgProvider`, stores and helpers |
 
-- `@korajs/auth` -- Client-side: auth client, device identity, token storage, passkeys, encryption
-- `@korajs/auth/server` -- Server-side: auth routes, token management, sessions, MFA, orgs, RBAC, OAuth
-- `@korajs/auth/react` -- React bindings: provider, hooks for auth and org state
+<!-- docs-check-prelude
+import { AuthClient, OrgClient, createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import type { AuthKeyValueStorage, DeviceKeyStore } from '@korajs/auth'
+import { defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const auth = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare const secureStore: AuthKeyValueStorage
+declare const deviceKeyStore: DeviceKeyStore
+declare function openSystemBrowser(url: string): Promise<void>
+declare const code: string
+declare const state: string
+-->
 
 ---
 
-## Client API
-
-```typescript
-import {
-  createKoraAuth,
-  createKoraAuthSync,
-  AuthClient,
-  AuthError,
-  OrgClient,
-  OrgClientError,
-  TokenStore,
-  EncryptedTokenStore,
-  generateDeviceKeyPair,
-  exportPublicKeyJwk,
-  signChallenge,
-  verifyChallenge,
-  computePublicKeyThumbprint,
-  toBase64Url,
-  fromBase64Url,
-  createDeviceKeyStore,
-  IndexedDBDeviceKeyStore,
-  InMemoryDeviceKeyStore,
-  createAuthTokenStorage,
-  createPersistentDeviceIdentity,
-} from '@korajs/auth'
-```
-
-### `AuthClient`
-
-Client-side authentication manager. Handles token storage, session restoration, sign-up, sign-in, sign-out, automatic token refresh, and auth state change notifications. Framework-agnostic. Works in browser, Tauri desktop WebView, and mobile JavaScript environments with pluggable storage and fetch support.
-
-Most apps should start with `createKoraAuth()`:
-
-```typescript
-const auth = createKoraAuth({ serverUrl: 'http://localhost:3001' })
-```
-
-```typescript
-const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
-```
+## Client
 
 ### `createKoraAuth(options)`
 
-Creates an `AuthClient` with production-shaped defaults for offline-first apps.
-
-```typescript
-const auth = createKoraAuth({
-  serverUrl: 'https://acme.example.com',
-})
-```
-
-For desktop and mobile apps, pass one credential store and Kora adapts it for token storage and stable device identity:
-
-```typescript
-const auth = createKoraAuth({
-  serverUrl: 'https://acme.example.com',
-  credentialStore: secureStore,
-  deviceKeyStore,
-})
-```
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `serverUrl` | `string` | Yes | -- |
-| `credentialStore` | `AuthKeyValueStorage` | No | Browser `localStorage` when available |
-| `deviceKeyStore` | `DeviceKeyStore` | No | IndexedDB when available |
-| `deviceIdentity` | `AuthDeviceIdentityProvider \| false` | No | Auto-created when persistent storage exists |
-| `storage` | `AuthTokenStorage` | No | Derived from `credentialStore` |
-| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
-| `storageKey` | `string` | No | `'kora_auth'` |
-
-#### `AuthClientConfig`
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `serverUrl` | `string` | Yes | -- |
-| `storageKey` | `string` | No | `'kora_auth'` |
-| `storage` | `AuthTokenStorage` | No | Browser `localStorage`, then memory fallback |
-| `fetch` | `typeof fetch` | No | `globalThis.fetch` |
-| `deviceIdentity` | `AuthDeviceIdentityProvider` | No | -- |
-
-#### Properties
-
-- `state: AuthState` -- Current auth state: `'loading'`, `'authenticated'`, or `'unauthenticated'`.
-- `currentUser: AuthUser | null` -- Currently authenticated user, or null.
-- `isAuthenticated: boolean` -- Whether the user is currently authenticated.
-
-#### Methods
-
-- `initialize(): Promise<void>` -- Restore session from stored tokens. Safe to call multiple times.
-- `signUp(params: { email: string; password: string; name?: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Register a new account.
-- `signIn(params: { email: string; password: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Sign in with email/password.
-- `signInWithOAuth(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL and redirect the current browser window by default.
-- `getOAuthAuthorizationUrl(provider: string, options?): Promise<{ url: string; state: string }>` -- Create an OAuth authorization URL without redirecting. Use this for desktop/mobile handoff flows.
-- `completeOAuthSignIn(provider: string, params: { code: string; state: string; deviceId?: string; devicePublicKey?: string }): Promise<AuthUser>` -- Complete an OAuth callback and store Kora tokens.
-- `linkOAuth(provider: string, params: { code: string; state: string }): Promise<LinkedOAuthAccount>` -- Link an OAuth provider to the signed-in user.
-- `listLinkedAccounts(): Promise<LinkedOAuthAccount[]>` -- List OAuth accounts linked to the signed-in user.
-- `unlinkOAuth(provider: string): Promise<void>` -- Unlink an OAuth provider from the signed-in user.
-- `signOut(): Promise<void>` -- Sign out. Clears local tokens and attempts server-side revocation (best-effort).
-- `getAccessToken(): Promise<string | null>` -- Get a valid access token, auto-refreshing if expired.
-- `getSyncToken(): Promise<string | null>` -- Alias for `getAccessToken()`. Used by the sync engine handshake.
-- `onAuthChange(callback: (state: AuthState) => void): () => void` -- Subscribe to auth state changes. Returns an unsubscribe function.
-
-#### Example
-
-```typescript
-const auth = new AuthClient({ serverUrl: 'http://localhost:3001' })
-await auth.initialize()
-
-if (!auth.isAuthenticated) {
-  await auth.signIn({ email: 'alice@example.com', password: 'secret' })
-}
-
-const unsub = auth.onAuthChange((state) => {
-  console.log('Auth state:', state)
-})
-```
-
-OAuth sign-in for web apps:
-
-```typescript
-await auth.signInWithOAuth('google')
-```
-
-OAuth sign-in for desktop and mobile apps:
-
-```typescript
-const { url } = await auth.getOAuthAuthorizationUrl('google')
-await openSystemBrowser(url)
-
-// After your loopback server or custom URL scheme receives the provider callback:
-await auth.completeOAuthSignIn('google', {
-  code,
-  state,
-})
-```
-
-For Tauri desktop apps, point `serverUrl` at the remote auth server and pass `createKoraAuthSync({ authClient, schema })` to `createApp({ sync: { authClient } })`. Email/password auth, refresh tokens, MFA, orgs, and RBAC are shared across web and desktop clients. Passkey support depends on the platform WebView's WebAuthn support; use `isPasskeySupported()` before rendering passkey UI.
-
-For desktop and mobile production apps, prefer `createKoraAuth()` with a secure credential store:
+Creates an `AuthClient` with offline-first defaults: token storage in `localStorage` (or your
+credential store) and a persistent device identity when a key store is available.
 
 ```typescript
 import { createKoraAuth } from '@korajs/auth'
 
-const auth = createKoraAuth({
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+
+// Desktop and mobile: one secure credential store for tokens and the device id
+const nativeAuth = createKoraAuth({
   serverUrl: 'https://acme.example.com',
   credentialStore: secureStore,
   deviceKeyStore,
 })
 ```
 
-The adapter can wrap Tauri secure storage, Expo SecureStore, iOS Keychain, Android Keystore, or any other sync or async credential store. `createKoraAuth()` also binds sessions to a stable offline device automatically when persistent key storage exists.
+| Option | Type | Default |
+|--------|------|---------|
+| `serverUrl` | `string` | required |
+| `credentialStore` | `AuthKeyValueStorage` (sync or async `getItem`/`setItem`/`removeItem`) | `localStorage` when available, else memory |
+| `storage` | `AuthTokenStorage` | adapted from `credentialStore` |
+| `deviceKeyStore` | `DeviceKeyStore` | IndexedDB when available |
+| `deviceIdentity` | `AuthDeviceIdentityProvider \| false` | created when persistent storage exists |
+| `storageKey` | `string` | `'kora_auth'` |
+| `fetch` | `typeof fetch` | `globalThis.fetch` |
+| `requestTimeoutMs` | `number` | `20000` |
+| `maxOfflineGraceMs` | `number` | no limit beyond the refresh token's expiry |
+| `refreshBackoff` | `{ baseDelayMs?, maxDelayMs? }` | exponential with jitter, honours `Retry-After` |
+
+`new AuthClient(config)` takes the same options without `credentialStore`/`deviceKeyStore`
+(`storage` and `deviceIdentity` instead).
+
+### `AuthClient`
+
+| Member | Description |
+|--------|-------------|
+| `state` | `'loading' \| 'authenticated' \| 'unauthenticated'`. |
+| `session` | `{ userId, deviceId, status: 'fresh' \| 'offline' \| 'locked', lastServerContactAt } \| null`. `offline`: the identity is known but no fresh token can be minted now; `locked`: offline longer than `maxOfflineGraceMs` or the clock moved backwards (local data is never wiped). |
+| `currentUser` / `isAuthenticated` | The signed-in user. |
+| `initialize()` | Restores the stored session. Network errors, timeouts, 5xx, rate limits and captive portals keep it (authenticated-offline); only a definitive rejection signs out. |
+| `signUp({ email, password, name? })` | Creates an account and signs in. |
+| `signIn({ email, password })` | Signs in. Throws `MfaRequiredError` (with `mfaToken`) when the account has MFA. |
+| `verifyMfa(mfaToken, { code } \| { recoveryCode })` | Completes an MFA sign-in. |
+| `signInWithOAuth(provider, options?)` | Creates the authorization URL and redirects (unless `redirect: false`). Returns `{ url, state, binding? }`. |
+| `getOAuthAuthorizationUrl(provider, options?)` | The URL without redirecting, for desktop and mobile. |
+| `completeOAuthSignIn(provider, { code, state })` | Completes a callback. The flow is bound to this client; a callback started elsewhere is refused. |
+| `linkOAuth(provider, { code, state })`, `listLinkedAccounts()`, `unlinkOAuth(provider)` | Account linking for the signed-in user. |
+| `signOut()` | Clears local tokens and revokes the refresh token on the server (best effort). |
+| `getAccessToken()` | A valid access token, refreshed when expired; `null` when none can be minted **now**, which does not mean signed out. `getSyncToken()` is an alias. |
+| `refreshAccessToken()` | Refreshes now even if the cached token looks valid (used when the sync server reports an expired or revoked session). Concurrent calls and tabs share one refresh. |
+| `retryNow()` | Clears the backoff and retries a refresh (also wired to `online` and `visibilitychange`). |
+| `getStoredIdentity()` / `getStoredClaims()` | Identity and claims of the stored tokens, without a network call. |
+| `onAuthChange(cb)` / `onSessionChange(cb)` | Subscriptions; return an unsubscribe function. |
+| `destroy()` | Removes listeners and timers. |
+
+```typescript
+import { MfaRequiredError } from '@korajs/auth'
+
+await auth.initialize()
+try {
+  await auth.signIn({ email: 'alice@example.com', password: 'correct horse battery' })
+} catch (error) {
+  if (error instanceof MfaRequiredError) {
+    await auth.verifyMfa(error.mfaToken, { code: '123456' })
+  }
+}
+
+// Desktop and mobile OAuth
+const { url } = await auth.getOAuthAuthorizationUrl('google', { redirect: false })
+await openSystemBrowser(url)
+await auth.completeOAuthSignIn('google', { code, state })
+```
 
 ### `createKoraAuthSync(options)`
 
-Signed-out synchronization is suspended by default. Pass `anonymous: 'allow'` only when the
-server intentionally uses `MixedAuthProvider`. The binding exposes `resolveSyncState()` with
-distinct `loading`, `signed-out`, `anonymous`, and `authenticated` states, so an empty token is
-never used as an auth-readiness signal.
-
-Creates an `AuthSyncBinding` for `createApp({ sync: { authClient } })`. Wires `@korajs/auth` to Kora sync with minimal boilerplate.
+Binds an auth client to Kora sync: `createApp({ sync: { url, authClient: binding } })`.
 
 ```typescript
-import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
 import { createApp } from 'korajs'
 
-const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
-
+const binding = createKoraAuthSync({ authClient: auth, schema })
 const app = createApp({
   schema,
-  sync: {
-    url: 'wss://localhost:3001/kora-sync',
-    authClient: createKoraAuthSync({ authClient, schema }),
-  },
+  sync: { url: 'wss://acme.example.com/kora-sync', authClient: binding, autoConnect: true },
 })
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `authClient` | `AuthSyncClient` | Yes | Auth client with `getAccessToken()` (and optional `onAuthChange`) |
-| `schema` | `SchemaDefinition` | No | When set, builds scope map from JWT claims via `extractScopeValuesFromClaims()` |
-| `scopeFromClaims` | `(claims) => Record<string, unknown>` | No | Custom claim → flat scope value mapping |
-| `anonymous` | `'suspend' \| 'allow'` | No | Signed-out behavior. Defaults to `'suspend'`. |
+| Option | Type | Description |
+|--------|------|-------------|
+| `authClient` | `AuthSyncClient` | An `AuthClient` (or anything with `getAccessToken()` and optional `onAuthChange`). |
+| `schema` | `SchemaDefinition` | Builds the client scope hint from token claims (`extractScopeValuesFromClaims`). |
+| `scopeFromClaims` | `(claims) => Record<string, unknown>` | Custom claim to scope value mapping. |
+| `anonymous` | `'suspend' \| 'allow'` | Signed-out behaviour. `'suspend'` (default) does not sync; `'allow'` syncs anonymously (server `MixedAuthProvider`). |
 
-Returns `AuthSyncBinding` (alias: `KoraAuthSyncBinding`, deprecated):
+The binding (`AuthSyncBinding`) supplies `auth({ forceRefresh? })`, `resolveSyncState()` (`loading`,
+`signed-out`, `anonymous` or `authenticated` with `userId`, `deviceId`, `offline`, `locked`),
+`resolveScopeMap()`, `resolveNodeId()`, `resolveUserId()` and `subscribe()`. Kora uses them to bind
+every local write to the signed-in user, keep one sync node per user and device, suspend sync while
+signed out or loading, and reconnect when the user changes. The scope map is only a hint that can
+narrow what the server grants.
 
-| Method | Description |
-|--------|-------------|
-| `auth()` | Returns `{ token }` for a permitted handshake; readiness is resolved separately |
-| `resolveScopeMap?()` | Builds per-collection scope map from current token + schema |
-| `resolveNodeId?()` | Returns JWT `dev` claim as device-bound sync node id |
-| `resolveUserId?()` | Returns JWT `sub` for local store namespacing |
-| `resolveSyncState?()` | Returns explicit loading, signed-out, anonymous, or authenticated state |
-| `subscribe?(listener)` | Notifies on auth state change so `createApp` can reconnect |
+### Token storage
 
-When `schema` is provided, scope values are extracted from:
+| Function | Description |
+|----------|-------------|
+| `createAuthTokenStorage({ store, prefix? })` | Adapts a sync or async key-value store to `AuthTokenStorage`. |
+| `createWebStorageAuthTokenStorage(storage, prefix?)` | `localStorage` or `sessionStorage`. |
+| `createMemoryAuthTokenStorage()` | Memory only (tests, SSR). |
+| `TokenStore` | Older synchronous token store (`saveTokens`, `loadTokens`, `clearTokens`). |
+| `EncryptedTokenStore({ key, storageKey? })` | Tokens encrypted with AES-256-GCM in `localStorage`: `saveTokens`, `loadTokens`, `clearTokens`, `getAccessToken`, `getRefreshToken` (async). |
 
-1. Top-level JWT claims matching schema scope field names
-2. Nested `claims.scope` object
-3. JWT `sub` → `userId` when `userId` is a declared scope field
+### Device identity
 
-The store's sync node id is set from the token `dev` claim, keeping device identity separate from the user id (`sub`).
+`createPersistentDeviceIdentity({ storage, keyStore?, deviceIdKey?, generateDeviceId? })` keeps a
+stable device id and a non-extractable ECDSA P-256 key pair and presents the public key at every
+sign-in. `createKoraAuth()` does this for you. Runtimes without IndexedDB (React Native) must pass a
+`keyStore` backed by the platform's secure storage.
 
-### Lower-Level Storage Adapters
-
-- `createAuthTokenStorage({ store, prefix? })` -- adapts a sync or async key-value credential store to `AuthTokenStorage`.
-- `createMemoryAuthTokenStorage()` -- in-memory token storage for tests, demos, and SSR.
-- `createWebStorageAuthTokenStorage(storage, prefix?)` -- adapts `localStorage` or `sessionStorage`.
-
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
-interface AuthKeyValueStorage {
-  getItem(key: string): string | null | Promise<string | null>
-  setItem(key: string, value: string): void | Promise<void>
-  removeItem(key: string): void | Promise<void>
+function generateDeviceKeyPair(): Promise<CryptoKeyPair>
+function exportPublicKeyJwk(keyPair: CryptoKeyPair): Promise<JsonWebKey>
+function signChallenge(privateKey: CryptoKey, challenge: string): Promise<string>
+function verifyChallenge(publicKeyJwk: JsonWebKey, challenge: string, signature: string): Promise<boolean>
+function computePublicKeyThumbprint(publicKeyJwk: JsonWebKey): Promise<string>
+function toBase64Url(buffer: ArrayBuffer): string
+function fromBase64Url(str: string): Uint8Array
+
+interface DeviceKeyStore {
+  saveKeyPair(deviceId: string, keyPair: CryptoKeyPair): Promise<void>
+  loadKeyPair(deviceId: string): Promise<CryptoKeyPair | null>
+  deleteKeyPair(deviceId: string): Promise<void>
+  hasKeyPair(deviceId: string): Promise<boolean>
 }
 ```
 
-### Device Identity Provider
-
-- `createPersistentDeviceIdentity({ storage, keyStore?, deviceIdKey?, generateDeviceId? })` -- stores a stable device ID and a non-extractable ECDSA P-256 key pair, then returns the public key during sign-up/sign-in.
-
-By default, the device key pair uses IndexedDB when available. Runtimes without IndexedDB, such as React Native, must pass an explicit `keyStore` backed by the platform's secure key storage.
-
-### `AuthUser`
-
-```typescript
-interface AuthUser {
-  id: string
-  email: string
-  name: string | null
-}
-```
-
-### `AuthState`
-
-```typescript
-type AuthState = 'loading' | 'authenticated' | 'unauthenticated'
-```
+`createDeviceKeyStore()` returns an `IndexedDBDeviceKeyStore` in browsers and an
+`InMemoryDeviceKeyStore` elsewhere.
 
 ### `OrgClient`
 
-Client-side organization management. Communicates with the server's org routes.
+Client for organization endpoints (`/orgs/...`). Those endpoints are **not** served by
+`createKoraAuthServer().handleRequest`: wire [`OrgRoutes`](#orgroutes) into your server under the
+same paths.
 
 ```typescript
 const orgClient = new OrgClient({
-  serverUrl: 'http://localhost:3001',
+  serverUrl: 'https://acme.example.com',
   getAccessToken: () => auth.getAccessToken(),
 })
 ```
 
-#### `OrgClientConfig`
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `serverUrl` | `string` | Yes | -- |
-| `getAccessToken` | `() => Promise<string \| null>` | Yes | -- |
-
-#### Properties
-
-- `activeOrgId: string | null` -- Currently active organization ID.
-- `activeOrg: ClientOrganization | null` -- Currently active organization.
-- `activeRole: string | null` -- Current user's role in the active org.
-
-#### Methods
-
-- `switchOrg(orgId: string): Promise<void>` -- Switch to a different organization.
-- `clearActiveOrg(): void` -- Clear the active organization.
-- `createOrg(params: { name: string; slug?: string }): Promise<ClientOrganization>` -- Create a new organization.
-- `listOrgs(): Promise<ClientOrganization[]>` -- List all organizations the user belongs to.
-- `getOrg(orgId: string): Promise<ClientOrganization>` -- Get a single organization.
-- `leaveOrg(orgId: string): Promise<void>` -- Leave an organization.
-- `listMembers(orgId: string): Promise<ClientMembership[]>` -- List members of an org.
-- `inviteMember(orgId: string, params: { email: string; role: string }): Promise<ClientInvitation>` -- Invite a user.
-- `removeMember(orgId: string, userId: string): Promise<void>` -- Remove a member.
-- `updateMemberRole(orgId: string, userId: string, role: string): Promise<void>` -- Update a member's role.
-- `onOrgChange(callback: () => void): () => void` -- Subscribe to active org changes.
-
-### `TokenStore`
-
-Client-side token persistence backed by `localStorage` with an in-memory fallback. Used internally by `AuthClient`.
-
-```typescript
-import { TokenStore } from '@korajs/auth'
-```
-
-### `EncryptedTokenStore`
-
-AES-256-GCM encrypted `localStorage` token store. Encrypts tokens at rest with a device-bound key.
-
-```typescript
-import { EncryptedTokenStore } from '@korajs/auth'
-
-const store = new EncryptedTokenStore({ encryptionKey: key })
-```
-
-#### `EncryptedTokenStoreConfig`
-
-| Field | Type | Required |
-|-------|------|----------|
-| `encryptionKey` | `CryptoKey` | Yes |
-
-### Device Identity
-
-Cryptographic device identity using ECDSA P-256 key pairs via the Web Crypto API.
-
-#### Functions
-
-- `generateDeviceKeyPair(): Promise<CryptoKeyPair>` -- Generate an ECDSA P-256 key pair.
-- `exportPublicKeyJwk(publicKey: CryptoKey): Promise<JsonWebKey>` -- Export public key as JWK.
-- `signChallenge(privateKey: CryptoKey, challenge: Uint8Array): Promise<Uint8Array>` -- Sign a challenge with the device's private key.
-- `verifyChallenge(publicKey: CryptoKey, challenge: Uint8Array, signature: Uint8Array): Promise<boolean>` -- Verify a signed challenge.
-- `computePublicKeyThumbprint(publicKey: CryptoKey): Promise<string>` -- Compute a SHA-256 thumbprint of the public key.
-- `toBase64Url(buffer: ArrayBuffer | Uint8Array): string` -- Encode bytes to base64url.
-- `fromBase64Url(str: string): Uint8Array` -- Decode base64url to bytes.
-
-### Device Key Store
-
-Persistent storage for device key pairs.
-
-- `createDeviceKeyStore(): DeviceKeyStore` -- Create a store (IndexedDB with in-memory fallback).
-- `IndexedDBDeviceKeyStore` -- IndexedDB-backed store.
-- `InMemoryDeviceKeyStore` -- In-memory store (testing/development).
-
-#### `DeviceKeyStore` Interface
-
-```typescript
-interface DeviceKeyStore {
-  getKeyPair(): Promise<CryptoKeyPair | null>
-  saveKeyPair(keyPair: CryptoKeyPair): Promise<void>
-  deleteKeyPair(): Promise<void>
-}
-```
+Properties: `activeOrgId`, `activeOrg`, `activeRole`. Methods: `createOrg({ name, slug? })`,
+`listOrgs()`, `getOrg(orgId)`, `updateOrg(orgId, { name?, slug?, metadata? })`, `deleteOrg(orgId)`,
+`switchOrg(orgId)`, `clearActiveOrg()`, `listMembers(orgId)`, `removeMember(orgId, userId)`,
+`updateMemberRole(orgId, userId, role)`, `transferOwnership(orgId, newOwnerId)`, `leaveOrg(orgId)`,
+`inviteMember(orgId, { email, role })`, `acceptInvitation(token)`, `listInvitations(orgId)`,
+`revokeInvitation(orgId, invitationId)`, `listMyInvitations()`, and
+`onOrgChange((orgId) => ...)`. Errors are `OrgClientError`.
 
 ---
 
 ## Passkeys (WebAuthn)
 
-Client-side functions are in `@korajs/auth`. Server-side functions are in `@korajs/auth/server`.
+### Client (`@korajs/auth`)
 
-### Client-Side
-
-```typescript
-import {
-  isPasskeySupported,
-  isPlatformAuthenticatorAvailable,
-  createPasskeyCredential,
-  authenticateWithPasskey,
-} from '@korajs/auth'
-```
-
-#### `isPasskeySupported()`
-
-Check if WebAuthn is supported in the current environment.
-
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function isPasskeySupported(): boolean
-```
+function isPlatformAuthenticatorAvailable(): Promise<boolean>
 
-#### `isPlatformAuthenticatorAvailable()`
-
-Check if a platform authenticator (Touch ID, Face ID, Windows Hello) is available.
-
-```typescript
-async function isPlatformAuthenticatorAvailable(): Promise<boolean>
-```
-
-#### `createPasskeyCredential(options)`
-
-Create a passkey credential during registration.
-
-```typescript
-async function createPasskeyCredential(options: {
-  challenge: string           // Base64url-encoded challenge from server
-  rpId: string                // Relying party ID (e.g. "example.com")
-  rpName: string              // Relying party display name
-  userId: string              // Base64url-encoded user ID
-  userName: string            // User email or username
-  userDisplayName: string     // Human-readable display name
+function createPasskeyCredential(options: {
+  challenge: string            // base64url, from the server
+  rpId: string
+  rpName: string
+  userId: string               // base64url
+  userName: string
+  userDisplayName: string
   excludeCredentialIds?: string[]
   authenticatorSelection?: {
     authenticatorAttachment?: 'platform' | 'cross-platform'
@@ -400,1277 +221,459 @@ async function createPasskeyCredential(options: {
     userVerification?: 'required' | 'preferred' | 'discouraged'
   }
 }): Promise<PasskeyRegistrationResponse>
-```
+// { credentialId, publicKey, clientDataJSON, attestationObject } (base64url)
 
-Returns:
-
-```typescript
-interface PasskeyRegistrationResponse {
-  credentialId: string      // Base64url-encoded credential ID
-  publicKey: string         // Base64url-encoded COSE public key
-  clientDataJSON: string    // Base64url-encoded clientDataJSON
-  attestationObject: string // Base64url-encoded attestation object
-}
-```
-
-#### `authenticateWithPasskey(options)`
-
-Authenticate with a passkey during login.
-
-```typescript
-async function authenticateWithPasskey(options: {
-  challenge: string             // Base64url-encoded challenge from server
-  rpId: string                  // Relying party ID
-  allowCredentialIds?: string[] // Limit to specific credentials
-  userVerification?: 'required' | 'preferred' | 'discouraged'
-  timeout?: number              // Timeout in ms (default: 60000)
-}): Promise<PasskeyAuthenticationResponse>
-```
-
-Returns:
-
-```typescript
-interface PasskeyAuthenticationResponse {
-  credentialId: string       // Base64url-encoded credential ID
-  authenticatorData: string  // Base64url-encoded authenticator data
-  clientDataJSON: string     // Base64url-encoded clientDataJSON
-  signature: string          // Base64url-encoded ECDSA signature
-  userHandle: string | null  // Base64url-encoded user handle
-}
-```
-
-#### Example
-
-```typescript
-if (isPasskeySupported()) {
-  // Registration
-  const credential = await createPasskeyCredential({
-    challenge: serverOptions.challenge,
-    rpId: 'example.com',
-    rpName: 'My App',
-    userId: serverOptions.userId,
-    userName: 'alice@example.com',
-    userDisplayName: 'Alice',
-  })
-  // Send credential to server for verification
-
-  // Authentication
-  const assertion = await authenticateWithPasskey({
-    challenge: serverOptions.challenge,
-    rpId: 'example.com',
-  })
-  // Send assertion to server for verification
-}
-```
-
-### Server-Side
-
-```typescript
-import {
-  generateRegistrationOptions,
-  verifyRegistrationResponse,
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse,
-} from '@korajs/auth/server'
-```
-
-#### `generateRegistrationOptions(params)`
-
-Generate options for creating a new passkey. Returns options to send to the client.
-
-```typescript
-function generateRegistrationOptions(params: {
-  rpId: string
-  rpName: string
-  userId: string
-  userName: string
-  userDisplayName: string
-  existingCredentialIds?: string[]
-}): RegistrationOptions
-```
-
-#### `verifyRegistrationResponse(params)`
-
-Verify a registration response from the client. Supports `"none"` attestation format.
-
-```typescript
-async function verifyRegistrationResponse(params: {
-  credential: PasskeyRegistrationResponse
-  expectedChallenge: string
-  expectedOrigin: string
-  expectedRpId: string
-}): Promise<RegistrationVerificationResult>
-```
-
-Returns:
-
-```typescript
-interface RegistrationVerificationResult {
-  verified: boolean
-  credentialId: string
-  publicKey: string     // Store this for future authentication
-  signCount: number
-}
-```
-
-#### `generateAuthenticationOptions(params)`
-
-Generate options for signing in with a passkey.
-
-```typescript
-function generateAuthenticationOptions(params: {
+function authenticateWithPasskey(options: {
+  challenge: string
   rpId: string
   allowCredentialIds?: string[]
+  userVerification?: 'required' | 'preferred' | 'discouraged'
+  timeout?: number
+}): Promise<PasskeyAuthenticationResponse>
+// { credentialId, authenticatorData, clientDataJSON, signature, userHandle }
+```
+
+Both throw `PasskeyUnsupportedError` (`PASSKEY_UNSUPPORTED`) without WebAuthn and `PasskeyError`
+(`PASSKEY_ERROR`) when the ceremony fails.
+
+### Server (`@korajs/auth/server`)
+
+<!-- docs-check: signature @korajs/auth/server @korajs/auth -->
+```typescript
+function generateRegistrationOptions(params: {
+  rpId: string; rpName: string; userId: string; userName: string; userDisplayName: string
+  existingCredentialIds?: string[]
+}): RegistrationOptions
+
+function verifyRegistrationResponse(params: {
+  credential: PasskeyRegistrationResponse
+  expectedChallenge: string; expectedOrigin: string; expectedRpId: string
+}): Promise<{ verified: boolean; credentialId: string; publicKey: string; signCount: number }>
+
+function generateAuthenticationOptions(params: {
+  rpId: string; allowCredentialIds?: string[]
 }): AuthenticationOptions
-```
 
-#### `verifyAuthenticationResponse(params)`
-
-Verify an authentication response. Checks the ECDSA P-256 signature and validates the sign counter.
-
-```typescript
-async function verifyAuthenticationResponse(params: {
+function verifyAuthenticationResponse(params: {
   assertion: PasskeyAuthenticationResponse
-  expectedChallenge: string
-  expectedOrigin: string
-  expectedRpId: string
-  publicKey: string           // Stored COSE public key from registration
-  previousSignCount: number   // Stored sign count
-}): Promise<AuthenticationVerificationResult>
+  expectedChallenge: string; expectedOrigin: string; expectedRpId: string
+  publicKey: string            // stored at registration
+  previousSignCount: number    // stored sign count
+  requireUserVerification?: boolean  // default true
+}): Promise<{ verified: boolean; newSignCount: number }>
 ```
 
-Returns:
-
-```typescript
-interface AuthenticationVerificationResult {
-  verified: boolean
-  newSignCount: number  // Store this to detect cloned authenticators
-}
-```
+Registration accepts the `none` attestation format. Authentication checks the ECDSA P-256
+signature, the user-verified flag and the sign counter. Failures throw `PasskeyVerificationError`
+(`PASSKEY_VERIFICATION_ERROR`).
 
 ---
 
-## Encryption
+## Local encryption
 
+These helpers protect data **on the device** (tokens, local secrets). End-to-end encryption of
+synced operations is configured with `sync.encryption` instead; see
+[Sync Encryption](/guide/sync-encryption).
+
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
-import {
-  generateEncryptionKey,
-  encryptData,
-  decryptData,
-  exportKey,
-  importKey,
-  deriveEncryptionKey,
-  generateSalt,
-  OperationEncryptor,
-  AutoLockManager,
-  isEncryptedField,
-} from '@korajs/auth'
+function generateEncryptionKey(): Promise<CryptoKey>   // AES-256-GCM
+function encryptData(key: CryptoKey, plaintext: Uint8Array): Promise<{ ciphertext: Uint8Array; iv: Uint8Array }>
+function decryptData(key: CryptoKey, ciphertext: Uint8Array, iv: Uint8Array): Promise<Uint8Array>
+function exportKey(key: CryptoKey): Promise<Uint8Array>          // 32 raw bytes
+function importKey(rawKey: Uint8Array): Promise<CryptoKey>
+function deriveEncryptionKey(passphrase: string, salt?: Uint8Array): Promise<{ key: CryptoKey; salt: Uint8Array }>
+function generateSalt(): Uint8Array                    // 32 random bytes
 ```
 
-### Database Encryption (AES-256-GCM)
-
-#### `generateEncryptionKey()`
-
-Generate a random 256-bit AES-GCM encryption key.
+`deriveEncryptionKey` uses PBKDF2-SHA-256 with 600 000 iterations and generates a salt when none is
+given; store the salt to derive the same key again. Errors: `EncryptionError` (`ENCRYPTION_ERROR`),
+`KeyDerivationError` (`KEY_DERIVATION_ERROR`), `CryptoUnavailableError` (`CRYPTO_UNAVAILABLE`).
 
 ```typescript
-async function generateEncryptionKey(): Promise<CryptoKey>
+import { decryptData, deriveEncryptionKey, encryptData } from '@korajs/auth'
+
+const { key, salt } = await deriveEncryptionKey('user passphrase')
+const { ciphertext, iv } = await encryptData(key, new TextEncoder().encode('secret'))
+const plaintext = await decryptData(key, ciphertext, iv)
+const { key: sameKey } = await deriveEncryptionKey('user passphrase', salt)
 ```
 
-#### `encryptData(key, plaintext)`
+`AutoLockManager({ timeout, onLock })` locks after `timeout` ms without `reportActivity()`:
+`start()`, `stop()`, `reportActivity()`, `lock()`, `unlock()`, `isLocked`.
 
-Encrypt data using AES-256-GCM with a randomly generated IV.
-
-```typescript
-async function encryptData(
-  key: CryptoKey,
-  plaintext: Uint8Array,
-): Promise<{ ciphertext: Uint8Array; iv: Uint8Array }>
-```
-
-#### `decryptData(key, ciphertext, iv)`
-
-Decrypt AES-256-GCM encrypted data. Detects tampering via the GCM authentication tag.
-
-```typescript
-async function decryptData(
-  key: CryptoKey,
-  ciphertext: Uint8Array,
-  iv: Uint8Array,
-): Promise<Uint8Array>
-```
-
-#### `exportKey(key)`
-
-Export an AES-256-GCM CryptoKey to raw bytes (32 bytes).
-
-```typescript
-async function exportKey(key: CryptoKey): Promise<Uint8Array>
-```
-
-#### `importKey(rawKey)`
-
-Import raw key bytes (must be exactly 32 bytes) into an AES-256-GCM CryptoKey.
-
-```typescript
-async function importKey(rawKey: Uint8Array): Promise<CryptoKey>
-```
-
-#### Example
-
-```typescript
-const key = await generateEncryptionKey()
-const data = new TextEncoder().encode('sensitive data')
-const { ciphertext, iv } = await encryptData(key, data)
-
-const decrypted = await decryptData(key, ciphertext, iv)
-const text = new TextDecoder().decode(decrypted)
-```
-
-### Key Derivation (PBKDF2)
-
-#### `deriveEncryptionKey(passphrase, salt?)`
-
-Derive an AES-256-GCM key from a passphrase using PBKDF2 with SHA-256 and 600,000 iterations (OWASP-recommended).
-
-```typescript
-async function deriveEncryptionKey(
-  passphrase: string,
-  salt?: Uint8Array,
-): Promise<{ key: CryptoKey; salt: Uint8Array }>
-```
-
-If no salt is provided, a random 32-byte salt is generated. The salt must be persisted alongside encrypted data.
-
-#### `generateSalt()`
-
-Generate a cryptographically random 32-byte salt.
-
-```typescript
-function generateSalt(): Uint8Array
-```
-
-#### Example
-
-```typescript
-// First time: derive key and store the salt
-const { key, salt } = await deriveEncryptionKey('my-passphrase')
-
-// Later: re-derive the same key
-const { key: sameKey } = await deriveEncryptionKey('my-passphrase', salt)
-```
-
-### `OperationEncryptor`
-
-End-to-end encryption for Kora sync operations. Encrypts `data` and `previousData` fields while leaving sync metadata (id, nodeId, timestamp, causalDeps, etc.) in cleartext.
-
-```typescript
-const encryptor = new OperationEncryptor({ key })
-```
-
-#### `OperationEncryptorConfig`
-
-| Field | Type | Required |
-|-------|------|----------|
-| `key` | `CryptoKey` | Yes |
-
-#### Methods
-
-- `encryptOperation(operation: Operation): Promise<Operation>` -- Encrypt an operation's data fields. Returns a new operation (immutable).
-- `decryptOperation(operation: Operation): Promise<Operation>` -- Decrypt an operation's data fields.
-- `isEncrypted(operation: Operation): boolean` -- Check if an operation's data fields are encrypted.
-- `encryptBatch(operations: Operation[]): Promise<Operation[]>` -- Encrypt multiple operations in parallel.
-- `decryptBatch(operations: Operation[]): Promise<Operation[]>` -- Decrypt multiple operations in parallel.
-
-#### `isEncryptedField(field)`
-
-Standalone utility to detect encrypted operation fields without an `OperationEncryptor` instance.
-
-```typescript
-function isEncryptedField(field: Record<string, unknown> | null): boolean
-```
-
-#### Example
-
-```typescript
-const key = await generateEncryptionKey()
-const encryptor = new OperationEncryptor({ key })
-
-// Before sending via sync
-const encrypted = await encryptor.encryptOperation(operation)
-syncEngine.send(encrypted)
-
-// After receiving from sync
-const decrypted = await encryptor.decryptOperation(receivedOp)
-store.apply(decrypted)
-```
-
-### `AutoLockManager`
-
-Manages inactivity-based auto-locking for the encrypted local store. No DOM dependencies -- uses `setTimeout` internally and accepts an `onLock` callback.
-
-```typescript
-const manager = new AutoLockManager({
-  timeout: 15 * 60 * 1000, // 15 minutes
-  onLock: () => {
-    // Clear decrypted data from memory, show lock screen
-  },
-})
-```
-
-#### `AutoLockConfig`
-
-| Field | Type | Required |
-|-------|------|----------|
-| `timeout` | `number` | Yes |
-| `onLock` | `() => void` | Yes |
-
-#### Properties
-
-- `isLocked: boolean` -- Whether the manager is in the locked state.
-
-#### Methods
-
-- `start(): void` -- Begin monitoring for inactivity.
-- `stop(): void` -- Stop monitoring. Does not change lock state.
-- `reportActivity(): void` -- Reset the inactivity timer. Call on user interactions.
-- `lock(): void` -- Manually lock immediately. Invokes `onLock`.
-- `unlock(): void` -- Return to unlocked state. Restarts the timer if running.
+`OperationEncryptor({ key })` (`encryptOperation`, `decryptOperation`, `encryptBatch`,
+`decryptBatch`, `isEncrypted`, and the standalone `isEncryptedField`) replaces an operation's `data`
+and `previousData` with a ciphertext envelope while keeping its id. It is a low-level utility, **not
+used by the sync engine**: an operation changed this way no longer matches its content-addressed id
+and every Kora server and client refuses it (`INVALID_OPERATION_ID`). Use `sync.encryption`.
 
 ---
 
-## React API
+## React (`@korajs/auth/react`)
 
-```typescript
-import {
-  AuthProvider,
-  useAuth,
-  useCurrentUser,
-  useAuthStatus,
-  AuthContext,
-  OrgContext,
-  useOrg,
-  useOrgMembers,
-  usePermission,
-} from '@korajs/auth/react'
-```
-
-### `<AuthProvider>`
-
-React context provider that wraps the `AuthClient`. Calls `client.initialize()` on mount and subscribes to auth state changes.
-
-```typescript
-interface AuthProviderProps {
-  client: AuthClient
-  children: ReactNode
-  fallback?: ReactNode  // Shown while initializing
-}
-```
-
-Must be placed above any component that uses `useAuth`, `useCurrentUser`, or `useAuthStatus`.
-
-#### Example
-
-```typescript
+<!-- docs-check-prelude
 import { createKoraAuth } from '@korajs/auth'
-import { AuthProvider } from '@korajs/auth/react'
+const authClient = createKoraAuth({ serverUrl: 'https://acme.example.com' })
+declare function MyApp(): JSX.Element
+declare function SignInForm(): JSX.Element
+-->
 
-const authClient = createKoraAuth({ serverUrl: 'http://localhost:3001' })
+| Export | Description |
+|--------|-------------|
+| `<AuthProvider client fallback?>` | Initializes the client on mount and provides it. `fallback` renders while loading. |
+| `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth }`. |
+| `useCurrentUser()` | `AuthUser \| null`. |
+| `useAuthStatus()` | `{ state, isAuthenticated, isLoading }`; re-renders only when the state changes. |
+| `<OrgProvider client>` | Provides an `OrgClient`. |
+| `useOrg()` | `{ org, role, orgId, switchOrg, createOrg, leaveOrg, clearOrg, listOrgs, error }`. |
+| `useOrgMembers(orgId)` | `{ members, isLoading, refresh, invite, removeMember, updateRole, error }`. |
+| `usePermission(role)` / `checkOrgPermission(currentRole, role)` | `true` when the active role is at least `role` (`viewer` < `billing` < `member` < `admin` < `owner`). |
 
-function App() {
+Hooks use `useSyncExternalStore`, so they are safe in concurrent rendering.
+
+```tsx
+import { AuthProvider, useAuth } from '@korajs/auth/react'
+
+function Root() {
   return (
-    <AuthProvider client={authClient} fallback={<div>Loading...</div>}>
-      <MyApp />
+    <AuthProvider client={authClient} fallback={<p>Loading...</p>}>
+      <Gate />
     </AuthProvider>
   )
 }
-```
 
-### `useAuth()`
-
-Full authentication hook. Returns user, loading state, error state, and auth methods. Re-renders on state changes. Uses `useSyncExternalStore` for React 18+ concurrent mode safety.
-
-```typescript
-function useAuth(): UseAuthResult
-```
-
-Returns:
-
-```typescript
-interface UseAuthResult {
-  user: AuthUser | null
-  isAuthenticated: boolean
-  isLoading: boolean
-  signUp: (params: { email: string; password: string; name?: string }) => Promise<void>
-  signIn: (params: { email: string; password: string }) => Promise<void>
-  signOut: () => Promise<void>
-  error: string | null
-}
-```
-
-#### Example
-
-```typescript
-function LoginPage() {
-  const { user, isAuthenticated, isLoading, signIn, error } = useAuth()
-
-  if (isLoading) return <div>Loading...</div>
-  if (isAuthenticated) return <div>Welcome, {user?.name}</div>
-
+function Gate() {
+  const { user, isAuthenticated, error } = useAuth()
+  if (!isAuthenticated) return <SignInForm />
   return (
-    <form onSubmit={async (e) => {
-      e.preventDefault()
-      await signIn({ email: 'user@example.com', password: 'secret' })
-    }}>
-      {error && <p>{error}</p>}
-      <button type="submit">Sign In</button>
-    </form>
+    <>
+      {error && <p role="alert">{error}</p>}
+      <p>Signed in as {user?.email}</p>
+      <MyApp />
+    </>
   )
 }
 ```
 
-### `useCurrentUser()`
+For apps whose local database belongs to the signed-in user, use `AuthBoundKoraProvider` from
+`@korajs/react` (see [Authentication](/guide/authentication#authenticated-app-lifecycle)).
 
-Lightweight hook that returns only the current user. Use instead of `useAuth` when you do not need auth methods or error state.
-
-```typescript
-function useCurrentUser(): AuthUser | null
-```
-
-#### Example
-
-```typescript
-function UserAvatar() {
-  const user = useCurrentUser()
-  if (!user) return null
-  return <span>{user.name ?? user.email}</span>
-}
-```
-
-### `useAuthStatus()`
-
-Returns the current auth status. Re-renders only when the auth state changes.
-
-```typescript
-function useAuthStatus(): AuthStatus
-```
-
-Returns:
-
-```typescript
-interface AuthStatus {
-  state: AuthState
-  isAuthenticated: boolean
-  isLoading: boolean
-}
-```
-
-#### Example
-
-```typescript
-function AuthGuard({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, isLoading } = useAuthStatus()
-  if (isLoading) return <Spinner />
-  if (!isAuthenticated) return <Navigate to="/login" />
-  return <>{children}</>
-}
-```
-
-### `useOrg()`
-
-Organization management hook. Re-renders when the active organization changes.
-
-```typescript
-function useOrg(): UseOrgResult
-```
-
-Returns:
-
-```typescript
-interface UseOrgResult {
-  org: ClientOrganization | null
-  role: string | null
-  orgId: string | null
-  switchOrg: (orgId: string) => Promise<void>
-  createOrg: (params: { name: string; slug?: string }) => Promise<ClientOrganization>
-  leaveOrg: () => Promise<void>
-  clearOrg: () => void
-  listOrgs: () => Promise<ClientOrganization[]>
-  error: string | null
-}
-```
-
-Must be used within an `OrgContext.Provider`.
-
-### `useOrgMembers(orgId)`
-
-Hook for managing organization members. Automatically loads members when `orgId` changes.
-
-```typescript
-function useOrgMembers(orgId: string): UseOrgMembersResult
-```
-
-Returns:
-
-```typescript
-interface UseOrgMembersResult {
-  members: ClientMembership[]
-  isLoading: boolean
-  refresh: () => Promise<void>
-  invite: (email: string, role: string) => Promise<ClientInvitation>
-  removeMember: (userId: string) => Promise<void>
-  updateRole: (userId: string, role: string) => Promise<void>
-  error: string | null
-}
-```
-
-### `usePermission(requiredRole)`
-
-Check if the current user has at least the specified role level in the active organization.
-
-```typescript
-function usePermission(requiredRole: string): boolean
-```
-
-Role hierarchy (lowest to highest): `viewer` < `billing` < `member` < `admin` < `owner`.
-
-#### Example
-
-```typescript
-function AdminPanel() {
-  const canManage = usePermission('admin')
-  if (!canManage) return <p>Access denied</p>
-  return <AdminSettings />
-}
-```
+`@korajs/auth/vue` exports `AuthProvider`, `OrgProvider`, `useAuth`, `useCurrentUser`,
+`useAuthStatus`, `useOrg`, `useOrgMembers` and `usePermission` with the same results as refs.
+`@korajs/auth/svelte` exports `initAuthProvider`/`destroyAuthProvider`, `initOrgProvider`/
+`destroyOrgProvider`, the store factories (`createAuthStore`, `createAuthStatusStore`,
+`createCurrentUserStore`, `createPermissionStore`) and the same `useAuth`/`useOrg` helpers.
 
 ---
 
-## Server API
+## Server (`@korajs/auth/server`)
 
-```typescript
-import {
-  createKoraAuthServer,
-  createSqliteOAuthStores,
-  BuiltInAuthRoutes,
-  TokenManager,
-  SessionManager,
-  TotpManager,
-  OrgRoutes,
-  RbacEngine,
-  OrgScopeResolver,
-  // ... and many more
-} from '@korajs/auth/server'
-```
+<!-- docs-check-prelude
+import { createKoraAuthServer, createSqliteUserStore } from '@korajs/auth/server'
+-->
 
 ### `createKoraAuthServer(options)`
 
-Creates the built-in auth server with sensible defaults for Kora sync.
+The built-in auth server: routes, tokens, devices, OAuth, MFA and the sync auth provider.
 
 ```typescript
-const oauthStores = await createSqliteOAuthStores({
-  filename: './auth.db',
-})
+import { createKoraAuthServer, createSqliteUserStore, TotpManager, InMemoryTotpStore } from '@korajs/auth/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
-const auth = createKoraAuthServer({
-  jwtSecret: process.env.KORA_AUTH_SECRET!,
-  oauth: {
-    providers: [
-      googleProvider({
-        clientId: process.env.GOOGLE_CLIENT_ID!,
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-        redirectUri: 'https://app.example.com/auth/oauth/google/callback',
-      }),
-    ],
-    stateStore: oauthStores.stateStore,
-    linkedIdentityStore: oauthStores.linkedIdentityStore,
-  },
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+const authServer = createKoraAuthServer({
+  jwtSecret: process.env.KORA_AUTH_SECRET,
+  userStore,
+  mfa: new TotpManager({ issuer: 'Acme', store: new InMemoryTotpStore() }),
 })
 
 const server = createProductionServer({
-  store,
-  syncOptions: {
-    auth: auth.auth,
-  },
-  httpRoutes: [
-    {
-      path: '/auth',
-      handle: auth.handleRequest,
-    },
-  ],
+  store: createSqliteServerStore({ filename: './kora.db' }),
+  syncOptions: { auth: authServer.auth },
+  httpRoutes: [{ path: '/auth', handle: authServer.handleRequest }],
 })
 ```
 
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `jwtSecret` | `string \| string[]` | Production | `KORA_AUTH_SECRET`, dev-only generated secret |
-| `userStore` | `UserStore` | No | `InMemoryUserStore` |
-| `tokenManager` | `TokenManager` | No | Created with revocation store |
-| `tokenManagerOptions` | `Omit<TokenManagerConfig, 'secret'>` | No | TokenManager defaults |
-| `path` | `string` | No | `'/auth'` |
-| `oauth` | `OAuthServerConfig` | No | OAuth routes disabled |
-| `challengeStore` | `ChallengeStore` | No | `InMemoryChallengeStore` |
-| `rateLimiter` | `RateLimiter` | No | `InMemoryRateLimiter` |
+| Option | Type | Default |
+|--------|------|---------|
+| `jwtSecret` | `string \| string[]` (index 0 signs, all verify) | `KORA_AUTH_SECRET`; a generated development secret outside production |
+| `userStore` | `UserStore` | `InMemoryUserStore` (refused in production) |
+| `revocationStore` | `TokenRevocationStore` | the user store's own (`getTokenRevocationStore()`) |
+| `allowInMemory` | `boolean` | `false`: with `NODE_ENV=production`, in-memory user or revocation stores throw `InMemoryAuthStoreError` (`IN_MEMORY_AUTH_STORE`) |
+| `tokenManager` / `tokenManagerOptions` | `TokenManager` / `Omit<TokenManagerConfig, 'secret'>` | created from `jwtSecret` |
+| `path` | `string` | `'/auth'` |
+| `oauth` | `OAuthServerConfig` | OAuth disabled |
+| `mfa` | `MfaVerifier` (for example a `TotpManager`) | none: sign-in is one step |
+| `challengeStore` / `rateLimiter` | `ChallengeStore` / `RateLimiter` | in memory |
+| `scopeValues` | `(claims) => values` | none: scoped collections bind `{ userId }` only |
+| `resolveScopes` | `(claims) => ScopeMap` | none |
 
-The returned object includes:
+`scopeValues` and `resolveScopes` decide what each sync session may read and write; see
+[Sync scopes](/guide/authentication#sync-scopes).
 
-- `routes` -- underlying `BuiltInAuthRoutes`
-- `userStore` -- configured user/device store
-- `tokenManager` -- configured token manager
-- `oauth` -- configured `OAuthManager`, when OAuth is enabled
-- `linkedIdentityStore` -- configured OAuth account-linking store, when OAuth is enabled
-- `auth` -- sync auth provider for `@korajs/server`
-- `handleRequest()` -- one HTTP handler for `/auth/*`
+Returned `KoraAuthServer`:
 
-When `oauth` is configured, `handleRequest()` also serves:
+| Member | Description |
+|--------|-------------|
+| `handleRequest(request)` | One handler for every route below. `request`: `{ method, path, body?, headers?, query?, ip? }`. |
+| `auth` | Sync auth provider for `KoraSyncServer` (`authenticate(token)` with server-derived scopes, `onRevoke`). |
+| `routes`, `userStore`, `tokenManager`, `oauth?`, `linkedIdentityStore?` | The configured parts. |
+| `revokeAllForUser(userId)` | Revokes every credential of a user and ends their live sync sessions. |
+| `onRevoke(listener)` | Revocation feed (`{ kind: 'device', userId, deviceId }` or `{ kind: 'user', userId }`). |
+| `bindSyncServer(server)` | Ends sessions on a sync server built with a wrapping provider. |
 
 | Route | Purpose |
 |-------|---------|
-| `GET /auth/oauth/:provider` | Create an authorization URL and state token. Returns `{ url, state }`. |
-| `GET /auth/oauth/:provider/callback` | Complete a browser OAuth callback from `code` and `state` query params. |
-| `POST /auth/oauth/:provider/callback` | Complete a desktop/mobile callback from JSON body `{ code, state, deviceId?, devicePublicKey? }`. |
-| `GET /auth/oauth/links` | List the signed-in user's linked OAuth identities. |
-| `POST /auth/oauth/:provider/link` | Link a provider to the signed-in user using `{ code, state }`. |
-| `DELETE /auth/oauth/:provider/link` | Unlink that provider from the signed-in user. |
+| `POST /auth/signup`, `POST /auth/signin` | Returns `{ user, tokens }`, or `{ mfaRequired: true, mfaToken }` for MFA accounts. |
+| `POST /auth/mfa/verify` | `{ mfaToken, code }` or `{ mfaToken, recoveryCode }`. |
+| `POST /auth/refresh` | Rotates the refresh token. |
+| `POST /auth/signout` | Revokes the session's tokens. |
+| `GET /auth/me`, `GET /auth/devices` | Profile and devices. |
+| `POST /auth/device/register`, `POST /auth/device/challenge`, `POST /auth/device/verify` | Device-key sign-in. |
+| `DELETE /auth/device/:id` | Revokes a device. |
+| `GET /auth/oauth/:provider` | Authorization URL and state (binding cookie for browsers). |
+| `GET` or `POST /auth/oauth/:provider/callback` | Completes sign-in. |
+| `POST /auth/oauth/:provider/link/start`, `POST` / `DELETE /auth/oauth/:provider/link`, `GET /auth/oauth/links` | Account linking. |
 
-`OAuthServerConfig` accepts all `OAuthManagerConfig` fields plus:
+Error responses are `{ error, code }` with stable codes such as `INVALID_CREDENTIALS`,
+`RATE_LIMITED`, `ACCESS_TOKEN_REQUIRED`, `ACCESS_TOKEN_INVALID`, `REFRESH_TOKEN_INVALID`,
+`REFRESH_IN_PROGRESS`, `MFA_TOKEN_INVALID`, `MFA_CODE_INVALID` and `DEVICE_OWNERSHIP_CONFLICT`.
 
-| Field | Type | Default |
-|-------|------|---------|
-| `providers` | `OAuthProviderConfig[]` | Required |
-| `linkedIdentityStore` | `LinkedIdentityStore` | `InMemoryLinkedIdentityStore` |
-| `stateStore` | `OAuthStateStore` | `InMemoryOAuthStateStore` |
-| `createNewUsers` | `boolean` | `true` |
-| `autoLinkVerifiedEmail` | `boolean` | `false` |
-| `allowUnlinkLastIdentity` | `boolean` | `false` |
-
-By default, Kora does not let a user unlink their last OAuth identity because OAuth-created accounts may not have another usable sign-in method. Enable `allowUnlinkLastIdentity` only when your app provides another recovery or sign-in path.
+`OAuthServerConfig`: `providers` (required), `stateStore`, `stateTtlMs`, `fetch`,
+`linkedIdentityStore`, `createNewUsers` (default `true`), `autoLinkVerifiedEmail` (default `false`),
+`allowUnlinkLastIdentity` (default `false`, so an OAuth-only account keeps a way to sign in).
 
 ### `BuiltInAuthRoutes`
 
-Lower-level server-side route handlers for custom auth wiring. Transport-agnostic -- returns `{ status, body }` response objects to wire into any HTTP framework.
+The handlers behind `handleRequest`, for custom wiring. Each returns
+`{ status, body: { data } | { error, code? } }`.
 
-```typescript
-const routes = new BuiltInAuthRoutes(config)
-```
+| Method | Description |
+|--------|-------------|
+| `handleSignUp(body, clientIp?)` | `{ email, password, name?, deviceId?, devicePublicKey? }` |
+| `handleSignIn(body, clientIp?)` | Returns `SignInResult`: `{ user, tokens }` or an MFA challenge. Rate limited per account and per IP. |
+| `handleMfaVerify({ mfaToken, code? , recoveryCode? })` | Completes MFA. |
+| `handleRefresh({ refreshToken })` | Atomic rotation with reuse detection. |
+| `handleSignOut(accessToken, { refreshToken? })` | |
+| `handleGetMe(accessToken)`, `handleListDevices(accessToken)` | |
+| `handleDeviceRegister(accessToken, { deviceId, publicKey, name })`, `handleDeviceChallenge(accessToken, deviceId)`, `handleDeviceVerify({ deviceId, challenge, signature })` | Device keys. |
+| `handleRevokeDevice(accessToken, deviceId)` | |
+| `authenticateAccess(token)` | The one check every route and the sync provider use: signature, expiry, user and device revocation. |
+| `revokeAllForUser(userId)`, `onRevoke(listener)` | Revocation. |
+| `toSyncAuthProvider({ scopeValues?, resolveScopes? })` | Sync provider. |
 
-#### `AuthRoutesConfig`
+Config: `userStore`, `tokenManager` (required), `challengeStore`, `rateLimiter`, `mfa`, `onRevoke`.
 
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `userStore` | `UserStore` | Yes | -- |
-| `tokenManager` | `TokenManager` | Yes | -- |
-| `challengeStore` | `ChallengeStore` | No | `InMemoryChallengeStore` |
-| `rateLimiter` | `RateLimiter` | No | `InMemoryRateLimiter` |
+### User stores
 
-#### Methods
-
-All handlers return `Promise<AuthRouteResponse<T>>` where:
-
-```typescript
-interface AuthRouteResponse<T> {
-  status: number
-  body: { data: T } | { error: string }
-}
-```
-
-- `signUp(params: { email, password, name? }): Promise<AuthRouteResponse<{ accessToken, refreshToken }>>` -- Register a new user.
-- `signIn(params: { email, password }): Promise<AuthRouteResponse<{ accessToken, refreshToken }>>` -- Sign in. Returns token pair.
-- `refresh(params: { refreshToken }): Promise<AuthRouteResponse<{ accessToken, refreshToken }>>` -- Refresh the access token.
-- `signOut(userId: string, params: { refreshToken? }): Promise<AuthRouteResponse<{ success: true }>>` -- Revoke tokens.
-- `getProfile(userId: string): Promise<AuthRouteResponse<UserProfile>>` -- Get the authenticated user's profile.
-- `changePassword(userId: string, params: { currentPassword, newPassword }): Promise<AuthRouteResponse<{ success: true }>>` -- Change password.
-- `registerDevice(userId: string, params: { publicKeyJwk, name? }): Promise<AuthRouteResponse<{ deviceId, challenge }>>` -- Register a device key.
-- `verifyDevice(userId: string, params: { deviceId, signature }): Promise<AuthRouteResponse<{ verified: true }>>` -- Verify device challenge.
-
-#### Example
-
-```typescript
-import { BuiltInAuthRoutes, TokenManager, InMemoryUserStore } from '@korajs/auth/server'
-
-const tokenManager = new TokenManager({
-  accessTokenSecret: process.env.JWT_SECRET!,
-  refreshTokenSecret: process.env.REFRESH_SECRET!,
-})
-
-const routes = new BuiltInAuthRoutes({
-  userStore: new InMemoryUserStore(),
-  tokenManager,
-})
-
-// Wire to Express
-app.post('/auth/signup', async (req, res) => {
-  const result = await routes.signUp(req.body)
-  res.status(result.status).json(result.body)
-})
-
-app.post('/auth/signin', async (req, res) => {
-  const result = await routes.signIn(req.body)
-  res.status(result.status).json(result.body)
-})
-```
+`InMemoryUserStore`, `createSqliteUserStore({ filename })` (`SqliteUserStore`) and
+`createPostgresUserStore(...)` (`PostgresUserStore`). The SQLite and Postgres stores also hold the
+token revocations. Custom stores implement `UserStore` (`createUser`, `findByEmail`, `findById`,
+`registerDevice`, `findDevice`, `listDevices`, `revokeDevice`, `setEmailVerified`, `updatePassword`,
+`listAll`, `update`, `delete`, `touchDevice`, optional `getTokenRevocationStore`).
 
 ### `TokenManager`
 
-Server-side JWT token creation, verification, and revocation.
-
+<!-- docs-check: signature @korajs/auth/server @korajs/auth -->
 ```typescript
-const tokenManager = new TokenManager(config)
+class TokenManager {
+  constructor(options: {
+    secret: string | string[]          // index 0 signs; all verify (rotation)
+    accessTokenLifetime?: number       // ms, default 15 minutes
+    refreshTokenLifetime?: number      // ms, default 90 days
+    deviceCredentialLifetime?: number  // ms, default 90 days
+    revocationStore?: TokenRevocationStore
+    refreshReuseGraceMs?: number       // default 30 s, 0 disables
+  })
+}
 ```
 
-#### `TokenManagerConfig`
+Methods: `issueTokens`, `issueAccessToken(userId, deviceId, options?)`,
+`issueRefreshToken(userId, deviceId, options?)`, `issueDeviceCredential`, `validateToken(token)`
+(signature and expiry, synchronous), `validateTokenWithRevocation(token)`, `rotateRefreshToken`,
+`refreshAccessToken`, `revokeToken(jti, expiresAt)`, `revokeFamily`, `revokeDeviceTokens(deviceId)`,
+`revokeAllForUser(userId)`. Without a revocation store, tokens stay valid until they expire.
 
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `accessTokenSecret` | `string` | Yes | -- |
-| `refreshTokenSecret` | `string` | Yes | -- |
-| `accessTokenTtlSeconds` | `number` | No | `900` (15 min) |
-| `refreshTokenTtlSeconds` | `number` | No | `604800` (7 days) |
-| `issuer` | `string` | No | `'kora'` |
-| `revocationStore` | `TokenRevocationStore` | No | `InMemoryTokenRevocationStore` |
+A just-rotated refresh token is accepted once more within `refreshReuseGraceMs` and returns the same
+successor pair (two tabs refreshing at once); later reuse revokes the token family.
+`TokenRevocationStore` implementations (`InMemoryTokenRevocationStore`,
+`SqliteTokenRevocationStore`, `PostgresTokenRevocationStore`) provide `isRevoked`, `revoke`,
+`consume`, `isConsumed` and the device and user cut-offs (`revokeAllForDevice`,
+`getDeviceRevokedBefore`, `revokeAllForUser`, `getUserRevokedBefore`).
 
-#### Methods
-
-- `createAccessToken(userId: string, claims?: Record<string, unknown>): Promise<string>` -- Create a signed access JWT.
-- `createRefreshToken(userId: string): Promise<string>` -- Create a signed refresh JWT.
-- `verifyAccessToken(token: string): Promise<TokenPayload>` -- Verify and decode an access token.
-- `verifyRefreshToken(token: string): Promise<TokenPayload>` -- Verify and decode a refresh token.
-- `revokeRefreshToken(token: string): Promise<void>` -- Revoke a refresh token.
-- `revokeAllUserTokens(userId: string): Promise<void>` -- Revoke all tokens for a user.
-- `isRevoked(tokenId: string): Promise<boolean>` -- Check if a token has been revoked.
+JWT helpers: `encodeJwt(payload, secret)`, `decodeJwt(token)`, `verifyJwt(token, secret)` (all
+synchronous, HS256; `decodeJwt` and `verifyJwt` return `null` on failure) and `isExpired(payload)`.
+Passwords: `hashPassword(password)` returns `{ hash, salt }` (PBKDF2-SHA-512, 600 000 iterations)
+and `verifyPassword(password, hash, salt)`.
 
 ### `SessionManager`
 
-Server-side session management with support for sliding window expiry, idle timeout, concurrent session limits, and MFA tracking.
+Server-side sessions for apps that keep their own session cookies.
 
-```typescript
-const sessions = new SessionManager({
-  store: new InMemorySessionStore(),
-  sessionTtlMs: 7 * 24 * 60 * 60 * 1000,
-  idleTimeoutMs: 30 * 60 * 1000,
-  maxSessionsPerUser: 5,
-})
-```
+| Config | Default |
+|--------|---------|
+| `store` (`SessionStore`, for example `InMemorySessionStore`) | required |
+| `sessionTtlMs` | 7 days |
+| `idleTimeoutMs` | 30 minutes |
+| `maxSessionsPerUser` | 10 |
+| `slidingWindow` | `true` |
 
-#### `SessionManagerConfig`
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `store` | `SessionStore` | Yes | -- |
-| `sessionTtlMs` | `number` | No | 7 days |
-| `idleTimeoutMs` | `number` | No | 30 minutes |
-| `maxSessionsPerUser` | `number` | No | `10` |
-| `slidingWindow` | `boolean` | No | `true` |
-
-#### Methods
-
-- `create(params: CreateSessionParams): Promise<Session>` -- Create a new session. Enforces max sessions limit.
-- `validate(sessionId: string): Promise<Session>` -- Validate a session. Throws if expired or not found.
-- `touch(sessionId: string): Promise<Session>` -- Update last activity time. Extends expiry if sliding window is enabled.
-- `markMfaVerified(sessionId: string): Promise<Session>` -- Mark a session as MFA-verified.
-- `requireMfa(sessionId: string): Promise<Session>` -- Require MFA verification. Throws `SessionMfaRequiredError` if not verified.
-- `revoke(sessionId: string): Promise<void>` -- Delete a session.
-- `revokeAll(userId: string): Promise<number>` -- Revoke all sessions for a user (sign out everywhere).
-- `revokeOthers(userId: string, currentSessionId: string): Promise<number>` -- Revoke all sessions except the current one.
-- `listSessions(userId: string): Promise<Session[]>` -- List all active sessions.
-- `cleanExpired(): Promise<number>` -- Clean up expired sessions.
-
-#### `Session`
-
-```typescript
-interface Session {
-  id: string
-  userId: string
-  deviceId: string | null
-  ipAddress: string | null
-  userAgent: string | null
-  createdAt: number
-  lastActiveAt: number
-  expiresAt: number
-  mfaVerified: boolean
-  metadata?: Record<string, unknown>
-}
-```
-
-#### `SessionStore` Interface
-
-```typescript
-interface SessionStore {
-  create(session: Session): Promise<void>
-  getById(sessionId: string): Promise<Session | null>
-  update(session: Session): Promise<void>
-  delete(sessionId: string): Promise<void>
-  listByUserId(userId: string): Promise<Session[]>
-  deleteAllForUser(userId: string): Promise<number>
-  deleteAllExcept(userId: string, keepSessionId: string): Promise<number>
-  cleanExpired(): Promise<number>
-}
-```
-
-Built-in: `InMemorySessionStore` (development/testing).
+Methods: `create({ userId, deviceId?, ipAddress?, userAgent?, mfaVerified?, metadata? })`,
+`validate(id)`, `touch(id)`, `markMfaVerified(id)`, `requireMfa(id)` (throws
+`SessionMfaRequiredError`), `revoke(id)`, `revokeAll(userId)`, `revokeOthers(userId, keepId)`,
+`listSessions(userId)`, `cleanExpired()`. Errors: `SessionNotFoundError`, `SessionExpiredError`,
+`SessionLimitExceededError`, `SessionMfaRequiredError`.
 
 ### `TotpManager`
 
-TOTP-based Multi-Factor Authentication. Implements RFC 6238 (TOTP) and RFC 4226 (HOTP). Compatible with Google Authenticator, Authy, 1Password, and other TOTP apps.
+RFC 6238 TOTP, compatible with authenticator apps.
 
 ```typescript
-const totp = new TotpManager({
-  issuer: 'MyApp',
-  store: new InMemoryTotpStore(),
-})
-```
+import { InMemoryTotpStore, TotpManager } from '@korajs/auth/server'
 
-#### `TotpConfig`
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `issuer` | `string` | Yes | -- |
-| `store` | `TotpStore` | Yes | -- |
-| `digits` | `number` | No | `6` |
-| `period` | `number` | No | `30` |
-| `algorithm` | `'SHA-1' \| 'SHA-256' \| 'SHA-512'` | No | `'SHA-1'` |
-| `window` | `number` | No | `1` |
-| `recoveryCodes` | `number` | No | `8` |
-
-#### Methods
-
-- `enable(userId: string, accountName: string): Promise<TotpSetupResult>` -- Enable TOTP MFA. Returns a QR code URI and recovery codes.
-- `verifySetup(userId: string, code: string): Promise<boolean>` -- Confirm MFA setup with a valid code from the authenticator app.
-- `verify(userId: string, code: string): Promise<boolean>` -- Verify a TOTP code during login.
-- `verifyRecoveryCode(userId: string, recoveryCode: string): Promise<boolean>` -- Verify a single-use recovery code.
-- `regenerateRecoveryCodes(userId: string, totpCode: string): Promise<string[]>` -- Regenerate recovery codes. Requires a valid TOTP code.
-- `disable(userId: string, code: string): Promise<void>` -- Disable MFA. Accepts either a TOTP code or a recovery code.
-- `isEnabled(userId: string): Promise<boolean>` -- Check if MFA is enabled and verified.
-- `remainingRecoveryCodes(userId: string): Promise<number>` -- Get the count of remaining recovery codes.
-
-#### `TotpSetupResult`
-
-```typescript
-interface TotpSetupResult {
-  secret: string         // Base32-encoded secret (for manual entry)
-  uri: string            // otpauth:// URI for QR code generation
-  recoveryCodes: string[] // Plaintext recovery codes (shown once)
-}
-```
-
-#### Example
-
-```typescript
-const totp = new TotpManager({ issuer: 'MyApp', store: new InMemoryTotpStore() })
-
-// Step 1: Enable (show QR code and recovery codes)
-const setup = await totp.enable('user-123', 'alice@example.com')
-
-// Step 2: Verify setup
+const totp = new TotpManager({ issuer: 'Acme', store: new InMemoryTotpStore() })
+const setup = await totp.enable('user-123', 'alice@example.com') // { secret, uri, recoveryCodes }
 await totp.verifySetup('user-123', '123456')
-
-// Step 3: On login, verify code
-const valid = await totp.verify('user-123', '654321')
 ```
+
+Config: `issuer`, `store`, `digits` (6), `period` (30 s), `algorithm` (`'SHA-1'`), `window` (1),
+`recoveryCodes` (8). Methods: `enable`, `verifySetup`, `verify`, `verifyRecoveryCode`,
+`regenerateRecoveryCodes(userId, totpCode)`, `disable(userId, code)`, `isEnabled`,
+`remainingRecoveryCodes`. A code is accepted once (replay protection); after 5 wrong codes the user
+is locked out with exponential backoff from 30 s to 15 minutes (`TotpLockedError`, `TOTP_LOCKED`).
 
 ### `OrgRoutes`
 
-Server-side route handlers for organization management. Enforces authorization (role checks) and input validation.
+Transport-agnostic organization handlers; every method returns `{ status, body }` and enforces
+membership and roles.
 
 ```typescript
-const orgRoutes = new OrgRoutes({ orgStore: new InMemoryOrgStore() })
+import { InMemoryOrgStore, OrgRoutes } from '@korajs/auth/server'
+
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+const orgRoutes = new OrgRoutes({ orgStore: new InMemoryOrgStore(), userLookup: userStore })
 ```
 
-All methods return `Promise<OrgRouteResponse<T>>`.
+| Method | Requires |
+|--------|----------|
+| `createOrg(userId, { name, slug?, metadata? })` | any user (becomes owner) |
+| `getOrg(userId, orgId)`, `listMembers(userId, orgId)` | membership |
+| `updateOrg(userId, orgId, params)` | admin |
+| `deleteOrg(userId, orgId)`, `transferOwnership(userId, orgId, { newOwnerId })` | owner |
+| `listUserOrgs(userId)` | |
+| `addMember(userId, orgId, { targetUserId, role })`, `updateMemberRole(...)`, `removeMember(userId, orgId, targetUserId)` | admin (or removing oneself) |
+| `createInvitation(userId, orgId, { email, role })`, `revokeInvitation(...)`, `listPendingInvitations(...)` | admin |
+| `acceptInvitation(userId, { token }, identity?)`, `listMyInvitations(userId, identity?)` | the invitee's **verified** email |
 
-#### Organization Methods
+Invitations are matched to the caller's verified email, from `userLookup` (a `UserStore` works) or
+an explicit `identity`; invitee listings never include the token.
 
-- `createOrg(userId, params: { name, slug?, metadata? })` -- Create an org. The caller becomes the owner. Status: 201.
-- `getOrg(userId, orgId)` -- Get an org by ID. Requires membership.
-- `updateOrg(userId, orgId, params: { name?, slug?, metadata? })` -- Update an org. Requires admin+.
-- `deleteOrg(userId, orgId)` -- Delete an org. Requires owner.
-- `listUserOrgs(userId)` -- List all orgs the user belongs to.
+### RBAC
 
-#### Member Methods
-
-- `addMember(userId, orgId, params: { targetUserId, role })` -- Add a member. Requires admin+.
-- `removeMember(userId, orgId, targetUserId)` -- Remove a member. Requires admin+ (or self-removal).
-- `updateMemberRole(userId, orgId, params: { targetUserId, role })` -- Update a member's role. Requires admin+.
-- `listMembers(userId, orgId)` -- List all members. Requires membership.
-- `transferOwnership(userId, orgId, params: { newOwnerId })` -- Transfer ownership. Requires owner.
-
-#### Invitation Methods
-
-- `createInvitation(userId, orgId, params: { email, role })` -- Create an invitation. Requires admin+.
-- `acceptInvitation(userId, params: { token })` -- Accept an invitation by token.
-- `revokeInvitation(userId, orgId, invitationId)` -- Revoke a pending invitation. Requires admin+.
-- `listPendingInvitations(userId, orgId)` -- List pending invitations. Requires admin+.
-- `listMyInvitations(userId, identity?)` -- List invitations addressed to the user's own verified email (resolved server-side via `userLookup`; tokens are never returned).
-
-#### Org Roles
-
-Roles in order of ascending privilege: `viewer`, `billing`, `member`, `admin`, `owner`.
-
-### `RbacEngine`
-
-Permission evaluation engine for role-based access control with role inheritance and wildcard matching.
+`RbacEngine(orgStore, { roles? })`: `hasPermission(userId, orgId, permission)`,
+`getUserPermissions`, `getRolePermissions(role)`, `roleHasPermission`, `registerScopeResolver`,
+`resolveScopes(userId, orgId, collections?)`, `getRoleNames`, `getRoleDefinition`. Permissions are
+`resource:action` strings with `*` wildcards. Built-in roles: `viewer` (`*:read`), `billing`
+(`org:billing`), `member` (`*:write`, `*:delete`, inherits viewer), `admin` (member management,
+settings, invitations, inherits member), `owner` (`*:*`).
 
 ```typescript
-const rbac = new RbacEngine(orgStore)
-// or with custom roles:
-const rbac = new RbacEngine(orgStore, { roles: customRoles })
-```
+import { defineRoles } from '@korajs/auth/server'
 
-#### Methods
-
-- `hasPermission(userId: string, orgId: string, permission: Permission): Promise<boolean>` -- Check if a user has a permission.
-- `getUserPermissions(userId: string, orgId: string): Promise<Permission[]>` -- Get all effective permissions.
-- `getRolePermissions(roleName: string): Permission[]` -- Get permissions for a role (including inherited).
-- `roleHasPermission(roleName: string, permission: Permission): boolean` -- Check if a role has a permission.
-- `registerScopeResolver(collection: string, resolver: CollectionScopeResolver): void` -- Register a custom scope resolver.
-- `resolveScopes(userId: string, orgId: string, collections?: string[]): Promise<SyncScopes | null>` -- Resolve sync scopes.
-- `getRoleNames(): string[]` -- Get all defined role names.
-- `getRoleDefinition(roleName: string): RoleDefinition | null` -- Get a role definition.
-
-#### `defineRoles()`
-
-Builder for defining custom roles with inheritance.
-
-```typescript
 const roles = defineRoles()
   .role('viewer', ['*:read'])
   .role('editor', ['*:write'], { inherits: ['viewer'] })
-  .role('admin', ['org:manage-members'], { inherits: ['editor'] })
   .build()
 ```
 
-#### Permission Format
+`OrgScopeResolver(orgStore, rbac)` builds per-collection scope filters from membership:
+`registerCollectionScope(collection, (ctx) => filter)`, `resolve(userId, orgId, collections)`,
+`canRead`, `canWrite`. Return its result from `resolveScopes` to grant org-scoped sync.
 
-Permissions are strings in the format `resource:action` (e.g., `todos:read`, `*:write`). The `*` wildcard matches any resource or action.
+### OAuth
 
-### `OrgScopeResolver`
+`OAuthManager({ providers, stateStore?, stateTtlMs?, fetch? })` with `googleProvider`,
+`githubProvider` and `microsoftProvider` (`{ clientId, clientSecret?, redirectUri, scopes?, pkce? }`).
+Native public clients use `pkce: true` without `clientSecret`. Durable stores:
+`createSqliteOAuthStores({ filename })` and `createPostgresOAuthStores(...)` return
+`{ stateStore, linkedIdentityStore }`; the in-memory stores are for development.
 
-Resolves sync scopes for org-aware data filtering. Combines org membership with RBAC permissions.
+### Other server modules
 
-```typescript
-const resolver = new OrgScopeResolver(orgStore, rbacEngine)
-```
+| Module | Summary |
+|--------|---------|
+| `PasswordResetManager({ userStore, resetStore?, tokenTtlMs?, maxRequestsPerEmail?, onResetRequested?, exposeTokenForDevelopment? })` | `requestReset(email)` (always succeeds, never returns the token outside development), `resetPassword`, `changePassword`. |
+| `EmailVerificationManager({ userStore, verificationStore?, tokenTtlMs?, maxRequestsPerUser?, onVerificationRequired? })` | `sendVerification`, `verifyEmail(token)`, `resendVerification(userId)`. |
+| `ExternalJwtProvider({ providerName, jwtSecret?, validateToken? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. |
+| `AdminApi({ userStore, sessionStore?, auditLogger?, isAdmin?, revokeAllForUser? })` | `getUser`, `listUsers({ email?, emailVerified?, limit?, offset? })`, `updateUser`, `deleteUser`, `getUserSessions`, `revokeUserSessions`, `revokeSession`, `getStats`. Wire `revokeAllForUser` so admin actions end tokens too. |
+| `AuditLogger` | `log`, `query`, `count`, `purge`, `getUserActivity`, `getFailedLogins`. |
+| `WebhookManager({ store, fetch?, allowPrivateTargets?, resolveHost? })` | `register({ url, events, metadata? })`, `update`, `remove`, `list`, `get`, `getDeliveries`, `dispatch`. |
 
-#### Methods
-
-- `registerCollectionScope(collection: string, resolver: CollectionScopeResolver): void` -- Register a custom scope for a collection.
-- `resolve(userId: string, orgId: string, collections: string[]): Promise<SyncScopes | null>` -- Resolve scopes for all collections.
-- `canWrite(userId: string, orgId: string, collection: string): Promise<boolean>` -- Check write access.
-- `canRead(userId: string, orgId: string, collection: string): Promise<boolean>` -- Check read access.
-
-#### Example
-
-```typescript
-const resolver = new OrgScopeResolver(orgStore, rbacEngine)
-
-// Custom: members only see their own todos
-resolver.registerCollectionScope('todos', (ctx) => {
-  if (ctx.role === 'member') {
-    return { orgId: ctx.orgId, userId: ctx.userId }
-  }
-  return { orgId: ctx.orgId }
-})
-
-const scopes = await resolver.resolve('user-1', 'org-1', ['todos', 'projects'])
-```
-
-### OAuth / Social Login
-
-```typescript
-import {
-  OAuthManager,
-  InMemoryLinkedIdentityStore,
-  InMemoryOAuthStateStore,
-  SqliteLinkedIdentityStore,
-  SqliteOAuthStateStore,
-  PostgresLinkedIdentityStore,
-  PostgresOAuthStateStore,
-  createSqliteOAuthStores,
-  createPostgresOAuthStores,
-  googleProvider,
-  githubProvider,
-  microsoftProvider,
-} from '@korajs/auth/server'
-```
-
-Built-in provider configs for Google, GitHub, and Microsoft. The `OAuthManager` handles the OAuth2 authorization code flow: generating authorization URLs, exchanging codes for tokens, and fetching user info. Most apps should configure OAuth through `createKoraAuthServer({ oauth })` so Kora also creates users, issues Kora tokens, registers devices, and stores linked identities.
-
-For desktop and mobile OAuth, enable PKCE and omit `clientSecret` for public native clients:
-
-```typescript
-const oauth = new OAuthManager({
-  providers: [
-    googleProvider({
-      clientId: process.env.GOOGLE_CLIENT_ID!,
-      redirectUri: 'com.acme.app:/oauth/callback',
-      pkce: true,
-    }),
-  ],
-})
-```
-
-When `pkce: true` is set, authorization URLs include an S256 `code_challenge` and token exchange includes the matching `code_verifier`.
-
-For production, provide durable stores for OAuth state and linked identities. The in-memory stores are for development and tests.
-
-```typescript
-const oauthStores = await createPostgresOAuthStores({
-  connectionString: process.env.DATABASE_URL!,
-})
-
-const auth = createKoraAuthServer({
-  jwtSecret: process.env.KORA_AUTH_SECRET!,
-  oauth: {
-    providers: [googleProvider({ clientId, clientSecret, redirectUri })],
-    stateStore: oauthStores.stateStore,
-    linkedIdentityStore: oauthStores.linkedIdentityStore,
-  },
-})
-```
-
-### Password Reset
-
-```typescript
-import {
-  PasswordResetManager,
-  InMemoryPasswordResetStore,
-} from '@korajs/auth/server'
-```
-
-Manages password reset token generation, validation, and consumption with rate limiting.
-
-### Email Verification
-
-```typescript
-import {
-  EmailVerificationManager,
-  InMemoryEmailVerificationStore,
-} from '@korajs/auth/server'
-```
-
-Manages email verification tokens for confirming user email addresses.
-
-### External Auth Providers
-
-```typescript
-import {
-  ExternalJwtProvider,
-  createClerkAdapter,
-  createSupabaseAdapter,
-} from '@korajs/auth/server'
-```
-
-- `ExternalJwtProvider` -- Validate JWTs from external identity providers.
-- `createClerkAdapter(config)` -- Create a Clerk auth adapter.
-- `createSupabaseAdapter(config)` -- Create a Supabase auth adapter.
-
-### Admin API
-
-```typescript
-import { AdminApi } from '@korajs/auth/server'
-```
-
-Administrative operations for managing users: list, search, update, ban, and delete users. Returns paginated results.
-
-### Audit Logging
-
-```typescript
-import { AuditLogger, InMemoryAuditLogStore } from '@korajs/auth/server'
-```
-
-Structured audit logging for auth events (sign-in, sign-out, password change, MFA enable/disable, etc.).
-
-### Webhooks
-
-```typescript
-import {
-  WebhookManager,
-  InMemoryWebhookStore,
-  verifyWebhookSignature,
-} from '@korajs/auth/server'
-```
-
-Register webhook endpoints and receive notifications for auth events. Endpoints must be `https` URLs that resolve to public addresses (loopback, private and link-local targets are refused; `allowPrivateTargets: true` relaxes this for local development).
-
-Each delivery carries `X-Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">` and `X-Webhook-Timestamp`. Verify with `verifyWebhookSignature(rawBody, signatureHeader, secret, { toleranceSeconds })` (default tolerance 300 s), which rejects replays of old deliveries. The pre-beta.13 `sha256=<hex>` format is no longer produced or accepted.
-
-### JWT Utilities
-
-```typescript
-import { encodeJwt, decodeJwt, verifyJwt, isExpired } from '@korajs/auth/server'
-```
-
-- `encodeJwt(payload, secret): Promise<string>` -- Create a signed JWT.
-- `decodeJwt(token): TokenPayload | null` -- Decode a JWT without verification.
-- `verifyJwt(token, secret): Promise<TokenPayload>` -- Verify and decode a JWT.
-- `isExpired(payload): boolean` -- Check if a JWT payload is expired.
-
-### Password Hashing
-
-```typescript
-import { hashPassword, verifyPassword } from '@korajs/auth/server'
-```
-
-- `hashPassword(password: string): Promise<string>` -- Hash a password using PBKDF2.
-- `verifyPassword(password: string, hash: string): Promise<boolean>` -- Verify a password against a hash.
+Webhook endpoints must be `https` URLs resolving to public addresses (`allowPrivateTargets: true`
+relaxes this for development; refused targets throw `WebhookTargetError`). Each delivery carries
+`X-Webhook-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`; verify it with
+`verifyWebhookSignature(rawBody, header, secret, { toleranceSeconds })` (default 300 s). The
+`sha256=<hex>` format of Kora 1.0.0-beta.12 and earlier is neither produced nor accepted.
 
 ---
 
 ## Types
 
-### Shared Types (from `@korajs/auth`)
-
+<!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
-type AuthState = 'loading' | 'authenticated' | 'unauthenticated'
-
-interface AuthUser {
-  id: string
-  email: string
-  name: string | null
-}
-
-interface AuthTokens {
-  accessToken: string
-  refreshToken: string
-}
-
-type TokenType = 'access' | 'refresh'
+interface AuthUser { id: string; email: string; name: string | null }
+interface AuthTokens { accessToken: string; refreshToken: string }
+type TokenType = 'access' | 'refresh' | 'device_credential'
 
 interface TokenPayload {
-  sub: string          // User ID
+  jti: string
+  sub: string        // user id
+  dev: string        // device id
   type: TokenType
-  iat: number          // Issued at (seconds)
-  exp: number          // Expiry (seconds)
-  jti: string          // Token ID
-  iss?: string         // Issuer
-  [key: string]: unknown
+  iat: number        // seconds
+  exp: number        // seconds
+  fam?: string       // refresh-token family
+  iatMs?: number
+  amr?: string[]     // authentication methods, e.g. ['pwd', 'otp']
 }
 
-type AuthEventType =
-  | 'signUp'
-  | 'signIn'
-  | 'signOut'
-  | 'tokenRefresh'
-  | 'sessionExpired'
-
-interface AuthEvent {
-  type: AuthEventType
-  userId?: string
-  timestamp: number
-}
-```
-
-### Organization Types (from `@korajs/auth/server`)
-
-```typescript
 type OrgRole = 'owner' | 'admin' | 'member' | 'viewer' | 'billing'
-
-interface Organization {
-  id: string
-  name: string
-  slug: string
-  ownerId: string
-  createdAt: number
-  updatedAt: number
-  metadata?: Record<string, unknown>
-}
-
-interface Membership {
-  orgId: string
-  userId: string
-  role: OrgRole
-  joinedAt: number
-  invitedBy: string | null
-}
-
-interface OrgInvitation {
-  id: string
-  orgId: string
-  email: string
-  role: OrgRole
-  token: string
-  status: InvitationStatus
-  invitedBy: string
-  createdAt: number
-  expiresAt: number
-}
-
 type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired'
-```
-
-### RBAC Types (from `@korajs/auth/server`)
-
-```typescript
-type Permission = string  // Format: "resource:action" (e.g., "todos:read", "*:write")
-
-interface RoleDefinition {
-  name: string
-  permissions: Permission[]
-  inherits?: string[]
-}
-
-interface ScopeFilter {
-  orgId?: string
-  userId?: string
-  __readonly?: boolean
-  [key: string]: unknown
-}
-
+type Permission = `${string}:${string}`  // 'resource:action'
 type SyncScopes = Record<string, ScopeFilter>
-
-interface ScopeContext {
-  userId: string
-  orgId: string
-  role: string
-  permissions: Permission[]
-}
-
+interface ScopeContext { userId: string; orgId: string; role: string; permissions: Permission[] }
 type CollectionScopeResolver = (ctx: ScopeContext) => ScopeFilter | null
 ```
 
-### Error Classes
+`AuthEvent` (`auth:signed-in`, `auth:signed-out`, `auth:locked`, `auth:unlocked`,
+`auth:token-refreshed`, `auth:device-revoked`, `auth:permission-changed`) is declared but not
+emitted; observe `onAuthChange` and `onSessionChange` instead.
 
-All errors extend `KoraError` from `@korajs/core`.
+## Errors
 
-| Error | Code | Entry Point |
-|-------|------|-------------|
-| `AuthError` | varies | `@korajs/auth` |
-| `OrgClientError` | varies | `@korajs/auth` |
-| `DeviceIdentityError` | `DEVICE_IDENTITY_ERROR` | `@korajs/auth` |
-| `CryptoUnavailableError` | `CRYPTO_UNAVAILABLE` | `@korajs/auth` |
-| `DeviceKeyStoreError` | `DEVICE_KEY_STORE_ERROR` | `@korajs/auth` |
-| `EncryptedTokenStoreError` | varies | `@korajs/auth` |
-| `PasskeyError` | `PASSKEY_ERROR` | `@korajs/auth` |
-| `PasskeyUnsupportedError` | `PASSKEY_UNSUPPORTED` | `@korajs/auth` |
-| `EncryptionError` | `ENCRYPTION_ERROR` | `@korajs/auth` |
-| `KeyDerivationError` | `KEY_DERIVATION_ERROR` | `@korajs/auth` |
-| `OperationEncryptionError` | `OPERATION_ENCRYPTION_ERROR` | `@korajs/auth` |
-| `PasskeyVerificationError` | `PASSKEY_VERIFICATION_ERROR` | `@korajs/auth/server` |
-| `SessionError` | varies | `@korajs/auth/server` |
-| `SessionNotFoundError` | `SESSION_NOT_FOUND` | `@korajs/auth/server` |
-| `SessionExpiredError` | `SESSION_EXPIRED` | `@korajs/auth/server` |
-| `SessionLimitExceededError` | `SESSION_LIMIT_EXCEEDED` | `@korajs/auth/server` |
-| `SessionMfaRequiredError` | `SESSION_MFA_REQUIRED` | `@korajs/auth/server` |
-| `TotpError` | varies | `@korajs/auth/server` |
-| `TotpInvalidCodeError` | `TOTP_INVALID_CODE` | `@korajs/auth/server` |
-| `TotpNotEnabledError` | `TOTP_NOT_ENABLED` | `@korajs/auth/server` |
-| `TotpAlreadyEnabledError` | `TOTP_ALREADY_ENABLED` | `@korajs/auth/server` |
-| `TotpNotVerifiedError` | `TOTP_NOT_VERIFIED` | `@korajs/auth/server` |
-| `TotpRecoveryExhaustedError` | `TOTP_RECOVERY_EXHAUSTED` | `@korajs/auth/server` |
-| `OrgError` | varies | `@korajs/auth/server` |
-| `OrgNotFoundError` | `ORG_NOT_FOUND` | `@korajs/auth/server` |
-| `OrgSlugTakenError` | `ORG_SLUG_TAKEN` | `@korajs/auth/server` |
-| `MembershipNotFoundError` | `MEMBERSHIP_NOT_FOUND` | `@korajs/auth/server` |
-| `MemberAlreadyExistsError` | `MEMBER_ALREADY_EXISTS` | `@korajs/auth/server` |
-| `InsufficientRoleError` | `INSUFFICIENT_ROLE` | `@korajs/auth/server` |
-| `CannotRemoveOwnerError` | `CANNOT_REMOVE_OWNER` | `@korajs/auth/server` |
-| `InvitationNotFoundError` | `INVITATION_NOT_FOUND` | `@korajs/auth/server` |
-| `InvitationExpiredError` | `INVITATION_EXPIRED` | `@korajs/auth/server` |
-| `RbacError` | varies | `@korajs/auth/server` |
-| `RoleNotFoundError` | `ROLE_NOT_FOUND` | `@korajs/auth/server` |
-| `CircularInheritanceError` | `CIRCULAR_INHERITANCE` | `@korajs/auth/server` |
-| `OAuthError` | varies | `@korajs/auth/server` |
-| `PasswordResetError` | varies | `@korajs/auth/server` |
-| `EmailVerificationError` | varies | `@korajs/auth/server` |
-| `AdminApiError` | varies | `@korajs/auth/server` |
-| `WebhookError` | varies | `@korajs/auth/server` |
+Every error extends `KoraError`. The [Error Codes reference](/api/errors#auth) gives cause and fix
+for each code.
+
+| Client (`@korajs/auth`) | Code |
+|-------------------------|------|
+| `AuthError` | varies; `MfaRequiredError` is `AUTH_MFA_REQUIRED` |
+| `AuthDeviceIdentityError` | `AUTH_DEVICE_IDENTITY_ERROR` |
+| `DeviceIdentityError`, `DeviceKeyStoreError`, `CryptoUnavailableError` | `DEVICE_IDENTITY_ERROR`, `DEVICE_KEY_STORE_ERROR`, `CRYPTO_UNAVAILABLE` |
+| `EncryptedTokenStoreError`, `EncryptionError`, `KeyDerivationError`, `OperationEncryptionError` | `ENCRYPTED_TOKEN_STORE_ERROR`, `ENCRYPTION_ERROR`, `KEY_DERIVATION_ERROR`, `OPERATION_ENCRYPTION_ERROR` |
+| `PasskeyError`, `PasskeyUnsupportedError` | `PASSKEY_ERROR`, `PASSKEY_UNSUPPORTED` |
+| `OrgClientError` | the server's code |
+
+| Server (`@korajs/auth/server`) | Codes |
+|--------------------------------|-------|
+| `InMemoryAuthStoreError` | `IN_MEMORY_AUTH_STORE` |
+| `DuplicateEmailError`, `DeviceOwnershipError` | `DUPLICATE_EMAIL`, `DEVICE_OWNERSHIP_CONFLICT` |
+| `PasskeyVerificationError` | `PASSKEY_VERIFICATION_ERROR` |
+| Session errors | `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `SESSION_LIMIT_EXCEEDED`, `SESSION_MFA_REQUIRED` |
+| TOTP errors | `TOTP_INVALID_CODE`, `TOTP_LOCKED`, `TOTP_NOT_ENABLED`, `TOTP_ALREADY_ENABLED`, `TOTP_NOT_VERIFIED`, `TOTP_RECOVERY_EXHAUSTED` |
+| Organization errors | `ORG_NOT_FOUND`, `ORG_SLUG_TAKEN`, `MEMBERSHIP_NOT_FOUND`, `MEMBER_ALREADY_EXISTS`, `INSUFFICIENT_ROLE`, `CANNOT_REMOVE_OWNER`, `INVITATION_NOT_FOUND`, `INVITATION_EXPIRED` |
+| RBAC errors | `INVALID_PERMISSION`, `ROLE_NOT_FOUND`, `CIRCULAR_INHERITANCE` |
+| OAuth errors | `OAUTH_STATE_MISMATCH`, `OAUTH_CODE_EXCHANGE_FAILED`, `OAUTH_USER_INFO_FAILED`, `OAUTH_PROVIDER_NOT_FOUND`, `DUPLICATE_LINKED_IDENTITY` |
+| Reset and verification | `RESET_TOKEN_EXPIRED`, `RESET_TOKEN_NOT_FOUND`, `RESET_RATE_LIMITED`, `VERIFICATION_TOKEN_EXPIRED`, `VERIFICATION_TOKEN_NOT_FOUND` |
+| External providers | `AUTH_EXTERNAL_TOKEN_INVALID`, `AUTH_EXTERNAL_OPERATION_NOT_SUPPORTED` |
+| Admin and webhooks | `ADMIN_USER_NOT_FOUND`, `ADMIN_UNAUTHORIZED`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED` |

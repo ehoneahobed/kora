@@ -17,7 +17,7 @@
  * Asserts the CORRECT behaviour (fails at 959b791): the late child is deleted.
  *
  * Round 2 (RT-71): the attacker speaks protocol 2, as the finding states. A protocol-1
- * (beta.13) session may store an undeclared id it cannot verify (beta.13 hashed
+ * (beta.12) session may store an undeclared id it cannot verify (beta.12 hashed
  * `undefined` members as `null`), so the second test pins what still protects that
  * path: server-derived ids are keyed, so the squat lands on no derived id and the
  * late child is still deleted.

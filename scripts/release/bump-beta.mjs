@@ -66,6 +66,22 @@ for (const dir of dirs) {
 	bumped.push({ name: pkg.name, from: pkg.version, to: next, base })
 }
 
+// The tauri-react template pins @korajs/tauri, which is on its own version line, through a
+// constant in the CLI (packages/cli/src/templates/tauri-version.ts). Keep it equal to the
+// bumped package so a scaffolded desktop app installs a version that exists.
+const tauri = bumped.find((p) => p.name === '@korajs/tauri')
+if (tauri) {
+	const constPath = join('packages', 'cli', 'src', 'templates', 'tauri-version.ts')
+	const source = readFileSync(constPath, 'utf8')
+	const CONST_LINE = /(KORA_TAURI_TEMPLATE_VERSION = ')([^']+)(')/
+	if (!CONST_LINE.test(source)) {
+		throw new Error(`Failed to find KORA_TAURI_TEMPLATE_VERSION in ${constPath}`)
+	}
+	if (!dryRun) {
+		writeFileSync(constPath, source.replace(CONST_LINE, `$1${tauri.to}$3`))
+	}
+}
+
 // Safety: the changeset "linked" group is meant to share one version. Read the
 // group from config and warn if its members drifted onto different bases, so a
 // human looks before publishing. Packages outside the group (for example

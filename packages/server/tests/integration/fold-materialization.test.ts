@@ -7,7 +7,7 @@
  * - SRV-1 server half: concurrent array / object / resolver edits materialize to the
  *   values every client folds to.
  * - Legacy duplicate pairs (Phase 2, RT-37) both fold.
- * - Re-materialization migration from a beta.12/beta.13-era database (no fold table,
+ * - Re-materialization migration from a beta.12-era database (no fold table,
  *   replay-materialized rows): idempotent, resumable, gated on the log-integrity scan.
  * - Rolling upgrade: operations appended without folding are caught up.
  *

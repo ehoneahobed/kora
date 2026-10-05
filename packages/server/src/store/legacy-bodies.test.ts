@@ -11,7 +11,7 @@ import type { ServerStore } from './server-store'
 import { SqliteServerStore } from './sqlite-server-store'
 
 /**
- * RT-85: the fold has no legacy clear rule, so the beta.13 clears a beta.13 server stored
+ * RT-85: the fold has no legacy clear rule, so the beta.12 clears a beta.12 (or older) server stored
  * (JSON without the cleared member) are made explicit once, when the id proves them. A
  * body an earlier release rewrote (a schema-transformed copy) proves nothing and keeps
  * folding as written.
@@ -21,7 +21,7 @@ const schema = defineSchema({
 	collections: { notes: { fields: { title: t.string(), assignee: t.string().optional() } } },
 })
 
-/** A beta.13 log: two inserts, a proven clear on n1, and a rewritten copy on n2. */
+/** A beta.12 log: two inserts, a proven clear on n1, and a rewritten copy on n2. */
 async function legacyOps(): Promise<Record<string, Operation>> {
 	const at = (wallTime: number) => ({ wallTime, logical: 0, nodeId: 'b13' })
 	const base = { nodeId: 'b13', collection: 'notes', causalDeps: [], schemaVersion: 1 }
@@ -71,7 +71,7 @@ async function exercise(open: () => Promise<{ store: ServerStore; reset: () => P
 	for (const key of ['insert', 'insert2', 'proven', 'rewritten']) {
 		await store.applyRemoteOperation(ops[key] as Operation)
 	}
-	// What an upgraded beta.13 database holds: the marker is absent.
+	// What an upgraded beta.12 database holds: the marker is absent.
 	await reset()
 	await store.setSchema(schema)
 	expect(await store.findRecord('notes', 'n1')).toMatchObject({ title: 'y', assignee: null })
@@ -86,7 +86,7 @@ async function exercise(open: () => Promise<{ store: ServerStore; reset: () => P
 	})
 }
 
-describe('legacy beta.13 clears made explicit once on the server (RT-85)', () => {
+describe('legacy beta.12 clears made explicit once on the server (RT-85)', () => {
 	test('SQLite', async () => {
 		const sqlite = new Database(':memory:')
 		await exercise(async () => ({

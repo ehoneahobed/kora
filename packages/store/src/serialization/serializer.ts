@@ -222,6 +222,31 @@ export function deserializeOperationWithCollection(
 	return { ...op, collection }
 }
 
+/**
+ * The read form of record-shaped values the developer wrote: a richtext field written
+ * as a string or ArrayBuffer is returned as the Yjs bytes it is stored (and read back)
+ * as, so `insert()` / `update()` (and their transaction previews) return the same
+ * value shape as `findById()` and queries. Other fields are returned as given.
+ *
+ * @param data - Record-shaped values (validated, at rest)
+ * @param fields - The collection's field descriptors
+ * @returns `data`, or a copy with richtext values in their read form
+ */
+export function toRichtextReadShape(
+	data: Record<string, unknown>,
+	fields: Record<string, FieldDescriptor>,
+): Record<string, unknown> {
+	let out = data
+	for (const [name, descriptor] of Object.entries(fields)) {
+		if (descriptor.kind !== 'richtext' || !(name in data)) continue
+		const value = data[name]
+		if (value === null || value === undefined || value instanceof Uint8Array) continue
+		if (out === data) out = { ...data }
+		out[name] = encodeRichtext(value as Parameters<typeof encodeRichtext>[0])
+	}
+	return out
+}
+
 function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 	if (value === null || value === undefined) {
 		return null
@@ -252,9 +277,9 @@ function serializeValue(value: unknown, descriptor: FieldDescriptor): unknown {
 
 /**
  * Field kinds whose column holds the raw string (the stored-text codec applies). Not
- * `enum`: its column has a `CHECK (col IN (...))` of the schema's literal values, so it
- * must hold them verbatim (an enum value SQL text cannot express is already refused by
- * the DDL).
+ * `enum`: its column holds the schema's literal values verbatim; an enum value SQL text
+ * cannot store exactly (U+0000, U+FFFF, a lone surrogate) is refused by `t.enum()` itself
+ * (the table no longer has a `CHECK`, RT-101).
  */
 const RAW_TEXT_KINDS: ReadonlySet<string> = new Set(['string', 'secret'])
 

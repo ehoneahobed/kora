@@ -37,7 +37,7 @@ packages/
   test/                     # @korajs/test - Cross-package convergence test utilities
 ```
 
-**Spec vs. source:** where this document and the shipped source disagree, the source is authoritative for behavior and this document must be updated, not the other way around. Two divergences were reconciled in July 2026: scaffolding uses bundled templates rather than giget, and the IndexedDB fallback is a hand-written adapter rather than the `idb` library.
+**Spec vs. source:** where this document and the shipped source disagree, the source is authoritative for behavior and this document must be updated, not the other way around. Two divergences were reconciled in July 2026: scaffolding uses bundled templates rather than giget, and the IndexedDB fallback is a hand-written adapter rather than the `idb` library. The 1.0.0-beta.13 remediation (October 2026, `remediation/BETA13-RELEASE-NOTES.md`) reconciled the rest: per-field merging is one deterministic CRDT fold in `@korajs/core` (arrays are multisets, resolvers fold in HLC order) and `@korajs/merge` keeps the cross-record constraints; the sync server grants scopes and verifies every operation id; the wire format is JSON (protobuf is an explicit opt-in); downloads follow a gap-free delivery watermark and unappliable operations are quarantined, never dropped; OPFS databases use SQLite's rollback journal, not WAL (the `opfs-sahpool` VFS has no shared memory); a drifting clock is reported, never write-blocking; and `useQuery` renders `[]` before its first local result. The sections below describe the shipped behavior.
 
 ---
 
@@ -92,7 +92,7 @@ These decisions are locked. Do not deviate or substitute.
 | Runtime | Node.js 20+ | LTS |
 | WebSocket | `ws` | Lightest Node.js WebSocket implementation |
 | Database ORM | `drizzle-orm` | TypeScript-native. Supports Postgres, MySQL, SQLite |
-| Wire format | `protobufjs` | Compact binary encoding for sync protocol |
+| Wire format | JSON (default); `protobufjs` | Clients speak JSON. `ProtobufMessageSerializer` is a lossless, explicit opt-in on both ends of a transport you control (not negotiated) |
 
 ### CLI and DevTools
 
@@ -111,10 +111,15 @@ These decisions are locked. Do not deviate or substitute.
 @korajs/store      -> @korajs/core
 @korajs/merge      -> @korajs/core
 @korajs/sync       -> @korajs/core, @korajs/merge
-@korajs/server     -> @korajs/core, @korajs/sync
+@korajs/server     -> @korajs/core, @korajs/merge, @korajs/sync
 @korajs/react      -> @korajs/core, @korajs/store, @korajs/sync
+@korajs/vue        -> @korajs/core, @korajs/store, @korajs/sync
+@korajs/svelte     -> @korajs/core, @korajs/store, @korajs/sync
+@korajs/auth       -> @korajs/core
+@korajs/tauri      -> @korajs/core
 @korajs/devtools   -> @korajs/core
-@korajs/cli        -> (all packages, dev dependency)
+@korajs/cli        -> @korajs/core (other packages as dev dependencies, for templates and tests)
+@korajs/test       -> @korajs/core, @korajs/merge, @korajs/store, @korajs/sync, @korajs/server, korajs
 ```
 
 **Strict rules:**
@@ -275,7 +280,12 @@ Every mutation produces an Operation. This is the most important type in the cod
 
 ```typescript
 interface Operation {
-  /** SHA-256 hash of (type + collection + recordId + data + timestamp + nodeId). Content-addressed. */
+  /**
+   * SHA-256 content hash of the canonical body. hashVersion 2 (protocol v2, the default) covers
+   * type, collection, recordId, data, previousData, timestamp, nodeId, sequenceNumber, causalDeps,
+   * schemaVersion and atomicOps. The server refuses an upload whose id does not match
+   * (INVALID_OPERATION_ID) and a reused id with different content (FORGED_DUPLICATE).
+   */
   id: string
 
   /** UUID v7 of the originating device. Time-sortable. */
@@ -307,6 +317,18 @@ interface Operation {
 
   /** Schema version at time of creation. Used for migration transforms. */
   schemaVersion: number
+
+  /** Content-hash version of `id` (absent = 1, beta.12 and earlier). */
+  hashVersion?: 1 | 2
+
+  /** Atomic intents (`op.increment`, `op.append`, ...) for fields in `data`. */
+  atomicOps?: Record<string, AtomicOp>
+
+  /** End-to-end encryption envelope; `data`/`previousData`/`atomicOps` travel only inside it. */
+  encrypted?: EncryptedOperationEnvelope
+
+  // Unhashed, server-authored or local metadata: transactionId, mutationName, fieldVersions,
+  // foldState (see packages/core/src/types.ts).
 }
 
 interface HLCTimestamp {
@@ -328,6 +350,8 @@ interface HLCTimestamp {
 - The operation log is APPEND-ONLY. Operations are never removed (except by compaction, which is a separate, explicit process).
 - For updates, `data` contains ONLY the fields that changed, not the full record. This enables field-level merging.
 - `previousData` is required for updates because it enables 3-way merge (base, local, remote).
+- An update whose value equals its own `previousData` is not a write for last-write-wins.
+- Values must have a canonical JSON form: `Map`, `Set`, class instances, `NaN` and cycles are refused (`NON_CANONICAL_VALUE`); `update(id, { field: undefined })` clears the field.
 
 ### Hybrid Logical Clock (HLC)
 
@@ -390,7 +414,9 @@ class HybridLogicalClock {
 **HLC Rules:**
 - NEVER use `Date.now()` directly for ordering. Always go through the HLC.
 - The HLC must be monotonic: each call to `now()` returns a timestamp strictly greater than the previous one.
-- Protect against clock drift: if `Date.now()` returns a value more than 60 seconds behind the current HLC wallTime, log a warning. If more than 5 minutes behind, refuse to generate timestamps (this indicates a severe clock issue).
+- Clock drift is reported, never write-blocking: if `Date.now()` is more than 60 seconds behind the HLC wallTime the clock calls `onDriftWarning`, more than 5 minutes `onDriftError`, and `now()` keeps issuing monotonic timestamps (wall time frozen, logical counter advancing). The user's data outranks the quality of its timestamps.
+- `receive()` validates a remote timestamp before adopting it: non-integer or negative fields, or `logical > MAX_LOGICAL` (99,999), throw `InvalidTimestampError`; more than 5 minutes ahead of reference-corrected time throws `RemoteClockDriftError`. Such operations are quarantined, not dropped.
+- The sync server refuses operations stamped more than 60 seconds ahead of server time (`INVALID_TIMESTAMP`); a device whose clock is more than 60 seconds fast pauses sync (`clock-error`) and re-stamps its queued writes once the clock is corrected.
 
 ### Version Vectors
 
@@ -477,6 +503,8 @@ export default defineSchema({
 
 This is the most critical component. The merge engine determines what happens when concurrent operations modify the same data.
 
+Every replica (device, server, restored backup) computes a record with one deterministic per-field CRDT fold: `foldRecord` / `mergeOp` in `@korajs/core` (`packages/core/src/fold/`). A record depends only on the SET of operations a replica holds, never on their arrival order. `@korajs/merge` holds the cross-record constraint and referential checks; its pairwise `MergeEngine` and `addWinsSet` are deprecated and back only `createApp({ experimental: { legacyMerge: true } })` for 1.0.0-beta.13.
+
 **Tier 1: Auto-Merge (Default for all fields)**
 
 ```
@@ -486,9 +514,15 @@ number         -> LWW
 boolean        -> LWW
 enum           -> LWW
 timestamp      -> LWW
-array          -> Add-wins set (union of elements)
+array          -> Element multiset merged per occurrence (duplicates kept, order of first addition;
+                  a removal beats a device that merely kept the element)
+object / json  -> Per top-level key LWW (nested values replaced whole)
 richtext       -> Yjs Y.Text CRDT (character-level merge)
+.merge(...)    -> 'counter' | 'max' | 'min' | 'append-only' | 'server-authoritative', each a fold
+                  over every write (three or more concurrent writers never lose an update)
 ```
+
+Insert onto an existing record merges per field. Delete vs update: the later of the newest delete and the newest write decides. Schema transforms run at fold time on the operation's view; operations are stored and synced exactly as written.
 
 LWW implementation:
 ```typescript
@@ -506,7 +540,7 @@ function lastWriteWins<T>(
 
 **Tier 2: Constraint Validation**
 
-After auto-merge produces a result, check constraints declared in the schema. If violated, apply the constraint's `onConflict` strategy.
+After auto-merge produces a result, check constraints declared in the schema. If violated, apply the constraint's `onConflict` strategy. Cross-record constraints are decided by the sync server (refusal at ingest, then corrections); devices only check them optimistically.
 
 ```typescript
 interface Constraint {
@@ -528,7 +562,7 @@ Constraint evaluation flow:
 
 **Tier 3: Custom Resolvers**
 
-For fields where neither auto-merge nor declarative constraints suffice:
+For fields where neither auto-merge nor declarative constraints suffice. A resolver is called once per write, in HLC order, with `local` = the value merged so far, `remote` = the write's value and `base` = the write's `previousData`, so it need not be commutative; a throwing resolver (or one returning a value with no JSON form) falls back to the write's value and is reported on the trace:
 
 ```typescript
 // Developer writes:
@@ -554,7 +588,7 @@ const schema = defineSchema({
 
 **Merge engine rules:**
 - DETERMINISTIC: Given the same set of operations, every node must produce the identical merged state. Test this with property-based tests.
-- COMMUTATIVE: merge(A, B) must equal merge(B, A). Test this exhaustively.
+- ORDER-INDEPENDENT: folding operations in any arrival order gives the same record (the fold is commutative, associative and idempotent over the operation set). Test this exhaustively.
 - IDEMPOTENT: Applying the same operation twice must produce the same result as applying it once.
 - Every merge decision must be loggable. Create a MergeTrace type that records: the conflicting operations, the strategy applied, the input values, and the output value. This feeds DevTools.
 
@@ -587,7 +621,7 @@ If subscription checking becomes a bottleneck, implement bloom filter-based depe
 
 ### Sync Protocol
 
-The sync protocol runs over any transport (WebSocket, HTTP, Bluetooth, etc.). It speaks in Protocol Buffers messages.
+The sync protocol (protocol v2 since 1.0.0-beta.13; beta.12 clients speak protocol 1, accepted with a deprecation warning for beta.13 only) runs over any transport (WebSocket, HTTP long-polling, etc.). Messages are JSON. `ProtobufMessageSerializer` (protobufjs) is lossless but not negotiated: it is an explicit choice on both ends of a transport you control. HTTP long-poll sessions are bound to the user by a server-issued `x-kora-session` id. Reference: `docs/guide/sync-protocol.md`.
 
 **Sync flow:**
 
@@ -612,11 +646,15 @@ Client                                    Server
 ```
 
 **Sync rules:**
+- The SERVER IS THE TRUST BOUNDARY. Nothing is accepted before the authenticated handshake (`HANDSHAKE_REQUIRED`). Scopes are granted by the server from verified identity; the client's scope and query views can only narrow them. Operations must come from the session's own node (`NODE_ID_MISMATCH`), node ids are claimed per user, ids are verified, and writes are authorized against the stored and resulting record, never client-sent `previousData`. Revocation ends live sessions on every instance.
 - Operations are sent in CAUSAL ORDER. Dependencies before dependents. (Server-to-client delivery order is the server-assigned delivery sequence, which is assigned in commit order and therefore respects causal order: a dependency is always committed, and thus sequenced, before its dependent.)
 - The protocol is IDEMPOTENT. Receiving the same operation twice is a no-op (content-addressing catches duplicates).
 - The protocol is RESUMABLE and GAP-FREE server-to-client. Every stored operation carries a monotonic delivery sequence; each client tracks a durable **delivery watermark** (the highest delivery sequence up to which it has applied every in-scope operation with no gap). Server-to-client batches chain `baseDeliverySequence -> maxDeliverySequence`; the client applies a batch only when its watermark equals the base and advances only on full apply, so a dropped or failed operation stalls the watermark and is re-sent, never skipped. This closes both the version-vector gap (a later op advancing the vector past a dropped one) and the resume-cursor skip (a retriable apply failure skipping an op). The version vector remains authoritative for the client-to-server direction and local dedup. See `docs/design/durable-delivery.md`.
 - Initial sync (new client) receives all operations matching its sync scope, resumed from the client's delivery watermark (0 on first sync). For large datasets, this is paginated in batches with `is_final` flag on the last batch.
-- Outbound queue persists to local storage. Operations survive page refresh and are sent when connection is re-established.
+- Outbound queue persists to local storage. Operations survive page refresh and are sent when connection is re-established. Nothing is uploaded before it is durable on the device, and an operation counts as synced only when the server acknowledged it (a contiguous "stored on the server" prefix per node).
+- NOTHING IS SILENTLY DROPPED. An operation the device cannot apply yet (unknown collection, failed decrypt, far-future timestamp, a missing transform) goes to a durable quarantine and is replayed; a possibly transient failure stalls delivery (`sync:apply-blocked`). A permanently refused upload is never re-sent and is undone on its author (`sync:operation-rejected`).
+- Writes belong to the user who made them: writes made before the app knew the signed-in user are held (`app.sync.assignHeld` / `discardHeld`, or `sync.unassignedWrites`).
+- The server bounds every session: message, batch and operation size limits, rate limits, heartbeats, `maxConnections`.
 
 ### Storage Adapter Interface
 
@@ -639,6 +677,12 @@ interface StorageAdapter {
 
   /** Apply a schema migration */
   migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
+
+  /** Optional: post-open state (backend, durability, journalMode) */
+  getStorageOpenState?(): StorageOpenState | null
+
+  /** Optional durability barrier; required for adapters that persist asynchronously */
+  ensureDurable?(): Promise<void>
 }
 
 interface Transaction {
@@ -649,15 +693,16 @@ interface Transaction {
 
 **Implementation priority:**
 1. SQLite WASM with OPFS (primary, implement first)
-2. IndexedDB via the hand-written adapter (fallback, implement second)
+2. IndexedDB via the hand-written adapter (fallback, implement second): SQLite WASM in memory, persisted to IndexedDB, with `ensureDurable()` as the barrier before upload
 3. Native SQLite via `better-sqlite3` (server-side and Electron, implement third)
 
 **SQLite WASM initialization:**
 - Load SQLite WASM lazily (not on page load). Initialize on first database interaction.
-- Use OPFS SyncAccessHandle Pool VFS (`opfs-sahpool`) for persistence.
-- Run SQLite in a Web Worker to avoid blocking the main thread.
-- If OPFS is unavailable (rare in 2026 but possible), fall back to IndexedDB with a console warning.
-- Set WAL mode for better concurrent read/write performance: `PRAGMA journal_mode=WAL`
+- Use OPFS SyncAccessHandle Pool VFS (`opfs-sahpool`) for persistence, one pool per database, held under a Web Lock by the worker that installed it.
+- Run SQLite in a Web Worker to avoid blocking the main thread. Multi-tab: one leader tab owns the worker; followers relay requests to it, and a hung or frozen leader is replaced.
+- If OPFS is unavailable (rare in 2026 but possible), fall back to IndexedDB and emit `store:storage-fallback`. Never run in memory silently: with no durable storage, emit `store:durability-lost` and refuse writes (`StorageDurabilityError`) unless `store.allowNonDurable` is set.
+- Do NOT set WAL on OPFS: WAL needs shared-memory VFS methods that `opfs-sahpool` does not implement, so the pragma is a silent no-op. OPFS databases use SQLite's rollback journal (`journal_mode = delete`); the IndexedDB fallback runs with `memory`; native SQLite (`better-sqlite3`) uses WAL. The adapter reports the mode it got as `journalMode`.
+- Request persistent storage (`navigator.storage.persist()`) in the background only, never on the `app.ready` path (`app.storage.persistence`).
 
 ---
 
@@ -685,11 +730,13 @@ const app = createApp({
   })
 })
 
-// With sync (add one line to enable)
+// With sync (one option; Kora connects on its own only with autoConnect,
+// otherwise call `await app.sync?.connect()` after `app.ready`)
 const app = createApp({
   schema,
   sync: {
-    url: 'wss://my-server.com/kora'
+    url: 'wss://my-server.com/kora',
+    autoConnect: true
   }
 })
 
@@ -703,13 +750,13 @@ const app = createApp({
   sync: {
     url: 'wss://my-server.com/kora',
     transport: 'websocket',     // or 'http'
+    autoConnect: true,
     auth: async () => ({ token: await getAuthToken() }),
-    scopes: {
-      todos: (ctx) => ({ where: { userId: ctx.userId } }),
-    },
+    // or: authClient: createKoraAuthSync({ authClient, schema }) from @korajs/auth
+    scope: { orgId: 'org-123' }, // can only NARROW the scopes the server grants
     encryption: {
       enabled: true,
-      key: 'user-passphrase'    // or keyProvider function
+      key: 'user-passphrase'    // or an async provider; or app.encryption.unlock(passphrase)
     }
   },
   devtools: process.env.NODE_ENV === 'development'
@@ -778,7 +825,8 @@ function App() {
 // Query hook (reactive, re-renders on data change)
 function TodoList() {
   const todos = useQuery(app.todos.where({ completed: false }).orderBy('createdAt'))
-  // todos is always up-to-date. No loading states for local data.
+  // [] on the very first render, then the local rows; useQueryState() returns
+  // { data, error, ready } when "loading" and "no rows" must differ.
 
   return todos.map(todo => <TodoItem key={todo.id} todo={todo} />)
 }
@@ -786,9 +834,10 @@ function TodoList() {
 // Mutation hook
 function AddTodo() {
   const addTodo = useMutation(app.todos.insert)
+  // { mutate, mutateAsync, isLoading, error, reset }
 
   return (
-    <button onClick={() => addTodo({ title: 'New todo' })}>
+    <button onClick={() => addTodo.mutate({ title: 'New todo' })}>
       Add
     </button>
   )
@@ -797,15 +846,18 @@ function AddTodo() {
 // Sync status
 function SyncIndicator() {
   const status = useSyncStatus()
-  // status: 'connected' | 'syncing' | 'synced' | 'offline' | 'error'
-  // Also: status.pendingOperations (number), status.lastSyncedAt (timestamp)
+  // status.status: 'connected' | 'reconnecting' | 'syncing' | 'synced' | 'offline' | 'clock-error'
+  //   | 'error' | 'schema-mismatch' | 'auth-required' | 'encryption-locked'
+  // Also: status.pendingOperations (number), status.lastSyncedAt (timestamp), heldOperations, ...
 }
+
+// Typed hooks: const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
 ```
 
 **React hook rules:**
-- `useQuery` returns data synchronously (from local store). No loading spinner needed for local data.
-- `useQuery` uses `useSyncExternalStore` under the hood for React 18+ concurrent mode safety.
-- Mutations are fire-and-forget. `useMutation` does not return a promise by default (optimistic). The developer can `await` if they need confirmation.
+- `useQuery` reads the local store, never the network. Its very first render returns `[]` (the subscription starts after mount); `useQueryState` exposes `ready` and `error`. A failed query throws to the nearest error boundary unless `throwOnError: false`.
+- `useQuery` uses `useSyncExternalStore` under the hood for React 18+ concurrent mode safety. Hooks are SSR-safe; `createApp` is inert where there is no `window` (`ServerRenderingAppError` on `app.ready`).
+- Mutations are fire-and-forget. `useMutation` returns `{ mutate, mutateAsync, isLoading, error, reset }`: `mutate` does not return a promise (optimistic); `await mutateAsync(...)` when confirmation is needed.
 - `useSyncStatus` re-renders only when status changes, not on every sync event.
 
 ---
@@ -953,7 +1005,7 @@ Page Context                    DevTools Extension
 
 ### Instrumentation Events
 
-The Kora core emits events that DevTools consumes:
+The Kora core emits events that DevTools consumes. The list below is the original core; the authoritative catalog (store, storage, sync, encryption and query events added since) is `KoraEvent` in `packages/core/src/events/events.ts`, documented in `docs/api/devtools.md`:
 
 ```typescript
 type KoraEvent =
@@ -1009,9 +1061,13 @@ $ npx create-kora-app my-app
 
   Kora.js - Offline-first application framework
 
-  ? Select a template:
-    > React (basic)         # Local-only, no sync
-      React (with sync)     # Includes sync server setup
+  ? Platform:              Web (browser) | Desktop (Tauri, native SQLite)
+  ? UI framework:          React | Vue 3 | Svelte 5
+  ? Use Tailwind CSS?
+  ? Enable multi-device sync?
+  ? Server-side database:  SQLite | PostgreSQL
+  # 13 bundled templates; `--yes` gives react-tailwind-sync. Every web template ships an offline
+  # app shell (the koraServiceWorker() Vite plugin from @korajs/cli/vite).
 
   ? Package manager:
     > pnpm
@@ -1046,10 +1102,14 @@ $ kora migrate
     + todos.priority (enum: low, medium, high, default: medium)
     ~ todos.tags (string -> array<string>)
 
-  Generated migration: kora/migrations/002-add-priority.ts
-
-  ? Apply migration to local store? (y/n)
+  Generated migration: kora/migrations/002-v1-to-v2.ts (+ .transforms.ts stub, .json manifest)
 ```
+
+`kora migrate --apply` runs a migration against server or native SQLite/Postgres databases. Changes to an existing table are `--kora:evolve-table` steps (and `--kora:relax-value-domain` for enum/requiredness changes) expanded against each database's live catalog in one transaction; Kora's internal columns, the operation log, the fold state and every `_kora_*` table are never touched. Browser databases migrate themselves on open from the schema's `migrations`.
+
+### kora deploy
+
+Fly.io, Railway, AWS ECS and AWS Lightsail. Render and Docker are "coming soon" and refused before anything is written (`DeployPlatformUnavailableError`).
 
 ### kora generate
 

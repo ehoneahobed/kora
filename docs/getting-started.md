@@ -1,255 +1,267 @@
 ---
 title: Getting Started
-description: "Scaffold an offline-first app with create-kora-app, define a schema, and get local persistence, reactive queries, and multi-device sync in about ten minutes."
+description: "Scaffold an offline-first app with create-kora-app, add a field with a schema migration, and learn the collection API, React hooks and sync setup."
 ---
 
 # Getting Started
 
-Get from zero to a working offline-first app in under 5 minutes.
+This tutorial scaffolds a local-first React app, adds a field with a schema migration, and shows
+the API you use from there. It takes about ten minutes. Every step on this page is checked in CI
+against a freshly scaffolded app (`scripts/docs/check-getting-started.mjs`).
 
-## Quick Start
+You need Node.js 20 or later and a package manager (pnpm, npm, yarn or bun).
 
-Scaffold a new project with a single command:
+## 1. Scaffold the app
 
-```bash
-npx create-kora-app my-app
-```
-
-You will be prompted to choose a template and package manager:
-
-```
-Kora.js - Offline-first application framework
-
-? Platform:
-  > Web (browser)
-    Desktop (Tauri - native SQLite)
-
-? UI framework:
-  > React
-
-? Use Tailwind CSS? Yes
-
-? Enable multi-device sync? Yes
-
-? Package manager:
-  > pnpm
-    npm
-    yarn
-    bun
-```
-
-Selecting **Desktop (Tauri)** scaffolds a native desktop app with native SQLite and sync enabled. See the [Tauri Desktop guide](/guide/tauri-desktop) for details.
-
-You can also skip the prompts entirely:
+Kora 1.0 is in beta, so ask for the `beta` tag (plain `npx create-kora-app` installs the older
+0.x line):
 
 ```bash
-npx create-kora-app my-app --yes  # Uses recommended defaults
-```
-
-Once scaffolding completes:
-
-```bash
+npx create-kora-app@beta my-app --template react-basic --pm pnpm --yes
 cd my-app
-pnpm install
 pnpm dev
 ```
 
-Your app is running. Everything works offline out of the box.
+Open `http://localhost:5173`. You have a todo app that stores its data in SQLite inside the
+browser. Add a few todos, reload, and they are still there. Stop the dev server and the data is
+still on the device: nothing here needs a network.
 
-## Manual Setup
+`--template react-basic` picks the smallest template (React, plain CSS, no sync server), and
+`--yes` skips the prompts. Without flags, `create-kora-app` asks for:
 
-If you prefer to add Kora to an existing project:
-
-```bash
-pnpm add korajs @korajs/react
+```
+? Project name
+? Platform:                 Web (browser) | Desktop (Tauri, native SQLite)
+? UI framework:             React | Vue 3 | Svelte 5
+? Authentication:           None   (email and OAuth templates are coming soon)
+? Use Tailwind CSS?
+? Enable multi-device sync?
+? Server-side database:     SQLite (zero-config) | PostgreSQL (production-scale)
+? Package manager:          pnpm | npm | yarn | bun
 ```
 
-## Project Structure
+`--yes` alone gives the recommended setup: React, Tailwind and a SQLite sync server
+(`react-tailwind-sync`), with the package manager that ran the command. The CLI installs the
+dependencies for you; pass `--skip-install` to do it yourself. Every web template also ships an
+offline app shell: production builds register a service worker, so the deployed app opens with no
+network (see [Offline Patterns](/guide/offline-patterns#the-app-shell)).
 
-A scaffolded Kora project looks like this:
+## 2. What you got
 
 ```
 my-app/
   src/
-    schema.ts         # Schema entry point
-    app.ts            # Kora app instance
-    main.tsx          # React entry point
-    components/       # Your UI components
-  kora.config.ts      # Optional: sync and DevTools config
-  package.json
+    schema.ts                     # the schema: the single source of truth for your data
+    modules/todos/
+      todo.schema.ts              # the todos collection
+      todo.queries.ts             # reads
+      todo.mutations.ts           # writes
+      useTodos.ts                 # React binding for the feature
+    App.tsx                       # the UI
+    main.tsx                      # createApp() and <KoraProvider>
+    kora-worker.ts                # SQLite WASM worker entry
+  kora.config.ts                  # `kora dev` settings
+  vite.config.ts                  # Vite, cross-origin isolation, offline app shell
 ```
 
-## Define Your Schema
+`src/main.tsx` creates the app once and hands it to React:
 
-The schema is the single source of truth for your data model. Create `src/schema.ts`:
+<!-- docs-check-prelude
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { KoraProvider } from '@korajs/react'
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+declare const koraWorkerUrl: string
+declare function App(): JSX.Element
+-->
 
-```typescript
-import { defineSchema, t } from 'korajs'
-
-export default defineSchema({
-  version: 1,
-
-  collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        completed: t.boolean().default(false),
-        createdAt: t.timestamp().auto(),
-      },
-      indexes: ['completed', 'createdAt'],
-    },
-  },
+```tsx
+const app = createApp({
+  schema,
+  store: { workerUrl: koraWorkerUrl },
+  devtools: import.meta.env.DEV,
 })
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <KoraProvider app={app} fallback={<div>Loading...</div>}>
+      <App />
+    </KoraProvider>
+  </StrictMode>,
+)
 ```
 
-Key points:
+<!-- docs-check-prelude -->
 
-- **`defineSchema`** validates your schema and generates TypeScript types.
-- **`t.string()`**, **`t.boolean()`**, etc. are field type builders that support chaining (`.default()`, `.optional()`, `.auto()`).
-- **`indexes`** improve query performance on the listed fields.
-- **`version`** tracks schema changes for migrations.
+SQLite runs in a Web Worker, persisted with OPFS, so storage never blocks the UI. `workerUrl` is
+the worker that `src/kora-worker.ts` builds. When OPFS is not available Kora falls back to durable
+IndexedDB, and when no durable storage exists at all it refuses writes instead of silently keeping
+them in memory (see [Storage Configuration](/guide/storage-configuration)). `<KoraProvider>` shows
+its `fallback` until the local database is open.
 
-For larger apps, keep `src/schema.ts` as the entry point and split collections by feature or domain
-module:
+## 3. Add a field with a migration
 
-```text
-src/
-  modules/
-    todos/
-      todo.schema.ts
-      todo.queries.ts
-      todo.mutations.ts
-      useTodos.ts
-      components/
-  schema.ts
-```
+Give todos a priority. A schema change that adds a column needs a new schema version and a
+migration, because existing devices already have a database at version 1.
 
-```typescript
-// src/modules/todos/todo.schema.ts
+Replace `src/modules/todos/todo.schema.ts`:
+
+<!-- docs-check: file src/modules/todos/todo.schema.ts -->
+```ts
 import { t } from 'korajs'
 
 export const todos = {
   fields: {
     title: t.string(),
     completed: t.boolean().default(false),
+    priority: t.enum(['low', 'medium', 'high']).default('medium'),
     createdAt: t.timestamp().auto(),
   },
   indexes: ['completed', 'createdAt'],
 }
 ```
 
-```typescript
-// src/schema.ts
-import { defineSchema } from 'korajs'
+Replace `src/schema.ts`:
+
+<!-- docs-check: file src/schema.ts -->
+```ts
+import { defineSchema, migrate, t } from 'korajs'
 import { todos } from './modules/todos/todo.schema'
 
 export default defineSchema({
-  version: 1,
-  collections: { todos },
+  version: 2,
+  collections: {
+    todos,
+  },
+  migrations: {
+    2: migrate().addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium')),
+  },
 })
 ```
 
-The CLI and runtime still read one schema export, but your collection definitions can live close to
-the code that owns them:
+Then show the priority in `src/App.tsx`, right after the line that renders the title
+(`<span className={`title ...`}>{String(todo.title)}</span>`):
 
-- `todo.schema.ts` defines the data shape.
-- `todo.queries.ts` contains reads only.
-- `todo.mutations.ts` contains writes: inserts, updates, deletes, and transactions.
-- `useTodos.ts` is the React binding that connects those reads and writes to components.
-- `components/` contains UI for the feature.
-
-The schema, query, and mutation files are framework-agnostic and apply across web, desktop, and
-mobile. The binding file is framework-specific; React templates use `useTodos.ts`. Kora does not
-require controllers, services, or a routing convention, so use the router and app structure that fits
-your framework.
-
-## Create the App
-
-Create `src/app.ts`:
-
-```typescript
-import { createApp } from 'korajs'
-import schema from './schema'
-
-export const app = createApp({ schema })
+<!-- docs-tutorial: insert src/App.tsx after {String(todo.title)}</span> -->
+```tsx
+<span className="time">{String(todo.priority)}</span>
 ```
 
-That is the entire setup for a local-only app. No database configuration, no storage boilerplate. Kora uses SQLite WASM with OPFS persistence under the hood, running in a Web Worker so your UI never blocks. If OPFS cannot be acquired at runtime, `createApp()` falls back to durable IndexedDB and emits `store:storage-fallback`; `store:opfs-unavailable` is reserved for the last-resort case where the app is running in non-persistent memory. See the [Multi-runtime Storage](/guide/multi-runtime-storage) guide.
+Save, and the dev server reloads. On the next open, the store sees that the database is at
+version 1 and runs migration 2 in one transaction: the column is added, existing todos read
+`'medium'`, and the schema version moves to 2. A migration either applies completely or not at
+all. Read [Schema Design](/guide/schema-design#migrations) for renames, backfills that sync, and
+schema transforms for devices that are still on an older version.
 
-## CRUD Operations
+## 4. The collection API
 
-With your app instance, you can immediately perform operations on your collections:
+Everything the template does goes through the app's collections. Every call works offline and
+persists before it resolves.
 
-```typescript
-import { app } from './app'
-
-// Insert a record
-const todo = await app.collections.todos.insert({
-  title: 'Ship Kora v1',
-  // completed defaults to false
-  // createdAt is set automatically
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: {
+      todos: {
+        fields: {
+          title: t.string(),
+          completed: t.boolean().default(false),
+          priority: t.enum(['low', 'medium', 'high']).default('medium'),
+          createdAt: t.timestamp().auto(),
+        },
+      },
+    },
+  }),
 })
-// => { id: '01905e5a-...', title: 'Ship Kora v1', completed: false, createdAt: 1712188800000 }
+-->
 
-// Find by ID
-const found = await app.collections.todos.findById(todo.id)
+```ts
+await app.ready
 
-// Update (partial: only the fields you pass)
-await app.collections.todos.update(todo.id, { completed: true })
+const todo = await app.todos.insert({ title: 'Ship the beta' })
+// { id: '0190…', title: 'Ship the beta', completed: false, priority: 'medium',
+//   createdAt: 1712188800000 }
 
-// Query with filters
-const active = await app.collections.todos
-  .where({ completed: false })
+await app.todos.update(todo.id, { completed: true })
+const found = await app.todos.findById(todo.id)
+
+const open = await app.todos
+  .where({ completed: false, priority: 'high' })
   .orderBy('createdAt', 'desc')
   .limit(10)
   .exec()
 
-// Count
-const count = await app.collections.todos.where({ completed: false }).count()
+const count = await app.todos.where({ completed: false }).count()
 
-// Delete
-await app.collections.todos.delete(todo.id)
+const stop = app.todos.where({ completed: false }).subscribe((rows) => {
+  console.log(`${rows.length} open`) // runs now, then after every change
+})
+
+await app.todos.delete(todo.id)
+stop()
 ```
 
-`app.collections` is collision-free and works for every wire collection name. Direct access such as
-`app.todos` remains available when the name does not overlap a framework member. A schema with an
-`events` collection keeps its wire name and uses `app.collections.events`; framework events remain
-available through `app.events` or `app.on(type, listener)`.
+These calls are typed from the schema: `app.todos.insert({ titel: 'x' })` and
+`where({ priority: 'urgent' })` are compile errors. Two names are worth knowing:
 
-Every operation works offline. Data is persisted to the local store immediately.
+- `app.collections.todos` is the same accessor. Use it for a collection whose name is also an app
+  property (`events`, `sync`, `storage`, `ready`, ...), which `app.<name>` cannot reach. In
+  development, `createApp` warns about such names.
+- `createdAt` and `updatedAt` are always queryable, even when the schema does not declare them:
+  every record keeps its creation and last-update time.
 
-## Use with React
+<!-- docs-check-prelude -->
 
-Wrap your app in `KoraProvider` and use hooks to access data reactively:
+## 5. React hooks
 
+The template's hooks (`useCollection`, `useQuery`, `useMutation` from `@korajs/react`) work with
+any collection name. For schema-checked names, inserts and rows, create typed hooks once next to
+your app:
+
+<!-- docs-check: file kora.ts -->
+```ts
+import { createKoraHooks } from '@korajs/react'
+import { createApp, defineSchema, t } from 'korajs'
+
+export const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: {
+      todos: {
+        fields: {
+          title: t.string(),
+          completed: t.boolean().default(false),
+          createdAt: t.timestamp().auto(),
+        },
+      },
+    },
+  }),
+})
+
+export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
+```
+
+<!-- docs-check: file TodoList.tsx -->
 ```tsx
-import { KoraProvider, useQuery, useMutation } from '@korajs/react'
-import { app } from './app'
+import { useCollection, useMutation, useQuery } from './kora'
 
-function App() {
-  return (
-    <KoraProvider app={app}>
-      <TodoList />
-    </KoraProvider>
-  )
-}
-
-function TodoList() {
-  // Reactive query: re-renders when data changes
-  const todos = useQuery(
-    app.todos.where({ completed: false }).orderBy('createdAt')
-  )
-
-  const addTodo = useMutation(app.todos.insert)
+export function TodoList() {
+  const todos = useCollection('todos') // 'todoz' is a type error
+  const open = useQuery(todos.where({ completed: false }).orderBy('createdAt'))
+  const add = useMutation(todos.insert)
+  const toggle = useMutation(todos.update)
 
   return (
     <div>
-      <button onClick={() => addTodo({ title: 'New todo' })}>
-        Add Todo
-      </button>
+      <button onClick={() => add.mutate({ title: 'New todo' })}>Add</button>
       <ul>
-        {todos.map((todo) => (
-          <li key={todo.id}>{todo.title}</li>
+        {open.map((todo) => (
+          <li key={todo.id} onClick={() => toggle.mutate(todo.id, { completed: true })}>
+            {todo.title}
+          </li>
         ))}
       </ul>
     </div>
@@ -257,60 +269,60 @@ function TodoList() {
 }
 ```
 
-`useQuery` returns data synchronously from the local store. There are no loading spinners for local data because the data is always available.
+`useMutation` returns `{ mutate, mutateAsync, isLoading, error, reset }`: call `mutate(...)`
+(fire and forget) or `await mutateAsync(...)`. `useQuery` re-renders when the result changes. Its
+very first render, before the local query has run, returns an empty array; use
+`useQueryState` when you need to tell "still loading" from "no rows" (or a query error). See
+[React Hooks](/guide/react-hooks).
 
-## Enable Sync
+## 6. Add sync
 
-To sync data across devices, add a `sync` property to your app config:
+Sync is one more option on `createApp`. Kora does not connect on its own unless you ask it to:
 
-```typescript
+<!-- docs-check: file sync-app.ts -->
+```ts
 import { createApp } from 'korajs'
-import schema from './schema'
+import schema from './src/schema'
 
 export const app = createApp({
   schema,
   sync: {
-    url: 'wss://my-server.com/kora',
+    url: 'wss://my-server.example.com/kora-sync',
+    autoConnect: true, // or call `await app.sync?.connect()` after `app.ready`
   },
 })
-
-await app.ready
-await app.sync?.connect()
 ```
 
-Kora handles connection management, conflict resolution, and operation syncing after `connect()` is called. When the device is offline, operations queue locally and sync when connectivity returns.
+Writes still land locally first. They upload when a connection exists, survive reloads while
+offline, and concurrent edits from other devices merge per field the same way on every device
+([Conflict Resolution](/guide/conflict-resolution)). For a working client and server, scaffold a
+sync template (`npx create-kora-app@beta my-app --yes` gives `react-tailwind-sync`): `pnpm dev`
+then starts the app and a local sync server together. Its sync is bound to the signed-in user, so
+it waits (`auth-required`) until someone signs in; the project README explains the
+`KORA_AUTH_SECRET` and OAuth settings. Running a server is covered in
+[Sync Configuration](/guide/sync-configuration) and [Production Server](/guide/production-server).
 
-For details on running the sync server, see [Deployment](/guide/deployment).
-
-## Deploy Your App
-
-Ready to share your app with the world? One command deploys to a cloud platform:
+## 7. Deploy
 
 ```bash
-kora deploy
+pnpm build          # tsc && vite build: dist/ with the offline app shell
+npx kora deploy     # Fly.io, Railway or AWS for sync templates
 ```
 
-See the [Deployment guide](/guide/deployment) for a full step-by-step walkthrough, including Fly.io setup and troubleshooting.
+See [Deployment](/guide/deployment).
 
-## What's Next
+## What's next
 
-- [Deployment](/guide/deployment): Deploy your app to Fly.io or Railway in 10 minutes
-- [Schema Design](/guide/schema-design): Field types, relations, state machines, and versioning
-- [State Machines](/guide/state-machines): Constrained enum transitions for workflows
-- [Offline Patterns](/guide/offline-patterns): Building UIs that embrace offline-first
-- [Conflict Resolution](/guide/conflict-resolution): How Kora handles concurrent edits
-- [React Hooks](/guide/react-hooks): Full reference for all React bindings
-- [Kora for AI Agents](/guide/ai-agents): Rules and the `kora agents-md` command so coding agents build Kora apps correctly
-- [Presence & Awareness](/guide/presence): Real-time collaborative presence
-- [Sync Configuration](/guide/sync-configuration): Transports, encryption, diagnostics, and reconnection
-- [Server-side Validation](/guide/server-side-validation): Adjudicate untrusted client operations before they become authoritative
-- [Production Server](/guide/production-server): Background-job data access, size and rate limits, and central blob storage
-- [Sync Encryption](/guide/sync-encryption): End-to-end encryption for sync
-- [Authentication](/guide/authentication): Sessions, MFA, organizations, RBAC, and passkeys
-- [Storage Configuration](/guide/storage-configuration): Client and server storage backends
-- [Multi-runtime Storage](/guide/multi-runtime-storage): Running more than one runtime on one origin, and storage diagnostics
-- [Backup and Restore](/guide/backup-restore): Local app backups and sync server backups
-- [Testing](/guide/testing): Test harness for offline-first apps
-- [Tauri Desktop Apps](/guide/tauri-desktop): Build native desktop apps with native SQLite
-- [DevTools](/guide/devtools): Debugging with the Kora browser extension
-- [API Reference](/api/): Complete reference for all packages
+- [Upgrading to beta.13](/guide/upgrading-to-beta13): moving an existing 1.0.0-beta.12 app and
+  server to this release
+- [Schema Design](/guide/schema-design): field types, the value domain, relations, migrations
+- [Conflict Resolution](/guide/conflict-resolution): exactly how concurrent edits merge
+- [Offline Patterns](/guide/offline-patterns): sync status, pending writes, the app shell
+- [React Hooks](/guide/react-hooks), [Vue](/api/vue), [Svelte](/api/svelte)
+- [Sync Configuration](/guide/sync-configuration) and [Sync Protocol](/guide/sync-protocol)
+- [Authentication](/guide/authentication) and [Sync Encryption](/guide/sync-encryption)
+- [Production Server](/guide/production-server) and [Deployment](/guide/deployment)
+- [Storage Configuration](/guide/storage-configuration) and [Backup and Restore](/guide/backup-restore)
+- [Testing](/guide/testing) and [DevTools](/guide/devtools)
+- [Error Codes](/api/errors): every Kora error code, its cause and its fix
+- [API Reference](/api/)

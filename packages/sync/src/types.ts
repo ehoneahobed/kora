@@ -31,6 +31,9 @@ export const SYNC_STATUSES = [
 	'error',
 	'schema-mismatch',
 	'auth-required',
+	// End-to-end encryption is on and this device's keyring is locked (ENC-1): sync is
+	// paused until `app.encryption.unlock(passphrase)`. Local reads and writes go on.
+	'encryption-locked',
 ] as const
 export type SyncStatus = (typeof SYNC_STATUSES)[number]
 
@@ -114,6 +117,17 @@ export interface SyncStatusInfo {
 	 * a warning (free up storage, stay online). `durable` otherwise.
 	 */
 	localDurability?: 'durable' | 'degraded'
+	/**
+	 * Sync protocol version the server answered with in the current (or last) session,
+	 * or null before any server answered.
+	 */
+	serverProtocolVersion?: number | null
+	/**
+	 * True when the server speaks an older sync protocol than this client (a pre-beta.13
+	 * server). It still syncs, but that protocol is deprecated and a later release
+	 * refuses it: upgrade the sync server.
+	 */
+	protocolDeprecated?: boolean
 	/** serverTime - localTime in ms measured at the last handshake, or null before first connect. Negative = this device's clock is fast. */
 	clockSkewMs: number | null
 	inFlightUploadOperations?: number
@@ -201,6 +215,14 @@ export interface SyncConfig {
 	 * Built automatically by createApp from schema scope declarations + flat scope values.
 	 */
 	scopeMap?: SyncScopeMap
+	/**
+	 * Collections the app's schema syncs (all of them, or the sync-scoped ones when the
+	 * schema declares partial sync rules). Set by createApp. When no `scopeMap` is
+	 * configured, a write on one of these that the server's accepted upload scope omits
+	 * is surfaced as `sync:operation-rejected` (`OUT_OF_UPLINK_SCOPE`) instead of being
+	 * treated as local-only (RT-89). Omitted: such writes stay local without a rejection.
+	 */
+	syncedCollections?: readonly string[]
 	/** Number of operations per batch. Defaults to 100. */
 	batchSize?: number
 	/**

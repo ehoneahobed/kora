@@ -45,7 +45,12 @@ const BROWSER_SUITES = [
 	'packages/store/tests/repro/browser/LMS-5-6-7.browser.mjs',
 	'packages/server/tests/repro/browser/NEW-DX-3.offline-shell.mjs',
 ]
-const TSC_PROBES = ['kora/tests/repro/types/DX-1.ts', 'kora/tests/repro/types/DX-2.ts']
+const TSC_PROBES = [
+	'kora/tests/repro/types/DX-1.ts',
+	'kora/tests/repro/types/DX-2.ts',
+	'kora/tests/repro/types/RT-100.ts',
+	'kora/tests/repro/types/RT-113.ts',
+]
 
 // ---------------------------------------------------------------- run suites
 const results = new Map() // key -> { status: 'passed'|'failed'|'skipped', kind: 'node'|'browser'|'tsc', file, title, msg }
@@ -303,7 +308,7 @@ const phaseNames = [
 	'Phase 0: safety net',
 	'Phase 1: trust boundary + P0 stopgaps (beta.13)',
 	'Phase 2: no silent loss',
-	'Phase 3: one fold + durability (beta.14)',
+	'Phase 3: one fold + durability (beta.13)',
 	'Phase 4: encryption, scale, types, DX (RC)',
 ]
 for (let ph = 0; ph <= 4; ph++) {

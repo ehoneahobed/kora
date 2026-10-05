@@ -21,7 +21,8 @@ const auth = createAuthStore()
 const todos = createTodosStores()
 const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 
-const filter = $state<Filter>('all')
+// biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
+let filter = $state<Filter>('all')
 let input = $state('')
 
 const filteredTodos = $derived(

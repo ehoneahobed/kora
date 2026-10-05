@@ -172,7 +172,7 @@ describe('protocol v2 handshake fields', () => {
 		},
 	)
 
-	test.each(serializers)('%s: a beta.13 message (no v2 fields) decodes as protocol 1', (_n, s) => {
+	test.each(serializers)('%s: a beta.12 message (no v2 fields) decodes as protocol 1', (_n, s) => {
 		const { protocolVersion: _p, ...legacy } = handshake
 		const back = s.decode(s.encode(legacy)) as HandshakeMessage
 		expect(back.protocolVersion).toBeUndefined()
@@ -192,7 +192,7 @@ describe('protocol v2 handshake fields', () => {
 
 describe('protocol v2 protobuf fields are invisible to a protocol-1 decoder', () => {
 	/**
-	 * A beta.13 decoder skips unknown field numbers by wire type. Reproduce that by
+	 * A beta.12 decoder skips unknown field numbers by wire type. Reproduce that by
 	 * walking the bytes with the same rule: every v2 field (46, 47; operation 14-16)
 	 * must be skippable, and the fields a v1 decoder knows must be unchanged.
 	 */

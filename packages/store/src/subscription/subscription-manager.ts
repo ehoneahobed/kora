@@ -1,11 +1,24 @@
 import type { Operation } from '@korajs/core'
+import { QueryError } from '../errors'
 import type {
 	CollectionRecord,
 	QueryDescriptor,
+	QueryErrorPhase,
+	QuerySubscriptionError,
+	SubscribeOptions,
 	Subscription,
 	SubscriptionCallback,
 } from '../types'
 import { SubscriptionBloomFilter } from './bloom-filter'
+import { type ResultsEqual, defaultResultsEqual } from './result-equality'
+
+/**
+ * Per-subscription options accepted by `register` / `registerAndFetch`.
+ */
+export interface RegisterOptions extends SubscribeOptions {
+	/** Result-set comparator; defaults to structural comparison of every value. */
+	resultsEqual?: ResultsEqual
+}
 
 let nextSubId = 0
 
@@ -53,7 +66,32 @@ export interface SubscriptionManagerOptions {
 
 	/** Called when a query subscription is registered (e.g. to register sync query subsets). */
 	onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
+
+	/**
+	 * Called for every subscription failure (the store emits `query:error`), in
+	 * addition to the subscriber's own `onError`.
+	 */
+	onQueryError?: (failure: QuerySubscriptionError) => void
 }
+
+/**
+ * A committed change to the rows of one collection that can affect query results
+ * (RT-98). Every invalidation the store makes produces one: local writes and remote
+ * applies (with the operation), and changes made without a new operation (rejection
+ * re-folds, scope retraction, cascade settling, rematerialization, backup restore,
+ * held/discarded writes).
+ */
+export interface RecordsChange {
+	/** Collection whose rows changed */
+	readonly collection: string
+	/** Changed record ids, or null when unknown (treat the whole collection as changed) */
+	readonly ids: readonly string[] | null
+	/** The operation that caused the change, when there is one */
+	readonly operation?: Operation
+}
+
+/** Listener for {@link RecordsChange}s made by this runtime (not those relayed from peers). */
+export type RecordsChangeListener = (change: RecordsChange) => void
 
 /**
  * Performance statistics for monitoring subscription checking efficiency.
@@ -96,6 +134,14 @@ export class SubscriptionManager {
 	private pendingCollections = new Set<string>()
 	private flushScheduled = false
 	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
+	private readonly onQueryError?: (failure: QuerySubscriptionError) => void
+	private readonly changeListeners = new Set<RecordsChangeListener>()
+	/**
+	 * Collections changed before the first change listener attached (a store's open:
+	 * rematerialization, migration backfills). Replayed to that listener, so other tabs
+	 * hear about changes made while this tab was still opening. Bounded by the schema.
+	 */
+	private unheardCollections: Set<string> | null = new Set()
 
 	// Bloom filter state
 	private bloomFilter: SubscriptionBloomFilter | null = null
@@ -117,6 +163,7 @@ export class SubscriptionManager {
 		this.bloomFalsePositiveRate =
 			options?.bloomFalsePositiveRate ?? DEFAULT_BLOOM_FALSE_POSITIVE_RATE
 		this.onQuerySubscribed = options?.onQuerySubscribed
+		this.onQueryError = options?.onQueryError
 	}
 
 	/**
@@ -131,33 +178,21 @@ export class SubscriptionManager {
 		descriptor: QueryDescriptor,
 		callback: SubscriptionCallback<CollectionRecord>,
 		executeFn: () => Promise<CollectionRecord[]>,
+		options?: RegisterOptions,
 	): () => void {
-		const id = `sub_${++nextSubId}`
-		const subscription: Subscription = {
-			id,
-			descriptor,
-			callback,
-			executeFn,
-			lastResults: [],
-		}
-		this.subscriptions.set(id, subscription)
-
-		// Mark bloom filter as needing rebuild since dependencies changed
-		this.bloomDirty = true
-
-		const externalCleanup = this.onQuerySubscribed?.(descriptor)
-
-		return () => {
-			this.subscriptions.delete(id)
-			this.bloomDirty = true
-			externalCleanup?.()
-		}
+		// No initial run: the empty baseline counts as delivered, so a flush only
+		// notifies when the results differ from it.
+		const subscription = this.createSubscription(descriptor, callback, executeFn, options)
+		subscription.delivered = true
+		return this.track(subscription)
 	}
 
 	/**
 	 * Register a subscription and immediately execute the query.
 	 * The initial results are stored as lastResults so subsequent flushes
-	 * correctly diff against the initial state.
+	 * correctly diff against the initial state. A failing initial run is reported
+	 * through `options.onError` and the `query:error` hook, never as an unhandled
+	 * rejection (STORE-12).
 	 *
 	 * @returns An unsubscribe function
 	 */
@@ -165,50 +200,188 @@ export class SubscriptionManager {
 		descriptor: QueryDescriptor,
 		callback: SubscriptionCallback<CollectionRecord>,
 		executeFn: () => Promise<CollectionRecord[]>,
+		options?: RegisterOptions,
 	): () => void {
-		const id = `sub_${++nextSubId}`
-		const subscription: Subscription = {
-			id,
+		const subscription = this.createSubscription(descriptor, callback, executeFn, options)
+		const unsubscribe = this.track(subscription)
+		void this.run(subscription)
+		return unsubscribe
+	}
+
+	private createSubscription(
+		descriptor: QueryDescriptor,
+		callback: SubscriptionCallback<CollectionRecord>,
+		executeFn: () => Promise<CollectionRecord[]>,
+		options: RegisterOptions | undefined,
+	): Subscription {
+		return {
+			id: `sub_${++nextSubId}`,
 			descriptor,
 			callback,
 			executeFn,
 			lastResults: [],
+			resultsEqual: options?.resultsEqual ?? defaultResultsEqual,
+			onError: options?.onError,
+			runsStarted: 0,
+			lastAppliedRun: 0,
+			errored: false,
+			delivered: false,
 		}
+	}
+
+	private track(subscription: Subscription): () => void {
+		const id = subscription.id
 		this.subscriptions.set(id, subscription)
 
 		// Mark bloom filter as needing rebuild since dependencies changed
 		this.bloomDirty = true
 
-		const externalCleanup = this.onQuerySubscribed?.(descriptor)
-
-		// Execute immediately, set lastResults, and call callback
-		executeFn().then((results) => {
-			// Guard: subscription may have been removed before the async fetch completes
-			if (this.subscriptions.has(id)) {
-				subscription.lastResults = results
-				callback(results)
-			}
-		})
+		const externalCleanup = this.onQuerySubscribed?.(subscription.descriptor)
 
 		return () => {
-			this.subscriptions.delete(id)
+			if (!this.subscriptions.delete(id)) return
 			this.bloomDirty = true
 			externalCleanup?.()
 		}
 	}
 
 	/**
+	 * Run a subscription's query and deliver the result when it changed. Never
+	 * throws: failures go to the error channel. Runs are numbered so a slow,
+	 * older run never overwrites the result of a newer one.
+	 */
+	private async run(sub: Subscription): Promise<void> {
+		const runNumber = (sub.runsStarted ?? 0) + 1
+		sub.runsStarted = runNumber
+		let results: CollectionRecord[]
+		try {
+			results = await sub.executeFn()
+		} catch (error) {
+			if (!this.isCurrent(sub, runNumber)) return
+			sub.lastAppliedRun = runNumber
+			sub.errored = true
+			this.reportError(sub, error, sub.delivered ? 'refresh' : 'initial')
+			return
+		}
+		if (!this.isCurrent(sub, runNumber)) return
+		sub.lastAppliedRun = runNumber
+
+		// After a failure, the next success is always delivered (even when equal to
+		// the last results) so bindings can leave their error state.
+		const equal = sub.resultsEqual ?? defaultResultsEqual
+		if (sub.delivered && !sub.errored && equal(sub.lastResults, results)) return
+
+		sub.lastResults = results
+		sub.delivered = true
+		sub.errored = false
+		try {
+			sub.callback(results)
+		} catch (error) {
+			this.reportError(sub, error, 'callback')
+		}
+	}
+
+	private isCurrent(sub: Subscription, runNumber: number): boolean {
+		return this.subscriptions.get(sub.id) === sub && runNumber > (sub.lastAppliedRun ?? 0)
+	}
+
+	private reportError(sub: Subscription, thrown: unknown, phase: QueryErrorPhase): void {
+		const error =
+			thrown instanceof Error
+				? thrown
+				: new QueryError(`Query subscription failed: ${String(thrown)}`, {
+						collection: sub.descriptor.collection,
+					})
+		const failure: QuerySubscriptionError = {
+			error,
+			phase,
+			collection: sub.descriptor.collection,
+			queryId: sub.id,
+		}
+		try {
+			this.onQueryError?.(failure)
+		} catch (hookError) {
+			console.error('[kora] query:error listener threw', hookError)
+		}
+		if (sub.onError) {
+			try {
+				sub.onError(failure)
+			} catch (handlerError) {
+				console.error('[kora] subscription onError handler threw', handlerError)
+			}
+			return
+		}
+		// No subscriber handler: log so the failure is never silent.
+		console.error(
+			`[kora] Query subscription ${sub.id} on "${sub.descriptor.collection}" failed (${phase}). Pass subscribe(cb, { onError }) to handle it.`,
+			error,
+		)
+	}
+
+	/**
 	 * Notify the manager that a mutation occurred on a collection.
 	 * Schedules a microtask flush to batch multiple mutations in the same tick.
 	 */
-	notify(collection: string, _operation: Operation): void {
-		this.invalidate(collection)
+	notify(collection: string, operation: Operation): void {
+		this.recordsChanged({ collection, ids: [operation.recordId], operation })
 	}
 
-	/** Invalidate a collection after a local-view change that has no domain operation. */
-	invalidate(collection: string): void {
+	/**
+	 * Invalidate a collection after a local-view change that has no domain operation
+	 * (a re-fold, a retraction, a restore). Pass the record ids when known.
+	 */
+	invalidate(collection: string, ids: readonly string[] | null = null): void {
+		this.recordsChanged({ collection, ids })
+	}
+
+	/**
+	 * The single entry point for a committed change made by this runtime (RT-98): it
+	 * schedules the affected queries and tells every change listener (the cross-tab
+	 * bus), so no invalidation path can reach this tab's queries without reaching the
+	 * other tabs' too.
+	 */
+	recordsChanged(change: RecordsChange): void {
+		this.pendingCollections.add(change.collection)
+		this.scheduleFlush()
+		if (this.unheardCollections) this.unheardCollections.add(change.collection)
+		for (const listener of this.changeListeners) {
+			try {
+				listener(change)
+			} catch (error) {
+				// A failing listener must not stop this tab's queries or other listeners.
+				console.error('[kora] records-change listener failed', error)
+			}
+		}
+	}
+
+	/**
+	 * Invalidate a collection for a change another runtime made to the shared
+	 * database. Not relayed to change listeners (the peer already broadcast it).
+	 */
+	invalidateFromPeer(collection: string): void {
 		this.pendingCollections.add(collection)
 		this.scheduleFlush()
+	}
+
+	/**
+	 * Listen to every committed change this runtime makes.
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRecordsChanged(listener: RecordsChangeListener): () => void {
+		this.changeListeners.add(listener)
+		const unheard = this.unheardCollections
+		this.unheardCollections = null
+		for (const collection of unheard ?? []) {
+			try {
+				listener({ collection, ids: null })
+			} catch (error) {
+				console.error('[kora] records-change listener failed', error)
+			}
+		}
+		return () => {
+			this.changeListeners.delete(listener)
+		}
 	}
 
 	/**
@@ -224,18 +397,9 @@ export class SubscriptionManager {
 
 		const affected = this.findAffectedSubscriptions(collections)
 
-		// Re-execute and diff
+		// Re-execute and diff. run() never throws: failures reach the error channel.
 		for (const sub of affected) {
-			try {
-				const newResults = await sub.executeFn()
-				if (!this.resultsEqual(sub.lastResults, newResults)) {
-					sub.lastResults = newResults
-					sub.callback(newResults)
-				}
-			} catch {
-				// Subscription re-execution failed -- skip silently for now.
-				// In future, we could emit an error event for DevTools.
-			}
+			await this.run(sub)
 		}
 	}
 
@@ -385,36 +549,8 @@ export class SubscriptionManager {
 		if (this.flushScheduled) return
 		this.flushScheduled = true
 		queueMicrotask(() => {
-			this.flush()
+			// flush() cannot reject: run() routes every failure to the error channel.
+			void this.flush()
 		})
-	}
-
-	/**
-	 * Compare two result sets. Uses ID-based comparison first (same length, same IDs),
-	 * then deep comparison of remaining fields when IDs match.
-	 * Avoids JSON.stringify which is O(n) and fragile to field ordering differences.
-	 */
-	private resultsEqual(prev: CollectionRecord[], next: CollectionRecord[]): boolean {
-		if (prev.length !== next.length) return false
-		if (prev.length === 0) return true
-
-		// Fast ID-based check: same records in same order means same result set
-		for (let i = 0; i < prev.length; i++) {
-			if (prev[i]?.id !== next[i]?.id) return false
-		}
-
-		// IDs match — do a field-level comparison for safety
-		for (let i = 0; i < prev.length; i++) {
-			const a = prev[i] as Record<string, unknown>
-			const b = next[i] as Record<string, unknown>
-			const keysA = Object.keys(a)
-			const keysB = Object.keys(b)
-			if (keysA.length !== keysB.length) return false
-			for (const key of keysA) {
-				if (a[key] !== b[key]) return false
-			}
-		}
-
-		return true
 	}
 }

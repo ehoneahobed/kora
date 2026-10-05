@@ -5,15 +5,25 @@ description: "Model workflow states safely in offline-first apps: field transiti
 
 # State Machines
 
-Kora supports state machines on enum fields. A state machine constrains which transitions are allowed, preventing invalid state changes during both local mutations and concurrent merges.
+Kora supports state machines on enum fields. A state machine constrains which transitions a
+device may write: an order goes from `draft` to `submitted` to `approved`, but a device can never
+jump it from `draft` to `delivered`.
 
-## Overview
+## What is enforced where
 
-Many application fields follow a strict workflow: an order goes from `draft` to `submitted` to `approved`, but should never jump from `draft` to `delivered`. Without state machines, concurrent offline edits could produce invalid state transitions. Kora's state machine system enforces transition rules at every layer:
+- **Local writes** (`update`, transactions, migration backfills) are validated against the
+  record's current local value. An invalid transition is refused (or, in `'last-valid-state'`
+  mode, dropped) before it produces an operation.
+- **Concurrent writes** from different devices are merged by the per-field fold, which treats the
+  state field like any enum: the later write by HLC wins. The fold does not re-check transitions,
+  so two individually valid changes can meet in an order the map does not list (see
+  [Concurrent changes](#concurrent-changes)).
+- **The sync server** does not check transitions on its own. Add a `validateOperation` rule, or
+  make the field `server-authoritative`, when the order must hold across devices.
 
-- **Local mutations**: Invalid transitions are rejected or silently blocked before they produce operations.
-- **Merge resolution**: When two devices concurrently change the same state field, the merge engine validates both transitions and picks a valid result.
-- **DevTools visibility**: Every state machine merge decision is recorded in a `MergeTrace` for debugging.
+<!-- docs-check-prelude
+import { defineSchema, t } from 'korajs'
+-->
 
 ## Defining Transitions
 
@@ -24,8 +34,6 @@ There are two ways to define state machine transitions: on the field itself usin
 The simplest approach is to call `.transitions()` on an enum field builder:
 
 ```typescript
-import { defineSchema, t } from 'korajs'
-
 export default defineSchema({
   version: 1,
   collections: {
@@ -48,7 +56,7 @@ export default defineSchema({
 })
 ```
 
-Each key in the transitions map is a source state, and the array contains the allowed target states. An empty array means the state is terminal -- no further transitions are possible.
+Each key in the transitions map is a source state, and the array contains the allowed target states. An empty array means the state is terminal: no further transitions are possible. A field-level map always uses the `'reject'` mode.
 
 ### Collection-Level State Machine
 
@@ -81,7 +89,7 @@ export default defineSchema({
 })
 ```
 
-Both approaches produce the same runtime behavior. The collection-level form gives you explicit control over `onInvalidTransition`.
+The collection-level form also chooses `onInvalidTransition`. When both are declared for the same field, the collection-level machine is used.
 
 ## Invalid Transition Behavior
 
@@ -89,7 +97,7 @@ The `onInvalidTransition` option controls what happens when a local mutation att
 
 ### `'reject'` (default)
 
-Throws an `InvalidStateTransitionError` with a clear message:
+Throws an `InvalidStateTransitionError` (code `INVALID_STATE_TRANSITION`) with a clear message:
 
 ```
 Invalid state transition in collection "orders":
@@ -104,18 +112,29 @@ The error includes the collection name, record ID, field name, current state, at
 Silently ignores the invalid transition. The state field keeps its current value, and the rest of the update (other fields) is applied normally.
 
 ```typescript
-stateMachine: {
-  field: 'status',
-  transitions: {
-    draft: ['submitted', 'cancelled'],
-    submitted: ['approved', 'cancelled'],
-    // ...
+const lenient = defineSchema({
+  version: 1,
+  collections: {
+    orders: {
+      fields: {
+        status: t.enum(['draft', 'submitted', 'approved', 'cancelled']).default('draft'),
+      },
+      stateMachine: {
+        field: 'status',
+        transitions: {
+          draft: ['submitted', 'cancelled'],
+          submitted: ['approved', 'cancelled'],
+          approved: [],
+          cancelled: [],
+        },
+        onInvalidTransition: 'last-valid-state',
+      },
+    },
   },
-  onInvalidTransition: 'last-valid-state',
-}
+})
 ```
 
-Use this when you want the system to be lenient -- for example, when users might attempt impossible transitions due to stale UI state, and you prefer to silently preserve the current state rather than show an error.
+Use this when you want the system to be lenient: for example, when users might attempt impossible transitions due to stale UI state, and you prefer to silently preserve the current state rather than show an error.
 
 ## Local Mutation Validation
 
@@ -128,6 +147,26 @@ State machine transitions are validated during `update()` calls. The validator c
 Same-state transitions (e.g., `submitted` to `submitted`) are always valid. This makes idempotent updates safe.
 
 For `insert()` calls, any valid enum value is accepted as the initial state. The state machine only constrains transitions from one state to another, not which state a new record starts in.
+
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const app = createApp({
+  schema: defineSchema({
+    version: 1,
+    collections: {
+      orders: {
+        fields: {
+          title: t.string().optional(),
+          customerName: t.string().optional(),
+          total: t.number().optional(),
+          status: t.enum(['draft', 'submitted', 'approved', 'shipped', 'delivered', 'cancelled']).default('draft'),
+        },
+      },
+    },
+  }),
+})
+declare const id: string
+-->
 
 ```typescript
 // Valid: insert with any allowed enum value
@@ -143,68 +182,37 @@ await app.orders.update(id, { status: 'delivered' })
 await app.orders.update(id, { title: 'Updated Widget' })
 ```
 
-## Merge Resolution
+## Concurrent changes
 
-When two devices concurrently modify a state machine field, the merge engine applies special rules instead of the default LWW strategy. The resolution depends on the validity of each side's transition from the base state:
-
-### Both Transitions Valid
-
-If both the local and remote transitions are valid moves from the base state, the merge falls back to Last-Write-Wins using HLC timestamps:
+Two devices that change the same state field while apart each pass local validation; when they
+sync, every replica keeps the later write by HLC (the state field merges like any enum):
 
 ```
-Base state:     "draft"
-Device A:       "submitted"   (valid: draft -> submitted)
-Device B:       "cancelled"   (valid: draft -> cancelled)
-
-Merged result:  whichever has the later HLC timestamp
+Base state:  "submitted" on both devices
+Device A:    submitted -> approved -> shipped   (valid locally)
+Device B:    submitted -> cancelled             (valid locally, written last)
+Every replica: "cancelled"
 ```
 
-Both transitions are legitimate, so the later one wins. This matches the standard LWW behavior but only after confirming both transitions are allowed.
+Every replica agrees, but the history `shipped -> cancelled` is not in the map. When that matters:
 
-### One Valid, One Invalid
-
-If only one side's transition is valid from the base state, the valid transition wins regardless of timestamps:
-
-```
-Base state:     "draft"
-Device A:       "submitted"   (valid: draft -> submitted)
-Device B:       "delivered"   (invalid: draft -> delivered)
-
-Merged result:  "submitted"   (valid wins)
-```
-
-This prevents an invalid transition on one device from overriding a correct transition on another, even if the invalid transition has a later timestamp.
-
-### Both Invalid
-
-If neither side's transition is valid from the base state, the base state is preserved:
-
-```
-Base state:     "draft"
-Device A:       "delivered"   (invalid: draft -> delivered)
-Device B:       "shipped"     (invalid: draft -> shipped)
-
-Merged result:  "draft"       (base state preserved)
-```
-
-A constraint violation is recorded in the `MergeTrace` for DevTools inspection.
-
-### Merge Summary
-
-| Local Valid | Remote Valid | Result |
-|-------------|-------------|--------|
-| Yes | Yes | LWW (later timestamp wins) |
-| Yes | No | Local wins |
-| No | Yes | Remote wins |
-| No | No | Base state preserved |
-
-All merge decisions are deterministic. Given the same operations, every device produces the same result.
+- **Validate on the server.** A `validateOperation` rule sees the stored record and the incoming
+  operation and can refuse a change whose `previousData` no longer matches the stored state
+  (the writer saw a stale value). The device learns it through `sync:operation-rejected`, and the
+  refused write is undone on its author. See [Server-side Validation](/guide/server-side-validation).
+- **Let the server decide.** `t.enum([...]).merge('server-authoritative')` makes server writes win;
+  devices request a transition through a server route that checks the current state.
+- **Model the decision as data.** Record each device's request (an `approvals` collection) and
+  derive the state from the requests.
 
 ## Example: Order Workflow
 
 A complete order lifecycle with terminal states:
 
+<!-- docs-check: standalone -->
 ```typescript
+import { defineSchema, t } from 'korajs'
+
 export default defineSchema({
   version: 1,
   collections: {
@@ -255,7 +263,7 @@ await app.orders.update(order.id, { status: 'submitted' })
 // Approve it
 await app.orders.update(order.id, { status: 'approved' })
 
-// This would throw -- cannot skip from approved to delivered
+// This would throw: cannot skip from approved to delivered
 try {
   await app.orders.update(order.id, { status: 'delivered' })
 } catch (e) {
@@ -271,6 +279,10 @@ await app.orders.update(order.id, { status: 'delivered' })
 ## Example: Task Status with Cancel-from-Anywhere
 
 Some workflows allow certain transitions from any state. Define those by listing the target in every source state:
+
+<!-- docs-check-prelude
+import { defineSchema, t } from 'korajs'
+-->
 
 ```typescript
 export default defineSchema({
@@ -326,10 +338,6 @@ Valid values: draft, submitted, approved, shipped, delivered, cancelled
 
 ## Inspecting in DevTools
 
-State machine merge decisions appear in the [DevTools Conflict Inspector](/guide/devtools) with strategy names like:
-
-- `state-machine-lww` -- both sides valid, resolved by timestamp
-- `state-machine-valid-wins` -- one valid transition beat an invalid one
-- `state-machine-both-invalid` -- both transitions invalid, base state preserved
-
-Each trace includes the base state, both attempted transitions, the allowed targets, and the final resolved value.
+A refused local transition throws before anything is written, so it never reaches DevTools.
+Concurrent changes of a state field appear in the [Conflict Inspector](/guide/devtools) like any
+last-write-wins decision (strategy `lww`), with both values and the winner.

@@ -14,7 +14,7 @@ import type { FieldDescriptor, Operation } from '../types'
  * | Field type     | Domain                                                    | Client SQLite / IndexedDB | Server SQLite | Server Postgres          | Wire (JSON / protobuf) |
  * |----------------|-----------------------------------------------------------|---------------------------|---------------|--------------------------|------------------------|
  * | `string`       | any string (U+0000 and lone surrogates included)          | TEXT / string             | TEXT          | TEXT, lossless text codec (RT-65) | JSON string (escaped) |
- * | `enum`         | one of the declared values                                | TEXT / string             | TEXT + CHECK  | TEXT + CHECK             | JSON string            |
+ * | `enum`         | one of the declared values                                | TEXT / string             | TEXT          | TEXT                     | JSON string            |
  * | `secret`       | string (stored hashed or encrypted)                       | TEXT                      | TEXT          | TEXT                     | JSON string            |
  * | `number`       | finite double; `-0` is `0`                                | REAL / number             | REAL          | DOUBLE PRECISION         | JSON number            |
  * | `boolean`      | `true` / `false`                                          | INTEGER 0/1 / boolean     | INTEGER       | INTEGER                  | JSON boolean           |
@@ -197,7 +197,7 @@ export function operationValueViolation(
 
 /**
  * The sync wire's binary form of a top-level value (`{ __kora_bytes__: <base64> }`, what
- * beta.13 sends a `Uint8Array` as). A json or object field value of exactly that shape
+ * beta.12 sends a `Uint8Array` as). A json or object field value of exactly that shape
  * would be read back as bytes, so it is refused.
  */
 export const WIRE_BYTES_KEY = '__kora_bytes__'

@@ -126,7 +126,12 @@ export function wireSyncLifecycleAfterReady(
 
 	if (config.sync.autoReconnect !== false) {
 		emitter.on('sync:disconnected', () => {
-			if (state.intentionalDisconnect || syncEngine.isSchemaBlocked()) {
+			// A locked encryption keyring pauses sync until app.encryption.unlock() (ENC-1).
+			if (
+				state.intentionalDisconnect ||
+				syncEngine.isSchemaBlocked() ||
+				syncEngine.isEncryptionLocked()
+			) {
 				return
 			}
 			// A disconnect while an attempt is in flight makes that attempt count as failed,
@@ -143,6 +148,8 @@ export function wireSyncLifecycleAfterReady(
 					} catch {
 						return false
 					}
+					// Locked keyring: stop retrying; unlock() resumes sync.
+					if (syncEngine.isEncryptionLocked()) return true
 					// Success means the session reached streaming, not that the handshake was
 					// sent: a server that accepts and then drops sessions must not reset the
 					// backoff (SYNC-8).

@@ -111,7 +111,7 @@ export async function rebaseUnsyncedOperationsInLog(
 	// before its dependents are hashed: deps among the rebased set are remapped first.
 	// Deps on non-rebased (already acknowledged or foreign) operations keep their ids.
 	// Each operation keeps its own hash version: a version-1 operation (written before
-	// beta.14) is re-hashed with version 1. The deserialized `data` has the embedded
+	// beta.13) is re-hashed with version 1. The deserialized `data` has the embedded
 	// metadata keys already stripped, matching exactly what the creation path hashed.
 	const idMapping: Record<string, string> = {}
 	const newOperations: Operation[] = []

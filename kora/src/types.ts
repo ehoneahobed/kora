@@ -11,7 +11,6 @@ import type {
 	SchemaInput,
 	SequenceConfig,
 } from '@korajs/core'
-import type { FieldBuilder } from '@korajs/core'
 import type { AuthSyncBinding } from '@korajs/core/bindings'
 import type {
 	AuditExportOptions,
@@ -31,6 +30,26 @@ import type {
 	TransactionContext,
 } from '@korajs/store'
 import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
+import type { ReservedAppProperty } from './reserved-app-properties'
+import type { TypedCollections, TypedTransactionProxy } from './typed-api'
+
+export type {
+	CollectionInsertOf,
+	CollectionRecordOf,
+	CollectionUpdateOf,
+	IncludeMap,
+	Pluralize,
+	RecordOf,
+	Singularize,
+	TypedCollectionAccessor,
+	TypedCollectionOf,
+	TypedCollections,
+	TypedQueryBuilder,
+	TypedTransactionCollection,
+	TypedTransactionProxy,
+	TypedWhere,
+	WhereOperatorsFor,
+} from './typed-api'
 
 /**
  * Adapter type for local storage.
@@ -85,6 +104,14 @@ export interface StoreOptions {
 	 * `StorageDurabilityError` instead.
 	 */
 	allowNonDurable?: boolean
+	/**
+	 * When Kora asks the browser for persistent storage (NEW-STORE-4).
+	 * `'auto'` (default): in the background, never awaited, after sign-in, the
+	 * first local write, or when running as an installed app. `'manual'`: only when
+	 * the app calls `app.storage.persistence.request()`. Either way `app.ready`
+	 * never waits on it and the boot check (`persisted()`) never prompts.
+	 */
+	persistence?: 'auto' | 'manual'
 }
 
 export interface StoreInfo {
@@ -115,6 +142,26 @@ export interface StorageApi {
 	 * @returns true when a database was deleted, false when none existed
 	 */
 	deleteDatabase(name: string, options?: { force?: boolean }): Promise<boolean>
+	/**
+	 * Durable storage (`navigator.storage.persist()`), kept off the startup path
+	 * (NEW-STORE-4). `app.ready` never waits on it. Kora checks `persisted()` at
+	 * boot (never prompts) and, unless `store.persistence` is `'manual'`, requests
+	 * persistence in the background after sign-in, the first local write, or when
+	 * running as an installed app. Every result is also a `storage:persistence` event.
+	 */
+	persistence: StoragePersistenceApi
+}
+
+/** `app.storage.persistence`: durable-storage status and an explicit request. */
+export interface StoragePersistenceApi {
+	/** Last known state. Synchronous; never prompts. */
+	status(): import('@korajs/store').StoragePersistenceStatus
+	/**
+	 * Ask the browser for persistent storage. Firefox shows a permission prompt and
+	 * the promise settles when the user answers, so call it from a user gesture and
+	 * do not block rendering on it. Never throws.
+	 */
+	request(): Promise<import('@korajs/store').StoragePersistenceStatus>
 }
 
 /**
@@ -273,6 +320,15 @@ export interface KoraConfig {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: Extract<KoraEvent, { type: `sync:${string}` }>) => void
+	/**
+	 * Server-rendering behaviour (DX-6). By default an app created where there is no
+	 * `window` (a Next.js / Remix server render) stays inert: it opens no database and
+	 * starts no sync, `app.ready` rejects with `ServerRenderingAppError`, and
+	 * `<KoraProvider app={app}>` renders its fallback. Pass `false` in a Node.js program
+	 * that wants a real database (or set `store.adapter: 'better-sqlite3'`, which implies
+	 * it); `true` keeps the app inert without a `window` even with that adapter.
+	 */
+	ssr?: boolean
 	/** Switches for behaviour that is being phased in or out. */
 	experimental?: ExperimentalOptions
 }
@@ -280,8 +336,8 @@ export interface KoraConfig {
 /** {@link KoraConfig.experimental}. */
 export interface ExperimentalOptions {
 	/**
-	 * Use the beta.13 pairwise merge pipeline instead of the W7 per-field fold.
-	 * Available for ONE beta (beta.14) to compare behaviour; removed afterwards.
+	 * Use the beta.12 pairwise merge pipeline instead of the W7 per-field fold.
+	 * Available for ONE beta (beta.13) to compare behaviour; removed afterwards.
 	 * Switching it on an existing database re-materializes every row on open.
 	 * Defaults to false.
 	 */
@@ -307,8 +363,76 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	devtools?: boolean
 	/** Called for each sync-related framework event. */
 	onSyncEvent?: (event: KoraSyncEvent) => void
+	/**
+	 * Server-rendering behaviour (DX-6). By default an app created where there is no
+	 * `window` (a Next.js / Remix server render) stays inert: it opens no database and
+	 * starts no sync, `app.ready` rejects with `ServerRenderingAppError`, and
+	 * `<KoraProvider app={app}>` renders its fallback. Pass `false` in a Node.js program
+	 * that wants a real database (or set `store.adapter: 'better-sqlite3'`, which implies
+	 * it); `true` keeps the app inert without a `window` even with that adapter.
+	 */
+	ssr?: boolean
 	/** Switches for behaviour that is being phased in or out. */
 	experimental?: ExperimentalOptions
+}
+
+/**
+ * End-to-end encryption keyring controls (`app.encryption`, ENC-1). Null when
+ * `sync.encryption` is not enabled.
+ *
+ * While the keyring is locked sync is paused; local reads and writes continue (this
+ * layer encrypts the sync wire, not the local database).
+ */
+export interface EncryptionControl {
+	/** Current lock state, key version and reason. */
+	getStatus(): import('@korajs/sync').EncryptionStatus
+	/** Subscribe to status changes. Returns an unsubscribe function. */
+	onStatusChange(listener: (status: import('@korajs/sync').EncryptionStatus) => void): () => void
+	/**
+	 * Unlock with the user's passphrase. Opens the cached or server key record (on the
+	 * user's first device, creates it) and resumes sync. When no record is known yet and
+	 * sync is not connected, resolves with `code: 'AWAITING_SERVER'` and finishes at the
+	 * next handshake (watch `onStatusChange`). Rejects with `WRONG_PASSPHRASE`, or
+	 * `UNLOCK_THROTTLED` after repeated failures (a device-side backoff).
+	 */
+	unlock(passphrase: string): Promise<import('@korajs/sync').EncryptionStatus>
+	/** Forget the keys on this device (and its key cache) and pause sync until unlock. */
+	lock(): Promise<import('@korajs/sync').EncryptionStatus>
+	/** Create a new key version for new operations; old versions stay readable. Online only. */
+	rotateKey(): Promise<import('@korajs/sync').EncryptionStatus>
+	/**
+	 * Re-wrap every key version under a new master key and passphrase (no data
+	 * re-encrypted); the old master key is retired. Online only. This alone does not
+	 * contain a LEAKED passphrase: devices that still hold only the old master key can be
+	 * fed records forged with it. After a leak, also `rotateKey()`, `enableRecovery()`
+	 * again, and re-unlock every other device with the new passphrase (`lock()` then
+	 * `unlock(newPassphrase)`; never type the old one again, and update any configured
+	 * `key`). A device that cannot be re-unlocked stays exposed. See the sync encryption
+	 * guide.
+	 */
+	changePassphrase(
+		newPassphrase: string,
+		options?: { currentPassphrase?: string },
+	): Promise<import('@korajs/sync').EncryptionStatus>
+	/**
+	 * Create (or replace) the recovery key and return it ONCE. Store it offline: it is
+	 * the only way back after a lost passphrase. Online only. Also creates a new key
+	 * version (the recovery key's anchor), like `rotateKey()`. Returns `kora-rk3-...`.
+	 */
+	enableRecovery(): Promise<string>
+	/** Recover after a lost passphrase with the recovery key, setting a new passphrase. */
+	recover(
+		recoveryKey: string,
+		newPassphrase: string,
+	): Promise<import('@korajs/sync').EncryptionStatus>
+	/**
+	 * Last resort for `KEY_RECORD_MISSING` (the server lost the key record and no device
+	 * that holds the keyring will reconnect): start a new keyring. Data encrypted under
+	 * the lost one stays unreadable unless a device holding it reconnects later (it then
+	 * merges both). Needs a passphrase (`key` or `unlock()`); runs at the next handshake.
+	 * Rejects with `KEY_RECORD_EXISTS` when the server holds a record.
+	 */
+	startNewKeyring(): Promise<import('@korajs/sync').EncryptionStatus>
 }
 
 /**
@@ -453,6 +577,8 @@ export interface KoraApp {
 	collections: Readonly<Record<string, CollectionAccessor>>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */
+	encryption: EncryptionControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
@@ -530,55 +656,10 @@ export interface KoraApp {
 }
 
 /**
- * A typed collection accessor with full type inference.
- * Methods are parameterized by the inferred record, insert, and update types.
- */
-export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate> {
-	/** Insert a new record. Returns the full record with generated id and metadata. */
-	insert(data: TInsert): Promise<TRecord>
-	/** Find a record by its ID. */
-	findById(id: string): Promise<TRecord | null>
-	/** Update a record by ID with partial data. Returns the updated record. */
-	update(id: string, data: TUpdate): Promise<TRecord>
-	/** Soft-delete a record by ID. */
-	delete(id: string): Promise<void>
-	/** Start building a query with WHERE conditions. */
-	where(conditions: Record<string, unknown>): QueryBuilder<TRecord>
-}
-
-/**
  * A typed Kora application object with collection accessors inferred from the schema.
  * Each collection becomes a property with fully typed insert/update/query methods.
  */
-type KoraFrameworkProperty =
-	| 'ready'
-	| 'events'
-	| 'on'
-	| 'collections'
-	| 'sync'
-	| 'sequences'
-	| 'blobs'
-	| 'storage'
-	| 'getStore'
-	| 'getSyncEngine'
-	| 'getQueryStoreCache'
-	| 'storeInfo'
-	| 'close'
-	| 'transaction'
-	| 'mutation'
-	| 'exportBackup'
-	| 'importBackup'
-	| 'replayTo'
-	| 'exportAudit'
-
-export type TypedCollections<S extends SchemaInput> = {
-	readonly [C in keyof S['collections'] & string]: S['collections'][C] extends {
-		// biome-ignore lint/suspicious/noExplicitAny: Required for TypeScript conditional type inference
-		fields: infer F extends Record<string, FieldBuilder<any, any, any>>
-	}
-		? TypedCollectionAccessor<InferRecord<F>, InferInsertInput<F>, InferUpdateInput<F>>
-		: CollectionAccessor
-}
+type KoraFrameworkProperty = ReservedAppProperty
 
 export type TypedKoraApp<S extends SchemaInput> = {
 	/** Resolves when the store is open and collections are ready. */
@@ -591,6 +672,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	collections: TypedCollections<S>
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
+	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */
+	encryption: EncryptionControl | null
 	/** Offline-safe sequence generation. */
 	sequences: SequenceAccessor
 	/** Blob subsystem: store, read, and pull the bytes behind `blob` fields. */
@@ -607,10 +690,13 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
-	/** Execute multiple mutations atomically within a transaction. */
-	transaction(fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	/**
+	 * Execute multiple mutations atomically within a transaction. The callback's `tx` has
+	 * one typed accessor per schema collection.
+	 */
+	transaction(fn: (tx: TypedTransactionProxy<S>) => Promise<void>): Promise<Operation[]>
 	/** Execute a named mutation — a transaction with a DevTools-visible name. */
-	mutation(name: string, fn: (tx: TransactionProxy) => Promise<void>): Promise<Operation[]>
+	mutation(name: string, fn: (tx: TypedTransactionProxy<S>) => Promise<void>): Promise<Operation[]>
 	/** Export all data as a portable backup binary. */
 	exportBackup(options?: BackupOptions): Promise<Uint8Array>
 	/** Restore data from a backup binary. */

@@ -1,267 +1,164 @@
 ---
 title: DevTools API
-description: "@korajs/devtools API reference: instrumentation events, the DevTools bridge, and embedding the in-page overlay."
+description: "@korajs/devtools API reference and the complete Kora event catalog: every event, its payload, who emits it and whether DevTools records it."
 ---
 
 # DevTools API Reference
 
-`@korajs/devtools` instruments a Kora application and feeds events to a browser DevTools panel for real-time inspection of operations, merges, conflicts, sync activity, and network status.
+`@korajs/devtools` records Kora's instrumentation events and shows them in a browser DevTools panel
+or an in-page overlay. `createApp({ devtools: true })` sets it up; see the
+[DevTools guide](/guide/devtools) for using the panels.
 
-## Imports
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const app = createApp({ schema })
+-->
 
-```typescript
-import {
-  Instrumenter,
-  EventBuffer,
-  MessageBridge,
-  filterEvents,
-  getEventCategory,
-  computeStatistics,
-  buildPanelModel,
-  renderDevtoolsPanel,
-  PortRouter,
-} from '@korajs/devtools'
+## Events {#events}
 
-import type {
-  DevtoolsConfig,
-  EventCategory,
-  EventFilterCriteria,
-  EventStatistics,
-  TimestampedEvent,
-} from '@korajs/devtools'
-```
-
-## `Instrumenter`
-
-Core orchestrator. Attaches to a `KoraEventEmitter`, records all emitted events into a ring buffer with sequential IDs and reception timestamps, and optionally forwards them through a `MessageBridge` for consumption by a DevTools panel.
-
-### Constructor
+Kora reports what happens to your data as typed events (`KoraEvent` in `@korajs/core`).
+Subscribe on the app:
 
 ```typescript
-new Instrumenter(emitter: KoraEventEmitter, config?: DevtoolsConfig)
-```
-
-The instrumenter subscribes to the supported `KoraEventType` values on the emitter and begins recording immediately.
-
-### Methods
-
-- `getBuffer(): EventBuffer` -- returns the underlying event buffer.
-- `getBridge(): MessageBridge | null` -- returns the message bridge, or `null` if `bridgeEnabled` is `false`.
-- `pause(): void` -- temporarily stop recording. Events emitted while paused are dropped.
-- `resume(): void` -- resume recording after a pause.
-- `isPaused(): boolean` -- whether the instrumenter is currently paused.
-- `destroy(): void` -- detach all listeners from the emitter and destroy the bridge. After calling destroy the instrumenter is inert.
-
-### Example
-
-```typescript
-const instrumenter = new Instrumenter(app.emitter, { bufferSize: 5000 })
-const buffer = instrumenter.getBuffer()
-// ... later
-instrumenter.destroy()
-```
-
-## `EventBuffer`
-
-Fixed-capacity ring buffer for storing timestamped events. When the buffer is full, the oldest events are evicted to make room for new ones.
-
-### Constructor
-
-```typescript
-new EventBuffer(capacity?: number)  // default: 10000
-```
-
-Throws if `capacity` is less than 1.
-
-### Properties
-
-- `capacity: number` -- maximum number of events the buffer can hold.
-- `size: number` -- current number of events in the buffer.
-
-### Methods
-
-- `push(event: TimestampedEvent): void` -- append an event. Evicts the oldest event when at capacity.
-- `getAll(): readonly TimestampedEvent[]` -- returns all events in insertion order (oldest first).
-- `getRange(start: number, end: number): readonly TimestampedEvent[]` -- returns events whose sequential IDs fall within `[start, end]` (inclusive).
-- `getByType(type: KoraEventType): readonly TimestampedEvent[]` -- returns events matching a specific event type.
-- `clear(): void` -- remove all events from the buffer.
-
-## `MessageBridge`
-
-Communicates between the page context and a DevTools panel via `window.postMessage`. All messages are namespaced with a `source` field to avoid collisions. Safe to instantiate in non-browser environments (SSR/Node) -- all operations become no-ops when `window` is not available.
-
-### Constructor
-
-```typescript
-new MessageBridge(channelName?: string)  // default: 'kora-devtools'
-```
-
-### Methods
-
-- `send(event: TimestampedEvent): void` -- post a timestamped event through the bridge. No-op if window is unavailable or the bridge has been destroyed.
-- `onReceive(callback: (event: TimestampedEvent) => void): () => void` -- register a callback for events received through the bridge. Returns an unsubscribe function.
-- `destroy(): void` -- remove all listeners and detach from window. After calling destroy all operations become no-ops.
-
-## Event Filtering
-
-### `filterEvents(events, criteria)`
-
-Filters a list of timestamped events by the given criteria. All criteria are combined with AND logic. Returns all events if no criteria are specified.
-
-```typescript
-function filterEvents(
-  events: readonly TimestampedEvent[],
-  criteria: EventFilterCriteria,
-): readonly TimestampedEvent[]
-```
-
-### `getEventCategory(type)`
-
-Maps a `KoraEventType` to its `EventCategory`.
-
-```typescript
-function getEventCategory(type: KoraEventType): EventCategory
-```
-
-### Example
-
-```typescript
-import { filterEvents, getEventCategory } from '@korajs/devtools'
-
-const mergeEvents = filterEvents(buffer.getAll(), {
-  categories: ['merge'],
-  timeRange: { start: Date.now() - 60_000, end: Date.now() },
+const off = app.events.on('sync:operation-rejected', (event) => {
+  console.warn(`${event.collection}/${event.recordId} was refused: ${event.code}`)
 })
-
-getEventCategory('operation:created') // => 'operation'
-getEventCategory('sync:sent')         // => 'sync'
+app.on('merge:conflict', (event) => console.log(event.trace.strategy))
+off()
 ```
 
-## Statistics
+`app.on` is the same as `app.events.on`. A sync server emits its events on the emitter passed to
+`KoraSyncServer` / `createProductionServer`. The **DevTools** column says whether the
+`Instrumenter` records the event for the panel.
 
-### `computeStatistics(events)`
+### Operations and merges
 
-Computes aggregate statistics from a collection of timestamped events in a single pass.
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `operation:created` | `operation` | after every local write | yes |
+| `operation:applied` | `operation`, `duration` | after the store applies a remote operation (not for local writes) | yes |
+| `merge:started` | `operationA`, `operationB` | before the conflict traces of an applied remote operation | yes |
+| `merge:conflict` | `trace` (`MergeTrace`) | once per fold decision that was a conflict | yes |
+| `merge:completed` | `trace` | after the traces of one merge | yes |
+| `constraint:violated` | `constraint`, `trace` | a device's optimistic constraint check failed after applying a remote operation (the server is the authority) | yes |
+| `replay:completed` | `targetOperationId`, `operationsApplied`, `duration` | `app.replayTo()` finished | yes |
 
+### Sync connection
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `sync:connected` | `nodeId` | handshake accepted | yes |
+| `sync:disconnected` | `reason` | connection closed | yes |
+| `sync:suspended` | `reason` (`auth-loading`, `auth-required`, `auth-rejected`, `device-revoked`, `encryption-locked`, ...) | sync is paused on purpose | yes |
+| `sync:auth-failed` | `reason` | the server refused the credentials | yes |
+| `sync:schema-mismatch` | `clientSchemaVersion`, `serverSchemaVersion`, `supportedMin`, `supportedMax`, `reason` | the server does not accept this schema version | yes |
+| `sync:clock-skew` | `skewMs`, `severity` (`info`, `slow-warning`, `fast-blocked`), `source` | clock skew measured at the handshake or reported by the server | no |
+| `sync:clock-rebase` | `rebasedCount`, `maxSkewMs` | unsynced future-dated operations were re-stamped | no |
+| `sync:node-id-rotated` | `previousNodeId`, `nodeId`, `reenqueuedCount`, `heldCount?` | the server refused this device's node id; writes moved to a new node | no |
+| `sync:local-node` | `nodeId`, `action`, `localSequence?`, `serverSequence?`, `operationCount?` | bookkeeping of this database's nodes: `history-behind`, `server-behind`, `adoption-*`, `held`, `clone-detected`, `principal-switched`, `held-assigned`, `held-discarded` | no |
+| `connection:quality` | `quality` | the measured quality changed | yes |
+| `sync:diagnostics` | `diagnostics` | periodic metrics snapshot | yes |
+| `sync:bandwidth` | `bytesPerSecond`, `direction` | bandwidth sample | yes |
+| `encryption:status` | `status` (`state`, `keyring`, `keyVersion`, `code?`, `message?`) | the encryption keyring locked, unlocked or failed | no |
+
+### Sync data flow
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `sync:sent` | `operations`, `batchSize` | a batch was uploaded | yes |
+| `sync:received` | `operations`, `batchSize` (server: also `uniqueOperations`, `duplicateOperations`, `rejectedOperations`) | a batch arrived | yes |
+| `sync:acknowledged` | `sequenceNumber` | the server acknowledged an upload | yes |
+| `sync:initial-sync-progress` | `progress`, `totalBatches`, `receivedBatches` | during the first sync | yes |
+| `sync:operation-rejected` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | the server refused one of this device's operations; it is kept in `app.sync.getRejectedOperations()`, not retried | no |
+| `sync:apply-failed` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | a received operation could not be applied (it is retried or quarantined, never skipped) | yes |
+| `sync:apply-blocked` / `sync:apply-retrying` / `sync:apply-recovered` | `failure` | a failed apply blocks delivery, is retried, or succeeded | yes |
+| `sync:delivery-gap` | `expectedBase`, `receivedBase`, `currentWatermark`, `messageId`, `repeatCount` | a batch did not continue the delivery watermark; it is re-requested | no |
+| `sync:scope-retracted` | `collection`, `recordId`, `quarantinedOperationIds` | a record left this device's sync scope | no |
+| `sync:durability-degraded` / `sync:durability-restored` | `message`, `failedAttempts` / none | the local database could not be made durable before uploads (the server holds the durable copy), and recovery | yes |
+
+### Server only
+
+| Event | Payload | Emitted |
+|-------|---------|---------|
+| `sync:protocol-deprecated` | `nodeId`, `clientProtocolVersion`, `serverProtocolVersion`, `message` | a protocol-1 client (Kora 1.0.0-beta.12 or earlier) connected |
+| `sync:unverified-legacy-operation` | `nodeId`, `operationId`, `collection`, `message` | a protocol-1 operation whose id could not be verified was stored |
+| `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
+| `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
+
+### Storage
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `store:durability-lost` | `dbName`, `phase` (`open`, `promotion`), `reason`, `message` | **blocking**: no durable storage; writes are refused with `StorageDurabilityError` unless `allowNonDurable` | yes |
+| `store:storage-blocked` | `dbName`, `resource`, `state` (`waiting`, `resolved`), `waitedMs?`, `message` | **blocking while waiting**: another holder has the database's OPFS storage | yes |
+| `store:opfs-unavailable` | `dbName`, `reason`, `message` | OPFS could not be used and the store is not durable (emitted with `store:durability-lost`) | yes |
+| `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
+| `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
+| `store:schema-ahead` | `dbName`, `storedVersion`, `codeVersion`, `message` | the database was migrated by a newer build; the store refused to open it (`SchemaVersionAheadError`) | yes |
+| `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
+| `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |
+| `store:quota-exceeded` | `dbName`, `message` | a write exceeded the storage quota | yes |
+| `store:log-integrity` | `dbName`, `repaired`, `quarantined`, `gaps`, `clean`, `message` | the open-time log scan repaired or quarantined rows | yes |
+| `store:rematerialized` | `dbName`, `mode`, `records`, `changedRows`, `message` | records were rebuilt with the fold (first open after upgrading, or after a restore) | yes |
+| `storage:persistence` | `state`, `persisted`, `message?` | the `navigator.storage` persistence check or request | yes |
+
+### Queries and presence
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `query:error` | `queryId`, `collection`, `phase`, `code`, `message` | a subscription failed (it keeps its last results) | yes |
+| `awareness:updated` | `states` | presence states changed | no |
+
+### Declared but not emitted
+
+`query:subscribed`, `query:invalidated`, `query:executed`, `state-machine:transition`,
+`state-machine:rejected` and `sync:apply-abandoned` are part of the `KoraEvent` type but no Kora
+package emits them in 1.0.0-beta.13. Do not build on them. State-machine refusals surface as
+`InvalidStateTransitionError` from the write.
+
+---
+
+## createApp integration
+
+With `devtools: true`, `createApp` creates an `Instrumenter` on the app's emitter, forwards events to
+the browser extension through `window.postMessage` and mounts the in-page overlay (toggle with
+Ctrl+Shift+K, Cmd+Shift+K on macOS). In Node and server renders only the instrumenter runs.
+
+## Instrumenter
+
+<!-- docs-check: signature @korajs/devtools @korajs/core -->
 ```typescript
-function computeStatistics(events: readonly TimestampedEvent[]): EventStatistics
-```
-
-Returns an `EventStatistics` object with counts by category and type, merge conflict and constraint violation counts, average merge/query durations, and sync operation totals.
-
-## UI State
-
-### `buildPanelModel(events)`
-
-Transforms raw timestamped events into a structured model for the four DevTools panels: timeline, conflicts, operations, and network status.
-
-```typescript
-function buildPanelModel(events: readonly TimestampedEvent[]): DevtoolsPanelModel
-```
-
-Returns:
-
-```typescript
-interface DevtoolsPanelModel {
-  timeline: TimelineItem[]
-  conflicts: ConflictItem[]
-  operations: OperationItem[]
-  network: NetworkStatusModel
+class Instrumenter {
+  constructor(emitter: KoraEventEmitter, config?: {
+    bufferSize?: number      // default 10000
+    bridgeEnabled?: boolean  // default true: post events through a MessageBridge
+    channelName?: string     // default 'kora-devtools'
+  })
 }
 ```
 
-### `renderDevtoolsPanel(target, events)`
-
-Renders the DevTools panel UI into the target element using Preact. Supports efficient re-renders via virtual DOM diffing. Contains four tabs: Timeline, Conflicts, Operations, and Network.
-
-```typescript
-function renderDevtoolsPanel(
-  target: HTMLElement,
-  events: readonly TimestampedEvent[],
-): void
-```
-
-### Example
+Methods: `getBuffer()`, `getBridge()`, `pause()`, `resume()`, `isPaused()`, `destroy()`. Events
+received while paused are dropped. The recorded types are listed in the tables above.
 
 ```typescript
-import { buildPanelModel, renderDevtoolsPanel } from '@korajs/devtools'
+import { Instrumenter } from '@korajs/devtools'
 
-// Programmatic access to panel data
-const model = buildPanelModel(buffer.getAll())
-console.log(model.network.connected, model.conflicts.length)
-
-// Render the full UI into a DOM element
-renderDevtoolsPanel(document.getElementById('devtools')!, buffer.getAll())
+const instrumenter = new Instrumenter(app.events, { bufferSize: 5000, bridgeEnabled: false })
+const recent = instrumenter.getBuffer().getAll()
+instrumenter.destroy()
 ```
 
-## `PortRouter`
+## Building blocks
 
-Routes content-script events to the matching DevTools panel by browser tab. Used in the Chrome extension background script to connect `kora-content` ports (from content scripts) with `kora-panel` ports (from the DevTools panel).
-
-### Methods
-
-- `handleConnection(port: ExtensionPort): void` -- register a port. Ports named `'kora-panel'` are treated as panel clients; ports named `'kora-content'` are treated as content-script clients. Events from a content script are forwarded to the panel client for the same tab.
-
-### Example
-
-```typescript
-import { PortRouter } from '@korajs/devtools'
-
-const router = new PortRouter()
-chrome.runtime.onConnect.addListener((port) => {
-  router.handleConnection(port)
-})
-```
-
-## Types
-
-### `DevtoolsConfig`
-
-Configuration for the `Instrumenter`.
-
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `bufferSize` | `number` | No | `10000` |
-| `bridgeEnabled` | `boolean` | No | `true` |
-| `channelName` | `string` | No | `'kora-devtools'` |
-
-### `EventCategory`
-
-```typescript
-type EventCategory = 'operation' | 'merge' | 'sync' | 'query' | 'connection'
-```
-
-### `EventFilterCriteria`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `categories` | `EventCategory[]` | Filter by event categories |
-| `types` | `KoraEventType[]` | Filter by specific event types |
-| `timeRange` | `{ start: number; end: number }` | Filter by reception time range |
-| `collection` | `string` | Filter by collection name |
-
-All fields are optional. Criteria are combined with AND logic.
-
-### `EventStatistics`
-
-| Field | Type |
-|-------|------|
-| `totalEvents` | `number` |
-| `eventsByCategory` | `Record<EventCategory, number>` |
-| `eventsByType` | `Partial<Record<KoraEventType, number>>` |
-| `mergeConflicts` | `number` |
-| `constraintViolations` | `number` |
-| `avgMergeDuration` | `number \| null` |
-| `avgQueryDuration` | `number \| null` |
-| `syncOperationsSent` | `number` |
-| `syncOperationsReceived` | `number` |
-
-### `TimestampedEvent`
-
-A `KoraEvent` wrapped with a reception timestamp and sequential ID.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `number` | Auto-incrementing sequential ID |
-| `event` | `KoraEvent` | The original framework event |
-| `receivedAt` | `number` | `Date.now()` when the instrumenter captured the event |
+| Export | Description |
+|--------|-------------|
+| `EventBuffer(capacity = 10000)` | Ring buffer of `TimestampedEvent` (`{ id, event, receivedAt }`): `push`, `getAll`, `getRange(startId, endId)`, `getByType`, `clear`, `size`, `capacity`. |
+| `MessageBridge(channelName = 'kora-devtools')` | `window.postMessage` transport: `send`, `onReceive`, `destroy`; a no-op without `window`. |
+| `filterEvents(events, { categories?, types?, timeRange?, collection? })` | AND-combined filter. |
+| `getEventCategory(type)` | `'operation' \| 'merge' \| 'sync' \| 'query' \| 'connection'`. |
+| `computeStatistics(events)` | Counts by category and type, merge conflicts, constraint violations, average merge and query durations, sync totals. |
+| `buildPanelModel(events)` | `{ timeline, conflicts, operations, network }`, the data behind the panels. |
+| `renderDevtoolsPanel(target, events)` | Renders the panel with Preact. |
+| `mountKoraDevtoolsOverlay(instrumenter)` (`@korajs/devtools/overlay`) | Mounts the overlay; returns a teardown function. |
+| `PortRouter` | Routes `kora-content` ports to the `kora-panel` port of the same tab in the extension's background script. |

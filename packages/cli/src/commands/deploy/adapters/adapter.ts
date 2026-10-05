@@ -10,6 +10,21 @@ export const DEPLOY_PLATFORMS = [
 
 export type DeployPlatform = (typeof DEPLOY_PLATFORMS)[number]
 
+/**
+ * Platforms `kora deploy` can actually deploy to today (DX-8). The others are listed as
+ * "coming soon" and refused before anything is written.
+ */
+export const IMPLEMENTED_DEPLOY_PLATFORMS = ['fly', 'railway', 'aws-ecs', 'aws-lightsail'] as const
+
+/**
+ * Whether `kora deploy` has a working adapter for the platform.
+ */
+export function isImplementedDeployPlatform(
+	platform: DeployPlatform,
+): platform is (typeof IMPLEMENTED_DEPLOY_PLATFORMS)[number] {
+	return (IMPLEMENTED_DEPLOY_PLATFORMS as readonly string[]).includes(platform)
+}
+
 export interface ProjectConfig {
 	projectRoot: string
 	appName: string

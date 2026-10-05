@@ -13,15 +13,18 @@ describe('Kora Studio Lab', () => {
 	let lab: LabManager
 	let server: StudioServer
 
+	// Booting the lab starts a sync server and two devices; under a loaded CI runner this
+	// takes well over the 10s default. The timeout is a hang guard, not a performance check.
 	beforeAll(async () => {
 		lab = new LabManager(defaultLabSchema())
 		await lab.start(2)
 		server = await startStudioServer({ port: 0, lab })
-	})
+	}, 60_000)
 
 	afterAll(async () => {
-		await server.close()
-		await lab.close()
+		// Setup may have failed part-way; close only what was started.
+		if (server !== undefined) await server.close()
+		if (lab !== undefined) await lab.close()
 	})
 
 	test('starts with connected devices and reports state over HTTP', async () => {

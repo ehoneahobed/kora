@@ -1,5 +1,5 @@
-import type { KoraEventEmitter } from '@korajs/core'
-import { buildScopeMap } from '@korajs/core'
+import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
+import { KoraError, buildScopeMap, hasSchemaSyncRules, isCollectionSyncScoped } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type {
@@ -9,7 +9,8 @@ import type {
 	StorageFallbackReason,
 } from '@korajs/store'
 import { createRemoteChunkProvider, serveBlobChunks } from '@korajs/store'
-import { SyncEncryptor, SyncEngine } from '@korajs/sync'
+import type { EncryptionKeyring } from '@korajs/sync'
+import { SyncEngine } from '@korajs/sync'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 import { ApplyPipeline } from './apply-pipeline'
 import { wireAuditPersistence } from './audit-bridge'
@@ -50,6 +51,7 @@ export async function initializeApp(
 	config: KoraConfig,
 	emitter: KoraEventEmitter,
 	mergeEngine: MergeEngine,
+	keyring: EncryptionKeyring | null = null,
 ): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	let effectiveAdapterType = adapterType
@@ -136,7 +138,10 @@ export async function initializeApp(
 				reason: fallbackReason,
 				message: `OPFS persistence is unavailable (${fallbackReason}) for database "${dbName}"; Kora is using durable IndexedDB instead.`,
 			})
-		} catch {
+		} catch (error) {
+			// A durable copy a newer build migrated is refused, never replaced by memory
+			// storage (RT-109): the store already emitted store:schema-ahead.
+			if (error instanceof KoraError && error.code === 'SCHEMA_VERSION_AHEAD') throw error
 			effectiveAdapterType = 'sqlite-wasm'
 			adapter = await createAdapter(
 				'sqlite-wasm',
@@ -161,10 +166,15 @@ export async function initializeApp(
 	// that belongs to another user is never written under, uploaded or adopted for this
 	// user. Later user changes rebind through the auth binding's subscription.
 	const principal = config.sync ? authPrincipal(authBinding) : undefined
+	let initialPrincipal: string | null = null
 	if (principal) {
 		const userId = await principal()
 		if (userId) await store.bindPrincipal(userId)
+		initialPrincipal = userId ?? null
 	}
+	// Open the signed-in user's cached keyring (ENC-1): a device that unlocked before
+	// starts unlocked, offline.
+	await keyring?.load(initialPrincipal)
 
 	let recordConflict: (() => void) | undefined
 	const applyPipeline = new ApplyPipeline({
@@ -196,11 +206,6 @@ export async function initializeApp(
 
 		const syncAuth = authBinding?.auth ?? config.sync.auth
 
-		const encryptor =
-			config.sync.encryption?.enabled === true
-				? await SyncEncryptor.create(config.sync.encryption)
-				: undefined
-
 		syncEngine = new SyncEngine({
 			transport,
 			store: mergeAwareStore,
@@ -215,6 +220,7 @@ export async function initializeApp(
 				batchSize: config.sync.batchSize,
 				schemaVersion: config.sync.schemaVersion ?? config.schema.version,
 				scopeMap,
+				syncedCollections: schemaSyncedCollections(config.schema),
 				encryption: config.sync.encryption,
 				strictHandshake: config.sync.strictHandshake,
 				operationTransforms: config.sync.operationTransforms,
@@ -223,7 +229,9 @@ export async function initializeApp(
 			queueStorage: new StoreQueueStorage(adapter),
 			rejectedStorage: new StoreRejectedOperationStorage(adapter),
 			syncState: new StoreSyncStatePersistence(store, scopeMap),
-			encryptor,
+			// End-to-end encryption uses the user's shared keyring, opened at each
+			// handshake from the server-stored wrapped record (ENC-1, D4b).
+			...(keyring ? { keyring } : {}),
 		})
 		recordConflict = () => syncEngine?.recordConflict()
 
@@ -304,4 +312,15 @@ function encodeDbNameComponent(value: string): string {
 		encoded += `_${char.codePointAt(0)?.toString(16) ?? '0'}`
 	}
 	return encoded || 'empty'
+}
+
+/**
+ * The collections a schema syncs: every collection, or only the sync-scoped ones when
+ * the schema declares partial sync rules (the others are local-only).
+ */
+function schemaSyncedCollections(schema: SchemaDefinition): string[] {
+	const names = Object.keys(schema.collections)
+	return hasSchemaSyncRules(schema)
+		? names.filter((name) => isCollectionSyncScoped(schema, name))
+		: names
 }

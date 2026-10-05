@@ -179,6 +179,27 @@ describe('resolveSessionScopes', () => {
 		expect(scopes?.projects).toEqual({ orgId: { $in: ['o1', 'o2'] } })
 	})
 
+	test('RT-89: a claims-only grant on a schemaless server is unscoped, not empty', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		// What TokenAuthProvider returns when validate() gives no scopes.
+		const grant = claimScopes({ userId: 'alice' })
+		expect(resolveSessionScopes(null, { authScopes: grant, authenticated: true })).toBeUndefined()
+		// The handshake stays a client-side filter, as on any schemaless server.
+		expect(
+			resolveSessionScopes(null, { authScopes: grant, handshakeScope: { notes: {} } }),
+		).toEqual({ notes: {} })
+		warn.mockRestore()
+	})
+
+	test('RT-89: explicit collections in a schemaless grant stay authoritative', () => {
+		const grant = claimScopes({ userId: 'alice' }, { notes: { ownerId: 'alice' } })
+		expect(
+			resolveSessionScopes(null, { authScopes: grant, handshakeScope: { other: {} } }),
+		).toEqual({ notes: { ownerId: 'alice' } })
+		// A deliberate empty grant (no claims) still grants nothing.
+		expect(resolveSessionScopes(null, { authScopes: {} })).toEqual({})
+	})
+
 	test('the reserved $claims key never leaks into the effective scope', () => {
 		const scopes = resolveSessionScopes(null, {
 			handshakeScope: { [SCOPE_CLAIMS_KEY]: { userId: 'x' }, todos: {} },

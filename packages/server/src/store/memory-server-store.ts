@@ -7,7 +7,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock } from '@korajs/core'
+import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
@@ -16,6 +16,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	projectFoldState,
 	refoldRecord,
@@ -37,6 +38,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationScopeSnapshot,
@@ -131,6 +133,8 @@ export class MemoryServerStore implements ServerStore {
 	private snapshotFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
+	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
+	private readonly encryptionKeyRecords = new Map<string, EncryptionKeyRecordRow>()
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
@@ -225,6 +229,13 @@ export class MemoryServerStore implements ServerStore {
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		assertOperationTransformCoverage(
+			this.operations.map((op) => op.schemaVersion),
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+			'memory server store',
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -255,6 +266,14 @@ export class MemoryServerStore implements ServerStore {
 
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
+		if (this.schema) {
+			assertOperationTransformCoverage(
+				this.operations.map((op) => op.schemaVersion),
+				this.schema.version,
+				transforms,
+				'memory server store',
+			)
+		}
 		const before = this.schema
 			? serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
 			: null
@@ -779,6 +798,45 @@ export class MemoryServerStore implements ServerStore {
 		this.closed = true
 	}
 
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		return this.encryptionKeyRecords.get(keyRecordKey(owner, keyring))?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		const key = keyRecordKey(owner, keyring)
+		if ((this.encryptionKeyRecords.get(key)?.revision ?? 0) !== expectedRevision) return false
+		this.encryptionKeyRecords.set(key, { owner, keyring, record, revision })
+		return true
+	}
+
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		return [...this.encryptionKeyRecords.values()]
+			.filter((row) => owner === undefined || row.owner === owner)
+			.map((row) => ({ ...row }))
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		const ids = new Set<string>()
+		for (const op of this.operations) {
+			if (ids.size >= limit) break
+			const keyId = op.encrypted?.keyId
+			if (typeof keyId !== 'string') continue
+			if (nodeOwner !== null && this.nodeOwners.get(op.nodeId) !== nodeOwner) continue
+			ids.add(keyId)
+		}
+		return [...ids]
+	}
+
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
 		this.assertOpen()
 		if (userId === RELEASED_NODE_OWNER) return false
@@ -864,7 +922,12 @@ export class MemoryServerStore implements ServerStore {
 	async exportBackup(): Promise<Uint8Array> {
 		this.assertOpen()
 		const { buildServerBackup } = await import('./server-backup')
-		return buildServerBackup(this.nodeId, this.operations, this.versionVector)
+		return buildServerBackup(
+			this.nodeId,
+			this.operations,
+			this.versionVector,
+			await this.listEncryptionKeyRecords(),
+		)
 	}
 
 	async importBackup(
@@ -872,8 +935,12 @@ export class MemoryServerStore implements ServerStore {
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes reconcile the key table (not part of the log), record by record (RT-110).
+		await restoreBackupKeyRecords(this, keyRecords, merge === true)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
@@ -974,9 +1041,15 @@ export class MemoryServerStore implements ServerStore {
 			if (existing) existing._deleted = 1
 			return
 		}
+		const values: Record<string, unknown> = { ...row.values }
+		for (const [field, descriptor] of Object.entries(
+			this.schema?.collections[collection]?.fields ?? {},
+		)) {
+			values[field] = materializedFieldValue(row.values, field, descriptor)
+		}
 		collectionMap.set(recordId, {
 			id: recordId,
-			...row.values,
+			...values,
 			_created_at: row.createdAt,
 			_updated_at: row.updatedAt,
 			_deleted: row.deleted ? 1 : 0,
@@ -1040,4 +1113,9 @@ export class MemoryServerStore implements ServerStore {
 			)
 		}
 	}
+}
+
+/** Map key of one owner's keyring (NUL never occurs in either part's meaning). */
+function keyRecordKey(owner: string, keyring: string): string {
+	return `${owner}\u0000${keyring}`
 }

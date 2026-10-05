@@ -1,5 +1,5 @@
 /**
- * W7 step 7: the beta.13 pipeline (`experimental.legacyMerge`) and the W7 fold,
+ * W7 step 7: the beta.12 pipeline (`experimental.legacyMerge`) and the W7 fold,
  * compared on random workloads.
  *
  * Each seed runs a workload through real devices (./workload.ts), collects the

@@ -6,7 +6,8 @@ type Filter = 'all' | 'active' | 'completed'
 const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
 	createTodosStores()
 
-const filter = $state<Filter>('all')
+// biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
+let filter = $state<Filter>('all')
 let input = $state('')
 
 const filteredTodos = $derived(

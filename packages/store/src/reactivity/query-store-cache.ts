@@ -1,4 +1,5 @@
 import type { QueryBuilder } from '../query/query-builder'
+import { queryKey } from '../query/query-key'
 import type { CollectionRecord } from '../types'
 import { QueryStore } from './query-store'
 
@@ -59,7 +60,7 @@ export class QueryStoreCache {
 	}
 
 	private getKey(queryBuilder: QueryBuilder<unknown>): string {
-		return `${this.scopeKey}:${JSON.stringify(queryBuilder.getDescriptor())}`
+		return `${this.scopeKey}:${queryKey(queryBuilder.getDescriptor())}`
 	}
 }
 

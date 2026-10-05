@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /**
- * Red-team round 2 probe (RT-71): a real beta.13 (protocol 1) client writes ordinary
+ * Red-team round 2 probe (RT-71): a real beta.12 (protocol 1) client writes ordinary
  * values through a v2 server that verifies every version-1 id.
  *
- * Usage: node scripts/remediation/rt-legacy-id-probe.mjs <path-to-beta13-build>
- * Prints one JSON line per case: whether the beta.13 client's write was refused, how
+ * Run it against the last published release, 1.0.0-beta.12 (tag v1.0.0-beta.12;
+ * compat-beta12.mjs says how to build it).
+ *
+ * Usage: node scripts/remediation/rt-legacy-id-probe.mjs <path-to-beta12-build>
+ * Prints one JSON line per case: whether the beta.12 client's write was refused, how
  * the server stored it (`hashVersion` 1 = verified, absent = stored unverified, RT-71),
- * and whether a beta.14 peer converged to the beta.13 client's row.
+ * and whether a beta.13 peer converged to the beta.12 client's row.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -14,9 +17,9 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = resolve(fileURLToPath(import.meta.url), '../../..')
-const b13 = process.argv[2]
-if (!b13) {
-	console.error('usage: rt-legacy-id-probe.mjs <path-to-beta13-build>')
+const b12 = process.argv[2]
+if (!b12) {
+	console.error('usage: rt-legacy-id-probe.mjs <path-to-beta12-build>')
 	process.exit(2)
 }
 const v2 = {
@@ -24,8 +27,8 @@ const v2 = {
 	server: await import(join(here, 'packages/server/dist/index.js')),
 }
 const old = {
-	kora: await import(join(b13, 'kora/dist/index.js')),
-	core: await import(join(b13, 'packages/core/dist/index.js')),
+	kora: await import(join(b12, 'kora/dist/index.js')),
+	core: await import(join(b12, 'packages/core/dist/index.js')),
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 

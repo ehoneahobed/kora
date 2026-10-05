@@ -1,5 +1,5 @@
 /**
- * RT-71: a beta.13 (protocol 1) client hashes an `undefined` object member as
+ * RT-71: a beta.12 (protocol 1) client hashes an `undefined` object member as
  * `"key":null`, and its JSON upload no longer holds the member. The server rebuilds
  * the forms it can (an update's cleared fields from `previousData`; declared nested
  * members with the schema), stores an update's cleared fields as `null` (what the
@@ -28,7 +28,7 @@ const schema = defineSchema({
 	},
 })
 
-/** What a beta.13 client uploads: id over the in-memory data, data after a JSON round trip. */
+/** What a beta.12 (or older) client uploads: id over the in-memory data, data after a JSON round trip. */
 function legacyOp(nodeId: string, seq: number, partial: Partial<Operation>): Operation {
 	const built = withContentId({
 		id: '',
@@ -60,7 +60,7 @@ async function setup(protocolVersion?: number) {
 	return { store, server, client, unverified }
 }
 
-describe('beta.13 undefined members (RT-71)', () => {
+describe('beta.12 undefined members (RT-71)', () => {
 	test('an update clearing a field is stored verified, with the field null', async () => {
 		const { store, server, client, unverified } = await setup()
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', assignee: 'bob' } })
@@ -113,7 +113,7 @@ describe('beta.13 undefined members (RT-71)', () => {
 			previousData: { title: 'x', assignee: 'bob' },
 			causalDeps: [insert.id],
 		})
-		// What beta.13 really sends for update(id, { title: 'y', assignee: undefined }).
+		// What beta.12 really sends for update(id, { title: 'y', assignee: undefined }).
 		const honest = legacyOp('legacy-node', 3, {
 			type: 'update',
 			data: { title: 'z', assignee: undefined },

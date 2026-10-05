@@ -2,7 +2,7 @@ import type { CollectionAccessor, Store } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import { AwarenessManager } from '@korajs/sync'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { createElement, useEffect } from 'react'
+import { StrictMode, createElement, useEffect } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import * as Y from 'yjs'
 import { KoraProvider } from '../context/kora-context'
@@ -259,5 +259,41 @@ describe('useRichText', () => {
 				},
 			}),
 		)
+	})
+
+	test('StrictMode: loads after the double mount, callbacks and result stay stable (DX-5)', async () => {
+		const helloBody = encodeText('Hello')
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: helloBody })),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: helloBody }])),
+		} as unknown as CollectionAccessor
+		const store = createMockStore({ notes })
+		const results: Array<ReturnType<typeof useRichText>> = []
+
+		function Probe(): ReturnType<typeof createElement> {
+			const result = useRichText('notes', 'rec-1', 'body')
+			results.push(result)
+			return createElement(
+				'span',
+				{ 'data-testid': 'value' },
+				result.ready ? result.text.toString() : 'loading',
+			)
+		}
+
+		const view = render(
+			createElement(StrictMode, null, createElement(KoraProvider, { store }, createElement(Probe))),
+		)
+		await waitFor(() => expect(screen.getByTestId('value').textContent).toBe('Hello'))
+		const settled = results.at(-1)
+		view.rerender(
+			createElement(StrictMode, null, createElement(KoraProvider, { store }, createElement(Probe))),
+		)
+		const after = results.at(-1)
+		expect(after?.undo).toBe(settled?.undo)
+		expect(after?.setCursor).toBe(settled?.setCursor)
+		expect(after).toBe(settled)
 	})
 })

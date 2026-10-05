@@ -1,6 +1,8 @@
 # Design: Structured, Secret, and Binary Field Types
 
 Status: state-of-the-art target (no phasing; each type is built to its complete form)
+
+> Design record. The field types shipped; their merge semantics were superseded in 1.0.0-beta.13 by the per-field CRDT fold in `@korajs/core` (arrays are element multisets merged per occurrence, objects merge per top-level key with nested values replaced whole, resolvers fold once per write in HLC order). Section 1 describes the pre-fold pairwise engine of the time. Current behaviour: `docs/guide/conflict-resolution.md` and `docs/guide/schema-design.md`.
 Scope: `@korajs/core` field system, with changes across `@korajs/merge`, `@korajs/store`, `@korajs/sync`, `@korajs/devtools`
 Bar: these three field types are a differentiating moat. The structured-data CRDT and the content-addressed blob channel are the parts a large engineering org evaluating offline-first frameworks would judge us on. They are built complete, correct, and property-tested, not stubbed.
 
@@ -10,7 +12,7 @@ Bar: these three field types are a differentiating moat. The structured-data CRD
 
 - `FieldKind` (core `types.ts`): `string | number | boolean | timestamp | richtext | enum | array`.
 - Merge dispatch (`merge/engine/field-merger.ts`, `autoMerge`): scalar kinds resolve by LWW, `array` by add-wins set, `richtext` by Yjs CRDT. `autoMerge` receives `baseValue`, `localValue`, `remoteValue`, and both operations' HLC timestamps, so a 3-way convergent merge has everything it needs.
-- Storage maps kinds to SQL columns: string→TEXT, number→REAL, boolean→INTEGER, enum→TEXT+CHECK, timestamp→INTEGER, array→TEXT (JSON), richtext→BLOB (Yjs state).
+- Storage maps kinds to SQL columns: string→TEXT, number→REAL, boolean→INTEGER, enum→TEXT (membership enforced by validation, no CHECK), timestamp→INTEGER, array→TEXT (JSON), richtext→BLOB (Yjs state).
 - Binary already crosses the whole system: `richtext` values are `Uint8Array`, tagged as canonical JSON in `op.data`, and travel over the protobuf wire as bytes. "A field kind whose value is binary" is a solved plumbing pattern.
 - Crypto already exists in `@korajs/auth` (`generateEncryptionKey`, `encryptData`, `decryptData`, key derivation, an `operation-encryptor` for end-to-end operation encryption). `@korajs/core` cannot depend on `@korajs/auth`, so field-level crypto primitives move into core.
 

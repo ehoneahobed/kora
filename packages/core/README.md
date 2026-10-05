@@ -1,13 +1,13 @@
 # @korajs/core
 
-Schema definitions, operations, Hybrid Logical Clock, version vectors, and type inference for Kora.js. This is the foundation package -- all other packages depend on it.
+Schema definitions, type inference, operations, the hybrid logical clock, version vectors and the record fold (the per-field merge every replica runs) for Kora.js. It is the foundation: every other package depends on it.
 
 > Most developers don't install this directly. Use [`korajs`](https://www.npmjs.com/package/korajs) instead.
 
 ## Install
 
 ```bash
-pnpm add @korajs/core
+pnpm add @korajs/core@beta
 ```
 
 ## Usage
@@ -25,7 +25,7 @@ const schema = defineSchema({
         title: t.string(),
         completed: t.boolean().default(false),
         tags: t.array(t.string()).default([]),
-        notes: t.richtext(),
+        notes: t.richtext().optional(),
         priority: t.enum(['low', 'medium', 'high']).default('medium'),
         createdAt: t.timestamp().auto(),
       },
@@ -48,29 +48,37 @@ const ts2 = clock.now()
 // Timestamps are always monotonically increasing
 HybridLogicalClock.compare(ts1, ts2) // negative (ts1 < ts2)
 
-// Merge with a remote timestamp
-const ts3 = clock.receive(remoteTimestamp)
+// Merge a remote timestamp (rejected, without changing the clock, if malformed or
+// more than 5 minutes in the future)
+const ts3 = clock.receive({ wallTime: ts2.wallTime + 5, logical: 0, nodeId: 'node-2' })
 ```
 
 ### Version Vectors
 
 ```typescript
-import { mergeVectors, deltaOperations } from '@korajs/core'
+import { computeDelta, mergeVectors, type Operation, type VersionVector } from '@korajs/core'
+
+declare const localVector: VersionVector
+declare const remoteVector: VersionVector
+declare const log: { getRange(nodeId: string, from: number, to: number): Promise<Operation[]> }
 
 const merged = mergeVectors(localVector, remoteVector)
-const missing = deltaOperations(localVector, remoteVector, operationLog)
+const missing = await computeDelta(localVector, remoteVector, log) // causal order
 ```
 
 ## What's Inside
 
-- **Schema system** -- `defineSchema`, `t` field builders, full TypeScript type inference
-- **Operation type** -- immutable, content-addressed mutation records
-- **Hybrid Logical Clock** -- causal ordering without synchronized clocks
-- **Version vectors** -- efficient delta sync computation
-- **Error types** -- structured `KoraError` base class
+- **Schema system**: `defineSchema`, `t` field builders, full TypeScript type inference
+- **Operation type**: immutable, content-addressed mutation records
+- **Hybrid Logical Clock**: causal ordering without synchronized clocks
+- **Version vectors**: delta computation for uploads
+- **Record fold**: `foldRecord`, `mergeOp`, `materialize`, `joinStates`: one deterministic per-field CRDT
+- **Atomic ops**: `op.increment`, `op.append` and friends
+- **Migrations**: `migrate()` builders for schema versions
+- **Error types**: structured `KoraError` base class with codes
 
 ## License
 
 MIT
 
-See the [full documentation](https://github.com/ehoneahobed/kora) for guides, API reference, and examples.
+See the [Core API reference](https://korajs.dev/api/core) and the [guides](https://korajs.dev).

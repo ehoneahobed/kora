@@ -134,10 +134,13 @@ describe('create-kora-app flow', () => {
 		expect(pkg).toContain('@korajs/server')
 		expect(pkg).toContain('"tw-sync-app"')
 
-		// Sync + devtools in main
+		// Sync + devtools in the app module, with hooks typed for the app (W11 typed path)
+		const kora = await readFile(join(targetDir, 'src', 'kora.ts'), 'utf-8')
+		expect(kora).toContain('sync:')
+		expect(kora).toContain('devtools: import.meta.env.DEV')
+		expect(kora).toContain('createKoraHooks<typeof app>()')
 		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
-		expect(main).toContain('sync:')
-		expect(main).toContain('devtools: import.meta.env.DEV')
+		expect(main).toContain("import { app } from './kora'")
 
 		// SQLite server store
 		const server = await readFile(join(targetDir, 'server.ts'), 'utf-8')

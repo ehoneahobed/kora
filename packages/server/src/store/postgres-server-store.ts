@@ -9,14 +9,25 @@ import type {
 	TimeSource,
 	VersionVector,
 } from '@korajs/core'
-import { HybridLogicalClock, quoteIdent } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	KoraError,
+	assertOperationTransformCoverage,
+	quoteIdent,
+} from '@korajs/core'
+import { planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
-import { envelopeColumn, parseEnvelopeColumn } from './envelope-column'
+import {
+	KEY_ID_SAMPLE_ROWS,
+	envelopeColumn,
+	envelopeKeyIds,
+	parseEnvelopeColumn,
+} from './envelope-column'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -49,6 +60,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
 	projectFoldState,
@@ -92,6 +104,7 @@ import type {
 	ConditionalApplyInput,
 	ConditionalApplyResult,
 	DeliveredOperation,
+	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
 	OperationResolutionOutcome,
@@ -290,6 +303,11 @@ export class PostgresServerStore implements ServerStore {
 		})
 		this.timeSource = timeSource ?? { now: () => Date.now() }
 		this.ready = this.initialize()
+		// RT-88: startup runs before anyone awaits it. The failure is not swallowed: every
+		// method awaits `ready` and rejects with it, `whenReady()` returns it, and
+		// createPostgresServerStore awaits it. Without this handler an unreachable
+		// database would be an unhandled rejection, which terminates Node.
+		this.ready.catch(() => {})
 	}
 
 	/** Resolves once the store's tables and identity are loaded. */
@@ -486,6 +504,56 @@ export class PostgresServerStore implements ServerStore {
 		return this.schema
 	}
 
+	/**
+	 * One-time migration (RT-101): drop the enum `CHECK` constraints (and any `NOT NULL`
+	 * on a schema field) that beta.12 and earlier DDL put on collection tables, in one
+	 * transaction. A check is dropped when it parses as an enum check (one column against
+	 * string literals, in every form Postgres normalizes `IN (...)` to, the single-value
+	 * `col = 'x'` included, RT-108) on an enum field of the schema, or as the multi-value
+	 * `= ANY (ARRAY[...])` shape on another non-internal column; checks added by hand are
+	 * kept. Idempotent and resumable: a later start finds nothing to drop.
+	 */
+	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
+		const fieldsByTable: Record<string, string[]> = {}
+		const enumFieldsByTable: Record<string, string[]> = {}
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			fieldsByTable[name] = Object.keys(collection.fields)
+			enumFieldsByTable[name] = Object.entries(collection.fields)
+				.filter(([, descriptor]) => descriptor.kind === 'enum')
+				.map(([field]) => field)
+		}
+		await this.db.transaction(async (tx) => {
+			const statements = await planPostgresConstraintRelaxation(
+				async (text) =>
+					(await tx.execute(sql.raw(text))) as unknown as Array<Record<string, unknown>>,
+				fieldsByTable,
+				enumFieldsByTable,
+			)
+			for (const statement of statements) await tx.execute(sql.raw(statement))
+		})
+	}
+
+	/**
+	 * Throws {@link OperationTransformCoverageError} when a schema version in the stored
+	 * log has no transform path to `version` (RT-103): those operations would fold as
+	 * absent, silently erasing them from their records.
+	 */
+	private async assertTransformCoverage(
+		version: number,
+		transforms: readonly OperationTransform[],
+	): Promise<void> {
+		if (transforms.length === 0) return
+		const rows = (await this.db.execute(
+			sql`SELECT DISTINCT schema_version AS v FROM operations`,
+		)) as unknown as { v: number | string }[]
+		assertOperationTransformCoverage(
+			rows.map((row) => Number(row.v)),
+			version,
+			transforms,
+			'Postgres server store',
+		)
+	}
+
 	getOperationTransforms(): readonly OperationTransform[] {
 		return this.operationTransforms
 	}
@@ -493,6 +561,7 @@ export class PostgresServerStore implements ServerStore {
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		if (this.schema) await this.assertTransformCoverage(this.schema.version, transforms)
 		this.operationTransforms = [...transforms]
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every
@@ -503,6 +572,11 @@ export class PostgresServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
+		await this.assertTransformCoverage(
+			schema.version,
+			options.operationTransforms ?? this.operationTransforms,
+		)
 		this.schema = schema
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
@@ -535,9 +609,12 @@ export class PostgresServerStore implements ServerStore {
 			}
 		}
 
+		// beta.12 tables carry enum CHECKs a schema upgrade cannot change: drop them once
+		// (RT-101); the value domain is enforced at ingest only.
+		await this.relaxValueDomainConstraints(schema)
 		await this.migrateTextCodec(schema)
 
-		// beta.13 clears stored by an earlier server, made explicit once (RT-85); their
+		// beta.12 clears stored by an earlier server, made explicit once (RT-85); their
 		// records are re-folded by the re-materialization below.
 		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
@@ -1405,7 +1482,12 @@ export class PostgresServerStore implements ServerStore {
 		const rows = await this.db.select().from(pgOperations).orderBy(asc(pgOperations.deliverySeq))
 		const operations = rows.map((row) => this.deserializeOperation(row))
 
-		return buildServerBackup(this.nodeId, operations, this.versionVector)
+		return buildServerBackup(
+			this.nodeId,
+			operations,
+			this.versionVector,
+			await this.listEncryptionKeyRecords(),
+		)
 	}
 
 	async importBackup(
@@ -1415,8 +1497,12 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 
-		const { mergeBackupOperations, parseServerBackup } = await import('./server-backup')
-		const { operations, versionVector } = parseServerBackup(data)
+		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+			'./server-backup'
+		)
+		const { operations, versionVector, keyRecords } = parseServerBackup(data)
+		// Both modes reconcile the key table (not part of the log), record by record (RT-110).
+		await restoreBackupKeyRecords(this, keyRecords, merge === true)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
@@ -1525,6 +1611,82 @@ export class PostgresServerStore implements ServerStore {
 			return null
 		}
 		return { wallTime: row.wallTime, logical: row.logical, nodeId: row.timestampNodeId }
+	}
+
+	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+		)) as unknown as { record: string }[]
+		return rows[0]?.record ?? null
+	}
+
+	async putEncryptionKeyRecord(
+		owner: string,
+		keyring: string,
+		record: string,
+		revision: number,
+		expectedRevision: number,
+	): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		const now = Date.now()
+		// One statement each, atomic on the (owner, keyring) primary key: concurrent writes
+		// from any number of server instances have exactly one winner.
+		const rows = (expectedRevision === 0
+			? await this.db.execute(
+					sql`INSERT INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+							VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now})
+							ON CONFLICT (owner, keyring) DO NOTHING RETURNING owner`,
+				)
+			: await this.db.execute(
+					sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+							WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+							RETURNING owner`,
+				)) as unknown as { owner: string }[]
+		return rows.length > 0
+	}
+
+	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			owner === undefined
+				? sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`
+				: sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+		)) as unknown as Array<{
+			owner: string
+			keyring: string
+			revision: number | string
+			record: string
+		}>
+		// BIGINT columns may come back as strings.
+		return rows.map((row) => ({
+			owner: row.owner,
+			keyring: row.keyring,
+			revision: Number(row.revision),
+			record: row.record,
+		}))
+	}
+
+	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (nodeOwner === null
+			? await this.db.execute(
+					sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+				)
+			: await this.db.execute(
+					sql`SELECT o.encrypted AS encrypted FROM node_claims c
+							JOIN operations o ON o.node_id = c.node_id
+							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+				)) as unknown as { encrypted: string | null }[]
+		return envelopeKeyIds(
+			rows.map((row) => row.encrypted),
+			limit,
+		)
 	}
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
@@ -1891,7 +2053,9 @@ export class PostgresServerStore implements ServerStore {
 			recordId,
 			...fieldNames.map((f) => {
 				const descriptor = collectionDef.fields[f]
-				return descriptor ? serializePgFieldValue(recordData[f] ?? null, descriptor) : null
+				return descriptor
+					? serializePgFieldValue(materializedFieldValue(recordData, f, descriptor), descriptor)
+					: null
 			}),
 			createdAt,
 			updatedAt,
@@ -1964,7 +2128,12 @@ export class PostgresServerStore implements ServerStore {
 				entry.recordId,
 				...fieldNames.map((field) => {
 					const descriptor = collectionDef.fields[field]
-					return descriptor ? serializePgFieldValue(row.values[field] ?? null, descriptor) : null
+					return descriptor
+						? serializePgFieldValue(
+								materializedFieldValue(row.values, field, descriptor),
+								descriptor,
+							)
+						: null
 				}),
 				row.createdAt,
 				row.updatedAt,
@@ -2018,7 +2187,7 @@ export class PostgresServerStore implements ServerStore {
 	 * or commits after it (and is merged into the batch's state).
 	 */
 	/**
-	 * Write the beta.13 clears the ids prove into the stored bodies, once per database
+	 * Write the beta.12 clears the ids prove into the stored bodies, once per database
 	 * (RT-85, see `provenLegacyClears`), and mark their records' fold states stale.
 	 * Idempotent: concurrent first starts write the same bodies.
 	 */
@@ -2515,6 +2684,19 @@ export class PostgresServerStore implements ServerStore {
 				)
 			`)
 
+			// Wrapped end-to-end encryption key records (ENC-1, D4b): salt, KDF parameters
+			// and wrapped keys per (owner, keyring). Never a usable key.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_encryption_keys (
+					owner TEXT NOT NULL,
+					keyring TEXT NOT NULL,
+					revision BIGINT NOT NULL,
+					record TEXT NOT NULL,
+					updated_at BIGINT NOT NULL,
+					PRIMARY KEY (owner, keyring)
+				)
+			`)
+
 			// Node id -> principal binding (see claimNode). One row per device node id.
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS node_claims (
@@ -2803,36 +2985,88 @@ export async function createPostgresServerStore(
 	const client = postgresClient(options.connectionString)
 	const db = drizzleFn(client)
 
-	return new PostgresServerStore(db, options.nodeId, undefined, {
+	const store = new PostgresServerStore(db, options.nodeId, undefined, {
 		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
 		...(options.revokedAuthoritativeNodeIds
 			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
 			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
+	// RT-88: fail at startup, where the caller awaits, rather than on the first sync.
+	try {
+		await store.whenReady()
+	} catch (error) {
+		await endPostgresClient(client)
+		throw new ServerStoreUnavailableError(options.connectionString, error)
+	}
+	return store
+}
+
+/**
+ * The Postgres server store could not start: the database is unreachable, refused the
+ * credentials, or its tables could not be created. `cause` is the driver's error.
+ */
+export class ServerStoreUnavailableError extends KoraError {
+	constructor(connectionString: string, cause: unknown) {
+		const reason = cause instanceof Error ? cause.message : String(cause)
+		super(
+			`Could not start the PostgreSQL server store (${redactConnectionString(connectionString)}): ${reason}. Check that the database is running and reachable, and that the connection string and credentials are correct.`,
+			'SERVER_STORE_UNAVAILABLE',
+			{ target: redactConnectionString(connectionString) },
+		)
+		this.name = 'ServerStoreUnavailableError'
+		;(this as { cause?: unknown }).cause = cause
+	}
+}
+
+/** host:port/database of a connection string, never its credentials. */
+function redactConnectionString(connectionString: string): string {
+	try {
+		const url = new URL(connectionString)
+		return `${url.hostname}${url.port ? `:${url.port}` : ''}${url.pathname}`
+	} catch {
+		return 'invalid connection string'
+	}
+}
+
+async function endPostgresClient(client: unknown): Promise<void> {
+	const end = (client as { end?: (options?: { timeout?: number }) => Promise<void> }).end
+	if (typeof end !== 'function') return
+	try {
+		await end.call(client, { timeout: 0 })
+	} catch {
+		// Best effort: the startup error above is the one that matters.
+	}
 }
 
 async function loadPostgresDeps(): Promise<{
 	postgresClient: (connectionString: string) => unknown
 	drizzleFn: (client: unknown) => PostgresJsDatabase
 }> {
+	// `postgres` is an optional peer: imported only when this backend is used. The
+	// specifiers come from an array so no bundler resolves them at build time (an app
+	// without `postgres` must still bundle), and the import is a real `import()` so it runs
+	// inside vitest's module runner too. A `new Function('return import(x)')` wrapper did
+	// neither reliably: it escaped vitest's VM (RT-30) and hid the real error.
+	const [postgresSpecifier, drizzleSpecifier] = POSTGRES_DRIVER_SPECIFIERS
+	let postgresMod: { default: (cs: string) => unknown }
+	let drizzleMod: { drizzle: (client: unknown) => PostgresJsDatabase }
 	try {
-		const dynamicImport = new Function('specifier', 'return import(specifier)') as (
-			specifier: string,
-		) => Promise<unknown>
-
-		const postgresMod = (await dynamicImport('postgres')) as { default: (cs: string) => unknown }
-		const drizzleMod = (await dynamicImport('drizzle-orm/postgres-js')) as {
-			drizzle: (client: unknown) => PostgresJsDatabase
-		}
-
-		return {
-			postgresClient: postgresMod.default,
-			drizzleFn: drizzleMod.drizzle,
-		}
-	} catch {
+		postgresMod = (await import(/* @vite-ignore */ postgresSpecifier)) as typeof postgresMod
+		drizzleMod = (await import(/* @vite-ignore */ drizzleSpecifier)) as typeof drizzleMod
+	} catch (error) {
 		throw new Error(
-			'PostgreSQL backend requires the "postgres" package. Install it in your project dependencies.',
+			`PostgreSQL backend requires the "postgres" package. Install it in your project dependencies. (${error instanceof Error ? error.message : String(error)})`,
 		)
 	}
+	return {
+		postgresClient: postgresMod.default,
+		drizzleFn: drizzleMod.drizzle,
+	}
 }
+
+/** Optional driver modules, loaded on first use of the Postgres backend. */
+const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
+	'postgres',
+	'drizzle-orm/postgres-js',
+]

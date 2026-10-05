@@ -2,6 +2,12 @@ import { generateSQL } from '@korajs/core'
 import type { CollectionDefinition, FieldDescriptor, SchemaDefinition } from '@korajs/core'
 import type { SchemaDiff } from './schema-differ'
 import { getChangedCollections } from './schema-differ'
+import {
+	type EvolveTableTarget,
+	evolveFieldSpec,
+	formatEvolveTableDirective,
+} from './table-evolution-directive'
+import { formatRelaxValueDomainDirective } from './value-domain-directive'
 
 export interface GeneratedMigration {
 	up: string[]
@@ -19,21 +25,23 @@ export function generateMigration(
 	diff: SchemaDiff,
 ): GeneratedMigration {
 	const up: string[] = []
-	const down: string[] = []
+	// Each change's inverse is one group of statements in its own order; the groups run
+	// in reverse order of the changes they undo.
+	const downGroups: string[][] = []
 
 	for (const change of diff.changes) {
 		if (change.type === 'collection-added') {
 			const collectionDef = current.collections[change.collection]
 			if (!collectionDef) continue
 			up.push(...generateSQL(change.collection, collectionDef))
-			down.push(...dropCollectionStatements(change.collection))
+			downGroups.push(dropCollectionStatements(change.collection))
 		}
 
 		if (change.type === 'collection-removed') {
 			const collectionDef = previous.collections[change.collection]
 			up.push(...dropCollectionStatements(change.collection))
 			if (collectionDef) {
-				down.push(...generateSQL(change.collection, collectionDef))
+				downGroups.push(generateSQL(change.collection, collectionDef))
 			}
 		}
 	}
@@ -58,60 +66,95 @@ export function generateMigration(
 		const currentDef = current.collections[collection]
 		if (!previousDef || !currentDef) continue
 
+		// A change to a field's value domain only (enum values, requiredness, default) needs
+		// no new table shape: the value domain is enforced by validation on every replica
+		// (RT-101). What it needs is the removal of the constraints beta.12 and earlier DDL
+		// restated it with (an enum CHECK, NOT NULL), which a table cannot evolve. The
+		// directive is expanded by `kora migrate --apply` against the live catalog of each
+		// backend, in the migration's transaction (with its history row), and is a no-op on
+		// tables that are already relaxed.
+		const valueDomainOnly = diff.changes.every(
+			(change) =>
+				change.collection !== collection ||
+				(change.type === 'field-changed' && isValueDomainChange(change.before, change.after)),
+		)
+		if (valueDomainOnly) {
+			const directive = relaxValueDomainDirective(collection, previousDef, currentDef)
+			up.push(directive)
+			downGroups.push([directive])
+			continue
+		}
+
 		validateRebuildSafety(collection, previousDef, currentDef)
 
-		up.push(...generateRebuildStatements(collection, previousDef, currentDef))
-		down.push(...generateRebuildStatements(collection, currentDef, previousDef))
+		// The table keeps everything the migration does not name (RT-105): a client store's
+		// `_version` / `_field_versions` and foreign keys, each store's indexes, the
+		// Postgres server store's column types. So the change is a directive that
+		// `kora migrate --apply` expands against each backend's live catalog (ADD / DROP
+		// COLUMN, a catalog-driven SQLite rebuild), in the migration's transaction, after
+		// relaxing beta.12 value-domain constraints the same way.
+		const relax = relaxValueDomainDirective(collection, previousDef, currentDef)
+		up.push(relax, formatEvolveTableDirective(evolveTarget(collection, previousDef, currentDef)))
+		downGroups.push([
+			relax,
+			formatEvolveTableDirective(evolveTarget(collection, currentDef, previousDef)),
+		])
 	}
-
-	down.reverse()
 
 	return {
 		up,
-		down,
+		down: downGroups.reverse().flat(),
 		summary: diff.changes.map(formatChange),
 		containsBreakingChanges: diff.hasBreakingChanges,
 	}
 }
 
-function generateRebuildStatements(
+/**
+ * Whether a field change touches only its value domain (same kind, item kind and auto
+ * flag; enum values, requiredness or default differ).
+ */
+function isValueDomainChange(before: FieldDescriptor, after: FieldDescriptor): boolean {
+	return (
+		before.kind === after.kind && before.itemKind === after.itemKind && before.auto === after.auto
+	)
+}
+
+/** The table changes that take a collection from `from` to `to`. */
+function evolveTarget(
 	collection: string,
 	from: CollectionDefinition,
 	to: CollectionDefinition,
-): string[] {
-	const table = quoteIdentifier(collection)
-	const tempTable = quoteIdentifier(`_kora_mig_${collection}_new`)
-
-	const targetColumns = [
-		'id TEXT PRIMARY KEY NOT NULL',
-		...Object.entries(to.fields).map(([field, descriptor]) => columnDefinition(field, descriptor)),
-		'_created_at INTEGER NOT NULL',
-		'_updated_at INTEGER NOT NULL',
-		'_deleted INTEGER NOT NULL DEFAULT 0',
-	]
-
-	const statements: string[] = []
-	statements.push(`CREATE TABLE ${tempTable} (\n  ${targetColumns.join(',\n  ')}\n)`)
-
-	const toFields = Object.keys(to.fields)
-	const columns = ['id', ...toFields, '_created_at', '_updated_at', '_deleted']
-	const selectExpressions = columns.map((column) =>
-		projectionForColumn(column, from.fields, to.fields[column] ?? null),
-	)
-
-	statements.push(
-		`INSERT INTO ${tempTable} (${columns.map(quoteIdentifier).join(', ')}) SELECT ${selectExpressions.join(', ')} FROM ${table}`,
-	)
-	statements.push(`DROP TABLE ${table}`)
-	statements.push(`ALTER TABLE ${tempTable} RENAME TO ${table}`)
-
-	for (const indexField of to.indexes) {
-		statements.push(
-			`CREATE INDEX IF NOT EXISTS idx_${collection}_${indexField} ON ${table} (${quoteIdentifier(indexField)})`,
-		)
+): EvolveTableTarget {
+	const target: EvolveTableTarget = {
+		table: collection,
+		add: {},
+		drop: [],
+		change: {},
+		addIndexes: to.indexes.filter((field) => !from.indexes.includes(field)),
+		removeIndexes: from.indexes.filter((field) => !to.indexes.includes(field)),
 	}
+	for (const [field, descriptor] of Object.entries(to.fields)) {
+		const before = from.fields[field]
+		if (!before) {
+			target.add[field] = evolveFieldSpec(descriptor)
+		} else if (before.kind !== descriptor.kind || before.itemKind !== descriptor.itemKind) {
+			target.change[field] = { from: evolveFieldSpec(before), to: evolveFieldSpec(descriptor) }
+		}
+	}
+	target.drop = Object.keys(from.fields).filter((field) => !(field in to.fields))
+	return target
+}
 
-	return statements
+function relaxValueDomainDirective(
+	collection: string,
+	from: CollectionDefinition,
+	to: CollectionDefinition,
+): string {
+	const fields = [...new Set([...Object.keys(from.fields), ...Object.keys(to.fields)])].sort()
+	const enums = fields.filter(
+		(field) => from.fields[field]?.kind === 'enum' || to.fields[field]?.kind === 'enum',
+	)
+	return formatRelaxValueDomainDirective({ table: collection, fields, enums })
 }
 
 function validateRebuildSafety(
@@ -143,105 +186,6 @@ function validateRebuildSafety(
 			)
 		}
 	}
-}
-
-function projectionForColumn(
-	column: string,
-	fromFields: Record<string, FieldDescriptor>,
-	targetDescriptor: FieldDescriptor | null,
-): string {
-	if (
-		column === 'id' ||
-		column === '_created_at' ||
-		column === '_updated_at' ||
-		column === '_deleted'
-	) {
-		return quoteIdentifier(column)
-	}
-
-	const sourceDescriptor = fromFields[column]
-	if (sourceDescriptor && targetDescriptor) {
-		return projectionForFieldTransform(column, sourceDescriptor, targetDescriptor)
-	}
-
-	if (sourceDescriptor) {
-		return quoteIdentifier(column)
-	}
-
-	if (!targetDescriptor) {
-		return 'NULL'
-	}
-
-	if (targetDescriptor.auto && targetDescriptor.kind === 'timestamp') {
-		return "CAST(strftime('%s','now') AS INTEGER) * 1000"
-	}
-
-	if (targetDescriptor.defaultValue !== undefined) {
-		return sqlLiteral(targetDescriptor.defaultValue)
-	}
-
-	return 'NULL'
-}
-
-function projectionForFieldTransform(
-	column: string,
-	source: FieldDescriptor,
-	target: FieldDescriptor,
-): string {
-	const sourceColumn = quoteIdentifier(column)
-	if (source.kind === target.kind && source.itemKind === target.itemKind) {
-		if (target.kind === 'enum' && target.enumValues && target.enumValues.length > 0) {
-			const allowed = target.enumValues.map((value) => sqlLiteral(value)).join(', ')
-			const fallback =
-				target.defaultValue !== undefined ? sqlLiteral(target.defaultValue) : sourceColumn
-			return `CASE WHEN ${sourceColumn} IN (${allowed}) THEN ${sourceColumn} ELSE ${fallback} END`
-		}
-		return sourceColumn
-	}
-
-	if (target.kind === 'string') {
-		return `CAST(${sourceColumn} AS TEXT)`
-	}
-
-	if (target.kind === 'number' || target.kind === 'timestamp') {
-		if (
-			source.kind === 'string' ||
-			source.kind === 'enum' ||
-			source.kind === 'number' ||
-			source.kind === 'timestamp' ||
-			source.kind === 'boolean'
-		) {
-			const castType = target.kind === 'number' ? 'REAL' : 'INTEGER'
-			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL ELSE CAST(${sourceColumn} AS ${castType}) END`
-		}
-	}
-
-	if (target.kind === 'boolean') {
-		if (source.kind === 'number' || source.kind === 'timestamp' || source.kind === 'boolean') {
-			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL WHEN CAST(${sourceColumn} AS REAL) = 0 THEN 0 ELSE 1 END`
-		}
-
-		if (source.kind === 'string' || source.kind === 'enum') {
-			return `CASE WHEN ${sourceColumn} IS NULL THEN NULL WHEN LOWER(TRIM(CAST(${sourceColumn} AS TEXT))) IN ('1','true','t','yes','y','on') THEN 1 WHEN LOWER(TRIM(CAST(${sourceColumn} AS TEXT))) IN ('0','false','f','no','n','off') THEN 0 ELSE ${projectionFallback(target)} END`
-		}
-	}
-
-	if (target.kind === 'enum' && target.enumValues && target.enumValues.length > 0) {
-		if (source.kind === 'string' || source.kind === 'enum') {
-			const allowed = target.enumValues.map((value) => sqlLiteral(value)).join(', ')
-			return `CASE WHEN ${sourceColumn} IN (${allowed}) THEN ${sourceColumn} ELSE ${projectionFallback(target)} END`
-		}
-	}
-
-	if (target.kind === 'array' && source.kind === 'array' && source.itemKind === target.itemKind) {
-		return sourceColumn
-	}
-
-	if (target.auto && target.kind === 'timestamp') {
-		return "CAST(strftime('%s','now') AS INTEGER) * 1000"
-	}
-
-	return projectionFallback(target)
 }
 
 function canTransformField(source: FieldDescriptor, target: FieldDescriptor): boolean {
@@ -288,77 +232,10 @@ function canTransformField(source: FieldDescriptor, target: FieldDescriptor): bo
 	return false
 }
 
-function projectionFallback(target: FieldDescriptor): string {
-	if (target.auto && target.kind === 'timestamp') {
-		return "CAST(strftime('%s','now') AS INTEGER) * 1000"
-	}
-
-	if (target.defaultValue !== undefined) {
-		return sqlLiteral(target.defaultValue)
-	}
-
-	return 'NULL'
-}
-
 function dropCollectionStatements(collection: string): string[] {
 	const table = quoteIdentifier(collection)
 	const opsTable = quoteIdentifier(`_kora_ops_${collection}`)
 	return [`DROP TABLE IF EXISTS ${table}`, `DROP TABLE IF EXISTS ${opsTable}`]
-}
-
-function columnDefinition(fieldName: string, descriptor: FieldDescriptor): string {
-	const sqlType = mapFieldType(descriptor)
-	const parts = [quoteIdentifier(fieldName), sqlType]
-
-	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
-		parts.push('NOT NULL')
-	}
-
-	if (descriptor.defaultValue !== undefined) {
-		parts.push(`DEFAULT ${sqlLiteral(descriptor.defaultValue)}`)
-	}
-
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		const values = descriptor.enumValues.map((value) => sqlLiteral(value)).join(', ')
-		parts.push(`CHECK (${quoteIdentifier(fieldName)} IN (${values}))`)
-	}
-
-	return parts.join(' ')
-}
-
-function mapFieldType(descriptor: FieldDescriptor): string {
-	switch (descriptor.kind) {
-		case 'string':
-			return 'TEXT'
-		case 'number':
-			return 'REAL'
-		case 'boolean':
-			return 'INTEGER'
-		case 'enum':
-			return 'TEXT'
-		case 'timestamp':
-			return 'INTEGER'
-		case 'array':
-			return 'TEXT'
-		case 'object':
-			return 'TEXT'
-		case 'json':
-			return 'TEXT'
-		case 'blob':
-			return 'TEXT'
-		case 'secret':
-			return 'TEXT'
-		case 'richtext':
-			return 'BLOB'
-	}
-}
-
-function sqlLiteral(value: unknown): string {
-	if (value === null) return 'NULL'
-	if (typeof value === 'number') return String(value)
-	if (typeof value === 'boolean') return value ? '1' : '0'
-	if (typeof value === 'string') return `'${value.replaceAll("'", "''")}'`
-	return `'${JSON.stringify(value).replaceAll("'", "''")}'`
 }
 
 function quoteIdentifier(identifier: string): string {

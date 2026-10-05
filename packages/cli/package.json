@@ -1,6 +1,6 @@
 {
   "name": "@korajs/cli",
-  "version": "1.0.0-beta.12",
+  "version": "1.0.0-beta.13",
   "description": "Kora.js CLI tooling and project scaffolding",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -20,6 +20,16 @@
       "require": {
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
+      }
+    },
+    "./vite": {
+      "import": {
+        "types": "./dist/vite.d.ts",
+        "default": "./dist/vite.js"
+      },
+      "require": {
+        "types": "./dist/vite.d.cts",
+        "default": "./dist/vite.cjs"
       }
     },
     "./create": {

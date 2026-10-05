@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
 import { ProjectExistsError } from '../../errors'
+import { KORA_TAURI_TEMPLATE_VERSION } from '../../templates/tauri-version'
 import { directoryExists } from '../../utils/fs-helpers'
 import { createCommand, deriveKoraTemplateVersion } from './create-command'
 import { applySyncProviderPreset } from './sync-provider-preset'
@@ -111,6 +112,25 @@ describe('create command flow', () => {
 		expect(pkg).not.toContain('{{koraVersion}}')
 	})
 
+	test('tauri template pins @korajs/tauri to its own version line, not koraVersion', async () => {
+		const targetDir = join(tempDir.path, 'tauri-version-test')
+		await scaffoldTemplate('tauri-react', targetDir, {
+			projectName: 'tauri-version-test',
+			packageManager: 'npm',
+			koraVersion: '1.0.0-beta.13',
+		})
+
+		const pkg = JSON.parse(await readFile(join(targetDir, 'package.json'), 'utf-8')) as {
+			dependencies: Record<string, string>
+		}
+		const tauriManifest = JSON.parse(
+			await readFile(new URL('../../../../tauri/package.json', import.meta.url), 'utf-8'),
+		) as { version: string }
+		expect(KORA_TAURI_TEMPLATE_VERSION).toBe(tauriManifest.version)
+		expect(pkg.dependencies['@korajs/tauri']).toBe(tauriManifest.version)
+		expect(pkg.dependencies.korajs).toBe('1.0.0-beta.13')
+	})
+
 	test('pins prerelease Kora template dependencies exactly', () => {
 		expect(deriveKoraTemplateVersion('1.0.0-beta.9')).toBe('1.0.0-beta.9')
 		expect(deriveKoraTemplateVersion('1.2.3')).toBe('^1.2.0')
@@ -201,7 +221,9 @@ describe('create command flow', () => {
 				packageManager: 'pnpm',
 				koraVersion: '0.1.0',
 			})
-			const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+			// The flagship creates its app in src/kora.ts (typed hooks bound to the app).
+			const appModule = template === 'react-tailwind-sync' ? 'kora.ts' : 'main.tsx'
+			const main = await readFile(join(targetDir, 'src', appModule), 'utf-8')
 			expect(main).toContain('devtools: import.meta.env.DEV')
 		}
 	})

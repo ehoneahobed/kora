@@ -18,10 +18,10 @@ export const FORGED_DUPLICATE_CODE = 'FORGED_DUPLICATE'
  *
  * Compared per the stored operation's hash version:
  * - version 1: type, collection, recordId, data, timestamp, nodeId, atomicOps (what a
- *   beta.13 id covers; an own operation renumbered by sequence repair keeps its id);
+ *   beta.12 id covers; an own operation renumbered by sequence repair keeps its id);
  * - version 2: also previousData, sequenceNumber, causalDeps (as a set) and schemaVersion.
  * Bodies are compared canonical (core canonical-body), version-1 updates in their legacy
- * canonical form (a cleared field stored as null), so a beta.13 client re-sending what
+ * canonical form (a cleared field stored as null), so a beta.12 client re-sending what
  * the server stored with restored nulls is the same operation. An envelope's ciphertext
  * is not compared (it is re-sealed with a fresh nonce per upload); its header fields,
  * which the envelope's AAD binds, are.
@@ -76,23 +76,23 @@ function contentKey(op: Operation, version: 1 | 2): string | null {
 /**
  * {@link isSameStoredOperation}, plus the stored copies earlier releases REWROTE under
  * the original id (RT-84): before transforms ran at fold time, a server stored a
- * schema-transformed operation (and beta.13 servers stored protocol-1 ciphertext
+ * schema-transformed operation (and beta.12 servers stored protocol-1 ciphertext
  * re-encrypted per upload) under the id of what the client sent, without a hash
  * version. Such a copy is not the content its id names, so its body can never equal an
  * honest re-upload. It is recognised by exactly that: it declares no hash version and
- * its id does not verify against its own content (with every beta.13 hash rebuild).
+ * its id does not verify against its own content (with every beta.12 hash rebuild).
  * For it, identity is the header the id was computed with and the server never
  * rewrote: id, node, type, collection, record and timestamp. Effects of a duplicate are
  * still derived from the STORED copy only (RT-77), so this widens nothing an upload
  * could influence.
  *
  * Copies stored by this release are the operation as uploaded (plus a verified hash
- * version declaration and a beta.13 clear made explicit, both identical under the id),
+ * version declaration and a beta.12 clear made explicit, both identical under the id),
  * so they always take the exact comparison.
  *
  * @param upload - The operation as uploaded
  * @param stored - The operation the store holds under the same id
- * @param schema - The server schema (for beta.13 nested-member hash rebuilds)
+ * @param schema - The server schema (for beta.12 nested-member hash rebuilds)
  */
 export async function isSameOperationAsStored(
 	upload: Operation,
@@ -118,7 +118,7 @@ export async function isSameOperationAsStored(
  *
  * @param upload - The echoed operation (of a node other than the session's)
  * @param stored - The operation the store holds under the same id
- * @param schema - The server schema (for beta.13 hash rebuilds)
+ * @param schema - The server schema (for beta.12 hash rebuilds)
  */
 export async function isRewrittenEcho(
 	upload: Operation,

@@ -119,7 +119,11 @@ export {
 	resolveAtomicOp,
 	toAtomicOp,
 } from './operations/atomic-ops'
-export type { AtomicOpSentinel } from './operations/atomic-ops'
+export type {
+	ArrayAtomicOpSentinel,
+	AtomicOpSentinel,
+	NumericAtomicOpSentinel,
+} from './operations/atomic-ops'
 
 // === Record materialization (shared client/server atomic-aware replay) ===
 export {
@@ -228,7 +232,25 @@ export type {
 } from './schema/define'
 export { generateFullDDL, generateSQL } from './schema/sql-gen'
 export { quoteIdent } from './schema/quote-ident'
-export { ArrayFieldBuilder, EnumFieldBuilder, FieldBuilder, t } from './schema/types'
+export {
+	ArrayFieldBuilder,
+	EnumFieldBuilder,
+	FieldBuilder,
+	JsonFieldBuilder,
+	ObjectFieldBuilder,
+	SecretFieldBuilder,
+	t,
+} from './schema/types'
+export type {
+	FieldInput,
+	FieldOutput,
+	FieldTypeInfo,
+	ObjectFieldValue,
+	RichtextInput,
+	ScalarFieldBuilder,
+	ScalarFieldKind,
+	Simplify,
+} from './schema/types'
 export { assertResolvedFieldValue, validateRecord } from './schema/validation'
 export {
 	DEFAULT_MAX_OPERATION_BYTES,
@@ -246,9 +268,15 @@ export {
 // === Type Inference ===
 export type {
 	FieldKindToType,
+	FieldMap,
+	InferFieldInput,
 	InferFieldType,
+	InferInsert,
 	InferInsertInput,
 	InferRecord,
+	InferRecordField,
+	InferUpdate,
+	InferUpdateField,
 	InferUpdateInput,
 } from './schema/infer'
 
@@ -287,7 +315,10 @@ export { defaultSequenceFormat, formatSequenceValue } from './sequences/sequence
 export type { OperationTransform } from './migration/operation-transform'
 export { applyOperationTransforms } from './migration/apply-operation-transforms'
 export {
+	OperationTransformCoverageError,
 	OperationTransformError,
+	assertOperationTransformCoverage,
+	missingTransformPaths,
 	operationSchemaView,
 	operationTransformsFingerprint,
 } from './migration/operation-view'

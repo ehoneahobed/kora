@@ -27,12 +27,30 @@ export const KORA_ATOMIC_OP_KEY: typeof KORA_ATOMIC_OP = KORA_ATOMIC_OP
 /**
  * Sentinel object returned by op.* helpers.
  * Detected by Collection.update() and resolved to concrete values.
+ *
+ * The type parameters carry the helper's operation and operand type (RT-113), so an
+ * update input accepts numeric helpers only on number and timestamp fields and array
+ * helpers, with the element type, only on array fields. The bare `AtomicOpSentinel` is
+ * any sentinel.
  */
-export interface AtomicOpSentinel {
+export interface AtomicOpSentinel<Type extends AtomicOpType = AtomicOpType, Value = unknown> {
 	readonly [KORA_ATOMIC_OP_KEY]: true
-	readonly type: AtomicOpType
-	readonly value: unknown
+	readonly type: Type
+	readonly value: Value
 }
+
+/** The numeric helpers (`op.increment`, `op.decrement`, `op.max`, `op.min`). */
+export type NumericAtomicOpSentinel = AtomicOpSentinel<'increment' | 'max' | 'min', number>
+
+/** The array helpers (`op.append`, `op.remove`) for an array of `Item`. */
+export type ArrayAtomicOpSentinel<Item> = AtomicOpSentinel<'append' | 'remove', Item>
+
+/**
+ * Constraint of an array helper's item: listing the primitive types keeps a literal
+ * argument's literal type (`op.append('high')` is `'high'`, assignable to an enum array),
+ * while objects are inferred as written (not readonly).
+ */
+type AtomicItem = string | number | boolean | bigint | symbol | object | null | undefined
 
 /**
  * Type guard: checks whether a value is an atomic op sentinel.
@@ -104,7 +122,10 @@ export function resolveAtomicOp(currentValue: unknown, sentinel: AtomicOpSentine
 	return applyAtomicOp(currentValue, { type: sentinel.type, value: sentinel.value })
 }
 
-function createSentinel(type: AtomicOpType, value: unknown): AtomicOpSentinel {
+function createSentinel<Type extends AtomicOpType, Value>(
+	type: Type,
+	value: Value,
+): AtomicOpSentinel<Type, Value> {
 	return Object.freeze({
 		[KORA_ATOMIC_OP]: true as const,
 		type,
@@ -137,7 +158,7 @@ export const op = {
 	 *
 	 * @param n - The amount to increment (use negative values to decrement)
 	 */
-	increment(n: number): AtomicOpSentinel {
+	increment(n: number): AtomicOpSentinel<'increment', number> {
 		return createSentinel('increment', n)
 	},
 
@@ -147,7 +168,7 @@ export const op = {
 	 *
 	 * @param n - The amount to decrement
 	 */
-	decrement(n: number): AtomicOpSentinel {
+	decrement(n: number): AtomicOpSentinel<'increment', number> {
 		return createSentinel('increment', -n)
 	},
 
@@ -157,7 +178,7 @@ export const op = {
 	 *
 	 * @param n - The value to compare against the current value
 	 */
-	max(n: number): AtomicOpSentinel {
+	max(n: number): AtomicOpSentinel<'max', number> {
 		return createSentinel('max', n)
 	},
 
@@ -167,7 +188,7 @@ export const op = {
 	 *
 	 * @param n - The value to compare against the current value
 	 */
-	min(n: number): AtomicOpSentinel {
+	min(n: number): AtomicOpSentinel<'min', number> {
 		return createSentinel('min', n)
 	},
 
@@ -177,7 +198,7 @@ export const op = {
 	 *
 	 * @param item - The item to append to the array
 	 */
-	append(item: unknown): AtomicOpSentinel {
+	append<Item extends AtomicItem>(item: Item): AtomicOpSentinel<'append', Item> {
 		return createSentinel('append', item)
 	},
 
@@ -187,7 +208,7 @@ export const op = {
 	 *
 	 * @param item - The item to remove from the array
 	 */
-	remove(item: unknown): AtomicOpSentinel {
+	remove<Item extends AtomicItem>(item: Item): AtomicOpSentinel<'remove', Item> {
 		return createSentinel('remove', item)
 	},
 }

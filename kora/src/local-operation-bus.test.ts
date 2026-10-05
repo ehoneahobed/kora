@@ -66,4 +66,52 @@ describe('local operation bus', () => {
 		expect(seen).toHaveLength(1)
 		expect(tabB.getVersionVector().get('server-peer')).toBe(4)
 	})
+	test('a change without an operation (scope retraction) refreshes the other tab (RT-98)', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const emitterA = new SimpleEventEmitter()
+		const emitterB = new SimpleEventEmitter()
+		const tabA = new Store({ schema, adapter, nodeId: 'shared', emitter: emitterA })
+		const tabB = new Store({ schema, adapter, nodeId: 'shared', emitter: emitterB })
+		await tabA.open()
+		await tabB.open()
+		const dbName = `bus-${Date.now()}-${Math.random()}`
+		cleanups.push(wireLocalOperationBus(dbName, tabA, emitterA))
+		cleanups.push(wireLocalOperationBus(dbName, tabB, emitterB))
+		cleanups.push(() => tabA.close())
+
+		const row = await tabA.collection('todos').insert({ title: 'visible' })
+		let seen: Array<{ id: string }> = []
+		tabB
+			.collection('todos')
+			.where({})
+			.subscribe((rows) => {
+				seen = rows as Array<{ id: string }>
+			})
+		await settle()
+		expect(seen.map((r) => r.id)).toEqual([row.id])
+
+		// No operation: a local-view change only the syncing tab makes.
+		await tabA.applyScopeRetraction('todos', String(row.id))
+		await settle()
+		expect(seen).toEqual([])
+	})
+
+	test('every store invalidation reaches change listeners; peer invalidations do not echo', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'n1' })
+		await store.open()
+		cleanups.push(() => store.close())
+		const changes: Array<{ collection: string; ids: readonly string[] | null; op: boolean }> = []
+		const stop = store.onRecordsChanged((change) =>
+			changes.push({ collection: change.collection, ids: change.ids, op: !!change.operation }),
+		)
+		const row = await store.collection('todos').insert({ title: 'a' })
+		await store.applyScopeRetraction('todos', String(row.id))
+		store.notifyExternalChange('todos')
+		stop()
+		expect(changes).toEqual([
+			{ collection: 'todos', ids: [row.id], op: true },
+			{ collection: 'todos', ids: [row.id], op: false },
+		])
+	})
 })

@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Protocol v2 wire-compatibility check against a real beta.13 build (33bca46).
+ * Protocol v2 wire-compatibility check against the last published release, 1.0.0-beta.12
+ * (tag v1.0.0-beta.12, protocol 1). The unreleased Phase 1 build (33bca46) also works as
+ * the legacy build, but no such client or server exists in the field.
  *
  * Usage:
- *   git archive 33bca46 | tar -x -C /tmp/b13 && (cd /tmp/b13 && pnpm install && pnpm build)
- *   node scripts/remediation/protocol-v2-compat.mjs /tmp/b13
+ *   git archive v1.0.0-beta.12 | tar -x -C /tmp/b12 && (cd /tmp/b12 && pnpm install && pnpm build)
+ *   node scripts/remediation/protocol-v2-compat.mjs /tmp/b12
  *
  * Runs two scenarios over real WebSockets with better-sqlite3 client stores:
- *   A. v2 clients (this tree) <-> beta.13 server: inserts and updates converge.
- *   B. beta.13 (protocol 1) client <-> v2 server (this tree), with a v2 client: the
+ *   A. v2 clients (this tree) <-> beta.12 server: inserts and updates converge.
+ *   B. beta.12 (protocol 1) client <-> v2 server (this tree), with a v2 client: the
  *      legacy client is accepted (deprecation warning), its writes reach the v2
  *      client, and the v2 client's writes reach it.
  * Prints one JSON line per scenario and exits non-zero on any failure.
@@ -19,9 +21,9 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = resolve(fileURLToPath(import.meta.url), '../../..')
-const b13 = process.argv[2]
-if (!b13) {
-	console.error('usage: protocol-v2-compat.mjs <path-to-beta13-build>')
+const b12 = process.argv[2]
+if (!b12) {
+	console.error('usage: protocol-v2-compat.mjs <path-to-beta12-build>')
 	process.exit(2)
 }
 
@@ -30,8 +32,8 @@ const v2 = {
 	server: await import(join(here, 'packages/server/dist/index.js')),
 }
 const old = {
-	kora: await import(join(b13, 'kora/dist/index.js')),
-	server: await import(join(b13, 'packages/server/dist/index.js')),
+	kora: await import(join(b12, 'kora/dist/index.js')),
+	server: await import(join(b12, 'packages/server/dist/index.js')),
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -96,7 +98,7 @@ async function scenario(name, run) {
 const results = []
 
 results.push(
-	await scenario('v2 clients <-> beta.13 server', async (dir) => {
+	await scenario('v2 clients <-> beta.12 server', async (dir) => {
 		const port = 47600 + Math.floor(Math.random() * 200)
 		const { server, store } = await startServer(old.server, old.kora, port)
 		const a = client(v2.kora, dir, 'a', port)
@@ -121,7 +123,7 @@ results.push(
 		if (quarantinedA + quarantinedB > 0) throw new Error('operations quarantined')
 		return {
 			serverOps: stored.length,
-			// A beta.13 server drops the v2-only fields (hashVersion): relayed ops are
+			// A beta.12 (or older) server drops the v2-only fields (hashVersion): relayed ops are
 			// then treated as version 1 by v2 clients (not verified), never quarantined.
 			serverKeptHashVersion: stored.some((o) => o.hashVersion === 2),
 		}
@@ -129,7 +131,7 @@ results.push(
 )
 
 results.push(
-	await scenario('beta.13 client + v2 client <-> v2 server', async (dir) => {
+	await scenario('beta.12 client + v2 client <-> v2 server', async (dir) => {
 		const port = 47800 + Math.floor(Math.random() * 200)
 		const warnings = []
 		const { server, store } = await startServer(v2.server, v2.kora, port, warnings)
@@ -139,9 +141,9 @@ results.push(
 		await modern.ready
 		await legacy.sync.connect()
 		await modern.sync.connect()
-		const fromLegacy = await legacy.notes.insert({ title: 'from-beta13' })
+		const fromLegacy = await legacy.notes.insert({ title: 'from-beta12' })
 		await until(
-			async () => (await modern.notes.findById(fromLegacy.id))?.title === 'from-beta13',
+			async () => (await modern.notes.findById(fromLegacy.id))?.title === 'from-beta12',
 			'legacy -> modern',
 		)
 		const fromModern = await modern.notes.insert({ title: 'from-v2' })

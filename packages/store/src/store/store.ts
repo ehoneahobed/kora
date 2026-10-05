@@ -2,6 +2,7 @@ import {
 	CausalTracker,
 	HybridLogicalClock,
 	KoraError,
+	assertOperationTransformCoverage,
 	createVersionVector,
 	deriveSideEffectOpId,
 	deserializeFoldState,
@@ -32,7 +33,7 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
-import { OptimisticLockError, StoreNotOpenError } from '../errors'
+import { OptimisticLockError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
@@ -65,6 +66,11 @@ import {
 } from '../lww/field-versions'
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import { runSchemaMigrations } from '../migrations/run-migrations'
+import {
+	STORED_SCHEMA_VERSION_SQL,
+	parseSchemaAhead,
+	storedSchemaVersion,
+} from '../migrations/schema-ceiling'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -85,7 +91,10 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
-import { SubscriptionManager } from '../subscription/subscription-manager'
+import {
+	type RecordsChangeListener,
+	SubscriptionManager,
+} from '../subscription/subscription-manager'
 import {
 	type AdoptionSchedule,
 	type LocalNodeRecord,
@@ -163,6 +172,7 @@ import type {
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import { relaxValueDomainConstraints } from './relax-constraints'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
 	SEQ_CONFLICTS_TABLE,
@@ -355,6 +365,19 @@ export class Store implements OperationLog {
 		this.secretKeyProvider = config.secretKeyProvider
 		this.subscriptionManager = new SubscriptionManager({
 			onQuerySubscribed: config.onQuerySubscribed,
+			// STORE-12: every subscription failure is observable (DevTools, app listeners).
+			onQueryError: (failure) => {
+				const code =
+					failure.error instanceof KoraError ? failure.error.code : failure.error.name || 'Error'
+				this.emitter?.emit({
+					type: 'query:error',
+					queryId: failure.queryId,
+					collection: failure.collection,
+					phase: failure.phase,
+					code,
+					message: failure.error.message,
+				})
+			},
 		})
 	}
 
@@ -363,13 +386,36 @@ export class Store implements OperationLog {
 	 * restore the sequence number and version vector, and create Collection instances.
 	 */
 	async open(): Promise<void> {
-		await this.adapter.open(this.schema)
+		try {
+			await this.adapter.open(this.schema)
+		} catch (error) {
+			const ahead =
+				error instanceof SchemaVersionAheadError
+					? { stored: error.storedVersion, code: error.codeVersion }
+					: parseSchemaAhead(error)
+			if (ahead !== null) throw this.schemaAhead(ahead.stored)
+			throw error
+		}
+		// A database a newer build already migrated is refused before anything here writes
+		// to it (RT-109). The DDL executors refuse it before their DDL; this also covers
+		// adapters that restore their data after it (the IndexedDB fallback).
+		const stored = storedSchemaVersion(
+			await this.adapter.query<{ value: unknown }>(STORED_SCHEMA_VERSION_SQL),
+		)
+		if (stored > this.schema.version) {
+			await this.adapter.close().catch(() => undefined)
+			throw this.schemaAhead(stored)
+		}
 		await this.adapter.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
 		)
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		this.foldActive = false
 
+		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
+		// NOT NULL constraints that cannot evolve with the schema: rebuild them once without
+		// (RT-101). Validation is the single authority for the value domain.
+		await relaxValueDomainConstraints(this.adapter, this.schema)
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
@@ -411,6 +457,9 @@ export class Store implements OperationLog {
 		// Run schema migrations if needed. Backfills write operations through the local
 		// write path, so the node id and clock must exist first (STORE-13).
 		try {
+			// Transforms that cannot read the stored log would fold those operations as
+			// absent and erase them from their records: refuse to open instead (RT-103).
+			await this.assertTransformCoverage()
 			await this.runMigrationsIfNeeded()
 			await this.ensureLegacyBodiesCanonical()
 			await this.ensureMaterialization()
@@ -1071,7 +1120,7 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Write every genuine beta.13 clear of the op log into its logged body, once per
+	 * Write every genuine beta.12 clear of the op log into its logged body, once per
 	 * database (RT-83, RT-85): the fold folds bodies as written, so the clear must be in
 	 * the body. Records already materialized by the fold are re-folded.
 	 */
@@ -1143,6 +1192,12 @@ export class Store implements OperationLog {
 		)
 		this.foldActive = true
 		if (result.snapshots > 0) await this.requestSnapshotResync()
+		if (result.changedRows > 0) {
+			// Other tabs on this database hear about it once the bus is wired (RT-98).
+			for (const collection of Object.keys(this.schema.collections)) {
+				this.subscriptionManager.invalidate(collection)
+			}
+		}
 		if (result.records > 0) {
 			this.emitter?.emit({
 				type: 'store:rematerialized',
@@ -1156,6 +1211,32 @@ export class Store implements OperationLog {
 						: `Re-materialized ${result.records} record(s) of "${this.dbName}" with the per-field fold (${result.mode}); ${result.changedRows} row(s) changed.`,
 			})
 		}
+	}
+
+	/**
+	 * Refuse to open when a schema version in the local operation log has no transform
+	 * path to the current schema (RT-103). Operations of a NEWER schema (authored by an
+	 * upgraded peer) are not checked: they are kept aside until this device upgrades.
+	 */
+	private async assertTransformCoverage(): Promise<void> {
+		const transforms = this.operationTransforms
+		if (transforms === undefined || transforms.length === 0) return
+		const versions = new Set<number>()
+		for (const collection of Object.keys(this.schema.collections)) {
+			const rows = await this.adapter.query<{ v: number }>(
+				`SELECT DISTINCT schema_version AS v FROM ${quoteIdent(`_kora_ops_${collection}`)}`,
+			)
+			for (const row of rows) {
+				const version = Number(row.v)
+				if (version < this.schema.version) versions.add(version)
+			}
+		}
+		assertOperationTransformCoverage(
+			versions,
+			this.schema.version,
+			transforms,
+			`local database "${this.dbName}"`,
+		)
 	}
 
 	/**
@@ -1196,6 +1277,7 @@ export class Store implements OperationLog {
 				changed,
 			)
 			if (result.snapshots > 0) await this.requestSnapshotResync()
+			for (const collection of changed) this.subscriptionManager.invalidate(collection)
 			this.emitter?.emit({
 				type: 'store:rematerialized',
 				dbName: this.dbName,
@@ -1252,13 +1334,19 @@ export class Store implements OperationLog {
 	 * provisional cascades of remote deletes (RT-69): the server's own copies were
 	 * delivered by now, and any it did not derive must not stay applied locally.
 	 *
+	 * With `provisionalOnly` only the provisional cascades are retired (RT-93: a stream
+	 * batch from a server that derives no cascades, which is not the end of a resync).
+	 *
+	 * @param options - `provisionalOnly`: leave row snapshots for the next catch-up
 	 * @returns How many snapshots were dropped
 	 */
-	async settleAfterCatchUp(): Promise<number> {
+	async settleAfterCatchUp(options: { provisionalOnly?: boolean } = {}): Promise<number> {
 		this.ensureOpen()
 		const folder = this.activeFold()
 		if (!folder) return 0
-		const pending = (await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
+		const pending =
+			options.provisionalOnly !== true &&
+			(await this.readMeta(SNAPSHOT_RESYNC_META_KEY)) === 'pending'
 		let settled = 0
 		const touched = new Set<string>()
 		await this.adapter.transaction(async (tx) => {
@@ -1435,7 +1523,9 @@ export class Store implements OperationLog {
 				for (const recordId of records) await fold.refoldInTx(tx, collection, recordId)
 			}
 		})
-		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
+		for (const [collection, records] of touched) {
+			this.subscriptionManager.invalidate(collection, [...records])
+		}
 	}
 
 	/**
@@ -1485,7 +1575,7 @@ export class Store implements OperationLog {
 				[collection, recordId],
 			)
 		})
-		this.subscriptionManager.invalidate(collection)
+		this.subscriptionManager.invalidate(collection, [recordId])
 	}
 
 	/** Hide all live rows that no longer match a newly accepted server scope. */
@@ -1895,7 +1985,32 @@ export class Store implements OperationLog {
 			return
 		}
 		this.recordOperationSequence(operation)
-		this.subscriptionManager.notify(operation.collection, operation)
+		this.subscriptionManager.invalidateFromPeer(operation.collection)
+	}
+
+	/**
+	 * Notify this store that another same-origin runtime changed rows of a collection
+	 * in the shared local database without an operation this tab can see (a re-fold,
+	 * a scope retraction, a restore; RT-98). Only re-runs the affected live queries.
+	 *
+	 * @param collection - The collection whose rows changed
+	 */
+	notifyExternalChange(collection: string): void {
+		this.ensureOpen()
+		if (!this.schema.collections[collection]) return
+		this.subscriptionManager.invalidateFromPeer(collection)
+	}
+
+	/**
+	 * Listen to every committed change this store makes to collection rows: local
+	 * writes, remote applies, and changes without a new operation (re-folds, scope
+	 * retraction, cascade settling, rematerialization, restore). The cross-tab bus
+	 * relays these to other tabs on the same database (RT-98).
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onRecordsChanged(listener: RecordsChangeListener): () => void {
+		return this.subscriptionManager.onRecordsChanged(listener)
 	}
 
 	/**
@@ -2969,7 +3084,8 @@ export class Store implements OperationLog {
 				for (const recordId of ids) await folder.refoldInTx(tx, collection, recordId)
 			}
 		})
-		for (const collection of touched.keys()) this.subscriptionManager.invalidate(collection)
+		for (const [collection, ids] of touched)
+			this.subscriptionManager.invalidate(collection, [...ids])
 	}
 
 	/**
@@ -3050,6 +3166,19 @@ export class Store implements OperationLog {
 			dbName: this.dbName,
 			message: error instanceof Error ? error.message : String(error),
 		})
+	}
+
+	/** Report a database a newer build migrated (`store:schema-ahead`) and build the error. */
+	private schemaAhead(storedVersion: number): SchemaVersionAheadError {
+		const error = new SchemaVersionAheadError(this.dbName, storedVersion, this.schema.version)
+		this.emitter?.emit({
+			type: 'store:schema-ahead',
+			dbName: this.dbName,
+			storedVersion,
+			codeVersion: this.schema.version,
+			message: error.message,
+		})
+		return error
 	}
 
 	/**

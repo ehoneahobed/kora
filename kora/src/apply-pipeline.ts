@@ -39,7 +39,7 @@ export interface ApplyPipelineDeps {
 	/** Called when a merge had a conflicting field decision (sync conflict counter). */
 	readonly onMergeConflict?: () => void
 	/**
-	 * The beta.13 pairwise merge engine. Used only when the store runs the legacy
+	 * The beta.12 pairwise merge engine. Used only when the store runs the legacy
 	 * materialization (`experimental.legacyMerge`, one beta).
 	 */
 	readonly mergeEngine?: MergeEngine

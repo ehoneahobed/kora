@@ -30,6 +30,8 @@
     "dev:full-stack": "pnpm --filter kora-full-stack dev",
     "verify:full-stack": "pnpm --filter kora-full-stack verify",
     "docs:dev": "pnpm --filter kora-docs dev",
+    "docs:check-code": "node scripts/docs/check-code-blocks.mjs",
+    "docs:check-tutorial": "node scripts/docs/check-getting-started.mjs",
     "remediation": "node scripts/remediation/check.mjs",
     "remediation:all": "node scripts/remediation/check.mjs --all"
   },

@@ -80,9 +80,11 @@ describe.skipIf(!PG_URL)('authority across Postgres instances (prefix rule)', ()
 			const nodeA = storeA.getNodeId()
 			expect(nodeA).toMatch(/^kora:server:[^:]+:[^:]+$/)
 
-			// The handshake advertises A's id and the legacy (configured plain) id.
+			// The handshake advertises the legacy (configured plain) id only.
 			const learned = device.getSyncEngine()?.getAuthoritativeNodeIds() ?? []
-			expect(learned).toContain(nodeA)
+			// Since RT-75 only explicit (non-prefixed) ids are advertised: the kora:server:
+			// namespace, A's id included, is authoritative by the prefix rule.
+			expect(learned).not.toContain(nodeA)
 			expect(learned).toContain(LEGACY_ID)
 
 			const item = await device.collection('items').insert({ title: 'x', status: 'draft' })
@@ -135,7 +137,7 @@ describe.skipIf(!PG_URL)('authority across Postgres instances (prefix rule)', ()
 			expect(device.getSyncEngine()?.getAuthoritativeNodeIds() ?? []).not.toContain(nodeB)
 			expect(await device.getSyncEngine()?.getQuarantinedOperations()).toEqual([])
 
-			// A legacy server id (history from before beta.14) stays authoritative: its
+			// A legacy server id (history from before protocol 2) stays authoritative: its
 			// write beats a later device write on every replica.
 			const legacy = await storeA.applyRemoteOperation({
 				id: 'legacy-server-write',

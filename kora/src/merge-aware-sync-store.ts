@@ -67,8 +67,8 @@ export class MergeAwareSyncStore implements SyncStore {
 	}
 
 	/** W7: the server's authoritative node ids (handshake), persisted by the store. */
-	async settleAfterCatchUp(): Promise<number> {
-		return this.store.settleAfterCatchUp()
+	async settleAfterCatchUp(options?: { provisionalOnly?: boolean }): Promise<number> {
+		return this.store.settleAfterCatchUp(options)
 	}
 
 	async setAuthoritativeNodeIds(

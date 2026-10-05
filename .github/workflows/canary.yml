@@ -9,6 +9,9 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   canary:
+    # Publishing only ever happens from the public repository. Forks and private copies
+    # (for example the security-fix mirror) must never publish to npm.
+    if: github.repository == 'ehoneahobed/kora'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

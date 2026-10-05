@@ -26,6 +26,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'sync:auth-failed': 'sync',
 	'sync:suspended': 'sync',
 	'sync:clock-skew': 'sync',
+	'encryption:status': 'sync',
 	'sync:node-id-rotated': 'sync',
 	'sync:local-node': 'sync',
 	'sync:clock-rebase': 'sync',
@@ -46,6 +47,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'query:subscribed': 'query',
 	'query:invalidated': 'query',
 	'query:executed': 'query',
+	'query:error': 'query',
+	'storage:persistence': 'connection',
 	'connection:quality': 'connection',
 	'sync:diagnostics': 'sync',
 	'sync:bandwidth': 'sync',
@@ -67,6 +70,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:db-name-collision': 'connection',
 	'store:storage-blocked': 'connection',
 	'store:storage-migrated': 'connection',
+	'store:schema-ahead': 'connection',
 	'replay:completed': 'operation',
 }
 

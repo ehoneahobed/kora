@@ -1,5 +1,28 @@
 # @korajs/sync
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** Sync protocol v2 (verifiable operation ids, encryption envelope v2, sequence
+  reservation, server-authored metadata). JSON is the wire format; protobuf is an explicit opt-in
+  on both ends and `DynamicProtobufSerializer` is removed.
+- Gap-free server-to-client delivery with a durable watermark; unappliable operations are
+  quarantined and replayed (`sync:apply-blocked`, `sync:apply-failed`, `sync:apply-recovered`).
+- An operation counts as synced only when the server acknowledged it; nothing is uploaded before
+  it is durable on the device (`localDurability: 'degraded'` after repeated barrier failures).
+- Writes are bound to the signed-in principal (held writes, `sync:local-node`); cloned databases
+  and servers restored from older backups recover automatically; refused writes are undone on
+  their author (`sync:operation-rejected`, `OUT_OF_UPLINK_SCOPE`).
+- End-to-end encryption uses a per-user keyring (authenticated, forward-only key records; recovery
+  keys anchored to their ring); ciphertext is bound to its operation.
+- Tokens are no longer sent in the WebSocket URL (`tokenInUrl` to opt in); HTTP long-poll sessions
+  carry `x-kora-session`; client-side scope filtering is removed (the server is the scope
+  authority).
+- Security fixes are described in the [security advisory](https://github.com/ehoneahobed/kora/blob/main/docs/releases/security-advisory-beta13.md).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

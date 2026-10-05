@@ -28,7 +28,7 @@ describe('SYNC-7: far-future remote op blocks the delivery stream', () => {
 			await b.sync()
 
 			// A legitimately-ingested op as if stamped while the server clock was 1 day fast.
-			// A legacy (version-1, beta.13-era) operation: hand-built ops carry no hash
+			// A legacy (version-1, beta.12-era) operation: hand-built ops carry no hash
 			// version, since protocol v2 verifies version-2 ids on receive.
 			const { hashVersion: _v2, ...seed } = network.server.getAllOperations()[0] as Operation
 			const future: Operation = {

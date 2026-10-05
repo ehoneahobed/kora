@@ -81,7 +81,12 @@ describe('ENC-2: decrypt failure handled as a transport close', () => {
 		const appA = createApp({
 			schema,
 			store: { adapter: 'better-sqlite3', name: join(dir, 'a.db') },
-			sync: { url: 'ws://memory', encryption: { enabled: true, key: 'someone-elses-key' } },
+			// Since ENC-1 every device of one user opens the same server-stored keyring, so
+			// "an op under a key this device does not hold" needs a different keyring.
+			sync: {
+				url: 'ws://memory',
+				encryption: { enabled: true, key: 'someone-elses-key', keyring: 'someone-else' },
+			},
 		})
 		const appB = createApp({
 			schema,

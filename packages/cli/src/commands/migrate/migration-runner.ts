@@ -1,3 +1,14 @@
+import {
+	expandEvolveTableForPostgres,
+	expandEvolveTableForSqlite,
+	parseEvolveTableDirective,
+} from './table-evolution-directive'
+import {
+	expandRelaxValueDomainForPostgres,
+	expandRelaxValueDomainForSqlite,
+	parseRelaxValueDomainDirective,
+} from './value-domain-directive'
+
 export interface RunMigrationOptions {
 	upStatements: string[]
 	migrationId?: string
@@ -10,6 +21,8 @@ export interface RunMigrationOptions {
 		open(path: string): {
 			exec(sql: string): void
 			isMigrationApplied?(id: string): boolean
+			/** Runs a SELECT/PRAGMA and returns its rows (needed by value-domain directives). */
+			query?(sql: string): Array<Record<string, unknown>>
 			close?(): void
 		}
 	}
@@ -99,6 +112,11 @@ async function runSqliteMigration(
 	const db = driver.open(path)
 	let statementsApplied = 0
 
+	// SQLite's table-rebuild procedure (generated rebuilds, relax-value-domain directives)
+	// needs foreign key enforcement off, and the pragma is a no-op inside a transaction.
+	const foreignKeysOn = Number(db.query?.('PRAGMA foreign_keys')[0]?.foreign_keys ?? 0) === 1
+	if (foreignKeysOn) db.exec('PRAGMA foreign_keys = OFF')
+
 	try {
 		db.exec('BEGIN')
 		db.exec(
@@ -115,9 +133,39 @@ async function runSqliteMigration(
 				skipped: true,
 			}
 		}
+		const now = Date.now()
+		const catalogQuery = (
+			table: string,
+		): ((text: string) => Promise<Array<Record<string, unknown>>>) => {
+			const query = db.query?.bind(db)
+			if (!query) {
+				throw new Error(
+					`Migration ${migrationId}: the SQLite driver cannot read the catalog needed to migrate "${table}".`,
+				)
+			}
+			return async (text) => query(text)
+		}
 		for (const statement of statements) {
-			db.exec(statement)
+			const relax = parseRelaxValueDomainDirective(statement)
+			const evolve = relax ? null : parseEvolveTableDirective(statement)
+			if (relax) {
+				const expanded = await expandRelaxValueDomainForSqlite(relax, catalogQuery(relax.table))
+				for (const rebuild of expanded) db.exec(rebuild)
+			} else if (evolve) {
+				const expanded = await expandEvolveTableForSqlite(evolve, catalogQuery(evolve.table), now)
+				for (const change of expanded) db.exec(change)
+			} else {
+				db.exec(statement)
+			}
 			statementsApplied++
+		}
+		// Table rebuilds run with foreign key enforcement off: refuse to commit one that left
+		// a dangling reference.
+		const violations = db.query?.('PRAGMA foreign_key_check') ?? []
+		if (violations.length > 0) {
+			throw new Error(
+				`Migration ${migrationId} left ${violations.length} foreign key violation(s) (first: ${JSON.stringify(violations[0])}); nothing was applied.`,
+			)
 		}
 		db.exec(
 			`INSERT OR REPLACE INTO _kora_migrations (id, from_version, to_version, applied_at) VALUES (${sqlLiteral(migrationId)}, ${fromVersion}, ${toVersion}, ${Date.now()})`,
@@ -138,6 +186,13 @@ async function runSqliteMigration(
 		}
 		throw error
 	} finally {
+		if (foreignKeysOn) {
+			try {
+				db.exec('PRAGMA foreign_keys = ON')
+			} catch {
+				// the connection is closed next; enforcement is per connection
+			}
+		}
 		if (typeof db.close === 'function') {
 			db.close()
 		}
@@ -148,6 +203,7 @@ async function loadSqliteDriver(projectRoot?: string): Promise<{
 	open(path: string): {
 		exec(sql: string): void
 		isMigrationApplied(id: string): boolean
+		query(sql: string): Array<Record<string, unknown>>
 		close(): void
 	}
 }> {
@@ -160,6 +216,7 @@ async function loadSqliteDriver(projectRoot?: string): Promise<{
 			exec(sql: string): void
 			prepare(sql: string): {
 				get(...params: unknown[]): { count?: number } | undefined
+				all(...params: unknown[]): Array<Record<string, unknown>>
 			}
 			close(): void
 		}
@@ -176,6 +233,9 @@ async function loadSqliteDriver(projectRoot?: string): Promise<{
 							.prepare('SELECT COUNT(*) AS count FROM _kora_migrations WHERE id = ?')
 							.get(id)
 						return (row?.count ?? 0) > 0
+					},
+					query(sql: string) {
+						return db.prepare(sql).all()
 					},
 					close() {
 						db.close()
@@ -201,7 +261,9 @@ async function runPostgresMigration(
 	const sql =
 		typeof clientFactoryOverride === 'function'
 			? clientFactoryOverride(connectionString)
-			: (await loadPostgresModule()).default(connectionString)
+			: // One connection: BEGIN, the statements and COMMIT must share it (postgres.js
+				// refuses a raw BEGIN on a pool, UNSAFE_TRANSACTION).
+				(await loadPostgresModule()).default(connectionString, { max: 1 })
 	let statementsApplied = 0
 
 	try {
@@ -221,8 +283,21 @@ async function runPostgresMigration(
 				skipped: true,
 			}
 		}
+		const now = Date.now()
+		const query = async (text: string) => (await sql.unsafe(text)) as Array<Record<string, unknown>>
 		for (const statement of statements) {
-			await sql.unsafe(statement)
+			const relax = parseRelaxValueDomainDirective(statement)
+			const evolve = relax ? null : parseEvolveTableDirective(statement)
+			if (relax) {
+				const expanded = await expandRelaxValueDomainForPostgres(relax, query)
+				for (const alter of expanded) await sql.unsafe(alter)
+			} else if (evolve) {
+				const expanded = await expandEvolveTableForPostgres(evolve, query, now)
+				for (const alter of expanded) await sql.unsafe(alter)
+			} else {
+				assertNotLegacyRebuild(statement, migrationId)
+				await sql.unsafe(statement)
+			}
 			statementsApplied++
 		}
 		await sql.unsafe(
@@ -250,12 +325,29 @@ async function runPostgresMigration(
 	}
 }
 
+/**
+ * Migrations generated before RT-105 rebuilt a changed collection table with fixed SQLite
+ * statements (`CREATE TABLE "_kora_mig_<collection>_new" ...`). On Postgres they cannot
+ * work (INTEGER/REAL/TEXT/BLOB columns, `strftime`): refuse them with the fix instead of
+ * failing half-way or rewriting the server store's column types.
+ */
+function assertNotLegacyRebuild(statement: string, migrationId: string): void {
+	if (/^\s*CREATE\s+TABLE\s+"?_kora_mig_[A-Za-z0-9_]+_new"?/i.test(statement)) {
+		throw new Error(
+			`Migration ${migrationId} was generated by an earlier \`kora migrate\` as a SQLite-only table rebuild, which cannot run on Postgres. Regenerate it: restore kora/schema.snapshot.json to the schema version it migrates from, delete the migration's files, and run \`kora migrate\` again.`,
+		)
+	}
+}
+
 function sqlLiteral(value: string): string {
 	return `'${value.replaceAll("'", "''")}'`
 }
 
 async function loadPostgresModule(): Promise<{
-	default: (connectionString: string) => {
+	default: (
+		connectionString: string,
+		options?: { max?: number },
+	) => {
 		unsafe: (query: string) => Promise<unknown>
 		end?: () => Promise<void>
 	}
@@ -267,7 +359,10 @@ async function loadPostgresModule(): Promise<{
 		const mod = await dynamicImport('postgres')
 		if (typeof mod === 'object' && mod !== null && 'default' in mod) {
 			return mod as {
-				default: (connectionString: string) => {
+				default: (
+					connectionString: string,
+					options?: { max?: number },
+				) => {
 					unsafe: (query: string) => Promise<unknown>
 					end?: () => Promise<void>
 				}

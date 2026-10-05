@@ -8,9 +8,9 @@
  * field is stamped at the latest write of ANY field. A device's concurrent offline
  * edit of a field that the record's newest write did not touch (older than that write,
  * newer than the field's own version) loses to the server's restatement of the old
- * value. This is the path for a beta.13 server (no `foldState`, per the compatibility
+ * value. This is the path for a server of the unreleased Phase 1 build (no `foldState`, per the compatibility
  * matrix) and for any server store that cannot supply a fold state (the fallback in
- * `ClientSession`, and a carried state the receiver cannot read); beta.13 devices
+ * `ClientSession`, and a carried state the receiver cannot read); Phase 1 build devices
  * honoured the per-field versions (`resolvePerFieldLww`).
  *
  * Asserts the CORRECT behaviour (fails at 959b791): the newer device edit survives.

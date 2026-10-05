@@ -188,8 +188,8 @@ describe('scaffoldTemplate', () => {
 		expect(pkg).toContain('lucide-react')
 		expect(pkg).toContain('@korajs/server')
 
-		// Check sync + dev-only devtools in main.tsx
-		const main = await readFile(join(targetDir, 'src', 'main.tsx'), 'utf-8')
+		// Check sync + dev-only devtools in the app module (src/kora.ts on the flagship)
+		const main = await readFile(join(targetDir, 'src', 'kora.ts'), 'utf-8')
 		expect(main).toContain('sync')
 		expect(main).toContain('ws://localhost:3001')
 		expect(main).toContain('devtools: import.meta.env.DEV')

@@ -1,5 +1,14 @@
 # @korajs/devtools
 
+## 1.0.0-beta.13
+
+### Minor Changes
+
+- Show the new storage, sync, encryption and query events (quarantine, apply-blocked, rejected
+  and forged operations, protocol deprecation, durability and encryption status).
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.9
 
 ### Patch Changes

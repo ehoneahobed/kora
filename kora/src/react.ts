@@ -8,17 +8,25 @@ export type {
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,
+	UseQueryStateResult,
 	UseRichTextResult,
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
+	KoraHooks,
 } from '@korajs/react'
 
 export type { UseRichTextOptions } from '@korajs/react'
 
 export {
 	KoraProvider,
+	createKoraHooks,
 	useApp,
 	useCollection,
 	useMutation,
 	useQuery,
+	useQueryState,
 	useRichText,
 	useSyncStatus,
 	usePresence,

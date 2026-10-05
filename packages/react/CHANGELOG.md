@@ -1,5 +1,19 @@
 # @korajs/react
 
+## 1.0.0-beta.13
+
+### Major Changes
+
+- **Breaking.** `useQuery` renders `[]` before its first local result and throws query errors to
+  the nearest error boundary (`throwOnError: false` to opt out); `useQueryState` returns
+  `{ data, error, ready }`.
+- `useMutation`, `useSyncStatus` and `useRichText` keep stable identities (StrictMode-safe); the
+  hooks are SSR-safe.
+- `createKoraHooks<typeof app>()` gives typed `useCollection`, `useQuery` and `useMutation`.
+- `AuthBoundKoraProvider` gains a `locked` state for encrypted apps.
+
+See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.13.md) and the [upgrade guide](https://github.com/ehoneahobed/kora/blob/main/docs/guide/upgrading-to-beta13.md) (servers first, then clients).
+
 ## 1.0.0-beta.12
 
 ### Minor Changes

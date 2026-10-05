@@ -1,68 +1,81 @@
 ---
 title: Core API
-description: "@korajs/core API reference: defineSchema, field type builders, operations, hybrid logical clocks, version vectors, and events."
+description: "@korajs/core API reference: defineSchema, field builders, atomic ops, operations, the hybrid logical clock, version vectors, the record fold, scopes, migrations, blobs and errors."
 ---
 
 # Core API Reference
 
-`@korajs/core` is the foundation of every Kora.js application. It defines the schema system, operation model, hybrid logical clock, and shared types. It has zero dependencies on other `@kora` packages.
-
-All exports documented here are also available from the `kora` meta-package.
+`@korajs/core` is the foundation of every Kora.js application. It defines the schema system, the
+operation model, the hybrid logical clock, the per-field merge (the fold) and the shared types. It
+depends on no other `@korajs` package. The `korajs` meta-package re-exports the everyday part
+(`defineSchema`, `t`, `migrate`, `op`, `HybridLogicalClock`, `generateUUIDv7`, `createOperation`,
+`KoraError`, `AppNotReadyError` and the schema and operation types); import everything else from
+`@korajs/core`.
 
 ```typescript
-import { defineSchema, t, op, migrate, HybridLogicalClock, createOperation, KoraError } from '@korajs/core'
-// or
-import { defineSchema, t, op, migrate, HybridLogicalClock, createOperation, KoraError } from 'korajs'
+import { defineSchema, t, op, migrate, HybridLogicalClock, KoraError } from '@korajs/core'
+// These names are also exported by 'korajs'.
 ```
+
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+import type { AtomicOp, EncryptedOperationEnvelope, HLCTimestamp, Operation } from '@korajs/core'
+const docsSchema = defineSchema({
+  version: 1,
+  collections: {
+    todos: { fields: { title: t.string(), tags: t.array(t.string()).default([]) } },
+    products: { fields: { name: t.string(), quantity: t.number().default(0) } },
+    players: { fields: { name: t.string(), highScore: t.number().default(0) } },
+    auctions: { fields: { title: t.string(), lowestBid: t.number().optional() } },
+  },
+})
+const app = createApp({ schema: docsSchema })
+declare const schema: typeof docsSchema
+declare const id: string
+-->
 
 ---
 
 ## defineSchema()
 
-Creates a validated schema definition that describes your application's data model. This is the primary entry point for configuring a Kora application.
+Validates a schema and returns it with its exact builder types, so `createApp({ schema })`
+produces typed collections without code generation.
 
-### Signature
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-function defineSchema(input: SchemaInput): SchemaDefinition
+function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinition<T>
 ```
-
-### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `input` | `SchemaInput` | Schema configuration object |
 
 #### SchemaInput
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `version` | `number` | Yes | Schema version number. Must be a positive integer. Increment when you make changes. |
-| `collections` | `Record<string, CollectionDefinition>` | Yes | Map of collection names to their definitions. |
-| `relations` | `Record<string, RelationDefinition>` | No | Map of relation names to their definitions. |
+| `version` | `number` | Yes | Positive integer. Increment it with every schema change and add a migration. |
+| `collections` | `Record<string, CollectionInput>` | Yes | At least one collection. Names start with a letter and contain letters, digits and underscores. |
+| `relations` | `Record<string, RelationInput>` | No | Relations between collections. |
+| `migrations` | `Record<number, MigrationBuilder>` | No | Migrations keyed by target version (2 to `version`), built with [`migrate()`](#migrations). |
+| `sync` | `Record<string, { where: Record<string, true \| string> }>` | No | [Partial-sync rules](#schema-sync-rules). |
 
-#### CollectionDefinition
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `fields` | `Record<string, FieldDescriptor>` | Yes | Map of field names to type descriptors built with `t`. |
-| `indexes` | `string[]` | No | Fields to index for faster queries. |
-| `constraints` | `Record<string, Constraint>` | No | Tier 2 constraint definitions for conflict resolution. |
-| `resolve` | `Record<string, ResolverFn>` | No | Tier 3 custom resolver functions for specific fields. |
-
-#### RelationDefinition
+#### CollectionInput
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `from` | `string` | Yes | Source collection name. |
-| `to` | `string` | Yes | Target collection name. |
-| `type` | `'many-to-one' \| 'one-to-many' \| 'many-to-many'` | Yes | Relationship cardinality. |
-| `field` | `string` | Yes | Foreign key field on the source collection. |
-| `onDelete` | `'set-null' \| 'cascade' \| 'restrict' \| 'no-action'` | No | Behavior when the referenced record is deleted. Defaults to `'no-action'`. |
+| `fields` | `Record<string, FieldBuilder>` | Yes | At least one field, built with [`t`](#type-builders). |
+| `indexes` | `string[]` | No | Fields to index. Each must exist. |
+| `constraints` | `ConstraintInput[]` | No | An **array** of unique, capacity or referential constraints. See [Conflict Resolution](/guide/conflict-resolution#constraints). |
+| `resolve` | `Record<string, (local, remote, base) => unknown>` | No | Custom resolvers per field (tier 3). |
+| `scope` | `string[]` | No | Legacy scope fields for sync filtering; prefer root-level `sync` rules. |
+| `stateMachine` | `{ field, transitions, onInvalidTransition: 'reject' \| 'last-valid-state' }` | No | A state machine on an enum field. See [State Machines](/guide/state-machines). |
 
-### Returns
+#### RelationInput
 
-`SchemaDefinition` -- A validated, frozen schema object used by `createApp` and other Kora internals.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from` | `string` | Yes | Source collection. |
+| `to` | `string` | Yes | Target collection. |
+| `type` | `'one-to-one' \| 'one-to-many' \| 'many-to-one' \| 'many-to-many'` | Yes | Cardinality. |
+| `field` | `string` | Yes | Foreign key field. It must be declared in the source collection's `fields`. |
+| `onDelete` | `'cascade' \| 'set-null' \| 'restrict' \| 'no-action'` | Yes | What happens to referencing records when the target is deleted, also when a delete races a concurrent reference (see [Conflict Resolution](/guide/conflict-resolution#relations)). |
 
 ### Example
 
@@ -71,7 +84,6 @@ import { defineSchema, t } from 'korajs'
 
 const schema = defineSchema({
   version: 1,
-
   collections: {
     todos: {
       fields: {
@@ -79,23 +91,21 @@ const schema = defineSchema({
         completed: t.boolean().default(false),
         assignee: t.string().optional(),
         tags: t.array(t.string()).default([]),
-        notes: t.richtext(),
+        notes: t.richtext().optional(),
         priority: t.enum(['low', 'medium', 'high']).default('medium'),
         dueDate: t.timestamp().optional(),
+        projectId: t.string().optional(),
         createdAt: t.timestamp().auto(),
       },
       indexes: ['assignee', 'completed', 'dueDate'],
     },
-
     projects: {
       fields: {
         name: t.string(),
         color: t.string().default('#3b82f6'),
-        createdAt: t.timestamp().auto(),
       },
     },
   },
-
   relations: {
     todoBelongsToProject: {
       from: 'todos',
@@ -110,453 +120,318 @@ const schema = defineSchema({
 
 ### Errors
 
-- Throws `KoraError` with code `INVALID_SCHEMA` if `version` is not a positive integer.
-- Throws `KoraError` with code `INVALID_SCHEMA` if a collection name is empty or contains invalid characters.
-- Throws `KoraError` with code `INVALID_SCHEMA` if a relation references a collection that does not exist.
-- Throws `KoraError` with code `INVALID_SCHEMA` if a relation references a field that does not exist on the source collection.
+`defineSchema()` throws `SchemaValidationError` (code `SCHEMA_VALIDATION`) at the call, with the
+offending collection or field in `context`, when:
+
+- `version` is not a positive integer, or there is no collection, or a collection has no field
+- a collection or field name is invalid
+- an index, scope field, resolver, constraint field or `priorityField` names a field that does not exist
+- a `priority-field` constraint has no `priorityField`, or a `custom` constraint no `resolve` function
+- a relation names a missing collection or a `field` the source collection does not declare
+- a migration key is not an integer from 2 to `version`, or a migration has no steps
+- a state machine or `.transitions()` map names a value that is not in the enum
 
 ---
 
-## t (Type Builders) {#type-builders}
+## t (Field builders) {#type-builders}
 
-The `t` object provides builder methods for defining field types in your schema. Each method returns a `FieldDescriptor` that can be further configured with modifier methods.
+Every builder returns an immutable builder; modifiers return a new one. The
+[Schema Design guide](/guide/schema-design#field-types) lists each type's storage, value domain and
+merge behaviour.
 
-```typescript
-import { t } from 'korajs'
-```
+| Builder | Value | Default merge |
+|---------|-------|---------------|
+| `t.string()` | `string` | last write wins |
+| `t.number()` | finite `number` | last write wins |
+| `t.boolean()` | `boolean` | last write wins |
+| `t.timestamp()` | integer milliseconds (`number`, not a `Date`) | last write wins |
+| `t.enum(values)` | one of `values` | last write wins |
+| `t.array(item)` | `Item[]` | element set: concurrent additions and removals both apply |
+| `t.object({ ... })` | the declared shape | per top-level key |
+| `t.json<T>()` | `T` (compile time only) | per top-level key |
+| `t.richtext()` | Yjs update bytes on read; a string or Yjs bytes on write | Yjs character merge |
+| `t.blob()` | `BlobRef` (see [Blobs](#blobs)) | last write wins |
+| `t.secret()` | `string`, encrypted at rest (`.hashed()` for passwords) | last write wins, redacted from traces |
 
-### t.string()
-
-Defines a text field. Stored as `TEXT` in SQLite.
-
-```typescript
-t.string()                    // Required string field
-t.string().optional()         // Optional (nullable) string field
-t.string().default('hello')   // Defaults to 'hello' on insert
-```
-
-### t.number()
-
-Defines a numeric field. Stored as `REAL` in SQLite.
-
-```typescript
-t.number()                    // Required number field
-t.number().optional()         // Optional (nullable) number field
-t.number().default(0)         // Defaults to 0 on insert
-```
-
-### t.boolean()
-
-Defines a boolean field. Stored as `INTEGER` (0/1) in SQLite.
-
-```typescript
-t.boolean()                   // Required boolean field
-t.boolean().default(false)    // Defaults to false on insert
-```
-
-### t.enum(values)
-
-Defines a field constrained to a set of string values. Stored as `TEXT` with a `CHECK` constraint in SQLite.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `values` | `readonly string[]` | Allowed values for this field. |
-
-```typescript
-t.enum(['low', 'medium', 'high'])                // Required enum field
-t.enum(['low', 'medium', 'high']).default('medium')  // Defaults to 'medium'
-```
-
-### t.timestamp()
-
-Defines a timestamp field. Stored as `INTEGER` (milliseconds since epoch) in SQLite.
-
-```typescript
-t.timestamp()                 // Required timestamp field
-t.timestamp().optional()      // Optional timestamp field
-t.timestamp().auto()          // Automatically set on insert (not user-writable)
-```
-
-### t.array(inner)
-
-Defines an array field. Stored as `TEXT` (JSON-serialized) in SQLite. Uses add-wins set semantics during merge -- concurrent additions from different devices are both preserved.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `inner` | `FieldDescriptor` | Type descriptor for array elements. |
-
-```typescript
-t.array(t.string())           // Array of strings
-t.array(t.number()).default([])  // Array of numbers, defaults to empty
-```
-
-### t.richtext()
-
-Defines a rich text field backed by a Yjs `Y.Text` CRDT. Stored as `BLOB` (Yjs state vector) in SQLite. Supports character-level collaborative editing with automatic merge.
-
-```typescript
-t.richtext()                  // Rich text field
-```
-
-Rich text fields cannot use `.default()` or `.optional()` modifiers. They are always initialized as empty `Y.Text` documents.
-
-### Field modifiers
-
-All type builders (except `t.richtext()`) support these chainable modifiers:
+### Modifiers
 
 | Modifier | Description |
 |----------|-------------|
-| `.optional()` | Makes the field nullable. Omitted fields default to `null`. |
-| `.default(value)` | Sets a default value applied on insert when the field is not provided. |
-| `.auto()` | Field is set automatically by Kora (e.g., `createdAt`). Cannot be provided by the developer. Only valid on `t.timestamp()`. |
-| `.merge(strategy)` | Declares the merge strategy for this field during conflict resolution. See [Conflict Resolution](/guide/conflict-resolution). Only valid on `t.number()`, `t.string()`, and `t.array()`. |
+| `.optional()` | The field may be omitted on insert. Reads `T \| null`. |
+| `.default(value)` | Value used when an insert omits the field. Typed by the field (`t.number().default('x')` is a type error). |
+| `.auto()` | The developer cannot set the field. Kora fills `t.timestamp().auto()` with the insert time; on any other kind the field stays empty. |
+| `.merge(strategy)` | Overrides the default merge. Strategies are not validated against the kind, so use them where the table below says they apply. |
+| `.transitions(map)` | Enum only: allowed state transitions. See [State Machines](/guide/state-machines). |
 
-Modifiers return a new `FieldDescriptor` and can be chained:
-
-```typescript
-t.string().optional()           // Valid
-t.number().default(0)           // Valid
-t.timestamp().auto()            // Valid
-t.string().optional().default('n/a')  // Valid -- optional with a default
-```
-
-### .merge(strategy)
-
-Declares how this field should be merged when concurrent edits conflict. Overrides the default Tier 1 auto-merge strategy.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `strategy` | `FieldMergeStrategy` | The merge strategy to use. |
-
-#### Available strategies
-
-| Strategy | Valid on | Behavior |
-|----------|---------|----------|
-| `'lww'` | All scalar types | Last-Write-Wins (default for scalars) |
-| `'counter'` | `t.number()` | Additive merge: both deltas are applied to the base value |
-| `'max'` | `t.number()` | Keeps the highest value across all sides |
-| `'min'` | `t.number()` | Keeps the lowest value across all sides |
-| `'union'` | `t.array()` | Add-wins set (default for arrays) |
-| `'append-only'` | `t.array()` | Append-only: additions are kept, removals are ignored |
-| `'server-authoritative'` | All types | Remote/server value always wins |
+| `.merge()` strategy | Use on | Behaviour (trace strategy name) |
+|---------------------|--------|---------------------------------|
+| `'lww'` | any | last write wins (`lww`) |
+| `'counter'` | `t.number()` | base value plus every concurrent delta (`schema-counter`) |
+| `'max'` / `'min'` | `t.number()`, `t.timestamp()` | extremum of every write (`schema-max`, `schema-min`) |
+| `'union'` | `t.array()` | element multiset merged per occurrence (duplicates kept), the array default (`lww-element-set`) |
+| `'append-only'` | `t.array()` | element multiset that ignores removals (`schema-append-only`); on other kinds it is last write wins |
+| `'server-authoritative'` | any | writes by the sync server beat every device write regardless of time (`schema-server-authoritative`) |
 
 ```typescript
 import { defineSchema, t } from 'korajs'
 
-const schema = defineSchema({
+const inventory = defineSchema({
   version: 1,
   collections: {
     products: {
       fields: {
         name: t.string(),
-        quantity: t.number().merge('counter'),   // additive - both decrements apply
-        highScore: t.number().merge('max'),      // keep the highest value
-        tags: t.array(t.string()).merge('append-only'), // never lose tags
-        status: t.string().merge('server-authoritative'), // server decides
+        quantity: t.number().merge('counter'),
+        highScore: t.number().merge('max'),
+        tags: t.array(t.string()).merge('append-only'),
+        status: t.string().merge('server-authoritative'),
       },
     },
   },
 })
 ```
 
-::: tip
-Schema-level merge strategies replace Tier 3 custom resolvers for common patterns like counters, max/min, and append-only lists. Use `.merge()` when a built-in strategy fits; use Tier 3 `resolve` functions for complex domain logic.
-:::
+### Type inference {#type-inference}
+
+| Field | Record (read) type | `insert()` | `update()` |
+|-------|--------------------|------------|------------|
+| required | `T` | required | `T` |
+| `.optional()` | `T \| null` | may be omitted (`null` is refused: omit the key) | `T \| null` |
+| `.default(v)` | `T \| null` | may be omitted | `T \| null` |
+| `t.timestamp().auto()` | `number` | cannot be set | cannot be set |
+| other `.auto()` | `T \| null` | cannot be set | cannot be set |
+| `t.enum([...])` | literal union | | |
+| `t.array(item)` | `Item[]` | | also `op.append` / `op.remove` |
+| `t.number()` / `t.timestamp()` | `number` | | also `op.increment` / `op.decrement` / `op.max` / `op.min` |
+| `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
+
+Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted field
+reads as `T | null` because `update(id, { field: null })` can clear it.
+
+```typescript
+import type { CollectionInsertOf, CollectionRecordOf } from 'korajs'
+
+type Todo = CollectionRecordOf<typeof app, 'todos'>
+type NewTodo = CollectionInsertOf<typeof app, 'todos'>
+```
+
+`InferRecord`, `InferInsert` and `InferUpdate` (from `@korajs/core`) do the same from a collection
+definition. Queries are typed too: `where()` accepts only the collection's fields (plus `id`,
+`createdAt`, `updatedAt`) with values of the field's type or the operators `$eq`, `$ne`, `$gt`,
+`$gte`, `$lt`, `$lte`, `$in`; `orderBy()` accepts only those keys; `include()` accepts only declared
+relations.
+
+---
+
+## op (Atomic field operations) {#atomic-ops}
+
+`op` values express intent instead of an absolute value, so concurrent changes from several
+devices combine instead of overwriting each other.
+
+```typescript
+import { op } from 'korajs'
+
+await app.products.update(id, { quantity: op.increment(1) })
+await app.products.update(id, { quantity: op.decrement(5) })
+await app.players.update(id, { highScore: op.max(1200) })
+await app.auctions.update(id, { lowestBid: op.min(40) })
+await app.todos.update(id, { tags: op.append('urgent') })
+await app.todos.update(id, { tags: op.remove('draft') })
+```
+
+| Helper | Field | Effect |
+|--------|-------|--------|
+| `op.increment(n)` / `op.decrement(n)` | number, timestamp | adds (subtracts) `n` |
+| `op.max(n)` / `op.min(n)` | number, timestamp | keeps the larger (smaller) value |
+| `op.append(item)` | array | adds one occurrence of `item` |
+| `op.remove(item)` | array | removes one occurrence of `item` |
+
+The helpers are typed by operation and operand (`NumericAtomicOpSentinel`,
+`ArrayAtomicOpSentinel<Item>`): `update()` accepts the numeric helpers only on number and
+timestamp fields, and `op.append` / `op.remove` only on array fields with an item of the
+element type. `op.append('x')` on a number field, `op.increment(1)` on an array, or
+`op.append(1)` on a `string[]` field is a compile error, as it is a runtime error.
+
+The operation stores the resolved value and the intent (`atomicOps`). In the merge, concurrent
+increments of the same field sum and concurrent `max`/`min` keep the extremum; a plain write in
+between takes over. Declare `.merge('counter')` (or `'max'`/`'min'`) when **every** write of a field
+should combine this way, including plain `update(id, { quantity: 7 })` writes.
 
 ---
 
 ## HybridLogicalClock
 
-Implements the Hybrid Logical Clock algorithm (Kulkarni et al.) for causal ordering of operations across distributed devices without requiring synchronized clocks.
+The clock that orders every operation (Kulkarni et al.). You rarely need it directly: the store
+creates operations with its own clock.
 
-### Constructor
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-new HybridLogicalClock(nodeId: string)
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `nodeId` | `string` | Unique identifier for this device/node. Typically a UUID v7. |
-
-### Methods
-
-#### .now()
-
-Generates a new timestamp for a local event. Each call returns a strictly greater timestamp than the previous one.
-
-```typescript
-now(): HLCTimestamp
-```
-
-**Returns:** `HLCTimestamp` -- A new timestamp with the current wall time (or incremented logical counter if wall time has not advanced).
-
-```typescript
-const clock = new HybridLogicalClock('node-abc-123')
-
-const ts1 = clock.now()  // { wallTime: 1712188800000, logical: 0, nodeId: 'node-abc-123' }
-const ts2 = clock.now()  // { wallTime: 1712188800000, logical: 1, nodeId: 'node-abc-123' }
-```
-
-#### .receive(remote)
-
-Updates the local clock after receiving a remote timestamp. Ensures the local clock stays ahead of both its own previous value and the remote value.
-
-```typescript
-receive(remote: HLCTimestamp): HLCTimestamp
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `remote` | `HLCTimestamp` | Timestamp received from a remote node. |
-
-**Returns:** `HLCTimestamp` -- The updated local timestamp after merging with the remote clock.
-
-```typescript
-const localClock = new HybridLogicalClock('node-a')
-const remoteTimestamp: HLCTimestamp = {
-  wallTime: 1712188900000,
-  logical: 5,
-  nodeId: 'node-b'
+class HybridLogicalClock {
+  constructor(
+    nodeId: string,
+    timeSource?: TimeSource,                  // { now(): number }, default Date
+    onDriftWarning?: (driftMs: number) => void,
+    onDriftError?: (driftMs: number) => void,
+  )
 }
-
-const updated = localClock.receive(remoteTimestamp)
-// updated.wallTime >= remoteTimestamp.wallTime
 ```
 
-#### HybridLogicalClock.compare(a, b) {#hlc-compare}
+| Member | Description |
+|--------|-------------|
+| `now(): HLCTimestamp` | A timestamp strictly greater than every earlier one from this clock. Never throws: when the physical clock moves backwards, the wall time freezes and the logical counter advances; drift over 60 s calls `onDriftWarning`, over 5 minutes `onDriftError`. |
+| `receive(remote): HLCTimestamp` | Merges a remote timestamp. Throws `InvalidTimestampError` (`INVALID_TIMESTAMP_FIELDS`) for non-integer or negative fields or `logical > MAX_LOGICAL`, and `RemoteClockDriftError` (`REMOTE_CLOCK_DRIFT`) for a timestamp more than 5 minutes ahead of reference-corrected time, before changing any state. |
+| `setReferenceOffset(ms)` | Records the server-minus-local offset learned at the handshake, so drift and remote validation use corrected time. |
+| `advanceTo(ts)` | Moves the clock forward to at least `ts` (never backwards). |
+| `static compare(a, b)` | Total order: `wallTime`, then `logical`, then `nodeId`. |
+| `static serialize(ts)` / `static deserialize(s)` | Lexicographically sortable string form. |
 
-Static method. Compares two timestamps for total ordering.
+`MAX_LOGICAL` is 99 999; an increment beyond it carries into the wall time (1 ms), so the counter
+never overflows.
 
 ```typescript
-static compare(a: HLCTimestamp, b: HLCTimestamp): number
+import { HybridLogicalClock, type HLCTimestamp } from 'korajs'
+
+const clock = new HybridLogicalClock('node-a')
+const first = clock.now()
+const remote: HLCTimestamp = { wallTime: first.wallTime + 10, logical: 5, nodeId: 'node-b' }
+const merged = clock.receive(remote)
+HybridLogicalClock.compare(merged, remote) // > 0
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `a` | `HLCTimestamp` | First timestamp. |
-| `b` | `HLCTimestamp` | Second timestamp. |
-
-**Returns:** `number`
-- Negative if `a` is before `b`
-- Positive if `a` is after `b`
-- Zero if `a` and `b` are identical (same wallTime, logical, and nodeId)
-
-Comparison order: `wallTime` first, then `logical`, then `nodeId` (lexicographic).
-
-```typescript
-const a: HLCTimestamp = { wallTime: 1000, logical: 0, nodeId: 'node-a' }
-const b: HLCTimestamp = { wallTime: 1000, logical: 1, nodeId: 'node-b' }
-
-HybridLogicalClock.compare(a, b) // negative (a is before b, because a.logical < b.logical)
-```
+The sync engine measures clock skew at every handshake: a device whose clock is far ahead is told
+so (`sync:clock-skew`) and its unsynced writes are re-stamped (`sync:clock-rebase`). See
+[Clock integrity](/guide/clock-integrity).
 
 ---
 
 ## generateUUIDv7()
 
-Generates a UUID v7 identifier. UUID v7 values are time-sortable and contain a millisecond-precision timestamp, making them suitable for record IDs and node IDs.
-
-### Signature
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function generateUUIDv7(): string
+function isValidUUIDv7(value: string): boolean
+function extractTimestamp(uuid: string): number
 ```
 
-### Returns
+Time-sortable identifiers for record ids and node ids.
 
-`string` -- A new UUID v7 string (e.g., `'0190a6e0-7b3c-7def-8a12-4b5c6d7e8f90'`).
+---
 
-### Example
+## Operations
+
+Every mutation produces one immutable, content-addressed `Operation`.
 
 ```typescript
-import { generateUUIDv7 } from 'korajs'
+interface Operation {
+  id: string                        // SHA-256 content hash (see hashVersion)
+  nodeId: string                    // the writing device
+  type: 'insert' | 'update' | 'delete'
+  collection: string
+  recordId: string
+  data: Record<string, unknown> | null          // null for delete; changed fields for update
+  previousData: Record<string, unknown> | null  // update: previous values of the changed fields
+  timestamp: HLCTimestamp
+  sequenceNumber: number            // per node, gap-free
+  causalDeps: string[]
+  schemaVersion: number
+  atomicOps?: Record<string, AtomicOp>
+  transactionId?: string            // not hashed
+  mutationName?: string             // not hashed
+  hashVersion?: 1 | 2               // absent = 1
+  fieldVersions?: Record<string, HLCTimestamp>  // server scope-entry inserts only
+  foldState?: string                // server scope-entry inserts only
+  encrypted?: EncryptedOperationEnvelope        // end-to-end encrypted operations
+}
+```
 
-const id = generateUUIDv7()
+- **Content hash.** Version 2 (every new operation) hashes `type`, `collection`, `recordId`,
+  `data`, `previousData`, `timestamp`, `nodeId`, `sequenceNumber`, `causalDeps`, `schemaVersion`
+  and `atomicOps`. Version 1 (operations written by Kora 1.0.0-beta.12 and earlier) leaves out
+  `previousData`, `sequenceNumber`, `causalDeps` and `schemaVersion`. `verifyOperationId(op)`
+  recomputes it; receivers refuse an operation whose id does not match.
+- **Canonical values.** `createOperation` canonicalizes `data` once (sorted keys, the value
+  domain of the schema), and the id covers exactly what is stored and sent.
+
+<!-- docs-check: signature @korajs/core -->
+```typescript
+function createOperation(
+  input: OperationInput,
+  clock: HybridLogicalClock,
+  options?: { hashVersion?: 1 | 2 },  // default 2
+): Promise<Operation>
+```
+
+`OperationInput` is `Operation` without `id`, `timestamp` and the server-only fields. Application
+code never calls it: collections create operations on `insert()`, `update()` and `delete()`. Use it
+for custom transports and tests.
+
+| Helper | Description |
+|--------|-------------|
+| `verifyOperationId(op)` | `Promise<boolean>`: the id matches the content for its `hashVersion`. |
+| `isValidOperation(value)` | Structural type guard. |
+| `computeOperationId(body, version)` | The content hash. |
+
+---
+
+## The record fold {#fold}
+
+Every replica (device, server, restored backup) computes a record from its operations with one
+deterministic per-field CRDT: the **fold**. The result depends only on the set of operations, not
+on their order, duplicates or batching. The [Conflict Resolution guide](/guide/conflict-resolution)
+describes the semantics per field type; these functions expose it for tools and tests.
+
+| Function | Description |
+|----------|-------------|
+| `foldRecord(ops, schema, options?)` | Folds a record's operations from scratch (any order). Returns `{ state, traces }`. |
+| `mergeOp(state, op, schema, options?)` | Merges one operation into a state (a join). Returns `{ state, traces, changed }`. |
+| `materialize(state, { richtext? })` | The record's field values, or `null` when it does not exist or is deleted. |
+| `joinStates(a, b, schema)` | Joins two replicas' states of one record. |
+| `serializeFoldState` / `deserializeFoldState` | Stable serialized form. |
+| `toMergeTrace(trace)` | Converts a fold trace to the DevTools `MergeTrace`. |
+
+`FoldOptions`: `exclude` (operation ids or a predicate to leave out), `richtext`
+(`mergeYjsUpdates` from `@korajs/store`, needed to materialize concurrent rich-text edits),
+`traces` (`'none' | 'conflicts' | 'all'`), `authoritativeNodeIds` and
+`revokedAuthoritativeNodeIds` (server authority for `merge('server-authoritative')`).
+
+```typescript
+import { foldRecord, materialize } from '@korajs/core'
+import type { Operation } from '@korajs/core'
+
+declare const operations: Operation[]
+const { state } = foldRecord(operations, schema)
+const record = state ? materialize(state) : null
 ```
 
 ---
 
-## createOperation()
+## Version vectors
 
-Creates a new immutable, content-addressed operation. The operation's `id` is derived from a SHA-256 hash of its contents, ensuring that identical operations always produce the same ID.
+`VersionVector` is `Map<nodeId, highest sequence number>`. The client uses it for its uploads and
+deduplication; downloads are resumed from the server's delivery sequence instead (see
+[Sync Protocol](/guide/sync-protocol)).
 
-### Signature
-
-```typescript
-function createOperation(input: OperationInput, clock: HybridLogicalClock): Promise<Operation>
-```
-
-`createOperation` is asynchronous (the content-addressed `id` is derived via a SHA-256 digest) and takes the HLC as a second argument. The operation's timestamp is generated internally from the clock, so it is not part of `OperationInput`.
-
-### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `input` | `OperationInput` | Operation data. See fields below. |
-| `clock` | `HybridLogicalClock` | The HLC used to generate this operation's timestamp. |
-
-#### OperationInput
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `nodeId` | `string` | Yes | UUID v7 of the originating device. |
-| `type` | `'insert' \| 'update' \| 'delete'` | Yes | What kind of mutation this represents. |
-| `collection` | `string` | Yes | Target collection name (from schema). |
-| `recordId` | `string` | Yes | ID of the affected record. |
-| `data` | `Record<string, unknown> \| null` | Yes | Field values. `null` for delete. For updates, only changed fields. |
-| `previousData` | `Record<string, unknown> \| null` | Yes | Previous values of changed fields (enables 3-way merge). `null` for insert/delete. |
-| `sequenceNumber` | `number` | Yes | Monotonically increasing per node. |
-| `causalDeps` | `string[]` | Yes | Operation IDs this operation causally depends on. Pass `[]` if none. |
-| `schemaVersion` | `number` | Yes | Schema version at time of creation. |
-| `atomicOps` | `Record<string, AtomicOp>` | No | Atomic operation intents for fields in `data` (e.g., increment, max). |
-| `transactionId` | `string` | No | Groups this operation with others in an atomic transaction. Not part of the content hash. |
-| `mutationName` | `string` | No | Human-readable name for the mutation group. For DevTools display. |
-
-### Returns
-
-`Promise<Operation>` -- Resolves to an immutable operation with a computed content-addressed `id`.
-
-### Example
-
-```typescript
-import { createOperation, HybridLogicalClock, generateUUIDv7 } from 'korajs'
-
-const nodeId = generateUUIDv7()
-const clock = new HybridLogicalClock(nodeId)
-
-const op = await createOperation({
-  nodeId,
-  type: 'insert',
-  collection: 'todos',
-  recordId: generateUUIDv7(),
-  data: { title: 'Ship Kora v1', completed: false },
-  previousData: null,
-  sequenceNumber: 1,
-  causalDeps: [],
-  schemaVersion: 1,
-}, clock)
-
-console.log(op.id) // SHA-256 content hash
-```
-
-::: tip
-In typical application code, you never call `createOperation` directly. The `Store` creates operations automatically when you call `insert()`, `update()`, or `delete()` on a collection. This function is exposed for advanced use cases like custom transports or testing.
-:::
+| Function | Description |
+|----------|-------------|
+| `createVersionVector()` | Empty vector. |
+| `mergeVectors(a, b)` | Per-node maximum. |
+| `advanceVector(v, nodeId, seq)` | Copy with `nodeId` raised to at least `seq`. |
+| `dominates(a, b)` / `vectorsEqual(a, b)` | Comparison. |
+| `computeDelta(local, remote, log)` | `Promise<Operation[]>`: operations `local` has and `remote` lacks, in causal order. `log` implements `getRange(nodeId, fromSeq, toSeq)`. |
+| `serializeVector(v)` / `deserializeVector(s)` | Sorted JSON form. |
 
 ---
 
-## op (Atomic Field Operations) {#atomic-ops}
+## Scopes {#schema-sync-rules}
 
-The `op` helper creates atomic field operations that are resolved against the current value at write time, rather than setting an absolute value. This prevents lost updates when multiple devices modify the same field concurrently.
-
-```typescript
-import { op } from '@korajs/core'
-// or
-import { op } from 'korajs'
-```
-
-### op.increment(amount)
-
-Increments a numeric field by the given amount.
+Root-level `sync` rules declare which collections sync and which fields filter them:
 
 ```typescript
-await app.products.update(id, { quantity: op.increment(1) })
-await app.products.update(id, { quantity: op.increment(-3) }) // decrement by 3
-```
-
-### op.decrement(amount)
-
-Decrements a numeric field by the given amount. Equivalent to `op.increment(-amount)`.
-
-```typescript
-await app.products.update(id, { quantity: op.decrement(5) })
-```
-
-### op.max(value)
-
-Sets the field to the given value only if it is greater than the current value.
-
-```typescript
-await app.players.update(id, { highScore: op.max(newScore) })
-```
-
-### op.min(value)
-
-Sets the field to the given value only if it is less than the current value.
-
-```typescript
-await app.auctions.update(id, { lowestBid: op.min(myBid) })
-```
-
-### op.append(item)
-
-Appends an item to an array field.
-
-```typescript
-await app.todos.update(id, { tags: op.append('urgent') })
-```
-
-### op.remove(item)
-
-Removes an item from an array field by value.
-
-```typescript
-await app.todos.update(id, { tags: op.remove('draft') })
-```
-
-::: warning
-Atomic operations are resolved locally before creating the operation. They do not provide distributed atomicity. Concurrent `op.increment(1)` calls from two devices both apply their deltas correctly because the operation stores the resolved value and the previous value, enabling 3-way merge.
-:::
-
----
-
-## buildScopeMap()
-
-Builds a scope map from a schema definition and a set of scope values. Used internally by sync scoping but available for custom scope logic.
-
-### Signature
-
-```typescript
-function buildScopeMap(
-  schema: SchemaDefinition,
-  scopeValues: Record<string, unknown>
-): ScopeMap
-```
-
-### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
-| `scopeValues` | `Record<string, unknown>` | Flat key-value pairs used to populate scope filters. |
-
-### Returns
-
-`ScopeMap`: a `Record<string, Record<string, unknown>>` mapping collection names to their scope filter objects.
-
----
-
-## Schema sync rules (partial sync DSL)
-
-Declare which collections sync and which fields filter data using root-level `sync` rules in `defineSchema()`:
-
-```typescript
-const schema = defineSchema({
+const scoped = defineSchema({
   version: 1,
   collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        userId: t.string(),
-        orgId: t.string(),
-      },
-    },
-    auditLog: {
-      fields: {
-        message: t.string(),
-      },
-    },
+    todos: { fields: { title: t.string(), userId: t.string(), orgId: t.string() } },
+    auditLog: { fields: { message: t.string() } },
   },
   sync: {
     todos: { where: { userId: true, orgId: true } },
@@ -564,1131 +439,226 @@ const schema = defineSchema({
 })
 ```
 
-Each `where` entry binds a **record field** to a **scope value key**:
+`true` binds the field to the scope value of the same name; a string binds it to another key
+(`ownerId: 'userId'`). With `sync` present, only the listed collections (plus collections with a
+legacy `scope`) sync.
 
-| Value | Meaning |
-|-------|---------|
-| `true` | Bind field to a scope value with the same name (`userId` → `scopeValues.userId`) |
-| `'otherKey'` | Bind field to a different scope value key (`ownerId: 'userId'`) |
+What a session may sync is decided **on the server** from its verified identity (see
+[Authentication](/guide/authentication#sync-scopes)). The client helpers below only build hints that
+can narrow it:
 
-When `schema.sync` is present, only collections listed in `sync` (or with legacy `collection.scope`) participate in sync. Other collections are omitted from the scope map (partial sync).
-
-Use with `buildScopeMap(schema, scopeValues)` or `createKoraAuthSync({ schema })` on the client, and `resolveSessionScopes()` on the server.
+| Function | Description |
+|----------|-------------|
+| `buildScopeMap(schema, scopeValues)` | Per-collection filters from flat scope values. |
+| `extractScopeValuesFromClaims(schema, claims)` | Scope values from (unverified) token claims: a top-level claim, then `claims.scope[key]`, then `sub` for `userId`. |
+| `collectSchemaScopeValueKeys(schema)` | Every scope value key the schema uses (`collectSchemaScopeFields` is a deprecated alias). |
+| `claimScopes(values, explicit?)` | Server side: a scope grant from verified values (used by auth providers and `resolveScopes`). |
 
 ---
 
-## extractScopeValuesFromClaims()
+## migrate() {#migrations}
 
-Extracts flat scope values from JWT (or auth) claims using the scope field names declared on your schema collections.
-
-### Signature
-
-```typescript
-function extractScopeValuesFromClaims(
-  schema: SchemaDefinition,
-  claims: Record<string, unknown>
-): Record<string, unknown>
-
-function collectSchemaScopeFields(schema: SchemaDefinition): string[]
-```
-
-### Resolution order
-
-For each scope field declared on any collection:
-
-1. Top-level claim with the same name (e.g. `orgId`)
-2. Nested `claims.scope[field]`
-3. JWT `sub` → `userId` when `userId` is a scope field
-
-Pass the result to `buildScopeMap()` or use `createKoraAuthSync({ schema })` to apply automatically during sync handshake.
-
-### Example
+`migrate()` returns an immutable `MigrationBuilder`; pass it under `migrations` in `defineSchema()`
+keyed by the target version. See the [Schema Design guide](/guide/schema-design#migrations) for how
+migrations run (one transaction per version, typed backfills that sync).
 
 ```typescript
-import { extractScopeValuesFromClaims, buildScopeMap } from '@korajs/core'
+import { defineSchema, migrate, t } from 'korajs'
 
-const scopeValues = extractScopeValuesFromClaims(schema, {
-  sub: 'user-abc',
-  orgId: 'org-123',
+const v2 = defineSchema({
+  version: 2,
+  collections: {
+    todos: {
+      fields: {
+        title: t.string(),
+        urgent: t.boolean().default(false),
+        priority: t.enum(['low', 'medium', 'high']).default('medium'),
+      },
+    },
+  },
+  migrations: {
+    2: migrate()
+      .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+      .addIndex('todos', 'priority')
+      .backfill('todos', (record) => ({ priority: record.urgent ? 'high' : 'medium' })),
+  },
 })
-
-const scopeMap = buildScopeMap(schema, scopeValues)
-// { todos: { userId: 'user-abc', orgId: 'org-123' }, ... }
 ```
-
----
-
-## migrate() / MigrationBuilder {#migrations}
-
-Creates a fluent migration builder for defining schema migration steps programmatically. The builder is immutable: each method returns a new instance.
-
-```typescript
-import { migrate, migrationStepsToSQL, t } from '@korajs/core'
-```
-
-### migrate()
-
-Returns a new empty `MigrationBuilder`.
-
-```typescript
-const migration = migrate()
-  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
-  .removeField('todos', 'legacyFlag')
-  .renameField('todos', 'desc', 'description')
-  .addIndex('todos', 'priority')
-```
-
-### MigrationBuilder methods
 
 | Method | Description |
 |--------|-------------|
-| `.addField(collection, field, builder)` | Add a new field to a collection. |
-| `.removeField(collection, field)` | Remove a field from a collection. |
-| `.renameField(collection, from, to)` | Rename a field. |
-| `.addIndex(collection, field)` | Add an index on a field. |
-| `.removeIndex(collection, field)` | Remove an index. |
-| `.backfill(collection, transform, reverseOrOptions?)` | Apply a transform to every live record (typed values). Changed records are written as update operations (`migration:v<N>`) that sync; `{ localOnly: true }` rewrites rows on this device only. Third argument: a reverse transform, or `{ reverseTransform?, localOnly? }`. |
+| `.addField(collection, field, builder)` | Adds a column. |
+| `.removeField(collection, field, builder?)` | Drops a column; pass the old builder to make it reversible. |
+| `.renameField(collection, from, to)` | Renames a column. |
+| `.addIndex(collection, field)` / `.removeIndex(collection, field)` | Index changes. |
+| `.backfill(collection, transform, reverseOrOptions?)` | Rewrites live records. Changes are written as updates named `migration:v<N>` that sync; `{ localOnly: true }` rewrites rows on this device only. The third argument is a reverse transform or `{ reverseTransform?, localOnly? }`. |
+| `.down(fn)` | Explicit rollback steps through a `RollbackBuilder` with the same methods. |
+| `.steps` | The ordered `MigrationStep[]`. |
+| `.safelyReversible` | `false` when a `backfill` has no reverse or a `removeField` has no builder, unless `.down()` was given. |
 
-### .build()
+### Rollbacks and SQL
 
-Returns a `MigrationDefinition` containing the ordered list of steps.
+| Function | Description |
+|----------|-------------|
+| `canAutoRollback(step)` | `true` for `addField`, `addIndex`, `removeIndex` and `renameField`; `false` for `removeField` and `backfill` (which `generateRollbackSteps` can still invert when they carry a descriptor or a reverse transform). |
+| `generateRollbackSteps(steps)` | Inverse steps in reverse order: `removeField` with a descriptor becomes `addField`, `backfill` with a `reverseTransform` runs it. Throws `MigrationRollbackError` (`MIGRATION_ROLLBACK`) for a step without an inverse. |
+| `createReversibleMigration(up, down \| null, from, to)` | `{ up, down, fromVersion, toVersion }`; `null` generates `down`. |
+| `migrationStepsToSQL(steps)` / `rollbackStepsToSQL(steps)` | SQL for the structural steps. |
 
 ```typescript
-const definition = migration.build()
-console.log(definition.steps) // Array of MigrationStep objects
+import { createReversibleMigration, generateRollbackSteps, migrate, t } from '@korajs/core'
+
+const migration = migrate()
+  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
+  .addIndex('todos', 'priority')
+
+const down = generateRollbackSteps(migration.steps) // removeIndex, then removeField
+const reversible = createReversibleMigration(migration.steps, null, 1, 2)
 ```
 
-### migrationStepsToSQL()
+### Older clients: operation transforms
 
-Converts migration steps into SQL statements.
+`OperationTransform` (`{ fromVersion, toVersion, transform(op) }`) and `operationSchemaView` let a
+server and newer clients read operations written under an older schema version without rewriting
+them. See [Schema Design](/guide/schema-design#devices-on-older-versions-transforms-at-fold-time).
+
+---
+
+## State machines {#state-machine}
+
+`t.enum(values).transitions(map)` (or a collection's `stateMachine`) restricts which transitions a
+local write may make. Transitions are validated on the writing device; concurrent writes from two
+devices merge by last write wins. See [State Machines](/guide/state-machines).
+
+| Function | Description |
+|----------|-------------|
+| `validateTransition(constraint, from, to)` | `{ valid, from, to, field, collection, allowedTargets }`. |
+| `buildStateMachineConstraints(schema)` | One `{ field, collection, transitions }` per enum field with transitions. |
+| `getTransitionMap(schema, collection, field)` | The field's map, or `null`. |
 
 ```typescript
-function migrationStepsToSQL(steps: readonly MigrationStep[]): string[]
-```
+import { validateTransition } from '@korajs/core'
 
-```typescript
-const sql = migrationStepsToSQL(definition.steps)
-// ['ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT \'medium\' CHECK(...)']
+const result = validateTransition(
+  { field: 'status', collection: 'orders', transitions: { draft: ['submitted'], submitted: [] } },
+  'draft',
+  'submitted',
+)
+result.valid // true
 ```
 
 ---
 
 ## quoteIdent()
 
-Quotes a SQL identifier (table or column name) for safe interpolation into generated SQL. It wraps the identifier in double quotes and doubles any embedded double quote, following the SQL standard. Both SQLite and PostgreSQL honor this form, so quoting lets a valid JavaScript identifier (camelCase, PascalCase, or a word that happens to be a SQL keyword like `order` or `select`) round-trip through generated DDL and queries without producing invalid or ambiguous SQL.
-
-### Signature
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
 function quoteIdent(name: string): string
 ```
 
-### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | `string` | The raw identifier (collection name, or field/column name). |
-
-### Returns
-
-`string` -- The identifier wrapped in double quotes, with any embedded double quotes doubled, ready to splice into SQL.
-
-### Example
-
-```typescript
-import { quoteIdent } from '@korajs/core'
-
-quoteIdent('formResponses') // '"formResponses"'
-quoteIdent('order')         // '"order"' (safe even though `order` is a SQL keyword)
-```
+Wraps a SQL identifier in double quotes and doubles embedded quotes, so camelCase names and SQL
+keywords (`order`) are safe in generated DDL on SQLite and Postgres. `quoteIdent('order')` returns
+`"order"`.
 
 ---
 
-## Blobs (content-addressed binary)
+## Blobs
 
-Blob helpers create and validate content-addressed references to binary data stored out of band. A `blob` field never carries the bytes in the operation log; it carries a small `BlobRef` keyed by the content hash, so identical content is stored once and never re-synced to a peer that already has that hash.
+A `t.blob()` field stores a small content-addressed `BlobRef`; the bytes live in a blob store and
+are transferred out of band, once per content hash.
 
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-import { createBlobRef, hashBlob, isBlobRef } from '@korajs/core'
-```
+function hashBlob(bytes: Uint8Array): Promise<string>    // hex SHA-256
+function createBlobRef(bytes: Uint8Array, metadata?: { mimeType?: string; filename?: string }): Promise<BlobRef>
+function isBlobRef(value: unknown): value is BlobRef      // shape check only
 
-### hashBlob()
-
-Computes the hex-encoded SHA-256 content hash of a byte buffer. This is the content address of a blob: identical bytes always hash to the same value.
-
-```typescript
-function hashBlob(bytes: Uint8Array): Promise<string>
-```
-
-### createBlobRef()
-
-Creates a content-addressed `BlobRef` for a byte buffer, carrying the content hash, size, and optional metadata.
-
-```typescript
-function createBlobRef(bytes: Uint8Array, metadata?: BlobRefMetadata): Promise<BlobRef>
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `bytes` | `Uint8Array` | The binary content. |
-| `metadata` | `BlobRefMetadata` | Optional MIME type and filename. Defaults to `{}`. |
-
-### isBlobRef()
-
-Type guard that checks whether a value is a structurally valid `BlobRef`. It validates the shape only (a non-empty hex hash and a non-negative integer size); it does not verify that the bytes behind the hash exist or match.
-
-```typescript
-function isBlobRef(value: unknown): value is BlobRef
-```
-
-### BlobRef
-
-A content-addressed reference to binary data stored out of band.
-
-```typescript
 interface BlobRef {
-  /** Hex-encoded SHA-256 hash of the bytes. The content address. */
-  hash: string
-  /** Size of the bytes in bytes. */
+  hash: string          // hex SHA-256 of the bytes
   size: number
-  /** Optional MIME type (for example "image/png"). */
-  mimeType?: string
-  /** Optional original filename. */
-  filename?: string
-  /** Hex-encoded SHA-256 hash of this blob's manifest (the chunk index a peer fetches first). Present when the blob was stored for transfer; absent for a bare reference. */
-  manifestHash?: string
-}
-```
-
-### BlobRefMetadata
-
-Optional metadata carried alongside a blob reference.
-
-```typescript
-interface BlobRefMetadata {
   mimeType?: string
   filename?: string
+  manifestHash?: string // chunk index, when stored for transfer
 }
 ```
 
 ---
 
-## Types
+## Events and merge traces
 
-### Operation
-
-The atomic unit of mutation in Kora.js. Every data change produces an `Operation`. Operations are immutable and content-addressed.
-
-```typescript
-interface Operation {
-  /** SHA-256 hash of content. Content-addressed. */
-  id: string
-
-  /** UUID v7 of the originating device. */
-  nodeId: string
-
-  /** What happened. */
-  type: 'insert' | 'update' | 'delete'
-
-  /** Which collection (from schema). */
-  collection: string
-
-  /** ID of the affected record. */
-  recordId: string
-
-  /** Field values. null for delete. For updates, only changed fields. */
-  data: Record<string, unknown> | null
-
-  /** Previous values of changed fields (enables 3-way merge). null for insert/delete. */
-  previousData: Record<string, unknown> | null
-
-  /** Hybrid Logical Clock timestamp. */
-  timestamp: HLCTimestamp
-
-  /** Monotonically increasing per node. Used in version vectors. */
-  sequenceNumber: number
-
-  /** Operation IDs this operation causally depends on (direct parents in the DAG). */
-  causalDeps: string[]
-
-  /** Schema version at time of creation. */
-  schemaVersion: number
-
-  /** Atomic operation intents for fields in data (e.g., increment, max). Present only when atomic ops were used. */
-  atomicOps?: Record<string, AtomicOp>
-
-  /** Groups this operation with others in an atomic transaction. Not part of the content hash. */
-  transactionId?: string
-
-  /** Human-readable name for the mutation group (e.g., 'complete-sale'). For DevTools display. */
-  mutationName?: string
-}
-```
-
-### HLCTimestamp
-
-A timestamp produced by the Hybrid Logical Clock. Provides total ordering across distributed devices.
-
-```typescript
-interface HLCTimestamp {
-  /** Physical wall-clock time in milliseconds since epoch. */
-  wallTime: number
-
-  /** Logical counter. Increments when wallTime has not changed since last event. */
-  logical: number
-
-  /** Node ID for tie-breaking. Ensures total order even with identical wall + logical. */
-  nodeId: string
-}
-```
-
-### VersionVector
-
-Tracks the latest sequence number seen from each node. Used for delta sync computation.
-
-```typescript
-type VersionVector = Map<string, number>  // nodeId -> max sequence number
-```
-
-### SchemaDefinition
-
-The validated output of `defineSchema()`. Passed to `createApp()`.
-
-```typescript
-interface SchemaDefinition {
-  version: number
-  collections: Record<string, CollectionDefinition>
-  relations: Record<string, RelationDefinition>
-  /** Schema migrations keyed by target version. */
-  migrations: Record<number, MigrationDefinition>
-  /** Declarative partial-sync rules per collection. Present only when sync rules are declared. */
-  sync?: Record<string, SyncRuleDefinition>
-}
-```
-
-### FieldDescriptor
-
-Describes a single field's type, default value, and modifiers. Produced by the `t` type builders.
-
-```typescript
-interface FieldDescriptor {
-  kind: FieldKind
-  required: boolean
-  defaultValue: unknown
-  auto: boolean
-  enumValues: readonly string[] | null
-  itemKind: FieldKind | null              // Element kind for array fields
-  mergeStrategy: FieldMergeStrategy | null
-  transitions: TransitionMap | null       // State machine transitions for enum fields
-  nestedFields?: Record<string, FieldDescriptor> | null   // For object fields
-  secretMode?: SecretMode | null          // For secret fields
-}
-```
-
-`FieldKind` is one of `'string' | 'number' | 'boolean' | 'timestamp' | 'richtext' | 'enum' | 'array' | 'object' | 'json' | 'blob' | 'secret'`. `FieldMergeStrategy` is one of `'lww' | 'counter' | 'max' | 'min' | 'union' | 'append-only' | 'server-authoritative'`. `SecretMode` is `'hashed' | 'encrypted'`.
-
-### MergeTrace
-
-Records the full context of a merge decision. Used by DevTools for conflict inspection.
+`KoraEvent` is the union of every instrumentation event (`app.events.on(type, listener)`); the
+[DevTools reference](/api/devtools#events) lists each event, its payload and when it fires.
+`MergeTrace` describes one merge decision:
 
 ```typescript
 interface MergeTrace {
-  /** First concurrent operation. */
   operationA: Operation
-
-  /** Second concurrent operation. */
   operationB: Operation
-
-  /** The field where the conflict occurred. */
-  field: string
-
-  /** Which strategy resolved the conflict (e.g. 'lww', 'crdt-text', 'add-wins-set', 'unique-constraint', 'custom'). */
-  strategy: string
-
-  /** Value from operation A. */
+  field: string          // '*' for a record-level decision (delete versus update)
+  strategy: string       // 'lww', 'lww-element-set', 'object-key-lww', 'crdt-text', 'schema-counter', 'custom', ...
   inputA: unknown
-
-  /** Value from operation B. */
   inputB: unknown
-
-  /** Base value (before either operation). null if unavailable. */
   base: unknown | null
-
-  /** The resolved output value. */
   output: unknown
-
-  /** Which tier resolved this conflict. */
   tier: 1 | 2 | 3
-
-  /** Name of the violated constraint, or null if no constraint was involved. */
   constraintViolated: string | null
-
-  /** Time spent resolving in milliseconds. */
   duration: number
 }
 ```
 
-### KoraEvent
-
-Union type of all instrumentation events emitted by the Kora runtime. Consumed by DevTools and custom event handlers.
-
-```typescript
-type KoraEvent =
-  | { type: 'operation:created'; operation: Operation }
-  | { type: 'operation:applied'; operation: Operation; duration: number }
-  | { type: 'merge:started'; operationA: Operation; operationB: Operation }
-  | { type: 'merge:completed'; trace: MergeTrace }
-  | { type: 'merge:conflict'; trace: MergeTrace }
-  | { type: 'constraint:violated'; constraint: string; trace: MergeTrace }
-  | { type: 'sync:connected'; nodeId: string }
-  | { type: 'sync:disconnected'; reason: string }
-  | {
-      type: 'sync:schema-mismatch'
-      clientSchemaVersion: number
-      serverSchemaVersion: number
-      supportedMin: number
-      supportedMax: number
-      reason: string
-    }
-  | { type: 'sync:auth-failed'; reason: string }
-  | {
-      type: 'sync:clock-skew'
-      /** serverTime - localTime in ms. Negative = this device's clock is fast. */
-      skewMs: number
-      severity: 'info' | 'slow-warning' | 'fast-blocked'
-      source: 'handshake' | 'server-reject'
-    }
-  | {
-      type: 'sync:clock-rebase'
-      /** Number of unsynced operations that were re-stamped. */
-      rebasedCount: number
-      /** How far ahead of server time the most future queued operation was, in ms. */
-      maxSkewMs: number
-    }
-  | { type: 'sync:sent'; operations: Operation[]; batchSize: number }
-  | { type: 'sync:received'; operations: Operation[]; batchSize: number }
-  | { type: 'sync:acknowledged'; sequenceNumber: number }
-  | {
-      type: 'sync:apply-failed'
-      operationId: string
-      collection: string
-      recordId: string
-      code: string
-      message: string
-      retriable: boolean
-    }
-  | {
-      type: 'sync:operation-rejected'
-      operationId: string
-      collection: string
-      recordId: string
-      code: string
-      message: string
-      retriable: boolean
-    }
-  | { type: 'query:subscribed'; queryId: string; collection: string }
-  | { type: 'query:invalidated'; queryId: string; trigger: Operation }
-  | { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
-  | { type: 'connection:quality'; quality: ConnectionQuality }
-  | { type: 'sync:diagnostics'; diagnostics: SyncDiagnosticsSnapshot }
-  | { type: 'sync:bandwidth'; bytesPerSecond: number; direction: 'in' | 'out' }
-  | {
-      type: 'sync:initial-sync-progress'
-      progress: number
-      totalBatches: number
-      receivedBatches: number
-    }
-  | { type: 'awareness:updated'; states: Map<number, unknown> }
-  | {
-      type: 'state-machine:transition'
-      collection: string
-      recordId: string
-      from: string
-      to: string
-      valid: boolean
-    }
-  | {
-      type: 'state-machine:rejected'
-      collection: string
-      recordId: string
-      from: string
-      to: string
-      allowed: string[]
-    }
-  | { type: 'store:persistence-error'; dbName: string; message: string; code: string }
-  | { type: 'store:quota-exceeded'; dbName: string; message: string }
-  | {
-      type: 'store:opfs-unavailable'
-      dbName: string
-      reason: 'lock-conflict' | 'timeout' | 'unsupported'
-      message: string
-    }
-  | {
-      type: 'store:storage-fallback'
-      dbName: string
-      from: 'opfs' | 'sqlite-wasm'
-      to: 'indexeddb'
-      reason: 'lock-conflict' | 'timeout' | 'unsupported'
-      message: string
-    }
-  | { type: 'store:db-name-collision'; dbName: string; message: string }
-  | {
-      type: 'replay:completed'
-      targetOperationId: string
-      operationsApplied: number
-      duration: number
-    }
-```
-
-::: warning
-`operation:applied` is declared in the catalog but is not yet emitted by the store. Do not rely on it firing; subscribe to `operation:created` to observe writes.
-:::
-
 ---
 
-## KoraError
+## Errors
 
-Base error class for all Kora.js errors. Includes a machine-readable `code` and optional `context` for debugging.
+Every Kora error extends `KoraError` with a machine-readable `code` and a `context` object.
 
-### Constructor
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-new KoraError(message: string, code: string, context?: Record<string, unknown>)
+class KoraError extends Error {
+  constructor(message: string, code: string, context?: Record<string, unknown>)
+  readonly code: string
+  readonly context?: Record<string, unknown>
+}
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `message` | `string` | Human-readable error message. |
-| `code` | `string` | Machine-readable error code (e.g., `'INVALID_SCHEMA'`, `'MERGE_CONFLICT'`). |
-| `context` | `Record<string, unknown>` | Optional. Additional data for debugging. |
-
-### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `message` | `string` | Human-readable error message. |
-| `code` | `string` | Machine-readable error code. |
-| `context` | `Record<string, unknown> \| undefined` | Additional debugging data. |
-| `name` | `string` | Always `'KoraError'`. |
-
-### Error codes
-
-| Code | Description |
-|------|-------------|
-| `INVALID_SCHEMA` | Schema definition is malformed or contains invalid references. |
-| `MERGE_CONFLICT` | A merge conflict could not be resolved automatically. |
-| `CONSTRAINT_VIOLATION` | A constraint was violated and the `onConflict` strategy failed. |
-| `STORAGE_ERROR` | A storage adapter operation failed. |
-| `SYNC_ERROR` | A sync protocol error occurred. |
-| `CLOCK_DRIFT` | The local clock has drifted more than 5 minutes behind the HLC. |
-| `INVALID_OPERATION` | An operation failed validation. |
-
-### Example
+Core error classes: `SchemaValidationError` (`SCHEMA_VALIDATION`), `OperationError`
+(`OPERATION_ERROR`), `OperationTooLargeError` (`OPERATION_TOO_LARGE`), `MergeConflictError`
+(`MERGE_CONFLICT`), `SyncError` (`SYNC_ERROR`), `StorageError` (`STORAGE_ERROR`), `AppNotReadyError`
+(`APP_NOT_READY`), `ClockDriftError` (`CLOCK_DRIFT`), `RemoteClockDriftError` (`REMOTE_CLOCK_DRIFT`),
+`InvalidTimestampError` (`INVALID_TIMESTAMP_FIELDS`). `getKoraErrorFix(code)` returns a short fix
+hint for common codes. The [Error Codes reference](/api/errors) lists every code of every package
+with its cause and fix.
 
 ```typescript
 import { KoraError } from 'korajs'
 
 try {
-  await app.todos.insert({ title: 123 }) // wrong type
+  // @ts-expect-error a number is not a valid title
+  await app.todos.insert({ title: 123 })
 } catch (err) {
   if (err instanceof KoraError) {
-    console.error(err.code)    // 'INVALID_OPERATION'
-    console.error(err.context) // { field: 'title', expected: 'string', received: 'number' }
+    err.code // 'SCHEMA_VALIDATION'
+    err.context // { collection: 'todos', field: 'title', expectedType: 'string', receivedType: 'number' }
   }
 }
 ```
 
 ---
 
-## State Machine Constraints {#state-machine}
+## generateProtoDefinitions()
 
-State machine constraints enforce valid transitions on enum fields. When a state machine is declared on an enum field, mutations and merges verify that the field only moves along allowed transitions. This prevents invalid state changes such as moving an order directly from `'draft'` to `'shipped'`.
-
+<!-- docs-check: signature @korajs/core -->
 ```typescript
-import { validateTransition, buildStateMachineConstraints, getTransitionMap } from '@korajs/core'
-```
-
-### .transitions() on EnumFieldBuilder
-
-The `.transitions()` method is available on `t.enum()` fields. It accepts a map of source states to allowed target states and returns a new `EnumFieldBuilder` with the transition rules attached.
-
-```typescript
-t.enum(['draft', 'pending', 'confirmed', 'cancelled']).transitions({
-  draft: ['pending', 'cancelled'],
-  pending: ['confirmed', 'cancelled'],
-  confirmed: [],
-  cancelled: [],
-})
-```
-
-Both the source and target states in the map must be valid enum values. The method throws a `SchemaValidationError` if any state in the map is not one of the declared enum values.
-
-#### Full schema example
-
-```typescript
-import { defineSchema, t } from 'korajs'
-
-const schema = defineSchema({
-  version: 1,
-  collections: {
-    orders: {
-      fields: {
-        title: t.string(),
-        status: t.enum(['draft', 'submitted', 'approved', 'cancelled'])
-          .default('draft')
-          .transitions({
-            draft: ['submitted', 'cancelled'],
-            submitted: ['approved', 'cancelled'],
-            approved: [],
-            cancelled: [],
-          }),
-      },
-    },
-  },
-})
-```
-
-### validateTransition()
-
-Validates whether a transition from one state to another is allowed by a given state machine constraint.
-
-#### Signature
-
-```typescript
-function validateTransition(
-  constraint: StateMachineConstraint,
-  fromValue: unknown,
-  toValue: unknown
-): TransitionValidationResult
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `constraint` | `StateMachineConstraint` | The state machine constraint defining allowed transitions. |
-| `fromValue` | `unknown` | The current state value (before the transition). Coerced to string. |
-| `toValue` | `unknown` | The target state value (after the transition). Coerced to string. |
-
-#### Returns
-
-`TransitionValidationResult` -- An object describing whether the transition is valid, along with the source state, target state, field name, collection name, and the full list of allowed targets from the source state.
-
-#### Example
-
-```typescript
-import { validateTransition } from '@korajs/core'
-
-const constraint = {
-  field: 'status',
-  collection: 'orders',
-  transitions: {
-    draft: ['submitted', 'cancelled'],
-    submitted: ['approved'],
-    approved: [],
-    cancelled: [],
-  },
-}
-
-const result = validateTransition(constraint, 'draft', 'submitted')
-// { valid: true, from: 'draft', to: 'submitted', field: 'status',
-//   collection: 'orders', allowedTargets: ['submitted', 'cancelled'] }
-
-const invalid = validateTransition(constraint, 'draft', 'approved')
-// { valid: false, from: 'draft', to: 'approved', field: 'status',
-//   collection: 'orders', allowedTargets: ['submitted', 'cancelled'] }
-```
-
-### buildStateMachineConstraints()
-
-Extracts all state machine constraints from a schema definition. Scans every collection for enum fields that have transition rules declared via the `.transitions()` builder method.
-
-#### Signature
-
-```typescript
-function buildStateMachineConstraints(schema: SchemaDefinition): StateMachineConstraint[]
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
-
-#### Returns
-
-`StateMachineConstraint[]` -- An array of constraint objects, one per enum field with transitions declared. Returns an empty array if no fields have transitions.
-
-#### Example
-
-```typescript
-import { defineSchema, t, buildStateMachineConstraints } from '@korajs/core'
-
-const schema = defineSchema({
-  version: 1,
-  collections: {
-    orders: {
-      fields: {
-        status: t.enum(['draft', 'submitted']).transitions({
-          draft: ['submitted'],
-          submitted: [],
-        }),
-        title: t.string(),
-      },
-    },
-  },
-})
-
-const constraints = buildStateMachineConstraints(schema)
-// [{ field: 'status', collection: 'orders', transitions: { draft: ['submitted'], submitted: [] } }]
-```
-
-### getTransitionMap()
-
-Finds the transition map for a specific field in a specific collection, if one exists.
-
-#### Signature
-
-```typescript
-function getTransitionMap(
-  schema: SchemaDefinition,
-  collection: string,
-  field: string
-): TransitionMap | null
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `schema` | `SchemaDefinition` | The validated schema from `defineSchema()`. |
-| `collection` | `string` | The collection name to search. |
-| `field` | `string` | The field name to look up. |
-
-#### Returns
-
-`TransitionMap | null` -- The transition map if the field has transitions declared, or `null` if the collection does not exist, the field does not exist, the field is not an enum, or no transitions are declared.
-
-#### Example
-
-```typescript
-const transitions = getTransitionMap(schema, 'orders', 'status')
-// { draft: ['submitted'], submitted: [] }
-
-const none = getTransitionMap(schema, 'orders', 'title')
-// null (title is a string field, not an enum with transitions)
-```
-
-### State machine types
-
-#### StateMachineConstraint
-
-A state machine constraint extracted from the schema. Used by merge and validation to enforce valid state transitions.
-
-```typescript
-interface StateMachineConstraint {
-  /** The enum field this constraint controls */
-  field: string
-  /** The collection this constraint applies to */
-  collection: string
-  /** Map of state to allowed next states */
-  transitions: TransitionMap
+function generateProtoDefinitions(schema: SchemaDefinition): {
+  proto: string                          // proto3 text
+  typeMap: Map<string, string>           // 'collection.field' -> protobuf type
+  jsonDescriptor: Record<string, unknown> // for protobufjs Root.fromJSON()
 }
 ```
 
-#### TransitionMap
-
-Map of state names to allowed next states.
-
-```typescript
-type TransitionMap = Record<string, string[]>
-```
-
-#### TransitionValidationResult
-
-Result of validating a state transition.
-
-```typescript
-interface TransitionValidationResult {
-  /** Whether the transition is allowed */
-  valid: boolean
-  /** The source state */
-  from: string
-  /** The target state */
-  to: string
-  /** The field being transitioned */
-  field: string
-  /** The collection containing the field */
-  collection: string
-  /** All allowed target states from the source state */
-  allowedTargets: string[]
-}
-```
-
-#### StateMachineDefinition
-
-Defines a state machine on an enum field at the collection level, constraining valid state transitions. Used as the `stateMachine` property in a `CollectionDefinition`.
-
-```typescript
-interface StateMachineDefinition {
-  /** The enum field this state machine controls */
-  field: string
-  /** Map of state to allowed next states */
-  transitions: Record<string, string[]>
-  /** What to do when an invalid transition is attempted */
-  onInvalidTransition: 'reject' | 'last-valid-state'
-}
-```
-
-| `onInvalidTransition` value | Behavior |
-|------------------------------|----------|
-| `'reject'` | The mutation is rejected and an error is thrown. |
-| `'last-valid-state'` | The field retains its previous value instead of transitioning. |
-
----
-
-## Migration Rollbacks {#migration-rollbacks}
-
-Migration rollbacks allow you to reverse schema migrations, either automatically (when the inverse is deterministic) or via explicit rollback steps. This builds on top of the `migrate()` / `MigrationBuilder` API documented [above](#migrations).
-
-```typescript
-import { canAutoRollback, generateRollbackSteps, createReversibleMigration } from '@korajs/core'
-```
-
-### canAutoRollback()
-
-Determines whether a single forward migration step can be automatically rolled back without explicit developer-provided down steps.
-
-#### Signature
-
-```typescript
-function canAutoRollback(step: MigrationStep): boolean
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `step` | `MigrationStep` | The forward migration step to check. |
-
-#### Returns
-
-`boolean` -- `true` if the step can be auto-rolled back, `false` if it requires an explicit `.down()` definition.
-
-#### Auto-rollback support by step type
-
-| Step type | Auto-rollback | Inverse operation |
-|-----------|---------------|-------------------|
-| `addField` | Yes | `removeField` (drops the added column) |
-| `addIndex` | Yes | `removeIndex` (drops the added index) |
-| `removeIndex` | Yes | `addIndex` (re-creates the index) |
-| `renameField` | Yes | `renameField` (swaps from/to names) |
-| `removeField` | No | Requires the field descriptor to re-create the column. Provide a `FieldBuilder` to `removeField()` or use `.down()`. |
-| `backfill` | No | Data transforms are not reversible. Provide a `reverseTransform` on the step or use `.down()`. |
-
-#### Example
-
-```typescript
-import { canAutoRollback } from '@korajs/core'
-
-canAutoRollback({ type: 'addField', collection: 'todos', field: 'priority', descriptor: /* ... */ })
-// true
-
-canAutoRollback({ type: 'backfill', collection: 'todos', transform: (r) => r })
-// false
-```
-
-### generateRollbackSteps()
-
-Generates rollback steps for a list of forward migration steps. Steps are reversed in order: the last forward step becomes the first rollback step.
-
-#### Signature
-
-```typescript
-function generateRollbackSteps(forwardSteps: readonly MigrationStep[]): MigrationStep[]
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `forwardSteps` | `readonly MigrationStep[]` | The forward migration steps to generate rollbacks for. |
-
-#### Returns
-
-`MigrationStep[]` -- Array of rollback steps in reverse execution order.
-
-#### Errors
-
-Throws `MigrationRollbackError` if any step cannot be auto-rolled back. Use `canAutoRollback()` to check before calling, or provide explicit down steps via the MigrationBuilder `.down()` API instead.
-
-#### Example
-
-```typescript
-import { migrate, generateRollbackSteps } from '@korajs/core'
-
-const migration = migrate()
-  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
-  .addIndex('todos', 'priority')
-
-const rollbackSteps = generateRollbackSteps(migration.steps)
-// [
-//   { type: 'removeIndex', collection: 'todos', field: 'priority' },
-//   { type: 'removeField', collection: 'todos', field: 'priority' },
-// ]
-```
-
-### createReversibleMigration()
-
-Creates a `ReversibleMigration` from forward steps, optional explicit down steps, and version information. If explicit down steps are provided, they are used as-is. Otherwise, auto-generation is attempted via `generateRollbackSteps()`.
-
-#### Signature
-
-```typescript
-function createReversibleMigration(
-  upSteps: readonly MigrationStep[],
-  downSteps: readonly MigrationStep[] | null,
-  fromVersion: number,
-  toVersion: number
-): ReversibleMigration
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `upSteps` | `readonly MigrationStep[]` | The forward migration steps. |
-| `downSteps` | `readonly MigrationStep[] \| null` | Optional explicit rollback steps. Pass `null` to auto-generate. |
-| `fromVersion` | `number` | The schema version before the migration. |
-| `toVersion` | `number` | The schema version after the migration. |
-
-#### Returns
-
-`ReversibleMigration` -- A complete reversible migration with both `up` and `down` steps.
-
-#### Errors
-
-Throws `MigrationRollbackError` if `downSteps` is `null` and auto-generation fails for any step.
-
-#### Example
-
-```typescript
-import { migrate, createReversibleMigration, t } from '@korajs/core'
-
-const migration = migrate()
-  .addField('todos', 'priority', t.enum(['low', 'medium', 'high']).default('medium'))
-  .addIndex('todos', 'priority')
-
-// Auto-generated rollback
-const reversible = createReversibleMigration(migration.steps, null, 1, 2)
-console.log(reversible.fromVersion) // 1
-console.log(reversible.toVersion)   // 2
-console.log(reversible.down)
-// [
-//   { type: 'removeIndex', collection: 'todos', field: 'priority' },
-//   { type: 'removeField', collection: 'todos', field: 'priority' },
-// ]
-```
-
-### MigrationBuilder .down()
-
-The `.down()` method on `MigrationBuilder` lets you define explicit rollback steps. This is required when a migration contains steps that cannot be auto-rolled back (such as `removeField` without a descriptor, or `backfill` without a `reverseTransform`).
-
-#### Signature
-
-```typescript
-down(fn: (rollback: RollbackBuilder) => void): MigrationBuilder
-```
-
-The `RollbackBuilder` passed to the callback provides the same step methods as `MigrationBuilder`: `addField()`, `removeField()`, `renameField()`, `addIndex()`, `removeIndex()`, and `backfill()`.
-
-#### Example
-
-```typescript
-import { migrate, t } from '@korajs/core'
-
-const migration = migrate()
-  .removeField('todos', 'legacyFlag')
-  .backfill('todos', (record) => ({
-    priority: record.urgency === 'high' ? 'high' : 'medium',
-  }))
-  .down((rollback) => {
-    rollback
-      .addField('todos', 'legacyFlag', t.boolean().default(false))
-      .backfill('todos', (record) => ({
-        urgency: record.priority === 'high' ? 'high' : 'normal',
-      }))
-  })
-
-console.log(migration.safelyReversible) // true
-```
-
-### MigrationRollbackError
-
-Error thrown when a migration step cannot be automatically rolled back and no explicit down step has been provided. Extends `KoraError` with code `'MIGRATION_ROLLBACK'`.
-
-```typescript
-class MigrationRollbackError extends KoraError {
-  constructor(step: MigrationStep)
-}
-```
-
-The error message includes the step type and collection name, telling you exactly which step needs an explicit `.down()` definition.
-
-### ReversibleMigration
-
-A migration that includes both forward (up) and backward (down) steps, along with version metadata.
-
-```typescript
-interface ReversibleMigration {
-  readonly up: readonly MigrationStep[]
-  readonly down: readonly MigrationStep[]
-  readonly fromVersion: number
-  readonly toVersion: number
-}
-```
-
----
-
-## Protobuf Code Generation {#proto-codegen}
-
-Generates Protocol Buffer definitions from a Kora schema. Useful for producing `.proto` files for external tooling, type-safe binary serialization, or runtime protobufjs usage without parsing `.proto` text.
-
-```typescript
-import { generateProtoDefinitions } from '@korajs/core'
-```
-
-### generateProtoDefinitions()
-
-Converts a validated schema into Protocol Buffer definitions. Produces three outputs: the `.proto` file text, a type map linking Kora field paths to protobuf types, and a JSON descriptor compatible with protobufjs `Root.fromJSON()`.
-
-#### Signature
-
-```typescript
-function generateProtoDefinitions(schema: SchemaDefinition): ProtoOutput
-```
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `schema` | `SchemaDefinition` | A validated schema from `defineSchema()`. |
-
-#### Returns
-
-`ProtoOutput` -- An object containing:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `proto` | `string` | The generated `.proto` file content as a string (proto3 syntax). |
-| `typeMap` | `Map<string, string>` | Maps Kora field paths (`"collection.field"`) to protobuf type strings. |
-| `jsonDescriptor` | `Record<string, unknown>` | JSON descriptor for runtime protobufjs usage via `Root.fromJSON()`. |
-
-#### Generated messages
-
-The output includes the following protobuf messages:
-
-| Message | Description |
-|---------|-------------|
-| `{Collection}Record` | Per-collection record message (e.g., `TodosRecord` for a `todos` collection). Includes an `id` field and all schema-defined fields. |
-| `KoraOperation` | Wire format for individual operations in the sync protocol. |
-| `OperationBatch` | Batches operations for sync transfer with an `is_final` flag. |
-| `HandshakeMessage` | Initiates a sync session with version vector and schema version. |
-| `HandshakeResponse` | Server acknowledges with its own version vector. |
-| `Acknowledgment` | Confirms receipt of an operation batch. |
-
-#### Type mapping
-
-Kora field kinds are mapped to protobuf scalar types as follows:
-
-| Kora field kind | Protobuf type |
-|-----------------|---------------|
-| `string` | `string` |
-| `number` | `double` |
-| `boolean` | `bool` |
-| `timestamp` | `int64` |
-| `richtext` | `bytes` |
-| `enum` | Generated nested enum (e.g., `TodosRecordPriority`) |
-| `array` | `repeated` of the item's scalar type |
-
-Enum fields produce a nested protobuf enum inside the parent message. A sentinel `_UNSPECIFIED = 0` value is always added as the first entry, following proto3 conventions.
-
-Collection names are converted to PascalCase for message names (e.g., `todo_items` becomes `TodoItemsRecord`). Field names are converted to snake_case for protobuf field names (e.g., `dueDate` becomes `due_date`).
-
-#### Example
-
-```typescript
-import { defineSchema, t, generateProtoDefinitions } from '@korajs/core'
-
-const schema = defineSchema({
-  version: 1,
-  collections: {
-    todos: {
-      fields: {
-        title: t.string(),
-        completed: t.boolean().default(false),
-        priority: t.enum(['low', 'medium', 'high']).default('medium'),
-        tags: t.array(t.string()).default([]),
-      },
-    },
-  },
-})
-
-const { proto, typeMap, jsonDescriptor } = generateProtoDefinitions(schema)
-```
-
-The `proto` string for this schema produces:
-
-```protobuf
-syntax = "proto3";
-
-package kora;
-
-// Collection record messages
-
-message TodosRecord {
-  string id = 1;
-  string title = 2;
-  bool completed = 3;
-  TodosRecordPriority priority = 4;
-  repeated string tags = 5;
-
-  enum TodosRecordPriority {
-    TODOSRECORDPRIORITY_UNSPECIFIED = 0;
-    TODOSRECORDPRIORITY_LOW = 1;
-    TODOSRECORDPRIORITY_MEDIUM = 2;
-    TODOSRECORDPRIORITY_HIGH = 3;
-  }
-}
-
-// Sync protocol messages
-
-message KoraOperation { ... }
-message OperationBatch { ... }
-message HandshakeMessage { ... }
-message HandshakeResponse { ... }
-message Acknowledgment { ... }
-```
-
-The `typeMap` contains:
-
-```typescript
-typeMap.get('todos.id')        // 'string'
-typeMap.get('todos.title')     // 'string'
-typeMap.get('todos.completed') // 'bool'
-typeMap.get('todos.priority')  // 'TodosRecordPriority'
-typeMap.get('todos.tags')      // 'repeated string'
-```
-
-The `jsonDescriptor` can be loaded directly with protobufjs for runtime encoding and decoding:
-
-```typescript
-import protobuf from 'protobufjs'
-
-const root = protobuf.Root.fromJSON(jsonDescriptor)
-const TodosRecord = root.lookupType('kora.TodosRecord')
-```
-## Store identity
-
-`app.storeInfo()` returns the base name, resolved database name, auth user id, persistence adapter,
-durability, and isolation lifecycle state without exposing another namespace's data.
+Generates a `.proto` file for external tooling: one `<Collection>Record` message per collection
+(PascalCase name, snake_case fields, an `id` field first, enums as nested enums with an
+`_UNSPECIFIED = 0` entry; `string`, `double`, `bool`, `int64`, `bytes`, `repeated`) plus simplified
+`KoraOperation`, `OperationBatch`, `HandshakeMessage`, `HandshakeResponse` and `Acknowledgment`
+messages. These sync messages are illustrative and are **not** the sync wire format: Kora syncs with
+JSON over protocol v2 (see [Sync Protocol](/guide/sync-protocol#wire-format)).

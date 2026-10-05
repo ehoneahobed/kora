@@ -1,7 +1,12 @@
 import { generateFullDDL } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 import type Database from 'better-sqlite3'
-import { AdapterError, StoreNotOpenError } from '../errors'
+import { AdapterError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
+import {
+	STORED_SCHEMA_VERSION_SQL,
+	parseSchemaCeiling,
+	storedSchemaVersion,
+} from '../migrations/schema-ceiling'
 import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
 import { Mutex } from './mutex'
 
@@ -50,6 +55,19 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 
 		const statements = generateFullDDL(schema)
 		for (const sql of statements) {
+			const ceiling = parseSchemaCeiling(sql)
+			if (ceiling !== null) {
+				// A database a newer build migrated gets none of this build's DDL (RT-109).
+				const stored = storedSchemaVersion(
+					this.db.prepare(STORED_SCHEMA_VERSION_SQL).all() as Array<{ value: unknown }>,
+				)
+				if (stored > ceiling) {
+					this.db.close()
+					this.db = null
+					throw new SchemaVersionAheadError(this.path, stored, ceiling)
+				}
+				continue
+			}
 			if (sql.startsWith('--kora:safe-alter')) {
 				// Safe ALTER TABLE — ignore "duplicate column name" errors for existing columns
 				try {

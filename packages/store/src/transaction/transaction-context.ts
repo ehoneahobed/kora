@@ -32,7 +32,7 @@ import {
 	writeUpdateInTx,
 } from '../mutations/write-ops'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
-import { deserializeRecord } from '../serialization/serializer'
+import { deserializeRecord, toRichtextReadShape } from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../types'
 
@@ -282,9 +282,15 @@ export class TransactionContext {
 		const insert = await prepareInsert(this.writeEnv(), collectionName, data)
 		this.buffer.push({ kind: 'insert', collection: collectionName, insert })
 		const now = Date.now()
-		// The returned record carries the at-rest form (secrets hashed/encrypted),
-		// exactly like a single-record insert.
-		return { id: insert.recordId, ...insert.data, createdAt: now, updatedAt: now }
+		// The returned record carries the at-rest form (secrets hashed/encrypted) and the
+		// read form of richtext (bytes), exactly like a single-record insert.
+		const fields = this.config.schema.collections[collectionName]?.fields ?? {}
+		return {
+			id: insert.recordId,
+			...toRichtextReadShape(insert.data, fields),
+			createdAt: now,
+			updatedAt: now,
+		}
 	}
 
 	private async update(
@@ -345,7 +351,8 @@ export class TransactionContext {
 		for (const [key, value] of Object.entries(data)) {
 			resolved[key] = isAtomicOp(value) ? resolveAtomicOp(current[key], value) : value
 		}
-		return toAtRestWriteData(resolved, definition, this.config.secretKeyProvider)
+		const atRest = await toAtRestWriteData(resolved, definition, this.config.secretKeyProvider)
+		return toRichtextReadShape(atRest, definition.fields)
 	}
 
 	/**
@@ -370,7 +377,12 @@ export class TransactionContext {
 			if (entry.kind === 'insert') {
 				if (entry.insert.recordId !== id) continue
 				const now = Date.now()
-				record = { id, ...entry.insert.data, createdAt: now, updatedAt: now }
+				record = {
+					id,
+					...toRichtextReadShape(entry.insert.data, definition.fields),
+					createdAt: now,
+					updatedAt: now,
+				}
 			} else if (entry.id === id && entry.kind === 'update') {
 				if (record) {
 					let allowed: Record<string, unknown>

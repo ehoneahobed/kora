@@ -144,6 +144,14 @@ export function legacyCollectionIndexName(collection: string, field: string): st
 }
 
 /**
+ * Prefix of the `generateFullDDL` statement `--kora:schema-ceiling <version>` (RT-109).
+ * It is a SQL comment, so executing it does nothing; Kora's storage adapters read the
+ * database's stored schema version there and refuse to run the rest of the DDL against a
+ * database a newer build already migrated.
+ */
+export const SCHEMA_CEILING_DIRECTIVE = '--kora:schema-ceiling'
+
+/**
  * Generate the full DDL for all collections plus metadata tables.
  *
  * @param schema - The complete schema definition
@@ -159,6 +167,10 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 			'  value TEXT NOT NULL\n' +
 			')',
 	)
+	// A SQL comment (a no-op for any executor): Kora's storage adapters refuse here, before
+	// any other DDL touches it, a database whose stored schema version is newer than this
+	// schema's (a newer build already migrated it, RT-109).
+	statements.push(`${SCHEMA_CEILING_DIRECTIVE} ${schema.version}`)
 
 	// Version vector table
 	statements.push(
@@ -231,25 +243,66 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 	return statements
 }
 
+/**
+ * A schema field's column: its type and default only. Requiredness and enum membership
+ * are value-domain rules, enforced by validation at write time on every replica; they
+ * are never restated as `NOT NULL` / `CHECK` constraints, which a table cannot evolve
+ * when the schema does (RT-101: an added enum value, a field made optional).
+ */
 function columnDefinition(fieldName: string, descriptor: FieldDescriptor): string {
 	const sqlType = mapFieldType(descriptor)
 	const parts = [quoteIdent(fieldName), sqlType]
 
-	if (descriptor.required && descriptor.defaultValue === undefined && !descriptor.auto) {
-		parts.push('NOT NULL')
-	}
-
 	if (descriptor.defaultValue !== undefined) {
-		parts.push(`DEFAULT ${sqlDefault(descriptor.defaultValue)}`)
-	}
-
-	// CHECK constraint for enum fields
-	if (descriptor.kind === 'enum' && descriptor.enumValues) {
-		const values = descriptor.enumValues.map((v) => `'${v}'`).join(', ')
-		parts.push(`CHECK (${quoteIdent(fieldName)} IN (${values}))`)
+		parts.push(`DEFAULT ${sqlDefaultLiteral(descriptor.defaultValue)}`)
 	}
 
 	return parts.join(' ')
+}
+
+/**
+ * Render a string as a SQL string literal, doubling embedded single quotes
+ * (SEC-9b). Valid in SQLite and in Postgres with standard_conforming_strings
+ * (the default since 9.1), where a backslash is an ordinary character.
+ *
+ * @param value - The string to quote
+ * @returns The quoted literal, e.g. `'don''t know'`
+ */
+export function sqlStringLiteral(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`
+}
+
+/**
+ * Render a schema default value as a SQL literal for a `DEFAULT` clause. Strings
+ * and JSON-serialized arrays/objects are quoted with `sqlStringLiteral`, so a
+ * default containing a quote yields valid DDL instead of breaking it (SEC-9b).
+ *
+ * @param value - The field's default value
+ * @returns A SQL literal
+ */
+export function sqlDefaultLiteral(value: unknown): string {
+	if (value === null) return 'NULL'
+	if (typeof value === 'string') return sqlStringLiteral(value)
+	if (typeof value === 'number') {
+		// Non-finite numbers have no SQL literal; NULL is the only safe default.
+		return Number.isFinite(value) ? String(value) : 'NULL'
+	}
+	if (typeof value === 'boolean') return value ? '1' : '0'
+	// Arrays and objects are stored as JSON strings
+	return sqlStringLiteral(JSON.stringify(value) ?? 'null')
+}
+
+/**
+ * Render the `CHECK (col IN (...))` constraint of an enum field, each value
+ * quoted with `sqlStringLiteral` (SEC-9b). No longer emitted by Kora's DDL (RT-101:
+ * enum membership is enforced by validation only); kept for tooling and tests.
+ *
+ * @param fieldName - The enum column
+ * @param values - The enum's allowed values
+ * @returns The CHECK clause
+ */
+export function enumCheckConstraint(fieldName: string, values: readonly string[]): string {
+	return `CHECK (${quoteIdent(fieldName)} IN (${values.map(sqlStringLiteral).join(', ')}))`
 }
 
 function mapFieldType(descriptor: FieldDescriptor): string {
@@ -277,13 +330,4 @@ function mapFieldType(descriptor: FieldDescriptor): string {
 		case 'richtext':
 			return 'BLOB' // Yjs state
 	}
-}
-
-function sqlDefault(value: unknown): string {
-	if (value === null) return 'NULL'
-	if (typeof value === 'string') return `'${value}'`
-	if (typeof value === 'number') return String(value)
-	if (typeof value === 'boolean') return value ? '1' : '0'
-	// Arrays and objects are stored as JSON strings
-	return `'${JSON.stringify(value)}'`
 }

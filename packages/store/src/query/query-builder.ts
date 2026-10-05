@@ -1,6 +1,8 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
 import { encodeStoredText, quoteIdent } from '@korajs/core'
+import { QueryError } from '../errors'
 import { deserializeRecord } from '../serialization/serializer'
+import { type ResultsEqual, createResultsEqual } from '../subscription/result-equality'
 import type { SubscriptionManager } from '../subscription/subscription-manager'
 import type {
 	CollectionRecord,
@@ -8,11 +10,15 @@ import type {
 	QueryDescriptor,
 	RawCollectionRow,
 	StorageAdapter,
+	SubscribeOptions,
 	SubscriptionCallback,
 	WhereClause,
 } from '../types'
 import { pluralize, singularize } from './pluralize'
+import { normalizeWhere } from './query-key'
 import { buildCountQuery, buildSelectQuery } from './sql-builder'
+
+const RESULTS_EQUAL_CACHE = new WeakMap<CollectionDefinition, ResultsEqual>()
 
 /**
  * Fluent query builder for constructing and executing collection queries.
@@ -43,19 +49,23 @@ export class QueryBuilder<T = CollectionRecord> {
 	) {
 		this.descriptor = {
 			collection: collectionName,
-			where: { ...initialWhere },
+			where: normalizeWhere(initialWhere),
 			orderBy: [],
 		}
 	}
 
 	/**
 	 * Add WHERE conditions (AND semantics, merged with existing conditions).
+	 *
+	 * A field whose value is `undefined` adds no condition (it does not remove an
+	 * earlier one); `null` matches missing values (`IS NULL`). Non-finite numbers are
+	 * refused. See {@link normalizeWhere} (RT-102).
 	 */
 	where(conditions: WhereClause): QueryBuilder<T> {
 		const clone = this.clone()
 		clone.descriptor = {
 			...clone.descriptor,
-			where: { ...clone.descriptor.where, ...conditions },
+			where: { ...clone.descriptor.where, ...normalizeWhere(conditions) },
 		}
 		return clone
 	}
@@ -146,7 +156,7 @@ export class QueryBuilder<T = CollectionRecord> {
 	 *
 	 * @returns An unsubscribe function
 	 */
-	subscribe(callback: SubscriptionCallback<T>): () => void {
+	subscribe(callback: SubscriptionCallback<T>, options?: SubscribeOptions): () => void {
 		const executeFn = () => this.exec()
 
 		// Resolve includeCollections for subscription tracking
@@ -161,7 +171,18 @@ export class QueryBuilder<T = CollectionRecord> {
 			descriptorCopy,
 			callback as SubscriptionCallback<CollectionRecord>,
 			executeFn as () => Promise<CollectionRecord[]>,
+			{ onError: options?.onError, resultsEqual: this.getResultsEqual() },
 		)
+	}
+
+	/** Comparator built once per collection definition and shared by its queries. */
+	private getResultsEqual(): ResultsEqual {
+		let cached = RESULTS_EQUAL_CACHE.get(this.definition)
+		if (!cached) {
+			cached = createResultsEqual(this.definition.fields)
+			RESULTS_EQUAL_CACHE.set(this.definition, cached)
+		}
+		return cached
 	}
 
 	/** Get the internal descriptor (for testing/debugging) */
@@ -348,15 +369,5 @@ export class QueryBuilder<T = CollectionRecord> {
 		}
 
 		return null
-	}
-}
-
-/**
- * Error thrown when a query encounters an invalid state.
- */
-class QueryError extends Error {
-	constructor(message: string) {
-		super(message)
-		this.name = 'QueryError'
 	}
 }
