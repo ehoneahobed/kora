@@ -436,17 +436,20 @@ the upgraded server accepts connections.** These clients use the signed-in devic
 their node id and cannot change it, on beta.12 and beta.13 alike, so without this step
 every existing device stays refused and its offline writes never upload. The script binds
 each node with history to the user who owns the auth device with that id, and leaves every
-other node unclaimed. It is idempotent and never overwrites an existing claim. Run it with
-the sync server stopped:
+other node unclaimed. It is idempotent and never overwrites an existing claim. Save it at the
+root of your app as `bind-node-claims.ts` and, with the sync server stopped, run
+`node --import tsx bind-node-claims.ts`:
 
-<!-- docs-check-prelude
-import type { SchemaDefinition } from '@korajs/core'
-declare const schema: SchemaDefinition
+<!-- docs-check-file src/schema.ts
+import { defineSchema, t } from 'korajs'
+export default defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
 -->
 
+<!-- docs-check: standalone -->
 ```ts
 import Database from 'better-sqlite3'
 import { createSqliteServerStore } from '@korajs/server'
+import schema from './src/schema' // your app's schema: the same one your sync server uses
 
 // The auth database (KORA_AUTH_DB), not the sync database: the templates keep them apart.
 const auth = new Database('./.kora/kora-auth.db', { readonly: true, fileMustExist: true })
@@ -466,16 +469,6 @@ for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
 }
 await store.close()
 ```
-
-<!-- docs-check-prelude
-import { createProductionServer, createSqliteServerStore } from '@korajs/server'
-import type { ProductionHttpRouteContext } from '@korajs/server'
-const store = createSqliteServerStore({ filename: './kora-server.db' })
-const server = createProductionServer({ store })
-declare const request: { kora: ProductionHttpRouteContext }
-declare const body: { title?: string; notes?: string }
-declare const recordId: string
--->
 
 Point both paths at your deployment's files (`KORA_SERVER_DB` and `KORA_AUTH_DB` in the
 templates; some apps keep both in one file). On Postgres, use `createPostgresServerStore`

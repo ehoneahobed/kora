@@ -34,6 +34,9 @@
  * The prelude is prepended to every later checked block of that page, minus the names the block
  * declares itself (its own imports and variables win); a new prelude replaces it,
  * and `<!-- docs-check-prelude -->` on one line clears it.
+ *   <!-- docs-check-file src/schema.ts       a hidden module written to that path in the page's
+ *   ...code...                                own directory (not a check unit), so a visible block
+ *   -->                                       can import an app file the reader already has.
  *   <!-- docs-check: file src/schema.ts -->  write this block to that path in the page's own
  *                                         directory, so other blocks can import './src/schema'.
  *   <!-- docs-tutorial: ... -->          an edit check-getting-started.mjs applies to a
@@ -101,9 +104,19 @@ function extractUnits(file) {
 	let prelude = ''
 	let skipped = 0
 	let pendingMarker = null
+	const hiddenFiles = []
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]
 		const trimmed = line.trim()
+		const hidden = trimmed.match(/^<!--\s*docs-check-file\s+(\S+)\s*$/)
+		if (hidden) {
+			const body = []
+			let j = i + 1
+			while (j < lines.length && lines[j].trim() !== '-->') body.push(lines[j++])
+			hiddenFiles.push({ path: hidden[1], code: body.join('\n') })
+			i = j
+			continue
+		}
 		if (trimmed.startsWith('<!-- docs-check-prelude')) {
 			if (trimmed.endsWith('-->')) {
 				// `<!-- docs-check-prelude -->` on one line clears the page prelude.
@@ -179,7 +192,7 @@ function extractUnits(file) {
 			segments: [{ startLine, code }],
 		})
 	}
-	return { units, problems, skipped }
+	return { units, problems, skipped, hiddenFiles }
 }
 
 const pkg = (name) => join(root, 'packages', name)
@@ -289,9 +302,14 @@ const signatureUnits = [] // generated after the compiler options exist (they ne
 let unitCount = 0
 let skippedCount = 0
 for (const file of files) {
-	const { units, problems, skipped } = extractUnits(file)
+	const { units, problems, skipped, hiddenFiles } = extractUnits(file)
 	allProblems.push(...problems)
 	skippedCount += skipped
+	for (const hidden of hiddenFiles) {
+		const name = join(outDir, slug(file), hidden.path)
+		mkdirSync(dirname(name), { recursive: true })
+		writeFileSync(name, `${hidden.code}\n`)
+	}
 	units.forEach((unit, index) => {
 		unitCount++
 		if (unit.signature) {
