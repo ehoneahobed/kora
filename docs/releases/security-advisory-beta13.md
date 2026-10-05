@@ -78,8 +78,8 @@ then clients**:
 pnpm add korajs@1.0.0-beta.13 @korajs/server@1.0.0-beta.13 @korajs/auth@1.0.0-beta.13   # plus every other @korajs/* package you use
 ```
 
-The `latest` npm dist-tag still points at the older 0.x line, which is affected and has no
-patched release: install with the `beta` tag or the exact version.
+The `latest` npm dist-tag now points at `1.0.0-beta.13`. Older versions are deprecated on npm
+with a link to this advisory.
 
 1.0.0-beta.13 is a breaking release. The changes you will meet first:
 

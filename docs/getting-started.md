@@ -13,8 +13,8 @@ You need Node.js 20 or later and a package manager (pnpm, npm, yarn or bun).
 
 ## 1. Scaffold the app
 
-Kora 1.0 is in beta, so ask for the `beta` tag (plain `npx create-kora-app` installs the older
-0.x line):
+Kora 1.0 is in beta. The `beta` tag always names the newest beta (`latest` currently points at
+the same release):
 
 ```bash
 npx create-kora-app@beta my-app --template react-basic --pm pnpm --yes

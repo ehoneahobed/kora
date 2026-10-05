@@ -1,7 +1,7 @@
 # create-kora-app
 
-Scaffold a new [Kora.js](https://korajs.dev) offline-first application. Kora 1.0 is in beta, so use
-the `beta` tag (the `latest` tag is the older 0.x line):
+Scaffold a new [Kora.js](https://korajs.dev) offline-first application. Kora 1.0 is in beta. The `beta`
+tag always names the newest beta (`latest` currently points at the same release):
 
 ```bash
 npx create-kora-app@beta my-app
