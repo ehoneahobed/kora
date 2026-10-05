@@ -3470,6 +3470,21 @@
    ],
    "pr": null,
    "notes": "Codex review of PR #4 (core schema/constraint-relaxation.ts sqliteTableNeedsRelaxation). CONFIRMED: repros packages/store/tests/repro/RT-111.test.ts (better-sqlite3, SQLite WASM worker bridge, IndexedDB adapters: a table with only hand-added checks was rebuilt and lost them; a beta.12 enum CHECK plus a hand-added CHECK lost both) and packages/server/tests/repro/RT-111.test.ts (SQLite server store restart drops CHECK (price >= 0) and a named enum-shaped CHECK on a string field). FIX by root cause: SQLite's pragmas do not report checks, so core parseSqliteCheckConstraints parses every column and table CHECK (name, verbatim expression, owning column) from sqlite_master.sql with a quote/comment-aware tokenizer; isKoraSqliteEnumCheck: only an enum-shaped check (parseEnumCheckDefinition) on one non-internal column that is an enum field of the schema is Kora's. sqliteTableNeedsRelaxation/sqliteConstraintRelaxationStatements/planSqliteConstraintRelaxation take the enum columns (client relax-constraints.ts and the SQLite server store pass the schema's enum fields; the CLI relax directive passes enums, else fields); a table with only foreign checks is not rebuilt, and a rebuild re-emits every kept check as a table constraint (name preserved). Same root cause in the CLI evolve-table SQLite rebuild (RT-105): it now carries checks over, except one that reads a dropped column (sqliteCheckReferencesColumn), which goes with it like its indexes. NOT NULL relaxation unchanged (non-internal columns). Residual: a hand-written enum-shaped check on an enum field is indistinguishable from Kora's and is relaxed (as on Postgres). Unit tests: core constraint-relaxation.test.ts (parser incl. quoted CHECK text, comments, nested parens; classification; no rebuild for foreign checks), cli table-evolution-directive.test.ts. Docs: schema-design.md, api/cli.md, release notes."
+  },
+  {
+   "id": "RT-112",
+   "title": "Production static server follows symbolic links out of staticDir: the containment check is lexical (resolve(join(root, path)) under root) while stat/createReadStream follow links, so a link inside staticDir (file, directory, or a directory reached for its index.html) serves files from anywhere the process can read",
+   "severity": "P2",
+   "workstream": "W12",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-112.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Codex review of PR #4 (server/static-files.ts locate). CONFIRMED: repro packages/server/tests/repro/RT-112.test.ts served /leak.txt (file link to a file outside), /leak/secret.txt (directory link) and /docs/ (index.html fallback through a directory link) with 200 and the outside content. FIX: containedRealPath compares realpath(candidate) with realpath(root), read per request so a root that is itself a link (atomic current -> releases/N deploys) follows its swaps; locate checks the file and, for a directory, the index.html fallback, and serves from the real path while headers (MIME, cache policy) follow the requested name; pre-compressed .br/.gz siblings are looked up next to the requested name and read only from a contained real path. An escape is a 404 (never 403: nothing about outside paths is revealed); a navigation to an escaping path gets the SPA shell. Links that stay inside the root and a linked root keep working (repro + static-files.test.ts unit test). Docs: production-server.md, release notes."
   }
  ],
  "rejectedProposalPins": {

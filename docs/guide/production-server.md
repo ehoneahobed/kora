@@ -160,7 +160,11 @@ builds normalise modification times; a redeploy is therefore always seen. Conten
 also send `Last-Modified`.
 
 Media types include `.webmanifest` (`application/manifest+json`), `.wasm` and `.mjs`.
-Only `GET` and `HEAD` are served; paths cannot escape `staticDir`.
+Only `GET` and `HEAD` are served; paths cannot escape `staticDir`, lexically (`..`, encoded
+separators) or through a symbolic link: every file, directory `index.html` and pre-compressed
+sibling is served only when its real path is inside the real path of `staticDir`, and an escape
+answers `404`, like a missing file. Links that stay inside `staticDir` keep working, and
+`staticDir` may itself be a link (an atomic `current -> releases/N` deploy is followed per request).
 
 The scaffolded templates add a service worker (`sw.js`, generated into `dist/` at build
 time by `koraServiceWorker()` from `@korajs/cli/vite`) that precaches this shell, so the

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { type Stats, createReadStream } from 'node:fs'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, join, resolve, sep } from 'node:path'
 import {
@@ -33,7 +33,10 @@ import {
  *   `/assets/`, so a stale tab asking for an old hashed chunk gets a 404, not HTML
  *   parsed as JavaScript.
  * - Correct media types, including `.webmanifest`, `.wasm` and `.mjs`.
- * - No path escapes the static directory.
+ * - No path escapes the static directory: lexically (`..`, encoded separators) nor through
+ *   a symbolic link (RT-112). Every file, directory index and pre-compressed sibling is
+ *   read from its real path, which must lie inside the static directory's real path; an
+ *   escape is a 404. Links that stay inside the directory keep working.
  */
 
 /** Media types by extension. Text types carry a charset. */
@@ -244,15 +247,45 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		return candidate
 	}
 
-	async function locate(pathname: string): Promise<{ path: string; stats: Stats } | null> {
+	/**
+	 * The real location of `path` when it is inside the real static directory, else null
+	 * (RT-112). The lexical check in {@link toFilePath} cannot see symbolic links, which
+	 * `stat` and `createReadStream` follow: a link inside the directory may point anywhere.
+	 * The root's real path is read per request, so a root that is itself a link (an atomic
+	 * `current -> releases/N` deploy) follows its swaps.
+	 */
+	async function containedRealPath(path: string): Promise<string | null> {
+		try {
+			const [realRoot, real] = await Promise.all([realpath(root), realpath(path)])
+			return real === realRoot || real.startsWith(realRoot + sep) ? real : null
+		} catch {
+			return null
+		}
+	}
+
+	/**
+	 * The file a URL path names (or its directory's `index.html`), read from its real,
+	 * contained location; `name` is the requested path, which decides the headers. A path
+	 * whose real location is outside the static directory is "not found", never
+	 * "forbidden": the server does not reveal what exists outside it.
+	 */
+	async function locate(
+		pathname: string,
+	): Promise<{ path: string; name: string; stats: Stats } | null> {
 		const filePath = toFilePath(pathname)
 		if (filePath === null) return null
-		const stats = await fileStat(filePath)
-		if (stats?.isFile()) return { path: filePath, stats }
+		const real = await containedRealPath(filePath)
+		if (real === null) return null
+		const stats = await fileStat(real)
+		if (stats?.isFile()) return { path: real, name: filePath, stats }
 		if (stats?.isDirectory()) {
-			const index = join(filePath, 'index.html')
-			const indexStats = await fileStat(index)
-			if (indexStats?.isFile()) return { path: index, stats: indexStats }
+			const index = join(real, 'index.html')
+			const realIndex = await containedRealPath(index)
+			if (realIndex === null) return null
+			const indexStats = await fileStat(realIndex)
+			if (indexStats?.isFile()) {
+				return { path: realIndex, name: join(filePath, 'index.html'), stats: indexStats }
+			}
 		}
 		return null
 	}
@@ -278,9 +311,9 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 			return
 		}
 
-		const { path, stats } = found
-		const ext = extname(path).toLowerCase()
-		const fileName = basename(path)
+		const { path, name, stats } = found
+		const ext = extname(name).toLowerCase()
+		const fileName = basename(name)
 		const cacheControl = cacheControlFor(fileName)
 		const revalidated = cacheControl === REVALIDATE_CACHE_CONTROL
 		const headers: Record<string, string | number> = {
@@ -317,7 +350,7 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		}
 
 		if (encoding) {
-			const body = await compressedBody(path, digest, encoding)
+			const body = await compressedBody(path, name, digest, encoding)
 			headers['Content-Encoding'] = encoding
 			headers['Content-Length'] = body.length
 			res.writeHead(200, headers)
@@ -334,13 +367,19 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		createReadStream(path).pipe(res)
 	}
 
-	async function compressedBody(path: string, digest: string, encoding: Encoding): Promise<Buffer> {
+	async function compressedBody(
+		path: string,
+		name: string,
+		digest: string,
+		encoding: Encoding,
+	): Promise<Buffer> {
 		// A pre-compressed sibling the build emitted wins when it holds exactly the file's
 		// current bytes (checked once per sibling version and source digest: with
-		// normalised mtimes, "not older than the file" proves nothing).
-		const sibling = `${path}${encoding === 'br' ? '.br' : '.gz'}`
-		const siblingStats = await fileStat(sibling)
-		if (siblingStats?.isFile()) {
+		// normalised mtimes, "not older than the file" proves nothing). It is looked up next
+		// to the requested name and read only from a contained real location (RT-112).
+		const sibling = await containedRealPath(`${name}${encoding === 'br' ? '.br' : '.gz'}`)
+		const siblingStats = sibling === null ? null : await fileStat(sibling)
+		if (sibling !== null && siblingStats?.isFile()) {
 			const siblingKey = `${fileVersionKey(siblingStats)}|${digest}`
 			const body = await readFile(sibling).catch(() => null)
 			if (body) {

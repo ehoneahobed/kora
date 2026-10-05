@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { type Server, createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -232,6 +232,29 @@ describe('redeploys with normalised mtimes (RT-99)', () => {
 				headers: { 'if-none-match': etags['index.html'] ?? '' },
 			})
 			expect(r.status).toBe(304)
+		})
+		rmSync(parent, { recursive: true, force: true })
+	})
+
+	test('symbolic links: an escape is a 404, a link inside the root is served (RT-112)', async () => {
+		const parent = mkdtempSync(join(tmpdir(), 'kora-links-'))
+		const root = join(parent, 'public')
+		mkdirSync(join(parent, 'private', 'site'), { recursive: true })
+		mkdirSync(root)
+		writeFileSync(join(parent, 'private', 'secret.txt'), 'secret')
+		writeFileSync(join(parent, 'private', 'site', 'index.html'), 'private')
+		writeFileSync(join(root, 'real.txt'), 'inside')
+		symlinkSync(join(parent, 'private', 'secret.txt'), join(root, 'leak.txt'))
+		symlinkSync(join(parent, 'private', 'site'), join(root, 'site'), 'dir')
+		symlinkSync(join(root, 'real.txt'), join(root, 'alias.txt'))
+		// A deploy that swaps a `current` link to a new release is followed per request.
+		symlinkSync(root, join(parent, 'current'), 'dir')
+		await serveOnce(join(parent, 'current'), async (base) => {
+			expect((await fetch(`${base}/leak.txt`)).status).toBe(404)
+			expect((await fetch(`${base}/site/`)).status).toBe(404)
+			const alias = await fetch(`${base}/alias.txt`)
+			expect(alias.status).toBe(200)
+			expect(await alias.text()).toBe('inside')
 		})
 		rmSync(parent, { recursive: true, force: true })
 	})
