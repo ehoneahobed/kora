@@ -445,17 +445,24 @@ declare const schema: SchemaDefinition
 -->
 
 ```ts
-import { createSqliteUserStore } from '@korajs/auth/server'
+import Database from 'better-sqlite3'
 import { createSqliteServerStore } from '@korajs/server'
 
-const store = createSqliteServerStore({ filename: './kora-server.db' })
-const users = await createSqliteUserStore({ filename: './kora-server.db' })
+// The auth database (KORA_AUTH_DB), not the sync database: the templates keep them apart.
+const auth = new Database('./.kora/kora-auth.db', { readonly: true, fileMustExist: true })
+const devices = auth.prepare('SELECT count(*) AS n FROM auth_devices').get() as { n: number }
+if (devices.n === 0) throw new Error('No auth devices found: is this the auth database?')
+const findDevice = auth.prepare('SELECT user_id FROM auth_devices WHERE id = ?')
+
+const store = createSqliteServerStore({ filename: './.kora/kora-server.db' })
 await store.setSchema(schema) // runs the one-time beta.13 migrations
 for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
-  const device = nodeId.startsWith('kora:') ? null : await users.findDevice(nodeId)
-  if (!device || (await store.getNodeClaimOwner(nodeId)) !== null) continue
+  if (nodeId.startsWith('kora:')) continue
+  const device = findDevice.get(nodeId) as { user_id: string } | undefined
+  // A real owner is kept. '' means an administrator released the node: bind it.
+  if (!device || (await store.getNodeClaimOwner(nodeId))) continue
   await store.releaseNodeClaim(nodeId)
-  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+  if (!(await store.claimNode(nodeId, device.user_id))) throw new Error(`could not bind ${nodeId}`)
 }
 await store.close()
 ```
@@ -470,10 +477,11 @@ declare const body: { title?: string; notes?: string }
 declare const recordId: string
 -->
 
-On Postgres, use `createPostgresServerStore` and `createPostgresUserStore` with a
-`connectionString`. Revoked devices are bound too: they stay signed out (auth enforces
-revocation), and if the user signs in again on that browser, the device id comes back
-and syncs. Another user who presents a bound node id is still refused `NODE_ID_CLAIMED`.
+Point both paths at your deployment's files (`KORA_SERVER_DB` and `KORA_AUTH_DB` in the
+templates; some apps keep both in one file). On Postgres, use `createPostgresServerStore`
+with a `connectionString` and read `auth_devices` from the auth database the same way.
+Revoked devices are bound too: they stay signed out (auth enforces revocation), and if the
+user signs in again on that browser, the device id comes back and syncs. Another user who presents a bound node id is still refused `NODE_ID_CLAIMED`.
 
 **Apps with token auth (`sync.auth`):**
 
